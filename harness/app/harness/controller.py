@@ -717,13 +717,19 @@ class Controller:
             stalled = bool(migrate.clock_stall(self.ledger))
         except Exception:                       # noqa: BLE001: an unreadable clock check counts as a stall
             stalled = True
-        late, relist, unsure, clock_tap = [], [], [], False
+        late, relist, unsure, unverified, clock_tap = [], [], [], [], False
         for row in self.handovers.journaled():
             p = row["press"]
             if self.handovers.key(p) in queued:
                 continue
             if row["state"] in ("refused", "found"):
                 self._post_pending_notice(row)
+                continue
+            if row["state"] == "unverified":
+                # Twentieth round: terminal. Its approval was used up and its calendar couldn't be read; the last
+                # run wrote that outcome but stopped before its card or its strike. It's never aged, taken or
+                # relisted: its card says again that the calendar couldn't be read, and it's struck.
+                unverified.append(row)
                 continue
             if boundary:
                 relist.append(row)
@@ -750,6 +756,8 @@ class Controller:
                 clock_tap = clock_tap or (stalled and self._choice_kind(p) == "migration_clock")
         if relist and self.config is not None:
             self._relist_taps(relist)
+        if unverified and self.config is not None:
+            self._finish_unverified(unverified)
         if unsure and self.config is not None:
             self._settle_unknown(unsure)
         if late and self.config is not None:
@@ -934,7 +942,9 @@ class Controller:
         tap: the error came before its decision was recorded, so nothing it leads to ran); "settling" (its
         approval was used up and the change's job is still being carried out: Harness's own executor finishes it,
         and its receipt follows); "ended" (nineteenth round: its approval was used up and the change's job has
-        ended, done or not); "settled" (its choice was used up, or the records can't say)."""
+        ended, done or not); "settled" (its choice was used up); "hold_unread" (twentieth round: the read itself
+        failed, a database error or a press that can't be read; never taken as settled: the tap is kept and read
+        again on the schedule and at every start, and struck only once a read answers with a terminal state)."""
         try:
             uid = int(p.get("id"))
             a = self.ledger.db.execute(
@@ -947,8 +957,10 @@ class Controller:
                                               (uid,)).fetchone():
                 return "settled"
             return "untaken"
-        except (TypeError, ValueError, sqlite3.Error):
-            return "settled"                    # can't tell: counted as taken, so it's never run a second time
+        except Exception as e:                  # noqa: BLE001: twentieth round: any failed read is "still settling"
+            log.warning("a tap's hold couldn't be read in the records (%s); it's kept and read again",
+                        type(e).__name__)
+            return "hold_unread"
 
     def _settle_unknown(self, rows: list[dict]) -> None:
         """Eighteenth round: the one path that settles taps whose outcome is unknown (an error after the intent,
@@ -963,8 +975,9 @@ class Controller:
           start, and settled once its job reads finished;
         - ended (nineteenth round): its approval's job has ended. Done or taken off is said; parts the calendar
           reads as not done are a failed or partial outcome, never "the records took it": its card names each part
-          not done, offers Go ahead for those safe to do again (CalendarChange.retry_safe) and asks him to ask again
-          for the rest;
+          not done, offers Go ahead for those safe to do again (CalendarChange.retry_safe) and says for the rest
+          why they aren't done again (twentieth round: unreadable, no identity, or possibly sent), never asking him
+          to send it again;
         - settled: its choice was used up: done, taken off since, or not shown, said truthfully, with no Go ahead.
         A read that can't answer keeps the tap unknown in the journal (never struck) and reads it again on
         CHECK_BACKOFF_S; he's told once when the next read is, by the time persisted for it. Once the schedule runs
@@ -975,9 +988,10 @@ class Controller:
             p, op = row["press"], row.get("op") or {}
             hold = self._records_hold(p)
             n = int(row.get("checks") or 0)
-            if hold == "settling":
-                # Nineteenth round: never struck while its job is still being carried out.
-                self._wait_check(row, "settling", n, now, waits)
+            if hold in ("settling", "hold_unread"):
+                # Nineteenth round: never struck while its job is still being carried out. Twentieth round: nor
+                # while the records can't be read to tell.
+                self._wait_check(row, hold, n, now, waits)
                 continue
             seen, parts = self._tap_read(op)
             extra: dict = {}
@@ -999,20 +1013,18 @@ class Controller:
             final.append((row, seen, parts, extra))
         if waits:
             tz = ZoneInfo(self.config.timezone)
-            with self.ledger.tx() as db:
-                for row, seen, at in waits:
-                    why = ("Harness's records are still carrying it out" if seen == "settling"
-                           else "your calendar couldn't be read just now")
-                    if at is None:
-                        next_read = "when Harness next starts"
-                    else:
-                        when = datetime.fromtimestamp(at, timezone.utc).astimezone(tz)
-                        next_read = f"at about {render.clock_words(when, suffix=True)}"
-                    self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
-                        f"{self._tap_head(row)} Harness can't tell yet whether it went through: {why}. It reads "
-                        f"your calendar for it again {next_read} and tells you what it finds; nothing is done "
-                        "twice."))
-                self.ledger.event("taps_waiting", {"count": len(waits)}, db=db)
+            try:
+                self._tell_waits(waits, tz, owner)
+            except Exception as e:              # noqa: BLE001: not told now, so not marked: told at the next read
+                log.error("a note that a tap waits couldn't be queued (%s); it goes at its next read",
+                          type(e).__name__)
+            else:
+                # Twentieth round: marked told only once the note is queued (the records' commit), so a note that
+                # couldn't be queued is never taken as said.
+                for row, _seen, at, n_next in waits:
+                    if at is not None and not self.handovers.journal_check(row["press"], n_next, at, True):
+                        log.error("a tap's waiting note was queued but its mark couldn't be written; it may be "
+                                  "said once more")
         for row, seen, _, _ in final:
             if seen == "records_unread" and not self.handovers.journal_outcome(row["press"], "unverified"):
                 log.error("an unverified tap's outcome couldn't be written to the tap journal")
@@ -1020,25 +1032,46 @@ class Controller:
             self._relist_taps([r for r, _, _, _ in final], restored=False,
                               verdicts={self.handovers.key(r["press"]): (s, pt, x) for r, s, pt, x in final})
 
+    def _tell_waits(self, waits: list, tz, owner: int) -> None:
+        """The notes that taps wait, queued in one transaction (twentieth round: the caller marks them told only
+        once this returns)."""
+        with self.ledger.tx() as db:
+            for row, seen, at, _n in waits:
+                why = {"settling": "Harness's records are still carrying it out",
+                       "hold_unread": "Harness's records couldn't be read just now"}.get(
+                           seen, "your calendar couldn't be read just now")
+                if at is None:
+                    next_read = "when Harness next starts"
+                else:
+                    when = datetime.fromtimestamp(at, timezone.utc).astimezone(tz)
+                    next_read = f"at about {render.clock_words(when, suffix=True)}"
+                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
+                    f"{self._tap_head(row)} Harness can't tell yet whether it went through: {why}. It reads "
+                    f"your calendar for it again {next_read} and tells you what it finds; nothing is done "
+                    "twice."))
+            self.ledger.event("taps_waiting", {"count": len(waits)}, db=db)
+
     def _wait_check(self, row: dict, seen: str, n: int, now: float, waits: list) -> None:
         """Nineteenth round: the next read of an unknown tap that can't settle yet, persisted before he's told of
         it: the schedule's step n, or CHECK_CAP_S once it's used up. He's told once, by the persisted time, or that
-        it's read at the next start when the time couldn't be written."""
+        it's read at the next start when the time couldn't be written. Twentieth round: the read is persisted here
+        with the told mark as it stands; the mark is set only after the note is queued (_settle_unknown)."""
         delay = self.CHECK_BACKOFF_S[n] if n < len(self.CHECK_BACKOFF_S) else self.CHECK_CAP_S
         at = now + delay
-        ok = self.handovers.journal_check(row["press"], n + 1, at, True)
+        ok = self.handovers.journal_check(row["press"], n + 1, at, bool(row.get("told_check")))
         if not ok:
             log.error("an unknown tap's next read couldn't be written to the tap journal; it's read at the next "
                       "start")
-        if seen == "settling" and n >= len(self.CHECK_BACKOFF_S):
-            log.warning("a tap whose change Harness's records are still carrying out is read again in an hour")
+        if seen in ("settling", "hold_unread") and n >= len(self.CHECK_BACKOFF_S):
+            log.warning("a tap whose change Harness's records are still carrying out (or can't read) is read again "
+                        "in an hour")
         if not row.get("told_check"):
-            waits.append((row, seen, at if ok else None))
+            waits.append((row, seen, at if ok else None, n + 1))
 
     def _ended_verdict(self, op: dict, seen: str, parts: list) -> tuple[str, dict]:
         """Nineteenth round: an approved change whose job ended while the calendar reads some of it not done. The
         parts not done (each by name and what was read), and which of them are safe to do again: "failed_retry"
-        when at least one is (its card has Go ahead for those only), else "failed_ask" (he's asked to ask again).
+        when at least one is (its card has Go ahead for those only), else "failed_ask" (no Go ahead).
         Nothing read ("unchecked", "no_identity") is "records_noread"."""
         if seen in ("unchecked", "no_identity"):
             return "records_noread", {}
@@ -1053,8 +1086,13 @@ class Controller:
                 log.warning("a failed change's parts couldn't be sorted for a retry (%s)", type(e).__name__)
                 safe = []
         open_ = [i for i, v in enumerate(got) if v not in ("done", "removed", "changed")]
-        extra = {"retry": safe, "names": names, "got": got,
-                 "ask": [i for i in open_ if i not in safe]}
+        ask = [i for i in open_ if i not in safe]
+        # Twentieth round: each part not offered again, by why: its read failed ("unread"), it carries no identity
+        # to read by (a Family removal: "no_identity"), or its write may have been sent, so absence or not-done
+        # can't tell what happened ("maybe_sent"). None of them has Go ahead, and none asks him to send it again.
+        why = {i: ("unread" if got[i] == "unread" else "no_identity" if got[i] in ("unchecked", "no_identity")
+                   else "maybe_sent") for i in ask}
+        extra = {"retry": safe, "names": names, "got": got, "ask": ask, "why": why}
         return ("failed_retry" if safe else "failed_ask"), extra
 
     def _recheck_taps(self) -> None:
@@ -1065,14 +1103,27 @@ class Controller:
         now = self._clock()
         try:
             queued = self.handovers.queued_keys()
-            due = [r for r in self.handovers.journaled()
-                   if r["state"] == "unknown" and r.get("next_check") is not None and r["next_check"] <= now
-                   and self.handovers.key(r["press"]) not in queued]
+            rows = [r for r in self.handovers.journaled() if self.handovers.key(r["press"]) not in queued]
+            due = [r for r in rows
+                   if r["state"] == "unknown" and r.get("next_check") is not None and r["next_check"] <= now]
+            # Twentieth round: one left recorded as unverified (its card or strike didn't happen) is finished too.
+            unverified = [r for r in rows if r["state"] == "unverified"]
         except Exception as e:                  # noqa: BLE001: a journal that can't be read now is read next tick
             log.warning("the tap journal couldn't be read for unknown taps (%s)", type(e).__name__)
             return
+        if unverified:
+            self._finish_unverified(unverified)
         if due:
             self._settle_unknown(due)
+
+    def _finish_unverified(self, rows: list[dict]) -> None:
+        """Twentieth round: taps whose outcome is recorded as unverified (an approval used up, the calendar never
+        readable) but that weren't struck: the outcome was written, then the run stopped before the card or the
+        strike. Never aged or taken again: the same card as at the time ("couldn't read your calendar to tell how
+        far it got", no Go ahead) goes again, and each is struck; striking twice is harmless."""
+        log.warning("a tap recorded as unverified wasn't finished; its card goes again and it's struck")
+        self._relist_taps(rows, restored=False,
+                          verdicts={self.handovers.key(r["press"]): ("records_unread", [], {}) for r in rows})
 
     def _tap_head(self, row: dict) -> str:
         try:
@@ -1227,12 +1278,28 @@ class Controller:
             out.append("The button below does " + ", ".join(name(i) for i in sorted(retry))
                        + " again on a new card for your approval, reading your calendar for "
                        + ("it" if len(retry) == 1 else "each") + " first so nothing is made twice.")
-        if ask:
-            out.append("For " + ", ".join(name(i) for i in ask) + ", Harness can't tell whether "
-                       + ("it was" if len(ask) == 1 else "they were") + " made and taken off since, so "
-                       + ("it isn't" if len(ask) == 1 else "they aren't") + " done again from here: ask Harness for "
-                       + ("it" if len(ask) == 1 else "them") + " again if you still want "
-                       + ("it." if len(ask) == 1 else "them."))
+        why = {int(k): v for k, v in (extra.get("why") or {}).items()}
+        groups = {"maybe_sent": [], "no_identity": [], "unread": []}
+        for i in ask:
+            groups.get(why.get(i, "maybe_sent"), groups["maybe_sent"]).append(i)
+
+        def they(idx, one, many):
+            return one if len(idx) == 1 else many
+        if groups["maybe_sent"]:
+            g = groups["maybe_sent"]
+            out.append("For " + ", ".join(name(i) for i in g) + ", its write may have reached your calendar, so "
+                       "Harness can't tell whether " + they(g, "it was", "they were") + " made and changed or taken "
+                       "off since; " + they(g, "it isn't", "they aren't") + " done again from here.")
+        if groups["no_identity"]:
+            g = groups["no_identity"]
+            out.append("For " + ", ".join(name(i) for i in g) + ", that kind of change leaves nothing Harness can "
+                       "read on your calendar to tell whether it went through, so " + they(g, "it isn't", "they aren't")
+                       + " done again from here.")
+        if groups["unread"]:
+            g = groups["unread"]
+            out.append("For " + ", ".join(name(i) for i in g) + ", your calendar couldn't be read just now, so "
+                       "Harness can't tell how far " + they(g, "it", "they") + " got; nothing more is done for "
+                       + they(g, "it", "them") + " from here.")
         return " ".join(out)
 
     @classmethod
@@ -1327,10 +1394,20 @@ class Controller:
         seen, parts = self._tap_read(op)
         if seen == "unread" or any(v == "unread" for _, v in parts):
             # Nineteenth round: the card said it reads first; a read that still can't answer does nothing.
+            # Twentieth round: never asks him to send it again (the failure isn't his): the same Go ahead comes
+            # back on a new card, which reads his calendar again when he uses it.
             with self.ledger.tx() as db:
                 self.ledger.event("tap_reconfirm_unread", {}, db=db)
-            return ("Your calendar still couldn't be read, so nothing was done. Ask Harness for it again once your "
-                    "calendar can be read.")
+                again = choices.mint(self.ledger, kind="tap_reconfirm", chat_id=self.config.owner_user_id,
+                                     ttl_s=self.TAP_RELIST_TTL_S, target=target, db=db)
+                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=render.fit(
+                    "Your calendar still couldn't be read, so nothing was done for that tap. The button below "
+                    "reads your calendar again first and does it only if it isn't there; if your calendar still "
+                    "can't be read, nothing is done."),
+                    buttons=[[("Go ahead", choices.callback_data(again))]],
+                    binds=[{"type": "choice", "nonce": again}])
+            return ("Your calendar still couldn't be read, so nothing was done. Harness reads it again when you tap "
+                    "Go ahead on the card that follows.")
         if retry is not None:
             return self._retry_ended(op, parts, retry)
         if seen == "done":
@@ -1377,15 +1454,16 @@ class Controller:
         if p is None:
             return "That can't be done from here, so nothing changed."
         pick = [changes[i] for i in now_safe if i < len(changes)]
+        # Twentieth round: the first offer's keys go in with the new card, so its preview is read at the very fixed
+        # ids the write will use, and they're set with its proposal, before it can be approved.
+        fixed = [keys[i] if i < len(keys) else f"{pid}:{i}" for i in now_safe if i < len(changes)]
         new_job = self.runner.recard(p, pick, "you asked for the parts that didn't go through to be done again, so "
-                                              "they're on a new card")
+                                              "they're on a new card", keys=fixed)
         row = self.ledger.db.execute("SELECT id FROM proposals WHERE job_id=? ORDER BY created_at DESC, rowid DESC"
                                      " LIMIT 1", (new_job,)).fetchone() if new_job else None
         if row is None:
             return "Nothing could be put on a new card, so nothing changed."
         with self.ledger.tx() as db:
-            self.ledger.set_meta(f"calendar_change_keys:{row['id']}", json.dumps(
-                [keys[i] if i < len(keys) else f"{pid}:{i}" for i in now_safe]), db)
             self.ledger.event("tap_retry_ended", {"proposal": pid, "parts": len(now_safe)}, db=db)
         return "A new card follows for the parts that didn't go through."
 

@@ -2,6 +2,13 @@
 
 ## 0.24.0
 
+- **A tap is never written off because Harness's own records couldn't be read.** It's kept and read again on the same schedule, and at every start, until the records answer.
+- **A tap whose calendar couldn't be read keeps its true card** even if Harness stopped right after deciding that: the next start says again that your calendar couldn't be read, never that Harness didn't get to your tap.
+- **A retry card shows what its write will find.** It reads the very events the first card was for, so an event that turned up there in the meantime shows as already there.
+- **Nothing asks you to send a request again** after a failure that wasn't yours. A part that isn't done again says why: its write may have reached your calendar, it leaves nothing Harness can read, or your calendar couldn't be read. When a Go ahead can't read your calendar, the same Go ahead comes back on a new card.
+- **Why one card has Go ahead and another doesn't:** an add that never showed up in Google across a restore gets none, because an empty spot where Harness writes can't be told apart from an event added and deleted since; a tap whose decision never reached Harness's records gets one, because nothing it leads to ran.
+- A card Cain's link turns down twice still reaches you, as a short fixed card with its buttons. Setting aside files names any file left with neither a good copy nor its original, and changes nothing else.
+
 - **A tap whose change is still being carried out is never given up on.** Harness keeps reading it every hour, and at every start, and tells you what came of it once the change has finished. A tap whose calendar can't be read is read after 1, 2, 5, 15, 30 and 60 minutes, then its card says your calendar couldn't be read.
 - **A change that didn't all go through says which parts.** Its card names each part that isn't done. Parts that are safe to do again come back on a new card for your approval, written to the same events so nothing is made twice; where Harness can't tell whether an event was added and taken off since, the card asks you to ask for it again.
 - **Undo never guesses.** A change recorded before Harness kept each event's version isn't undone automatically: the receipt says so and asks you for the change you want on a new card. A day of a repeating event you edited in any way since (notes, place, guests, reminders) is left alone.

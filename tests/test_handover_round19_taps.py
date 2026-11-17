@@ -63,7 +63,9 @@ def journal_checks(m):
     real = m.c.handovers.journal_check
 
     def check(press, n, next_at, told):
-        got.append((n, round(next_at - m.c._clock())))
+        step = (n, round(next_at - m.c._clock()))
+        if not got or got[-1] != step:          # twentieth round: the told mark rewrites the same read once queued
+            got.append(step)
         return real(press, n, next_at, told)
     m.c.handovers.journal_check = check
     return got
@@ -175,7 +177,8 @@ def test_an_add_whose_write_may_have_been_sent_is_ambiguous_and_asks_him_to_ask_
     later(m, clock, 61)
     cards = new_cards(m, before)
     said = " ".join(c["text"] for c in cards)
-    assert "Dentist: not on your calendar" in said and "ask Harness for it again" in said
+    assert "Dentist: not on your calendar" in said and "may have reached your calendar" in said
+    assert "ask Harness for it again" not in said                              # twentieth round: never asks again
     assert "Go ahead" not in card_labels(cards)
     assert not any(e[0] == "insert" for e in m.gmail.log[1:])
 
@@ -209,7 +212,8 @@ def test_the_failed_card_words_name_every_part_and_no_button():
     text = Controller._relist_words("unknown", "failed_retry", [], restored=False, extra=extra)
     assert "Lunch: not on your calendar" in text and "PT: not done on your calendar" in text
     assert "Dentist" not in text.split("The button")[0].split("through: ")[1]
-    assert "For Lunch" in text and "ask Harness for it again" in text
+    assert "For Lunch" in text and "isn't done again from here" in text
+    assert "ask Harness" not in text and "again if you" not in text            # twentieth round: never asks again
     assert not any(b in text for b in ("Go ahead", "Approve", "Undo"))
     unread = Controller._relist_words("unknown", "records_unread", [], restored=False)
     assert "couldn't read your calendar" in unread and "doesn't show" not in unread

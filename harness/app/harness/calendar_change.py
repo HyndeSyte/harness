@@ -1177,11 +1177,13 @@ class CalendarChange:
                  len(parts), len(checks))
         return self._preview_of(parts, checks)
 
-    def preview_quiet(self, job, params: dict) -> Preview | None:
+    def preview_quiet(self, job, params: dict, keys: list[str] | None = None) -> Preview | None:
         """preview for one change of several already found clear together (runner._split): what it
-        will do and what to check, saying nothing and moving no job. None: it can't be read alone."""
+        will do and what to check, saying nothing and moving no job. None: it can't be read alone.
+        Twentieth round: `keys`, the keys its fixed ids are made from when they're already known (a
+        retry's, from its first offer), so the preview reads the very ids the write will."""
         try:
-            parts, _ = self._plan_all(params, "preview")
+            parts, _ = self._plan_all(params, "preview", keys=keys)
         except (Refuse, ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
             return None
         return self._preview_of(parts, self._checks(job, parts))
@@ -4576,7 +4578,8 @@ class CalendarChange:
                        (now, pid))
             self._save_plan(pid, plan, db)
 
-    def _plan_all(self, params: dict, pid: str, *, run: bool = False) -> tuple[list[Part], list[str]]:
+    def _plan_all(self, params: dict, pid: str, *, run: bool = False,
+                  keys: list[str] | None = None) -> tuple[list[Part], list[str]]:
         """Every change he asked for, found and decided before anything is written. One event
         named twice for the same thing is one part (Nov 11: a card moved PT on Gmail and its copy
         on Family as two lines); named for two different things, it's unclear. Eighteenth round: each
@@ -4585,7 +4588,7 @@ class CalendarChange:
         a Go ahead leaves out, read again now (_skip_now)."""
         parts: list[Part] = []
         notes: list[str] = []
-        keys = self.keys_of(pid)
+        keys = self.keys_of(pid) if keys is None else [str(k) for k in keys]
         self._forcing = bool(self.ledger.get_meta(f"calendar_change_force:{pid}"))
         skip = self._skip_now(pid) if run else set()
         self._skipping = skip
@@ -6046,8 +6049,10 @@ class CalendarChange:
         """Nineteenth round: for an approved change whose job ended with parts not done (`got`, tap_parts's
         verdicts), the parts that are safe to do again: a Gmail removal whose bound event is still there
         ("not_done"), and an add absent at its fixed id that the records' own run never sent (each of its steps
-        pending, failed with nothing written, or found in its very version), so absent there can only mean it was
-        never made. An add whose write was sent, or may have been, is ambiguous when absent and isn't offered."""
+        pending, or failed with nothing written), so absent there can only mean it was never made. An add whose
+        write was sent, or may have been, is ambiguous when absent and isn't offered. Twentieth round, stated as
+        built: a step found in its very version keeps its entry in the settle record, so it reads as ambiguous here
+        and gets no Go ahead (absence after it was seen there means it was there and is gone since)."""
         pid = str((op or {}).get("proposal") or "")
         changes = list((op or {}).get("changes") or [])
         keys = [str(k) for k in (op or {}).get("keys") or []]

@@ -36,14 +36,25 @@ jobs:
   # The specialist's image, built as Home Assistant builds it, and its embedded build id compared with
   # the source tree's (0.24.0, tenth round): the install step keys its migration and the dry run to that
   # id, so the image and the tree must agree. Not a required check; it reports on every push.
+  # Twentieth round: built with --no-cache and plain progress, so every layer is built in this run and
+  # the log shows each one (a CACHED layer fails the job), and stamped with this run's id as a label,
+  # checked before the compare, so the image compared can only be the one built here.
   image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build the specialist's image
-        run: docker build -t harness-ci harness
+        run: |
+          set -o pipefail
+          stamp="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build --no-cache --pull --progress=plain --label "harness.ci.run=$stamp" -t harness-ci harness 2>&1 | tee build.log
+          if grep -E '^#[0-9]+ CACHED' build.log; then echo "a layer came from cache"; exit 1; fi
       - name: The image's build id equals the source tree's
         run: |
+          stamp="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          built=$(docker image inspect -f '{{ index .Config.Labels "harness.ci.run" }}' harness-ci)
+          echo "built in run: $built (this run: $stamp)"
+          test "$built" = "$stamp"
           tree=$(python3 harness/app/harness/buildid.py harness harness/app)
           image=$(docker run --rm --entrypoint cat harness-ci /opt/harness/BUILD_ID)
           echo "source tree: $tree"

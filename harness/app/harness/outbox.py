@@ -76,15 +76,115 @@ def tells_to_use(text: str, label: str) -> bool:
     return False
 
 
-def strip_button_words(text: str, labels: list[str]) -> str:
-    """The card's text with every sentence that tells him to use one of `labels` taken out, line by line, so what's
-    left says what happened without pointing at a button that isn't there. Nineteenth round: only a sentence that
-    matches the link's own imperative patterns (tells_to_use) goes; a sentence that merely mentions the words ("we'll
-    go ahead with it", "undo this later") stays."""
+# Twentieth round: the link's own label finder too, mirrored from cain/rootfs/opt/cain/gate/rules.ts (VERB,
+# STATIC_LABELS, WITH_LABELS, named() and the button part of check(), with hidden()), so the outbox strips exactly
+# what the link refuses: the wider verb list (choose, pick, select), a label after a line break ("Tap" at a line's
+# end, the label on the next), quoted and bold labels, and every label the link knows, not only the ones a refusal
+# named. tests/test_outbox_round20.py compares these with the link's source, and both suites run the shared cases
+# in tests/imperative_cases.json.
+VERB = "(?:[Tt]ap|[Tt]apping|[Pp]ress|[Pp]ressing|[Hh]it|[Cc]lick|[Cc]hoose|[Pp]ick|[Ss]elect)"
+STATIC_LABELS = (
+    "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
+    "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
+    "Not this time", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
+    "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now",
+)
+WITH_LABELS = (
+    "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Not this time", "Turn back on", "Not now",
+    "Use new", "Keep old", "Keep rule", "Drop rule", "All of it", "Part of it", "None wrong: stop checking",
+    "Something was off: keep checking", "Open connector settings",
+)
+HIDE = "\u0000"
+
+
+def hidden(text: str) -> str:
+    """The link's hidden(text): link targets, code and bare links covered in place (same length, new lines kept)."""
+    t = list(text)
+
+    def cover(a: int, b: int) -> None:
+        for i in range(a, b):
+            if t[i] != "\n":
+                t[i] = HIDE
+    for m in re.finditer(r"\]\([^)\s]*\)", text):
+        cover(m.start() + 1, m.end())
+    for pat in (r"```[\s\S]*?```", r"`[^`\n]+`", r"<?https?://[^\s<>()]+>?"):
+        for m in re.finditer(pat, text):
+            cover(m.start(), m.end())
+    return "".join(t)
+
+
+def named(seen: str, label: str) -> list[tuple[int, int, int, int]]:
+    """The link's named(seen, label): each place the label is named as a button, as (match start, match end,
+    label start, label end), the first form to find a label's start keeping it."""
+    lab = re.escape(label)
+    forms = [
+        re.compile(r"(?<![A-Za-z])" + VERB + r"\s+(?:(?:on\s+)?the\s+|on\s+)?" + Q + "(" + lab + ")" + Q
+                   + r"(?![A-Za-z0-9])"),
+        re.compile(r"(?<![A-Za-z0-9])" + Q + "(" + lab + ")" + Q + r"\s+[Bb]uttons?\b"),
+    ]
+    if label in WITH_LABELS:
+        forms.append(re.compile(r"(?<![A-Za-z])[Ww]ith\s+(?:the\s+)?" + Q + "(" + lab + ")" + Q
+                                + r"(?![A-Za-z0-9])"))
+    out, starts = [], set()
+    for rx in forms:
+        for m in rx.finditer(seen):
+            if m.start(1) not in starts:
+                starts.add(m.start(1))
+                out.append((m.start(), m.end(), m.start(1), m.end(1)))
+    return out
+
+
+def refused_spans(text: str, carried, known=()) -> list[tuple[int, int, str]]:
+    """What the link refuses a specialist's card for (core.ts addCard with check()'s button rule): every known label
+    (STATIC_LABELS and `known`, longest first, spans never overlapping) named as a button the card doesn't carry
+    (`carried`), in an imperative position. Each as (start, end, label), start..end covering the verb (or "button")
+    and the label."""
+    t = str(text or "")
+    seen = hidden(t)
+    has = {str(x) for x in carried or ()}
+    labels = sorted({str(x).strip() for x in (*STATIC_LABELS, *(known or ())) if str(x).strip()},
+                    key=lambda x: -len(x))
+    taken: list[tuple[int, int]] = []
     out = []
-    for line in text.split("\n"):
-        parts = re.split(r"(?<=[.!?])\s+", line)
-        keep = [x for x in parts if not any(tells_to_use(_plain(x), label) for label in labels)]
+    for label in labels:
+        for a, b, at, end in named(seen, label):
+            if any(x < end and at < y for x, y in taken):
+                continue
+            taken.append((at, end))
+            if label in has:
+                continue
+            if imperative(t, at, end):
+                out.append((min(a, at), max(b, end), label))
+    return sorted(out)
+
+
+# A sentence ends at ".", "!" or "?", a closing bold or italic tag after it kept with it (twentieth round: "<b>Done.</b>
+# Tap ..." is two sentences, so a head in bold isn't lost with the sentence after it).
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+|(?<=[.!?]</b>)\s+|(?<=[.!?]</i>)\s+")
+
+
+def strip_button_words(text: str, labels: list[str], carried=()) -> str:
+    """The card's text with every sentence the link would refuse it for taken out (refused_spans, read across line
+    breaks, against every label the link knows and the refusal's own `labels`), keeping its lines, so what's left
+    says what happened without pointing at a button that isn't there. A sentence that merely holds the words ("we'll
+    go ahead with it", "undo this later") stays."""
+    segs: list[tuple[int, str]] = []            # (line number, sentence), in order
+    lines = text.split("\n")
+    for n, line in enumerate(lines):
+        for x in SENTENCE_END.split(line):
+            segs.append((n, x))
+    plain, spans = "", []
+    for i, (n, x) in enumerate(segs):
+        if i:
+            plain += "\n" if segs[i - 1][0] != n else " "
+        a = len(plain)
+        plain += _plain(x)
+        spans.append((a, len(plain)))
+    hits = refused_spans(plain, carried, known=labels)
+    drop = {i for i, (a, b) in enumerate(spans) for x, y, _ in hits if x < max(b, a + 1) and a < y}
+    out = []
+    for n, line in enumerate(lines):
+        keep = [x for i, (ln, x) in enumerate(segs) if ln == n and i not in drop]
         if keep or not line.strip():
             out.append(" ".join(keep))
     return "\n".join(out).strip()
@@ -93,7 +193,7 @@ def strip_button_words(text: str, labels: list[str]) -> str:
 def _head(text: str) -> str:
     """A card's first line, its required fact: what it's about (its bold head, or its first sentence)."""
     first = next((x for x in (text or "").split("\n") if x.strip()), "")
-    return _plain(re.split(r"(?<=[.!?])\s+", first)[0]).strip()
+    return _plain(SENTENCE_END.split(first)[0]).strip()
 
 
 class Outbox:
@@ -104,18 +204,19 @@ class Outbox:
         self.sleep = sleep
         self.tz = ZoneInfo(tz)
 
-    def _template(self, row, stripped: str, labels: list[str]) -> str:
-        """Nineteenth round: the fixed card for a refusal that left nothing usable: what it's about (his message,
-        quoted, when it's for one), when it was written, and the outcome (what's left of its words, or that its
-        full words couldn't be shown). Nothing in it can tell him to use a button."""
-        what = ""
-        if row["job_id"]:
-            asked = " ".join(self.ledger.job_text(row["job_id"]).split())[:120]
-            if asked and not any(tells_to_use(asked, x) for x in labels):
-                what = f"About your message \u201c{render.escape(asked)}\u201d."
+    # Twentieth round: the fixed card for a refusal: fixed words only, no quoted message and nothing the model or a
+    # calendar wrote, checked in tests against every label the link knows (refused_spans), so it can't be refused.
+    TEMPLATE_HEAD = "<b>An update from Harness</b>, written {when}."
+    TEMPLATE_BODY = "Harness has an update on this; its full words couldn't be shown here."
+    TEMPLATE_JOB = "It's about a message of yours."
+
+    def _template(self, row) -> str:
+        """Twentieth round: the fixed card posted when a refused card's stripped words would lose its head, leave
+        nothing, or are refused again: when it was written, whether it's about a message of his, and that its full
+        words couldn't be shown, all fixed text. The card keeps its own buttons."""
         when = datetime.fromisoformat(row["created_at"]).astimezone(self.tz).strftime("%a %-I:%M %p")
-        outcome = stripped.strip() or "Harness has an update on this; its full words couldn't be shown here."
-        return "\n".join(x for x in (f"<b>An update from Harness</b>, written {when}.", what, outcome) if x)
+        return "\n".join(x for x in (self.TEMPLATE_HEAD.format(when=when),
+                                      self.TEMPLATE_JOB if row["job_id"] else "", self.TEMPLATE_BODY) if x)
 
     def flush(self, *, limit: int = 20) -> int:
         """Send what is due. Returns how many were delivered."""
@@ -159,10 +260,11 @@ class Outbox:
             # Nineteenth round: only the sentences matching the link's own imperative patterns go; if nothing is
             # left, or the card's head (its required fact) went with them, a fixed template from its structured
             # fields goes instead (_template), its buttons kept.
-            stripped = strip_button_words(text, labels)
+            carried = [str(b[0]) for r in (buttons or []) for b in r]
+            stripped = strip_button_words(text, labels, carried)
             head = _head(text)
             templated = not stripped.strip() or bool(head and head not in _plain(stripped))
-            text = render.fit(self._template(row, stripped, labels) if templated else stripped)
+            text = render.fit(self._template(row) if templated else stripped)
             log.error("Cain's link refused a card for naming %s; it goes %s", ", ".join(labels),
                       "as a fixed template" if templated else "without those words")
             if not self.ledger.fenced:
@@ -171,8 +273,24 @@ class Outbox:
             try:
                 mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
             except ChatError as e2:
-                self._failed(row, e2)
-                return False
+                again = refused_labels(e2)
+                if not again or templated:
+                    self._failed(row, e2)
+                    return False
+                # Twentieth round: refused a second time (it named a label the first refusal didn't): the fixed
+                # template goes, its buttons kept, never a dead card.
+                log.error("Cain's link refused the card again for naming %s; it goes as a fixed template",
+                          ", ".join(again))
+                if not self.ledger.fenced:
+                    self.ledger.event("link_refused_card", {"outbox": row["id"], "labels": again[:5],
+                                                            "said": e2.description[:200], "template": True,
+                                                            "second": True})
+                try:
+                    mid = self._deliver(row["chat_id"], render.fit(self._template(row)), buttons, row["kind"],
+                                        self._expires(binds))
+                except ChatError as e3:
+                    self._failed(row, e3)
+                    return False
         now = self.ledger.now()
         # Fourteenth round: the delivery marks are exempt from a staged restore's fence (the restart card goes
         # out and isn't sent twice). Fifteenth round: through the ledger's outbox-only method.

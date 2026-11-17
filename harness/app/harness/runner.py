@@ -590,7 +590,8 @@ class Runner:
                     replaced=bool(replaced_keys) or None if change else None)
 
     def _offer(self, job, d, params, receipt, warnings, lines, *, seen=None, head=(),
-               replaced: bool | None = None, keep_versions: bool = True, new_family: bool = False) -> None:
+               replaced: bool | None = None, keep_versions: bool = True, new_family: bool = False,
+               keys: list[str] | None = None) -> None:
         """The proposal, and the card that tells him about it, or its run with no tap. Only his
         own newest message, under 2 minutes old, with nothing of Cain's and not split, runs with
         no tap: anything else carries a flag (_provenance) and comes on a card."""
@@ -625,6 +626,10 @@ class Runner:
                 # started again is a new change family and keeps nothing (eighth round).
                 olds = self.calendar_change.inherit_keys(pid, params["changes"],
                                                          {} if new_family else self._earlier_keys(job), db)
+                if keys is not None:
+                    # Twentieth round: a retry's fixed ids, set with its proposal (the very ids its preview read),
+                    # so no card is ever approvable while its write would go to another id.
+                    self.ledger.set_meta(f"calendar_change_keys:{pid}", json.dumps([str(k) for k in keys]), db)
             if change:                      # what it says it will do, for his tap and the record
                 self.calendar_change.note_lines(
                     pid, lines or [render.change_line(c, self.config.timezone, self.ledger.now())
@@ -715,17 +720,18 @@ class Runner:
             return "Already on the calendar, so nothing to bring back." if found else "Nothing to bring back there."
         return f"Back on {n} new card{'s' * (n != 1)}, each waiting for your tap."
 
-    def recard(self, p, changes: list, why: str, keep_versions: bool = False) -> str:
+    def recard(self, p, changes: list, why: str, keep_versions: bool = False, keys: list[str] | None = None) -> str:
         """A change on a fresh card for the same message (sixth round): one the calendar refused for
         its version (calendar_change._finish), read anew so the card is bound to the event's version
         now, never to the old card's; or one that waited on a card while writes were paused
         (calendar_change._resume_paused), keeping the version its card was bound to. Its request's id,
-        or "" when there's none to offer."""
+        or "" when there's none to offer. Twentieth round: `keys`, the keys of the fixed ids it must
+        write to (a retry's, from its first offer): set with its proposal, and its preview read at them."""
         old = self.ledger.job(p["job_id"])
         if old is None or not changes:
             return ""
         return self._offer_new(old, {"changes": list(changes)}, why, replaced=True if keep_versions else False,
-                               keep_versions=keep_versions)
+                               keep_versions=keep_versions, keys=keys)
 
     def script_card(self, chat_id: int, text: str, params: dict, own: Callable[[str, Any], None]) -> str:
         """A smoke run's step, from its own script (tenth round): a request the specialist makes itself
@@ -1120,7 +1126,7 @@ class Runner:
         return "The correction is on a new card." + (" That card is off." if won else "")
 
     def _offer_new(self, src, params: dict, why: str, *, replaced: bool, keep_versions: bool = True,
-                   new_family: bool = False) -> str:
+                   new_family: bool = False, keys: list[str] | None = None) -> str:
         """A change for the same message as `src` (its quote, flags and fixed ids kept), as a new
         request, on a card: never applied without his tap. Its request's id."""
         root = self.ledger.get_meta(f"job_parent:{src['id']}") or src["id"]
@@ -1134,11 +1140,11 @@ class Runner:
             parts = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
             self.ledger.set_meta(f"job_parts:{root}", json.dumps(parts + [new]), db)
         job = self.ledger.job(new)
-        seen = self.calendar_change.preview_quiet(job, params)
+        seen = self.calendar_change.preview_quiet(job, params, keys=keys)
         warnings = [why] + (seen.checks if seen else [])
         self._offer(job, effects.REGISTRY[effects.CALENDAR_CHANGE], params, {"reason": "offered_again"}, warnings,
                     seen.lines if seen else None, seen=seen, replaced=replaced, keep_versions=keep_versions,
-                    new_family=new_family)
+                    new_family=new_family, keys=keys)
         return new
 
     def _newer_note(self, job, pids: list[str]) -> str:

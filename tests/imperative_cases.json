@@ -1,18 +1,213 @@
-[
-  ["Tap Go ahead to see it.", "Go ahead", true],
-  ["tap on the Undo button", "Undo", true],
-  ["Press “Approve” now.", "Approve", true],
-  ["Clicking **Undo** takes it off.", "Undo", true],
-  ["hit the Stop", "Stop", true],
-  ["The Undo button takes it off.", "Undo", true],
-  ["Use the \"Add anyway\" buttons below.", "Add anyway", true],
-  ["There's no Go ahead here.", "Go ahead", false],
-  ["We'll go ahead with it.", "go ahead", false],
-  ["You can undo this later.", "undo", false],
-  ["Pick Undo if it's wrong.", "Undo", false],
-  ["It ends with Undo.", "Undo", false],
-  ["Go ahead does it now.", "Go ahead", false],
-  ["Tapping elsewhere, Undo stays.", "Undo", false],
-  ["retap Undo", "Undo", false],
-  ["Undo buttonless", "Undo", false]
-]
+{
+ "imperative": [
+  [
+   "Tap Go ahead to see it.",
+   "Go ahead",
+   true
+  ],
+  [
+   "tap on the Undo button",
+   "Undo",
+   true
+  ],
+  [
+   "Press “Approve” now.",
+   "Approve",
+   true
+  ],
+  [
+   "Clicking **Undo** takes it off.",
+   "Undo",
+   true
+  ],
+  [
+   "hit the Stop",
+   "Stop",
+   true
+  ],
+  [
+   "The Undo button takes it off.",
+   "Undo",
+   true
+  ],
+  [
+   "Use the \"Add anyway\" buttons below.",
+   "Add anyway",
+   true
+  ],
+  [
+   "There's no Go ahead here.",
+   "Go ahead",
+   false
+  ],
+  [
+   "We'll go ahead with it.",
+   "go ahead",
+   false
+  ],
+  [
+   "You can undo this later.",
+   "undo",
+   false
+  ],
+  [
+   "Pick Undo if it's wrong.",
+   "Undo",
+   false
+  ],
+  [
+   "It ends with Undo.",
+   "Undo",
+   false
+  ],
+  [
+   "Go ahead does it now.",
+   "Go ahead",
+   false
+  ],
+  [
+   "Tapping elsewhere, Undo stays.",
+   "Undo",
+   false
+  ],
+  [
+   "retap Undo",
+   "Undo",
+   false
+  ],
+  [
+   "Undo buttonless",
+   "Undo",
+   false
+  ]
+ ],
+ "refusal": [
+  {
+   "text": "Done.\nTap\nGo ahead to see it.",
+   "buttons": [],
+   "known": [
+    "Go ahead"
+   ],
+   "refused": [
+    "Go ahead"
+   ]
+  },
+  {
+   "text": "Done. Tap on the\n\"Undo\" to take it off.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "It's ready. Tap Undo to take it off.",
+   "buttons": [
+    "Go ahead"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "Tap Undo to take it off.",
+   "buttons": [
+    "Undo"
+   ],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "Pick Undo if it's wrong.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "Choose\nApprove when ready.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "Press **Approve** now.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Approve"
+   ]
+  },
+  {
+   "text": "Tap “Turn on” below.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Turn on"
+   ]
+  },
+  {
+   "text": "Tap Undo both to put both back.",
+   "buttons": [
+    "Undo both"
+   ],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "It ends with Undo.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "The Undo button takes it off.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "We'll go ahead with it. Tap\nAdd anyway to add it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Add anyway",
+    "Go ahead"
+   ],
+   "refused": [
+    "Add anyway"
+   ]
+  },
+  {
+   "text": "About your message “Tap Approve”.",
+   "buttons": [
+    "Go ahead"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "refused": [
+    "Approve"
+   ]
+  },
+  {
+   "text": "See [Undo button](https://example.com/x).",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "Code: `tap Undo` here.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  }
+ ]
+}

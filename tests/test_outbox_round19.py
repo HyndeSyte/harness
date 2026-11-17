@@ -21,7 +21,7 @@ from test_plain_commands import nothing_he_shouldnt_see, plain_prompt  # noqa: F
 from fake_caldav import no_network  # noqa: F401  (autouse)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CASES = json.loads((ROOT / "tests" / "imperative_cases.json").read_text())
+CASES = json.loads((ROOT / "tests" / "imperative_cases.json").read_text())["imperative"]
 
 
 def _ts_regex(src: str, name: str, q: str) -> str:
@@ -98,4 +98,6 @@ def test_a_card_whose_head_goes_with_the_stripped_sentence_gets_the_template(m):
     before = len(m.link.cards)
     m.c.outbox.flush()
     (card,) = posted(m, before)
-    assert card["text"].startswith("**An update from Harness**") and "Nothing else changed." in card["text"]
+    assert card["text"].startswith("**An update from Harness**")
+    # Twentieth round: the template is fixed text only; what's left of the card's words isn't in it.
+    assert "Nothing else changed." not in card["text"] and "full words couldn't be shown" in card["text"]
