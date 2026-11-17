@@ -91,7 +91,12 @@ stale lock is taken over only by a rename followed by the exclusive create again
 one contender proceeds, and a lock that can't be read fails the watch as `lock_unavailable`;
 the lock's time is refreshed at the check and before the write, the holder re-reads the lock
 and requires its own token just before it writes the acceptance and again after, taking the
-acceptance back if it lost the lock meanwhile, and a second write for the same sha is a no-op).
+acceptance back if it lost the lock meanwhile, and a second write for the same sha is a no-op;
+twenty-fifth round: every acceptance records the lock's generation, each takeover moves the
+generation on, and the Ship card counts an acceptance only under the current one, so a holder
+taken over can't leave a live acceptance by writing late; the sha-bound check runs before and
+after the write, a superseded sha is refused, never accepted again, and an acceptance must be
+the pull request's head as GitHub has it, at the watch's checks and again when the card reads it).
 Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
@@ -103,6 +108,13 @@ rename and exclusive create, with a loud line in the watch's output. One that lo
 `lock_unavailable`, and its notice names the exact path and the command that removes it
 (`rm -f /data/work/ship-gate-pr-<number>.lock`). Run that on the Pi only when no watch of
 that pull request is running, then watch again.
+
+Generations (0.12.0, twenty-fifth round). Beside each pull request's lock the watch keeps its
+generation (`/data/work/ship-gate-pr-<number>.gen`). A takeover of a stale lock, a legacy one
+included, moves it on and says so in the watch's output, with the lock's age in words: the
+acceptances kept before it no longer count, so run the watch again for the pull request's head.
+A generation file that can't be read fails the watch as `lock_unavailable`; delete it only when
+no watch of that pull request is running, then watch the current head again.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

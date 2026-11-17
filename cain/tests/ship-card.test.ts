@@ -10,7 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
 import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
 import { watchFile } from "../rootfs/opt/cain/link/merge";
-import { acceptedFor, supersede, keepWatch, otherLive, takeLock, beat, letGo, LOCK_STALE_MS, CRITICAL_MAX_MS } from "../rootfs/opt/cain/link/shipgate";
+import { acceptedFor, supersede, keepWatch, otherLive, takeLock, beat, letGo, LOCK_STALE_MS, CRITICAL_MAX_MS, readGen, genFile, agoWords } from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -446,20 +446,20 @@ describe("twenty-first review: one live acceptance per pull request, and superse
     accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
   test("a watch refuses to accept while another live acceptance of that pull request stands, naming it; after a supersede it accepts", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate21-"));
-    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2)).accepted_head).toBe(SHA2);
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { headNow: (_p, h) => h }).accepted_head).toBe(SHA2);
     expect(otherLive(dir, 5, SHA1)).toEqual([SHA2]);
-    const refused = keepWatch(dir, line(SHA1), watchFile(dir, SHA1));
+    const refused = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h });
     expect(refused).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
     expect(refused.failure_why).toContain(SHA2);
     expect(acceptedFor(dir, 5)).toEqual([SHA2]);                     // still the one live acceptance
-    expect(keepWatch(dir, line("6".repeat(40), 6), watchFile(dir, "6".repeat(40))).accepted_head).toBe("6".repeat(40));   // another pull request's: its own
+    expect(keepWatch(dir, line("6".repeat(40), 6), watchFile(dir, "6".repeat(40)), { headNow: (_p, h) => h }).accepted_head).toBe("6".repeat(40));   // another pull request's: its own
     expect(await supersede(dir, SHA2, async () => SHA1)).toEqual({ ok: true, pr: 5 });
-    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1)).accepted_head).toBe(SHA1);
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h }).accepted_head).toBe(SHA1);
     expect(acceptedFor(dir, 5)).toEqual([SHA1]);
   });
   test("supersede refuses while the pull request's head is still the sha being replaced, naming the head, or when the head can't be read", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate21-"));
-    keepWatch(dir, line(SHA2), watchFile(dir, SHA2));
+    keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { headNow: (_p, h) => h });
     const same = await supersede(dir, SHA2, async () => SHA2);
     expect(same).toMatchObject({ ok: false });
     expect((same as any).why).toContain(`pull request 5's head is still ${SHA2}`);
@@ -484,7 +484,7 @@ describe("twenty-second review: one live acceptance per pull request, made true 
   test("a second watch of the same pull request finishing while the first holds the lock is never kept as an acceptance", () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate22-"));
     let second: any = null;
-    const first = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { beforeWrite: () => { second = keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { waitMs: 200 }); } });
+    const first = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h, beforeWrite: () => { second = keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { headNow: (_p, h) => h, waitMs: 200 }); } });
     expect(first.accepted_head).toBe(SHA1);
     expect(second).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
     expect(acceptedFor(dir, 5)).toEqual([SHA1]);
@@ -497,7 +497,7 @@ describe("twenty-second review: one live acceptance per pull request, made true 
     const one = (head: string) => Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
       const l = ${JSON.stringify(line(head))};
       while (Date.now() < ${go}) {}
-      const k = keepWatch(${JSON.stringify(dir)}, l, ${JSON.stringify(watchFile(dir, head))}, { beforeWrite: () => { const t = Date.now() + 300; while (Date.now() < t) {} } });
+      const k = keepWatch(${JSON.stringify(dir)}, l, ${JSON.stringify(watchFile(dir, head))}, { headNow: (_p, h) => h, beforeWrite: () => { const t = Date.now() + 300; while (Date.now() < t) {} } });
       console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
     const ps = [one(SHA1), one(SHA2)];
     const outs = await Promise.all(ps.map(async (p) => { await p.exited; return JSON.parse((await new Response(p.stdout).text()).trim()); }));
@@ -554,7 +554,7 @@ describe("twenty-third review: the gate lock made true", () => {
     expect((await new Response(holder.stdout).text()).trim().split("\n")).toEqual(["held", "done"]);
     // A watch kept at the same time as a slow live holder is never an acceptance.
     const h2 = takeLock(lock, 100) as any;
-    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 300 })).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h, waitMs: 300 })).toMatchObject({ accepted_head: null, passed: false, failure: "live_acceptance" });
     letGo(h2);
   }, 30_000);
   test("an unreadable lock counts as held: it fails by the deadline as lock_unavailable, with a notice, and is never taken over", () => {
@@ -568,7 +568,7 @@ describe("twenty-third review: the gate lock made true", () => {
     console.error = (...a: unknown[]) => { errs.push(a.join(" ")); };
     const t0 = Date.now();
     let kept: any;
-    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 600 }); } finally { console.error = was; }
+    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h, waitMs: 600 }); } finally { console.error = was; }
     expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
     expect(Date.now() - t0).toBeLessThan(5_000);
     expect(kept).toMatchObject({ accepted_head: null, passed: false, failure: "lock_unavailable" });
@@ -580,7 +580,7 @@ describe("twenty-third review: the gate lock made true", () => {
   test("a holder that finds its lock no longer its own writes no acceptance and leaves the other's lock alone", () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate23-"));
     const lock = join(dir, "ship-gate-pr-5.lock");
-    const kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { beforeWrite: () => { writeFileSync(lock, JSON.stringify({ pid: 1, token: "someone-else", at: "x" })); } });
+    const kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h, beforeWrite: () => { writeFileSync(lock, JSON.stringify({ pid: 1, token: "someone-else", at: "x" })); } });
     expect(kept).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
     expect(JSON.parse(readFileSync(lock, "utf8")).token).toBe("someone-else");
   });
@@ -596,12 +596,12 @@ describe("twenty-fourth review: the gate's acceptance write fenced, and the lega
     const a = Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
       const { writeFileSync } = await import("node:fs");
       const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA1))}, ${JSON.stringify(watchFile(dir, SHA1))},
-        { atWrite: () => { writeFileSync(${JSON.stringify(sig)}, "1"); const t = Date.now() + 2_000; while (Date.now() < t) {} } });
+        { headNow: (_p, h) => h, atWrite: () => { writeFileSync(${JSON.stringify(sig)}, "1"); const t = Date.now() + 2_000; while (Date.now() < t) {} } });
       console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
     const t0 = Date.now();
     while (!existsSync(sig) && Date.now() - t0 < 10_000) await Bun.sleep(10);
     const b = Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
-      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA2))}, ${JSON.stringify(watchFile(dir, SHA2))}, { staleMs: 400, waitMs: 3_000 });
+      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA2))}, ${JSON.stringify(watchFile(dir, SHA2))}, { headNow: (_p, h) => h, staleMs: 400, waitMs: 3_000 });
       console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
     const read = async (p: any) => { await p.exited; return JSON.parse((await new Response(p.stdout).text()).trim()); };
     const [ra, rb] = [await read(a), await read(b)];
@@ -612,9 +612,9 @@ describe("twenty-fourth review: the gate's acceptance write fenced, and the lega
   }, 30_000);
   test("a second write for the same sha is a no-op", () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate24-"));
-    const first = keepWatch(dir, line(SHA1), watchFile(dir, SHA1));
+    const first = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h });
     const before = readFileSync(watchFile(dir, SHA1), "utf8");
-    const again = keepWatch(dir, { ...line(SHA1), attempts_seen: ["other"] }, watchFile(dir, SHA1));
+    const again = keepWatch(dir, { ...line(SHA1), attempts_seen: ["other"] }, watchFile(dir, SHA1), { headNow: (_p, h) => h });
     expect(again.accepted_head).toBe(SHA1);
     expect(first.accepted_head).toBe(SHA1);
     expect(readFileSync(watchFile(dir, SHA1), "utf8")).toBe(before);
@@ -629,9 +629,9 @@ describe("twenty-fourth review: the gate's acceptance write fenced, and the lega
     const was = console.error;
     console.error = (...x: unknown[]) => { errs.push(x.join(" ")); };
     let kept: any;
-    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 600 }); } finally { console.error = was; }
+    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h, waitMs: 600 }); } finally { console.error = was; }
     expect(kept.accepted_head).toBe(SHA1);
-    expect(errs.join("\n")).toContain("took over a legacy watch lock with no holder token");
+    expect(errs.join("\n")).toContain("took over a watch lock left by an earlier version of the watch, with no holder token");
     expect(existsSync(lock)).toBe(false);
     expect(readdirSync(dir).filter((n) => n.includes(".stale-"))).toEqual([]);
   });
@@ -645,10 +645,138 @@ describe("twenty-fourth review: the gate's acceptance write fenced, and the lega
       const was = console.error;
       console.error = () => {};
       let kept: any;
-      try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 300 }); } finally { console.error = was; }
+      try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => h, waitMs: 300 }); } finally { console.error = was; }
       expect(kept).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
       expect(kept.failure_why).toContain(`rm -f ${lock}`);
       expect(readFileSync(lock, "utf8")).toBe(content);
     }
+  });
+});
+
+describe("twenty-fifth review: acceptances under the lock's generation, the sha-bound check before and after the write, and the head from GitHub", () => {
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  const mod = join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts");
+  const echo = { headNow: (_p: number, h: string) => h };
+  const quietly = <T>(f: () => T): T => { const was = console.error; console.error = () => {}; try { return f(); } finally { console.error = was; } };
+  const out = async (p: any) => { await p.exited; return JSON.parse((await new Response(p.stdout).text()).trim()); };
+  const consumer = (dir: string) => Bun.spawn(["bun", "-e", `const { acceptedFor } = await import(${JSON.stringify(mod)}); console.log(JSON.stringify(acceptedFor(${JSON.stringify(dir)}, 5)));`], { stdout: "pipe", stderr: "pipe" });
+  const until = async (f: string) => { const t0 = Date.now(); while (!existsSync(f) && Date.now() - t0 < 15_000) await Bun.sleep(10); };
+
+  test("a holder paused after its pre-write check, a taker that publishes, then the holder writing and pausing before its post-write check: the consumer reads exactly one valid acceptance, the taker's, in two processes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    const [checked, wrote] = [join(dir, "checked"), join(dir, "wrote")];
+    const a = Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
+      const { writeFileSync } = await import("node:fs");
+      const spin = (ms) => { const t = Date.now() + ms; while (Date.now() < t) {} };
+      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA1))}, ${JSON.stringify(watchFile(dir, SHA1))}, { headNow: (_p, h) => h,
+        atWrite: () => { writeFileSync(${JSON.stringify(checked)}, "1"); spin(2_000); },
+        afterWrite: () => { writeFileSync(${JSON.stringify(wrote)}, "1"); spin(4_000); } });
+      console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure, why: k.failure_why }));`], { stdout: "pipe", stderr: "pipe" });
+    await until(checked);
+    const b = Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
+      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA2))}, ${JSON.stringify(watchFile(dir, SHA2))}, { headNow: (_p, h) => h, staleMs: 400, waitMs: 3_000 });
+      console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
+    expect(await out(b)).toEqual({ accepted: SHA2, failure: null });                // the taker published
+    expect(readGen(dir, 5)).toBe(1);                                                // its takeover moved the generation on
+    await until(wrote);                                                             // the holder has written, and is paused
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8"))).toMatchObject({ accepted_head: SHA1, gen: 0 });   // its write is there
+    expect(await out(consumer(dir))).toEqual([SHA2]);                              // but only the taker's counts, at once
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);
+    const ra = await out(a);
+    expect(ra).toMatchObject({ accepted: null, failure: "lock_unavailable" });
+    expect(ra.why).toContain("no acceptance stands for this head, and the watch must be run again for it");
+    expect(await out(consumer(dir))).toEqual([SHA2]);
+  }, 40_000);
+
+  test("a record written under an earlier generation, or with a generation file that can't be read, is no acceptance", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).gen).toBe(0);
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+    writeFileSync(genFile(dir, 5), "1\n");                                          // a takeover moved it on
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    writeFileSync(genFile(dir, 5), "garbage");
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    writeFileSync(genFile(dir, 5), "1\n");
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);   // a stale record of the sha: watched again, it counts
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+  });
+
+  test("re-watching a superseded sha while the newer head has no live acceptance is refused, in two processes, and the record stays superseded", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(await supersede(dir, SHA1, async () => SHA2)).toEqual({ ok: true, pr: 5 });
+    const go = Date.now() + 1_500;
+    const one = () => Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
+      while (Date.now() < ${go}) {}
+      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA1))}, ${JSON.stringify(watchFile(dir, SHA1))}, { headNow: (_p, h) => h, waitMs: 3_000 });
+      console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
+    const rs = await Promise.all([one(), one()].map(out));
+    for (const r of rs) expect(r).toEqual({ accepted: null, failure: "superseded" });
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).superseded.at).toBeString();
+    // And when the lock is held by another watch, the failure isn't written over the superseded record either.
+    writeFileSync(join(dir, "ship-gate-pr-5.lock"), JSON.stringify({ pid: 1, token: "other", gen: 0, at: "x" }));
+    expect(quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { ...echo, waitMs: 200 })).failure).toBe("live_acceptance");
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).superseded.at).toBeString();
+  }, 30_000);
+
+  test("an acceptance of a newer head, then a delayed watch of the older head: refused; and an older head is refused against GitHub's head even with no acceptance standing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    const github = { headNow: (_p: number, _h: string) => SHA2 };
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2), github).accepted_head).toBe(SHA2);
+    const late = quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), github));
+    expect(late.accepted_head).toBeNull();
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);
+    const dir2 = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    const older = quietly(() => keepWatch(dir2, line(SHA1), watchFile(dir2, SHA1), github));
+    expect(older).toMatchObject({ accepted_head: null, failure: "head_not_current" });
+    expect(older.failure_why).toContain(`is now ${SHA2}, not ${SHA1}`);
+    expect(acceptedFor(dir2, 5)).toEqual([]);
+    expect(quietly(() => keepWatch(dir2, line(SHA1), watchFile(dir2, SHA1), { headNow: () => null }))).toMatchObject({ accepted_head: null, failure: "head_not_current" });
+    // The head moving between the write and the post-write check takes the acceptance back.
+    let n = 0;
+    const moving = { headNow: (_p: number, h: string) => (n++ === 0 ? h : SHA2) };
+    expect(quietly(() => keepWatch(dir2, line(SHA1), watchFile(dir2, SHA1), moving))).toMatchObject({ accepted_head: null, failure: "head_not_current" });
+    expect(acceptedFor(dir2, 5)).toEqual([]);
+  });
+
+  test("the Ship card consumes an acceptance only against GitHub's head as it is now: an unreadable head refuses it", async () => {
+    const r = shipRig();
+    r.github.watched[PR] = SHA1;
+    expect(r.msg(await ship(r)).content).toContain(LINE);
+    const r2 = shipRig({ facts: null });
+    r2.github.watched[PR] = SHA1;
+    await expect(ship(r2)).rejects.toThrow("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it");
+    const r3 = shipRig({ facts: null });                                            // no acceptance: as before
+    expect(r3.msg(await ship(r3)).content).toContain(LINE);
+  });
+
+  test("a token-less JSON lock older than the stale bound is taken over with the warning, in words and with no ISO time; a current one is left with the exact removal command", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    writeFileSync(lock, JSON.stringify({ pid: 4242, at: "2026-11-01T00:00:00Z" }));
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+    const errs: string[] = [];
+    const was = console.error;
+    console.error = (...x: unknown[]) => { errs.push(x.join(" ")); };
+    let kept: any;
+    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { ...echo, waitMs: 600 }); } finally { console.error = was; }
+    expect(kept.accepted_head).toBe(SHA1);
+    const warn = errs.find((e) => e.includes("WARNING"))!;
+    expect(warn).toContain("took over a watch lock left by an earlier version of the watch, with no holder token");
+    expect(warn).toContain("last changed about 5 minutes ago");
+    expect(warn).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    expect(readGen(dir, 5)).toBe(1);
+    expect(agoWords(90 * 60_000)).toBe("about 2 hours ago");
+    const dir2 = mkdtempSync(join(tmpdir(), "ship-gate25-"));
+    const lock2 = join(dir2, "ship-gate-pr-5.lock");
+    writeFileSync(lock2, JSON.stringify({ pid: 4242, at: "x" }));                   // current (just made)
+    const kept2 = quietly(() => keepWatch(dir2, line(SHA1), watchFile(dir2, SHA1), { ...echo, waitMs: 300 }));
+    expect(kept2).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(kept2.failure_why).toContain(`remove the lock with: rm -f ${lock2}`);
+    expect(JSON.parse(readFileSync(lock2, "utf8"))).toEqual({ pid: 4242, at: "x" });
   });
 });

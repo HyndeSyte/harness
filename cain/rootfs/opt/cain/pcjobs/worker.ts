@@ -945,7 +945,7 @@ export const evidenceSha = (bytes: Buffer | string, probedAt: string, guard: str
 const versionSame = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && vcmp(a, b) === 0;
 // Whether a hold clears: validated probe evidence, after the hold, of the versions loaded now. why: what was
 // compared, for the log line (the hold's recorded versions against the probed ones included).
-export function holdCleared(o: Opts, inst: Install, had: VersionHold): { cleared: boolean; why: string } {
+export function holdCleared(o: Opts, inst: Install, had: VersionHold): { cleared: boolean; why: string; floorless?: string[] } {
   const c = readConfirmed(o);
   if (!c || !c.probed_at || !c.evidence_sha256) return { cleared: false, why: "no confirmation with probe evidence" };
   let bytes: Buffer;
@@ -967,10 +967,21 @@ export function holdCleared(o: Opts, inst: Install, had: VersionHold): { cleared
   const notOlder = (held: string | null, seen: string | null | undefined) => !held || (!!seen && vcmp(seen, held) >= 0);
   if (!notOlder(had.seen.extension_version, probed.extension_version) || !notOlder(had.seen.chrome_version, probed.chrome_version))
     return { cleared: false, why: `the probe saw Claude in Chrome ${probed.extension_version} and Chrome ${probed.chrome_version}, older than the hold recorded (${had.seen.extension_version ?? "none"} and ${had.seen.chrome_version ?? "none"})` };
+  // Twenty-fifth round: a version the hold couldn't read when it was made (null) gives no floor. The clear is still
+  // allowed (the condition must be gone and the probe's versions must be the ones loaded now), but it is recorded as
+  // made without a version floor, naming which (floorless), so the log, the clear's record and the run's status line
+  // say so.
+  const floorless = [...(had.seen.extension_version ? [] : ["Claude in Chrome"]), ...(had.seen.chrome_version ? [] : ["Chrome"])];
   const vsHold = [`Claude in Chrome: the hold saw ${had.seen.extension_version ?? "none"}, the probe ${probed.extension_version}${versionSame(had.seen.extension_version, probed.extension_version) ? " (same)" : " (changed since the hold)"}`,
     `Chrome: the hold saw ${had.seen.chrome_version ?? "none"}, the probe ${probed.chrome_version}${versionSame(had.seen.chrome_version, probed.chrome_version) ? " (same)" : " (changed since the hold)"}`];
-  return { cleared: true, why: vsHold.join("; ") };
+  if (floorless.length) vsHold.push(`made without a version floor for ${floorless.join(" and ")} (the hold couldn't read ${floorless.length > 1 ? "them" : "it"} when it was made)`);
+  return { cleared: true, why: vsHold.join("; "), ...(floorless.length ? { floorless } : {}) };
 }
+// The last clear made without a version floor (twenty-fifth round): kept beside the hold (version-hold-cleared.json)
+// and named on the next status line the worker writes (its heartbeat line in worker.log), once.
+export const holdClearedFile = (o: Opts) => join(o.home, "version-hold-cleared.json");
+let floorNote: string | null = null;
+export const takeFloorNote = () => { const n = floorNote; floorNote = null; return n; };
 export type HoldFail = "version_hold_unwritable" | "version_hold_cannot_invalidate";
 export const holdFailed = (x: unknown): x is HoldFail => x === "version_hold_unwritable" || x === "version_hold_cannot_invalidate";
 export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode | null = null): HoldCode | HoldFail | null {
@@ -992,7 +1003,11 @@ export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode |
   const cl = holdCleared(o, inst, had);
   if (cl.cleared) {
     rmSync(P.versionHold(o), { force: true });
-    try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_cleared ${had.code}: ${cl.why}\n`); } catch { /* never stops it */ }
+    try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_cleared${cl.floorless ? "_without_floor" : ""} ${had.code}: ${cl.why}\n`); } catch { /* never stops it */ }
+    if (cl.floorless) {
+      writeWhole(holdClearedFile(o), JSON.stringify({ at: now.toISOString(), code: had.code, without_floor: cl.floorless }) + "\n");
+      floorNote = `version_hold_cleared_without_floor:${cl.floorless.map((x) => x.replace(/ /g, "_")).join(",")}`;
+    }
     return null;
   }
   if (versionMismatch(o, inst)) return null;           // probe_stale refuses next, naming what changed
@@ -1108,10 +1123,10 @@ export function defaultChromeDirs(plat = process.platform): string[] {
 // object, or neither file holding an extensions.settings table) is a failure, never a
 // pass: "unreadable".
 export function profileScan(o: Opts, inst: Install, running: string[] = []): "elsewhere" | "unreadable" | null {
-  const mine = resolve(inst.profile.user_data_dir).toLowerCase();
+  const mine = normDir(inst.profile.user_data_dir);
   const id = inst.profile.extension_id;
   for (const udd of [...(o.chromeDirs ?? defaultChromeDirs(platform(o))), ...inst.other_user_data_dirs, ...running]) {
-    if (resolve(udd).toLowerCase() === mine || !exists(udd)) continue;
+    if (normDir(udd) === mine || !exists(udd)) continue;
     let profiles: string[] = [];
     try { profiles = readdirSync(udd).filter((n) => n === "Default" || /^Profile \d+$/.test(n)); } catch { return "unreadable"; }
     for (const pr of profiles) {
@@ -1150,12 +1165,10 @@ export function profileScan(o: Opts, inst: Install, running: string[] = []): "el
 //   - a process in the chain whose command line is empty (Windows shows none for a
 //     process it won't let the worker read) or whose start time can't be read fails it.
 // Any other chain is extension_elsewhere, never a pass.
-export const UDD_FLAG = /--user-data-dir=(?:"([^"]+)"|(\S+))/i;
 const BROWSER = /(?:^|[\\/"\s])(chrome|msedge|brave|chromium)(?:\.exe)?(?:"|\s|$)/i;
 const CMD_EXE = /^\s*"?(?:[A-Za-z]:[\\/][^"]*[\\/])?cmd(?:\.exe)?"?(?:\s|$)/i;
 const browserOf = (cmd: string): BrowserKind | null => (BROWSER.exec(cmd)?.[1]?.toLowerCase() as BrowserKind | undefined) ?? null;
 const isBrowser = (p: Proc) => !!browserOf(p.cmd) && !/--type=/.test(p.cmd) && !CMD_EXE.test(p.cmd);
-const uddOf = (cmd: string) => { const m = UDD_FLAG.exec(cmd); return m ? (m[1] ?? m[2]) : null; };
 // The dedicated Chrome's profile path, matched exactly (0.12.0, twenty-fourth round). The --user-data-dir argument
 // is read as a whole argument (at the start of the command line or after whitespace, the argument or its value
 // quoted or not), never as a substring of another argument, and only when the command line names it once. Both
@@ -1179,11 +1192,14 @@ export const sameProfileDir = (cmd: string, dir: string): boolean => {
   const args = uddArgs(cmd);
   return args.length === 1 && !!args[0] && normDir(args[0]) === normDir(dir);
 };
-const sameDir = (a: string, b: string) => resolve(a).toLowerCase() === resolve(b).toLowerCase();
 const slashes = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+// Twenty-fifth round: every listing that identifies a Chrome profile reads it the one way the dedicated match does
+// (uddArgs: the whole --user-data-dir argument, quoted or not) and compares it the one way (normDir). A browser whose
+// command line names the flag more than once has each named folder scanned (fail closed); one that names none runs
+// on its default folder.
 export const runningDirs = (ps: Proc[], inst: Install, defaults: Partial<Record<BrowserKind, string>> = browserDefaults()) =>
-  [...new Set(ps.filter(isBrowser).map((p) => uddOf(p.cmd) ?? defaults[browserOf(p.cmd)!] ?? null)
-    .filter((d): d is string => !!d && !sameDir(d, inst.profile.user_data_dir)))];
+  [...new Set(ps.filter(isBrowser).flatMap((p) => { const a = uddArgs(p.cmd).filter(Boolean); return a.length ? a : [defaults[browserOf(p.cmd)!] ?? null]; })
+    .filter((d): d is string => !!d && normDir(d) !== normDir(inst.profile.user_data_dir)))];
 
 // The extension's host, as its registered manifest names it (install.json's
 // native_host_manifest): its path, resolved against the manifest's folder, when the
@@ -1566,7 +1582,8 @@ const unlock = (o: Opts) => rmSync(P.lock(o), { force: true });
 interface RunState { stale: boolean; skew: number | null; reason?: Reason | null; warnings?: string[] }
 
 function beat(o: Opts, code: Heartbeat["code"], job: string | null, now: Date, st: RunState, more: string[] = []): Heartbeat {
-  const warnings = [...(st.warnings ?? []), ...more];
+  const note = takeFloorNote();
+  const warnings = [...(st.warnings ?? []), ...more, ...(note ? [note] : [])];
   const reason = code === "probe_stale" || code === "extension_version_unknown" ? st.reason ?? null : null;
   const h: Heartbeat = { v: 1, worker_clock: now.toISOString(), code, job, stale_lock: st.stale, skew_ms: st.skew, reason };
   try {
@@ -5162,12 +5179,17 @@ export const PROBE_GATE_HINT: Record<string, string> = {
 // call answered in time with exit 0, every non-blank line parsed (listingMismatches), the Cain jobs Chrome's
 // browser process is on it with a readable file version, and that process is the one the general process
 // listing names (same id). The evidence keeps line counts and numbers, never a command line.
-// stand_in: a test's exeVersion stand-in is in use (never on a real PC), so no PowerShell call is made.
-export interface ChromeListingLine { applies: boolean; stand_in?: boolean; lines: number; mismatched: number[]; dedicated: boolean; same_process: boolean;
+// Twenty-fifth round: the step never passes without a parsed listing. The twenty-fourth round let a test's
+// exeVersion stand-in pass it with no PowerShell call at all; now the only stand-in is a listing runner (chromePs,
+// which returns the listing's text and is parsed and checked like the real one), and the exeVersion stand-in
+// without one refuses the step by name (listing_stand_in), wherever the worker runs.
+export const LISTING_STAND_IN = "listing_stand_in";
+export interface ChromeListingLine { applies: boolean; lines: number; mismatched: number[]; dedicated: boolean; same_process: boolean;
   version: string | null; failure: string | null; passed: boolean }
 export function chromeListingStep(o: Opts, inst: Install): ChromeListingLine {
   const none: ChromeListingLine = { applies: false, lines: 0, mismatched: [], dedicated: false, same_process: false, version: null, failure: null, passed: false };
-  if (!o.chromePs && o.exeVersion) return { ...none, applies: true, stand_in: true, passed: true };
+  if (!o.chromePs && o.exeVersion)
+    return { ...none, applies: true, failure: `${LISTING_STAND_IN}: a version stand-in is set with no listing to parse, so the listing can't be checked` };
   if (!o.chromePs && platform(o) !== "win32") return none;
   let raw = "";
   const r = chromeExeVersions(o.chromePs ? () => (raw = o.chromePs!()) : () => {

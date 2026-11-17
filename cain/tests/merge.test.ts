@@ -740,7 +740,7 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     expect(line).toMatchObject({ pr: 21, bound_head: H1, accepted_head: H1, failure: null, passed: true });
     expect(line.reports.every((r) => r.head === H1)).toBe(true);
     expect(w.read.some((p) => p.includes(OLD))).toBe(false);                // the old head's gate was never read
-    expect(watchAccepted(JSON.stringify(line))).toEqual({ pr: 21, head: H1 });
+    expect(watchAccepted(JSON.stringify(line))).toEqual({ pr: 21, head: H1, gen: 0 });
     expect(watchAccepted(JSON.stringify({ ...line, superseded: { at: "x" } }))).toBeNull();
     expect(watchAccepted("not json")).toBeNull();
   });

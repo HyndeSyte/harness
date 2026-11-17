@@ -312,16 +312,16 @@ in the harness repo; until then the keeper says it is waiting).
   shallow copy, the queue's branch missing, an empty queue with a tap pending, an
   unreadable tap record, a tap it can't settle, and a tap whose settling has waited three
   rounds on an unreadable record or a failed fetch from GitHub (that line names the job by
-  what it does, its action and site, and its code; or, when the keeper can't tell those, by
-  when it was queued; never its id). Each is told once while it lasts, and again only if it clears for three rounds
+  what it does, its action and site, and its code; or, when the keeper can't tell those, as
+  a job seen by the keeper at a time; never its id). Each is told once while it lasts, and again only if it clears for three rounds
   in a row and comes back; a code your App has no words for comes as "a stop
   condition the App does not know" with its code. After an update, a notice an earlier
   keeper never delivered may come as "an earlier notice could not be delivered". Don't repeat it; if he asks, the fix is in
   that line and in the Troubleshooting table of cain/docs/pc-jobs.md. If `pcjobs.sh worker`
   or `list` says the link refused a notice for him for good, it won't be sent again: tell him
   in your own words if it matters. If it says, marked ATTENTION, that the link refused the
-  keeper's notices as not allowed, that is your App's own setup, not his: the notices wait
-  until the App restarts with it fixed, so log it as a Build item (Cloud jobs) and tell him
+  keeper's notices as not allowed, that is your App's own setup, not his: the line counts
+  every notice waiting, and they all wait until the App restarts with it fixed, so log it as a Build item (Cloud jobs) and tell him
   only if a notice he needs is waiting. A line counting server errors means the notice is
   still being retried: nothing to tell him.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
@@ -488,7 +488,7 @@ create, update or run any other routine.
      it refuses while the pull request's head is still that sha), then watch the new head the
      same way before its card. A pull request has one live acceptance at a time: a watch won't
      accept while another stands (`live_acceptance`, naming it), and a watch that can't take or
-     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. One wait for GitHub is at most 15 minutes and a watch at most 2
+     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. A watch also refuses a sha whose acceptance was superseded (`superseded`), or that isn't the pull request's head on GitHub when it is kept (`head_not_current`). A watch that took over a stopped watch's lock says the acceptances kept before it no longer count: watch the pull request's head again. While a watch's acceptance stands, a Ship card is refused if GitHub's head for the pull request can't be read: show it again in a minute. One wait for GitHub is at most 15 minutes and a watch at most 2
      hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the

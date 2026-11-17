@@ -137,8 +137,11 @@ export const PC_JOB_ID = /^j-\d{8}-[a-z0-9]{6}$/;
 const PC_SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 const PC_ACTION = /^[a-z][a-z0-9_]{2,39}$/;
 export const pcJobWords = (j: { site: string; action: string }) => `the job to ${j.action.replace(/_/g, " ")} on ${j.site}`;
-// A job the keeper can't name by its site and action (twenty-third round): by when it was queued, in words
-// ("a PC browser job queued at Nov 15, 2:05 PM", or "queued on Nov 15" when only the day is known), never an id.
+// A job the keeper can't name by its site and action (twenty-third round): by a time, in words, never an id.
+// Twenty-fifth round: the time is when the keeper saw the job (its record of it, or the moment it was handed the
+// job in a shape it couldn't read), not when the owner's request was queued, so it is worded "a PC browser job
+// seen by the keeper at Nov 15, 2:05 PM" ("seen by the keeper on Nov 15" when only the day is known). The
+// structured field keeps its name (queued).
 export const PC_QUEUED = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/;
 export function pcQueuedWords(queued: string, tz = "America/New_York"): string | null {
   if (!PC_QUEUED.test(queued)) return null;
@@ -146,7 +149,7 @@ export function pcQueuedWords(queued: string, tz = "America/New_York"): string |
   const t = Date.parse(day ? `${queued}T12:00:00Z` : queued);
   if (!Number.isFinite(t)) return null;
   const f = (o: Intl.DateTimeFormatOptions) => { try { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: day ? "UTC" : tz }).format(t); } catch { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: "UTC" }).format(t); } };
-  return day ? `a PC browser job queued on ${f({ month: "short", day: "numeric" })}` : `a PC browser job queued at ${f({ month: "short", day: "numeric" })}, ${f({ hour: "numeric", minute: "2-digit" })}`;
+  return day ? `a PC browser job seen by the keeper on ${f({ month: "short", day: "numeric" })}` : `a PC browser job seen by the keeper at ${f({ month: "short", day: "numeric" })}, ${f({ hour: "numeric", minute: "2-digit" })}`;
 }
 const PC_NOTICE_KEEP = 200;              // the notice ids the link remembers having posted (the newest)
 export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
@@ -1489,6 +1492,10 @@ export class Link {
     const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    // Twenty-fifth round: a watch's acceptance is consumed only against the pull request's head as GitHub has it now.
+    // When one stands, a head that can't be read refuses the card (the acceptance can't be checked), never passes it.
+    if (watched.length && f?.head !== head)
+      throw new Refusal("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it: show the card again in a minute");
     // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
     // the head (a squash or a rebase would leave it out). So the card asks main too, the way the
     // landing does, and says "Already in main" only when main has it.

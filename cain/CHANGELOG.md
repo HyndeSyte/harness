@@ -128,6 +128,14 @@
 - If the PC can't keep its note that a version changed, it sets its confirmation aside so nothing runs until a new probe, or stops with its own reason when even that fails. A probe clears that note only when it saw the same or newer versions.
 - The PC matches its Chrome profile folder exactly, whatever the quotes, slashes or letter case.
 - Queue messages Cain's App turns away as not allowed now stop and show at the top of the keeper's status; messages that hit a passing server error are retried less often, with a count. A job handed over in a shape the keeper can't read is still named, by the time.
+- A Ship gate watch that stopped and was taken over can no longer leave a second acceptance standing, even for a moment: each takeover starts a new round, and only acceptances kept in the current round count for a Ship card.
+- A change whose acceptance was replaced is never accepted again, and an acceptance only counts for the change's newest commit, checked both when it is kept and when a Ship card reads it.
+- The probe's Chrome listing check now always reads a real listing before it can pass.
+- When Cain's App turns the keeper's messages away as not allowed, the keeper's status counts every message waiting, they all wait for the fix, and its notice file is only rewritten when something in it changes.
+- A held run cleared by a probe when the hold couldn't read Chrome's version is now noted as cleared without a version to compare against.
+- The PC reads the Chrome profile folder the same exact way everywhere, so a second profile with a similar folder name can't confuse it.
+- Probing after an update works while runs are held: the probe is checked against the versions it read itself, and a hold stops a probe only while its cause is still there. A probe clears a hold only when it saw the same or newer versions.
+- A job the keeper can't name by its site is now said to be seen by the keeper at a time, which is what that time is.
 
 ## 0.11.0
 

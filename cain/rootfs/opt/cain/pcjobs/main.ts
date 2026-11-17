@@ -242,7 +242,7 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 //     sent again, logged loudly, and shown on the keeper's status (pcjobs.sh worker and list, noticeTrouble);
 //   - twenty-third round: every caller names the job by its site and action, or, when the keeper can't say
 //     them, by when it was queued ({queued}: the job's created time, else the day in its id); the link words
-//     that "a PC browser job queued at ...". A job given any other way (a string, a queue id) is a bug: logged
+//     that "a PC browser job seen by the keeper at ..." (twenty-fifth round wording). A job given any other way (a string, a queue id) is a bug: logged
 //     as an error, and the notice still goes, named by when it was queued where the id says so.
 export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused"
   | "reuse_record_unreadable" | "reuse_fetch_failed" | "notice_undelivered";
@@ -262,9 +262,9 @@ export const CLEAR_ROUNDS = 3;
 export const WAIT_ROUNDS = 3;
 // A mark keeps its code and job (twenty-second round), so a post whose acknowledgement was lost is sent
 // again with its saved id until the link confirms it, whether or not its condition is still here.
-// config: the link last refused this mark as not allowed (401 or 403); fails: server errors in a row; skip: rounds
-// still to wait before the next try (twenty-fourth round, the backoff).
-interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean; config?: boolean; fails?: number; skip?: number }
+// fails: server errors in a row; skip: rounds still to wait before the next try (twenty-fourth round, the backoff).
+// (The twenty-fourth round's per-mark config flag is read once into the file's own config, below, and dropped.)
+interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean; fails?: number; skip?: number }
 // Twenty-fourth round, kept for this process: the link refused the keeper's key or setup (no more sends until the
 // keeper starts again), and whether the notice file's upgrade couldn't be saved (logged once, shown on the status).
 let configStopped = false;
@@ -272,7 +272,11 @@ let migrationUnsaved = false;
 export const SERVER_FAILS_SHOWN = 3;
 export const BACKOFF_MAX_ROUNDS = 32;
 export function resetNoticeProcess(): void { configStopped = false; migrationUnsaved = false; }
-interface Told { told: Record<string, ToldMark>; waits: Record<string, number> }
+// config (twenty-fifth round): the link refused the keeper's key or setup (401 or 403), kept in the notice file as
+// delivery state for the whole keeper, not on the one mark that got the answer: every mark still owed stays owed
+// (pending, never flagged or dropped), the status line counts them all from this file, and the flag goes only once
+// the link answers a send with anything else (after the fix and a restart, when sends start again).
+interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true }
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
 const NOTICE_ID = /^[0-9a-f]{16,64}$/;
 const SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
@@ -300,19 +304,21 @@ function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "di
     return t;
   }
   const told: Record<string, ToldMark> = {}, waits: Record<string, number> = {};
+  let config = a && typeof a === "object" && a.config === true;
   if (a && typeof a === "object" && a.told && typeof a.told === "object")
     for (const [k, m] of Object.entries(a.told as Record<string, any>))
       if (m && typeof m.id === "string" && NOTICE_ID.test(m.id)) {
+        if (m.config === true && m.posted !== true) config = true;          // the twenty-fourth round's per-mark flag
         const code = isCode(m.code) ? m.code : undefined;
         const job = jobWhat(m.job);
         const n = (v: unknown) => Number.isInteger(v) && (v as number) > 0 ? { v: v as number } : null;
         told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0, ...(code ? { code } : {}), ...(job ? { job } : {}),
-          ...(m.refused === true ? { refused: true } : {}), ...(m.config === true ? { config: true } : {}),
+          ...(m.refused === true ? { refused: true } : {}),
           ...(n(m.fails) ? { fails: n(m.fails)!.v } : {}), ...(n(m.skip) ? { skip: Math.min(n(m.skip)!.v, BACKOFF_MAX_ROUNDS) } : {}) };
       }
   if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
     for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
-  const t = { told, waits };
+  const t: Told = { told, waits, ...(config ? { config: true as const } : {}) };
   if (a?.v !== 3) {
     migrateTold(cfg, t);
     if (!saveTold(cfg, t, true)) {
@@ -339,10 +345,14 @@ function migrateTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | 
   }
 }
 const newNoticeId = () => randomBytes(12).toString("hex");
+// Twenty-fifth round: written only when its content changes (a round that only finds the same marks still owed
+// leaves the file alone), and then whole: a temporary file, then renamed into place.
 function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
+  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}) });
+  try { if (readFileSync(toldFile(cfg), "utf8") === text) return true; } catch { /* not there yet, or unreadable: written */ }
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
-    writeFileSync(`${toldFile(cfg)}.tmp`, JSON.stringify({ v: 3, ...t }));
+    writeFileSync(`${toldFile(cfg)}.tmp`, text);
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
     return true;
   } catch (e) { if (!quiet) log(`couldn't keep which notices went out: ${(e as Error).message}`); return false; }
@@ -351,8 +361,10 @@ function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
 // "refused" on a permanent refusal (logged loudly, never sent again), "retry" otherwise.
 // Twenty-fourth round: a mark waiting out its backoff is not sent this round (its skip counted down); once the link
 // refused the keeper's key or setup (401 or 403), nothing more is sent this process; a 5xx answer doubles the wait
-// (the next 0, 1, 3, 7 ... tries skipped, up to BACKOFF_MAX_ROUNDS - 1) and is counted; any other answer resets both.
-function send(cfg: Config, m: ToldMark, code: PcNotice): "posted" | "retry" | "refused" {
+// (the next 0, 1, 3, 7, 15, 31 tries skipped, then 31 each time: BACKOFF_MAX_ROUNDS - 1) and is counted; any other
+// answer resets both. Twenty-fifth round: the configuration refusal is the notice file's own state (t.config), so
+// every owed mark counts on the status, and it clears only when the link answers a send with anything else.
+function send(cfg: Config, t: Told, m: ToldMark, code: PcNotice): "posted" | "retry" | "refused" {
   if (configStopped) return "retry";
   if (m.skip && m.skip > 0) { m.skip -= 1; return "retry"; }
   let a: NoticeAnswer = false;
@@ -361,11 +373,11 @@ function send(cfg: Config, m: ToldMark, code: PcNotice): "posted" | "retry" | "r
   try { a = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job ? { job } : {}) }); } catch { a = false; }
   if (a === "config") {
     configStopped = true;
-    m.config = true;
+    t.config = true;
     log(`ERROR: the link refused the keeper's notice ${code} as not allowed (HTTP 401 or 403: its key or setup): no more notices are sent until the keeper starts again; the keeper's status shows it`);
     return "retry";
   }
-  delete m.config;
+  delete t.config;
   if (a === "server") {
     m.fails = (m.fails ?? 0) + 1;
     m.skip = Math.min(2 ** (m.fails - 1), BACKOFF_MAX_ROUNDS) - 1;
@@ -381,7 +393,7 @@ function send(cfg: Config, m: ToldMark, code: PcNotice): "posted" | "retry" | "r
   return a ? "posted" : "retry";
 }
 // The fallback name of a job the keeper was handed in a shape it can't read (twenty-fourth round): the time the
-// keeper noticed it, to the minute, worded by the link as "a PC browser job queued at <time>". Never a bare line.
+// keeper noticed it, to the minute, worded by the link as "a PC browser job seen by the keeper at <time>". Never a bare line.
 const queuedNow = (): JobWhat => ({ queued: new Date().toISOString().replace(/:\d{2}\.\d{3}Z$/, ":00Z") });
 // The job a caller passed, checked (twenty-third round): a site and action, or a queued time. A string (a queue
 // id, or anything else) is a bug: logged as an error, named by when it was queued where the id says so.
@@ -397,12 +409,15 @@ export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobW
   const t = readTold(cfg);
   let m = t.told[key];
   if (m?.posted || m?.refused) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
+  // Twenty-fifth round: one try per mark per round. A mark resendOwed already tried (or counted down) this round
+  // isn't sent again by the condition's own tell, so the backoff counts rounds, not calls.
+  if (m && triedThisRound.has(`${toldFile(cfg)}\0${key}`)) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
   const what = checkedJob(cfg, code, job);
   if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0, code, ...(what ? { job: what } : {}) }; saveTold(cfg, t); }
   m.clear = 0;
   m.code ??= code;
   if (!m.job && what) m.job = what;
-  const a = send(cfg, m, m.code);
+  const a = send(cfg, t, m, m.code);
   if (a === "posted") m.posted = true;
   if (a === "refused") m.refused = true;
   saveTold(cfg, t);
@@ -411,13 +426,16 @@ export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobW
 // once per round, so no mark is left unsent because no round looks at its key any more.
 // A mark acknowledged by this round's resend starts its clear count only at the next round, as when cleared sends it.
 const ackedThisRound = new Set<string>();
+const triedThisRound = new Set<string>();
 export function resendOwed(cfg: Config): void {
   ackedThisRound.clear();
+  triedThisRound.clear();
   const t = readTold(cfg);
   let changed = false;
   for (const [k, m] of Object.entries(t.told)) {
     if (m.posted || m.refused || !m.code) continue;
-    const a = send(cfg, m, m.code);
+    triedThisRound.add(`${toldFile(cfg)}\0${k}`);
+    const a = send(cfg, t, m, m.code);
     changed = true;                                                   // a backoff count or a refusal flag may have moved
     if (a === "posted") { m.posted = true; m.clear = 0; ackedThisRound.add(`${toldFile(cfg)}\0${k}`); }
     if (a === "refused") { m.refused = true; changed = true; }
@@ -431,8 +449,10 @@ export function noticeTrouble(cfg: Pick<Config, "used">): string[] {
   const t = readTold(cfg);
   const marks = Object.values(t.told);
   const out: string[] = [];
-  const config = marks.filter((m) => m.config && !m.posted && m.code);
-  if (config.length) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${config.length} notice${config.length > 1 ? "s" : ""} for Dane wait${config.length > 1 ? "" : "s"} (${[...new Set(config.map((m) => m.code))].join(", ")}). Check the link and the keeper share the relay key, then restart the App: they go then.`);
+  // Twenty-fifth round: every mark still owed counts (never posted, never refused for good), not only the one that
+  // got the answer; read from the notice file, so a restarted keeper shows it until a send gets through.
+  const owed = marks.filter((m) => !m.posted && !m.refused && m.code);
+  if (t.config) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${owed.length} notice${owed.length === 1 ? "" : "s"} for Dane wait${owed.length === 1 ? "s" : ""}${owed.length ? ` (${[...new Set(owed.map((m) => m.code))].join(", ")})` : ""}. Check the link and the keeper share the relay key, then restart the App: they go then.`);
   out.push(...marks.filter((m) => m.refused && m.code).map((m) =>
     `Keeper: the link refused a notice for Dane for good (${m.code}); it isn't sent again. The keeper's log says why; tell him in your own words if it matters.`));
   out.push(...marks.filter((m) => !m.posted && m.code && (m.fails ?? 0) >= SERVER_FAILS_SHOWN).map((m) =>
@@ -450,7 +470,7 @@ export function cleared(cfg: Config, key: string): void {
   let changed = false;
   const m = t.told[key];
   if (m && !m.posted && !m.refused) {
-    const a = m.code ? send(cfg, m, m.code) : "retry";
+    const a = m.code && !triedThisRound.has(`${toldFile(cfg)}\0${key}`) ? send(cfg, t, m, m.code) : "retry";
     if (m.code) changed = true;
     if (a === "posted") { m.posted = true; m.clear = 0; changed = true; }
     if (a === "refused") { m.refused = true; changed = true; }

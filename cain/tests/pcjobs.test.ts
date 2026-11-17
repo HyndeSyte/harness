@@ -46,7 +46,7 @@ import {
   newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
   VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
   evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
-  regAnswer, chromeListingStep, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
+  regAnswer, chromeListingStep, LISTING_STAND_IN, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -809,9 +809,12 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
     events.push(fin("done"));
     return { code: 0, out: stream(events), timedOut: false };
   };
+  // The probe's chrome_listing step parses a listing (twenty-fifth round: never a stand-in pass): one in the command's
+  // format for the dedicated Chrome as the general process listing shows it.
+  const listing = () => { const d = dedicated(); return `${d.pid}|${d.ppid}|${new Date(d.created).toISOString()}|131.0.6778.86|${d.cmd}\r\n`; };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
     acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
-    policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], exeVersion: () => null, envRegistry: () => [], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
+    policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], exeVersion: () => null, chromePs: listing, envRegistry: () => [], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, hookTiming: async () => TIMING_OK, payloadReplay: () => REPLAY_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
@@ -7075,8 +7078,8 @@ describe("twenty-fourth review: the Chrome listing's timeout from the worker's o
     expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => `${sample(q.udd, pid)}\r\nwrapped tail of a long line` }), q.inst)).toMatchObject({ passed: false, mismatched: [4] });
     expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => sample(q.udd, pid + 9_000) }), q.inst)).toMatchObject({ passed: false, same_process: false });
     expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => sample("C:/elsewhere", pid) }), q.inst)).toMatchObject({ passed: false, dedicated: false });
-    expect(chromeListingStep(q.opts({ platform: "linux" }), q.inst).applies).toBe(true);           // the stand-in in use: no PowerShell
-    expect(chromeListingStep(q.opts({ platform: "linux", exeVersion: undefined }), q.inst).applies).toBe(false);
+    expect(chromeListingStep(q.opts({ platform: "linux", chromePs: undefined }), q.inst)).toMatchObject({ applies: true, passed: false });   // twenty-fifth round: a stand-in never passes
+    expect(chromeListingStep(q.opts({ platform: "linux", exeVersion: undefined, chromePs: undefined }), q.inst).applies).toBe(false);
     // In a probe: the listing names another process than the general listing does, so the probe refuses by the step's name.
     const e = await probe(q.opts({ ...attended, exeVersion: undefined, chromePs: () => sample(q.udd, pid + 9_000) })).then(() => null, (x) => x);
     expect(e?.code).toBe("chrome_listing");
@@ -7220,3 +7223,60 @@ function probeConfirmed(q: { home: string; opts: (o?: Partial<Opts>) => Opts; in
     evidence_sha256: evidenceSha(bytes, probedAt, conf.guard_sha256) }, null, 2));
   return { cf, bytes };
 }
+
+describe("twenty-fifth review: the listing step never passes on a stand-in, a floorless hold clear is recorded and named, and one profile comparator everywhere", () => {
+  test("the listing step with only the version stand-in refuses by name, and the probe refuses with it set; it never passes without a parsed listing", async () => {
+    const q = queueRig();
+    const step = chromeListingStep(q.opts({ chromePs: undefined }), q.inst);
+    expect(step).toMatchObject({ applies: true, passed: false });
+    expect(step.failure).toStartWith(`${LISTING_STAND_IN}:`);
+    expect((step as any).stand_in).toBeUndefined();
+    const e = await probe(q.opts({ ...attended, chromePs: undefined })).then(() => null, (x) => x);
+    expect(e?.code).toBe("chrome_listing");
+    expect(String(e?.detail)).toContain(LISTING_STAND_IN);
+    expect(existsSync(join(q.home, "probe-evidence.json"))).toBe(false);
+    // With a listing to parse, it is checked like the real one.
+    expect(chromeListingStep(q.opts(), q.inst)).toMatchObject({ applies: true, passed: true, same_process: true });
+  }, 120_000);
+
+  test("a hold whose Chrome version couldn't be read when it was made clears only with the condition gone, and the clear is recorded without a version floor and named on the status line", async () => {
+    const { q, id } = oneJob();
+    const fp = fingerprint(q.opts(), q.inst)!;
+    const hold = { at: new Date(T0.getTime() - 60_000).toISOString(), code: "versions_changed" as const, folders: [],
+      seen: { extension_version: fp.extension_version, chrome_version: null, chrome_version_source: null } };
+    expect(writeVersionHold(q.opts(), hold)).toBe(true);
+    probeConfirmed(q, new Date(Date.parse(hold.at) + 30_000).toISOString());
+    // The condition seen now: not cleared, floor or no floor.
+    const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.2_0");
+    mkdirSync(extra);
+    expect(holdCleared(q.opts(), q.inst, hold)).toMatchObject({ cleared: false, why: expect.stringContaining("condition is still seen") });
+    rmSync(extra, { recursive: true });
+    const cl = holdCleared(q.opts(), q.inst, hold);
+    expect(cl).toMatchObject({ cleared: true, floorless: ["Chrome"] });
+    expect(cl.why).toContain("made without a version floor for Chrome");
+    // In a run: the clear is logged and kept as made without a floor, and the run's status line names it.
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    const log = readFileSync(join(q.home, "worker.log"), "utf8");
+    expect(log).toContain("version_hold_cleared_without_floor versions_changed");
+    expect(log).toMatch(/ ok j-\S+ .*version_hold_cleared_without_floor:Chrome/);
+    expect(JSON.parse(readFileSync(holdClearedFile(q.opts()), "utf8"))).toMatchObject({ code: "versions_changed", without_floor: ["Chrome"] });
+    expect(readVersionHold(q.opts())).toBeNull();
+  });
+
+  test("with a prefix-sharing second profile running and the dedicated Chrome's flag quoted whole, the profile scan and the listing step agree with the dedicated match", async () => {
+    const { q, id } = oneJob();
+    const ded = q.dedicated();
+    const quoted = { ...ded, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" "--user-data-dir=${q.udd}" --profile-directory=Default` };
+    const twin = { pid: 7100, ppid: 1, created: T0.getTime() - 120_000, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir=${q.udd}-2` };
+    mkdirSync(join(`${q.udd}-2`, "Default"), { recursive: true });
+    writeFileSync(join(`${q.udd}-2`, "Default", "Preferences"), JSON.stringify({ extensions: { settings: {} } }));
+    // The dedicated folder (which holds the extension) is never scanned as another profile; the twin is.
+    expect(runningDirs([quoted, twin], q.inst, {})).toEqual([`${q.udd}-2`]);
+    expect(runningDirs([{ ...ded, cmd: `chrome.exe --user-data-dir=${q.udd}/` }, twin], q.inst, {})).toEqual([`${q.udd}-2`]);
+    expect(await run(q.opts({ ...attended, procs: () => [quoted, twin] }))).toMatchObject({ code: "ok", job: id });
+    // The listing step's cross-check: the listing names the twin first, then the dedicated one; the same process is found.
+    const line = (p: typeof ded) => `${p.pid}|${p.ppid}|${new Date(p.created).toISOString()}|131.0.6778.86|${p.cmd}`;
+    const listed = [line(twin), line(quoted), ""].join("\r\n");
+    expect(chromeListingStep(q.opts({ chromePs: () => listed, procs: () => [twin, quoted] }), q.inst)).toMatchObject({ passed: true, same_process: true, dedicated: true });
+  });
+});

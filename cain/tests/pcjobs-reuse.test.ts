@@ -7,7 +7,7 @@
 // finalised after, settled from the queue at the start of each round).
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
@@ -1027,7 +1027,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
       await child.exited;
       expect(JSON.parse((await new Response(child.stdout).text()).trim())).toEqual([true, true, "refused", true]);   // posted, already posted, refused, posted
       const lines = Object.values(r.posted).map((m: any) => m.content as string);
-      expect(lines).toContain(`${PC_NOTICES.reuse_fetch_failed} (It is a PC browser job queued at Nov 15, 9:05 AM, code reuse_fetch_failed.)`);
+      expect(lines).toContain(`${PC_NOTICES.reuse_fetch_failed} (It is a PC browser job seen by the keeper at Nov 15, 9:05 AM, code reuse_fetch_failed.)`);
       expect(r.reports).toEqual([]);                                                // the gate's rules: nothing to fix or hold
       expect(linkNotify({ link: "http://127.0.0.1:1", discordEnv: envFile() })("reuse_fetch_failed", { id: "f".repeat(24) })).toBe(false);   // no answer: passing
     } finally { server.stop(true); }
@@ -1115,15 +1115,15 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     } finally { console.log = was; }
     // Twenty-fourth round: a bad shape is never the bare line: named by the time the keeper saw it.
     expect(sent).toEqual([{ code: "reuse_fetch_failed", job: { queued: "2026-11-15" } }, { code: "reuse_fetch_failed", job: { queued: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z$/) } }]);
-    expect(pcQueuedWords(sent[1].job.queued)).toMatch(/^a PC browser job queued at /);
+    expect(pcQueuedWords(sent[1].job.queued)).toMatch(/^a PC browser job seen by the keeper at /);
     expect(logs.filter((l) => l.includes("error: notice reuse_fetch_failed was given its job")).length).toBe(2);
     // No site and action anywhere: the job file's created time, else the day in its id.
     expect(whatOf(cfg, { job: "j-20261113-zzzzzz" })).toEqual({ queued: "2026-11-13" });
     mkdirSync(join(cfg.dir, "jobs"), { recursive: true });
     writeFileSync(join(cfg.dir, "jobs", "j-20261113-yyyyyy.json"), JSON.stringify({ created: "2026-11-13T19:05:07.123Z" }));
     expect(queuedOf(cfg, "j-20261113-yyyyyy")).toEqual({ queued: "2026-11-13T19:05:07Z" });
-    expect(pcQueuedWords("2026-11-13T19:05:07Z")).toBe("a PC browser job queued at Nov 13, 2:05 PM");
-    expect(pcQueuedWords("2026-11-13")).toBe("a PC browser job queued on Nov 13");
+    expect(pcQueuedWords("2026-11-13T19:05:07Z")).toBe("a PC browser job seen by the keeper at Nov 13, 2:05 PM");
+    expect(pcQueuedWords("2026-11-13")).toBe("a PC browser job seen by the keeper on Nov 13");
     expect(pcQueuedWords("j-20261113-yyyyyy")).toBeNull();
     void cleared;
   });
@@ -1239,8 +1239,110 @@ describe("twenty-fourth review: notice refusals by kind, and a job named even wh
       const posted = await r.link.pcNotice(x.code, x.job, "a".repeat(23) + String(sent.indexOf(x)));
       const line = r.posted[posted.message].content as string;
       expect(line).not.toBe(PC_NOTICES.reuse_unsettled);                              // never the bare base line
-      expect(line).toContain("(It is a PC browser job queued at ");
+      expect(line).toContain("(It is a PC browser job seen by the keeper at ");
       expect(line).toContain("code reuse_unsettled");
     }
+  });
+});
+
+describe("twenty-fifth review: the configuration refusal as the keeper's delivery state, the told file written only on change, the backoff pinned, and the fallback worded as seen by the keeper", () => {
+  const quiet = <T>(f: () => T): T => {
+    const was = console.log;
+    console.log = () => {};
+    try { return f(); } finally { console.log = was; }
+  };
+  const ino = (f: string) => { try { return statSync(f).ino; } catch { return null; } };
+
+  test("a 401 or 403 counts every owed mark on the status line, keeps them all pending, and the told file is not rewritten while nothing changes; after the fix and a restart they all go", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const calls: string[] = [];
+    let answer: any = "config";
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { calls.push(c); return answer; }) as any });
+    // Two marks owed (never acknowledged) before the refusal.
+    quiet(() => { answer = false; tell(cfg, "reuse_fetch_failed", "fetch:a", { site: "example.com", action: "read_account_settings" }); tell(cfg, "reuse_unsettled", "unsettled:b", { queued: "2026-11-15" }); });
+    answer = "config";
+    quiet(() => resendOwed(cfg));
+    expect(calls).toEqual(["reuse_fetch_failed", "reuse_unsettled", "reuse_fetch_failed"]);     // the first resend got 403: nothing more this process
+    const file = `${w.used}.told.json`;
+    const kept = JSON.parse(readFileSync(file, "utf8"));
+    expect(kept.config).toBe(true);
+    expect(Object.values(kept.told).every((m: any) => m.posted === false && !m.refused && m.config === undefined)).toBe(true);
+    const lines = noticeTrouble({ used: w.used });
+    expect(lines[0]).toStartWith("Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); 2 notices for Dane wait (reuse_fetch_failed, reuse_unsettled).");
+    // More rounds with everything still owed: no sends, and the file is left alone (same inode, same bytes).
+    const before = { ino: ino(file), text: readFileSync(file, "utf8") };
+    quiet(() => { resendOwed(cfg); resendOwed(cfg); tell(cfg, "reuse_fetch_failed", "fetch:a"); });
+    expect(calls.length).toBe(3);
+    expect(ino(file)).toBe(before.ino);
+    expect(readFileSync(file, "utf8")).toBe(before.text);
+    expect(readdirSync(dirname(file)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    // A restart (a new process) still shows it from the file until a send gets through.
+    resetNoticeProcess();
+    expect(noticeTrouble({ used: w.used })[0]).toContain("2 notices for Dane wait");
+    answer = true;
+    quiet(() => resendOwed(cfg));
+    expect(calls.slice(3).sort()).toEqual(["reuse_fetch_failed", "reuse_unsettled"]);
+    expect(JSON.parse(readFileSync(file, "utf8")).config).toBeUndefined();
+    expect(noticeTrouble({ used: w.used })).toEqual([]);
+  });
+
+  test("a notice file from the twenty-fourth round with the flag on one mark reads as the keeper's state, counting every owed mark", () => {
+    resetNoticeProcess();
+    const w = world();
+    mkdirSync(dirname(w.used), { recursive: true });
+    writeFileSync(`${w.used}.told.json`, JSON.stringify({ v: 3, told: { "fetch:a": { id: "1".repeat(24), posted: false, clear: 0, code: "reuse_fetch_failed", config: true },
+      "unsettled:b": { id: "2".repeat(24), posted: false, clear: 0, code: "reuse_unsettled" } }, waits: {} }));
+    expect(noticeTrouble({ used: w.used })[0]).toContain("2 notices for Dane wait (reuse_fetch_failed, reuse_unsettled)");
+  });
+
+  test("5xx answers: the exact skip sequence 0, 1, 3, 7, 15, 31, then the cap, the count on the status after three, and the reset after a success", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const tries: number[] = [];
+    let n = 0;
+    let answer: any = "server";
+    const cfg = w.cfg("pi-1", { notify: ((_c: string) => { tries.push(n); return answer; }) as any });
+    quiet(() => tell(cfg, "reuse_fetch_failed", "fetch:a", { site: "example.com", action: "read_account_settings" }));   // round 0: the first try, a 5xx
+    const status: string[][] = [];
+    quiet(() => { for (n = 1; n <= 160; n++) { resendOwed(cfg); if (n === 3) status.push(noticeTrouble({ used: w.used })); } });
+    const skips = tries.slice(1).map((t, i) => t - tries[i] - 1);
+    expect(skips.slice(0, 8)).toEqual([0, 1, 3, 7, 15, 31, 31, 31]);           // capped at BACKOFF_MAX_ROUNDS - 1
+    expect(noticeTrouble({ used: w.used }).join("\n")).toContain(`server error ${tries.length} times in a row (reuse_fetch_failed)`);
+    // After three failures (rounds 0, 1 and 3), the count shows.
+    expect(status[0]).toEqual(["Keeper: the link answered a notice for Dane with a server error 3 times in a row (reuse_fetch_failed); it is tried again less often until the link answers."]);
+    // A success resets both the count and the wait: the next 5xx skips none again.
+    answer = true;
+    quiet(() => { for (let i = 0; i < 40 && noticeTrouble({ used: w.used }).length; i++) resendOwed(cfg); });
+    expect(noticeTrouble({ used: w.used })).toEqual([]);
+    const m = JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told["fetch:a"];
+    expect(m.posted).toBe(true);
+    expect(m.fails).toBeUndefined();
+    expect(m.skip).toBeUndefined();
+    answer = "server";
+    tries.length = 0;
+    n = 0;
+    quiet(() => { tell(cfg, "reuse_unsettled", "unsettled:c", { queued: "2026-11-15" }); for (n = 1; n <= 3; n++) resendOwed(cfg); });
+    expect(tries).toEqual([0, 1, 3]);                                         // a fresh mark: skips 0, then 1, from the start
+  });
+
+  test("in whole keeper rounds, one try per mark per round: the condition's own tell doesn't spend a second try", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const tries: number[] = [];
+    let n = 0;
+    const notify = ((_c: string) => { tries.push(n); return "server"; }) as any;
+    mkdirSync(w.used, { recursive: true });                                         // the store can't be read: told each round
+    quiet(() => { for (n = 1; n <= 20; n++) round(w.cfg("pi-1", { notify })); });
+    expect(tries).toEqual([1, 2, 4, 8, 16]);                                        // skips 0, 1, 3, 7 in rounds
+  }, 60_000);
+
+  test("the link words the fallback as a job seen by the keeper", () => {
+    expect(pcQueuedWords("2026-11-13T19:05:07Z")).toBe("a PC browser job seen by the keeper at Nov 13, 2:05 PM");
+    expect(pcQueuedWords("2026-11-13")).toBe("a PC browser job seen by the keeper on Nov 13");
+    expect(pcQueuedWords("2026-11-13T19:05:07Z")).not.toContain("queued");
   });
 });

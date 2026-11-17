@@ -468,9 +468,12 @@ export function judgeShipGate(head: string, reports: GateReport[]): ShipGateLine
 // Its caps (twentieth round): one wait GitHub asks for longer than RATE_WAIT_CAP_MS (15 minutes) ends
 // the watch with rate_wait_cap; the whole watch never runs past WATCH_CAP_MS (2 hours, whatever
 // untilMs asks), and a watch that reaches it unsettled ends with watch_cap.
-export type WatchFailure = "no_head" | "other_head" | "head_moved" | "rate_wait_cap" | "watch_cap" | "live_acceptance" | "lock_unavailable";
+// Twenty-fifth round: superseded (a re-watch of a sha whose acceptance was superseded) and head_not_current (the
+// pull request's head on GitHub, read at the acceptance's check, isn't the sha) are refused by the keeping
+// (shipgate.ts keepWatch), never accepted.
+export type WatchFailure = "no_head" | "other_head" | "head_moved" | "rate_wait_cap" | "watch_cap" | "live_acceptance" | "lock_unavailable" | "superseded" | "head_not_current";
 export interface WatchTarget { head?: string; pr?: number }
-export type WatchLine = ShipGateLine & { pr: number | null; bound_head: string | null; accepted_head: string | null; failure: WatchFailure | null; failure_why: string | null };
+export type WatchLine = ShipGateLine & { pr: number | null; bound_head: string | null; accepted_head: string | null; failure: WatchFailure | null; failure_why: string | null; gen?: number };
 export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, target: string | WatchTarget, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<WatchLine> {
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
   const now = o.now ?? (() => new Date());
@@ -525,10 +528,35 @@ export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, tar
 // an acceptance replaced (after a rebase); the Ship card reads every unsuperseded acceptance of its
 // pull request (shipgate.ts acceptedFor) and is refused for any other head while one stands.
 export const watchFile = (dir: string, sha: string) => `${dir}/ship-gate-${sha}.json`;
-export function watchAccepted(text: string | null): { pr: number | null; head: string } | null {
+// Twenty-fifth round, the generation: every acceptance records the generation of its pull request's watch lock it
+// was written under (gen; a record from before this round has none and reads as generation 0), and each takeover of
+// a stale lock moves the pull request's generation on (shipgate.ts, ship-gate-pr-<n>.gen). An acceptance counts only
+// under the generation as it is now: one written by a holder that was taken over is no acceptance from the moment of
+// the takeover, whether or not that holder ever resumes to take it back. current: the pull request's generation now
+// (shipgate.ts readGen), or null when it can't be read, and then nothing counts. Leaving it out reads the record
+// alone (the dry run's report only; the Ship card and the watch always pass it).
+export const recordGen = (x: any): number | null => x?.gen === undefined ? 0 : Number.isInteger(x.gen) && x.gen >= 0 ? x.gen : null;
+export function watchAccepted(text: string | null, current?: number | null): { pr: number | null; head: string; gen: number } | null {
   try {
     const x = JSON.parse(text ?? "");
     if (typeof x?.accepted_head !== "string" || !SHA.test(x.accepted_head) || x.superseded) return null;
-    return { pr: typeof x.pr === "number" ? x.pr : null, head: x.accepted_head };
+    const gen = recordGen(x);
+    if (gen === null || (current !== undefined && (current === null || gen !== current))) return null;
+    return { pr: typeof x.pr === "number" ? x.pr : null, head: x.accepted_head, gen };
   } catch { return null; }
+}
+// The sha-bound check (twenty-fifth round): what the record kept for one sha says about an acceptance of that very
+// sha and pull request, under the pull request's generation now. "kept": a live acceptance of it stands (a second
+// write is a no-op); "superseded": it was accepted and then marked replaced, which refuses a new acceptance of it
+// (never read as none: a superseded sha never comes back to life); "stale": accepted under an earlier generation, so
+// it counts for nothing; "none": no acceptance of it is kept. The watch makes it before and after its write
+// (shipgate.ts keepWatch).
+export type ShaBound = "kept" | "superseded" | "stale" | "none";
+export function shaBound(text: string | null, pr: number, head: string, current: number | null): ShaBound {
+  let x: any;
+  try { x = JSON.parse(text ?? ""); } catch { return "none"; }
+  if (typeof x?.accepted_head !== "string" || x.accepted_head.toLowerCase() !== head || x.pr !== pr) return x?.superseded && x?.bound_head === head ? "superseded" : "none";
+  if (x.superseded) return "superseded";
+  const gen = recordGen(x);
+  return current !== null && gen === current ? "kept" : "stale";
 }
