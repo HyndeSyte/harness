@@ -375,6 +375,35 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   time, and the Cain jobs Chrome is matched by the profile path its command line names
   (`--user-data-dir`), never a renderer or another Chrome. A run refused `probe_stale` names
   the versions from its preflight's own reading (no third read).
+  **Twenty-fourth round:** the time limit is decided from the worker's own state (the time
+  the call took on its monotonic clock, past the limit meaning the kill was sent), never from
+  the shape of the call's error, which is unproven on Bun for Windows. Any timeout
+  (`chrome_version_timeout`), any non-zero exit or failed start, and any output the parser
+  can't read line for line (`chrome_version_unreadable`) fails the phase by its code and
+  never reaches the Last Version file; only a listing that parsed whole without the Cain jobs
+  Chrome on it falls back to that file, named as the fallback. The listing sample in the
+  tests is synthetic, written in the command's format, not captured from a real PC: the
+  probe's new `chrome_listing` step captures the real listing on your PC and checks it against
+  the parser (every line read, the Cain jobs Chrome on it with a file version, the same
+  process the general listing names) before anything a confirmation could be written from; a
+  mismatch refuses the probe by that step's name, and `confirm-profile` refuses on Windows
+  without it. The Cain jobs Chrome's match now normalises both sides (quotes stripped, slashes
+  made forward, the full path resolved, a trailing separator removed, compared without case)
+  and reads `--user-data-dir` as a whole argument, named once; an 8.3 short folder name
+  (`PC-WOR~1`) isn't expanded, so it reads as a miss and nothing runs (start that Chrome with
+  the full folder path). **The hold, as kept now:** when `version-hold.json` and its pending
+  file both can't be written, the confirmation is set aside (renamed to
+  `confirmed.json.invalidated`) or, failing that, deleted, so every later run is
+  `profile_unconfirmed` until a new probe and confirmation; if even that fails, the run
+  refuses `version_hold_cannot_invalidate` and its heartbeat brings Cain a line for you. The
+  refusal is durable only when a confirmation existed to invalidate (with none, nothing runs
+  anyway). After a session, a hold that can't be written is the run's code
+  (`version_hold_unwritable`), not `versions_changed`. **A probe under a standing hold clears
+  it only** when the probed versions are the hold's recorded versions or later ones by number
+  (an older version, a rollback or another profile, never clears it) and the hold's condition
+  (an update waiting, more than one version folder) is no longer seen; with the validated
+  evidence above. The probe-evidence hash is computed from the guard hash (it binds the
+  evidence to the confirmation's guard hash), not part of the guard hash itself.
 - **Settings from anywhere else, checked every run.** Claude Code still reads managed
   settings whatever the flags say, so before every run the worker also reads your user
   settings as the session sees them (`claude-config/settings.json` and
@@ -1372,6 +1401,9 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
       `worker.log` (`hook_margin_low: no start on hooked call 7`, `a late start on hooked call
       3`, or `table_full: 200 unfinished calls when hooked call 201 came`); a full table is
       seen by the next check, within a second, well inside the 36 seconds.
+      **Twenty-fourth round:** the reason names the call the check actually judged (the one
+      whose start was late, or that never started), recorded when the check decides, not the
+      first tracked call with any start line.
       A run session with no navigation log path (`PCW_NAV_LOG`) is refused before anything
       starts, `nav_log_unset`, never left to die at 36 seconds. The worst real-run gap since the last
       probe is kept beside the probe's own figure in `hook-worst.json` (`probe`: `max_gap_ms`,
@@ -1529,14 +1561,26 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     sees the first and fails `live_acceptance`; one that can't get the lock within 10 seconds
     fails the same way, and a lock left by a killed watch is taken over after a minute.
     **Twenty-third round, the lock made true:** the lock holds its holder's token and its time
-    is refreshed while held; the holder checks it is still its own before it writes, and never
-    removes another's. A lock older than a minute is taken over only by renaming it to a name
-    of the taker's own and then making the lock again: of two takers only the one whose rename
-    succeeded goes on, and it checks the live acceptances again once it has the lock. The work
+    is refreshed at the check and before the write (not periodically); the holder checks it is
+    still its own before it writes, and never removes another's. A lock older than a minute is
+    taken over only by renaming it to a name of the taker's own and then making the lock again
+    with the exclusive create: exactly one contender proceeds (the renamer may lose that create
+    to another watch, which then holds the lock), and it checks the live acceptances again once
+    it has the lock. The work
     under the lock is bounded far below that minute (10 seconds at most, or nothing is
     accepted), so a slow live holder is never taken for a dead one. A lock that can't be read
     counts as held: the watch backs off until its 10 seconds are up, then fails
-    `lock_unavailable` with a notice naming the lock. A watch
+    `lock_unavailable` with a notice naming the lock. **Twenty-fourth round:** the acceptance
+    write is fenced. Just before it writes, the holder re-reads the lock and requires its own
+    token, checks again that no acceptance is kept for that very sha (if one is, its write is a
+    no-op) and that no live acceptance of another head stands; right after the write it reads
+    the lock once more, and if a watch took the lock over meanwhile (this holder was suspended
+    past the minute), it takes its acceptance back (`lock_unavailable`). The contender that took
+    over checked the live acceptances after its takeover, so whichever order the two writes come
+    in, at most one acceptance stays. A lock with no holder token (the empty file an earlier
+    version made) older than a minute is taken over the same way, with a loud line; one that
+    looks current, or whose content doesn't parse, still counts as held, and the notice names
+    the exact path and the removal command (`rm -f <path>`). A watch
     of a single sha with no `--pr` never blocks a card. It reads the gate now and then every 10
     minutes (`--every`) for up to 2 hours (`--hours`, at most 2), printing one line per reading, and
     keeps the step in `/data/work/ship-gate-<sha>.json`: the workflow file read, the head
@@ -1642,7 +1686,16 @@ its request, if still waiting, is refused with that reason.
   status (`pcjobs.sh worker` and `list`) until its condition clears. Every notice about a job
   names it by its site and action, or, when the keeper can't say them, by when it was queued
   ("a PC browser job queued at Nov 15, 2:05 PM"); a job given any other way is a logged bug,
-  never a refusal or an unnamed line. A notice file that can't be read
+  never a refusal or an unnamed line. **Twenty-fourth round:** a job handed in any shape the
+  keeper can't read (a string that isn't a queue id, a malformed object) is named by the time
+  the keeper saw it ("a PC browser job queued at ..."), with its code: the bare line is never
+  posted for a notice about a job. The link's 401 and 403 answers are a configuration refusal
+  (its key or setup): the keeper stops sending for that process and `pcjobs.sh worker` and
+  `list` show it first, marked ATTENTION (they read the notice file only, never the relay
+  key); after a restart with the key fixed, the waiting notices go. A 5xx answer is retried
+  with backoff (the next 1, 3, 7 ... tries skipped, up to 31), the same notice id each time,
+  and after 3 in a row the count shows on the status. A notice file upgrade that can't be
+  saved is logged once per process and shown on the status. A notice file that can't be read
   counts as nothing told: a notice can repeat, never be lost. A code the link has no words for
   (a keeper newer than the link) still reaches you, as "a stop condition the App does not
   know, code <code>, see troubleshooting". A shallow copy and a tap that can't be settled hold that tap alone
@@ -1785,7 +1838,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | a stop condition the App does not know, code `<code>` (a Discord line) | the keeper's log in the Cain App's log | The keeper is newer than the link that posts its notices (an update half applied). Find the code in this table; restart the Cain App so both run the same version. Needs a code change: no. |
 | `other_head` or `head_moved` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`) | its last line and `/data/work/ship-gate-<sha>.json`: `failure`, `failure_why` | The pull request's head was not the sha the watch was told (another commit was pushed), or it moved away from it. Nothing was accepted. Start a new watch with `--head` set to the commit actually pushed, before pushing it. Needs a code change: no. |
 | `live_acceptance` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`), or a Ship card refused for "more than one live acceptance" | the refusal's words; `/data/work/ship-gate-*.json` | Another live acceptance of that pull request stands. Once the pull request's head has moved past it, run `keeper.sh ship-gate --supersede <that sha>`, then watch again. A supersede refused with "head is still" means nothing new was pushed yet: push the new head first. Twenty-second round: two watches of one pull request finishing together are kept under its lock file (`/data/work/ship-gate-pr-<number>.lock`): one is accepted, the other fails `live_acceptance`. A failure that says the lock stayed held: run the watch again once the other is done; a lock left by a killed watch is taken over after a minute (twenty-third round: by a rename only one taker can win, and never while its holder is still working). |
-| `lock_unavailable` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`) | the watch's output and `/data/work/ship-gate-<sha>.json`: `failure_why` names the lock | The pull request's watch lock couldn't be taken or kept in time: it couldn't be read (something not a lock file sits at its path), or the watch's work under it took too long. Nothing was accepted. Run the watch again once no other watch of that pull request runs; if it repeats, delete the lock file it names. Needs a code change: no. |
+| `lock_unavailable` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`) | the watch's output and `/data/work/ship-gate-<sha>.json`: `failure_why` names the lock | The pull request's watch lock couldn't be taken or kept in time: it couldn't be read (something not a lock file sits at its path), or the watch's work under it took too long. Nothing was accepted. Run the watch again once no other watch of that pull request runs; if it repeats, delete the lock file it names. Twenty-fourth round: the notice gives the exact command (`rm -f /data/work/ship-gate-pr-<number>.lock`); run it on the Pi only while no watch of that pull request runs. An empty lock from an earlier version is taken over by itself once it is over a minute old (the watch prints a `WARNING: took over a legacy watch lock` line). A watch whose lock was taken over while it was writing takes its acceptance back and fails this way too. Needs a code change: no. |
 | a Ship card refused: "the Ship gate's watch of this pull request accepted `<sha>`, not this head" | `/data/work/ship-gate-<sha>.json` | An earlier watch accepted another head of this pull request (often before a rebase). If this head replaces it, run `keeper.sh ship-gate --supersede <sha>`, then watch this head with `--pr <number> --head <head> --watch`. |
 | `rate_wait_cap` or `watch_cap` (the gate watch) | the watch's lines: the last reading's `why` | GitHub asked for a wait past 15 minutes (or sent a wait it couldn't read), or the watch reached its 2 hour cap unsettled. Nothing was accepted. Wait for GitHub's limit to reset, then watch again. |
 | `extension_slow_attach` (`confirm-profile`) | `probe-evidence.json`: `not_ready` (counts, `waits_ms`, `first_wait_ms`) | A probe session hit the not-ready cap: Claude in Chrome took too long to attach. Restart the Cain jobs Chrome, wait a minute, then run the probe again. Needs a code change: only if it repeats on a healthy Chrome. |
@@ -1811,10 +1864,16 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `update_pending` | chrome://extensions in the Cain jobs Chrome; the version folders under the profile's `Extensions\<id>` | Chrome has unpacked a Claude in Chrome update into a newer version folder but still runs the old one. Restart the Cain jobs Chrome (close every window, open it again); the next run is `probe_stale` until you probe and confirm the new version. Needs a code change: no. Runs stay held after the restart until a new probe and confirmation (`version-hold.json` in the worker folder; twenty-first round): an auto-update needs a new probe. Twenty-second round: an update found by the check after a session fails that run `versions_changed` with a detail starting `update_pending:`, and the hold is written then too. |
 | `extension_versions_ambiguous` | the version folders under the Cain jobs profile's `Extensions\<id>`; `version-hold.json` in the worker folder (`folders`) | The profile holds more than one Claude in Chrome version folder, so which one Chrome runs can't be bound to the probe. Restart the Cain jobs Chrome (it removes the old folder), then run the probe again and `confirm-profile`; runs stay held until then. Twenty-second round: the hold clears only for a confirmation of a probe run after the hold was made (`probed_at`), of the versions loaded now; editing `confirmed.json` never clears it. Twenty-third round: only on validated probe evidence (`evidence_sha256` in `confirmed.json` checked against `probe-evidence.json`); an edited probe time or evidence file never clears it, and the probe works under the hold. |
 | `versions_changed` (a run's result) | the run's `detail` | Claude in Chrome's loaded version or Chrome's version changed during the run (an auto-update), checked once the session ended; the run's report was discarded. Restart the Cain jobs Chrome, then run the probe again and `confirm-profile`. Twenty-second round: the detail starts with `update_pending:` or `extension_versions_ambiguous:` when an update or a second folder showed (the hold is written then), or `version_mismatch:`. Chrome's version read from another source than the probe's is named in the detail and `worker.log` (`chrome_version_source`) and doesn't fail the run. Twenty-third round: only when the version is the same by its numbers; another source with another version fails the run like any other change, and every change writes the hold (`versions_changed` in `version-hold.json`), so later runs wait for a new probe. |
-| `version_hold_unwritable` | `worker.log`: `version_hold_unwritable ... kept=...`; `version-hold.json.pending` in the worker folder | The worker saw a Claude in Chrome update waiting, a second version folder or a version change but couldn't write `version-hold.json` (disk full, or the worker folder can't be written). No run starts until it can: free disk space or fix the folder's permissions, then run again; the hold is then written and asks for a new probe (Restart the Cain jobs Chrome, probe, `confirm-profile`). Twenty-third round: `kept=` says how the refusal was kept: `pending` (the pending file), `confirmation_broken` (the confirmation's guard hash zeroed: every run is `probe_stale` until a new probe), `confirmation_removed`, or `none` (only that run refused). Needs a code change: no. |
-| `chrome_version_timeout` (a run's refusal or result) | `worker.log`: `chrome_version_timeout` | The PowerShell call that reads the Cain jobs Chrome's version ran out of its 20 seconds, so the worker couldn't tell Chrome's version: nothing ran, or the run's report was thrown away when it happened after the session. Close heavy programs or restart the PC, then run again. Needs a code change: only if it repeats on an idle PC. |
+| `version_hold_unwritable` | `worker.log`: `version_hold_unwritable ... kept=...`; `version-hold.json.pending` in the worker folder | The worker saw a Claude in Chrome update waiting, a second version folder or a version change but couldn't write `version-hold.json` (disk full, or the worker folder can't be written). No run starts until it can: free disk space or fix the folder's permissions, then run again; the hold is then written and asks for a new probe (Restart the Cain jobs Chrome, probe, `confirm-profile`). Twenty-third round: `kept=` says how the refusal was kept. Twenty-fourth round: `pending` (the pending file), `confirmation_renamed` (the confirmation set aside as `confirmed.json.invalidated`: every run is `profile_unconfirmed` until a new probe and confirmation), `confirmation_removed` (deleted, the same), or `no_confirmation` (none existed to invalidate: nothing runs until one is written). The refusal is durable only when a confirmation existed to invalidate. After a session, a hold that can't be written is the run's own code (`version_hold_unwritable`), never `versions_changed`. Needs a code change: no. |
+| `version_hold_cannot_invalidate` (twenty-fourth round) | `worker.log`: `version_hold_cannot_invalidate ... kept=none`; Cain's "At his PC" line | The worker couldn't write its version hold, its pending file, or set `confirmed.json` aside (neither renamed nor deleted). Nothing ran. Free disk space or fix the worker folder's permissions (only SYSTEM, Administrators and you, with write access for you), then start a run; it then asks for a new probe. Needs a code change: no. |
+| `chrome_version_timeout` (a run's refusal or result) | `worker.log`: `chrome_version_timeout` | The PowerShell call that reads the Cain jobs Chrome's version ran out of its 20 seconds, so the worker couldn't tell Chrome's version: nothing ran, or the run's report was thrown away when it happened after the session. Close heavy programs or restart the PC, then run again. Twenty-fourth round: the timeout is told from the worker's own clock (the time the call took), never from how the call's error looked, and never falls back to the Last Version file. Needs a code change: only if it repeats on an idle PC. |
+| `chrome_version_unreadable` (a run's refusal or result; twenty-fourth round) | `worker.log`: `chrome_version_unreadable:` with the exit code or the line numbers that didn't parse | The PowerShell call that lists `chrome.exe` failed (a non-zero exit, or it couldn't start), or printed lines the worker's parser can't read. Nothing ran, or the run's report was thrown away; the Last Version file is never used for this. Run the probe again: its `chrome_listing` step captures the real listing and checks it against the parser. If that step refuses, it needs a code change (report the line numbers). |
+| `chrome_listing` (probe; twenty-fourth round) | the probe's last line; `worker.log`: `probe chrome_listing` (line counts, line numbers, never the command lines) | The probe ran the real PowerShell listing of `chrome.exe` on this PC and it didn't match the parser (a line in another format), or it didn't show the Cain jobs Chrome with a readable file version, or the process it named isn't the one the general process listing shows. The tests' listing sample is synthetic (written in the command's format, not captured), so this step is where the real format is proven. Check the Cain jobs Chrome is open on its own folder, then probe again; if it still refuses, report the line numbers: needs a code change. A Cain jobs Chrome started with an 8.3 short folder name (`PC-WOR~1`) isn't matched (a false miss, so nothing runs): start it with the full folder path. |
 | `notice_undelivered` (a Discord line) | the keeper's log: `was never delivered and its code can't be told` | After an update, the keeper found a notice an earlier version never delivered and can't tell which one it was. Nothing to fix by itself: if something about PC jobs seems stuck, check the other rows here and the keeper's log. |
 | a refused notice (`pcjobs.sh worker` or `list` says "the link refused a notice for Dane for good") | the keeper's log: `ERROR: the link refused notice` | The link answered a notice with a permanent refusal, so the keeper won't send it again. Read the keeper's log line for the code; usually the link and the keeper are from different releases (install the same Cain release). It leaves the status once its condition has been clear for three rounds. Needs a code change: yes, if it repeats on one release. |
+| "the link refused the keeper's notices as not allowed" (`pcjobs.sh worker` or `list`, marked ATTENTION; twenty-fourth round) | the keeper's log: `refused the keeper's notice ... as not allowed (HTTP 401 or 403` | The link answered 401 or 403: it won't take the keeper's key or setup (the relay key the keeper derives from the Discord settings differs from the link's). The keeper stops sending for that process; the notices wait. Check both read the same Discord bot settings, then restart the Cain App: the waiting notices go then. Needs a code change: no. |
+| "the link answered a notice for Dane with a server error N times in a row" (`pcjobs.sh worker` or `list`; twenty-fourth round) | the keeper's log: `the link answered with a server error` | The link answered with a 5xx. The keeper keeps the notice and tries again less often (it skips 1, 3, 7 ... tries, up to 31, between attempts), with the same notice id; the line shows after 3 failures in a row and goes once the link answers. Check the Cain App's log for the link's error. Needs a code change: only if it repeats. |
+| "the notice file's one-time upgrade couldn't be saved" (`pcjobs.sh worker` or `list`; twenty-fourth round) | the keeper's log: `the notice file's one-time upgrade couldn't be saved` (once per process) | The keeper couldn't write its notice file in `/data` (disk full, or a leftover `.tmp` in the way). Notices still go; the upgrade is tried again each round. Free space on the Pi. Needs a code change: no. |
 | `nav_log_unset` (a run's result) | the run's result | The run session was started without its navigation log path (`PCW_NAV_LOG`), so the worker couldn't see its hooks start: it refused the session before anything started. The worker always sets it, so this means the worker's environment was changed. Start the worker again from a new terminal. Needs a code change: yes, if it repeats. |
 | `boundary_not_accepted` | `confirmed.json`: `boundary_version`; `confirm-profile`'s output | The confirmation doesn't hold your acceptance of the current boundary text (you ran `confirm-profile` without `--accept-boundary`, the confirmation is from before this release, or the text changed). Read the boundary (top of this note), then run `confirm-profile --accept-boundary` after a passing probe. Needs a code change: no. |
 | `injection_required` (`confirm-profile`) | `probe-evidence.json`: `injection`, `injection_plan` | A planted-instruction case didn't pass: the page was never read, or the token came out in an accepted value. Run the probe again; if it repeats, the schema or the session prompt needs a change. |

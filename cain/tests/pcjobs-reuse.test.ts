@@ -11,7 +11,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { cleared, linkNotify, noticeTrouble, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { cleared, linkNotify, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
 import { askValues, PC_NOTICES, pcQueuedWords } from "../rootfs/opt/cain/link/core";
 import { linkFetch } from "../rootfs/opt/cain/link/http";
@@ -1113,7 +1113,9 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
       tell(cfg, "reuse_fetch_failed", "fetch:s1", "j-20261115-abcdef" as any);
       tell(cfg, "reuse_fetch_failed", "fetch:s2", { site: "Bad Site", action: "x" } as any);
     } finally { console.log = was; }
-    expect(sent).toEqual([{ code: "reuse_fetch_failed", job: { queued: "2026-11-15" } }, { code: "reuse_fetch_failed", job: undefined }]);
+    // Twenty-fourth round: a bad shape is never the bare line: named by the time the keeper saw it.
+    expect(sent).toEqual([{ code: "reuse_fetch_failed", job: { queued: "2026-11-15" } }, { code: "reuse_fetch_failed", job: { queued: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z$/) } }]);
+    expect(pcQueuedWords(sent[1].job.queued)).toMatch(/^a PC browser job queued at /);
     expect(logs.filter((l) => l.includes("error: notice reuse_fetch_failed was given its job")).length).toBe(2);
     // No site and action anywhere: the job file's created time, else the day in its id.
     expect(whatOf(cfg, { job: "j-20261113-zzzzzz" })).toEqual({ queued: "2026-11-13" });
@@ -1124,5 +1126,121 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     expect(pcQueuedWords("2026-11-13")).toBe("a PC browser job queued on Nov 13");
     expect(pcQueuedWords("j-20261113-yyyyyy")).toBeNull();
     void cleared;
+  });
+});
+
+describe("twenty-fourth review: notice refusals by kind, and a job named even when it was handed in a bad shape", () => {
+  const TOKEN = "not-a-real-token.for-the-notice-test-24";
+  const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
+  const envFile = () => { const d = mkdtempSync(join(tmpdir(), "pcjobs-env24-")); writeFileSync(join(d, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`); return join(d, ".env"); };
+  const quiet = <T>(f: () => T): { out: T; logs: string[] } => {
+    const logs: string[] = [];
+    const was = console.log;
+    console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try { return { out: f(), logs }; } finally { console.log = was; }
+  };
+
+  test.skipIf(!Bun.which("curl"))("the keeper's curl reads 401 and 403 as a configuration refusal and a 5xx as the link's own trouble", async () => {
+    let answer = 403;
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(JSON.stringify({ status: "nope" }), { status: answer, headers: { "content-type": "application/json" } }) });
+    const r = rig();
+    const real = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true, localOnly: new Set(["/pc-notice"]) }) });
+    try {
+      const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
+      const one = async (port: number, env: string) => {
+        const src = `const { linkNotify } = await import(${JSON.stringify(main)});
+          console.log(JSON.stringify(linkNotify({ link: "http://127.0.0.1:${port}", discordEnv: ${JSON.stringify(env)} })("reuse_fetch_failed", { id: "c".repeat(24) })));`;
+        const child = Bun.spawn(["bun", "-e", src], { stdout: "pipe", stderr: "pipe" });
+        await child.exited;
+        return JSON.parse((await new Response(child.stdout).text()).trim());
+      };
+      expect(await one(server.port, envFile())).toBe("config");
+      answer = 401; expect(await one(server.port, envFile())).toBe("config");
+      answer = 502; expect(await one(server.port, envFile())).toBe("server");
+      answer = 500; expect(await one(server.port, envFile())).toBe("server");
+      // The link's real handler with a wrong key answers 403: a configuration refusal.
+      const wrong = mkdtempSync(join(tmpdir(), "pcjobs-env24w-"));
+      writeFileSync(join(wrong, ".env"), "DISCORD_BOT_TOKEN=another-token\n");
+      expect(await one(real.port, join(wrong, ".env"))).toBe("config");
+    } finally { server.stop(true); real.stop(true); }
+  }, 30_000);
+
+  test("a configuration refusal stops the sends for this process and shows prominently on the status; a new process sends again", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const calls: string[] = [];
+    let answer: any = "config";
+    const notify = ((c: string) => { calls.push(c); return answer; }) as any;
+    mkdirSync(w.used, { recursive: true });                                         // the store can't be read: a notice is owed
+    const { logs } = quiet(() => { for (let i = 0; i < 3; i++) round(w.cfg("pi-1", { notify })); });
+    expect(calls).toEqual(["reuse_store_unreadable"]);                              // one try, then no more this process
+    expect(logs.join("\n")).toContain("refused the keeper's notice reuse_store_unreadable as not allowed (HTTP 401 or 403");
+    const lines = noticeTrouble({ used: w.used });
+    expect(lines[0]).toStartWith("Keeper: ATTENTION: the link refused the keeper's notices as not allowed");
+    expect(lines[0]).toContain("reuse_store_unreadable");
+    for (const l of lines) { expect(l).not.toMatch(/[0-9a-f]{24}/); expect(l).not.toMatch(/\d{4}-\d{2}-\d{2}T/); }
+    // The App restarted (a new process) with the key fixed: it goes, and the status line goes with it.
+    resetNoticeProcess();
+    answer = true;
+    quiet(() => round(w.cfg("pi-1", { notify })));
+    expect(calls).toEqual(["reuse_store_unreadable", "reuse_store_unreadable"]);
+    expect(noticeTrouble({ used: w.used })).toEqual([]);
+  });
+
+  test("5xx answers back off exponentially, and after a few the count shows on the status", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const tries: number[] = [];
+    let n = 0;
+    let answer: any = "server";
+    const notify = ((_c: string) => { tries.push(n); return answer; }) as any;
+    mkdirSync(w.used, { recursive: true });
+    quiet(() => { for (n = 1; n <= 12; n++) round(w.cfg("pi-1", { notify })); });
+    // Rounds with a try: each failure skips the next 0, 1, 3, 7 ... tries.
+    const gaps = tries.slice(1).map((t, i) => t - tries[i]);
+    expect(gaps.slice(0, 3).every((g, i) => g >= (gaps[i - 1] ?? 0))).toBe(true);
+    expect(tries.length).toBeLessThan(12);
+    expect(tries.length).toBeGreaterThanOrEqual(SERVER_FAILS_SHOWN);
+    expect(noticeTrouble({ used: w.used }).join("\n")).toMatch(/server error \d+ times in a row \(reuse_store_unreadable\)/);
+    // The link answers: the count goes.
+    answer = true;
+    quiet(() => { for (let i = 0; i < 40 && noticeTrouble({ used: w.used }).length; i++) round(w.cfg("pi-1", { notify })); });
+    expect(noticeTrouble({ used: w.used })).toEqual([]);
+  });
+
+  test("the notice file's upgrade that can't be saved is logged once per process and shown on the status", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    mkdirSync(dirname(w.used), { recursive: true });
+    writeFileSync(`${w.used}.told.json`, JSON.stringify({ v: 2, told: { store: { id: "1".repeat(24), posted: true, clear: 0 } }, waits: {} }));
+    mkdirSync(`${w.used}.told.json.tmp`, { recursive: true });                      // the save's temporary file can't be written
+    const { logs } = quiet(() => { noticeTrouble({ used: w.used }); noticeTrouble({ used: w.used }); return null; });
+    expect(logs.filter((l) => l.includes("one-time upgrade couldn't be saved")).length).toBe(1);
+    expect(noticeTrouble({ used: w.used })).toContain("Keeper: the notice file's one-time upgrade couldn't be saved; it is tried again each round, and notices still go. The keeper's log says why.");
+    rmSync(`${w.used}.told.json.tmp`, { recursive: true });
+    expect(noticeTrouble({ used: w.used })).toEqual([]);                            // saved now
+  });
+
+  test("a job handed as a non-id string or a malformed object is named by the fallback time, never the bare line, and keeps its code", async () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: any[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((code: string, n?: any) => { sent.push({ code, job: n?.job }); return true; }) as any });
+    quiet(() => { tell(cfg, "reuse_unsettled", "unsettled:a", "not an id" as any); tell(cfg, "reuse_unsettled", "unsettled:b", { site: 5 } as any); tell(cfg, "reuse_unsettled", "unsettled:c", [] as any); });
+    expect(sent.length).toBe(3);
+    const r = rig();
+    for (const x of sent) {
+      expect(x.code).toBe("reuse_unsettled");
+      expect(x.job).toEqual({ queued: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00Z$/) });
+      const posted = await r.link.pcNotice(x.code, x.job, "a".repeat(23) + String(sent.indexOf(x)));
+      const line = r.posted[posted.message].content as string;
+      expect(line).not.toBe(PC_NOTICES.reuse_unsettled);                              // never the bare base line
+      expect(line).toContain("(It is a PC browser job queued at ");
+      expect(line).toContain("code reuse_unsettled");
+    }
   });
 });

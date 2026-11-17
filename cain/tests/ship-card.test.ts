@@ -585,3 +585,70 @@ describe("twenty-third review: the gate lock made true", () => {
     expect(JSON.parse(readFileSync(lock, "utf8")).token).toBe("someone-else");
   });
 });
+
+describe("twenty-fourth review: the gate's acceptance write fenced, and the legacy lock taken over", () => {
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  const mod = join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts");
+  test("a holder suspended past the stale bound at its write, a takeover, then the first holder resuming: exactly one acceptance commits, in two processes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate24-"));
+    const sig = join(dir, "suspended");
+    const a = Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
+      const { writeFileSync } = await import("node:fs");
+      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA1))}, ${JSON.stringify(watchFile(dir, SHA1))},
+        { atWrite: () => { writeFileSync(${JSON.stringify(sig)}, "1"); const t = Date.now() + 2_000; while (Date.now() < t) {} } });
+      console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
+    const t0 = Date.now();
+    while (!existsSync(sig) && Date.now() - t0 < 10_000) await Bun.sleep(10);
+    const b = Bun.spawn(["bun", "-e", `const { keepWatch } = await import(${JSON.stringify(mod)});
+      const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA2))}, ${JSON.stringify(watchFile(dir, SHA2))}, { staleMs: 400, waitMs: 3_000 });
+      console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
+    const read = async (p: any) => { await p.exited; return JSON.parse((await new Response(p.stdout).text()).trim()); };
+    const [ra, rb] = [await read(a), await read(b)];
+    expect(rb.accepted).toBe(SHA2);                                                 // the contender that took over commits
+    expect(ra).toEqual({ accepted: null, failure: "lock_unavailable" });            // the resumed holder takes its write back
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);
+    expect(existsSync(join(dir, "ship-gate-pr-5.lock"))).toBe(false);
+  }, 30_000);
+  test("a second write for the same sha is a no-op", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate24-"));
+    const first = keepWatch(dir, line(SHA1), watchFile(dir, SHA1));
+    const before = readFileSync(watchFile(dir, SHA1), "utf8");
+    const again = keepWatch(dir, { ...line(SHA1), attempts_seen: ["other"] }, watchFile(dir, SHA1));
+    expect(again.accepted_head).toBe(SHA1);
+    expect(first.accepted_head).toBe(SHA1);
+    expect(readFileSync(watchFile(dir, SHA1), "utf8")).toBe(before);
+  });
+  test("upgrading from the twenty-second round's empty lock file: an old one is taken over with a loud line; the notice names the path and the removal command", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate24-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    writeFileSync(lock, "");                                                        // the earlier round's lock: empty, no token
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+    const errs: string[] = [];
+    const was = console.error;
+    console.error = (...x: unknown[]) => { errs.push(x.join(" ")); };
+    let kept: any;
+    try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 600 }); } finally { console.error = was; }
+    expect(kept.accepted_head).toBe(SHA1);
+    expect(errs.join("\n")).toContain("took over a legacy watch lock with no holder token");
+    expect(existsSync(lock)).toBe(false);
+    expect(readdirSync(dir).filter((n) => n.includes(".stale-"))).toEqual([]);
+  });
+  test("a legacy lock that looks current, and one whose content fails to parse, are never taken over; the notice gives the exact removal command", () => {
+    for (const [content, age] of [["", 0], ["{not json", 5 * 60_000]] as const) {
+      const dir = mkdtempSync(join(tmpdir(), "ship-gate24-"));
+      const lock = join(dir, "ship-gate-pr-5.lock");
+      writeFileSync(lock, content);
+      const t = new Date(Date.now() - age);
+      utimesSync(lock, t, t);
+      const was = console.error;
+      console.error = () => {};
+      let kept: any;
+      try { kept = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { waitMs: 300 }); } finally { console.error = was; }
+      expect(kept).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+      expect(kept.failure_why).toContain(`rm -f ${lock}`);
+      expect(readFileSync(lock, "utf8")).toBe(content);
+    }
+  });
+});

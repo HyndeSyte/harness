@@ -123,6 +123,11 @@
 - If reading Chrome's version takes too long, the PC stops with its own reason instead of guessing. A run that stops because a page check started late or never says which call it was.
 - Two Ship gate watches can't both take over a lock left by a stopped watch, a slow watch is never taken over, and a lock that can't be read stops the watch with a notice.
 - Messages from the queue keeper that an earlier version never delivered are sent after the update, or as one line saying an earlier message could not be delivered. A message Cain's App refuses for good is no longer retried and shows in the keeper's status. A job whose site can't be told is named by when it was queued.
+- A Ship gate watch that loses its lock while writing now takes its acceptance back, so only one acceptance of a change is ever kept. A lock left by an earlier version is taken over by itself after a minute, and a lock that can't be read names the command that removes it.
+- The PC tells a slow Chrome version check by its own clock, and a failed or unreadable check stops the run by name instead of guessing from another file. The probe now checks your PC's real Chrome listing before you can confirm it.
+- If the PC can't keep its note that a version changed, it sets its confirmation aside so nothing runs until a new probe, or stops with its own reason when even that fails. A probe clears that note only when it saw the same or newer versions.
+- The PC matches its Chrome profile folder exactly, whatever the quotes, slashes or letter case.
+- Queue messages Cain's App turns away as not allowed now stop and show at the top of the keeper's status; messages that hit a passing server error are retried less often, with a count. A job handed over in a shape the keeper can't read is still named, by the time.
 
 ## 0.11.0
 

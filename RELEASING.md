@@ -87,9 +87,22 @@ refused while it stands, naming the accepted sha, and after a rebase
 only once the pull request's head differs from it; a pull request has one live acceptance at
 a time, and a watch refuses to accept while another stands, `live_acceptance`, checked and
 kept under the pull request's own lock file so two watches finishing together keep one; a
-stale lock is taken over only by a rename one taker can win, and a lock that can't be read
-fails the watch as `lock_unavailable`). Run it once on a head
+stale lock is taken over only by a rename followed by the exclusive create again, so exactly
+one contender proceeds, and a lock that can't be read fails the watch as `lock_unavailable`;
+the lock's time is refreshed at the check and before the write, the holder re-reads the lock
+and requires its own token just before it writes the acceptance and again after, taking the
+acceptance back if it lost the lock meanwhile, and a second write for the same sha is a no-op).
+Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
+
+Upgrading the gate's lock (0.12.0, twenty-fourth round). A lock file left by an earlier
+version of the watch (`/data/work/ship-gate-pr-<number>.lock`, empty or with no holder
+token) is taken over by the next watch once it is more than a minute old, through the same
+rename and exclusive create, with a loud line in the watch's output. One that looks current
+(under a minute old) or whose content doesn't parse still counts as held: the watch fails
+`lock_unavailable`, and its notice names the exact path and the command that removes it
+(`rm -f /data/work/ship-gate-pr-<number>.lock`). Run that on the Pi only when no watch of
+that pull request is running, then watch again.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

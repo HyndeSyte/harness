@@ -253,13 +253,25 @@ const PC_NOTICE_CODES: readonly PcNotice[] = ["reuse_migrated", "reuse_shallow",
 export type JobWhat = { site: string; action: string } | { queued: string };
 export interface NoticeSend { id: string; job?: JobWhat }
 // What the link answered: true (posted, or already posted), false (no answer or a passing error: try again),
-// or "refused" (a permanent refusal: never sent again).
-export type Notify = (code: PcNotice, n?: NoticeSend) => boolean | "refused";
+// "refused" (a permanent refusal: never sent again), and (twenty-fourth round) "config" (401 or 403: the link
+// won't take the keeper's key or setup: no more sends this process, shown on the status) or "server" (a 5xx:
+// retried with backoff, counted on the status).
+export type NoticeAnswer = boolean | "refused" | "config" | "server";
+export type Notify = (code: PcNotice, n?: NoticeSend) => NoticeAnswer;
 export const CLEAR_ROUNDS = 3;
 export const WAIT_ROUNDS = 3;
 // A mark keeps its code and job (twenty-second round), so a post whose acknowledgement was lost is sent
 // again with its saved id until the link confirms it, whether or not its condition is still here.
-interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean }
+// config: the link last refused this mark as not allowed (401 or 403); fails: server errors in a row; skip: rounds
+// still to wait before the next try (twenty-fourth round, the backoff).
+interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean; config?: boolean; fails?: number; skip?: number }
+// Twenty-fourth round, kept for this process: the link refused the keeper's key or setup (no more sends until the
+// keeper starts again), and whether the notice file's upgrade couldn't be saved (logged once, shown on the status).
+let configStopped = false;
+let migrationUnsaved = false;
+export const SERVER_FAILS_SHOWN = 3;
+export const BACKOFF_MAX_ROUNDS = 32;
+export function resetNoticeProcess(): void { configStopped = false; migrationUnsaved = false; }
 interface Told { told: Record<string, ToldMark>; waits: Record<string, number> }
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
 const NOTICE_ID = /^[0-9a-f]{16,64}$/;
@@ -293,13 +305,21 @@ function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "di
       if (m && typeof m.id === "string" && NOTICE_ID.test(m.id)) {
         const code = isCode(m.code) ? m.code : undefined;
         const job = jobWhat(m.job);
+        const n = (v: unknown) => Number.isInteger(v) && (v as number) > 0 ? { v: v as number } : null;
         told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0, ...(code ? { code } : {}), ...(job ? { job } : {}),
-          ...(m.refused === true ? { refused: true } : {}) };
+          ...(m.refused === true ? { refused: true } : {}), ...(m.config === true ? { config: true } : {}),
+          ...(n(m.fails) ? { fails: n(m.fails)!.v } : {}), ...(n(m.skip) ? { skip: Math.min(n(m.skip)!.v, BACKOFF_MAX_ROUNDS) } : {}) };
       }
   if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
     for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
   const t = { told, waits };
-  if (a?.v !== 3) { migrateTold(cfg, t); saveTold(cfg, t); }
+  if (a?.v !== 3) {
+    migrateTold(cfg, t);
+    if (!saveTold(cfg, t, true)) {
+      if (!migrationUnsaved) log(`ERROR: the notice file's one-time upgrade couldn't be saved (${toldFile(cfg)}): it is tried again each round, and notices still go; the keeper's status shows it`);
+      migrationUnsaved = true;
+    } else migrationUnsaved = false;
+  }
   return t;
 }
 // The one-time migration of an earlier keeper's marks (twenty-third round): each gets its code from its key;
@@ -319,20 +339,40 @@ function migrateTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | 
   }
 }
 const newNoticeId = () => randomBytes(12).toString("hex");
-function saveTold(cfg: Pick<Config, "used">, t: Told): void {
+function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
     writeFileSync(`${toldFile(cfg)}.tmp`, JSON.stringify({ v: 3, ...t }));
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
-  } catch (e) { log(`couldn't keep which notices went out: ${(e as Error).message}`); }
+    return true;
+  } catch (e) { if (!quiet) log(`couldn't keep which notices went out: ${(e as Error).message}`); return false; }
 }
 // One send of a mark, with its saved id: "posted" once the link confirms it posted (or had already posted it),
 // "refused" on a permanent refusal (logged loudly, never sent again), "retry" otherwise.
+// Twenty-fourth round: a mark waiting out its backoff is not sent this round (its skip counted down); once the link
+// refused the keeper's key or setup (401 or 403), nothing more is sent this process; a 5xx answer doubles the wait
+// (the next 0, 1, 3, 7 ... tries skipped, up to BACKOFF_MAX_ROUNDS - 1) and is counted; any other answer resets both.
 function send(cfg: Config, m: ToldMark, code: PcNotice): "posted" | "retry" | "refused" {
-  let a: boolean | "refused" = false;
-  const job = m.job === undefined ? undefined : jobWhat(m.job);
-  if (m.job !== undefined && !job) { log(`error: notice ${code} carries a job that isn't a site and action or a queued time: sent without it`); delete m.job; }
+  if (configStopped) return "retry";
+  if (m.skip && m.skip > 0) { m.skip -= 1; return "retry"; }
+  let a: NoticeAnswer = false;
+  let job = m.job === undefined ? undefined : jobWhat(m.job);
+  if (m.job !== undefined && !job) { log(`error: notice ${code} carries a job that isn't a site and action or a queued time: named by the time instead`); job = m.job = queuedNow(); }
   try { a = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job ? { job } : {}) }); } catch { a = false; }
+  if (a === "config") {
+    configStopped = true;
+    m.config = true;
+    log(`ERROR: the link refused the keeper's notice ${code} as not allowed (HTTP 401 or 403: its key or setup): no more notices are sent until the keeper starts again; the keeper's status shows it`);
+    return "retry";
+  }
+  delete m.config;
+  if (a === "server") {
+    m.fails = (m.fails ?? 0) + 1;
+    m.skip = Math.min(2 ** (m.fails - 1), BACKOFF_MAX_ROUNDS) - 1;
+    log(`couldn't tell the owner (${code}): the link answered with a server error (${m.fails} in a row); the next ${m.skip} tr${m.skip === 1 ? "y is" : "ies are"} skipped, then it goes again with the same notice id`);
+    return "retry";
+  }
+  delete m.fails; delete m.skip;
   if (a === "refused") {
     log(`ERROR: the link refused notice ${code} for good (not a passing error): it won't be sent again; the keeper's status shows it until its condition clears`);
     return "refused";
@@ -340,14 +380,17 @@ function send(cfg: Config, m: ToldMark, code: PcNotice): "posted" | "retry" | "r
   if (!a) log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`);
   return a ? "posted" : "retry";
 }
+// The fallback name of a job the keeper was handed in a shape it can't read (twenty-fourth round): the time the
+// keeper noticed it, to the minute, worded by the link as "a PC browser job queued at <time>". Never a bare line.
+const queuedNow = (): JobWhat => ({ queued: new Date().toISOString().replace(/:\d{2}\.\d{3}Z$/, ":00Z") });
 // The job a caller passed, checked (twenty-third round): a site and action, or a queued time. A string (a queue
 // id, or anything else) is a bug: logged as an error, named by when it was queued where the id says so.
 function checkedJob(cfg: Pick<Config, "used"> & Partial<Pick<Config, "dir">>, code: PcNotice, job: unknown): JobWhat | undefined {
   if (job === undefined || job === null) return undefined;
   const w = jobWhat(job);
   if (w) return w;
-  log(`error: notice ${code} was given its job ${typeof job === "string" ? "as a string" : "in a shape that isn't a site and action"}: a bug in the keeper; the notice goes, named by when its job was queued where that can be told`);
-  return typeof job === "string" && ID.test(job) ? queuedOf(cfg, job) : undefined;
+  log(`error: notice ${code} was given its job ${typeof job === "string" ? "as a string" : "in a shape that isn't a site and action"}: a bug in the keeper; the notice goes, named by when its job was queued where that can be told, else by the time now`);
+  return (typeof job === "string" && ID.test(job) ? queuedOf(cfg, job) : undefined) ?? queuedNow();
 }
 // The condition is here this round: told once (its id kept before the post), and its clear count reset.
 export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobWhat): void {
@@ -375,16 +418,27 @@ export function resendOwed(cfg: Config): void {
   for (const [k, m] of Object.entries(t.told)) {
     if (m.posted || m.refused || !m.code) continue;
     const a = send(cfg, m, m.code);
-    if (a === "posted") { m.posted = true; m.clear = 0; changed = true; ackedThisRound.add(`${toldFile(cfg)}\0${k}`); }
+    changed = true;                                                   // a backoff count or a refusal flag may have moved
+    if (a === "posted") { m.posted = true; m.clear = 0; ackedThisRound.add(`${toldFile(cfg)}\0${k}`); }
     if (a === "refused") { m.refused = true; changed = true; }
   }
   if (changed) saveTold(cfg, t);
 }
-// The keeper's status lines about its notices (pcjobs.sh worker and list): each notice the link refused for good.
+// The keeper's status lines about its notices (pcjobs.sh worker and list), read from the notice file alone (never
+// the relay key): a refusal of the keeper's key or setup first, each notice the link refused for good, server errors
+// past SERVER_FAILS_SHOWN in a row, and a notice file whose upgrade couldn't be saved.
 export function noticeTrouble(cfg: Pick<Config, "used">): string[] {
   const t = readTold(cfg);
-  return Object.values(t.told).filter((m) => m.refused && m.code).map((m) =>
-    `Keeper: the link refused a notice for Dane for good (${m.code}); it isn't sent again. The keeper's log says why; tell him in your own words if it matters.`);
+  const marks = Object.values(t.told);
+  const out: string[] = [];
+  const config = marks.filter((m) => m.config && !m.posted && m.code);
+  if (config.length) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${config.length} notice${config.length > 1 ? "s" : ""} for Dane wait${config.length > 1 ? "" : "s"} (${[...new Set(config.map((m) => m.code))].join(", ")}). Check the link and the keeper share the relay key, then restart the App: they go then.`);
+  out.push(...marks.filter((m) => m.refused && m.code).map((m) =>
+    `Keeper: the link refused a notice for Dane for good (${m.code}); it isn't sent again. The keeper's log says why; tell him in your own words if it matters.`));
+  out.push(...marks.filter((m) => !m.posted && m.code && (m.fails ?? 0) >= SERVER_FAILS_SHOWN).map((m) =>
+    `Keeper: the link answered a notice for Dane with a server error ${m.fails} times in a row (${m.code}); it is tried again less often until the link answers.`));
+  if (migrationUnsaved) out.push("Keeper: the notice file's one-time upgrade couldn't be saved; it is tried again each round, and notices still go. The keeper's log says why.");
+  return out;
 }
 // A condition seen clear this round. A mark whose post was never acknowledged (posted false) is never
 // counted down or deleted (twenty-second round): it is sent again with its saved id until the link answers
@@ -397,6 +451,7 @@ export function cleared(cfg: Config, key: string): void {
   const m = t.told[key];
   if (m && !m.posted && !m.refused) {
     const a = m.code ? send(cfg, m, m.code) : "retry";
+    if (m.code) changed = true;
     if (a === "posted") { m.posted = true; m.clear = 0; changed = true; }
     if (a === "refused") { m.refused = true; changed = true; }
   } else if (m && !ackedThisRound.delete(`${toldFile(cfg)}\0${key}`)) { m.clear += 1; if (m.clear >= CLEAR_ROUNDS) delete t.told[key]; changed = true; }
@@ -455,6 +510,10 @@ export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
     // permanent answer to a request it won't post (a client error); anything else is passing.
     const out = p.stdout.toString(), cut = out.lastIndexOf("\n");
     const http = Number(out.slice(cut + 1).trim());
+    // Twenty-fourth round: the status code first, whatever the body: 401 and 403 are a refusal of the keeper's key
+    // or setup; a 5xx is the link's own trouble.
+    if (http === 401 || http === 403) return "config";
+    if (http >= 500 && http <= 599) return "server";
     let st: unknown;
     try { st = JSON.parse(out.slice(0, cut))?.status; } catch { return false; }
     return http === 200 && st === "posted" ? true : http === 400 && st === "refused" ? "refused" : false;
@@ -749,10 +808,14 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return `The PC stopped taking jobs because the Cain jobs profile holds more than one Claude in Chrome version, so the one Chrome runs can't be bound to the probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h?.code === "chrome_version_timeout")
     return "The PC didn't take jobs because its worker couldn't read Chrome's version in time. At the PC: close heavy programs or restart the PC, then start a run.";
+  if (h?.code === "chrome_version_unreadable")
+    return `The PC didn't take jobs because its worker couldn't read Chrome's version from the PowerShell listing. At the PC: run ${REPROBE}; if its chrome_listing step refuses, follow that row in Troubleshooting.`;
   if (h?.code === "versions_changed")
     return `The PC stopped taking jobs because Claude in Chrome or Chrome changed version during a run, and a version change needs a new probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
   if (h?.code === "version_hold_unwritable")
     return "The PC stopped taking jobs because its worker couldn't write a note that Claude in Chrome's version changed. At the PC: free disk space or check the worker folder can be written, then start a run; it then asks for a new probe.";
+  if (h?.code === "version_hold_cannot_invalidate")
+    return "The PC stopped taking jobs because its worker couldn't write a note that Claude in Chrome's or Chrome's version changed, and couldn't set its old confirmation aside either. At the PC: free disk space or fix the worker folder's permissions, then start a run; it then asks for a new probe.";
   if (h?.code === "worker_signin_missing")
     return "The PC isn't taking jobs because the worker's own Claude Code isn't signed in. At the PC: run the setup step that signs in claude-config, then start a run.";
   if (h?.code === "session_cleanup_failed")

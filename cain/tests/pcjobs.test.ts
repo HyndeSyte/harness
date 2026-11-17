@@ -46,7 +46,7 @@ import {
   newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
   VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
   evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
-  regAnswer, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
+  regAnswer, chromeListingStep, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -5391,7 +5391,7 @@ say({ type: "result", subtype: "success", result: "{}" });`);
     expect(helperBuild(q.opts({ platform: "win32", jobHelper: undefined, csc: () => null }))).toEqual({ applies: true, code: "helper_compiler_missing", passed: false });
     // The gates, in order, by name. session_ids and fragment_strip never gate.
     const good = { redirect_read: { session_ended: true, passed: true }, structured_address: { passed: true }, forged_address: { passed: true }, kill_latency: { passed: true },
-      not_ready: { passed: true }, hook_timing: { passed: true }, payload_replay: { passed: true }, job_readback: { passed: true }, helper_build: { passed: true }, session_ids: { passed: false }, fragment_strip: { passed: false } } as any;
+      not_ready: { passed: true }, hook_timing: { passed: true }, payload_replay: { passed: true }, job_readback: { passed: true }, helper_build: { passed: true }, chrome_listing: { passed: true }, session_ids: { passed: false }, fragment_strip: { passed: false } } as any;
     expect(PROBE_GATES).not.toContain("session_ids");
     expect(probeGate(good, "win32")).toBeNull();
     for (const k of PROBE_GATES) expect([k, probeGate({ ...good, [k]: { passed: false, session_ended: false } }, "win32")]).toEqual([k, k]);
@@ -5772,7 +5772,7 @@ describe("seventeenth review: one time budget per hook run, duplicate keys seen 
 
   test("no gating step reads a recorded-only value: each is flipped and no verdict moves", () => {
     const good = { redirect_read: { session_ended: true, secret_withheld: true, passed: true }, structured_address: { passed: true }, forged_address: { passed: true },
-      kill_latency: { passed: true }, not_ready: { passed: true }, hook_timing: { passed: true }, payload_replay: { passed: true }, job_readback: { applies: true, passed: true }, helper_build: { applies: true, passed: true },
+      kill_latency: { passed: true }, not_ready: { passed: true }, hook_timing: { passed: true }, payload_replay: { passed: true }, job_readback: { applies: true, passed: true }, helper_build: { applies: true, passed: true }, chrome_listing: { applies: true, passed: true },
       session_ids: { passed: true, match: true }, fragment_strip: { passed: true, stripped: true, tab_bare: true } } as any;
     const flip = (ev: any, path: string, v: boolean) => { const c = JSON.parse(JSON.stringify(ev)); const [a, b] = path.split("."); c[a][b] = v; return c; };
     for (const plat of ["win32", "linux"])
@@ -6811,7 +6811,7 @@ describe("twenty-third review: version evidence over its source, the hold made d
     expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "versions_changed", job: null, stale_lock: false, skew_ms: null, reason: null })).toContain("restart the Cain jobs Chrome");
   });
 
-  test("both writes failing: the confirmation is broken before any browser work, and once Chrome settles the run is still refused", async () => {
+  test("both writes failing: the confirmation is invalidated before any browser work, and once Chrome settles the run is still refused", async () => {
     const { q } = oneJob();
     const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.2_0");
     mkdirSync(extra);
@@ -6819,20 +6819,21 @@ describe("twenty-third review: version evidence over its source, the hold made d
     mkdirSync(join(holdFile, "blocked"), { recursive: true });                      // the hold's rename fails
     mkdirSync(join(`${holdFile}.pending`, "blocked"), { recursive: true });         // and so does the pending file's
     expect((await run(q.opts(attended))).code).toBe("version_hold_unwritable");
-    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("version_hold_unwritable extension_versions_ambiguous kept=confirmation_broken");
-    expect(JSON.parse(readFileSync(join(q.home, "confirmed.json"), "utf8")).guard_sha256).toBe(BROKEN_GUARD);
+    // Twenty-fourth round: the confirmation is invalidated by renaming it aside, not by editing it in place.
+    expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("version_hold_unwritable extension_versions_ambiguous kept=confirmation_renamed");
+    expect(existsSync(join(q.home, "confirmed.json"))).toBe(false);
+    expect(existsSync(join(q.home, "confirmed.json.invalidated"))).toBe(true);
     rmSync(extra, { recursive: true });                                             // Chrome settles on one folder
     const again = await run(q.opts(attended));                                      // a fresh process: nothing kept in memory
-    expect(again.code).not.toBe("ok");
-    expect(["probe_stale", "version_hold_unwritable"]).toContain(again.code);
+    expect(again.code).toBe("profile_unconfirmed");                                // the confirmation set aside: nothing runs until a new probe
     expect(q.launches.length).toBe(0);
-    // Nothing can be kept at all (no confirmation to break, nothing writable): refused all the same.
+    // No confirmation existed to invalidate, nothing writable: refused all the same, named as such.
     const q2 = queueRig();
     const want = { at: T0.toISOString(), code: "update_pending" as const, folders: [], seen: { extension_version: null, chrome_version: null, chrome_version_source: null } };
     rmSync(join(q2.home, "confirmed.json"));
     mkdirSync(join(q2.home, "version-hold.json", "x"), { recursive: true });
     mkdirSync(join(q2.home, "version-hold.json.pending", "x"), { recursive: true });
-    expect(persistHold(q2.opts(), want, T0)).toBe("confirmation_removed");
+    expect(persistHold(q2.opts(), want, T0)).toBe("no_confirmation");
   });
 
   test("a hold clears only on validated probe evidence: an edited probe time or an edited evidence file never clears it", async () => {
@@ -6894,16 +6895,17 @@ describe("twenty-third review: version evidence over its source, the hold made d
 });
 
 describe("twenty-third review: the dedicated Chrome's listing, its time limit, one read on a stale probe, and why a call table filled", () => {
-  // A listing in the format CHROME_PS_COMMAND prints (pid|ppid|start|file version|command line): the dedicated
-  // browser process, one of its renderers, and the owner's everyday Chrome.
+  // A synthetic listing, written by hand in the format CHROME_PS_COMMAND prints (pid|ppid|start|file version|command
+  // line), not captured from a real PC (the probe's chrome_listing step checks the real one): the dedicated browser
+  // process, one of its renderers, and the owner's everyday Chrome.
   const sample = (udd: string) => [
     `11204|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}" --profile-directory=Default`,
     `11388|11204|2026-11-15T13:58:03.0000000Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --type=renderer --user-data-dir="${udd}" --lang=en-US`,
     `9020|4400|2026-11-14T08:00:00.0000000Z|131.0.6778.70|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"`,
-    "", "not a line"].join("\r\n");
+    ""].join("\r\n");
   test("the listing parses with each process's start time, and the dedicated Chrome is matched by the profile path its command line names", () => {
     const q = queueRig();
-    const lines = parseChromeExeListing(sample(q.udd));
+    const lines = parseChromeExeListing(sample(q.udd) + "\r\nnot a line");
     expect(lines.length).toBe(3);
     expect(lines[0]).toMatchObject({ version: "131.0.6778.86", proc: { pid: 11204, ppid: 8812, created: Date.parse("2026-11-15T13:58:02.123Z") } });
     expect(lines.filter((l) => isDedicated(l.proc, q.inst)).map((l) => l.proc.pid)).toEqual([11204]);     // not the renderer, not the everyday Chrome
@@ -6914,10 +6916,13 @@ describe("twenty-third review: the dedicated Chrome's listing, its time limit, o
 
   test("a PowerShell call that runs out of time fails the phase by its own code, never the fallback", async () => {
     const { q, id } = oneJob();
-    const late = () => { const e: any = new Error("spawnSync powershell.exe ETIMEDOUT"); e.code = "ETIMEDOUT"; throw e; };
-    expect(chromeExeVersions(late)).toBe("timeout");
-    expect(chromeExeVersions(() => { throw new Error("not found"); })).toBeNull();
-    const out = await run(q.opts({ ...attended, exeVersion: undefined, chromePs: late }));
+    // Twenty-fourth round: the time passes on the worker's own clock during the call (off), whatever the error says.
+    let off = 0;
+    const mono = () => performance.now() + off;
+    const late = () => { off += CHROME_PS_TIMEOUT_MS; const e: any = new Error("spawnSync powershell.exe ETIMEDOUT"); e.code = "ETIMEDOUT"; throw e; };
+    expect(chromeExeVersions(late, mono)).toMatchObject({ fail: "chrome_version_timeout" });
+    expect(chromeExeVersions(() => { throw new Error("not found"); })).toMatchObject({ fail: "chrome_version_unreadable" });   // twenty-fourth round: never the fallback
+    const out = await run(q.opts({ ...attended, exeVersion: undefined, chromePs: late, mono }));
     expect(out).toEqual({ code: "chrome_version_timeout", job: null, closed: [], detail: CHROME_VERSION_TIMEOUT_HINT });
     expect(q.launches.length).toBe(0);
     expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("chrome_version_timeout:");
@@ -6925,7 +6930,7 @@ describe("twenty-third review: the dedicated Chrome's listing, its time limit, o
     // After the session: the run fails by the same code, its report not kept.
     let after = false;
     q.during(() => { after = true; });
-    const out2 = await run(q.opts({ ...attended, exeVersion: undefined, chromePs: () => (after ? late() : sample(q.udd)) }));
+    const out2 = await run(q.opts({ ...attended, exeVersion: undefined, mono, chromePs: () => (after ? late() : sample(q.udd)) }));
     expect(out2).toMatchObject({ code: "chrome_version_timeout", job: id });
     expect(out2.detail).toContain("couldn't be read after the session");
     expect(q.remoteHas(`reports/${id}.json`)).toBe(false);
@@ -6951,9 +6956,9 @@ describe("twenty-third review: the dedicated Chrome's listing, its time limit, o
     const child = spawn(fake, ["-e", "setTimeout(() => {}, 60000)", `--user-data-dir=${udd}`], { stdio: "ignore", windowsHide: true });
     try {
       await new Promise((r) => setTimeout(r, 1500));
-      const lines = chromeExeVersions();
-      expect(Array.isArray(lines)).toBe(true);
-      const mine = (lines as any[]).find((l) => l.proc.pid === child.pid);
+      const listed = chromeExeVersions() as any;
+      expect(Array.isArray(listed.lines)).toBe(true);
+      const mine = (listed.lines as any[]).find((l) => l.proc.pid === child.pid);
       expect(mine).toBeDefined();
       expect(mine.proc.cmd).toContain(udd);
       expect(Number.isFinite(mine.proc.created)).toBe(true);
@@ -7017,6 +7022,189 @@ setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 7000
     const out = await run(o);
     expect(out).toMatchObject({ code: "hook_margin_low", job: id, detail: "hook_margin_low: table_full: 200 unfinished calls when hooked call 201 came" });
     expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("hook_margin_low: table_full: 200 unfinished calls when hooked call 201 came");
+  });
+});
+
+describe("twenty-fourth review: the Chrome listing's timeout from the worker's own state, the hold invalidated, the clear under a standing hold, the call that triggered, and the profile path matched exactly", () => {
+  // A synthetic listing, written by hand in the command's format (not captured from a real PC: the probe's chrome_listing step checks the real one).
+  const sample = (udd: string, pid = 11204) => [
+    `${pid}|8812|2026-11-15T13:58:02.1234567Z|131.0.6778.86|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --user-data-dir="${udd}" --profile-directory=Default`,
+    `9020|4400|2026-11-14T08:00:00.0000000Z|131.0.6778.70|"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"`, ""].join("\r\n");
+  // A monotonic clock a test moves: each read returns the next value.
+  const clockOf = (...ts: number[]) => { let i = 0; return () => ts[Math.min(i++, ts.length - 1)]; };
+
+  test("the timeout is decided from the worker's own clock, whatever shape the child's error has", () => {
+    // A plain error with no timeout shape, after the limit on the worker's clock: a timeout.
+    expect(chromeExeVersions(() => { throw new Error("something"); }, clockOf(0, CHROME_PS_TIMEOUT_MS + 5))).toMatchObject({ fail: "chrome_version_timeout" });
+    // Output that came back, but only after the limit: a timeout too.
+    expect(chromeExeVersions(() => sample("C:/w/chrome"), clockOf(0, CHROME_PS_TIMEOUT_MS))).toMatchObject({ fail: "chrome_version_timeout" });
+    // A quick failure (a non-zero exit): chrome_version_unreadable, naming the exit code.
+    const exit1 = () => { const e: any = new Error("Command failed"); e.status = 1; throw e; };
+    const r = chromeExeVersions(exit1, clockOf(0, 50)) as any;
+    expect(r.fail).toBe("chrome_version_unreadable");
+    expect(r.why).toContain("exit code 1");
+    // An error shaped like a timeout but well within the limit is not a timeout.
+    const shaped = () => { const e: any = new Error("ETIMEDOUT"); e.code = "ETIMEDOUT"; throw e; };
+    expect(chromeExeVersions(shaped, clockOf(0, 10))).toMatchObject({ fail: "chrome_version_unreadable" });
+    // Unparseable output: chrome_version_unreadable with the line number, never its contents.
+    const bad = chromeExeVersions(() => `${sample("C:/w/chrome")}\r\nsecret command line`, clockOf(0, 10)) as any;
+    expect(bad.fail).toBe("chrome_version_unreadable");
+    expect(bad.why).toContain("line 4");
+    expect(bad.why).not.toContain("secret");
+    expect(listingMismatches(`1|2|not a time|131.0.1.1|x\n1|2||not.a.version|x\n1|2|||x`)).toEqual([1, 2]);
+    expect(chromeExeVersions(() => sample("C:/w/chrome"), clockOf(0, 10))).toMatchObject({ lines: [{ version: "131.0.6778.86" }, { version: "131.0.6778.70" }] });
+  });
+
+  test("a non-zero exit or unparseable output fails the run by its code and never reaches the Last Version file", async () => {
+    for (const ps of [() => { const e: any = new Error("failed"); e.status = 2; throw e; }, () => "garbage that is not the listing"]) {
+      const { q } = oneJob();
+      writeFileSync(join(q.udd, "Last Version"), "131.0.6778.86");                 // the fallback file is there, and must not be read
+      const out = await run(q.opts({ ...attended, exeVersion: undefined, chromePs: ps }));
+      expect(out).toEqual({ code: "chrome_version_unreadable", job: null, closed: [], detail: CHROME_VERSION_UNREADABLE_HINT });
+      expect(q.launches.length).toBe(0);
+      expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain("chrome_version_unreadable:");
+      expect(readFileSync(join(q.home, "worker.log"), "utf8")).not.toContain("chrome_version_fallback");
+    }
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "chrome_version_unreadable", job: null, stale_lock: false, skew_ms: null, reason: null })).toContain("chrome_listing");
+  });
+
+  test("the probe's chrome_listing step: the real listing checked against the parser, a mismatch refusing the probe by the step's name", async () => {
+    const q = queueRig();
+    const pid = (q.opts().procs!() as any[])[0].pid;
+    expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => sample(q.udd, pid) }), q.inst)).toMatchObject({ applies: true, passed: true, lines: 2, version: "131.0.6778.86", same_process: true });
+    expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => `${sample(q.udd, pid)}\r\nwrapped tail of a long line` }), q.inst)).toMatchObject({ passed: false, mismatched: [4] });
+    expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => sample(q.udd, pid + 9_000) }), q.inst)).toMatchObject({ passed: false, same_process: false });
+    expect(chromeListingStep(q.opts({ exeVersion: undefined, chromePs: () => sample("C:/elsewhere", pid) }), q.inst)).toMatchObject({ passed: false, dedicated: false });
+    expect(chromeListingStep(q.opts({ platform: "linux" }), q.inst).applies).toBe(true);           // the stand-in in use: no PowerShell
+    expect(chromeListingStep(q.opts({ platform: "linux", exeVersion: undefined }), q.inst).applies).toBe(false);
+    // In a probe: the listing names another process than the general listing does, so the probe refuses by the step's name.
+    const e = await probe(q.opts({ ...attended, exeVersion: undefined, chromePs: () => sample(q.udd, pid + 9_000) })).then(() => null, (x) => x);
+    expect(e?.code).toBe("chrome_listing");
+    expect(String(e?.detail)).toContain("another process");
+    expect(existsSync(join(q.home, "probe-evidence.json"))).toBe(false);
+    // And confirm-profile's gate names it on Windows.
+    expect(probeGate({ chrome_listing: { passed: false } } as any, "win32")).not.toBeNull();
+  }, 120_000);
+
+  test("the hold invalidated by rename, then by delete; when neither works, its own code and a notice", () => {
+    const want = { at: T0.toISOString(), code: "update_pending" as const, folders: [], seen: { extension_version: null, chrome_version: null, chrome_version_source: null } };
+    const blocked = (q: ReturnType<typeof queueRig>) => {
+      mkdirSync(join(q.home, "version-hold.json", "x"), { recursive: true });
+      mkdirSync(join(q.home, "version-hold.json.pending", "x"), { recursive: true });
+    };
+    const q1 = queueRig(); blocked(q1);
+    expect(persistHold(q1.opts(), want, T0)).toBe("confirmation_renamed");
+    expect(existsSync(invalidatedFile(q1.opts()))).toBe(true);
+    const q2 = queueRig(); blocked(q2);
+    expect(persistHold(q2.opts({ invalidateFs: { rename: () => { throw new Error("no"); }, remove: (f) => rmSync(f) } }), want, T0)).toBe("confirmation_removed");
+    const q3 = queueRig(); blocked(q3);
+    const stuck = { rename: () => { throw new Error("no"); }, remove: () => { throw new Error("no"); } };
+    expect(persistHold(q3.opts({ invalidateFs: stuck }), want, T0)).toBe("none");
+    expect(readFileSync(join(q3.home, "worker.log"), "utf8")).toContain("version_hold_cannot_invalidate update_pending kept=none");
+    expect(heartbeatNotice({ v: 1, worker_clock: T0.toISOString(), code: "version_hold_cannot_invalidate", job: null, stale_lock: false, skew_ms: null, reason: null })).toContain("couldn't set its old confirmation aside");
+  });
+
+  test("a run whose hold can't be kept or the confirmation set aside refuses by its own code", async () => {
+    const { q } = oneJob();
+    mkdirSync(join(q.udd, "Default", "Extensions", EXT, "1.2.2_0"));
+    mkdirSync(join(q.home, "version-hold.json", "x"), { recursive: true });
+    mkdirSync(join(q.home, "version-hold.json.pending", "x"), { recursive: true });
+    const stuck = { rename: () => { throw new Error("no"); }, remove: () => { throw new Error("no"); } };
+    expect(await run(q.opts({ ...attended, invalidateFs: stuck }))).toEqual({ code: "version_hold_cannot_invalidate", job: null, closed: [], detail: VERSION_HOLD_CANNOT_INVALIDATE_HINT });
+    expect(q.launches.length).toBe(0);
+  });
+
+  test("the after-session check: a hold write that fails is the run's code, not versions_changed", async () => {
+    const { q, id } = oneJob();
+    let after = false;
+    q.during(() => {
+      after = true;
+      mkdirSync(join(q.home, "version-hold.json", "x"), { recursive: true });
+      mkdirSync(join(q.home, "version-hold.json.pending", "x"), { recursive: true });
+    });
+    const out = await run(q.opts({ ...attended, exeVersion: () => (after ? "131.0.7000.1" : null) }));
+    expect(out).toMatchObject({ code: "version_hold_unwritable", job: id });
+    expect(out.detail).toContain("version_hold_unwritable: the version hold couldn't be written");
+    expect(q.remoteHas(`reports/${id}.json`)).toBe(false);
+  });
+
+  test("a probe under a standing hold can't clear it unless its versions are the hold's (or later) and the condition is gone", () => {
+    const { q } = oneJob();
+    const fp = fingerprint(q.opts(), q.inst)!;
+    const hold = { at: new Date(T0.getTime() - 60_000).toISOString(), code: "versions_changed" as const, folders: [],
+      seen: { extension_version: fp.extension_version, chrome_version: "131.0.6778.90", chrome_version_source: "chrome_exe" as const } };
+    expect(writeVersionHold(q.opts(), hold)).toBe(true);
+    const at = new Date(Date.parse(hold.at) + 30_000).toISOString();
+    // Valid evidence of the versions loaded now, but Chrome older than the hold recorded: not cleared.
+    probeConfirmed(q, at);
+    expect(holdCleared(q.opts(), q.inst, hold)).toMatchObject({ cleared: false });
+    expect(holdCleared(q.opts(), q.inst, hold).why).toContain("older than the hold recorded");
+    expect(versionHold(q.opts(), q.inst, T0)).toBe("versions_changed");
+    // The hold's versions, but the condition seen now (a second version folder): not cleared.
+    const same = { ...hold, seen: { ...hold.seen, chrome_version: fp.chrome_version } };
+    const extra = join(q.udd, "Default", "Extensions", EXT, "1.2.2_0");
+    mkdirSync(extra);
+    expect(holdCleared(q.opts(), q.inst, same)).toMatchObject({ cleared: false, why: expect.stringContaining("condition is still seen") });
+    rmSync(extra, { recursive: true });
+    // The hold's versions and the condition gone: cleared.
+    expect(holdCleared(q.opts(), q.inst, same).cleared).toBe(true);
+  });
+
+  test("the reason names the call the check judged late, not the first tracked call with a start", () => {
+    const t = newCallTable();
+    trackCall(t, "a", 0, 1_000); trackCall(t, "b", 5, 2_000); trackCall(t, "c", 10, 3_000);
+    const starts = [{ id: "a", t0: 1_010 }, { id: "c", t0: 3_000 + 20_000 }];        // a on time, c late (b never started, not yet due)
+    const why = watchCalls(t, starts, [], 1_000);
+    expect(why).toBe("late_start");
+    expect(t.trigger).toBe("c");
+    expect(callWhy(t, "late_start", starts, 1_000)).toBe("a late start on hooked call 3");
+  });
+
+  test("a real session with two started, unfinished calls, the second late: its reason names hooked call 2", async () => {
+    const home = mkdtempSync(join(tmpdir(), "late24-"));
+    const log = join(home, "log.jsonl");
+    const script = join(home, "session.js");
+    writeFileSync(script, `const fs = require("node:fs");
+const log = ${JSON.stringify(log)};
+const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+const use = (id) => say({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "${CH}navigate", input: {} }] } });
+say({ type: "system", subtype: "init", session_id: "sess-late-0024", tools: [], mcp_servers: [{ name: "claude-in-chrome", status: "connected" }] });
+setTimeout(() => { use("h0"); fs.appendFileSync(log, JSON.stringify({ start: "nav-guard", id: "h0", t0: Date.now() }) + "\\n"); }, 200);
+setTimeout(() => { use("h1"); fs.appendFileSync(log, JSON.stringify({ start: "nav-guard", id: "h1", t0: Date.now() + 20000 }) + "\\n"); }, 600);
+setTimeout(() => say({ type: "result", subtype: "success", result: "{}" }), 60000);`);
+    const env = cleanEnv({ PCW_NAV_LOG: log, PCW_ABORT_FILE: join(home, "abort"), PCW_SESSION_KIND: "run" });
+    const s = await realLaunch([process.execPath, script], home, 70_000, env as Record<string, string>);
+    expect(s.aborted).toBe("hook_margin_low");
+    expect(s.abort_why).toBe("a late start on hooked call 2");
+  }, 90_000);
+
+  test("the dedicated Chrome's profile path matched exactly, both sides normalised", () => {
+    const inst = (udd: string) => ({ profile: { user_data_dir: udd } }) as any;
+    const proc = (cmd: string) => ({ pid: 1, ppid: 0, created: 0, cmd: `"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" ${cmd}` });
+    const want = "C:/pc-worker-k7q2xz/chrome";
+    const yes = [
+      `--user-data-dir="C:\\pc-worker-k7q2xz\\chrome"`,                              // quoted value, backslashes
+      `"--user-data-dir=C:\\pc-worker-k7q2xz\\chrome"`,                              // the whole argument quoted
+      `--user-data-dir=C:/PC-Worker-K7Q2XZ/Chrome`,                                  // case
+      `--user-data-dir=C:\\pc-worker-k7q2xz\\chrome\\`,                              // a trailing separator
+      `--user-data-dir=C:\\pc-worker-k7q2xz\\x\\..\\chrome --profile-directory=Default`,   // the full path resolved
+    ];
+    for (const c of yes) expect([c, isDedicated(proc(c), inst(want))]).toEqual([c, true]);
+    expect(isDedicated(proc(`--user-data-dir=C:/pc-worker-k7q2xz/chrome`), inst("c:\\PC-WORKER-K7Q2XZ\\chrome\\"))).toBe(true);
+    const no = [
+      `--user-data-dir=C:\\pc-worker-k7q2xz\\chrome-other`,                          // a longer path that starts the same
+      `--user-data-dir=C:\\pc-worker-k7q2xz`,                                        // a parent
+      `--x-user-data-dir=C:\\pc-worker-k7q2xz\\chrome`,                              // not the argument itself
+      `--load-extension=--user-data-dir=C:\\pc-worker-k7q2xz\\chrome`,               // inside another argument
+      `--user-data-dir=C:\\other --user-data-dir=C:\\pc-worker-k7q2xz\\chrome`,      // named twice: fails closed
+      `--user-data-dir=C:\\PC-WOR~1\\chrome`,                                        // an 8.3 short name: a false miss, fails closed
+      ``,
+    ];
+    for (const c of no) expect([c, isDedicated(proc(c), inst(want))]).toEqual([c, false]);
+    expect(uddArgs(`a --user-data-dir="C:\\a b\\c" --x`)).toEqual(["C:\\a b\\c"]);
+    expect(normDir(`"C:\\A\\B\\"`)).toBe("c:/a/b");
+    expect(normDir("C:\\")).toBe("c:/");
+    expect(sameProfileDir(`--user-data-dir=/tmp/w/chrome/`, "/tmp/w/./chrome")).toBe(true);
   });
 });
 

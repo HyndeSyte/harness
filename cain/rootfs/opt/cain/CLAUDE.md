@@ -319,7 +319,11 @@ in the harness repo; until then the keeper says it is waiting).
   keeper never delivered may come as "an earlier notice could not be delivered". Don't repeat it; if he asks, the fix is in
   that line and in the Troubleshooting table of cain/docs/pc-jobs.md. If `pcjobs.sh worker`
   or `list` says the link refused a notice for him for good, it won't be sent again: tell him
-  in your own words if it matters.
+  in your own words if it matters. If it says, marked ATTENTION, that the link refused the
+  keeper's notices as not allowed, that is your App's own setup, not his: the notices wait
+  until the App restarts with it fixed, so log it as a Build item (Cloud jobs) and tell him
+  only if a notice he needs is waiting. A line counting server errors means the notice is
+  still being retried: nothing to tell him.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -345,7 +349,9 @@ in the harness repo; until then the keeper says it is waiting).
   or Chrome updated during the run; its report was thrown away, and the PC holds every run
   until he restarts the Cain jobs Chrome and probes again), `chrome_version_timeout` (the PC
   couldn't read Chrome's version in time, so nothing ran or the report was thrown away: he
-  closes heavy programs or restarts the PC, then runs again), `nav_log_unset` (the worker started a run session without its
+  closes heavy programs or restarts the PC, then runs again), `chrome_version_unreadable` (the
+  PC couldn't read Chrome's version from its process listing, so nothing ran or the report was
+  thrown away: he probes again, and the probe says if the listing needs a fix), `nav_log_unset` (the worker started a run session without its
   navigation log, so nothing ran: he starts the worker again from a new terminal), `refusal_cap` (the session was refused twelve times
   and ended), `domain_not_allowed` (the job named
   a host its allowlist entry doesn't allow; nothing ran), `containment_unavailable` (the
@@ -358,7 +364,9 @@ in the harness repo; until then the keeper says it is waiting).
   `extension_versions_ambiguous` (the Cain jobs profile holds more than one Claude in Chrome
   version: he restarts the Cain jobs Chrome and probes again), `version_hold_unwritable` (the
   worker couldn't write its note that Claude in Chrome's version changed: he frees disk space
-  or fixes the worker folder, then runs again and probes), `boundary_not_accepted` (he hasn't accepted the stated
+  or fixes the worker folder, then runs again and probes), `version_hold_cannot_invalidate`
+  (the same, and the worker couldn't set its old confirmation aside either: he frees disk
+  space or fixes the worker folder's permissions, then runs again and probes), `boundary_not_accepted` (he hasn't accepted the stated
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
@@ -480,7 +488,7 @@ create, update or run any other routine.
      it refuses while the pull request's head is still that sha), then watch the new head the
      same way before its card. A pull request has one live acceptance at a time: a watch won't
      accept while another stands (`live_acceptance`, naming it), and a watch that can't take or
-     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again. One wait for GitHub is at most 15 minutes and a watch at most 2
+     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. One wait for GitHub is at most 15 minutes and a watch at most 2
      hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the

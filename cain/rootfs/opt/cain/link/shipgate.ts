@@ -67,13 +67,13 @@ export const liveWhy = (other: string[]) =>
 // then checks again and sees the first; a lock another watch still held at that time keeps its line as a failure
 // (live_acceptance), never an acceptance, and one that couldn't be read keeps it as lock_unavailable, with a notice.
 // Twenty-third round, the lock made true:
-// - the lock holds a token of its holder ({pid, token, at}); its time is refreshed while held (beat: after the
-//   check, and again just before the write), and the holder checks it still holds its own token before it
+// - the lock holds a token of its holder ({pid, token, at}); its time is refreshed at the check and before the write
+//   (beat; not periodically), and the holder checks it still holds its own token before it
 //   writes and before it lets go, so it never writes on, or removes, a lock that isn't its own;
 // - a lock whose time is older than LOCK_STALE_MS (a watch killed holding it) is taken over only by an atomic
-//   rename of it to a name of the taker's own, then the exclusive create again: of two takers only the one
-//   whose rename succeeded goes on (the other's rename finds nothing and it backs off), and it checks the live
-//   acceptances again after it has the lock (keepWatch). A rename that turns out to have caught a fresh lock
+//   rename of it to a name of the taker's own, then the exclusive create again: exactly one contender proceeds (the
+//   renamer may lose the exclusive create to another watch, which is fine: that watch holds it), and it checks
+//   the live acceptances again after it has the lock (keepWatch). A rename that turns out to have caught a fresh lock
 //   (one made between the stat and the rename) puts it back where it was, and backs off;
 // - the critical section is bounded (one directory read and one write) far below LOCK_STALE_MS: a holder that
 //   took longer than CRITICAL_MAX_MS to reach its write doesn't write (lock_unavailable), so a slow live holder
@@ -86,14 +86,21 @@ if (CRITICAL_MAX_MS * 4 > LOCK_STALE_MS) throw new Error("ship gate: the lock's 
 const lockFile = (dir: string, pr: number) => `${dir}/ship-gate-pr-${pr}.lock`;
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 export interface HeldLock { file: string; token: string; since: number }
-type LockRead = { kind: "gone" } | { kind: "unreadable" } | { kind: "held"; mtimeMs: number; token: string };
+// Twenty-fourth round, the legacy rule: a lock with no token (the empty file the twenty-second round made, or
+// JSON without a token) is "legacy". Older than the stale bound, it is taken over through the same rename then
+// exclusive create, with a loud log line; one that looks current still counts as held. A file whose content
+// fails to parse, or that can't be read at all, counts as held ("unreadable"), whatever its age.
+type LockRead = { kind: "gone" } | { kind: "unreadable" } | { kind: "held"; mtimeMs: number; token: string } | { kind: "legacy"; mtimeMs: number };
 function readLock(f: string): LockRead {
   let mtimeMs: number;
   try { mtimeMs = statSync(f).mtimeMs; } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "gone" } : { kind: "unreadable" }; }
-  try {
-    const x = JSON.parse(readFileSync(f, "utf8"));
-    return x && typeof x.token === "string" && x.token ? { kind: "held", mtimeMs, token: x.token } : { kind: "unreadable" };
-  } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "gone" } : { kind: "unreadable" }; }
+  let text: string;
+  try { text = readFileSync(f, "utf8"); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { kind: "gone" } : { kind: "unreadable" }; }
+  if (text.trim() === "") return { kind: "legacy", mtimeMs };
+  let x: any;
+  try { x = JSON.parse(text); } catch { return { kind: "unreadable" }; }
+  if (x && typeof x === "object" && !Array.isArray(x) && typeof x.token === "string" && x.token) return { kind: "held", mtimeMs, token: x.token };
+  return x && typeof x === "object" && !Array.isArray(x) && !("token" in x) ? { kind: "legacy", mtimeMs } : { kind: "unreadable" };
 }
 export type LockMiss = { miss: "held" | "unreadable" | "error" };
 export function takeLock(f: string, waitMs: number, o: { staleMs?: number } = {}): HeldLock | LockMiss {
@@ -110,16 +117,21 @@ export function takeLock(f: string, waitMs: number, o: { staleMs?: number } = {}
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") return { miss: "error" };
     }
     const r = readLock(f);
-    last = r.kind === "unreadable" ? "unreadable" : "held";
     if (r.kind === "gone") continue;
-    if (r.kind === "held" && Date.now() - r.mtimeMs > staleMs) {
+    last = r.kind === "held" ? "held" : "unreadable";
+    if ((r.kind === "held" || r.kind === "legacy") && Date.now() - r.mtimeMs > staleMs) {
       // The takeover: rename the stale lock to a name of this taker's own. Only one rename can succeed.
       const aside = `${f}.stale-${token}`;
       let moved = false;
       try { renameSync(f, aside); moved = true; } catch { moved = false; }
       if (moved) {
         const caught = readLock(aside);
-        if (caught.kind === "held" && caught.token === r.token && Date.now() - caught.mtimeMs > staleMs) { rmSync(aside, { force: true }); continue; }
+        const same = r.kind === "held" ? caught.kind === "held" && caught.token === r.token : caught.kind === "legacy" && caught.mtimeMs === r.mtimeMs;
+        if (same && Date.now() - (caught as { mtimeMs: number }).mtimeMs > staleMs) {
+          if (r.kind === "legacy") console.error(`ship gate: WARNING: took over a legacy watch lock with no holder token (${f}), last changed ${new Date(r.mtimeMs).toISOString()}, older than the ${Math.round(staleMs / 1000)} second stale bound: left by an earlier version of the watch`);
+          rmSync(aside, { force: true });
+          continue;
+        }
         // A fresh lock made between the stat and the rename: put it back (never over a newer one), and back off.
         try { linkSync(aside, f); } catch { /* a newer lock stands: that holder goes on */ }
         rmSync(aside, { force: true });
@@ -136,8 +148,12 @@ export function beat(l: HeldLock): boolean {
   try { const t = new Date(); utimesSync(l.file, t, t); return true; } catch { return false; }
 }
 export function letGo(l: HeldLock): void { if (ownsLock(l)) rmSync(l.file, { force: true }); }
-const lockNotice = (f: string) => `the pull request's watch lock (${f}) couldn't be taken or kept in time (another watch held it, or it couldn't be read): nothing was accepted; run the watch again once no other watch of this pull request is running, and if this repeats, delete that lock file`;
-export function keepWatch(dir: string, line: WatchLine, out: string, o: { waitMs?: number; staleMs?: number; beforeWrite?: () => void } = {}): WatchLine {
+export const lockNotice = (f: string) => `the pull request's watch lock (${f}) couldn't be taken or kept in time (another watch held it, or it couldn't be read): nothing was accepted; run the watch again once no other watch of this pull request is running, and if this repeats with no watch running, remove the lock with: rm -f ${f}`;
+// An acceptance already kept for this very sha and pull request, not superseded: a second write for it is a no-op.
+const keptAcceptance = (out: string, pr: number, head: string): boolean => {
+  try { const a = watchAccepted(readFileSync(out, "utf8")); return !!a && a.pr === pr && a.head === head; } catch { return false; }
+};
+export function keepWatch(dir: string, line: WatchLine, out: string, o: { waitMs?: number; staleMs?: number; beforeWrite?: () => void; atWrite?: () => void } = {}): WatchLine {
   let kept = line;
   mkdirSync(dirname(out), { recursive: true });
   const write = (l: WatchLine) => { writeFileSync(`${out}.tmp`, JSON.stringify(l, null, 2) + "\n"); renameSync(`${out}.tmp`, out); };
@@ -167,7 +183,24 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: { waitMs
       kept = unavailable();
       console.error(`ship gate: ${kept.failure_why}`);
     }
+    if (!held || !kept.accepted_head || kept.pr === null) { write(kept); return kept; }
+    // Twenty-fourth round, the fenced write. Just before the acceptance is written: the lock re-read and its token
+    // required to be this holder's own; the sha-bound gate check again (an acceptance already kept for this very sha
+    // makes this write a no-op; a live acceptance of another head refuses it). Then, after the write, the token is read
+    // once more: a holder suspended past the stale bound between that check and its write (and so taken over) finds the
+    // lock no longer its own and takes its acceptance back. A contender that took over checked the live acceptances
+    // after its takeover, so whichever order the two writes come in, at most one acceptance stays.
+    if (!ownsLock(held)) { kept = unavailable(); console.error(`ship gate: ${kept.failure_why}`); write(kept); return kept; }
+    if (keptAcceptance(out, kept.pr, kept.accepted_head)) return JSON.parse(readFileSync(out, "utf8")) as WatchLine;
+    const other = otherLive(dir, kept.pr, kept.accepted_head);
+    if (other.length) { kept = { ...line, accepted_head: null, passed: false, failure: "live_acceptance", failure_why: liveWhy(other) }; write(kept); return kept; }
+    o.atWrite?.();
     write(kept);
+    if (!ownsLock(held)) {
+      kept = unavailable();
+      console.error(`ship gate: the lock was taken over while this acceptance was being written: it is taken back. ${kept.failure_why}`);
+      write(kept);
+    }
   } finally { if (held) letGo(held); }
   return kept;
 }
