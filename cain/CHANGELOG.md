@@ -97,7 +97,12 @@
 - One known gap, said plainly: if a tap was used while saving to GitHub was failing, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 - If the box ever loses or cuts short the record keeper's list of used taps, even one that held only withdrawn answers, it now always notices, and saves nothing to GitHub until it has rebuilt the list from GitHub. A withdrawn answer stays withdrawn through that rebuild, and an answer the box can't prove reached GitHub is withdrawn rather than saved. Nothing to set up.
-- This version also includes everything in 0.12.0 (the PC job worker).
+- This version also includes everything in 0.12.0 (the PC job worker) and 0.12.1 (Microsoft 365 read-only for Cain).
+
+## 0.12.1
+
+- Cain can read your Microsoft 365 now that it's connected: your OneDrive files and your Outlook mail and calendar.
+- He can't send, change or delete anything there. Mail, drafts, calendar events and invitations, mail rules, and adding, moving, renaming or deleting files are switched off for him, the same as sending through Gmail, Slack and Google Calendar.
 
 ## 0.12.0
 
