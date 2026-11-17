@@ -22,7 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, LockTimeout, lockRefusal, lockWait, probeLock, readLog, syncDir, withLogLock } from "../applog.ts";
+import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, LockTimeout, lockRefusal, lockWait, probeLock, readLog, syncDir, withLogLock, type LogRead } from "../applog.ts";
 import { installState } from "../installflag.ts";
 import { lockGate } from "../startgate.ts";
 
@@ -153,7 +153,7 @@ export function headDate(remote: string): string | null {
   try {
     // Round 24: under the same timed, session-killed wrapper as git's network calls.
     const p = netRun(["curl", "-sSI", "-m", "5", "--proto", "=https", `https://${host}/`], { env: proxyEnv(), timeoutMs: HEAD_DATE_TIMEOUT_MS });
-    if (p.timedOut) return null;
+    if (p.timedOut || p.refused) return null;
     const m = /^date:\s*(.+?)\s*$/im.exec(p.out);
     return m ? m[1] : null;
   } catch { return null; }
@@ -197,13 +197,16 @@ export function sessionTool(): string | null {
 export const NET_SESSION_WHY = "the session tool (setsid) isn't on the image, so a network call that hangs couldn't be stopped whole with everything it started";
 // Round 24: one network command (git or curl): its own session, a hard wall-clock limit, the whole session killed on
 // expiry. timedOut: it was stopped. Nothing here waits on a prompt (stdin is closed).
-export function netRun(argv: string[], o: { cwd?: string; env: Record<string, string>; timeoutMs: number }): { exitCode: number | null; out: string; timedOut: boolean; ms: number } {
+// Round 25: no fallback without the session tool: the wrapper refuses (refused, with NET_SESSION_WHY) and runs nothing, so
+// no network command ever runs without a group kill on expiry.
+export function netRun(argv: string[], o: { cwd?: string; env: Record<string, string>; timeoutMs: number }): { exitCode: number | null; out: string; timedOut: boolean; ms: number; refused?: boolean } {
   const sid = sessionTool();
+  if (!sid) return { exitCode: null, out: NET_SESSION_WHY, timedOut: false, ms: 0, refused: true };
   const t0 = performance.now();
-  const p = Bun.spawnSync(sid ? [sid, ...argv] : argv, { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: o.timeoutMs, killSignal: "SIGKILL" });
+  const p = Bun.spawnSync([sid, ...argv], { cwd: o.cwd, env: o.env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: o.timeoutMs, killSignal: "SIGKILL" });
   const timedOut = !!(p as any).exitedDueToTimeout;
   // On expiry the whole session goes: the command and anything it started (a transport, a credential helper).
-  if (timedOut && sid && p.pid) { try { process.kill(-p.pid, "SIGKILL"); } catch { /* gone already */ } }
+  if (timedOut && p.pid) { try { process.kill(-p.pid, "SIGKILL"); } catch { /* gone already */ } }
   return { exitCode: p.exitCode, out: (p.stdout?.toString() ?? "") + (p.stderr?.toString() ?? ""), timedOut, ms: Math.round(performance.now() - t0) };
 }
 export const netTimeout = (cfg: Config) => ({ timeoutMs: Math.min(Math.max(cfg.pushTimeoutMs ?? envPushTimeout() ?? PUSH_TIMEOUT_MS, PUSH_TIMEOUT_MIN_MS), consumedWait() - lockWait.ms) });
@@ -234,6 +237,7 @@ function git(cfg: Config, args: string[], cwd = cfg.dir, net?: { timeoutMs: numb
   if (net) {
     const r = netRun(argv, { cwd, env, timeoutMs: net.timeoutMs });
     lastNetMs = r.ms;
+    if (r.refused) throw new GitError(`git ${args[0]}: ${NET_SESSION_WHY}`);
     if (r.timedOut) throw new GitTimeout(args[0], net.timeoutMs);
     code = r.exitCode; raw = r.out;
   } else {
@@ -253,7 +257,9 @@ function git(cfg: Config, args: string[], cwd = cfg.dir, net?: { timeoutMs: numb
 type Synced = { date: string | null; fetchedAt: number; cloned: boolean; fetched: boolean; reset: string | null; fetchTimedOut?: boolean; resetCopy?: ResetCopyDone };
 const conflictFile = (cfg: Config) => cfg.forceConflict ?? join(dirname(cfg.queue), "record-force-conflict");
 // Round 24: what a reset-copy request did on the round that consumed it (logged with fixed wording, in the state's log).
-export type ResetCopyDone = { acted: boolean; why: string; discarded: number; keys: string[] };
+// Round 25: dropped, the consumed records whose commits the reset discards (each tombstoned before the discard), told
+// like any change that didn't land.
+export type ResetCopyDone = { acted: boolean; why: string; discarded: number; keys: string[]; dropped?: { tap: string; id: string; why: string }[] };
 // Round 24: the reset-copy request (record.sh reset-copy) is stamped with the push-refused hold it was made for (its id)
 // and the reset epoch; the smoke test's force-conflict with {"by": "force-conflict"}. The next round consumes the file
 // whatever it finds: a reset-copy acts only while that very hold is still recorded in the same epoch, and anything else
@@ -264,7 +270,11 @@ export const RESET_COPY_WHY = {
   stale: "reset-copy: the hold it was made for is no longer recorded (or the reset epoch moved on), so it was deleted without acting",
   unstamped: "reset-copy: the request carried no hold stamp, so it was deleted without acting",
   nothing: "reset-copy: the hold it was made for is still recorded, but there were no local commits to discard; the request is used up",
+  // Round 25: the settled intents and tombstones are written (fsynced) before the discard; if they can't be, nothing is
+  // discarded and the request is kept for the next round.
+  waits: "reset-copy: the open intents or the withdrawn changes' tombstones couldn't be written down before the reset, so nothing was discarded and the request waits for the next round",
 } as const;
+export const RESET_COPY_DROP_WHY = "its commit was discarded by a reset of the record's copy (record.sh reset-copy) before it reached GitHub";
 // An empty file is the smoke test's switch as record.sh force-conflict has always written it.
 function readStamp(cfg: Config): { by?: string; hold?: string; epoch?: number } {
   try {
@@ -299,29 +309,43 @@ function sync(cfg: Config, now: () => number = Date.now, o: { conflictFile?: boo
   const fetchedAt = now();
   // Round 24: the reset-copy request is consumed by this round, local commits or not.
   let rc: ResetCopyDone | undefined;
-  let force = false;
+  let force = false, keep = false;
   // The nightly check leaves it for the round (o.conflictFile false), which resets the copy and its state together.
   if (o.conflictFile !== false && existsSync(conflictFile(cfg))) {
     const stamp = readStamp(cfg);
     if (stamp.by === "force-conflict") { if (fetched && ahead(cfg)) { force = true; rmSync(conflictFile(cfg), { force: true }); } }
     else if (fetched) {
-      rmSync(conflictFile(cfg), { force: true });
       const st = rawState(cfg);
       const hold = st?.pushRefused, epoch = st?.epoch?.n ?? 0;
       if (stamp.by !== "reset-copy" || typeof stamp.hold !== "string" || !stamp.hold) rc = { acted: false, why: RESET_COPY_WHY.unstamped, discarded: 0, keys: [] };
       else if (!hold || hold.id !== stamp.hold || (stamp.epoch ?? 0) !== epoch) rc = { acted: false, why: RESET_COPY_WHY.stale, discarded: 0, keys: [] };
       else if (!ahead(cfg)) rc = { acted: false, why: RESET_COPY_WHY.nothing, discarded: 0, keys: [] };
       else {
-        let discarded = 0, keys: string[] = [];
-        try { discarded = Number(git(cfg, ["rev-list", "--count", `origin/${cfg.branch}..HEAD`]).trim()) || 0; } catch { /* counted as 0 */ }
-        keys = rangeTapKeys(cfg, `origin/${cfg.branch}`, "HEAD");
-        // The consuming intents those commits answer are settled first, from the commits themselves.
-        try { const r = resolveIntents(cfg, new Date(now()).toISOString()); if (r.consumed.length || r.dropped.length) log(`reset-copy: ${r.consumed.length} open intent(s) settled consumed and ${r.dropped.length} dropped before the reset`); }
-        catch (e) { log(`reset-copy: the open intents couldn't be settled before the reset (${clean((e as Error).message, 120)}); they are settled from the record's history next round`); }
-        rc = { acted: true, why: RESET_COPY_WHY.acted, discarded, keys };
-        force = true;
+        // Round 25: crash-safe order. 1. the open intents settled from the commits and 2. a tombstone for each consumed
+        // record the discarded commits carry (its request not queued, so not run again), each fsynced; 3. the discard
+        // (below, as a forced conflict); 4. only then is the request used up. A crash between 2 and 3 leaves the
+        // request, and the next round does it again (each step is idempotent). Any failure in 1 or 2 discards nothing.
+        try {
+          const nowIso = new Date(now()).toISOString();
+          const discarded = Number(git(cfg, ["rev-list", "--count", `origin/${cfg.branch}..HEAD`]).trim()) || 0;
+          const keys = rangeTapKeys(cfg, `origin/${cfg.branch}`, "HEAD");
+          const r = resolveIntents(cfg, nowIso);
+          if (r.open) throw new Error("the open intents couldn't be settled from the commits");
+          if (r.consumed.length || r.dropped.length) log(`reset-copy: ${r.consumed.length} open intent(s) settled consumed and ${r.dropped.length} dropped before the reset`);
+          const dropped = tombstoneDiscarded(cfg, nowIso);
+          rc = { acted: true, why: RESET_COPY_WHY.acted, discarded, keys, dropped };
+          force = true;
+        } catch (e) {
+          log(`${RESET_COPY_WHY.waits} (${clean(redact(cfg, (e as Error).message), 160)})`);
+          rc = { acted: false, why: RESET_COPY_WHY.waits, discarded: 0, keys: [] };
+          keep = true;
+        }
       }
       log(`${rc.why}${rc.acted ? `: ${rc.discarded} local commit(s) discarded, carrying ${rc.keys.length} consumed tap key(s)${rc.keys.length ? ` (${rc.keys.join(", ")})` : ""}` : ""}`);
+      // The tests' crash point between the written tombstones and the discard.
+      if (rc.acted) cfg.crashPoint?.("reset-copy-written");
+      // Anything but an acting request is used up now; an acting one once its discard is done (below).
+      if (!rc.acted && !keep) rmSync(conflictFile(cfg), { force: true });
     }
   }
   if (fetched) {
@@ -338,6 +362,8 @@ function sync(cfg: Config, now: () => number = Date.now, o: { conflictFile?: boo
         git(cfg, ["clean", "-qfd"]);
       }
     } else git(cfg, ["reset", "--quiet", "--hard", `origin/${cfg.branch}`]);   // a fast-forward: nothing local is lost
+    // Round 25: an acting reset-copy request is used up only once its discard is done.
+    if (rc?.acted) { rmSync(conflictFile(cfg), { force: true }); syncDir(dirname(conflictFile(cfg))); }
   }
   // The Date header comes from its own unauthenticated HEAD request, never from git's exchange.
   const date = fetched ? (cfg.fetchDate ? cfg.fetchDate() : headDate(cfg.remote)) : null;
@@ -516,17 +542,20 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   landSkipped?: LandSkip[];   // round 23: this round's landing-check records skipped, with their causes (not kept across rounds)
   holdSeq?: number;           // round 24: the last push-refused hold's number (its id is hold-<n>, stamped on a reset-copy request)
   tapsLogBorn?: boolean;      // round 24: the consumed-key log has existed (so a missing file is never read as no tombstones)
+  // Round 25: the created flag is monotonic (never cleared, a detected loss included), and a lost or shortened log is
+  // marked "lost, rebuilding" until the rebuild has rewritten it and fsynced it: meanwhile every push is refused.
+  tapsLogRebuild?: { since: string; why: string };
   fetchHiccup?: { since: string; rounds: number; cause: "fetch-timeout" | "fetch-failed"; told?: boolean };   // round 24
   pushSlow?: { since: string; count: number; told?: boolean };   // round 24: consecutive pushes stopped at the ceiling
 };
 export type PushRefused = { kind: GuardKind; why: string; since: string; tries: number; told?: boolean; by?: ("round" | "nightly")[];
   id?: string; hiccups?: number; hiccupSince?: string; hiccupTold?: boolean };
 export type PushAlarm = { tap: string; id: string; at: string; why: string; item?: string };
-export type GuardKind = "unknown-remote" | "git" | "conflict" | "log" | "lock" | "too-many";
+export type GuardKind = "unknown-remote" | "git" | "conflict" | "log" | "lock" | "too-many" | "deadline";
 // Round 23: a check of what a push carried that couldn't be completed (kept and retried each round until a clean scan),
 // and a push whose outcome is unknown (timed out, or errored with no fetch after it), settled by the next fresh fetch.
 export type AlarmCheck = { before: string | null; since: string; why: string; tries: number; told?: boolean };
-export type PushUnknown = { at: string; head: string; before: string | null; keys: string[]; why: string; tries: number; fails?: number; told?: boolean };
+export type PushUnknown = { at: string; head: string; before: string | null; keys: string[]; why: string; tries: number; fails?: number; told?: boolean; keysOk?: boolean };
 // Round 21: a "waiting" notice names its request (id) and its stuck episode (ep): deduplicated per (tap, request, episode).
 type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded" | "unstamped" | "unlanded" | "waiting"; reason: string; msg?: string; at: string; id?: string; ep?: number };
 const TAPS_KEPT = 1000;
@@ -591,8 +620,12 @@ export function openIntents(cfg: Config): Map<string, string> {
   }
   return open;
 }
-function intendConsume(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { t: "consuming", tap, id, at }, { wait: consumedWait() }); }
-function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }, { wait: consumedWait() }); }
+function intendConsume(cfg: Config, tap: string, id: string, at: string) {
+  tapsLogBornFirst(cfg);
+  appendLog(tapsLogFile(cfg), { t: "consuming", tap, id, at }, { wait: consumedWait() });
+  cfg.crashPoint?.("taps-append");
+}
+function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { tapsLogBornFirst(cfg); appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }, { wait: consumedWait() }); }
 // Round 19: each intent a crash left open is resolved from the record's history: consumed when a commit carries its
 // Tap-Key trailer (the request's local commit happened), else dropped. A crash after the commit never leads to a re-ask.
 // Round 20: only from a commit that carries both the tap key and the intent's own request id (Tap-Key and Tap-Request):
@@ -666,13 +699,15 @@ function pairStates(rs: any[]): Map<string, { tap: string; id: string; at: strin
 const rebasedWatch = new Set<string>();
 // Round 24: each skipped record's cause, in fixed words (what the status and the link's rows carry); the raw error goes to
 // the keeper's log only. The causes: lock-timeout, read-failed, git-failed, other, and the two the loop decides itself.
-export type LandSkipCause = "lock-timeout" | "read-failed" | "git-failed" | "other" | "push-unknown";
+export type LandSkipCause = "lock-timeout" | "read-failed" | "git-failed" | "other" | "push-unknown" | "fetch-failed";
 export const LAND_SKIP_WHY: Record<LandSkipCause, string> = {
   "lock-timeout": "the consumed-key log was locked by another writer past the timeout",
   "read-failed": "GitHub's copy or the consumed-key log couldn't be read under the lock, so nothing was dropped",
   "git-failed": "a git command of the landing check failed",
   "other": "an unexpected error in the landing check (its detail is in the keeper's log)",
   "push-unknown": "a push that may have carried it has an unknown outcome until a fresh fetch settles it",
+  // Round 25: after the first fetch of the drop phase that fails or times out, the round's remaining drops wait.
+  "fetch-failed": "GitHub didn't answer the fetch a drop needs, so the round's drops wait for the next round",
 };
 export type LandSkip = { tap: string; id: string; why: string; cause: LandSkipCause };
 // Round 24: re-bases of one watch (an unknown boot id at each keeper start) before its hold is listed as a landing row.
@@ -705,13 +740,14 @@ export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boo
   // Round 23: each record on its own: a lock timeout (or any error) at one record's mark or drop skips that record, listed
   // with its cause, and the rest are looked at. Round 24: after the first lock timeout of the round, every record left that
   // would need the lock is skipped with the same cause at once (no second wait).
-  let lockedOut = false;
+  let lockedOut = false, netOut = false;
   for (const x of pending) {
     const k = tapPair(x.tap, x.id);
     try {
       if (remote.has(k)) {
         if (lockedOut) { skip(x, "lock-timeout"); continue; }
         cfg.crashPoint?.("landing-mark");
+        tapsLogBornFirst(cfg);
         appendLog(tapsLogFile(cfg), { t: "landed", tap: x.tap, id: x.id, at: new Date(o.now).toISOString() }, { wait: consumedWait() }); delete watch[k]; out.landed.push(x.tap); continue;
       }
       const rk = `${cfg.dir}\0${k}`;
@@ -730,7 +766,10 @@ export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boo
       // Round 23: a push whose outcome is unknown and that may have carried this key blocks its drop until a fetch settles it.
       if (o.blocked?.has(x.tap)) { skip(x, "push-unknown"); continue; }
       if (lockedOut) { skip(x, "lock-timeout"); continue; }
+      // Round 25: one network failure or timeout a round in the drop phase: the rest wait (a bounded round).
+      if (netOut) { skip(x, "fetch-failed"); continue; }
       const r = dropUnlanded(cfg, x.tap, x.id, why, new Date(o.now).toISOString());
+      if (r === "net") { netOut = true; skip(x, "fetch-failed"); continue; }
       if (r === "retry") { skip(x, "read-failed"); continue; }
       delete watch[k];
       if (r === "dropped") out.unlanded.push({ tap: x.tap, id: x.id, why });
@@ -764,13 +803,17 @@ function remotePairs(cfg: Config): Set<string> {
 // fetches GitHub's branch afresh (never the remote-tracking ref as the last push or fetch left it: a push that errored
 // but landed, with its follow-up fetch failed, would read as absent there), and refuses to drop ("retry", looked at again
 // next round) when that fetch or the read of its history fails; a record whose commit is on GitHub is marked landed.
-export function dropUnlanded(cfg: Config, tap: string, id: string, why: string, at: string): "dropped" | "landed" | "gone" | "retry" {
+// Round 25: a fetch that fails or times out answers "net" (the caller skips the round's remaining drops with fetch-failed);
+// a read of the fetched history that fails answers "retry".
+export function dropUnlanded(cfg: Config, tap: string, id: string, why: string, at: string): "dropped" | "landed" | "gone" | "retry" | "net" {
   const k = tapPair(tap, id);
   return withLogLock(tapsLogFile(cfg), () => { // dropUnlanded
     const now = pairStates(readLog<any>(tapsLogFile(cfg), { repair: false }).records).get(k);
     if (now?.s !== "open") return "gone";
     let remote: Set<string>;
-    try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, netTimeout(cfg)); remote = remotePairs(cfg); }
+    try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, netTimeout(cfg)); }
+    catch (e) { log(`didn't drop tap key ${tap} (request ${id}): GitHub didn't answer the fetch under the lock (${clean(redact(cfg, (e as Error).message), 160)}); the round's other drops wait too, looked at again next round`); return "net"; }
+    try { remote = remotePairs(cfg); }
     catch (e) { log(`didn't drop tap key ${tap} (request ${id}): GitHub's copy couldn't be read again under the lock (${clean(redact(cfg, (e as Error).message), 160)}); looked at again next round`); return "retry"; }
     if (remote.has(k)) { appendLogHeld(tapsLogFile(cfg), { t: "landed", tap, id, at, how: "on GitHub when its drop came to be written" }); return "landed"; }
     appendLogHeld(tapsLogFile(cfg), { t: "dropped", tap, id, unlanded: true, why, at });
@@ -788,6 +831,8 @@ export const GUARD_WHY: Record<GuardKind, string> = {
   "conflict": "an unpushed commit carries a dropped request and couldn't be taken out of the local commits cleanly (a later change overlaps it), so nothing is pushed until it is taken out or the copy is reset",
   "too-many": "too many dropped requests' commits to take out in one round, so nothing is pushed this round",
   "lock": "the consumed-key log couldn't be locked for the push, so nothing is pushed this round",
+  // Round 25: the guarded section's one deadline left too little time for the push.
+  "deadline": "the checks before the push took too long to leave it time within its bound, so nothing is pushed this round",
 };
 // Round 21: the push path's tombstone check. Every unpushed commit (on the local branch, not on the remote's) whose Tap-Key
 // and Tap-Request pair has an unlanded drop is taken out of the local branch (the commits after it replayed onto its
@@ -829,37 +874,58 @@ export function abandonCommits(cfg: Config): { abandoned: string[]; refused?: st
 // expiry, and the lock is released by withLogLock's finally whatever the push did: a timeout is an unknown outcome
 // (timedOut). A push counts as done (confirmed) only once GitHub's branch, read back with ls-remote after the lock is
 // released, equals the pushed head. An incomplete check of what it carried is kept (incomplete), never taken as none.
-export type GuardOutcome = { pushed: boolean; error?: string; timedOut?: boolean; ms?: number; confirmed?: boolean; refused?: { kind: GuardKind; why: string }; alarms: PushAlarm[]; incomplete?: string; before: string | null; head?: string | null };
+export type GuardOutcome = { pushed: boolean; error?: string; timedOut?: boolean; ms?: number; heldMs?: number; confirmed?: boolean; refused?: { kind: GuardKind; why: string }; alarms: PushAlarm[]; incomplete?: string; before: string | null; head?: string | null };
 export function remoteTip(cfg: Config): string | null {
   try { return git(cfg, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${cfg.branch}`]).trim() || null; } catch { return null; }
 }
-export function guardedPush(cfg: Config, push: () => void, nowIso: string): GuardOutcome {
+// Round 25: one deadline for the whole guarded section (the guard's checks, the push, the scan of what it carried, and
+// the read-back after the lock is released): LOCKED_BOUND_MS below the consumed-key log's wait (two lock waits under it),
+// so an overlapping keeper's writer never waits out its 90 seconds behind it. The push gets what is left of the deadline
+// less a reserve for the scan (one lock wait), never more than the network ceiling; with less than the shortest network
+// limit left, nothing is pushed (kind "deadline"). The time held under the lock is logged and returned (heldMs) for the
+// resilience run.
+export const lockedBound = () => consumedWait() - 2 * lockWait.ms;
+export function guardedPush(cfg: Config, push: (net: { timeoutMs: number }) => void, nowIso: string): GuardOutcome {
   let g: GuardOutcome;
+  let deadline = 0;
   try {
     g = withLogLock(tapsLogFile(cfg), () => { // guardedPush
+      const tLock = performance.now();
+      deadline = tLock + lockedBound();
+      const held = (o: GuardOutcome): GuardOutcome => {
+        const heldMs = Math.round(performance.now() - tLock);
+        log(`push guard: held the consumed-key log's lock for ${heldMs} ms (bound ${lockedBound()} ms, its writers wait ${consumedWait()} ms)`);
+        return { ...o, heldMs };
+      };
       const ab = abandonCommits(cfg);
-      if (ab.refused) { if (ab.detail) log(`push guard (${ab.kind}): ${ab.detail}`); return { pushed: false, refused: { kind: ab.kind ?? "git", why: ab.refused }, alarms: [], before: null }; }
+      if (ab.refused) { if (ab.detail) log(`push guard (${ab.kind}): ${ab.detail}`); return held({ pushed: false, refused: { kind: ab.kind ?? "git", why: ab.refused }, alarms: [], before: null }); }
       const before = remoteTip(cfg);
       let head: string | null = null;
       try { head = git(cfg, ["rev-parse", "--verify", "HEAD"]).trim() || null; } catch { head = null; }
+      cfg.crashPoint?.("push-guard-checked");
+      const left = Math.min(netTimeout(cfg).timeoutMs, Math.floor(deadline - performance.now() - lockWait.ms));
+      if (left < PUSH_TIMEOUT_MIN_MS) { log(`push guard (deadline): the checks before the push took too long (${Math.round(performance.now() - tLock)} ms): nothing pushed this round`); return held({ pushed: false, refused: { kind: "deadline", why: GUARD_WHY.deadline }, alarms: [], before: null }); }
       let error: string | undefined, timedOut = false;
       const t0 = performance.now();
-      try { push(); } catch (e) { error = (e as Error).message; timedOut = e instanceof GitTimeout; }
+      try { push({ timeoutMs: left }); } catch (e) { error = (e as Error).message; timedOut = e instanceof GitTimeout; }
       const ms = Math.round(performance.now() - t0);
       const scan = pushedTombstoned(cfg, before, nowIso);
-      return { pushed: !error, ...(error ? { error } : {}), ...(timedOut ? { timedOut: true } : {}), ms, alarms: scan.alarms, ...(scan.incomplete ? { incomplete: scan.incomplete } : {}), before, head };
+      return held({ pushed: !error, ...(error ? { error } : {}), ...(timedOut ? { timedOut: true } : {}), ms, alarms: scan.alarms, ...(scan.incomplete ? { incomplete: scan.incomplete } : {}), before, head });
     }, { wait: consumedWait() });
   } catch (e) {
     log(`push guard (lock): ${clean((e as Error).message, 200)}`);
     return { pushed: false, refused: { kind: "lock", why: GUARD_WHY.lock }, alarms: [], before: null };
   }
-  if (g.pushed && g.head) g.confirmed = confirmPush(cfg, g.head);
+  if (g.pushed && g.head) g.confirmed = confirmPush(cfg, g.head, deadline);
   return g;
 }
 // Round 23: GitHub's branch read back (ls-remote, under the hard timeout) equal to the pushed head.
-export function confirmPush(cfg: Config, head: string): boolean {
+// Round 25: within the guarded section's deadline (none left: not confirmed this round, a hiccup round).
+export function confirmPush(cfg: Config, head: string, deadline?: number): boolean {
+  const limit = deadline === undefined ? netTimeout(cfg).timeoutMs : Math.min(netTimeout(cfg).timeoutMs, Math.floor(deadline + lockWait.ms - performance.now()));
+  if (limit < PUSH_TIMEOUT_MIN_MS) { log("the push answered, but no time was left within the push's bound to read GitHub's branch back: not counted as confirmed"); return false; }
   try {
-    const tip = git(cfg, ["ls-remote", "origin", `refs/heads/${cfg.branch}`], cfg.dir, netTimeout(cfg)).split(/\s+/)[0] ?? "";
+    const tip = git(cfg, ["ls-remote", "origin", `refs/heads/${cfg.branch}`], cfg.dir, { timeoutMs: limit }).split(/\s+/)[0] ?? "";
     if (tip === head) return true;
     log(`the push answered, but GitHub's ${cfg.branch} reads ${tip ? "another commit" : "nothing"} on the read back: not counted as confirmed`);
   } catch (e) { log(`the push answered, but GitHub's ${cfg.branch} couldn't be read back (${clean(redact(cfg, (e as Error).message), 160)}): not counted as confirmed`); }
@@ -893,11 +959,38 @@ function itemOfTap(cfg: Config, tap: string): string | null {
   return null;
 }
 // Round 23: the tap keys of the commits in a range (a push's), for a push whose outcome is unknown.
-function rangeTapKeys(cfg: Config, before: string | null, head: string): string[] {
-  try {
-    const text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)", before ? `${before}..${head}` : head]);
-    return [...new Set(text.split("\x1e").map((x) => x.trim()).filter((x) => TAP_KEY.test(x)))];
-  } catch { return []; }
+// Round 25: a git failure is its own error (TapKeysError), never an empty list: only an extraction that succeeded may
+// say what the range carried.
+export class TapKeysError extends Error { constructor(msg: string) { super(msg); this.name = "TapKeysError"; } }
+export function rangeTapKeys(cfg: Config, before: string | null, head: string): string[] {
+  let text: string;
+  try { text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)", before ? `${before}..${head}` : head]); }
+  catch (e) { throw new TapKeysError(`the tap keys of the pushed commits couldn't be read: ${clean(redact(cfg, (e as Error).message), 160)}`); }
+  return [...new Set(text.split("\x1e").flatMap((x) => x.split(",")).map((x) => x.trim()).filter((x) => TAP_KEY.test(x)))];
+}
+// Round 25: before a reset-copy discards the local commits, a tombstone (an unlanded drop) for each consumed record they
+// carry whose request isn't queued (a queued one is applied again), each fsynced; a record tombstoned this way by an
+// earlier try (a crash before its discard) is listed again, so it is told once the discard is done.
+function tombstoneDiscarded(cfg: Config, at: string): { tap: string; id: string; why: string }[] {
+  const text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", `origin/${cfg.branch}..HEAD`]);
+  const queued = new Set<string>();
+  for (const p of pending(cfg)) if (p.req?.id) queued.add(p.req.id);
+  // Takes settled in those commits are planned again after the reset (resetCopy), so they are never tombstoned either.
+  for (const w of Array.isArray(rawState(cfg)?.settled) ? rawState(cfg).settled : []) if (typeof w?.req?.id === "string") queued.add(w.req.id);
+  const states = pairStates(readLog<any>(tapsLogFile(cfg), { repair: false }).records);
+  const tombs = tombstones(cfg);
+  const out: { tap: string; id: string; why: string }[] = [];
+  for (const r of text.split("\x1e")) {
+    const [tap, id] = r.split("\x1f").map((x) => (x ?? "").trim());
+    if (!tap || !id || !TAP_KEY.test(tap) || queued.has(id)) continue;
+    const k = tapPair(tap, id), now = states.get(k);
+    if (now?.s === "open") {
+      tapsLogBornFirst(cfg);
+      appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, unlanded: true, why: RESET_COPY_DROP_WHY, at }, { wait: consumedWait() });
+      out.push({ tap, id, why: RESET_COPY_DROP_WHY });
+    } else if (now?.s === "gone" && tombs.has(k)) out.push({ tap, id, why: RESET_COPY_DROP_WHY });
+  }
+  return out;
 }
 // Round 20: rounds in a row in which a consuming intent couldn't be resolved before the keeper says so (a keeper notice
 // to Cain, and one line on each card to him).
@@ -980,7 +1073,7 @@ export function holdLapsed(cfg: Config, k: string, h: Hold, at: Date, downtime: 
   if (holdSeen.size > 5000) holdSeen.delete(holdSeen.keys().next().value!);
   return mono - holdSeen.get(key)! > HOLD_IDLE_MS || expired(h, at, downtime);
 }
-function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() }); }
+function appendConsumed(cfg: Config, tap: string, id: string, at: string) { tapsLogBornFirst(cfg); appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() }); }
 // Round 18: whether the link has superseded a key, read from its issued-key log now (its tail, as it stands at this
 // instant), just before the keeper consumes that key: a supersede the link appended after this round's mirror is
 // still seen, so a key is either consumed or superseded, never both.
@@ -1118,15 +1211,56 @@ export function keeperLockProbe(cfg: Config): string | null { return sessionTool
 // Round 24: a missing file is no tombstones only when the keeper's state proves the log never existed (its created flag
 // unset and no consumed record ever counted, or no keeper state at all: the pristine first start); otherwise it throws, so
 // the push guard refuses and the alarm check reports incomplete.
+// Round 25: the flag is monotonic and written to the keeper state (fsynced) before the log's first append
+// (tapsLogBornFirst), never at the round's end, so a crash between the two can't lose it; a detected loss never clears
+// it but marks the log "lost, rebuilding" (tapsLogRebuild), and while that mark stands the strict reader throws whether
+// or not the file is there, so every push is refused until the rebuild has rewritten the log and fsynced it. A missing
+// keeper state counts as the pristine first start only with independent proof: the record's copy readable and no ref of
+// it carrying a Tap-Key trailer (no consumed record could ever have been written).
 export const TAPS_LOG_MISSING = "the consumed-key log is missing, and the keeper's state doesn't show it never existed";
+export const TAPS_LOG_REBUILDING = "the consumed-key log was lost and is being rebuilt, so its withdrawn changes can't be checked yet";
 export function tapsLogNeverExisted(cfg: Config): boolean {
-  if (!existsSync(stateFile(cfg))) return true;
+  if (!existsSync(stateFile(cfg))) return freshStartProof(cfg);
   const j = rawState(cfg);
   if (!j || typeof j !== "object") return false;
+  if (j.tapsLogRebuild) return false;
   return j.tapsLogBorn !== true && !(Number.isInteger(j.logHigh?.consumed) && j.logHigh.consumed > 0);
+}
+function freshStartProof(cfg: Config): boolean {
+  if (!existsSync(join(cfg.dir, ".git"))) return false;
+  try { return git(cfg, ["log", "--all", "--format=%(trailers:key=Tap-Key,valueonly)"]).trim() === ""; } catch { return false; }
+}
+// The state file's monotonic fields patched in place (fsynced). No state file yet (a first start): nothing is written,
+// and the first round's state carries the flag (the fresh-start proof covers the gap).
+function patchStateFile(cfg: Config, f: (j: any) => boolean): void {
+  const j = rawState(cfg);
+  if (!j || typeof j !== "object") return;
+  if (f(j)) writeAtomic(stateFile(cfg), JSON.stringify(j));
+}
+const bornSeen = new Set<string>();
+function tapsLogBornFirst(cfg: Config): void {
+  const k = `${stateFile(cfg)}\0${tapsLogFile(cfg)}`;
+  if (bornSeen.has(k)) return;
+  patchStateFile(cfg, (j) => { if (j.tapsLogBorn === true) return false; j.tapsLogBorn = true; return true; });
+  if (rawState(cfg)?.tapsLogBorn === true) bornSeen.add(k);
+}
+// Every write of the keeper state keeps the created flag the file already has (it is never cleared).
+function stateText(cfg: Config, text: string): string {
+  if (rawState(cfg)?.tapsLogBorn !== true) return text;
+  try { const j = JSON.parse(text); if (j && typeof j === "object" && j.tapsLogBorn !== true) { j.tapsLogBorn = true; return JSON.stringify(j); } } catch { /* written as given */ }
+  return text;
+}
+// The rebuilt log made durable (an empty file when the rebuild added nothing), then the mark cleared in the state file.
+function finishTapsLogRebuild(cfg: Config): void {
+  const f = tapsLogFile(cfg);
+  if (!existsSync(f)) { mkdirSync(dirname(f), { recursive: true }); const fd = openSync(f, "a"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+  else { const fd = openSync(f, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
+  syncDir(dirname(f));
+  patchStateFile(cfg, (j) => { if (!j.tapsLogRebuild) return false; delete j.tapsLogRebuild; j.tapsLogBorn = true; return true; });
 }
 function tombstonesStrict(cfg: Config): Set<string> {
   const out = new Set<string>();
+  if (rawState(cfg)?.tapsLogRebuild) throw new Error(TAPS_LOG_REBUILDING);
   if (!existsSync(tapsLogFile(cfg))) { if (tapsLogNeverExisted(cfg)) return out; throw new Error(TAPS_LOG_MISSING); }
   for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records) if (j?.t === "dropped" && j.unlanded === true && TAP_KEY.test(j.tap) && typeof j.id === "string") out.add(tapPair(j.tap, j.id));
   return out;
@@ -1323,6 +1457,7 @@ function revive(j: any): State | null {
     // Round 24: the hold ids' counter, the consumed-key log's created flag, the fetch hiccups, slow pushes.
     ...(Number.isInteger(j.holdSeq) ? { holdSeq: j.holdSeq } : {}),
     ...(j.tapsLogBorn === true ? { tapsLogBorn: true } : {}),
+    ...(j.tapsLogRebuild && typeof j.tapsLogRebuild.since === "string" ? { tapsLogRebuild: { since: j.tapsLogRebuild.since, why: String(j.tapsLogRebuild.why ?? TAPS_LOG_REBUILDING) } } : {}),
     ...(j.fetchHiccup && typeof j.fetchHiccup.since === "string" && Number.isInteger(j.fetchHiccup.rounds) && (j.fetchHiccup.cause === "fetch-timeout" || j.fetchHiccup.cause === "fetch-failed")
       ? { fetchHiccup: { since: j.fetchHiccup.since, rounds: j.fetchHiccup.rounds, cause: j.fetchHiccup.cause, ...(j.fetchHiccup.told === true ? { told: true } : {}) } } : {}),
     ...(j.pushSlow && typeof j.pushSlow.since === "string" && Number.isInteger(j.pushSlow.count)
@@ -1335,7 +1470,8 @@ function revive(j: any): State | null {
     ...(j.pushUnknown && typeof j.pushUnknown.head === "string" && /^[0-9a-f]{40}$/.test(j.pushUnknown.head) && typeof j.pushUnknown.at === "string" && Array.isArray(j.pushUnknown.keys)
       ? { pushUnknown: { at: j.pushUnknown.at, head: j.pushUnknown.head, before: typeof j.pushUnknown.before === "string" ? j.pushUnknown.before : null, keys: j.pushUnknown.keys.filter((x: any) => TAP_KEY.test(x)).slice(-500),
         why: String(j.pushUnknown.why ?? "the push's outcome is unknown"), tries: Number.isInteger(j.pushUnknown.tries) ? j.pushUnknown.tries : 1,
-        ...(Number.isInteger(j.pushUnknown.fails) ? { fails: j.pushUnknown.fails } : {}), ...(j.pushUnknown.told === true ? { told: true } : {}) } } : {}) };
+        ...(Number.isInteger(j.pushUnknown.fails) ? { fails: j.pushUnknown.fails } : {}), ...(j.pushUnknown.told === true ? { told: true } : {}),
+        ...(j.pushUnknown.keysOk === true ? { keysOk: true } : {}) } } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -1544,7 +1680,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           if (asked) {
             st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
             if (asked.nonce) st0.recoverLines = [...(st0.recoverLines ?? []), { nonce: asked.nonce, said: asked.said }].slice(-50);
-            writeAtomic(stateFile(cfg), JSON.stringify(st0));
+            writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st0)));
             rmSync(recoverTaken(cfg), { force: true });
             forgetRebuild(cfg);
             log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted with no damaged log to move aside: the consumed set is rebuilt and verified against a fresh fetch`);
@@ -1555,8 +1691,10 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           st0.rebuild = { since: nowIso0, why, tries: 0 };
           // The counts reset to what the logs hold now, so the loss is detected once.
           st0.logHigh = logCounts(cfg);
-          // Round 24: the consumed-key log's created flag starts again with the counts (a lost log is rebuilt).
-          if (existsSync(tapsLogFile(cfg))) st0.tapsLogBorn = true; else delete st0.tapsLogBorn;
+          // Round 25: the created flag is never cleared here; a lost or shortened consumed-key log (or one missing at a
+          // start with no state) is marked "lost, rebuilding" until the rebuild has rewritten it and fsynced it.
+          if (existsSync(tapsLogFile(cfg))) st0.tapsLogBorn = true;
+          if (lc.lost.some((l) => l.includes("consumed tap keys")) || (fresh && !existsSync(tapsLogFile(cfg)))) st0.tapsLogRebuild = { since: nowIso0, why: TAPS_LOG_REBUILDING };
           // Install taps default to off after any restore that lost install records.
           if (lc.installLost) {
             try { appendLog(installLogFile(cfg), { t: "flag", how: "off", by: "keeper", why: "a restore lost install-log records", at: nowIso0 }); st0.logHigh.install = (st0.logHigh.install ?? 0) + 1; }
@@ -1564,8 +1702,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           }
           // A keeper with no state takes its holds from the record after the sync, so its state isn't written
           // here: the rebuild mark is carried into this round's state below (startRebuild).
-          if (!fresh) writeAtomic(stateFile(cfg), JSON.stringify(st0));
-          startRebuild.set(cfg.dir, { rebuild: st0.rebuild!, logHigh: st0.logHigh });
+          if (!fresh) writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st0)));
+          startRebuild.set(cfg.dir, { rebuild: st0.rebuild!, logHigh: st0.logHigh, ...(st0.tapsLogRebuild ? { tapsLogRebuild: st0.tapsLogRebuild } : {}) });
           forgetRebuild(cfg);
           if (lc.lost.length) {
             log(`RESTORE DETECTED: ${why}; starting degraded: tap-derived requests wait until the consumed set is rebuilt from the record's history`);
@@ -1578,7 +1716,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       synced0 = sync(cfg, () => clock().getTime());
       st = loadState(cfg);
       { const sr = startRebuild.get(cfg.dir);
-        if (sr) { startRebuild.delete(cfg.dir); if (!st.rebuild) st.rebuild = sr.rebuild; st.logHigh = sr.logHigh; } }
+        if (sr) { startRebuild.delete(cfg.dir); if (!st.rebuild) st.rebuild = sr.rebuild; st.logHigh = sr.logHigh; if (sr.tapsLogRebuild && !st.tapsLogRebuild) st.tapsLogRebuild = sr.tapsLogRebuild; } }
       // The generation floor: the keeper's own count (its state file, in /data outside the
       // working copy) and the highest generation the link has posted on a card, so a re-clone
       // with the state file lost never goes below a card that is up.
@@ -1780,7 +1918,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         try {
           // Round 22: the consumed-key log's repair is one non-blocking try of its flock: on would-block it is skipped to
           // the next round (readers skip a torn tail meanwhile), so a round never stalls behind a writer here.
-          let r: ReturnType<typeof readLog>;
+          let r: LogRead;   // round 25: a type, never a reference to the primitive (the AST lock lint)
           try { r = readLog(f, { repair: f === issuedMirrorFile(cfg) ? "mirror" : "try" }); }
           catch (e) { if (e instanceof LockTimeout) { log(`the log of ${what} is locked by another writer: its torn check is skipped to the next round`); continue; } throw e; }
           if (r.torn) { log(`TORN: a torn final record (${r.tornBytes} bytes) in the log of ${what} was truncated; the records before it stand`); relay(cfg, `The record keeper found a torn final record in its log of ${what} (a write cut short, as by a power cut) and truncated it; every record before it stands. Nothing to tell him.`); }
@@ -1798,7 +1936,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         // Round 23: a fresh fetch settles a push of unknown outcome first; until one does, its tap keys' drops wait.
         if (synced0.fetched) resolvePushUnknown(cfg, S, clock());
         const lc = unlandedConsumes(cfg, { fetched: synced0.fetched, inStep: !S.unpushed && !S.reset && !ahead(cfg), now: clock().getTime(), queued, watch: (S.landWatch ??= {}), blocked: new Set(S.pushUnknown?.keys ?? []) });
-        unlandedNow = lc.unlanded;
+        // Round 25: the consumed records a reset-copy tombstoned before its discard are told like any change that didn't land.
+        unlandedNow = [...(synced0.resetCopy?.dropped ?? []), ...lc.unlanded];
         if (lc.skipped.length) S.landSkipped = lc.skipped; else delete S.landSkipped;
         if (!Object.keys(S.landWatch ?? {}).length) delete S.landWatch;
       }
@@ -1851,6 +1990,12 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           const used = new Set(installState(installLogFile(cfg)).onceUsed);
           for (const k of once) if (!used.has(k)) appendLog(installLogFile(cfg), { t: "once-used", kid: k, by: "keeper", why: "rebuilt from the record's history", at: nowIso });
           rebuilt.add(cfg.dir);
+          // Round 25: a lost consumed-key log counts as rebuilt only from a fresh fetch, once rewritten and fsynced.
+          if (S.tapsLogRebuild && synced0.fetched) {
+            finishTapsLogRebuild(cfg);
+            log(`the consumed-key log, lost since ${S.tapsLogRebuild.since}, is rebuilt and fsynced: pushes are checked against it again`);
+            delete S.tapsLogRebuild;
+          }
           log(`rebuilt the consumed tap keys from the record's history${n ? `: ${n} key(s) not in the log added` : ": nothing missing"}`);
           if (S.rebuild) {
             const was = S.rebuild;
@@ -1991,6 +2136,16 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
             log(`held ${id} (tap key ${tapK}): the consumed set is unverified until its rebuild from the record's history completes`);
             if (it.local) relay(cfg, `Pending: your request ${id} carries tap key ${tapK}, and the record keeper can't verify yet that it wasn't already acted on (${S.rebuild.why}; the rebuild needs GitHub). It is held, not refused, and decided by itself once the rebuild completes. Send nothing again. Nothing to tell him.`);
           }
+          continue;
+        }
+        // Round 25: a round whose opening fetch didn't answer (a hiccup round) decides against the box's copy only, and the
+        // keeper is not the only writer of the record's rows on GitHub (its owner can edit the repository there), so a row
+        // may have moved since the last fetch. A request carrying a tap key is held, untouched in its queue (pending, no
+        // intent written, nothing consumed), and decided on the next round whose fetch answers.
+        if (tapK && !synced0.fetched && !seen.has(id)) {
+          held.add(it.name);
+          outcomes.push(null);
+          log(`held ${id} (tap key ${tapK}): this round's fetch from GitHub didn't answer, so a row it rests on may have moved there; decided on the next round whose fetch answers`);
           continue;
         }
         // Round 13: a key that misses the mirror (or the link's state) is looked up again, synchronously, in
@@ -2161,7 +2316,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         return { applied: items.length, ok: true };
       }
       // Saved before the push: the holds and the ledger's generation are the local commits'.
-      writeAtomic(stateFile(cfg), unlanded(S));
+      writeAtomic(stateFile(cfg), stateText(cfg, unlanded(S)));
       appliedNames = new Set(items.filter((it) => it.local && !held.has(it.name)).map((it) => it.name));
     } catch (e) {
       log(`stopped this round, nothing let go: ${redact(cfg, (e as Error).message)}`);
@@ -2174,12 +2329,12 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       cfg.beforePush?.();
       // Round 21: never push a commit whose request was dropped as not landed (its tombstone in the consumed-key log).
       // Round 22: through the push guard: fail closed, and the consumed-key flock held until the push's result is known.
-      guard = guardedPush(cfg, () => {
+      guard = guardedPush(cfg, (net) => {
         const blocked = blockFile(cfg);
         if (existsSync(blocked)) {
           log("the smoke test's push block is on: pushing to a wrong remote this round");
-          git(cfg, ["push", "--quiet", join(cfg.dir, ".git", "no-such-remote.git"), `HEAD:${cfg.branch}`], cfg.dir, netTimeout(cfg));
-        } else git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`], cfg.dir, netTimeout(cfg));
+          git(cfg, ["push", "--quiet", join(cfg.dir, ".git", "no-such-remote.git"), `HEAD:${cfg.branch}`], cfg.dir, net);
+        } else git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`], cfg.dir, net);
       }, clock().toISOString());
       pushGuardOutcome(cfg, st!, guard, clock());
       notePushSpeed(cfg, st!, guard, clock());
@@ -2204,7 +2359,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         // Round 23: nor one that timed out (its hard timeout already spent this round's wait).
         const retry = answered && !existsSync(blockFile(cfg)) && attempt < 2 && !guard?.refused && !guard?.timedOut;
         if (!retry) { tally(st!, clock()); releaseBlock(cfg, clock()); }
-        writeAtomic(stateFile(cfg), unlanded(st!));
+        writeAtomic(stateFile(cfg), stateText(cfg, unlanded(st!)));
         writeStatus(cfg, st!, cv!, clock());
         if (retry) continue;
         return { applied: items.length, ok: false, pushFailed: true };
@@ -2229,7 +2384,7 @@ let appliedNames = new Set<string>();
 // Round 13: this round's held requests (by queue name), left in their queue.
 let held = new Set<string>();
 // Round 13: a rebuild mark made at the start check, carried into the round's state.
-const startRebuild = new Map<string, { rebuild: NonNullable<State["rebuild"]>; logHigh: State["logHigh"] }>();
+const startRebuild = new Map<string, { rebuild: NonNullable<State["rebuild"]>; logHigh: State["logHigh"]; tapsLogRebuild?: State["tapsLogRebuild"] }>();
 
 const blockFile = (cfg: Config) => cfg.blockPush ?? join(dirname(cfg.queue), "record-block-push");
 
@@ -2347,7 +2502,7 @@ function resetCopy(cfg: Config, st: State, why: string, now: Date, lf: { floor: 
   st.owed = [];
   if (lost.length) relay(cfg, `The record keeper had to reset its copy of the record (${clean(why, 160)}). These changes may not have reached GitHub: ${lost.map((w) => w.o.id).join(", ")}. Check each in /data/record and send it again if it's missing.`);
   delete st.unpushed;
-  writeAtomic(stateFile(cfg), JSON.stringify(st));
+  writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st)));
 }
 
 // A new reset epoch: one generation above the keeper's count and the link's floor (both read now),
@@ -2435,10 +2590,14 @@ export function retryAlarmCheck(cfg: Config, st: State, now: Date): void {
 function notePushUnknown(cfg: Config, st: State, g: GuardOutcome, now: Date): void {
   if (!g.head) return;
   const was = st.pushUnknown;
-  const keys = [...new Set([...(was?.keys ?? []), ...rangeTapKeys(cfg, was ? was.before : g.before, g.head)])].slice(-500);
+  // Round 25: keysOk only while every extraction behind the record succeeded (a failure is sticky for the record).
+  let got: string[] = [], keysOk = was ? was.keysOk === true : true;
+  try { got = rangeTapKeys(cfg, was ? was.before : g.before, g.head); }
+  catch (e) { keysOk = false; log(`push outcome unknown: ${(e as Error).message}; it can't be settled as not landed from a scan until they can`); }
+  const keys = [...new Set([...(was?.keys ?? []), ...got])].slice(-500);
   const why = g.timedOut ? "the push got no answer within its time limit and was stopped" : "the push failed and GitHub couldn't be read after it";
   st.pushUnknown = { at: was?.at ?? now.toISOString(), head: g.head, before: was ? was.before : g.before, keys, why, tries: (was?.tries ?? 0) + 1,
-    ...(was?.fails ? { fails: was.fails } : {}), ...(was?.told ? { told: true } : {}) };
+    ...(was?.fails ? { fails: was.fails } : {}), ...(was?.told ? { told: true } : {}), ...(keysOk ? { keysOk: true } : {}) };
   log(`push outcome unknown (${why}): kept until a fresh fetch settles it; drops of ${keys.length} tap key(s) it may have carried wait`);
 }
 // Round 23: settled by a fresh fetch: whether GitHub's branch has the pushed head, and what it carried checked for alarms.
@@ -2486,7 +2645,11 @@ export function resolvePushUnknown(cfg: Config, st: State, now: Date): void {
     if (!reachable || u.fails >= PUSH_UNKNOWN_FALLBACK_TRIES) {
       try {
         const sc = remoteScan(cfg, u.head, u.keys);
+        // Round 25: "not landed" needs evidence: the head absent, a key extraction that succeeded with a non-empty list,
+        // and none of those keys on GitHub. A failed extraction or an empty list keeps it unresolved (a try counted).
         if (sc.headOn) { landed = true; how = "a full read of GitHub's history found its head"; }
+        else if (u.keysOk !== true) log("push outcome unknown: the tap keys it may have carried couldn't be read, so its head's absence proves nothing; kept unresolved");
+        else if (!u.keys.length) log("push outcome unknown: no tap keys were read from what it may have carried, so its head's absence proves nothing; kept unresolved");
         else if (!sc.keysOn.length) { landed = false; how = "a full read of GitHub's history found neither its head nor any of its tap keys"; }
         else log(`push outcome unknown: GitHub's history has ${sc.keysOn.length} of its tap key(s) but not its head; kept unresolved`);
       } catch (e) { log(`push outcome unknown: the full read of GitHub's history failed too (${clean(redact(cfg, (e as Error).message), 120)}); kept`); }
@@ -2593,7 +2756,7 @@ function nightlyOutcome(cfg: Config, g: GuardOutcome, now: Date): void {
     pushGuardOutcome(cfg, st, g, now, "nightly");
     notePushSpeed(cfg, st, g, now);
     if (g.timedOut || (g.error && !g.refused)) notePushUnknown(cfg, st, g, now);
-    writeAtomic(stateFile(cfg), JSON.stringify(st));
+    writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st)));
     patchStatus(cfg, st, now);
   } catch (e) { log(`couldn't keep the nightly push's outcome in the keeper state: ${clean((e as Error).message, 160)}`); }
 }
@@ -2747,7 +2910,7 @@ function local(cfg: Config, o: Outcome, round_ms: number, waited: Map<string, Om
 // Cain's queued requests let go. One that was applied in an earlier round that
 // stopped before writing its status file gets that file from the log.
 function finish(cfg: Config, st: State, items: Pending[], outcomes: (Outcome | null)[], book: Map<string, Outcome>) {
-  writeAtomic(stateFile(cfg), JSON.stringify(st));
+  writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st)));
   mkdirSync(cfg.outcomes, { recursive: true });
   items.forEach((it, i) => {
     if (!it.local || held.has(it.name)) return;   // round 13: a held request stays in the queue
@@ -2833,7 +2996,7 @@ export function nightly(cfg: Config): boolean {
     git(cfg, ["commit", "--quiet", "-m", `Nightly record check: ${findings.length} to look at`]);
     // Round 22: through the push guard too. Round 23: its outcome kept in the keeper state and status, the same record,
     // notice, retry and resolution as a round's push (nightlyOutcome).
-    const g = guardedPush(cfg, () => { git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`], cfg.dir, netTimeout(cfg)); }, (cfg.now?.() ?? new Date()).toISOString());
+    const g = guardedPush(cfg, (net) => { git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`], cfg.dir, net); }, (cfg.now?.() ?? new Date()).toISOString());
     nightlyOutcome(cfg, g, cfg.now?.() ?? new Date());
     if (g.refused) throw new Error(g.refused.why);
     if (g.error) throw new Error(g.error);

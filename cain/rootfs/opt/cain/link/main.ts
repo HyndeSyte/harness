@@ -53,7 +53,7 @@ import { lockGate } from "../startgate";
 import { localReadings, verdict } from "../clock";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
-import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { ensureStop, readStop, since, TRUST_DIR, TRUST_DIR_REFUSED, writeStop } from "../stop";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
@@ -101,6 +101,13 @@ const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
 
+// Round 25: a trust folder moved outside the test root refuses the start, with its fixed reason, before anything is
+// written (it waits there, so the run loop doesn't restart it every few seconds).
+if (TRUST_DIR_REFUSED) {
+  console.log(`[cain] link: REFUSED TO START: ${TRUST_DIR_REFUSED}`);
+  setInterval(() => console.log(`[cain] link: REFUSED TO START: ${TRUST_DIR_REFUSED}`), 3_600_000);
+  await new Promise(() => {});
+}
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
 // A copy of the link's log lines for the device smoke test (the App log is Home Assistant's).
 teeConsole(process.env.LINK_LOG ?? "/data/work/link.log");

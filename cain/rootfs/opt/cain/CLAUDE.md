@@ -712,7 +712,10 @@ that its pushes keep running out of time because the connection is too slow for 
 confirmed: nothing to tell him, it tries again each round; log a Build item only if it lasts a day. `record.sh
 reset-copy` answers refused when the keeper isn't holding back its pushes: nothing to reset then, so don't retry it.
 keeper.sh clock lists each of these under unresolved_landings with its kind in row (fetch-hiccup, push-slow and
-landing-held among them).
+landing-held among them). Round 25: while the keeper can't read GitHub, a request of yours that carries a tap key waits
+in its queue and is decided once a fetch answers: send nothing again, and record nothing from that tap until its status
+says done. A push held back because the keeper is rebuilding a lost log of the taps it acted on goes again by itself once
+the rebuild is done: nothing to do or tell him.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

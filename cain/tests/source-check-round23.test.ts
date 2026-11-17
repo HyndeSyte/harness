@@ -178,7 +178,7 @@ describe("2. the push runs under a hard timeout and the flock is released (invar
     expect(keeperStatus(k).push_unknown.keys).toContain(kid);
     // A drop of that key waits: GitHub can't be read afresh.
     failFetch = true;
-    expect(dropUnlanded(k.cfg, kid, "cain-r23-2-b", "the test's drop", "x")).toBe("retry");
+    expect(dropUnlanded(k.cfg, kid, "cain-r23-2-b", "the test's drop", "x")).toBe("net");   // round 25: a failed fetch is "net" (nothing dropped)
     expect(readLog<any>(tapsLogFile(k.cfg)).records.some((x) => x.t === "dropped" && x.tap === kid)).toBe(false);
     // GitHub answers again: pushed, and the unknown outcome settled by the fresh fetch.
     g(k, "config", "--unset", "remote.origin.receivepack");
@@ -399,7 +399,7 @@ describe("8. the drop reads GitHub afresh under the lock (invariants: the consum
     expect(remoteRequests(k, kid)).toEqual(["cain-r23-8-a"]);           // it landed
     expect(localTrack(k)).not.toBe(remoteTipOf(k));                    // the copy doesn't know it
     expect(keeperStatus(k).push_unknown.keys).toContain(kid);
-    expect(dropUnlanded(k.cfg, kid, "cain-r23-8-a", "the test's drop", "x")).toBe("retry");
+    expect(dropUnlanded(k.cfg, kid, "cain-r23-8-a", "the test's drop", "x")).toBe("net");   // round 25: a failed fetch is "net" (nothing dropped)
     expect(readLog<any>(tapsLogFile(k.cfg)).records.some((x) => x.t === "dropped" && x.tap === kid)).toBe(false);
     k.cfg.gitHook = undefined;
     expect(dropUnlanded(k.cfg, kid, "cain-r23-8-a", "the test's drop", "x")).toBe("landed");

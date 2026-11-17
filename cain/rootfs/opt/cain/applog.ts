@@ -186,7 +186,7 @@ export const LOCK_CALLERS: Record<string, string> = {
   "consumed-key log: consuming intent (keeper intendConsume)": "the request stays queued and is tried again next round",
   "consumed-key log: consumed record (keeper appendConsumed)": "the state keeps it, and the intent is resolved from the commit's trailers next round",
   "consumed-key log: dropped intent (keeper dropIntent)": "the intent stays open and is resolved from the record's history next round",
-  "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": "nothing is marked or dropped and no commit is abandoned; looked at again next round",
+  "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": "nothing is marked or dropped and no commit is abandoned; looked at again next round (round 25: a reset-copy's tombstones, tombstoneDiscarded: nothing is discarded and the request waits for the next round)",
   "consumed-key log: the push guard (keeper guardedPush)": "nothing is pushed this round (refused: the lock); the local commits stay and the next round tries again",
   "held log: held (link holdTap)": "the tap answers busy and the card keeps its buttons",
   "held log: releasing, released, dropped, replay marks (link releaseHeldTaps, replayWatch, replayWaiting)": "the release or mark is retried next sweep",
@@ -210,6 +210,7 @@ export const LOCK_SITES: Record<string, Record<string, string[]>> = {
   "consumed-key log: consumed record (keeper appendConsumed)": { "record/main.ts": ["appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() })"] },
   "consumed-key log: dropped intent (keeper dropIntent)": { "record/main.ts": ['{ t: "dropped", tap, id, at, why }'] },
   "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": { "record/main.ts": ['{ t: "landed", tap: x.tap', 'withLogLock(tapsLogFile(cfg), () => { // dropUnlanded', '{ t: "landed", tap, id, at, how', '{ t: "dropped", tap, id, unlanded: true'] },
+  // Round 25: the reset-copy's tombstones are on the same line form ('{ t: "dropped", tap, id, unlanded: true, why: RESET_COPY_DROP_WHY').
   "consumed-key log: the push guard (keeper guardedPush)": { "record/main.ts": ["withLogLock(tapsLogFile(cfg), () => { // guardedPush"] },
   "held log: held (link holdTap)": { "link/core.ts": ['appendLog(this.heldFile()!, { t: "held"'] },
   "held log: releasing, released, dropped, replay marks (link releaseHeldTaps, replayWatch, replayWaiting)": { "link/core.ts": ['appendLog(this.heldFile()!, { t: "dropped"', 'appendLog(this.heldFile()!, { t: "released"', 'appendLog(this.heldFile()!, { t: "releasing"', '{ t: "replay-waiting"', '{ t: "replay-done"'] },

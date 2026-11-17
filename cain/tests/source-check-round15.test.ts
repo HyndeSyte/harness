@@ -430,7 +430,9 @@ describe("6. the post-restore sweep pages back to the card horizon", () => {
 });
 
 describe("7. the known gap: a consumption committed only locally, then a whole-image restore", () => {
-  test("known gap: the remote down, a tap consumed locally, copy, ledger and keeper state restored to an older snapshot: a re-tap acts again", () => {
+  // Round 25: a round whose fetch fails holds tap-derived requests (nothing is consumed then), so the gap now needs a
+  // round whose fetch answers and whose push fails.
+  test("known gap: the push failing, a tap consumed locally, copy, ledger and keeper state restored to an older snapshot: a re-tap acts again", () => {
     const k = keeperRig();
     k.cain({ id: "cain-g0", ops: [{ op: "note", item: "P44", text: "a round" }] });
     expect(cycle(k.cfg).ok).toBe(true);
@@ -441,14 +443,14 @@ describe("7. the known gap: a consumption committed only locally, then a whole-i
     files.forEach((f, i) => { if (existsSync(f)) cpSync(f, join(snap, String(i))); });
     dirs.forEach((d, i) => { if (existsSync(d)) cpSync(d, join(snap, `d${i}`), { recursive: true }); });
     const T = "tap-00000000c701";
-    remoteDown(k);
+    k.cfg.beforePush = () => { throw new Error("remote: pushes are off"); };
     k.cain(shipTake("cain-gap-1", T));
     cycle(k.cfg);
     expect(localLog(k)).toContain(`Tap-Key: ${T}`);                  // consumed, but only in the local copy
     files.forEach((f, i) => { rmSync(f, { force: true }); if (existsSync(join(snap, String(i)))) cpSync(join(snap, String(i)), f); });
     dirs.forEach((d, i) => { rmSync(d, { recursive: true, force: true }); if (existsSync(join(snap, `d${i}`))) cpSync(join(snap, `d${i}`), d, { recursive: true }); else mkdirSync(d, { recursive: true }); });
     forgetRebuild(k.cfg);
-    remoteBack(k);
+    k.cfg.beforePush = undefined;
     k.issue(T, { item: "P33", kind: "ship", label: "Ship" });         // his card survived on Discord
     k.cain(shipTake("cain-gap-2", T), { issue: false });
     expect(cycle(k.cfg).ok).toBe(true);

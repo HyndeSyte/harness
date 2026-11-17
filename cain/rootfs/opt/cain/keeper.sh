@@ -110,6 +110,10 @@
 #                                        start with the boot id unreadable). A push-refused row also carries
 #                                        hiccups, hiccup_since and hiccup_age_min (rounds whose push wasn't
 #                                        confirmed). reset-copy is refused unless a push is held back now
+#                                        Round 25: a push-refused row of kind "deadline" (the checks before a
+#                                        push left it too little time within its bound) and of kind "log" while
+#                                        a lost consumed-key log is rebuilt; a landing skip's cause may be
+#                                        "fetch-failed" (the round's drops wait after one fetch that failed)
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

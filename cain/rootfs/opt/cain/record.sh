@@ -33,6 +33,9 @@
 #                               back its pushes now; the request is stamped with that hold and the reset
 #                               epoch, the next round uses it up either way, and it acts only if that
 #                               hold is still recorded (a stale request never resets a later round)
+#                               Round 25: before the reset the keeper settles the open intents and writes a
+#                               tombstone for each acted-on tap its discarded commits carry, both fsynced, and
+#                               uses the request up only once the reset is done (a restart in between redoes it)
 set -u
 dir="${RECORD_DIR:-/data/record}"
 queue="${RECORD_QUEUE:-/data/record-queue}"

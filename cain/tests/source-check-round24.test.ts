@@ -122,8 +122,8 @@ describe("1. every network call is timed, and a timeout is a hiccup round (invar
     const t = performance.now();
     cycle(k.cfg);
     expect(performance.now() - t).toBeLessThan(20_000);
-    expect(readConsumed(k.cfg).get(kid)).toBe("cain-r24-1-a");           // consumed once, by its own request
-    expect(readLog<any>(tapsLogFile(k.cfg)).records.filter((x) => x.tap === kid && x.t === undefined)).toHaveLength(1);
+    // Round 25: a hiccup round holds the tap-derived request (nothing consumed); it is decided once a fetch answers.
+    expect(readConsumed(k.cfg).has(kid)).toBe(false);
     expect(readLog<any>(tapsLogFile(k.cfg)).records.some((x) => x.t === "dropped")).toBe(false);
     expect(keeperState(k).fetchHiccup).toMatchObject({ rounds: 1, cause: "fetch-timeout" });
     expect(keeperStatus(k).fetch_hiccup).toMatchObject({ rounds: 1, why: FETCH_HICCUP_WHY["fetch-timeout"] });
@@ -136,6 +136,7 @@ describe("1. every network call is timed, and a timeout is a hiccup round (invar
     expect(keeperStatus(k).fetch_hiccup).toBeUndefined();
     expect(remoteRequests(k, kid)).toEqual(["cain-r24-1-a"]);
     expect(readConsumed(k.cfg).get(kid)).toBe("cain-r24-1-a");
+    expect(readLog<any>(tapsLogFile(k.cfg)).records.filter((x) => x.tap === kid && x.t === undefined)).toHaveLength(1);
   }, 90_000);
 
   test("past its threshold a run of fetch hiccups is told once, in fixed words; the fetch answering again is told once", () => {
@@ -162,7 +163,8 @@ describe("1. every network call is timed, and a timeout is a hiccup round (invar
     expect(src).toMatch(/const p = netRun\(\["curl"/);
     expect(src).toContain('git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, netTimeout(cfg)); }\n  catch (e) { fetched = false;');
     // Every network git call in the keeper carries the timed wrapper.
-    for (const line of src.split("\n").filter((l) => /git\(cfg, \["(fetch|ls-remote|clone|push)"/.test(l))) expect(line.includes("netTimeout(cfg)") ? "timed" : line.trim()).toBe("timed");
+    // Round 25: the push and its read-back take their limit from the guarded section's deadline (net, { timeoutMs: limit }).
+    for (const line of src.split("\n").filter((l) => /git\(cfg, \["(fetch|ls-remote|clone|push)"/.test(l))) expect(/netTimeout\(cfg\)\)|, net\);|\{ timeoutMs: limit \}\)/.test(line) ? "timed" : line.trim()).toBe("timed");
   }, 20_000);
 });
 
@@ -197,7 +199,8 @@ describe("2. a failing resolver of a push of unknown outcome counts and falls ba
     const k = keeperRig();
     expect(round(k, "cain-r24-2-b0").ok).toBe(true);
     const st = keeperState(k);
-    st.pushUnknown = { at: new Date(k.cfg.now!().getTime()).toISOString(), head: "e".repeat(40), before: null, keys: ["tap-0000003f2422"], why: "the push got no answer within its time limit and was stopped", tries: 1 };
+    // Round 25: keysOk, the key extraction behind the record succeeded (needed for "not landed").
+    st.pushUnknown = { at: new Date(k.cfg.now!().getTime()).toISOString(), head: "e".repeat(40), before: null, keys: ["tap-0000003f2422"], keysOk: true, why: "the push got no answer within its time limit and was stopped", tries: 1 };
     writeFileSync(k.cfg.holds!, JSON.stringify(st));
     cycle(k.cfg);
     expect(keeperStatus(k).push_unknown).toBeUndefined();
@@ -224,10 +227,11 @@ describe("3. a missing consumed-key log is verified absence only when the keeper
     const k = pushedWithTomb("tap-0000003f2432", "cain-r24-3-b");
     expect(pushedTombstoned({ ...k.cfg, tapsLog: join(k.root, "no-such-dir", "x") } as any, null, "x").incomplete).toBeDefined();
   }, 60_000);
-  test("a keeper whose state proves the log never existed (or no state at all, a first start): no tombstones, verified", () => {
+  test("a keeper whose state proves the log never existed: no tombstones, verified (round 25: no state at all needs independent proof)", () => {
     const d = mkdtempSync(join(tmpdir(), "r24-pristine-"));
     const cfg: any = { queue: join(d, "queue"), holds: join(d, "holds.json"), tapsLog: join(d, "taps.jsonl"), dir: join(d, "record"), branch: "main" };
-    expect(pushedTombstoned(cfg, null, "x")).toEqual({ alarms: [] });
+    // Round 25: no state and no copy is no proof of a first start (source-check-round25.test.ts covers the proof).
+    expect(pushedTombstoned(cfg, null, "x").incomplete).toBeDefined();
     writeFileSync(cfg.holds, JSON.stringify({ holds: {}, waiting: [], downtime: [], logHigh: { consumed: 0 } }));
     expect(pushedTombstoned(cfg, null, "x")).toEqual({ alarms: [] });
     writeFileSync(cfg.holds, JSON.stringify({ holds: {}, waiting: [], downtime: [], logHigh: { consumed: 2 } }));
@@ -449,44 +453,9 @@ describe("10. re-bases of a landing watch show as a row (invariants: the consume
   }, 180_000);
 });
 
-const walk = (dir: string): string[] => readdirSync(dir).flatMap((n) => { const p = join(dir, n); return statSync(p).isDirectory() ? walk(p) : p.endsWith(".ts") ? [p] : []; });
-const PRIMS = "appendLog|appendLogHeld|appendInstall|withLogLock|readLog";
-const LOCKERS = "appendLog|appendLogHeld|appendInstall|withLogLock";
-// Round 24's lint: the lock primitives are never re-exported, aliased, taken as a value or called in a generic form the
-// call-site scan wouldn't see.
-function lockLint(src: string): string[] {
-  const hits: string[] = [];
-  const rules: [RegExp, string][] = [
-    [new RegExp(`import\\s*\\{[^}]*\\b(${PRIMS})\\s+as\\s+\\w+`), "aliased import"],
-    [new RegExp(`export\\s*\\{[^}]*\\b(${PRIMS})\\b[^}]*\\}\\s*(from\\b|;|$)`), "re-export"],
-    [/export\s*\*\s*from\s*["'][^"']*applog/, "re-export of the log module"],
-    [/import\s*\*\s*as\s+\w+\s+from\s*["'][^"']*applog/, "namespace import of the log module"],
-    [new RegExp(`(=|:|\\(|,|return)\\s*(${PRIMS})\\s*(;|,|\\)|$)`), "taken as a value"],
-    [new RegExp(`\\[\\s*["'\`](${PRIMS})["'\`]\\s*\\]`), "bracket access"],
-    [new RegExp(`\\b(${LOCKERS})\\s*<[^>(]*>\\s*\\(`), "generic-form call"],
-    // A generic read is fine, but not one that repairs (it takes the lock) out of the call-site scan's sight.
-    [/\breadLog\s*<[^>(]*>\s*\([^)]*repair: (true|"try"|f === [^)]*"try")/, "generic-form repairing read"],
-  ];
-  src.split("\n").forEach((l, i) => {
-    if (/^\s*\/\//.test(l)) return;
-    for (const [re, what] of rules) if (re.test(l) && !(what === "taken as a value" && /^\s*import\s*\{/.test(l))) hits.push(`${what} at line ${i + 1}: ${l.trim().slice(0, 120)}`);
-  });
-  return hits;
-}
-
-describe("11. the lock primitives can't be aliased, and the link's real entry file starts (invariants: every append-only log)", () => {
-  test("the lint catches each banned form", () => {
-    for (const bad of ['import { withLogLock as lock } from "../applog";', 'export { appendLog } from "../applog";', 'export * from "./applog";', 'import * as L from "../applog.ts";',
-      "const f = withLogLock;", 'mod["appendLog"](f, r);', "withLogLock<number>(file, () => 1);", "run(appendLogHeld);", "readLog<any>(f, { repair: true });"]) expect(lockLint(bad).length).toBeGreaterThan(0);
-    for (const ok of ["withLogLock(file, () => 1);", 'import { appendLog, withLogLock } from "../applog.ts";', "appendLog(f, r, { wait: consumedWait() });", "readLog<any>(f, { repair: false })"])
-      expect(lockLint(ok)).toEqual([]);
-  });
-  test("no source file aliases, re-exports or generically calls a lock primitive (the log module defines them)", () => {
-    const files = walk(ROOT).map((p) => p.slice(ROOT.length + 1)).filter((f) => f !== "applog.ts");
-    expect(files.length).toBeGreaterThan(20);
-    const hits = files.flatMap((f) => lockLint(readFileSync(join(ROOT, f), "utf8")).map((h) => `${f}: ${h}`));
-    expect(hits).toEqual([]);
-  });
+// Round 25: the textual lock lint that was here is replaced by the TypeScript-compiler AST check in
+// source-check-round25.test.ts (lockLintAst), which also matches every lock-taking call against the lock-site scan.
+describe("11. the link's real entry file starts (invariants: every append-only log)", () => {
   test("the link's real entry file, launched the way the image does (bun <file>), passes the start gate and listens", async () => {
     const d = mkdtempSync(join(tmpdir(), "r24-link-"));
     mkdirSync(join(d, "work"), { recursive: true });

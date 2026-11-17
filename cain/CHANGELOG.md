@@ -86,11 +86,15 @@
 - A change from your tap that was withdrawn is never pushed after it was withdrawn: when the box can't be sure, it holds its saves to GitHub and keeps trying each minute, and Cain is told. You hear of it only if saving stays stuck over half an hour, as before, and there is nothing for you to do.
 - Saving the record to GitHub is now timed: a push that hangs is stopped (a stalled transfer at once, any push after 75 seconds), the box finds out on its next try whether it landed, and nothing is taken back or asked again until it knows. Cain hears saving goes again only once GitHub really has it.
 - Reading from GitHub is timed the same way, so a GitHub that never answers can't freeze the box: it works on its own copy and tries again a minute later. On a slow connection, pushes that keep running out of time are listed as that, and Cain hears once. Nothing for you to do.
+- While the box can't read GitHub, your taps on questions wait (nothing is recorded from them yet) and count once it reads GitHub again, since your record may have changed there meanwhile. Nothing for you to do.
+- If the box ever loses its list of taps it has acted on, it saves nothing to GitHub until it has rebuilt that list from your record, so a withdrawn answer can't slip through, even if GitHub is slow to answer then.
+- When GitHub stops answering during the App's routine checks, it waits for the next minute instead of trying again and again in the same minute, and saving to GitHub never holds the App's records locked longer than the others wait for them.
+- Fixing a stuck save (the reset Cain can run) is safe if the box restarts in the middle of it: it picks up where it stopped, and nothing is lost or done twice.
 - If a change of the box's clock jumps it forward, questions keep their buttons and your taps still count: how long a question is kept follows Discord's own times.
 - If the box can't lock the App's logs, the App says so in one notice and takes no taps until that is fixed, rather than failing quietly.
 - A question whose earlier answer Cain's record is still acting on, after a restart, waits and says it settles by itself, and is never asked again in the meantime.
 - The App's logs take turns properly even if something dies in the middle of writing one, and long messages with emoji or accents are cut cleanly.
-- One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
+- One known gap, said plainly: if a tap was used while saving to GitHub was failing, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
 
 ## 0.11.0

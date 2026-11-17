@@ -930,7 +930,8 @@ What Cain's link enforces:
   still refuses a card it doesn't know with a line.
 
   The exactly-once limit, plainly. Across a whole-image restore, exactly-once holds only for consumptions
-  that reached the remote. A consumption committed locally while the remote was down, followed by a
+  that reached the remote. A consumption committed locally while the push to the remote was failing
+  (round 25: a round whose fetch fails consumes nothing from a tap), followed by a
   restore of the copy, the ledger and the keeper's state together to an older consistent snapshot, is a
   known gap: a re-tap on a card that survived on Discord can act again. A test pins that behaviour as the
   known gap; closing it would take a new store, which this round doesn't add.
@@ -1334,6 +1335,38 @@ What Cain's link enforces:
   unresolved_landings. A source test bans re-exporting, aliasing or generic-form calls of the lock
   primitives (so the call-site scan can't miss one), and the link's real entry file is launched in a test
   the way the keeper's is.
+
+  Round 25 (the twenty-fifth review's fixes, to defects in round 24's own additions; the design stays
+  frozen, and no new durable store: the keeper state carries the new fields). The table in
+  `cain/docs/source-check-invariants.md` is updated for every row this round touches.
+
+  The consumed-key log's created flag never goes back: it is written to the keeper's state (fsynced)
+  before the log's first append, not at the round's end, and a detected loss of the log no longer clears
+  it. A lost or shortened log is marked "lost, rebuilding" instead, and while that mark stands every push
+  is refused (the alarm check is incomplete), whether the file is there or not, until a rebuild from a
+  fresh fetch has rewritten the log and fsynced it. A missing keeper state counts as a first start only
+  with independent proof: the record's copy is readable and no ref of it carries a tap key.
+
+  A push of unknown outcome is settled as "not landed" by the fallback scan only when the tap keys it may
+  have carried were read without error, the list is not empty, and none of them is on GitHub with its
+  commit absent. A failed read of those keys is its own error, never an empty list, and keeps the outcome
+  unresolved (a try counted, the row kept). In the landing check, the first fetch a drop needs that fails
+  or times out skips the round's remaining drops (cause fetch-failed), so a hung GitHub costs one time
+  limit a round, not one per record.
+
+  The network wrapper has no fallback: without the session tool it runs nothing and answers a fixed
+  reason, and the image build fails without the tool. The guarded push runs under one deadline (guard,
+  push, scan, read-back) below the consumed-key log's 90-second wait, and logs how long it held the lock.
+  In a round whose fetch from GitHub fails, requests that carry a tap key wait in the queue (no intent,
+  nothing consumed) for a round whose fetch answers: the keeper is the only writer the design gives the
+  record, but the repository can also be edited on GitHub, so a row may have moved there.
+
+  `record.sh reset-copy` settles the open intents and writes a tombstone for each consumed record its
+  discarded commits carry (unless the request is still queued and runs again) before the discard, both
+  fsynced, and the request is used up only once the discard is done: a restart in between does it again.
+  The link's trust folder follows CAIN_TRUST_DIR only under /tmp (a test's folder); set to anything else,
+  the link refuses to start with a fixed reason. The lock lint is now a TypeScript-compiler syntax-tree
+  check, and the link's entry file is launched in a test as a non-root user.
 
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
