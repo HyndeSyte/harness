@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- The cases both sides check now cover cards that say a change isn't done or couldn't be verified, a card turned down twice, and the calendar specialist's new tap wording.
+
 - A card from the calendar specialist that the link turns down still says what happened, in a few fixed words both sides check, and the cases they share now come from real differences between how each reads a card.
 
 - The calendar specialist now reads a card the way the link does in full (the same words for buttons, a button named across a line break, every button the link knows), and a card turned down twice still reaches you as a short fixed card with its buttons.

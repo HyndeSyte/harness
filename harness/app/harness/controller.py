@@ -718,10 +718,22 @@ class Controller:
         except Exception:                       # noqa: BLE001: an unreadable clock check counts as a stall
             stalled = True
         late, relist, unsure, unverified, clock_tap = [], [], [], [], False
+        # Twenty-second round: strikes the records hold as pending are finished first (no card: it's queued), and
+        # a tap whose next read the records put off waits for it, at a start as in the running loop.
+        try:
+            flags, rereads = self._flags(self.STRIKE_FLAG), self._flags(self.REREAD_FLAG)
+        except Exception as e:                  # noqa: BLE001: none read: each tap goes by its journal
+            log.warning("the records' tap flags couldn't be read (%s)", type(e).__name__)
+            flags, rereads = {}, {}
+        if flags:
+            self._resume_strikes(flags, skip=queued)
+        now = self._clock()
         for row in self.handovers.journaled():
             p = row["press"]
-            if self.handovers.key(p) in queued:
+            if self.handovers.key(p) in queued or self.handovers.key(p) in flags:
                 continue
+            if row["state"] == "unknown" and not self._due(rereads.get(self.handovers.key(p)), now):
+                continue                        # read again by the running loop once its time comes
             if row["state"] in ("refused", "found"):
                 self._post_pending_notice(row)
                 continue
@@ -996,11 +1008,21 @@ class Controller:
             p, op = row["press"], row.get("op") or {}
             try:
                 hold = self._records_hold(p)
-            except Exception as e:              # noqa: BLE001: a fault in Harness, not a state: kept, on the hold schedule
+            except Exception as e:              # noqa: BLE001: a fault in Harness, not a state of the records
+                # Twenty-second round: counted per tap, consecutive (the journal's "error" reads), on its own
+                # six-read schedule; after that its outcome is a terminal internal error: one card with no Go
+                # ahead saying so (never that the records couldn't be read), and it's struck. Never read hourly.
+                errs = int(row.get("error_checks") or 0)
+                if errs >= len(self.CHECK_BACKOFF_S):
+                    log.error("a tap's hold read kept hitting an error in Harness (%s); its outcome is recorded as "
+                              "an internal error", type(e).__name__)
+                    if not self.handovers.journal_outcome(p, "internal_error"):
+                        log.error("a tap's internal error couldn't be written to the tap journal")
+                    terminal.append(dict(row, state="internal_error"))
+                    continue
                 if row.get("last_seen") != "hold_error":
-                    log.error("a tap's hold read hit an error in Harness (%s); it's kept and read again",
-                              type(e).__name__)
-                self._wait_check(row, "hold_error", int(row.get("hold_checks") or 0), now, waits, "hold")
+                    log.error("a tap's hold read hit an error in Harness (%s); it's read again", type(e).__name__)
+                self._wait_check(row, "hold_error", errs, now, waits, "error")
                 continue
             if hold == "unidentified":
                 # Twenty-first round: permanent. One card saying it couldn't be identified, no Go ahead, struck.
@@ -1054,7 +1076,7 @@ class Controller:
                 # Twenty-first round: recorded as unverified, then finished on the one per-tap path (its card and
                 # its strike in one transaction), never relisted with the others.
                 if not self.handovers.journal_outcome(row["press"], "unverified"):
-                    log.error("an unverified tap's outcome couldn't be written to the tap journal")
+                    self._defer_reread(row)     # twenty-second round: never read again at every tick
                 terminal.append(dict(row, state="unverified"))
         final = [x for x in final if x[1] != "records_unread"]
         if final:
@@ -1070,7 +1092,7 @@ class Controller:
             for row, seen, at, _n, _kind in waits:
                 why = {"settling": "Harness's records are still carrying it out",
                        "hold_unread": "Harness's records couldn't be read just now",
-                       "hold_error": "Harness's records couldn't be read just now"}.get(
+                       "hold_error": "an error in Harness got in the way just now"}.get(
                            seen, "your calendar couldn't be read just now")
                 if at is None:
                     next_read = "when Harness next starts"
@@ -1100,7 +1122,7 @@ class Controller:
             log.warning("a tap waits: %s; it's read again in %d minutes, and every hour once its schedule is used up",
                         {"settling": "Harness's records are still carrying it out",
                          "hold_unread": "Harness's records couldn't be read",
-                         "hold_error": "an error in Harness on reading its records"}.get(
+                         "hold_error": "an error in Harness on checking it"}.get(
                              seen, "the calendar couldn't be read"),
                         delay // 60)
         if not row.get("told_check"):
@@ -1155,73 +1177,186 @@ class Controller:
         try:
             queued = self.handovers.queued_keys()
             rows = [r for r in self.handovers.journaled() if self.handovers.key(r["press"]) not in queued]
+            # Twenty-second round: a tap with a strike pending in the records has its card; it's only struck.
+            flags = self._flags(self.STRIKE_FLAG)
+            rereads = self._flags(self.REREAD_FLAG)
+            rows = [r for r in rows if self.handovers.key(r["press"]) not in flags]
             due = [r for r in rows
-                   if r["state"] == "unknown" and r.get("next_check") is not None and r["next_check"] <= now]
+                   if r["state"] == "unknown" and r.get("next_check") is not None and r["next_check"] <= now
+                   and self._due(rereads.get(self.handovers.key(r["press"])), now)]
             # Twentieth round: one left recorded as unverified (its card or strike didn't happen) is finished too.
             # Twenty-first round: and one recorded as unidentified; each at most on its strike's back-off.
             unverified = [r for r in rows if r["state"] in self.TAP_TERMINAL]
         except Exception as e:                  # noqa: BLE001: a journal that can't be read now is read next tick
             log.warning("the tap journal couldn't be read for unknown taps (%s)", type(e).__name__)
             return
+        if flags:
+            self._resume_strikes(flags, skip=queued)
         if unverified:
             self._finish_terminal(unverified)
         if due:
             self._settle_unknown(due)
 
     # Twenty-first round: the terminal states a tap's journal can hold that are finished on one per-tap path.
-    TAP_TERMINAL = ("unverified", "unidentified")
+    # Twenty-second round: and "internal_error" (its hold read kept raising an error in Harness itself).
+    TAP_TERMINAL = ("unverified", "unidentified", "internal_error")
     STRIKE_BACKOFF_S = (60, 120, 300, 900, 1800, 3600)
+    STRIKE_FLAG = "tap_strike:"                 # twenty-second round: a strike pending, in the records
+    REREAD_FLAG = "tap_reread:"                 # twenty-second round: an unverified outcome not journaled
+
+    def _backoff(self, fails: int) -> int:
+        return self.STRIKE_BACKOFF_S[min(max(fails, 1), len(self.STRIKE_BACKOFF_S)) - 1]
+
+    def _flags(self, prefix: str) -> dict:
+        """Twenty-second round: the records' per-tap flags under `prefix`, by tap key, each a dict (a value that
+        can't be read is {}: due now)."""
+        out = {}
+        for r in self.ledger.db.execute("SELECT key, value FROM meta WHERE substr(key, 1, ?)=?",
+                                        (len(prefix), prefix)).fetchall():
+            try:
+                v = json.loads(r["value"])
+            except (TypeError, ValueError):
+                v = {}
+            out[r["key"][len(prefix):]] = v if isinstance(v, dict) else {}
+        return out
+
+    @staticmethod
+    def _due(flag: dict | None, now: float) -> bool:
+        try:
+            return flag is None or now >= float(flag.get("due") or 0)
+        except (TypeError, ValueError):
+            return True
+
+    def _defer_reread(self, row: dict) -> None:
+        """Twenty-second round: an unverified outcome that couldn't be journaled leaves the tap unknown with its
+        next read past. So its next read is put off in the records instead, on STRIKE_BACKOFF_S (1, 2, 5, 15, 30
+        and 60 minutes), and a start respects it too: the calendars aren't read for it at every tick."""
+        key = self.handovers.key(row["press"])
+        try:
+            old = self._flags(self.REREAD_FLAG + key).get("", {})
+            fails = int(old.get("fails") or 0) + 1
+            delay = self._backoff(fails)
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(self.REREAD_FLAG + key, json.dumps({"fails": fails, "due": self._clock() + delay}),
+                                     db)
+            log.error("a tap's unverified outcome couldn't be written to the tap journal; it's read again in %d "
+                      "minutes", delay // 60)
+        except Exception as e:                  # noqa: BLE001: the records too: read at its next schedule
+            log.error("a tap's next read couldn't be put off in the records either (%s)", type(e).__name__)
 
     def _finish_terminal(self, rows: list[dict]) -> None:
-        """Twentieth round: taps whose outcome is recorded as unverified (an approval used up, the calendar never
-        readable) but that weren't struck, finished: never aged or taken again, the card ("couldn't read your
-        calendar to tell how far it got", no Go ahead) goes, and each is struck.
+        """Twentieth round: taps whose outcome is terminal (an approval used up and the calendar never readable;
+        twenty-first round: or a press that can't be identified) but that weren't struck, finished: never aged or
+        taken again, their card (no Go ahead) goes, and each is struck.
 
-        Twenty-first round, one tap at a time (_finish_one): its card and its strike in one transaction, so a strike
-        that can't be written rolls back its card, and a "card queued" mark in the records, written with the card
-        and checked before it, so no tap ever gets a second card. A failing strike is tried again on
-        STRIKE_BACKOFF_S, not every tick; one tap's failure never holds back the others. Also unidentified taps
-        (a press whose id can't be read): one card saying it couldn't be identified, no Go ahead, struck."""
+        Twenty-second round, the records first: the card, its "card queued" mark and a "strike pending" flag are
+        committed in one ledger transaction (_queue_terminal), and only then is the tap struck from the journal (a
+        rename), as an idempotent cleanup (_strike). A crash between any two steps leaves the flag, and every tick
+        and every start strikes what it finds flagged, with no second card (the mark). A strike that can't be
+        written is retried on STRIKE_BACKOFF_S, its next try persisted in the flag, so a restart respects it. The
+        card is never rolled back: once the outcome is terminal it's true. One tap's failure never holds back the
+        others."""
         now = self._clock()
-        backoff = self.__dict__.setdefault("_strike_retry", {})
+        try:
+            flags = self._flags(self.STRIKE_FLAG)
+        except Exception as e:                  # noqa: BLE001: no flags read: each is finished as it stands
+            log.warning("the records' strike flags couldn't be read (%s)", type(e).__name__)
+            flags = {}
+        backoff = self.__dict__.setdefault("_queue_retry", {})
         for row in rows:
             key = self.handovers.key(row["press"])
+            if key in flags:
+                if self._due(flags[key], now):
+                    self._strike(key, row["press"], flags[key])
+                continue
             fails, due = backoff.get(key, (0, 0.0))
             if now < due:
                 continue
             try:
-                self._finish_one(row)
-            except Exception as e:              # noqa: BLE001: this tap is tried again later; the others go on
+                flag = self._queue_terminal(row)
+            except Exception as e:              # noqa: BLE001: the records couldn't take it now: tried again later
                 fails += 1
-                delay = self.STRIKE_BACKOFF_S[min(fails, len(self.STRIKE_BACKOFF_S)) - 1]
-                backoff[key] = (fails, now + delay)
-                log.error("a finished tap couldn't be struck from the tap journal (%s); nothing was queued for it, "
-                          "and it's tried again in %d minutes", type(e).__name__, delay // 60)
-            else:
-                backoff.pop(key, None)
+                backoff[key] = (fails, now + self._backoff(fails))
+                log.error("a finished tap's card couldn't be queued (%s); it's tried again in %d minutes",
+                          type(e).__name__, self._backoff(fails) // 60)
+                continue
+            backoff.pop(key, None)
+            self._strike(key, row["press"], flag)
 
-    def _finish_one(self, row: dict) -> None:
-        """One terminal tap's card and strike, in one ledger transaction: the card is queued (deduplicated by the
-        tap in the outbox) with its "card queued" mark only if the mark isn't there yet, then the tap is struck
-        strictly; a strike that can't be written raises, and the transaction rolls back the card and the mark."""
+    TERMINAL_WORDS = {
+        # Twenty-second round: its own lead. A press whose id can't be read was never matched to a request.
+        "unidentified": ("Harness couldn't tell which request this tap was for; nothing was changed. It couldn't "
+                         "identify this tap in its records, so nothing more is done for it from here."),
+        # Twenty-second round: an error in Harness itself, said as that, never as records that can't be read.
+        "internal_error": ("Harness hit an internal error while working out what came of it, so it can't tell how "
+                           "far it got. It isn't taken again from here, and nothing more is done for it."),
+    }
+
+    def _queue_terminal(self, row: dict) -> dict:
+        """Twenty-second round: one terminal tap's card, its "card queued" mark and its "strike pending" flag, in
+        one ledger transaction; the card only if the mark isn't there yet. Returns the flag as it stands."""
         key = self.handovers.key(row["press"])
         mark = f"tap_card_queued:{key}"
         state = row.get("state")
-        if state == "unidentified":
-            words = ("Harness stopped or hit an error before it noted what came of it, and it couldn't identify this "
-                     "tap in its records, so it isn't taken again from here and nothing more is done for it.")
-        else:
-            words = ("Harness stopped or hit an error before it noted what came of it, so it was read on your "
-                     "calendar first and not taken again by itself. "
-                     + self._relist_words("unknown", "records_unread", [], restored=False))
+        words = self.TERMINAL_WORDS.get(state) or (
+            "Harness stopped or hit an error before it noted what came of it, so it was read on your calendar first "
+            "and not taken again by itself. " + self._relist_words("unknown", "records_unread", [], restored=False))
+        flag = {"press": dict(row["press"]), "fails": 0, "due": 0.0}
         with self.ledger.tx() as db:
             if db.execute("SELECT 1 FROM meta WHERE key=?", (mark,)).fetchone() is None:
                 self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
-                                    text=render.fit(f"{self._tap_head(row)} {words}"), once=f"tap:{key}",
-                                    outcome="unverified")
+                                    text=render.fit(f"{self._tap_head(row)} {words}"),
+                                    once=Ledger.once_key(key, "outcome", str(state)), outcome="unverified")
                 self.ledger.set_meta(mark, "1", db)
                 self.ledger.event("tap_finished", {"state": state}, db=db)
-            self.handovers.journal_done(row["press"], strict=True)
+            had = db.execute("SELECT value FROM meta WHERE key=?", (self.STRIKE_FLAG + key,)).fetchone()
+            if had is None:
+                self.ledger.set_meta(self.STRIKE_FLAG + key, json.dumps(flag), db)
+            else:
+                try:
+                    flag = dict(json.loads(had[0]))
+                except (TypeError, ValueError):
+                    pass
+        return flag
+
+    def _strike(self, key: str, press: dict, flag: dict) -> bool:
+        """Twenty-second round: a flagged tap struck from the journal (striking one already gone does nothing),
+        then its flag cleared. A strike that can't be written leaves the flag with its next try on
+        STRIKE_BACKOFF_S."""
+        now = self._clock()
+        try:
+            self.handovers.journal_done(press, strict=True)
+        except Exception as e:                  # noqa: BLE001: kept flagged; tried again on the back-off
+            fails = int((flag or {}).get("fails") or 0) + 1
+            delay = self._backoff(fails)
+            try:
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(self.STRIKE_FLAG + key, json.dumps(
+                        {"press": dict(press), "fails": fails, "due": now + delay}), db)
+            except Exception as e2:             # noqa: BLE001: tried again at the next tick instead
+                log.error("a strike's next try couldn't be written to the records (%s)", type(e2).__name__)
+            log.error("a finished tap couldn't be struck from the tap journal (%s); its card is queued once, and "
+                      "the strike is tried again in %d minutes", type(e).__name__, delay // 60)
+            return False
+        try:
+            with self.ledger.tx() as db:
+                db.execute("DELETE FROM meta WHERE key IN (?, ?)", (self.STRIKE_FLAG + key, self.REREAD_FLAG + key))
+        except Exception as e:                  # noqa: BLE001: the next tick finds the flag, strikes nothing, clears it
+            log.warning("a strike's flag couldn't be cleared (%s); it's cleared at the next tick", type(e).__name__)
+        return True
+
+    def _resume_strikes(self, flags: dict, skip=()) -> None:
+        """Twenty-second round: every strike the records hold as pending and due, at each tick and at a start,
+        whether or not its journal row still reads as terminal: no card, only the strike."""
+        now = self._clock()
+        for key, flag in flags.items():
+            if key in skip or not self._due(flag, now):
+                continue
+            press = flag.get("press")
+            if not isinstance(press, dict) or not press:
+                log.error("a pending strike's tap couldn't be read from the records")
+                continue
+            self._strike(key, press, flag)
 
     def _tap_head(self, row: dict) -> str:
         try:
@@ -1237,7 +1372,8 @@ class Controller:
                        "found": "already on your calendar",
                        # Twenty-first round: every state a journal row can hold has words here, so no list raises.
                        "unverified": "Harness couldn't read your calendar to tell how far it got",
-                       "unidentified": "Harness couldn't identify it in its records",
+                       "unidentified": "Harness couldn't tell which request it was for",
+                       "internal_error": "Harness hit an internal error on it",
                        "refused": "not taken"}
     # Eighteenth round: what an Undo already read as done leaves, in his words.
     UNDO_FOUND = {"gone": "already undone on your calendar: the event is gone",
@@ -1379,6 +1515,9 @@ class Controller:
                   "not_done": "not done on your calendar", "unread": "couldn't be read just now",
                   "unchecked": "can't be read on your calendar"}
 
+    # Twenty-second round: a part with no reason recorded and no read (tests/imperative_cases.json "said").
+    CANT_TELL_PART = "For {names}, Harness can't tell how far {how} got; nothing more is done for {what} from here."
+
     @classmethod
     def _failed_words(cls, seen: str, extra: dict) -> str:
         """Nineteenth round: a change whose job ended with parts not done: each part not done by name, which of them
@@ -1397,12 +1536,14 @@ class Controller:
                        + " again on a new card for your approval, reading your calendar for "
                        + ("it" if len(retry) == 1 else "each") + " first so nothing is made twice.")
         why = {int(k): v for k, v in (extra.get("why") or {}).items()}
-        groups = {"maybe_sent": [], "no_identity": [], "unread": [], "checked_not_done": []}
+        groups = {"maybe_sent": [], "no_identity": [], "unread": [], "checked_not_done": [], "unknown": []}
         for i in ask:
             # Twenty-first round: a part with no reason recorded is sorted by its own read, never by default as
             # "may have been sent".
-            w = why.get(i) or cls._why_not_again(got[i] if i < len(got) else "")
-            groups.get(w, groups["maybe_sent"]).append(i)
+            # Twenty-second round: with no reason recorded and no read either, it's "can't tell", never "may have
+            # been sent".
+            w = why.get(i) or (cls._why_not_again(got[i]) if i < len(got) and got[i] else "unknown")
+            groups.get(w, groups["unknown"]).append(i)
 
         def they(idx, one, many):
             return one if len(idx) == 1 else many
@@ -1421,6 +1562,10 @@ class Controller:
             out.append("For " + ", ".join(name(i) for i in g) + ", your calendar couldn't be read just now, so "
                        "Harness can't tell how far " + they(g, "it", "they") + " got; nothing more is done for "
                        + they(g, "it", "them") + " from here.")
+        if groups["unknown"]:
+            g = groups["unknown"]
+            out.append(cls.CANT_TELL_PART.format(names=", ".join(name(i) for i in g), how=they(g, "it", "they"),
+                                                 what=they(g, "it", "them")))
         if groups["checked_not_done"]:
             g = groups["checked_not_done"]
             out.append("For " + ", ".join(name(i) for i in g) + ", checked: not done; " + they(g, "it", "they")

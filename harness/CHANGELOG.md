@@ -2,6 +2,11 @@
 
 ## 0.24.0
 
+- **A tap Harness couldn't finish always gets its card.** The card is saved first and the tap crossed off after, so a stop in between never leaves a tap gone with nothing said. A note that can't be crossed off waits its turn, even across a restart.
+- **An error inside Harness on a tap ends after a few tries** with one card saying so, instead of being read every hour. It never says your records couldn't be read when that isn't what happened.
+- **A tap Harness can't match to a request says just that**, and that nothing was changed. A part Harness can't tell anything about says it can't tell, never that it may have reached your calendar.
+- Harness no longer reads your calendars over and over when it can't note a tap's outcome, and a second card about the same tap (such as a retry card) is never dropped as a repeat.
+
 - **A tap Harness couldn't finish gets its card once, never again and again.** If its note can't be crossed off, the card waits with it and Harness tries again later, after a few minutes and then hourly. Any number of such taps all get their own card.
 - **The records and your calendar each get their own tries.** If Harness's records couldn't be read for a while, your calendar still gets its full six reads once they can.
 - **A tap Harness can't identify says so once**, with no Go ahead, instead of being read again every hour.

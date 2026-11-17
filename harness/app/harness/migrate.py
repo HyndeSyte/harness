@@ -2032,16 +2032,26 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
             accepted = set(progress.get("accepted") or [])
             lost = [n for n in progress.get("lost") or [] if n not in accepted]
             settled.extend(sorted(accepted))       # twenty-first round: a loss he accepted no longer stops a run
+            unverified_now: list[str] = []
             for name, rec in progress["files"].items():
                 if name in movable or os.path.lexists(os.path.join(folder, name)) or name in accepted:
                     continue
-                d = rec.get("digest")
+                d = rec.get("digest") if isinstance(rec, dict) else None
                 copy = os.path.join(dest, name)
-                if not d or not os.path.isfile(copy) or _sha256(copy) != d:
+                if not isinstance(d, str) or not d:
+                    # Twenty-second round: the digest rule on every loaded record, readable or rebuilt: a null or
+                    # missing digest is unverified, never trusted, and named in the answer.
+                    unverified_now.append(name)
+                    lost.append(name)
+                    continue
+                if not os.path.isfile(copy) or _sha256(copy) != d:
                     lost.append(name)
                     continue
                 settled.append(name)
             if lost:
+                if unverified_now:
+                    progress = dict(progress, unverified=sorted(set(progress.get("unverified") or [])
+                                                                | set(unverified_now)))
                 return _set_aside_lost(base, progress, sorted(set(lost)), progress_path)
         named = [str(n) for n in plan.get("conflict") or []]
         refusals = [f"{n}: {_protected_why(base, n)}" for n in named if n not in movable and n not in settled and

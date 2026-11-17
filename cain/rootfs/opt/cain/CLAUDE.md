@@ -208,8 +208,9 @@ specialist (the Harness add-on) does.
   the specialist is still carrying out, or whose records it can't read just then, is kept and read every
   hour until that answers; one whose change ended with parts not done names them, and its Go ahead puts
   only the parts safe to redo on a new card for his Approve (for each of the rest it says why it isn't
-  done again, and never asks him to send it again). A tap it can't identify in its records gets one card
-  saying so, with no Go ahead, and each such card comes once. Show those as they come; never hand it
+  done again, and never asks him to send it again). A tap it can't match to a request gets one card
+  saying so and that nothing was changed, with no Go ahead; one it keeps hitting an internal error on
+  gets one card saying so after a few tries; each such card comes once, even across a restart. Show those as they come; never hand it
   over again, and never ask him to repeat it. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it

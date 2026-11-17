@@ -82,7 +82,8 @@ def test_a_strike_that_cant_be_written_never_repeats_the_card_and_is_retried_on_
     for _ in range(200):                                                       # ten minutes of ticks
         later(m, clock, 3)
     assert states(m) == ["unverified"]                                         # kept
-    assert how_far(m, before) == [] and queued_how_far(m) == []                # rolled back with the strike
+    # Twenty-second round: the card is committed before the strike and never rolled back with it: it goes once.
+    assert len(how_far(m, before)) == 1 and len(queued_how_far(m)) == 1
     assert fails.calls <= 5                                                    # backed off, not every tick
     fails.on = False                                                           # the journal can be written again
     for _ in range(1300):                                                      # past the longest back-off
@@ -163,7 +164,7 @@ def test_one_taps_failing_strike_never_rolls_back_the_others(m, monkeypatch, clo
     later(m, clock, 3)
     left = m.c.handovers.journaled()
     assert [m.c.handovers.key(r["press"]) for r in left] == [stuck]            # only its own row stays
-    assert len(how_far(m, before)) == 10
+    assert len(how_far(m, before)) == 11                                       # twenty-second round: its card too
     monkeypatch.setattr(m.c.handovers, "journal_done", real)
     for _ in range(40):
         later(m, clock, 3)

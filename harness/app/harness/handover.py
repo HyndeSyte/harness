@@ -369,7 +369,9 @@ class Inbox:
         next one is (seconds since the epoch, on the records' clock), and whether he's been told it waits.
         Twenty-first round: `kind`, whose schedule the read counts on: "hold" (the records couldn't be read, or are
         still carrying it out), "calendar" (the calendar couldn't be read), or "first" (the tap's first read,
-        counted on both); and `seen`, what that read found, so the log says a state only when it changes."""
+        counted on both); twenty-second round: "error" (an error in Harness itself on its hold read, on a
+        counter of its own that any other read starts again); and `seen`, what that read found, so the log says a
+        state only when it changes."""
         if not self.journal or not press:
             return False
         return self._append({"check": self.key(press), "n": int(n), "next": float(next_at), "told": bool(told),
@@ -438,7 +440,7 @@ class Inbox:
                 taps.setdefault(k, {"press": {a: str(b) for a, b in r["press"].items()}, "at": r.get("at"),
                                     "intent": False, "op": {}, "committed": False, "outcome": "", "note": "",
                                     "delivered": False, "checks": 0, "next_check": None, "told_check": False,
-                                    "hold_checks": 0, "last_kind": "", "last_seen": ""})
+                                    "hold_checks": 0, "last_kind": "", "last_seen": "", "error_checks": 0})
                 continue
             k = _row_key(r, self.key)
             t = taps.get(k)
@@ -469,6 +471,9 @@ class Inbox:
                     t["hold_checks"] = n
                 if kind in ("calendar", "first"):
                     t["checks"] = n
+                # Twenty-second round: consecutive reads that hit an error in Harness itself, on their own counter;
+                # any other read starts it again.
+                t["error_checks"] = n if kind == "error" else 0
                 t["next_check"], t["last_kind"], t["last_seen"] = nxt, kind, str(r.get("seen") or "")
                 t["told_check"] = t["told_check"] or bool(r.get("told"))
         for t in taps.values():
