@@ -1104,7 +1104,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     const calls = [...main.matchAll(/\b(tell|waited)\(cfg, ([^;]*?)\);/g)].map((m) => m[2]).filter((a) => !a.startsWith("code, key"));
     expect(calls.length).toBeGreaterThanOrEqual(8);
     for (const a of calls) {
-      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"queue_unreachable_again"|^"worker_not_starting"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
+      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"queue_unreachable_again"|^"worker_not_starting"|^"worker_not_starting_unconfirmed"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
       if (tapNotice) expect(a).toMatch(/, whatOf\(cfg, (l|t)\)$/);
     }
     const w = world();
@@ -1740,8 +1740,8 @@ describe("0.12.2 review: a short job's worker-not-starting notice, held through 
     // Seen clear for good once the worker is heard from after it.
     for (let i = 0; i < 3; i++) run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, 30)), [short("failed")], at(created, 31)); });
     expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
-    // Closed as expired without ever being claimed, the worker never heard from in its life: told again.
-    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -60)), [short("failed")], at(created, 20)); });
+    // Closed as expired without ever being claimed, the worker last heard from longer ago than its check-in interval: told again.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -7 * 60)), [short("failed")], at(created, 20)); });
     expect(sent).toEqual(["worker_not_starting", "worker_not_starting"]);
     // A job that was claimed and failed, a heartbeat heard within the job's life, or an expiry long past: not this notice.
     resetNoticeProcess();
@@ -1754,6 +1754,57 @@ describe("0.12.2 review: a short job's worker-not-starting notice, held through 
     run(() => { noticeRound(); k.workerQuietNotice(cfg2, null, [short("failed")], at(created, 15 + 7 * 60)); });
     expect(sent2).toEqual([]);
   });
+
+  test("third pass: a job shorter than the check-in interval raises nothing while a fresh heartbeat exists", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const created = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const short = (state: string) => ({ state, attempt: null, created: created.toISOString(), expires: at(created, 15).toISOString() }) as any;
+    // Heard from an hour before the job: fresh, though older than the job's life. Waited out, then closed unclaimed: nothing.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -60)), [short("pending")], at(created, 15)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -60)), [short("failed")], at(created, 20)); });
+    expect(sent).toEqual([]);
+    // Heard from more than the interval before: told.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -(6 * 60 + 3))), [short("failed")], at(created, 20)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+  });
+
+  test("third pass: through a flapping queue the hold is capped, then told once as unconfirmed; never before the cap", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const start = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const job = { state: "pending", attempt: null, created: at(start, -1).toISOString(), expires: at(start, 48 * 60).toISOString() } as any;
+    const h = beatAt(at(start, -1));
+    // The outage raises queue-unreachable; then the queue flaps, one good fetch between failures, which keeps that notice
+    // standing and so the worker check held. Rounds are a minute apart, as the keeper runs them.
+    let i = 0;
+    const round = (ok: boolean) => { run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [job], at(start, i)); k.queueFetch(cfg, ok); }); i++; };
+    for (; i < k.FETCH_FAIL_ROUNDS + 1;) round(false);
+    expect(sent).toEqual(["queue_unreachable"]);
+    const heldAt = Date.parse(JSON.parse(readFileSync(f, "utf8")).quietHeld);
+    expect(heldAt).toBe(at(start, 1).getTime());                                  // the first round after the first failed fetch
+    while (at(start, i).getTime() - heldAt < k.QUIET_HOLD_MAX_MS) round(i % 2 === 0);
+    expect(sent).toEqual(["queue_unreachable"]);
+    expect(JSON.parse(readFileSync(f, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    round(false);
+    expect(sent).toEqual(["queue_unreachable", "worker_not_starting_unconfirmed"]);
+    for (let n = 0; n < 20; n++) round(n % 2 === 0);
+    expect(sent).toEqual(["queue_unreachable", "worker_not_starting_unconfirmed"]);
+    // The queue back for good: the hold's start is forgotten at the first round judged normally, and the told mark stands.
+    for (let n = 0; n < k.QUEUE_CLEAR_FETCHES + 1; n++) round(true);
+    const t = JSON.parse(readFileSync(f, "utf8"));
+    expect(t.quietHeld).toBeUndefined();
+    expect(t.told[k.WORKER_QUIET_KEY]).toMatchObject({ code: "worker_not_starting_unconfirmed", posted: true });
+    expect(sent).toEqual(["queue_unreachable", "worker_not_starting_unconfirmed"]);
+    expect(PC_NOTICES.worker_not_starting_unconfirmed).toMatch(/isn't confirmed/);
+  }, 60_000);
 
   test("a 6 hour queue outage with a pending job and an aging heartbeat raises only queue-unreachable, never worker-not-starting", () => {
     resetNoticeProcess();

@@ -25,7 +25,7 @@ import {
   manifestCheck, normalPath, checkHost, signAllowlistFile, ownerKeygen, PROFILE_BOUND, LAST_RUN_KEYS, readsAsRecorded,
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
-  browserPreflight, hostChain, extensionPrefs, quietForeign, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -819,7 +819,7 @@ function queueRig(o: { attributes?: string | false; confirmed?: boolean } = {}) 
   const listing = () => { const d = dedicated(); return `${d.pid}|${d.ppid}|${new Date(d.created).toISOString()}|131.0.6778.86|${d.cmd}\r\n`; };
   const opts = (over: Partial<Opts> = {}): Opts => ({ home, now: () => now, mono: () => monoNow, sleep: () => {}, skew: () => null, chromeDirs: [],
     acl: GOOD_ACL, files, launch, registry: () => [{ view: "HKCU", path: manifest }], pidAlive: () => true, procStart: () => null, cliVersion: () => "2.1.0", cliHash: () => "c".repeat(64), managed: [], managedDirs: [],
-    policyKeys: () => [], env: TEST_ENV, procs: () => [dedicated()], exeVersion: () => null, chromePs: listing, envRegistry: () => [], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
+    policyKeys: () => [], forcelist: () => ({ entries: [], unreadable: [] }), env: TEST_ENV, procs: () => [dedicated()], exeVersion: () => null, chromePs: listing, envRegistry: () => [], killPid: () => {}, browserDefaults: {}, selfTest: async () => null,
     shortPath: (p: string) => p, processCheck: async () => PROCESS_OK, hookTiming: async () => TIMING_OK, payloadReplay: () => REPLAY_OK, resolveHosts: false, jobHelper: "C:\\pcw\\pcw-jobrun.exe",
     readback: (o: Opts) => ({ applies: (o.platform ?? process.platform) === "win32", outer_job: false, readback: true, passed: true }), holders: () => [],
     ask: async (m: string) => { asked.push(m); chromeProc = { pid: chromeProc.pid + 1, created: chromeProc.created + 60_000 }; }, ...over });
@@ -1906,7 +1906,7 @@ describe("hangs, locks and clocks", () => {
     for (const name of ["spendNonce", "nonces/", "confirmGate", "go_token)", "confirm.ts\""]) expect(src).not.toContain(name);
     // The command line's commands, every one of them.
     const cli = src.slice(src.indexOf("if (isMain"));
-    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "check-cli", "clean-probe", "owner-keygen", "owner-fpr", "sign-allowlist"]);
+    expect([...cli.matchAll(/cmd === "([a-z-]+)"/g)].map((m) => m[1])).toEqual(["run", "probe", "bind-profile", "confirm-profile", "check-host", "dump-extensions", "check-cli", "clean-probe", "owner-keygen", "owner-fpr", "sign-allowlist"]);
     // Only confirm.ts holds the nonce spend, and it imports from the worker, not the other way round.
     expect(readFileSync(join(OPT, "pcjobs/confirm.ts"), "utf8")).toContain("export function spendNonce");
   });
@@ -3408,7 +3408,7 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
 
   test("any other enabled extension in the dedicated profile fails the preflight (extra_extension); disabled and Chrome's own component ones don't; the confirmation lists them", async () => {
     const { q, id } = oneJob();
-    const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", COMPONENT = "cccccccccccccccccccccccccccccccc";
+    const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", COMPONENT = "mhjfbmdgcfjbbpaeojofohoefgiehjai";   // the PDF viewer, a built-in id
     const secure = (others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
       JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, ...others } } }));
     // Enabled, in Preferences only: read from the same source.
@@ -3430,8 +3430,8 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     // What check-host and confirm-profile print: every extension found, with whether it is on and its raw fields.
     secure({ [OTHER]: { state: 1, disable_reasons: [1], manifest: { name: "Helper" } } });
     expect(checkHost(q.opts()).extensions).toEqual([
-      { id: EXT, name: null, enabled: true, component: false, kind: "claude", status: "on", location: null, state: 1, disable_reasons: null },
-      { id: OTHER, name: "Helper", enabled: false, component: false, kind: "foreign", status: "present, off", location: null, state: 1, disable_reasons: [1] },
+      { id: EXT, name: null, enabled: true, component: false, kind: "claude", status: "on", location: null, state: 1, disable_reasons: null, path_kind: "profile", policy: [] },
+      { id: OTHER, name: "Helper", enabled: false, component: false, kind: "foreign", status: "present, off", location: null, state: 1, disable_reasons: [1], path_kind: "absent", policy: [] },
     ]);
   });
 
@@ -3615,40 +3615,48 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     // A field only one file holds isn't a disagreement; a field both hold that isn't state or version is read from Secure Preferences.
     both({ [EXT]: { path: mine.path } }, { [EXT]: { state: 1 } });
     expect(extensionPrefs(q.inst).disagree).toEqual([]);
-    both({ [EXT]: mine, [OTHER]: { location: 5, state: 1 } }, { [EXT]: mine, [OTHER]: { location: 1, state: 1 } });
+    const PAY = "nmmhkkegccagdldgiimedpiccmgmieda";
+    both({ [EXT]: mine, [PAY]: { location: 5, state: 1 } }, { [EXT]: mine, [PAY]: { location: 1, state: 1 } });
     expect(extensionPrefs(q.inst)).toMatchObject({ disagree: [], others: [] });
-    expect(extensionPrefs(q.inst).extensions.find((x) => x.id === OTHER)).toMatchObject({ location: 5, component: true });
+    expect(extensionPrefs(q.inst).extensions.find((x) => x.id === PAY)).toMatchObject({ location: 5, component: true });
   });
 
-  test("only Chrome's internal locations (5, 10) are exempt; policy and external installs count while on; any disable reason, or a state other than 1, is off; raw fields printed", async () => {
+  test("built-in ids at Chrome's internal locations (5, 10) are Chrome's; policy locations count whatever their state; any disable reason, or a state other than 1, is off; raw fields printed", async () => {
     const { q } = oneJob();
-    const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const with_ = (e: object) => { writeFileSync(join(q.udd, "Default", "Secure Preferences"),
-      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, [OTHER]: e } } })); return extensionPrefs(q.inst).others; };
-    expect(with_({ location: 5, state: 1 })).toEqual([]);                     // component
-    expect(with_({ location: 10, state: 1 })).toEqual([]);                    // external component (0.12.2)
-    for (const location of [1, 2, 3, 4, 6, 7, 8, 9]) expect([location, with_({ location, state: 1 })]).toEqual([location, [OTHER]]);
-    // 0.12.2, second pass: on only as Chrome would run it. Any disable reason (the user's, a permissions increase, policy,
-    // corruption) or a state other than 1 is off; no reason (missing, 0 or an empty list) with state 1 or no state is on.
-    expect(with_({ location: 1, disable_reasons: [1] })).toEqual([]);
-    expect(with_({ location: 1, disable_reasons: 1 | 2 })).toEqual([]);
-    expect(with_({ location: 1, disable_reasons: [2] })).toEqual([]);
-    expect(with_({ location: 9, disable_reasons: 1024 })).toEqual([]);
-    expect(with_({ location: 1, state: 0 })).toEqual([]);
-    expect(with_({ location: 1, state: 1, disable_reasons: [] })).toEqual([OTHER]);
-    expect(with_({ location: 1, state: 1, disable_reasons: 0 })).toEqual([OTHER]);
-    expect(with_({ location: 1, disable_reasons: "x" })).toEqual([OTHER]);             // unreadable reasons: fail closed, on
+    const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PAY = "nmmhkkegccagdldgiimedpiccmgmieda";
+    const with_ = (id: string, e: object) => { writeFileSync(join(q.udd, "Default", "Secure Preferences"),
+      JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, [id]: e } } })); return extensionPrefs(q.inst).others; };
+    expect(with_(PAY, { location: 5, state: 1 })).toEqual([]);                     // component, no path
+    expect(with_(PAY, { location: 10, state: 1 })).toEqual([]);                    // external component, no path
+    // 0.12.2, third pass: an id not on the built-in list at an internal location is foreign.
+    expect(with_(OTHER, { location: 5, state: 1 })).toEqual([OTHER]);
+    expect(with_(OTHER, { location: 10, state: 1 })).toEqual([OTHER]);
+    for (const location of [1, 2, 3, 4, 6, 7, 8, 9]) expect([location, with_(OTHER, { location, state: 1 })]).toEqual([location, [OTHER]]);
+    // On only as Chrome would run it. Any disable reason or a state other than 1 is off; no reason (missing, 0 or an
+    // empty list) with state 1 or no state is on. A policy location counts whatever its reasons.
+    expect(with_(OTHER, { location: 1, disable_reasons: [1] })).toEqual([]);
+    expect(with_(OTHER, { location: 1, disable_reasons: 1 | 2 })).toEqual([]);
+    expect(with_(OTHER, { location: 1, disable_reasons: [2] })).toEqual([]);
+    expect(with_(OTHER, { location: 6, disable_reasons: [8192] })).toEqual([]);
+    expect(with_(OTHER, { location: 9, disable_reasons: 1024 })).toEqual([OTHER]);
+    expect(with_(OTHER, { location: 7, state: 0 })).toEqual([OTHER]);
+    expect(with_(OTHER, { location: 1, state: 0 })).toEqual([]);
+    expect(with_(OTHER, { location: 1, state: 1, disable_reasons: [] })).toEqual([OTHER]);
+    expect(with_(OTHER, { location: 1, state: 1, disable_reasons: 0 })).toEqual([OTHER]);
+    expect(with_(OTHER, { location: 1, disable_reasons: "x" })).toEqual([OTHER]);             // unreadable reasons: fail closed, on
     // The raw fields, as Chrome wrote them, numbers only, in check-host's error and the probe's evidence.
-    with_({ location: 7, state: 1, disable_reasons: [0, "x"], manifest: { name: "Policy helper" } });
+    with_(OTHER, { location: 7, state: 1, disable_reasons: [0, "x"], manifest: { name: "Policy helper" } });
     let err: any = null;
     try { checkHost(q.opts()); } catch (e) { err = e; }
-    expect(err.detail.extensions).toContainEqual({ id: OTHER, name: "Policy helper", enabled: true, component: false, kind: "foreign", status: "on", location: 7, state: 1, disable_reasons: [0] });
-    with_({ location: 1, state: 1, disable_reasons: [1] });
+    expect(err.detail.extensions).toContainEqual({ id: OTHER, name: "Policy helper", enabled: true, component: false, kind: "policy", status: "on", location: 7, state: 1,
+      disable_reasons: [0], path_kind: "absent", policy: [] });
     const p = queueRig({ confirmed: false });
     writeFileSync(join(p.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } },
-      [OTHER]: { location: 5, state: 1 } } } }));
+      [PAY]: { location: 5, state: 1 } } } }));
     const ev = await probe(p.opts(attended));
-    expect(ev.extensions).toContainEqual({ id: OTHER, name: null, enabled: true, component: true, kind: "chrome", status: "on", location: 5, state: 1, disable_reasons: null });
+    expect(ev.extensions).toContainEqual({ id: PAY, name: null, enabled: true, component: true, kind: "chrome", status: "on", location: 5, state: 1, disable_reasons: null,
+      path_kind: "absent", policy: [] });
+    expect(ev.extension_policy).toEqual({ entries: [], unreadable: [] });
   });
 
   test("0.12.2: Chrome's own component extensions (Web Store Payments at location 10, as Chrome 157 writes it) pass; a user-installed one is still extra_extension", async () => {
@@ -3657,22 +3665,21 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     const mine = { active_permissions: { api: ["tabs", "nativeMessaging"] }, creation_flags: 9, from_webstore: true, install_time: "13400000000000000",
       location: 1, manifest: { key: "x", manifest_version: 3, name: "Claude", version: "1.2.3" }, path: `${EXT}\\1.2.3_0`, state: 1, was_installed_by_default: false, was_installed_by_oem: false };
     // Chrome's own entries as Chrome 157 writes them: Payments at the external component location (10), the Web Store at
-    // the component location (5), each with its packaged path and no state field.
+    // the component location (5), each with its path in Chrome's install folder and no state field.
     const payments = { active_permissions: { api: ["identity", "webview"] }, creation_flags: 137, first_install_time: "13400000000000000", from_webstore: false,
       location: 10, manifest: { key: "x", manifest_version: 2, name: "Chrome Web Store Payments", version: "1.0.0.6" },
       path: `C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments`, was_installed_by_default: true, was_installed_by_oem: false };
-    const webstore = { active_permissions: { api: ["management"] }, location: 5, manifest: { name: "Web Store", version: "0.2" }, path: "...\\resources\\web_store", state: 1 };
+    const webstore = { active_permissions: { api: ["management"] }, location: 5, manifest: { name: "Web Store", version: "0.2" },
+      path: "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store", state: 1 };
     const write = (others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
       JSON.stringify({ extensions: { settings: { [EXT]: mine, ...others } }, protection: { macs: { extensions: { settings: {} } } } }));
     write({ [PAYMENTS]: payments, [WEBSTORE]: webstore });
     expect(extensionPrefs(q.inst)).toMatchObject({ others: [], disagree: [] });
-    expect(extensionPrefs(q.inst).extensions.find((x) => x.id === PAYMENTS)).toMatchObject({ name: "Chrome Web Store Payments", enabled: true, component: true, location: 10 });
+    expect(extensionPrefs(q.inst).extensions.find((x) => x.id === PAYMENTS)).toMatchObject({ name: "Chrome Web Store Payments", enabled: true, component: true, location: 10, path_kind: "chrome_install" });
     expect(checkHost(q.opts()).extensions.map((x) => x.id)).toEqual([WEBSTORE, EXT, PAYMENTS].sort());
     expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
-    // A known id with no location is Chrome's; a known id at a user location (an unpacked extension can claim any id) is not.
-    write({ [PAYMENTS]: { ...payments, location: undefined } });
-    expect(extensionPrefs(q.inst).others).toEqual([]);
+    // A known id at a user location (an unpacked extension can claim any id) is not Chrome's.
     write({ [PAYMENTS]: { ...payments, location: 4 } });
     expect(extensionPrefs(q.inst).others).toEqual([PAYMENTS]);
     // A user-installed extension from the store (location 1) beside Chrome's own: still refused, naming only it.
@@ -3681,131 +3688,174 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
     let err: any = null;
     try { checkHost(q.opts()); } catch (e) { err = e; }
-    expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [USER] } });
+    expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [USER], by_policy: [] } });
   });
 
-  // 0.12.2, second pass: the entries Chrome brings back on every start of the Cain jobs Chrome, in the shape Chrome 157 writes
-  // them (no state field; disable_reasons a list). Installed through the Windows registry (location 3) or external preferences
-  // (2, 6), Chrome keeps them present and disabled, its external-install prompt pending (reason 1024) or the user's (1).
-  describe("0.12.2 second pass: what counts as on, and the start's clean-up", () => {
-    const REG = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", PREFX = "ffffffffffffffffffffffffffffffff", STORE = "dddddddddddddddddddddddddddddddd";
+  // 0.12.2, third pass: read only. The owner's reported profile, in the shape Chrome 157 writes it (no state field;
+  // disable_reasons a list): Web Store Payments at location 10 in Chrome's install folder, two entries pushed through the
+  // registry at location 6 waiting on the external-install prompt (8192), Google Docs Offline at location 1, enabled, and
+  // Claude in Chrome. Nothing in the worker writes either preferences file.
+  describe("0.12.2 third pass: what counts as on, settled by classification alone, nothing written", () => {
+    const REG1 = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", REG2 = "ffffffffffffffffffffffffffffffff", STORE = "dddddddddddddddddddddddddddddddd", FORCED = "cccccccccccccccccccccccccccccccc";
     const DOCS = "ghbmnnjooekpmoecnnnilnnbdlolhkhi", PAYMENTS = "nmmhkkegccagdldgiimedpiccmgmieda";
     const mine = { active_permissions: { api: ["tabs", "nativeMessaging"] }, creation_flags: 9, from_webstore: true, install_time: "13400000000000000",
-      location: 1, manifest: { key: "x", manifest_version: 3, name: "Claude", version: "1.2.3" }, path: `${EXT}\\1.2.3_0`, state: 1, was_installed_by_default: false, was_installed_by_oem: false };
-    const registry = (extra: object = {}) => ({ active_permissions: { api: ["storage"] }, creation_flags: 1, from_webstore: true, install_time: "13400000000000000",
-      location: 3, manifest: { manifest_version: 3, name: "Vendor helper", version: "4.1" }, path: `${REG}\\4.1_0`, was_installed_by_default: false, was_installed_by_oem: false, ...extra });
-    const extPref = (extra: object = {}) => ({ creation_flags: 1, from_webstore: true, location: 2, manifest: { manifest_version: 3, name: "Office add in", version: "2.0" },
-      path: `${PREFX}\\2.0_0`, was_installed_by_default: false, ...extra });
-    const docs = (extra: object = {}) => ({ creation_flags: 137, from_webstore: true, location: 6, manifest: { manifest_version: 3, name: "Google Docs Offline", version: "1.97.1" },
-      path: `${DOCS}\\1.97.1_0`, was_installed_by_default: true, was_installed_by_oem: false, ...extra });
+      location: 1, manifest: { key: "x", manifest_version: 3, name: "Claude", version: "1.2.3" }, path: `${EXT}\\1.2.3_0`, was_installed_by_default: false, was_installed_by_oem: false };
     const payments = { active_permissions: { api: ["identity", "webview"] }, creation_flags: 137, from_webstore: false, location: 10,
       manifest: { manifest_version: 2, name: "Chrome Web Store Payments", version: "1.0.0.6" },
-      path: "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments", was_installed_by_default: true };
-    const store = { ...mine, manifest: { manifest_version: 3, name: "Some helper", version: "2.0" }, path: `${STORE}\\2.0_0` };
-    const write = (q: any, others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
-      JSON.stringify({ extensions: { settings: { [EXT]: mine, ...others } }, protection: { macs: { extensions: { settings: {} } } } }));
-    const line = (q: any, id: string) => extensionPrefs(q.inst).extensions.find((x) => x.id === id);
+      path: "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments", was_installed_by_default: true, was_installed_by_oem: false };
+    const pushed = (id: string, name: string) => ({ creation_flags: 1, disable_reasons: [8192], from_webstore: true, install_time: "13400000000000000", location: 6,
+      manifest: { manifest_version: 3, name, version: "4.1" }, path: `${id}\\4.1_0`, was_installed_by_default: false, was_installed_by_oem: false });
+    // Docs Offline as reported: the store location, enabled, its real id; was_installed_by_default false, so its id alone decides.
+    const docs = { creation_flags: 137, from_webstore: true, location: 1, manifest: { manifest_version: 3, name: "Google Docs Offline", version: "1.97.1" },
+      path: `${DOCS}\\1.97.1_0`, was_installed_by_default: false, was_installed_by_oem: false };
+    const store = (extra: object = {}) => ({ ...mine, manifest: { manifest_version: 3, name: "Some helper", version: "2.0" }, path: `${STORE}\\2.0_0`, ...extra });
+    const reported = () => ({ [PAYMENTS]: payments, [REG1]: pushed(REG1, "Vendor helper"), [REG2]: pushed(REG2, "Office add in"), [DOCS]: docs });
+    const sec = (q: any) => join(q.udd, "Default", "Secure Preferences"), pre = (q: any) => join(q.udd, "Default", "Preferences");
+    const write = (q: any, others: object) => writeFileSync(sec(q),
+      JSON.stringify({ extensions: { settings: { [EXT]: mine, ...others } }, protection: { macs: { extensions: { settings: { [DOCS]: "0123ABCD" } } } } }));
+    const line = (q: any, id: string, policy?: any) => extensionPrefs(q.inst, policy).extensions.find((x) => x.id === id);
+    const refusal = (o: any) => { try { checkHost(o); return null; } catch (e: any) { return e; } };
 
-    test("a registry-installed extension present and disabled passes, listed as present, off", async () => {
+    test("the owner's reported profile is no extension on, and every entry point leaves both preferences files exactly as they were", async () => {
       const { q, id } = oneJob();
-      write(q, { [REG]: registry({ disable_reasons: [1024] }), [PAYMENTS]: payments });
+      write(q, reported());
+      writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [REG1]: { disable_reasons: [8192] } } } }));
+      const bytes = () => [readFileSync(sec(q), "utf8"), readFileSync(pre(q), "utf8")];
+      const before = bytes();
       expect(extensionPrefs(q.inst).others).toEqual([]);
-      expect(line(q, REG)).toMatchObject({ kind: "foreign", status: "present, off", enabled: false, location: 3, disable_reasons: [1024] });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", status: "on", path_kind: "chrome_install" });
+      for (const x of [REG1, REG2]) expect(line(q, x)).toMatchObject({ kind: "foreign", status: "present, off", location: 6, state: null, disable_reasons: [8192] });
+      expect(line(q, DOCS)).toMatchObject({ kind: "default_app", status: "on", location: 1 });
       expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+      expect(checkHost(q.opts())).toMatchObject({ host: "ok", extension_policy: { entries: [], unreadable: [] } });
       expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
-      // The heartbeat's line in worker.log lists it with its status; Chrome open, so nothing was written to its preferences.
-      expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain(`extension=${REG}:present_off`);
-      expect(JSON.parse(readFileSync(join(q.udd, "Default", "Secure Preferences"), "utf8")).extensions.settings[REG].disable_reasons).toEqual([1024]);
+      const log = readFileSync(join(q.home, "worker.log"), "utf8");
+      expect(log).toContain(`extension=${REG1}:present_off`);
+      expect(log).toContain(`extension=${DOCS}:on`);
+      // Chrome closed (no lock file, no Chrome in the listing): still nothing written, by a run, check-host or the dump.
+      rmSync(join(q.udd, "lockfile"));
+      const closed = q.opts({ ...attended, procs: () => [] });
+      q.ask(READ); round(q.cfg);
+      expect((await run(closed)).code).toBe("browser_unreachable");
+      expect(checkHost(closed)).toMatchObject({ host: "ok" });
+      dumpExtensions(q.inst);
+      expect(bytes()).toEqual(before);
+      expect(log).not.toContain("extension_disabled");
     });
 
-    test("the same registry-installed extension enabled is refused, naming it, while the Cain jobs Chrome is open", async () => {
+    test("no code path in the worker writes a preferences file: no write, rename or removal names one", () => {
+      const src = readFileSync(WORKER_FILE, "utf8");
+      expect(src).not.toContain("quietForeign");
+      const writes = src.split("\n").filter((l) => /\b(writeFileSync|renameSync|rmSync|appendFileSync|copyFileSync|unlinkSync|openSync)\(/.test(l));
+      expect(writes.filter((l) => /Preferences|PREF_FILES/.test(l))).toEqual([]);
+    });
+
+    test("a built-in id at location 10 with a path under the profile folder is foreign and refused", () => {
       const { q } = oneJob();
-      write(q, { [REG]: registry(), [PAYMENTS]: payments });
-      expect(line(q, REG)).toMatchObject({ kind: "foreign", status: "on" });
-      expect(extensionPrefs(q.inst).others).toEqual([REG]);
-      expect((await run(q.opts(attended))).code).toBe("extra_extension");
-      expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain(`extension=${REG}:on`);
-      let err: any = null;
-      try { checkHost(q.opts()); } catch (e) { err = e; }
-      expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [REG], chrome_open: true } });
-      expect(heartbeatNotice(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8")))).toMatch(/turns it off itself/);
-      expect(readFileSync(join(q.home, "worker.log"), "utf8")).not.toContain("extension_disabled");
+      write(q, { [PAYMENTS]: { ...payments, path: join(q.udd, "Default", "Extensions", PAYMENTS, "1.0.0.6_0") } });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", component: false, path_kind: "profile" });
+      expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      expect(refusal(q.opts())).toMatchObject({ code: "extra_extension", detail: { other_enabled: [PAYMENTS] } });
+      // So is one at a relative path (how Chrome writes an install under the profile's Extensions), or any other folder.
+      write(q, { [PAYMENTS]: { ...payments, path: `${PAYMENTS}\\1.0.0.6_0` } });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", path_kind: "profile" });
+      write(q, { [PAYMENTS]: { ...payments, path: "D:\\Tools\\payments" } });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", path_kind: "other" });
+      // A look-alike install folder inside the user data folder is still the profile's.
+      write(q, { [PAYMENTS]: { ...payments, path: join(q.udd, "Google", "Chrome", "Application", "157.0.0.0", "resources", "x") } });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", path_kind: "profile" });
     });
 
-    test("a default-installed app (Google Docs Offline) disabled passes like Chrome's own; enabled it counts", async () => {
-      const { q, id } = oneJob();
-      write(q, { [DOCS]: docs({ disable_reasons: [1] }) });
-      expect(line(q, DOCS)).toMatchObject({ kind: "default_app", status: "present, off" });
-      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
-      write(q, { [DOCS]: docs() });
-      expect(line(q, DOCS)).toMatchObject({ kind: "default_app", status: "on" });
-      expect(extensionPrefs(q.inst).others).toEqual([DOCS]);
-      // Its id at a user location (an unpacked extension can claim any id) is no default app.
-      write(q, { [DOCS]: docs({ location: 4, was_installed_by_default: false, creation_flags: 1, disable_reasons: [1] }) });
-      expect(line(q, DOCS)).toMatchObject({ kind: "foreign" });
-    });
-
-    test("Chrome's component extension passes, its kind chrome", async () => {
-      const { q, id } = oneJob();
-      write(q, { [PAYMENTS]: payments });
-      expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", status: "on", component: true });
-      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
-      expect(readFileSync(join(q.home, "worker.log"), "utf8")).not.toContain("extension=");
-    });
-
-    test("a user-installed store extension enabled is refused", async () => {
+    test("a built-in id with no location is foreign", () => {
       const { q } = oneJob();
-      write(q, { [STORE]: store, [PAYMENTS]: payments });
-      expect(line(q, STORE)).toMatchObject({ kind: "foreign", status: "on" });
+      const { location: _, ...noLocation } = payments;
+      write(q, { [PAYMENTS]: noLocation });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", location: null });
+      expect(extensionPrefs(q.inst).others).toEqual([PAYMENTS]);
       expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
     });
 
-    test("the worker's start, with the Cain jobs Chrome closed, disables every foreign entry and logs each once; Chrome's own, Claude in Chrome and an off default app are left", async () => {
-      const { q, id } = oneJob();
-      // Split across both files, as Chrome can write them: the external preferences one in Preferences too.
-      write(q, { [REG]: registry(), [PREFX]: extPref({ disable_reasons: [1024] }), [STORE]: { ...store, state: 1 }, [DOCS]: docs({ disable_reasons: [1] }), [PAYMENTS]: payments });
-      const prefsFile = join(q.udd, "Default", "Preferences");
-      writeFileSync(prefsFile, JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [PREFX]: { disable_reasons: [1024] } } } }));
-      const before = JSON.parse(readFileSync(join(q.udd, "Default", "Secure Preferences"), "utf8"));
-      // Chrome open (its lock file there): nothing is written.
-      expect(quietForeign(q.opts(attended), q.inst)).toMatchObject({ closed: false, disabled: [] });
-      // Chrome closed: no lock file, and no Chrome on its folder in the process listing.
-      rmSync(join(q.udd, "lockfile"));
-      const closed = q.opts({ ...attended, procs: () => [] });
-      expect((await run(closed)).code).toBe("browser_unreachable");
-      const sec = JSON.parse(readFileSync(join(q.udd, "Default", "Secure Preferences"), "utf8"));
-      expect(sec.extensions.settings[REG].disable_reasons).toEqual([1]);
-      expect(sec.extensions.settings[PREFX].disable_reasons).toEqual([1, 1024]);
-      expect(sec.extensions.settings[STORE]).toMatchObject({ disable_reasons: [1], state: 0 });
-      expect(sec.extensions.settings[EXT]).toEqual(before.extensions.settings[EXT]);
-      expect(sec.extensions.settings[DOCS]).toEqual(before.extensions.settings[DOCS]);
-      expect(sec.extensions.settings[PAYMENTS]).toEqual(before.extensions.settings[PAYMENTS]);
-      expect(sec.protection).toEqual(before.protection);
-      const pre = JSON.parse(readFileSync(prefsFile, "utf8"));
-      expect(pre.profile).toEqual({ name: "Cain jobs" });
-      expect(pre.extensions.settings[PREFX].disable_reasons).toEqual([1, 1024]);
-      const count = (x: string) => readFileSync(join(q.home, "worker.log"), "utf8").split("\n").filter((l) => l.endsWith(` extension_disabled ${x}`)).length;
-      for (const x of [REG, PREFX, STORE]) expect([x, count(x)]).toEqual([x, 1]);
-      for (const x of [EXT, DOCS, PAYMENTS]) expect([x, count(x)]).toEqual([x, 0]);
-      // A second start logs nothing again; check-host now passes and says it disabled nothing this time.
-      expect((await run(closed)).code).toBe("browser_unreachable");
-      for (const x of [REG, PREFX, STORE]) expect([x, count(x)]).toEqual([x, 1]);
-      expect(checkHost(closed).disabled_now).toEqual([]);
-      // Chrome open again: the run goes on, every foreign entry present, off.
-      writeFileSync(join(q.udd, "lockfile"), "");
-      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
-      expect(extensionPrefs(q.inst).extensions.filter((x) => x.kind === "foreign").map((x) => x.status)).toEqual(["present, off", "present, off", "present, off"]);
+    test("a force-installed entry at location 9 with the user's disable reason is refused by name, and so is one the forcelist policy names", () => {
+      const { q } = oneJob();
+      write(q, { ...reported(), [FORCED]: { ...store(), path: `${FORCED}\\3.0_0`, location: 9, disable_reasons: [1] } });
+      expect(line(q, FORCED)).toMatchObject({ kind: "policy", status: "on", enabled: true, disable_reasons: [1] });
+      expect(extensionPrefs(q.inst).others).toEqual([FORCED]);
+      expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      expect(refusal(q.opts())).toMatchObject({ code: "extra_extension", detail: { other_enabled: [FORCED], by_policy: [{ id: FORCED, hives: [], location: 9 }] } });
+      expect(refusal(q.opts()).detail.fix).toMatch(/policy/);
+      // At the store location, disabled, but named in HKLM's and HKCU's ExtensionInstallForcelist: on, refused, naming both hives.
+      write(q, { ...reported(), [FORCED]: { ...store(), path: `${FORCED}\\3.0_0`, location: 1, disable_reasons: [1] } });
+      expect(extensionPrefs(q.inst).others).toEqual([]);
+      const forcelist = () => ({ entries: [{ hive: "HKLM" as const, id: FORCED }, { hive: "HKCU" as const, id: FORCED }], unreadable: [] });
+      const o = q.opts({ ...attended, forcelist });
+      expect(browserPreflight(o, q.inst)).toBe("extra_extension");
+      const err = refusal(o);
+      expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [FORCED], by_policy: [{ id: FORCED, hives: ["HKLM", "HKCU"], location: 1 }],
+        extension_policy: forcelist() } });
+      expect(err.detail.extensions.find((x: any) => x.id === FORCED)).toMatchObject({ kind: "policy", status: "on", policy: ["HKLM", "HKCU"] });
     });
 
-    test("check-host with the Cain jobs Chrome closed turns an enabled foreign entry off and says so; a Chrome found in the listing, or a listing that can't be read, writes nothing", () => {
+    test("the forcelist is read from reg query's listing: ids only, the update address never kept", () => {
+      const text = `\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallForcelist\r\n    1    REG_SZ    ${FORCED};https://clients2.google.com/service/update2/crx\r\n    2    REG_SZ    ${STORE}\r\n    3    REG_SZ    not-an-id\r\n\r\n`;
+      expect(parseForcelist("HKLM", text)).toEqual([{ hive: "HKLM", id: FORCED }, { hive: "HKLM", id: STORE }]);
+      expect(JSON.stringify(parseForcelist("HKLM", text))).not.toContain("clients2");
+    });
+
+    test("a store install enabled is refused", () => {
       const { q } = oneJob();
-      write(q, { [REG]: registry() });
-      rmSync(join(q.udd, "lockfile"));
-      expect(() => checkHost(q.opts())).toThrow("extra_extension");                        // the rig's listing has the dedicated Chrome
-      expect(() => checkHost(q.opts({ procs: () => null }))).toThrow("extra_extension");
-      expect(line(q, REG)).toMatchObject({ status: "on" });
-      expect(checkHost(q.opts({ procs: () => [] }))).toMatchObject({ host: "ok", disabled_now: [REG] });
-      expect(line(q, REG)).toMatchObject({ status: "present, off", disable_reasons: [1] });
+      write(q, { ...reported(), [STORE]: store() });
+      expect(line(q, STORE)).toMatchObject({ kind: "foreign", status: "on", path_kind: "profile", policy: [] });
+      expect(extensionPrefs(q.inst).others).toEqual([STORE]);
+      expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+    });
+
+    test("a store install disabled is present, off: listed, never counted", async () => {
+      const { q, id } = oneJob();
+      write(q, { ...reported(), [STORE]: store({ disable_reasons: [1] }) });
+      expect(line(q, STORE)).toMatchObject({ kind: "foreign", status: "present, off", enabled: false, path_kind: "profile", policy: [] });
+      expect(extensionPrefs(q.inst).others).toEqual([]);
+      expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+      expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain(`extension=${STORE}:present_off`);
+    });
+
+    test("dump-extensions prints each entry's id, location, state, disable reasons and path's folder kind, never a path, name or other value", () => {
+      const { q } = oneJob();
+      write(q, { ...reported(), [STORE]: store({ disable_reasons: [1] }) });
+      writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [REG1]: { disable_reasons: [8192] } } } }));
+      const d = dumpExtensions(q.inst);
+      expect(d.entries.map((x) => x.id)).toEqual([EXT, STORE, REG1, REG2, DOCS, PAYMENTS].sort());
+      expect(d.entries.find((x) => x.id === PAYMENTS)).toEqual({ id: PAYMENTS, files: ["Secure Preferences"], location: 10, state: null, disable_reasons: null, by_default: true, path_kind: "chrome_install" });
+      expect(d.entries.find((x) => x.id === REG1)).toEqual({ id: REG1, files: ["Secure Preferences", "Preferences"], location: 6, state: null, disable_reasons: [8192], by_default: false, path_kind: "profile" });
+      expect(d.entries.find((x) => x.id === DOCS)).toEqual({ id: DOCS, files: ["Secure Preferences"], location: 1, state: null, disable_reasons: null, by_default: false, path_kind: "profile" });
+      const text = JSON.stringify(d);
+      for (const leak of ["Program Files", "web_store_payments", "Google Docs Offline", "Vendor helper", "Claude", "1.97.1", "0123ABCD", "Cain jobs", "\\\\"]) expect([leak, text.includes(leak)]).toEqual([leak, false]);
+    });
+
+    test("path kinds: Chrome's install folder (per machine or per user), default_apps, the profile, anything else", () => {
+      const udd = "C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\User Data";
+      expect(pathKind(undefined, udd)).toBe("absent");
+      expect(pathKind(7, udd)).toBe("unreadable");
+      expect(pathKind("C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments", udd)).toBe("chrome_install");
+      expect(pathKind("C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\Application\\157.0.0.0\\resources\\pdf", udd)).toBe("chrome_install");
+      expect(pathKind("C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\default_apps\\docs.crx", udd)).toBe("default_apps");
+      expect(pathKind(`${udd}\\Default\\Extensions\\x\\1_0`, udd)).toBe("profile");
+      expect(pathKind("abc\\1_0", udd)).toBe("profile");
+      expect(pathKind("C:\\Program Files\\Google\\Chrome\\Application\\resources\\x", udd)).toBe("other");
+      expect(pathKind("D:\\x\\Google\\Chrome\\Application\\1.2.3\\resources\\x", udd)).toBe("other");
+    });
+
+    test("Google Docs Offline is Chrome's own on or off; marked by default or from default_apps too; its id at a user location is foreign", () => {
+      const { q } = oneJob();
+      write(q, { [DOCS]: { ...docs, disable_reasons: [1] } });
+      expect(line(q, DOCS)).toMatchObject({ kind: "default_app", status: "present, off" });
+      write(q, { [STORE]: store({ was_installed_by_default: true }) });
+      expect(line(q, STORE)).toMatchObject({ kind: "default_app", status: "on" });
+      expect(extensionPrefs(q.inst).others).toEqual([]);
+      write(q, { [STORE]: store({ path: "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\default_apps\\helper" }) });
+      expect(line(q, STORE)).toMatchObject({ kind: "default_app", path_kind: "default_apps" });
+      write(q, { [DOCS]: { ...docs, location: 4 } });
+      expect(line(q, DOCS)).toMatchObject({ kind: "foreign", status: "on" });
+      expect(extensionPrefs(q.inst).others).toEqual([DOCS]);
     });
   });
 

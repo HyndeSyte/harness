@@ -333,7 +333,8 @@ in the harness repo; until then the keeper says it is waiting).
   "the PC job queue on GitHub can't be reached" after about half an hour of failed fetches
   (`queue_unreachable`, or `queue_unreachable_again` when it comes back within a day of
   clearing), and "jobs are waiting for the PC, or one ran out of time waiting, and its worker
-  hasn't been heard from" (`worker_not_starting`). Neither is his to fix unless he is at his PC: put the second on
+  hasn't been heard from" (`worker_not_starting`; after 12 hours of a queue outage it may come as
+  `worker_not_starting_unconfirmed`, worded as not confirmed). Neither is his to fix unless he is at his PC: put the second on
   his "At his PC" list only if he says he started the worker and nothing happened. A line
   counting server errors means the notice is still being retried: nothing to tell him.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
@@ -389,7 +390,7 @@ in the harness repo; until then the keeper says it is waiting).
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
-  `extra_extension` (another extension is on in the Cain jobs profile; he closes that Chrome and runs check-host, and the worker turns it off itself),
+  `extra_extension` (another extension is on in the Cain jobs profile, or a Chrome policy installs one: he runs check-host, which names it, and turns it off in that Chrome; a policy one stays until its policy stops naming it; the worker never changes his profile),
   `prefs_disagree` (Chrome's two preference files disagree about an extension: he
   restarts the Cain jobs Chrome),
   `unattended_unsupported` (his install file asks for unattended runs),
