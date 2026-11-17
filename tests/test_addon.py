@@ -119,17 +119,20 @@ def test_cain_config_denies_every_api_and_mapping():
     assert cfg["init"] == "false"
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
     # password fields, the review caps as bounded numbers, the panel's owner (a Home
-    # Assistant user id, not a key), and the alarms' webhook id, hidden like a key (C1
-    # second review: the App's alarms reach Home Assistant without its API). Nothing else.
+    # Assistant user id, not a key), the alarms' webhook id, hidden like a key (C1
+    # second review: the App's alarms reach Home Assistant without its API), and the PC
+    # job keeper's token and repo name. Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  notice_hook: ""\nschema:\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  notice_hook: ""\n'
+        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n")
+        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
+        "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():
@@ -2483,6 +2486,9 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
             '  "/look", "/cards", "/check", "/replay", "/connector"])' in auth.replace("\r\n", "\n"))
+    # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and
+    # /pc-notice (the keeper runs as root, so being root is its key).
+    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice"])' in auth
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

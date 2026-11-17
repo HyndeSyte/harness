@@ -43,7 +43,9 @@
       "Edit(//data/review-queue/**)",
       "Edit(//data/review-spend.json)",
       "Edit(//data/record-holds.json)",
-      "Edit(//data/record-holds.json.next)"
+      "Edit(//data/record-holds.json.next)",
+      "Edit(//data/pc-jobs/**)",
+      "Edit(//data/pc-jobs-outcomes/**)"
     ]
   },
   "hooks": {

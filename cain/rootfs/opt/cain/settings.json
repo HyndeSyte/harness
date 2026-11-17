@@ -9,6 +9,8 @@
       "Bash(/opt/cain/record.sh:*)",
       "Bash(/opt/cain/review.sh)",
       "Bash(/opt/cain/review.sh:*)",
+      "Bash(/opt/cain/pcjobs.sh)",
+      "Bash(/opt/cain/pcjobs.sh:*)",
       "mcp__plugin_discord_discord__download_attachment",
       "mcp__plugin_discord_discord__fetch_messages"
     ],
@@ -41,7 +43,9 @@
       "Edit(//data/review-spend.json)",
       "Edit(//data/record-holds.json)",
       "Edit(//data/record-holds.json.next)",
-      "Edit(//etc/claude-code/**)"
+      "Edit(//etc/claude-code/**)",
+      "Edit(//data/pc-jobs/**)",
+      "Edit(//data/pc-jobs-outcomes/**)"
     ],
     "disableBypassPermissionsMode": "disable"
   },

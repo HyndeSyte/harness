@@ -61,7 +61,7 @@ export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/rela
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
   "/look", "/cards", "/check", "/replay", "/connector"]);
 // Root's services, on the unix socket only: what Cain sent (his edit allowlist) and the cards.
-export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check"]);
+export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice"]);
 
 export function sameKey(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);

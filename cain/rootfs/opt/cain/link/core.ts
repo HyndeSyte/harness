@@ -60,7 +60,9 @@
 // - Ship cards built from GitHub and the review service (0.11.0): the question names each
 //   App and version the tap installs, a line from GitHub has the pull request's title, how
 //   much it changes, the parts that matter most and its checks (read as the landing reads
-//   them: a failed check, or one not run yet, refuses the card; merged at that head, it's in
+//   them: a failed check, or one not run yet, refuses the card, and pcjobs-windows, whenever
+//   the head's tests.yml names it or it ran there, refuses it unless every run of it GitHub
+//   lists for that very head passed (merge.ts judgeChecks); merged at that head, it's in
 //   main already), and the last line is the review service's own for the review Cain names,
 //   which must be a review of that very head. Cain's words say only what Dane will notice, on
 //   one line. Anything going wrong while the new lines are built gives the card as it was
@@ -87,7 +89,7 @@ import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
-import { judgeChecks, type Facts, type Landed } from "./merge";
+import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -112,6 +114,53 @@ const STOPPED_FIRST: Landed = { ok: false, why: "his Stop came first", again: fa
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
 const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
+// The PC job keeper's lines to him (pcjobs/main.ts tell): each names what happened and the fix,
+// with its Troubleshooting row in cain/docs/pc-jobs.md.
+export const PC_NOTICES: Record<string, string> = {
+  reuse_migrated: "Your PC job keeper counted a tap of yours approving a reused value as used: an older version wrote it down without the record that could show whether its job reached your PC. If you still want that check, Cain asks you again.",
+  reuse_shallow: "Your PC job keeper can't settle a tap of yours approving a reused value, because its copy of the PC job queue is shallow. Fix: delete the pc-jobs folder in the Cain App's data and restart the App (pc-jobs.md, Troubleshooting). Other PC jobs go on, and the tap stays used meanwhile.",
+  queue_branch_missing: "Your PC job keeper stopped: the PC job queue's main branch is missing on GitHub while a tap of yours approving a reused value waits to be settled. Fix: restore the main branch in the pc-jobs repository (pc-jobs.md, Troubleshooting). The keeper goes on by itself once it is back.",
+  queue_empty_pending: "Your PC job keeper stopped: the PC job queue on GitHub is empty while a tap of yours approving a reused value waits to be settled. Fix: give the queue its first commit again, as in setup step 2 (pc-jobs.md, Troubleshooting); the tap then counts as used.",
+  reuse_store_unreadable: "Your PC job keeper can't read its record of the taps you spent on reused values, so it takes no job that reuses a value until it can. Other PC jobs go on. Fix: see the store row in pc-jobs.md, Troubleshooting.",
+  reuse_unsettled: "Your PC job keeper can't tell whether a job made from a tap of yours approving a reused value reached your PC: git gave no clear answer. The tap stays used, other PC jobs go on, and it tries again each round. If it lasts, see pc-jobs.md, Troubleshooting.",
+  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next round with a successful fetch from GitHub (within a minute while GitHub answers), once that fetch shows none of it arrived; then the job is queued again by itself. If it keeps being refused, check the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  reuse_record_unreadable: "Your PC job keeper has tried for three rounds to settle a tap of yours approving a reused value, written by an older version, but a file in its copy of the PC job queue can't be read. The tap stays used and other PC jobs go on. Fix: see the reuse_record_unreadable row in pc-jobs.md, Troubleshooting.",
+  reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
+  hold_clear_unrecorded: "Your PC isn't taking jobs: its worker couldn't write its record of clearing a version hold (version-hold-cleared.json in the worker folder), so the hold stays. At the PC: free disk space or fix the worker folder's permissions so that file can be written, then start a run (pc-jobs.md, Troubleshooting).",
+  worker_start_refused: "Your PC isn't taking jobs: its worker refused to start because a setting meant only for its tests is set where it runs (the PC_WORKER_TEST_BUILD variable, or a preload, require, import or loader flag in NODE_OPTIONS or BUN_OPTIONS, or a bunfig.toml preload). At the PC: remove it as the worker's own refusal says, open a new terminal, then start a run (pc-jobs.md, Troubleshooting).",
+  worker_not_starting: "Jobs are waiting for your PC, and its worker hasn't been heard from for hours. If it was started and nothing happened, a setting on the PC may be stopping it before it can start or say why, such as a preload in BUN_OPTIONS or NODE_OPTIONS set in Windows' environment settings. At the PC: follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  queue_unreachable: "Your PC job keeper hasn't been able to reach the PC job queue on GitHub for about half an hour, so new PC jobs wait and results don't come back. It keeps trying by itself. If it lasts, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  notice_undelivered: "Your PC job keeper had an earlier notice for you that could not be delivered, and after its update it can no longer say which one. If something about PC jobs seems stuck, see pc-jobs.md, Troubleshooting; Cain can read the keeper's log.",
+};
+export const PC_NOTICE_REPEAT = "Said again, in case it didn't reach you before:";
+// A code the keeper sends that this link has no words for (a keeper ahead of the link).
+export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
+export const PC_NOTICE_ID = /^[0-9a-f]{16,64}$/;
+export const PC_JOB_ID = /^j-\d{8}-[a-z0-9]{6}$/;
+// A PC job as the owner's line names it (0.12.0, twenty-second round): by what it does, its site and action
+// (the queue's own shapes), never by its queue id.
+const PC_SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+const PC_ACTION = /^[a-z][a-z0-9_]{2,39}$/;
+export const pcJobWords = (j: { site: string; action: string }) => `the job to ${j.action.replace(/_/g, " ")} on ${j.site}`;
+// A job the keeper can't name by its site and action (twenty-third round): by a time, in words, never an id.
+// Twenty-fifth round: the time is when the keeper saw the job (its record of it, or the moment it was handed the
+// job in a shape it couldn't read), not when the owner's request was queued, so it is worded "a PC browser job
+// seen by the keeper at Nov 15, 2:05 PM" ("seen by the keeper on Nov 15" when only the day is known). The
+// structured field keeps its name (queued).
+export const PC_QUEUED = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/;
+export function pcQueuedWords(queued: string, tz = "America/New_York"): string | null {
+  if (!PC_QUEUED.test(queued)) return null;
+  const day = queued.length === 10;
+  const t = Date.parse(day ? `${queued}T12:00:00Z` : queued);
+  if (!Number.isFinite(t)) return null;
+  const f = (o: Intl.DateTimeFormatOptions) => { try { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: day ? "UTC" : tz }).format(t); } catch { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: "UTC" }).format(t); } };
+  return day ? `a PC browser job seen by the keeper on ${f({ month: "short", day: "numeric" })}` : `a PC browser job seen by the keeper at ${f({ month: "short", day: "numeric" })}, ${f({ hour: "numeric", minute: "2-digit" })}`;
+}
+// The notice ids the link remembers having posted (twenty-eighth round: by age, PC_NOTICE_RETAIN_MS, the keeper's
+// NOTICE_DEDUP_MS; PC_NOTICE_KEEP only bounds the store's size, far above what the keeper sends in that time).
+export const PC_NOTICE_RETAIN_MS = 30 * DAY;
+const PC_NOTICE_KEEP = 5_000;
+export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
 const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
@@ -129,7 +178,7 @@ const MOVED = "stop moved";              // a message's Stop moved on: its butto
 const REPOSTED = "moved down";           // an older Stopped notice, once a newer one carries Turn back on
 export const STILL_STOPPED = "**Still stopped.** Cain's Build and Ship jobs, Ship cards and outside reviews stay stopped, and nothing lands in main, until you tap Turn back on.";
 // Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
-const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
+const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"], [/\bj-\d{8}-[a-z0-9]{6}\b/, "a PC job id"],
   [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
 const LIMIT = 2000;
 const SUPPRESS_EMBEDS = 1 << 2;
@@ -137,6 +186,8 @@ const DIRECT_KINDS = new Set(["stopped", "resumed", "alert"]);
 const ITEM = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
 const QUESTION = /^[A-Za-z0-9][A-Za-z0-9._:#-]{0,39}$/;
 const SNOWFLAKE = /^\d{15,22}$/;
+// The one answer of an owner-reuse ask that approves it (reuseProof): its first option.
+export const REUSE_YES = "Use it";
 const SHA = /^[0-9a-f]{40}$/;
 export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
@@ -182,6 +233,14 @@ export interface Shown {
     tries?: number; next?: number;    // it can't land yet: how often it was tried, and when it's tried next
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
+  values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
+}
+// The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
+// tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
+// characters; at most 3 (more, and none count).
+export function askValues(text: string): string[] {
+  const out = [...String(text ?? "").matchAll(/"([^"\r\n]{4,300})"/g)].map((m) => m[1]);
+  return out.length <= 3 ? out : [];
 }
 export interface Ask {               // Cain's question waiting behind the open one
   text: string; options: string[]; item: string; question: string; replyTo?: string; at: number; expires: number;
@@ -207,6 +266,7 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
+  pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -517,7 +577,8 @@ export interface Deps {
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
-  checkRuns?: (pr: string, head: string) => Promise<any[] | "missing" | null>;   // the head's check runs (merge.ts checkRuns)
+  checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
+  gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1382,7 +1443,7 @@ export class Link {
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
-      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
+      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false }, values: askValues(text) });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -1442,7 +1503,8 @@ export class Link {
   // some time. Then GitHub is asked for the pull request and the head's check runs at once,
   // within FACTS_MS, and a part that doesn't come says so. Refused: no line for that review, a
   // review of another head or none named in it, its lines unreadable, a newer head on GitHub, a
-  // commit GitHub doesn't have, a check that failed or hasn't run. A pull request merged at
+  // commit GitHub doesn't have, a check that failed or hasn't run, pcjobs-windows (when the
+  // head's tests.yml names it or it ran there) not passed yet. A pull request merged at
   // this head is in main already: the landing asks nothing of its checks, so neither does the
   // card. Anything else going wrong while the new lines are built gives the card as it was
   // before: "Ship it?", his line and the line from GitHub as it was. Never no card.
@@ -1459,6 +1521,25 @@ export class Link {
       if (rev.head !== head || (rev.pr !== null && rev.pr.toLowerCase() !== pr.toLowerCase()))
         throw new Refusal(`review ${review} was of another head or pull request: get a review of this head as it is now`);
     }
+    // A ship_gate watch of this pull request accepted another head (twentieth round: a watch binds to
+    // the exact sha its pusher named, and its acceptance is kept by sha): a card for any other head is
+    // refused while that acceptance stands, naming it and the command that records it replaced.
+    // One live acceptance per pull request (twenty-first round): the card reads that single one; more than
+    // one live (left from before the rule) is refused, naming each, until all but one are superseded.
+    // Twenty-sixth round: a gate state that can't be read (its generation file or a kept record) refuses the card by
+    // name, never reads as no acceptance.
+    const gate = this.d.gateWatch?.(pr) ?? [];
+    // Twenty-eighth round: an acceptance whose supersede is owed (GitHub's rate limit stopped it) is not current: the
+    // card is refused by name, with the wait GitHub asked for, never left to the head read alone.
+    if (!Array.isArray(gate) && "owed" in gate)
+      throw new Refusal(`the Ship gate's watch of this pull request is waiting on a supersede: ${gate.owed}. No card goes until it is done`);
+    if (!Array.isArray(gate))
+      throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gate.unknown}. No card goes until it can be read`);
+    const watched = gate;
+    if (watched.length > 1)
+      throw new Refusal(`the Ship gate's watch of this pull request has more than one live acceptance (${watched.join(", ")}): supersede all but the one for this head (keeper.sh ship-gate --supersede <sha>) before showing its card`);
+    if (watched.length && watched[0] !== head)
+      throw new Refusal(`the Ship gate's watch of this pull request accepted ${watched.join(" and ")}, not this head: if this head replaces it (a rebase), run keeper.sh ship-gate --supersede ${watched[0]}, then watch this head with keeper.sh ship-gate --pr <number> --head ${head} --watch before showing its card`);
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
@@ -1466,6 +1547,10 @@ export class Link {
     const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    // Twenty-fifth round: a watch's acceptance is consumed only against the pull request's head as GitHub has it now.
+    // When one stands, a head that can't be read refuses the card (the acceptance can't be checked), never passes it.
+    if (watched.length && f?.head !== head)
+      throw new Refusal("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it: show the card again in a minute");
     // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
     // the head (a squash or a rebase would leave it out). So the card asks main too, the way the
     // landing does, and says "Already in main" only when main has it.
@@ -1475,11 +1560,15 @@ export class Link {
       throw new Refusal("GitHub says it's merged, but main doesn't have that head (a squash or a rebase?), so a Ship tap can't install it");
     try {
       if (!merged && runs === "missing") throw new Refusal("GitHub doesn't have that commit: show the card for its head as it is now");
-      const checks = !merged && Array.isArray(runs) ? judgeChecks(runs) : null;
+      const checks = !merged && runs && runs !== "missing" && Array.isArray(runs.runs) ? judgeChecks(runs.runs, runs.windows === true) : null;
       const failed = checks?.find((c) => c.state === "failed");
       if (failed) throw new Refusal(`its ${failed.name} check didn't pass (${failed.conclusion}): fix it through Build first, then show a new Ship card`);
       const notRun = checks?.find((c) => c.state === "missing");
       if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
+      // Unlike a required check, a Windows run still going refuses the card: no ruleset holds
+      // main to it, so the card waits for it to pass (the landing checks it again).
+      if (checks?.some((c) => c.name === WINDOWS_CHECK && c.state === "running"))
+        throw new Refusal(`CI is still running ${WINDOWS_CHECK} on it: show the card once it has passed`);
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
@@ -1556,6 +1645,104 @@ export class Link {
     return { status: "ok", reply_to: rid, card: m?.card ?? null, item: m?.item ?? null, question: m?.question || null,
       asked: m?.q?.q ?? null, open: m ? live(m, now) : null,
       buttons: m?.buttons ? [...(m.labels ?? [])] : [], live: m ? live(m, now) : null };
+  }
+
+  // -- one line from the PC job keeper (POST /pc-notice, 0.12.0 nineteenth round) -------
+  // The keeper sends only a code; the words are the link's own (PC_NOTICES), so nothing from the
+  // queue or a page reaches Discord. The keeper sends each condition once while it lasts, and marks
+  // it sent only on this answer ("posted"). A keeper newer than this link may send a code the link
+  // has no words for (0.12.0, twentieth round): a plain code (lower-case letters, digits and "_",
+  // at most 40) gets the generic line, naming the code; anything else is refused.
+  //
+  // Twenty-first round: a notice may carry its id (the keeper's, kept before it posts) and the job it
+  // is about. The link deduplicates on the id: one it has already posted is answered "posted" with that
+  // message, and nothing is posted again, so a post whose acknowledgement was lost isn't repeated.
+  // Twenty-second round: the job is named by what it does, {site, action} in the queue's own shapes, never
+  // by its queue id (Cain's rules and the gate keep those ids away from him); the notice id stays in the
+  // payload, never in the words.
+  // Twenty-eighth round: repeat, a notice the keeper re-minted under a new id because its first id may have outlived the
+  // link's record of posted ids (PC_NOTICE_RETAIN_MS): worded as a repeat, so a second showing never reads as new.
+  async pcNotice(code: unknown, job?: unknown, id?: unknown, repeat?: unknown): Promise<{ status: "posted"; message: string; duplicate?: true }> {
+    const c = String(code ?? "");
+    const base = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
+    if (!base) throw new Refusal("not a PC job keeper notice");
+    const nid = id === undefined || id === null ? null : String(id);
+    if (nid !== null && !PC_NOTICE_ID.test(nid)) throw new Refusal("not a PC job keeper notice id");
+    let named: string | null = null;
+    if (job !== undefined && job !== null) {
+      const j = job as any;
+      // Twenty-third round: or, when the keeper can't say its site and action, by when it was queued ({queued}).
+      const queued = j && typeof j === "object" && !Array.isArray(j) && Object.keys(j).length === 1 && typeof j.queued === "string" ? pcQueuedWords(j.queued, this.d.tz) : null;
+      if (queued) named = queued;
+      else {
+        if (typeof j !== "object" || Array.isArray(j) || typeof j.site !== "string" || typeof j.action !== "string" || !PC_SITE.test(j.site) || !PC_ACTION.test(j.action)
+          || Object.keys(j).some((k) => k !== "site" && k !== "action"))
+          throw new Refusal("not a PC job: a job is named by its site and action, never by its queue id");
+        named = pcJobWords({ site: j.site, action: j.action });
+      }
+    }
+    if (nid !== null) {
+      const had = this.d.load().pcNotices?.[nid];
+      if (had) return { status: "posted", message: had.msg, duplicate: true };
+    }
+    const said = named ? `${base} (It is ${named}, code ${c}.)` : base;
+    const text = repeat === true ? `${PC_NOTICE_REPEAT} ${said}` : said;
+    noMachineText(text);
+    const message = await this.notice(text);
+    if (nid !== null) {
+      const s = this.d.load();
+      const kept = Object.entries({ ...(s.pcNotices ?? {}), [nid]: { msg: message, at: this.d.now() } }).filter(([, v]) => this.d.now() - v.at <= PC_NOTICE_RETAIN_MS)
+        .sort((a, b) => b[1].at - a[1].at).slice(0, PC_NOTICE_KEEP);
+      s.pcNotices = Object.fromEntries(kept);
+      this.d.save(s);
+    }
+    return { status: "posted", message };
+  }
+
+  // -- his yes to reusing a PC result's values (POST /reuse, the PC job keeper's ask) ----
+  // A follow-up PC job may carry a value an earlier result reported only on his yes
+  // (pcjobs/core.ts, owner_reuse). Cain writes the job, so his say-so proves nothing: the
+  // keeper sends the Discord message id the job names, and the link answers from what it
+  // recorded and what Discord has, never from Cain's words. Only one thing is a yes (0.12.0):
+  // his tap on the "Use it" button, the first option, of one of Cain's asks (a tap is
+  // recorded only from him, in his DM, with Cain paired to him: who(), below), where the
+  // values the job names are exactly the values that ask quoted when the link posted it
+  // (askValues, recorded with the ask as values) and Discord still shows each of them on it.
+  // The id is the ask's own message id. A message he typed never authorises, even one that
+  // replies to the ask or quotes the value: free text can be misread, and the keeper refuses
+  // a reuse that names a plain message. One tap answers for one job: the keeper records each
+  // id it accepted in an append-only file that survives restarts (pcjobs/main.ts usedReuse).
+  // Anything else is a Refusal: an id that isn't a Discord id, a message that isn't one of
+  // Cain's asks, an ask not answered by his "Use it" tap, other values than it quoted.
+  // Discord down is an error. The keeper refuses the job on either (fail closed).
+  async reuseProof(messageId: unknown, values: unknown): Promise<{ status: "ok"; message: string; via: "tap"; ask: string; values: string[] }> {
+    const id = String(messageId ?? "").trim();
+    if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id: the ask he tapped \"Use it\" on");
+    const vals = Array.isArray(values) ? values : [];
+    if (!vals.length || vals.length > 3 || !vals.every((v) => typeof v === "string" && v.length >= 4 && v.length <= 300 && !/[\u0000-\u001f\u007f]/.test(v)))
+      throw new Refusal("needs 1 to 3 values, each one line of 4 to 300 characters");
+    const want = vals as string[];
+    const { owner, dm, bot } = await this.identity();
+    if (this.d.paired() && this.d.paired() !== owner) throw new Refusal("Cain is paired with someone other than the bot's owner");
+    const s = this.d.load();
+    const rec = s.messages[id];
+    if (!rec) throw new Refusal("that isn't one of your asks: only his \"Use it\" tap on your ask approves a reuse, never a message he typed");
+    if (rec.kind !== "ask") throw new Refusal("that message is a card of the link's, not one of Cain's asks");
+    if (!(rec.outcome === "answered" && !rec.words && rec.q && rec.label !== undefined))
+      throw new Refusal("no tap of his is recorded on that ask: it was answered in words, expired, replaced or is still open");
+    if (rec.label !== rec.q.options[0] || rec.label !== REUSE_YES)
+      throw new Refusal(`he answered that ask by tapping "${rec.label}", not its first option "${REUSE_YES}"`);
+    const asked = rec.values ?? [];
+    if (!asked.length) throw new Refusal("that ask quoted no value when it was posted, so his tap approved none");
+    if (asked.length !== want.length || want.some((v) => !asked.includes(v)) || new Set(want).size !== want.length)
+      throw new Refusal("the values aren't exactly the ones that ask quoted when it was posted");
+    let msg: any;
+    try { msg = await this.rest("GET", `/channels/${dm}/messages/${id}`); }
+    catch (e) { if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM"); throw e; }
+    if (String(msg?.author?.id ?? "") !== bot) throw new Refusal("that ask isn't the bot's message");
+    const text = withoutOutcome(String(msg?.content ?? ""));
+    if (want.some((v) => !text.includes(v))) throw new Refusal("that ask doesn't show every value exactly as written");
+    return { status: "ok", message: id, via: "tap", ask: id, values: [...want] };
   }
 
   // -- taps -------------------------------------------------------------------

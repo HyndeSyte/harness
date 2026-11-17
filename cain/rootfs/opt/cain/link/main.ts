@@ -31,6 +31,13 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//   from the PC job keeper (pcjobs/main.ts), on this machine only:
+//     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
+//                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
+//                                       exactly those values when posted; a message he typed never counts
+//                                       (core.ts reuseProof); "ok", or refused with why
+//     POST /pc-notice {code, id?, job?: {site, action}, repeat?}   one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
+//                                       condition and its fix; "posted" (a plain code it has no words for gets a generic line naming it), or refused
 // Nothing is published to the LAN: the App has no "ports:".
 //
 // The gate (piece D), enforcing since 0.10.0: the link's send points fix and refuse
@@ -48,18 +55,20 @@
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { appendSynced, CAIN_ROUTES, type Caller, checkRequest, RequestLog, RERUN_SAFE, routeAllowed, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
+import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
-import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { ensureStop, readStop, TRUST_DIR, writeStop } from "../stop";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
+import { Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
+import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { linkRoutes, rootFetch } from "./http";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
@@ -211,9 +220,11 @@ const link = new Link({
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
-  // A Ship card reads the head's checks as the landing does (merge.ts), and the review
+  // A Ship card reads the head's checks as the landing does (merge.ts headChecks, pcjobs-windows
+  // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
-  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? checkRuns(github, p.repo, head) : null; },
+  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
+  gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
@@ -280,22 +291,15 @@ setTimeout(seed, 10_000);
 // start, from this machine only; root's services (the broker) use a unix socket only root
 // can open. A caller that proves nothing gets only /health's "ok".
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
-const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
 const KEYS = process.env.CAIN_KEYS ?? "/run/cain/keys";
 const LINK_SOCK = process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
 function cainKey(): string { try { return readFileSync(`${KEYS}/cain.key`, "utf8").trim(); } catch { return ""; } }
 const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
 
-async function route(req: Request, url: URL, caller: Caller, raw: string, reqId?: string): Promise<Response> {
-  if (!routeAllowed(caller, url.pathname)) return json({ status: "refused" }, 403);
-  if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
-  if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());
-  if (req.method !== "POST") return json({ status: "not found" }, 404);
-  if (raw.length > 16384) return json({ status: "too large" }, 413);
-  let b: any = {};
-  try { b = raw ? JSON.parse(raw) : {}; } catch { return json({ status: "not JSON" }, 400); }
-  return handle(url, b, reqId);
-}
+// The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
+// exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
+const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ };
+const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept
 // and signed back, with K_sign = HMAC(bot token, "harness-link-sign-v2"). The old relay key,
@@ -397,56 +401,12 @@ Bun.serve({
     return route(req, url, d.caller as Caller, raw);
   },
 });
-// Root's own: the broker reads the cards and says what Cain sent. The folder is root's.
+// Root's own: the broker reads the cards and says what Cain sent, and the PC job keeper checks
+// his taps and tells him what it can't do (/reuse, /pc-notice). The folder is root's.
 try { rmSync(LINK_SOCK, { force: true }); } catch { /* none */ }
-Bun.serve({
-  unix: LINK_SOCK, idleTimeout: 30, maxRequestBodySize: MAX_BODY,
-  async fetch(req) {
-    const url = new URL(req.url);
-    const raw = req.method === "POST" ? await boundedText(req, MAX_BODY) : "";
-    if (raw === null) return json({ status: "too large" }, 413);
-    return route(req, url, "root", raw);
-  },
-});
+Bun.serve({ unix: LINK_SOCK, idleTimeout: 30, maxRequestBodySize: MAX_BODY, fetch: rootFetch(routeDeps, MAX_BODY) });
 try { chmodSync(LINK_SOCK, 0o600); } catch (e) { console.log(`[cain] link: couldn't close its root socket to others: ${String(e).slice(0, 80)}`); }
 
-async function handle(url: URL, b: any, reqId?: string): Promise<Response> {
-    try {
-      switch (url.pathname) {
-        case "/card": return json({ id: await link.addCard({ text: String(b.text ?? ""), rows: b.rows ?? [], kind: b.kind, expires: b.expires, req: reqId }) });
-        case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
-        case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
-        case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
-        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
-          item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to }));
-        case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
-        case "/replied": return json(await link.replied(b.m));
-        case "/look": return json(await link.look(b.m));
-        case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
-        case "/sent": return json(await link.sent(b, { background: true }));
-        case "/replay": return json(link.replay(b.days));
-        case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
-        case "/stopped": {
-          const st = link.stopped();
-          return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."
-            : st.at === null ? "Nothing runs: the Stop state can't be read. Tell Dane in one line, and log a Build item."
-            : `Everything has been stopped${since(st, process.env.CHECKIN_TZ)}: Dane tapped Stop. Only he can turn it back on.` });
-        }
-        case "/morning": {
-          if (list(b.options).length) throw new Refusal("the morning message asks nothing: send each decision with ask");
-          const m = await link.morningPost(String(b.text ?? ""));
-          await toHarness("/morning-posted", {});
-          return json({ status: "posted", ...m });
-        }
-      }
-    } catch (e) {
-      if (e instanceof Refusal) return json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400);
-      return json({ status: "error", said: String(e).slice(0, 200) }, 500);
-    }
-    return json({ status: "not found" }, 404);
-}
 console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
 if (stateStore.lostNow())
   link.relayLine("The link's record of cards and messages was damaged on disk (both copies) and started over, the damaged copies kept aside: buttons on cards from before now won't work, and the calendar specialist's cards from just before may need sending again (they go out as an explicit unknown, never twice). Tell Dane in one line that the Pi's storage needs a look, and keep it in PENDING until it's fixed.");

@@ -54,7 +54,8 @@ data)
   chown root:root "$D" && chmod 0711 "$D" || die "/data"
   # What section 3.2 opens to him by name; any other entry is root's alone.
   his="cain work trust record record-queue record-outcomes record-holds.json review-inbox review-queue
-review-spend.json review-health.json review-useful.jsonl review-private-terms.txt jobs gate session.log"
+review-spend.json review-health.json review-useful.jsonl review-private-terms.txt jobs gate session.log
+pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   for e in "$D"/* "$D"/.[!.]* "$D"/..?*; do
     { [ -e "$e" ] && [ ! -L "$e" ]; } || continue
     case " $(echo $his) " in *" ${e##*/} "*) ;; *) chmod go-rwx "$e" || die "$e" ;; esac
@@ -72,8 +73,8 @@ review-spend.json review-health.json review-useful.jsonl review-private-terms.tx
   own "$D/discord" root:discord 0751   # he may pass through to the inbox, nothing else
   own "$D/discord/access.json" root:discord 0640
   own "$D/discord/inbox" discord:cain 2750
-  for q in record-queue review-inbox jobs; do install -d -m 2770 -o root -g cain "$D/$q"; done
-  for q in record-outcomes review-queue gate; do
+  for q in record-queue review-inbox jobs pc-jobs-queue; do install -d -m 2770 -o root -g cain "$D/$q"; done
+  for q in record-outcomes review-queue gate pc-jobs-outcomes; do
     install -d -m 2750 -o root -g cain "$D/$q"
     find "$D/$q" -mindepth 1 -maxdepth 1 -type f -exec chgrp cain {} + -exec chmod 0640 {} +
   done
@@ -86,11 +87,17 @@ review-spend.json review-health.json review-useful.jsonl review-private-terms.tx
   for f in relay.queue relay.queue.work checkins notes.seen jobs.nudged meanings.sent meanings.tried places.sent places.tried alerted-login; do
     [ -e "$D/$f" ] && { chown root:root "$D/$f"; chmod go-rwx "$D/$f"; }
   done
-  # The record keeper's copy: his to read, not to write. Its folders keep the group (setgid).
-  if [ -d "$D/record" ]; then
-    chgrp -R cain "$D/record" && chmod -R g+rX,g-w,o-rwx "$D/record" \
-      && find "$D/record" -type d -exec chmod g+s {} + || die "/data/record"
-  fi
+  # The record keeper's copy, and the PC job keeper's copy of its queue (pcjobs.sh list, result
+  # and worker read it): his to read, not to write. Their folders keep the group (setgid).
+  for r in record pc-jobs; do
+    if [ -d "$D/$r" ]; then
+      chgrp -R cain "$D/$r" && chmod -R g+rX,g-w,o-rwx "$D/$r" \
+        && find "$D/$r" -type d -exec chmod g+s {} + || die "/data/$r"
+    fi
+  done
+  # The PC job keeper's notice marks, for the attention lines pcjobs.sh shows him; the taps it
+  # spent (pc-jobs-reuse-used.jsonl) stay root's.
+  own "$D/pc-jobs-reuse-used.jsonl.told.json" root:cain 0640
   ;;
 verify)
   T=(bun "$OPT/c1/tools.ts"); tmp="${CAIN_ROOT_TMP:-/run/cain/root-tmp}"

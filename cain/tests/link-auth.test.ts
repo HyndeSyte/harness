@@ -81,7 +81,7 @@ describe("each caller opens only its own routes", () => {
   });
 
   test("root's socket opens only what the broker needs", () => {
-    expect([...ROOT_ROUTES].sort()).toEqual(["/cards", "/check", "/sent"]);
+    expect([...ROOT_ROUTES].sort()).toEqual(["/cards", "/check", "/pc-notice", "/reuse", "/sent"]);   // the PC job keeper's two, root's
     expect(routeAllowed("root", "/card")).toBe(false);
     expect(routeAllowed("root", "/ship")).toBe(false);
   });

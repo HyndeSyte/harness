@@ -58,6 +58,9 @@ const ROOT_FOR_HIM = [
   /^\/data\/gate\/[^/]+$/,
   /^\/data\/session\.log$/,
   /^\/data\/discord\/inbox\/[^/]+$/,
+  /^\/data\/pc-jobs\/.+$/,                         // the PC job keeper's copy of its queue (no token in it)
+  /^\/data\/pc-jobs-outcomes\/[^/]+$/,
+  /^\/data\/pc-jobs-reuse-used\.jsonl\.told\.json$/,   // its notice marks; the taps it spent stay root's
   /^\/run\/cain\/keys\/(cain|handover)\.key$/,
   /^\/run\/cain\/(discord\.state|mode)$/,
 ];

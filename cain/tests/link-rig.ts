@@ -37,7 +37,7 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string } } = {}) {
   let state: State = emptyState();
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
@@ -53,8 +53,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     // A Ship card's other read (with facts): the head's check runs ("missing": GitHub has no such
     // commit; null: no answer), which can hang; and what was asked, in order.
     runs: passing() as any[] | "missing" | null,
+    windows: false,                                // the head's tests.yml names pcjobs-windows (merge.ts headChecks)
     runsHang: false,
     asked: [] as string[],
+    watched: {} as Record<string, string>,         // the head a ship_gate watch accepted, by pull request (merge.ts watchAccepted)
   };
   // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
   const reviews = { list: [] as Reviewed[] | null };
@@ -161,7 +163,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     },
     landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
     facts: opts.facts ? (pr: string) => { github.asked.push(`facts ${pr}`); return github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts); } : undefined,
-    checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(copy(github.runs)); } : undefined,
+    checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(Array.isArray(github.runs)
+      ? { runs: copy(github.runs), windows: github.windows || github.runs.some((x: any) => x?.name === "pcjobs-windows" && x?.app?.id === ACTIONS_APP) }
+      : github.runs); } : undefined,
+    gateWatch: opts.gateWatch ?? ((pr: string) => (github.watched[pr] ? [github.watched[pr]] : [])),
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,

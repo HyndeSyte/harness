@@ -366,6 +366,18 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   export RECORD_TOKEN
   while true; do bun "$OPT/record/main.ts" 2>&1; sleep 10; done
 ) &
+# The PC job keeper (pcjobs/main.ts): the one writer of jobs to the PC job queue (its own
+# private repo), run on Dane's PC by the worker in a Chrome profile of its own
+# (cain/docs/pc-jobs.md). Its token comes from the App's options and goes only into its
+# environment. With no token it waits and does nothing.
+(
+  PC_JOBS_TOKEN="$(bashio::config 'pc_jobs_token' 2>/dev/null || true)"
+  [ "$PC_JOBS_TOKEN" = "null" ] && PC_JOBS_TOKEN=""
+  PC_JOBS_REPO="$(bashio::config 'pc_jobs_repo' 2>/dev/null || true)"
+  [ "$PC_JOBS_REPO" = "null" ] && PC_JOBS_REPO=""
+  export PC_JOBS_TOKEN PC_JOBS_REPO
+  while true; do bun "$OPT/pcjobs/main.ts" 2>&1; sleep 10; done
+) &
 # The review runner (review/main.ts): outside-model reviews. Its keys come from the App's
 # options and go only into its environment, under names no other tool reads. Never printed.
 (

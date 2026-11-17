@@ -1,0 +1,20 @@
+{
+  "v": 1,
+  "id": "j-20261115-probe1",
+  "from": "cain",
+  "created": "2026-11-15T14:00:00Z",
+  "expires": "2026-11-16T14:00:00Z",
+  "state": "pending",
+  "lease_until": null,
+  "attempt": null,
+  "site": "example.com",
+  "action": "read_account_settings",
+  "step": "read",
+  "start_url": "https://example.com/account/settings",
+  "done_looks_like": "The account settings page is open in the Cain jobs profile; report whether it is signed in, whether the account exists, and whether two-step sign-in is on",
+  "follows": null,
+  "preview_seen": null,
+  "owner_go": null,
+  "go_token": null,
+  "owner_reuse": null
+}

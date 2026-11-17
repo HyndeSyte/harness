@@ -5,12 +5,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsAt, checkRuns, facts, inMain, judgeChecks, keyAnswer, land, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, GATE_RECORD_FORMAT, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, RATE_WAIT_CAP_MS, refusalOf, WATCH_CAP_MS, watchAccepted, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
 
-function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; main?: string; prHead?: string } = {}) {
+function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; main?: string; prHead?: string; yml?: string | null | 0; winStatus?: number } = {}) {
   const parents: Record<string, string> = over.parents ?? { [M1]: M0, [H1]: M1, [H2]: H1, [X1]: M0 };
   const state = {
     main: over.main ?? M1,
@@ -40,11 +40,20 @@ function gh(over: { pull?: any; runs?: any[]; parents?: Record<string, string>; 
     api: async (path) => {
       if (state.apiDown) throw new Error("timeout");
       if (path === `/repos/${REPO}/pulls/13`) return { status: 200, body: pull };
+      // The head's tests.yml: its text, none (undefined or null: 404), or 0 (no answer).
+      if (path === `/repos/${REPO}/contents/.github/workflows/tests.yml?ref=${H1}`) {
+        if (over.yml === 0) return { status: 502, body: null };
+        if (over.yml == null) return { status: 404, body: null };
+        return { status: 200, body: { encoding: "base64", content: Buffer.from(over.yml).toString("base64") } };
+      }
       if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) {
         const name = new URL(`http://x${path}`).searchParams.get("check_name");
+        if (name === "pcjobs-windows" && over.winStatus) return { status: over.winStatus, body: { message: "Server Error" } };
         const mine = name ? runs.filter((r: any) => r?.name === name) : runs;
         return { status: 200, body: { total_count: mine.length, check_runs: mine } };
       }
+      // GitHub Actions' workflow runs for the head: none listed here (the check runs carry every attempt).
+      if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${H1}`)) return { status: 200, body: { total_count: 0, workflow_runs: [] } };
       return { status: 404, body: null };
     },
     git: async (args, o) => {
@@ -134,6 +143,72 @@ describe("landing his Ship tap", () => {
     }
     const { d } = gh({ runs: [run("pytest", "failure", "completed", ACTIONS_APP, 1), run("pytest", "success", "completed", ACTIONS_APP, 2), run("bun", "success"), run("pr", "success")] });
     expect(await land(d, L)).toEqual({ ok: true, already: false });
+  });
+
+  test("pcjobs-windows, when the head's tests.yml names it or it ran there, must pass too; an older head without it lands as before", async () => {
+    const run = (name: string, conclusion: string | null, status = "completed", id = 1) => ({ id, name, status, conclusion, head_sha: H1, app: { id: ACTIONS_APP } });
+    const req = () => ["pytest", "bun", "pr"].map((n, i) => run(n, "success", "completed", 100 + i));
+    const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
+    const cases: [any[], string | null | 0, string | null, boolean][] = [
+      [[...req(), run("pcjobs-windows", "success")], YML, null, false],
+      [[...req(), run("pcjobs-windows", "failure")], YML, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      [[...req(), run("pcjobs-windows", "cancelled")], YML, "CI's pcjobs-windows check didn't pass on it (cancelled)", false],
+      [[...req(), run("pcjobs-windows", null, "in_progress")], YML, "CI is still running pcjobs-windows on it", true],
+      [req(), YML, "CI hasn't run pcjobs-windows on it", false],                       // named, never run: fail closed
+      [[...req(), run("pcjobs-windows", "failure")], null, "CI's pcjobs-windows check didn't pass on it (failure)", false],   // ran, not named
+      [req(), "jobs:\n  pytest: {}\n  bun: {}\n", null, false],                       // an older workflow
+      [req(), null, null, false],
+      [req(), 0, "GitHub didn't answer about its checks", true],                        // tests.yml unread: nothing judged
+    ];
+    for (const [runs, yml, why, again] of cases) {
+      const { d, state } = gh({ runs, yml });
+      expect(await land(d, L)).toEqual(why === null ? { ok: true, already: false } : { ok: false, why, again });
+      expect(state.pushes).toHaveLength(why === null ? 1 : 0);
+    }
+  });
+
+  test("headChecks: the runs, and whether pcjobs-windows must pass", async () => {
+    const run = (name: string, conclusion = "success") => ({ id: 1, name, status: "completed", conclusion, head_sha: H1, app: { id: ACTIONS_APP } });
+    const req = ["pytest", "bun", "pr"].map((n) => run(n));
+    expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pcjobs-windows: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: true });
+    expect(await headChecks(gh({ runs: req, yml: "jobs:\n  pytest: {}\n" }).d, REPO, H1)).toEqual({ runs: req, windows: false });
+    expect(await headChecks(gh({ runs: [...req, run("pcjobs-windows")] }).d, REPO, H1)).toEqual({ runs: [...req, { ...run("pcjobs-windows"), via: ["check_runs"] }], windows: true });
+    expect(await headChecks(gh({ runs: req, yml: 0 }).d, REPO, H1)).toBeNull();
+    expect(await headChecks(gh({ runs: req }).d, REPO, H2)).toBe("missing");
+  });
+
+  test("the Windows-job gate against a fake GitHub: an API error, no run, a cancelled run, a stale-head run and re-run attempts in both orders all refuse or hold; none passes", async () => {
+    const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
+    const run = (conclusion: string | null, status = "completed", id = 1, head = H1) => ({ id, name: "pcjobs-windows", status, conclusion, head_sha: head, app: { id: ACTIONS_APP } });
+    const req = () => ["pytest", "bun", "pr"].map((n, i) => ({ id: 100 + i, name: n, status: "completed", conclusion: "success", head_sha: H1, app: { id: ACTIONS_APP } }));
+    const cases: [string, { runs: any[]; winStatus?: number }, string, boolean][] = [
+      ["API error", { runs: [...req(), run("success")], winStatus: 502 }, "GitHub didn't answer about its checks", true],
+      ["API refusal", { runs: [...req(), run("success")], winStatus: 403 }, "GitHub didn't answer about its checks", true],
+      ["no run", { runs: req() }, "CI hasn't run pcjobs-windows on it", false],
+      ["cancelled", { runs: [...req(), run("cancelled")] }, "CI's pcjobs-windows check didn't pass on it (cancelled)", false],
+      ["stale head", { runs: [...req(), run("success", "completed", 1, H2)] }, "CI hasn't run pcjobs-windows on it", false],
+      ["no head named", { runs: [...req(), { ...run("success"), head_sha: undefined }] }, "CI hasn't run pcjobs-windows on it", false],
+      ["green, then a failed re-run", { runs: [...req(), run("success", "completed", 1), run("failure", "completed", 2)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      ["failed, then a green re-run", { runs: [...req(), run("failure", "completed", 1), run("success", "completed", 2)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      ["green re-run listed first", { runs: [...req(), run("success", "completed", 2), run("failure", "completed", 1)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+      ["green, then a re-run going", { runs: [...req(), run("success", "completed", 1), run(null, "in_progress", 2)] }, "CI is still running pcjobs-windows on it", true],
+      ["a re-run going, listed first", { runs: [...req(), run(null, "queued", 2), run("success", "completed", 1)] }, "CI is still running pcjobs-windows on it", true],
+      ["a stale green beside this head's failure", { runs: [...req(), run("success", "completed", 2, H2), run("failure", "completed", 1)] }, "CI's pcjobs-windows check didn't pass on it (failure)", false],
+    ];
+    for (const [, c, why, again] of cases) {
+      const { d, state } = gh({ ...c, yml: YML });
+      expect(await land(d, L)).toEqual({ ok: false, why, again });
+      expect(state.pushes).toEqual([]);
+      // The Ship card reads the same: headChecks, then judgeChecks.
+      const h = await headChecks(d, REPO, H1);
+      if (c.winStatus) { expect(h).toBeNull(); continue; }
+      expect(h).not.toBeNull();
+      const w = judgeChecks((h as any).runs, (h as any).windows).find((x) => x.name === "pcjobs-windows")!;
+      expect(w.state).not.toBe("passed");
+    }
+    // A stale-head run that didn't pass isn't this head's either, and doesn't make an older workflow wait.
+    const old = gh({ runs: [...req(), run("failure", "completed", 1, H2)], yml: "jobs:\n  pytest: {}\n" });
+    expect(await land(old.d, L)).toEqual({ ok: true, already: false });
   });
 
   test("when GitHub or the fetch doesn't answer, nothing is pushed, and a new card can follow", async () => {
@@ -237,7 +312,7 @@ describe("landing, with real git", () => {
           const name = new URL(`http://x${path}`).searchParams.get("check_name");
           const mine = runs.filter((r) => r.name === name);
           return { status: 200, body: { total_count: mine.length, check_runs: mine } };
-        })() : { status: 404, body: null },
+        })() : path.includes("/actions/runs?") ? { status: 200, body: { total_count: 0, workflow_runs: [] } } : { status: 404, body: null },
       git: async (args) => {
         const p = Bun.spawn(["git", "-C", link, ...args], { stdout: "pipe", stderr: "pipe", env });
         const [out, err] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
@@ -459,5 +534,266 @@ describe("review fixes (Fable, Nov 13)", () => {
     const missing = gh();
     missing.d.api = async () => ({ status: 404, body: { message: "Not Found" } });
     expect(await land(missing.d, L)).toEqual({ ok: false, why: "GitHub has no such pull request", again: false });
+  });
+});
+
+describe("seventeenth review: the Windows gate reads every run and every attempt, page by page, and can be read without acting", () => {
+  const YML = "jobs:\n  pytest: {}\n  bun: {}\n  pcjobs-windows:\n    runs-on: windows-latest\n";
+  const ok = (name: string, id: number) => ({ id, name, status: "completed", conclusion: "success", head_sha: H1, app: { id: ACTIONS_APP } });
+  const win = (id: number, conclusion: string | null, status = "completed") => ({ id, name: "pcjobs-windows", status, conclusion, head_sha: H1, app: { id: ACTIONS_APP } });
+  const job = (id: number, conclusion: string | null, status = "completed", name = "pcjobs-windows") => ({ id, name, status, conclusion, head_sha: H1 });
+  // A fake GitHub: the required checks, pcjobs-windows's check runs (each page's list given), the
+  // workflow runs for the head, and each run attempt's jobs (each page's list given). A page given as
+  // a number is that HTTP status instead.
+  type Page = any[] | number;
+  const fake = (o: { checkPages?: Page[]; checkTotal?: number; runs?: any[]; jobs?: Record<string, Page[]>; jobTotal?: Record<string, number>; yml?: string; seen?: string[] }) => ({
+    api: async (path: string) => {
+      o.seen?.push(path);
+      const u = new URL(`http://x${path}`);
+      const page = Number(u.searchParams.get("page") ?? 1);
+      if (path.startsWith(`/repos/${REPO}/contents/.github/workflows/tests.yml?ref=${H1}`))
+        return { status: 200, body: { encoding: "base64", content: Buffer.from(o.yml ?? YML).toString("base64") } };
+      if (path.startsWith(`/repos/${REPO}/commits/${H1}/check-runs`)) {
+        const name = u.searchParams.get("check_name")!;
+        if (name !== "pcjobs-windows") return { status: 200, body: { total_count: 1, check_runs: [ok(name, { pytest: 1, bun: 2, pr: 3 }[name] ?? 9)] } };
+        expect(u.searchParams.get("filter")).toBe("all");
+        const pages = o.checkPages ?? [[]];
+        const p = pages[page - 1];
+        if (typeof p === "number") return { status: p, body: { message: "Server Error" } };
+        return { status: 200, body: { total_count: o.checkTotal ?? pages.reduce((n: number, x) => n + (Array.isArray(x) ? x.length : 0), 0), check_runs: p ?? [] } };
+      }
+      if (path.startsWith(`/repos/${REPO}/actions/runs?head_sha=${H1}`)) return { status: 200, body: { total_count: (o.runs ?? []).length, workflow_runs: o.runs ?? [] } };
+      const m = /^\/repos\/[^/]+\/[^/]+\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs/.exec(path);
+      if (m) {
+        const key = `${m[1]}/${m[2]}`;
+        const pages = o.jobs?.[key] ?? [[]];
+        const p = pages[page - 1];
+        if (typeof p === "number") return { status: p, body: { message: "Server Error" } };
+        return { status: 200, body: { total_count: o.jobTotal?.[key] ?? pages.reduce((n: number, x) => n + (Array.isArray(x) ? x.length : 0), 0), jobs: p ?? [] } };
+      }
+      return { status: 404, body: null };
+    },
+  });
+  const filler = (n: number, from: number) => Array.from({ length: n }, (_, i) => job(from + i, "success", "completed", `other-${from + i}`));
+
+  test("a failed attempt on the second page of the check runs refuses, beside a green re-run on the first", async () => {
+    const d = fake({ checkPages: [[...Array.from({ length: 99 }, (_, i) => win(1000 + i, "success")), win(2000, "success")], [win(5, "failure")]] });
+    const a = await windowsAttempts(d, REPO, H1);
+    expect(Array.isArray(a) ? a.length : a).toBe(101);
+    const r = await gateReport(d, REPO, H1);
+    expect(r).toMatchObject({ decision: "refuse", windows: "failed", why: "CI's pcjobs-windows check didn't pass on it (failure)" });
+    expect(await land(gh({ runs: [] }).d, L)).toMatchObject({ ok: false });   // the plain fake still lands nothing without runs
+  });
+
+  test("a failed earlier attempt seen only in the per-attempt jobs refuses, even when the check runs list only the green re-run", async () => {
+    // Run 77 was run twice: attempt 1 failed, attempt 2 passed. The check runs list only the green one.
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 2, path: ".github/workflows/tests.yml" }];
+    // Attempt 1's jobs come over two pages, the Windows job on the second.
+    const seen: string[] = [];
+    const d = fake({ checkPages: [[win(902, "success")]], runs, seen, jobs: { "77/1": [filler(100, 1), [job(901, "failure")]], "77/2": [[job(902, "success")]] } });
+    const r = await gateReport(d, REPO, H1);
+    expect(r).toMatchObject({ decision: "refuse", windows: "failed" });
+    expect(r.attempts.map((a) => [a.id, a.conclusion]).sort()).toEqual([[901, "failure"], [902, "success"]]);
+    expect(r.attempts.find((a) => a.id === 902)!.via).toEqual(["check_runs", "run 77 attempt 2"]);
+    expect(seen).toContain(`/repos/${REPO}/actions/runs/77/attempts/1/jobs?per_page=100&page=2`);
+    // The same with every attempt green: accepted.
+    const g = fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [filler(100, 1), [job(901, "success")]], "77/2": [[job(902, "success")]] } });
+    expect(await gateReport(g, REPO, H1)).toMatchObject({ decision: "accept", windows: "passed", workflow: { file: ".github/workflows/tests.yml", read: "named" } });
+  });
+
+  test("a page that fails, or a listing that isn't whole, holds: nothing is judged on part of it", async () => {
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 2 }];
+    // The check runs' second page fails.
+    const a = fake({ checkPages: [Array.from({ length: 100 }, (_, i) => win(1000 + i, "success")), 500], checkTotal: 101 });
+    expect(await windowsAttempts(a, REPO, H1)).toBeNull();
+    expect(await gateReport(a, REPO, H1)).toMatchObject({ decision: "hold" });
+    // An attempt's jobs' second page fails.
+    const b = fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [filler(100, 1), 502], "77/2": [[job(902, "success")]] }, jobTotal: { "77/1": 101 } });
+    expect(await gateReport(b, REPO, H1)).toMatchObject({ decision: "hold" });
+    // A short page before the total: not whole.
+    const c = fake({ checkPages: [[win(1, "success")]], checkTotal: 3 });
+    expect(await gateReport(c, REPO, H1)).toMatchObject({ decision: "hold" });
+    // A rate limit (403) on the workflow runs: hold.
+    const d = { api: async (p: string) => p.includes("/actions/runs?") ? { status: 403, body: { message: "rate limit" } } : fake({ checkPages: [[win(1, "success")]] }).api(p) };
+    expect(await gateReport(d, REPO, H1)).toMatchObject({ decision: "hold" });
+    // The landing holds on the same reading.
+    expect(await headChecks(a, REPO, H1)).toBeNull();
+  });
+
+  test("eighteenth review: a rate-limit page (403 or 429) anywhere in the reading holds, never accepts, even with a listing-shaped body", async () => {
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 1 }];
+    const green = () => fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [[job(902, "success")]] } });
+    expect(await gateReport(green(), REPO, H1)).toMatchObject({ decision: "accept" });
+    const where = ["check_name=pytest", "check_name=pcjobs-windows", "/actions/runs?", "/attempts/1/jobs", "tests.yml"];
+    for (const status of [403, 429]) for (const w of where) {
+      // The limited page carries a body shaped like a good listing: it still counts as failed.
+      const body = { total_count: 1, check_runs: [win(902, "success")], workflow_runs: runs, jobs: [job(902, "success")], encoding: "base64", content: "" };
+      const d = { api: async (p: string) => p.includes(w) ? { status, body, headers: status === 403 ? { "x-ratelimit-remaining": "0" } : {} } : green().api(p) };
+      const r = await gateReport(d, REPO, H1);
+      expect([status, w, r.decision]).toEqual([status, w, "hold"]);
+      expect(r.why).toContain("rate limit");
+      expect(await headChecks(d, REPO, H1)).toBeNull();                         // the landing and the Ship card wait on it too
+    }
+    // A limited page on the second page of a listing that is otherwise whole: hold.
+    const two = { api: async (p: string) => p.includes("check_name=pcjobs-windows") && p.endsWith("page=2") ? { status: 429, body: null }
+      : fake({ checkPages: [Array.from({ length: 100 }, (_, i) => win(1000 + i, "success")), [win(5, "success")]] }).api(p) };
+    expect(await gateReport(two, REPO, H1)).toMatchObject({ decision: "hold" });
+    // The watch keeps watching through a limited reading and accepts only on a whole one.
+    let i = 0;
+    const flaky = { api: async (p: string) => i === 1 && p.includes("/actions/runs?") ? { status: 403, body: null, headers: { "retry-after": "0" } } : fake({ checkPages: i === 0 ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] }).api(p) };
+    const line = await watchShipGate(flaky, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => { i++; } });
+    expect(line.reports.map((r) => r.decision)).toEqual(["hold", "hold", "accept"]);
+    expect(line.passed).toBe(true);
+  });
+
+  test("the dry run names the head, the workflow file it read and every attempt, and changes nothing", async () => {
+    const r = await gateReport(fake({ checkPages: [[win(3, null, "in_progress")]] }), REPO, H1, () => new Date("2026-11-16T10:00:00Z"));
+    expect(r).toEqual({ head: H1, at: "2026-11-16T10:00:00.000Z", decision: "hold", why: "CI is still running pcjobs-windows on it", windows: "running",
+      workflow: { file: ".github/workflows/tests.yml", read: "named" }, attempts: [{ id: 3, status: "in_progress", conclusion: null, via: ["check_runs"] }] });
+    expect(await gateReport(fake({}), REPO, "nope")).toMatchObject({ decision: "refuse", why: "that isn't a full commit sha" });
+    expect(await gateReport(fake({}), REPO, H1)).toMatchObject({ decision: "refuse", windows: "missing", why: "CI hasn't run pcjobs-windows on it" });
+    expect(await gateReport(fake({ yml: "jobs:\n  pytest: {}\n" }), REPO, H1)).toMatchObject({ decision: "accept", windows: "not_required", workflow: { read: "not_named" } });
+  });
+
+  test("the probe's ship_gate step: refused while the Windows run is pending, accepted only once it passed", async () => {
+    // GitHub as it moves: no run yet, then running, then passed.
+    const states: Page[][] = [[[]], [[win(5, null, "queued")]], [[win(5, null, "in_progress")]], [[win(5, "success")]]];
+    let i = 0;
+    const d = { api: async (p: string) => fake({ checkPages: states[Math.min(i, states.length - 1)] }).api(p) };
+    const line = await watchShipGate(d, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => { i++; } });
+    expect(line.reports.map((r) => r.decision)).toEqual(["refuse", "hold", "hold", "accept"]);
+    expect(line).toMatchObject({ step: "ship_gate", head: H1, workflow: { file: ".github/workflows/tests.yml", read: "named" }, attempts_seen: [5],
+      refused_while_pending: true, accepted_early: false, accepted_after_pass: true, passed: true });
+    // Never seen pending: not shown, so it doesn't pass.
+    const g = (rs: Partial<GateReport>[]) => judgeShipGate(H1, rs.map((r) => ({ head: H1, at: "", why: "", workflow: null, attempts: [], windows: null, decision: "hold", ...r }) as GateReport));
+    const done = { id: 5, status: "completed", conclusion: "success", via: [] };
+    const going = { id: 5, status: "in_progress", conclusion: null, via: [] };
+    expect(g([{ decision: "accept", windows: "passed", attempts: [done] }]).passed).toBe(false);
+    // Accepted while an attempt was still going: fails, whatever came after.
+    expect(g([{ decision: "accept", windows: "running", attempts: [going] }, { decision: "accept", windows: "passed", attempts: [done] }])).toMatchObject({ accepted_early: true, passed: false });
+    // A failed attempt: refused at the end, never accepted.
+    expect(g([{ decision: "hold", windows: "running", attempts: [going] }, { decision: "refuse", windows: "failed", attempts: [{ ...done, conclusion: "failure" }] }])).toMatchObject({ accepted_after_pass: false, passed: false });
+    // Watching stops on a failure and on its time.
+    let j = 0;
+    const f = { api: async (p: string) => fake({ checkPages: j++ < 4 ? [[win(5, null, "in_progress")]] : [[win(5, "failure")]] }).api(p) };
+    expect((await watchShipGate(f, REPO, H1, { everyMs: 1, untilMs: 1_000, sleep: async () => {} })).reports.at(-1)).toMatchObject({ decision: "refuse", windows: "failed" });
+    let t = 0;
+    const slow = await watchShipGate(fake({ checkPages: [[win(5, null, "in_progress")]] }), REPO, H1, { everyMs: 10, untilMs: 35, sleep: async () => { t += 10; }, now: () => new Date(t) });
+    expect(slow.reports.length).toBe(4);                                  // at 0, 10, 20 and 30: the next would pass 35
+    expect(slow.passed).toBe(false);
+  });
+  test("nineteenth review: a rate limit only on a 429, or a 403 with x-ratelimit-remaining 0, Retry-After or a secondary-limit body; any other 403 is a permission failure naming the endpoint", async () => {
+    const NOW = Date.parse("2026-11-16T10:00:00Z");
+    expect(refusalOf({ status: 429, body: null }, NOW)).toEqual({ kind: "rate_limit", wait_ms: null });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "30" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 30_000 });
+    expect(refusalOf({ status: 403, body: null, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(NOW / 1000 + 90) } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 90_000 });
+    expect(refusalOf({ status: 403, body: null, headers: { "retry-after": "5" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 5_000 });
+    expect(refusalOf({ status: 403, body: { message: "You have exceeded a secondary rate limit. Please wait." } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: null });
+    expect(refusalOf({ status: 403, body: { message: "Resource not accessible by integration" }, headers: { "x-ratelimit-remaining": "57" } }, NOW)).toEqual({ kind: "permission", wait_ms: null });
+    expect(refusalOf({ status: 403, body: { message: "API rate limit exceeded" } }, NOW)).toEqual({ kind: "permission", wait_ms: null });
+    expect(refusalOf({ status: 200, body: null }, NOW)).toBeNull();
+    // In the reading: a plain 403 holds as a permission failure naming its endpoint; a limited one names the rate limit and the wait.
+    const runs = [{ id: 77, head_sha: H1, run_attempt: 1 }];
+    const green = () => fake({ checkPages: [[win(902, "success")]], runs, jobs: { "77/1": [[job(902, "success")]] } });
+    const plain = { api: async (p: string) => p.includes("/actions/runs?") ? { status: 403, body: { message: "Forbidden" } } : green().api(p) };
+    const r = await gateReport(plain, REPO, H1, () => new Date(NOW));
+    expect(r).toMatchObject({ decision: "hold", limited: { kind: "permission", endpoint: `/repos/${REPO}/actions/runs`, wait_ms: null } });
+    expect(r.why).toBe(`GitHub refused the reading of /repos/${REPO}/actions/runs (HTTP 403, not a rate limit): a permission failure, so nothing is judged on it`);
+    const limited = { api: async (p: string) => p.includes("/actions/runs?") ? { status: 403, body: null, headers: { "retry-after": "120" } } : green().api(p) };
+    const l = await gateReport(limited, REPO, H1, () => new Date(NOW));
+    expect(l).toMatchObject({ decision: "hold", limited: { kind: "rate_limit", wait_ms: 120_000 } });
+    expect(l.why).toContain("rate limit stopped a page of the reading");
+    expect(l.why).toContain("wait 120 s");
+  });
+
+  test("nineteenth review: the watch honours Retry-After and x-ratelimit-reset before its next reading", async () => {
+    let t = Date.parse("2026-11-16T10:00:00Z");
+    const waits: number[] = [];
+    let i = 0;
+    const green = () => fake({ checkPages: [[win(5, "success")]] });
+    const d = { api: async (p: string) => {
+      if (i === 0 && p.includes("check_name=pcjobs-windows")) return { status: 429, body: null, headers: { "retry-after": "300" } };
+      if (i === 1 && p.includes("check_name=pcjobs-windows")) return { status: 403, body: null, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(t / 1000 + 600) } };
+      return green().api(p);
+    } };
+    const line = await watchShipGate(d, REPO, H1, { everyMs: 60_000, untilMs: 3 * 3_600_000, sleep: async (ms) => { waits.push(ms); t += ms; i++; }, now: () => new Date(t) });
+    expect(waits).toEqual([300_000, 600_000]);
+    expect(line.reports.map((r) => r.decision)).toEqual(["hold", "hold", "accept"]);
+  });
+
+  // Twentieth review: the watch takes the exact sha the pusher supplies (--pr and --head), waits for
+  // the pull request's head to equal it, and fails by name when another head shows or it moves away.
+  const OLD = "f".repeat(40);
+  const prWatch = (heads: (i: number) => string, greenFrom = 2) => {
+    let i = 0;
+    const read: string[] = [];
+    const d = { api: async (p: string) => {
+      read.push(p);
+      if (p === `/repos/${REPO}/pulls/21`) return { status: 200, body: { head: { sha: heads(i) } } };
+      return fake({ checkPages: i < greenFrom ? [[win(5, null, "in_progress")]] : [[win(5, "success")]] }).api(p);
+    } };
+    return { d, read, tick: async () => { i++; } };
+  };
+  test("twentieth review: the pull request has an older head when the watch starts and the intended push comes after: it binds to the intended sha only", async () => {
+    const w = prWatch((i) => (i < 2 ? OLD : H1), 3);                       // two readings of the old head, then the push
+    const line = await watchShipGate(w.d, REPO, { pr: 21, head: H1 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(line).toMatchObject({ pr: 21, bound_head: H1, accepted_head: H1, failure: null, passed: true });
+    expect(line.reports.every((r) => r.head === H1)).toBe(true);
+    expect(w.read.some((p) => p.includes(OLD))).toBe(false);                // the old head's gate was never read
+    expect(watchAccepted(JSON.stringify(line))).toBeNull();                                // twenty-sixth round: no generation is never current
+    expect(watchAccepted(JSON.stringify({ ...line, gen: 1 }))).toBeNull();                 // twenty-seventh round: no record format is never current
+    expect(watchAccepted(JSON.stringify({ ...line, gen: 1, format: GATE_RECORD_FORMAT }))).toEqual({ pr: 21, head: H1, gen: 1 });
+    expect(watchAccepted(JSON.stringify({ ...line, superseded: { at: "x" } }))).toBeNull();
+    expect(watchAccepted("not json")).toBeNull();
+  });
+  test("twentieth review: a different head appearing is a named failure, and nothing is accepted", async () => {
+    const w = prWatch((i) => (i < 1 ? OLD : H2));
+    const line = await watchShipGate(w.d, REPO, { pr: 21, head: H1 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(line).toMatchObject({ failure: "other_head", bound_head: null, accepted_head: null, passed: false });
+    expect(line.failure_why).toContain(`a different head appeared on the pull request (${H2}, not ${H1})`);
+    expect(w.read.some((p) => p.includes(H2) && !p.endsWith("/pulls/21"))).toBe(false);
+  });
+  test("twentieth review: the head moving away from the sha after it was there is a named failure, and nothing is accepted", async () => {
+    const w = prWatch((i) => (i < 1 ? H1 : H2), 5);                        // bound at once, then a later push moves it
+    const line = await watchShipGate(w.d, REPO, { pr: 21, head: H1 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(line).toMatchObject({ failure: "head_moved", bound_head: H1, accepted_head: null, passed: false });
+    expect(line.failure_why).toContain(`moved away from ${H1} to ${H2}`);
+    const none = await watchShipGate(w.d, REPO, { pr: 21 }, { everyMs: 1, untilMs: 10_000, sleep: w.tick });
+    expect(none).toMatchObject({ failure: "no_head", accepted_head: null });     // a pull request watch needs --head
+  });
+  test("twentieth review: one wait over 15 minutes ends the watch by name; an unreadable Retry-After or reset counts as the cap", async () => {
+    const NOW = Date.parse("2026-11-16T10:00:00Z");
+    expect(RATE_WAIT_CAP_MS).toBe(15 * 60_000);
+    expect(WATCH_CAP_MS).toBe(2 * 3_600_000);
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "soon" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "-5" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": "" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 403, body: null, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": "1e10" } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: RATE_WAIT_CAP_MS });
+    expect(refusalOf({ status: 429, body: null, headers: { "retry-after": new Date(NOW + 60_000).toUTCString() } }, NOW)).toEqual({ kind: "rate_limit", wait_ms: 60_000 });
+    // An unreadable header waits the cap (not past it), then reads again.
+    let t = NOW, i = 0;
+    const waits: number[] = [];
+    const d = (hdr: Record<string, string>) => ({ api: async (p: string) => (i === 0 && p.includes("check_name=pcjobs-windows")
+      ? { status: 429, body: null, headers: hdr } : fake({ checkPages: [[win(5, "success")]] }).api(p)) });
+    const clock = { sleep: async (ms: number) => { waits.push(ms); t += ms; i++; }, now: () => new Date(t) };
+    const capped = await watchShipGate(d({ "retry-after": "garbage" }), REPO, H1, { everyMs: 60_000, untilMs: WATCH_CAP_MS, ...clock });
+    expect(waits).toEqual([RATE_WAIT_CAP_MS]);
+    expect(capped).toMatchObject({ failure: null, accepted_head: H1 });
+    // Asked for longer than the cap: the watch ends at once, unsettled, named.
+    i = 0; waits.length = 0;
+    const long = await watchShipGate(d({ "retry-after": "1200" }), REPO, H1, { everyMs: 60_000, untilMs: WATCH_CAP_MS, ...clock });
+    expect(waits).toEqual([]);
+    expect(long).toMatchObject({ failure: "rate_wait_cap", accepted_head: null, passed: false });
+    expect(long.failure_why).toContain("past the 15 minute cap on one wait");
+  });
+  test("twentieth review: the whole watch is capped at 2 hours, whatever it is asked, and ends by name", async () => {
+    let t = Date.parse("2026-11-16T10:00:00Z");
+    const t0 = t;
+    const line = await watchShipGate(fake({ checkPages: [[win(5, null, "in_progress")]] }), REPO, H1,
+      { everyMs: 10 * 60_000, untilMs: 6 * 3_600_000, sleep: async (ms) => { t += ms; }, now: () => new Date(t) });
+    expect(t - t0).toBeLessThanOrEqual(WATCH_CAP_MS);
+    expect(line.reports.length).toBe(13);                                    // 0, 10, ... 120 minutes: the next would pass 2 hours
+    expect(line).toMatchObject({ failure: "watch_cap", accepted_head: null, passed: false });
+    expect(line.failure_why).toBe("the watch reached its 2 hour cap unsettled");
   });
 });

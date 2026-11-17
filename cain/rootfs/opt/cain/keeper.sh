@@ -37,6 +37,18 @@
 #                                        on a fix, a refusal and a clean reply; sends nothing
 #   keeper.sh replay [days]              the gate's rules over his DM (default 14 days), reading only;
 #                                        you hear one line when it's done
+#   keeper.sh ship-gate <full head sha> [--watch]
+#                                        the Windows Ship gate read for that head without acting: what it
+#                                        would decide and why, the workflow file it read and every
+#                                        pcjobs-windows attempt it saw; --watch is the probe's ship_gate step
+#   keeper.sh ship-gate --pr <number> --head <full sha> --watch
+#                                        the same watch, started before the push, for the exact sha about to
+#                                        be pushed: it waits until the pull request's head equals that sha and
+#                                        accepts only it, and fails by name (other_head, head_moved) if another
+#                                        head appears or the head moves away; kept as ship-gate-<sha>.json
+#   keeper.sh ship-gate --supersede <full sha>
+#                                        records that the acceptance kept for that sha is replaced (a rebase),
+#                                        so a new watch can accept the pull request's new head for its card
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
@@ -52,6 +64,8 @@ if [ "$cmd" = selftest ]; then
   if [ "$(head -c 10 "${CAIN_MODE_FILE:-/run/cain/mode}" 2>/dev/null)" = "own" ]; then exec bun /opt/cain/discord/selftest.ts; fi
   exec bun "$hooks/discord-send.ts" --self-test
 fi
+# Needs no key and no link either: it reads GitHub's public API only, and changes nothing.
+if [ "$cmd" = ship-gate ]; then exec bun "${CAIN_LINK_DIR:-/opt/cain/link}/shipgate.ts" "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;

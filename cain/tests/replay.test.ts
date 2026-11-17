@@ -344,6 +344,7 @@ describe("the replay", () => {
 
   test("Cain's, from this machine only; /sent root's alone (C1)", () => {
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const http = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes
     for (const route of ["/replay", "/look", "/cards", "/check", "/connector"]) {
       expect(routeAllowed("cain", route)).toBe(true);
       expect(routeAllowed("specialist", route)).toBe(false);
@@ -354,7 +355,11 @@ describe("the replay", () => {
     // key counts only from this machine, and only routes the caller may use are routed.
     expect(main).toContain("const d = linkDecides(MODE, asked);");
     expect(main).toContain("cainKey: !relayKey && sameKey(bare, cainKey()), local");
-    expect(main.indexOf("if (!routeAllowed(caller, url.pathname)) return json({ status: \"refused\" }, 403);")).toBeLessThan(main.indexOf('case "/replay"'));
+    // Both servers route through http.ts (linkRoutes), where the caller's check comes before any route.
+    expect(main).toContain("const route = linkRoutes(routeDeps);");
+    expect(main).toContain("fetch: rootFetch(routeDeps, MAX_BODY)");
+    expect(http.indexOf("if (!routeAllowed(caller, url.pathname)) return json({ status: \"refused\" }, 403);")).toBeLessThan(http.indexOf('case "/replay"'));
+    expect(http.indexOf("if (!routeAllowed(caller, url.pathname))")).toBeGreaterThan(0);
     expect(main).toContain('if (token() && link.replayDue()) link.replay(30, "rules")');   // once by itself after the rules change
   });
 });
