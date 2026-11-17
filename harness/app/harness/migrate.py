@@ -2069,43 +2069,105 @@ REQUEUE_OP = {"requeued": True}
 
 
 def _requeue_intents(lines: list[dict], key: str) -> int:
-    """Twenty-eighth round: the intents a requeue appended for that tap (REQUEUE_OP) among its journal lines."""
-    return sum(1 for r in lines if r.get("intent") == key and r.get("op") == REQUEUE_OP)
+    """Twenty-eighth round: the intents a requeue appended for that tap (REQUEUE_OP) among its journal lines.
+    Twenty-ninth round: only those after the last tombstone for them (a discard that couldn't take the journal's
+    lock), which every reader honours."""
+    n = 0
+    for r in lines:
+        if r.get("intent") == key and r.get("op") == REQUEUE_OP:
+            n += 1
+        elif r.get("cleared") == key and r.get("op") == REQUEUE_OP:
+            n = 0
+    return n
 
 
 def _drop_requeue_intents(journal: str, key: str) -> bool:
     """Twenty-eighth round: a discarded tap's intents that a refused requeue left (REQUEUE_OP, that very key) taken
-    out of the tap journal; every other line kept byte for byte, torn ones included. Written whole (a temporary
-    file, fsynced, renamed). Whether the journal holds none of them now."""
+    out of the tap journal; every other line kept byte for byte, torn ones included.
+
+    Twenty-ninth round: through handover.Inbox.drop_lines, under the journal's exclusive append lock (the one every
+    append takes, in the App and here) held across the read, filter, temporary write, fsync, rename and folder fsync,
+    so a tap appended meanwhile is never lost and the rename is durable; when the lock can't be taken the journal
+    isn't rewritten and a tombstone ({"cleared": key, "op": REQUEUE_OP}) is appended instead, which every reader
+    honours. Whether the journal holds none of them now (or they're tombstoned)."""
+    import time as _time
+    from . import handover
+    inbox = handover.Inbox(lambda: "", journal=journal)
+    return inbox.drop_lines(lambda r: r.get("intent") == key and r.get("op") == REQUEUE_OP,
+                            tombstone={"cleared": key, "op": dict(REQUEUE_OP), "at": _time.time()})
+
+
+def _side_file(journal: str) -> str:
+    """Twenty-ninth round: the controller's file beside the journal (Controller.REREAD_SIDE)."""
+    return journal + ".reread"
+
+
+def _side_relist(journal: str, key: str, gen: int | None, epoch: int = 0) -> tuple[bool, object]:
+    """Twenty-ninth round: the tap's relist count beside the journal set (gen, with its epoch) or cleared (gen None),
+    written whole (a temporary file, fsynced, renamed, the folder synced). Returns whether it took and the file's
+    previous content (None when there was none), so a refused transaction can put it back. A file that doesn't
+    read is left alone: the controller reads none of it, so it can't bring back a count."""
+    path = _side_file(journal)
     try:
-        with open(journal, encoding="utf-8", errors="surrogateescape", newline="") as f:
-            raw = f.readlines()
+        with open(path, encoding="utf-8") as f:
+            old = json.load(f)
     except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    keep = []
-    for line in raw:
-        try:
-            r = json.loads(line)
-        except ValueError:
-            keep.append(line)
-            continue
-        if isinstance(r, dict) and r.get("intent") == key and r.get("op") == REQUEUE_OP:
-            continue
-        keep.append(line)
-    if len(keep) == len(raw):
-        return True
-    tmp = journal + ".tmp"
+        old = None
+    except (OSError, ValueError):
+        return True, False
+    if old is not None and not isinstance(old, dict):
+        return True, False
+    side = json.loads(json.dumps(old)) if old else {}
+    gens = side.get("gens") if isinstance(side.get("gens"), dict) else {}
+    eps = side.get("epochs") if isinstance(side.get("epochs"), dict) else {}
+    if gen is None:
+        if key not in gens and key not in eps:
+            return True, False
+        gens.pop(key, None)
+        eps.pop(key, None)
+    else:
+        gens.pop(key, None)
+        gens[key] = gen
+        if epoch:
+            eps[key] = epoch
+        else:
+            eps.pop(key, None)
+    side["gens"] = gens
+    if eps:
+        side["epochs"] = eps
+    else:
+        side.pop("epochs", None)
+    return _side_write(path, side), old
+
+
+def _side_write(path: str, data) -> bool:
+    from . import handover
     try:
-        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
-            f.write("".join(keep))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, journal)
+        if data is None or (isinstance(data, dict) and not data.get("taps") and not data.get("gens")):
+            if os.path.exists(path):
+                os.remove(path)
+        else:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        handover._fsync_dir(os.path.dirname(os.path.abspath(path)))
     except OSError:
         return False
     return True
+
+
+def _side_epoch(journal: str, key: str) -> int:
+    """Twenty-ninth round: the tap's epoch beside the journal (0 when there's none or it doesn't read)."""
+    try:
+        with open(_side_file(journal), encoding="utf-8") as f:
+            got = json.load(f)
+        e = (got.get("epochs") or {}).get(key, 0)
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return e if isinstance(e, int) and not isinstance(e, bool) and e > 0 else 0
 
 
 def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "discard", *,
@@ -2124,7 +2186,19 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
       very key. A tap with an outcome (in the journal, or its card in the records) gets a strike flag with that
       press, so the controller only strikes it and never acts on it again; one with none is handed back to the
       running loop, which reads the calendar for it before anything. A press that doesn't check out is refused and
-      the tap stays set aside."""
+      the tap stays set aside.
+
+    Twenty-ninth round, what the operations leave:
+    - a requeue leaves at most one intent for the tap in the journal (a refused requeue's is reused, never added
+      again), and starts the tap's relist count afresh (a new epoch, so its cards get a fresh Go ahead, up to the
+      cap again); a discard clears that intent and the count. Each changes the count beside the journal first and
+      the records second, and puts the count back when the records refuse.
+    - a discard's journal rewrite holds the journal's append lock (<journal>.lock) from its read to its rename and
+      folder sync; with no lock to take it appends a tombstone line instead, which every reader honours.
+    - if that rewrite fails after the discard committed, the intent is an orphan: never read, carded or acted on
+      (the discard record skips it everywhere), and the result says so; the same discard run again clears it.
+    - a struck relist mark whose count couldn't be read keeps no count for good: if that tap is ever listed again
+      it's stopped with its own card, never counted from one."""
     import sqlite3 as _sqlite3
     import time as _time
     if action not in SET_ASIDE_ACTIONS:
@@ -2148,10 +2222,21 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                 gone = [k[len(TAP_DISCARDED):] for (k,) in db.execute(
                     "SELECT key FROM meta WHERE substr(key, 1, ?)=?", (len(TAP_DISCARDED), TAP_DISCARDED))]
                 return {"ok": True, "taps": rows, "discarded": gone, "said": f"{len(rows)} set-aside tap record(s)"}
+            from . import handover
+            jpath = journal or base + handover.TAP_JOURNAL
+            if key not in rows and action == "discard" and db.execute(
+                    "SELECT 1 FROM meta WHERE key=?", (TAP_DISCARDED + key,)).fetchone() is not None:
+                # Twenty-ninth round: a discard done again on a discarded tap only clears what the first one
+                # couldn't: its count beside the journal and an intent a refused requeue left in the journal.
+                ok, _ = _side_relist(jpath, key, None)
+                if not ok or not _drop_requeue_intents(jpath, key):
+                    return {"ok": False, "said": "it was discarded before, and what it left in the tap journal "
+                                                 "still couldn't be cleared"}
+                return {"ok": True, "discarded": key, "said": "it was discarded before; what it left in the tap "
+                                                             "journal is cleared now"}
             if key not in rows:
                 return {"ok": False, "taps": rows, "said": "that tap isn't set aside, so nothing was done"}
-            from . import handover
-            lines, entry = _tap_lines(journal or base + handover.TAP_JOURNAL, key)
+            lines, entry = _tap_lines(jpath, key)
             kept_path = os.path.join(folder, SET_ASIDE_TAPS)
             kept = _read_json(kept_path) or {}
             # Twenty-sixth round: the copy's exception text scrubbed at this writer too (scrub.scrub_fields), the
@@ -2178,7 +2263,7 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                     return {"ok": False, "said": "its journal lines don't carry one press for that tap, so it stays "
                                                  "set aside"}
                 state = entry[0]["state"] if entry else ""
-                route = _requeue_route(journal or base + handover.TAP_JOURNAL, key, lines, entry)
+                route = _requeue_route(jpath, key, lines, entry)
                 if route.startswith("refuse:"):
                     return {"ok": False, "said": route[len("refuse:"):] + ", so it stays set aside"}
                 carded = db.execute("SELECT 1 FROM meta WHERE key=? OR substr(key, 1, ?)=?",
@@ -2187,9 +2272,32 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                 # Twenty-eighth round: an intent a refused requeue left for this tap stands for this requeue too
                 # (it's never appended twice), so the tap holds one intent whichever requeue goes through.
                 if route == "unknown" and not (state in _TAP_OUTCOMES or carded) and state != "unknown" \
-                        and not _requeue_intents(lines, key) and not _journal_intent(journal or base + handover.TAP_JOURNAL, entry[0]["press"]):
+                        and not _requeue_intents(lines, key) and not _journal_intent(jpath, entry[0]["press"]):
                     return {"ok": False, "said": "its intent couldn't be written to the tap journal, so it stays set "
                                                  "aside"}
+            # Twenty-ninth round: a requeue starts the tap's relist count afresh (a new epoch, so its cards never reuse
+            # an earlier relist's once-keys) and a discard clears it, each in the same step as its mark: the count
+            # beside the journal first, then the records; a transaction the records refuse puts it back. So the
+            # larger of the mark and the count beside the journal never brings back a count that was lowered.
+            had = db.execute("SELECT value FROM meta WHERE key=?", ("tap_relist:" + key,)).fetchone()
+            try:
+                old_mark = json.loads(had[0]) if had else None
+            except (TypeError, ValueError):
+                old_mark = None
+            old_mark = old_mark if isinstance(old_mark, dict) else ({} if had else None)
+            new_mark = None
+            if action == "discard":
+                side_ok, side_old = _side_relist(jpath, key, None)
+            else:
+                e = old_mark.get("epoch", 0) if old_mark else 0
+                e = e if isinstance(e, int) and not isinstance(e, bool) and e > 0 else 0
+                epoch = max(e, _side_epoch(jpath, key)) + 1
+                new_mark = {k: v for k, v in (old_mark or {}).items() if k != "ended"}
+                new_mark.update(gen=0, epoch=epoch, pending=bool(new_mark.get("pending")))
+                side_ok, side_old = _side_relist(jpath, key, 0, epoch)
+            if not side_ok:
+                return {"ok": False, "said": "its count beside the tap journal couldn't be changed, so it stays set "
+                                             "aside"}
             # Twenty-seventh round: a transaction the records refuse leaves the tap set aside and says so (an intent
             # appended for it above stays in the journal, and the controller skips every set-aside tap's lines).
             try:
@@ -2216,18 +2324,24 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                         said = "requeued: the tap journal shows it was never acted on"
                     else:
                         said = "requeued: nothing of it is left in the tap journal"
+                    if new_mark is not None:
+                        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                                   ("tap_relist:" + key, json.dumps(new_mark)))
                     db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + key,))
                     db.execute("COMMIT")
                 except BaseException:
                     db.execute("ROLLBACK")
                     raise
             except _sqlite3.Error as e:
+                if side_old is not False and not _side_write(_side_file(jpath), side_old):
+                    log.error("set-aside: a tap's count beside the journal couldn't be put back")
                 return {"ok": False, "said": f"the records refused it ({type(e).__name__}), so it stays set aside"}
             # Twenty-eighth round: a discarded tap keeps no intent a refused requeue left, so nothing (a later
             # change to the discard record included) has an intent of his to act on. Its other lines stay.
-            if action == "discard" and not _drop_requeue_intents(journal or base + handover.TAP_JOURNAL, key):
+            if action == "discard" and not _drop_requeue_intents(jpath, key):
                 log.error("set-aside: a discarded tap's requeue intent couldn't be cleared from the tap journal")
-                said += "; an intent a refused requeue left in the tap journal couldn't be cleared"
+                said += ("; an intent a refused requeue left in the tap journal couldn't be cleared (it's never acted "
+                         "on; run the discard again to clear it)")
         finally:
             db.close()
         log.warning("set-aside: a set-aside tap was handled (%s); its copy is kept in %s", action, SET_ASIDE_TAPS)
@@ -2829,7 +2943,8 @@ if __name__ == "__main__":
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 4 and args[1] == "--set-aside" and args[2] == "--taps":
-        got = {"ok": False, "said": "name an operation first: --taps export|discard|requeue <tap key>"}
+        got = {"ok": False, "said": "name an operation first: --taps export|discard|requeue <tap key> (discard "
+                                    "again on a discarded tap clears what its first discard couldn't)"}
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 2 and args[1] == "--set-aside":

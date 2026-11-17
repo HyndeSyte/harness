@@ -2,6 +2,10 @@
 
 ## 0.24.0
 
+- **When taps wait because Harness can't read part of its records, you get one card saying so**, and that it keeps retrying by itself. Nothing is needed from you.
+- **A set-aside tap you put back can get a *Go ahead* again**, and a tap Harness stopped after six listings stays stopped for good.
+- A tap of yours that comes in while a set-aside tap is being discarded is never lost.
+
 - **A tap Harness has brought back to you six times stays at six**, however its count is damaged, so it never gets a seventh *Go ahead*.
 - **When Harness can't read its list of set-aside taps for a while, it says so** on its status page and in your digest, checks back less often, and finishes the waiting taps as soon as it can read the list again.
 - A set-aside tap you discard leaves nothing behind for Harness to act on later.

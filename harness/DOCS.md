@@ -658,6 +658,15 @@ On Gmail, and then the same on Family:
     while the records refuse writes. Open the status page and `/health` and note that neither shows the
     storage note or a `storage` field on a healthy install; the tests show both carry it, with no write,
     when the records and the file beside the tap journal refuse.
+3c. The waiting note (done by hand, once per install, not per calendar): with the App's records made
+    unreadable for the set-aside list (in a test copy, not your real records), check that after three
+    tries the status page, `/health` (`waiting`) and the next digest all carry the note that taps wait, and
+    that one card came saying taps are waiting and Harness keeps retrying by itself. Put the records back
+    and note that the note clears.
+
+Cain's link watching `/health` for its `storage` and `waiting` fields and telling you is separate work, not
+in this build: it is a precondition of turning these handovers on beyond the smoke run, since the digest
+can't reach you while the records refuse writes.
 4. A card for an event that changed since it. To produce the Gmail stale card: add a throwaway
    one-off event in Google Calendar on the web (not a series), ask Cain to move it, and when its card
    comes, open the event in Google Calendar and change its end time by 15 minutes, save, then tap
@@ -982,9 +991,29 @@ pending strike or listing mark found for a discarded or set-aside tap is skipped
 can't read which taps are set aside does nothing and comes back after 1, then 5, then every 15 minutes; from
 the third such try in a row Harness's health (a "waiting" note), its status page and the digest's standing
 problems say taps from before its last start wait, with the log saying so at most once an hour, and that
-clears at the first replay that reads them, which settles every tap it had put off that's due. Discard also
+clears at the first replay that reads them, which settles every tap it had put off that's due. When that note
+first comes on, Harness also queues one card for you (once for that outage, and only where its outbox takes
+it) saying taps are waiting and it keeps retrying by itself; nothing is asked of you. While the records stay
+unreadable the running loop reads no calendar and writes nothing for those taps, and its own log line about
+it comes once and then at most hourly. Discard also
 takes out of the tap journal an intent that a refused requeue left for that tap (every other line, torn ones
-included, stays as it was). Requeue checks the tap's journal
+included, stays as it was). A requeue leaves at most one such intent for a tap, and a discard clears it. That
+rewrite holds the tap journal's own lock (`<journal>.lock`, the one every append takes, in Harness and in the
+tool) from its read to its rename and the folder's sync, so a tap written down meanwhile waits for it and is
+never lost; where that lock can't be taken the journal isn't rewritten, and a tombstone line is added instead,
+which every reader honours. If the rewrite fails after the discard is committed, the intent stays as an orphan:
+the discard record means it's never read on your calendar, carded or acted on (by the start's replay, the
+running loop or either resume), and the tool says so; running the same discard again clears it (and only
+that). Requeue starts the tap's listing count afresh and discard clears it, each in the same step as its
+listing mark: the count beside the tap journal is changed first and the records' transaction second, and a
+transaction the records refuse puts the count beside the journal back, so the larger of the two never brings
+back a count that was lowered. A requeued tap's cards are keyed on its new count, so a requeued tap gets a
+fresh *Go ahead*, up to six again. A tap ended after six listings (or stopped because its count couldn't be
+read) is ended for good: its mark says so whatever count it holds, and it's never counted on or carded again.
+A struck mark whose count couldn't be read is kept with no count, and stays that way: such a tap, if it's
+ever listed again, is stopped with its own card rather than counted from one. Once, at a start, marks written
+by earlier builds are put into this form (an ended mark at the old count of seven, or a struck mark written
+as nought, which takes the count beside the journal, or no count when there's none). Requeue checks the tap's journal
 lines carry one press for that very key (otherwise it's refused and stays set aside); a tap with an outcome
 gets its strike back with that press and is only crossed off. One with none goes by its journal alone: if it
 holds an intent, or any other sign the tap was started (a read, a delivery, or a line that can't be read but
@@ -1020,7 +1049,11 @@ Harness's own keys and the link's token replaced, never the patterns, so an even
 reaches you as written. Those words are a type of their own in the code, built only from Harness's own
 wording and your events' fields; the refusals that carry them keep their message as that type, and anything
 else handed to that light scrub (an error's text, a calendar service's answer, plain text) gets the whole scrub
-instead. A source check makes sure no error, traceback or service answer is built into them, and that the light
+instead. That type can only be built by its factory (a fixed template filled with your event's fields) or a
+refusal's message, and the records' and tap journal's writers go by it too: only that type keeps your titles in
+the field for your words; anything else there, and any record already kept as text, gets the whole scrub. The
+source check finds the light scrub by what it was imported as, under any name, and flags any other way of
+building that type. A source check makes sure no error, traceback or service answer is built into them, and that the light
 scrub is only ever handed one of those refusals. The source check for errors covers format calls, an error's
 attributes, joins over its arguments, traceback formatting, the message of a refusal raised with it, and a name
 it's rebound to (simply, in a tuple, or by adding to it), and counts a call as logged or scrubbed only when it's

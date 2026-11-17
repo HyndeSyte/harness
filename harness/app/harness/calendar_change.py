@@ -970,8 +970,7 @@ class Unclear(Refuse):
     `ask` is the question, which only makes sense before anything is approved."""
 
     def __init__(self, words: str, ask: str = ""):
-        super().__init__(words)
-        self.ask = scrub.OwnerText(ask)
+        super().__init__(words, ask=ask)
 
 
 class Stopped(Exception):

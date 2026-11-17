@@ -35,7 +35,8 @@ from fake_caldav import no_network  # noqa: F401  (autouse)
 @pytest.mark.parametrize("title", TITLES)
 def test_only_owner_text_keeps_his_titles(title):
     words = f"Nothing changed: “{title}” isn't on your calendar."
-    assert scrub.scrub_owner(scrub.OwnerText(words)) == words                  # his words, as written
+    built = scrub.OwnerText.template("Nothing changed: “{title}” isn't on your calendar.", title=title)
+    assert scrub.scrub_owner(built) == words                                   # his words, as written
     assert scrub.scrub_owner(words) == scrub.scrub(words) != words             # plain text: the whole scrub
     assert scrub.scrub_owner(Refuse(words)) == words                           # a refusal carries his words
     assert scrub.scrub_owner(ValueError(words)) == scrub.scrub(words)          # any other exception doesn't
@@ -344,16 +345,6 @@ def test_the_scan_passes_these(body):
 
 
 # -- 6. the composed digest with the family inputs, no write ----------------------------------------------------------
-
-class Family:
-    """The Family calendar's digest view: its lines read from the calendar, never written."""
-
-    def digest_lines(self, *a, **kw):
-        return ["Family: Swim lessons at 5:00 PM"]
-
-    def __getattr__(self, name):
-        return lambda *a, **kw: None
-
 
 def test_the_composed_digest_has_the_family_inputs_with_every_write_refused(m, monkeypatch):
     c = m.c

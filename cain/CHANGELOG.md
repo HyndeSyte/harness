@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- Cain knows a set-aside tap Dane puts back can get a Go ahead again, a tap stopped after six listings stays stopped, and the calendar specialist sends one card when taps wait because it can't read its list of set-aside taps.
+
 - Cain knows a tap the calendar specialist brought back six times never gets a seventh Go ahead, and that its /health says "waiting" while it can't read its list of set-aside taps (taps from before its last start wait until it can).
 
 - Cain knows a tap the calendar specialist can't safely try again gets one card saying it was stopped, a tap whose calendar read failed is read again once the calendar answers, and the specialist's cards show event names as written.

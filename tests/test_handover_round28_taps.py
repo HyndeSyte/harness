@@ -275,7 +275,9 @@ def test_a_replay_with_the_set_aside_list_down_for_hours_backs_off_and_settles_o
     assert state["reads"] <= 4 * 60 // 15 + 3                                  # backed off to every 15 minutes
     assert "waiting" in m.c.handovers.health()                                 # said where no records are needed
     assert m.c.notes.get("tap_setaside")
-    assert m.ledger.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == before   # nothing for any of them
+    # nothing for any of them (twenty-ninth round: only the one card that taps are waiting)
+    assert m.ledger.db.execute("SELECT COUNT(*) FROM outbox WHERE text NOT LIKE 'Some taps of yours are waiting%'"
+                               ).fetchone()[0] == before
     state["down"], state["passes"] = False, 0                                  # the records answer again
     while state["passes"] == 0:
         later(m, clock, 60)

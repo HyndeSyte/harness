@@ -84,21 +84,48 @@ def _known(text) -> str:
     return out
 
 
+_MINT = object()                        # twenty-ninth round: OwnerText's private constructor key
+
+
 class OwnerText(str):
     """Twenty-eighth round: words for him, built by the specialist from its own word constants and his events' own
     fields (a title, a time), never from an exception's text or a provider's response (tests/test_outbox_round28.py
-    checks every place one is built). The one type scrub_owner takes as his words."""
+    checks every place one is built). The one type scrub_owner takes as his words.
+
+    Twenty-ninth round: its constructor is private. Words for him are built only by OwnerText.template (a literal
+    template and his events' fields), by an owner refusal's message (OwnerRefusal, its .owner and .ask), or by
+    scrub_owner's own result; OwnerText(...) called directly raises, and tests/test_outbox_round29.py's scan flags
+    any other construction."""
     __slots__ = ()
+
+    def __new__(cls, value="", key=None):
+        if key is not _MINT:
+            raise TypeError("words for him are built with OwnerText.template or an owner refusal")
+        return super().__new__(cls, value)
+
+    @classmethod
+    def template(cls, fmt: str, /, **fields) -> "OwnerText":
+        """A literal template (the scan checks it's a string literal at every call) filled with his events' own
+        fields (a title, a time, a day), each as text."""
+        return cls(fmt.format(**{k: str(v) for k, v in fields.items()}) if fields else fmt, _MINT)
+
+
+def _owner(text: str) -> OwnerText:
+    """The scrub module's own minting: an owner refusal's message, and scrub_owner's result."""
+    return OwnerText(text, _MINT)
 
 
 class OwnerRefusal(Exception):
     """Twenty-eighth round: a refusal whose message is words for him (calendar_change.Refuse, rules.RuleError,
     ics_edit.Cant, ledger.LedgerFenced): its message kept as OwnerText (.owner) when it's given as text. Every place
-    one is raised is checked like an OwnerText built (tests/test_outbox_round28.py)."""
+    one is raised is checked like an OwnerText built (tests/test_outbox_round28.py). Twenty-ninth round: `ask`, a
+    question for him (calendar_change.Unclear), kept as OwnerText (.ask) too."""
 
-    def __init__(self, *args):
+    def __init__(self, *args, ask: str | None = None):
         super().__init__(*args)
-        self.owner = OwnerText(args[0]) if args and isinstance(args[0], str) else None
+        self.owner = _owner(args[0]) if args and isinstance(args[0], str) else None
+        if ask is not None:
+            self.ask = _owner(ask if isinstance(ask, str) else "")
 
 
 def scrub_owner(text) -> str:
@@ -111,7 +138,7 @@ def scrub_owner(text) -> str:
     if isinstance(text, OwnerRefusal) and text.owner is not None:
         text = text.owner
     if isinstance(text, OwnerText):
-        return OwnerText(_known(text))
+        return _owner(_known(text))
     return scrub(text)
 
 
@@ -125,19 +152,20 @@ def scrub(text) -> str:
 
 # The fields of a record that hold exception text: scrubbed wherever a sink writes one. Twenty-seventh round:
 # "words" holds a refusal in his own words (a change's part that stopped, naming his event), so it gets only the
-# known secrets replaced (OWNER_FIELDS, scrub_owner), never the heuristic patterns.
+# known secrets replaced (OWNER_FIELDS, scrub_owner), never the heuristic patterns. Twenty-ninth round: by type,
+# not by position: only an OwnerText value there gets the light scrub; anything else in that field (plain text,
+# and a record kept as JSON text, where no value has a type) gets the whole scrub.
 ERROR_FIELDS = frozenset({"error", "errors", "last_error", "exception", "detail", "why", "words", "refused"})
 OWNER_FIELDS = frozenset({"words"})
 
 
 def scrub_fields(value):
     """A record (dicts and lists, any depth) with every string under an ERROR_FIELDS key scrubbed (an OWNER_FIELDS
-    key's with scrub_owner)."""
+    key's OwnerText with scrub_owner, anything else there with the whole scrub)."""
     if isinstance(value, dict):
         def one(k, x):
-            # Twenty-eighth round: a field that holds his words holds them as written whether or not they were read
-            # back from storage (where OwnerText becomes plain text), so it gets the known secrets replaced only.
-            return _known(x) if k in OWNER_FIELDS else scrub(x)
+            # Twenty-ninth round: type-gated: the light scrub only for OwnerText in an owner field.
+            return _owner(_known(x)) if k in OWNER_FIELDS and isinstance(x, OwnerText) else scrub(x)
         return {k: (one(k, v) if isinstance(v, str) and k in ERROR_FIELDS
                     else [one(k, x) if isinstance(x, str) else scrub_fields(x) for x in v]
                     if isinstance(v, list) and k in ERROR_FIELDS else scrub_fields(v))

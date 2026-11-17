@@ -36,6 +36,7 @@ controller and waits on an event.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -61,6 +62,7 @@ MAX_SUGGESTION = 1500
 MAX_MEANINGS_BODY = 16384             # up to 60 short rows, or the place book
 PRESS_WAIT_S = 8                      # a tap's answer to Cain's link waits this long at most (its own limit is 10 s)
 TAP_JOURNAL = ".taps.jsonl"           # beside the ledger: taps written down before they're taken (fourteenth round)
+JOURNAL_LOCK = ".lock"                # twenty-ninth round: beside the journal, its exclusive append lock (flock)
 FENCED_TAP = ("Not taken: Harness is waiting to restart so its records can be put back from a backup. Restart the "
               "Harness App in Home Assistant now. Nothing changed.")
 # Fifteenth round: a tap that couldn't be written down is refused (never "working"), and he hears it.
@@ -177,11 +179,43 @@ class Handover:
             self.done.set()
 
 
+@contextlib.contextmanager
+def journal_lock(journal: str):
+    """Twenty-ninth round: the tap journal's exclusive lock, shared by every process that writes it (an flock on
+    the file beside it, JOURNAL_LOCK, which a rename of the journal never replaces): each append, each strike's
+    rewrite and the set-aside tool's rewrite hold it, so an append blocks until a rewrite has read, filtered,
+    written, fsynced, renamed and synced the folder. Raises OSError when the lock file can't be opened."""
+    import fcntl
+    fd = os.open(journal + JOURNAL_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)                      # closing the last descriptor releases the flock
+
+
+@contextlib.contextmanager
+def _journal_lock_or_none(journal: str):
+    """The journal's lock where it can be taken; an append goes on without it when the lock file can't be opened
+    (a read-only or full folder fails the append itself anyway)."""
+    try:
+        cm = journal_lock(journal)
+        cm.__enter__()
+    except OSError as e:
+        log.warning("the tap journal's lock couldn't be taken: %s", type(e).__name__)
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        cm.__exit__(None, None, None)
+
+
 def _row_key(r: dict, key: Callable[[dict], str]) -> str:
     """The tap a journal line belongs to."""
     if isinstance(r.get("press"), dict):
         return key(r["press"])
-    for field_ in ("intent", "committed", "outcome", "delivered", "check"):
+    for field_ in ("intent", "committed", "outcome", "delivered", "check", "cleared"):
         if field_ in r:
             return str(r.get(field_) or "")
     return str(r.get("key") or "")
@@ -310,7 +344,7 @@ class Inbox:
         """One line appended, written whole and fsynced, or not at all: a short write or a failed fsync is cut
         back off (best effort) and counts as not written."""
         data = (json.dumps(_scrub.scrub_fields(row)) + "\n").encode()   # twenty-sixth round: scrubbed at the sink
-        with self._lock:
+        with self._lock, _journal_lock_or_none(self.journal):
             try:
                 new = not os.path.exists(self.journal)
                 fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -410,7 +444,7 @@ class Inbox:
 
         def mine(r: dict) -> bool:
             return _row_key(r, self.key) == key
-        with self._lock:
+        with self._lock, _journal_lock_or_none(self.journal):
             rows = self._journal_lines()
             keep = [r for r in rows if not mine(r)]
             if len(keep) == len(rows):
@@ -440,6 +474,78 @@ class Inbox:
             os.fsync(f.fileno())
         os.replace(tmp, self.journal)
 
+    def drop_lines(self, drop: Callable[[dict], bool], tombstone: dict | None = None) -> bool:
+        """Twenty-ninth round: the journal rewritten without the lines `drop` picks, every other line (torn ones
+        included) kept byte for byte, under the journal's exclusive lock held across the whole read, filter,
+        temporary write, fsync, rename and folder fsync, so a tap appended meanwhile (by this process or another)
+        waits and is never lost, and the rename is on disk before the lock goes. When the lock can't be taken the
+        journal isn't rewritten: `tombstone` (a line every reader honours) is appended instead. Whether the lines
+        are gone or tombstoned."""
+        if not self.journal:
+            return True
+        with self._lock:
+            try:
+                cm = journal_lock(self.journal)
+                cm.__enter__()
+            except OSError as e:
+                log.warning("the tap journal's lock couldn't be taken (%s); a tombstone is appended",
+                            type(e).__name__)
+                return bool(tombstone) and self._append_raw(tombstone)
+            try:
+                return self._drop_locked(drop)
+            finally:
+                cm.__exit__(None, None, None)
+
+    def _drop_locked(self, drop: Callable[[dict], bool]) -> bool:
+        try:
+            with open(self.journal, encoding="utf-8", errors="surrogateescape", newline="") as f:
+                raw = f.readlines()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        keep = []
+        for line in raw:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                keep.append(line)
+                continue
+            if isinstance(r, dict) and drop(r):
+                continue
+            keep.append(line)
+        if len(keep) == len(raw):
+            return True
+        tmp = self.journal + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                f.write("".join(keep))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.journal)
+        except OSError:
+            return False
+        _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+        return True
+
+    def _append_raw(self, row: dict) -> bool:
+        """The tombstone's append when the journal's lock can't be taken (O_APPEND, one write, fsynced); the caller
+        holds self._lock."""
+        data = (json.dumps(_scrub.scrub_fields(row)) + "\n").encode()
+        try:
+            fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        except OSError:
+            return False
+        try:
+            if os.write(fd, data) != len(data):
+                return False
+            os.fsync(fd)
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+        return True
+
     def journaled(self) -> list[dict]:
         """The taps written down and not yet struck off, oldest first, each {"press", "at", "intent", "op",
         "committed", "outcome", "note", "delivered", "state"}. state: "committed" (its outcome, done, is recorded),
@@ -463,7 +569,12 @@ class Inbox:
             t = taps.get(k)
             if t is None:
                 continue
-            if "intent" in r:
+            if "cleared" in r:
+                # Twenty-ninth round: a tombstone the set-aside tool appends when it can't take the journal's lock
+                # to rewrite it: the intents with that op written before it no longer count.
+                if t["intent"] and t["op"] == (r.get("op") if isinstance(r.get("op"), dict) else None):
+                    t["intent"], t["op"] = False, {}
+            elif "intent" in r:
                 t["intent"] = True
                 t["op"] = r.get("op") if isinstance(r.get("op"), dict) else {}
             elif "committed" in r:

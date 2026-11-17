@@ -46,7 +46,9 @@ TITLES = [
 def test_the_owner_scrub_leaves_his_titles(title):
     assert scrub.scrub(title) != title                                         # the heuristic would redact it
     # Twenty-eighth round: his words as the owner-text type (plain text now gets the whole scrub).
-    assert scrub.scrub_owner(scrub.OwnerText(f"Nothing changed: “{title}” isn't on your calendar.")) == \
+    # Twenty-ninth round: built with its factory (a literal template and his event's field).
+    assert scrub.scrub_owner(scrub.OwnerText.template("Nothing changed: “{title}” isn't on your calendar.",
+                                                      title=title)) == \
         f"Nothing changed: “{title}” isn't on your calendar."
 
 
@@ -69,12 +71,17 @@ def test_a_refusal_card_names_his_event_as_written(m, monkeypatch, title):
 
 
 def test_a_stopped_parts_words_are_kept_as_written_at_the_records_sink(m):
-    with m.ledger.tx() as db:
-        m.ledger.set_meta("cc_plan:r27", json.dumps({"words": "“Token: pickup” moved since the card",
-                                                     "error": "Token: abc123"}), db)
-    got = json.loads(m.ledger.get_meta("cc_plan:r27"))
+    # Twenty-ninth round: the sinks go by type. His words as OwnerText keep his titles at a sink that has them as
+    # values (the tap journal's, scrub_fields); a record kept as JSON text has no types, so its words get the whole
+    # scrub there, as anything that isn't his words does.
+    words = scrub.OwnerText.template("“{t}” moved since the card", t="Token: pickup")
+    got = scrub.scrub_fields({"words": words, "error": "Token: abc123"})
     assert got["words"] == "“Token: pickup” moved since the card"          # his words, as written
     assert got["error"] != "Token: abc123"                                     # exception text still scrubbed
+    with m.ledger.tx() as db:
+        m.ledger.set_meta("cc_plan:r27", json.dumps({"words": str(words), "error": "Token: abc123"}), db)
+    kept = json.loads(m.ledger.get_meta("cc_plan:r27"))
+    assert kept["words"] == scrub.scrub(str(words)) and kept["error"] != "Token: abc123"
 
 
 # -- 7. the exception-to-text scan, extended -------------------------------------------------------------------------

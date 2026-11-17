@@ -763,6 +763,8 @@ class Controller:
             self._setaside_unread(e)
             return
         self._setaside_read()
+        if not self.__dict__.get("_legacy_checked"):
+            self.__dict__["_legacy_checked"] = self._legacy_relist_marks()
         try:
             flags, rereads = self._flags(self.STRIKE_FLAG), self._flags(self.REREAD_FLAG)
             relists = self._relist_marks()
@@ -868,6 +870,10 @@ class Controller:
     SETASIDE_ALARM_AT = 3                       # twenty-eighth round: failures in a row before health says so
     SETASIDE_WORDS = ("Harness can't read its list of set-aside taps, so taps of yours from before its last start "
                       "wait until it can. Nothing is done twice.")
+    # Twenty-ninth round: the one card he gets when the waiting flag first sets (once-keyed on that outage).
+    SETASIDE_CARD_WORDS = ("Some taps of yours are waiting: Harness can't read part of its records just now, so it "
+                           "keeps retrying by itself and takes them up once it can. Nothing is done twice, and "
+                           "nothing is needed from you.")
 
     def _setaside_unread(self, e: BaseException) -> None:
         """Twenty-eighth round: the start replay couldn't read the set-aside taps. The pass waits on the back-off
@@ -876,22 +882,41 @@ class Controller:
         n = self.__dict__["_setaside_fails"] = self.__dict__.get("_setaside_fails", 0) + 1
         delay = self.SETASIDE_BACKOFF_S[min(n, len(self.SETASIDE_BACKOFF_S)) - 1]
         now = self._clock()
+        self.__dict__.setdefault("_setaside_since", int(now))
         self.__dict__["_replay_put_off"].append(now + delay)
         if n < self.SETASIDE_ALARM_AT:
             log.warning("the set-aside taps couldn't be read (%s); the start replay waits %d minutes",
                         type(e).__name__, delay // 60)
             return
+        first = "tap_setaside" not in self.notes
         self.notes["tap_setaside"] = self.SETASIDE_WORDS
         if self.handovers is not None:
             self.handovers.waiting = "taps waiting: the records' set-aside list can't be read"
+        if first:
+            self._setaside_card(now)
         if now - self.__dict__.get("_setaside_said", float("-inf")) >= 3600:
             self.__dict__["_setaside_said"] = now
             log.error("the set-aside taps still can't be read (%s, %d tries in a row); the start replay waits, and "
                       "Harness's health says so until they can", type(e).__name__, n)
 
+    def _setaside_card(self, now: float) -> None:
+        """Twenty-ninth round: when the waiting flag first sets, one card for him, once-keyed on this outage (its
+        first failure's time), queued only where the outbox takes it: a refused write is logged, and the flag on
+        /health and the status page stay (Cain's link polling those flags is a precondition of enabling this beyond
+        the smoke run)."""
+        started = self.__dict__.setdefault("_setaside_since", int(now))
+        try:
+            with self.ledger.tx() as db:
+                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
+                                    text=render.fit(self.SETASIDE_CARD_WORDS), once=f"setaside_waiting:{started}")
+        except (Exception, TransactionAborted) as e:  # noqa: BLE001: the flags still say it
+            self._reraise_dead(e)
+            log.warning("the card that taps are waiting couldn't be queued (%s)", type(e).__name__)
+
     def _setaside_read(self) -> None:
         """Twenty-eighth round: the set-aside taps read: the failure count starts again and the flag is cleared."""
         self.__dict__["_setaside_fails"] = 0
+        self.__dict__.pop("_setaside_since", None)
         if self.notes.pop("tap_setaside", None) is not None and self.handovers is not None:
             self.handovers.waiting = ""
 
@@ -1319,8 +1344,15 @@ class Controller:
             # Twenty-first round: and one recorded as unidentified; each at most on its strike's back-off.
             unverified = [r for r in rows if r["state"] in self.TAP_TERMINAL]
         except Exception as e:                  # noqa: BLE001: a journal that can't be read now is read next tick
-            log.warning("the tap journal couldn't be read for unknown taps (%s)", type(e).__name__)
+            # Twenty-ninth round: said once, then at most once an hour while it goes on (a long outage of the
+            # records doesn't fill the log a line a minute); the next read that works starts it again.
+            now_s = self._clock()
+            if now_s - self.__dict__.get("_unknown_unread_said", float("-inf")) >= 3600:
+                self.__dict__["_unknown_unread_said"] = now_s
+                log.warning("the tap journal couldn't be read for unknown taps (%s); tried again each tick, said "
+                            "again hourly", type(e).__name__)
             return
+        self.__dict__.pop("_unknown_unread_said", None)
         if flags:
             self._resume_strikes(flags, skip=queued)
         if relists:
@@ -1386,7 +1418,12 @@ class Controller:
                 v = json.loads(r["value"])
             except (TypeError, ValueError):
                 v = None
-            bad = not isinstance(v, dict) or (prefix == self.RELIST_FLAG and self._gen_of(v.get("gen")) is None)
+            # Twenty-ninth round: an ended mark is terminal whatever its generation (a null one included), so it
+            # reads by its state first and never counts as unreadable for its generation; an epoch (a requeue's
+            # fresh count) must read too.
+            bad = not isinstance(v, dict) or (prefix == self.RELIST_FLAG and (
+                self._epoch_of(v.get("epoch", 0)) is None
+                or (v.get("ended") is not True and self._gen_of(v.get("gen")) is None)))
             if bad and unreadable is not None:
                 unreadable.add(r["key"][len(prefix):])
             out[r["key"][len(prefix):]] = v if isinstance(v, dict) else {}
@@ -1400,20 +1437,100 @@ class Controller:
             return None
         return value if 0 <= value <= cls.RELIST_GEN_CAP else None
 
-    def _relist_count(self, key: str, marks: dict | None, unreadable: set, side_gens: dict) -> int | None:
-        """Twenty-eighth round: how many times a tap was relisted, or None when it can't be told. `marks` the
-        records' marks (None when they couldn't be read), `unreadable` the keys whose mark failed its schema,
-        `side_gens` the counts kept beside the journal. The larger of the mark and the count beside the journal
-        when both read; the one that reads otherwise; none (no mark and no count beside it) is 0. A mark that
-        doesn't read with no count beside it, or a count beside it that doesn't read with no mark, is None."""
-        side = self._gen_of(side_gens.get(key)) if key in side_gens else None
-        side_bad = key in side_gens and side is None
+    @staticmethod
+    def _epoch_of(value) -> int | None:
+        """Twenty-ninth round: a relist mark's epoch (how many requeues started its count afresh), when it reads: an
+        integer (never a bool) of 0 or more. None for anything else."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if value >= 0 else None
+
+    @staticmethod
+    def _relist_label(gen: int, epoch: int) -> str:
+        """Twenty-ninth round: a relist's card label, its generation, with the epoch in front once a requeue started
+        the count afresh, so a requeued tap's cards never reuse the once-keys of its earlier ones."""
+        return str(gen) if not epoch else f"{epoch}.{gen}"
+
+    def _relist_state(self, key: str, marks: dict | None, unreadable: set, side: dict) -> tuple[int | None, int, bool]:
+        """Twenty-ninth round: a tap's relist count, its epoch and whether it was ended, from the records' mark
+        (`marks`, None when they couldn't be read; `unreadable`, the keys whose mark failed its schema) and the
+        side file beside the journal (`side`, its "gens" and "epochs"). The state is decided first: an ended mark is
+        terminal whatever its generation. Otherwise the larger (epoch, count) of the mark and the side entry when
+        both read; the one that reads otherwise; neither (no mark and no side entry) is 0. A mark that doesn't read
+        with no side entry, or a side entry that doesn't read with no mark, gives no count (None).
+
+        Invariant: every path that lowers or resets a count (a requeue, a discard) changes or clears the tap's side
+        entry in the same step as its mark (the side file first, then the records, the side entry put back when
+        the records refuse), so the larger of the two never brings back a count that was lowered."""
+        side_gens = side.get("gens") if isinstance(side.get("gens"), dict) else {}
+        side_epochs = side.get("epochs") if isinstance(side.get("epochs"), dict) else {}
+        mark = (marks or {}).get(key) if marks is not None and key not in unreadable else None
+        if isinstance(mark, dict) and mark.get("ended") is True:
+            return self.RELIST_GEN_CAP, self._epoch_of(mark.get("epoch", 0)) or 0, True
+        s_gen = self._gen_of(side_gens.get(key)) if key in side_gens else None
+        s_epoch = self._epoch_of(side_epochs.get(key, 0))
+        side_ok = s_gen is not None and s_epoch is not None
+        side_bad = key in side_gens and not side_ok
         if marks is not None and key not in unreadable:
-            mark = self._gen_of((marks.get(key) or {}).get("gen")) if key in marks else None
-            if mark is None and key not in marks:
-                return None if side_bad else (side or 0)
-            return max(mark, side) if side is not None else mark
-        return side
+            if key not in marks:
+                return (None, 0, False) if side_bad else ((s_gen, s_epoch, False) if side_ok else (0, 0, False))
+            got = (self._epoch_of(mark.get("epoch", 0)) or 0, self._gen_of(mark.get("gen")))
+            if side_ok and (s_epoch, s_gen) > got:
+                return s_gen, s_epoch, False
+            return got[1], got[0], False
+        return (s_gen, s_epoch, False) if side_ok else (None, 0, False)
+
+    LEGACY_CHECKED = "relist_marks_checked"     # twenty-ninth round: the one-time check of earlier builds' marks
+
+    def _legacy_relist_marks(self) -> bool:
+        """Twenty-ninth round: once, at a start, relist marks written by earlier builds are put into this build's
+        schema, so none reads as unreadable or collides with a used once-key: an ended value at the old over-cap
+        number (RELIST_GEN_CAP + 1) becomes the ended state (terminal, its generation the cap), and a struck mark
+        written as nought (no epoch: the twenty-seventh round's strike of a generation it couldn't read) takes the
+        count beside the journal, or, with none there, no count (so its next relist ends with UNKNOWN_COUNT_WORDS,
+        never a card refused as a duplicate). A count beside the journal at the old over-cap number becomes the
+        cap. Whether it's done (it's tried again at the next start when the records refuse it)."""
+        try:
+            if self.ledger.get_meta(self.LEGACY_CHECKED):
+                return True
+            side = self._side_load()
+            side_gens = side.get("gens") if isinstance(side.get("gens"), dict) else {}
+            fixed: dict = {}
+            for r in self.ledger.db.execute("SELECT key, value FROM meta WHERE substr(key, 1, ?)=?",
+                                            (len(self.RELIST_FLAG), self.RELIST_FLAG)).fetchall():
+                try:
+                    v = json.loads(r["value"])
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(v, dict):
+                    continue
+                k, gen = r["key"][len(self.RELIST_FLAG):], v.get("gen")
+                if isinstance(gen, int) and not isinstance(gen, bool) and gen > self.RELIST_GEN_CAP:
+                    fixed[k] = dict(v, gen=self.RELIST_GEN_CAP, ended=True)
+                elif gen == 0 and not isinstance(gen, bool) and not v.get("pending") and not v.get("epoch") \
+                        and v.get("ended") is not True:
+                    fixed[k] = dict(v, gen=self._gen_of(side_gens.get(k)))
+            over = {k: g for k, g in side_gens.items()
+                    if isinstance(g, int) and not isinstance(g, bool) and g > self.RELIST_GEN_CAP}
+            if over:
+                side["gens"] = dict(side_gens, **{k: self.RELIST_GEN_CAP for k in over})
+                if not self._side_save(side):
+                    log.debug("an earlier build's relist count beside the journal couldn't be repaired")
+            with self.ledger.tx() as db:
+                for k, v in fixed.items():
+                    self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(v), db)
+                self.ledger.set_meta(self.LEGACY_CHECKED, "1", db)
+            if fixed:
+                log.warning("%d relisted tap mark(s) from an earlier build were repaired", len(fixed))
+            return True
+        except Exception as e:                  # noqa: BLE001: tried again at the next start
+            log.warning("the earlier builds' relist marks couldn't be checked (%s)", type(e).__name__)
+            return False
+
+    def _relist_count(self, key: str, marks: dict | None, unreadable: set, side_gens: dict) -> int | None:
+        """Twenty-eighth round: how many times a tap was relisted, or None when it can't be told (twenty-ninth
+        round: _relist_state, with the side file's counts only)."""
+        return self._relist_state(key, marks, unreadable, {"gens": side_gens})[0]
 
     @staticmethod
     def _due_at(flag: dict | None, now: float) -> float:
@@ -1477,16 +1594,28 @@ class Controller:
 
     SIDE_GENS_KEPT = 256                        # twenty-sixth round: relist counts kept beside the journal, at most
 
-    def _side_gens(self, gens: dict) -> None:
+    def _side_gens(self, gens: dict, epochs: dict | None = None) -> None:
         """Twenty-sixth round: each relisted tap's generation, kept beside the journal too (the side file's
         "gens", newest last, at most SIDE_GENS_KEPT), so a relist whose records' marks can't be read still counts
         on from it. Best effort: a count that can't be kept here is taken as at the cap when it's needed."""
         side = self._side_load()
         kept = side.get("gens") if isinstance(side.get("gens"), dict) else {}
+        eps = side.get("epochs") if isinstance(side.get("epochs"), dict) else {}
         for k, g in gens.items():
             kept.pop(k, None)
             kept[k] = g
+            # Twenty-ninth round: the tap's epoch beside its count (none kept for epoch 0).
+            e = (epochs or {}).get(k, 0)
+            if e:
+                eps[k] = e
+            else:
+                eps.pop(k, None)
         side["gens"] = dict(list(kept.items())[-self.SIDE_GENS_KEPT:])
+        eps = {k: v for k, v in eps.items() if k in side["gens"]}
+        if eps:
+            side["epochs"] = eps
+        else:
+            side.pop("epochs", None)
         if not self._side_save(side):
             log.debug("a relist count couldn't be kept beside the journal")
 
@@ -1863,11 +1992,11 @@ class Controller:
         flags = self._flags(self.RELIST_FLAG, unreadable)
         out = {k: v for k, v in flags.items() if v.get("pending")}
         if unreadable & set(out):
-            side = self._side_load().get("gens")
-            side = side if isinstance(side, dict) else {}
+            side = self._side_load()
             for k in unreadable & set(out):
                 log.warning("a relisted tap's mark couldn't be read; its count beside the journal is used")
-                out[k] = dict(out[k], gen=self._relist_count(k, None, unreadable, side))
+                gen, epoch, _ = self._relist_state(k, None, unreadable, side)
+                out[k] = dict(out[k], gen=gen, **({"epoch": epoch} if epoch else {}))
         for k, v in mem.items():
             if v.get("pending"):
                 out[k] = dict(out.get(k) or v, due=max(float((out.get(k) or {}).get("due") or 0),
@@ -1924,8 +2053,14 @@ class Controller:
         try:
             with self.ledger.tx() as db:
                 # Twenty-eighth round: the generation kept as it reads (None when it doesn't), never nought.
-                self.ledger.set_meta(self.RELIST_FLAG + key, json.dumps({"gen": self._gen_of(mark.get("gen")),
-                                                                         "pending": False}), db)
+                # Twenty-ninth round: an ended mark stays ended once struck (its state read first, whatever its
+                # generation), and a requeue's epoch is kept with the count.
+                struck = {"gen": self._gen_of(mark.get("gen")), "pending": False}
+                if self._epoch_of(mark.get("epoch", 0)):
+                    struck["epoch"] = mark["epoch"]
+                if mark.get("ended") is True:
+                    struck["ended"] = True
+                self.ledger.set_meta(self.RELIST_FLAG + key, json.dumps(struck), db)
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + key,))
         except Exception as e:                  # noqa: BLE001: the next tick strikes nothing and settles it
             log.warning("a relisted tap's mark couldn't be settled (%s); it's settled at the next tick",
@@ -2113,14 +2248,20 @@ class Controller:
             log.warning("the relisted taps' marks couldn't be read (%s); their count beside the journal is used",
                         type(e).__name__)
             old_marks = None
-        side_gens = self._side_load().get("gens")
-        side_gens = side_gens if isinstance(side_gens, dict) else {}
-        gens, unknown = {}, set()
+        # Twenty-ninth round: the state first (_relist_state): an ended mark is terminal whatever its generation,
+        # so a tap declared ended is struck again with no card and never counted on; a requeued tap counts afresh
+        # in its own epoch, its cards keyed on that epoch too.
+        side = self._side_load()
+        gens, unknown, epochs, ended = {}, set(), {}, set()
         for row in rows:
             k = self.handovers.key(row["press"])
             if k in unreadable:
                 log.warning("a relisted tap's mark couldn't be read; its count beside the journal is used")
-            was = self._relist_count(k, old_marks, unreadable, side_gens)
+            was, epochs[k], done = self._relist_state(k, old_marks, unreadable, side)
+            if done:
+                ended.add(k)
+                gens[k] = self.RELIST_GEN_CAP + 1
+                continue
             if was is None:
                 unknown.add(k)                  # no count anywhere: stopped, never counted from one again
                 gens[k] = self.RELIST_GEN_CAP + 1
@@ -2128,7 +2269,8 @@ class Controller:
             gens[k] = was + 1
         capped = [r for r in rows if gens[self.handovers.key(r["press"])] > self.RELIST_GEN_CAP]
         if capped:
-            self._relist_ended(capped, gens, unknown=unknown)
+            self._relist_ended(capped, gens, unknown=unknown, already=ended,
+                               marks={k: (old_marks or {}).get(k) for k in ended}, epochs=epochs)
             rows = [r for r in rows if gens[self.handovers.key(r["press"])] <= self.RELIST_GEN_CAP]
             if not rows:
                 return
@@ -2177,8 +2319,11 @@ class Controller:
         parts = self._relist_summary_parts(n, counts, found_words, len(shown), len(rest), restored)
         # Twenty-fourth round: each tap's card is keyed on (tap, "relist", generation), and the summary and the list
         # on the batch's taps and generations, so a relist done again is refused as a duplicate and mints nothing.
-        batch = hashlib.sha256("\n".join(sorted(f"{k}#{g}" for k, g in gens.items())).encode()).hexdigest()[:24]
-        marks = {k: {"press": dict(row["press"]), "gen": gens[k], "pending": True, "fails": 0, "due": 0.0}
+        labels = {k: self._relist_label(gens[k], epochs.get(k, 0))
+                  for k in (self.handovers.key(r["press"]) for r in rows)}
+        batch = hashlib.sha256("\n".join(sorted(f"{k}#{g}" for k, g in labels.items())).encode()).hexdigest()[:24]
+        marks = {k: {"press": dict(row["press"]), "gen": gens[k], "pending": True, "fails": 0, "due": 0.0,
+                     **({"epoch": epochs[k]} if epochs.get(k) else {})}
                  for row in rows for k in [self.handovers.key(row["press"])]}
         with self.ledger.tx() as db:
             if summary_into is None:
@@ -2186,7 +2331,7 @@ class Controller:
                                     once=Ledger.once_key(f"batch:{batch}", "relist", "summary"))
             for row, seen, tparts in shown:
                 p = row["press"]
-                once = Ledger.once_key(self.handovers.key(p), "relist", str(gens[self.handovers.key(p)]))
+                once = Ledger.once_key(self.handovers.key(p), "relist", labels[self.handovers.key(p)])
                 if db.execute("SELECT 1 FROM meta WHERE key=?", (f"outbox_once:{once}",)).fetchone() is not None:
                     continue                    # this very relist's card is queued: nothing minted again
                 extra = extras.get(self.handovers.key(p)) or {}
@@ -2205,7 +2350,7 @@ class Controller:
                                                         "op": row.get("op") or {},
                                                         "untaken": seen in ("untaken", "untaken_unread"),
                                                         # twenty-fourth round: the card its retries are counted on
-                                                        "card": f"relist{gens[self.handovers.key(p)]}",
+                                                        "card": f"relist{labels[self.handovers.key(p)]}",
                                                         **({"retry": list(extra.get("retry") or [])}
                                                            if seen == "failed_retry" else {})}), db=db)
                 self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(f"{head} {text}"),
@@ -2232,9 +2377,9 @@ class Controller:
             if not self.handovers.journal_outcome(row["press"], "found"):
                 log.error("a tap's outcome couldn't be written to the tap journal")
         if summary_into is not None:
-            summary_into.append({"gens": {k: m["gen"] for k, m in marks.items()}, "counts": counts,
+            summary_into.append({"gens": dict(labels), "counts": counts,
                                  "found": found_words, "shown": len(shown), "rest": len(rest)})
-        self._side_gens({k: m["gen"] for k, m in marks.items()})
+        self._side_gens({k: m["gen"] for k, m in marks.items()}, {k: epochs.get(k, 0) for k in marks})
         mem = self.__dict__.setdefault("_relist_mem", {})
         for row in rows:
             k = self.handovers.key(row["press"])
@@ -2307,7 +2452,8 @@ class Controller:
     UNKNOWN_COUNT_WORDS = ("Harness couldn't safely try this tap again, so it was stopped and nothing more is done "
                            "for it from here.")
 
-    def _relist_ended(self, rows: list[dict], gens: dict, unknown=()) -> None:
+    def _relist_ended(self, rows: list[dict], gens: dict, unknown=(), already=(), marks: dict | None = None,
+                      epochs: dict | None = None) -> None:
         """Twenty-fifth round: taps past RELIST_GEN_CAP generations. Each gets one card (once-keyed on the tap,
         "relist", "ended") with no Go ahead, in one transaction with its relisted mark (its strike pending), then
         it's struck: never read on the calendar or relisted again. Twenty-seventh round: a tap in `unknown` (no
@@ -2315,20 +2461,31 @@ class Controller:
         owner = self.config.owner_user_id
         # Twenty-eighth round: an ended mark holds the cap as its generation (a count that reads), or none when the
         # tap's count couldn't be read anywhere, so a later read of it ends it the same way again.
-        marks = {self.handovers.key(r["press"]): {"press": dict(r["press"]), "gen": (
-            None if self.handovers.key(r["press"]) in unknown else self.RELIST_GEN_CAP), "pending": True, "fails": 0,
-            "due": 0.0, "ended": True} for r in rows}
+        # Twenty-ninth round: a tap in `already` was declared ended before (its mark in `marks`): it keeps that
+        # mark's generation and gets no second card, only its strike.
+        old = marks or {}
+
+        def gen_for(k):
+            if k in already:
+                return self._gen_of((old.get(k) or {}).get("gen"))
+            return None if k in unknown else self.RELIST_GEN_CAP
+        marks = {self.handovers.key(r["press"]): {"press": dict(r["press"]), "gen": gen_for(self.handovers.key(
+            r["press"])), "pending": True, "fails": 0, "due": 0.0, "ended": True,
+            **({"epoch": (epochs or {})[self.handovers.key(r["press"])]}
+               if (epochs or {}).get(self.handovers.key(r["press"])) else {})} for r in rows}
         with self.ledger.tx() as db:
             for row in rows:
                 k = self.handovers.key(row["press"])
-                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, outcome="unverified",
-                                    text=render.fit(f"{self._tap_head(row)} "
-                                                    f"{self.UNKNOWN_COUNT_WORDS if k in unknown else self.RELIST_ENDED_WORDS}"),
-                                    once=Ledger.once_key(k, "relist", "ended"))
+                if k not in already:
+                    words = self.UNKNOWN_COUNT_WORDS if k in unknown else self.RELIST_ENDED_WORDS
+                    self.ledger.enqueue(chat_id=owner, kind="notice", db=db, outcome="unverified",
+                                        text=render.fit(f"{self._tap_head(row)} {words}"),
+                                        once=Ledger.once_key(k, "relist", f"{marks[k]['epoch']}.ended"
+                                                             if marks[k].get("epoch") else "ended"))
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + k,))
                 self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(marks[k]), db)
             self.ledger.event("taps_relist_ended", {"count": len(rows)}, db=db)
-        self._side_gens({k: m["gen"] for k, m in marks.items()})
+        self._side_gens({k: m["gen"] for k, m in marks.items()}, {k: m.get("epoch", 0) for k, m in marks.items()})
         mem = self.__dict__.setdefault("_relist_mem", {})
         for row in rows:
             k = self.handovers.key(row["press"])
