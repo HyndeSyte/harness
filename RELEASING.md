@@ -96,7 +96,9 @@ twenty-fifth round: every acceptance records the lock's generation, each takeove
 generation on, and the Ship card counts an acceptance only under the current one, so a holder
 taken over can't leave a live acceptance by writing late; the sha-bound check runs before and
 after the write, a superseded sha is refused, never accepted again, and an acceptance must be
-the pull request's head as GitHub has it, at the watch's checks and again when the card reads it).
+the pull request's head as GitHub has it, at the watch's checks and again when the card reads it;
+twenty-sixth round: the generation never resets, a missing or unreadable generation file is
+fail-closed, and the card refuses an unreadable gate state by name).
 Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
@@ -113,8 +115,24 @@ Generations (0.12.0, twenty-fifth round). Beside each pull request's lock the wa
 generation (`/data/work/ship-gate-pr-<number>.gen`). A takeover of a stale lock, a legacy one
 included, moves it on and says so in the watch's output, with the lock's age in words: the
 acceptances kept before it no longer count, so run the watch again for the pull request's head.
-A generation file that can't be read fails the watch as `lock_unavailable`; delete it only when
-no watch of that pull request is running, then watch the current head again.
+A generation file that can't be read fails the watch as `lock_unavailable`.
+
+Generations never reset (0.12.0, twenty-sixth round). A new generation file starts at 1, and a
+record with no generation (or 0) never counts, so acceptances from before this round are void:
+run the watch once after installing. A generation file that is missing while any lock or record
+of that pull request carries a generation, or can't be read, is fail-closed: no acceptance
+counts, a watch fails `lock_unavailable`, and a Ship card is refused as "the Ship gate's state is
+unknown" (so is one whose kept records can't be read). Never delete the file. The recovery, on
+the Pi once no watch of that pull request is running:
+`/opt/cain/keeper.sh ship-gate --recover-generation <number>`, which rewrites the file whole with
+a number above every generation in it and in the pull request's locks and records (it refuses
+while the lock looks current); then watch the current head again. The head read at the
+acceptance uses a GitHub token only when the environment hands one in (`SHIP_GATE_GITHUB_TOKEN`;
+the link has none of its own), retries a rate-limited read briefly, and names a rate limit apart
+from a head that moved.
+
+Owner's ship checklist, for the gate: rerun the watch after any takeover (the watch's output
+says when one happened), and after a generation recovery.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

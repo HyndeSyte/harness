@@ -473,7 +473,7 @@ export function judgeShipGate(head: string, reports: GateReport[]): ShipGateLine
 // (shipgate.ts keepWatch), never accepted.
 export type WatchFailure = "no_head" | "other_head" | "head_moved" | "rate_wait_cap" | "watch_cap" | "live_acceptance" | "lock_unavailable" | "superseded" | "head_not_current";
 export interface WatchTarget { head?: string; pr?: number }
-export type WatchLine = ShipGateLine & { pr: number | null; bound_head: string | null; accepted_head: string | null; failure: WatchFailure | null; failure_why: string | null; gen?: number };
+export type WatchLine = ShipGateLine & { pr: number | null; bound_head: string | null; accepted_head: string | null; failure: WatchFailure | null; failure_why: string | null; gen?: number; gen_floor?: number };
 export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, target: string | WatchTarget, o: { everyMs: number; untilMs: number; sleep?: (ms: number) => Promise<void>; now?: () => Date; each?: (r: GateReport) => void }): Promise<WatchLine> {
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>((ok) => setTimeout(ok, ms)));
   const now = o.now ?? (() => new Date());
@@ -529,19 +529,21 @@ export async function watchShipGate(d: Pick<MergeDeps, "api">, repo: string, tar
 // pull request (shipgate.ts acceptedFor) and is refused for any other head while one stands.
 export const watchFile = (dir: string, sha: string) => `${dir}/ship-gate-${sha}.json`;
 // Twenty-fifth round, the generation: every acceptance records the generation of its pull request's watch lock it
-// was written under (gen; a record from before this round has none and reads as generation 0), and each takeover of
+// was written under (gen; twenty-sixth round: a record with none, or 0, is never current: recordGen), and each takeover of
 // a stale lock moves the pull request's generation on (shipgate.ts, ship-gate-pr-<n>.gen). An acceptance counts only
 // under the generation as it is now: one written by a holder that was taken over is no acceptance from the moment of
 // the takeover, whether or not that holder ever resumes to take it back. current: the pull request's generation now
 // (shipgate.ts readGen), or null when it can't be read, and then nothing counts. Leaving it out reads the record
 // alone (the dry run's report only; the Ship card and the watch always pass it).
-export const recordGen = (x: any): number | null => x?.gen === undefined ? 0 : Number.isInteger(x.gen) && x.gen >= 0 ? x.gen : null;
+// Twenty-sixth round: a record with no generation (from before the twenty-sixth round) or generation 0 is never
+// current: generation files start at 1, so pre-round acceptances are void and the watch is run again once.
+export const recordGen = (x: any): number | null => Number.isInteger(x?.gen) && x.gen >= 1 ? x.gen : null;
 export function watchAccepted(text: string | null, current?: number | null): { pr: number | null; head: string; gen: number } | null {
   try {
     const x = JSON.parse(text ?? "");
     if (typeof x?.accepted_head !== "string" || !SHA.test(x.accepted_head) || x.superseded) return null;
     const gen = recordGen(x);
-    if (gen === null || (current !== undefined && (current === null || gen !== current))) return null;
+    if (gen === null || (current !== undefined && (current === null || current < 1 || gen !== current))) return null;
     return { pr: typeof x.pr === "number" ? x.pr : null, head: x.accepted_head, gen };
   } catch { return null; }
 }
@@ -558,5 +560,5 @@ export function shaBound(text: string | null, pr: number, head: string, current:
   if (typeof x?.accepted_head !== "string" || x.accepted_head.toLowerCase() !== head || x.pr !== pr) return x?.superseded && x?.bound_head === head ? "superseded" : "none";
   if (x.superseded) return "superseded";
   const gen = recordGen(x);
-  return current !== null && gen === current ? "kept" : "stale";
+  return current !== null && gen !== null && gen === current ? "kept" : "stale";
 }

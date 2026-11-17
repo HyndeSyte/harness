@@ -46,7 +46,7 @@ import {
   newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
   VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
   evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
-  regAnswer, chromeListingStep, LISTING_STAND_IN, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
+  regAnswer, chromeListingStep, LISTING_STAND_IN, LISTING_RUNNER_REFUSED, TEST_BUILD_FLAG, chromeReadFailWhy, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -55,6 +55,8 @@ import { makeToken, publicKey as shipPublicKey, readToken } from "../rootfs/opt/
 import { publicOf } from "../rootfs/opt/cain/link/shipkey.ts";
 import { b64url } from "../rootfs/opt/cain/ship-token.ts";
 import { cleanEnv, sh } from "./rig.ts";
+// Twenty-sixth round: the worker honours a listing runner (chromePs) only in a test build, named by this flag.
+process.env.PC_WORKER_TEST_BUILD = "1";
 
 // Each test drives real git repos; git on a Windows runner is slow, so give them time.
 setDefaultTimeout(120_000);
@@ -7278,5 +7280,46 @@ describe("twenty-fifth review: the listing step never passes on a stand-in, a fl
     const line = (p: typeof ded) => `${p.pid}|${p.ppid}|${new Date(p.created).toISOString()}|131.0.6778.86|${p.cmd}`;
     const listed = [line(twin), line(quoted), ""].join("\r\n");
     expect(chromeListingStep(q.opts({ chromePs: () => listed, procs: () => [twin, quoted] }), q.inst)).toMatchObject({ passed: true, same_process: true, dedicated: true });
+  });
+});
+
+describe("twenty-sixth review: the listing runner only in a test build, and a floorless hold clear refused unless recorded", () => {
+  const outsideTestBuild = <T>(f: () => T): T => {
+    const was = process.env[TEST_BUILD_FLAG];
+    delete process.env[TEST_BUILD_FLAG];
+    try { return f(); } finally { if (was !== undefined) process.env[TEST_BUILD_FLAG] = was; }
+  };
+  test("a production configuration with the listing runner set refuses the listing step by name, and the run's version read doesn't parse it", () => {
+    const q = queueRig();
+    expect(chromeListingStep(q.opts(), q.inst)).toMatchObject({ applies: true, passed: true });     // the test build: parsed and checked
+    const step = outsideTestBuild(() => chromeListingStep(q.opts(), q.inst));
+    expect(step).toMatchObject({ applies: true, passed: false, dedicated: false });
+    expect(step.failure).toStartWith(`${LISTING_RUNNER_REFUSED}:`);
+    const read = outsideTestBuild(() => chromeVersionRead(q.opts({ exeVersion: undefined }), q.inst));
+    expect(read?.source).not.toBe("chrome_exe");
+    expect(chromeReadFailWhy()).toContain(LISTING_RUNNER_REFUSED);
+  });
+
+  test("a floorless hold clear whose record can't be written is refused: the hold stays, the log and the run's status line say so", async () => {
+    const { q } = oneJob();
+    const fp = fingerprint(q.opts(), q.inst)!;
+    const hold = { at: new Date(T0.getTime() - 60_000).toISOString(), code: "versions_changed" as const, folders: [],
+      seen: { extension_version: fp.extension_version, chrome_version: null, chrome_version_source: null } };
+    expect(writeVersionHold(q.opts(), hold)).toBe(true);
+    probeConfirmed(q, new Date(Date.parse(hold.at) + 30_000).toISOString());
+    expect(holdCleared(q.opts(), q.inst, hold)).toMatchObject({ cleared: true, floorless: ["Chrome"] });
+    mkdirSync(join(holdClearedFile(q.opts()), "blocker"), { recursive: true });   // the record's path can't be written
+    const out = await run(q.opts(attended));
+    expect(out.code).toBe("version_hold_unwritable");
+    expect(readVersionHold(q.opts())).toMatchObject({ code: "versions_changed" });  // the hold stays
+    const log = readFileSync(join(q.home, "worker.log"), "utf8");
+    expect(log).toContain("version_hold_clear_unrecorded versions_changed");
+    expect(log).not.toContain("version_hold_cleared_without_floor versions_changed");
+    expect(log).toMatch(/ version_hold_unwritable .*version_hold_clear_unrecorded/);
+    // Once the path can be written, the same clear goes through and is recorded.
+    rmSync(holdClearedFile(q.opts()), { recursive: true });
+    expect((await run(q.opts(attended))).code).toBe("ok");
+    expect(JSON.parse(readFileSync(holdClearedFile(q.opts()), "utf8"))).toMatchObject({ without_floor: ["Chrome"] });
+    expect(readVersionHold(q.opts())).toBeNull();
   });
 });

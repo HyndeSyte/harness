@@ -136,6 +136,13 @@
 - The PC reads the Chrome profile folder the same exact way everywhere, so a second profile with a similar folder name can't confuse it.
 - Probing after an update works while runs are held: the probe is checked against the versions it read itself, and a hold stops a probe only while its cause is still there. A probe clears a hold only when it saw the same or newer versions.
 - A job the keeper can't name by its site is now said to be seen by the keeper at a time, which is what that time is.
+- The Ship gate's round counter can no longer go back to the start: if its file goes missing or can't be read, no acceptance counts until it is rewritten with a fresh number above every round recorded, and a new command does that (`keeper.sh ship-gate --recover-generation <number>`). Acceptances kept by earlier test builds of this version no longer count, so the Ship gate watch is run once more after this update.
+- A Ship card is refused by name when the Ship gate's own records can't be read, instead of going out as if nothing had been accepted.
+- The keeper's warning that Cain's App turned its messages away now stays until the App really answers, even after a restart while the App can't be reached.
+- A message the keeper couldn't deliver is tried once per round however many times it comes up, so its slower retries keep their pace.
+- The Ship gate's check of the change's newest commit can use a GitHub token when one is handed to it, waits briefly when GitHub asks it to, and says plainly when GitHub's rate limit, not a new commit, is what stopped it. A watch checks first that the tool it reads GitHub with is installed.
+- The PC's Chrome listing check only ever accepts a stand-in listing in its own tests; anywhere else it refuses the step.
+- A held run is no longer cleared without a version to compare against unless the PC could write down that it did; if it can't, the hold stays and the run says the worker folder can't be written.
 
 ## 0.11.0
 

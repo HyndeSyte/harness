@@ -9,10 +9,10 @@
 import { describe, expect, test } from "bun:test";
 import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
 import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
-import { watchFile } from "../rootfs/opt/cain/link/merge";
-import { acceptedFor, supersede, keepWatch, otherLive, takeLock, beat, letGo, LOCK_STALE_MS, CRITICAL_MAX_MS, readGen, genFile, agoWords } from "../rootfs/opt/cain/link/shipgate";
+import { watchAccepted, watchFile } from "../rootfs/opt/cain/link/merge";
+import { acceptedFor, supersede, keepWatch, otherLive, takeLock, beat, letGo, LOCK_STALE_MS, CRITICAL_MAX_MS, readGen, genFile, agoWords, gateState, recoverGen, ghHeadRead, githubToken } from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -419,7 +419,8 @@ describe("twentieth review: the watch's acceptance is kept by sha, and supersede
   test("a card for a new head is refused naming the accepted sha and --supersede; after the supersede and a new watch, the new head's card goes", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate-"));
     const kept = (head: string, accepted: string | null, pr = 5) =>
-      writeFileSync(watchFile(dir, head), JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: accepted, failure: null }) + "\n");
+      writeFileSync(watchFile(dir, head), JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: accepted, failure: null, gen: 1 }) + "\n");
+    writeFileSync(genFile(dir, 5), "1\n"); writeFileSync(genFile(dir, 6), "1\n");   // twenty-sixth round: generations start at 1
     const r = rig({ facts: true, gateWatch: () => acceptedFor(dir, 5) });
     r.github.facts = facts();
     r.reviews.list = [REVIEW];
@@ -678,9 +679,9 @@ describe("twenty-fifth review: acceptances under the lock's generation, the sha-
       const k = keepWatch(${JSON.stringify(dir)}, ${JSON.stringify(line(SHA2))}, ${JSON.stringify(watchFile(dir, SHA2))}, { headNow: (_p, h) => h, staleMs: 400, waitMs: 3_000 });
       console.log(JSON.stringify({ accepted: k.accepted_head, failure: k.failure }));`], { stdout: "pipe", stderr: "pipe" });
     expect(await out(b)).toEqual({ accepted: SHA2, failure: null });                // the taker published
-    expect(readGen(dir, 5)).toBe(1);                                                // its takeover moved the generation on
+    expect(readGen(dir, 5)).toBe(2);                                                // its takeover moved the generation on (files start at 1)
     await until(wrote);                                                             // the holder has written, and is paused
-    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8"))).toMatchObject({ accepted_head: SHA1, gen: 0 });   // its write is there
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8"))).toMatchObject({ accepted_head: SHA1, gen: 1 });   // its write is there
     expect(await out(consumer(dir))).toEqual([SHA2]);                              // but only the taker's counts, at once
     expect(acceptedFor(dir, 5)).toEqual([SHA2]);
     const ra = await out(a);
@@ -692,13 +693,13 @@ describe("twenty-fifth review: acceptances under the lock's generation, the sha-
   test("a record written under an earlier generation, or with a generation file that can't be read, is no acceptance", () => {
     const dir = mkdtempSync(join(tmpdir(), "ship-gate25-"));
     expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
-    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).gen).toBe(0);
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).gen).toBe(1);
     expect(acceptedFor(dir, 5)).toEqual([SHA1]);
-    writeFileSync(genFile(dir, 5), "1\n");                                          // a takeover moved it on
+    writeFileSync(genFile(dir, 5), "2\n");                                          // a takeover moved it on
     expect(acceptedFor(dir, 5)).toEqual([]);
     writeFileSync(genFile(dir, 5), "garbage");
     expect(acceptedFor(dir, 5)).toEqual([]);
-    writeFileSync(genFile(dir, 5), "1\n");
+    writeFileSync(genFile(dir, 5), "2\n");
     expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);   // a stale record of the sha: watched again, it counts
     expect(acceptedFor(dir, 5)).toEqual([SHA1]);
   });
@@ -779,4 +780,134 @@ describe("twenty-fifth review: acceptances under the lock's generation, the sha-
     expect(kept2.failure_why).toContain(`remove the lock with: rm -f ${lock2}`);
     expect(JSON.parse(readFileSync(lock2, "utf8"))).toEqual({ pid: 4242, at: "x" });
   });
+});
+
+describe("twenty-sixth review: the generation never resets, the card refuses an unknown gate state, and the head read through the real request wrapper", () => {
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  const echo = { headNow: (_p: number, h: string) => h };
+  const quietly = <T>(f: () => T): T => { const was = console.error; console.error = () => {}; try { return f(); } finally { console.error = was; } };
+  const record = (dir: string, head: string, gen?: number, pr = 5) =>
+    writeFileSync(watchFile(dir, head), JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: head, failure: null, ...(gen === undefined ? {} : { gen }) }) + "\n");
+  const cardGate = (dir: string) => () => { const st = gateState(dir, 5); return "heads" in st ? st.heads : st; };
+
+  test("a generation file deleted after a takeover, with the taken-over holder's late write never retracted: nothing counts, the watch fails closed, and the recovery rewrites it above every recorded generation", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate26-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    // The first holder takes the lock: the generation file starts at 1.
+    const first = takeLock(lock, 100) as any;
+    expect(first.gen).toBe(1);
+    expect(readGen(dir, 5)).toBe(1);
+    // It stalls past the stale bound; a second watch takes over (generation 2) and keeps its acceptance.
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+    expect(quietly(() => keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { ...echo, waitMs: 600 })).accepted_head).toBe(SHA2);
+    expect(readGen(dir, 5)).toBe(2);
+    // The first holder writes late, under its generation, and dies before its post-check: never retracted.
+    record(dir, SHA1, 1);
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);
+    // The generation file is deleted (the earlier round's documented recovery): nothing counts, and the state is unknown.
+    rmSync(genFile(dir, 5));
+    expect(readGen(dir, 5)).toBeNull();
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    expect(gateState(dir, 5)).toMatchObject({ unknown: expect.stringContaining("--recover-generation 5") });
+    expect(watchAccepted(readFileSync(watchFile(dir, SHA1), "utf8"), readGen(dir, 5))).toBeNull();
+    // A new watch fails closed rather than starting again at 1 (which would bring the late write back).
+    const k = quietly(() => keepWatch(dir, line("7".repeat(40)), watchFile(dir, "7".repeat(40)), { ...echo, waitMs: 300 }));
+    expect(k).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(k.failure_why).toContain("--recover-generation 5");
+    expect(existsSync(genFile(dir, 5))).toBe(false);
+    // The recovery: refused while a lock looks current; then above every recorded generation, and nothing kept before counts.
+    writeFileSync(lock, JSON.stringify({ pid: 1, token: "live", gen: 2, at: "x" }));
+    expect(recoverGen(dir, 5)).toMatchObject({ ok: false, why: expect.stringContaining("looks to be running") });
+    rmSync(lock);
+    expect(recoverGen(dir, 5)).toEqual({ ok: true, gen: 3 });
+    expect(readFileSync(genFile(dir, 5), "utf8")).toBe("3\n");
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    expect(readdirSync(dir).filter((n) => n.includes(".tmp"))).toEqual([]);
+    // Watched again, the pull request's head counts under the new generation.
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2), echo).accepted_head).toBe(SHA2);
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA2), "utf8")).gen).toBe(3);
+    expect(acceptedFor(dir, 5)).toEqual([SHA2]);
+    // An unreadable generation file is recovered the same way.
+    writeFileSync(genFile(dir, 5), "garbage");
+    expect(gateState(dir, 5)).toMatchObject({ unknown: expect.any(String) });
+    expect(recoverGen(dir, 5)).toEqual({ ok: true, gen: 4 });
+  });
+
+  test("a legacy record (no generation, or generation 0) counts for nothing, doesn't block the first watch, and the new file starts at 1", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate26-"));
+    record(dir, SHA2);                                                              // from before the generation
+    record(dir, "8".repeat(40), 0);                                                 // the twenty-fifth round's generation 0
+    expect(watchAccepted(readFileSync(watchFile(dir, SHA2), "utf8"))).toBeNull();
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    expect(gateState(dir, 5)).toEqual({ heads: [] });
+    expect(otherLive(dir, 5, SHA1)).toEqual([]);
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(readGen(dir, 5)).toBe(1);
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+    // A Ship card for this head goes; the legacy acceptance of another head doesn't refuse it.
+  });
+
+  test("the Ship card refuses by name when the gate state is unknown: a garbled generation file while another sha's acceptance exists, or a record that doesn't parse", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate26-"));
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2), echo).accepted_head).toBe(SHA2);
+    const r = rig({ facts: true, gateWatch: cardGate(dir) });
+    r.github.facts = facts();
+    r.reviews.list = [REVIEW];
+    await expect(ship(r)).rejects.toThrow(`accepted ${SHA2}, not this head`);
+    writeFileSync(genFile(dir, 5), "not a number");
+    await expect(ship(r)).rejects.toThrow("the Ship gate's state is unknown for this pull request");
+    writeFileSync(genFile(dir, 5), "1\n");
+    await expect(ship(r)).rejects.toThrow(`accepted ${SHA2}, not this head`);
+    writeFileSync(join(dir, `ship-gate-${"9".repeat(40)}.json`), "{garbled");
+    await expect(ship(r)).rejects.toThrow("the Ship gate's state is unknown for this pull request");
+    // And a watch accepts nothing while the state can't be read.
+    expect(await supersede(dir, SHA2, async () => SHA1)).toEqual({ ok: true, pr: 5 });
+    expect(quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo))).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+  });
+
+  test("the head read through the real request wrapper against a local server: a head, a 403 rate limit, a 5xx, malformed JSON, a retried 429, and the token sent", async () => {
+    const server = Bun.spawn(["bun", "-e", `
+      let n429 = 0;
+      const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch(req) {
+        const pr = Number(new URL(req.url).pathname.split("/").pop());
+        const j = (b, status = 200, headers = {}) => new Response(typeof b === "string" ? b : JSON.stringify(b), { status, headers: { "content-type": "application/json", ...headers } });
+        if (pr === 1) return j({ head: { sha: "${SHA1.toUpperCase()}" } });
+        if (pr === 2) return j({ message: "API rate limit exceeded" }, 403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 1800) });
+        if (pr === 3) return j({ message: "oops" }, 502);
+        if (pr === 4) return j("<html>not json", 200);
+        if (pr === 5) return n429++ === 0 ? j({ message: "slow down" }, 429, { "retry-after": "0" }) : j({ head: { sha: "${SHA2}" } });
+        if (pr === 6) return j({ message: "Resource not accessible" }, 403);
+        if (pr === 7) return req.headers.get("authorization") === "Bearer ghp_testtoken_000000000000000000" ? j({ head: { sha: "${SHA1}" } }) : j({ message: "Bad credentials" }, 401);
+        return j({}, 404);
+      } });
+      console.log(s.port);`], { stdout: "pipe", stderr: "pipe" });
+    try {
+      const reader = server.stdout.getReader();
+      const port = Number(new TextDecoder().decode((await reader.read()).value).trim());
+      const base = `http://127.0.0.1:${port}`;
+      expect(ghHeadRead("o/r", 1, { base })).toBe(SHA1);
+      const limited = ghHeadRead("o/r", 2, { base });
+      expect(limited).toMatchObject({ miss: "rate_limit" });
+      expect((limited as any).wait_ms).toBeGreaterThan(20 * 60_000);
+      expect(ghHeadRead("o/r", 3, { base })).toEqual({ miss: "unreadable", why: "GitHub answered with a server error (502)" });
+      expect(ghHeadRead("o/r", 4, { base })).toEqual({ miss: "unreadable", why: "GitHub's answer wasn't JSON" });
+      expect(ghHeadRead("o/r", 5, { base })).toBe(SHA2);                             // one bounded retry, as Retry-After asked
+      expect(ghHeadRead("o/r", 6, { base })).toEqual({ miss: "unreadable", why: "GitHub refused the read (403)" });
+      expect(ghHeadRead("o/r", 7, { base })).toMatchObject({ miss: "unreadable" });
+      expect(ghHeadRead("o/r", 7, { base, token: "ghp_testtoken_000000000000000000" })).toBe(SHA1);
+      expect(githubToken({ SHIP_GATE_GITHUB_TOKEN: "ghp_testtoken_000000000000000000" })).toBe("ghp_testtoken_000000000000000000");
+      expect(githubToken({ SHIP_GATE_GITHUB_TOKEN: "bad token; rm -rf" })).toBeUndefined();
+      // The watch words a rate limit apart from a moved head, through the same wrapper.
+      const dir = mkdtempSync(join(tmpdir(), "ship-gate26-"));
+      const k = quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: () => ghHeadRead("o/r", 2, { base }) }));
+      expect(k).toMatchObject({ accepted_head: null, failure: "head_not_current" });
+      expect(k.failure_why).toContain("GitHub's rate limit stopped the read of the pull request's head");
+      expect(k.failure_why).toContain("isn't known to have moved");
+      expect(k.failure_why).not.toContain("is now");
+      const k2 = quietly(() => keepWatch(dir, line(SHA2), watchFile(dir, SHA2), { headNow: () => ghHeadRead("o/r", 1, { base }) }));
+      expect(k2.failure_why).toContain(`is now ${SHA1}, not ${SHA2}`);
+    } finally { server.kill(); }
+  }, 30_000);
 });

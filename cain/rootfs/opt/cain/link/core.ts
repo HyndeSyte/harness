@@ -567,7 +567,7 @@ export interface Deps {
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
-  gateWatch?: (pr: string) => string[];                            // every unsuperseded head a ship_gate watch of this pull request accepted (shipgate.ts acceptedFor)
+  gateWatch?: (pr: string) => string[] | { unknown: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, or the gate state unknown (shipgate.ts gateState)
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1480,7 +1480,12 @@ export class Link {
     // refused while that acceptance stands, naming it and the command that records it replaced.
     // One live acceptance per pull request (twenty-first round): the card reads that single one; more than
     // one live (left from before the rule) is refused, naming each, until all but one are superseded.
-    const watched = this.d.gateWatch?.(pr) ?? [];
+    // Twenty-sixth round: a gate state that can't be read (its generation file or a kept record) refuses the card by
+    // name, never reads as no acceptance.
+    const gate = this.d.gateWatch?.(pr) ?? [];
+    if (!Array.isArray(gate))
+      throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gate.unknown}. No card goes until it can be read`);
+    const watched = gate;
     if (watched.length > 1)
       throw new Refusal(`the Ship gate's watch of this pull request has more than one live acceptance (${watched.join(", ")}): supersede all but the one for this head (keeper.sh ship-gate --supersede <sha>) before showing its card`);
     if (watched.length && watched[0] !== head)

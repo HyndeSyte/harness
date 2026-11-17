@@ -857,6 +857,8 @@ function chromeVersionReadNow(o: Opts, inst: Install): { read: ChromeRead | null
     const exe = exeOf(ps.find((p) => isDedicated(p, inst))?.cmd ?? "");
     const v = exe ? o.exeVersion(exe)?.trim() ?? null : null;
     if (v && OK.test(v)) return { read: { version: v, source: "chrome_exe" }, failed: null, why: null };
+  } else if (runnerRefused(o)) {
+    return { read: null, failed: "chrome_version_unreadable", why: `${LISTING_RUNNER_REFUSED}: a listing runner is set outside a test build` };
   } else if (platform(o) === "win32" || o.chromePs) {
     const listed = chromeExeVersions(o.chromePs, o.mono);
     if ("fail" in listed) return { read: null, failed: listed.fail, why: listed.why };
@@ -1002,12 +1004,16 @@ export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode |
   if (!had) return null;
   const cl = holdCleared(o, inst, had);
   if (cl.cleared) {
+    // Twenty-sixth round: a clear made without a version floor is refused unless its record is written first: the
+    // hold stays, the log and the run's status line say so, and the run refuses as version_hold_unwritable.
+    if (cl.floorless && !writeWhole(holdClearedFile(o), JSON.stringify({ at: now.toISOString(), code: had.code, without_floor: cl.floorless }) + "\n")) {
+      try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_clear_unrecorded ${had.code}: the record of a clear without a version floor (${holdClearedFile(o)}) couldn't be written, so the hold stays\n`); } catch { /* never stops it */ }
+      floorNote = "version_hold_clear_unrecorded";
+      return "version_hold_unwritable";
+    }
     rmSync(P.versionHold(o), { force: true });
     try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_cleared${cl.floorless ? "_without_floor" : ""} ${had.code}: ${cl.why}\n`); } catch { /* never stops it */ }
-    if (cl.floorless) {
-      writeWhole(holdClearedFile(o), JSON.stringify({ at: now.toISOString(), code: had.code, without_floor: cl.floorless }) + "\n");
-      floorNote = `version_hold_cleared_without_floor:${cl.floorless.map((x) => x.replace(/ /g, "_")).join(",")}`;
-    }
+    if (cl.floorless) floorNote = `version_hold_cleared_without_floor:${cl.floorless.map((x) => x.replace(/ /g, "_")).join(",")}`;
     return null;
   }
   if (versionMismatch(o, inst)) return null;           // probe_stale refuses next, naming what changed
@@ -5184,10 +5190,20 @@ export const PROBE_GATE_HINT: Record<string, string> = {
 // which returns the listing's text and is parsed and checked like the real one), and the exeVersion stand-in
 // without one refuses the step by name (listing_stand_in), wherever the worker runs.
 export const LISTING_STAND_IN = "listing_stand_in";
+// Twenty-sixth round: the listing runner (chromePs) is honoured only in a test build, named by the explicit flag
+// PC_WORKER_TEST_BUILD=1 in the worker's own process environment (set by the test files, never by setup); anywhere
+// else a caller that sets the field gets the step refused by name (listing_runner_refused), and a run's version read
+// fails as unreadable, so a fabricated listing is never parsed as the real one.
+export const TEST_BUILD_FLAG = "PC_WORKER_TEST_BUILD";
+export const LISTING_RUNNER_REFUSED = "listing_runner_refused";
+const testBuild = () => process.env[TEST_BUILD_FLAG] === "1";
+const runnerRefused = (o: Opts) => !!o.chromePs && !testBuild();
 export interface ChromeListingLine { applies: boolean; lines: number; mismatched: number[]; dedicated: boolean; same_process: boolean;
   version: string | null; failure: string | null; passed: boolean }
 export function chromeListingStep(o: Opts, inst: Install): ChromeListingLine {
   const none: ChromeListingLine = { applies: false, lines: 0, mismatched: [], dedicated: false, same_process: false, version: null, failure: null, passed: false };
+  if (runnerRefused(o))
+    return { ...none, applies: true, failure: `${LISTING_RUNNER_REFUSED}: a listing runner is set outside a test build, so its listing is not read as the real one` };
   if (!o.chromePs && o.exeVersion)
     return { ...none, applies: true, failure: `${LISTING_STAND_IN}: a version stand-in is set with no listing to parse, so the listing can't be checked` };
   if (!o.chromePs && platform(o) !== "win32") return none;

@@ -11,7 +11,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirS
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { cleared, linkNotify, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { cleared, linkNotify, noticeRound, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
 import { askValues, PC_NOTICES, pcQueuedWords } from "../rootfs/opt/cain/link/core";
 import { linkFetch } from "../rootfs/opt/cain/link/http";
@@ -1344,5 +1344,69 @@ describe("twenty-fifth review: the configuration refusal as the keeper's deliver
     expect(pcQueuedWords("2026-11-13T19:05:07Z")).toBe("a PC browser job seen by the keeper at Nov 13, 2:05 PM");
     expect(pcQueuedWords("2026-11-13")).toBe("a PC browser job seen by the keeper on Nov 13");
     expect(pcQueuedWords("2026-11-13T19:05:07Z")).not.toContain("queued");
+  });
+});
+
+describe("twenty-sixth review: the configuration flag clears only on a real answer from the link, and one try per mark per round on every path", () => {
+  const quiet = <T>(f: () => T): T => {
+    const was = console.log;
+    console.log = () => {};
+    try { return f(); } finally { console.log = was; }
+  };
+
+  test("a 403, a restart, then the link unreachable (no answer, an exception): the attention line stays until a definitive answer, and pending notices stay owed", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    let answer: any = "config";
+    const cfg = w.cfg("pi-1", { notify: ((_c: string) => { if (answer === "throw") throw new Error("down"); return answer; }) as any });
+    quiet(() => tell(cfg, "reuse_fetch_failed", "fetch:a", { site: "example.com", action: "read_account_settings" }));
+    expect(noticeTrouble({ used: w.used })[0]).toStartWith("Keeper: ATTENTION: the link refused the keeper's notices as not allowed");
+    for (const down of [false, "throw"]) {
+      resetNoticeProcess();                                                         // the App restarted, the link unreachable
+      answer = down;
+      quiet(() => resendOwed(cfg));
+      expect(noticeTrouble({ used: w.used })[0]).toStartWith("Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); 1 notice for Dane waits");
+      expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).config).toBe(true);
+    }
+    // A definitive HTTP answer that didn't post it (not 401 or 403): the flag clears, and the notice is still owed.
+    resetNoticeProcess();
+    answer = "http";
+    quiet(() => resendOwed(cfg));
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).config).toBeUndefined();
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told["fetch:a"].posted).toBe(false);
+    answer = true;
+    quiet(() => resendOwed(cfg));
+    expect(noticeTrouble({ used: w.used })).toEqual([]);
+  });
+
+  test("linkNotify tells no answer apart from an HTTP answer: an unreachable link is false, a 404 is an answer", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "notify26-"));
+    writeFileSync(join(dir, "discord.env"), "DISCORD_BOT_TOKEN=test-token\n");
+    const server = Bun.spawn(["bun", "-e", `const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("nope", { status: 404 }) }); console.log(s.port);`], { stdout: "pipe" });
+    try {
+      const port = Number(new TextDecoder().decode((await server.stdout.getReader().read()).value).trim());
+      expect(linkNotify({ link: `http://127.0.0.1:${port}`, discordEnv: join(dir, "discord.env") })("reuse_fetch_failed", { id: "a".repeat(24) })).toBe("http");
+      expect(linkNotify({ link: "http://127.0.0.1:9", discordEnv: join(dir, "discord.env") })("reuse_fetch_failed", { id: "a".repeat(24) })).toBe(false);
+    } finally { server.kill(); }
+  });
+
+  test("a mark the direct tell made, told again and resent in the same round: one try", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const calls: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { calls.push(c); return false; }) as any });
+    quiet(() => {
+      noticeRound();
+      tell(cfg, "reuse_unsettled", "unsettled:b", { queued: "2026-11-15" });
+      tell(cfg, "reuse_unsettled", "unsettled:b", { queued: "2026-11-15" });
+      resendOwed(cfg, false);
+      cleared(cfg, "unsettled:b");
+    });
+    expect(calls).toEqual(["reuse_unsettled"]);
+    // The next round tries it once more.
+    quiet(() => { resendOwed(cfg); tell(cfg, "reuse_unsettled", "unsettled:b"); });
+    expect(calls).toEqual(["reuse_unsettled", "reuse_unsettled"]);
   });
 });

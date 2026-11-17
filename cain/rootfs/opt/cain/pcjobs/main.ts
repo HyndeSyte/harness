@@ -256,7 +256,10 @@ export interface NoticeSend { id: string; job?: JobWhat }
 // "refused" (a permanent refusal: never sent again), and (twenty-fourth round) "config" (401 or 403: the link
 // won't take the keeper's key or setup: no more sends this process, shown on the status) or "server" (a 5xx:
 // retried with backoff, counted on the status).
-export type NoticeAnswer = boolean | "refused" | "config" | "server";
+// Twenty-sixth round: "http", an HTTP answer from the link that is none of those (try again). false is reserved for no
+// answer at all (the link unreachable, a timeout, no key to send with): only a definitive HTTP answer other than 401
+// or 403 clears the keeper's configuration refusal.
+export type NoticeAnswer = boolean | "refused" | "config" | "server" | "http";
 export type Notify = (code: PcNotice, n?: NoticeSend) => NoticeAnswer;
 export const CLEAR_ROUNDS = 3;
 export const WAIT_ROUNDS = 3;
@@ -371,6 +374,7 @@ function send(cfg: Config, t: Told, m: ToldMark, code: PcNotice): "posted" | "re
   let job = m.job === undefined ? undefined : jobWhat(m.job);
   if (m.job !== undefined && !job) { log(`error: notice ${code} carries a job that isn't a site and action or a queued time: named by the time instead`); job = m.job = queuedNow(); }
   try { a = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job ? { job } : {}) }); } catch { a = false; }
+  if (a === false) { log(`couldn't tell the owner (${code}): the link didn't answer; trying again next round, with the same notice id`); return "retry"; }
   if (a === "config") {
     configStopped = true;
     t.config = true;
@@ -389,8 +393,8 @@ function send(cfg: Config, t: Told, m: ToldMark, code: PcNotice): "posted" | "re
     log(`ERROR: the link refused notice ${code} for good (not a passing error): it won't be sent again; the keeper's status shows it until its condition clears`);
     return "refused";
   }
-  if (!a) log(`couldn't tell the owner (${code}); trying again next round, with the same notice id`);
-  return a ? "posted" : "retry";
+  if (a !== true) { log(`couldn't tell the owner (${code}): the link answered without posting it; trying again next round, with the same notice id`); return "retry"; }
+  return "posted";
 }
 // The fallback name of a job the keeper was handed in a shape it can't read (twenty-fourth round): the time the
 // keeper noticed it, to the minute, worded by the link as "a PC browser job seen by the keeper at <time>". Never a bare line.
@@ -411,9 +415,12 @@ export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobW
   if (m?.posted || m?.refused) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
   // Twenty-fifth round: one try per mark per round. A mark resendOwed already tried (or counted down) this round
   // isn't sent again by the condition's own tell, so the backoff counts rounds, not calls.
+  // Twenty-sixth round: the same attempted set for every path (resend, tell, cleared), recorded before the send, so a
+  // mark the direct tell made and sent isn't tried again by a second tell or the resend in the same round.
   if (m && triedThisRound.has(`${toldFile(cfg)}\0${key}`)) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
   const what = checkedJob(cfg, code, job);
   if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0, code, ...(what ? { job: what } : {}) }; saveTold(cfg, t); }
+  triedThisRound.add(`${toldFile(cfg)}\0${key}`);
   m.clear = 0;
   m.code ??= code;
   if (!m.job && what) m.job = what;
@@ -427,13 +434,15 @@ export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobW
 // A mark acknowledged by this round's resend starts its clear count only at the next round, as when cleared sends it.
 const ackedThisRound = new Set<string>();
 const triedThisRound = new Set<string>();
-export function resendOwed(cfg: Config): void {
-  ackedThisRound.clear();
-  triedThisRound.clear();
+// A new round of the keeper (twenty-sixth round, named): the attempted and acknowledged sets start empty. resendOwed
+// starts one unless told it runs inside a round already started (fresh false).
+export function noticeRound(): void { ackedThisRound.clear(); triedThisRound.clear(); }
+export function resendOwed(cfg: Config, fresh = true): void {
+  if (fresh) noticeRound();
   const t = readTold(cfg);
   let changed = false;
   for (const [k, m] of Object.entries(t.told)) {
-    if (m.posted || m.refused || !m.code) continue;
+    if (m.posted || m.refused || !m.code || triedThisRound.has(`${toldFile(cfg)}\0${k}`)) continue;
     triedThisRound.add(`${toldFile(cfg)}\0${k}`);
     const a = send(cfg, t, m, m.code);
     changed = true;                                                   // a backoff count or a refusal flag may have moved
@@ -470,7 +479,9 @@ export function cleared(cfg: Config, key: string): void {
   let changed = false;
   const m = t.told[key];
   if (m && !m.posted && !m.refused) {
-    const a = m.code && !triedThisRound.has(`${toldFile(cfg)}\0${key}`) ? send(cfg, t, m, m.code) : "retry";
+    const tried = triedThisRound.has(`${toldFile(cfg)}\0${key}`);
+    if (m.code && !tried) triedThisRound.add(`${toldFile(cfg)}\0${key}`);
+    const a = m.code && !tried ? send(cfg, t, m, m.code) : "retry";
     if (m.code) changed = true;
     if (a === "posted") { m.posted = true; m.clear = 0; changed = true; }
     if (a === "refused") { m.refused = true; changed = true; }
@@ -535,8 +546,11 @@ export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
     if (http === 401 || http === 403) return "config";
     if (http >= 500 && http <= 599) return "server";
     let st: unknown;
-    try { st = JSON.parse(out.slice(0, cut))?.status; } catch { return false; }
-    return http === 200 && st === "posted" ? true : http === 400 && st === "refused" ? "refused" : false;
+    try { st = JSON.parse(out.slice(0, cut))?.status; } catch { st = undefined; }
+    if (!(http >= 100 && http <= 599)) return false;                 // no status line: no answer
+    if (http === 200 && st === "posted") return true;
+    if (http === 400 && st === "refused") return "refused";
+    return "http";
   };
 }
 
