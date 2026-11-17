@@ -21,15 +21,170 @@ branch is up to date with `main` and these checks passed on it:
   so a pull request can't change the check it is judged by; it only reads the pull
   request with git and never runs its files):
   - the branch is up to date with `main` as it is when the check runs;
-  - the description, read live from GitHub, follows `.github/pull_request_template.md`;
+  - the description, read live from GitHub, follows `.github/pull_request_template.md`,
+    and is for this round: for each App that goes up a version it carries the line
+    `Changelog: <App> <version> <hash>` (the first 12 hex digits of the SHA-256 of that
+    App's newest CHANGELOG section), so a description left from an earlier round of fixes
+    fails until it is refreshed; the failure prints the line to add;
   - each App whose shipped files changed (anything in its folder but `tests/` and
     `tools/`, a move in or out counting at both ends) goes up exactly one version step
     from `main`, with a matching section at the top of its `CHANGELOG.md`. An App that
     didn't change keeps `main`'s version. A change to `repository.yaml` needs at least
     one App bumped. A `config.yaml` whose `version` is missing, duplicated, unparseable
     or not a quoted `X.Y.Z` fails, on `main` or the branch;
+  - when the pull request changes the PC worker's guard (its hook `worker.ts`, the pinned
+    session settings or the pinned Public Suffix List): the hook's `POLICY_VERSION` steps
+    above `main`'s (so a rebase over another pull request that touched the guard bumps it
+    again), every hook timeout in the pinned settings equals the hook's `HOOK_TIMEOUT_S`,
+    and the description carries `Hook policy version: <N>` and the guard-surface hash line
+    of each of those three files at the head (`cain/tools/guard-surface.sh` prints them). A
+    new policy version needs a new probe and confirmation on the PC. The probe steps that
+    gate it are listed in `cain/docs/pc-jobs.md`; since the twentieth round its `hook_timing`
+    step needs a cold first sample (taken within 5 minutes of a Restart of the PC, not a Shut
+    down, which Windows Fast Startup doesn't count; `cold_sample_missing` otherwise, printing
+    the uptime measured), its `structured_address` step records each reading tool's
+    address-named key paths (extra paths refuse as a schema mismatch needing a policy
+    change; the refusal lists them grouped by tool, the failing tool marked, and the probe
+    prints the same hint at its end), and its result names the Claude in Chrome id and loaded
+    version and Chrome's version (chrome.exe's file version, or the Last Version file as a
+    named fallback, the source recorded) that every run then checks before and after its
+    session, comparing versions by their numbers (a source difference with an equal version
+    is only a note; any version change fails the run and writes the hold), and an
+    auto-update needs a new probe: a version hold clears only on validated probe evidence
+    (the confirmation's hash of the probe evidence, checked against the evidence file, a probe
+    run after the hold, of the versions loaded now);
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
-    filters and no `if` or `continue-on-error`, and no other workflow reuses the names.
+    filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
+    the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
+    `tests.yml` defines it.
+
+`pcjobs-windows` is not a required check in the rulesets (making it one needs the
+repository's rulesets, which take admin rights no session has). The link enforces it
+instead: when the head's `tests.yml` names it, or a run of it exists on the head, a Ship
+card is refused, and a landing refused or held, unless every run of it GitHub lists for
+that exact head commit passed, in whatever order ("CI is still running pcjobs-windows on
+it" waits; a failed, cancelled or skipped attempt refuses even beside a green re-run, so a
+flaky Windows run needs a new commit; a run for another commit doesn't count, and none at
+all refuses; GitHub not answering holds). It reads every run and every attempt: the head's
+check runs of that name with every attempt listed, and GitHub Actions' workflow runs for the
+head with each attempt's jobs, each listing followed page by page until it is whole; a page
+that fails or a listing that isn't whole holds, and so does a refused page from GitHub (HTTP
+403 or 429), whatever it holds: named a rate limit only on a 429, or a 403 with
+`x-ratelimit-remaining: 0`, a `Retry-After` header or a body that says secondary rate limit,
+and otherwise a permission failure naming the endpoint. `/opt/cain/keeper.sh ship-gate <full head
+sha>` on the Pi reads that gate for a head without acting and prints what it would decide and
+why, the workflow file it read and every attempt it saw (`--watch` keeps watching a fresh
+head until its Windows run is done: the PC probe's `ship_gate` step, started before that head
+is pushed so it sees the Windows run pending; `--pr <number> --head <full sha> --watch`
+instead takes the exact commit about to be pushed, waits until the pull request's head equals
+it, accepts only that sha and fails by name (`other_head`, `head_moved`) if a different head
+appears or the head moves away; it honours GitHub's Retry-After and rate-limit reset before
+its next reading, each wait capped at 15 minutes and the whole watch at 2 hours (an
+unreadable header counts as the cap); every acceptance is kept by sha in
+`/data/work/ship-gate-<sha>.json`, a Ship card for any other head of that pull request is
+refused while it stands, naming the accepted sha, and after a rebase
+`keeper.sh ship-gate --supersede <accepted sha>` records that the acceptance is replaced,
+only once the pull request's head differs from it; a pull request has one live acceptance at
+a time, and a watch refuses to accept while another stands, `live_acceptance`, checked and
+kept under the pull request's own lock file so two watches finishing together keep one; a
+stale lock is taken over only by a rename followed by the exclusive create again, so exactly
+one contender proceeds, and a lock that can't be read fails the watch as `lock_unavailable`;
+the lock's time is refreshed at the check and before the write, the holder re-reads the lock
+and requires its own token just before it writes the acceptance and again after, taking the
+acceptance back if it lost the lock meanwhile, and a second write for the same sha is a no-op;
+twenty-fifth round: every acceptance records the lock's generation, each takeover moves the
+generation on, and the Ship card counts an acceptance only under the current one, so a holder
+taken over can't leave a live acceptance by writing late; the sha-bound check runs before and
+after the write, a superseded sha is refused, never accepted again, and an acceptance must be
+the pull request's head as GitHub has it, at the watch's checks and again when the card reads it;
+twenty-sixth round: the generation never resets, a missing or unreadable generation file is
+fail-closed, and the card refuses an unreadable gate state by name; twenty-seventh round: the
+watch's whole critical section has one deadline, records carry a format version, the recovery
+takes the lock, and one garbled record blocks only its own pull request).
+Run it once on a head
+with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
+
+Upgrading the gate's lock (0.12.0, twenty-fourth round). A lock file left by an earlier
+version of the watch (`/data/work/ship-gate-pr-<number>.lock`, empty or with no holder
+token) is taken over by the next watch once it is more than a minute old, through the same
+rename and exclusive create, with a loud line in the watch's output. One that looks current
+(under a minute old) or whose content doesn't parse still counts as held: the watch fails
+`lock_unavailable`, and its notice names the exact path and the command that removes it
+(`rm -f /data/work/ship-gate-pr-<number>.lock`). Run that on the Pi only when no watch of
+that pull request is running, then watch again.
+
+Generations (0.12.0, twenty-fifth round). Beside each pull request's lock the watch keeps its
+generation (`/data/work/ship-gate-pr-<number>.gen`). A takeover of a stale lock, a legacy one
+included, moves it on and says so in the watch's output, with the lock's age in words: the
+acceptances kept before it no longer count, so run the watch again for the pull request's head.
+A generation file that can't be read fails the watch as `lock_unavailable`.
+
+Generations never reset (0.12.0, twenty-sixth round). A new generation file starts at 1, and a
+record with no generation (or 0) never counts, so acceptances from before this round are void:
+run the watch once after installing. A generation file that is missing while any lock or record
+of that pull request carries a generation, or can't be read, is fail-closed: no acceptance
+counts, a watch fails `lock_unavailable`, and a Ship card is refused as "the Ship gate's state is
+unknown" (so is one whose kept records can't be read). Never delete the file. The recovery, on
+the Pi once no watch of that pull request is running:
+`/opt/cain/keeper.sh ship-gate --recover-generation <number>`, which rewrites the file whole with
+a number above every generation in it and in the pull request's locks and records (it refuses
+while the lock looks current); then watch the current head again. The head read at the
+acceptance uses a GitHub token only when the environment hands one in (`SHIP_GATE_GITHUB_TOKEN`;
+the link has none of its own), retries a rate-limited read briefly, and names a rate limit apart
+from a head that moved.
+
+Records, the deadline and the recovery (0.12.0, twenty-seventh round). Every record a watch keeps
+now carries a record format (`"format": 27`), and a record without it never counts, whatever
+generation it carries: acceptances kept before this round are void, so run the watch once after
+installing. The watch's work under the lock has one deadline (10 seconds from taking the lock):
+both reads of the pull request's head take their time and any rate-limit wait from what is left
+of it, and the lock, its generation and the time are checked again just before the acceptance is
+written; past the deadline nothing is accepted (`lock_unavailable`, saying the watch ran past its
+bound), and an acceptance already written is taken back. A live watch normally lets go of the lock within 11 seconds, under a quarter
+of the minute after which a lock counts as stale (not a hard bound: see the twenty-eighth round below). The generation
+recovery (`--recover-generation <number>`, optionally `--floor <number>`) now takes the gate lock
+itself, the same way a watch does, writes above every generation it finds (a stale lock it took
+over included), checks nothing ended above what it wrote, and lets go; it refuses while a watch
+runs. A record that can't be read or doesn't parse blocks only its own pull request (or every
+one, when its text names none), and the refusal names it with the command that sets it aside:
+`/opt/cain/keeper.sh ship-gate --quarantine <sha>`, recorded in
+`/data/work/ship-gate-quarantine.jsonl`. The only full reset of a pull request's gate is deleting
+all of its gate files at once (its lock, its `.gen` file and every `ship-gate-<sha>.json` naming
+it), and only while no watch of it runs. Every GitHub read the gate makes goes through one
+wrapper; a supersede stopped by GitHub's rate limit is kept as owed on its record and says so.
+
+The bound and the quarantine (0.12.0, twenty-eighth round). The 10 second deadline bounds the
+acceptance window, not lock holding: nothing is accepted past it, a live watch normally lets go
+within 11 seconds, but its file reads and writes can't be interrupted, so under a disk stall the
+holding is unbounded, fenced by the token and the generation (a holder taken over writes nothing
+that counts). The deadline is checked before each record is parsed and each live check. The watch
+refuses to start with curl older than 7.32 and kills a curl that runs over its limit itself. The
+quarantine takes the gate lock (it refuses while a watch runs), renames before it logs, and takes
+`--pr <number>` for a record that names no pull request; a lock file that doesn't parse is set
+aside with `/opt/cain/keeper.sh ship-gate --quarantine-lock <number>`. A Ship card is refused while
+an acceptance's supersede is owed. Without a token page reads are never retried and refusals say
+how many reads are left; a fine-grained read-only token in `SHIP_GATE_GITHUB_TOKEN` is the
+recommended default.
+
+Takeovers, the quarantine's put-back and the curl rule (0.12.0, twenty-ninth round). Every takeover
+of a stale lock moves the generation on before it acts: a watch's, the generation recovery's, and
+both quarantines' (the lock quarantine's moving of the pull request's own lock aside included), so a
+holder stalled past the stale bound that writes after the takeover leaves nothing that counts. A
+quarantine never deletes what it moved: a put-back that fails leaves the file under its quarantine
+name, logged with its generations and the failure (`put_back_failed`), and prints the restore command
+(`mv -n <quarantined file> <record path>`, run once no watch runs). A missing record is a refusal, not
+"no gate": the Ship card is refused while a quarantine or recovery holds the lock, or while a
+quarantined record isn't in the log. An owed supersede run again while the head is still the sha
+being replaced clears its mark under the lock ("no longer owed: head unchanged"). curl's version
+check and child kill are in the one request wrapper, so every gate read has them; the dry run, the
+watch and the supersede refuse to start below curl 7.32, and a read that fails on the Pi's side is
+named as that. After the fenced write the deadline is checked again at once.
+
+Owner's ship checklist, for the gate: rerun the watch after any takeover (the watch's output
+says when one happened, and since the twenty-ninth round a quarantine's or recovery's takeover
+counts too), after a generation recovery, after a quarantine (of a record or a lock file), after
+restoring a quarantined record with its `mv -n` command, and once after installing this round. Never
+delete a `.quarantined-` file: restore it or leave it.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.
@@ -69,7 +224,9 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
 6. Push the branch and open a pull request into `main`. The description follows the
    template's four sections: what changed, how it was tested, what is not verified, and
-   anything Dane must do (for example a new option to switch on). Its title,
+   anything Dane must do (for example a new option to switch on), and the round line the
+   `pr` check asks for (run check_pr.py by hand to get it). Refresh the whole description
+   whenever a new round of fixes changes the CHANGELOG. Its title,
    `<App> <version>: <what he'll notice>`, is plain words with no em dashes, shas or ids.
    Dane's Ship card doesn't show it: the link writes every line there but Cain's own.
 7. Wait for the `pytest`, `bun` and `pr` checks on the pull request to pass. Fix until

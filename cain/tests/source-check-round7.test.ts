@@ -12,8 +12,8 @@ import { CHECKS_PATH, parseChecks } from "../rootfs/opt/cain/record/core.ts";
 import { cycle, requestLoggedIn } from "../rootfs/opt/cain/record/main.ts";
 import { landingLedger } from "../rootfs/opt/cain/link/landings";
 const claimLanding = (dir: string, key: string, what: { pr: string; head: string; at: string }) => landingLedger(dir, join(dir, "..", "marker.json")).claim(key, what);
-import { Link as OldLink } from "./fixtures/link-0.11.0/core";
-import { cycle as oldCycle } from "./fixtures/keeper-0.11.0/main.ts";
+import { Link as OldLink } from "./fixtures/link-0.12.0/core";
+import { cycle as oldCycle } from "./fixtures/keeper-0.12.0/main.ts";
 import { MIN, PR, SHA1, pendingWith, rig as linkRig } from "./link-rig";
 import { PENDING, rig as keeperRig } from "./rig.ts";
 

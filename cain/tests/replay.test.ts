@@ -339,7 +339,7 @@ describe("the replay", () => {
   });
 
   test("keyed and on this machine only", () => {
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     const local = /const LOCAL_ONLY = new Set\(\[([^\]]*)\]\)/.exec(main)![1];
     for (const route of ["/replay", "/look", "/cards", "/check", "/connector", "/sent"]) expect(local).toContain(`"${route}"`);
     expect(main.indexOf('if (!keyOk) return json({ status: "refused" }, 403);')).toBeLessThan(main.indexOf('case "/replay"'));

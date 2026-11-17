@@ -195,7 +195,7 @@ describe("the cards, published for the reply hook", () => {
   });
 
   test("the link asks for a write after each save and each sweep, and answers /cards itself", () => {
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     expect(main).toContain("const stateStore = stateFile(STATE, () => cards.soon());");
     expect(main).toContain("function save(s: State, sync = false): void { stateStore.save(s, sync); }");
     expect(main).toContain("finally { cards.soon(); setTimeout(sweepLoop, SWEEP_MS); }");
@@ -276,7 +276,7 @@ describe("the gate at the link's send points", () => {
       "name each one instead of a count", "\"Undo\" isn't one of its buttons (Yes, No)"]) expect(said).toContain(why);
     expect(said).toEndWith(". Rewrite it and send it again.");
     expect(r.posts()).toBe(0);
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     expect(main).toContain('json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400)');
   });
 
@@ -419,7 +419,7 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     expect(Object.keys(r.state().sent!).sort()).toEqual([reply, part1, part2].sort());
     expect(cardsView(r.state(), r.t.now).sent).not.toContain(edited);
     // The link's start and its 6-hourly pass seed through this, and nothing else.
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     expect(main).toContain("const n = await seedReplies(link, TRANSCRIPTS,");
     expect(main).not.toContain("seedSent(");
   });

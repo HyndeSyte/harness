@@ -1,4 +1,4 @@
-// The record keeper as of main at Cain 0.11.0 (commit 4746b670b38b91ff6cb6a8530da9763b1e5562c8; unchanged copy), for the
+// The record keeper as of main at Cain 0.12.0 (commit 867d002f216be8327b5f22b05e5241c8aca3f873; unchanged copy), for the
 // roll-forward tests: the previous version must tolerate the ledger's files. Rebuilt by
 // cain/tests/fixtures/regenerate.sh; never edited by hand.
 // The record keeper's rules, with no I/O, so they can be tested on their own.

@@ -12,8 +12,8 @@ import { CHECK_WAIT_MS, closedItems, STATUS_CHANGED } from "../rootfs/opt/cain/l
 import { CHECKS_PATH, checkTextProblem, inStep, MAX_NEXT_STEP, ONE_OFF_AUDIT_PATH, openRow, parseChecks, parseRequest, plan, rowHash,
   type Checks, type Plan, type Request, type Tree } from "../rootfs/opt/cain/record/core.ts";
 import { clockSynced, cycle } from "../rootfs/opt/cain/record/main.ts";
-import * as old from "./fixtures/keeper-0.11.0/core.ts";
-import { cycle as oldCycle } from "./fixtures/keeper-0.11.0/main.ts";
+import * as old from "./fixtures/keeper-0.12.0/core.ts";
+import { cycle as oldCycle } from "./fixtures/keeper-0.12.0/main.ts";
 import { HOUR, MIN, NOV11_8AM, pendingWith, PR, rig as linkRig, SHA1 } from "./link-rig";
 import { PENDING, T0, rig as keeperRig } from "./rig.ts";
 

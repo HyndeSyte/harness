@@ -29,6 +29,13 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//   from the PC job keeper (pcjobs/main.ts), on this machine only:
+//     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
+//                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
+//                                       exactly those values when posted; a message he typed never counts
+//                                       (core.ts reuseProof); "ok", or refused with why
+//     POST /pc-notice {code, id?, job?: {site, action}, repeat?}   one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
+//                                       condition and its fix; "posted" (a plain code it has no words for gets a generic line naming it), or refused
 // Nothing is published to the LAN: the App has no "ports:".
 //
 // The gate (piece D), enforcing since 0.10.0: the link's send points fix and refuse
@@ -58,11 +65,13 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { checkRuns, facts, land, mainTip, settledFrom, type MergeDeps } from "./merge";
+import { checkRuns, facts, headChecks, inMain, land, mainTip, settledFrom, type MergeDeps } from "./merge";
 import { requestLoggedIn } from "../record/main";
 import { landingLedger } from "./landings";
+import { gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { linkFetch } from "./http";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
@@ -302,9 +311,11 @@ const link = new Link({
   } : undefined,
   mainTip: deployKey ? async (pr) => { const p = pullOf(pr); return p ? mainTip(github, p.repo) : null; } : undefined,
   facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
-  // A Ship card reads the head's checks as the landing does (merge.ts), and the review
+  // A Ship card reads the head's checks as the landing does (merge.ts headChecks, pcjobs-windows
+  // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
-  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? checkRuns(github, p.repo, head) : null; },
+  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
+  gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
@@ -384,73 +395,13 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle", "/installtaps", "/recoverlogs"]);
-const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
-const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
-
+// The routes themselves are in http.ts (linkFetch), so a test serves exactly this handler (0.12.0, twenty-third round).
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle", "/installtaps", "/recoverlogs"]);
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
   port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
-  async fetch(req, server) {
-    const url = new URL(req.url);
-    const keyOk = same(req.headers.get("x-harness-key") ?? "", key("harness-relay-v1"));
-    if (req.method === "GET" && url.pathname === "/health")
-      return json(healthBody(keyOk, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
-    if (!keyOk) return json({ status: "refused" }, 403);
-    const ip = server.requestIP(req)?.address ?? "";
-    if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
-      return json({ status: "refused" }, 403);
-    if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
-    if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());
-    if (req.method !== "POST") return json({ status: "not found" }, 404);
-    const raw = await req.text();
-    if (raw.length > 16384) return json({ status: "too large" }, 413);
-    let b: any = {};
-    try { b = raw ? JSON.parse(raw) : {}; } catch { return json({ status: "not JSON" }, 400); }
-    try {
-      switch (url.pathname) {
-        case "/card": return json({ id: await link.addCard({ text: String(b.text ?? ""), rows: b.rows ?? [], kind: b.kind, expires: b.expires }) });
-        case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
-        case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
-        case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
-        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
-          item: b.item, question: b.question, replyTo: b.reply_to, checked: b.checked, reason: b.reason }));
-        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to, checked: b.checked }));
-        case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
-        case "/replied": return json(await link.replied(b.m));
-        case "/look": return json(await link.look(b.m));
-        case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
-        case "/sent": return json(await link.sent(b, { background: true }));
-        case "/replay": return json(link.replay(b.days));
-        case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
-        case "/clock": return json(link.clockReport());
-        case "/settle": return json(await link.settleKey({ tap: b.tap, how: b.how, said: b.said }));
-        case "/installtaps": return json(await link.installTaps({ how: b.how, said: b.said }));
-        case "/recoverlogs": return json(await link.recoverLogs({ said: b.said }));
-        case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
-        case "/slowread": return json(link.slowRead());
-        case "/failwebhook": return json(link.failWebhook());
-        case "/stallread": return json(await link.stallRead(Number(b.seconds ?? 20)));
-        case "/stopped": {
-          const st = link.stopped();
-          return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."
-            : st.at === null ? "Nothing runs: the Stop state can't be read. Tell Dane in one line, and log a Build item."
-            : `Everything has been stopped${since(st, process.env.CHECKIN_TZ)}: Dane tapped Stop. Only he can turn it back on.` });
-        }
-        case "/morning": {
-          if (list(b.options).length) throw new Refusal("the morning message asks nothing: send each decision with ask");
-          const m = await link.morningPost(String(b.text ?? ""));
-          await toHarness("/morning-posted", {});
-          return json({ status: "posted", ...m });
-        }
-      }
-    } catch (e) {
-      if (e instanceof Refusal) return json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400);
-      return json({ status: "error", said: String(e).slice(0, 200) }, 500);
-    }
-    return json({ status: "not found" }, 404);
-  },
+  fetch: linkFetch({ link, keyOk: (h) => same(h, key("harness-relay-v1")),
+    health: () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() }), toHarness, tz: process.env.CHECKIN_TZ, localOnly: LOCAL_ONLY }),
 });
 console.log(`[cain] link listening on ${PORT}`);
 

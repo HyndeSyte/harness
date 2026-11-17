@@ -51,3 +51,13 @@ jobs:
       - run: >-
           docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w oven/bun:1.4.4
           sh -c 'uname -m && bun test cain/tests/source-check-round21.test.ts -t "flock" && bun test cain/tests/source-check-round20.test.ts -t "OS advisory lock" && bun test cain/tests/source-check-round22.test.ts -t "start probe" && bun test cain/tests/source-check-round25.test.ts -t "non-root"'
+  # The PC job worker runs on Dane's Windows PC: its tests run on Windows too. Not a
+  # required check (RELEASING.md); pytest and bun above stay the gate.
+  pcjobs-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - run: bun test cain/tests/pcjobs.test.ts

@@ -12,7 +12,7 @@ import { ABANDONED_TAP, NOT_ACTED_TAP, LOST_TAP, UNRESOLVED_TELL_FAILS, UNRESOLV
 import { settledFrom, type MergeDeps } from "../rootfs/opt/cain/link/merge";
 import { parseRequest, tapDerived } from "../rootfs/opt/cain/record/core.ts";
 import { cycle, pruneTaps, TAP_KEEP_MS } from "../rootfs/opt/cain/record/main.ts";
-import { Link as OldLink } from "./fixtures/link-0.11.0/core";
+import { Link as OldLink } from "./fixtures/link-0.12.0/core";
 import { DAY, MIN, PR, SHA1, SHA2, pendingWith, rig as linkRig } from "./link-rig";
 import { rig as keeperRig } from "./rig.ts";
 
@@ -430,14 +430,14 @@ describe("7 to 9. the fixture's regeneration, the resilience run, and the docs",
     expect(text).toContain("link-$version");
     expect(text).toContain("keeper-$version");
     // Rebuilt from the commit the committed fixture names, where that commit is in this clone.
-    const at = /commit ([0-9a-f]{40})/.exec(readFileSync(join(import.meta.dir, "fixtures/link-0.11.0/core.ts"), "utf8"))?.[1];
+    const at = /commit ([0-9a-f]{40})/.exec(readFileSync(join(import.meta.dir, "fixtures/link-0.12.0/core.ts"), "utf8"))?.[1];
     expect(at).toBeDefined();
     const has = Bun.spawnSync(["git", "cat-file", "-e", `${at}^{commit}`], { cwd: import.meta.dir }).exitCode === 0;
     if (!has) return;                                                 // a shallow CI checkout: the script is checked by hand
     const out = mkdtempSync(join(tmpdir(), "fixture-"));
-    const p = Bun.spawnSync(["bash", script, at!, "0.11.0", out], { cwd: join(import.meta.dir, "../.."), stdout: "pipe", stderr: "pipe" });
+    const p = Bun.spawnSync(["bash", script, at!, "0.12.0", out], { cwd: join(import.meta.dir, "../.."), stdout: "pipe", stderr: "pipe" });
     expect(p.exitCode).toBe(0);
-    for (const f of ["link-0.11.0/core.ts", "keeper-0.11.0/core.ts", "keeper-0.11.0/main.ts"])
+    for (const f of ["link-0.12.0/core.ts", "keeper-0.12.0/core.ts", "keeper-0.12.0/main.ts"])
       expect(readFileSync(join(out, f), "utf8")).toBe(readFileSync(join(import.meta.dir, "fixtures", f), "utf8"));
   });
 
