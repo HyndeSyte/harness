@@ -331,8 +331,9 @@ in the harness repo; until then the keeper says it is waiting).
   an hour. A notice that waited longer than the link remembers, or one from before the keeper kept its
   age, may come once more, worded as said again. Two more lines come from the keeper itself:
   "the PC job queue on GitHub can't be reached" after about half an hour of failed fetches
-  (`queue_unreachable`), and "jobs are waiting and the PC's worker hasn't been heard from for
-  hours" (`worker_not_starting`). Neither is his to fix unless he is at his PC: put the second on
+  (`queue_unreachable`, or `queue_unreachable_again` when it comes back within a day of
+  clearing), and "jobs are waiting for the PC, or one ran out of time waiting, and its worker
+  hasn't been heard from" (`worker_not_starting`). Neither is his to fix unless he is at his PC: put the second on
   his "At his PC" list only if he says he started the worker and nothing happened. A line
   counting server errors means the notice is still being retried: nothing to tell him.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
