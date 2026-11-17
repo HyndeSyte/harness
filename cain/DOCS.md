@@ -1261,6 +1261,36 @@ What Cain's link enforces:
   combined fault scenario are the real arm64 gate. Making the job a required check is a change to the
   repository's ruleset that only you can make.
 
+  Round 23 (the twenty-third review's fixes, to defects in round 22's own additions; the design stays
+  frozen for the combined fault scenario, and no new durable store: the keeper state already written each
+  round carries the new fields). The table in `cain/docs/source-check-invariants.md` is updated for every
+  row this round touches.
+
+  Pushes go again only once GitHub is seen to have them: a push counts as confirmed when GitHub's branch,
+  read back right after it, is the commit the keeper pushed (or a fresh fetch finds nothing waiting to
+  push). A push that passes the check but fails on the network, times out or can't be read back leaves the
+  held-back record in place, with nothing said to Cain. The push itself now runs under a hard time limit
+  (20 seconds, well below the 30 seconds the consumed-key log's other writers wait for its lock), with
+  git's low-speed limit and no prompt of any kind to wait on; on expiry git and everything it started are
+  stopped and the lock is released. A push that timed out, or failed with GitHub unreadable after it, has an
+  unknown outcome: kept in the keeper's state, listed under unresolved landings, and no drop of the taps it
+  may have carried happens until a fresh fetch settles whether it landed. The drop itself fetches GitHub's
+  branch afresh under the lock and drops nothing when that fails, so a push that errored but landed is never
+  taken for one that didn't. The nightly check's push goes through the same held-back record, notice,
+  retry and resolution as a round's, so a refusal is told once whichever push hit it. The check of what a
+  push carried fails closed too: an unreadable consumed-key log, an unknown GitHub branch or a git failure
+  is "alarm check incomplete", kept, listed, told to Cain once and checked again each round until clean.
+  What Cain and you read about a held-back push is fixed wording per cause; git's own text (which can
+  carry commit ids and paths) stays in the keeper's log. The remedy for a withdrawn change that can't be
+  taken out cleanly is `/opt/cain/record.sh reset-copy` (its next round resets its copy to GitHub's, as after
+  a conflict). With the box's boot id unreadable, the two-hour landing window starts again at each keeper
+  start, so a reboot can never shorten it. A lock busy past its wait at one landing mark skips only that
+  record (listed with its cause in the keeper's status); the rest are looked at. Every lock-acquiring call in
+  the whole source tree is listed with what it does when the lock is busy. Each row of `keeper.sh clock`'s
+  unresolved_landings now names its kind (row: landing, push-refused, push-alarm, alarm-check,
+  push-unknown). The start probe's helper runs under the same runtime and flags as the App's own process,
+  and a helper that can't start is its own refusal reason.
+
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
   predicate. A reset of the record that wins before that point (checked right before the claim)

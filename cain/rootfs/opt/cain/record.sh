@@ -25,6 +25,11 @@
 #                               web address's userinfo is in it, printing yes or no, never the match
 #   record.sh force-conflict    the device smoke test only: the next round with unpushed local commits
 #                               resets the keeper's copy, as a rebase conflict would
+#   record.sh reset-copy        round 23: the remedy when the keeper says a withdrawn change can't be
+#                               taken out of its local commits cleanly (its pushes held back): its next
+#                               round resets its copy to GitHub's, as after a conflict (the same switch
+#                               as force-conflict); requests still queued are applied again, the
+#                               withdrawn one never pushed, and its pushes go again once one is confirmed
 set -u
 dir="${RECORD_DIR:-/data/record}"
 queue="${RECORD_QUEUE:-/data/record-queue}"
@@ -116,5 +121,8 @@ case "${1:-}" in
   force-conflict)
     # The next round with unpushed local commits treats their rebase as a conflict and resets.
     : > "${RECORD_FORCE_CONFLICT:-/data/record-force-conflict}" && echo "the record keeper's next round with unpushed commits resets its copy, as after a conflict" ;;
-  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id> | block-push [minutes] | clock-test <header-only|none|step:-N|off> | force-conflict | leak-check [files]" >&2; exit 2 ;;
+  reset-copy)
+    # Round 23: the documented remedy for pushes held back by a withdrawn change that can't be taken out cleanly.
+    : > "${RECORD_FORCE_CONFLICT:-/data/record-force-conflict}" && echo "the record keeper's next round resets its copy to GitHub's, as after a conflict; the withdrawn change is never pushed" ;;
+  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id> | block-push [minutes] | clock-test <header-only|none|step:-N|off> | force-conflict | reset-copy | leak-check [files]" >&2; exit 2 ;;
 esac

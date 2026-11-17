@@ -22,7 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, LockTimeout, lockRefusal, probeLock, readLog, syncDir, withLogLock } from "../applog.ts";
+import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, LockTimeout, lockRefusal, lockWait, probeLock, readLog, syncDir, withLogLock } from "../applog.ts";
 import { installState } from "../installflag.ts";
 import { lockGate } from "../startgate.ts";
 
@@ -52,6 +52,7 @@ export type Config = {
   beforePush?: () => void; // the tests' hook: runs right before the push
   gitHook?: (args: string[]) => void;   // round 22: the tests' hook, run before every git command (throws to fail it, or blocks)
   bootId?: () => string;   // round 22: the box's boot id (default /proc/sys/kernel/random/boot_id); the tests' stand-in
+  pushTimeoutMs?: number;  // round 23: the hard timeout of a network git call under the consumed-key flock (default PUSH_TIMEOUT_MS)
   fetchDate?: () => string | null;   // the tests' stand-in for GitHub's Date header on a fetch from a local remote
   leakCheck?: string;      // the smoke test's leak check (default /data/record-leak-check): see leakCheck()
   logFile?: string;        // the keeper's log copy (RECORD_LOG, /data/work/record-keeper.log), which the leak check reads
@@ -165,7 +166,20 @@ function proxyEnv(): Record<string, string> {
 
 // git with tracing off (nothing of the HTTP exchange is ever traced), the token only through
 // the askpass helper, and what it says redacted.
-function git(cfg: Config, args: string[], cwd = cfg.dir): string {
+// Round 23: a network call under the consumed-key flock (the guarded push, the drop's fresh fetch, the push's
+// confirmation) runs with net: a hard timeout (its own session, killed whole with SIGKILL on expiry, so a hung
+// credential helper or transport child goes too), git's low-speed limit, no terminal prompt and no askpass or ssh
+// prompt to wait on. Expiry throws a GitTimeout: the call's outcome is unknown.
+export const PUSH_TIMEOUT_MS = 20_000;
+export const NET_LOW_SPEED_S = 10;
+// Round 23: writers of the consumed-key log wait this long for its flock (CONSUMED_WAIT_FACTOR times the shared lock
+// wait: 30 seconds by default), well above the push's hard timeout, so a push that holds the flock to its timeout never
+// makes another writer of that log time out.
+export const CONSUMED_WAIT_FACTOR = 6;
+export const consumedWait = () => lockWait.ms * CONSUMED_WAIT_FACTOR;
+export class GitTimeout extends Error { constructor(what: string, ms: number) { super(`git ${what}: no answer within ${Math.round(ms / 1000)} seconds (stopped)`); this.name = "GitTimeout"; } }
+const SETSID = ["/usr/bin/setsid", "/bin/setsid"].find((f) => existsSync(f)) ?? null;
+function git(cfg: Config, args: string[], cwd = cfg.dir, net?: { timeoutMs: number }): string {
   cfg.gitHook?.(args);
   const env: Record<string, string> = { ...process.env as any, GIT_TERMINAL_PROMPT: "0" };
   for (const k of ["GIT_TRACE", "GIT_TRACE_CURL", "GIT_TRACE_CURL_NO_DATA", "GIT_TRACE_PACKET", "GIT_TRACE_PERFORMANCE", "GIT_TRACE_SETUP", "GIT_CURL_VERBOSE"]) delete env[k];
@@ -178,14 +192,23 @@ function git(cfg: Config, args: string[], cwd = cfg.dir): string {
   }
   // Byte-exact files (the shas writers send are of the bytes as committed), links
   // checked out as plain files, and no hooks from the copy's own config.
-  const p = Bun.spawnSync(["git", "-c", "core.autocrlf=false", "-c", "core.symlinks=false", "-c", "core.hooksPath=/dev/null",
-    "-c", `user.name=${KEEPER}`, "-c", "user.email=HyndeSyte@users.noreply.github.com", ...args],
-    { cwd, env, stdout: "pipe", stderr: "pipe" });
+  const netArgs = net ? ["-c", "http.lowSpeedLimit=1000", "-c", `http.lowSpeedTime=${NET_LOW_SPEED_S}`, "-c", "credential.interactive=never"] : [];
+  if (net) { env.GCM_INTERACTIVE = "never"; env.SSH_ASKPASS = "/bin/false"; env.GIT_SSH_COMMAND = env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes"; if (!env.GIT_ASKPASS) env.GIT_ASKPASS = "/bin/false"; }
+  const argv = ["git", "-c", "core.autocrlf=false", "-c", "core.symlinks=false", "-c", "core.hooksPath=/dev/null",
+    "-c", `user.name=${KEEPER}`, "-c", "user.email=HyndeSyte@users.noreply.github.com", ...netArgs, ...args];
+  const p = Bun.spawnSync(net && SETSID ? [SETSID, ...argv] : argv,
+    { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "pipe", ...(net ? { timeout: net.timeoutMs, killSignal: "SIGKILL" as const } : {}) });
+  if (net && (p as any).exitedDueToTimeout) {
+    // The whole session goes: git and anything it started (a transport, a credential helper).
+    if (SETSID && p.pid) { try { process.kill(-p.pid, "SIGKILL"); } catch { /* gone already */ } }
+    throw new GitTimeout(args[0], net.timeoutMs);
+  }
   let out = (p.stdout.toString() + p.stderr.toString()).trim();
   out = redact(cfg, out);
   if (p.exitCode !== 0) throw new GitError(`git ${args[0]}: ${out.split("\n")[0]}`);
   return out;
 }
+const netTimeout = (cfg: Config) => ({ timeoutMs: cfg.pushTimeoutMs ?? PUSH_TIMEOUT_MS });
 
 // The keeper's copy, brought up to GitHub's. Local commits GitHub doesn't have yet (a push
 // that failed) are kept and rebased onto what GitHub has; only a rebase that conflicts resets
@@ -215,7 +238,7 @@ function sync(cfg: Config, now: () => number = Date.now): Synced {
     if (ahead(cfg)) {
       try {
         // The smoke test's forced conflict: this rebase counts as one that conflicted.
-        if (existsSync(conflictFile(cfg))) { rmSync(conflictFile(cfg), { force: true }); throw new GitError("git rebase: conflict forced by the smoke test (record.sh force-conflict)"); }
+        if (existsSync(conflictFile(cfg))) { rmSync(conflictFile(cfg), { force: true }); throw new GitError("git rebase: conflict forced by the smoke test or a reset of the copy (record.sh force-conflict or reset-copy)"); }
         git(cfg, ["rebase", "--quiet", `origin/${cfg.branch}`]);
       }
       catch (e) {
@@ -397,10 +420,18 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // Round 22: a push the push guard refused (kind, why, since, tries, whether Cain was told), retried each round, and
   // pushes found to have carried a dropped request's commit (alarms), both listed under unresolved landings.
   pushRefused?: PushRefused;
-  pushAlarms?: PushAlarm[] };
-export type PushRefused = { kind: GuardKind; why: string; since: string; tries: number; told?: boolean };
-export type PushAlarm = { tap: string; id: string; at: string; why: string };
-export type GuardKind = "unknown-remote" | "git" | "conflict" | "log" | "lock";
+  pushAlarms?: PushAlarm[];
+  alarmCheck?: AlarmCheck;   // round 23
+  pushUnknown?: PushUnknown;   // round 23
+  landSkipped?: LandSkip[];   // round 23: this round's landing-check records skipped, with their causes (not kept across rounds)
+};
+export type PushRefused = { kind: GuardKind; why: string; since: string; tries: number; told?: boolean; by?: ("round" | "nightly")[] };
+export type PushAlarm = { tap: string; id: string; at: string; why: string; item?: string };
+export type GuardKind = "unknown-remote" | "git" | "conflict" | "log" | "lock" | "too-many";
+// Round 23: a check of what a push carried that couldn't be completed (kept and retried each round until a clean scan),
+// and a push whose outcome is unknown (timed out, or errored with no fetch after it), settled by the next fresh fetch.
+export type AlarmCheck = { before: string | null; since: string; why: string; tries: number; told?: boolean };
+export type PushUnknown = { at: string; head: string; before: string | null; keys: string[]; why: string; tries: number };
 // Round 21: a "waiting" notice names its request (id) and its stuck episode (ep): deduplicated per (tap, request, episode).
 type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded" | "unstamped" | "unlanded" | "waiting"; reason: string; msg?: string; at: string; id?: string; ep?: number };
 const TAPS_KEPT = 1000;
@@ -465,8 +496,8 @@ export function openIntents(cfg: Config): Map<string, string> {
   }
   return open;
 }
-function intendConsume(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { t: "consuming", tap, id, at }); }
-function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }); }
+function intendConsume(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { t: "consuming", tap, id, at }, { wait: consumedWait() }); }
+function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }, { wait: consumedWait() }); }
 // Round 19: each intent a crash left open is resolved from the record's history: consumed when a commit carries its
 // Tap-Key trailer (the request's local commit happened), else dropped. A crash after the commit never leads to a re-ask.
 // Round 20: only from a commit that carries both the tap key and the intent's own request id (Tap-Key and Tap-Request):
@@ -532,8 +563,15 @@ function pairStates(rs: any[]): Map<string, { tap: string; id: string; at: strin
   }
   return state;
 }
-export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boolean; now: number; queued?: Set<string>; watch?: State["landWatch"] }): { landed: string[]; unlanded: { tap: string; id: string; why: string }[] } {
-  const out = { landed: [] as string[], unlanded: [] as { tap: string; id: string; why: string }[] };
+// Round 23: per process, the landing watches re-based in this keeper run because the boot id can't be read. Without the
+// boot id a reboot is seen only when the box's uptime reading drops, so a reboot whose new uptime is past the saved
+// first-seen reading would shorten the window: instead, each watch starts again (a fresh first sighting and round count)
+// at the first round of each keeper run, so the window is never shorter; with the boot id unknown, a keeper restarted
+// more often than the window holds its automatic drops by window.
+const rebasedWatch = new Set<string>();
+export type LandSkip = { tap: string; id: string; why: string };
+export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boolean; now: number; queued?: Set<string>; watch?: State["landWatch"]; blocked?: Set<string> }): { landed: string[]; unlanded: { tap: string; id: string; why: string }[]; skipped: LandSkip[] } {
+  const out = { landed: [] as string[], unlanded: [] as { tap: string; id: string; why: string }[], skipped: [] as LandSkip[] };
   const watch = o.watch ?? {};
   let recs: any[] = [];
   try { recs = readLog<any>(tapsLogFile(cfg), { repair: false }).records; } catch { return out; }
@@ -548,108 +586,181 @@ export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boo
   historyTaps(cfg, { pairs: all });
   historyTaps(cfg, { pairs: remote, refs: [`origin/${cfg.branch}`] });
   const mono = monoOf(cfg), boot = bootId(cfg);
+  // Round 23: each record on its own: a lock timeout (or any error) at one record's mark or drop skips that record, listed
+  // with its cause, and the rest are looked at.
   for (const x of pending) {
     const k = tapPair(x.tap, x.id);
-    if (remote.has(k)) { delete watch[k]; appendLog(tapsLogFile(cfg), { t: "landed", tap: x.tap, id: x.id, at: new Date(o.now).toISOString() }); out.landed.push(x.tap); continue; }
-    if (!watch[k] || watch[k].boot !== boot || !(watch[k].since <= mono)) watch[k] = { tap: x.tap, id: x.id, since: mono, rounds: 0, boot };
-    const lw = watch[k];
-    if (o.inStep) lw.rounds++;
-    const why = !all.has(k) ? "its commit is on no ref of the record's copy any more (a reset or a rebuild discarded it)"
-      : o.inStep && mono - lw.since > LANDED_WINDOW_MS && lw.rounds >= LANDED_MIN_ROUNDS ? `its commit isn't on GitHub's ${cfg.branch} ${Math.round(LANDED_WINDOW_MS / 3_600_000)} hours after the keeper first saw it unlanded, over ${lw.rounds} fetch rounds with the copy in step` : null;
-    if (!why) continue;
-    const r = dropUnlanded(cfg, x.tap, x.id, why, new Date(o.now).toISOString());
-    delete watch[k];
-    if (r === "dropped") out.unlanded.push({ tap: x.tap, id: x.id, why });
-    else if (r === "landed") out.landed.push(x.tap);
+    try {
+      if (remote.has(k)) { appendLog(tapsLogFile(cfg), { t: "landed", tap: x.tap, id: x.id, at: new Date(o.now).toISOString() }, { wait: consumedWait() }); delete watch[k]; out.landed.push(x.tap); continue; }
+      const rk = `${cfg.dir}\0${k}`;
+      if (boot === "unknown" && !rebasedWatch.has(rk)) { rebasedWatch.add(rk); watch[k] = { tap: x.tap, id: x.id, since: mono, rounds: 0, boot }; }
+      else if (!watch[k] || watch[k].boot !== boot || !(watch[k].since <= mono)) watch[k] = { tap: x.tap, id: x.id, since: mono, rounds: 0, boot };
+      const lw = watch[k];
+      if (o.inStep) lw.rounds++;
+      const why = !all.has(k) ? "its commit is on no ref of the record's copy any more (a reset or a rebuild discarded it)"
+        : o.inStep && mono - lw.since > LANDED_WINDOW_MS && lw.rounds >= LANDED_MIN_ROUNDS ? `its commit isn't on GitHub's ${cfg.branch} ${Math.round(LANDED_WINDOW_MS / 3_600_000)} hours after the keeper first saw it unlanded, over ${lw.rounds} fetch rounds with the copy in step` : null;
+      if (!why) continue;
+      // Round 23: a push whose outcome is unknown and that may have carried this key blocks its drop until a fetch settles it.
+      if (o.blocked?.has(x.tap)) { out.skipped.push({ tap: x.tap, id: x.id, why: "a push that may have carried it has an unknown outcome until a fresh fetch settles it" }); continue; }
+      const r = dropUnlanded(cfg, x.tap, x.id, why, new Date(o.now).toISOString());
+      if (r === "retry") { out.skipped.push({ tap: x.tap, id: x.id, why: "GitHub's copy couldn't be read again under the lock, so nothing was dropped" }); continue; }
+      delete watch[k];
+      if (r === "dropped") out.unlanded.push({ tap: x.tap, id: x.id, why });
+      else if (r === "landed") out.landed.push(x.tap);
+    } catch (e) {
+      const why = e instanceof LockTimeout ? "the consumed-key log was locked by another writer past the timeout" : `an error (${clean((e as Error).message, 120)})`;
+      out.skipped.push({ tap: x.tap, id: x.id, why });
+    }
   }
+  for (const s of out.skipped) log(`landing check: skipped tap key ${s.tap} (request ${s.id}) this round: ${s.why}; looked at again next round`);
+  return out;
+}
+// The (tap key, request id) pairs on GitHub's branch as the copy knows it, read strictly: any git failure throws.
+function remotePairs(cfg: Config): Set<string> {
+  const ref = `refs/remotes/origin/${cfg.branch}`;
+  git(cfg, ["rev-parse", "--verify", "--quiet", ref]);
+  const text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", ref]);
+  const out = new Set<string>();
+  for (const r of text.split("\x1e")) { const [k, id] = r.split("\x1f").map((x) => (x ?? "").trim()); if (k && id) out.add(tapPair(k, id)); }
   return out;
 }
 // Round 21: the drop is one locked step on the consumed-key log. Round 22: the same flock the push guard holds from its
-// tombstone check until its push's result is known, so a drop and a push never overlap; and under the lock the drop looks
-// at the remote's branch again (as the last push or fetch left it): a record whose commit is there now is marked landed
-// instead, never dropped.
-export function dropUnlanded(cfg: Config, tap: string, id: string, why: string, at: string): "dropped" | "landed" | "gone" {
+// tombstone check until its push's result is known, so a drop and a push never overlap. Round 23: under the lock the drop
+// fetches GitHub's branch afresh (never the remote-tracking ref as the last push or fetch left it: a push that errored
+// but landed, with its follow-up fetch failed, would read as absent there), and refuses to drop ("retry", looked at again
+// next round) when that fetch or the read of its history fails; a record whose commit is on GitHub is marked landed.
+export function dropUnlanded(cfg: Config, tap: string, id: string, why: string, at: string): "dropped" | "landed" | "gone" | "retry" {
   const k = tapPair(tap, id);
   return withLogLock(tapsLogFile(cfg), () => { // dropUnlanded
     const now = pairStates(readLog<any>(tapsLogFile(cfg), { repair: false }).records).get(k);
     if (now?.s !== "open") return "gone";
-    const remote = new Set<string>();
-    historyTaps(cfg, { pairs: remote, refs: [`origin/${cfg.branch}`] });
+    let remote: Set<string>;
+    try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, netTimeout(cfg)); remote = remotePairs(cfg); }
+    catch (e) { log(`didn't drop tap key ${tap} (request ${id}): GitHub's copy couldn't be read again under the lock (${clean(redact(cfg, (e as Error).message), 160)}); looked at again next round`); return "retry"; }
     if (remote.has(k)) { appendLogHeld(tapsLogFile(cfg), { t: "landed", tap, id, at, how: "on GitHub when its drop came to be written" }); return "landed"; }
     appendLogHeld(tapsLogFile(cfg), { t: "dropped", tap, id, unlanded: true, why, at });
     const ab = abandonCommits(cfg);
-    if (ab.refused) log(`couldn't take the dropped commit for tap key ${tap} out of the local branch yet (${ab.refused}): the push guard refuses every push until it can`);
+    if (ab.refused) log(`couldn't take the dropped commit for tap key ${tap} out of the local branch yet (${ab.detail ?? ab.refused}): the push guard refuses every push until it can`);
     return "dropped";
-  });
+  }, { wait: consumedWait() });
 }
+// Round 23: the guard's refusals in fixed words for each kind (what Cain and the owner's notice read): git's own text
+// (which can carry abbreviated commit ids, refs and paths) goes to the keeper's log only, as detail.
+export const GUARD_WHY: Record<GuardKind, string> = {
+  "log": "the consumed-key log couldn't be read to check for dropped requests, so nothing is pushed",
+  "unknown-remote": "GitHub's copy of the record isn't known to the box's copy, so it can't be checked that no dropped request's commit would be pushed; nothing is pushed",
+  "git": "the unpushed commits couldn't be listed to check for dropped requests, so nothing is pushed",
+  "conflict": "an unpushed commit carries a dropped request and couldn't be taken out of the local commits cleanly (a later change overlaps it), so nothing is pushed until it is taken out or the copy is reset",
+  "too-many": "too many dropped requests' commits to take out in one round, so nothing is pushed this round",
+  "lock": "the consumed-key log couldn't be locked for the push, so nothing is pushed this round",
+};
 // Round 21: the push path's tombstone check. Every unpushed commit (on the local branch, not on the remote's) whose Tap-Key
 // and Tap-Request pair has an unlanded drop is taken out of the local branch (the commits after it replayed onto its
 // parent). Round 22: it fails closed. Only a verified absence of tombstoned commits lets a push go: no tombstones at all,
 // or a known remote branch and a readable range with none in it. The consumed-key log unreadable, the remote branch
 // unknown, any git error and a removal that conflicts each refuse the push (refused says why, kind which).
-export function abandonCommits(cfg: Config): { abandoned: string[]; refused?: string; kind?: GuardKind } {
-  const out = { abandoned: [] as string[] } as { abandoned: string[]; refused?: string; kind?: GuardKind };
+// Round 23: refused is the kind's fixed words (GUARD_WHY); detail, git's own text, is for the keeper's log only.
+export function abandonCommits(cfg: Config): { abandoned: string[]; refused?: string; kind?: GuardKind; detail?: string } {
+  const out = { abandoned: [] as string[] } as { abandoned: string[]; refused?: string; kind?: GuardKind; detail?: string };
+  const no = (kind: GuardKind, detail: string) => ({ ...out, kind, refused: GUARD_WHY[kind], detail: clean(redact(cfg, detail), 300) });
   let tomb: Set<string>;
-  try { readLog<any>(tapsLogFile(cfg), { repair: false }); tomb = tombstones(cfg); }
-  catch (e) { return { abandoned: [], kind: "log", refused: `the consumed-key log can't be read to check for dropped requests (${clean((e as Error).message, 120)}), so nothing is pushed` }; }
+  try { tomb = tombstonesStrict(cfg); }
+  catch (e) { return no("log", `the consumed-key log can't be read: ${(e as Error).message}`); }
   if (!tomb.size) return out;
   const ref = `refs/remotes/origin/${cfg.branch}`;
   for (let guard = 0; guard < 50; guard++) {
     try { git(cfg, ["rev-parse", "--verify", "--quiet", ref]); }
-    catch { return { ...out, kind: "unknown-remote", refused: `GitHub's ${cfg.branch} isn't known to the record's copy, so it can't be checked that no dropped request's commit would be pushed; nothing is pushed` }; }
+    catch (e) { return no("unknown-remote", `${ref} isn't known: ${(e as Error).message}`); }
     let text = "";
     try { text = git(cfg, ["log", "--reverse", "--format=%x1e%H%x1f%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", `${ref}..HEAD`]); }
-    catch (e) { return { ...out, kind: "git", refused: `the unpushed commits couldn't be listed to check for dropped requests (${clean((e as Error).message, 120)}), so nothing is pushed` }; }
+    catch (e) { return no("git", `listing ${ref}..HEAD failed: ${(e as Error).message}`); }
     const hit = text.split("\x1e").map((r) => r.split("\x1f").map((x) => (x ?? "").trim())).find(([sha, k, id]) => sha && k && id && tomb.has(tapPair(k, id)));
     if (!hit) return out;
     try { git(cfg, ["rebase", "--quiet", "--onto", `${hit[0]}^`, hit[0]]); out.abandoned.push(hit[0]); log(`took the commit of dropped request ${hit[2]} (tap key ${hit[1]}) out of the local branch: it is never pushed`); }
     catch (e) {
       let abort = "";
-      try { git(cfg, ["rebase", "--abort"]); } catch (x) { if (existsSync(join(cfg.dir, ".git", "rebase-merge")) || existsSync(join(cfg.dir, ".git", "rebase-apply"))) abort = `; its rebase couldn't be undone either (${clean((x as Error).message, 80)})`; }
-      return { ...out, kind: "conflict", refused: `an unpushed commit carries dropped request ${hit[2]} (tap key ${hit[1]}) and couldn't be taken out of the local branch (a conflict: ${clean((e as Error).message, 120)})${abort}, so nothing is pushed until it is taken out or the copy is reset` };
+      try { git(cfg, ["rebase", "--abort"]); } catch (x) { if (existsSync(join(cfg.dir, ".git", "rebase-merge")) || existsSync(join(cfg.dir, ".git", "rebase-apply"))) abort = `; its rebase couldn't be undone either (${(x as Error).message})`; }
+      return no("conflict", `commit ${hit[0]} of dropped request ${hit[2]} (tap key ${hit[1]}) couldn't be taken out: ${(e as Error).message}${abort}`);
     }
   }
-  return { ...out, kind: "git", refused: "too many dropped requests' commits to take out in one round; nothing is pushed this round" };
+  return no("too-many", "50 removals in one round");
 }
 // Round 22: the push guard. The consumed-key log's flock is held from the tombstone check (abandonCommits) until the
 // push's result is known, so a drop (which takes the same flock) can't tombstone a commit that a push is carrying. A
 // refused guard pushes nothing. After the push, the range it carried (the remote branch before it to the remote branch
 // after it) is checked against the tombstones (pushedTombstoned): a match is an alarm. A lock held past the timeout
 // refuses the push (kind "lock"), retried next round.
-export type GuardOutcome = { pushed: boolean; error?: string; refused?: { kind: GuardKind; why: string }; alarms: PushAlarm[]; before: string | null };
+// Round 23: the push runs under a hard timeout (git with net: PUSH_TIMEOUT_MS, well below consumedWait()), killed on
+// expiry, and the lock is released by withLogLock's finally whatever the push did: a timeout is an unknown outcome
+// (timedOut). A push counts as done (confirmed) only once GitHub's branch, read back with ls-remote after the lock is
+// released, equals the pushed head. An incomplete check of what it carried is kept (incomplete), never taken as none.
+export type GuardOutcome = { pushed: boolean; error?: string; timedOut?: boolean; confirmed?: boolean; refused?: { kind: GuardKind; why: string }; alarms: PushAlarm[]; incomplete?: string; before: string | null; head?: string | null };
 export function remoteTip(cfg: Config): string | null {
   try { return git(cfg, ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${cfg.branch}`]).trim() || null; } catch { return null; }
 }
 export function guardedPush(cfg: Config, push: () => void, nowIso: string): GuardOutcome {
+  let g: GuardOutcome;
   try {
-    return withLogLock(tapsLogFile(cfg), () => { // guardedPush
+    g = withLogLock(tapsLogFile(cfg), () => { // guardedPush
       const ab = abandonCommits(cfg);
-      if (ab.refused) return { pushed: false, refused: { kind: ab.kind ?? "git", why: ab.refused }, alarms: [], before: null };
+      if (ab.refused) { if (ab.detail) log(`push guard (${ab.kind}): ${ab.detail}`); return { pushed: false, refused: { kind: ab.kind ?? "git", why: ab.refused }, alarms: [], before: null }; }
       const before = remoteTip(cfg);
-      let error: string | undefined;
-      try { push(); } catch (e) { error = (e as Error).message; }
-      return { pushed: !error, ...(error ? { error } : {}), alarms: pushedTombstoned(cfg, before, nowIso), before };
-    });
+      let head: string | null = null;
+      try { head = git(cfg, ["rev-parse", "--verify", "HEAD"]).trim() || null; } catch { head = null; }
+      let error: string | undefined, timedOut = false;
+      try { push(); } catch (e) { error = (e as Error).message; timedOut = e instanceof GitTimeout; }
+      const scan = pushedTombstoned(cfg, before, nowIso);
+      return { pushed: !error, ...(error ? { error } : {}), ...(timedOut ? { timedOut: true } : {}), alarms: scan.alarms, ...(scan.incomplete ? { incomplete: scan.incomplete } : {}), before, head };
+    }, { wait: consumedWait() });
   } catch (e) {
-    return { pushed: false, refused: { kind: "lock", why: `the consumed-key log couldn't be locked for the push (${clean((e as Error).message, 160)}), so nothing is pushed this round` }, alarms: [], before: null };
+    log(`push guard (lock): ${clean((e as Error).message, 200)}`);
+    return { pushed: false, refused: { kind: "lock", why: GUARD_WHY.lock }, alarms: [], before: null };
   }
+  if (g.pushed && g.head) g.confirmed = confirmPush(cfg, g.head);
+  return g;
+}
+// Round 23: GitHub's branch read back (ls-remote, under the hard timeout) equal to the pushed head.
+export function confirmPush(cfg: Config, head: string): boolean {
+  try {
+    const tip = git(cfg, ["ls-remote", "origin", `refs/heads/${cfg.branch}`], cfg.dir, netTimeout(cfg)).split(/\s+/)[0] ?? "";
+    if (tip === head) return true;
+    log(`the push answered, but GitHub's ${cfg.branch} reads ${tip ? "another commit" : "nothing"} on the read back: not counted as confirmed`);
+  } catch (e) { log(`the push answered, but GitHub's ${cfg.branch} couldn't be read back (${clean(redact(cfg, (e as Error).message), 160)}): not counted as confirmed`); }
+  return false;
 }
 // Round 22: the commits a push carried (from the remote branch before it to the remote branch now) whose Tap-Key and
 // Tap-Request pair has an unlanded drop: each an alarm (a dropped answer reached GitHub).
-export function pushedTombstoned(cfg: Config, before: string | null, nowIso: string): PushAlarm[] {
-  const tomb = tombstones(cfg);
-  if (!tomb.size) return [];
+// Round 23: it fails closed: an unreadable consumed-key log, an unknown remote tip or a git failure in the scan makes it
+// incomplete (the fixed words why), kept and retried by the caller until a clean scan; never read as verified absence.
+export function pushedTombstoned(cfg: Config, before: string | null, nowIso: string): { alarms: PushAlarm[]; incomplete?: string } {
+  let tomb: Set<string>;
+  try { tomb = tombstonesStrict(cfg); }
+  catch (e) { log(`couldn't read the consumed-key log to check what the push carried: ${clean((e as Error).message, 160)}`); return { alarms: [], incomplete: "the consumed-key log couldn't be read to check what the push carried" }; }
+  if (!tomb.size) return { alarms: [] };
   const tip = remoteTip(cfg);
-  if (!tip || tip === before) return [];
+  if (!tip) { log("GitHub's branch isn't known to the copy after the push: what it carried couldn't be checked"); return { alarms: [], incomplete: "GitHub's copy of the record isn't known to the box's copy, so what the push carried couldn't be checked" }; }
+  if (tip === before) return { alarms: [] };
   let text = "";
   try { text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", before ? `${before}..${tip}` : tip]); }
-  catch (e) { log(`couldn't check the pushed range against the dropped requests: ${clean((e as Error).message, 120)}`); return []; }
+  catch (e) { log(`couldn't check the pushed range against the dropped requests: ${clean(redact(cfg, (e as Error).message), 160)}`); return { alarms: [], incomplete: "the commits the push carried couldn't be listed to check them" }; }
   const out: PushAlarm[] = [];
   for (const r of text.split("\x1e")) {
     const [k, id] = r.split("\x1f").map((x) => (x ?? "").trim());
-    if (k && id && tomb.has(tapPair(k, id))) out.push({ tap: k, id, at: nowIso, why: `a push carried the commit of request ${id} (tap key ${k}), which was dropped as not landed` });
+    if (k && id && tomb.has(tapPair(k, id))) { const item = itemOfTap(cfg, k); out.push({ tap: k, id, at: nowIso, why: "a push carried the change of a request that was dropped as not landed", ...(item ? { item } : {}) }); }
   }
-  return out;
+  return { alarms: out };
+}
+// The item a tap key's card was about, from the keeper's mirror of the issued-key log (null: not there).
+function itemOfTap(cfg: Config, tap: string): string | null {
+  try { for (const r of readLog<any>(issuedMirrorFile(cfg), { repair: false }).records) if (r?.kid === tap && typeof r.item === "string" && /^[A-Z]\d{1,4}$/.test(r.item)) return r.item; } catch { /* none */ }
+  return null;
+}
+// Round 23: the tap keys of the commits in a range (a push's), for a push whose outcome is unknown.
+function rangeTapKeys(cfg: Config, before: string | null, head: string): string[] {
+  try {
+    const text = git(cfg, ["log", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)", before ? `${before}..${head}` : head]);
+    return [...new Set(text.split("\x1e").map((x) => x.trim()).filter((x) => TAP_KEY.test(x)))];
+  } catch { return []; }
 }
 // Round 20: rounds in a row in which a consuming intent couldn't be resolved before the keeper says so (a keeper notice
 // to Cain, and one line on each card to him).
@@ -732,7 +843,7 @@ export function holdLapsed(cfg: Config, k: string, h: Hold, at: Date, downtime: 
   if (holdSeen.size > 5000) holdSeen.delete(holdSeen.keys().next().value!);
   return mono - holdSeen.get(key)! > HOLD_IDLE_MS || expired(h, at, downtime);
 }
-function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }); }
+function appendConsumed(cfg: Config, tap: string, id: string, at: string) { appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() }); }
 // Round 18: whether the link has superseded a key, read from its issued-key log now (its tail, as it stands at this
 // instant), just before the keeper consumes that key: a supersede the link appended after this round's mirror is
 // still seen, so a key is either consumed or superseded, never both.
@@ -864,10 +975,15 @@ function mirrorIssued(cfg: Config): number {
 export function keeperLockProbe(cfg: Config): string | null { return probeLock(dirname(tapsLogFile(cfg))); }
 // Round 21: a commit whose Tap-Key and Tap-Request pair has an unlanded drop (its tombstone in the consumed-key log) counts
 // for nothing here: the rebuild never brings a dropped consumption back, and it never resolves an intent.
-function tombstones(cfg: Config): Set<string> {
+// Round 23: tombstonesStrict throws when the log can't be read (the push path's checks fail closed on it); tombstones,
+// for the rebuild's history read, takes an unreadable log as none.
+function tombstonesStrict(cfg: Config): Set<string> {
   const out = new Set<string>();
-  try { for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records) if (j?.t === "dropped" && j.unlanded === true && TAP_KEY.test(j.tap) && typeof j.id === "string") out.add(tapPair(j.tap, j.id)); } catch { /* none readable */ }
+  for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records) if (j?.t === "dropped" && j.unlanded === true && TAP_KEY.test(j.tap) && typeof j.id === "string") out.add(tapPair(j.tap, j.id));
   return out;
+}
+function tombstones(cfg: Config): Set<string> {
+  try { return tombstonesStrict(cfg); } catch { return new Set<string>(); }
 }
 export function historyTaps(cfg: Config, o: { cards?: string[]; once?: Set<string>; refs?: string[]; lines?: Set<string>; pairs?: Set<string> } = {}): Map<string, string> {
   const out = new Map<string, string>();
@@ -1049,10 +1165,17 @@ function revive(j: any): State | null {
     ...(j.landWatch && typeof j.landWatch === "object" && !Array.isArray(j.landWatch) ? { landWatch: Object.fromEntries(Object.entries(j.landWatch)
       .filter(([, w]: [string, any]) => w && typeof w.tap === "string" && typeof w.id === "string" && Number.isFinite(w.since) && Number.isInteger(w.rounds) && typeof w.boot === "string")
       .slice(-2000).map(([k, w]: [string, any]) => [k, { tap: w.tap, id: w.id, since: w.since, rounds: w.rounds, boot: w.boot }])) } : {}),
-    ...(j.pushRefused && typeof j.pushRefused.why === "string" && typeof j.pushRefused.since === "string" && ["unknown-remote", "git", "conflict", "log", "lock"].includes(j.pushRefused.kind)
-      ? { pushRefused: { kind: j.pushRefused.kind, why: j.pushRefused.why, since: j.pushRefused.since, tries: Number.isInteger(j.pushRefused.tries) ? j.pushRefused.tries : 1, ...(j.pushRefused.told === true ? { told: true } : {}) } } : {}),
+    ...(j.pushRefused && typeof j.pushRefused.why === "string" && typeof j.pushRefused.since === "string" && Object.keys(GUARD_WHY).includes(j.pushRefused.kind)
+      ? { pushRefused: { kind: j.pushRefused.kind, why: GUARD_WHY[j.pushRefused.kind as GuardKind], since: j.pushRefused.since, tries: Number.isInteger(j.pushRefused.tries) ? j.pushRefused.tries : 1, ...(j.pushRefused.told === true ? { told: true } : {}),
+        ...(Array.isArray(j.pushRefused.by) ? { by: j.pushRefused.by.filter((x: any) => x === "round" || x === "nightly") } : {}) } } : {}),
     ...(Array.isArray(j.pushAlarms) ? { pushAlarms: j.pushAlarms.filter((a: any) => a && typeof a.tap === "string" && typeof a.id === "string" && typeof a.at === "string" && typeof a.why === "string")
-      .slice(-50).map((a: any) => ({ tap: a.tap, id: a.id, at: a.at, why: a.why })) } : {}) };
+      .slice(-50).map((a: any) => ({ tap: a.tap, id: a.id, at: a.at, why: a.why, ...(typeof a.item === "string" ? { item: a.item } : {}) })) } : {}),
+    // Round 23: an incomplete alarm check and a push of unknown outcome.
+    ...(j.alarmCheck && typeof j.alarmCheck.since === "string" && typeof j.alarmCheck.why === "string" && (j.alarmCheck.before === null || typeof j.alarmCheck.before === "string")
+      ? { alarmCheck: { before: j.alarmCheck.before, since: j.alarmCheck.since, why: j.alarmCheck.why, tries: Number.isInteger(j.alarmCheck.tries) ? j.alarmCheck.tries : 1, ...(j.alarmCheck.told === true ? { told: true } : {}) } } : {}),
+    ...(j.pushUnknown && typeof j.pushUnknown.head === "string" && /^[0-9a-f]{40}$/.test(j.pushUnknown.head) && typeof j.pushUnknown.at === "string" && Array.isArray(j.pushUnknown.keys)
+      ? { pushUnknown: { at: j.pushUnknown.at, head: j.pushUnknown.head, before: typeof j.pushUnknown.before === "string" ? j.pushUnknown.before : null, keys: j.pushUnknown.keys.filter((x: any) => TAP_KEY.test(x)).slice(-500),
+        why: String(j.pushUnknown.why ?? "the push's outcome is unknown"), tries: Number.isInteger(j.pushUnknown.tries) ? j.pushUnknown.tries : 1 } } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -1507,10 +1630,16 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       try {
         const queued = new Set<string>();
         for (const p of pending(cfg)) if (p.req?.id) queued.add(p.req.id);
-        unlandedNow = unlandedConsumes(cfg, { fetched: synced0.fetched, inStep: !S.unpushed && !S.reset && !ahead(cfg), now: clock().getTime(), queued, watch: (S.landWatch ??= {}) }).unlanded;
+        // Round 23: a fresh fetch settles a push of unknown outcome first; until one does, its tap keys' drops wait.
+        if (synced0.fetched) resolvePushUnknown(cfg, S, clock());
+        const lc = unlandedConsumes(cfg, { fetched: synced0.fetched, inStep: !S.unpushed && !S.reset && !ahead(cfg), now: clock().getTime(), queued, watch: (S.landWatch ??= {}), blocked: new Set(S.pushUnknown?.keys ?? []) });
+        unlandedNow = lc.unlanded;
+        if (lc.skipped.length) S.landSkipped = lc.skipped; else delete S.landSkipped;
         if (!Object.keys(S.landWatch ?? {}).length) delete S.landWatch;
       }
       catch (e) { log(`couldn't check which consumed tap keys landed: ${(e as Error).message}`); }
+      // Round 23: an incomplete check of what a push carried, run again each round until it is clean.
+      try { retryAlarmCheck(cfg, S, clock()); } catch (e) { log(`couldn't run the push alarm check again: ${clean((e as Error).message, 160)}`); }
       try { const n = mirrorIssued(cfg); if (n) log(`mirrored ${n} issued tap key(s) from the link's issued-key log`); }
       catch (e) { log(`couldn't mirror the link's issued-key log: ${(e as Error).message}`); }
       let reg = readIssued(cfg, clock().getTime());
@@ -1859,6 +1988,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         // Cain's requests that were already applied are let go, with their status file if it
         // was never written.
         if (synced0.fetched) landed(cfg, S, clock());
+        // Round 23: in step with a fresh fetch and nothing to push: nothing dropped is held back any more.
+        if (synced0.fetched && S.pushRefused) clearRefused(cfg, S, "a fresh fetch found the copy in step with GitHub, nothing waiting to push");
         tally(S, clock());
         finish(cfg, S, items, outcomes, book);
         writeStatus(cfg, S, cv, clock());
@@ -1882,8 +2013,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         const blocked = blockFile(cfg);
         if (existsSync(blocked)) {
           log("the smoke test's push block is on: pushing to a wrong remote this round");
-          git(cfg, ["push", "--quiet", join(cfg.dir, ".git", "no-such-remote.git"), `HEAD:${cfg.branch}`]);
-        } else git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]);
+          git(cfg, ["push", "--quiet", join(cfg.dir, ".git", "no-such-remote.git"), `HEAD:${cfg.branch}`], cfg.dir, netTimeout(cfg));
+        } else git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`], cfg.dir, netTimeout(cfg));
       }, clock().toISOString());
       pushGuardOutcome(cfg, st!, guard, clock());
       if (guard.refused) throw new Error(guard.refused.why);
@@ -1892,16 +2023,20 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
     if (why) {
       // A lost race, or a push GitHub refused or never answered. Confirm before deciding.
       let answered = true;
-      try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch]); } catch { answered = false; }
+      try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, netTimeout(cfg)); } catch { answered = false; }
+      // Round 23: a push that timed out or errored has an unknown outcome until a fetch settles it (this one, when it
+      // answered; otherwise a later round's).
+      if (guard && !guard.refused && (guard.timedOut || guard.error)) { notePushUnknown(cfg, st!, guard, clock()); if (answered) resolvePushUnknown(cfg, st!, clock()); }
       // Round 22: a push that answered with an error may still have landed: the range it may have carried is checked too.
-      if (answered && guard && !guard.refused) pushGuardOutcome(cfg, st!, { ...guard, refused: undefined, alarms: pushedTombstoned(cfg, guard.before, clock().toISOString()) }, clock());
+      else if (answered && guard && !guard.refused) { const scan = pushedTombstoned(cfg, guard.before, clock().toISOString()); pushGuardOutcome(cfg, st!, { ...guard, refused: undefined, alarms: scan.alarms, incomplete: scan.incomplete }, clock()); }
       if (!answered || ahead(cfg)) {
         st!.unpushed = true;
         if (!st!.pushFailed) log(`push didn't land (${clean(why, 200)}); the local commits stay and their outcomes stand`);
         st!.pushFailed = { at: clock().toISOString(), why: clean(why, 200), since: st!.pushFailed?.since ?? clock().toISOString() };
         // GitHub answered (a lost race): rebase and try again now. Otherwise the next round.
         // Round 22: a push the guard refused isn't tried again this round (nothing changed); the next round tries.
-        const retry = answered && !existsSync(blockFile(cfg)) && attempt < 2 && !guard?.refused;
+        // Round 23: nor one that timed out (its hard timeout already spent this round's wait).
+        const retry = answered && !existsSync(blockFile(cfg)) && attempt < 2 && !guard?.refused && !guard?.timedOut;
         if (!retry) { tally(st!, clock()); releaseBlock(cfg, clock()); }
         writeAtomic(stateFile(cfg), unlanded(st!));
         writeStatus(cfg, st!, cv!, clock());
@@ -2088,37 +2223,124 @@ function noteClock(st: State, v: Verdict) {
 
 // Round 22: what a push guard's outcome changes in the state: a refusal is kept (kind, why, since, tries), logged, and
 // told to Cain once per refusal (a conflict as one that stays until the commit is taken out or the copy is reset), and
-// listed under unresolved landings; the next push that goes clears it, and Cain hears pushes resumed. An alarm is kept
-// (PUSH_ALARMS_KEPT, listed under unresolved landings for PUSH_ALARM_KEEP_MS), logged and told to Cain at once.
+// listed under unresolved landings. An alarm is kept (PUSH_ALARMS_KEPT, listed under unresolved landings for
+// PUSH_ALARM_KEEP_MS), logged and told to Cain at once.
+// Round 23: the refusal record is cleared, and Cain hears pushes go again, only after a confirmed push (GitHub's branch
+// read back equal to the pushed head), or a fresh fetch that finds nothing waiting to push; a push that passed the guard
+// but failed, timed out or wasn't confirmed keeps the record (a hiccup round, logged). The round's and the nightly
+// check's pushes share the one record (by lists which were refused), so the same refusal is told once whichever push hit
+// it. A check of what a push carried that couldn't be completed is kept as alarmCheck, told once, and retried each round.
 export const PUSH_ALARM_KEEP_MS = 30 * 86_400_000;
 const PUSH_ALARMS_KEPT = 50;
+export const RESET_COPY_CMD = "/opt/cain/record.sh reset-copy";
 export const pushRefusedLine = (r: PushRefused) => r.kind === "conflict"
-  ? `The record keeper is holding back its pushes to GitHub: a change that was dropped as not landed is still in its local commits and can't be taken out cleanly, so nothing is pushed until it is taken out or its copy is reset (a reset of the copy does it: /opt/cain/record.sh force-conflict). It tries again each round. Ship taps wait meanwhile, and the App tells him itself if saving stays stuck over half an hour (don't repeat it). Log a Build item if it lasts. (${clean(r.why, 300)})`
-  : `The record keeper is holding back its pushes to GitHub: it couldn't verify that no dropped change would be pushed (${clean(r.why, 300)}). It tries again each round, and pushes as soon as it can verify. Nothing to do unless it lasts; then log a Build item.`;
-export const pushAlarmLine = (a: PushAlarm) => `Push alarm: ${a.why}. The answer from that tap may have been applied although it was dropped and he was asked again. Check the item at its source, record what it is now, and if his two answers differ, tell him in one line which one stands (no codes or ids). It is listed under unresolved landings.`;
-function pushGuardOutcome(cfg: Config, st: State, g: GuardOutcome, now: Date): void {
-  const nowIso = now.toISOString();
-  for (const a of g.alarms) {
+  ? `The record keeper is holding back its pushes to GitHub: a change that was dropped as not landed is still in its local commits and can't be taken out cleanly, so nothing is pushed until it is taken out or its copy is reset. The remedy: run ${RESET_COPY_CMD} (its next round resets its copy to GitHub's, as after a conflict, and requests still queued are applied again). It tries again each round. Ship taps wait meanwhile, and the App tells him itself if saving stays stuck over half an hour (don't repeat it). (${r.why})`
+  : `The record keeper is holding back its pushes to GitHub: ${r.why}. It tries again each round, and pushes as soon as it can verify. Nothing to do unless it lasts; then log a Build item.`;
+export const PUSHES_AGAIN_LINE = "The record keeper's pushes to GitHub go again: its push was confirmed on GitHub, and nothing dropped is held in its local commits now. Nothing to do.";
+export const pushAlarmLine = (a: PushAlarm) => `Push alarm: ${a.why}, on ${a.item ? `item ${a.item}` : "an item keeper.sh clock lists under unresolved landings"}. The answer from that tap may have been applied although it was dropped and he was asked again. Check the item at its source, record what it is now, and if his two answers differ, tell him in one line which one stands (no codes or ids). It is listed under unresolved landings.`;
+export const alarmCheckLine = (c: AlarmCheck) => `Push alarm check incomplete: the record keeper couldn't check whether its push carried a withdrawn change (${c.why}). It is not taken as nothing found: it is listed under unresolved landings and checked again each round until a clean check, and you hear the result. Nothing to do unless it lasts; then log a Build item.`;
+function noteAlarms(cfg: Config, st: State, alarms: PushAlarm[]): void {
+  for (const a of alarms) {
     if ((st.pushAlarms ?? []).some((x) => x.tap === a.tap && x.id === a.id)) continue;
     st.pushAlarms = [...(st.pushAlarms ?? []), a].slice(-PUSH_ALARMS_KEPT);
-    log(`ALARM: ${a.why}`);
+    log(`ALARM: ${a.why} (tap key ${a.tap}, request ${a.id})`);
     relay(cfg, pushAlarmLine(a));
   }
+}
+function noteAlarmCheck(cfg: Config, st: State, before: string | null, why: string, now: Date): void {
+  const was = st.alarmCheck;
+  st.alarmCheck = { before: was ? was.before : before, since: was?.since ?? now.toISOString(), why, tries: (was?.tries ?? 0) + 1, ...(was?.told ? { told: true } : {}) };
+  log(`ALARM CHECK INCOMPLETE (try ${st.alarmCheck.tries}): ${why}; kept and checked again each round`);
+  if (!st.alarmCheck.told) { st.alarmCheck.told = true; relay(cfg, alarmCheckLine(st.alarmCheck)); }
+}
+// Round 23: an incomplete alarm check, run again (from the remote tip before its push) until it is clean.
+export function retryAlarmCheck(cfg: Config, st: State, now: Date): void {
+  const c = st.alarmCheck;
+  if (!c) return;
+  const r = pushedTombstoned(cfg, c.before, now.toISOString());
+  noteAlarms(cfg, st, r.alarms);
+  if (r.incomplete) { noteAlarmCheck(cfg, st, c.before, r.incomplete, now); return; }
+  log(`the push alarm check is complete now (after ${c.tries} incomplete tr${c.tries === 1 ? "y" : "ies"}): ${r.alarms.length ? `${r.alarms.length} alarm(s)` : "no withdrawn change reached GitHub"}`);
+  if (c.told) relay(cfg, `Push alarm check complete: ${r.alarms.length ? "a withdrawn change did reach GitHub; see the push alarm line." : "no withdrawn change reached GitHub. Nothing to do."}`);
+  delete st.alarmCheck;
+}
+// Round 23: a push whose outcome is unknown (timed out, or errored with no answer after it): kept with the tap keys of the
+// commits it may have carried (their drops wait for a fresh fetch), and listed under unresolved landings.
+function notePushUnknown(cfg: Config, st: State, g: GuardOutcome, now: Date): void {
+  if (!g.head) return;
+  const was = st.pushUnknown;
+  const keys = [...new Set([...(was?.keys ?? []), ...rangeTapKeys(cfg, was ? was.before : g.before, g.head)])].slice(-500);
+  const why = g.timedOut ? "the push got no answer within its time limit and was stopped" : "the push failed and GitHub couldn't be read after it";
+  st.pushUnknown = { at: was?.at ?? now.toISOString(), head: g.head, before: was ? was.before : g.before, keys, why, tries: (was?.tries ?? 0) + 1 };
+  log(`push outcome unknown (${why}): kept until a fresh fetch settles it; drops of ${keys.length} tap key(s) it may have carried wait`);
+}
+// Round 23: settled by a fresh fetch: whether GitHub's branch has the pushed head, and what it carried checked for alarms.
+export function resolvePushUnknown(cfg: Config, st: State, now: Date): void {
+  const u = st.pushUnknown;
+  if (!u) return;
+  let landed: boolean;
+  try { landed = git(cfg, ["rev-list", "--count", `refs/remotes/origin/${cfg.branch}..${u.head}`]).trim() === "0"; }
+  catch (e) { log(`couldn't settle the push of unknown outcome yet: ${clean(redact(cfg, (e as Error).message), 120)}`); return; }
+  log(`the push of unknown outcome (since ${u.at}) is settled by a fresh fetch: ${landed ? "it landed" : "it didn't land; its commits stay local and are pushed again"}`);
+  const scan = pushedTombstoned(cfg, u.before, now.toISOString());
+  noteAlarms(cfg, st, scan.alarms);
+  if (scan.incomplete) noteAlarmCheck(cfg, st, u.before, scan.incomplete, now);
+  delete st.pushUnknown;
+}
+function clearRefused(cfg: Config, st: State, how: string): void {
+  if (!st.pushRefused) return;
+  log(`pushes go again (${how}; refused ${st.pushRefused.tries} time(s) since ${st.pushRefused.since})`);
+  if (st.pushRefused.told) relay(cfg, PUSHES_AGAIN_LINE);
+  delete st.pushRefused;
+}
+function pushGuardOutcome(cfg: Config, st: State, g: GuardOutcome, now: Date, by: "round" | "nightly" = "round"): void {
+  const nowIso = now.toISOString();
+  noteAlarms(cfg, st, g.alarms);
+  if (g.incomplete) noteAlarmCheck(cfg, st, g.before, g.incomplete, now);
   if (g.refused) {
     const was = st.pushRefused;
     const same = was && was.kind === g.refused.kind;
-    st.pushRefused = { kind: g.refused.kind, why: clean(g.refused.why, 300), since: same ? was!.since : nowIso, tries: same ? was!.tries + 1 : 1, ...(same && was!.told ? { told: true } : {}) };
-    log(`push refused by the push guard (${g.refused.kind}, try ${st.pushRefused.tries}): ${clean(g.refused.why, 200)}`);
+    st.pushRefused = { kind: g.refused.kind, why: GUARD_WHY[g.refused.kind] ?? clean(g.refused.why, 300), since: same ? was!.since : nowIso, tries: same ? was!.tries + 1 : 1,
+      ...(same && was!.told ? { told: true } : {}), by: [...new Set([...(same ? was!.by ?? [] : []), by])] };
+    log(`push refused by the push guard (${g.refused.kind}, ${by}, try ${st.pushRefused.tries}): ${st.pushRefused.why}`);
     // A lock or git hiccup is told once it has lasted three rounds; a conflict or an unknown remote at once.
     if (!st.pushRefused.told && (g.refused.kind === "conflict" || g.refused.kind === "unknown-remote" || st.pushRefused.tries >= 3)) {
       st.pushRefused.told = true;
       relay(cfg, pushRefusedLine(st.pushRefused));
     }
   } else if (st.pushRefused) {
-    log(`the push guard lets pushes go again (refused ${st.pushRefused.tries} time(s) since ${st.pushRefused.since})`);
-    if (st.pushRefused.told) relay(cfg, "The record keeper's pushes to GitHub go again: nothing dropped is held in its local commits now. Nothing to do.");
-    delete st.pushRefused;
+    if (g.confirmed) clearRefused(cfg, st, `a ${by} push confirmed on GitHub`);
+    else log(`the push guard passed, but the ${by} push wasn't confirmed on GitHub (${g.timedOut ? "it timed out" : g.error ? "it failed" : "GitHub's branch couldn't be read back equal to it"}): the refused-push record stays (a hiccup round)`);
   }
+}
+// Round 23: the nightly check's push outcome, kept in the keeper state and its status at once (the next round's status
+// carries it on): the same record, notice, retry and resolution as a round's push.
+function nightlyOutcome(cfg: Config, g: GuardOutcome, now: Date): void {
+  try {
+    const st = loadState(cfg);
+    pushGuardOutcome(cfg, st, g, now, "nightly");
+    if (g.timedOut || (g.error && !g.refused)) notePushUnknown(cfg, st, g, now);
+    writeAtomic(stateFile(cfg), JSON.stringify(st));
+    patchStatus(cfg, st, now);
+  } catch (e) { log(`couldn't keep the nightly push's outcome in the keeper state: ${clean((e as Error).message, 160)}`); }
+}
+// The push fields of the status (refused push, alarms, incomplete alarm check, unknown push), from the state.
+function pushStatus(st: State, now: Date): Record<string, unknown> {
+  const a = (st.pushAlarms ?? []).filter((x) => now.getTime() - Date.parse(x.at) <= PUSH_ALARM_KEEP_MS);
+  return {
+    ...(st.pushRefused ? { push_refused: st.pushRefused } : {}),
+    ...(a.length ? { push_alarms: a } : {}),
+    ...(st.alarmCheck ? { alarm_check: { since: st.alarmCheck.since, why: st.alarmCheck.why, tries: st.alarmCheck.tries, told: st.alarmCheck.told === true } } : {}),
+    ...(st.pushUnknown ? { push_unknown: { since: st.pushUnknown.at, why: st.pushUnknown.why, keys: st.pushUnknown.keys, tries: st.pushUnknown.tries } } : {}),
+    ...(st.landSkipped?.length ? { landing_skipped: st.landSkipped } : {}),
+  };
+}
+function patchStatus(cfg: Config, st: State, now: Date): void {
+  let j: any = {};
+  try { j = JSON.parse(readFileSync(statusFile(cfg), "utf8")); } catch { return; }   // no status yet: the next round writes it
+  for (const k of ["push_refused", "push_alarms", "alarm_check", "push_unknown"]) delete j[k];
+  const { landing_skipped: _skip, ...push } = pushStatus(st, now);
+  writeAtomic(statusFile(cfg), JSON.stringify({ ...j, ...push }));
 }
 
 // The keeper's status for the link (written whole, every round): the ledger's generation, whether
@@ -2134,9 +2356,9 @@ function writeStatus(cfg: Config, st: State, v: Verdict, now: Date) {
       ...(st.floorWhy ? { link_state: { readable: false, why: st.floorWhy } } : {}),
       ...(st.epochWait ? { epoch_wait: st.epochWait } : {}),
       ...(st.tapNotices?.length ? { tap_notices: st.tapNotices } : {}),
-      // Round 22: a refused push and the push alarms, for the link's unresolved landings.
-      ...(st.pushRefused ? { push_refused: st.pushRefused } : {}),
-      ...((): { push_alarms?: PushAlarm[] } => { const a = (st.pushAlarms ?? []).filter((x) => now.getTime() - Date.parse(x.at) <= PUSH_ALARM_KEEP_MS); return a.length ? { push_alarms: a } : {}; })(),
+      // Round 22: a refused push and the push alarms, for the link's unresolved landings. Round 23: with an incomplete
+      // alarm check, a push of unknown outcome, and this round's skipped landing-check records.
+      ...pushStatus(st, now),
       // Round 18: the supersede records mirrored so far (the link's line asking him again waits for its own here).
       ...((): { superseded?: string[] } => { const x = mirroredSupersedes(cfg); return x.length ? { superseded: x } : {}; })(),
       // Round 19: the per-key answer the link's check before asking him again reads.
@@ -2332,9 +2554,10 @@ export function nightly(cfg: Config): boolean {
     writeFileSync(p, report);
     git(cfg, ["add", "state/record-check.md"]);
     git(cfg, ["commit", "--quiet", "-m", `Nightly record check: ${findings.length} to look at`]);
-    // Round 22: through the push guard too.
-    const g = guardedPush(cfg, () => { git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`]); }, (cfg.now?.() ?? new Date()).toISOString());
-    if (g.alarms.length) for (const a of g.alarms) { log(`ALARM: ${a.why}`); relay(cfg, pushAlarmLine(a)); }
+    // Round 22: through the push guard too. Round 23: its outcome kept in the keeper state and status, the same record,
+    // notice, retry and resolution as a round's push (nightlyOutcome).
+    const g = guardedPush(cfg, () => { git(cfg, ["push", "--quiet", "origin", `HEAD:${cfg.branch}`], cfg.dir, netTimeout(cfg)); }, (cfg.now?.() ?? new Date()).toISOString());
+    nightlyOutcome(cfg, g, cfg.now?.() ?? new Date());
     if (g.refused) throw new Error(g.refused.why);
     if (g.error) throw new Error(g.error);
     if (findings.length) relay(cfg, `Nightly record check found ${findings.length} thing(s) to fix; they're in state/record-check.md. Fix what you can, record what you did, and bring Dane only what is his to decide.`);

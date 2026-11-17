@@ -656,6 +656,39 @@ export function plainPush(why: string | undefined, reset: boolean): string {
   if (!w && reset) return "the box had to start its copy over";
   return "GitHub turned the save down for a reason the box couldn't name";
 }
+// Round 23: a row of keeper.sh clock's unresolved_landings, with its kind as an explicit discriminator. "landing" rows
+// are the link's own (a Ship landing GitHub can't settle yet, with the landing fields); the others are the record
+// keeper's: a push its guard refused, a push alarm, an incomplete check of what a push carried, a push of unknown outcome.
+export type UnresolvedRow =
+  | { row: "landing"; tap_key: string; what: string; [k: string]: unknown }
+  | { row: "push-refused"; what: "record push refused"; kind: string; since: string; failures: number; last_error: string; retried: string; told: boolean }
+  | { row: "push-alarm"; what: "record push alarm"; tap_key: string; item: string | null; since: string; last_error: string }
+  | { row: "alarm-check"; what: "record push alarm check incomplete"; since: string; failures: number; last_error: string; retried: string; told: boolean }
+  | { row: "push-unknown"; what: "record push outcome unknown"; since: string; failures: number; last_error: string; tap_keys: string[]; retried: string };
+export function keeperPushRows(st: KeeperStatus | null | undefined): UnresolvedRow[] {
+  const s = st as any;
+  const out: UnresolvedRow[] = [];
+  const r = s?.push_refused;
+  if (r && typeof r.why === "string") out.push({ row: "push-refused", what: "record push refused", kind: String(r.kind ?? ""), since: String(r.since ?? ""), failures: Number(r.tries ?? 1), last_error: r.why, retried: "each keeper round", told: r.told === true });
+  for (const a of Array.isArray(s?.push_alarms) ? s.push_alarms : []) if (a && typeof a.why === "string") out.push({ row: "push-alarm", what: "record push alarm", tap_key: String(a.tap ?? ""), item: typeof a.item === "string" ? a.item : null, since: String(a.at ?? ""), last_error: a.why });
+  const c = s?.alarm_check;
+  if (c && typeof c.why === "string") out.push({ row: "alarm-check", what: "record push alarm check incomplete", since: String(c.since ?? ""), failures: Number(c.tries ?? 1), last_error: c.why, retried: "each keeper round", told: c.told === true });
+  const u = s?.push_unknown;
+  if (u && typeof u.why === "string") out.push({ row: "push-unknown", what: "record push outcome unknown", since: String(u.since ?? ""), failures: Number(u.tries ?? 1), last_error: u.why, tap_keys: Array.isArray(u.keys) ? u.keys.map(String) : [], retried: "settled by the keeper's next fresh fetch" });
+  return out;
+}
+// Round 23: the owner's outage notice's reason, switching on the row kinds: a refused push says why it is held back;
+// a push of unknown outcome is GitHub not answering; alarms and incomplete checks don't change why saving is stuck.
+export function outageWhy(rows: UnresolvedRow[], st: KeeperStatus): string {
+  for (const r of rows) {
+    switch (r.row) {
+      case "push-refused": return plainPush(r.last_error, false);
+      case "push-unknown": return "GitHub didn't answer";
+      case "push-alarm": case "alarm-check": case "landing": break;
+    }
+  }
+  return plainPush(st.push_failed?.why, !!st.reset);
+}
 // undefined: no status file (the keeper hasn't written one); null: one that can't be read.
 export function keeperStatus(text: string | null | undefined): KeeperStatus | null | undefined {
   if (text === undefined || text === null) return undefined;
@@ -2119,7 +2152,7 @@ export class Link {
     if (this.d.now() - since <= OUTAGE_NOTICE_MS && o.rounds < OUTAGE_ROUNDS) return;
     const tz = this.d.tz ?? "America/New_York";
     const when = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone: tz }).format(since);
-    const why = plainPush(st.push_failed?.why, !!st.reset);
+    const why = outageWhy(keeperPushRows(st), st);
     // How long Ship taps have been held: a Ship tap waits on any unsaved change, from the first
     // failed push of this run (or the outage's start).
     const heldSince = Date.parse(st.push_failed?.since ?? o.since);
@@ -2160,7 +2193,9 @@ export class Link {
       // Round 17: the keeper saw a new link run that no fresh fetch has verified for yet (the remote away).
       verify_pending: (keeperStatus(this.files().status) as any)?.verify_pending ?? null,
       // Landings the remote can't settle yet (round 9): each key with its age and last error.
-      unresolved_landings: Object.entries(this.d.load().unresolved ?? {}).map(([k, u]) => ({ tap_key: tapKid(k), what: u.what,
+      // Round 23: every row carries row, its kind ("landing" for these, a keeper row's own kind otherwise): consumers
+      // switch on it, never on which fields a row has.
+      unresolved_landings: Object.entries(this.d.load().unresolved ?? {}).map(([k, u]) => ({ row: "landing", tap_key: tapKid(k), what: u.what,
         since: new Date(u.since).toISOString(), age_min: Math.round((this.d.now() - u.since) / 60_000), failures: u.fails, last_error: u.last,
         next_try: new Date(u.next).toISOString(), told: u.told === true,
         // Round 11: the exact message he sends to settle it, and the docs section that says how to check.
@@ -2184,13 +2219,10 @@ export class Link {
 
   // Round 22: the keeper's refused push and push alarms from its status, as unresolved_landings rows (what: "record push
   // refused" or "record push alarm"), also given as unresolved_pushes.
-  private keeperPushes(): Record<string, unknown>[] {
-    const st = keeperStatus(this.files().status) as any;
-    const out: Record<string, unknown>[] = [];
-    const r = st?.push_refused;
-    if (r && typeof r.why === "string") out.push({ what: "record push refused", kind: String(r.kind ?? ""), since: String(r.since ?? ""), failures: Number(r.tries ?? 1), last_error: r.why, retried: "each keeper round", told: r.told === true });
-    for (const a of Array.isArray(st?.push_alarms) ? st.push_alarms : []) if (a && typeof a.why === "string") out.push({ what: "record push alarm", tap_key: String(a.tap ?? ""), since: String(a.at ?? ""), last_error: a.why });
-    return out;
+  // Round 23: each row has its kind in row ("push-refused", "push-alarm", "alarm-check", "push-unknown"), with an incomplete
+  // alarm check and a push of unknown outcome listed too.
+  private keeperPushes(): UnresolvedRow[] {
+    return keeperPushRows(keeperStatus(this.files().status));
   }
 
   // The accepted source check an ask or Ship card for the item rests on now, or null: the

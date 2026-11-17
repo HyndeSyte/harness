@@ -201,11 +201,13 @@ export const LOCK_CALLERS: Record<string, string> = {
   "install log (keeper restore flag, once-used rebuild; link install-taps through appendInstall)": "nothing is written: install taps stay as they were, and the rebuild or flag is tried again next round",
   "torn check (keeper cycle, readLog repair try)": "one non-blocking try: on would-block the repair is skipped to the next round, the round goes on",
   "repair at start (link repairLogs, landings repair; readLog repair true)": "the repair waits for the lock up to the timeout, then is skipped and tried at the next start; readers skip a torn tail anyway",
+  // Round 23: the whole source tree is scanned, so the log module's own primitives are listed too.
+  "the log module's own primitives (applog.ts readLog repair, appendLog, the start probe and its contention helper)": "the primitive throws the LockTimeout to its caller (each listed above), writing nothing; the start probe answers its reason, so the start is refused and probed again hourly",
 };
 // Round 22: for each LOCK_CALLERS entry, the source fragments of its call sites (file: fragments on the call's line).
 export const LOCK_SITES: Record<string, Record<string, string[]>> = {
   "consumed-key log: consuming intent (keeper intendConsume)": { "record/main.ts": ['{ t: "consuming", tap, id, at }'] },
-  "consumed-key log: consumed record (keeper appendConsumed)": { "record/main.ts": ["appendLog(tapsLogFile(cfg), { tap, id, at })"] },
+  "consumed-key log: consumed record (keeper appendConsumed)": { "record/main.ts": ["appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() })"] },
   "consumed-key log: dropped intent (keeper dropIntent)": { "record/main.ts": ['{ t: "dropped", tap, id, at, why }'] },
   "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": { "record/main.ts": ['{ t: "landed", tap: x.tap', 'withLogLock(tapsLogFile(cfg), () => { // dropUnlanded', '{ t: "landed", tap, id, at, how', '{ t: "dropped", tap, id, unlanded: true'] },
   "consumed-key log: the push guard (keeper guardedPush)": { "record/main.ts": ["withLogLock(tapsLogFile(cfg), () => { // guardedPush"] },
@@ -222,12 +224,15 @@ export const LOCK_SITES: Record<string, Record<string, string[]>> = {
   "install log (keeper restore flag, once-used rebuild; link install-taps through appendInstall)": { "record/main.ts": ['{ t: "flag", how: "off", by: "keeper"', '{ t: "once-used", kid: k, by: "keeper"'], "installflag.ts": ["appendLog(file, rec)"], "link/core.ts": ['{ t: "once-used", kid, msg: msgId', '{ t: "flag", how, by: "cain"', '{ t: "flag", how: "on", by: "owner"'] },
   "torn check (keeper cycle, readLog repair try)": { "record/main.ts": ['repair: f === issuedMirrorFile(cfg) ? "mirror" : "try"'] },
   "repair at start (link repairLogs, landings repair; readLog repair true)": { "link/core.ts": ["readLog(this.d.issuedLog, { repair: true })"], "link/landings.ts": ["readLog(join(dir, SETTLED_LOG), { repair: true })"] },
+  "the log module's own primitives (applog.ts readLog repair, appendLog, the start probe and its contention helper)": { "applog.ts": ["withLogLock(file, () => readOnce<T>(file, true))", "withLogLock(file, () => readOnce<T>(file, true), { wait: 0 })", "withLogLock(probe, () => undefined)", "withLogLock(file, () => appendBuf(file, buf), o)", 'withLogLock(file, () => { writeFileSync(flag, "held")'] },
 };
 export const LIBC_NAMES = ["libc.so.6", "libc.so", "libc", "libc.dylib", "libSystem.B.dylib"];
 // A test's view of the FFI: names to try instead of LIBC_NAMES, or a flock stand-in returning [rc, errno].
 // Round 22: errnoSyms, the errno symbols to try instead of ERRNO_SYMS (a test's libc that loads with no errno symbol).
 export const ERRNO_SYMS = ["__errno_location", "__error"];
-export const lockTest: { names: string[] | null; call: null | ((fd: number, op: number) => [number, number]); errnoSyms: string[] | null } = { names: null, call: null, errnoSyms: null };
+// Round 23: helper, the argv prefix to start the contention helper with instead of probeHelperArgv() (a test's helper
+// that can't start).
+export const lockTest: { names: string[] | null; call: null | ((fd: number, op: number) => [number, number]); errnoSyms: string[] | null; helper: string[] | null } = { names: null, call: null, errnoSyms: null, helper: null };
 const sleepSync = (ms: number) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* spin */ } };
 type Flock = (fd: number, op: number) => [number, number];
 let flockFn: Flock | null = null;
@@ -293,11 +298,24 @@ export function probeLock(dir: string): string | null {
     // The contention self-test.
     const flag = join(dir, `.lock-probe.${process.pid}.held`);
     try { rmSync(flag, { force: true }); } catch { /* none */ }
-    const p = Bun.spawn([process.execPath, import.meta.path, "--hold", probe, flag, String(PROBE_HOLD_MS)], { stdio: ["ignore", "ignore", "ignore"] });
+    // Round 23: started with the exact runtime and loader flags this process runs under (its executable and its
+    // execArgv), on this module's own file, so the helper runs wherever the entry point does. A helper that can't be
+    // spawned, or exits before it takes the lock, is its own refusal ("failed to start"), told apart from one that
+    // runs but can't take the lock and from a flock that doesn't contend.
+    let p: ReturnType<typeof Bun.spawn>;
+    try { p = Bun.spawn([...(lockTest.helper ?? probeHelperArgv()), "--hold", probe, flag, String(PROBE_HOLD_MS)], { stdio: ["ignore", "ignore", "ignore"] }); }
+    catch (e) { return `the lock self-test's helper process failed to start (${String((e as Error)?.message ?? e).slice(0, 80)}), so contention couldn't be checked`; }
     child = p;
     const until = performance.now() + 5_000;
-    while (!existsSync(flag) && p.exitCode === null && performance.now() < until) sleepSync(10);
-    if (!existsSync(flag)) return "the lock self-test's helper process couldn't take the probe lock, so contention couldn't be checked";
+    // Whether the helper has exited: its /proc entry gone or a zombie (exitCode isn't updated while this loop blocks).
+    const gone = () => {
+      if (p.exitCode !== null) return true;
+      try { const st = readFileSync(`/proc/${p.pid}/stat`, "utf8"); return /^\s*[ZX]/.test(st.slice(st.lastIndexOf(")") + 1)); }
+      catch (e: any) { return e?.code === "ENOENT" && existsSync("/proc/self/stat"); }
+    };
+    while (!existsSync(flag) && !gone() && performance.now() < until) sleepSync(10);
+    if (!existsSync(flag) && gone()) return "the lock self-test's helper process failed to start (it exited before taking the probe lock), so contention couldn't be checked";
+    if (!existsSync(flag)) return "the lock self-test's helper process started but couldn't take the probe lock within 5 seconds, so contention couldn't be checked";
     const fd = openSync(lockFile(probe), "a+", 0o600);
     let rc = 0, err = 0;
     try { [rc, err] = flock()(fd, LOCK_EX | LOCK_NB); if (rc === 0) flock()(fd, LOCK_UN); } finally { closeSync(fd); }
@@ -308,16 +326,21 @@ export function probeLock(dir: string): string | null {
   } catch (e) { return String((e as Error)?.message ?? e).slice(0, 300); }
   finally { try { child?.kill(); } catch { /* gone */ } }
 }
+// Round 23: the contention helper's command: the running executable, its own runtime flags (process.execArgv: the
+// loader and preload the entry point was started with), and this module's file.
+export const probeHelperArgv = (): string[] => [process.execPath, ...process.execArgv, import.meta.path];
 // The status line he sees when the probe fails (the link's notice; the keeper's line through Cain).
 export const lockRefusal = (who: "link" | "record keeper", why: string) =>
   `Cain's ${who === "link" ? "App" : "record keeper"} can't lock its logs on this box, so it isn't ${who === "link" ? "taking taps or posting cards" : "applying anything"}. Nothing was lost. It needs a fix in a new version of the App. (${why.replace(/(?:\/[\w.@+-]+)+/g, "its log folder").slice(0, 160)})`;
 // Round 19: a test's short write: returns how many bytes the write puts down (null: all of them).
 export const shortWriteSpy: { on: null | ((file: string) => number | null) } = { on: null };
-export function appendLog(file: string, rec: unknown): void {
+// Round 23: o.wait, the lock wait in ms instead of lockWait.ms (the consumed-key log's writers wait longer than its
+// guarded push's hard timeout).
+export function appendLog(file: string, rec: unknown, o: { wait?: number } = {}): void {
   const buf = encode(rec);
   const fresh = !existsSync(file);
   if (fresh) mkdirSync(dirname(file), { recursive: true });
-  withLogLock(file, () => appendBuf(file, buf));
+  withLogLock(file, () => appendBuf(file, buf), o);
   // A new log's directory entry is fsynced too, so a power cut can't lose the whole file.
   if (fresh) syncDir(dirname(file));
 }

@@ -699,9 +699,14 @@ even if an old push is retried: act only on his new answer. If you hear the reco
 because it can't lock its logs, tell him that line in your own words, once, and log a Build item; nothing else to do, it
 tries again by itself. If you hear the record keeper is holding back its pushes to GitHub, say nothing to him (the App tells him
 itself if saving stays stuck over half an hour): it tries again each round and you hear when pushes go again; if it says a withdrawn change can't be taken out
-cleanly and it lasts, log a Build item (a reset of its copy, `/opt/cain/record.sh force-conflict`, also clears it). A
-"Push alarm" line means an answer that was withdrawn may have reached the record anyway: check that item at its source,
-record what it is now, and if his two answers differ tell him in one line which one stands, with no codes or ids.
+cleanly, run `/opt/cain/record.sh reset-copy` once (its next round resets its copy to GitHub's, as after a conflict;
+you get the usual reset lines and re-check queue), and log a Build item if it comes back. Pushes go again only once
+GitHub is seen to have them, and you hear it then. A "Push alarm" line means an answer that was withdrawn may have
+reached the record anyway: check that item at its source, record what it is now, and if his two answers differ tell him
+in one line which one stands, with no codes or ids. A "Push alarm check incomplete" line means the keeper couldn't yet
+check whether a push carried a withdrawn change: nothing to do, it checks again each round and you hear the result (a
+"Push alarm check complete" line); log a Build item only if it lasts a day. keeper.sh clock lists each of these under
+unresolved_landings with its kind in row.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

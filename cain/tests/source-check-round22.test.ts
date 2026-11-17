@@ -113,10 +113,11 @@ describe("1. the push path's tombstone check fails closed (invariants: the consu
     const told = k.relayed().split(" / ").filter((l) => l.includes("can't be taken out cleanly"));
     expect(told).toHaveLength(1);
     expect(told[0]).not.toMatch(/\b[0-9a-f]{40}\b|cse_/);
-    // The copy reset to GitHub's (the dropped request has left the queue): later landings resume.
+    // The copy reset to GitHub's (the dropped request has left the queue): later landings resume. Round 23: through the
+    // documented path only, record.sh reset-copy.
     dropQueued(k, "cain-r22-1-c");
-    g(k, "fetch", "--quiet", "origin", "main");
-    g(k, "reset", "--quiet", "--hard", "origin/main");
+    const sh = Bun.spawnSync(["bash", join(import.meta.dir, "../rootfs/opt/cain/record.sh"), "reset-copy"], { env: { ...process.env, RECORD_FORCE_CONFLICT: join(dirname(k.cfg.queue), "record-force-conflict") } });
+    expect(sh.exitCode).toBe(0);
     expect(round(k, "cain-r22-1-after").ok).toBe(true);
     expect(remoteHas(k, "a round cain-r22-1-after")).toBe(true);
     expect(remoteHas(k, "his first answer")).toBe(false);

@@ -96,6 +96,13 @@
 #                                        retried each round; "record push alarm": a withdrawn request's
 #                                        commit reached GitHub), with no settle line; unresolved_pushes
 #                                        lists the same rows alone
+#                                        Round 23: every row has row, its kind ("landing", "push-refused",
+#                                        "push-alarm", "alarm-check": a check of what a push carried that
+#                                        couldn't be completed, retried each round; "push-unknown": a push
+#                                        whose outcome is unknown until a fresh fetch, with the tap keys it
+#                                        may have carried); switch on row, not on which fields a row has.
+#                                        The remedy for a withdrawn change that can't be taken out cleanly
+#                                        is /opt/cain/record.sh reset-copy
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or
