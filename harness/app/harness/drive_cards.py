@@ -9,7 +9,8 @@ around his own appointments, and one card when a drive can't be found, with Skip
     off for that event.
   * A drive that can't be found is never left off silently. The digest names the event's day
     and time (family_gmail.py), and he gets one card naming the day, the time and the reason (no
-    usable address, or the lookup failed), with Skip. A lookup that failed counts once it has
+    usable address, the lookup failed, or the event before it can't be placed and there's no time
+    to go home between), with Skip. A lookup that failed counts once it has
     failed on two reads in a row, so a moment's outage sends nothing. An event whose place the
     place book is already asking about (places.py) gets no second card: that question is the
     card. Each event is asked about once, ever; Skip leaves it without drive blocks for good.
@@ -31,13 +32,16 @@ log = logging.getLogger("harness.drive_cards")
 NO_ADDRESS = "no_address"
 FAILED = "failed"
 PLACE = "place"                        # the place book is asking where it is: that's the card
+CHAIN = "chain"                        # the event before it can't be placed, and from home doesn't fit
 FAILS_BEFORE_CARD = 2                  # reads in a row a lookup must fail before he hears of it
 MAX_CARDS_PER_READ = 3
 MAX_RECEIPTS = 5
 CARD_TTL_S = 7 * 24 * 3600
 REASONS = {NO_ADDRESS: "no usable address. Add a street address to it, or tap Skip.",
            FAILED: "the drive lookup failed. I'll keep trying at each read; tap Skip to leave it "
-                   "without drive blocks."}
+                   "without drive blocks.",
+           CHAIN: "the drive from the event before it can't be worked out, and there isn't time to go "
+                  "home between. Add a street address to that one, or tap Skip."}
 
 
 def _day(d: datetime) -> str:
@@ -63,6 +67,21 @@ class DriveCards:
         """His own appointments that have had drives, so a read of Gmail that fails keeps them."""
         return {r["key"] for r in self.ledger.db.execute("SELECT key FROM drive_cards WHERE kind='own'")}
 
+    def own_rows(self) -> list:
+        """His own appointments as last read: key, series uid, start, end and place."""
+        return self.ledger.db.execute("SELECT * FROM drive_cards WHERE kind='own'").fetchall()
+
+    def waiting_since(self, key: str, said: str, start: datetime, now: datetime) -> datetime:
+        """When his appointment first waited for a Family event beside it to be judged."""
+        row = self._row(key)
+        if row is None:
+            self._upsert(key, "own", said, start)
+            row = self._row(key)
+        if not row["wait_since"]:
+            self._set(key, wait_since=iso(now))
+            return now
+        return datetime.fromisoformat(row["wait_since"])
+
     def _row(self, key: str):
         return self.ledger.db.execute("SELECT * FROM drive_cards WHERE key=?", (key,)).fetchone()
 
@@ -81,9 +100,13 @@ class DriveCards:
                        (*fields.values(), iso(self.ledger.now()), key))
 
     # -- receipts for his own appointments' drives ------------------------------------------------------
-    def seen(self, key: str, kind: str, said: str, start: datetime) -> None:
-        """An event whose drives are worked out at this read."""
+    def seen(self, key: str, kind: str, said: str, start: datetime, end: datetime | None = None,
+             place: str = "", uid: str = "") -> None:
+        """An event whose drives are worked out at this read. His own appointment's end, place and
+        series are kept, so a read of Gmail cut short still knows where its drives fit."""
         self._upsert(key, kind, said, start)
+        if end is not None:
+            self._set(key, until=end.isoformat(), place=place, uid=uid)
 
     def written(self, key: str, what: str) -> None:
         """Its drives were added or moved on Gmail: a receipt waits for a read that finds them. One

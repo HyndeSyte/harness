@@ -10,6 +10,14 @@
 - **Calls are left alone:** an appointment whose location is a phone number, or whose title or location names a phone call, gets no drive blocks and no card.
 - **A town that starts like "Suite" or "Floor" (Sterling, Florence) keeps its town,** so those addresses are looked up and kept as they are.
 - **Fewer false alarms and gaps:** many new addresses at once are looked up over the next reads without a "lookup failed" card; an appointment right after one that can't be placed still gets its drive from home; a read of Gmail that's cut short keeps that day's drives as they were; a place you skipped stops being named in the digest; and once the place book has your answer, a drive that then can't be looked up gets its card.
+- **Repeating appointments:** each week of a series gets its own drives. Moving one week moves its drives, cancelling one takes them off, and editing the whole series never leaves two sets of drives on a day.
+- **Calls, read better:** a place that's only a phone number gets no drives in any of its usual shapes (a tel: link, an extension, a country code, letters like 1-800-FLOWERS, or a dial-in with its PIN). A street address wins over the title, so an outing called "Curtain call" at a theater keeps its drives.
+- **When Gmail can't be read in full,** only your own appointments' drives stay as they are. A Family event that moves or is cancelled meanwhile takes its drives with it, and after a day without a full read the digest says so.
+- **An appointment beside a Family event that's never judged** no longer waits for good: after a day, or 12 hours before it starts if that's sooner, it gets its drives from home, and they're worked out again once the judgment lands.
+- **The nearest drives are looked up first,** and one still waiting within 12 hours is named in the digest.
+- **No impossible drive from home:** when the place before an appointment can't be found, the drive from home is used only if you can get home and leave in time without crossing another drive; otherwise the digest names it and you get a card.
+- **A block you made yourself called "Busy (drive there)"** counts as your appointment. Harness knows its own blocks by a hidden mark, and drive blocks carry no guests and send no updates.
+- **A new setting, own_drive_days,** says how many days ahead your own appointments get drive blocks. It starts at 3, so you can check a few real ones first, then widen it (up to 60).
 - **Nothing new is written to the Family calendar.**
 
 ## 0.23.0

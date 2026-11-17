@@ -75,16 +75,52 @@ def is_online(place: str) -> bool:
     return bool(_ONLINE.search(place or ""))
 
 
-# A phone call: a location that is only a phone number, or words naming a call.
-_PHONE = re.compile(r"\s*(?:tel:\s*)?(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}"
-                    r"\s*(?:(?:x|ext\.?)\s*\d{1,6})?\s*", re.I)
-_CALL = re.compile(r"\b(?:phone|call|calls|facetime)\b", re.I)
+# A phone call: a location that is only a phone number (with a label, an extension or a PIN), or
+# words naming a call. A number is a tel: address, seven digits or more with a country code or
+# not, or a vanity number with letters ("1-800-FLOWERS", "540-555-CALL").
+_TEL = re.compile(r"\btel:[+\w().;=,-]+", re.I)
+_NUMBER = re.compile(r"\+?\(?\d[\d\s().-]{5,}\d")
+_VANITY = re.compile(r"(?<![\w-])(?:\+?1[\s.-]?)?(?:8\d\d[\s.-]?(?=[A-Z0-9-]*[A-Z])[A-Z0-9][A-Z0-9-]{3,10}"
+                     r"|\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?[A-Z]{4})(?![\w-])")
+_DIAL_WORDS = re.compile(r"\b(?:dial[\s-]*in|dial|phone|telephone|tel|mobile|cell|call|conference|conf|line|"
+                         r"bridge|number|num|no|pin|passcode|password|pw|access|code|meeting|id|ext|extension|"
+                         r"x|or|and|then|press|enter|us|toll|free)\b", re.I)
+_CALL = re.compile(r"\b(?:phone|call|calls|facetime|dial[\s-]*in|conference call)\b", re.I)
+
+
+def _phone_only(text: str) -> bool:
+    """Nothing but a phone number, with its label, extension or PIN: no place in it."""
+    found = False
+
+    def number(m: re.Match) -> str:
+        nonlocal found
+        if sum(ch.isdigit() for ch in m.group(0)) >= 7:
+            found = True
+            return " "
+        return m.group(0)
+    rest, tel = _TEL.subn(" ", text)
+    rest, vanity = _VANITY.subn(" ", rest)
+    rest = _NUMBER.sub(number, rest)
+    if not (found or tel or vanity):
+        return False
+    rest = _DIAL_WORDS.sub(" ", re.sub(r"\d+", " ", rest))
+    return not re.sub(r"[\s:#,;*()+./=_-]+", "", rest)
 
 
 def is_call(text: str) -> bool:
-    """A phone call, not a place to drive to: a phone number for a location, or a title or
-    location that names a call."""
-    return bool(_PHONE.fullmatch(text or "") or _CALL.search(text or ""))
+    """A phone call, not a place to drive to: a location that is a phone number in any of its
+    shapes, or words naming a call. Whole words only ("Callahan's" isn't one). A street address
+    beside it wins (is_a_call, below)."""
+    return bool(text) and (_phone_only(text) or bool(_CALL.search(text)))
+
+
+def is_a_call(title: str, location: str) -> bool:
+    """An appointment that's a call: its location is a phone number or names a call, or its title
+    names one, unless the location has a street address, which means he goes there ("Curtain
+    call" at a theater)."""
+    if street_address(location):
+        return False
+    return is_call(location) or is_call(title)
 
 
 _COORDS = re.compile(r"\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*")

@@ -20,9 +20,11 @@ import pytest
 from harness import caldav, choices, drive, family_rules, handover, ical, inputs, meaning, meaning_live, places
 from harness.calendar_change import CalendarChange
 from harness.family_copy import FamilyCopy
-from harness.family_gmail import DROP_TITLE, FamilyGmail, Want, _leg_title, home_from_options, leg_key
+from harness.family_gmail import (DROP_TITLE, FamilyGmail, Want, _leg_title, home_from_options, leg_key,
+                                  own_days_from_options)
 from harness.mail_dates import MailDates
 from harness.ledger import Ledger
+from harness.engines import EngineError
 from harness.net import HttpResponse, TransportError
 from conftest import Clock
 from fakes import FakeEngine, ManualExecutor, SyncExecutor, result
@@ -1961,7 +1963,7 @@ class AnyMaps(Maps):
     ("Dr Patel", "(540) 555-1212"),
     ("Phone call with Dr Patel", "Dr Patel's office"),              # a title naming a call
     ("Dr Patel", "Phone: Dr Patel's office"),                       # a location naming one
-    ("Call with Sam", CLINIC),
+    ("Call with Sam", "Sam's office"),                            # a call, and no street address
 ])
 def test_a_phone_call_gets_no_drive_and_no_card(drives, title, location):
     quiet_family(drives)
@@ -2080,3 +2082,395 @@ def test_a_place_he_skipped_isnt_named_in_the_digest(drives):
     go(drives)
     assert "couldn't find a drive" not in (drives.gm.digest_line() or "")
     assert drive_cards_sent(drives) == []
+
+
+# -- 10. drive blocks for his own appointments, third round (0.24.0) ---------------------------------------
+
+def weekly(rig, title, first, location, weeks=4, uid="weekly-pt", hours=1):
+    """A weekly series of his own on Gmail: one uid, each instance its own (its original start)."""
+    out = []
+    for n in range(weeks):
+        start = first + timedelta(weeks=n)
+        out.append(mine(rig, title, start, location, hours=hours, uid=uid,
+                        instance=start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")))
+    return out
+
+
+def legs_by_day(rig):
+    """Drive blocks on Gmail, each day's (title, start) list."""
+    out = {}
+    for title, start, end, _ in blocks(rig):
+        if "drive" in title:
+            out.setdefault(start.astimezone(NY).date(), []).append((title, start))
+    return out
+
+
+def no_two_overlap(rig):
+    """No drive block on Gmail overlaps another: never two sets for one trip."""
+    legs = [(s, e) for t, s, e, _ in blocks(rig) if "drive" in t]
+    return all(not (a[0] < b[1] and b[0] < a[1]) for i, a in enumerate(legs) for b in legs[i + 1:])
+
+
+def own_key(o):
+    return hashlib.sha256(f"{o.uid}|{o.instance}|own".encode()).hexdigest()[:32]
+
+
+def test_a_weekly_series_gets_one_drive_pair_per_instance_keyed_by_its_full_instance(drives):
+    quiet_family(drives)
+    occs = weekly(drives, "PT", when(drives, days=2, hour=10), CLINIC)
+    go(drives)
+    go(drives)
+    there = [b for b in blocks(drives) if b[0] == "Busy (drive there)"]
+    back = [b for b in blocks(drives) if b[0] == "Busy (drive back)"]
+    assert [b[2] for b in there] == [o.start for o in occs]
+    assert [b[1] for b in back] == [o.end for o in occs]
+    keys = {r["key"] for r in drives.ledger.db.execute("SELECT key FROM drive_cards WHERE kind='own'")}
+    assert keys == {own_key(o) for o in occs} and len(keys) == 4      # uid and the whole instance id
+
+
+def test_one_moved_instance_takes_its_drives_with_it_and_gets_one_card(drives):
+    quiet_family(drives)
+    occs = weekly(drives, "PT", when(drives, days=2, hour=10), CLINIC)
+    for _ in range(3):
+        go(drives)
+    assert drives.gm.send_drive_receipts() == 4
+    moved = occs[1]
+    later = moved.start + timedelta(days=1, hours=4)
+    drives.feeds.window.occurrences.remove(moved)
+    mine(drives, "PT", later, CLINIC, uid=moved.uid, instance=moved.instance)   # same instance, new time
+    for _ in range(3):
+        go(drives)
+        assert len([b for b in blocks(drives) if b[0] == "Busy (drive there)"]) == 4
+        assert no_two_overlap(drives)
+    starts = [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"]
+    assert later in starts and moved.start not in starts
+    assert drives.gm.send_drive_receipts() == 1                         # exactly one card, for the move
+    drives.tick()
+    assert drives.with_button("Undo")[1].startswith("Moved on your Gmail: Busy (drive there) 1:30 PM to 2:00 PM")
+    assert drives.gm.send_drive_receipts() == 0
+
+
+def test_one_cancelled_instance_loses_its_drives_and_the_rest_stay(drives):
+    quiet_family(drives)
+    occs = weekly(drives, "PT", when(drives, days=2, hour=10), CLINIC)
+    go(drives)
+    go(drives)
+    drives.feeds.window.occurrences.remove(occs[2])                     # that week cancelled
+    go(drives)
+    go(drives)
+    starts = [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"]
+    assert starts == [occs[0].start, occs[1].start, occs[3].start]
+    assert len([b for b in blocks(drives) if b[0] == "Busy (drive back)"]) == 3
+
+
+def test_the_whole_series_edited_never_leaves_two_drive_sets_for_a_day(drives):
+    quiet_family(drives)
+    occs = weekly(drives, "PT", when(drives, days=2, hour=10), CLINIC)
+    go(drives)
+    go(drives)
+    for o in occs:
+        drives.feeds.window.occurrences.remove(o)
+    new = weekly(drives, "PT", when(drives, days=2, hour=14), CLINIC)    # every week now at 2: new instances
+    for _ in range(3):
+        go(drives)
+        for day, legs in legs_by_day(drives).items():
+            assert [t for t, _ in legs].count("Busy (drive there)") <= 1, day
+            assert [t for t, _ in legs].count("Busy (drive back)") <= 1, day
+    assert [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"] == [o.start for o in new]
+
+
+def test_a_family_event_moved_or_cancelled_in_a_partial_read_leaves_one_drive_set(drives):
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    c = when(drives, days=4, hour=10)
+    goes(drives, "Eye doctor", a, CLINIC)
+    mine(drives, "Haircut", b, PARK)
+    goes(drives, "Swim lesson", c, PARK)
+    go(drives)
+    go(drives)
+    drives.feeds.window.unreadable = 1                              # not all of Gmail could be read
+    moved = when(drives, days=5, hour=13)
+    goes(drives, "Eye doctor", moved, CLINIC)                       # across days, on Family
+    goes(drives, "Swim lesson", a - timedelta(hours=2), PARK)       # into the haircut's day
+    for _ in range(3):
+        go(drives)
+        assert no_two_overlap(drives)
+    got = blocks(drives)
+    eye = [x for x in got if moved - 60 * M <= x[1] <= moved + 120 * M]
+    assert [x[0] for x in eye] == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]
+    swim = a - timedelta(hours=2)
+    assert ("Busy (drive there)", swim - 30 * M, swim, "") in got   # its drives came with it
+    # The haircut's own drives are as they were: his appointment wasn't read.
+    assert ("Busy (drive back)", b + 60 * M, b + 90 * M, "") in got
+    # Nothing is left of the eye doctor's old day but the haircut's drives and the swim lesson.
+    old_day = [x for x in got if x[1].astimezone(NY).date() == a.astimezone(NY).date()]
+    assert not [x for x in old_day if a - 60 * M <= x[1] <= a + 60 * M and x[0] != "Busy (family)"
+                and x[2] > swim + 60 * M + 30 * M]
+    assert [x[1] for x in got if x[0] == "Busy (family)"].count(a) == 0
+    # Cancelled on Family while Gmail is still partly read: its drives go too.
+    del drives.icloud.events[f"{FAMILY_PATH}goes-{hashlib.sha256(b'Swim lesson').hexdigest()[:12]}.ics"]
+    for _ in range(3):
+        go(drives)
+    assert not [x for x in blocks(drives) if swim - 60 * M <= x[1] <= swim + 90 * M]
+    assert ("Busy (drive back)", b + 60 * M, b + 90 * M, "") in blocks(drives)
+
+
+def test_partial_reads_through_a_departure_then_a_clean_read_add_no_second_leg(drives):
+    quiet_family(drives)
+    start = when(drives, days=0, hour=15)
+    mine(drives, "Dentist", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert len(blocks(drives)) == 2
+    added = count(drives, "family_gmail_added")
+    drives.feeds.window.unreadable = 1
+    for _ in range(8):                                              # 9:00 to 17:00, an hour a read
+        drives.clock.advance(hours=1)
+        go(drives)
+        assert no_two_overlap(drives)
+    drives.feeds.window.unreadable = 0
+    drives.clock.advance(minutes=30)
+    go(drives)
+    go(drives)
+    assert count(drives, "family_gmail_added") == added      # nothing written twice
+    assert len(drives.google.live()) == 2
+
+
+def test_a_day_with_no_clean_read_of_gmail_is_said_in_the_digest(drives):
+    quiet_family(drives)
+    mine(drives, "Dentist", when(drives, days=3, hour=10), CLINIC)
+    go(drives)
+    go(drives)
+    drives.feeds.window.unreadable = 1
+    go(drives)
+    assert "hasn't been read in full" not in (drives.gm.digest_line() or "")
+    drives.clock.advance(hours=25)
+    go(drives)
+    assert ("your Gmail calendar hasn't been read in full for a day, so the drives around your own "
+            "appointments haven't changed") in drives.gm.digest_line()
+    drives.feeds.window.unreadable = 0
+    go(drives)
+    assert "hasn't been read in full" not in (drives.gm.digest_line() or "")
+
+
+@pytest.mark.parametrize("title,location", [
+    ("Curtain call", "Town Theater, " + PARK),                      # an outing: the address wins
+    ("Call of the Wild (play)", PARK),
+    ("Recall clinic", PARK),
+])
+def test_a_place_to_go_with_call_in_its_title_keeps_its_drives(drives, title, location):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=19)
+    mine(drives, title, start, location)
+    go(drives)
+    go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (drive back)"]
+
+
+@pytest.mark.parametrize("location", [
+    "5405551212",                                                   # a bare number
+    "+1 540 555 1212",
+    "+44 20 7946 0958",                                             # a country code
+    "(540) 555-1212 ext. 12",                                       # extensions
+    "540.555.1212 x12",
+    "1-800-FLOWERS",                                                # a vanity number
+    "Dial-in: +1 540 555 1212, PIN: 4433#",                         # a labelled dial-in
+    "Conference line 540-555-1212 access code 998877",
+    "+1 540-555-1212,,123456#",
+    "tel:+1-540-555-1212",                                          # a tel: address
+    "tel:+15405551212;ext=55",
+])
+def test_a_phone_number_location_in_any_shape_gets_no_drive_and_no_card(drives, location):
+    quiet_family(drives)
+    mine(drives, "Dr Patel", when(drives, days=1, hour=10), location)
+    for _ in range(4):
+        go(drives)
+    drives.tick()
+    assert blocks(drives) == []
+    assert drive_cards_sent(drives) == []
+    assert [s for s in drives.bot.sent if s[1].startswith("Where is")] == []
+    assert "drive" not in (drives.gm.digest_line() or "")
+    assert not [u for u in drives.maps.urls if drive.GEOCODE_HOST in u]   # never sent to the map
+
+
+def test_is_call_reads_numbers_not_addresses():
+    assert drive.is_call("540-555-1212") and drive.is_call("Phone: Dr Patel's office")
+    assert not drive.is_call(CLINIC) and not drive.is_call("Callahan's Pub, " + PARK)
+    assert not drive.is_call("38.5, -78.5") and not drive.is_call("Suite 1200, 9 Park Ave, Town, VA 22901")
+    assert not drive.is_call("Room 101")
+
+
+class Undecided(ByTitle):
+    """A judge that never manages to judge the titles named in `never`."""
+
+    def __init__(self):
+        super().__init__()
+        self.never = set()
+
+    def complete(self, *, system, user, schema):
+        if any(f"title: {t}" in user for t in self.never):
+            self.calls.append({"system": system, "user": user, "schema": schema})
+            raise EngineError("timeout")
+        return super().complete(system=system, user=user, schema=schema)
+
+
+def test_an_appointment_beside_a_family_event_never_judged_gets_drives_from_home_in_time(drives):
+    drives.judge = Undecided()
+    quiet_family(drives)
+    start = when(drives, days=1, hour=16)                           # 31 hours off
+    seed(drives, "Mystery thing", start)
+    drives.judge.never.add("Mystery thing")
+    mine(drives, "Dentist", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []                                     # waits for the judgment, at first
+    drives.clock.advance(hours=20)                                  # 11 hours before it starts
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 30 * M, start, ""),
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
+    for _ in range(6):                                              # through his departure, still undecided
+        drives.clock.advance(hours=1)
+        go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (drive back)"]
+    assert count(drives, "family_gmail_added") == 2
+
+
+def test_the_judgment_landing_late_recalculates_the_drives(drives):
+    drives.judge = Undecided()
+    quiet_family(drives)
+    start = when(drives, days=0, hour=20)                           # within 12 hours: no waiting
+    seed(drives, "Eye doctor", start, extra=["LOCATION:" + CLINIC.replace(",", "\\,")])
+    drives.judge.never.add("Eye doctor")
+    mine_occ = mine(drives, "Eye doctor", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (drive back)"]
+    drives.judge.never.clear()                                      # judged at last: he goes himself
+    eid = answer_ex(drives, "Eye doctor", ["presence"])
+    drives.judge.by["Eye doctor"] = judged(ob("presence", start, start + timedelta(hours=1),
+                                              place="event_location"), cites=[eid])
+    for _ in range(3):
+        go(drives)
+        assert no_two_overlap(drives)
+    # One set of drives, now the Family event's (Gmail already has him busy, so no block of its own).
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 30 * M, start, ""),
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
+    own = own_key(mine_occ)
+    live = {r["key"] for r in drives.ledger.db.execute("SELECT key FROM family_gmail WHERE state='live'")}
+    assert live and not live & {leg_key(own, "there"), leg_key(own, "back")}
+
+
+def test_lookups_go_soonest_first_and_a_near_one_still_waiting_is_named(drives, monkeypatch):
+    drives.maps = AnyMaps()
+    drives.gm.drives.transport = drives.maps
+    quiet_family(drives)
+    soon = when(drives, days=0, hour=17)                            # 8 hours off
+    starts = [soon] + [when(drives, days=2 + n, hour=10) for n in range(14)]
+    for n, start in reversed(list(enumerate(starts))):             # the feed lists the far ones first
+        mine(drives, f"Visit {n}", start, f"{n + 10} Oak St, Town, VA")
+    go(drives)
+    go(drives)
+    there = sorted(b[2] for b in blocks(drives) if b[0] == "Busy (drive there)")
+    assert there and there == starts[:len(there)]                   # the soonest, in order
+    # With no allowance left before the near one is asked, the digest names it.
+    monkeypatch.setattr(drive, "MAX_REQUESTS_PER_READ", 0)
+    near = when(drives, days=0, hour=18)
+    mine(drives, "Quick one", near, "77 Elm St, Town, VA")
+    go(drives)
+    local = near.astimezone(NY)
+    assert f"couldn't look up the drive for the event at {local:%b} {local.day}, 6:00" in drives.gm.digest_line()
+    far = starts[-1].astimezone(NY)
+    assert f"{far:%b} {far.day}, 10:00" not in drives.gm.digest_line()
+
+
+def test_a_tight_pair_whose_first_cant_be_placed_doesnt_get_an_impossible_drive_from_home(drives):
+    quiet_family(drives)
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=15)
+    mine(drives, "Dentist", a, "40 Nowhere Rd, Town, VA")           # its way home can't be found
+    mine(drives, "Haircut", b, PARK)                                # from home is 30 minutes: 10:45
+    for _ in range(3):
+        go(drives)
+    drives.tick()
+    assert blocks(drives) == [("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
+    local = b.astimezone(NY)
+    assert f"the event at {local:%b} {local.day}, 11:15" in drives.gm.digest_line()
+    cards = [s[1] for s in drive_cards_sent(drives)]
+    assert any(f"at 11:15 AM: the drive from the event before it can't be worked out" in t for t in cards)
+
+
+def test_a_drive_from_home_that_would_cross_a_kept_drive_isnt_written(drives):
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=12)
+    goes(drives, "Eye doctor", a, CLINIC, hours=1.5)
+    go(drives)
+    go(drives)
+    mine(drives, "Haircut", b, PARK)
+    real = drives.gm.drives.between
+
+    def between(origin, destination):                               # the clinic's way home: no address
+        if origin == CLINIC and destination == drive.HOME:
+            return drive.NO_ADDRESS
+        return real(origin, destination)
+    drives.gm.drives.between = between
+    for _ in range(3):
+        go(drives)
+        assert no_two_overlap(drives)                               # not even for one read
+    # Once the clinic's drive home is off Gmail, the haircut's drive from home fits.
+    assert ("Busy (drive there)", b - 30 * M, b, "") in blocks(drives)
+
+
+def test_drive_blocks_have_no_guests_no_updates_and_the_add_ons_mark(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, CLINIC)
+    before = family_snapshot(drives)
+    go(drives)
+    go(drives)
+    assert family_snapshot(drives) == before
+    assert not [x for x in drives.icloud.log if x[0] in ("PUT", "DELETE")]
+    made = list(drives.google.live().values())
+    assert len(made) == 2
+    for e in made:
+        assert not e.get("attendees")
+        assert e["extendedProperties"]["private"] == {"harness": "family_gmail"}
+        assert e["guestsCanInviteOthers"] is False and e["guestsCanSeeOtherGuests"] is False
+    assert drives.google.queries and all(q.get("sendUpdates") == "none" for m, q in drives.google.queries
+                                         if m != "GET")
+    # A drive block he made himself, by hand, at a street address: his own appointment, not skipped.
+    hand = when(drives, days=4, hour=10)
+    mine(drives, "Busy (drive there)", hand, PARK, uid="his-own-block")
+    # The add-on's own blocks read back from his calendar: never an appointment of his.
+    for e in made:
+        drives.feeds.window.occurrences.append(occ(e["summary"], datetime.fromisoformat(e["start"]["dateTime"]),
+                                                   hours=0.5, uid=e["id"] + "@google.com", location=CLINIC))
+    go(drives)
+    go(drives)
+    go(drives)
+    titles = [b[0] for b in blocks(drives)]
+    assert titles.count("Busy (drive there)") == 2 and titles.count("Busy (drive back)") == 2
+    assert ("Busy (drive there)", hand - 30 * M, hand, "") in blocks(drives)
+
+
+def test_his_own_appointments_get_drives_only_as_far_ahead_as_the_option_says(drives, tmp_path):
+    quiet_family(drives)
+    near, far = when(drives, days=2, hour=10), when(drives, days=5, hour=10)
+    mine(drives, "Dentist", near, CLINIC)
+    mine(drives, "Haircut", far, PARK)
+    (tmp_path / "options.json").write_text(json.dumps({"own_drive_days": 3}))
+    drives.gm.own_days_fn = lambda: own_days_from_options(str(tmp_path))
+    go(drives)
+    go(drives)
+    assert [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"] == [near]
+    (tmp_path / "options.json").write_text(json.dumps({"own_drive_days": 7}))   # widened
+    go(drives)
+    assert [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"] == [near, far]
+
+
+@pytest.mark.parametrize("text,days", [("{}", 3), ('{"own_drive_days": 10}', 10), ('{"own_drive_days": 0}', 1),
+                                       ('{"own_drive_days": 99}', 60), ('{"own_drive_days": "x"}', 3),
+                                       ('{"own_drive_days": true}', 3), ("not json", 3)])
+def test_the_own_drive_days_option_is_read_short_by_default(tmp_path, text, days):
+    (tmp_path / "options.json").write_text(text)
+    assert own_days_from_options(str(tmp_path)) == days
+    assert own_days_from_options(str(tmp_path / "missing")) == 3

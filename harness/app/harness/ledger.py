@@ -343,6 +343,10 @@ CREATE TABLE IF NOT EXISTS drive_cards(
   reason TEXT NOT NULL,
   aid TEXT NOT NULL,
   fails INTEGER NOT NULL,
+  uid TEXT NOT NULL DEFAULT '',
+  until TEXT NOT NULL DEFAULT '',
+  place TEXT NOT NULL DEFAULT '',
+  wait_since TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

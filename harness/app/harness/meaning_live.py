@@ -293,6 +293,12 @@ class MeaningLive:
         words = " ".join(sorted(family_rules.words(occ.summary)))
         return dated.get((words, sp.anchor.date().isoformat()))
 
+    def _soonest(self, ev) -> datetime:
+        zone = ZoneInfo(self.tz)
+        return min((o.occ.start if isinstance(o.occ.start, datetime)
+                    else datetime.combine(o.occ.start, time(), zone) for o in ev.occurrences),
+                   default=datetime.max.replace(tzinfo=zone))
+
     def wants(self, items, now: datetime, *, find=None) -> dict[str, Want]:
         """From the judgments alone, with no model: the same judgment and the same Family give
         the same wants. The usual skips first (his copies, holds, his own name)."""
@@ -307,7 +313,8 @@ class MeaningLive:
         self.unplaced = {}
         self.unjudged = []
         none: dict[str, tuple[datetime, str, str]] = {}
-        for ev in evs.values():
+        # Soonest first, so the map's allowance for this read goes to the nearest places.
+        for ev in sorted(evs.values(), key=self._soonest):
             row = meaning.stored(self.ledger, ev.key)
             j = meaning.last_good(row)
             if j is None:

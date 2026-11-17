@@ -411,10 +411,18 @@ how many blocks are on Gmail.
   place's name on its first line and the street address on the next counts as that street address,
   and so does a name before a comma; a suite or unit number is left out of the lookup. Your own
   appointments on your Gmail calendar get the same drive blocks (and no block of their own, since
-  they're already there): events you own, at a place with a street address, your place book or the
+  they're already there), as far ahead as the `own_drive_days` option says (1 to 60 days; it starts
+  at 3, so the first run is a few days you can check before widening it): events you own, at a place with a street address, your place book or the
   map can find. Skipped: blocks Harness made, "Busy" holds, events shown as free, all-day events,
-  invitations someone else organized, calls (a phone number for the place, or a title or
-  place naming a phone call) and telehealth or anything online, and events with no location. One at the same time as a Family event you go to is that event. Two events on the same
+  invitations someone else organized, calls (a place that is only a phone number, in any shape: a
+  tel: address, an extension, a country code, letters, or a dial-in with its PIN; or a title or
+  place naming a phone call, unless the place has a street address) and telehealth or anything
+  online, and events with no location. A block you made yourself titled like a drive block is
+  yours: Harness knows its own blocks by a hidden mark, not their titles. Each event of a repeating
+  series gets its own drives, and a series edited or one week moved or cancelled takes them along,
+  never leaving two sets for one trip. One at the same time as a Family event you go to is that
+  event; one beside a Family event not judged yet waits for the judgment up to a day (or until 12
+  hours before it), then gets its drives from home, worked out again once the judgment lands. Two events on the same
   day too close to go home between them, Family or your own, get one drive straight from the first
   to the second, and only the last one of the stretch drives home. Your own appointments' drives
   follow them when they move or are cancelled, and each event's new or moved drives get a card with
@@ -422,8 +430,14 @@ how many blocks are on Gmail.
   A drive that can't be found is never left off silently: the digest names the event's day and time,
   and you get one card naming the day, the time and why (no usable address, or the lookup failed
   on two reads in a row), with Skip, which leaves that event without drive blocks for good. If the
-  place book is already asking where that place is, that question is the card. Nothing here writes
-  to the Family calendar. A place you type on a block makes it yours, like any other edit.
+  place book is already asking where that place is, that question is the card. Lookups go soonest
+  first, and one still waiting within 12 hours of its event is named in the digest. When the place
+  of the event before can't be found, the drive from home is used only if you can get home after it
+  and leave in time without crossing another drive; otherwise that one is named too, with a card.
+  When Gmail can't be read in full, your own appointments' drives stay as they are, and Family
+  events around them are still worked out, moved or taken off; after a day of that the digest says
+  so. Nothing here writes to the Family calendar, and drive blocks carry no guests and send no
+  updates. A place you type on a block makes it yours, like any other edit.
 
 ## Standing rules from before 0.5.1
 
