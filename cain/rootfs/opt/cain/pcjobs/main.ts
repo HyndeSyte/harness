@@ -1032,7 +1032,7 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
   if (h?.code === "host_parent_gone")
     return "The PC isn't taking jobs because Claude in Chrome's helper lost its Chrome. At the PC: restart the Cain jobs Chrome.";
   if (h?.code === "extra_extension")
-    return "The PC isn't taking jobs because the Cain jobs Chrome has another extension turned on. At the PC: remove it there (worker.ts check-host lists them).";
+    return "The PC isn't taking jobs because the Cain jobs Chrome has another extension turned on. At the PC: close every window of the Cain jobs Chrome and run worker.ts check-host; the worker turns it off itself and lists what it turned off, then open that Chrome again.";
   if (h?.code === "prefs_disagree")
     return "The PC isn't taking jobs because Chrome's two preference files disagree about an extension in the Cain jobs profile. At the PC: restart the Cain jobs Chrome, then run worker.ts check-host.";
   if (h?.code === "unattended_unsupported")

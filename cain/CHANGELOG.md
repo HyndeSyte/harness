@@ -3,6 +3,8 @@
 ## 0.12.2
 
 - PC jobs run again with Chrome 157: Chrome's own built-in extensions, such as Chrome Web Store Payments, no longer count as an extra extension in the Cain jobs profile. Any extension you or anything else installed still stops runs, as before.
+- Extensions other programs put in the Cain jobs Chrome (through the Windows registry), and Chrome's default apps such as Google Docs Offline, no longer stop PC jobs while they are off. Only an extension Chrome would actually run counts.
+- The PC worker now turns such extensions off itself each time it starts while the Cain jobs Chrome is closed, and notes each one it turned off in its log, so you never have to keep clicking them off. If one is on while that Chrome is open, the run stops and names it: close that Chrome and run check-host once.
 - After installing, run the probe and confirm again at your PC once: the worker changed, so nothing runs until you do.
 - The worker's two checks inside each run (before every browser action and after every page read) now refuse to work if a preload setting or the tests' variable is set where they run, like the worker itself.
 - Cain now tells you the PC's worker isn't starting for short jobs too: a job that waits out its whole time, or expires without being picked up, while the PC hasn't been heard from.

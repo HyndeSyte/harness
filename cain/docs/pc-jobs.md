@@ -297,11 +297,30 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   media router) when their entry names no location. A known id at any other location counts
   like any extension: an unpacked one can claim any id. Store installs (1), policy installs
   (7, 9), external installs (2, 3, 6), unpacked (4) and command-line (8) ones all
-  count. An extension counts as off only for a disable reason you set (Chrome's
-  user-action reason, 1, in its `disable_reasons`); any other disable reason, or a `state`
-  field alone, leaves it counted. `check-host`, `confirm-profile` and the probe's evidence
-  (`extensions`) list every extension found there, with whether it counts as on and the
-  raw `location`, `state` and `disable_reasons` fields as Chrome wrote them. Chrome unpacks an update into a newer version folder and
+  count while they are on. **What counts as on** (0.12.2, second pass): only an extension
+  Chrome itself would run, with no disable reason at all (`disable_reasons` missing, 0 or an
+  empty list) and a `state` of 1, or no `state` field (Chrome 157 writes none). An entry
+  present but disabled for any reason (by you, an external install's prompt still pending,
+  blocked by policy, corrupted and the rest), or with another `state`, is **present, off**:
+  listed, never counted. So the extensions other programs install through the Windows
+  registry or external preferences, which Chrome brings back on every start but keeps
+  disabled, don't stop runs. Chrome's default-installed apps (Google Docs Offline, or any
+  entry Chrome marks as installed by default) count like Chrome's own only while they are
+  off; one that is on counts like any store install. **What the worker does with foreign
+  entries:** at every start (`run`, the probe, `bind-profile`, `check-host`), while the Cain
+  jobs Chrome is closed (no lock file in its folder and no Chrome on its folder in the
+  process listing), it adds Chrome's user-action disable reason (1) to every entry that is
+  neither Chrome's own nor Claude in Chrome (a default-installed app already off is left
+  alone), in each preferences file that holds it, so Chrome keeps it off and asks nothing;
+  each one it turned off goes to `worker.log` once (`extension_disabled <id>`). Chrome
+  rewrites its preferences while it runs, so with Chrome open the worker writes nothing, and
+  an entry that is on stops the run as `extra_extension`, naming it. Each heartbeat line in
+  `worker.log` lists every extension other than Claude in Chrome and Chrome's own with its
+  status (`extension=<id>:on` or `extension=<id>:present_off`). `check-host`,
+  `confirm-profile` and the probe's evidence (`extensions`) list every extension found
+  there, with its `kind` (`claude`, `chrome`, `default_app`, `foreign`), its `status` (`on`
+  or `present, off`) and the raw `location`, `state` and `disable_reasons` fields as Chrome
+  wrote them; `check-host` also names what it turned off now (`disabled_now`). Chrome unpacks an update into a newer version folder and
   switches to it only when it restarts: while the newest folder isn't the active version,
   every run stops (`update_pending`) until you restart the Cain jobs Chrome. Where the
   init data doesn't carry it, a run (every run is attended in this version) goes on with
@@ -1020,9 +1039,10 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    its profile **Cain jobs**, sign in there only to the sites the jobs need (never your
    daily profile, nothing financial, not your main mail), and install Claude in Chrome
    **only in this profile, and no other extension in it**: any other enabled extension
-   there stops runs (`extra_extension`; remove it, or turn it off yourself in
-   chrome://extensions: only an extension you turned off counts as off, and only the
-   extensions Chrome ships itself are exempt, such as Chrome Web Store Payments). In this profile's chrome://settings/content/popups
+   there stops runs (`extra_extension`). You don't have to remove anything: an extension
+   that is present but off doesn't count, and the worker turns every other one off itself
+   whenever it starts while this Chrome is closed (step 10 says when). Chrome's own, such as
+   Chrome Web Store Payments, are exempt. In this profile's chrome://settings/content/popups
    (**Pop-ups and redirects**), choose **Don't allow sites to send pop-ups or use
    redirects** and remove any site from its allowed list. Chrome's default already blocks
    them and writes nothing for it; every run reads the setting from the profile's
@@ -1122,7 +1142,13 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    or the built file no longer matches what it recorded. If that compiler is missing every
    run stops with `helper_compiler_missing`; if security software stops the build or the
    helper, `helper_blocked`; otherwise `containment_unavailable` (Troubleshooting).
-10. **Bind the profile, once.** With the Cain jobs Chrome open and no other Claude Code
+10. **Bind the profile, once.** First close every window of the Cain jobs Chrome and run
+    `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts check-host --home C:/pc-worker-k7q2xz`:
+    with that Chrome closed the worker turns off every extension in the profile that is
+    neither Chrome's own nor Claude in Chrome (those installed by other programs through the
+    registry included) and names them in `disabled_now`; its `extensions` then lists each as
+    `present, off`. Nothing to remove by hand. Then open the Cain jobs Chrome again.
+    With the Cain jobs Chrome open and no other Claude Code
     running, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
     bind-profile --attended --home C:/pc-worker-k7q2xz`. A short session opens a page the worker
     serves on `127.0.0.1`, which sets a random marker as a cookie in this profile only,
@@ -2021,7 +2047,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `transcripts`; `C:/pc-worker-k7q2xz/claude-config` | What a session wrote in `claude-config` couldn't be deleted, after retries. On Windows the message names what holds it where the worker can read it (its image name, process id and the image name of the process that started it, from the Restart Manager through the Job Object helper; `worker.log`'s `session_cleanup_failed held_by` line too). Something holds it open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete everything in `claude-config` but `.credentials.json`, `settings.json` and `CLAUDE.md` by hand, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
 | Your own `claude` is logged out after a run | `claude` in a terminal of your own; `echo $env:CLAUDE_CONFIG_DIR` there; `worker.ts check-cli` | This design should make that impossible: the worker's sessions sign in from `C:/pc-worker-k7q2xz/claude-config` and never read, copy or write your `~/.claude`, so nothing a run does reaches your own sign-in. Check that your terminal doesn't still have `CLAUDE_CONFIG_DIR` set from setup step 9 (then your `claude` is using the worker's folder: close that terminal); that you aren't running an earlier draft of this worker (one copied your sign-in into each session, where a refresh could replace yours); and whether you were signed out for another reason (an expired session, a password change, signing out elsewhere). Sign your own `claude` in again; the worker's sign-in is unaffected. If it happens again with this version, report it: needs a code change: yes. |
 | `extension_entry_missing` | `worker.ts check-host --home C:/pc-worker-k7q2xz`; the profile folder's `Secure Preferences` and `Preferences` | Neither preferences file of the dedicated profile has `extensions.settings.<your extension id>`: `profile_directory` or `extension_id` in `install.json` doesn't match where Claude in Chrome is installed, or Chrome hasn't written its entry yet (open the Cain jobs Chrome once, then close and reopen it). Not `wrong_profile`: the profile's name was right. `check-host` prints which file and key path it read when it works. Needs a code change: no. |
-| `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled` and `extensions`, each with its raw `location`, `state` and `disable_reasons`; chrome://extensions in the Cain jobs profile | Another extension counts as on in the dedicated profile (read from the same preferences as Claude in Chrome's own entry). Only the extensions Chrome ships itself are exempt (0.12.2): Chrome's internal locations, component (`location` 5) and external component (`location` 10, Chrome Web Store Payments on Chrome 157), and Chrome's own ids (the Web Store, Web Store Payments, the PDF viewer and the like) with no location; a store install (1), a policy install (7, 9), an external one (2, 3, 6), an unpacked one (4) or a command-line one (8) counts, whatever id it claims. Only your own turning it off counts as off (`disable_reasons` holding 1); Chrome disabling it for another reason leaves it counted. Remove it, or turn it off yourself, in chrome://extensions there, then run `check-host` again. A default app Chrome installed by itself counts too; one installed by policy can only be removed by that policy. Needs a code change: no. |
+| `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled`, `chrome_open` and `extensions`, each with its `kind`, `status` and raw `location`, `state` and `disable_reasons`; the `extension=<id>:on` notes on the heartbeat lines in `worker.log` | An extension other than Claude in Chrome and Chrome's own is **on** in the dedicated profile: no disable reason and a `state` of 1 (or none). Present but disabled for any reason is `present, off` and never counts; Chrome's own (component `location` 5, external component 10, its built-in ids with no location) never count; a default-installed app (Google Docs Offline) counts only while on. Close every window of the Cain jobs Chrome and run `check-host` again: with Chrome closed the worker turns every foreign entry off itself (`disabled_now`, and `extension_disabled <id>` in `worker.log`, once each), so nothing needs removing by hand. Then open that Chrome again and run. If it comes back on after a restart, the program that installed it turned it on again: run `check-host` with Chrome closed once more and say so in a Build item. Needs a code change: no. |
 | `host_parent_gone` | Task Manager, Details, with the PID, Command line and Start time columns: Claude in Chrome's native host and the PID it names as its parent | The process that started Claude in Chrome's native host is gone, or its process id now belongs to a process that started after the host (or, in the same tick, to another program): the host is left over from a Chrome that closed. Restart the Cain jobs Chrome (close every window of it, open it again on its profile); its hosts end with it and fresh ones start. If a host survives that, end it in Task Manager. The worker ends nothing itself here. Needs a code change: no. |
 | `host_parent_gone`, or a stale-lock clearing, again and again while the Cain jobs Chrome is healthy (just restarted, one window, its extension working) | `probe-evidence.json`'s `restart.chain_before` and `chain_after`, or the `probe restart` line in `worker.log`; Task Manager, Details, with the PID, Parent PID (add it with Select columns), Command line and Start time columns for `chrome.exe` (the one with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` and no `--type`), the `cmd.exe` naming the native host, and the host; the worker's `heartbeat.json` and the last lines of `worker.log` | The worker compares process start times allowing one tick of Windows' 15.6 ms timer (equal or within 16 ms is never "later"). Repeated refusals on a healthy Chrome mean the times Windows reports differ by more than that, or a parent id really was reused. Capture the three processes' ids, parent ids and start times (to the millisecond: `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" \| Select ProcessId,ParentProcessId,CreationDate`) and the probe's chain lines, and file them for a fix. Don't loosen anything by hand. Needs a code change: maybe. |
 | `prefs_disagree` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `ids` and `extensions`; the profile folder's `Secure Preferences` and `Preferences` | Chrome's two preference files hold the same extension with a different state or manifest version, usually in the middle of an update or after Chrome was ended without closing. The worker merges nothing on a disagreement. Close every window of the Cain jobs Chrome, open it again on its profile (it rewrites both), then run `check-host` again. If it stays, the profile may be damaged: make a new dedicated profile (setup step 7 on). Needs a code change: no. |
