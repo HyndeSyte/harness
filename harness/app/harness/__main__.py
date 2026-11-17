@@ -26,7 +26,7 @@ from .discord_api import DiscordAPI, DiscordTransport
 from .cain_relay import CainLink
 from .discord_chat import LinkChat
 from .discord_keeper import DiscordKeeper, KeeperStore
-from . import commands, handover, inputs, watch
+from . import commands, handover, inputs, scrub, watch
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
@@ -34,7 +34,7 @@ from .family_gmail import FamilyGmail, home_from_options, rules_from_options, sc
 from .ledger import Ledger, TransactionAborted
 from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
-from .net import CalDavTransport, GoogleTransport, MapTransport, RedactingFilter, UrllibTransport
+from .net import CalDavTransport, GoogleTransport, MapTransport, UrllibTransport
 from .setup_web import SetupApp, serve
 from .vault import Vault
 
@@ -49,7 +49,7 @@ def scrub_environment() -> None:
 
 def configure_logging() -> None:
     handler = logging.StreamHandler(sys.stdout)
-    handler.addFilter(RedactingFilter())
+    handler.addFilter(scrub.ScrubFilter())    # twenty-sixth round: net's redaction and the shared scrub
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root = logging.getLogger()
     root.handlers[:] = [handler]
@@ -326,7 +326,7 @@ def main() -> int:
         except Exception as e:                 # noqa: BLE001: thirteenth round, never a start that can't recover
             log.error("the specialist couldn't start (%s): serving the status page and health only", type(e).__name__)
             from . import migrate
-            why = (f"the records weren't opened: {e}" if isinstance(e, migrate.SwapRefused)
+            why = (f"the records weren't opened: {scrub.scrub(e)}" if isinstance(e, migrate.SwapRefused)
                    else f"the records couldn't be opened ({type(e).__name__})")
             got = degraded(data_dir, port, why, lock_wait=isinstance(e, migrate.LockBusy),
                            files=getattr(e, "files", None), marker_unwritten=getattr(e, "marker_unwritten", ""))

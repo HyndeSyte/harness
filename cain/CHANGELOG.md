@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- Cain knows a tap the calendar specialist put off is come back to without a restart, a discarded set-aside tap is left alone for good, and taps finished one by one after a failed listing share one summary card.
+
 - Cain knows one tap the calendar specialist can't save no longer holds up the others, every tap it sets aside gets one card, and a tap brought back six times gets a last card saying nothing more is done for it.
 
 - Cain knows the calendar specialist's list of taps after a stop comes once, a last card ends a Go ahead that keeps failing, and a cleanup step it can't read is set aside with one card.

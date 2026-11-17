@@ -61,6 +61,7 @@ from zoneinfo import ZoneInfo
 
 from . import (caldav, choices, commands, effects, family_copy, family_rules, google_cal, ical, ics_edit,
                net, provenance, render)
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .canonical import canonical_hash
 from .family_add import GAVE_UP_WORDS, _looks_pasted, gave_up, read_due
 from .ledger import Ledger, iso
@@ -1158,7 +1159,7 @@ class CalendarChange:
         try:
             parts, _ = self._plan_all(params, "preview")
         except Unclear as why:
-            self._ask(job, receipt, f"Nothing changed: {why}." + (f" {why.ask}" if why.ask else ""))
+            self._ask(job, receipt, f"Nothing changed: {scrubbed(why)}." + (f" {why.ask}" if why.ask else ""))
             return None
         except Refuse as why:
             # Titles in it come from a calendar anyone can invite him to: made safe, like a receipt.
@@ -1166,7 +1167,7 @@ class CalendarChange:
             with self.ledger.tx() as db:
                 self.ledger.transition(job["id"], "no_action", db=db, receipt=json.dumps(
                     {**receipt, "reason": "calendar_change_impossible"}))
-                self._say(db, job["chat_id"], job["id"], f"Nothing changed: {_safe(str(why))}.")
+                self._say(db, job["chat_id"], job["id"], f"Nothing changed: {_safe(scrubbed(why))}.")
             return None
         except (ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant) as e:
             log.warning("calendar change job %s: couldn't preview (%s)", render.short(job["id"]),
@@ -3775,7 +3776,7 @@ class CalendarChange:
             if adopted:
                 self._done_by_earlier(p, adopted)
                 return
-            self._refused(p, "not_found", f"Nothing changed: {_safe(str(why))}.")
+            self._refused(p, "not_found", f"Nothing changed: {_safe(scrubbed(why))}.")
             return
         except (ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
             self._smoke_now = ""
@@ -4027,16 +4028,26 @@ class CalendarChange:
         lock = threading.Lock()
         done = threading.Event()
 
+        def _hand_off(e: BaseException) -> None:
+            box["err"] = e                       # raised in the waiting caller, or logged once abandoned
+
         def run() -> None:
+            # Twenty-sixth round: whatever ends the write (an answer, an error, an interrupt), the error is handed to
+            # the waiting caller and the completion signal is set in a finally, so the caller always returns.
+            late = False
             try:
-                with net.deadline(self.write_deadline_s):
-                    box["out"] = call(*args)
-            except BaseException as e:          # handed to the caller, or logged once abandoned
-                box["err"] = e
-            with lock:
-                box["finished"] = True
-                late = box.get("late", False)
-            done.set()
+                try:
+                    with net.deadline(self.write_deadline_s):
+                        box["out"] = call(*args)
+                except BaseException as e:      # handed to the caller, or logged once abandoned
+                    _hand_off(e)
+            finally:
+                try:
+                    with lock:
+                        box["finished"] = True
+                        late = box.get("late", False)
+                finally:
+                    done.set()
             if late:
                 self._late.put((pid, fence, calendar, box.get("out"), type(box["err"]).__name__
                                 if "err" in box else "", getattr(call, "__name__", "")))
@@ -4537,9 +4548,9 @@ class CalendarChange:
             if entry is None and guard is not None and s.kind in ("changed", "gone"):
                 entry = rec.get("entry")       # a retry that finds it moved on: a read says whose change
         except Refuse as e:
-            entry, stopped = None, Stopped("failed", words=str(e))
+            entry, stopped = None, Stopped("failed", words=scrubbed(e))
         except (ValueError, KeyError, TypeError, ical.Unreadable) as e:
-            entry, stopped = None, Stopped("failed", words=str(e) if isinstance(e, ics_edit.Cant)
+            entry, stopped = None, Stopped("failed", words=scrubbed(e) if isinstance(e, ics_edit.Cant)
                                            else "I couldn't read that event")
         else:
             stopped = None
@@ -7292,7 +7303,7 @@ class CalendarChange:
             try:
                 step = self._rebuild(rec)
             except Refuse as why:
-                rec.update(status="failed", kind="failed", words=str(why))
+                rec.update(status="failed", kind="failed", words=scrubbed(why))
                 self._save_plan(pid, plan)
                 return
             except (ValueError, KeyError, TypeError, AttributeError):

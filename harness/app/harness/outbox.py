@@ -20,6 +20,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import approvals, choices, render
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .chat import ChatError
 from .ledger import Ledger, LedgerError, iso
 
@@ -336,7 +337,7 @@ class Outbox:
                 elif b["type"] == "choice":
                     choices.bind(self.ledger, b["nonce"], mid)
             except (ValueError, LedgerError) as e:
-                self.ledger.event("bind_failed", {"outbox": row["id"], "error": str(e)[:100]})
+                self.ledger.event("bind_failed", {"outbox": row["id"], "error": scrubbed(e)[:100]})
         return True
 
     def _unbutton(self, row) -> bool:

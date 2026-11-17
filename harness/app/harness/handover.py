@@ -49,6 +49,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
+from . import scrub as _scrub
+
 log = logging.getLogger("harness.handover")
 
 PORT = 8098
@@ -304,7 +306,7 @@ class Inbox:
     def _append(self, row: dict) -> bool:
         """One line appended, written whole and fsynced, or not at all: a short write or a failed fsync is cut
         back off (best effort) and counts as not written."""
-        data = (json.dumps(row) + "\n").encode()
+        data = (json.dumps(_scrub.scrub_fields(row)) + "\n").encode()   # twenty-sixth round: scrubbed at the sink
         with self._lock:
             try:
                 new = not os.path.exists(self.journal)

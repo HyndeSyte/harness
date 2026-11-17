@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
+from . import scrub as _scrub
 from .canonical import canonical_hash
 
 SCHEMA_VERSION = 1
@@ -433,6 +434,26 @@ def cross_thread_writes() -> list[dict]:
         return list(_CROSS)
 
 
+def _scrubbed_json(value):
+    """Twenty-sixth round: a record kept as JSON text with its exception-text fields (scrub.ERROR_FIELDS) scrubbed;
+    any other value as it is. Re-encoded only when the scrub changed something."""
+    if not isinstance(value, str) or not value[:1] in ("{", "[") \
+            or not any(f'"{f}"' in value for f in _scrub.ERROR_FIELDS):
+        return value
+    try:
+        got = json.loads(value)
+    except ValueError:
+        return value
+    clean = _scrub.scrub_fields(got)
+    return value if clean == got else json.dumps(clean)
+
+
+def _hand_off(box: list, e: BaseException) -> None:
+    """Twenty-sixth round: an error caught whole (BaseException) handed to the code that raises it after, by name,
+    so the source scan can tell a hand-off from a swallow (tests/test_outbox_round26.py)."""
+    box.append(e)
+
+
 class TransactionAborted(BaseException):
     """Twenty-fourth round: an enqueue savepoint whose cleanup failed, so the transaction it ran in is gone: rolled
     back in full (or its connection closed and opened again), any outer work a caller believed pending with it. A
@@ -709,10 +730,12 @@ class Ledger:
     def set_meta(self, key: str, value: str, db=None) -> None:
         (db or self.db).execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, _scrubbed_json(value)))
 
     def event(self, kind: str, detail: dict | str, db=None) -> None:
-        text = detail if isinstance(detail, str) else json.dumps(detail, sort_keys=True)
+        # Twenty-sixth round: exception text in an event's fields is scrubbed here, at the sink.
+        text = _scrubbed_json(detail) if isinstance(detail, str) else json.dumps(_scrub.scrub_fields(detail),
+                                                                                sort_keys=True)
         (db or self.db).execute(
             "INSERT INTO events(at, kind, detail) VALUES(?, ?, ?)",
             (iso(self.now()), kind, text))
@@ -954,17 +977,19 @@ class Ledger:
             # holding the write lock. If the rollback-to fails the savepoint isn't released (on the autocommit
             # connection that would commit what it holds): its own transaction is rolled back in full (or the
             # connection closed and opened again), and the original exception is raised with the cleanup's chained.
-            cleanup: BaseException | None = None
+            # Twenty-sixth round: each cleanup error handed off explicitly (_hand_off), chained to the original below.
+            kept: list[BaseException] = []
             try:
                 conn.execute("ROLLBACK TO SAVEPOINT enqueue")
             except BaseException as rb:        # noqa: BLE001: kept, chained to the original below
-                cleanup = rb
+                _hand_off(kept, rb)
             finally:
-                if cleanup is None:
+                if not kept:
                     try:
                         conn.execute("RELEASE SAVEPOINT enqueue")
                     except BaseException as rel:   # noqa: BLE001: kept, chained to the original below
-                        cleanup = rel
+                        _hand_off(kept, rel)
+            cleanup: BaseException | None = kept[0] if kept else None
             if cleanup is not None:
                 # Twenty-fourth round: a distinct error, chained as before (the original, its cause the cleanup's),
                 # since the transaction the caller believed pending is gone.
@@ -1118,7 +1143,7 @@ class Ledger:
                        f" told_kind=CASE WHEN {new} THEN '' ELSE told_kind END,"
                        f" told_outbox=CASE WHEN {new} THEN NULL ELSE told_outbox END,"
                        f" named=CASE WHEN {new} THEN 0 ELSE named END",
-                       (name, now, error[:300], kind, now, 1 if kind in NEEDS_HIM else 0))
+                       (name, now, _scrub.scrub(error)[:300], kind, now, 1 if kind in NEEDS_HIM else 0))
 
     def inputs(self) -> dict[str, sqlite3.Row]:
         return {r["name"]: r for r in self.db.execute("SELECT * FROM inputs")}

@@ -33,6 +33,7 @@ import os
 from datetime import datetime
 
 from . import approvals, choices, effects, provenance, render
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .ledger import Ledger, iso
 
 log = logging.getLogger("harness.migrate")
@@ -207,7 +208,7 @@ def run_live(ledger: Ledger, cc, chat_id: int, version: str | None = None, build
         with ledger.hold_writers():
             return _run_live(ledger, cc, chat_id, version, build, tell, retry)
     except TimeoutError as e:
-        return _wait(ledger, chat_id, version, build, f"the ledger couldn't be held for the move ({e})", tell)
+        return _wait(ledger, chat_id, version, build, f"the ledger couldn't be held for the move ({scrubbed(e)})", tell)
 
 
 def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: bool,
@@ -224,7 +225,7 @@ def _run_live(ledger: Ledger, cc, chat_id: int, version: str, build: str, tell: 
     try:
         check_steps(STEPS, ledger)
     except StepConflict as e:
-        return _wait(ledger, chat_id, version, build, f"the schema steps conflict: {e}", tell)
+        return _wait(ledger, chat_id, version, build, f"the schema steps conflict: {scrubbed(e)}", tell)
     if marker and os.path.isfile(marker) and not retry:
         # Thirteenth round: the last start stopped in the middle of the move (its transaction never landed, so
         # the records are as they were). It isn't tried again by itself, so a move that kills the App can't
@@ -2004,6 +2005,42 @@ def _tap_lines(journal: str, key: str) -> tuple[list[dict], list[dict]]:
     return lines, [r for r in inbox.journaled() if inbox.key(r["press"]) == key]
 
 
+def _requeue_route(journal: str, key: str, lines: list[dict], entry: list[dict]) -> str:
+    """Twenty-sixth round: how a requeued tap with no outcome goes back, by its journal alone. "unknown" when the
+    journal holds an intent, or any other sign it was started (a line naming the tap that isn't its press: a read,
+    a delivery, or a line that can't be read); "not_started" only when the journal reads whole and its lines are
+    that tap's press and nothing else; "gone" when nothing of it is left; "refuse:<why>" for anything ambiguous (the
+    journal can't be read, or lines with no journaled entry)."""
+    tap_id, _, custom = key.partition("|")
+    torn = False
+    try:
+        with open(journal, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                if not raw.strip():
+                    continue
+                try:
+                    json.loads(raw)
+                except ValueError:
+                    torn = torn or (bool(tap_id) and tap_id in raw) or (bool(custom) and custom in raw)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return f"refuse:the tap journal couldn't be read ({type(e).__name__})"
+    if not lines and not torn:
+        return "gone"
+    if not entry:
+        return "refuse:its journal lines have no tap entry to go back to"
+    started = torn or any(not isinstance(r.get("press"), dict) for r in lines) or entry[0].get("state") != "not_started"
+    return "unknown" if started else "not_started"
+
+
+def _journal_intent(journal: str, press: dict) -> bool:
+    """Twenty-sixth round: an intent with no calendar effect named appended for a requeued tap that was started
+    without one readable, so it reads as unknown (read first, never taken by itself)."""
+    from . import handover
+    return handover.Inbox(lambda: "", journal=journal).journal_intent(press, {"requeued": True})
+
+
 def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "discard", *,
                    journal: str | None = None) -> dict:
     """Twenty-fourth round, from the command line with the App stopped (python3 -m harness.migrate <records>
@@ -2050,7 +2087,12 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
             lines, entry = _tap_lines(journal or base + handover.TAP_JOURNAL, key)
             kept_path = os.path.join(folder, SET_ASIDE_TAPS)
             kept = _read_json(kept_path) or {}
-            kept[key] = {"record": rows[key], "journal": lines, "at": _time.time(), "action": action}
+            # Twenty-sixth round: the copy's exception text scrubbed at this writer too (scrub.scrub_fields), the
+            # set-aside record's own text included.
+            from . import scrub
+            from .ledger import _scrubbed_json
+            record = _scrubbed_json(rows[key])
+            kept[key] = scrub.scrub_fields({"record": record, "journal": lines, "at": _time.time(), "action": action})
             try:
                 _write_json(kept_path, kept)
             except OSError as e:
@@ -2069,24 +2111,39 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                     return {"ok": False, "said": "its journal lines don't carry one press for that tap, so it stays "
                                                  "set aside"}
                 state = entry[0]["state"] if entry else ""
+                route = _requeue_route(journal or base + handover.TAP_JOURNAL, key, lines, entry)
+                if route.startswith("refuse:"):
+                    return {"ok": False, "said": route[len("refuse:"):] + ", so it stays set aside"}
                 carded = db.execute("SELECT 1 FROM meta WHERE key=? OR substr(key, 1, ?)=?",
                                     (f"tap_card_queued:{key}", len(f"outbox_once:tap:{key}|outcome|"),
                                      f"outbox_once:tap:{key}|outcome|")).fetchone() is not None
+                if route == "unknown" and not (state in _TAP_OUTCOMES or carded) and state != "unknown" \
+                        and not _journal_intent(journal or base + handover.TAP_JOURNAL, entry[0]["press"]):
+                    return {"ok": False, "said": "its intent couldn't be written to the tap journal, so it stays set "
+                                                 "aside"}
             db.execute("BEGIN IMMEDIATE")
             try:
                 if action == "discard":
                     db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                               (TAP_DISCARDED + key, json.dumps({"at": _time.time(), "record": rows[key]})))
-                    db.execute("DELETE FROM meta WHERE key IN (?, ?)", ("tap_strike:" + key, "tap_reread:" + key))
+                               (TAP_DISCARDED + key, json.dumps({"at": _time.time(), "record": record})))
+                    # Twenty-sixth round: every state that could still act on it goes in the same transaction: its
+                    # strike pending, its next read, and its relist mark (with its generation and pending strike).
+                    db.execute("DELETE FROM meta WHERE key IN (?, ?, ?)",
+                               ("tap_strike:" + key, "tap_reread:" + key, "tap_relist:" + key))
                     said = "discarded: it's never taken again, and its copy is kept beside the records"
                 elif entry and (state in _TAP_OUTCOMES or carded):
                     full = next(dict(r["press"]) for r in entry if r.get("press"))
                     db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("tap_strike:" + key, json.dumps(
                         {"press": full, "fails": 0, "due": 0.0, "state": state if state in _TAP_OUTCOMES else ""})))
                     said = "requeued to be struck: it has an outcome, so it's only crossed off"
+                elif route == "unknown":
+                    # Twenty-sixth round: an intent (or any start) in the journal: outcome unknown. Harness reads
+                    # the calendar for it first and gives a card (Go ahead at most), never acting by itself.
+                    said = "requeued as unknown: Harness reads your calendar for it first and never takes it by itself"
+                elif route == "not_started":
+                    said = "requeued: the tap journal shows it was never acted on"
                 else:
-                    said = ("requeued: it has no outcome, so the running loop reads your calendar for it first"
-                            if entry else "requeued: nothing of it is left in the tap journal")
+                    said = "requeued: nothing of it is left in the tap journal"
                 db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + key,))
                 db.execute("COMMIT")
             except BaseException:

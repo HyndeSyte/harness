@@ -653,6 +653,11 @@ On Gmail, and then the same on Family:
     added and taken off"; either way it's never added again from a tap's card. This step confirms what
     Google answers on the real calendar. On Family, the same: delete a throwaway event in the Calendar app
     and note that a read of its address answers 404.
+3b. The storage note (done by hand, once per install, not per calendar): Harness's status page and its
+    `/health` are where it says it can't save where it got to with a tap, since the digest can't be queued
+    while the records refuse writes. Open the status page and `/health` and note that neither shows the
+    storage note or a `storage` field on a healthy install; the tests show both carry it, with no write,
+    when the records and the file beside the tap journal refuse.
 4. A card for an event that changed since it. To produce the Gmail stale card: add a throwaway
    one-off event in Google Calendar on the web (not a series), ask Cain to move it, and when its card
    comes, open the event in Google Calendar and change its end time by 15 minutes, save, then tap
@@ -939,9 +944,14 @@ list it again, so no second summary and no second *Go ahead* reach you. If the r
 listing (its mark or any of its cards can't be written), each tap is tried on its own: the others are listed
 and settle in that same tick, and the refused tap is put off after 1, 2, 5, 15, 30 and 60 minutes (in memory
 and in the file beside the tap journal), keeping what its last calendar read found so its next try doesn't
-read your calendar again. A tap listed six times already isn't listed again: one card says Harness has
-brought it back several times without finishing it and nothing more is done for it, with no *Go ahead*, and
-it's struck. The new approval card for parts done
+read your calendar again: that verdict is kept until the tap settles or is set aside, however many hourly
+tries it takes, not for a time (at most 256 such verdicts are kept). The taps settled one by one get one
+summary between them, after their own cards, never one each. A tap listed six times already isn't listed
+again: one card says Harness has brought it back several times without finishing it and nothing more is done
+for it, with no *Go ahead*, and it's struck. Each listing's count is kept with its mark in the records and in
+the file beside the tap journal too; when the records' marks can't be read the count there is used, and a tap
+whose count can't be read in either place is taken as listed six times, so it gets that last card rather than
+being counted from one again. The new approval card for parts done
 again belongs to its own job and carries none. A strike flag that can't be read (unparseable, or with no tap
 in it) is struck by the tap's id when its card is there, once the id and custom id read from its key match
 the tap journal's own lines for that tap (a key that doesn't match is set aside, not struck); with no card
@@ -954,11 +964,17 @@ again on the same schedule, and after six failures the tap is set aside the same
 handle a set-aside tap, with the App stopped: `python3 -m harness.migrate <records> --set-aside --taps`
 lists them, and `... --set-aside --taps export|discard|requeue '<tap key>'` handles one, each writing its
 record and its journal lines whole beside the records (harness-set-aside-taps.json) first. Export does only
-that. Discard replaces the set-aside record with a lasting discard record in one transaction, so the tap is
-never read on your calendar or taken again, though its journal lines stay. Requeue checks the tap's journal
+that. Discard replaces the set-aside record with a lasting discard record in one transaction, and in that same
+transaction removes the tap's pending strike, its put-off read and its listing mark (with its count), so the
+tap is never read on your calendar or taken again and its journal lines, which stay, are never rewritten; a
+pending strike or listing mark found for a discarded tap is skipped. Requeue checks the tap's journal
 lines carry one press for that very key (otherwise it's refused and stays set aside); a tap with an outcome
-gets its strike back with that press and is only crossed off, and one with none goes back to the running
-loop, which reads your calendar for it before anything. If the unverified outcome itself can't be
+gets its strike back with that press and is only crossed off. One with none goes by its journal alone: if it
+holds an intent, or any other sign the tap was started (a read, a delivery, or a line naming the tap that
+can't be read), it goes back as outcome unknown (an intent is added when none can be read), so Harness reads
+your calendar for it and gives a card, *Go ahead* at most, never acting by itself; only a journal that reads
+whole and holds that tap's press and nothing else sends it back as never acted on; a journal that can't be
+read is refused and the tap stays set aside. If the unverified outcome itself can't be
 written to the tap journal, the tap's next read is put off in the records on the same 1, 2, 5, 15, 30 and
 60 minutes, at a start too, so your calendars aren't read for it at every tick; when the records can't take
 that either (a full or read-only card takes both down at once), it's held in memory on the same schedule
@@ -969,9 +985,15 @@ about it is said at most once an hour, by the time kept in that file. When even 
 a start waits one step of the schedule (a minute) before reading such a tap, so a crash loop doesn't read
 your calendar at every start, and Harness's health (what Cain's watch reads), its status page and the
 digest's standing problems say it can't save where it got to with a tap, with the log saying so at most once
-an hour; that clears once the file takes a write again. An exception's message is scrubbed before it's
-written to the tap journal or kept: every key Harness holds, auth headers, and a web address's query and
-user part are replaced, in an older journal line's error too when it's copied. A tap that settles normally clears its put-off read in the same transaction as
+an hour; that clears once the file takes a write again. None of those needs a write: the health and the status
+page are built in memory and the status text and the digest's composition only read the records. The digest
+still needs its message queued in the records to reach you, so while the records refuse writes the health and
+the status page are where it shows; the smoke run checks that by hand. An exception's message is scrubbed
+where it's kept or shown: the tap journal's writer, the records' writers, the set-aside tool's copy and the
+log's handler all scrub it, as does every other place Harness turns an error into words. Every key Harness
+holds, auth headers, JSON fields named for a token, secret, password or refresh token, long random-looking
+strings, and a web address's query and user part are replaced, in an older journal line's error too when it's
+copied. A tap that settles normally clears its put-off read in the same transaction as
 its card. A message's outcome for the fixed card is checked before anything is queued, and the message, its
 key and its outcome are written together or not at all; if undoing a failed write itself fails, the records'
 transaction is gone (rolled back in full, or its connection opened again so later writes still commit), and
@@ -979,9 +1001,12 @@ a distinct "transaction aborted" error, with the first error as its cause, ends 
 can catch it as an ordinary error and go on writing as if its transaction still held. Each tap is its own
 boundary, in the running loop and at a start: that error (after the rollback or the reopen) puts that one tap
 off on the 1 to 60 minute schedule and the next tap goes on; only a reopen that itself failed ends the tick,
-and a start's replay cut short is taken up again from the running loop once its time comes. No catch of
-every error anywhere in Harness swallows that one: each lets it go on, or is on a short list (tested) with
-its reason. You're told a tap waits only once that note is queued, so a note that couldn't be
+and a start's replay cut short is taken up again from the running loop once its time comes. A start's replay
+that puts off more than one tap comes back for the earliest of them each time, until none is left, so a tap
+carried over from the file beside the journal is never left for the next restart. No catch of every error
+anywhere in Harness swallows that one: each ends by raising it or by handing it, by name, to the code that
+raises it (tested, with no list of exceptions). A calendar write's own thread hands its error to the caller
+waiting on it and signals that it's done whatever happens, so the caller always returns. You're told a tap waits only once that note is queued, so a note that couldn't be
 queued goes at the next read, or after a restart. A tap whose decision never reached the records, read
 while your calendar can't be read, says so: its *Go ahead* reads first, and if your calendar still can't
 be read nothing is done, you're told plainly, and the same *Go ahead* comes back on a new card that reads

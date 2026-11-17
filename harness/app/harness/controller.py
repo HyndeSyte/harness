@@ -33,7 +33,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import (approvals, callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
-               handover, net, policy, provenance, render, rules, vault, watch)
+               handover, policy, provenance, render, rules, scrub, vault, watch)
 from .calendar_change import CalendarChange
 from .chat import Decision, Incoming
 from .config import Config
@@ -162,6 +162,7 @@ class Controller:
         self.discord = None
         self.discord_chat = None
         self.handovers = None
+        scrub.set_provider("controller", self._secrets)   # twenty-sixth round: its keys, for every sink's scrub
         self._discord_seen: str | None = None    # fingerprint of the token it identified with
         self._reconciled = False
         self._handover_jobs: dict[str, list] = {}
@@ -621,9 +622,9 @@ class Controller:
                 if h.kind == "press" and h.intent:
                     self._unknown_tap(h, "LedgerFenced")
                 elif h.kind == "press":
-                    self._refuse_tap(h, str(e) or self.FENCED, restore_staged=True)
+                    self._refuse_tap(h, scrub.scrub(e) or self.FENCED, restore_staged=True)
                 else:
-                    h.finish("refused", str(e) or self.FENCED, restore_staged=True)
+                    h.finish("refused", scrub.scrub(e) or self.FENCED, restore_staged=True)
             except Exception as e:             # noqa: BLE001: told, and the rest still taken
                 log.error("a %s couldn't be taken: %s: %s", h.kind, type(e).__name__, e)
                 if h.kind == "press" and h.intent:
@@ -721,12 +722,22 @@ class Controller:
             self.__dict__["_replay_again_at"] = None
         self._taps_replayed = True
         self.__dict__["_in_replay"] = True
+        # Twenty-sixth round: each pass gathers the due times of the rows only a start replay handles that it put off
+        # (skipped as not due yet, or deferred during the pass), and re-arms itself for the earliest of them, so no
+        # such row waits for the next restart. Cleared only when none is left; the failure count starts again after
+        # a pass that finished.
+        self.__dict__["_replay_put_off"] = []
         try:
             self._replay_body()
         except BaseException:
             n = self.__dict__["_replay_fails"] = self.__dict__.get("_replay_fails", 0) + 1
             self.__dict__["_replay_again_at"] = self._clock() + self._backoff(n)
             raise
+        else:
+            put_off = self.__dict__["_replay_put_off"]
+            self.__dict__["_replay_again_at"] = min(put_off) if put_off else None
+            if not put_off:
+                self.__dict__["_replay_fails"] = 0
         finally:
             self.__dict__["_in_replay"] = False
 
@@ -765,7 +776,9 @@ class Controller:
                     or self.handovers.key(p) in relists or self.handovers.key(p) in held:
                 continue
             if row["state"] != "unknown" and not self._due(mem.get(self.handovers.key(p)), now):
-                continue                        # twenty-fifth round: put off at its own boundary; resumed later
+                # Twenty-fifth round: put off at its own boundary; resumed later. Twenty-sixth round: at its due time.
+                self.__dict__["_replay_put_off"].append(self._due_at(mem.get(self.handovers.key(p)), now))
+                continue
             if row["state"] == "unknown" and not self._reread_due(self.handovers.key(p), rereads, now):
                 continue                        # read again by the running loop once its time comes
             if row["state"] in ("refused", "found"):
@@ -1049,14 +1062,14 @@ class Controller:
         out it gets its card saying the calendar couldn't be read, its outcome recorded as unverified. A tap is
         struck only once its card is queued."""
         now, owner, final, waits, terminal = self._clock(), self.config.owner_user_id, [], [], []
-        cache = self.__dict__.get("_relist_verdicts", {})
         for row in rows:
             p, op = row["press"], row.get("op") or {}
             # Twenty-fifth round: a tap whose relist the records refused is tried again with the verdict its last
-            # read gave (within CHECK_CAP_S), so the calendar isn't read again for it.
-            hit = cache.get(self.handovers.key(p))
-            if hit and now - hit[0] < self.CHECK_CAP_S:
-                seen_, parts_, *more_ = hit[1]
+            # read gave, so the calendar isn't read again for it. Twenty-sixth round: for as long as it's put off
+            # (until it settles or is set aside), not for a time.
+            hit = self._kept_verdict(self.handovers.key(p))
+            if hit is not None:
+                seen_, parts_, *more_ = hit
                 final.append((row, seen_, parts_, (more_[0] if more_ else None) or {}))
                 continue
             try:
@@ -1289,35 +1302,25 @@ class Controller:
                 "request": row.get("op") or {}, "error_checks": int(row.get("error_checks") or 0),
                 "error": self._scrub(row.get("error") or "unknown")[:500]}
 
-    _SCRUB = (
-        (re.compile(r"(?i)\b(authorization|proxy-authorization|x-api-key|api[-_]?key|cookie|set-cookie|password|"
-                    r"access_token|refresh_token|client_secret)(['\"]?\s*[:=]\s*['\"]?)([^'\"\s,;}&]+(?:\s+[^'\"\s,;}&]+)?)"),
-         r"\1\2[redacted]"),
-        (re.compile(r"(?i)\b(bearer|basic|bot)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
-        (re.compile(r"(?i)\b((?:https?|webcals?)://)[^/\s@]+@"), r"\1[redacted]@"),
-        (re.compile(r"(?i)\b((?:https?|webcals?)://[^\s?#'\"<>]*)\?[^\s#'\"<>]*"), r"\1?[redacted]"),
-    )
-
-    def _scrub(self, text) -> str:
-        """Twenty-fifth round: an exception's message as the journal and the kept copy may hold it: every secret
-        Harness has loaded (net.REDACT), the keys it keeps and the link's token replaced, then auth headers, a
-        URL's query and its user part."""
-        out = net.REDACT(str(text))
-        secrets = set()
+    def _secrets(self) -> list[str]:
+        """Twenty-sixth round: the secrets the shared scrub replaces for this controller (scrub.add_provider): the
+        keys its vault holds and the link's token."""
+        out = []
         for f in (*vault.FIELDS, *vault.FAMILY_FIELDS):
             try:
-                secrets.add(str(self.vault.get(f) or ""))
+                out.append(str(self.vault.get(f) or ""))
             except Exception:                   # noqa: BLE001: a key that can't be read isn't in the text
                 pass
         try:
-            secrets.add(str(self.handovers._token_fn() or "") if self.handovers is not None else "")
+            out.append(str(self.handovers._token_fn() or "") if self.handovers is not None else "")
         except Exception:                       # noqa: BLE001: likewise
             pass
-        for sec in sorted((x for x in secrets if len(x) >= 8), key=len, reverse=True):
-            out = out.replace(sec, "[redacted]")
-        for pattern, repl in self._SCRUB:
-            out = pattern.sub(repl, out)
         return out
+
+    def _scrub(self, text) -> str:
+        """Twenty-fifth round: an exception's message as the journal and the kept copy may hold it. Twenty-sixth
+        round: the shared scrub (scrub.scrub), which every sink applies too, with this controller's secrets."""
+        return scrub.scrub(text)
 
     def _backoff(self, fails: int) -> int:
         return self.STRIKE_BACKOFF_S[min(max(fails, 1), len(self.STRIKE_BACKOFF_S)) - 1]
@@ -1334,6 +1337,14 @@ class Controller:
                 v = {}
             out[r["key"][len(prefix):]] = v if isinstance(v, dict) else {}
         return out
+
+    @staticmethod
+    def _due_at(flag: dict | None, now: float) -> float:
+        """Twenty-sixth round: a deferral's due time (now when it can't be read)."""
+        try:
+            return float((flag or {}).get("due") or now)
+        except (TypeError, ValueError):
+            return now
 
     @staticmethod
     def _due(flag: dict | None, now: float) -> bool:
@@ -1371,7 +1382,7 @@ class Controller:
         if not path:
             return False
         try:
-            if not data.get("taps"):
+            if not data.get("taps") and not data.get("gens"):
                 if os.path.exists(path):
                     os.remove(path)
                 self._storage_clear()
@@ -1386,6 +1397,21 @@ class Controller:
             return False
         self._storage_clear()
         return True
+
+    SIDE_GENS_KEPT = 256                        # twenty-sixth round: relist counts kept beside the journal, at most
+
+    def _side_gens(self, gens: dict) -> None:
+        """Twenty-sixth round: each relisted tap's generation, kept beside the journal too (the side file's
+        "gens", newest last, at most SIDE_GENS_KEPT), so a relist whose records' marks can't be read still counts
+        on from it. Best effort: a count that can't be kept here is taken as at the cap when it's needed."""
+        side = self._side_load()
+        kept = side.get("gens") if isinstance(side.get("gens"), dict) else {}
+        for k, g in gens.items():
+            kept.pop(k, None)
+            kept[k] = g
+        side["gens"] = dict(list(kept.items())[-self.SIDE_GENS_KEPT:])
+        if not self._side_save(side):
+            log.debug("a relist count couldn't be kept beside the journal")
 
     def _side_forget(self, key: str) -> None:
         """A settled tap's deferral beside the journal goes with it (nothing is written when there's none)."""
@@ -1718,6 +1744,12 @@ class Controller:
         whether or not its journal row still reads as terminal: no card, only the strike."""
         now = self._clock()
         held = self.__dict__.get("_strike_mem", {})
+        try:
+            skip = set(skip) | self._discarded()    # twenty-sixth round: a discarded tap is never written for
+        except Exception as e:                  # noqa: BLE001: can't tell which are discarded: none resumed now
+            log.warning("the discarded taps couldn't be read (%s); pending strikes wait for the next tick",
+                        type(e).__name__)
+            return
         for key, flag in flags.items():
             if key in skip or not self._due(flag, now) or not self._due(held.get(key), now):
                 continue
@@ -1755,8 +1787,14 @@ class Controller:
 
     def _resume_relists(self, marks: dict, skip=()) -> None:
         """Each relisted tap whose strike is pending and due is struck, and only that: its cards are queued, so it's
-        never read on the calendar or relisted again."""
+        never read on the calendar or relisted again. Twenty-sixth round: never a discarded tap's."""
         now = self._clock()
+        try:
+            skip = set(skip) | self._discarded()
+        except Exception as e:                  # noqa: BLE001: can't tell which are discarded: none resumed now
+            log.warning("the discarded taps couldn't be read (%s); pending strikes wait for the next tick",
+                        type(e).__name__)
+            return
         for key, mark in marks.items():
             if key in skip or not self._due(mark, now):
                 continue
@@ -1818,6 +1856,13 @@ class Controller:
                 "SELECT key FROM meta WHERE substr(key, 1, ?)=?", (len(prefix), prefix))}
         return out
 
+    def _discarded(self) -> set[str]:
+        """Twenty-sixth round: the taps discarded with the set-aside tool (migrate.TAP_DISCARDED). Read before any
+        strike is resumed, so a discarded tap's journal lines are never rewritten; a read that fails raises, and the
+        resume waits for the next tick."""
+        return {r[0][len(migrate.TAP_DISCARDED):] for r in self.ledger.db.execute(
+            "SELECT key FROM meta WHERE substr(key, 1, ?)=?", (len(migrate.TAP_DISCARDED), migrate.TAP_DISCARDED))}
+
     def _quarantine_strike(self, key: str, *, operator: bool, why: str = "") -> None:
         """Twenty-fourth round: an unreadable strike flag set aside, in one transaction with its operator card when
         there's no card about the tap: the flag's text moved whole under QUARANTINE_FLAG (kept for recovery: the
@@ -1841,6 +1886,7 @@ class Controller:
                 record["rows"] = lines
             self.ledger.set_meta(self.QUARANTINE_FLAG + key, json.dumps(record), db)
             db.execute("DELETE FROM meta WHERE key=?", (self.STRIKE_FLAG + key,))
+        self._drop_verdict(key)                 # twenty-sixth round: a set-aside tap's kept verdict goes with it
 
     def _kept_line(self, r: dict) -> dict:
         """Twenty-fifth round: a journal line as a kept copy holds it: no interaction token, errors scrubbed."""
@@ -1933,7 +1979,8 @@ class Controller:
         return self.TAP_STATE_WORDS["found"]
 
     def _relist_taps(self, rows: list[dict], *, restored: bool = True,
-                     verdicts: dict | None = None, reads: dict | None = None) -> None:
+                     verdicts: dict | None = None, reads: dict | None = None,
+                     summary_into: list | None = None) -> None:
         """Fifteenth round: the records were put back from a backup at this start, so no tap written down before it
         is taken by itself. Sixteenth round, truthfully: each tap's recorded state (carried out before the records
         were put back; outcome unknown; not carried out) and, for one that reaches a calendar, a read of the
@@ -1948,21 +1995,35 @@ class Controller:
 
         Twenty-fifth round: `reads` gathers each calendar read made here, so a relist the records refused is tried
         again without reading the calendar again (_relist_guarded). A tap relisted RELIST_GEN_CAP times already
-        isn't relisted again: it gets one card saying nothing more is done for it, and it's struck."""
+        isn't relisted again: it gets one card saying nothing more is done for it, and it's struck.
+
+        Twenty-sixth round: `summary_into`, a list, takes the batch summary's part for these taps instead of its own
+        card (the per-tap fallback of _relist_guarded, which queues one summary for all the taps it settled)."""
         owner, tz = self.config.owner_user_id, ZoneInfo(self.config.timezone)
         # Twenty-fourth round: each tap's relist generation (one more than its last relist's), stored with its
         # relisted mark. Twenty-fifth round: read first, so a tap past the cap is never read on the calendar.
+        # Twenty-sixth round: when the records' marks can't be read, the count kept beside the journal (the side
+        # file's "gens") is used; a tap whose count can't be read there either is taken as at the cap, so it ends
+        # with its one card instead of being counted from one again.
         try:
-            old_marks = self._flags(self.RELIST_FLAG)
-        except Exception:                       # noqa: BLE001: unreadable: the first generation
-            old_marks = {}
+            old_gens = {k: v.get("gen") for k, v in self._flags(self.RELIST_FLAG).items()}
+        except Exception as e:                  # noqa: BLE001: the count beside the journal, else at the cap
+            log.warning("the relisted taps' marks couldn't be read (%s); their count beside the journal is used",
+                        type(e).__name__)
+            old_gens = None
+        side_gens = self._side_load().get("gens")
+        side_gens = side_gens if isinstance(side_gens, dict) else {}
         gens = {}
         for row in rows:
             k = self.handovers.key(row["press"])
+            if old_gens is not None:
+                was, fallback = old_gens.get(k), 0
+            else:
+                was, fallback = side_gens.get(k), self.RELIST_GEN_CAP
             try:
-                gens[k] = int((old_marks.get(k) or {}).get("gen") or 0) + 1
+                gens[k] = int(was if was is not None else fallback) + 1
             except (TypeError, ValueError):
-                gens[k] = 1
+                gens[k] = self.RELIST_GEN_CAP + 1
         capped = [r for r in rows if gens[self.handovers.key(r["press"])] > self.RELIST_GEN_CAP]
         if capped:
             self._relist_ended(capped, gens)
@@ -2007,37 +2068,20 @@ class Controller:
         rest = timed[max(0, self.RELIST_MAX - len(untimed)):]
         counts = {k: sum(1 for r, _, _ in open_ if r["state"] == k) for k in ("committed", "unknown", "not_started")}
         n = len(rows)
-        if restored:
-            parts = [f"<b>Harness's records were put back from a backup</b>, so "
-                     f"{'a tap of yours from before it was' if n == 1 else f'{n} taps of yours from before it were'} "
-                     "not taken by itself."]
-        else:
-            parts = [f"<b>Harness stopped or hit an error before it noted what came of "
-                     f"{'a tap of yours' if n == 1 else f'{n} taps of yours'}</b>, so "
-                     f"{'it was' if n == 1 else 'they were'} read on your calendar first and not taken again by "
-                     f"{'itself' if n == 1 else 'themselves'}."]
-        said = [f"{c} {self.TAP_STATE_WORDS[k]}" for k, c in counts.items() if c]
         found_words: dict[str, int] = {}
         for r in found:
             w = self._found_words(r.get("op") or {})
             found_words[w] = found_words.get(w, 0) + 1
-        for w, c in found_words.items():
-            said.append(f"{c} {w}, so nothing is left to do for {'it' if c == 1 else 'them'}")
-        if said:
-            parts.append("Of " + ("it" if n == 1 else "them") + ": " + "; ".join(said) + ".")
-        if shown:
-            parts.append(("The newest one is on the card below" if len(shown) == 1
-                          else f"The newest {len(shown)} are on the cards below")
-                         + ", each saying what Harness found."
-                         + (f" The other {len(rest)} are listed after them by time and state." if rest else ""))
+        parts = self._relist_summary_parts(n, counts, found_words, len(shown), len(rest), restored)
         # Twenty-fourth round: each tap's card is keyed on (tap, "relist", generation), and the summary and the list
         # on the batch's taps and generations, so a relist done again is refused as a duplicate and mints nothing.
         batch = hashlib.sha256("\n".join(sorted(f"{k}#{g}" for k, g in gens.items())).encode()).hexdigest()[:24]
         marks = {k: {"press": dict(row["press"]), "gen": gens[k], "pending": True, "fails": 0, "due": 0.0}
                  for row in rows for k in [self.handovers.key(row["press"])]}
         with self.ledger.tx() as db:
-            self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(" ".join(parts)),
-                                once=Ledger.once_key(f"batch:{batch}", "relist", "summary"))
+            if summary_into is None:
+                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(" ".join(parts)),
+                                    once=Ledger.once_key(f"batch:{batch}", "relist", "summary"))
             for row, seen, tparts in shown:
                 p = row["press"]
                 once = Ledger.once_key(self.handovers.key(p), "relist", str(gens[self.handovers.key(p)]))
@@ -2082,12 +2126,73 @@ class Controller:
                 k = self.handovers.key(row["press"])
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + k,))
                 self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(marks[k]), db)
+        if summary_into is not None:
+            summary_into.append({"gens": {k: m["gen"] for k, m in marks.items()}, "counts": counts,
+                                 "found": found_words, "shown": len(shown), "rest": len(rest)})
+        self._side_gens({k: m["gen"] for k, m in marks.items()})
         mem = self.__dict__.setdefault("_relist_mem", {})
         for row in rows:
             k = self.handovers.key(row["press"])
             mem[k] = dict(marks[k])
             self.__dict__.get("_reread_mem", {}).pop(k, None)
+            self._drop_verdict(k)
             self._strike_relisted(k, row["press"], marks[k])
+
+    def _relist_summary_parts(self, n: int, counts: dict, found_words: dict, shown: int, rest: int,
+                              restored: bool) -> list[str]:
+        """The batch summary's sentences for n relisted taps (twenty-sixth round: shared by a batch and by the
+        per-tap fallback's one summary)."""
+        if restored:
+            parts = [f"<b>Harness's records were put back from a backup</b>, so "
+                     f"{'a tap of yours from before it was' if n == 1 else f'{n} taps of yours from before it were'} "
+                     "not taken by itself."]
+        else:
+            parts = [f"<b>Harness stopped or hit an error before it noted what came of "
+                     f"{'a tap of yours' if n == 1 else f'{n} taps of yours'}</b>, so "
+                     f"{'it was' if n == 1 else 'they were'} read on your calendar first and not taken again by "
+                     f"{'itself' if n == 1 else 'themselves'}."]
+        said = [f"{c} {self.TAP_STATE_WORDS[k]}" for k, c in counts.items() if c]
+        for w, c in found_words.items():
+            said.append(f"{c} {w}, so nothing is left to do for {'it' if c == 1 else 'them'}")
+        if said:
+            parts.append("Of " + ("it" if n == 1 else "them") + ": " + "; ".join(said) + ".")
+        if shown:
+            parts.append(("The newest one is on the card below" if shown == 1
+                          else f"The newest {shown} are on the cards below")
+                         + ", each saying what Harness found."
+                         + (f" The other {rest} are listed after them by time and state." if rest else ""))
+        return parts
+
+    def _relist_summary(self, entries: list[dict], restored: bool) -> None:
+        """Twenty-sixth round: one summary card for the taps the per-tap fallback settled, keyed as a batch's is (on
+        those taps and their generations), queued after their own cards. One the records refuse is logged: each of
+        those taps already has its own card."""
+        gens: dict = {}
+        counts: dict = {}
+        found: dict = {}
+        shown = rest = 0
+        for e in entries:
+            gens.update(e["gens"])
+            for k, c in e["counts"].items():
+                counts[k] = counts.get(k, 0) + c
+            for w, c in e["found"].items():
+                found[w] = found.get(w, 0) + c
+            shown, rest = shown + e["shown"], rest + e["rest"]
+        if not gens:
+            return
+        parts = self._relist_summary_parts(len(gens), counts, found, shown, rest, restored)
+        if shown:                               # each tap here went alone, so each has its own card
+            parts[-1] = ("It is on its own card" if shown == 1 else "Each is on its own card") \
+                + ", saying what Harness found."
+        batch = hashlib.sha256("\n".join(sorted(f"{k}#{g}" for k, g in gens.items())).encode()).hexdigest()[:24]
+        try:
+            with self.ledger.tx() as db:
+                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
+                                    text=render.fit(" ".join(parts)),
+                                    once=Ledger.once_key(f"batch:{batch}", "relist", "summary"))
+        except (Exception, TransactionAborted) as e:  # noqa: BLE001: each tap has its own card already
+            self._reraise_dead(e)
+            log.error("a relist's summary couldn't be queued (%s); each tap has its own card", type(e).__name__)
 
     RELIST_GEN_CAP = 6                          # twenty-fifth round: relists of one tap before its ended card
     RELIST_ENDED_WORDS = ("Harness has brought this tap back to you several times without finishing it, so nothing "
@@ -2109,11 +2214,13 @@ class Controller:
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + k,))
                 self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(marks[k]), db)
             self.ledger.event("taps_relist_ended", {"count": len(rows)}, db=db)
+        self._side_gens({k: m["gen"] for k, m in marks.items()})
         mem = self.__dict__.setdefault("_relist_mem", {})
         for row in rows:
             k = self.handovers.key(row["press"])
             mem[k] = dict(marks[k])
             self.__dict__.get("_reread_mem", {}).pop(k, None)
+            self._drop_verdict(k)
             self._strike_relisted(k, row["press"], marks[k])
 
     def _relist_guarded(self, rows: list[dict], *, restored: bool = True, verdicts: dict | None = None) -> None:
@@ -2125,15 +2232,13 @@ class Controller:
         whose reopen failed (no working connection) still ends the tick."""
         if not rows:
             return
-        cache = self.__dict__.setdefault("_relist_verdicts", {})
-        now = self._clock()
         verdicts = dict(verdicts) if verdicts is not None else None
         for row in rows:
             k = self.handovers.key(row["press"])
-            hit = cache.get(k)
-            if hit and (verdicts is None or k not in verdicts) and now - hit[0] < self.CHECK_CAP_S:
+            hit = self._kept_verdict(k)
+            if hit is not None and (verdicts is None or k not in verdicts):
                 verdicts = {} if verdicts is None else verdicts
-                verdicts[k] = hit[1]
+                verdicts[k] = hit
         reads: dict = {}
         try:
             self._relist_taps(rows, restored=restored, verdicts=verdicts, reads=reads)
@@ -2144,24 +2249,47 @@ class Controller:
             first = e
         else:
             for row in rows:
-                cache.pop(self.handovers.key(row["press"]), None)
+                self._drop_verdict(self.handovers.key(row["press"]))
             return
         known = dict(verdicts or {})
         known.update(reads)
         alone = len(rows) == 1
+        settled: list[dict] = []                # twenty-sixth round: one summary for the taps settled below
         for row in rows:
             k = self.handovers.key(row["press"])
             try:
                 if alone:
                     raise first
-                self._relist_taps([row], restored=restored, verdicts=known if k in known else verdicts)
+                self._relist_taps([row], restored=restored, verdicts=known if k in known else verdicts,
+                                  summary_into=settled)
             except (Exception, TransactionAborted) as e:  # noqa: BLE001: this tap put off; the next goes on
                 self._reraise_dead(e)
                 if k in known:
-                    cache[k] = (now, known[k])
+                    self._keep_verdict(k, known[k])
                 self._defer_tap(k, e, "a tap's relist couldn't be written to the records")
             else:
-                cache.pop(k, None)
+                self._drop_verdict(k)
+        if settled:
+            self._relist_summary(settled, restored)
+
+    RELIST_VERDICTS_KEPT = 256                  # twenty-sixth round: kept relist verdicts, at most (oldest go first)
+
+    def _kept_verdict(self, key: str):
+        """Twenty-sixth round: the calendar verdict kept for a tap whose relist the records refused, or None. It's
+        kept until the tap settles or is set aside (or discarded), never expired by the clock, so a tap put off on
+        the hourly step doesn't read the calendar again; bounded by count (RELIST_VERDICTS_KEPT)."""
+        hit = self.__dict__.get("_relist_verdicts", {}).get(key)
+        return hit[1] if hit else None
+
+    def _keep_verdict(self, key: str, verdict) -> None:
+        cache = self.__dict__.setdefault("_relist_verdicts", {})
+        cache.pop(key, None)
+        cache[key] = (self._clock(), verdict)
+        while len(cache) > self.RELIST_VERDICTS_KEPT:
+            cache.pop(next(iter(cache)))
+
+    def _drop_verdict(self, key: str) -> None:
+        self.__dict__.get("_relist_verdicts", {}).pop(key, None)
 
     @staticmethod
     def _reraise_dead(e: BaseException) -> None:
@@ -2188,8 +2316,7 @@ class Controller:
         mem[key] = {"fails": fails, "due": due}
         self._hold_deferral(key, type(e).__name__, said)
         if self.__dict__.get("_in_replay"):
-            again = self.__dict__.get("_replay_again_at")
-            self.__dict__["_replay_again_at"] = due if again is None else min(again, due)
+            self.__dict__.setdefault("_replay_put_off", []).append(due)
 
     @staticmethod
     def _card_outcome(state: str, seen: str) -> str | None:

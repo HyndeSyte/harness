@@ -23,6 +23,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import calendar_feed, digest, ingress_filter, policy, prompts, render, schema
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .config import Config
 from .engines import CallOutcome, Engine, call_with_retries
 from .ledger import Ledger, iso
@@ -123,7 +124,7 @@ class Canary:
         try:
             out = schema.parse_output(res.output, stage_at_least=self.config.stage_at_least)
         except schema.OutputError as e:
-            return False, f"bad output: {e}"
+            return False, f"bad output: {scrubbed(e)}"
         if out.type != "answer" or "canary ok" not in out.body["text"].lower():
             return False, "wrong answer"
         return True, ""

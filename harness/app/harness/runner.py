@@ -27,6 +27,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from . import approvals, choices, commands, effects, policy, prompts, provenance, render, rules, schema
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .config import Config
 from .engines import CallOutcome, Engine, EngineError, EngineResult, call_with_retries
 from .ledger import Ledger, iso
@@ -353,7 +354,7 @@ class Runner:
                 job = self.ledger.job(job_id)
                 if job is not None and job["state"] == "running":
                     self._fail(job, "internal_error", job["engine"],
-                               detail=f"{type(e).__name__}: {e}"[:120])
+                               detail=scrubbed(f"{type(e).__name__}: {e}")[:120])
             done += 1
         return done
 
@@ -384,11 +385,11 @@ class Runner:
         except schema.OutputError as e:
             if self.calendar_change is not None and isinstance(e.__cause__, effects.ChangeRefusal):
                 self.calendar_change.refuse_in_words(job, {"engine": engine, "model": res.model,
-                                                           "usd": round(res.usd, 5)}, str(e))
+                                                           "usd": round(res.usd, 5)}, scrubbed(e))
                 return
             if self.family_add is not None and isinstance(e.__cause__, effects.PlainRefusal):
                 self.family_add.refuse_in_words(job, {"engine": engine, "model": res.model,
-                                                      "usd": round(res.usd, 5)}, str(e))
+                                                      "usd": round(res.usd, 5)}, scrubbed(e))
                 return
             repaired, touched = effects.repair_fields(res.output)
             try:
@@ -397,7 +398,7 @@ class Runner:
             except schema.OutputError:
                 out = None
             if out is None:
-                self._fail(job, "bad_output", engine, result=res, detail=str(e)[:120])
+                self._fail(job, "bad_output", engine, result=res, detail=scrubbed(e)[:120])
                 return
             log.info("job %s: the reply's shape was repaired (%s)", job_id, str(e)[:80])
             # Whatever was set right, a change from it waits for his tap.
@@ -491,9 +492,9 @@ class Runner:
             try:
                 rule_id = rules.hold(self.ledger, body["rule"], job_id=job["id"], db=db)
             except rules.RuleError as e:
-                receipt["rule"] = {"refused": str(e)[:120]}
+                receipt["rule"] = {"refused": scrubbed(e)[:120]}
                 self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
-                self._reply(db, job, f"I can't keep that as a rule: {e}.")
+                self._reply(db, job, f"I can't keep that as a rule: {scrubbed(e)}.")
                 return
             receipt["rule"] = {"id": rule_id, "status": "pending"}
             self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)

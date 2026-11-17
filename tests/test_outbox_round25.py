@@ -91,7 +91,7 @@ BASE_ALLOWED = [
                                                   "the original right after (Ledger.enqueue)"),
     ("ledger.py", "except BaseException as rel:", "the savepoint's release failing: kept, and raised chained to the "
                                                    "original right after (Ledger.enqueue)"),
-    ("calendar_change.py", "except BaseException as e:", "a calendar write's thread hands its error to the caller "
+    ("calendar_change.py", "except BaseException as e:", "reviewed in the twenty-sixth round: a calendar write's thread hands its error to the caller "
                                                          "that waits on it, or logs it once abandoned"),
 ]
 

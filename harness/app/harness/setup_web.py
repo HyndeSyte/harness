@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 from .net import REDACT
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .vault import FIELDS, LABELS, TEXT_FIELDS, Vault, VaultError
 
 log = logging.getLogger("harness.web")
@@ -378,7 +379,7 @@ def make_handler(app: SetupApp):
                         v.set_key(f, form[f], by=name)
                         done.append(f"{LABELS[f]} saved")
                 except VaultError as e:
-                    errors.append(str(e))
+                    errors.append(scrubbed(e))
             return "; ".join(done + errors)
 
         def _post_arm(self, form, name):
