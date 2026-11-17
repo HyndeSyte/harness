@@ -47,6 +47,7 @@ _NOT_NAME_WORDS = frozenset({"the", "a", "an", "of", "at", "and", "in", "on"})
 
 NO_ADDRESS = "no address"
 FAILED = "failed"
+LATER = "later"                   # this read's allowance of lookups is spent: the next read asks
 HOME = "home"                     # between(): his home, from the add-on's settings
 
 _ONLINE = re.compile(r"://|\b(?:zoom|teams|webex|google meet|telehealth|virtual|online)\b", re.I)
@@ -60,7 +61,10 @@ _SIDE = r"(?:\s+(?:[NSEW]|NE|NW|SE|SW)\.?(?=\s*(?:,|$)))?"
 _STREET = re.compile(rf"\d+[A-Za-z]?(?:\s+[\w.'-]+){{0,5}}?\s+(?:{_SUFFIX})\b\.?{_SIDE}"
                      rf"|\d+[A-Za-z]?\s+(?:us|va|rt|rte|route|hwy|highway)\.?[ -]?\d+\b{_SIDE}", re.I)
 # A suite, unit or floor between the street and the town: skipped, never sent.
-_UNIT = re.compile(r"\s*,?\s*(?:suite|ste|unit|apt|bldg|building|floor|fl|room|rm|#)\.?\s*#?\s*[\w-]{1,8}\b", re.I)
+# The unit word ends at a word boundary and a unit number or letter follows it ("Suite 4",
+# "Unit B", "#12"), so a town that starts with one ("Sterling", "Florence") stays a town.
+_UNIT = re.compile(r"\s*,?\s*(?:(?:suite|ste|unit|apt|bldg|building|floor|fl|room|rm)\b\.?|#)\s*#?\s*"
+                   r"(?=[\w-]{1,8}\b)(?:[A-Za-z-]*\d[\w-]*|[A-Za-z])\b", re.I)
 # ", Town, ST 12345", ", ST", or a town and state with no comma between them when a zip
 # code follows ("Town ST 12345", after a comma or not).
 _TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z]{2})(?:\s+(\d{5})(?:-\d{4})?)?\b"
@@ -69,6 +73,18 @@ _TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z
 
 def is_online(place: str) -> bool:
     return bool(_ONLINE.search(place or ""))
+
+
+# A phone call: a location that is only a phone number, or words naming a call.
+_PHONE = re.compile(r"\s*(?:tel:\s*)?(?:\+?1[\s.-]*)?\(?\d{3}\)?[\s.-]*\d{3}[\s.-]*\d{4}"
+                    r"\s*(?:(?:x|ext\.?)\s*\d{1,6})?\s*", re.I)
+_CALL = re.compile(r"\b(?:phone|call|calls|facetime)\b", re.I)
+
+
+def is_call(text: str) -> bool:
+    """A phone call, not a place to drive to: a phone number for a location, or a title or
+    location that names a call."""
+    return bool(_PHONE.fullmatch(text or "") or _CALL.search(text or ""))
 
 
 _COORDS = re.compile(r"\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*")
@@ -158,7 +174,16 @@ class Drives:
         """A new read. A service that's down isn't asked again until the next."""
         self._requests = 0
         self._down = False
+        self._refused = False
         self._started = self.clock()
+
+    def capped(self) -> bool:
+        """This read's allowance of lookups ran out with the service still answering: what wasn't
+        asked waits for the next read, and isn't a failed lookup."""
+        return self._refused and not self._down
+
+    def _later(self, found):
+        return LATER if found == FAILED and self.capped() else found
 
     def on(self) -> bool:
         return bool(street_address(self.school_fn()))
@@ -185,6 +210,11 @@ class Drives:
         return (address.casefold(), "", address) if address else None
 
     def between(self, origin: str, destination: str) -> float | str:
+        """The drive from one place to another, or NO_ADDRESS, or FAILED, or LATER (the lookups
+        for this read are spent: asked at the next)."""
+        return self._later(self._between(origin, destination))
+
+    def _between(self, origin: str, destination: str) -> float | str:
         """The drive from one place to another, or NO_ADDRESS, or FAILED. Either can be HOME,
         map coordinates, or an event's place. Home that can't be used is FAILED: that's the
         setting's trouble, not the event's."""
@@ -216,6 +246,10 @@ class Drives:
         return self._read(found)
 
     def find_place(self, text: str) -> str:
+        """As _find_place, or LATER when this read's lookups are spent before it was asked."""
+        return self._later(self._find_place(text))
+
+    def _find_place(self, text: str) -> str:
         """A place named on Family, by its name on the map near home: "Name, street address",
         or "lat, lon" when the map has no street for it, or NO_ADDRESS, or FAILED (ask again at
         the next read). Only the text goes out, cleaned and cut short."""
@@ -342,8 +376,10 @@ class Drives:
         return str(minutes) if minutes >= 0 else FAILED
 
     def _get(self, url: str, *, no_route_ok: bool = False):
-        if self._down or self._requests >= MAX_REQUESTS_PER_READ \
-                or self.clock() - self._started > MAX_SECONDS_PER_READ:
+        if self._down:
+            return None
+        if self._requests >= MAX_REQUESTS_PER_READ or self.clock() - self._started > MAX_SECONDS_PER_READ:
+            self._refused = True           # not asked: not a failure (capped())
             return None
         if self._requests:
             self.sleep(1)

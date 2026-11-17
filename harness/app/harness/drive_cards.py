@@ -152,18 +152,21 @@ class DriveCards:
         """At this read, its drive couldn't be found, for this reason."""
         self._upsert(key, kind, said, start)
         row = self._row(key)
-        if row["ask"] in ("asked", "skipped", PLACE):
-            return                         # asked once, ever: or the place book is asking
+        if row["ask"] in ("asked", "skipped"):
+            return                         # asked once, ever
         if reason == PLACE:
-            self._set(key, ask=PLACE, reason=NO_ADDRESS)
-            return
-        self._set(key, ask="failing", reason=reason, fails=row["fails"] + 1 if reason == FAILED else 0)
+            self._set(key, ask=PLACE, reason=NO_ADDRESS, fails=0)
+            return                         # the place book is asking: that's the card
+        # Once the place book has its answer (or he skipped its question), the place book isn't
+        # asking any more: a lookup that fails from here gets its own card.
+        fails = row["fails"] + 1 if reason == FAILED and row["ask"] == "failing" else int(reason == FAILED)
+        self._set(key, ask="failing", reason=reason, fails=fails)
 
     def fine(self, key: str) -> None:
         """Its drives were all found at this read: a failing lookup starts its count again."""
         row = self._row(key)
-        if row is not None and (row["fails"] or row["ask"] == "failing"):
-            self._set(key, fails=0, ask="" if row["ask"] == "failing" else row["ask"])
+        if row is not None and (row["fails"] or row["ask"] in ("failing", PLACE)):
+            self._set(key, fails=0, ask="" if row["ask"] in ("failing", PLACE) else row["ask"])
 
     def ask(self, chat_id: int | None, now: datetime) -> int:
         """One card per event with no drive, each asked once. Not before breakfast unless the event

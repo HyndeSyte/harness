@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness import caldav, choices, drive, family_rules, handover, ical, inputs, meaning, meaning_live
+from harness import caldav, choices, drive, family_rules, handover, ical, inputs, meaning, meaning_live, places
 from harness.calendar_change import CalendarChange
 from harness.family_copy import FamilyCopy
 from harness.family_gmail import DROP_TITLE, FamilyGmail, Want, _leg_title, home_from_options, leg_key
@@ -1935,3 +1935,148 @@ def test_a_gmail_read_that_fails_keeps_his_drives(drives):
     go(drives)
     go(drives)
     assert len(blocks(drives)) == 2
+
+
+# -- 9. drive blocks for his own appointments, second round (0.24.0) ---------------------------------------
+
+class AnyMaps(Maps):
+    """The map services, for any street address: a point of its own, and 20 minutes from home."""
+
+    def request(self, method, url, *, headers=None, timeout=30):
+        parts = urlsplit(url)
+        if parts.hostname == drive.GEOCODE_HOST and not self.fail:
+            q = parse_qs(parts.query)["q"][0]
+            if q not in POINTS:
+                self.urls.append(url)
+                n = int(hashlib.sha256(q.encode()).hexdigest()[:4], 16) / 1e6
+                return HttpResponse(200, {}, f'[{{"lat": "{38 + n}", "lon": "{-78 - n}"}}]'.encode())
+        if parts.hostname == drive.ROUTE_HOST and not self.fail:
+            self.urls.append(url)
+            return HttpResponse(200, {}, b'{"routes": [{"duration": 1200}]}')
+        return super().request(method, url, headers=headers, timeout=timeout)
+
+
+@pytest.mark.parametrize("title,location", [
+    ("Dr Patel", "540-555-1212"),                                   # a phone number for a place
+    ("Dr Patel", "(540) 555-1212"),
+    ("Phone call with Dr Patel", "Dr Patel's office"),              # a title naming a call
+    ("Dr Patel", "Phone: Dr Patel's office"),                       # a location naming one
+    ("Call with Sam", CLINIC),
+])
+def test_a_phone_call_gets_no_drive_and_no_card(drives, title, location):
+    quiet_family(drives)
+    mine(drives, title, when(drives, days=1, hour=10), location)
+    for _ in range(4):
+        go(drives)
+    drives.tick()
+    assert blocks(drives) == []
+    assert drive_cards_sent(drives) == []
+    assert [s for s in drives.bot.sent if s[1].startswith("Where is")] == []
+    assert "drive" not in (drives.gm.digest_line() or "")
+
+
+def test_a_chained_pair_whose_first_cant_be_placed_drives_the_second_from_home(drives):
+    quiet_family(drives)
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    mine(drives, "Dentist", a, "40 Nowhere Rd, Town, VA")           # a street the map doesn't know
+    mine(drives, "Haircut", b, PARK)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", b - 30 * M, b, ""),                  # from home: 25 minutes, rounded up
+        ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
+    local = a.astimezone(NY)
+    note = drives.gm.digest_line()
+    assert f"couldn't find a drive to the event at {local:%b} {local.day}, 10:00" in note
+    assert "11:30" not in note
+
+
+def test_a_chained_pair_whose_first_lookup_fails_names_the_second_too(drives):
+    quiet_family(drives)
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    mine(drives, "Dentist", a, CLINIC)
+    mine(drives, "Haircut", b, PARK)
+    go(drives)                                                      # Family judged
+    real = drives.gm.drives.between
+
+    def between(origin, destination):                               # only the clinic's way home fails
+        if origin == CLINIC and destination == drive.HOME:
+            return drive.FAILED
+        return real(origin, destination)
+    drives.gm.drives.between = between
+    for _ in range(3):
+        go(drives)
+    drives.tick()
+    note = drives.gm.digest_line()
+    assert "10:00" in note and "11:30" in note                      # both named, never one silently
+    assert len(drive_cards_sent(drives)) == 2
+
+
+def test_new_addresses_past_the_lookup_allowance_wait_and_raise_no_card(drives):
+    drives.maps = AnyMaps()
+    drives.gm.drives.transport = drives.maps
+    quiet_family(drives)
+    starts = [when(drives, days=2 + n, hour=10) for n in range(11)]
+    for n, start in enumerate(starts):
+        mine(drives, f"Visit {n}", start, f"{n + 10} Oak St, Town, VA")
+    for _ in range(8):
+        go(drives)
+        assert drive_cards_sent(drives) == []
+        assert "couldn't look up" not in (drives.gm.digest_line() or "")
+    drives.tick()
+    assert drive_cards_sent(drives) == []
+    assert [b[1] for b in blocks(drives) if b[0] == "Busy (drive there)"] == [s - 30 * M for s in starts]
+    assert drives.ledger.db.execute("SELECT COUNT(*) FROM drive_cards WHERE fails>0").fetchone()[0] == 0
+
+
+def test_a_partial_gmail_read_keeps_the_whole_chain(drives):
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    goes(drives, "Eye doctor", a, CLINIC)
+    mine(drives, "Haircut", b, PARK)
+    go(drives)
+    go(drives)
+    before = blocks(drives)
+    assert [x[0] for x in before] == ["Busy (drive there)", "Busy (family)", "Busy (drive there)",
+                                      "Busy (drive back)"]
+    drives.feeds.window.unreadable = 1                              # not all of Gmail could be read
+    for _ in range(3):
+        go(drives)
+        assert blocks(drives) == before                             # no drive home beside the drive on
+    drives.feeds.window.unreadable = 0
+    go(drives)
+    go(drives)
+    assert blocks(drives) == before
+
+
+def test_after_the_place_book_answers_a_failing_lookup_gets_its_card(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, "Dr Patel's office")             # a name the map doesn't know
+    for _ in range(4):
+        go(drives)
+    drives.tick()
+    assert len([s for s in drives.bot.sent if s[1].startswith("Where is")]) == 1
+    drives.live.places.import_rows([{"key": places.place_key("Dr Patel's office"), "address": PARK,
+                                     "skip": False, "said_on": "2026-11-01"}])
+    drives.maps.fail = "timeout"
+    for _ in range(3):
+        go(drives)
+    drives.tick()
+    [card] = drive_cards_sent(drives)
+    assert "the drive lookup failed" in card[1]
+
+
+def test_a_place_he_skipped_isnt_named_in_the_digest(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, "Dr Patel's office")
+    for _ in range(4):
+        go(drives)
+    drives.tick()
+    [ask] = [s for s in drives.bot.sent if s[1].startswith("Where is")]
+    assert "couldn't find a drive" in drives.gm.digest_line()
+    drives.press(ask, "Skip")
+    go(drives)
+    go(drives)
+    assert "couldn't find a drive" not in (drives.gm.digest_line() or "")
+    assert drive_cards_sent(drives) == []

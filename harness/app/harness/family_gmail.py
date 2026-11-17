@@ -567,19 +567,31 @@ class FamilyGmail:
         drives come from there. With no full read of Gmail, the drives already there stay and
         nothing is added: not knowing isn't knowing it's gone."""
         self._own_unplaced: dict[str, tuple[datetime, str, str]] = {}
+        self._kept_days: set = set()       # days whose drives stay as they are (a partial read)
         drives = self.drives
         if self.live is None or drives is None or not hasattr(drives, "between") or not drives.home_on():
             return {}
         off = self.live.drive_cards.off()
         ahead = self._gmail_ahead()
         if ahead is None or not ahead.occurrences or ahead.unreadable:
+            # His appointments' drives stay, and so does the rest of each day's chain they're in:
+            # the Family drives that day were worked out with them, and worked out again without
+            # them they'd overlap (a drive home beside the kept drive straight on).
+            zone = ZoneInfo(self.tz)
             for key in self.live.drive_cards.own_keys() - off:
                 for which in ("there", "back"):
                     row = self.ledger.db.execute("SELECT * FROM family_gmail WHERE key=? AND state='live'",
                                                  (leg_key(key, which),)).fetchone()
                     if row is not None:
-                        self._kept_own[row["key"]] = Want(row["key"], row["title"], self._when(row["start"]),
-                                                          self._when(row["end"]), "", "confirmed")
+                        for t in (row["start"], row["end"]):
+                            self._kept_days.add(self._when(t).astimezone(zone).date())
+            titles = {DRIVE_THERE, DRIVE_BACK, *MAYBE_DRIVE.values()}
+            for row in self.ledger.db.execute("SELECT * FROM family_gmail WHERE state='live'").fetchall():
+                start, end = self._when(row["start"]), self._when(row["end"])
+                if row["title"] in titles and {start.astimezone(zone).date(),
+                                               end.astimezone(zone).date()} & self._kept_days:
+                    state = "provisional" if row["title"] in MAYBE_DRIVE.values() else "confirmed"
+                    self._kept_own[row["key"]] = Want(row["key"], row["title"], start, end, "", state)
             return {}
         me = (self._address() or "").casefold()
         find = getattr(drives, "find_place", None)
@@ -593,7 +605,8 @@ class FamilyGmail:
             if o.end <= now or o.start >= until or o.end <= o.start:
                 continue
             location = (o.location or "").strip()
-            if not location or drive.is_online(location) or drive.is_online(o.summary):
+            if not location or drive.is_online(location) or drive.is_online(o.summary) \
+                    or drive.is_call(location) or drive.is_call(o.summary):
                 continue                       # nowhere to drive to: a call, telehealth, or no place
             if any(f.start < o.end and f.end > o.start and (f.place or not f.legs) for f in family.values()
                    if f.kind == "me"):
@@ -608,7 +621,7 @@ class FamilyGmail:
             if not where:
                 if ask:
                     self.live.places.unresolved(location, o.summary, o.start)
-                if self.live.places.findable(location):
+                if not self.live.places.later and self.live.places.findable(location):
                     self._own_unplaced[key] = (o.start, self._own_said[key],
                                                drive_cards.PLACE if ask else drive_cards.FAILED)
                 continue
@@ -634,18 +647,23 @@ class FamilyGmail:
         zone = ZoneInfo(self.tz)
         days: dict = {}
         # Soonest first, so a limit on lookups leaves the far-off days for the next read.
-        placed = sorted((w for w in wants.values() if w.place and w.legs and w.end > now and w.key not in off),
-                        key=lambda w: w.start)
+        kept_days = getattr(self, "_kept_days", set())
+        placed = sorted((w for w in wants.values() if w.place and w.legs and w.end > now and w.key not in off
+                         and w.start.astimezone(zone).date() not in kept_days), key=lambda w: w.start)
         for want in placed:
             days.setdefault(want.start.astimezone(zone).date(), []).append(want)
         out: dict[str, Want] = {}
         failed: set[datetime] = set()
         not_found: set[datetime] = set()
         trouble: dict[str, tuple[datetime, str]] = {}
+        waiting: set[str] = set()          # lookups this read had no allowance left for
+        last: list = [None]                # the last lookup's answer, as drives.between gave it
 
         def minutes(origin: str, destination: str, event: Want) -> int | None:
-            found = drives.between(origin, destination)
-            if found == drive.FAILED:
+            found = last[0] = drives.between(origin, destination)
+            if found == drive.LATER:
+                waiting.add(event.key)     # asked at the next read: not a failure, no card
+            elif found == drive.FAILED:
                 failed.add(event.start)
                 trouble[event.key] = (event.start, drive_cards.FAILED)
             elif found == drive.NO_ADDRESS:
@@ -667,8 +685,20 @@ class FamilyGmail:
                 there_from: str | None = drive.HOME
                 if prev is not None:
                     back = minutes(prev.place, drive.HOME, prev)
+                    back_found = last[0]
                     out_again = minutes(drive.HOME, event.place, event)
-                    if back is None or out_again is None:
+                    if back is None and back_found == drive.NO_ADDRESS and out_again is not None:
+                        there_from = drive.HOME    # the last one can't be placed: from home
+                    elif back is None and out_again is not None:
+                        # Which way he goes can't be told yet: this one has no drive there at
+                        # this read, and says why, never silently.
+                        there_from = None
+                        if back_found == drive.LATER:
+                            waiting.add(event.key)
+                        else:
+                            failed.add(event.start)
+                            trouble.setdefault(event.key, (event.start, drive_cards.FAILED))
+                    elif back is None or out_again is None:
                         there_from = None          # can't tell which way he goes: no drive between
                     elif event.start - prev.end < timedelta(minutes=back + out_again):
                         there_from = prev.place    # no time to go home: straight on
@@ -695,17 +725,18 @@ class FamilyGmail:
             trouble[key] = (start, why)
         self.leg_note = self._leg_note(failed, not_found, now)
         if cards is not None:
-            self._drive_cards(cards, placed, trouble, unplaced, now)
+            self._drive_cards(cards, placed, trouble, unplaced, now, waiting)
         return out
 
-    def _drive_cards(self, cards, placed: list[Want], trouble: dict, unplaced: dict, now: datetime) -> None:
+    def _drive_cards(self, cards, placed: list[Want], trouble: dict, unplaced: dict, now: datetime,
+                     waiting: set = frozenset()) -> None:
         """Each event's drives as found at this read, for its cards (drive_cards.py)."""
         why = getattr(self.live, "_why", {})
         for event in placed:
             kind = "own" if event.kind == "own" else "family"
             said = self._own_said.get(event.key) or why.get(event.key, {}).get("said", "")
             cards.seen(event.key, kind, said, event.start)
-            if event.key not in trouble:
+            if event.key not in trouble and event.key not in waiting:
                 cards.fine(event.key)
         for key, (start, reason) in trouble.items():
             if not now < start < now + NOTE_AHEAD:

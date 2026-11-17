@@ -353,7 +353,8 @@ class MeaningLive:
                         where, ask = self.places.resolve(occ.location, find)
                         if ask:
                             self.places.unresolved(occ.location, occ.summary, b.start)
-                        if not where and legs and self.places.findable(occ.location):
+                        if not where and legs and not self.places.later \
+                                and self.places.findable(occ.location):
                             # No drive for it, never silently (drive_cards.py).
                             self.unplaced[key] = (b.start, meaning.shown(occ.summary),
                                                   drive_cards.PLACE if ask else drive_cards.FAILED)

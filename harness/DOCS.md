@@ -413,8 +413,8 @@ how many blocks are on Gmail.
   appointments on your Gmail calendar get the same drive blocks (and no block of their own, since
   they're already there): events you own, at a place with a street address, your place book or the
   map can find. Skipped: blocks Harness made, "Busy" holds, events shown as free, all-day events,
-  invitations someone else organized, calls and telehealth or anything online, and events with no
-  location. One at the same time as a Family event you go to is that event. Two events on the same
+  invitations someone else organized, calls (a phone number for the place, or a title or
+  place naming a phone call) and telehealth or anything online, and events with no location. One at the same time as a Family event you go to is that event. Two events on the same
   day too close to go home between them, Family or your own, get one drive straight from the first
   to the second, and only the last one of the stretch drives home. Your own appointments' drives
   follow them when they move or are cancelled, and each event's new or moved drives get a card with

@@ -7,6 +7,9 @@
 - **Skipped on purpose:** blocks Harness made, "Busy" holds, events shown as free, all-day events, invitations someone else organized, calls, telehealth and anything online, and events with no location.
 - **A location with the place's name on one line and the street address on the next is read as that address,** so its block gets the address and its drives. A suite number or a town written without commas no longer cuts the address short.
 - **A drive that can't be found is never left off quietly.** The digest still names the day and time, even beside another problem, and you get one card saying the day, the time and why (no usable address, or the lookup failed), with Skip. If you're already being asked where that place is, that question is the card: never two for one event.
+- **Calls are left alone:** an appointment whose location is a phone number, or whose title or location names a phone call, gets no drive blocks and no card.
+- **A town that starts like "Suite" or "Floor" (Sterling, Florence) keeps its town,** so those addresses are looked up and kept as they are.
+- **Fewer false alarms and gaps:** many new addresses at once are looked up over the next reads without a "lookup failed" card; an appointment right after one that can't be placed still gets its drive from home; a read of Gmail that's cut short keeps that day's drives as they were; a place you skipped stops being named in the digest; and once the place book has your answer, a drive that then can't be looked up gets its card.
 - **Nothing new is written to the Family calendar.**
 
 ## 0.23.0
