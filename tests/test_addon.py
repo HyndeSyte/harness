@@ -912,7 +912,9 @@ def test_each_failed_switch_reaches_dane_once_as_he_really_runs(tmp_path):
                           'a=$(sed -n "$((k + 1))p" "$STUB_DATA/answers"); a=${a:-1}\n'
                           'case "$a" in 4|1f) echo "2026-11-15T23:00:0${n}Z the smoke test failed" >> "$f";; esac\n'
                           'exit "${a%f}"'),
-        "notice.sh": 'echo "notice $*" >> "$STUB_DATA/calls"',
+        # Its alarms to Dane's phone shown to work (Cain's fourth service review, must-fix 6): the start
+        # asks before a switch, and that question isn't an alarm.
+        "notice.sh": 'case "$1" in proven|hooked) exit 0 ;; esac; echo "notice $*" >> "$STUB_DATA/calls"',
     }, 'echo "mode=$mode kind=$stop_kind"')
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -949,7 +951,7 @@ def test_each_failed_switch_reaches_dane_once_as_he_really_runs(tmp_path):
     assert read(calls) == ["notice tell switch-failed the smoke test failed"] and "the old way" in read(queue)[0]
     # The alarm couldn't be kept (the lock busy): not counted as told, so the next start tells it.
     fresh("1f")
-    (opt / "notice.sh").write_text('#!/bin/bash\necho "notice $*" >> "$STUB_DATA/calls"\n'
+    (opt / "notice.sh").write_text('#!/bin/bash\ncase "$1" in proven|hooked) exit 0 ;; esac\necho "notice $*" >> "$STUB_DATA/calls"\n'
                                    '[ -f "$STUB_DATA/lock-busy" ] && exit 75; exit 0\n')
     (data / "lock-busy").write_text("1")
     assert _run_start(tmp_path, **env) == "mode=old kind=" and not (data / "c1/failed-told").exists() and read(queue) == []
@@ -1598,7 +1600,7 @@ def _said(tmp_path, sent_line):
     """What Cain gets from a typed line: the line itself, or, for one naming a file of his (a text too
     long or unusual to type as it is), that file's text."""
     text = _typed(sent_line)
-    m = re.search(r"too long or unusual to type here.*/from-app/(\S+?\.txt)\b", text)
+    m = re.search(r"too long(?: or unusual)? to type here.*?/from-app/(\S+?\.txt)\b", text)
     return (tmp_path / "from-app" / m.group(1)).read_text(encoding="utf-8").rstrip("\n") if m else text
 
 
