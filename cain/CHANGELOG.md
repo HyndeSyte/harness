@@ -143,6 +143,14 @@
 - The Ship gate's check of the change's newest commit can use a GitHub token when one is handed to it, waits briefly when GitHub asks it to, and says plainly when GitHub's rate limit, not a new commit, is what stopped it. A watch checks first that the tool it reads GitHub with is installed.
 - The PC's Chrome listing check only ever accepts a stand-in listing in its own tests; anywhere else it refuses the step.
 - A held run is no longer cleared without a version to compare against unless the PC could write down that it did; if it can't, the hold stays and the run says the worker folder can't be written.
+- Acceptances kept by earlier test builds of this version now really never count: each kept acceptance carries a format mark, and one without it is ignored, so run the Ship gate watch once more after this update.
+- A Ship gate watch gives up cleanly if GitHub is slow or asks it to wait while it holds its lock, so it never holds the lock long enough to be mistaken for a stopped watch, and it says so.
+- Rewriting the Ship gate's round counter now takes the gate's lock itself, so it can't cross a watch starting at the same moment.
+- One damaged Ship gate record no longer blocks every pull request, only its own, and the refusal names it with a command that sets it aside (`keeper.sh ship-gate --quarantine <sha>`).
+- Every GitHub read the Ship gate makes is handled the same way, and a replacement GitHub's rate limit stopped is kept as owed and says so.
+- The PC worker won't start if the tests' own setting is found on the PC, and only the tests can turn on their stand-in listing.
+- When the PC can't write down a cleared hold, you get one message saying so with the fix, and the run names the right file.
+- If Cain's App stops answering the keeper's messages for a while, Cain's own status says how many are waiting and for how long.
 
 ## 0.11.0
 

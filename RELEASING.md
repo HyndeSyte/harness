@@ -98,7 +98,9 @@ taken over can't leave a live acceptance by writing late; the sha-bound check ru
 after the write, a superseded sha is refused, never accepted again, and an acceptance must be
 the pull request's head as GitHub has it, at the watch's checks and again when the card reads it;
 twenty-sixth round: the generation never resets, a missing or unreadable generation file is
-fail-closed, and the card refuses an unreadable gate state by name).
+fail-closed, and the card refuses an unreadable gate state by name; twenty-seventh round: the
+watch's whole critical section has one deadline, records carry a format version, the recovery
+takes the lock, and one garbled record blocks only its own pull request).
 Run it once on a head
 with a failed-then-green Windows re-run before relying on the gate: it must say `refuse`.
 
@@ -131,8 +133,29 @@ acceptance uses a GitHub token only when the environment hands one in (`SHIP_GAT
 the link has none of its own), retries a rate-limited read briefly, and names a rate limit apart
 from a head that moved.
 
+Records, the deadline and the recovery (0.12.0, twenty-seventh round). Every record a watch keeps
+now carries a record format (`"format": 27`), and a record without it never counts, whatever
+generation it carries: acceptances kept before this round are void, so run the watch once after
+installing. The watch's work under the lock has one deadline (10 seconds from taking the lock):
+both reads of the pull request's head take their time and any rate-limit wait from what is left
+of it, and the lock, its generation and the time are checked again just before the acceptance is
+written; past the deadline nothing is accepted (`lock_unavailable`, saying the watch ran past its
+bound), and an acceptance already written is taken back. The longest a live watch holds the lock
+is 11 seconds, under a quarter of the minute after which a lock counts as stale. The generation
+recovery (`--recover-generation <number>`, optionally `--floor <number>`) now takes the gate lock
+itself, the same way a watch does, writes above every generation it finds (a stale lock it took
+over included), checks nothing ended above what it wrote, and lets go; it refuses while a watch
+runs. A record that can't be read or doesn't parse blocks only its own pull request (or every
+one, when its text names none), and the refusal names it with the command that sets it aside:
+`/opt/cain/keeper.sh ship-gate --quarantine <sha>`, recorded in
+`/data/work/ship-gate-quarantine.jsonl`. The only full reset of a pull request's gate is deleting
+all of its gate files at once (its lock, its `.gen` file and every `ship-gate-<sha>.json` naming
+it), and only while no watch of it runs. Every GitHub read the gate makes goes through one
+wrapper; a supersede stopped by GitHub's rate limit is kept as owed on its record and says so.
+
 Owner's ship checklist, for the gate: rerun the watch after any takeover (the watch's output
-says when one happened), and after a generation recovery.
+says when one happened), after a generation recovery, after a quarantine, and once after
+installing this round.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.
