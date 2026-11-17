@@ -30,6 +30,7 @@ import errno
 import json
 import logging
 import os
+import re
 from datetime import datetime
 
 from . import approvals, choices, effects, provenance, render
@@ -2011,7 +2012,6 @@ def _requeue_route(journal: str, key: str, lines: list[dict], entry: list[dict])
     a delivery, or a line that can't be read); "not_started" only when the journal reads whole and its lines are
     that tap's press and nothing else; "gone" when nothing of it is left; "refuse:<why>" for anything ambiguous (the
     journal can't be read, or lines with no journaled entry)."""
-    tap_id, _, custom = key.partition("|")
     torn = False
     try:
         with open(journal, encoding="utf-8", errors="replace") as f:
@@ -2021,7 +2021,7 @@ def _requeue_route(journal: str, key: str, lines: list[dict], entry: list[dict])
                 try:
                     json.loads(raw)
                 except ValueError:
-                    torn = torn or (bool(tap_id) and tap_id in raw) or (bool(custom) and custom in raw)
+                    torn = torn or _torn_names(raw, key)
     except FileNotFoundError:
         pass
     except OSError as e:
@@ -2032,6 +2032,30 @@ def _requeue_route(journal: str, key: str, lines: list[dict], entry: list[dict])
         return "refuse:its journal lines have no tap entry to go back to"
     started = torn or any(not isinstance(r.get("press"), dict) for r in lines) or entry[0].get("state") != "not_started"
     return "unknown" if started else "not_started"
+
+
+def _field(name: str, value: str) -> "re.Pattern":
+    """Twenty-seventh round: a JSON field whose whole value is exactly `value` (a delimited match, never a part of
+    a longer value). `name` empty: any field."""
+    v = re.escape(json.dumps(value)[1:-1])
+    return re.compile((r'"' + re.escape(name) + r'"' if name else r'"[^"\\]*"') + r'\s*:\s*"' + v + r'"')
+
+
+def _torn_names(raw: str, key: str) -> bool:
+    """Twenty-seventh round: whether a torn journal line names that very tap, by delimited fields only: its whole
+    key as a field's value (an intent, a read, a delivery), or a press whose id is exactly the tap's (its custom id,
+    where the line still holds it whole, exactly the tap's too), or, with the id torn off, its custom id exactly. A
+    custom id that only contains the tap's, or another tap's line, never matches."""
+    tap_id, _, custom = key.partition("|")
+    if _field("", key).search(raw):
+        return True
+    has_id = bool(tap_id) and _field("id", tap_id).search(raw) is not None
+    other_id = re.search(r'"id"\s*:\s*"', raw) is not None and not has_id
+    whole_custom = re.search(r'"custom_id"\s*:\s*"(?:[^"\\]|\\.)*"', raw)
+    same_custom = bool(custom) and _field("custom_id", custom).search(raw) is not None
+    if has_id:
+        return same_custom or whole_custom is None
+    return same_custom and not other_id
 
 
 def _journal_intent(journal: str, press: dict) -> bool:
@@ -2121,34 +2145,39 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                         and not _journal_intent(journal or base + handover.TAP_JOURNAL, entry[0]["press"]):
                     return {"ok": False, "said": "its intent couldn't be written to the tap journal, so it stays set "
                                                  "aside"}
-            db.execute("BEGIN IMMEDIATE")
+            # Twenty-seventh round: a transaction the records refuse leaves the tap set aside and says so (an intent
+            # appended for it above stays in the journal, and the controller skips every set-aside tap's lines).
             try:
-                if action == "discard":
-                    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
-                               (TAP_DISCARDED + key, json.dumps({"at": _time.time(), "record": record})))
-                    # Twenty-sixth round: every state that could still act on it goes in the same transaction: its
-                    # strike pending, its next read, and its relist mark (with its generation and pending strike).
-                    db.execute("DELETE FROM meta WHERE key IN (?, ?, ?)",
-                               ("tap_strike:" + key, "tap_reread:" + key, "tap_relist:" + key))
-                    said = "discarded: it's never taken again, and its copy is kept beside the records"
-                elif entry and (state in _TAP_OUTCOMES or carded):
-                    full = next(dict(r["press"]) for r in entry if r.get("press"))
-                    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("tap_strike:" + key, json.dumps(
-                        {"press": full, "fails": 0, "due": 0.0, "state": state if state in _TAP_OUTCOMES else ""})))
-                    said = "requeued to be struck: it has an outcome, so it's only crossed off"
-                elif route == "unknown":
-                    # Twenty-sixth round: an intent (or any start) in the journal: outcome unknown. Harness reads
-                    # the calendar for it first and gives a card (Go ahead at most), never acting by itself.
-                    said = "requeued as unknown: Harness reads your calendar for it first and never takes it by itself"
-                elif route == "not_started":
-                    said = "requeued: the tap journal shows it was never acted on"
-                else:
-                    said = "requeued: nothing of it is left in the tap journal"
-                db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + key,))
-                db.execute("COMMIT")
-            except BaseException:
-                db.execute("ROLLBACK")
-                raise
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    if action == "discard":
+                        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                                   (TAP_DISCARDED + key, json.dumps({"at": _time.time(), "record": record})))
+                        # Twenty-sixth round: every state that could still act on it goes in the same transaction: its
+                        # strike pending, its next read, and its relist mark (with its generation and pending strike).
+                        db.execute("DELETE FROM meta WHERE key IN (?, ?, ?)",
+                                   ("tap_strike:" + key, "tap_reread:" + key, "tap_relist:" + key))
+                        said = "discarded: it's never taken again, and its copy is kept beside the records"
+                    elif entry and (state in _TAP_OUTCOMES or carded):
+                        full = next(dict(r["press"]) for r in entry if r.get("press"))
+                        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("tap_strike:" + key, json.dumps(
+                            {"press": full, "fails": 0, "due": 0.0, "state": state if state in _TAP_OUTCOMES else ""})))
+                        said = "requeued to be struck: it has an outcome, so it's only crossed off"
+                    elif route == "unknown":
+                        # Twenty-sixth round: an intent (or any start) in the journal: outcome unknown. Harness reads
+                        # the calendar for it first and gives a card (Go ahead at most), never acting by itself.
+                        said = "requeued as unknown: Harness reads your calendar for it first and never takes it by itself"
+                    elif route == "not_started":
+                        said = "requeued: the tap journal shows it was never acted on"
+                    else:
+                        said = "requeued: nothing of it is left in the tap journal"
+                    db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + key,))
+                    db.execute("COMMIT")
+                except BaseException:
+                    db.execute("ROLLBACK")
+                    raise
+            except _sqlite3.Error as e:
+                return {"ok": False, "said": f"the records refused it ({type(e).__name__}), so it stays set aside"}
         finally:
             db.close()
         log.warning("set-aside: a set-aside tap was handled (%s); its copy is kept in %s", action, SET_ASIDE_TAPS)

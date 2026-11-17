@@ -88,7 +88,7 @@ def test_a_relist_refused_past_the_sixth_time_still_reads_the_calendar_once(m, m
 def test_the_kept_verdicts_are_bounded_by_count(m):
     cache = m.c.__dict__.setdefault("_relist_verdicts", {})
     for i in range(Controller.RELIST_VERDICTS_KEPT + 10):
-        m.c._keep_verdict(f"{i}|x", ("untaken_unread", [], {}))
+        m.c._keep_verdict(f"{i}|x", ("untaken", [], {}))
     assert len(cache) == Controller.RELIST_VERDICTS_KEPT and "0|x" not in cache
 
 
@@ -148,10 +148,10 @@ def test_the_strike_resume_skips_a_discarded_tap_even_with_its_mark_still_there(
 def marks_unreadable(mp):
     real = Controller._flags
 
-    def flags_(self, prefix):
+    def flags_(self, prefix, *more):
         if prefix == Controller.RELIST_FLAG:
             raise sqlite3.DatabaseError("database disk image is malformed")
-        return real(self, prefix)
+        return real(self, prefix, *more)
     mp.setattr(Controller, "_flags", flags_)
 
 
@@ -177,7 +177,8 @@ def test_with_the_marks_and_the_file_beside_unreadable_the_tap_ends_at_once(m, m
     for _ in range(Controller.RELIST_GEN_CAP + 3):
         relisted(m, press)
     assert reconfirms(m) == 1                                                  # never counted from one again
-    assert len(queued(m, Controller.RELIST_ENDED_WORDS)) == 1
+    # twenty-seventh round: its end says it couldn't be retried safely, not that it was brought back before
+    assert len(queued(m, Controller.UNKNOWN_COUNT_WORDS)) == 1
 
 
 # -- 8. the per-tap fallback queues one batch summary -------------------------------------------------------------------

@@ -40,8 +40,9 @@ UNTAKEN = "the error came before it was taken"
 
 
 def per_tap(monkeypatch):
-    """Every unknown tap's records say untaken and its calendar can't be read: each is relisted with Go ahead. The
-    calendar reads and hold reads are counted per tap."""
+    """Every unknown tap's records say untaken and its calendar reads it as not done: each is relisted with Go
+    ahead. The calendar reads and hold reads are counted per tap. (Twenty-seventh round: a read that answers, since
+    only those verdicts are kept for a relist the records refuse; a failed read is read again.)"""
     reads, holds = {}, {}
 
     def hold(self, p):
@@ -51,7 +52,7 @@ def per_tap(monkeypatch):
     def read(self, op):
         tap = str(op.get("proposal", "")).removeprefix("p-")
         reads[tap] = reads.get(tap, 0) + 1
-        return ("unread", [])
+        return ("not_done", [])
     monkeypatch.setattr(Controller, "_records_hold", hold)
     monkeypatch.setattr(Controller, "_tap_read", read)
     return reads, holds

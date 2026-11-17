@@ -2,6 +2,11 @@
 
 ## 0.24.0
 
+- **A tap whose calendar couldn't be read during an outage is read again once your calendar answers**, and its card says what Harness found then.
+- **A tap Harness can't safely try again says just that**: it was stopped and nothing more is done for it, never that it was brought back several times when it wasn't.
+- Your event names show in Harness's cards as you wrote them, even ones like "Token: pickup".
+- A tap put aside stays untouched until it's sorted, every tap put off is come back to without a restart, and a tap Harness has listed six times stays at six even if its count is damaged.
+
 - **Every tap Harness put off is come back to without a restart**, even when two wait on different times, and each is finished once.
 - **A tap whose listing Harness can't save reads your calendar once**, however many hours it takes to save it, and taps finished one by one after that share one summary card.
 - **A tap you discard with the set-aside taps tool is left alone for good.** One you put back that had been started is read on your calendar first and gets a card, never done again by itself.

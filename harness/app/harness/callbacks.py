@@ -14,7 +14,7 @@ import logging
 from typing import Callable
 
 from . import approvals, choices, commands, render, rules
-from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
+from .scrub import scrub_owner as owner_scrubbed   # twenty-seventh round: his own words, known secrets only
 from .chat import ChatError
 from .ledger import Ledger
 
@@ -110,7 +110,7 @@ class Callbacks:
             if kind == "rule_keep_old":
                 return render.escape(rules.resolve(self.ledger, target, "old"))
         except rules.RuleError as e:
-            return render.escape(f"Nothing changed: {scrubbed(e)}.")
+            return render.escape(f"Nothing changed: {owner_scrubbed(e)}.")
         if kind in ("settings_approve", "settings_decline") and self.settings_fn:
             return render.escape(self.settings_fn(
                 target, "approve" if kind == "settings_approve" else "decline"))

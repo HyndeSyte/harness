@@ -15,6 +15,10 @@ What it replaces: every secret registered with net.REDACT, the secrets a provide
 its vault holds and the link's token), auth headers and key=value secrets, JSON-quoted token, secret, password and
 refresh-token fields, a URL's user part and its query, and long high-entropy strings (40 or more characters of
 letters, digits and token punctuation, with upper case, lower case and digits all present).
+
+Twenty-seventh round: words shown to him (a "Nothing changed" refusal naming his events, a stopped part's words) go
+through scrub_owner(), which replaces only the registered and providers' secrets, so his event titles and notes are
+never redacted by a pattern.
 """
 from __future__ import annotations
 
@@ -64,8 +68,8 @@ def _high_entropy(m: re.Match) -> str:
     return s
 
 
-def scrub(text) -> str:
-    """Exception text with its secrets replaced (see the module's docstring)."""
+def _known(text) -> str:
+    """Text with the registered secrets (net.REDACT) and the providers' secrets replaced, and nothing else."""
     out = net.REDACT(str(text))
     with _lock:
         providers = list(_providers.values())
@@ -77,20 +81,40 @@ def scrub(text) -> str:
             continue
     for sec in sorted((s for s in secrets if len(s) >= 8), key=len, reverse=True):
         out = out.replace(sec, REDACTED)
+    return out
+
+
+def scrub_owner(text) -> str:
+    """Twenty-seventh round: owner-facing words (a "Nothing changed" refusal, which names his events) with only the
+    registered and providers' secrets replaced. The heuristic patterns are left out here, so an event called
+    "Token: pickup", a note that reads like key=value, or a long mixed-case word reaches him as written. Exception
+    text that isn't his own words goes through scrub() instead."""
+    return _known(text)
+
+
+def scrub(text) -> str:
+    """Exception text with its secrets replaced (see the module's docstring)."""
+    out = _known(text)
     for pattern, repl in PATTERNS:
         out = pattern.sub(repl, out)
     return _LONG.sub(_high_entropy, out)
 
 
-# The fields of a record that hold exception text: scrubbed wherever a sink writes one.
+# The fields of a record that hold exception text: scrubbed wherever a sink writes one. Twenty-seventh round:
+# "words" holds a refusal in his own words (a change's part that stopped, naming his event), so it gets only the
+# known secrets replaced (OWNER_FIELDS, scrub_owner), never the heuristic patterns.
 ERROR_FIELDS = frozenset({"error", "errors", "last_error", "exception", "detail", "why", "words", "refused"})
+OWNER_FIELDS = frozenset({"words"})
 
 
 def scrub_fields(value):
-    """A record (dicts and lists, any depth) with every string under an ERROR_FIELDS key scrubbed."""
+    """A record (dicts and lists, any depth) with every string under an ERROR_FIELDS key scrubbed (an OWNER_FIELDS
+    key's with scrub_owner)."""
     if isinstance(value, dict):
-        return {k: (scrub(v) if isinstance(v, str) and k in ERROR_FIELDS
-                    else [scrub(x) if isinstance(x, str) else scrub_fields(x) for x in v]
+        def one(k, x):
+            return scrub_owner(x) if k in OWNER_FIELDS else scrub(x)
+        return {k: (one(k, v) if isinstance(v, str) and k in ERROR_FIELDS
+                    else [one(k, x) if isinstance(x, str) else scrub_fields(x) for x in v]
                     if isinstance(v, list) and k in ERROR_FIELDS else scrub_fields(v))
                 for k, v in value.items()}
     if isinstance(value, list):

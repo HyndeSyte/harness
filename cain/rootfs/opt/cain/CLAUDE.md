@@ -214,7 +214,9 @@ specialist (the Harness add-on) does.
   to check his calendar (the one card of its own that asks him that); each such card comes once, even
   across a restart, and so does its note that a tap waits, each card that brings Go ahead back, and each
   listing of taps after a stop. After six tries on one such card a last one says nothing more is done for
-  that tap, and a tap listed six times gets one last card saying so too; a cleanup step it can't use gets one
+  that tap, and a tap listed six times gets one last card saying so too (one whose count it can't read gets a
+  card saying it couldn't be tried again safely and was stopped); a tap whose calendar read failed is read again
+  once the calendar answers, and its cards name his events as he wrote them; a cleanup step it can't use gets one
   card and is set aside (sorting set-aside taps with its command-line tool is Dane's, at the Pi). One tap it
   can't save doesn't hold up the others in that listing, and the taps finished one by one then share one
   summary card. A set-aside tap Dane discards is left alone for good; one he puts back that had been started

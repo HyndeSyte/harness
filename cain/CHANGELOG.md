@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- Cain knows a tap the calendar specialist can't safely try again gets one card saying it was stopped, a tap whose calendar read failed is read again once the calendar answers, and the specialist's cards show event names as written.
+
 - Cain knows a tap the calendar specialist put off is come back to without a restart, a discarded set-aside tap is left alone for good, and taps finished one by one after a failed listing share one summary card.
 
 - Cain knows one tap the calendar specialist can't save no longer holds up the others, every tap it sets aside gets one card, and a tap brought back six times gets a last card saying nothing more is done for it.

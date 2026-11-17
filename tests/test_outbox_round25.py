@@ -3,13 +3,12 @@ source and the card text checks.
 
 2. The aborted-transaction error is held at each tap's own boundary (after the savepoint's rollback or reopen); only
    a reopen that itself failed still ends the tick.
-6. No catch of BaseException (or a bare except) anywhere in the App swallows it: each re-raises, or is on an explicit
-   list with its reason; the reopen helper's cleanup catches ordinary errors only.
+6. The reopen helper's cleanup catches ordinary errors only. (Its allow-list scan of BaseException catches was
+   deleted in the twenty-seventh round; tests/test_outbox_round26.py has the scan with no list.)
 9. The "check your calendar" allowance is bound to the internal-error card's builder, not to its lead appearing in a
    text.
 All names and ids invented.
 """
-import ast
 import json
 import sqlite3
 from pathlib import Path
@@ -85,70 +84,8 @@ def test_a_reopen_that_itself_fails_still_ends_the_tick(m, monkeypatch):
 
 # -- 6. every catch of BaseException re-raises -------------------------------------------------------------------------
 
-# (module, the line's own text, why it may keep the error without a raise in its body)
-BASE_ALLOWED = [
-    ("ledger.py", "except BaseException as rb:", "the savepoint's rollback-to failing: kept, and raised chained to "
-                                                  "the original right after (Ledger.enqueue)"),
-    ("ledger.py", "except BaseException as rel:", "the savepoint's release failing: kept, and raised chained to the "
-                                                   "original right after (Ledger.enqueue)"),
-    ("calendar_change.py", "except BaseException as e:", "reviewed in the twenty-sixth round: a calendar write's thread hands its error to the caller "
-                                                         "that waits on it, or logs it once abandoned"),
-]
-
-
-def _raises(body) -> bool:
-    """A raise in the handler's own code (a raise inside a function or class defined there doesn't count)."""
-    todo = list(body)
-    while todo:
-        node = todo.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            continue
-        if isinstance(node, ast.Raise):
-            return True
-        todo.extend(ast.iter_child_nodes(node))
-    return False
-
-
-def _base(handler) -> bool:
-    t = handler.type
-    if t is None:
-        return True
-    names = t.elts if isinstance(t, ast.Tuple) else [t]
-    return any(isinstance(n, ast.Name) and n.id == "BaseException" for n in names)
-
-
-def base_catches_without_a_raise(name: str, source: str) -> list[str]:
-    lines = source.splitlines()
-    out = []
-    for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.ExceptHandler) and _base(node) and not _raises(node.body):
-            text = lines[node.lineno - 1].strip()
-            if not any(name == f and text.startswith(words) for f, words, _ in BASE_ALLOWED):
-                out.append(f"{name}:{node.lineno}: {text}")
-    return out
-
-
-def test_no_catch_of_base_exception_swallows_it():
-    found = []
-    for path in sorted(APP.glob("*.py")):
-        found += base_catches_without_a_raise(path.name, path.read_text(encoding="utf-8"))
-    assert not found, "\n".join(found)
-
-
-def test_the_allowed_base_catches_are_still_there_and_have_their_reason():
-    for name, words, why in BASE_ALLOWED:
-        assert why and any(line.strip().startswith(words)
-                           for line in (APP / name).read_text(encoding="utf-8").splitlines()), (name, words)
-
-
-@pytest.mark.parametrize("source", [
-    "try:\n    f()\nexcept BaseException:\n    pass\n",
-    "try:\n    f()\nexcept:\n    log()\n",
-    "try:\n    f()\nexcept (ValueError, BaseException) as e:\n    keep(e)\n",
-    "try:\n    f()\nexcept BaseException:\n    def g():\n        raise\n",
-])
-def test_the_scan_finds_a_swallowed_base_catch(source):
-    assert base_catches_without_a_raise("x.py", source)
+# The allow-list scan that stood here was deleted in the twenty-seventh round: the scan with no list
+# in tests/test_outbox_round26.py (every base catch ends with a raise or a hand-off) replaces it.
 
 
 def test_the_reopen_helpers_cleanup_lets_an_interrupt_through(m, monkeypatch):

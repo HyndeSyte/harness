@@ -622,9 +622,9 @@ class Controller:
                 if h.kind == "press" and h.intent:
                     self._unknown_tap(h, "LedgerFenced")
                 elif h.kind == "press":
-                    self._refuse_tap(h, scrub.scrub(e) or self.FENCED, restore_staged=True)
+                    self._refuse_tap(h, scrub.scrub_owner(e) or self.FENCED, restore_staged=True)
                 else:
-                    h.finish("refused", scrub.scrub(e) or self.FENCED, restore_staged=True)
+                    h.finish("refused", scrub.scrub_owner(e) or self.FENCED, restore_staged=True)
             except Exception as e:             # noqa: BLE001: told, and the rest still taken
                 log.error("a %s couldn't be taken: %s: %s", h.kind, type(e).__name__, e)
                 if h.kind == "press" and h.intent:
@@ -751,12 +751,21 @@ class Controller:
         late, relist, unsure, unverified, clock_tap = [], [], [], [], False
         # Twenty-second round: strikes the records hold as pending are finished first (no card: it's queued), and
         # a tap whose next read the records put off waits for it, at a start as in the running loop.
+        # Twenty-seventh round: the set-aside and discarded taps are read on their own first; a pass that can't
+        # tell which they are does nothing and is taken up again on the back-off, so a set-aside tap's journal
+        # lines (an intent a requeue appended before its transaction failed, say) never get a card or a strike.
+        try:
+            held = self._quarantined()
+        except Exception as e:                  # noqa: BLE001: can't tell which are set aside: this pass waits
+            log.warning("the set-aside taps couldn't be read (%s); the start replay waits", type(e).__name__)
+            self.__dict__["_replay_put_off"].append(self._clock() + self.STRIKE_BACKOFF_S[0])
+            return
         try:
             flags, rereads = self._flags(self.STRIKE_FLAG), self._flags(self.REREAD_FLAG)
-            relists, held = self._relist_marks(), self._quarantined()
+            relists = self._relist_marks()
         except Exception as e:                  # noqa: BLE001: none read: each tap goes by its journal
             log.warning("the records' tap flags couldn't be read (%s)", type(e).__name__)
-            flags, rereads, relists, held = {}, {}, {}, set()
+            flags, rereads, relists = {}, {}, {}
         if flags:
             self._resume_strikes(flags, skip=queued)
         # Twenty-fourth round: a relisted tap whose strike is pending is only struck, never read or relisted again.
@@ -780,7 +789,14 @@ class Controller:
                 self.__dict__["_replay_put_off"].append(self._due_at(mem.get(self.handovers.key(p)), now))
                 continue
             if row["state"] == "unknown" and not self._reread_due(self.handovers.key(p), rereads, now):
-                continue                        # read again by the running loop once its time comes
+                # Read again by the running loop once its time comes. Twenty-seventh round: only a row with a next
+                # read in the journal is the running loop's (it reads none without one); for any other the replay
+                # re-arms itself for its due time, so it's settled without a restart.
+                if row.get("next_check") is None:
+                    k = self.handovers.key(p)
+                    self.__dict__["_replay_put_off"].append(max(self._due_at(rereads.get(k), now),
+                                                                self._due_at(mem.get(k), now)))
+                continue
             if row["state"] in ("refused", "found"):
                 try:
                     self._post_pending_notice(row)
@@ -1068,7 +1084,7 @@ class Controller:
             # read gave, so the calendar isn't read again for it. Twenty-sixth round: for as long as it's put off
             # (until it settles or is set aside), not for a time.
             hit = self._kept_verdict(self.handovers.key(p))
-            if hit is not None:
+            if hit is not None and self._verdict_read(hit):  # twenty-seventh round: only a read that answered
                 seen_, parts_, *more_ = hit
                 final.append((row, seen_, parts_, (more_[0] if more_ else None) or {}))
                 continue
@@ -1081,7 +1097,7 @@ class Controller:
                 errs = int(row.get("error_checks") or 0)
                 # Twenty-fifth round: scrubbed of secrets (registered ones, auth headers, URL queries) before it's
                 # journaled or kept.
-                error = self._scrub(f"{type(e).__name__}: {e}")[:500]
+                error = scrub.scrub(f"{type(e).__name__}: {e}")[:500]
                 if errs >= len(self.CHECK_BACKOFF_S):
                     log.error("a tap's hold read kept hitting an error in Harness (%s); its outcome is recorded as "
                               "an internal error", type(e).__name__)
@@ -1300,7 +1316,7 @@ class Controller:
         return {"state": row.get("state") or "internal_error", "at": self._clock(), "tapped_at": row.get("at"),
                 "identity": {k: str(press.get(k, "")) for k in ("id", "custom_id", "message_id", "app")},
                 "request": row.get("op") or {}, "error_checks": int(row.get("error_checks") or 0),
-                "error": self._scrub(row.get("error") or "unknown")[:500]}
+                "error": scrub.scrub(row.get("error") or "unknown")[:500]}
 
     def _secrets(self) -> list[str]:
         """Twenty-sixth round: the secrets the shared scrub replaces for this controller (scrub.add_provider): the
@@ -1317,25 +1333,26 @@ class Controller:
             pass
         return out
 
-    def _scrub(self, text) -> str:
-        """Twenty-fifth round: an exception's message as the journal and the kept copy may hold it. Twenty-sixth
-        round: the shared scrub (scrub.scrub), which every sink applies too, with this controller's secrets."""
-        return scrub.scrub(text)
-
     def _backoff(self, fails: int) -> int:
         return self.STRIKE_BACKOFF_S[min(max(fails, 1), len(self.STRIKE_BACKOFF_S)) - 1]
 
-    def _flags(self, prefix: str) -> dict:
+    def _flags(self, prefix: str, unreadable: set | None = None) -> dict:
         """Twenty-second round: the records' per-tap flags under `prefix`, by tap key, each a dict (a value that
-        can't be read is {}: due now)."""
+        can't be read is {}: due now). Twenty-seventh round: `unreadable`, a set, takes the keys whose value
+        couldn't be read (not JSON, or not an object), so a caller that counts on a value (a relist's generation)
+        can tell one that can't be read from one that's empty."""
         out = {}
         for r in self.ledger.db.execute("SELECT key, value FROM meta WHERE substr(key, 1, ?)=?",
                                         (len(prefix), prefix)).fetchall():
             try:
                 v = json.loads(r["value"])
             except (TypeError, ValueError):
+                v = None
+            if not isinstance(v, dict):
+                if unreadable is not None:
+                    unreadable.add(r["key"][len(prefix):])
                 v = {}
-            out[r["key"][len(prefix):]] = v if isinstance(v, dict) else {}
+            out[r["key"][len(prefix):]] = v
         return out
 
     @staticmethod
@@ -1745,9 +1762,10 @@ class Controller:
         now = self._clock()
         held = self.__dict__.get("_strike_mem", {})
         try:
-            skip = set(skip) | self._discarded()    # twenty-sixth round: a discarded tap is never written for
-        except Exception as e:                  # noqa: BLE001: can't tell which are discarded: none resumed now
-            log.warning("the discarded taps couldn't be read (%s); pending strikes wait for the next tick",
+            # Twenty-sixth round: a discarded tap is never written for. Twenty-seventh round: nor a set-aside one.
+            skip = set(skip) | self._quarantined()
+        except Exception as e:                  # noqa: BLE001: can't tell which are set aside: none resumed now
+            log.warning("the set-aside taps couldn't be read (%s); pending strikes wait for the next tick",
                         type(e).__name__)
             return
         for key, flag in flags.items():
@@ -1790,9 +1808,9 @@ class Controller:
         never read on the calendar or relisted again. Twenty-sixth round: never a discarded tap's."""
         now = self._clock()
         try:
-            skip = set(skip) | self._discarded()
-        except Exception as e:                  # noqa: BLE001: can't tell which are discarded: none resumed now
-            log.warning("the discarded taps couldn't be read (%s); pending strikes wait for the next tick",
+            skip = set(skip) | self._quarantined()  # twenty-seventh round: set-aside taps too, as discarded ones
+        except Exception as e:                  # noqa: BLE001: can't tell which are set aside: none resumed now
+            log.warning("the set-aside taps couldn't be read (%s); pending strikes wait for the next tick",
                         type(e).__name__)
             return
         for key, mark in marks.items():
@@ -1894,7 +1912,7 @@ class Controller:
         if isinstance(r.get("press"), dict):
             r["press"] = {k: v for k, v in r["press"].items() if k != "token"}
         if r.get("error"):
-            r["error"] = self._scrub(r["error"])
+            r["error"] = scrub.scrub(r["error"])
         return r
 
     def _journal_match(self, key: str, press: dict) -> bool | None:
@@ -2005,28 +2023,39 @@ class Controller:
         # Twenty-sixth round: when the records' marks can't be read, the count kept beside the journal (the side
         # file's "gens") is used; a tap whose count can't be read there either is taken as at the cap, so it ends
         # with its one card instead of being counted from one again.
+        # Twenty-seventh round: a mark whose value can't be read (not JSON) counts as unreadable too, not as empty,
+        # so a corrupt mark goes to the count beside the journal as well; and a tap whose count can't be read
+        # anywhere ends with its own card (UNKNOWN_COUNT_WORDS), which doesn't say it was brought back before.
+        unreadable: set = set()
         try:
-            old_gens = {k: v.get("gen") for k, v in self._flags(self.RELIST_FLAG).items()}
+            old_gens = {k: v.get("gen") for k, v in self._flags(self.RELIST_FLAG, unreadable).items()}
         except Exception as e:                  # noqa: BLE001: the count beside the journal, else at the cap
             log.warning("the relisted taps' marks couldn't be read (%s); their count beside the journal is used",
                         type(e).__name__)
             old_gens = None
         side_gens = self._side_load().get("gens")
         side_gens = side_gens if isinstance(side_gens, dict) else {}
-        gens = {}
+        gens, unknown = {}, set()
         for row in rows:
             k = self.handovers.key(row["press"])
-            if old_gens is not None:
-                was, fallback = old_gens.get(k), 0
+            if old_gens is not None and k not in unreadable:
+                was = old_gens.get(k)
+                fallback = 0
             else:
-                was, fallback = side_gens.get(k), self.RELIST_GEN_CAP
+                if k in unreadable:
+                    log.warning("a relisted tap's mark couldn't be read; its count beside the journal is used")
+                was, fallback = side_gens.get(k), None
+            if was is None and fallback is None:
+                unknown.add(k)                  # no count anywhere: stopped, never counted from one again
+                gens[k] = self.RELIST_GEN_CAP + 1
+                continue
             try:
                 gens[k] = int(was if was is not None else fallback) + 1
             except (TypeError, ValueError):
                 gens[k] = self.RELIST_GEN_CAP + 1
         capped = [r for r in rows if gens[self.handovers.key(r["press"])] > self.RELIST_GEN_CAP]
         if capped:
-            self._relist_ended(capped, gens)
+            self._relist_ended(capped, gens, unknown=unknown)
             rows = [r for r in rows if gens[self.handovers.key(r["press"])] <= self.RELIST_GEN_CAP]
             if not rows:
                 return
@@ -2056,8 +2085,8 @@ class Controller:
                 if reads is not None:
                     reads[self.handovers.key(row["press"])] = (seen, parts, {})
             if seen == "done":
-                if not self.handovers.journal_outcome(row["press"], "found"):
-                    log.error("a tap's outcome couldn't be written to the tap journal")
+                # Twenty-seventh round: journaled as found only once the records take its relist (below), so a
+                # relist the records refuse leaves the tap unknown in the journal, read again on its schedule.
                 row = dict(row, state="found")
             checked.append((row, seen, parts))
         found = [r for r, _, _ in checked if r["state"] == "found"]
@@ -2126,6 +2155,9 @@ class Controller:
                 k = self.handovers.key(row["press"])
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + k,))
                 self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(marks[k]), db)
+        for row in found:
+            if not self.handovers.journal_outcome(row["press"], "found"):
+                log.error("a tap's outcome couldn't be written to the tap journal")
         if summary_into is not None:
             summary_into.append({"gens": {k: m["gen"] for k, m in marks.items()}, "counts": counts,
                                  "found": found_words, "shown": len(shown), "rest": len(rest)})
@@ -2197,11 +2229,16 @@ class Controller:
     RELIST_GEN_CAP = 6                          # twenty-fifth round: relists of one tap before its ended card
     RELIST_ENDED_WORDS = ("Harness has brought this tap back to you several times without finishing it, so nothing "
                           "more is done for it from here.")
+    # Twenty-seventh round: the end for a tap whose relist count can't be read anywhere (it may never have been
+    # brought back): no Go ahead, since Harness can't tell how often it was offered.
+    UNKNOWN_COUNT_WORDS = ("Harness couldn't safely try this tap again, so it was stopped and nothing more is done "
+                           "for it from here.")
 
-    def _relist_ended(self, rows: list[dict], gens: dict) -> None:
+    def _relist_ended(self, rows: list[dict], gens: dict, unknown=()) -> None:
         """Twenty-fifth round: taps past RELIST_GEN_CAP generations. Each gets one card (once-keyed on the tap,
         "relist", "ended") with no Go ahead, in one transaction with its relisted mark (its strike pending), then
-        it's struck: never read on the calendar or relisted again."""
+        it's struck: never read on the calendar or relisted again. Twenty-seventh round: a tap in `unknown` (no
+        readable count anywhere) gets UNKNOWN_COUNT_WORDS instead, with no Go ahead either."""
         owner = self.config.owner_user_id
         marks = {self.handovers.key(r["press"]): {"press": dict(r["press"]), "gen": gens[self.handovers.key(
             r["press"])], "pending": True, "fails": 0, "due": 0.0, "ended": True} for r in rows}
@@ -2209,7 +2246,8 @@ class Controller:
             for row in rows:
                 k = self.handovers.key(row["press"])
                 self.ledger.enqueue(chat_id=owner, kind="notice", db=db, outcome="unverified",
-                                    text=render.fit(f"{self._tap_head(row)} {self.RELIST_ENDED_WORDS}"),
+                                    text=render.fit(f"{self._tap_head(row)} "
+                                                    f"{self.UNKNOWN_COUNT_WORDS if k in unknown else self.RELIST_ENDED_WORDS}"),
                                     once=Ledger.once_key(k, "relist", "ended"))
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + k,))
                 self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(marks[k]), db)
@@ -2236,7 +2274,7 @@ class Controller:
         for row in rows:
             k = self.handovers.key(row["press"])
             hit = self._kept_verdict(k)
-            if hit is not None and (verdicts is None or k not in verdicts):
+            if hit is not None and self._verdict_read(hit) and (verdicts is None or k not in verdicts):
                 verdicts = {} if verdicts is None else verdicts
                 verdicts[k] = hit
         reads: dict = {}
@@ -2281,7 +2319,24 @@ class Controller:
         hit = self.__dict__.get("_relist_verdicts", {}).get(key)
         return hit[1] if hit else None
 
+    # Twenty-seventh round: verdicts that say the calendar couldn't be read. Never kept: the tap's next try goes
+    # through the unread handling and the unknown re-read schedule again, so a read that failed in an outage isn't
+    # carried past the calendar's recovery.
+    UNREAD_VERDICTS = frozenset({"unread", "untaken_unread", "records_unread"})
+
+    @classmethod
+    def _verdict_read(cls, verdict) -> bool:
+        """Twenty-seventh round: whether a verdict came from a read that answered (only those are kept)."""
+        try:
+            seen, parts = verdict[0], verdict[1]
+            return seen not in cls.UNREAD_VERDICTS and not any(v == "unread" for _, v in (parts or []))
+        except (TypeError, ValueError, IndexError):
+            return False
+
     def _keep_verdict(self, key: str, verdict) -> None:
+        if not self._verdict_read(verdict):
+            self._drop_verdict(key)
+            return
         cache = self.__dict__.setdefault("_relist_verdicts", {})
         cache.pop(key, None)
         cache[key] = (self._clock(), verdict)
@@ -2822,7 +2877,7 @@ class Controller:
         try:
             msgs = self.discord.api.history(self.discord.dm(), 50 if h.message else 20)
         except DiscordError as e:
-            h.finish("error", f"The specialist couldn't read the DM ({e.code}). Nothing changed.")
+            h.finish("error", f"The specialist couldn't read the DM ({scrub.scrub(e.code)}). Nothing changed.")
             return
         mine = [m for m in msgs if str((m.get("author") or {}).get("id")) == str(owner)]
         if h.message:
@@ -3341,17 +3396,7 @@ class Controller:
                                                            self.ledger.get_meta("digest_date")):
                     return      # a fresh read is on its way; give it up to 5 minutes
             self.ledger.set_meta("digest_date", daily.local_date(now, cfg.timezone))
-            d = daily.gather(self.ledger, cfg, paused=paused, notes=list(self.notes.values()),
-                             calendar=self.calendar, family=self.family,
-                             mirror_line=self.mirror.digest_line() if self.mirror else "",
-                             family_add_line=" ".join(x for x in (
-                                 self.family_add.digest_line() if self.family_add else "",
-                                 self.family_copy.digest_line() if self.family_copy else "",
-                                 self.family_gmail.digest_line() if self.family_gmail else "",
-                                 self.calendar_change.digest_line() if self.calendar_change else "",
-                                 self.mail_dates.digest_line() if self.mail_dates else "",
-                                 self.meaning_live.digest_line() if self.meaning_live else "")
-                                 if x), watch=self.inputs)
+            d = self._compose_digest(paused)
             if daily.deliver(self.ledger, cfg, d, hold=self._discord_mode()):
                 if self.inputs is not None:
                     try:                               # what it named is known to him now
@@ -3360,6 +3405,21 @@ class Controller:
                         log.warning("input watch: after the digest: %s", type(e).__name__)
                 if self.meaning_live:
                     self.meaning_live.send_receipts()  # each new block's card, with Undo
+
+    def _compose_digest(self, paused: bool):
+        """The morning digest as composed from every input (no write: delivering it is daily.deliver's).
+        Twenty-seventh round: its own method, so the storage note's no-write check runs on this very path."""
+        return daily.gather(self.ledger, self.config, paused=paused, notes=list(self.notes.values()),
+                            calendar=self.calendar, family=self.family,
+                            mirror_line=self.mirror.digest_line() if self.mirror else "",
+                            family_add_line=" ".join(x for x in (
+                                self.family_add.digest_line() if self.family_add else "",
+                                self.family_copy.digest_line() if self.family_copy else "",
+                                self.family_gmail.digest_line() if self.family_gmail else "",
+                                self.calendar_change.digest_line() if self.calendar_change else "",
+                                self.mail_dates.digest_line() if self.mail_dates else "",
+                                self.meaning_live.digest_line() if self.meaning_live else "")
+                                if x), watch=self.inputs)
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:
