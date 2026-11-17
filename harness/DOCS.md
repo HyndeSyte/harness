@@ -996,29 +996,49 @@ first comes on, Harness also queues one card for you (once for that outage, and 
 it) saying taps are waiting and it keeps retrying by itself; nothing is asked of you. The outage is kept in the
 small file beside the tap journal (whether one is open, its number from a counter there, never the clock, and
 whether its card is queued), so a restart in the middle of it, or the clock stepping, sends no second card; a
-card the outbox refuses is tried again at the next failed read under the same key, so exactly one goes, and the next
-read that works closes the outage. While the records stay
+card the outbox refuses is tried again at the next failed read under the same key, so exactly one goes. The outage
+closes only after three reads that work in a row (read a minute apart; a failed read starts the run again), never
+on the clock, so reads that keep flapping give one card, not one per failure. Where the outage can't be recorded
+in that file no card is queued, the log says so as an error, and the health and status notes still say the taps
+wait. While the records stay
 unreadable the running loop reads no calendar and writes nothing for those taps, and its own log line about
 it comes once and then at most hourly. Discard also
 takes out of the tap journal an intent that a refused requeue left for that tap (every other line, torn ones
 included, stays as it was). A requeue leaves at most one such intent for a tap, and a discard clears it. That
 rewrite holds the tap journal's own lock (`<journal>.lock`, the one every append takes, in Harness and in the
 tool) from its read to its rename and the folder's sync, so a tap written down meanwhile waits for it and is
-never lost; where that lock can't be taken the journal isn't rewritten, and a tombstone line is added instead,
-which every reader honours. The lock fails closed for Harness's own writers too: a strike that can't take it
-appends a tombstone for that tap (read back, and appended again if a rewrite raced it) instead of rewriting,
-and a tap or progress line that can't take it is refused (the journal left as it was, the tap answered as not
-taken) and Harness's health says `storage` until an append takes the lock again. The lock file is Harness's
-own, group-writable, and the set-aside tool refuses to run as any user but the tap journal's owner (the App's
-own user), so it never leaves a lock file Harness can't open. The tap journal must be on local storage: its
-lock and its renames aren't sound on a network mount, so Harness refuses to start (degraded, every tap refused,
-the status page saying why) when the journal's folder is one. If the rewrite fails after the discard is committed, the intent stays as an orphan:
+never lost. Nothing is ever written to the tap journal without that lock. Where it can't be taken, a strike
+(Harness's own, or the tool's discard) isn't written into the journal at all: its tombstone goes in a second file
+beside it (`<journal>.struck`) that is only ever appended to, never rewritten, replaced or removed, so no
+rewrite of the journal, even one that read the journal before the tombstone landed and renames after, can drop
+it. Every reader of the journal (Harness's, and the tool's) honours the tombstones in both files, and the next
+strike that takes the lock writes them into the journal and notes in that file how far it got. A tap or
+progress line that can't take the lock is refused (the journal left as it was, the tap answered as not taken).
+Harness's health says `storage` whenever a lock can't be taken (an append's or a strike's), with words of its
+own when the journal itself refuses a write; the lock reason clears at the next lock taken, the write reason at
+the next write that goes. The lock file is Harness's own and group-writable; created by root before there's a
+journal, it's given the owner of the journal's folder. The set-aside tool checks, before it opens or creates
+anything, that it runs as the owner of the tap journal, its lock, its two side files, the records (and their
+write-ahead files) and the records' own lock, and refuses otherwise, so a run as root or another user changes
+no file. The tap journal must be on local storage: its lock and its renames are only sound on a local file
+system, so Harness starts degraded (every tap refused, the status page saying why) unless the journal's folder is
+on one of ext4, xfs, btrfs, f2fs, overlay, tmpfs or vfat; any other type (a network file system, any fuse mount,
+a type it doesn't know) or a mount table it can't read counts as not local. Home Assistant OS keeps the App's data
+on ext4. If the rewrite fails after the discard is committed, the intent stays as an orphan:
 the discard record means it's never read on your calendar, carded or acted on (by the start's replay, the
 running loop or either resume), and the tool says so; running the same discard again clears it (and only
 that). Requeue starts the tap's listing count afresh and discard clears it, each in the same step as its
 listing mark: the count beside the tap journal is changed first and the records' transaction second, and a
 transaction the records refuse puts the count beside the journal back, so the larger of the two never brings
-back a count that was lowered. A requeued tap's cards are keyed on its new count, so a requeued tap gets a
+back a count that was lowered. A requeue draws its round inside its own write transaction: the counter is read and
+raised there in one statement that keeps the larger of what's there and the new round, so two runs can't draw the
+same round or lower it, and the count beside the journal is written inside that transaction too, put back as it was
+if the records refuse. The small file beside the journal is never written over contents that can't be read: such a
+file is moved aside (`<file>.unreadable`) with an error in the log, and the write that found it is refused (an
+outage's card isn't sent then; the health notes still say it). Every tap whose key can still be picked out of it,
+and every tap in the journal then, has its count treated as lost: if it's listed again it's stopped with its own
+card and gets no *Go ahead*, until a requeue gives it a count again (when nothing can be picked out of it, every tap
+with a listing mark is treated so). A requeued tap's cards are keyed on its new count, so a requeued tap gets a
 fresh *Go ahead*, up to six again. That count's round (its epoch) comes from one counter in the records for
 every tap, never pruned, so even a tap whose mark and count beside the journal were both lost gets cards it
 never had before after a requeue, never ones refused as duplicates. There's no limit on requeues: each gives
@@ -1077,7 +1097,12 @@ reaches you as written. That type copies and pickles like any text. The source c
 what it was imported as, under any name, and flags any other way of building that type; it reads every module
 of Harness, subpackages included, and refuses the ways of reaching the scrub it can't follow (a star import, a
 lookup by name, the scrub module or its protected names rebound other than by a plain name, passed on as an
-argument, or subclassed). That's what's enforced: the check is a source scan, not a sandbox. A source check makes sure no error, traceback or service answer is built into them, and that the light
+argument, or subclassed), and, anywhere in Harness, dynamic imports, lookups in the module table, exec, eval,
+compile and a function's globals. It knows the scrub module by its full module path, so a file of the same name
+elsewhere is checked like any other. The tag is honoured only in text the record writer's own serialiser wrote:
+the records' writer drops a tag from any other text (plain JSON, or text from outside) before it scrubs it, so such
+text gets the whole scrub and never reads back as your words, and the source check flags a record written as plain
+JSON that carries your words or the tag. That's what's enforced: the check is a source scan, not a sandbox. A source check makes sure no error, traceback or service answer is built into them, and that the light
 scrub is only ever handed one of those refusals. The source check for errors covers format calls, an error's
 attributes, joins over its arguments, traceback formatting, the message of a refusal raised with it, and a name
 it's rebound to (simply, in a tuple, or by adding to it), and counts a call as logged or scrubbed only when it's

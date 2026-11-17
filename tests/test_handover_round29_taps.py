@@ -220,8 +220,9 @@ def test_with_no_lock_to_take_the_discard_appends_a_tombstone_every_reader_honou
     got = migrate.set_aside_taps(m.ledger.path, key, "discard", journal=m.c.handovers.journal)
     assert got["ok"]
     after = journal_text(m)
-    assert after.startswith(before)                                            # not rewritten: appended to
-    assert '"cleared"' in after
+    assert after == before                                                     # not rewritten, not written to
+    # thirty-first round: the tombstone goes beside the journal (handover.STRUCK_SIDE), never into it unlocked
+    assert '"cleared"' in open(m.c.handovers.journal + handover.STRUCK_SIDE, encoding="utf-8").read()
     row = next(r for r in m.c.handovers.journaled() if m.c.handovers.key(r["press"]) == key)
     assert not row["intent"] and row["state"] != "unknown"                     # the tombstone is honoured
     lines, _ = migrate._tap_lines(m.c.handovers.journal, key)

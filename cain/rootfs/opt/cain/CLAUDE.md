@@ -223,13 +223,16 @@ specialist (the Harness add-on) does.
   gets a card after a calendar read, never an action by itself, and starts its count of listings afresh, so
   it can get a Go ahead again (even when its count was lost); a tap listed six times never gets a seventh Go
   ahead, however its count was damaged, and one stopped that way stays stopped. If it can't save anywhere, or
-  can't take its tap journal's lock (it then refuses taps rather than write them down unlocked), its /health
-  says "storage" beside its status (its digest can't reach him then): tell Dane plainly that it can't save
-  where it got to with a tap. It won't start with its tap journal on network storage (it runs degraded and
-  says why). If its /health says "waiting", it can't read its list of set-aside taps, so taps from before its
-  last start wait (it checks back less often and finishes them once it can; it also sends him one card per
-  outage, even across a restart, saying taps are waiting and it keeps retrying, which needs nothing from
-  him): tell Dane plainly. Show those as they come; never hand it
+  can't take its tap journal's lock (it then refuses taps rather than write them down unlocked, and never
+  writes the journal without it), or can't write its tap journal, its /health says "storage" beside its status
+  (its digest can't reach him then): tell Dane plainly that it can't save where it got to with a tap. It won't
+  start unless its tap journal is on local storage (ext4 and the like; it runs degraded and says why). If its
+  /health says "waiting", it can't read its list of set-aside taps, so taps from before its last start wait (it
+  checks back less often and finishes them once it can; it also sends him one card per outage, even across a
+  restart or reads that come and go, saying taps are waiting and it keeps retrying, which needs nothing from
+  him; if it can't note the outage it sends no card, and /health still says "waiting"): tell Dane plainly. A tap
+  whose count it may have lost (a damaged file beside its journal, moved aside rather than written over) gets no
+  further Go ahead, only the card saying it was stopped, until Dane puts it back. Show those as they come; never hand it
   over again, and never ask him to repeat it. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it

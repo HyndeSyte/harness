@@ -437,15 +437,21 @@ def cross_thread_writes() -> list[dict]:
 
 def _scrubbed_json(value):
     """Twenty-sixth round: a record kept as JSON text with its exception-text fields (scrub.ERROR_FIELDS) scrubbed;
-    any other value as it is. Re-encoded only when the scrub changed something."""
-    if not isinstance(value, str) or not value[:1] in ("{", "[") \
-            or not any(f'"{f}"' in value for f in _scrub.ERROR_FIELDS):
+    any other value as it is. Re-encoded only when the scrub changed something.
+
+    Thirty-first round: a tag naming his words (scrub.OWNER_TAG) is honoured only in text the serialiser wrote
+    (scrub.dumps, checked with scrub.serialised); in any other text every tag is dropped before the scrub, so a tag
+    forged in plain JSON or in text from outside gets the whole scrub and never reads back as his words."""
+    if not isinstance(value, str) or not value[:1] in ("{", "["):
+        return value
+    trusted = _scrub.serialised(value)
+    if not any(f'"{f}"' in value for f in _scrub.ERROR_FIELDS) and (trusted or _scrub.OWNER_TAG not in value):
         return value
     try:
         got = json.loads(value)
     except ValueError:
         return value
-    clean = _scrub.scrub_fields(got)
+    clean = _scrub.scrub_fields(got if trusted else _scrub.untag(got))
     return value if clean == got else json.dumps(clean)
 
 

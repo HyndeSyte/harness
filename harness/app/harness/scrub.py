@@ -240,10 +240,42 @@ def _for_storage(value):
     return str(value) if isinstance(value, OwnerText) else value
 
 
+class _Serialised(str):
+    """Thirty-first round: JSON text written by dumps(), the one place a tag (OWNER_TAG) is written from OwnerText.
+    The records' sink (ledger._scrubbed_json, through serialised()) honours a tag only in text of this type; a tag
+    in any other text, however it was written (plain json.dumps, text from outside), is dropped there, so his words'
+    light scrub can't be claimed by text that isn't his. Its constructor is private, as OwnerText's is."""
+    __slots__ = ()
+
+    def __new__(cls, value="", key=None):
+        if key is not _MINT:
+            raise TypeError("serialised records are written with scrub.dumps")
+        return super().__new__(cls, value)
+
+    def __reduce__(self):
+        return (str, (str(self),))          # a copy that leaves this process is plain text: its tags aren't trusted
+
+
 def dumps(value, **kw) -> str:
-    """Thirtieth round: a record as JSON text for the records, scrubbed and with his words tagged (_for_storage)."""
+    """Thirtieth round: a record as JSON text for the records, scrubbed and with his words tagged (_for_storage).
+    Thirty-first round: marked as this serialiser's output (_Serialised), which the records' sink checks."""
     import json
-    return json.dumps(_for_storage(value), **kw)
+    return _Serialised(json.dumps(_for_storage(value), **kw), _MINT)
+
+
+def serialised(text) -> bool:
+    """Thirty-first round: whether `text` is dumps()'s own output, so a tag in it is his words' (the sink's check)."""
+    return isinstance(text, _Serialised)
+
+
+def untag(value):
+    """Thirty-first round: a record read from JSON text that didn't come from dumps() with every OWNER_TAG key
+    dropped, at any depth, so nothing in it reads as his words."""
+    if isinstance(value, dict):
+        return {k: untag(v) for k, v in value.items() if k != OWNER_TAG}
+    if isinstance(value, list):
+        return [untag(x) for x in value]
+    return value
 
 
 def _rehydrate(value):

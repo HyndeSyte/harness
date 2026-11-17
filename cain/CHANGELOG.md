@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- Cain knows the calendar specialist never writes its tap journal without its lock, sends one waiting card per outage even when reads come and go, starts only with its journal on local storage, says "storage" when it can't lock or write its journal, and stops a tap whose count it may have lost until Dane puts it back.
+
 - Cain knows the calendar specialist sends one waiting card per outage (a restart doesn't send a second), a requeued tap always gets a fresh Go ahead, and the specialist won't start with its tap journal on network storage (its /health says "storage" when it can't lock its journal).
 
 - Cain knows a set-aside tap Dane puts back can get a Go ahead again, a tap stopped after six listings stays stopped, and the calendar specialist sends one card when taps wait because it can't read its list of set-aside taps.

@@ -58,7 +58,9 @@ def test_a_strike_with_the_lock_unopenable_appends_a_tombstone_and_never_rewrite
     monkeypatch.setattr(handover, "journal_lock", no_lock)
     h.journal_done(gone, strict=True)
     after = journal_text(m)
-    assert after.startswith(before) and '"struck"' in after                    # appended to, not rewritten
+    assert after == before                                                     # not rewritten, not written to
+    # thirty-first round: the tombstone goes beside the journal, only ever appended there
+    assert '"struck"' in open(h.journal + handover.STRUCK_SIDE, encoding="utf-8").read()
     assert [h.key(r["press"]) for r in h.journaled()] == [h.key(stays)]         # every reader honours it
     assert h.lines_for(h.key(gone)) == [] and not h.has_lines(h.key(gone))
     monkeypatch.undo()
@@ -112,7 +114,7 @@ def test_a_concurrent_append_and_strike_under_a_lock_permission_failure_loses_no
             done["t"].join(5)
         return real_replace(src, dst, *a, **kw)
 
-    def raw(self, row, _real=Inbox._append_raw):                               # the new code's tombstone
+    def raw(self, row, _real=Inbox._side_tombstone):                           # the new code's tombstone
         if "t" not in done:
             done["t"] = threading.Thread(target=append)
             done["t"].start()
@@ -120,7 +122,7 @@ def test_a_concurrent_append_and_strike_under_a_lock_permission_failure_loses_no
         return _real(self, row)
     monkeypatch.setattr(handover, "journal_lock", lock)
     monkeypatch.setattr(os, "replace", replace)
-    monkeypatch.setattr(Inbox, "_append_raw", raw)
+    monkeypatch.setattr(Inbox, "_side_tombstone", raw)
     h.journal_done(gone, strict=True)
     assert done.get("ok")
     keys = [h.key(r["press"]) for r in h.journaled()]
@@ -210,7 +212,8 @@ def test_an_outage_with_a_restart_in_the_middle_gives_one_waiting_card(m, monkey
     assert "waiting" in m.c.handovers.health()
     assert len(queued(m, Controller.SETASIDE_CARD_WORDS)) == 1                 # exactly one, the whole outage
     monkeypatch.setattr(Controller, "_quarantined", lambda self: {})           # it reads again: the outage closes
-    later(m, clock, 3600)
+    for _ in range(Controller.SETASIDE_CLOSE_AFTER):                           # (thirty-first round: after a run)
+        later(m, clock, 3600)
     assert "waiting" not in m.c.handovers.health()
     assert side(m)["outage"]["open"] is False
 
@@ -223,7 +226,8 @@ def test_a_second_outage_gets_its_own_card(m, monkeypatch, clock, tmp_path):
         for _ in range(30):
             later(m, clock, 60)
         monkeypatch.setattr(Controller, "_quarantined", lambda self: {})
-        later(m, clock, 3600)
+        for _ in range(Controller.SETASIDE_CLOSE_AFTER):                       # thirty-first round: a run closes it
+            later(m, clock, 3600)
     assert len(queued(m, Controller.SETASIDE_CARD_WORDS)) == 2
 
 

@@ -199,16 +199,19 @@ def journal_lock(journal: str):
 
 
 def _lock_file_owned(fd: int, journal: str) -> None:
-    """Thirtieth round: the lock file group-writable, and, when root holds it, owned by the journal's owner."""
+    """Thirtieth round: the lock file group-writable, and, when root holds it, owned by the journal's owner
+    (thirty-first round: by its folder's owner while there's no journal)."""
     try:
         st = os.fstat(fd)
         if st.st_uid == os.geteuid() and (st.st_mode & 0o777) != 0o660:
             os.fchmod(fd, 0o660)
         if os.geteuid() == 0:
+            # Thirty-first round: with no journal yet, the owner of the journal's folder (the App's data folder), so
+            # a lock file root creates first is never left root's.
             try:
                 j = os.stat(journal)
             except FileNotFoundError:
-                return
+                j = os.stat(os.path.dirname(os.path.abspath(journal)) or ".")
             if (st.st_uid, st.st_gid) != (j.st_uid, j.st_gid):
                 os.fchown(fd, j.st_uid, j.st_gid)
     except OSError:
@@ -216,16 +219,23 @@ def _lock_file_owned(fd: int, journal: str) -> None:
 
 
 LOCK_STORAGE = "taps unsaved: the tap journal's lock can't be taken"   # thirtieth round: /health's storage flag
+JOURNAL_WRITE_STORAGE = "taps unsaved: the tap journal can't be written"   # thirty-first round: its own reason
+# Thirty-first round: beside the journal, the strike tombstones written when its lock can't be taken. Only ever
+# appended to (never rewritten, replaced or removed), so no rewrite of the journal can drop one; every reader honours
+# them, and the next strike that takes the lock compacts them into the journal and appends {"consumed": n}, the
+# length of the file it applied, after which only the tombstones past that point still count.
+STRUCK_SIDE = ".struck"
 
-# Thirtieth round: file systems the tap journal mustn't sit on: its flock and its fsynced renames are only sound on
-# local storage, so the App refuses to start (degraded, every tap refused) when the journal's folder is on one.
-NETWORK_FS = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "ceph", "glusterfs", "lustre",
-                        "gfs2", "ocfs2", "davfs", "fuse.sshfs", "fuse.glusterfs", "fuse.rclone", "fuse.s3fs",
-                        "fuse.cephfs", "sshfs", "9p"})
+# Thirty-first round: the file systems the tap journal may sit on, an allowlist. Its flock and its fsynced renames
+# are only sound on local storage, so the App starts degraded (every tap refused) when the journal's folder is on
+# anything else: a network file system, a fuse mount of any kind, a type it doesn't know, or a mount table it can't
+# read. Home Assistant OS keeps the App's data on ext4.
+LOCAL_FS = frozenset({"ext4", "xfs", "btrfs", "f2fs", "overlay", "tmpfs", "vfat"})
 
 
 class NetworkJournal(RuntimeError):
-    """Thirtieth round: the tap journal's folder is on a network mount."""
+    """Thirtieth round: the tap journal's folder isn't on local storage (thirty-first round: on no type of LOCAL_FS,
+    or on one that can't be told)."""
 
 
 def mount_type(path: str, mountinfo: str = "/proc/self/mountinfo") -> str:
@@ -239,19 +249,119 @@ def mount_type(path: str, mountinfo: str = "/proc/self/mountinfo") -> str:
                 if " - " not in line or len(parts) < 5:
                     continue
                 point = parts[4].replace("\\040", " ")
-                fstype = line.split(" - ", 1)[1].split()[0]
+                fstype = (line.split(" - ", 1)[1].split() or [""])[0]
                 if (real == point or real.startswith(point.rstrip("/") + "/")) and len(point) >= len(best):
                     best, kind = point, fstype
-    except OSError:
+    except (OSError, ValueError):
         return ""
     return kind
 
 
 def check_local(journal: str, mountinfo: str = "/proc/self/mountinfo") -> None:
-    """Thirtieth round: raises NetworkJournal when the tap journal's folder is on a network mount."""
+    """Raises NetworkJournal unless the tap journal's folder is on a file system of LOCAL_FS (thirty-first round:
+    an allowlist; an unreadable mount table, an unknown type and any fuse type are refused)."""
     kind = mount_type(os.path.dirname(os.path.abspath(journal)) or ".", mountinfo)
-    if kind in NETWORK_FS or kind.startswith(("nfs", "fuse.sshfs")):
-        raise NetworkJournal(f"the tap journal is on a network mount ({kind}); it must be on local storage")
+    if kind not in LOCAL_FS:
+        raise NetworkJournal(f"the tap journal isn't on local storage ({kind or 'its file system unknown'}); it "
+                             f"must be on one of {', '.join(sorted(LOCAL_FS))}")
+
+
+# Thirty-first round: the file beside the journal that holds relist counts, epochs, deferrals and the outage
+# (Controller.REREAD_SIDE, migrate._side_file) is never written over contents that couldn't be read: an unreadable
+# one is moved aside (to <file>.unreadable, or .unreadable.<n> when that's taken) and the write that found it is
+# refused. Which taps' counts it may have held is kept as "lost": every tap key that can still be picked out of its
+# text, and every tap with journal lines then; when its text can't be read at all, or no key can be picked out of
+# it, "lost_all". A lost tap with no count of its own beside the journal again gets no count (no Go ahead) until a
+# requeue gives it one; with "lost_all", so does every tap that had a relist mark.
+SIDE_ASIDE = ".unreadable"
+_TAP_KEY = re.compile(r'"((?:[^"\\]|\\.)*\|(?:[^"\\]|\\.)*)"')
+
+
+def side_aside(path: str) -> bool:
+    """Whether an unreadable side file was moved aside from `path` (and is still there)."""
+    folder, name = os.path.split(os.path.abspath(path))
+    try:
+        return any(n.startswith(name + SIDE_ASIDE) for n in os.listdir(folder or "."))
+    except OSError:
+        return False
+
+
+def _move_aside(path: str) -> None:
+    dest, n = path + SIDE_ASIDE, 1
+    while os.path.exists(dest):
+        n += 1
+        dest = f"{path}{SIDE_ASIDE}.{n}"
+    try:
+        os.rename(path, dest)
+        _fsync_dir(os.path.dirname(os.path.abspath(path)))
+        log.error("the file beside the tap journal couldn't be read; it was moved aside to %s and isn't written over",
+                  os.path.basename(dest))
+    except OSError as e:
+        log.error("the file beside the tap journal couldn't be read or moved aside (%s); it isn't written over",
+                  type(e).__name__)
+
+
+def _salvaged(raw: bytes | None) -> tuple[set, bool]:
+    """The tap keys still legible in an unreadable side file's text, and whether that's all of them can't be told."""
+    if raw is None:
+        return set(), True
+    text = raw.decode("utf-8", errors="replace")
+    keys = set()
+    for m in _TAP_KEY.finditer(text):
+        try:
+            keys.add(json.loads(f'"{m.group(1)}"'))
+        except ValueError:
+            continue
+    return keys, not keys and bool(text.strip())
+
+
+def _aside_lost(path: str) -> tuple[set, bool]:
+    """What the side files moved aside from `path` may have held (their legible keys, or all)."""
+    folder, name = os.path.split(os.path.abspath(path))
+    keys, every = set(), False
+    try:
+        names = [n for n in os.listdir(folder or ".") if n.startswith(name + SIDE_ASIDE)]
+    except OSError:
+        return set(), True
+    for n in names:
+        try:
+            with open(os.path.join(folder, n), "rb") as f:
+                got = _salvaged(f.read())
+        except OSError:
+            got = (set(), True)
+        keys |= got[0]
+        every = every or got[1]
+    return keys, every
+
+
+def load_side(path: str, keys: Callable[[], list]) -> dict:
+    """Thirty-first round: the side file beside the journal, read: {} when there's none; its object when it reads.
+    One that doesn't read (not JSON, not an object, or a read error) is moved aside and given as {"lost": the taps
+    it may have held, "lost_all" when that can't be told, "unread": True}: a writer handed that refuses to write.
+    With none there but one moved aside, the same without "unread", so the first write after it keeps them."""
+    raw = None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        got = json.loads(raw.decode("utf-8"))
+    except FileNotFoundError:
+        if not side_aside(path):
+            return {}
+        lost, every = _aside_lost(path)
+        return {"lost": sorted(lost | set(keys())), **({"lost_all": True} if every else {})}
+    except (OSError, ValueError):
+        got = None
+    if isinstance(got, dict):
+        return got
+    lost, every = _salvaged(raw) if not (raw is not None and got is not None) else (set(), False)
+    _move_aside(path)
+    return {"lost": sorted(lost | set(keys())), **({"lost_all": True} if every else {}), "unread": True}
+
+
+def side_keeps(data: dict) -> bool:
+    """Whether a side file's contents are worth a file (else it's removed)."""
+    return bool(data.get("taps") or data.get("gens") or data.get("outage") or data.get("lost")
+                or data.get("lost_all"))
 
 
 def _row_key(r: dict, key: Callable[[dict], str]) -> str:
@@ -294,6 +404,7 @@ class Inbox:
         self.storage = ""                    # twenty-fifth round: taps' progress can't be saved anywhere, or ""
         self.waiting = ""                    # twenty-eighth round: the start replay can't read the set-aside taps
         self.lock_storage = ""               # thirtieth round: an append refused for want of the journal's lock
+        self.write_storage = ""              # thirty-first round: the journal itself refused a write
 
     @classmethod
     def for_tests(cls, token_fn: Callable[[], str], wake: threading.Event | None = None, **kw) -> "Inbox":
@@ -306,9 +417,10 @@ class Inbox:
 
     def health(self) -> dict:
         extra = {"migration": dict(self.migration)} if self.migration else {}
-        if self.storage or self.lock_storage:
-            # twenty-fifth round: said where no storage is needed; thirtieth round: or the journal's lock refused
-            extra["storage"] = self.storage or self.lock_storage
+        if self.storage or self.lock_storage or self.write_storage:
+            # twenty-fifth round: said where no storage is needed; thirtieth round: or the journal's lock refused;
+            # thirty-first round: or the journal refused a write, each with its own words
+            extra["storage"] = self.storage or self.lock_storage or self.write_storage
         if self.waiting:
             extra["waiting"] = self.waiting     # twenty-eighth round: the start replay's taps wait on the records
         if self.degraded:
@@ -383,30 +495,131 @@ class Inbox:
         except OSError:
             log.error("the tap journal couldn't be read")
             return []
-        return self._unstruck(rows)
+        return self._unstruck(rows, self._side_tombstones()[0])
 
-    def _unstruck(self, rows: list[dict]) -> list[dict]:
-        """Thirtieth round: a strike tombstone ({"struck": key}, appended when the journal's lock couldn't be taken
-        to rewrite it) takes out every line of that tap written before it, and itself; every reader honours it."""
-        if not any("struck" in r for r in rows):
-            return rows
-        out: list[dict] = []
-        for r in rows:
-            if "struck" in r:
-                k = str(r.get("struck") or "")
-                out = [x for x in out if _row_key(x, self.key) != k]
+    def _unstruck(self, rows: list[dict], side: list[dict] = ()) -> list[dict]:
+        """Thirtieth round: a strike tombstone in the journal ({"struck": key}, as the thirtieth round's builds
+        appended it) takes out every line of that tap written before it, and itself. Thirty-first round: and the
+        tombstones in the file beside it (STRUCK_SIDE, `side`, the ones not yet compacted): a strike takes out every
+        line of that tap, a cleared intent every intent of that tap with that op. Every reader honours both."""
+        if any("struck" in r for r in rows):
+            out: list[dict] = []
+            for r in rows:
+                if "struck" in r:
+                    k = str(r.get("struck") or "")
+                    out = [x for x in out if _row_key(x, self.key) != k]
+                    continue
+                out.append(r)
+            rows = out
+        if side:
+            hidden = self._hidden_by(side)
+            rows = [r for r in rows if not hidden(r)]
+        return rows
+
+    def _hidden_by(self, side: list[dict]) -> Callable[[dict], bool]:
+        """Thirty-first round: whether a journal line is taken out by one of the tombstones beside the journal."""
+        struck = {str(t.get("struck") or "") for t in side if "struck" in t}
+        cleared = [(str(t.get("cleared") or ""), t.get("op")) for t in side if "cleared" in t]
+
+        def hidden(r: dict) -> bool:
+            if _row_key(r, self.key) in struck:
+                return True
+            return "intent" in r and any(r.get("intent") == k and r.get("op") == op for k, op in cleared)
+        return hidden
+
+    def _side_tombstones(self) -> tuple[list[dict], int]:
+        """Thirty-first round: the tombstones beside the journal (STRUCK_SIDE) that still count (those past the last
+        {"consumed": n}), and the length of its whole lines (what a compaction now applies)."""
+        try:
+            with open(self.journal + STRUCK_SIDE, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return [], 0
+        except OSError:
+            log.error("the tap journal's strikes beside it couldn't be read")
+            return [], 0
+        found, consumed, at = [], 0, 0
+        whole = raw.rfind(b"\n") + 1
+        for chunk in raw[:whole].split(b"\n")[:-1]:
+            start, at = at, at + len(chunk) + 1
+            if not chunk.strip():
                 continue
-            out.append(r)
-        return out
+            try:
+                row = json.loads(chunk.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if "consumed" in row:
+                try:
+                    consumed = max(consumed, int(row["consumed"]))
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if "struck" in row or "cleared" in row:
+                found.append((start, row))
+        return [r for start, r in found if start >= consumed], whole
+
+    def _side_tombstone(self, row: dict) -> bool:
+        """Thirty-first round: a tombstone recorded beside the journal (STRUCK_SIDE) when the journal's lock can't be
+        taken: appended (O_APPEND, one write, fsynced), never written into the journal, so no rewrite of the journal
+        can drop it; there's nothing to read back. The caller holds self._lock."""
+        path = self.journal + STRUCK_SIDE
+        data = ("\n" + _scrub.dumps(dict(row, at=time.time())) + "\n").encode()   # a torn line before it stays apart
+        try:
+            new = not os.path.exists(path)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        except OSError as e:
+            log.error("the tap journal's strike couldn't be written beside it: %s", type(e).__name__)
+            self.write_storage = JOURNAL_WRITE_STORAGE
+            return False
+        try:
+            if os.write(fd, data) != len(data):
+                raise OSError("short write")
+            os.fsync(fd)
+        except OSError as e:
+            log.error("the tap journal's strike couldn't be written beside it: %s", e)
+            self.write_storage = JOURNAL_WRITE_STORAGE
+            return False
+        finally:
+            os.close(fd)
+        if new:
+            try:
+                _fsync_dir(os.path.dirname(os.path.abspath(path)))
+            except OSError:
+                pass
+        return True
+
+    def _consumed(self, n: int) -> None:
+        """Thirty-first round: after a compaction under the lock, the tombstones beside the journal up to `n` bytes
+        are applied: said by appending {"consumed": n} there (the file is never rewritten). A marker that can't be
+        written leaves them counting, which only takes out lines already gone."""
+        if n <= 0:
+            return
+        try:
+            fd = os.open(self.journal + STRUCK_SIDE, os.O_WRONLY | os.O_APPEND)
+        except OSError:
+            return
+        try:
+            os.write(fd, ("\n" + json.dumps({"consumed": n}) + "\n").encode())
+            os.fsync(fd)
+        except OSError as e:
+            log.warning("the tap journal's compacted strikes couldn't be marked beside it: %s", type(e).__name__)
+        finally:
+            os.close(fd)
 
     def _take_lock(self):
-        """Thirtieth round: the journal's lock entered, or None when it can't be taken (logged)."""
+        """Thirtieth round: the journal's lock entered, or None when it can't be taken (logged). Thirty-first round:
+        any lock that can't be taken (an append's, a strike's, a rewrite's) raises /health's storage flag, and any
+        lock taken clears that cause."""
         try:
             cm = journal_lock(self.journal)
             cm.__enter__()
         except OSError as e:
             log.error("the tap journal's lock couldn't be taken: %s", type(e).__name__)
+            self.lock_storage = LOCK_STORAGE
             return None
+        self.lock_storage = ""
         return cm
 
     def _append(self, row: dict) -> bool:
@@ -418,7 +631,6 @@ class Inbox:
             # left as it is) and /health's storage flag says so, never written unlocked beside a rewrite.
             cm = self._take_lock()
             if cm is None:
-                self.lock_storage = LOCK_STORAGE
                 return False
             try:
                 return self._append_locked(data)
@@ -431,6 +643,7 @@ class Inbox:
             fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         except OSError as e:
             log.error("the tap journal couldn't be opened: %s", type(e).__name__)
+            self.write_storage = JOURNAL_WRITE_STORAGE
             return False
         try:
             size = os.fstat(fd).st_size
@@ -446,12 +659,13 @@ class Inbox:
                     os.fsync(fd)
                 except OSError:
                     pass
+                self.write_storage = JOURNAL_WRITE_STORAGE
                 return False
         finally:
             os.close(fd)
         if new:
             _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
-        self.lock_storage = ""
+        self.write_storage = ""
         return True
 
     def journal_add(self, h: Handover) -> bool:
@@ -527,11 +741,12 @@ class Inbox:
         def mine(r: dict) -> bool:
             return _row_key(r, self.key) == key
         with self._lock:
-            # Thirtieth round: fail closed. With no lock to take the journal isn't rewritten: a strike tombstone is
-            # appended instead (every reader honours it), and read back, so a rewrite that raced it can't lose it.
+            # Thirtieth round: fail closed. With no lock to take the journal isn't rewritten. Thirty-first round: and
+            # nothing is written to it unlocked: the strike's tombstone goes beside it (STRUCK_SIDE, only ever
+            # appended), which every reader honours and no rewrite of the journal can drop.
             cm = self._take_lock()
             if cm is None:
-                if self._tombstone({"struck": key}):
+                if self._side_tombstone({"struck": key}):
                     return
                 log.error("the tap journal's lock couldn't be taken and its strike couldn't be written")
                 if strict:
@@ -542,38 +757,53 @@ class Inbox:
             finally:
                 cm.__exit__(None, None, None)
 
-    def _tombstone(self, row: dict, tries: int = 3) -> bool:
-        """Thirtieth round: a tombstone appended with no lock (O_APPEND, one fsynced write) and read back, appended
-        again (up to `tries` times) when a rewrite that raced it replaced the file without it. The caller holds
-        self._lock."""
-        for _ in range(tries):
-            mark = dict(row, at=time.time(), nonce=os.urandom(6).hex())
-            if not self._append_raw(mark):
-                return False
-            try:
-                with open(self.journal, encoding="utf-8", errors="replace") as f:
-                    if any(mark["nonce"] in line for line in f):
-                        return True
-            except OSError:
-                return False
-        return False
-
     def _strike_locked(self, mine, strict: bool) -> None:
-        rows = self._journal_lines()
+        """Under the journal's lock: the journal rewritten without the tap's lines, and (thirty-first round) without
+        the lines the tombstones beside it take out, which are then marked applied there."""
+        side, upto = self._side_tombstones()
+        raw = self._raw_rows()
+        rows = self._unstruck(raw, side)
         keep = [r for r in rows if not mine(r)]
-        if len(keep) == len(rows):
+        if len(keep) == len(raw):
+            if side:
+                self._consumed(upto)          # nothing of theirs is left in the journal
             return
         try:
             self._rewrite(keep)
         except OSError as e:
             log.error("the tap journal couldn't be updated: %s", type(e).__name__)
+            self.write_storage = JOURNAL_WRITE_STORAGE
             if strict:
                 raise
             return
+        self.write_storage = ""
         try:
             _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
         except OSError as e:
             log.error("the tap journal's folder couldn't be synced: %s", type(e).__name__)
+        if side:
+            self._consumed(upto)
+
+    def _raw_rows(self) -> list[dict]:
+        """The journal's lines as written (no tombstone applied); a line that can't be read is skipped."""
+        rows = []
+        try:
+            with open(self.journal, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            log.error("the tap journal couldn't be read")
+            return []
+        return rows
 
     def _rewrite(self, keep: list[dict]) -> None:
         """The journal rewritten with only `keep` (removed when empty), whole: a temporary file, fsynced, renamed
@@ -598,19 +828,18 @@ class Inbox:
         if not self.journal:
             return True
         with self._lock:
-            try:
-                cm = journal_lock(self.journal)
-                cm.__enter__()
-            except OSError as e:
-                log.warning("the tap journal's lock couldn't be taken (%s); a tombstone is appended",
-                            type(e).__name__)
-                return bool(tombstone) and self._tombstone(tombstone)
+            cm = self._take_lock()
+            if cm is None:
+                # Thirty-first round: the tombstone goes beside the journal (STRUCK_SIDE), never into it unlocked.
+                return bool(tombstone) and self._side_tombstone(tombstone)
             try:
                 return self._drop_locked(drop)
             finally:
                 cm.__exit__(None, None, None)
 
     def _drop_locked(self, drop: Callable[[dict], bool]) -> bool:
+        side, upto = self._side_tombstones()          # thirty-first round: compacted here too
+        hidden = self._hidden_by(side)
         try:
             with open(self.journal, encoding="utf-8", errors="surrogateescape", newline="") as f:
                 raw = f.readlines()
@@ -625,10 +854,12 @@ class Inbox:
             except ValueError:
                 keep.append(line)
                 continue
-            if isinstance(r, dict) and drop(r):
+            if isinstance(r, dict) and (drop(r) or hidden(r)):
                 continue
             keep.append(line)
         if len(keep) == len(raw):
+            if side:
+                self._consumed(upto)
             return True
         tmp = self.journal + ".tmp"
         try:
@@ -638,26 +869,11 @@ class Inbox:
                 os.fsync(f.fileno())
             os.replace(tmp, self.journal)
         except OSError:
+            self.write_storage = JOURNAL_WRITE_STORAGE
             return False
         _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
-        return True
-
-    def _append_raw(self, row: dict) -> bool:
-        """The tombstone's append when the journal's lock can't be taken (O_APPEND, one write, fsynced); the caller
-        holds self._lock."""
-        data = (_scrub.dumps(row) + "\n").encode()
-        try:
-            fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        except OSError:
-            return False
-        try:
-            if os.write(fd, data) != len(data):
-                return False
-            os.fsync(fd)
-        except OSError:
-            return False
-        finally:
-            os.close(fd)
+        if side:
+            self._consumed(upto)
         return True
 
     def journaled(self) -> list[dict]:
@@ -744,6 +960,15 @@ class Inbox:
         with self._lock:
             rows = self._journal_lines()
         return any(_row_key(r, self.key) == key for r in rows)
+
+    def line_keys(self) -> list[str]:
+        """Thirty-first round: every tap key with a journal line now (the taps whose counts an unreadable side file may
+        have held)."""
+        if not self.journal:
+            return []
+        with self._lock:
+            rows = self._journal_lines()
+        return sorted({_row_key(r, self.key) for r in rows} - {""})
 
     def row_for(self, press: dict) -> dict | None:
         """One tap's journal entry (journaled), or None."""

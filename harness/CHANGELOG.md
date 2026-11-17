@@ -2,6 +2,11 @@
 
 ## 0.24.0
 
+- **A tap Harness crosses off stays crossed off**, even when it can't lock its tap journal at that moment, and it never writes the journal without that lock.
+- **When reads of its records come and go, the card that taps are waiting still comes once**, and a damaged file beside the tap journal is put aside rather than overwritten, so no tap gets more *Go ahead*s than it should.
+- Harness only starts with its tap journal on local storage (ext4 and the like), and its status says whether it can't lock or can't write the journal.
+- Event names you wrote stay as written only where Harness itself saved them as yours; any other text gets the full clean-up.
+
 - **The card that taps are waiting comes once for each outage**, even when Harness restarts in the middle of one.
 - **A requeued tap always gets a fresh *Go ahead***, even when its count was lost, and a tap stopped for good stays stopped.
 - Event names like "Token: pickup" stay as you wrote them when Harness saves a card's words and shows them later.

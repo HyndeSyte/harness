@@ -868,6 +868,10 @@ class Controller:
 
     SETASIDE_BACKOFF_S = (60, 300, 900)         # twenty-eighth round: start replay waits on the set-aside list
     SETASIDE_ALARM_AT = 3                       # twenty-eighth round: failures in a row before health says so
+    # Thirty-first round: an open outage closes only after this many good reads in a row (counted beside the journal,
+    # never on the clock; a failed read starts the run again), so reads that flap give one card, not one per failure.
+    SETASIDE_CLOSE_AFTER = 3
+    SETASIDE_CLOSE_EVERY_S = 60                 # the next read while a run of good reads is under way
     SETASIDE_WORDS = ("Harness can't read its list of set-aside taps, so taps of yours from before its last start "
                       "wait until it can. Nothing is done twice.")
     # Twenty-ninth round: the one card he gets when the waiting flag first sets (once-keyed on that outage).
@@ -883,6 +887,13 @@ class Controller:
         delay = self.SETASIDE_BACKOFF_S[min(n, len(self.SETASIDE_BACKOFF_S)) - 1]
         now = self._clock()
         self.__dict__["_replay_put_off"].append(now + delay)
+        # Thirty-first round: a failed read while an outage is still open starts its run of good reads again.
+        side = self._side_load()
+        outage = side.get("outage") if isinstance(side.get("outage"), dict) else {}
+        if outage.get("open") and outage.get("good"):
+            side["outage"] = dict(outage, good=0)
+            if not self._side_save(side):
+                log.error("the outage of the set-aside list couldn't be kept beside the tap journal")
         if n < self.SETASIDE_ALARM_AT:
             log.warning("the set-aside taps couldn't be read (%s); the start replay waits %d minutes",
                         type(e).__name__, delay // 60)
@@ -917,7 +928,9 @@ class Controller:
             outage = {"n": n + 1, "open": True, "carded": False}
             side["outage"] = outage
             if not self._side_save(side):
-                log.warning("the outage of the set-aside list couldn't be kept beside the tap journal")
+                # Thirty-first round: said loudly; the flags on /health and the status page still say the taps wait.
+                log.error("the outage of the set-aside list couldn't be recorded beside the tap journal, so no card "
+                          "goes for it; /health and the status page still say the taps wait")
                 return                          # no card without a kept outage: a restart can't send a second
         elif outage.get("carded"):
             return
@@ -934,14 +947,25 @@ class Controller:
             log.warning("the waiting card's mark couldn't be kept beside the tap journal; its once-key holds it")
 
     def _setaside_read(self) -> None:
-        """Twenty-eighth round: the set-aside taps read: the failure count starts again and the flag is cleared."""
+        """Twenty-eighth round: the set-aside taps read: the failure count starts again and the flag is cleared.
+        Thirty-first round: an open outage closes only after SETASIDE_CLOSE_AFTER good reads in a row; until then the
+        start replay reads again every SETASIDE_CLOSE_EVERY_S, and a failed read starts the run again."""
         self.__dict__["_setaside_fails"] = 0
         # Thirtieth round: the outage kept beside the journal is closed (its number kept for the next one).
         side = self._side_load()
-        if isinstance(side.get("outage"), dict) and side["outage"].get("open"):
-            side["outage"] = {"n": side["outage"].get("n") or 0, "open": False, "carded": False}
+        outage = side.get("outage") if isinstance(side.get("outage"), dict) else {}
+        if outage.get("open"):
+            try:
+                good = int(outage.get("good") or 0) + 1
+            except (TypeError, ValueError):
+                good = 1
+            if good >= self.SETASIDE_CLOSE_AFTER:
+                side["outage"] = {"n": outage.get("n") or 0, "open": False, "carded": False}
+            else:
+                side["outage"] = dict(outage, good=good)
+                self.__dict__.setdefault("_replay_put_off", []).append(self._clock() + self.SETASIDE_CLOSE_EVERY_S)
             if not self._side_save(side):
-                log.warning("the outage of the set-aside list couldn't be closed beside the tap journal")
+                log.error("the outage of the set-aside list couldn't be kept beside the tap journal")
         if self.notes.pop("tap_setaside", None) is not None and self.handovers is not None:
             self.handovers.waiting = ""
 
@@ -1516,6 +1540,14 @@ class Controller:
         if self._nocount(mark):
             # Thirtieth round: no count for good, whatever the side file holds (only a requeue clears it).
             return None, self._epoch_of(mark.get("epoch", 0)) or 0, False
+        lost = side.get("lost") if isinstance(side.get("lost"), list) else []
+        had_mark = marks is None or key in unreadable or key in (marks or {})
+        if key not in side_gens and (key in lost or (side.get("lost_all") is True and had_mark)):
+            # Thirty-first round: an unreadable side file was moved aside, and a count of this tap's may have been
+            # in it (its key is legible there or it had journal lines then; or nothing could be told and it has a
+            # relist mark): no count (no Go ahead), whatever the mark says, until a requeue writes it one beside the
+            # journal again.
+            return None, self._epoch_of((mark or {}).get("epoch", 0)) or 0, False
         s_gen = self._gen_of(side_gens.get(key)) if key in side_gens else None
         s_epoch = self._epoch_of(side_epochs.get(key, 0))
         side_ok = s_gen is not None and s_epoch is not None
@@ -1612,28 +1644,30 @@ class Controller:
 
     def _side_load(self) -> dict:
         """The small next-read file beside the journal: {"taps": {key: {"fails", "due"}}, "restarts": n, "logged":
-        t}. {} when there's none or it can't be read."""
+        t}. {} when there's none. Thirty-first round: one that can't be read is moved aside, never written over
+        (handover.load_side): what's given then carries "unread", which _side_save refuses, and "lost", the taps whose
+        counts it may have held."""
         path = self._side_path()
         if not path:
             return {}
-        try:
-            with open(path, encoding="utf-8") as f:
-                got = json.load(f)
-        except (OSError, ValueError):
-            return {}
-        if not isinstance(got, dict):
-            return {}
+        got = handover.load_side(path, self.handovers.line_keys)
         if not isinstance(got.get("taps"), dict):
             got["taps"] = {}
         return got
 
     def _side_save(self, data: dict) -> bool:
-        """Written whole (a temporary file, fsynced, renamed); removed once it holds no tap. Whether it took."""
+        """Written whole (a temporary file, fsynced, renamed); removed once it holds no tap. Whether it took.
+        Thirty-first round: never over a file that couldn't be read (data loaded from one carries "unread"): that
+        write is refused, said loudly, and the file was moved aside instead."""
         path = self._side_path()
         if not path:
             return False
+        if data.get("unread"):
+            log.error("the file beside the tap journal couldn't be read, so it isn't written over (it was moved "
+                      "aside); this change to it is lost")
+            return False
         try:
-            if not data.get("taps") and not data.get("gens") and not data.get("outage"):
+            if not handover.side_keeps(data):
                 if os.path.exists(path):
                     os.remove(path)
                 self._storage_clear()
