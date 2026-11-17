@@ -27,7 +27,8 @@ KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
                    "family_add_undo", "family_add_loosen", "family_add_keep",
                    "rule_approve", "rule_decline", "calendar_change_undo",
                    "mail_dates_undo", "cain_question", "meaning_answer", "meaning_undo",
-                   "place_skip", "stopped_redo", "stopped_drop", "drive_undo", "drive_skip"})
+                   "place_skip", "stopped_redo", "stopped_drop", "drive_undo", "drive_skip",
+                   "drive_remove", "drive_keep"})
 PREFIX = "c"
 
 

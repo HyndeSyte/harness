@@ -441,20 +441,54 @@ how many blocks are on Gmail.
   drives come off only when the feed says it's gone (a date taken out of its series, a cancelled
   instance, the series ended before it, or it's there but no longer wants drives) or when it's
   missing from two full reads in a row. A full read is Google answering 200 with a body that ends
-  as a calendar does and isn't under half the size of the last full one. When more than three
-  appointments look gone at once, that read is taken as a bad one and the digest says so (six reads
-  in a row saying the same are believed). A series split with "this and following" keeps its drives
-  as they are. When Gmail isn't read in full, your own appointments' drives stay as they are, but
-  they are no stop for anything else: Family events, read in full, are still worked out, moved or
-  taken off without them, and a drive of yours that one of theirs crosses shows as "Maybe busy" until
-  a full read. After a day of that the digest says so. Each download's ETag and Last-Modified are
-  kept, and when Google's copy is more than 6 hours old the digest says so. Events you declined or
-  marked tentative get no drives. Drives put back just as the last card said send no new card.
+  as a calendar does and isn't under half the size of the last full one. An appointment missing
+  from one full read keeps its drives, and nothing is made, moved or taken off for your other
+  appointments that day until a full read settles it.
+- **Odd data waits for your go:** a smaller feed is believed only once it has held, and more than
+  three appointments losing their drives at once is never done quietly. Either way you get one card
+  listing the appointments by day and time, with "Take them off" and "Keep them", and nothing comes
+  off until you tap Take them off (until then nothing new is made those days either). Evidence for
+  either oddity counts only reads with a new ETag or a new body (by its hash): the same body
+  downloaded again adds nothing, and a 304 (not modified) is the last full read again and adds
+  nothing either. It's believed with two such reads at least 2 hours apart; before that the digest
+  names it as a possible bad read. A believed smaller feed asks about every appointment that had
+  drives when it was believed.
+- **Splits, by continuity:** a series split with "this and following" is the old series ending (by
+  its UNTIL or COUNT) where a new series starts: after the old one's last instance and before its
+  second lost one, whatever the time or place. The lost instances, overrides of the old series
+  included, go on in order under the new series' instances, with their drives: a new time or place
+  moves them, never a removal, and they don't count toward the three. A whole series moved to a new
+  time ("all events") is matched day by day the same way.
+- **Partial reads write nothing:** when Gmail isn't read in full, your own appointments' drives stay
+  exactly as they are, busy, but they are no stop for anything else: Family events, read in full,
+  are still worked out, moved or taken off without them. A Family event's drive that crosses one of
+  yours is named in the digest, with a card when the event is within a day; both stay busy. After a
+  day of partial reads the digest says so. Each download's ETag, size and Last-Modified are kept,
+  and when the last full download (Google answering 200) is more than 6 hours old the digest says
+  so; Last-Modified isn't used for that. Events you declined or marked tentative get no drives.
+  Drives put back just as the last card said send no new card.
+- **A lost state file:** blocks with Harness's mark that no record knows are taken back as records,
+  by the id Harness gives each block (from its event and generation) and, when no record at all is
+  left, by title and times (a drive ending as its appointment starts, or starting as it ends, the
+  appointment keyed by its uid and original start). An exact duplicate of a kept block (same title,
+  times and place) comes off; nothing else is written, and no test event is needed again.
+- **`remove_all_blocks` (off by default):** on, every block on Gmail carrying Harness's mark, from
+  yesterday on, comes off at the next read (ones you've edited too), and nothing new is written
+  while it stays on. Off again, blocks are written as before.
 - **First live run (`own_drive_dry_run`, on by default):** while it's on, your own appointments'
-  drive blocks are only written to the add-on's log ("drive dry run: would write ..." and "would
-  remove ...", each with the appointment's day and time), never to Gmail, and no card goes out for
-  them; Family events' drives work as before. Read the log against your real calendar for a day,
-  then turn the option off in Harness's settings. Nothing here writes to the Family calendar, and drive blocks carry no guests and send no
+  drive blocks are only written to Harness's log ("drive dry run: would write ...", "would remove
+  ..." and "would ask before removing ...", each with the appointment's day and time), never to
+  Gmail, no card goes out for them and nothing is kept as written. Family events' drives are worked
+  out first, from Family alone, so they come out exactly as they would without your appointments;
+  the dry run's own drive lookups are kept apart, and its counts, removal evidence and feed-size
+  baseline are its own and are cleared when it's turned off. The digest gives the counts of drive
+  blocks that would be written and appointments that would lose theirs since the last digest. The
+  log also gets each download's headers (names and values, no body; cookies not logged), and up to
+  three anonymised samples each of a real split, a cancelled week and a moved week are kept in
+  `drive_samples` in Harness's data folder (titles and places replaced, guests, notes and links left
+  out), for test fixtures later. Turn it off only after a week with at least one real split, one
+  cancellation, one partial read and one feed-size change seen in the log and no wrong would-write or
+  would-remove line; keep `own_drive_days` at 3 for the first live days, then widen it. Nothing here writes to the Family calendar, and drive blocks carry no guests and send no
   updates. A place you type on a block makes it yours, like any other edit.
 
 ## Standing rules from before 0.5.1

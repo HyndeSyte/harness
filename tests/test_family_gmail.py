@@ -249,6 +249,10 @@ class FakeGoogle:
 
 @pytest.fixture
 def g(on):
+    return make_g(on)
+
+
+def make_g(on):
     on.feeds = Feeds()
     on.google = FakeGoogle()
     on.key = KEY

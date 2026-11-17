@@ -17,6 +17,12 @@ around his own appointments, and one card when a drive can't be found, with Skip
     card. Each event is asked about once, ever; Skip leaves it without drive blocks for good.
   * A receipt for drives put back just as the last card told him (the same key, times and place)
     isn't sent again.
+  * Removals on odd data wait for his go: when Gmail's feed shrank and that was believed, or more
+    than 3 appointments lose their drives at once, one card lists them by day and time, with
+    "Take them off" and "Keep them", and nothing comes off until he taps Take them off (family_gmail.py).
+  * A Family event's drive that crosses a drive kept for his own appointment while his calendar
+    isn't read in full is named in the digest, and gets one card when it's within a day. Both stay
+    busy; nothing is retitled.
   * Fixed templates only: the event's day and time, and on a receipt its title cleaned and cut
     short (meaning.shown). Nothing here writes a calendar; family_gmail.py does.
 """
@@ -86,15 +92,21 @@ class DriveCards:
         """His own appointments that have had drives, so a read of Gmail that fails keeps them."""
         return {r["key"] for r in self.ledger.db.execute("SELECT key FROM drive_cards WHERE kind='own'")}
 
-    def own_rows(self) -> list:
-        """His own appointments as last read: key, series uid, start, end and place."""
-        return self.ledger.db.execute("SELECT * FROM drive_cards WHERE kind='own'").fetchall()
+    def own_rows(self, kind: str = "own") -> list:
+        """His own appointments as last read: key, series uid, start, end and place. kind "dry": the
+        dry run's own records, kept apart so nothing it counts carries into live mode."""
+        return self.ledger.db.execute("SELECT * FROM drive_cards WHERE kind=?", (kind,)).fetchall()
 
-    def waiting_since(self, key: str, said: str, start: datetime, now: datetime) -> datetime:
+    def clear_dry(self) -> None:
+        """Live mode again: the dry run's records and counts go, whatever they said."""
+        with self.ledger.tx() as db:
+            db.execute("DELETE FROM drive_cards WHERE kind='dry'")
+
+    def waiting_since(self, key: str, said: str, start: datetime, now: datetime, kind: str = "own") -> datetime:
         """When his appointment first waited for a Family event beside it to be judged."""
         row = self._row(key)
         if row is None:
-            self._upsert(key, "own", said, start)
+            self._upsert(key, kind, said, start)
             row = self._row(key)
         if not row["wait_since"]:
             self._set(key, wait_since=iso(now))
@@ -284,8 +296,78 @@ class DriveCards:
             sent += 1
         return sent
 
+    # -- removals on odd data: his go first ------------------------------------------------------------
+    def hold(self, key: str) -> str:
+        """'' | 'asked' | 'approved' | 'kept': where his go on removing this appointment's drives stands."""
+        row = self._row(key)
+        return row["hold"] if row is not None else ""
+
+    def clear_hold(self, key: str) -> None:
+        """Back in a read: a later removal asks again."""
+        row = self._row(key)
+        if row is not None and (row["hold"] or row["bid"]):
+            self._set(key, hold="", bid="")
+
+    def ask_removals(self, chat_id: int | None, items: list[tuple[str, datetime]], why: str, now: datetime,
+                     *, send: bool = True) -> bool:
+        """One card listing the appointments by day and time, with Take them off and Keep them. Nothing
+        comes off until he taps Take them off. send False (the dry run): marked asked, nothing sent. False:
+        there's no one to ask yet."""
+        if not items or (send and chat_id is None):
+            return False
+        bid = secrets.token_hex(8)
+        zone = ZoneInfo(self.tz)
+        whens = [f"{_day(s.astimezone(zone))} at {_time(s.astimezone(zone))}" for _, s in sorted(items, key=lambda x: x[1])]
+        head = ("Your Gmail calendar came back much smaller than before" if why == "shrink" else
+                f"{len(items)} of your appointments look gone from your Gmail calendar at once")
+        text = (f"{head}. Should their drive blocks come off? {'; '.join(whens)}. They stay until you tap "
+                "Take them off.")
+        with self.ledger.tx() as db:
+            if send:
+                ok = choices.mint(self.ledger, kind="drive_remove", target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+                keep = choices.mint(self.ledger, kind="drive_keep", target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+                self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db,
+                                    buttons=[[("Take them off", choices.callback_data(ok)),
+                                              ("Keep them", choices.callback_data(keep))]],
+                                    binds=[{"type": "choice", "nonce": ok}, {"type": "choice", "nonce": keep}])
+                self.ledger.event("drive_removals_asked", {"n": len(items), "why": why}, db=db)
+            for key, _ in items:
+                db.execute("UPDATE drive_cards SET hold='asked', bid=?, updated_at=? WHERE key=?", (bid, iso(now), key))
+        return True
+
+    # -- a Family drive crossing a kept drive of his -----------------------------------------------------
+    def conflict(self, key: str, kind: str, said: str, start: datetime, kept_start: datetime,
+                 chat_id: int | None, now: datetime) -> None:
+        """Within a day of the event: one card, said once for that kept drive. Nothing changes on Gmail."""
+        self._upsert(key, kind, said, start)
+        row = self._row(key)
+        if row["conflict"] == kept_start.isoformat() or chat_id is None or not now < start < now + NEAR:
+            return
+        zone = ZoneInfo(self.tz)
+        local, kept = start.astimezone(zone), kept_start.astimezone(zone)
+        text = (f"The drive for the event on {_day(local)} at {_time(local)} crosses a drive block kept "
+                f"for your own appointment ({_time(kept)}), because your Gmail calendar couldn't be read in full. "
+                "Both stay on your calendar as busy until it reads in full.")
+        with self.ledger.tx() as db:
+            self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db)
+            db.execute("UPDATE drive_cards SET conflict=?, updated_at=? WHERE key=?",
+                       (kept_start.isoformat(), iso(now), key))
+            self.ledger.event("drive_conflict_told", {}, db=db)
+
     # -- taps ------------------------------------------------------------------------------------------
     def on_choice(self, kind: str, target: str) -> str:
+        if kind in ("drive_remove", "drive_keep"):
+            rows = self.ledger.db.execute("SELECT * FROM drive_cards WHERE bid=? AND bid!=''",
+                                          (target or "",)).fetchall()
+            asked = [r for r in rows if r["hold"] == "asked"]
+            if not asked:
+                return "Already settled. Nothing changed."
+            to = "approved" if kind == "drive_remove" else "kept"
+            for r in asked:
+                self._set(r["key"], hold=to)
+            if to == "approved":
+                return "Taking those drive blocks off your Gmail at the next read."
+            return "Keeping those drive blocks on your Gmail."
         if kind == "drive_undo":
             row = self.ledger.db.execute("SELECT * FROM drive_cards WHERE rid=? AND rid!=''",
                                          (target or "",)).fetchone()

@@ -97,9 +97,12 @@ class FeedResult:
     size: int = 0              # bytes
     complete: bool = False     # the body ends with END:VCALENDAR
     etag: str = ""
-    last_modified: str = ""    # Google's Last-Modified header, as sent
+    last_modified: str = ""    # Google's Last-Modified header, as sent (kept, never used for the feed's age)
     read_id: str = field(default_factory=lambda: secrets.token_hex(6))   # this download, and no other
-    fetched_at: datetime | None = None
+    fetched_at: datetime | None = None   # when this 200 arrived: the feed's age is counted from it
+    # What the body was: a read counts as new evidence only with a new ETag or body hash.
+    body_hash: str = ""
+    raw: str = field(default="", repr=False)   # the body, for anonymised samples in the dry run only
 
 
 @dataclass
@@ -109,8 +112,20 @@ class Snapshot:
     feeds: dict[str, FeedResult] = field(default_factory=dict)
 
 
+_UNSHOWN_HEADERS = frozenset({"set-cookie", "cookie", "authorization", "proxy-authorization"})
+
+
+def headers_line(status: int, headers: dict) -> str:
+    """A response's headers, names and values, never its body. A cookie's value isn't kept."""
+    parts = []
+    for name, value in sorted((str(k).lower(), str(v)) for k, v in (headers or {}).items()):
+        shown = "(not logged)" if name in _UNSHOWN_HEADERS else " ".join(value.split())[:300]
+        parts.append(f"{name}: {shown}")
+    return f"{status}; " + "; ".join(parts)
+
+
 def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
-              tz: str, ahead_until: datetime | None = None) -> FeedResult:
+              tz: str, ahead_until: datetime | None = None, log_headers: bool = False) -> FeedResult:
     fid = feed_id(url)
     REDACT.register(url, url.rsplit("/", 2)[-2])          # the address and its private part
     try:
@@ -119,8 +134,13 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
     except TransportError as e:
         log.info("calendar %s: no answer (%s)", fid[:4], e.kind)
         return FeedResult(fid, False, error="couldn't reach Google", kind="unreachable")
+    if log_headers:                              # the drive dry run: each answer's headers, for later
+        log.info("calendar %s: headers %s", fid[:4], headers_line(resp.status, resp.headers or {}))
     if resp.status != 200:
         log.info("calendar %s: Google answered %s", fid[:4], resp.status)
+    if resp.status == 304:
+        # Not modified: the last full read again. No new evidence, and no new download time.
+        return FeedResult(fid, False, error="not modified", kind="not_modified", status=304)
     if resp.status >= 500 or resp.status in (408, 429):
         return FeedResult(fid, False, error="Google isn't answering right now", kind="unreachable")
     if resp.status == 404:
@@ -156,7 +176,8 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
     return FeedResult(fid, True, window=w,
                       day=start.astimezone(ZoneInfo(tz)).date().isoformat(), ahead=ahead,
                       ahead_error=ahead_error, feed_ahead=ahead, status=resp.status, size=len(resp.body),
-                      complete=text.rstrip().endswith("END:VCALENDAR"), etag=etag, last_modified=modified)
+                      complete=text.rstrip().endswith("END:VCALENDAR"), etag=etag, last_modified=modified,
+                      body_hash=hashlib.sha256(resp.body).hexdigest()[:32], raw=text)
 
 
 def today_bounds(now: datetime, tz: str) -> tuple[datetime, datetime, str]:
@@ -171,8 +192,12 @@ class CalendarFeeds:
     """Owned by the controller thread; fetches happen in workers."""
 
     def __init__(self, ledger: Ledger, transport: Transport, executor: Executor,
-                 urls_fn, tz: str, *, ahead_days: int = 0, ahead_when=None, ahead_from=None):
+                 urls_fn, tz: str, *, ahead_days: int = 0, ahead_when=None, ahead_from=None,
+                 headers_fn=lambda: False):
         self.ledger = ledger
+        # Called at each read: True logs each answer's headers (names and values, no body). On while
+        # the drive dry run is (family_gmail.py), for fixtures later.
+        self.headers_fn = headers_fn
         # (address, start, until) -> Window or None: his Gmail calendar read now, in place of the
         # feed's cached copy for the days ahead. None, or no answer, keeps the feed's.
         self.ahead_from = ahead_from
@@ -220,9 +245,17 @@ class CalendarFeeds:
             return
         self.start()
 
-    def _read(self, url: str, start: datetime, end: datetime, ahead_until: datetime | None) -> FeedResult:
+    def _log_headers(self) -> bool:
+        try:
+            return bool(self.headers_fn())
+        except Exception:
+            return False
+
+    def _read(self, url: str, start: datetime, end: datetime, ahead_until: datetime | None,
+              log_headers: bool = False) -> FeedResult:
         """In a worker: a slow answer from Google never holds up his chat."""
-        res = fetch_one(self.transport, url, start=start, end=end, tz=self.tz, ahead_until=ahead_until)
+        res = fetch_one(self.transport, url, start=start, end=end, tz=self.tz, ahead_until=ahead_until,
+                        log_headers=log_headers)
         if ahead_until is not None:
             self._fresh_ahead(res, (start, ahead_until))
         return res
@@ -262,7 +295,8 @@ class CalendarFeeds:
             fid = feed_id(url)
             if fid in self._futures:
                 continue
-            self._futures[fid] = self.executor.submit(self._read, url, start, end, ahead_until)
+            self._futures[fid] = self.executor.submit(self._read, url, start, end, ahead_until,
+                                                      self._log_headers())
             self._started_at[fid] = now
 
     def collect(self) -> None:
@@ -292,6 +326,12 @@ class CalendarFeeds:
                 log.info("calendar %s: the read stopped (%s)", fid[:4], type(e).__name__)
                 res = FeedResult(fid, False, error="the read stopped on an unexpected problem")
             if fid not in live:
+                continue
+            if res.kind == "not_modified" and fid in self.snapshot.feeds:
+                # Google says nothing changed: the last full read stands as it was, with its own
+                # download time, and counts as no new read.
+                self.ledger.input_ok(f"calendar:{fid}", label=self.snapshot.feeds[fid].window.calendar
+                                     if self.snapshot.feeds[fid].window else "")
                 continue
             if res.ok:
                 res.fetched_at = now

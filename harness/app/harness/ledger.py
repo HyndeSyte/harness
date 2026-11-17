@@ -351,6 +351,9 @@ CREATE TABLE IF NOT EXISTS drive_cards(
   missed INTEGER NOT NULL DEFAULT 0,
   missed_read TEXT NOT NULL DEFAULT '',
   shown TEXT NOT NULL DEFAULT '',
+  hold TEXT NOT NULL DEFAULT '',
+  bid TEXT NOT NULL DEFAULT '',
+  conflict TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

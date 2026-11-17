@@ -74,6 +74,9 @@ class Window:
     # instance of it that isn't in `occurrences` is gone by the feed's own word (an excluded date,
     # a cancelled override, or the series ended before it), not by a read cut short.
     series: set = field(default_factory=set)
+    # Of those, the ones whose repeat rule ends (UNTIL or COUNT): a series that can stop, so the
+    # old half of a "this and following" split (family_gmail.py).
+    bounded: set = field(default_factory=set)
 
 
 # -- lines and properties -------------------------------------------------------
@@ -600,6 +603,8 @@ def window(text: str, *, start: datetime, end: datetime, tz: str,
                     continue                       # replaced by its override below
                 add(ev, inst, dur)
             out.series.add(uid)
+            if rule.get("UNTIL") or rule.get("COUNT"):
+                out.bounded.add(uid)
         except Unreadable:
             if _maybe_relevant(ev, ev.first("RRULE"), start, end, default, local):
                 out.unreadable += 1

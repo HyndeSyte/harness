@@ -110,7 +110,8 @@ class Callbacks:
             return self.mail_dates.on_choice(kind, target)
         if kind in ("stopped_redo", "stopped_drop"):   # what he asked while stopped
             return commands.on_stopped_choice(self.ledger, kind, target, undo=self._undo_kept)
-        if kind in ("meaning_answer", "meaning_undo", "place_skip", "drive_undo", "drive_skip") \
+        if kind in ("meaning_answer", "meaning_undo", "place_skip", "drive_undo", "drive_skip",
+                    "drive_remove", "drive_keep") \
                 and self.meaning_live is not None:
             return self.meaning_live.on_choice(kind, target)   # templates only, no model words
         return "Nothing changed."

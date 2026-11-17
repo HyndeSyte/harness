@@ -559,7 +559,7 @@ class MeaningLive:
             return self._undo(rid, code)
         if kind == "place_skip":
             return self.places.on_choice(kind, target)
-        if kind in ("drive_undo", "drive_skip"):
+        if kind in ("drive_undo", "drive_skip", "drive_remove", "drive_keep"):
             return self.drive_cards.on_choice(kind, target)
         return "Nothing changed."
 

@@ -204,7 +204,17 @@ class Drives:
         self.home_fn = home_fn             # his home: "lat, lon" or a street address, the same
         self.sleep = sleep
         self.clock = clock
+        # "" in live use. The drive dry run (family_gmail.py) sets its own: it reads every kept answer
+        # but keeps what it looks up apart, so nothing it asks can change a Family event's drives.
+        self.side = ""
         self.begin()
+
+    def _kept(self, key: str):
+        found = self.ledger.get_meta(self.side + key) if self.side else None
+        return found if found is not None else self.ledger.get_meta(key)
+
+    def _keep(self, key: str, value: str, db) -> None:
+        self.ledger.set_meta(self.side + key, value, db)
 
     def begin(self) -> None:
         """A new read. A service that's down isn't asked again until the next."""
@@ -264,7 +274,7 @@ class Drives:
         if a_id == b_id:
             return 0.0
         key = "drive_between:" + _hash(a_id + "|" + b_id)
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return self._read(kept)
         near = self._near()
@@ -278,7 +288,7 @@ class Drives:
         if found == FAILED:
             return FAILED
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found, db)
+            self._keep(key, found, db)
         return self._read(found)
 
     def find_place(self, text: str) -> str:
@@ -300,7 +310,7 @@ class Drives:
         if near in (NO_ADDRESS, FAILED):
             return FAILED
         key = "drive_name:" + _hash(" ".join(sorted(want)) + "|" + near)
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return NO_ADDRESS if kept == "none" else kept
         lon, lat = (float(x) for x in near.split(","))
@@ -329,10 +339,10 @@ class Drives:
                 found = point_text(f"{r_lat}, {r_lon}")
             break
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found or "none", db)
+            self._keep(key, found or "none", db)
             if found != "none" and street_address(found):
                 # Its point too, so the drive to it isn't a second lookup.
-                self.ledger.set_meta("drive_place:" + _hash(street_address(found).casefold()), point, db)
+                self._keep("drive_place:" + _hash(street_address(found).casefold()), point, db)
         return NO_ADDRESS if found in ("none", "") else found
 
     def _near(self) -> str:
@@ -354,7 +364,7 @@ class Drives:
             return NO_ADDRESS
         school = street_address(self.school_fn())
         key = "drive_minutes:" + _hash(school.casefold() + "|" + address.casefold())
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return self._read(kept)
         home = self._locate(school)
@@ -367,7 +377,7 @@ class Drives:
         if found == FAILED:
             return FAILED
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found, db)
+            self._keep(key, found, db)
         return self._read(found)
 
     @staticmethod
@@ -380,7 +390,7 @@ class Drives:
     def _locate(self, address: str, near: str = "") -> str:
         """"lon,lat", which is how the route service wants it."""
         key = "drive_place:" + _hash(address.casefold())
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return NO_ADDRESS if kept == "none" else kept
         fields = {"format": "jsonv2", "limit": "1", "q": address}
@@ -396,7 +406,7 @@ class Drives:
         except (KeyError, IndexError, TypeError, ValueError):
             return FAILED
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found, db)
+            self._keep(key, found, db)
         return NO_ADDRESS if found == "none" else found
 
     def _route(self, start: str, end: str) -> str:

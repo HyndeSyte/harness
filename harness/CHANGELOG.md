@@ -18,14 +18,18 @@
 - **No impossible drive from home:** when the place before an appointment can't be found, the drive from home is used only if you can get home and leave in time without crossing another drive; otherwise the digest names it and you get a card.
 - **A block you made yourself called "Busy (drive there)"** counts as your appointment. Harness knows its own blocks by a hidden mark, and drive blocks carry no guests and send no updates.
 - **A new setting, own_drive_days,** says how many days ahead your own appointments get drive blocks. It starts at 3, so you can check a few real ones first, then widen it (up to 60).
-- **A dry run first: a new setting, own_drive_dry_run, starts on.** While it's on, the drives your own appointments would get are only written to Harness's log, with each appointment's day and time, never to your Gmail, and no card goes out for them. Read the log against your calendar for a day, then turn it off.
-- **Your appointments' drives only come off when your calendar clearly says so:** a week taken out of a series, a series ended before it, or an appointment that no longer needs a drive. One that's just missing from a read keeps its drives until two full reads in a row agree. A read that's cut short, or much smaller than the last, changes nothing, and so does one where more than three appointments seem to vanish at once (the digest says so).
-- **Splitting a repeating appointment ("this and following")** keeps one set of drives a day, with no new cards.
+- **A dry run first: a new setting, own_drive_dry_run, starts on.** While it's on, the drives your own appointments would get are only written to Harness's log, with each appointment's day and time, never to your Gmail, and no card goes out for them. Nothing on your Gmail changes because of them: Family events' drives come out exactly as they would without your appointments, and nothing the dry run counts carries over once you turn it off. The morning digest says how many drive blocks would have been written and how many appointments would have lost theirs. The log also gets each download's headers, and a few anonymised examples (titles and places replaced) of a split, a cancelled week and a moved week are kept in Harness's data folder.
+- **Your appointments' drives only come off when your calendar clearly says so:** a week taken out of a series, a series ended before it, or an appointment that no longer needs a drive. One that's just missing from a read keeps its drives until two full reads in a row agree, and nothing else that day changes until then.
+- **Nothing is written on a read that's cut short.** Your drives stay exactly as they are, busy.
+- **Odd changes wait for you.** If your calendar comes back much smaller than before, or more than three appointments lose their drives at once, you get one card listing them by day and time, with Take them off and Keep them. Nothing comes off until you tap Take them off. A one-off bad read sends no card: it has to hold over fresh downloads at least 2 hours apart first.
+- **Splitting a repeating appointment ("this and following")** keeps its drives, even with a new time or place: they move with it, and nothing is taken off and added again. A whole series moved to a new time moves its drives the same way.
 - **Drives put back just as you were last told** don't send another card.
 - **Events you declined or marked as maybe get no drives.**
-- **When Gmail isn't read in full, a Family event's drives still go on.** Your own appointment's place isn't used for them until a full read confirms it, and a drive of yours they cross shows as "Maybe busy" until then.
+- **When Gmail isn't read in full, a Family event's drives still go on.** Your own appointment's place isn't used for them until a full read confirms it. If one of them crosses a drive kept for your own appointment, both stay busy, the digest says so, and you get a card when that event is within a day.
 - **A drive left off within a day of its event always gets its card,** with the reason, straight away.
-- **The digest says when Google's copy of your calendar is more than 6 hours old.**
+- **The digest says when your Gmail calendar hasn't been downloaded in full for more than 6 hours.**
+- **If Harness loses its records, it doesn't double your blocks.** It finds the blocks it made on your Gmail and takes them back, and an exact duplicate comes off.
+- **A new setting, remove_all_blocks, starts off.** On, every block Harness made comes off your Gmail and nothing new is written while it stays on. Off again, they're written as before.
 - **Nothing new is written to the Family calendar.**
 
 ## 0.23.0
