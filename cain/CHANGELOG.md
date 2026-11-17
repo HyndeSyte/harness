@@ -3,13 +3,15 @@
 ## 0.12.2
 
 - PC jobs run again with Chrome 157: Chrome's own built-in extensions, such as Chrome Web Store Payments, no longer count as an extra extension in the Cain jobs profile. Any extension you or anything else installed still stops runs, as before.
-- Extensions other programs put in the Cain jobs Chrome (through the Windows registry, waiting on Chrome's prompt) no longer stop PC jobs while they are off, and Google's default apps such as Google Docs Offline never do. Only an extension Chrome would actually run counts, plus any extension a Chrome policy installs, which always counts and is named with the policy.
+- Extensions other programs put in the Cain jobs Chrome (through the Windows registry, waiting on Chrome's prompt) no longer stop PC jobs while they are off. Only an extension Chrome would actually run counts, plus any extension a Chrome policy installs, which always counts and is named with the policy.
+- Google Docs Offline must be off in the Cain jobs Chrome: if it is on, the run stops and names it, with the fix. Turn it off once on that Chrome's extensions page. A new worker command, open-chrome, starts the Cain jobs Chrome with Chrome's default apps disabled, so it stays off.
+- The extension check now stops a run when it can't be sure: a setting it doesn't recognise, a Chrome policy it can't read, or a policy that installs any other extension (including through the ExtensionSettings policy), each named. Chrome's own extensions count as Chrome's only when they sit in Chrome's own folder.
 - The PC worker never changes your Chrome profile: it only reads it to decide. If something else is on, the run stops and check-host names it, for you to turn off in that Chrome.
 - A new worker command, dump-extensions, lists each extension entry in the Cain jobs profile with numbers and folder kinds only, never names or paths, so the setup can be recorded.
 - After installing, run the probe and confirm again at your PC once: the worker changed, so nothing runs until you do.
 - The worker's two checks inside each run (before every browser action and after every page read) now refuse to work if a preload setting or the tests' variable is set where they run, like the worker itself.
-- Cain now tells you the PC's worker isn't starting for short jobs too: a job that waits out its whole time, or expires without being picked up, while the PC hasn't been heard from in 6 hours. A short job alone says nothing while the PC checked in recently.
-- During an outage of the PC job queue you only hear that the queue can't be reached, not also that the PC isn't starting. That line clears only after the queue answers a few times in a row, and if it comes back within a day it says so. After 12 hours of it, a PC that seems not to start is still mentioned, marked as not confirmed.
+- Cain now tells you the PC's worker isn't starting for short jobs too: a job that waits out its whole time, or expires without being picked up, while the PC hasn't been heard from in 3 hours. If the PC checked in shortly before the job, Cain waits for it to be picked up, and tells you within 12 hours if it never is, even across a restart of Cain.
+- During an outage of the PC job queue you only hear that the queue can't be reached, not also that the PC isn't starting. That line clears only after the queue answers a few times in a row, and if it comes back within a day it says so. Within 12 hours, a PC that seems not to start is still mentioned, marked as not confirmed, and that line keeps being sent until it gets through.
 - The Ship gate's follow-ups: its records, quarantine and supersede steps are stricter, a stuck read of GitHub refuses the Ship card by name, and nothing it sets aside is ever deleted.
 
 ## 0.12.1

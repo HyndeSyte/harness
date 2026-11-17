@@ -62,6 +62,9 @@ export const MIN_LIFE_MS = 15 * 60_000;          // a job lives at least this lo
 export const MAX_LIFE_MS = 72 * 3_600_000;       // and at most this long
 export const LEASE_MS = 30 * 60_000;             // a claim lasts this long, renewed while working
 export const SKEW_MS = 2 * 60_000;               // the Pi's and the PC's clocks may differ by this much
+// The heartbeat interval (0.12.2, fourth pass): a run refreshes the worker's heartbeat in the queue at least this
+// often, whatever its code; the keeper counts a heartbeat fresh for three of these.
+export const HEARTBEAT_INTERVAL_MS = 60 * 60_000;
 export const MAX_FACTS = 8;
 const TOKEN_SKEW_MS = 5 * 60_000;
 

@@ -62,7 +62,7 @@ import { basename, dirname, join, resolve, win32 as pathWin32 } from "node:path"
 import { domainToASCII, fileURLToPath } from "node:url";
 import { createHash, createHmac, generateKeyPairSync, createPrivateKey, createPublicKey, randomBytes, type KeyObject } from "node:crypto";
 import {
-  addressCtxFor, canonical, checkFacts, factsFor, isReadOnly, jobText, keyFingerprint, LEASE_MS, newAttempt, onLogin, onPin, onRedirect, parseAllowlist,
+  addressCtxFor, canonical, checkFacts, factsFor, isReadOnly, jobText, keyFingerprint, LEASE_MS, HEARTBEAT_INTERVAL_MS, newAttempt, onLogin, onPin, onRedirect, parseAllowlist,
   parseHeartbeat, parseJob, parseKeys, parseResult, pinFor, riskyMatch, resultText, sanitizeUrl, signAllowlist, signerOf, SKEW_MS, stateAfter,
   attributesGood, KID, TOOL, registrableDomain, entryDomains, entryRegistrable, hostAllowed, jobScopeProblem, queryAllowed, plainHost, PSL_FILE, PSL_SHA256, pslText, QUERY_MAX,
   type Allow, type Checked, type Code, type FactType, type Handoff, type Heartbeat, type Job, type Reason, type Result, type Status,
@@ -127,7 +127,9 @@ export interface Opts {
   exeVersion?: (exe: string) => string | null;      // a test's stand-in for an executable's file version (Windows reads it with chromeExeVersions)
   chromePs?: () => string;                          // a test's stand-in for chromeExeVersions' PowerShell output (throws as execFileSync would)
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
-  forcelist?: () => ForceList;                      // Windows: Chrome's ExtensionInstallForcelist policy (readForcelist unless a test stands in)
+  forcelist?: () => ForceList;                      // Windows: Chrome's extension policies as read now (readPolicy unless a test stands in)
+  reg?: RegQuery;                                   // Windows: one reg query call, for readPolicy (the real reg.exe unless a test stands in)
+  startChrome?: (exe: string, args: string[]) => void; // starts the dedicated Chrome (a detached spawn unless a test stands in)
   killPid?: (pid: number) => void;                  // ends one process (a stuck bridge's), killTree unless a test stands in
   platform?: string;
   has?: (file: string) => boolean;                  // whether a file exists (existsSync unless a test stands in), for CLAUDE_CODE_GIT_BASH_PATH
@@ -215,16 +217,20 @@ export const LOCK_STALE_MS = LEASE_MS + SKEW_MS;
 //   confirm_path: always false in this version: the confirm path's code can't be reached.
 //   diagnostics: false; true turns on the local diagnostic capture for the first probes.
 //   profile: the dedicated Chrome profile (user_data_dir, profile_directory, profile_name,
-//            extension_id). The worker never starts Chrome: the owner keeps it open on
-//            this profile, and a run without it is browser_unreachable.
+//            extension_id). The owner keeps Chrome open on this profile, started with
+//            worker.ts open-chrome (0.12.2, fourth pass: the pinned arguments, chromeLaunchArgs,
+//            with --disable-default-apps); a run without it is browser_unreachable.
 //   native_host_manifest: the manifest Claude in Chrome's native messaging host is registered
 //            with (the file its NativeMessagingHosts registry entry names); the worker reads
 //            the host's path from it to check the host's parent chain.
 //   other_user_data_dirs: Chrome folders to scan besides the usual ones.
+//   default_app_ids (optional, 0.12.2 fourth pass): ids of Google's default apps the setup session's dump-extensions
+//            shows in the dedicated profile, beside Google Docs Offline: exempt only while off, like it.
 export interface Install {
   v: 1; owner_fpr: string; claude: string; session_minutes: number; unattended: boolean; confirm_path: false; diagnostics: boolean; native_host_manifest: string;
   profile: { user_data_dir: string; profile_directory: string; profile_name: string; extension_id: string };
   other_user_data_dirs: string[];
+  default_app_ids?: string[];
 }
 const INSTALL_KEYS = ["v", "owner_fpr", "claude", "session_minutes", "unattended", "confirm_path", "diagnostics", "native_host_manifest", "profile", "other_user_data_dirs"];
 const PROFILE_KEYS = ["user_data_dir", "profile_directory", "profile_name", "extension_id"];
@@ -232,7 +238,9 @@ const str = (x: unknown) => typeof x === "string" && x.length > 0 && x.length < 
 const same = (o: any, keys: string[]) => !!o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).sort().join(",") === [...keys].sort().join(",");
 
 export function parseInstall(x: any): Install | null {
-  if (!same(x, INSTALL_KEYS) || x.v !== 1 || typeof x.owner_fpr !== "string" || !/^[0-9a-f]{64}$/.test(x.owner_fpr) || !str(x.claude)
+  const keys = x && typeof x === "object" && "default_app_ids" in x ? [...INSTALL_KEYS, "default_app_ids"] : INSTALL_KEYS;
+  if (x && "default_app_ids" in x && (!Array.isArray(x.default_app_ids) || x.default_app_ids.length > 10 || !x.default_app_ids.every((i: unknown) => typeof i === "string" && /^[a-p]{32}$/.test(i)))) return null;
+  if (!same(x, keys) || x.v !== 1 || typeof x.owner_fpr !== "string" || !/^[0-9a-f]{64}$/.test(x.owner_fpr) || !str(x.claude)
     || !Number.isInteger(x.session_minutes) || x.session_minutes < 1 || x.session_minutes * 60_000 > MAX_SESSION_MS
     || typeof x.unattended !== "boolean" || x.confirm_path !== false || typeof x.diagnostics !== "boolean" || !str(x.native_host_manifest)
     || !Array.isArray(x.other_user_data_dirs) || x.other_user_data_dirs.length > 10 || !x.other_user_data_dirs.every(str)) return null;
@@ -668,36 +676,37 @@ export function activeExtensionVersion(inst: Install): string | null {
 
 // The extension's entry, and every other extension, in the dedicated profile's preferences:
 // extensions.settings in Secure Preferences and in Preferences, whichever holds it (an
-// entry can be split between them). Secure Preferences wins: a field both files hold is
-// read from it. When both files hold the same extension and disagree on its state or its
-// manifest's version, the merged view could be wrong, so the preflight refuses: the
-// ids in disagree. files names the file(s) the pinned entry was read from, key its key
-// path; no file holding it is extension_entry_missing at preflight (a profile that is right
-// but doesn't list the extension, separate from wrong_profile).
+// entry can be split between them). When both files hold the same extension and disagree on
+// its state or its manifest's version, the preflight refuses: the ids in disagree. files
+// names the file(s) the pinned entry was read from, key its key path; no file holding it is
+// extension_entry_missing at preflight (a profile that is right but doesn't list the
+// extension, separate from wrong_profile).
 // 0.12.2, third pass: read only. Nothing in the worker writes Preferences or Secure Preferences
-// (Chrome keeps integrity codes over its extension entries and resets an entry it finds edited,
-// which turns a default app such as Google Docs Offline back on). The gate is settled by how each
-// entry is classified, in this order:
+// (Chrome keeps integrity codes over its extension entries and resets an entry it finds edited).
+// 0.12.2, fourth pass: the gate fails closed. Each entry is classified, in this order:
 //   claude: the allowed extension (install.json's extension_id).
-//   policy: an entry at a policy location (7, 9), or whose id is named in the
-//     ExtensionInstallForcelist policy under HKLM or HKCU Software\Policies\Google\Chrome. It counts
-//     as on whatever its state or disable reason: Chrome turns it on again itself.
+//   policy: an entry at a policy location (7, 9), or whose id a Chrome policy installs
+//     (ExtensionInstallForcelist, or ExtensionSettings with installation_mode force_installed or
+//     normal_installed, under HKLM or HKCU, the WOW6432Node paths too). It counts as on whatever its
+//     state or disable reason. A policy id that isn't in the profile yet refuses too.
 //   chrome: an id on Chrome's built-in list (CHROME_BUILTIN_IDS) at an internal location, component
-//     (5) or external component (10), whose path is inside Chrome's install folder or absent (as
-//     Chrome writes it for component extensions). A missing location never qualifies, and anything
-//     else carrying a built-in id is foreign: an unpacked extension can claim any id.
-//   default_app: Google's default-installed apps: an entry Chrome marks was_installed_by_default,
-//     one loaded from the default_apps folder, or Google Docs Offline's id at the store location (1).
-//     Chrome's own, whether on or off.
+//     (5) or external component (10), AND a path inside Chrome's install folder. No path, a missing
+//     location or any other path is foreign: an unpacked extension can claim any id.
+//   default_app: an id on the fixed default-app list (DEFAULT_APP_IDS: Google Docs Offline) or in
+//     install.json's default_app_ids (the ids the setup session's dump shows). Exempt only while off:
+//     an enabled one refuses by name, with its one-time fix (turn it off on chrome://extensions; the
+//     worker opens Chrome with --disable-default-apps, so Chrome never turns it back on).
 //   foreign: anything else.
-// status: "on" when Chrome would run it (no disable reason at all, and a state of 1 or no state
-// field, as Chrome 157 writes), "present, off" otherwise (any disable reason, the external-install
-// prompt's 8192 included, or a state other than 1); a policy entry is always "on".
-// others, the ones that refuse a run (extra_extension at preflight): every policy entry and every
-// foreign entry that is on. Each line carries the raw location, state and disable_reasons fields
-// as Chrome wrote them (numbers only), the folder kind of its path (path_kind, never the path), its
-// kind, its status and the policy hives naming it; check-host and the probe print them for every
-// extension found, with the policy's own listing.
+// status (entryStatus): "present, off" only for state 0, or for a disable_reasons list or bitmask
+// that is non-empty and non-zero; "unrecognised" for any state value other than 0 or 1, or a
+// disable_reasons that isn't a number or a list of numbers (null and strings included), naming the
+// field; "on" otherwise (no state field or state 1, with no reason: missing, 0 or an empty list).
+// A policy entry is always "on". When both files hold an id, each file's view is classified on its own
+// (a field only one file holds is in both views) and they combine conservatively: whichever view makes
+// it foreign or a policy entry, shows it on, or can't be read, wins.
+// others, the ones that refuse a run (extra_extension at preflight): every policy entry and policy id,
+// every foreign or default-app entry that is on, and every entry (but Claude in Chrome) whose state or
+// disable reasons can't be read. A policy hive that can't be read refuses too (refusals, by name).
 export const PREF_FILES = ["Secure Preferences", "Preferences"];
 export const COMPONENT_LOCATION = 5;
 // Chrome's internal locations (its ManifestLocation): kComponent and kExternalComponent.
@@ -734,65 +743,144 @@ export function pathKind(path: unknown, userDataDir: string): PathKind {
   if (/(^|\/)default_apps(\/|$)/.test(p)) return "default_apps";
   return CHROME_RESOURCES.test(`${p}/`) ? "chrome_install" : "other";
 }
+// 0.12.2, fourth pass: a real path under Chrome's install folder is required; no path is foreign.
 export const chromeOwn = (id: string, location: number | null, pk: PathKind) =>
-  CHROME_BUILTIN_IDS.includes(id) && location !== null && CHROME_LOCATIONS.includes(location) && (pk === "chrome_install" || pk === "absent");
-// Google's default-installed apps: marked was_installed_by_default by Chrome, loaded from its default_apps folder,
-// or Google Docs Offline's id at the store location (1), how Chrome 157 lists it.
+  CHROME_BUILTIN_IDS.includes(id) && location !== null && CHROME_LOCATIONS.includes(location) && pk === "chrome_install";
+// Google's default apps, by id only (0.12.2, fourth pass): Google Docs Offline, plus the ids install.json's
+// default_app_ids adds (the ones the setup session's dump-extensions shows on the owner's PC). Exempt only while off.
 export const DOCS_OFFLINE_ID = "ghbmnnjooekpmoecnnnilnnbdlolhkhi";
-export const DEFAULT_APP_LOCATIONS: readonly number[] = [1];
-export const defaultApp = (id: string, e: any, location: number | null, pk: PathKind) =>
-  e?.was_installed_by_default === true || pk === "default_apps"
-  || (id === DOCS_OFFLINE_ID && location !== null && DEFAULT_APP_LOCATIONS.includes(location));
+export const DEFAULT_APP_IDS: readonly string[] = [DOCS_OFFLINE_ID];
+export const defaultAppIds = (inst: Install): string[] => [...DEFAULT_APP_IDS, ...(inst.default_app_ids ?? [])];
+export const DEFAULT_APP_FIX = "turn it off once on chrome://extensions in the Cain jobs Chrome (opened with worker.ts open-chrome, which starts Chrome with --disable-default-apps, so it stays off); the worker never changes it itself";
 export const USER_DISABLE = 1;
 type RawReasons = number | number[] | null;
 export type ExtensionKind = "claude" | "policy" | "chrome" | "default_app" | "foreign";
-export type ExtensionStatus = "on" | "present, off";
-export type PolicyHive = "HKLM" | "HKCU";
+export type ExtensionStatus = "on" | "present, off" | "unrecognised";
+export type PolicyHive = "HKLM" | "HKCU" | "HKLM\\WOW6432Node" | "HKCU\\WOW6432Node";
+export type PolicyName = "ExtensionInstallForcelist" | "ExtensionSettings";
 export interface ExtensionLine { id: string; name: string | null; enabled: boolean; component: boolean; kind: ExtensionKind; status: ExtensionStatus;
-  location: number | null; state: number | null; disable_reasons: RawReasons; path_kind: PathKind; policy: PolicyHive[] }
-// The ExtensionInstallForcelist policy, as read now: each id it names with the hive that names it, and the hives whose
-// key couldn't be read. A key that isn't there is no entry (reg answers 1); anything else but 0 is unreadable. The
-// ids only: the update address beside each is never kept or printed. Off Windows there is no registry: empty.
-export interface ForceList { entries: { hive: PolicyHive; id: string }[]; unreadable: PolicyHive[] }
-export const FORCELIST_KEYS: Record<PolicyHive, string> = {
-  HKLM: "HKLM\\SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallForcelist",
-  HKCU: "HKCU\\SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallForcelist",
+  location: number | null; state: number | null; disable_reasons: RawReasons; path_kind: PathKind; policy: PolicyHive[]; unrecognised: string[] }
+// Chrome's extension policies, as read now (0.12.2, fourth pass): each id a policy installs, with the hive and the
+// policy naming it (ExtensionSettings' installation_mode too), and each hive and policy that couldn't be read. A key
+// or value that isn't there is no entry (reg answers 1); anything else but 0, or a listing that doesn't parse, is
+// unreadable, which refuses the run. The ids only: the update address beside each is never kept or printed. Off
+// Windows there is no registry: empty.
+export interface PolicyEntry { hive: PolicyHive; id: string; policy: PolicyName; mode?: "force_installed" | "normal_installed" }
+export interface ForceList { entries: PolicyEntry[]; unreadable: { hive: PolicyHive; policy: PolicyName }[] }
+export const POLICY_HIVES: readonly PolicyHive[] = ["HKLM", "HKCU", "HKLM\\WOW6432Node", "HKCU\\WOW6432Node"];
+export const CHROME_POLICY_KEYS: Record<PolicyHive, string> = {
+  HKLM: "HKLM\\SOFTWARE\\Policies\\Google\\Chrome",
+  HKCU: "HKCU\\SOFTWARE\\Policies\\Google\\Chrome",
+  "HKLM\\WOW6432Node": "HKLM\\SOFTWARE\\WOW6432Node\\Policies\\Google\\Chrome",
+  "HKCU\\WOW6432Node": "HKCU\\SOFTWARE\\WOW6432Node\\Policies\\Google\\Chrome",
 };
+export const FORCELIST_KEYS: Record<PolicyHive, string> = Object.fromEntries(POLICY_HIVES.map((h) => [h, `${CHROME_POLICY_KEYS[h]}\\ExtensionInstallForcelist`])) as Record<PolicyHive, string>;
 export const NO_FORCELIST: ForceList = { entries: [], unreadable: [] };
-// reg query's listing of the key, parsed: every REG_SZ value's leading 32-letter id (an entry is "<id>" or "<id>;<update address>").
-export function parseForcelist(hive: PolicyHive, text: string): ForceList["entries"] {
-  const out: ForceList["entries"] = [];
-  for (const m of text.matchAll(/^\s+\S+\s+REG_(?:EXPAND_)?SZ\s+([a-p]{32})(?:;.*)?\s*$/gm)) if (!out.some((x) => x.id === m[1])) out.push({ hive, id: m[1] });
+const ID32 = /^[a-p]{32}$/;
+// reg query's listing of the forcelist key, parsed: every REG_SZ value's leading 32-letter id (an entry is "<id>" or "<id>;<update address>").
+export function parseForcelist(hive: PolicyHive, text: string): PolicyEntry[] {
+  const out: PolicyEntry[] = [];
+  for (const m of text.matchAll(/^\s+\S+\s+REG_(?:EXPAND_)?SZ\s+([a-p]{32})(?:;.*)?\s*$/gm)) if (!out.some((x) => x.id === m[1])) out.push({ hive, id: m[1], policy: "ExtensionInstallForcelist" });
   return out;
 }
-export function readForcelist(plat = process.platform): ForceList {
-  if (plat !== "win32") return { entries: [], unreadable: [] };
-  const out: ForceList = { entries: [], unreadable: [] };
-  for (const hive of ["HKLM", "HKCU"] as const) {
-    try {
-      const r = spawnSync("reg", ["query", FORCELIST_KEYS[hive], "/reg:64"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, windowsHide: true });
-      if (r.error) out.unreadable.push(hive);
-      else if (r.status === 0) out.entries.push(...parseForcelist(hive, r.stdout ?? ""));
-      else if (r.status !== 1) out.unreadable.push(hive);
-    } catch { out.unreadable.push(hive); }
+const INSTALL_MODES = ["force_installed", "normal_installed"] as const;
+// ExtensionSettings' entries that install an extension: each key (an id, or ids joined by commas; "*" and update-address
+// keys install nothing) whose installation_mode is force_installed or normal_installed.
+function settingsEntries(hive: PolicyHive, dict: Record<string, unknown>): PolicyEntry[] {
+  const out: PolicyEntry[] = [];
+  for (const [key, v] of Object.entries(dict)) {
+    const mode = (v as any)?.installation_mode;
+    if (!INSTALL_MODES.includes(mode)) continue;
+    for (const id of key.split(",").map((s) => s.trim())) if (ID32.test(id) && !out.some((x) => x.id === id)) out.push({ hive, id, policy: "ExtensionSettings", mode });
   }
   return out;
 }
-export const forcelistOf = (o: Opts): ForceList => (o.forcelist ?? (() => readForcelist(platform(o))))();
-export interface ExtensionPrefs { files: string[]; key: string; extensions: ExtensionLine[]; others: string[]; disagree: string[]; policy: ForceList }
+// ExtensionSettings as a JSON string value (reg query <Chrome key> /v ExtensionSettings): null when it doesn't parse.
+export function parseSettingsValue(hive: PolicyHive, text: string): PolicyEntry[] | null {
+  const m = /^\s+ExtensionSettings\s+REG_(?:EXPAND_)?SZ\s+(.*?)\s*$/m.exec(text);
+  if (!m) return null;
+  try {
+    const dict = JSON.parse(m[1]);
+    return dict && typeof dict === "object" && !Array.isArray(dict) ? settingsEntries(hive, dict) : null;
+  } catch { return null; }
+}
+// ExtensionSettings as a key with a subkey per extension (reg query <Chrome key>\ExtensionSettings /s), the other
+// layout Chrome reads: each subkey's installation_mode value.
+export function parseSettingsKey(hive: PolicyHive, text: string): PolicyEntry[] {
+  const dict: Record<string, Record<string, string>> = {};
+  let at: string | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    const k = /^HKEY_[^\\]+\\.*\\ExtensionSettings\\([^\\]+)\s*$/i.exec(line);
+    if (k) { at = k[1]; dict[at] ??= {}; continue; }
+    if (/^HKEY_/i.test(line)) { at = null; continue; }
+    const v = /^\s+(\S+)\s+REG_(?:EXPAND_)?SZ\s+(.*?)\s*$/.exec(line);
+    if (v && at) dict[at][v[1]] = v[2];
+  }
+  return settingsEntries(hive, dict);
+}
+export interface RegAnswer { status: number | null; stdout: string; error?: boolean }
+export type RegQuery = (args: string[]) => RegAnswer;
+const regQuery: RegQuery = (args) => {
+  const r = spawnSync("reg", ["query", ...args, "/reg:64"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, windowsHide: true });
+  return { status: r.status, stdout: r.stdout ?? "", error: !!r.error };
+};
+// Every hive's ExtensionInstallForcelist and ExtensionSettings (as a value and as a key). Fail closed: a reg call that
+// fails, answers anything but 0 or 1 (not there), or an ExtensionSettings value that doesn't parse, is unreadable.
+export function readPolicy(plat = process.platform, reg: RegQuery = regQuery): ForceList {
+  if (plat !== "win32") return { entries: [], unreadable: [] };
+  const out: ForceList = { entries: [], unreadable: [] };
+  const add = (es: PolicyEntry[]) => { for (const e of es) if (!out.entries.some((x) => x.hive === e.hive && x.id === e.id && x.policy === e.policy)) out.entries.push(e); };
+  const ask = (hive: PolicyHive, policy: PolicyName, args: string[], parse: (t: string) => PolicyEntry[] | null) => {
+    try {
+      const r = reg(args);
+      if (r.error || (r.status !== 0 && r.status !== 1)) { out.unreadable.push({ hive, policy }); return; }
+      if (r.status === 1) return;
+      const es = parse(r.stdout ?? "");
+      if (es === null) { if (!out.unreadable.some((x) => x.hive === hive && x.policy === policy)) out.unreadable.push({ hive, policy }); return; }
+      add(es);
+    } catch { out.unreadable.push({ hive, policy }); }
+  };
+  for (const hive of POLICY_HIVES) {
+    ask(hive, "ExtensionInstallForcelist", [FORCELIST_KEYS[hive]], (t) => parseForcelist(hive, t));
+    ask(hive, "ExtensionSettings", [CHROME_POLICY_KEYS[hive], "/v", "ExtensionSettings"], (t) => parseSettingsValue(hive, t));
+    ask(hive, "ExtensionSettings", [`${CHROME_POLICY_KEYS[hive]}\\ExtensionSettings`, "/s"], (t) => parseSettingsKey(hive, t));
+  }
+  return out;
+}
+export const readForcelist = (plat = process.platform): ForceList => readPolicy(plat);
+export const forcelistOf = (o: Opts): ForceList => (o.forcelist ?? (() => readPolicy(platform(o), o.reg ?? regQuery)))();
+// refusals: each reason the gate refuses, by name (the entry and the field, the policy id, or the hive).
+export interface Refusal { id?: string; why: "on" | "default_app_on" | "policy" | "unrecognised" | "policy_unreadable"; field?: string; hive?: PolicyHive; policy?: PolicyName }
+export interface ExtensionPrefs { files: string[]; key: string; extensions: ExtensionLine[]; others: string[]; disagree: string[]; policy: ForceList; refusals: Refusal[] }
 const num = (x: unknown) => typeof x === "number" && Number.isFinite(x) ? x : null;
 const rawReasons = (x: unknown): RawReasons => typeof x === "number" && Number.isFinite(x) ? x
   : Array.isArray(x) ? x.filter((v): v is number => typeof v === "number" && Number.isFinite(v)) : null;
-// Any disable reason at all. A disable_reasons field that is there but isn't a number or a list
-// can't be read, so it is no reason: the extension counts as on (fail closed).
+const reasonNumber = (v: unknown) => typeof v === "number" && Number.isInteger(v) && v >= 0;
+// How an entry stands, by its own raw fields (0.12.2, fourth pass, fail closed): off only for state 0, or for a
+// disable_reasons list or bitmask that is non-empty and non-zero; any other state value, or a disable_reasons that
+// isn't a whole number or a list of them, is unrecognised, naming the field.
+export function entryStatus(e: any): { status: ExtensionStatus; unrecognised: string[] } {
+  const bad: string[] = [];
+  let off = false;
+  if ("state" in (e ?? {})) {
+    if (e.state === 0) off = true;
+    else if (e.state !== 1) bad.push("state");
+  }
+  if ("disable_reasons" in (e ?? {})) {
+    const r = e.disable_reasons;
+    if (reasonNumber(r)) { if (r !== 0) off = true; }
+    else if (Array.isArray(r) && r.every(reasonNumber)) { if (r.some((v: number) => v !== 0)) off = true; }
+    else bad.push("disable_reasons");
+  }
+  return { status: bad.length ? "unrecognised" : off ? "present, off" : "on", unrecognised: bad };
+}
+// Kept for the probe's and check-host's readers: any disable reason at all, and whether Chrome would run it.
 export const anyReason = (r: RawReasons) => Array.isArray(r) ? r.some((v) => v !== 0) : typeof r === "number" ? r !== 0 : false;
-// Whether Chrome itself would run the extension: no disable reason, and state 1 or no state field.
 export const runsInChrome = (state: number | null, r: RawReasons) => !anyReason(r) && (state === null || state === 1);
-interface RawPrefs { files: string[]; merged: Record<string, any>; held: Record<string, string[]>; disagree: string[] }
+interface RawPrefs { files: string[]; merged: Record<string, any>; views: Record<string, any[]>; held: Record<string, string[]>; disagree: string[] }
 function readPrefs(inst: Install): RawPrefs {
   const p = inst.profile;
   const dir = join(p.user_data_dir, p.profile_directory);
-  const merged: Record<string, any> = {};
   const seen: Record<string, any[]> = {};
   const held: Record<string, string[]> = {};
   const files: string[] = [];
@@ -801,45 +889,107 @@ function readPrefs(inst: Install): RawPrefs {
     if (!table || typeof table !== "object" || Array.isArray(table)) continue;
     for (const [id, e] of Object.entries(table)) {
       if (!e || typeof e !== "object" || Array.isArray(e)) continue;
-      merged[id] = { ...(e as object), ...(merged[id] ?? {}) };            // Secure Preferences, read first, wins
       (seen[id] ??= []).push(e);
       (held[id] ??= []).push(f);
       if (id === p.extension_id) files.push(f);
     }
   }
+  // Each id's views: one per file holding it, a field only the other file holds filled in from it. The merged view
+  // (Secure Preferences first) is the one printed; the views are what the gate judges.
+  const merged: Record<string, any> = {}, views: Record<string, any[]> = {};
+  for (const [id, es] of Object.entries(seen)) {
+    merged[id] = es.length > 1 ? { ...es[1], ...es[0] } : es[0];
+    views[id] = es.length > 1 ? [{ ...es[1], ...es[0] }, { ...es[0], ...es[1] }] : [es[0]];
+  }
   const differs = (a: unknown, b: unknown) => a !== undefined && b !== undefined && JSON.stringify(a) !== JSON.stringify(b);
   const disagree = Object.keys(seen).sort().filter((id) => seen[id].length > 1
     && (differs(seen[id][0].state, seen[id][1].state) || differs(seen[id][0].manifest?.version, seen[id][1].manifest?.version)));
-  return { files, merged, held, disagree };
+  return { files, merged, views, held, disagree };
+}
+function classify(inst: Install, id: string, e: any, hives: PolicyHive[]): ExtensionLine {
+  const p = inst.profile;
+  const reasons = rawReasons(e.disable_reasons), location = num(e.location), state = num(e.state);
+  const name = typeof e.manifest?.name === "string" && /^[\w .,()'&+-]{1,60}$/.test(e.manifest.name) ? e.manifest.name : null;
+  const pk = pathKind(e.path, p.user_data_dir);
+  const kind: ExtensionKind = id === p.extension_id ? "claude"
+    : (location !== null && POLICY_LOCATIONS.includes(location)) || hives.length ? "policy"
+    : CHROME_BUILTIN_IDS.includes(id) ? (chromeOwn(id, location, pk) ? "chrome" : "foreign")
+    : defaultAppIds(inst).includes(id) ? "default_app" : "foreign";
+  const st = entryStatus(e);
+  const status: ExtensionStatus = kind === "policy" ? "on" : st.status;
+  return { id, name, enabled: status !== "present, off", component: kind === "chrome", kind, status, location, state, disable_reasons: reasons, path_kind: pk,
+    policy: hives, unrecognised: kind === "claude" ? [] : st.unrecognised };
+}
+// Two views of one id, combined conservatively: a policy or foreign view wins over Chrome's own or a default app (views
+// of different kinds otherwise count as foreign), unrecognised over on, on over off. The line printed is the winning view's.
+function combine(lines: ExtensionLine[]): ExtensionLine {
+  if (lines.length === 1) return lines[0];
+  const kinds = [...new Set(lines.map((x) => x.kind))];
+  const kind: ExtensionKind = kinds.length === 1 ? kinds[0] : kinds.includes("policy") ? "policy" : kinds.includes("claude") ? "claude" : "foreign";
+  const statuses = lines.map((x) => x.status);
+  const status: ExtensionStatus = kind === "policy" ? "on" : statuses.includes("unrecognised") ? "unrecognised" : statuses.includes("on") ? "on" : "present, off";
+  const base = lines.find((x) => x.kind === kind && x.status === status) ?? lines.find((x) => x.status === status) ?? lines[0];
+  const unrecognised = [...new Set(lines.flatMap((x) => x.unrecognised))];
+  return { ...base, kind, status, enabled: status !== "present, off", component: kind === "chrome", unrecognised: kind === "claude" ? [] : unrecognised };
 }
 export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST): ExtensionPrefs {
   const p = inst.profile;
-  const { files, merged, disagree } = readPrefs(inst);
-  const extensions = Object.keys(merged).sort().map((id): ExtensionLine => {
-    const e = merged[id];
-    const reasons = rawReasons(e.disable_reasons), location = num(e.location), state = num(e.state);
-    const name = typeof e.manifest?.name === "string" && /^[\w .,()'&+-]{1,60}$/.test(e.manifest.name) ? e.manifest.name : null;
-    const pk = pathKind(e.path, p.user_data_dir);
-    const hives = [...new Set(policy.entries.filter((x) => x.id === id).map((x) => x.hive))];
-    const kind: ExtensionKind = id === p.extension_id ? "claude"
-      : (location !== null && POLICY_LOCATIONS.includes(location)) || hives.length ? "policy"
-      : CHROME_BUILTIN_IDS.includes(id) ? (chromeOwn(id, location, pk) ? "chrome" : "foreign")
-      : defaultApp(id, e, location, pk) ? "default_app" : "foreign";
-    const on = kind === "policy" || runsInChrome(state, reasons);
-    return { id, name, enabled: on, component: kind === "chrome", kind, status: on ? "on" : "present, off", location, state, disable_reasons: reasons, path_kind: pk, policy: hives };
+  const { files, merged, views, disagree } = readPrefs(inst);
+  const hivesOf = (id: string) => [...new Set(policy.entries.filter((x) => x.id === id).map((x) => x.hive))];
+  const extensions = Object.keys(merged).sort().map((id) => {
+    const lines = views[id].map((v) => classify(inst, id, v, hivesOf(id)));
+    const line = combine(lines);
+    // The printed fields stay the merged entry's (Secure Preferences first), the classification the combined one.
+    const shown = classify(inst, id, merged[id], hivesOf(id));
+    return { ...shown, kind: line.kind, status: line.status, enabled: line.enabled, component: line.component, unrecognised: line.unrecognised };
   });
-  return { files, key: `extensions.settings.${p.extension_id}`, extensions, disagree, policy,
-    others: extensions.filter((x) => x.kind === "policy" || (x.kind === "foreign" && x.enabled)).map((x) => x.id) };
+  const refusals: Refusal[] = [];
+  for (const x of extensions) {
+    if (x.kind === "claude") continue;
+    for (const field of x.unrecognised) refusals.push({ id: x.id, why: "unrecognised", field });
+    if (x.kind === "policy") refusals.push({ id: x.id, why: "policy" });
+    else if (x.status === "on" && x.kind === "foreign") refusals.push({ id: x.id, why: "on" });
+    else if (x.status === "on" && x.kind === "default_app") refusals.push({ id: x.id, why: "default_app_on" });
+  }
+  // A policy id other than Claude in Chrome that isn't in the profile yet: Chrome installs it at its next start.
+  for (const id of [...new Set(policy.entries.map((x) => x.id))].sort())
+    if (id !== p.extension_id && !merged[id]) refusals.push({ id, why: "policy" });
+  for (const u of policy.unreadable) refusals.push({ why: "policy_unreadable", hive: u.hive, policy: u.policy });
+  const others = [...new Set(refusals.filter((r) => r.id).map((r) => r.id!))];
+  return { files, key: `extensions.settings.${p.extension_id}`, extensions, disagree, policy, others, refusals };
 }
-// The policy entries among others, each with the hives naming it and its location: what extra_extension names.
-export const byPolicy = (prefs: ExtensionPrefs) => prefs.extensions.filter((x) => x.kind === "policy")
-  .map((x) => ({ id: x.id, hives: x.policy, location: x.location }));
-// The heartbeat line's listing in worker.log: each extension other than Claude in Chrome and Chrome's own (a
-// default-installed app included), with its status; a policy entry as policy; a forcelist hive that couldn't be read.
+// Whether the gate refuses: any extension by name, or a policy hive that can't be read.
+export const gateRefuses = (prefs: ExtensionPrefs) => prefs.refusals.length > 0;
+// The policy ids among the refusals, each with the hives and policies naming it and its location (null when it isn't in
+// the profile yet): what extra_extension names.
+export const byPolicy = (prefs: ExtensionPrefs) => [...new Set(prefs.refusals.filter((r) => r.why === "policy").map((r) => r.id!))].map((id) => {
+  const named = prefs.policy.entries.filter((x) => x.id === id);
+  return { id, hives: [...new Set(named.map((x) => x.hive))], policies: [...new Set(named.map((x) => x.policy))],
+    location: prefs.extensions.find((x) => x.id === id)?.location ?? null };
+});
+// The heartbeat line's listing in worker.log: each extension other than Claude in Chrome and Chrome's own, with its
+// status; a policy entry as policy; an enabled default app as default_app_on; an unreadable field by name; a policy id not
+// in the profile; a policy hive that couldn't be read.
 export const extensionNotes = (prefs: ExtensionPrefs): string[] => [
   ...prefs.extensions.filter((x) => x.kind === "foreign" || x.kind === "default_app" || x.kind === "policy")
-    .map((x) => `extension=${x.id}:${x.kind === "policy" ? "policy" : x.enabled ? "on" : "present_off"}`),
-  ...prefs.policy.unreadable.map((h) => `extension_policy_unreadable=${h}`)];
+    .map((x) => `extension=${x.id}:${x.kind === "policy" ? "policy" : x.status === "unrecognised" ? "unrecognised"
+      : x.kind === "default_app" && x.enabled ? "default_app_on" : x.enabled ? "on" : "present_off"}`),
+  ...prefs.refusals.filter((r) => r.why === "unrecognised").map((r) => `extension_unrecognised=${r.id}:${r.field}`),
+  ...prefs.refusals.filter((r) => r.why === "policy" && !prefs.extensions.some((x) => x.id === r.id)).map((r) => `extension=${r.id}:policy_not_installed`),
+  ...prefs.policy.unreadable.map((u) => `extension_policy_unreadable=${u.hive.replace(/\\/g, "/")}:${u.policy}`)];
+// The refusal's own words for check-host: which extension, and the fix for each kind.
+export function gateFix(prefs: ExtensionPrefs): string {
+  const out: string[] = [];
+  const ids = (why: Refusal["why"]) => [...new Set(prefs.refusals.filter((r) => r.why === why).map((r) => r.id!))];
+  if (ids("on").length) out.push(`turn off ${ids("on").join(", ")} in the Cain jobs Chrome (chrome://extensions), or remove it, then run check-host again`);
+  if (ids("default_app_on").length) out.push(`${ids("default_app_on").join(", ")} is Google's default app, on: ${DEFAULT_APP_FIX}`);
+  if (ids("policy").length) out.push(`${ids("policy").join(", ")} is installed by a Chrome policy (ExtensionInstallForcelist or ExtensionSettings, or a policy location), so Chrome keeps it on: the policy must stop naming it`);
+  const un = prefs.refusals.filter((r) => r.why === "unrecognised");
+  if (un.length) out.push(`the worker can't read ${un.map((r) => `${r.id}'s ${r.field}`).join(", ")} (a value it doesn't know), so it can't tell whether Chrome runs it: refused; restart the Cain jobs Chrome, run dump-extensions and report it`);
+  const hives = prefs.policy.unreadable;
+  if (hives.length) out.push(`Chrome's extension policy under ${hives.map((u) => `${u.hive} (${u.policy})`).join(", ")} couldn't be read, so the worker can't tell what it installs: refused; run the worker as your own Windows account and check that key`);
+  return out.join("; ") + "; the worker never changes the profile";
+}
 // dump-extensions (0.12.2, third pass): every entry in the dedicated profile's preferences, sanitized for pasting into the
 // record as a regression fixture: its id, location, state and disable reasons (numbers only, as Chrome wrote them), whether
 // Chrome marked it installed by default, the folder kind of its path and which file(s) hold it. Never the path's own
@@ -848,7 +998,7 @@ export interface DumpLine { id: string; files: string[]; location: number | null
   by_default: boolean | null; path_kind: PathKind }
 export function dumpExtensions(inst: Install): { entries: DumpLine[] } {
   const { merged, held } = readPrefs(inst);
-  return { entries: Object.keys(merged).sort().filter((id) => /^[a-p]{32}$/.test(id)).map((id) => {
+  return { entries: Object.keys(merged).sort().filter((id) => ID32.test(id)).map((id) => {
     const e = merged[id];
     return { id, files: held[id] ?? [], location: num(e.location), state: num(e.state), disable_reasons: rawReasons(e.disable_reasons),
       by_default: typeof e.was_installed_by_default === "boolean" ? e.was_installed_by_default : null, path_kind: pathKind(e.path, inst.profile.user_data_dir) };
@@ -1506,6 +1656,30 @@ export function orphanHosts(ps: Proc[], inst: Install): Proc[] {
 
 const chromeRunning = (udd: string) => ["lockfile", "SingletonLock", "SingletonSocket"].some((n) => exists(join(udd, n)));
 
+// The dedicated Chrome's start (0.12.2, fourth pass): worker.ts open-chrome starts Chrome on the dedicated folder and
+// profile with Chrome's --disable-default-apps flag, so Chrome never installs Google's default apps there or turns one
+// back on. The arguments are pinned (chromeLaunchArgs, held by a test): nothing else is passed. It refuses while that
+// Chrome is open (Chrome reads its flags only when it starts), and starts it detached, then returns: the owner keeps it open.
+export const DISABLE_DEFAULT_APPS = "--disable-default-apps";
+export const chromeLaunchArgs = (inst: Install): string[] =>
+  [`--user-data-dir=${inst.profile.user_data_dir}`, `--profile-directory=${inst.profile.profile_directory}`, DISABLE_DEFAULT_APPS];
+// chrome.exe where Chrome installs it: per machine (Program Files, either view), then per user (LocalAppData).
+export function chromeExe(env: Record<string, string | undefined>, has: (f: string) => boolean = existsSync): string | null {
+  const roots = [env.ProgramFiles ?? env.PROGRAMFILES, env["ProgramFiles(x86)"] ?? env["PROGRAMFILES(X86)"], env.LOCALAPPDATA ?? env.LocalAppData];
+  for (const r of roots) if (r) { const f = pathWin32.join(r, "Google", "Chrome", "Application", "chrome.exe"); if (has(f)) return f; }
+  return null;
+}
+export function openChrome(o: Opts): { started: string; args: string[] } {
+  const inst = mustInstall(o);
+  if (chromeRunning(inst.profile.user_data_dir))
+    throw new WorkerError("chrome_already_open", "the Cain jobs Chrome is already open: Chrome reads its start flags only when it starts, so close every window of it (check no chrome.exe with its folder is left), then run open-chrome again");
+  const exe = chromeExe(envOf(o), o.has ?? existsSync);
+  if (!exe) throw new WorkerError("chrome_not_found", "chrome.exe isn't in Program Files or LocalAppData's Google\\Chrome\\Application");
+  const args = chromeLaunchArgs(inst);
+  (o.startChrome ?? ((e, a) => { spawn(e, a, { detached: true, stdio: "ignore", windowsHide: false }).unref(); }))(exe, args);
+  return { started: exe, args };
+}
+
 // confirmed.json, written by confirm-profile from a passing probe.
 // read_context: the probe found this PC's reading tools don't report their tab's address,
 // so every run needs a tab context after each read (endCheck's contextAfterRead).
@@ -1608,7 +1782,7 @@ function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code |
   const prefs = extensionPrefs(inst, forcelistOf(o));
   if (!prefs.files.length) return "extension_entry_missing";
   if (prefs.disagree.length) return "prefs_disagree";
-  if (prefs.others.length) return "extra_extension";
+  if (gateRefuses(prefs)) return "extra_extension";
   // An extension update unpacked but not yet running, or more than one version folder: held until a new
   // probe (versionHold); the probe itself refuses while either is seen.
   if (bypassConfirm) { if (updatePending(inst)) return "update_pending"; if (extensionFolders(inst).length > 1) return "extension_versions_ambiguous"; }
@@ -1843,7 +2017,7 @@ function close(o: Opts, job: Job, r: Result) {
 function stageBeat(o: Opts, h: Heartbeat): boolean {
   let old: Heartbeat | null = null;
   try { old = parseHeartbeat(readFileSync(join(P.queue(o), "worker", "heartbeat.json"), "utf8")); } catch { old = null; }
-  if (old && old.code === h.code && old.stale_lock === h.stale_lock && old.reason === h.reason && Date.parse(h.worker_clock) - Date.parse(old.worker_clock) < 24 * 3_600_000) return false;
+  if (old && old.code === h.code && old.stale_lock === h.stale_lock && old.reason === h.reason && Date.parse(h.worker_clock) - Date.parse(old.worker_clock) < HEARTBEAT_INTERVAL_MS) return false;
   put(o, ["worker", "heartbeat.json"], JSON.stringify(h, null, 2) + "\n");
   return true;
 }
@@ -6445,6 +6619,8 @@ export function checkCli(o: Opts): CliCheck {
 export interface HostCheck { host: "ok"; extension_entry: { files: string[]; key: string }; extensions: ExtensionLine[]; extension_policy: ForceList; popups: PopupState }
 // 0.12.2, third pass: read only, like the preflight. extra_extension names each extension that refuses a run
 // (other_enabled), the policy entries among them with the hives naming them (by_policy), and the policy as read now.
+// Fourth pass: also every refusal by name (refusals: an enabled default app, a field the worker can't read, a policy
+// hive that can't be read), with the fix for each.
 export function checkHost(o: Opts): HostCheck {
   const inst = mustInstall(o);
   const reg = manifestViews(o, inst);
@@ -6455,12 +6631,9 @@ export function checkHost(o: Opts): HostCheck {
     throw new WorkerError("extension_entry_missing", `neither Secure Preferences nor Preferences of the dedicated profile has ${prefs.key}: check profile_directory and extension_id in install.json`);
   if (prefs.disagree.length)
     throw new WorkerError("prefs_disagree", { ids: prefs.disagree, extensions: prefs.extensions });
-  if (prefs.others.length) {
-    const pol = byPolicy(prefs);
-    throw new WorkerError("extra_extension", { other_enabled: prefs.others, by_policy: pol, extension_policy: prefs.policy, extensions: prefs.extensions,
-      fix: pol.length ? "an extension named in by_policy is installed by a Chrome policy (ExtensionInstallForcelist, or a policy location), so Chrome keeps it on: the policy must stop naming it; the worker never changes it"
-        : "turn off each extension named in other_enabled in the Cain jobs Chrome (chrome://extensions), or remove it, then run check-host again; the worker never changes the profile itself" });
-  }
+  if (gateRefuses(prefs))
+    throw new WorkerError("extra_extension", { other_enabled: prefs.others, by_policy: byPolicy(prefs), refusals: prefs.refusals, extension_policy: prefs.policy,
+      extensions: prefs.extensions, fix: gateFix(prefs) });
   return { host: "ok", extension_entry: { files: prefs.files, key: prefs.key }, extensions: prefs.extensions, extension_policy: prefs.policy, popups: popupState(inst) };
 }
 
@@ -6821,6 +6994,7 @@ if (isMain && process.argv[2] === "nav-guard") {
         extensions: extensionPrefs(mustInstall(o), forcelistOf(o)).extensions });
     } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
     else if (cmd === "dump-extensions") say(dumpExtensions(mustInstall(o)));
+    else if (cmd === "open-chrome") say(openChrome(o));
     else if (cmd === "check-cli") say({ cli: checkCli(o) });
     else if (cmd === "clean-probe") say(cleanProbe(o));
     else if (cmd === "owner-keygen") say({ owner_pub: ownerKeygen(flag(args, "--kid") ?? "", flag(args, "--out") ?? o.home, process.env.PC_OWNER_PASSPHRASE ?? "") });
@@ -6829,6 +7003,6 @@ if (isMain && process.argv[2] === "nav-guard") {
       const text = signAllowlistFile(a1, flag(args, "--key") ?? "", process.env.PC_OWNER_PASSPHRASE ?? "", flag(args, "--kid") ?? "");
       const out = flag(args, "--out");
       if (out) { writeFileSync(out, text); say({ written: out }); } else process.stdout.write(text);
-    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | dump-extensions | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
+    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | dump-extensions | open-chrome | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
   } catch (e) { fail(e); }
 }

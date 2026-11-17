@@ -293,36 +293,56 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   writes nothing to the profile** (0.12.2, third pass): nothing in it writes `Preferences`
   or `Secure Preferences`, since Chrome keeps integrity codes over its extension entries and
   resets an entry it finds edited, which would turn a default app back on. The gate is
-  settled by how each entry is classified, read only, in this order:
+  settled by how each entry is classified, read only, and **fails closed** (0.12.2, fourth
+  pass), in this order:
   - **Claude in Chrome**: install.json's `extension_id`.
-  - **Policy** (`policy`): an entry at a policy location (`location` 7 or 9), or whose id
-    the `ExtensionInstallForcelist` policy names under `HKLM` or `HKCU`
-    `Software\Policies\Google\Chrome`. It counts as **on** whatever its `state` or disable
-    reason (Chrome turns it back on itself) and stops runs, named with the hives that name it
-    (`by_policy`). The worker reads that key at every preflight, `check-host` and the probe
-    (`extension_policy`: the ids it names per hive, never the update address; a hive whose
-    key can't be read is listed as `unreadable` and logged as `extension_policy_unreadable`).
+  - **Policy** (`policy`): an entry at a policy location (`location` 7 or 9), or whose id a
+    Chrome policy installs: `ExtensionInstallForcelist`, or `ExtensionSettings` with an
+    `installation_mode` of `force_installed` or `normal_installed` (as a JSON value or as a
+    key per extension), under `HKLM` or `HKCU` `Software\Policies\Google\Chrome` and the
+    `WOW6432Node` paths too. It counts as **on** whatever its `state` or disable reason
+    (Chrome turns it back on itself) and stops runs, named with the hives and policies that
+    name it (`by_policy`). Any such id other than Claude in Chrome stops runs even before it
+    is in the profile. The worker reads those keys at every preflight, `check-host` and the
+    probe (`extension_policy`: the ids per hive and policy, never the update address). A hive
+    whose policy can't be read stops runs too, named (`refusals`: `policy_unreadable` with the
+    hive and policy; `extension_policy_unreadable=<hive>:<policy>` in `worker.log`). The worker
+    reads `HKCU` as the account it runs as, so it must run as your own Windows account.
   - **Chrome's own** (`chrome`): an id on Chrome's built-in list (the Web Store, Web Store
     Payments, the PDF viewer, Hangouts, Network Speech, CryptoToken, Feedback, the Cast media
     router) **and** at an internal location, component (`location` 5) or external component
     (`location` 10, where Chrome 157 puts Web Store Payments), **and** with its `path` in
     Chrome's install folder (`...\Google\Chrome\Application\<version>\resources\...`,
-    outside the user data folder) or no `path`. A missing location never qualifies, and any
-    other entry carrying a built-in id is foreign: an unpacked extension can claim any id.
-  - **Google's default-installed apps** (`default_app`): an entry Chrome marks
-    `was_installed_by_default`, one loaded from a `default_apps` folder, or Google Docs
-    Offline's id at the store location (1). Chrome's own, on or off.
-  - **Foreign**: anything else. It stops runs while it is **on**: no disable reason at all
-    (`disable_reasons` missing, 0 or an empty list) and a `state` of 1, or no `state` field
-    (Chrome 157 writes none). An entry with any disable reason (yours, the external-install
-    prompt's 8192, and the rest) or another `state` is **present, off**: listed, never counted.
-    So the extensions other programs push through the registry, which Chrome keeps present
-    and waiting on its prompt, don't stop runs.
+    outside the user data folder). No `path` (fourth pass), a missing location, or any other
+    entry carrying a built-in id is foreign: an unpacked extension can claim any id.
+  - **Google's default apps** (`default_app`, fourth pass): an id on a fixed list (Google Docs
+    Offline's), or one install.json's optional `default_app_ids` adds (ids the setup session's
+    `dump-extensions` shows; at most 10). Exempt **only while off**: an enabled one stops runs,
+    named, with its one-time fix in the refusal: turn it off on the Cain jobs Chrome's
+    chrome://extensions page. Start that Chrome with `worker.ts open-chrome`, which passes
+    Chrome's `--disable-default-apps` flag, so Chrome never installs a default app there or
+    turns one back on. Being marked installed by default, or loaded from a `default_apps`
+    folder, exempts nothing on its own.
+  - **Foreign**: anything else. It stops runs while it is **on**.
+  What counts as off (fourth pass, fail closed): a `state` of 0, or a `disable_reasons` list or
+  bitmask that is non-empty and non-zero (yours, the external-install prompt's 8192, and the
+  rest): **present, off**, listed, never counted. No `state` field or a `state` of 1, with no
+  disable reason (`disable_reasons` missing, 0 or an empty list), is **on**. Any other `state`
+  value (2, null, a string), or a `disable_reasons` that isn't a whole number or a list of them
+  (null, a string), is **unrecognised**: the run stops, naming the entry and the field
+  (`refusals`: `unrecognised` with `field`), whatever kind the entry is but Claude in Chrome.
+  So the extensions other programs push through the registry, which Chrome keeps present
+  and waiting on its prompt, don't stop runs. When both preference files hold an id with
+  different fields, each file's view is judged on its own and they combine conservatively:
+  whichever makes it foreign, puts it at a policy location, shows it on, or can't be read, wins.
   Each heartbeat line in `worker.log` lists every extension other than Claude in Chrome and
-  Chrome's own with its status (`extension=<id>:on`, `extension=<id>:present_off`, or
-  `extension=<id>:policy`). `check-host`, `confirm-profile` and the probe's evidence
+  Chrome's own with its status (`extension=<id>:on`, `extension=<id>:present_off`,
+  `extension=<id>:default_app_on`, `extension=<id>:unrecognised` with
+  `extension_unrecognised=<id>:<field>`, `extension=<id>:policy`, or
+  `extension=<id>:policy_not_installed`). `check-host`, `confirm-profile` and the probe's evidence
   (`extensions`) list every extension found there, with its `kind` (`claude`, `policy`,
-  `chrome`, `default_app`, `foreign`), its `status` (`on` or `present, off`), the hives whose
+  `chrome`, `default_app`, `foreign`), its `status` (`on`, `present, off` or `unrecognised`, with
+  the fields in `unrecognised`), the hives whose
   policy names it (`policy`), the folder kind of its `path` (`path_kind`: `absent`,
   `chrome_install`, `default_apps`, `profile`, `other`; never the path itself) and the raw
   `location`, `state` and `disable_reasons` fields as Chrome wrote them. **`worker.ts
@@ -1044,14 +1064,17 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
 6. **Cain's public Ship key.** The line "Ship key (public): ..." in Cain's App log, as
    `link-1 <key>` in `C:/pc-worker-k7q2xz/ship.pub`. Nothing uses it yet; the confirm path will.
 7. **The dedicated Chrome profile.** Start a separate Chrome on its own folder:
-   `chrome.exe --user-data-dir=C:/pc-worker-k7q2xz/chrome --profile-directory=Default`. Name
+   `chrome.exe --user-data-dir=C:/pc-worker-k7q2xz/chrome --profile-directory=Default
+   --disable-default-apps` the first time (once install.json is written, always start it with
+   `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts open-chrome --home C:/pc-worker-k7q2xz`,
+   which passes exactly those arguments and refuses while that Chrome is open). Name
    its profile **Cain jobs**, sign in there only to the sites the jobs need (never your
    daily profile, nothing financial, not your main mail), and install Claude in Chrome
    **only in this profile, and no other extension in it**: any other enabled extension
    there stops runs (`extra_extension`). An extension that is present but off doesn't
    count (those other programs push through the registry, waiting on Chrome's prompt,
-   included), nor do Chrome's own, such as Chrome Web Store Payments, or Google's
-   default-installed apps, such as Google Docs Offline. The worker never changes the
+   included), nor do Chrome's own, such as Chrome Web Store Payments. Google Docs Offline
+   counts while it is on: turn it off once on chrome://extensions. The worker never changes the
    profile: one that is on is yours to turn off in chrome://extensions (step 10 checks), and
    one a Chrome policy installs stays on until that policy stops naming it. In this profile's chrome://settings/content/popups
    (**Pop-ups and redirects**), choose **Don't allow sites to send pop-ups or use
@@ -1155,12 +1178,12 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    helper, `helper_blocked`; otherwise `containment_unavailable` (Troubleshooting).
 10. **Bind the profile, once.** First run
     `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts check-host --home C:/pc-worker-k7q2xz`
-    (Chrome open or closed: it reads only). It passes when nothing but Claude in Chrome,
-    Chrome's own and Google's default apps is on; its `extensions` lists each entry with its
-    `kind` and `status`, and `extension_policy` what Chrome's forcelist policy names. If it
-    says `extra_extension`, turn off each extension in `other_enabled` in this Chrome's
-    chrome://extensions (one in `by_policy` stays on until its policy stops naming it), and
-    run it again. Nothing in the worker turns anything off or removes anything. Then run
+    (Chrome open or closed: it reads only). It passes when nothing but Claude in Chrome and
+    Chrome's own is on, no policy installs another extension and every policy hive reads; its
+    `extensions` lists each entry with its `kind` and `status`, and `extension_policy` what
+    Chrome's extension policies name. If it says `extra_extension`, follow its `fix`: turn off
+    each extension in `other_enabled` in this Chrome's chrome://extensions, Google Docs Offline
+    included (one in `by_policy` stays on until its policy stops naming it), and run it again. Nothing in the worker turns anything off or removes anything. Then run
     `worker.ts dump-extensions --home C:/pc-worker-k7q2xz` and paste its output into the
     setup record: it holds ids, numbers and folder kinds only.
     With the Cain jobs Chrome open and no other Claude Code
@@ -1966,7 +1989,16 @@ its request, if still waiting, is refused with that reason.
   copy of the heartbeat may only be old because of the outage: `queue_unreachable` says it
   instead), and that hold is capped: after 12 hours held (rounds while `queue_unreachable` still
   stands count as held, so a flapping queue can't hold it for ever), a condition seen in the copy
-  is told once as `worker_not_starting_unconfirmed`, worded as not confirmed. Once raised,
+  is told once as `worker_not_starting_unconfirmed`, worded as not confirmed. **Fourth pass:** a
+  heartbeat is fresh for three heartbeat intervals (3 hours; a run refreshes the queue's copy at
+  least hourly), and a heartbeat at or after a job was queued means the worker started since. A
+  condition held back, by a heartbeat before the job that looked fresh (the worker may have died
+  right after it) or by a failing fetch, is kept pending in the notice file (`quietPending`, so a
+  restart keeps it) until each of its jobs is claimed (or closed with a result after a claim) or
+  the worker is heard from after it, or until 12 hours from when it was first held, any queue
+  hold included: then it is told, as `worker_not_starting_unconfirmed` while the fetch is failing,
+  `worker_not_starting` otherwise, and that notice stays owed, sent again each round with its id,
+  until the link acknowledges it. Once raised,
   `queue_unreachable` clears only after three good fetches in a row (a failure between them keeps
   it standing), and when the queue is unreachable again within a day of clearing the notice is
   `queue_unreachable_again`, worded as again. A notice re-minted under a new id has its new id and
@@ -2019,7 +2051,8 @@ its request, if still waiting, is refused with that reason.
   `C:/pc-worker-k7q2xz/worker.log` holds one line per run, codes and ids only (and
   `transcripts_swept` when a start found a crashed session's transcripts and deleted them). The same
   heartbeat goes to the queue repo (`worker/heartbeat.json`) when its code changes, or
-  once a day, so Cain can say the PC is alive and why it isn't working.
+  at a run at least an hour after the last (0.12.2, fourth pass: the heartbeat interval; it was
+  once a day), so Cain can say the PC is alive and why it isn't working.
 - **Diagnostics, for the first probes:** `--diagnose` (or `"diagnostics": true` in the
   install config) appends one line per run to `C:/pc-worker-k7q2xz/diagnostics.log`, outside
   the queue repo: the code, the final address with its digits masked, the name of the
@@ -2067,7 +2100,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `transcripts`; `C:/pc-worker-k7q2xz/claude-config` | What a session wrote in `claude-config` couldn't be deleted, after retries. On Windows the message names what holds it where the worker can read it (its image name, process id and the image name of the process that started it, from the Restart Manager through the Job Object helper; `worker.log`'s `session_cleanup_failed held_by` line too). Something holds it open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete everything in `claude-config` but `.credentials.json`, `settings.json` and `CLAUDE.md` by hand, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
 | Your own `claude` is logged out after a run | `claude` in a terminal of your own; `echo $env:CLAUDE_CONFIG_DIR` there; `worker.ts check-cli` | This design should make that impossible: the worker's sessions sign in from `C:/pc-worker-k7q2xz/claude-config` and never read, copy or write your `~/.claude`, so nothing a run does reaches your own sign-in. Check that your terminal doesn't still have `CLAUDE_CONFIG_DIR` set from setup step 9 (then your `claude` is using the worker's folder: close that terminal); that you aren't running an earlier draft of this worker (one copied your sign-in into each session, where a refresh could replace yours); and whether you were signed out for another reason (an expired session, a password change, signing out elsewhere). Sign your own `claude` in again; the worker's sign-in is unaffected. If it happens again with this version, report it: needs a code change: yes. |
 | `extension_entry_missing` | `worker.ts check-host --home C:/pc-worker-k7q2xz`; the profile folder's `Secure Preferences` and `Preferences` | Neither preferences file of the dedicated profile has `extensions.settings.<your extension id>`: `profile_directory` or `extension_id` in `install.json` doesn't match where Claude in Chrome is installed, or Chrome hasn't written its entry yet (open the Cain jobs Chrome once, then close and reopen it). Not `wrong_profile`: the profile's name was right. `check-host` prints which file and key path it read when it works. Needs a code change: no. |
-| `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled`, `by_policy`, `extension_policy` and `extensions`, each with its `kind`, `status`, `policy`, `path_kind` and raw `location`, `state` and `disable_reasons`; the `extension=<id>:on` and `extension=<id>:policy` notes on the heartbeat lines in `worker.log`; `worker.ts dump-extensions` for the sanitized entries | An extension other than Claude in Chrome, Chrome's own and Google's default apps is **on** in the dedicated profile (no disable reason and a `state` of 1, or none), or a Chrome policy installs one (a policy location, 7 or 9, or its id in `ExtensionInstallForcelist` under `HKLM` or `HKCU`), whatever its state. Present but disabled for any reason is `present, off` and never counts; Chrome's own are built-in ids at `location` 5 or 10 with their path in Chrome's install folder (or none); a built-in id anywhere else is foreign. The worker writes nothing to the profile. Turn each one in `other_enabled` off in that Chrome's chrome://extensions, or remove it, and run `check-host` again. One in `by_policy`: the policy that names it must stop (the program or administrator that set it); the worker can't. If one comes back on after a restart, the program that installed it turned it on again: say so in a Build item, with the `dump-extensions` output. Needs a code change: no. |
+| `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled`, `by_policy`, `refusals` (each with `why`: `on`, `default_app_on`, `policy`, `unrecognised` with its `field`, or `policy_unreadable` with its `hive`), `fix`, `extension_policy` and `extensions`, each with its `kind`, `status`, `policy`, `path_kind`, `unrecognised` and raw `location`, `state` and `disable_reasons`; the `extension=<id>:...`, `extension_unrecognised=` and `extension_policy_unreadable=` notes on the heartbeat lines in `worker.log`; `worker.ts dump-extensions` for the sanitized entries and the file(s) each came from | An extension other than Claude in Chrome and Chrome's own is **on** in the dedicated profile (Google Docs Offline included), or a Chrome policy installs one (a policy location, 7 or 9, or its id in `ExtensionInstallForcelist` or `ExtensionSettings` with `force_installed` or `normal_installed`, under `HKLM`, `HKCU` or their `WOW6432Node` paths), whatever its state and even before it is in the profile; or the worker can't read an entry's `state` or `disable_reasons`, or a policy hive. Off is a `state` of 0 or a non-empty, non-zero disable reason; Chrome's own are built-in ids at `location` 5 or 10 with their path in Chrome's install folder (no path is foreign). The worker writes nothing to the profile. Follow `fix`: turn each one in `other_enabled` off in that Chrome's chrome://extensions, or remove it (Docs Offline: turn it off once; started with `worker.ts open-chrome`, Chrome keeps default apps off), and run `check-host` again. One in `by_policy`: the policy that names it must stop (the program or administrator that set it); the worker can't. `policy_unreadable`: check that the worker runs as your own Windows account and that the named key reads (`reg query <key>`). `unrecognised`: restart the Cain jobs Chrome; if it stays, file a Build item with the `dump-extensions` output. If one comes back on after a restart, the program that installed it turned it on again: say so in a Build item, with the `dump-extensions` output. Needs a code change: only for `unrecognised` that stays. |
 | `host_parent_gone` | Task Manager, Details, with the PID, Command line and Start time columns: Claude in Chrome's native host and the PID it names as its parent | The process that started Claude in Chrome's native host is gone, or its process id now belongs to a process that started after the host (or, in the same tick, to another program): the host is left over from a Chrome that closed. Restart the Cain jobs Chrome (close every window of it, open it again on its profile); its hosts end with it and fresh ones start. If a host survives that, end it in Task Manager. The worker ends nothing itself here. Needs a code change: no. |
 | `host_parent_gone`, or a stale-lock clearing, again and again while the Cain jobs Chrome is healthy (just restarted, one window, its extension working) | `probe-evidence.json`'s `restart.chain_before` and `chain_after`, or the `probe restart` line in `worker.log`; Task Manager, Details, with the PID, Parent PID (add it with Select columns), Command line and Start time columns for `chrome.exe` (the one with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` and no `--type`), the `cmd.exe` naming the native host, and the host; the worker's `heartbeat.json` and the last lines of `worker.log` | The worker compares process start times allowing one tick of Windows' 15.6 ms timer (equal or within 16 ms is never "later"). Repeated refusals on a healthy Chrome mean the times Windows reports differ by more than that, or a parent id really was reused. Capture the three processes' ids, parent ids and start times (to the millisecond: `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" \| Select ProcessId,ParentProcessId,CreationDate`) and the probe's chain lines, and file them for a fix. Don't loosen anything by hand. Needs a code change: maybe. |
 | `prefs_disagree` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `ids` and `extensions`; the profile folder's `Secure Preferences` and `Preferences` | Chrome's two preference files hold the same extension with a different state or manifest version, usually in the middle of an update or after Chrome was ended without closing. The worker merges nothing on a disagreement. Close every window of the Cain jobs Chrome, open it again on its profile (it rewrites both), then run `check-host` again. If it stays, the profile may be damaged: make a new dedicated profile (setup step 7 on). Needs a code change: no. |
@@ -2131,8 +2164,8 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | A supersede that says the supersede that was owed is "no longer owed: head unchanged" (twenty-ninth round) | `owed_cleared` on `/data/work/ship-gate-<sha>.json` | The supersede was run again after GitHub's wait while the pull request's head is still that sha, and that sha's acceptance is the live one: nothing needed replacing, so the owed mark was cleared under the gate lock and the Ship card reads that acceptance again. Nothing to do; supersede it after a new head is pushed. If it says the acceptance no longer counts, watch the pull request's head again. Needs a code change: no. |
 | A refusal saying a quarantine "couldn't be put back", or a Ship card refused because a record "was set aside without being recorded or put back", or because a quarantine or generation recovery "is at work" (twenty-ninth round) | the refusal's words; `put_back_failed` in `/data/work/ship-gate-quarantine.jsonl`; a `ship-gate-<sha>.json.quarantined-<random>` file | The quarantine moved a record it then found was valid and a newer file stood in its place, or it was cut off mid-way; nothing was deleted. Once no watch of that pull request runs, look at both files, set aside or remove whatever stands at the record's path if the moved one should win, and run the `mv -n` restore command the words give; then try again. "At work" means the quarantine or recovery is still running: try again in a minute. Needs a code change: no. |
 | `preload_flag_refused` (the worker's status line; `worker.log`, marked ATTENTION; twenty-eighth round), or `worker_start_refused` (a Discord line) | `worker.log` on the PC; `heartbeat.json`: `start_refused` | A preload that could load test code into the worker is set where it runs: a require, import, preload, loader or (twenty-ninth round) config-file flag in `NODE_OPTIONS` or `BUN_OPTIONS` (or in the command's own arguments), or a `preload` in a `bunfig.toml` in the folder the worker starts from or its worker folder, or in Bun's user-level `.bunfig.toml` (in the home folder or `XDG_CONFIG_HOME`). Remove it (`Remove-Item Env:NODE_OPTIONS`, `Remove-Item Env:BUN_OPTIONS`, and from Windows' environment variables if set there; delete or fix the `bunfig.toml` or `.bunfig.toml`), open a new terminal and run again. The same Discord line comes for `test_build_flag_refused`. Needs a code change: no. |
-| `worker_not_starting` (a Discord line: jobs are waiting, or one ran out of time waiting, and the worker hasn't been heard from; twenty-ninth round) | the keeper's log; `heartbeat.json` in the queue older than 6 hours (or than a shorter job's life), or none | A job has waited 6 hours, or its whole life if that is shorter, or expired unclaimed, and the PC's worker hasn't written a heartbeat in the last 6 hours (0.12.2; a shorter job raises nothing while a heartbeat under 6 hours old exists). While the queue itself can't be fetched it is held, for at most 12 hours; after that it comes as `worker_not_starting_unconfirmed`, worded as not confirmed, since the keeper's copy of the heartbeat may only be old because of the outage: fix the queue first (`queue_unreachable`). If you started it and its window closed with no status line of its own, Bun itself may be failing before the worker runs: usually a `--preload` or `--config` in `BUN_OPTIONS` or `NODE_OPTIONS` set in Windows' environment settings (System Properties, Environment Variables). Remove it there, open a new terminal and start a run. If you simply haven't been at the PC, nothing is wrong: the line clears once the worker runs. Needs a code change: no. |
-| `worker_not_starting_unconfirmed` (a Discord line: jobs are waiting and the worker hasn't been heard from, not confirmed; 0.12.2, third pass) | the keeper's log; `queue_unreachable` standing for 12 hours or more | The `worker_not_starting` condition, seen in the keeper's copy of the queue after the worker check was held 12 hours for a queue outage (or a queue that keeps flapping). The copy's heartbeat may be old only because the queue can't be read: fix `queue_unreachable` first. If the queue reads again and the PC still hasn't been heard from, follow the `worker_not_starting` row. Needs a code change: no. |
+| `worker_not_starting` (a Discord line: jobs are waiting, or one ran out of time waiting, and the worker hasn't been heard from; twenty-ninth round) | the keeper's log; `heartbeat.json` in the queue older than 3 hours, or from before the job was queued, or none | A job has waited 6 hours, or its whole life if that is shorter, or expired unclaimed, and the PC's worker hasn't written a heartbeat in the last 3 hours (0.12.2, fourth pass: three heartbeat intervals) or since the job was queued. A job judged while an earlier heartbeat still looked fresh is held until it is picked up, for at most 12 hours, then told. While the queue itself can't be fetched it is held the same way, for at most 12 hours; after that it comes as `worker_not_starting_unconfirmed`, worded as not confirmed, since the keeper's copy of the heartbeat may only be old because of the outage: fix the queue first (`queue_unreachable`). If you started it and its window closed with no status line of its own, Bun itself may be failing before the worker runs: usually a `--preload` or `--config` in `BUN_OPTIONS` or `NODE_OPTIONS` set in Windows' environment settings (System Properties, Environment Variables). Remove it there, open a new terminal and start a run. If you simply haven't been at the PC, nothing is wrong: the line clears once the worker runs. Needs a code change: no. |
+| `worker_not_starting_unconfirmed` (a Discord line: jobs are waiting and the worker hasn't been heard from, not confirmed; 0.12.2, third pass) | the keeper's log; `queue_unreachable` standing for 12 hours or more | The `worker_not_starting` condition, held 12 hours while the queue couldn't be fetched (or kept flapping), any hold since it was first seen included; the line is sent again until it gets through. The copy's heartbeat may be old only because the queue can't be read: fix `queue_unreachable` first. If the queue reads again and the PC still hasn't been heard from, follow the `worker_not_starting` row. Needs a code change: no. |
 | `queue_unreachable` (a Discord line: the keeper can't reach the PC job queue on GitHub; twenty-ninth round) | the keeper's log: a round that didn't finish on the fetch, 30 in a row | The queue's fetch has failed for 30 rounds in a row (about half an hour), whatever the link answered. Usually the Pi's network, GitHub, or the `pc_jobs_token` option (expired or without access to the queue repository). Fix the cause; the keeper goes on by itself and the line clears after three rounds whose fetch worked. Needs a code change: no. |
 | `queue_unreachable_again` (a Discord line: the queue can't be reached again, within a day of it coming back; 0.12.2) | the keeper's log, as for `queue_unreachable` | The same as `queue_unreachable`, raised again within 24 hours of the last one clearing (three good fetches in a row): the cause keeps coming back. Look for a flaky network on the Pi or a token near its expiry. Needs a code change: no. |
 | `lock_unavailable` saying the watch "ran past its 10 second bound" (twenty-seventh round) | the watch's output and `/data/work/ship-gate-<sha>.json`: `failure_why` | The watch's work under the lock (both reads of the pull request's head, any rate-limit wait, the write) has one 10 second deadline; it ran out, so nothing was accepted, or an acceptance just written was taken back. Usually GitHub was slow or asked to wait. Run the watch again in a minute. Needs a code change: no. |
@@ -2161,7 +2194,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `tabs_unexpected` (and the leftover-tab case) | `diagnostics.log` with `--diagnose`: `other_tabs`; `leftover-tabs.json` | A tab beyond the run's own sat in Claude's tab group: a popup, or a tab you opened there. Close every tab in that group but the one the worker left (or close them all, and delete `leftover-tabs.json`), and run again. A `leftover_tab` warning alone is normal: the reading tools can't close the run's tab, and the next run reuses it. |
 | `tool_inventory` | `probe`'s detail: `missing` and `extra` names, and the `expected` against the `found` tool names; before a claim, `worker.log`'s `bridge tool_inventory expected=... found=...` line, and after a run its `run tool_inventory expected=... found=...` line | The extension or CLI renamed, added or dropped a tool, or another MCP server reached the session. Any tool besides the allowed ones fails it, one on neither the allow nor the deny list included (a built-in a new CLI added: it needs adding to the deny list, a code change). A renamed allowed tool needs a code change; an extra MCP server comes from settings outside the pinned file. |
 | `wrong_profile` | `probe`'s detail; `diagnostics.log` with `--diagnose`; `profile-marker.json` | Another Chrome profile answered, the extension has no site access to `http://127.0.0.1`, the profile's name or extension folder isn't as set up (or the newest version folder's `manifest.json` can't be read or names another version), the model read back something other than the page's static word `bound`, or the canary page came without the profile's marker: the profile isn't bound, or its cookies for `127.0.0.1` were cleared. Run `bind-profile --attended` (setup step 10). |
-| `browser_unreachable` | is the Cain jobs Chrome open? | Start it with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` before the run. |
+| `browser_unreachable` | is the Cain jobs Chrome open? | Start it with `worker.ts open-chrome --home C:/pc-worker-k7q2xz` before the run (it passes `--user-data-dir`, `--profile-directory` and `--disable-default-apps`; `chrome_already_open` means it is open already, `chrome_not_found` that chrome.exe isn't in Program Files or LocalAppData). |
 | `probe_stale` | `confirmed.json`'s `fingerprint`, `worker_sha256`, `cain_version` and `policy_version` against what is installed now; `heartbeat.json`'s `reason` | Claude in Chrome (`extension_version_changed`), Chrome (`chrome_version_changed`) or `claude` (`cli_version_changed`) updated, or the worker itself did (`worker_changed`: a new Cain release, its version step included, or a confirmation from before these were recorded). For the extension or Chrome, restart the Cain jobs Chrome first. Then run `probe --attended`, then `confirm-profile --accept-boundary`. Nothing else runs until then. |
 | `probe_stale` with reason `cli_version_changed` | `worker.ts check-cli`: the pinned against the current version and hash | Usually the autoupdater: the session runs with `DISABLE_AUTOUPDATER=1`, but a `claude` you run yourself in a terminal (or an installer) updates the same executable. Set `DISABLE_AUTOUPDATER=1` in your own Windows user environment too, then run the probe and `confirm-profile --accept-boundary` again. Needs a code change: no. |
 | `update_pending` | chrome://extensions in the Cain jobs Chrome; the version folders under the profile's `Extensions\<id>` | Chrome has unpacked a Claude in Chrome update into a newer version folder but still runs the old one. Restart the Cain jobs Chrome (close every window, open it again); the next run is `probe_stale` until you probe and confirm the new version. Needs a code change: no. Runs stay held after the restart until a new probe and confirmation (`version-hold.json` in the worker folder; twenty-first round): an auto-update needs a new probe. Twenty-second round: an update found by the check after a session fails that run `versions_changed` with a detail starting `update_pending:`, and the hold is written then too. |
@@ -2192,7 +2225,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `hook_missing_decision` | `diagnostics.log` with `--diagnose`: `missing`; `nav-decisions.jsonl` | A tool use had no decision in nav-guard's log: the hook didn't run, didn't answer in time, or didn't see that call. The report was discarded. Check Git Bash runs the runtime (setup step 9); run the probe, whose smoke step names it. |
 | `hook_selftest_failed` | run `worker.ts probe --attended`; in Git Bash, `"C:/Users/you/.bun/bin/bun.exe" --version` | The preflight started the real nav-guard with an allow, a deny and malformed input, and one didn't answer as it should, or its log couldn't be written. Nothing was claimed. Check the runtime path, that the worker folder is writable by you, and that the harness copy is complete. |
 | `canary_cookie_missing` | `probe`'s detail; chrome://settings/cookies in the Cain jobs profile | The canary page got no marker cookie at all: the profile's cookies for `127.0.0.1` were cleared (by hand, or by **Clear cookies and site data when you close all windows**), or another profile answered. Turn that setting off for this profile, then run `bind-profile --attended` again (setup step 10). |
-| `chrome_not_restarted` (probe) | Task Manager, Details: `chrome.exe` with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` | The probe asked you to restart the Cain jobs Chrome, and its browser process didn't change. Close every window of it (check no `chrome.exe` with that folder is left), open it again, and press Enter. |
+| `chrome_not_restarted` (probe) | Task Manager, Details: `chrome.exe` with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` | The probe asked you to restart the Cain jobs Chrome, and its browser process didn't change. Close every window of it (check no `chrome.exe` with that folder is left), open it again with `worker.ts open-chrome`, and press Enter. |
 | `extension_version_unknown` | `heartbeat.json`'s `reason`; `probe-evidence.json`'s `live_extension_version` | From an earlier version, which stopped unattended runs on it. This version has no unattended runs: attended runs go on with the version in the extension's manifest standing in. Nothing to fix by hand. |
 | `read_unverified` | the job's result, or the heartbeat (before any claim); `probe-evidence.json`: `reading_reports_url` | In a run: a read wasn't followed by a tab context, and either the probe found this PC's reading tools don't report their tab's address or that read's own answer lacked it. Run again; if the model keeps skipping it, the session prompt needs a change. Before any claim (the bridge check): the reading tools no longer report addresses the way the probe recorded (an extension update changed their answers): run the probe and `confirm-profile` again. Needs a code change: no. |
 | `canary_first` | the job's result; `diagnostics.log` with `--diagnose` | The model read a page (`read_page`, `get_page_text` or `find`) before the tab context that shows the canary page, so what it read couldn't be placed. Run again; if it keeps happening, the session prompt needs a change. Needs a code change: maybe. |

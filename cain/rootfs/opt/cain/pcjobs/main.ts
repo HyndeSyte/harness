@@ -25,7 +25,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { dirname, join, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
-  DEFAULT_REPO, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type OwnerReuse, type Result } from "./core.ts";
+  DEFAULT_REPO, HEARTBEAT_INTERVAL_MS, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type OwnerReuse, type Result } from "./core.ts";
 
 export type Config = {
   remote: string; dir: string; queue: string; outcomes: string; branch: string;
@@ -294,8 +294,10 @@ export function resetNoticeProcess(): void { configStopped = false; migrationUns
 // fetchFails (twenty-ninth round): the queue's fetch failing in rounds in a row, counted on its own, whatever the sends do.
 // 0.12.2: kept while the queue-unreachable notice stands, so a good fetch between failures doesn't end it (queueFetch);
 // queueBack: when that notice last cleared, so one raised again within QUEUE_AGAIN_MS is worded as coming back.
-// quietHeld (0.12.2, third pass): when the worker-not-starting check was first held for a failing fetch, so the hold is capped.
-interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number; queueBack?: string; quietHeld?: string }
+// quietPending (0.12.2, fourth pass): a worker-not-starting condition held back (a heartbeat that looked fresh, or the
+// queue's fetch failing): since when, and the jobs it is for. Kept across restarts until a job is acknowledged, or told.
+interface QuietPending { since: string; jobs: string[] }
+interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number; queueBack?: string; quietPending?: QuietPending }
 export const SILENT_ROUNDS = 30;
 // Twenty-eighth round, the bound on exactly-once display: the link remembers the notice ids it posted for
 // PC_NOTICE_RETAIN_MS (link/core.ts, 30 days). A mark still owed whose id is older than that is re-minted before its
@@ -348,7 +350,7 @@ function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "di
   const t: Told = { told, waits, ...(config ? { config: true as const } : {}), ...(Number.isInteger(a?.silent) && a.silent > 0 ? { silent: a.silent } : {}),
     ...(Number.isInteger(a?.fetchFails) && a.fetchFails > 0 ? { fetchFails: a.fetchFails } : {}),
     ...(typeof a?.queueBack === "string" && Number.isFinite(Date.parse(a.queueBack)) ? { queueBack: a.queueBack } : {}),
-    ...(typeof a?.quietHeld === "string" && Number.isFinite(Date.parse(a.quietHeld)) ? { quietHeld: a.quietHeld } : {}) };
+    ...(quietPendingOf(a?.quietPending) ? { quietPending: quietPendingOf(a.quietPending)! } : {}) };
   if (a?.v !== 3) {
     migrateTold(cfg, t);
     if (!saveTold(cfg, t, true)) {
@@ -375,10 +377,16 @@ function migrateTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | 
   }
 }
 const newNoticeId = () => randomBytes(12).toString("hex");
+// A held worker-not-starting condition as the notice file keeps it; a garbled one with a readable time keeps its time
+// (its deadline still runs), with no jobs, so it is told at its deadline.
+function quietPendingOf(x: any): QuietPending | null {
+  if (!x || typeof x !== "object" || typeof x.since !== "string" || !Number.isFinite(Date.parse(x.since))) return null;
+  return { since: x.since, jobs: Array.isArray(x.jobs) ? x.jobs.filter((j: unknown): j is string => typeof j === "string").slice(0, 200) : [] };
+}
 // Twenty-fifth round: written only when its content changes (a round that only finds the same marks still owed
 // leaves the file alone), and then whole: a temporary file, then renamed into place.
 function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
-  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}), ...(t.fetchFails ? { fetchFails: t.fetchFails } : {}), ...(t.queueBack ? { queueBack: t.queueBack } : {}), ...(t.quietHeld ? { quietHeld: t.quietHeld } : {}) });
+  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}), ...(t.fetchFails ? { fetchFails: t.fetchFails } : {}), ...(t.queueBack ? { queueBack: t.queueBack } : {}), ...(t.quietPending ? { quietPending: t.quietPending } : {}) });
   try { if (readFileSync(toldFile(cfg), "utf8") === text) return true; } catch { /* not there yet, or unreadable: written */ }
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
@@ -617,38 +625,61 @@ export function heartbeatNotices(cfg: Config, h: Heartbeat | null): void {
 // claimed (failed, no attempt) within the last WORKER_QUIET_MS, each judged at min(now, its expiry), with the
 // heartbeat missing or not fresh there. Held, neither told nor seen clear, while the queue's fetch is failing
 // (fetchFails): the keeper's copy of the heartbeat is then old because of the outage, not the worker.
-// 0.12.2, third pass: a heartbeat is fresh while it is no older than WORKER_QUIET_MS (SKEW_MS allowed), the interval the
-// keeper allows the worker between check-ins, so a job shorter than that interval raises nothing while a fresh
-// heartbeat exists. The hold through a queue outage is capped: once the check has been held QUIET_HOLD_MAX_MS since it
-// was first held (rounds whose fetch worked but whose outage notice still stands count as held, so a flapping queue
-// can't hold it for ever) and the condition is seen in the copy, it is told as worker_not_starting_unconfirmed, which
-// the link words as unconfirmed; the hold's start is forgotten at the first round that judges it normally again.
+// 0.12.2, fourth pass: a heartbeat is fresh for three heartbeat intervals (HEARTBEAT_FRESH_MS), not WORKER_QUIET_MS, and
+// a heartbeat at or after a job was queued (SKEW_MS allowed) means the worker started since: that job isn't waiting on a
+// worker that won't start. A condition held back, because the heartbeat before the job looked fresh (the worker may have
+// died right after it) or because the queue's fetch is failing, isn't dropped: it stays pending (quietPending, in the
+// notice file, so it survives a restart) until each of its jobs is acknowledged (claimed, so it has an attempt, whatever
+// result it then has, or a heartbeat at or after it was queued), or until QUIET_PENDING_MAX_MS from when it was first
+// held (12 hours worst case, any queue hold included): then it is told, as worker_not_starting_unconfirmed while the
+// queue's fetch is failing, worker_not_starting otherwise. A told mark stays owed until the link acknowledges it (resent
+// each round with its saved id), never sent once and forgotten.
 export const WORKER_QUIET_MS = 6 * 3_600_000;
-export const QUIET_HOLD_MAX_MS = 12 * 3_600_000;
+export const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
+export const QUIET_PENDING_MAX_MS = 12 * 3_600_000;
 export const WORKER_QUIET_KEY = "workerquiet";
 export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[], now: Date): void {
   const heard = h ? Date.parse(h.worker_clock) : NaN;
-  const quietFor = (j: Job): boolean => {
+  const keyOf = (j: Job) => typeof j.id === "string" ? j.id : String(j.created);
+  // When a job has waited its bound (pending, or closed as expired without ever being claimed within the last
+  // WORKER_QUIET_MS), the time it is judged at: min(now, its expiry); null otherwise.
+  const waitedAt = (j: Job): number | null => {
     const created = Date.parse(j.created), expires = Date.parse(j.expires);
     const life = Number.isFinite(expires) && Number.isFinite(created) ? Math.max(0, expires - created) : WORKER_QUIET_MS;
     const bound = Math.min(WORKER_QUIET_MS, life);
     const at = Number.isFinite(expires) ? Math.min(now.getTime(), expires) : now.getTime();
-    const unclaimedExpiry = j.state === "failed" && j.attempt === null && Number.isFinite(expires) && expires + SKEW_MS <= now.getTime() && now.getTime() - expires <= WORKER_QUIET_MS;
-    if (j.state !== "pending" && !unclaimedExpiry) return false;
-    const quiet = !Number.isFinite(heard) || at - heard > WORKER_QUIET_MS + SKEW_MS;
-    return quiet && at - created >= bound;
+    const unclaimedExpiry = j.state === "failed" && !j.attempt && Number.isFinite(expires) && expires + SKEW_MS <= now.getTime() && now.getTime() - expires <= WORKER_QUIET_MS;
+    if (j.state !== "pending" && !unclaimedExpiry) return null;
+    return at - created >= bound ? at : null;
   };
-  const owed = h?.code !== "start_refused" && jobs.some(quietFor);
+  const acked = (j: Job) => !!j.attempt || (Number.isFinite(heard) && heard + SKEW_MS >= Date.parse(j.created));
   const t = readTold(cfg);
-  if (t.fetchFails) {
-    const since = Date.parse(t.quietHeld ?? "");
-    if (!Number.isFinite(since)) { t.quietHeld = now.toISOString(); saveTold(cfg, t); return; }
-    if (owed && now.getTime() - since >= QUIET_HOLD_MAX_MS) tell(cfg, "worker_not_starting_unconfirmed", WORKER_QUIET_KEY);
-    return;
+  const held = !!t.fetchFails;
+  // A start refusal is told by its own notice: nothing held for it here.
+  const refused = h?.code === "start_refused";
+  const live = refused ? [] : jobs.map((j) => ({ j, at: waitedAt(j) })).filter((x): x is { j: Job; at: number } => x.at !== null && !acked(x.j));
+  const quiet = live.filter((x) => !Number.isFinite(heard) || x.at - heard > HEARTBEAT_FRESH_MS + SKEW_MS);
+  const looksFresh = live.filter((x) => !quiet.includes(x));
+  let pend: QuietPending | undefined = t.quietPending ? { since: t.quietPending.since, jobs: [...t.quietPending.jobs] } : undefined;
+  if (pend && refused) pend = undefined;
+  if (pend) {
+    const byKey = new Map(jobs.map((j) => [keyOf(j), j] as const));
+    const left = pend.jobs.filter((k) => { const j = byKey.get(k); return !(j && acked(j)); });
+    pend = left.length || !pend.jobs.length ? { since: pend.since, jobs: left } : undefined;
   }
-  if (t.quietHeld) { delete t.quietHeld; saveTold(cfg, t); }
-  if (owed) tell(cfg, "worker_not_starting", WORKER_QUIET_KEY);
-  else cleared(cfg, WORKER_QUIET_KEY);
+  const hold = (xs: { j: Job }[]) => { for (const { j } of xs) { pend ??= { since: now.toISOString(), jobs: [] }; if (!pend.jobs.includes(keyOf(j))) pend.jobs.push(keyOf(j)); } };
+  hold(held ? live : looksFresh);
+  let code: "worker_not_starting" | "worker_not_starting_unconfirmed" | null = null;
+  if (!held && quiet.length) code = "worker_not_starting";
+  else if (pend && now.getTime() - Date.parse(pend.since) >= QUIET_PENDING_MAX_MS) code = held ? "worker_not_starting_unconfirmed" : "worker_not_starting";
+  if (code) pend = undefined;
+  if (JSON.stringify(pend ?? null) !== JSON.stringify(t.quietPending ?? null)) {
+    if (pend) t.quietPending = pend; else delete t.quietPending;
+    saveTold(cfg, t);
+  }
+  if (code === "worker_not_starting_unconfirmed") tell(cfg, "worker_not_starting_unconfirmed", WORKER_QUIET_KEY);
+  else if (code) tell(cfg, "worker_not_starting", WORKER_QUIET_KEY);
+  else if (!held && !pend) cleared(cfg, WORKER_QUIET_KEY);
 }
 // A condition seen clear this round. A mark whose post was never acknowledged (posted false) is never
 // counted down or deleted (twenty-second round): it is sent again with its saved id until the link answers
@@ -1048,7 +1079,7 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
   if (h?.code === "host_parent_gone")
     return "The PC isn't taking jobs because Claude in Chrome's helper lost its Chrome. At the PC: restart the Cain jobs Chrome.";
   if (h?.code === "extra_extension")
-    return "The PC isn't taking jobs because the Cain jobs Chrome has another extension turned on, or one a Chrome policy installs. At the PC: run worker.ts check-host, which names it; turn it off in that Chrome, or, if it names a policy, have that policy stop installing it.";
+    return "The PC isn't taking jobs because the Cain jobs Chrome has another extension turned on (Google Docs Offline counts), one a Chrome policy installs, or one whose settings or policy it can't read. At the PC: run worker.ts check-host, which names it and the fix; turn it off in that Chrome, or, if it names a policy, have that policy stop installing it.";
   if (h?.code === "prefs_disagree")
     return "The PC isn't taking jobs because Chrome's two preference files disagree about an extension in the Cain jobs profile. At the PC: restart the Cain jobs Chrome, then run worker.ts check-host.";
   if (h?.code === "unattended_unsupported")
