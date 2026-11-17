@@ -61,7 +61,7 @@ import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
-import { gateState, WATCH_DIR } from "./shipgate";
+import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkFetch } from "./http";
@@ -212,6 +212,11 @@ const link = new Link({
   // service's lines (/data/trust/reviewed.json), for a review of that head.
   checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
   gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
+  // 0.12.2: while a watch's acceptance stands, the card reads the gate's head through the gate's own curl wrapper
+  // (shipgate.ts gateHeadRead: curl's version read anew each time, killed at its limit, a timeout named), never fetch.
+  // It is authenticated when SHIP_GATE_GITHUB_TOKEN is set, the recommended default (without it these reads share
+  // GitHub's 60 an hour from this address with every watch).
+  gateHead: (pr, ms) => { const p = pullOf(pr); return p ? gateHeadRead(p.repo, p.pr, { ms: Math.max(1_000, ms - 500) }) : Promise.resolve({ unknown: "that isn't a pull request's address" }); },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).

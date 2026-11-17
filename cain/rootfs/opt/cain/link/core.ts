@@ -104,6 +104,8 @@ const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
 const HOUR = 3_600_000;
 const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts and checks, asked at once) before it says it couldn't read them
+// 0.12.2: the card's wait for the gate's head read ran out (an abort at its time limit), named as the gate's state unknown.
+export const GATE_HEAD_TIMED_OUT = "the read of the pull request's head from GitHub was stopped at its time limit (a timeout)";
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -578,6 +580,9 @@ export interface Deps {
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
   gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
+  // 0.12.2: the pull request's head as the gate reads it (shipgate.ts gateHeadRead, through its curl wrapper), within ms:
+  // the head, or the gate's state unknown, named. Absent (the tests' rig): the facts' head is used, as before.
+  gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }>;
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1507,13 +1512,24 @@ export class Link {
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
-    const { facts, checkRuns } = this.d;
-    const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
+    const { facts, checkRuns, gateHead } = this.d;
+    // 0.12.2: while an acceptance stands, the gate's head is read through the gate's own curl wrapper (gateHead), beside
+    // the facts; its wait running out is named as a timeout, and any read that doesn't give the head is the gate's state
+    // unknown, by name.
+    const gateRead = watched.length && gateHead
+      ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
+      : Promise.resolve(null);
+    const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    if (watched.length && gateHead) {
+      if (gh === null) throw new Refusal(`the Ship gate's state is unknown for this pull request: ${GATE_HEAD_TIMED_OUT}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (typeof gh !== "string") throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gh.unknown}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (gh !== head) throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    }
     // Twenty-fifth round: a watch's acceptance is consumed only against the pull request's head as GitHub has it now.
     // When one stands, a head that can't be read refuses the card (the acceptance can't be checked), never passes it.
-    if (watched.length && f?.head !== head)
+    if (watched.length && !gateHead && f?.head !== head)
       throw new Refusal("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it: show the card again in a minute");
     // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
     // the head (a squash or a rebase would leave it out). So the card asks main too, the way the

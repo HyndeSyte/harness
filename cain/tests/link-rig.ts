@@ -37,7 +37,8 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string } } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };
+    gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }> } = {}) {
   let state: State = emptyState();
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
@@ -166,6 +167,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       ? { runs: copy(github.runs), windows: github.windows || github.runs.some((x: any) => x?.name === "pcjobs-windows" && x?.app?.id === ACTIONS_APP) }
       : github.runs); } : undefined,
     gateWatch: opts.gateWatch ?? ((pr: string) => (github.watched[pr] ? [github.watched[pr]] : [])),
+    ...(opts.gateHead ? { gateHead: opts.gateHead } : {}),
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,
