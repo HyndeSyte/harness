@@ -11,6 +11,7 @@ import { CODES_WHY, SHIP_WORDS_WHY } from "../rootfs/opt/cain/gate/cain";
 import { CHECKS_PASSED, CHECKS_RUNNING, CHECKS_UNREAD, IN_MAIN, MERGED_UNREAD, NO_REVIEW, REVIEW_READ, unlabeled } from "../rootfs/opt/cain/link/core";
 import { GATE_RECORD_FORMAT, watchAccepted, watchFile } from "../rootfs/opt/cain/link/merge";
 import { acceptedFor, supersede, keepWatch, otherLive, takeLock, beat, letGo, LOCK_STALE_MS, CRITICAL_MAX_MS, CRITICAL_SLACK_MS, readGen, genFile, agoWords, gateState, recoverGen, ghHeadRead, githubToken, quarantineRecord, quarantineLog, genRecorded } from "../rootfs/opt/cain/link/shipgate";
+import * as gate28 from "../rootfs/opt/cain/link/shipgate";
 import { checkRun, keeperHolds, MIN, NOV11_8AM, passing, pendingWith, PR, rig, SHA1, SHA2 } from "./link-rig";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1054,10 +1055,13 @@ describe("twenty-seventh review: one deadline for the critical section, the reco
     expect(k.failure_why).toContain(`--quarantine ${nobody}`);
     // A record that reads is never set aside; the garbled one is, recorded, and the watch goes.
     expect(quarantineRecord(dir, SHA1)).toMatchObject({ ok: false, why: expect.stringContaining("reads and parses") });
-    const q = quarantineRecord(dir, nobody);
+    // Twenty-eighth round: a record that names no pull request is set aside under the lock of the one named with --pr.
+    expect(quarantineRecord(dir, nobody)).toMatchObject({ ok: false, why: expect.stringContaining("--pr <number>") });
+    expect(k.failure_why).toContain(`--quarantine ${nobody} --pr 9`);
+    const q = quarantineRecord(dir, nobody, { pr: 9 });
     expect(q.ok).toBe(true);
     expect(existsSync(watchFile(dir, nobody))).toBe(false);
-    expect(JSON.parse(readFileSync(quarantineLog(dir), "utf8").trim())).toMatchObject({ file: watchFile(dir, nobody), pr: null, gen_max: null });
+    expect(JSON.parse(readFileSync(quarantineLog(dir), "utf8").trim())).toMatchObject({ file: watchFile(dir, nobody), pr: 9, gen_max: null });
     expect(keepWatch(dir, line(SHA2, 9), watchFile(dir, SHA2), echo).accepted_head).toBe(SHA2);
     // A quarantined record's generation still raises a later recovery.
     expect(quarantineRecord(dir, other).ok).toBe(true);
@@ -1097,5 +1101,249 @@ describe("twenty-seventh review: one deadline for the critical section, the reco
     expect(main).toMatch(/gateWatch: \(pr\) => \{[^\n]*gateState\(WATCH_DIR/);
     expect(main).not.toMatch(/acceptedFor|otherLive/);
     expect(core).not.toMatch(/acceptedFor|otherLive|from "\.\/shipgate"/);
+  });
+});
+
+describe("twenty-eighth review: the quarantine under the gate lock, curl's limits enforced from this side, an owed supersede on the card, lock files set aside, the bound said as it is, and the unauthenticated quota", () => {
+  const g = gate28 as any;
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  const echo = { headNow: (_p: number, h: string) => h };
+  const quietly = <T>(f: () => T): T => { const was = console.error; console.error = () => {}; try { return f(); } finally { console.error = was; } };
+  const pauseMs = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const garbled = (pr: number, gen: number) => `{"step": "ship_gate", "pr": ${pr}, "gen": ${gen}, "accepted_head": "torn`;
+  const valid = (head: string, pr = 5, gen = 1) => JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: head, failure: null, gen, gen_floor: gen, format: GATE_RECORD_FORMAT }) + "\n";
+  const logLines = (dir: string) => { try { return readFileSync(quarantineLog(dir), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  // A curl that ignores its time limit (and says it is 7.29 when asked), counting its calls.
+  const slowCurl = () => {
+    const d = mkdtempSync(join(tmpdir(), "slow-curl-"));
+    writeFileSync(join(d, "curl"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "curl 7.29.0 (x86_64-pc-linux-gnu)"; exit 0; fi\necho x >> ${JSON.stringify(join(d, "calls"))}\nexec sleep 30\n`, { mode: 0o755 });
+    return { dir: d, bin: join(d, "curl"), calls: () => { try { return readFileSync(join(d, "calls"), "utf8").trim().split("\n").length; } catch { return 0; } } };
+  };
+
+  test("the quarantine takes the gate lock: a current lock refuses it, and a record a watch rewrote between the check and the rename is put back, never set aside", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const f = watchFile(dir, SHA1);
+    writeFileSync(f, garbled(5, 3));
+    // A watch holding the lock: the quarantine refuses, and changes nothing.
+    writeFileSync(genFile(dir, 5), "3\n");
+    const held = takeLock(join(dir, "ship-gate-pr-5.lock"), 0);
+    expect("token" in held).toBe(true);
+    expect(g.quarantineRecord(dir, SHA1)).toMatchObject({ ok: false, why: expect.stringContaining("looks to be running") });
+    expect(readFileSync(f, "utf8")).toBe(garbled(5, 3));
+    letGo(held as any);
+    // A watch writes a valid acceptance just before the rename: what was moved parses, so it is put back.
+    let called = false;
+    const r = g.quarantineRecord(dir, SHA1, { beforeRename: () => { called = true; writeFileSync(f, valid(SHA1, 5, 3)); } });
+    expect(called).toBe(true);
+    expect(r).toMatchObject({ ok: false, why: expect.stringContaining("put back") });
+    expect(JSON.parse(readFileSync(f, "utf8"))).toMatchObject({ accepted_head: SHA1, gen: 3 });
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+    expect(logLines(dir)).toEqual([]);
+    expect(readdirSync(dir).some((n) => n.includes(".quarantined-"))).toBe(false);
+    // The generation logged is that of the contents actually moved, not the ones first read.
+    writeFileSync(f, garbled(5, 3));
+    const r2 = g.quarantineRecord(dir, SHA1, { beforeRename: () => writeFileSync(f, garbled(5, 7)) });
+    expect(r2.ok).toBe(true);
+    expect(logLines(dir)).toEqual([expect.objectContaining({ file: f, pr: 5, gen_max: 7 })]);
+    expect(existsSync(join(dir, "ship-gate-pr-5.lock"))).toBe(false);                 // let go
+  });
+
+  test("a rename that fails leaves no log entry and the record where it was", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const f = watchFile(dir, SHA1);
+    writeFileSync(f, garbled(5, 2));
+    const r = g.quarantineRecord(dir, SHA1, { rename: () => { throw new Error("EBUSY"); } });
+    expect(r).toMatchObject({ ok: false, why: expect.stringContaining("couldn't be set aside") });
+    expect(logLines(dir)).toEqual([]);
+    expect(readFileSync(f, "utf8")).toBe(garbled(5, 2));
+    expect(existsSync(join(dir, "ship-gate-pr-5.lock"))).toBe(false);
+  });
+
+  test("a curl that ignores its time limit is killed from this side at the deadline plus a small margin; a try under one second is skipped, never handed to curl", () => {
+    const c = slowCurl();
+    const t0 = Date.now();
+    const r = g.ghGet("/repos/o/r/pulls/8", { base: "http://127.0.0.1:9", curl: c.bin, deadline: t0 + 2_000 });
+    const took = Date.now() - t0;
+    expect(r).toEqual({ miss: "deadline" });
+    expect(c.calls()).toBe(1);
+    expect(took).toBeGreaterThanOrEqual(1_900);
+    expect(took).toBeLessThan(2_000 + g.CURL_KILL_MARGIN_MS + 600);
+    // Under a second left: skipped as the deadline, curl never started.
+    expect(g.ghGet("/repos/o/r/pulls/8", { base: "http://127.0.0.1:9", curl: c.bin, deadline: Date.now() + 900 })).toEqual({ miss: "deadline" });
+    expect(c.calls()).toBe(1);
+    // The head read under the lock with that curl: nothing accepted, named as the bound, the lock let go in time.
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const t1 = Date.now();
+    const k = quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { criticalMs: 2_500,
+      headNow: (n, _h, deadline) => g.ghHeadRead("o/r", n, { base: "http://127.0.0.1:9", curl: c.bin, deadline }) }));
+    expect(k).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(Date.now() - t1).toBeLessThan(2_500 + g.CURL_KILL_MARGIN_MS + 1_000);
+    expect(existsSync(join(dir, "ship-gate-pr-5.lock"))).toBe(false);
+  }, 20_000);
+
+  test("curl older than 7.32 refuses the watch at its start, by name", async () => {
+    const c = slowCurl();
+    expect(g.curlVersion(c.bin)).toEqual([7, 29, 0]);
+    expect(g.curlVersionOk([7, 29, 0])).toBe(false);
+    expect(g.curlVersionOk([7, 32, 0])).toBe(true);
+    expect(g.curlVersionOk([8, 5, 0])).toBe(true);
+    expect(g.curlRefusal(null)).toContain("curl isn't installed");
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const p = Bun.spawn(["bun", join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts"), "--pr", "5", "--head", SHA1, "--watch", "--dir", dir],
+      { env: { ...process.env, PATH: `${c.dir}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
+    const killer = setTimeout(() => p.kill(), 15_000);
+    const err = await new Response(p.stderr).text();
+    clearTimeout(killer);
+    expect(await p.exited).toBe(1);
+    expect(err).toContain("curl 7.29.0 is older than 7.32");
+    expect(c.calls()).toBe(0);
+  }, 20_000);
+
+  test("the Ship card treats an acceptance with an owed supersede as not current, naming the owed supersede and its wait", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2), echo).accepted_head).toBe(SHA2);
+    const owed = await supersede(dir, SHA2, async () => ({ miss: "rate_limit" as const, wait_ms: 125_000 }));
+    expect(owed).toMatchObject({ ok: false, owed: true });
+    const st = gateState(dir, 5) as any;
+    expect(st.owed).toContain(`--supersede ${SHA2}`);
+    expect(st.owed).toContain("about 3 minutes");
+    const cardGate = () => { const x = gateState(dir, 5) as any; return "heads" in x ? (x.owed ? { owed: x.owed } : x.heads) : x; };
+    const r = rig({ facts: true, gateWatch: cardGate });
+    r.github.facts = facts();
+    r.reviews.list = [REVIEW];
+    await expect(ship(r)).rejects.toThrow("waiting on a supersede");
+    await expect(ship(r)).rejects.toThrow("about 3 minutes");
+    // The link's own reader maps it the same way.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    expect(main).toMatch(/gateWatch: \(pr\) => \{[^\n]*st\.owed \? \{ owed: st\.owed \}/);
+    // Once it goes through, the card reads the gate as usual.
+    expect(await supersede(dir, SHA2, async () => SHA1)).toEqual({ ok: true, pr: 5 });
+    expect(gateState(dir, 5)).toEqual({ heads: [] });
+  });
+
+  test("a lock file that doesn't parse, and a takeover's leftover that doesn't, are named with their quarantine and set aside under the lock, their generations counted", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    writeFileSync(genFile(dir, 5), "6\n");
+    writeFileSync(lock, `{"pid": 1, "token": "x", "gen": 4`);
+    writeFileSync(`${lock}.stale-abc`, `{"pid": 2, "gen": 9, "tok`);
+    expect(genRecorded(dir, 5).blocker).toContain("--quarantine-lock 5");
+    const k = quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { ...echo, waitMs: 200 }));
+    expect(k).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(k.failure_why).toContain("--quarantine-lock 5");
+    const q = g.quarantineLock(dir, 5);
+    expect(q.ok).toBe(true);
+    expect(q.moved.length).toBe(2);
+    expect(existsSync(lock)).toBe(false);
+    expect(existsSync(`${lock}.stale-abc`)).toBe(false);
+    expect(logLines(dir).map((l) => l.gen_max).sort()).toEqual([4, 9]);
+    expect(genRecorded(dir, 5).blocker).toBeUndefined();
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(quietly(() => recoverGen(dir, 5))).toEqual({ ok: true, gen: 10 });           // above the leftover's 9
+    // Nothing that doesn't parse: nothing changed.
+    expect(g.quarantineLock(dir, 5)).toMatchObject({ ok: false, why: expect.stringContaining("fails to parse") });
+  });
+
+  test("the deadline is checked before each record is parsed: past it the gate's reading stops as late, never as a reading", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(gateState(dir, 5, Date.now() - 1)).toMatchObject({ unknown: expect.stringContaining("ran out"), late: true });
+    expect(gateState(dir, 5, Date.now() + 60_000)).toEqual({ heads: [SHA1] });
+  });
+
+  test("a holder stalled past the stale threshold is taken over, and the takeover fences its later write and its take-back", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const lock = join(dir, "ship-gate-pr-5.lock");
+    let taker: any = null;
+    const a = quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { ...echo, staleMs: 300, criticalMs: 8_000,
+      atWrite: () => { pauseMs(500); taker = takeLock(lock, 2_000, { staleMs: 300 }); } }));
+    expect("token" in taker).toBe(true);
+    expect(taker.gen).toBe(2);                                                      // the takeover moved the generation on
+    expect(a).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(a.failure_why).toContain("was taken over while this watch was keeping its acceptance");
+    expect(acceptedFor(dir, 5)).toEqual([]);                                        // the stalled holder's write counts for nothing
+    expect(JSON.parse(readFileSync(lock, "utf8")).token).toBe(taker.token);         // and it never let go of the taker's lock
+    letGo(taker);
+    // The taker's own acceptance, written after the stalled holder's take-back, stands.
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(acceptedFor(dir, 5)).toEqual([SHA1]);
+  });
+
+  test("a watch's exclusive create injected between the recovery's rename and its own create: the recovery fails, or writes above that watch's generation, and the watch's acceptance is not current", () => {
+    const stale = (dir: string) => {
+      const lock = join(dir, "ship-gate-pr-5.lock");
+      writeFileSync(genFile(dir, 5), "1\n");
+      writeFileSync(lock, JSON.stringify({ pid: 1, token: "stalled", gen: 1, at: "x" }));
+      const old = new Date(Date.now() - 5 * 60_000);
+      utimesSync(lock, old, old);
+      return lock;
+    };
+    // The watch keeps its acceptance and lets go before the recovery's create: the recovery writes above it.
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    stale(dir);
+    let w: any = null;
+    const r = quietly(() => recoverGen(dir, 5, { afterTakeover: () => { w = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo); } } as any));
+    expect(w.accepted_head).toBe(SHA1);
+    const wGen = JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).gen;
+    expect(r.ok).toBe(true);
+    expect((r as any).gen).toBeGreaterThan(wGen);
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    // The watch still holds the lock at the recovery's create: the recovery fails and changes nothing.
+    const dir2 = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    const lock2 = stale(dir2);
+    let holder: any = null;
+    const r2 = quietly(() => recoverGen(dir2, 5, { waitMs: 300, afterTakeover: () => { holder = takeLock(lock2, 0); } } as any));
+    expect("token" in holder).toBe(true);
+    expect(r2).toMatchObject({ ok: false, why: expect.stringContaining("looks to be running") });
+    expect(readGen(dir2, 5)).toBe(1);
+    letGo(holder);
+  });
+
+  test("without a token a page read is never retried and every refusal says how many reads are left; with one it is retried as before", async () => {
+    const server = Bun.spawn(["bun", "-e", `
+      let n = 0;
+      const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch(req) {
+        if (new URL(req.url).pathname === "/count") return new Response(String(n));
+        n++;
+        return new Response(JSON.stringify({ message: "API rate limit exceeded" }), { status: 403, headers: { "content-type": "application/json", "retry-after": "1", "x-ratelimit-remaining": "0", "x-ratelimit-limit": "60" } });
+      } });
+      console.log(s.port);`], { stdout: "pipe", stderr: "pipe" });
+    try {
+      const port = Number(new TextDecoder().decode((await server.stdout.getReader().read()).value).trim());
+      const base = `http://127.0.0.1:${port}`;
+      const count = async () => Number(await (await fetch(`${base}/count`)).text());
+      g.resetQuota();
+      expect(g.quotaNote({})).toContain("isn't known yet");
+      expect(g.pageRetries({})).toBe(0);
+      const r = g.ghPage("/repos/o/r/actions/runs", { base, env: {} });
+      expect(r.status).toBe(403);
+      expect(await count()).toBe(1);
+      expect(g.quotaNote({})).toBe(" (reads without a GitHub token: 0 of 60 left this hour)");
+      const token = { SHIP_GATE_GITHUB_TOKEN: "t".repeat(40) };
+      expect(g.pageRetries(token)).toBe(2);
+      expect(g.quotaNote(token)).toBe("");
+      g.ghPage("/repos/o/r/actions/runs", { base, env: token });
+      expect(await count()).toBe(4);
+      // The watch's printed refusal carries it.
+      const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts"), "utf8");
+      expect(src).toContain("failure_why: why,");
+      expect(src).toContain("${r.owed ? quotaNote() : \"\"}");
+    } finally { server.kill(); }
+  }, 20_000);
+
+  test("the recovery deletes temporary generation files a cut-off write left behind", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate28-"));
+    writeFileSync(genFile(dir, 5), "2\n");
+    const left = `${genFile(dir, 5)}.tmp-123-abcd`;
+    writeFileSync(left, "9\n");
+    expect(quietly(() => recoverGen(dir, 5))).toEqual({ ok: true, gen: 3 });
+    expect(existsSync(left)).toBe(false);
+  });
+
+  test("the bound is said as it is: the acceptance window, not lock holding", () => {
+    const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts"), "utf8");
+    expect(src).toContain("what is bounded is the acceptance window");
+    expect(src).toContain("the holding is unbounded");
   });
 });

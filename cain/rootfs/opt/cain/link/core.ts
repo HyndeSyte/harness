@@ -127,8 +127,10 @@ export const PC_NOTICES: Record<string, string> = {
   reuse_record_unreadable: "Your PC job keeper has tried for three rounds to settle a tap of yours approving a reused value, written by an older version, but a file in its copy of the PC job queue can't be read. The tap stays used and other PC jobs go on. Fix: see the reuse_record_unreadable row in pc-jobs.md, Troubleshooting.",
   reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
   hold_clear_unrecorded: "Your PC isn't taking jobs: its worker couldn't write its record of clearing a version hold (version-hold-cleared.json in the worker folder), so the hold stays. At the PC: free disk space or fix the worker folder's permissions so that file can be written, then start a run (pc-jobs.md, Troubleshooting).",
+  worker_start_refused: "Your PC isn't taking jobs: its worker refused to start because a setting meant only for its tests is set where it runs (the PC_WORKER_TEST_BUILD variable, or a preload, require, import or loader flag in NODE_OPTIONS or BUN_OPTIONS, or a bunfig.toml preload). At the PC: remove it as the worker's own refusal says, open a new terminal, then start a run (pc-jobs.md, Troubleshooting).",
   notice_undelivered: "Your PC job keeper had an earlier notice for you that could not be delivered, and after its update it can no longer say which one. If something about PC jobs seems stuck, see pc-jobs.md, Troubleshooting; Cain can read the keeper's log.",
 };
+export const PC_NOTICE_REPEAT = "Said again, in case it didn't reach you before:";
 // A code the keeper sends that this link has no words for (a keeper ahead of the link).
 export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
 export const PC_NOTICE_ID = /^[0-9a-f]{16,64}$/;
@@ -152,7 +154,10 @@ export function pcQueuedWords(queued: string, tz = "America/New_York"): string |
   const f = (o: Intl.DateTimeFormatOptions) => { try { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: day ? "UTC" : tz }).format(t); } catch { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: "UTC" }).format(t); } };
   return day ? `a PC browser job seen by the keeper on ${f({ month: "short", day: "numeric" })}` : `a PC browser job seen by the keeper at ${f({ month: "short", day: "numeric" })}, ${f({ hour: "numeric", minute: "2-digit" })}`;
 }
-const PC_NOTICE_KEEP = 200;              // the notice ids the link remembers having posted (the newest)
+// The notice ids the link remembers having posted (twenty-eighth round: by age, PC_NOTICE_RETAIN_MS, the keeper's
+// NOTICE_DEDUP_MS; PC_NOTICE_KEEP only bounds the store's size, far above what the keeper sends in that time).
+export const PC_NOTICE_RETAIN_MS = 30 * DAY;
+const PC_NOTICE_KEEP = 5_000;
 export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
@@ -568,7 +573,7 @@ export interface Deps {
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
-  gateWatch?: (pr: string) => string[] | { unknown: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, or the gate state unknown (shipgate.ts gateState)
+  gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1484,6 +1489,10 @@ export class Link {
     // Twenty-sixth round: a gate state that can't be read (its generation file or a kept record) refuses the card by
     // name, never reads as no acceptance.
     const gate = this.d.gateWatch?.(pr) ?? [];
+    // Twenty-eighth round: an acceptance whose supersede is owed (GitHub's rate limit stopped it) is not current: the
+    // card is refused by name, with the wait GitHub asked for, never left to the head read alone.
+    if (!Array.isArray(gate) && "owed" in gate)
+      throw new Refusal(`the Ship gate's watch of this pull request is waiting on a supersede: ${gate.owed}. No card goes until it is done`);
     if (!Array.isArray(gate))
       throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gate.unknown}. No card goes until it can be read`);
     const watched = gate;
@@ -1611,7 +1620,9 @@ export class Link {
   // Twenty-second round: the job is named by what it does, {site, action} in the queue's own shapes, never
   // by its queue id (Cain's rules and the gate keep those ids away from him); the notice id stays in the
   // payload, never in the words.
-  async pcNotice(code: unknown, job?: unknown, id?: unknown): Promise<{ status: "posted"; message: string; duplicate?: true }> {
+  // Twenty-eighth round: repeat, a notice the keeper re-minted under a new id because its first id may have outlived the
+  // link's record of posted ids (PC_NOTICE_RETAIN_MS): worded as a repeat, so a second showing never reads as new.
+  async pcNotice(code: unknown, job?: unknown, id?: unknown, repeat?: unknown): Promise<{ status: "posted"; message: string; duplicate?: true }> {
     const c = String(code ?? "");
     const base = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
     if (!base) throw new Refusal("not a PC job keeper notice");
@@ -1634,12 +1645,14 @@ export class Link {
       const had = this.d.load().pcNotices?.[nid];
       if (had) return { status: "posted", message: had.msg, duplicate: true };
     }
-    const text = named ? `${base} (It is ${named}, code ${c}.)` : base;
+    const said = named ? `${base} (It is ${named}, code ${c}.)` : base;
+    const text = repeat === true ? `${PC_NOTICE_REPEAT} ${said}` : said;
     noMachineText(text);
     const message = await this.notice(text);
     if (nid !== null) {
       const s = this.d.load();
-      const kept = Object.entries({ ...(s.pcNotices ?? {}), [nid]: { msg: message, at: this.d.now() } }).sort((a, b) => b[1].at - a[1].at).slice(0, PC_NOTICE_KEEP);
+      const kept = Object.entries({ ...(s.pcNotices ?? {}), [nid]: { msg: message, at: this.d.now() } }).filter(([, v]) => this.d.now() - v.at <= PC_NOTICE_RETAIN_MS)
+        .sort((a, b) => b[1].at - a[1].at).slice(0, PC_NOTICE_KEEP);
       s.pcNotices = Object.fromEntries(kept);
       this.d.save(s);
     }

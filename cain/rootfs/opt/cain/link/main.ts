@@ -34,7 +34,7 @@
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
 //                                       exactly those values when posted; a message he typed never counts
 //                                       (core.ts reuseProof); "ok", or refused with why
-//     POST /pc-notice {code, id?, job?: {site, action}}   one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
+//     POST /pc-notice {code, id?, job?: {site, action}, repeat?}   one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
 //                                       condition and its fix; "posted" (a plain code it has no words for gets a generic line naming it), or refused
 // Nothing is published to the LAN: the App has no "ports:".
 //
@@ -211,7 +211,7 @@ const link = new Link({
   // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
   checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
-  gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? st.heads : st; },
+  gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).

@@ -49,6 +49,8 @@ import {
   regAnswer, chromeListingStep, LISTING_STAND_IN, LISTING_RUNNER_REFUSED, TEST_BUILD_FLAG, TEST_BUILD_FLAG_REFUSED, testBuildFlagRefusal, VERSION_HOLD_CLEAR_UNRECORDED_HINT, chromeReadFailWhy, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
+import * as worker28 from "../rootfs/opt/cain/pcjobs/worker.ts";
+import * as keeper28 from "../rootfs/opt/cain/pcjobs/main.ts";
 import { get as httpGet } from "node:http";
 import { spendNonce } from "../rootfs/opt/cain/pcjobs/confirm.ts";
 import { makeToken, publicKey as shipPublicKey, readToken } from "../rootfs/opt/cain/ship-token.ts";
@@ -7373,5 +7375,59 @@ describe("twenty-seventh review: the test build only from a test-only module, th
     // A hold that itself can't be written keeps its own hint and no reason.
     rmSync(holdClearedFile(q.opts()), { recursive: true });
     expect((await run(q.opts(attended))).code).toBe("ok");
+  });
+});
+describe("twenty-eighth review: a preload refused at the start, and every start refusal leaving a heartbeat the keeper tells the owner by", () => {
+  const w = worker28 as any;
+  const k = keeper28 as any;
+  const ENTRY = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/worker.ts");
+  const TESTBUILD = join(import.meta.dir, "pcworker-testbuild.ts");
+  const quiet = <T>(f: () => T): T => { const was = console.log; console.log = () => {}; try { return f(); } finally { console.log = was; } };
+
+  test("a require, import, preload or loader flag in the options variables or the runtime's arguments, a bunfig preload, or the symbol already set refuses the start", () => {
+    const home = mkdtempSync(join(tmpdir(), "pcw28-"));
+    const cwd = mkdtempSync(join(tmpdir(), "pcw28-cwd-"));
+    const clean = (env: Record<string, string>, argv: string[] = []) => w.preloadRefusal({ home }, env, argv, cwd, false);
+    expect(clean({})).toBeNull();
+    expect(clean({ NODE_OPTIONS: "--max-old-space-size=4096" })).toBeNull();
+    for (const env of [{ NODE_OPTIONS: `--require ${TESTBUILD}` }, { NODE_OPTIONS: `-r ${TESTBUILD}` }, { NODE_OPTIONS: `--import=${TESTBUILD}` },
+      { NODE_OPTIONS: "--loader x" }, { BUN_OPTIONS: `--preload ${TESTBUILD}` }])
+      expect(clean(env)).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED, detail: expect.stringContaining("Remove-Item Env:NODE_OPTIONS") });
+    expect(clean({}, ["--preload", TESTBUILD])).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+    expect(w.preloadRefusal({ home }, {}, [], cwd, true)).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+    writeFileSync(join(home, "bunfig.toml"), `preload = ["${TESTBUILD}"]\n`);
+    expect(clean({})).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+    expect(readFileSync(join(home, "worker.log"), "utf8")).toContain(`${w.PRELOAD_FLAG_REFUSED} ATTENTION:`);
+  });
+
+  test("the real entry point started with the options variable pointing at the test module exits with the refusal and leaves its heartbeat", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pcw28-"));
+    const p = Bun.spawn([process.execPath, ENTRY, "check-cli", "--home", home],
+      { env: { ...cleanEnv(), NODE_OPTIONS: `--require ${TESTBUILD}`, BUN_OPTIONS: `--preload ${TESTBUILD}` }, stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(p.stdout).text();
+    expect(await p.exited).toBe(1);
+    expect(JSON.parse(out.trim().split("\n")[0])).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED, detail: expect.stringContaining("open a new terminal") });
+    expect(readFileSync(join(home, "worker.log"), "utf8")).toContain(`${w.PRELOAD_FLAG_REFUSED} ATTENTION:`);
+    expect(parseHeartbeat(readFileSync(join(home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "start_refused", reason: "preload_flag_set" });
+  });
+
+  test("the old variable's refusal leaves a heartbeat pushed to the queue, and the keeper owes the owner a notice for it in the link's words", async () => {
+    const { q } = oneJob();
+    const p = Bun.spawn([process.execPath, ENTRY, "check-cli", "--home", q.home], { env: { ...cleanEnv(), [TEST_BUILD_FLAG]: "1" }, stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(p.stdout).text();
+    expect(await p.exited).toBe(1);
+    expect(JSON.parse(out.trim().split("\n")[0])).toMatchObject({ error: TEST_BUILD_FLAG_REFUSED });
+    expect(parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8"))).toMatchObject({ code: "start_refused", reason: "test_build_flag_set" });
+    expect(parseHeartbeat(q.remoteFile("worker/heartbeat.json"))).toMatchObject({ code: "start_refused", reason: "test_build_flag_set" });
+    // The keeper's end: its round reads the heartbeat and tells the owner, once, with Cain's line for the PC list.
+    const sent: string[] = [];
+    k.resetNoticeProcess();
+    quiet(() => round({ ...q.cfg, used: join(q.root, "state", "reuse-used.jsonl"), notify: ((c: string) => { sent.push(c); return true; }) as any }));
+    quiet(() => round({ ...q.cfg, used: join(q.root, "state", "reuse-used.jsonl"), notify: ((c: string) => { sent.push(c); return true; }) as any }));
+    expect(sent).toEqual(["worker_start_refused"]);
+    const hb = readHeartbeat(q.cfg.dir);
+    expect(hb).toMatchObject({ code: "start_refused" });
+    expect(heartbeatNotice(hb)).toContain("refused to start");
+    expect(heartbeatNotice(hb)).not.toMatch(/\bcheck|resend|send it again|tap again|\b[0-9a-f]{40}\b|\d{4}-\d{2}-\d{2}T|j-\d{8}/i);
   });
 });

@@ -999,11 +999,15 @@ export function listLine(j: Job, r: Result | null): string {
 // hold_clear_unrecorded (twenty-seventh round), with version_hold_unwritable only: the worker couldn't write its record
 // of a version hold clear made without a version floor (version-hold-cleared.json), so the hold stays; the keeper sends
 // the owner a notice for it (pcjobs/main.ts holdClearNotice).
-export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed", "worker_changed", "hold_clear_unrecorded"] as const;
+// test_build_flag_set and preload_flag_set (twenty-eighth round), with start_refused only: the worker refused to start
+// because the tests' variable, or a preload, require, import or loader flag (or a preload config), was set where it runs;
+// the keeper sends the owner a notice for it (pcjobs/main.ts startRefusedNotice).
+export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed", "worker_changed", "hold_clear_unrecorded",
+  "test_build_flag_set", "preload_flag_set"] as const;
 export type Reason = typeof REASONS[number];
-export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed";
+export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed" | "start_refused";
   job: string | null; stale_lock: boolean; skew_ms: number | null; reason: Reason | null }
-export const HEARTBEAT_CODES = [...CODES, "idle", "stopped", "busy", "queue_misconfigured", "git_failed"];
+export const HEARTBEAT_CODES = [...CODES, "idle", "stopped", "busy", "queue_misconfigured", "git_failed", "start_refused"];
 
 // The queue's .gitattributes: every structured file it holds is text with LF line
 // endings, so a Windows checkout never drifts to CRLF, and files stay mergeable.

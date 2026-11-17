@@ -5219,6 +5219,31 @@ export function testBuildFlagRefusal(o: Pick<Opts, "home">, env: Record<string, 
   try { mkdirSync(o.home, { recursive: true }); appendFileSync(join(o.home, "worker.log"), `${new Date().toISOString()} ${TEST_BUILD_FLAG_REFUSED} ATTENTION: ${TEST_BUILD_FLAG_HINT}\n`); } catch { /* the refusal stands */ }
   return { error: TEST_BUILD_FLAG_REFUSED, detail: TEST_BUILD_FLAG_HINT };
 }
+// Twenty-eighth round: the test symbol could still be set in the production worker by a preload: Node's options variable
+// (or Bun's) carrying a require, import, preload or loader flag, the runtime's own arguments carrying one, or a
+// bunfig.toml preload in the folder the worker starts from or its worker folder. The production entry point refuses
+// to start on any of those, or when the symbol is already defined as it starts (nothing in it sets the symbol, so
+// only a preload can have), with the same ATTENTION line and the removal command.
+export const PRELOAD_FLAG_REFUSED = "preload_flag_refused";
+const PRELOAD_FLAG = /(^|\s)(-r|--require|--import|--preload|--loader|--experimental-loader|--experimental-specifier-resolution)(=|\s|$)/;
+export const PRELOAD_FLAG_HINT = "a preload is set where the worker runs (a require, import, preload or loader flag in NODE_OPTIONS or BUN_OPTIONS or in the runtime's own arguments, or a preload in a bunfig.toml in the folder it starts from or its worker folder): it could load test code into the worker, so the worker doesn't start. Remove it (in PowerShell: Remove-Item Env:NODE_OPTIONS and Remove-Item Env:BUN_OPTIONS, and delete them from Windows' environment variables if they are set there; delete or fix the bunfig.toml), open a new terminal and run again";
+export function preloadRefusal(o: Pick<Opts, "home">, env: Record<string, string | undefined> = process.env, execArgv: string[] = process.execArgv, cwd = process.cwd(),
+  symbolSet = testBuild()): { error: string; detail: string } | null {
+  const bunfig = [cwd, o.home].some((d) => { try { return /^\s*preload\s*=/m.test(readFileSync(join(d, "bunfig.toml"), "utf8")); } catch { return false; } });
+  const flagged = PRELOAD_FLAG.test(env.NODE_OPTIONS ?? "") || PRELOAD_FLAG.test(env.BUN_OPTIONS ?? "") || execArgv.some((a) => PRELOAD_FLAG.test(a));
+  if (!symbolSet && !flagged && !bunfig) return null;
+  try { mkdirSync(o.home, { recursive: true }); appendFileSync(join(o.home, "worker.log"), `${new Date().toISOString()} ${PRELOAD_FLAG_REFUSED} ATTENTION: ${PRELOAD_FLAG_HINT}\n`); } catch { /* the refusal stands */ }
+  return { error: PRELOAD_FLAG_REFUSED, detail: PRELOAD_FLAG_HINT };
+}
+// Twenty-eighth round: a start refusal leaves a heartbeat (start_refused, with its reason) before the worker exits, in
+// the worker folder and, when the queue copy is there, pushed to the queue, so the keeper tells the owner
+// (pcjobs/main.ts startRefusedNotice). Best effort: the refusal stands whatever happens to the heartbeat.
+export function startRefusedBeat(o: Opts, reason: "test_build_flag_set" | "preload_flag_set"): Heartbeat {
+  const h: Heartbeat = { v: 1, worker_clock: new Date().toISOString(), code: "start_refused", job: null, stale_lock: false, skew_ms: null, reason };
+  try { mkdirSync(o.home, { recursive: true }); writeFileSync(P.beat(o), JSON.stringify(h) + "\n"); } catch { /* the refusal stands */ }
+  try { if (exists(join(P.queue(o), ".git")) && update(o) && stageBeat(o, h)) commitPush(o, "worker start_refused"); } catch { /* the refusal stands */ }
+  return h;
+}
 const runnerRefused = (o: Opts) => !!o.chromePs && !testBuild();
 export interface ChromeListingLine { applies: boolean; lines: number; mismatched: number[]; dedicated: boolean; same_process: boolean;
   version: string | null; failure: string | null; passed: boolean }
@@ -6584,7 +6609,10 @@ if (isMain && process.argv[2] === "nav-guard") {
   };
   // Twenty-seventh round: the tests' build variable set where the worker runs: it doesn't start.
   const refused = testBuildFlagRefusal(o);
-  if (refused) { say(refused); process.exit(1); }
+  if (refused) { startRefusedBeat(o, "test_build_flag_set"); say(refused); process.exit(1); }
+  // Twenty-eighth round: and a preload that could set the test symbol in the production worker.
+  const preloaded = preloadRefusal(o);
+  if (preloaded) { startRefusedBeat(o, "preload_flag_set"); say(preloaded); process.exit(1); }
   try {
     const [cmd, a1] = args;
     if (cmd === "run") run(o).then(say, fail);
