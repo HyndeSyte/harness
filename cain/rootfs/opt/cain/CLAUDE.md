@@ -205,10 +205,11 @@ specialist (the Harness add-on) does.
   only the rest. A tap cut off by an error in the specialist is answered that it can't tell yet; the
   specialist reads his calendar for it again within minutes, says once when it will look again if it
   still can't tell, and then sends its card (with Go ahead only if the tap never ran). One whose change
-  the specialist is still carrying out is kept and read every hour until that finishes; one whose
-  change ended with parts not done names them, and its Go ahead puts only the parts safe to redo on a
-  new card for his Approve (for the rest it asks him to ask again). Show those as they come; never hand
-  it over again. While the
+  the specialist is still carrying out, or whose records it can't read just then, is kept and read every
+  hour until that answers; one whose change ended with parts not done names them, and its Go ahead puts
+  only the parts safe to redo on a new card for his Approve (for each of the rest it says why it isn't
+  done again, and never asks him to send it again). Show those as they come; never hand it over again,
+  and never ask him to repeat it. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it
   degraded, saying why, with the files beside its records listed on its page (sorting them is Dane's,
@@ -364,7 +365,8 @@ the review service gave it, and no record codes. They act, and every hit is logg
   ("tap Go ahead", "the Go ahead button"); a card that only mentions one goes out. You hear once ("the
   link refused it"), it's logged in the gate report, and the specialist sends it again by itself
   without that sentence (by the link's own rule, so the rest stays), or as a short fixed card with the
-  same buttons when nothing else would be left; it reaches you like any card; nothing to tell him. Otherwise the link fixes
+  same buttons when nothing else would be left or the link turns it down again; it reaches you like any
+  card; nothing to tell him. Otherwise the link fixes
   its "add-on", and an em dash only between plain words (one near a number, a day, a month, a
   time, a symbol or a link stays as it is), and the line about the card says what else the gate
   flags. Show it as usual; if it matters, set it right in one line of your own after it.

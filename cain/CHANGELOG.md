@@ -2,6 +2,9 @@
 
 ## 0.12.0
 
+- The calendar specialist now reads a card the way the link does in full (the same words for buttons, a button named across a line break, every button the link knows), and a card turned down twice still reaches you as a short fixed card with its buttons.
+- Why a specialist's card has Go ahead or not: an add that never showed up in Google across a restore gets none (an empty spot can't be told apart from an event added and deleted since); a tap whose decision never reached the specialist's records gets one (nothing it leads to ran).
+
 - The calendar specialist strips from a card the link turns down only the sentence that told you to use a missing button, using the very same rule the link does, so the rest of the card reaches you.
 
 - When you send a few messages in a row, Cain can tell the calendar specialist which one your calendar request is in, so it acts on that one and not on your newest.
