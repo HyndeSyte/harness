@@ -214,7 +214,9 @@ told to check first). A text too long or unusual to type goes as a file in his f
 typed naming it. A tap that can't go in waits, never lost, and check-ins that miss their hour
 are named in the next one, however many. If nothing goes in for half an hour while something
 waits (his screen not busy), or for two hours in all, or a draft or a screen the App doesn't know
-stays half an hour, you hear "Cain isn't getting messages", once, and when it's back.
+stays half an hour, you hear "Cain isn't getting messages", once, and when it's back; a sign-in
+waiting half an hour that no sign-in alarm told you of gets "Cain is waiting at a sign-in", with
+the way to sign in.
 If a try of the move fails, he keeps running the old way (after a restart of the App, when the
 try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
 session (`/opt/cain/notice.sh`), what happened and the way back:
