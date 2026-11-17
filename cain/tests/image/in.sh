@@ -179,15 +179,29 @@ final)
   [ "$(seen '──────\n❯\302\240\n──────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n')" = ready ] \
     || fail "prompt-state: his empty prompt with its no-break space isn't read as ready"
   # The App's way out of a question no one answers (unstick.sh), with the image's own tools and a
-  # stand-in tmux: a question that has waited 5 minutes gets one Esc and a line for him.
+  # stand-in tmux (his pane's process 4242, the run script's mark holding it): a question that has
+  # waited 5 minutes gets one Esc and a line for him; none for another session's mark.
   u="$(mktemp -d)"
   printf '> /auto-mode-setup\n  Teach auto mode about your environment?\n  Enter to continue · Esc to cancel\n' > "$u/screen"
-  printf '#!/bin/bash\n[ "$2" = capture-pane ] && exec cat "%s/screen"\necho "$*" >> "%s/sent"\n' "$u" "$u" > "$u/tmux"
+  printf '#!/bin/bash\ncase "$2" in capture-pane) exec cat "%s/screen" ;; display) echo 4242; exit 0 ;; esac\necho "$*" >> "%s/sent"\n' "$u" "$u" > "$u/tmux"
   chmod +x "$u/tmux"
-  unstick() { TMUX_CMD="$u/tmux" UNSTICK_DIR="$u/state" RELAY_QUEUE="$u/queue" UNSTICK_GAP_S=600 UNSTICK_NOW="$1" "$OPT/unstick.sh"; }
-  [ -z "$(unstick 1000)" ] && [ ! -e "$u/sent" ] && [ -z "$(unstick 1300)" ] \
+  echo 4242 > "$u/checked"; echo 7 > "$u/other"
+  unstick() { TMUX_CMD="$u/tmux" SESSION_CHECKED="$u/${2:-checked}" UNSTICK_DIR="$u/state" RELAY_QUEUE="$u/queue" UNSTICK_GAP_S=600 UNSTICK_NOW="$1" "$OPT/unstick.sh"; }
+  [ -z "$(unstick 1000 other)" ] && [ -z "$(unstick 1300 other)" ] && [ ! -e "$u/sent" ] \
+    || fail "unstick: a key went to a session whose check isn't the one marked"
+  [ -z "$(unstick 2000)" ] && [ ! -e "$u/sent" ] && [ -z "$(unstick 2300)" ] \
     && [ "$(cat "$u/sent")" = "-u send-keys -t cain Escape" ] && grep -q "pressed Esc" "$u/queue" \
     || fail "unstick: a question that waited 5 minutes didn't get one Esc and a line for him"
+  # The watchdog (watch.sh) and the typing helpers, with the image's own tools: a line waiting at his
+  # idle prompt for 30 minutes of it tells Dane once (a stand-in notice.sh), and nothing else.
+  mkdir -p "$u/opt"; cp "$OPT/watch.sh" "$OPT/typing.sh" "$OPT/prompt-state.sh" "$u/opt/"
+  printf '#!/bin/bash\necho "$*" >> "%s/notice"\n' "$u" > "$u/opt/notice.sh"; chmod +x "$u/opt/notice.sh"
+  printf '> \n  ? for shortcuts\n' > "$u/screen"; echo '{"text": "x"}' > "$u/wqueue"
+  watch() { TMUX_CMD="$u/tmux" WATCH_OPT="$u/opt" WATCH_DIR="$u/watch" RELAY_QUEUE="$u/wqueue" CHECKIN_DIR="$u/done" \
+    CHECKIN_DELIVERED="$u/delivered" CHECKIN_TRY="$u/try" WATCH_HM=0300 WATCH_STEP_S=600 WATCH_NOW="$1" "$u/opt/watch.sh"; }
+  for n in 0 600 1200 1800 2400; do watch $((5000 + n)) || fail "watch.sh failed"; done
+  [ "$(cat "$u/notice")" = "tell stalled nothing has gone in for 30 minutes" ] \
+    || fail "watch.sh: a line waiting 30 minutes at his idle prompt didn't tell Dane once: $(cat "$u/notice" 2>&1)"
   rm -rf "$u"
   holder cain; h=$!; sleep 1
   out="$(checked)"; kill "$h" 2>/dev/null; wait "$h" 2>/dev/null

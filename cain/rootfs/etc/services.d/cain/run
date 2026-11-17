@@ -25,13 +25,19 @@ export TMPDIR=/run/cain/root-tmp CAIN_ROOT_TMP=/run/cain/root-tmp
 OPT=/opt/cain
 SOCK_TMUX=/run/cain/tmux/cain.sock
 # Whether his session as it runs now has passed its check of his own user (the old way: at once,
-# as 0.11.0 ran): checkin.sh types nothing into one that hasn't (Cain's third service review). Taken
-# away before every start of his session and at its every end; set only when the check passes.
+# as 0.11.0 ran): checkin.sh and unstick.sh send nothing into one that hasn't (Cain's third service
+# review). Taken away before every start of his session and at its every end; set only when the
+# check passes, holding the process his pane runs (session.sh, which runs Claude Code once), so it
+# counts only for that session (typing.sh, checked; Cain's fourth service review, fix soon 10).
 export SESSION_CHECKED=/run/cain/session-checked
 unchecked() { rm -f "$SESSION_CHECKED" 2>/dev/null || true; }
 checked_now() {
-  touch "$SESSION_CHECKED" 2>/dev/null \
-    || bashio::log.error "His session passed its check, but that couldn't be marked ($SESSION_CHECKED), so nothing is typed into it"
+  local pid=""
+  pid="$(timeout 10 $TMUX_CMD -u display -p -t cain '#{pane_pid}' 2>/dev/null | tr -cd '0-9')" || pid=""
+  if [ -n "$pid" ] && { printf '%s\n' "$pid" > "$SESSION_CHECKED.tmp" && mv -f "$SESSION_CHECKED.tmp" "$SESSION_CHECKED"; } 2>/dev/null; then
+    return 0
+  fi
+  bashio::log.error "His session passed its check, but that couldn't be marked ($SESSION_CHECKED), so nothing is typed into it yet: tried again in 10 seconds"
 }
 # Should this start ever end (a step it can't get past, or a fault in it), the finish script
 # halts the container: Dane hears it from root first (notice.sh; C1 second review). Not when a
@@ -96,7 +102,13 @@ else
          fi ;;
     fresh|switching)
       mode=old
-      if [ "$state" = switching ] || [ -f /data/link/specialist-signs ]; then
+      # A switch begun is finished or undone, always. A new one begins only once the App's alarms
+      # to his phone are shown to work (notice.sh proven: Cain's fourth service review, must-fix 6),
+      # so his move never leaves Dane with one way to hear of it.
+      if [ "$state" = fresh ] && [ -f /data/link/specialist-signs ] && ! "$OPT/notice.sh" proven; then
+        bashio::log.info "The switch to his own user waits until the App's alarms to his phone are shown to work"
+      fi
+      if [ "$state" = switching ] || { [ -f /data/link/specialist-signs ] && "$OPT/notice.sh" proven; }; then
         bashio::log.info "Switching Cain to his own user (state $state)"
         for try in 1 2 3; do
           rc=0; "$OPT/c1/cutover.sh" || rc=$?
@@ -124,7 +136,7 @@ else
           esac
           # Not switched: the old layout is whole again. Once more only while it may be tried.
           if [ "$("$OPT/c1/state.sh")" != fresh ]; then mode=none; switch_stopped=1; stop_kind=switch-stopped; stopped_why="the switch was undone but the state isn't fresh"; break; fi
-          [ -f /data/link/specialist-signs ] && bun "$OPT/c1/tools.ts" may-retry /data/c1/failed || break
+          [ -f /data/link/specialist-signs ] && "$OPT/notice.sh" proven && bun "$OPT/c1/tools.ts" may-retry /data/c1/failed || break
         done
         [ "$mode" != old ] || [ "$rc" != 1 ] || bashio::log.warning "Not switched (above): Cain runs the old way for now"
         # A failed try is told once the way he runs has passed its checks (below). A try that
@@ -165,8 +177,6 @@ if [ "$mode" = none ]; then "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_c
 { printf '%s\n' "$mode" > /run/cain/mode.tmp && chmod 0644 /run/cain/mode.tmp && mv /run/cain/mode.tmp /run/cain/mode; } \
   || bashio::log.error "Couldn't write /run/cain/mode"
 bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session held until the check of his own user finishes}"
-# The App's alarms to Dane (notice.sh): their daily repeats and retries, whatever the mode.
-( while true; do sleep 600; "$OPT/notice.sh" tick 2>&1 || true; done ) &
 
 # What each way of running reads where. The old way keeps 0.11.0's places; the new one the
 # places of C1's section 3.2.
@@ -177,6 +187,7 @@ if [ "$mode" = old ]; then
   TOKEN_FILE=/data/.claude/channels/discord/.env; ACCESS_FILE=/data/.claude/channels/discord/access.json
   CRED=/data/.claude/.credentials.json
   TMUX_CMD="tmux"
+  export CAIN_AS=""   # he is root the old way: his files are read as they are
 else
   export CAIN_GATE_LOG=/data/gate/report.jsonl CAIN_GATE_REPLAY=/data/gate/replay.json CAIN_GATE_TRIES=/data/gate/tries.json
   export CAIN_GATE_DM=/data/gate/dm.json CAIN_GATE_REPLIED=/data/gate/replied.json
@@ -193,8 +204,13 @@ else
   fi
   CRED=/data/cain/.claude/.credentials.json
   TMUX_CMD="$OPT/as-cain tmux -S $SOCK_TMUX"
+  export CAIN_AS="$OPT/as-cain"   # his files (transcripts, his folder) read and written as him
 fi
 export TMUX_CMD
+# The App's alarms to Dane (notice.sh): their daily repeats and retries, the probe and its readback,
+# whatever the mode: a minute in, then every 10 minutes. Started here, once CAIN_AS says how his
+# files are read (the readback is his).
+( sleep 60; while true; do "$OPT/notice.sh" tick 2>&1 || true; sleep 600; done ) &
 
 if [ "$mode" = old ]; then
   # 0.11.0's start, unchanged: the rules copied in (c1/lock.sh old did, and checked them), the
@@ -570,6 +586,14 @@ while session_up; do
     listed_at=$(date +%s); ( list_connectors ) &
   fi
   if [ "$mode" = old ] && [ -f /data/link/specialist-signs ] \
+     && [ "$(head -n 1 /data/c1/connectors-before 2>/dev/null || true)" = listed ] && ! "$OPT/notice.sh" proven; then
+    # The switch waits for the App's alarms to his phone (notice.sh proven). With no notice_hook set,
+    # that's the laptop session's to set: Cain hears once a day, to file it.
+    if ! "$OPT/notice.sh" hooked && [ -z "$(find /data/c1/hook-told -mmin -1440 2>/dev/null)" ]; then
+      relay "The move to your own user waits for the App's alarms to his phone, and their channel isn't set up (no notice_hook in the App's options). File it as a note on P33 for the laptop session. Nothing to tell him."
+      touch /data/c1/hook-told
+    fi
+  elif [ "$mode" = old ] && [ -f /data/link/specialist-signs ] \
      && [ "$(head -n 1 /data/c1/connectors-before 2>/dev/null || true)" = listed ]; then
     if [ $(( $(date +%s) - asked )) -ge 600 ] && bun "$OPT/c1/tools.ts" may-retry /data/c1/failed; then
       asked=$(date +%s)
@@ -599,10 +623,15 @@ while session_up; do
   # still there 5 minutes later, his session starts fresh, at most once an hour (Dane hears of one
   # that comes back sooner).
   if [ "$(timeout -k 5 90 "$OPT/unstick.sh" || true)" = restart ]; then
-    bashio::log.warning "Esc didn't close the question waiting on Cain's screen: starting his session fresh"
+    bashio::log.warning "His screen stayed stuck (unstick.sh, above): starting his session fresh"
     end_his_session || fail_closed
     break
   fi
+  # The watchdog over what the App types into his session (watch.sh): Dane hears, from root, when
+  # nothing goes in.
+  timeout -k 5 60 "$OPT/watch.sh" || true
+  # His check passed, but its mark couldn't be kept: tried again.
+  if [ -n "$checked" ] && [ ! -s "$SESSION_CHECKED" ]; then checked_now; fi
   if [ -z "$cleared" ] && [ -n "$checked" ] && [ $(( $(date +%s) - up_since )) -ge 120 ]; then
     cleared=1; quick=0
     if [ "$mode" = own ]; then "$OPT/notice.sh" clear switched || true; else "$OPT/notice.sh" clear running || true; fi
