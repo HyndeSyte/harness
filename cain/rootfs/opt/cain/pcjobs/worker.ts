@@ -3157,7 +3157,7 @@ export function readScope(url: string, scope: NavScope): string | null {
 // parser's own rejections (bom, lone_surrogate, unsafe_integer, number_range, not_strict_json), a key
 // written twice (duplicate_key), more than one address field, whatever its case or depth
 // (address_fields: url beside URL, or a nested copy of tabUrl), or no address in the one field (no_address).
-export const UNPLACED_REASONS = ["bom", "lone_surrogate", "unsafe_integer", "number_range", "not_strict_json", "duplicate_key", "address_fields", "no_address", "unreadable", "probe_marker"] as const;
+export const UNPLACED_REASONS = ["bom", "lone_surrogate", "unsafe_integer", "number_range", "not_strict_json", "duplicate_key", "address_fields", "no_address", "unreadable", "probe_marker", "preload_flag_refused", "test_build_flag_refused"] as const;
 export type UnplacedReason = typeof UNPLACED_REASONS[number];
 export const parserReason = (e: unknown): UnplacedReason => {
   const m = (e as Error)?.message;
@@ -4693,7 +4693,9 @@ export function verdict(s: Session, st: Stream, log: Decision[], tools: string[]
 // hook_denied: the hook's own deny reasons that aren't a page's doing (probe_marker), when one fired.
 export const LAST_RUN_KEYS = ["at", "job", "code", "field", "domain", "hook", "hook_denied"];
 // The probe-mode denies of a run (the backstop to runPreflight): named in the run's report.
-export const hookDeniedOf = (log: Decision[]): string[] => log.some((d) => d.why === "probe_marker" || d.reason === "probe_marker") ? ["probe_marker"] : [];
+// 0.12.2: and the hooks' start refusals (preload_flag_refused, test_build_flag_refused), each named once.
+export const HOOK_DENIED = ["probe_marker", "preload_flag_refused", "test_build_flag_refused"];
+export const hookDeniedOf = (log: Decision[]): string[] => HOOK_DENIED.filter((r) => log.some((d) => d.why === r || d.reason === r));
 // The field is written only when it is one of the worker's own field names or one of the
 // action's schema keys; anything else (a key the model made up, a lowercase word copied
 // from a page, a report key with _size after it) is written as unknown_field.
@@ -5252,14 +5254,19 @@ const PRELOAD_FLAG = /(^|\s)(-r|--require|--import|--preload|--loader|--experime
 // preload in Bun's user-level configuration file (.bunfig.toml in XDG_CONFIG_HOME or the user's home folder).
 const CONFIG_FLAG = /(^|\s)(-c|--config|--experimental-config-file)(=|\s|$)/;
 export const PRELOAD_FLAG_HINT = "a preload is set where the worker runs (a require, import, preload, loader or config-file flag in NODE_OPTIONS or BUN_OPTIONS or in the runtime's own arguments, or a preload in a bunfig.toml in the folder it starts from or its worker folder, or in Bun's user-level .bunfig.toml in the home folder): it could load test code into the worker, so the worker doesn't start. Remove it (in PowerShell: Remove-Item Env:NODE_OPTIONS and Remove-Item Env:BUN_OPTIONS, and delete them from Windows' environment variables if they are set there; delete or fix the bunfig.toml or .bunfig.toml), open a new terminal and run again";
+// The scan itself, without a log line: the symbol already set, a flag, or a bunfig preload in one of the folders or
+// Bun's user-level file. A few small file reads at most, so the hooks can run it inside their budget.
+export function preloadFound(dirs: string[], env: Record<string, string | undefined>, execArgv: string[], symbolSet: boolean, userHome = homedir()): boolean {
+  if (symbolSet) return true;
+  const flag = (v: string) => PRELOAD_FLAG.test(v) || CONFIG_FLAG.test(v);
+  if (flag(env.NODE_OPTIONS ?? "") || flag(env.BUN_OPTIONS ?? "") || execArgv.some(flag)) return true;
+  const hasPreload = (f: string) => { try { return /^\s*preload\s*=/m.test(readFileSync(f, "utf8")); } catch { return false; } };
+  return [...new Set(dirs)].some((d) => hasPreload(join(d, "bunfig.toml")))
+    || [env.XDG_CONFIG_HOME, userHome].some((d) => !!d && hasPreload(join(d, ".bunfig.toml")));
+}
 export function preloadRefusal(o: Pick<Opts, "home">, env: Record<string, string | undefined> = process.env, execArgv: string[] = process.execArgv, cwd = process.cwd(),
   symbolSet = testBuild(), userHome = homedir()): { error: string; detail: string } | null {
-  const hasPreload = (f: string) => { try { return /^\s*preload\s*=/m.test(readFileSync(f, "utf8")); } catch { return false; } };
-  const bunfig = [cwd, o.home].some((d) => hasPreload(join(d, "bunfig.toml")))
-    || [env.XDG_CONFIG_HOME, userHome].some((d) => !!d && hasPreload(join(d, ".bunfig.toml")));
-  const flag = (v: string) => PRELOAD_FLAG.test(v) || CONFIG_FLAG.test(v);
-  const flagged = flag(env.NODE_OPTIONS ?? "") || flag(env.BUN_OPTIONS ?? "") || execArgv.some(flag);
-  if (!symbolSet && !flagged && !bunfig) return null;
+  if (!preloadFound([cwd, o.home], env, execArgv, symbolSet, userHome)) return null;
   try { mkdirSync(o.home, { recursive: true }); appendFileSync(join(o.home, "worker.log"), `${new Date().toISOString()} ${PRELOAD_FLAG_REFUSED} ATTENTION: ${PRELOAD_FLAG_HINT}\n`); } catch { /* the refusal stands */ }
   return { error: PRELOAD_FLAG_REFUSED, detail: PRELOAD_FLAG_HINT };
 }
@@ -5270,6 +5277,19 @@ export function sealTestBuild(g: any = globalThis): boolean {
   if (Object.getOwnPropertyDescriptor(g, TEST_BUILD_MARK) !== undefined) return false;
   try { Object.defineProperty(g, TEST_BUILD_MARK, { value: false, writable: false, configurable: false, enumerable: false }); } catch { return false; }
   return g[TEST_BUILD_MARK] === false;
+}
+// 0.12.2: the hooks' own start check. nav-guard and read-guard are the worker's code too, started by the session's
+// Claude Code with the session's environment (sessionEnv: no NODE_OPTIONS, BUN_OPTIONS or test variable), so each seals
+// the test symbol and runs the same scan as the worker's entry: the tests' variable set, the symbol already defined, a
+// preload or config-file flag in the options variables or the runtime's arguments, or a bunfig preload in the folder the
+// hook starts in (the session folder), the worker folder (where its log is) or Bun's user-level file. It returns the
+// refusal's code (the hook answers with its deny or block and logs it), or null. No log line of its own: the hook
+// records its refusal in the session's log, and does nothing else that takes time.
+export function hookStartRefusal(sealed: boolean, env: Record<string, string | undefined> = process.env, execArgv: string[] = process.execArgv,
+  cwd = process.cwd(), userHome = homedir()): typeof TEST_BUILD_FLAG_REFUSED | typeof PRELOAD_FLAG_REFUSED | null {
+  if (env[TEST_BUILD_FLAG] !== undefined && !testBuild()) return TEST_BUILD_FLAG_REFUSED;
+  const workerDir = env.PCW_NAV_LOG ? dirname(env.PCW_NAV_LOG) : cwd;
+  return preloadFound([cwd, workerDir], env, execArgv, !sealed, userHome) ? PRELOAD_FLAG_REFUSED : null;
 }
 // Twenty-eighth round: a start refusal leaves a heartbeat (start_refused, with its reason) before the worker exits, in
 // the worker folder and, when the queue copy is there, pushed to the queue, so the keeper tells the owner
@@ -6558,6 +6578,8 @@ const isMain = (() => {
 if (isMain && process.argv[2] === "nav-guard") {
   // The session's hook: nothing but stdin, PCW_NAV_ALLOW and PCW_NAV_LOG. Every way out
   // that isn't a logged allow is a deny: exit 2 with the decision on stdout.
+  // 0.12.2: the test symbol sealed first, as the worker's entry does; the start check answers below.
+  const startRefused = hookStartRefusal(sealTestBuild());
   const t0 = processStart();
   let callId: string | null = null, readAt: number | null = null;
   // The probe-only behaviours, bound to the probe's own session and step (probeMode).
@@ -6569,6 +6591,11 @@ if (isMain && process.argv[2] === "nav-guard") {
     if (f) try { appendFileSync(f, JSON.stringify({ hook: "nav-guard", t0, id: callId, read_at: readAt, answered_at: Date.now(), answer }) + "\n"); } catch { /* never stops the hook */ }
   };
   const refuse = (why: string) => { try { stamp(`deny:${why}`); process.stdout.write(denyJson(why) + "\n"); process.stderr.write(`${DENY_MESSAGE}\n`); } finally { process.exit(2); } };
+  // 0.12.2: a preload or the tests' variable where the hook runs: deny at once, logged, before anything else.
+  if (startRefused) {
+    try { if (process.env.PCW_NAV_LOG) appendFileSync(process.env.PCW_NAV_LOG, JSON.stringify({ id: null, tool: "", url: null, decision: "deny", why: startRefused, t0, done_at: Date.now() }) + "\n"); } catch { /* the deny stands */ }
+    refuse(startRefused);
+  }
   // The probe's slowed hook (PCW_HOOK_STALL_MS, set only by the probe's own session): no
   // answer and no decision until well past Claude Code's timeout for it, so the probe sees
   // what the permission layer does alone. It still refuses in the end.
@@ -6610,7 +6637,14 @@ if (isMain && process.argv[2] === "nav-guard") {
   else if (full) read().catch(() => { /* the hard stop answers */ });
 } else if (isMain && process.argv[2] === "read-guard") {
   // The read-time drift check (PostToolUse). Every way out that isn't a logged allow replaces the answer.
+  // 0.12.2: the test symbol sealed first, as the worker's entry does.
+  const startRefused = hookStartRefusal(sealTestBuild());
   const block = () => { try { writeAbort(process.env.PCW_ABORT_FILE, "read_unplaced", null); process.stdout.write(readBlockJson("read_unplaced") + "\n"); } finally { process.exit(0); } };
+  // 0.12.2: a preload or the tests' variable where the hook runs: the read is blocked at once, logged, never captured.
+  if (startRefused) {
+    try { if (process.env.PCW_NAV_LOG) appendFileSync(process.env.PCW_NAV_LOG, JSON.stringify({ id: null, tool: "", url: null, decision: "deny", why: "read_unplaced", phase: "post", reason: startRefused }) + "\n"); } catch { /* the block stands */ }
+    block();
+  }
   // Probe mode outside a bound probe session: the read is refused at once, never captured.
   const probe = probeMode(process.env);
   if (probe.deny) {

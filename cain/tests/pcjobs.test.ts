@@ -7512,3 +7512,86 @@ describe("twenty-ninth review: the preload scan reads Bun's user-level configura
     expect(main).toContain("preloadRefusal(o, process.env, process.execArgv, process.cwd(), !sealed)");
   });
 });
+
+describe("0.12.2: the hooks seal the test symbol and run the worker's preload scan at their own start, and refuse by their own answer", () => {
+  const w = worker28 as any;
+  const ENTRY = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/worker.ts");
+  const TESTBUILD = join(import.meta.dir, "pcworker-testbuild.ts").replace(/\\/g, "/");
+
+  test("the hook's start check: the session's own environment passes; a flag, a bunfig preload, the symbol already defined or the tests' variable refuses", () => {
+    const home = mkdtempSync(join(tmpdir(), "pcw122-"));
+    const cwd = join(home, "session");
+    mkdirSync(cwd, { recursive: true });
+    const user = mkdtempSync(join(tmpdir(), "pcw122-user-"));
+    const o: Opts = { home, env: process.env, resolveHosts: false };
+    const env = sessionEnv(o, ["https://example.com/account/settings"]);
+    outsideTestBuild(() => {
+      expect(w.hookStartRefusal(true, env, [], cwd, user)).toBeNull();
+      expect(w.hookStartRefusal(true, { ...env, NODE_OPTIONS: "--max-old-space-size=4096" }, [], cwd, user)).toBeNull();
+      expect(w.hookStartRefusal(false, env, [], cwd, user)).toBe(w.PRELOAD_FLAG_REFUSED);
+      expect(w.hookStartRefusal(true, { ...env, NODE_OPTIONS: `--require ${TESTBUILD}` }, [], cwd, user)).toBe(w.PRELOAD_FLAG_REFUSED);
+      expect(w.hookStartRefusal(true, { ...env, BUN_OPTIONS: `--preload ${TESTBUILD}` }, [], cwd, user)).toBe(w.PRELOAD_FLAG_REFUSED);
+      expect(w.hookStartRefusal(true, env, ["--config", "x/bunfig.toml"], cwd, user)).toBe(w.PRELOAD_FLAG_REFUSED);
+      expect(w.hookStartRefusal(true, { ...env, [TEST_BUILD_FLAG]: "1" }, [], cwd, user)).toBe(TEST_BUILD_FLAG_REFUSED);
+      // A bunfig preload in the session folder (where the hook starts) or the worker folder (where its log is).
+      writeFileSync(join(cwd, "bunfig.toml"), `preload = ["${TESTBUILD}"]\n`);
+      expect(w.hookStartRefusal(true, env, [], cwd, user)).toBe(w.PRELOAD_FLAG_REFUSED);
+      rmSync(join(cwd, "bunfig.toml"));
+      writeFileSync(join(home, "bunfig.toml"), `preload = ["${TESTBUILD}"]\n`);
+      expect(w.hookStartRefusal(true, env, [], cwd, user)).toBe(w.PRELOAD_FLAG_REFUSED);
+    });
+    // The worker's entry scan is unchanged by the split.
+    expect(w.preloadRefusal({ home: user }, {}, [], user, false, user)).toBeNull();
+    // A run whose hooks refused at their start names it in its report, beside probe_marker.
+    expect(hookDeniedOf([{ id: null, tool: "", url: null, decision: "deny" as const, why: "preload_flag_refused" }])).toEqual(["preload_flag_refused"]);
+    expect(hookDeniedOf([{ id: null, tool: "", url: null, decision: "deny" as const, why: "read_unplaced", phase: "post" as const, reason: "test_build_flag_refused" as const }]))
+      .toEqual(["test_build_flag_refused"]);
+  });
+
+  test("the real nav-guard and read-guard, started with the symbol pre-defined by a preload or with a preload flag or the tests' variable, deny or block at once and log it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pcw122-hooks-"));
+    const base = cleanEnv({ PCW_NAV_ALLOW: JSON.stringify(["https://example.com/account/settings"]), PCW_HOOK_BUDGET_MS: "8000" });
+    const cases: [string, Record<string, string>, string][] = [
+      // The symbol defined as true by the test module, through the Node options variable (as the worker entry's real test).
+      ["node_options_require", { NODE_OPTIONS: `--require ${TESTBUILD}` }, w.PRELOAD_FLAG_REFUSED],
+      // And through Bun's (not on Windows, where Bun itself can fail on its preload path before the hook runs).
+      ...(process.platform === "win32" ? [] : [["bun_options_preload", { BUN_OPTIONS: `--preload ${TESTBUILD}` }, w.PRELOAD_FLAG_REFUSED] as [string, Record<string, string>, string]]),
+      ["test_variable", { [TEST_BUILD_FLAG]: "1" }, TEST_BUILD_FLAG_REFUSED],
+    ];
+    const call = JSON.stringify({ session_id: SID, tool_use_id: "toolu_pre1", tool_name: `${CH}navigate`, tool_input: { url: "https://example.com/account/settings" } });
+    const read = JSON.stringify({ session_id: SID, tool_use_id: "r1", tool_name: `${CH}get_page_text`, tool_input: { tabId: 1 }, tool_response: { structuredContent: { tabUrl: "https://example.com/account/settings" } } });
+    for (const [name, more, code] of cases) {
+      const log = join(dir, `${name}.jsonl`), abort = join(dir, `${name}-abort`);
+      const t0 = Date.now();
+      const nav = spawnSync(process.execPath, [ENTRY, "nav-guard"], { cwd: dir, input: call, env: { ...base, ...more, PCW_NAV_LOG: log }, encoding: "utf8", timeout: 30_000 });
+      expect([name, nav.status]).toEqual([name, 2]);
+      expect(JSON.parse(nav.stdout).hookSpecificOutput).toMatchObject({ hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: expect.stringContaining(code) });
+      const rg = spawnSync(process.execPath, [ENTRY, "read-guard"], { cwd: dir, input: read, env: { ...base, ...more, PCW_NAV_LOG: log, PCW_ABORT_FILE: abort }, encoding: "utf8", timeout: 30_000 });
+      expect([name, rg.status]).toEqual([name, 0]);
+      expect(JSON.parse(rg.stdout)).toMatchObject({ decision: "block" });
+      expect(readAbort(abort)).toBe("read_unplaced");
+      // Both answered at once, well inside one hook budget for the two.
+      expect([name, Date.now() - t0 < 8_000]).toEqual([name, true]);
+      const lines = readFileSync(log, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(lines).toEqual([expect.objectContaining({ id: null, decision: "deny", why: code }),
+        expect.objectContaining({ id: null, decision: "deny", why: "read_unplaced", phase: "post", reason: code })]);
+    }
+    // The same hook without any of those answers as usual: its deny is about the call itself, not a start refusal.
+    const plain = spawnSync(process.execPath, [ENTRY, "nav-guard"], { cwd: dir, input: "{not json", env: { ...base, PCW_NAV_LOG: join(dir, "plain.jsonl") }, encoding: "utf8", timeout: 30_000 });
+    expect(plain.status).toBe(2);
+    expect(JSON.parse(plain.stdout).hookSpecificOutput.permissionDecisionReason).toContain("unreadable_input");
+  }, 60_000);
+
+  test("each hook entry seals the test symbol before its start check, and refuses before its probe mode, budget and input", () => {
+    const src = readFileSync(ENTRY, "utf8");
+    for (const [start, end] of [["if (isMain && process.argv[2] === \"nav-guard\") {", "} else if (isMain && process.argv[2] === \"read-guard\") {"],
+      ["} else if (isMain && process.argv[2] === \"read-guard\") {", "} else if (isMain) {"]]) {
+      const body = src.slice(src.indexOf(start), src.indexOf(end));
+      const check = body.indexOf("const startRefused = hookStartRefusal(sealTestBuild());");
+      expect(check).toBeGreaterThan(0);
+      expect(body.indexOf("if (startRefused)")).toBeGreaterThan(check);
+      expect(body.indexOf("if (startRefused)")).toBeLessThan(body.indexOf("hookBudget("));
+      expect(body.indexOf("if (startRefused)")).toBeLessThan(body.indexOf("if (probe.deny)"));
+    }
+  });
+});
