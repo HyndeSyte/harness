@@ -254,9 +254,9 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 //     it: delivery is at least once, and the retry carries the mark's saved notice id, on which the link deduplicates,
 //     so the owner never sees it twice.
 export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused"
-  | "reuse_record_unreadable" | "reuse_fetch_failed" | "notice_undelivered" | "hold_clear_unrecorded" | "worker_start_refused" | "worker_not_starting" | "queue_unreachable";
+  | "reuse_record_unreadable" | "reuse_fetch_failed" | "notice_undelivered" | "hold_clear_unrecorded" | "worker_start_refused" | "worker_not_starting" | "queue_unreachable" | "queue_unreachable_again";
 const PC_NOTICE_CODES: readonly PcNotice[] = ["reuse_migrated", "reuse_shallow", "queue_branch_missing", "queue_empty_pending", "reuse_store_unreadable", "reuse_unsettled",
-  "reuse_push_refused", "reuse_record_unreadable", "reuse_fetch_failed", "notice_undelivered", "hold_clear_unrecorded", "worker_start_refused", "worker_not_starting", "queue_unreachable"];
+  "reuse_push_refused", "reuse_record_unreadable", "reuse_fetch_failed", "notice_undelivered", "hold_clear_unrecorded", "worker_start_refused", "worker_not_starting", "queue_unreachable", "queue_unreachable_again"];
 // The job a notice is about, by what it does (twenty-second round): its site and action, never its id; or,
 // when those can't be told (twenty-third round), when it was queued.
 export type JobWhat = { site: string; action: string } | { queued: string };
@@ -292,7 +292,9 @@ export function resetNoticeProcess(): void { configStopped = false; migrationUns
 // (pending, never flagged or dropped), the status line counts them all from this file, and the flag goes only once
 // the link answers a send with anything else (after the fix and a restart, when sends start again).
 // fetchFails (twenty-ninth round): the queue's fetch failing in rounds in a row, counted on its own, whatever the sends do.
-interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number }
+// 0.12.2: kept while the queue-unreachable notice stands, so a good fetch between failures doesn't end it (queueFetch);
+// queueBack: when that notice last cleared, so one raised again within QUEUE_AGAIN_MS is worded as coming back.
+interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number; queueBack?: string }
 export const SILENT_ROUNDS = 30;
 // Twenty-eighth round, the bound on exactly-once display: the link remembers the notice ids it posted for
 // PC_NOTICE_RETAIN_MS (link/core.ts, 30 days). A mark still owed whose id is older than that is re-minted before its
@@ -343,7 +345,8 @@ function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "di
   if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
     for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
   const t: Told = { told, waits, ...(config ? { config: true as const } : {}), ...(Number.isInteger(a?.silent) && a.silent > 0 ? { silent: a.silent } : {}),
-    ...(Number.isInteger(a?.fetchFails) && a.fetchFails > 0 ? { fetchFails: a.fetchFails } : {}) };
+    ...(Number.isInteger(a?.fetchFails) && a.fetchFails > 0 ? { fetchFails: a.fetchFails } : {}),
+    ...(typeof a?.queueBack === "string" && Number.isFinite(Date.parse(a.queueBack)) ? { queueBack: a.queueBack } : {}) };
   if (a?.v !== 3) {
     migrateTold(cfg, t);
     if (!saveTold(cfg, t, true)) {
@@ -373,7 +376,7 @@ const newNoticeId = () => randomBytes(12).toString("hex");
 // Twenty-fifth round: written only when its content changes (a round that only finds the same marks still owed
 // leaves the file alone), and then whole: a temporary file, then renamed into place.
 function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
-  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}), ...(t.fetchFails ? { fetchFails: t.fetchFails } : {}) });
+  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}), ...(t.fetchFails ? { fetchFails: t.fetchFails } : {}), ...(t.queueBack ? { queueBack: t.queueBack } : {}) });
   try { if (readFileSync(toldFile(cfg), "utf8") === text) return true; } catch { /* not there yet, or unreadable: written */ }
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
@@ -395,9 +398,19 @@ function send(cfg: Config, t: Told, m: ToldMark, code: PcNotice): "posted" | "re
   // Twenty-eighth round: an id older than the link's record of posted ids is re-minted, and the notice goes as a repeat.
   // Twenty-ninth round: an unknown age (a mark from before the age was kept, with no minted or since time) counts as
   // past that retention: it is re-minted once as a repeat, and its mint time stamped then is what later renewals use.
+  // 0.12.2: the new id and its mint time are kept in the notice file before the send; if that write fails, the mark
+  // keeps its old id and nothing is sent this round (a send under an id the file doesn't hold could be shown twice).
   const born = Date.parse(m.minted ?? m.since ?? "");
   if (!Number.isFinite(born) || Date.now() - born > NOTICE_DEDUP_MS) {
+    const was = { id: m.id, minted: m.minted, repeat: m.repeat };
     m.id = newNoticeId(); m.minted = new Date().toISOString(); m.repeat = true;
+    if (!saveTold(cfg, t)) {
+      m.id = was.id;
+      if (was.minted === undefined) delete m.minted; else m.minted = was.minted;
+      if (was.repeat === undefined) delete m.repeat; else m.repeat = was.repeat;
+      log(`ERROR: notice ${code} needs a new id (owed longer than the link remembers posted notices, or of unknown age), but the new id couldn't be kept in the notice file (${toldFile(cfg)}): it isn't sent this round, and is tried again next round`);
+      return "retry";
+    }
     log(`notice ${code} was owed ${Number.isFinite(born) ? "longer than the link remembers posted notices" : "since before its age was kept, so possibly longer than the link remembers posted notices"}: it goes again under a new id, worded as a repeat`);
   }
   let a: NoticeAnswer = false;
@@ -492,18 +505,34 @@ export function fetchUnanswered(cfg: Config): void {
 // any send was answered (the silent-round rule lets a queue that stays unreachable go unescalated while the link still
 // answers some notice). After FETCH_FAIL_ROUNDS failed fetches in a row, an owed queue_unreachable notice goes to the
 // owner through the link, under the usual mark rules (told once, cleared after three rounds with a fetch that worked).
+// 0.12.2, hysteresis: once raised, the notice clears only after QUEUE_CLEAR_FETCHES good fetches in a row (the mark's
+// CLEAR_ROUNDS clear rounds), and the failure streak is kept until then, so one good fetch between failures neither
+// drops the notice nor starts a fresh one. Raised again within QUEUE_AGAIN_MS of clearing, it goes as
+// queue_unreachable_again, which the link words as the queue being unreachable again.
 export const FETCH_FAIL_ROUNDS = 30;
+export const QUEUE_CLEAR_FETCHES = CLEAR_ROUNDS;
+export const QUEUE_AGAIN_MS = 24 * 3_600_000;
 export const QUEUE_UNREACHABLE_KEY = "queueunreachable";
 export function queueFetch(cfg: Config, ok: boolean): void {
   const t = readTold(cfg);
   if (ok) {
-    if (t.fetchFails) { delete t.fetchFails; saveTold(cfg, t); }
+    const had = !!t.told[QUEUE_UNREACHABLE_KEY];
     cleared(cfg, QUEUE_UNREACHABLE_KEY);
+    const after = readTold(cfg);
+    let changed = false;
+    if (had && !after.told[QUEUE_UNREACHABLE_KEY]) { after.queueBack = new Date().toISOString(); changed = true; }
+    if (after.fetchFails && !after.told[QUEUE_UNREACHABLE_KEY]) { delete after.fetchFails; changed = true; }
+    if (changed) saveTold(cfg, after);
     return;
   }
   t.fetchFails = (t.fetchFails ?? 0) + 1;
   saveTold(cfg, t);
-  if (t.fetchFails >= FETCH_FAIL_ROUNDS) tell(cfg, "queue_unreachable", QUEUE_UNREACHABLE_KEY);
+  if (t.fetchFails >= FETCH_FAIL_ROUNDS) {
+    const back = Date.parse(t.queueBack ?? "");
+    const again = !t.told[QUEUE_UNREACHABLE_KEY] && Number.isFinite(back) && Date.now() - back <= QUEUE_AGAIN_MS;
+    if (again) tell(cfg, "queue_unreachable_again", QUEUE_UNREACHABLE_KEY);
+    else tell(cfg, "queue_unreachable", QUEUE_UNREACHABLE_KEY);
+  }
 }
 export function resendOwed(cfg: Config, fresh = true): void {
   if (fresh) noticeRound();
@@ -581,13 +610,28 @@ export function heartbeatNotices(cfg: Config, h: Heartbeat | null): void {
 // worker_not_starting, owed while the heartbeat is older than WORKER_QUIET_MS (or there is none) and a job has waited
 // at least that long, under the usual mark rules; seen clear once the worker is heard from or nothing waits that long.
 // A heartbeat that already says the start was refused is told by its own notice instead.
+// 0.12.2: a job's bound is min(WORKER_QUIET_MS, its life from created to expires), so a short job that expires first
+// still raises it: a pending job that has waited its bound, or one the keeper closed as expired without it ever being
+// claimed (failed, no attempt) within the last WORKER_QUIET_MS, each judged at min(now, its expiry), with the
+// heartbeat missing or older than the job's bound there (SKEW_MS allowed, as before). Held, neither told nor seen
+// clear, while the queue's fetch is failing (fetchFails): the keeper's copy of the heartbeat is then old because of
+// the outage, not the worker.
 export const WORKER_QUIET_MS = 6 * 3_600_000;
 export const WORKER_QUIET_KEY = "workerquiet";
 export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[], now: Date): void {
+  if (readTold(cfg).fetchFails) return;
   const heard = h ? Date.parse(h.worker_clock) : NaN;
-  const quiet = !Number.isFinite(heard) || now.getTime() - heard > WORKER_QUIET_MS + SKEW_MS;
-  const waiting = jobs.some((j) => j.state === "pending" && now.getTime() - Date.parse(j.created) > WORKER_QUIET_MS);
-  if (quiet && waiting && h?.code !== "start_refused") tell(cfg, "worker_not_starting", WORKER_QUIET_KEY);
+  const quietFor = (j: Job): boolean => {
+    const created = Date.parse(j.created), expires = Date.parse(j.expires);
+    const life = Number.isFinite(expires) && Number.isFinite(created) ? Math.max(0, expires - created) : WORKER_QUIET_MS;
+    const bound = Math.min(WORKER_QUIET_MS, life);
+    const at = Number.isFinite(expires) ? Math.min(now.getTime(), expires) : now.getTime();
+    const unclaimedExpiry = j.state === "failed" && j.attempt === null && Number.isFinite(expires) && expires + SKEW_MS <= now.getTime() && now.getTime() - expires <= WORKER_QUIET_MS;
+    if (j.state !== "pending" && !unclaimedExpiry) return false;
+    const quiet = !Number.isFinite(heard) || at - heard > bound + SKEW_MS;
+    return quiet && at - created >= bound;
+  };
+  if (h?.code !== "start_refused" && jobs.some(quietFor)) tell(cfg, "worker_not_starting", WORKER_QUIET_KEY);
   else cleared(cfg, WORKER_QUIET_KEY);
 }
 // A condition seen clear this round. A mark whose post was never acknowledged (posted false) is never

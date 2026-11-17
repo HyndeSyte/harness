@@ -1104,7 +1104,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     const calls = [...main.matchAll(/\b(tell|waited)\(cfg, ([^;]*?)\);/g)].map((m) => m[2]).filter((a) => !a.startsWith("code, key"));
     expect(calls.length).toBeGreaterThanOrEqual(8);
     for (const a of calls) {
-      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"worker_not_starting"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
+      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"queue_unreachable_again"|^"worker_not_starting"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
       if (tapNotice) expect(a).toMatch(/, whatOf\(cfg, (l|t)\)$/);
     }
     const w = world();
@@ -1670,7 +1670,7 @@ describe("twenty-ninth review: a mark of unknown age re-minted once, the worker 
     renameSync(`${w.remote}.gone`, w.remote);
     quiet(() => round(cfg));
     const t = JSON.parse(readFileSync(`${w.used}.told.json`, "utf8"));
-    expect(t.fetchFails).toBeUndefined();
+    expect(t.fetchFails).toBe(k.FETCH_FAIL_ROUNDS + 3);                           // 0.12.2: the streak is kept while the notice stands
     expect(t.told[k.QUEUE_UNREACHABLE_KEY].clear).toBe(1);
     const words = PC_NOTICES.queue_unreachable;
     expect(words).not.toMatch(ownerWords);
@@ -1709,5 +1709,135 @@ describe("twenty-ninth review: a mark of unknown age re-minted once, the worker 
     const r = rig();
     const a = await r.link.pcNotice("worker_not_starting");
     expect(r.posted[a.message].content).toBe(words);
+  });
+});
+
+describe("0.12.2 review: a short job's worker-not-starting notice, held through a queue outage; the queue notice's hysteresis and its again wording; the re-mint kept before its send", () => {
+  const k = keeper28 as any;
+  const run = <T>(f: () => T): { out: T; logs: string[] } => {
+    const was = console.log;
+    const logs: string[] = [];
+    console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try { return { out: f(), logs }; } finally { console.log = was; }
+  };
+  const at = (base: Date, min: number) => new Date(base.getTime() + min * 60_000);
+  const beatAt = (d: Date) => parseHeartbeat(JSON.stringify({ v: 1, worker_clock: d.toISOString().replace(/\.\d{3}Z$/, "Z"), code: "idle", job: null, stale_lock: false, skew_ms: null, reason: null }));
+
+  test("a 15 minute job and no heartbeat: worker-not-starting is raised once it has waited its life, and on its unclaimed expiry", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const created = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const short = (state: string, attempt: string | null = null) => ({ state, attempt, created: created.toISOString(), expires: at(created, 15).toISOString() }) as any;
+    // Waiting less than its life: nothing.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, null, [short("pending")], at(created, 10)); });
+    expect(sent).toEqual([]);
+    // Waited its whole life with no heartbeat (the round before the keeper closes it): told.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, null, [short("pending")], at(created, 15)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+    // Seen clear for good once the worker is heard from after it.
+    for (let i = 0; i < 3; i++) run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, 30)), [short("failed")], at(created, 31)); });
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    // Closed as expired without ever being claimed, the worker never heard from in its life: told again.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -60)), [short("failed")], at(created, 20)); });
+    expect(sent).toEqual(["worker_not_starting", "worker_not_starting"]);
+    // A job that was claimed and failed, a heartbeat heard within the job's life, or an expiry long past: not this notice.
+    resetNoticeProcess();
+    const w2 = world();
+    w2.first();
+    const sent2: string[] = [];
+    const cfg2 = w2.cfg("pi-1", { notify: ((c: string) => { sent2.push(c); return true; }) as any });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, null, [short("failed", "a".repeat(16))], at(created, 20)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, beatAt(at(created, 5)), [short("pending")], at(created, 15)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, null, [short("failed")], at(created, 15 + 7 * 60)); });
+    expect(sent2).toEqual([]);
+  });
+
+  test("a 6 hour queue outage with a pending job and an aging heartbeat raises only queue-unreachable, never worker-not-starting", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const start = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const job = { state: "pending", attempt: null, created: at(start, -1).toISOString(), expires: at(start, 24 * 60).toISOString() } as any;
+    const h = beatAt(at(start, -1));                                                // the copy's heartbeat, last fetched as the outage began
+    // Each round as the keeper runs it: the heartbeat's notices first, then the fetch, which fails.
+    for (let i = 0; i <= 7 * 60; i++) run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [job], at(start, i)); k.queueFetch(cfg, false); });
+    expect(sent).toEqual(["queue_unreachable"]);
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    // The keeper's round reads the heartbeat's notices before its fetch, so the streak it reads is the earlier rounds'.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    expect(main.indexOf("heartbeatNotices(cfg, readHeartbeat(cfg.dir))")).toBeLessThan(main.indexOf("fetched = sync(cfg, seen)"));
+  }, 60_000);
+
+  test("queue-unreachable, once raised, clears only after good fetches in a row; one good fetch between failures neither drops it nor raises a fresh one; back within a day it is worded as again", async () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const fetch = (ok: boolean) => run(() => { noticeRound(); k.queueFetch(cfg, ok); });
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS; i++) fetch(false);
+    expect(sent).toEqual(["queue_unreachable"]);
+    // Flapping: a good fetch, then a failure, many times over.
+    for (let i = 0; i < 8; i++) { fetch(true); fetch(false); }
+    expect(sent).toEqual(["queue_unreachable"]);
+    let t = JSON.parse(readFileSync(f, "utf8"));
+    expect(t.told[k.QUEUE_UNREACHABLE_KEY]).toMatchObject({ posted: true, clear: 0 });
+    expect(t.fetchFails).toBeGreaterThanOrEqual(k.FETCH_FAIL_ROUNDS);
+    // Good fetches in a row: kept until the last of them, then gone, its clearing stamped.
+    for (let i = 0; i < k.QUEUE_CLEAR_FETCHES - 1; i++) fetch(true);
+    expect(JSON.parse(readFileSync(f, "utf8")).told[k.QUEUE_UNREACHABLE_KEY]).toBeDefined();
+    fetch(true);
+    t = JSON.parse(readFileSync(f, "utf8"));
+    expect(t.told[k.QUEUE_UNREACHABLE_KEY]).toBeUndefined();
+    expect(t.fetchFails).toBeUndefined();
+    expect(Number.isFinite(Date.parse(t.queueBack))).toBe(true);
+    // Unreachable again within the day: worded as again.
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS; i++) fetch(false);
+    expect(sent).toEqual(["queue_unreachable", "queue_unreachable_again"]);
+    for (let i = 0; i < k.QUEUE_CLEAR_FETCHES; i++) fetch(true);
+    // Past the day: the plain line.
+    t = JSON.parse(readFileSync(f, "utf8"));
+    t.queueBack = new Date(Date.now() - k.QUEUE_AGAIN_MS - 60_000).toISOString();
+    writeFileSync(f, JSON.stringify(t));
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS; i++) fetch(false);
+    expect(sent).toEqual(["queue_unreachable", "queue_unreachable_again", "queue_unreachable"]);
+    // The link's words for it.
+    const words = PC_NOTICES.queue_unreachable_again;
+    expect(words).toContain("again");
+    expect(words).not.toMatch(/\u2014|add-on|\bcheck|resend|send it again|tap again|try again|\d{4}-\d{2}-\d{2}T|j-\d{8}/i);
+    const r = rig();
+    const a = await r.link.pcNotice("queue_unreachable_again");
+    expect(r.posted[a.message].content).toBe(words);
+  }, 60_000);
+
+  test("a re-minted id is kept in the notice file before its send; if that can't be written, nothing is sent and the error is logged", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const f = `${w.used}.told.json`;
+    const sent: { id: string; repeat?: boolean; onDisk: any }[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string, n: any) => { sent.push({ id: n.id, ...(n.repeat ? { repeat: true } : {}), onDisk: JSON.parse(readFileSync(f, "utf8")).told["unsettled:r"] }); return false; }) as any });
+    const old = "e".repeat(24);
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, JSON.stringify({ v: 3, told: { "unsettled:r": { id: old, posted: false, clear: 0, code: "reuse_unsettled", since: new Date(Date.now() - k.NOTICE_DEDUP_MS - 86_400_000).toISOString() } }, waits: {} }));
+    mkdirSync(`${f}.tmp`, { recursive: true });                                      // the notice file can't be written
+    const { logs } = run(() => resendOwed(cfg));
+    expect(sent).toEqual([]);
+    expect(logs.some((l) => l.includes("ERROR: notice reuse_unsettled needs a new id") && l.includes("isn't sent this round"))).toBe(true);
+    expect(JSON.parse(readFileSync(f, "utf8")).told["unsettled:r"].id).toBe(old);
+    // Writable again: the stamp is on disk when the send happens.
+    rmSync(`${f}.tmp`, { recursive: true });
+    run(() => resendOwed(cfg));
+    expect(sent.length).toBe(1);
+    expect(sent[0].id).not.toBe(old);
+    expect(sent[0].repeat).toBe(true);
+    expect(sent[0].onDisk).toMatchObject({ id: sent[0].id, repeat: true });
+    expect(Number.isFinite(Date.parse(sent[0].onDisk.minted))).toBe(true);
   });
 });
