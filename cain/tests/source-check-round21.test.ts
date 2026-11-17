@@ -371,8 +371,7 @@ describe("5. flock: probed at start, resolved through a soname list, its errors 
     const why = probeLock(dir)!;
     expect(why).toContain("flock couldn't be loaded from libc");
     expect(why).toContain("libno-such-c.so.9");
-    const k = keeperRig();
-    expect(keeperLockProbe(k.cfg)).toContain("flock couldn't be loaded");
+    expect(keeperLockProbe({ queue: join(dir, "keeper", "queue") } as any)).toContain("flock couldn't be loaded");   // no git needed (the arm64 job has none)
     const line = lockRefusal("link", `${why} at ${dir}/x.log`);
     expect(line).toContain("can't lock its logs on this box");
     expect(line).not.toMatch(/\/tmp\/|\b[0-9a-f]{7,40}\b|again/);
