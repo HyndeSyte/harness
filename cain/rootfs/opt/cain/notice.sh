@@ -24,8 +24,8 @@
 # stopped, paused, or restarting), "session" (his session keeps ending), "switch" (his move to his
 # own user failed; he runs the old way), "screen" (a question keeps coming back on his screen,
 # where no one answers it: unstick.sh), "deliver" (what the App types into his session doesn't go
-# in: watch.sh) and "phone" (its alarms to his phone failed their test). Within a group a newer
-# alarm replaces the last.
+# in, or his screen waits at a sign-in: watch.sh) and "phone" (its alarms to his phone failed their
+# test). Within a group a newer alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
 # is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
@@ -50,7 +50,7 @@ OPT="${NOTICE_OPT:-/opt/cain}"
 D="${NOTICE_DATA:-/data}"
 DIR="${NOTICE_DIR:-$D/c1/notice.d}"
 PROBED="${NOTICE_PROBED:-$D/c1/notice-probed}"   # "<when> <hook's hash>": the last probe Home Assistant took
-PROVEN="${NOTICE_PROVEN:-$D/c1/notice-proven}"   # the last probe read back moved: its time
+PROVEN="${NOTICE_PROVEN:-$D/c1/notice-proven}"   # "<when> <hook's hash>": the last probe read back moved
 READ="${NOTICE_READ:-$D/work/alarms-checked}"    # Cain's reading of the helper: his file
 QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
@@ -68,7 +68,7 @@ group_of() {
     session) echo session ;;
     switch-failed|switch-waits) echo switch ;;
     waiting) echo screen ;;
-    stalled) echo deliver ;;
+    stalled|signin) echo deliver ;;
     phone) echo phone ;;
     *) return 1 ;;
   esac
@@ -104,6 +104,8 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and the App couldn't clear it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     stalled) T="Cain isn't getting messages"
       M="Cain isn't getting messages: what the App types into his session (your taps, his check-ins) hasn't gone in for a while${c}. The App keeps trying, and clears what it can by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    signin) T="Cain is waiting at a sign-in"
+      M="Cain is waiting at a sign-in on his screen${c}, so nothing reaches him. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
     phone) T="Cain's alarms reach you here only"
       M="Cain's alarms to your phone through Home Assistant didn't pass their test${c}, so for now they reach you only here, from his bot. Nothing for you to do: Cain has it filed for a fix." ;;
     *) return 1 ;;
@@ -202,7 +204,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|phone) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -256,8 +258,11 @@ probe() {   # no notification: Home Assistant's automation only notes the time, 
   return 1
 }
 # What Cain read back for the last probe Home Assistant took: 0 it moved (to the probe's time or
-# later, a minute's slack for the clocks), 1 it didn't (his reading, written after the probe, is
-# older), 2 nothing to go on yet (no probe, no reading since it, or one that isn't a time).
+# later: Home Assistant runs on the same clock and sets it after the probe was sent, so no slack,
+# and an earlier probe's time never passes for this one: outside round 24), 1 it didn't (his
+# reading, written after the probe, is older), 2 nothing to go on yet (no probe, no reading since
+# it, or one that isn't a time: a time later than his file was written can't have been read, so
+# it proves nothing).
 readback() {
   local t m r s
   t="$(head -n 1 "$PROBED" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"; [ -n "$t" ] || return 2
@@ -265,16 +270,19 @@ readback() {
   { [ -n "$m" ] && [ "$m" -ge "$t" ]; } || return 2
   r="$(as_him head -c 100 "$READ" 2>/dev/null | head -n 1 | tr -cd '0-9:T .+Z-')"
   [ -n "$r" ] && s="$(date -d "$r" +%s 2>/dev/null)" || return 2
-  [ "$s" -ge $((t - 60)) ] && return 0
+  [ "$s" -le $((m + 60)) ] || return 2
+  [ "$s" -ge "$t" ] && return 0
   return 1
 }
 check_readback() {
-  local t rb=0
+  local t f rb=0
   readback || rb=$?
   t="$(head -n 1 "$PROBED" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"
+  f="$(head -n 1 "$PROBED" 2>/dev/null | cut -s -d' ' -f2 | tr -cd '0-9a-f')"
   case "$rb" in
-    0) if [ "$(head -n 1 "$PROVEN" 2>/dev/null)" != "$t" ]; then
-         { printf '%s\n' "$t" > "$PROVEN.tmp" && mv -f "$PROVEN.tmp" "$PROVEN"; } 2>/dev/null \
+    # Kept with the hook it was made with: a proof counts only while that hook is the one set.
+    0) if [ "$(head -n 1 "$PROVEN" 2>/dev/null)" != "$t $f" ]; then
+         { printf '%s %s\n' "$t" "$f" > "$PROVEN.tmp" && mv -f "$PROVEN.tmp" "$PROVEN"; } 2>/dev/null \
            && echo "[cain] alarms: Cain read the helper moved by the probe: the channel to his phone works"
        fi
        clear_groups phone ;;
@@ -303,7 +311,10 @@ tick() {
 }
 
 case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}")" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
-  proven) t="$(head -n 1 "$PROVEN" 2>/dev/null | tr -cd '0-9')"; [ -n "$t" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
+  # A proof within two days, made with the hook set now (none set, or another, proves nothing).
+  proven) t="$(head -n 1 "$PROVEN" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"
+          f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
+          [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
   *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
