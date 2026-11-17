@@ -3620,13 +3620,14 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     expect(extensionPrefs(q.inst).extensions.find((x) => x.id === OTHER)).toMatchObject({ location: 5, component: true });
   });
 
-  test("only Chrome's component location is exempt; policy and external installs count; off only for the user's own disable reason; raw fields printed", async () => {
+  test("only Chrome's internal locations (5, 10) are exempt; policy and external installs count; off only for the user's own disable reason; raw fields printed", async () => {
     const { q } = oneJob();
     const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const with_ = (e: object) => { writeFileSync(join(q.udd, "Default", "Secure Preferences"),
       JSON.stringify({ extensions: { settings: { [EXT]: { path: `${EXT}\\1.2.3_0`, state: 1, manifest: { version: "1.2.3" } }, [OTHER]: e } } })); return extensionPrefs(q.inst).others; };
     expect(with_({ location: 5, state: 1 })).toEqual([]);                     // component
-    for (const location of [1, 2, 3, 4, 6, 7, 8, 9, 10]) expect([location, with_({ location, state: 1 })]).toEqual([location, [OTHER]]);
+    expect(with_({ location: 10, state: 1 })).toEqual([]);                    // external component (0.12.2)
+    for (const location of [1, 2, 3, 4, 6, 7, 8, 9]) expect([location, with_({ location, state: 1 })]).toEqual([location, [OTHER]]);
     // Disable reasons: only the user's own (1) turns it off; others (a permissions increase, policy, corruption) leave it counted, as does state 0 alone.
     expect(with_({ location: 1, disable_reasons: [1] })).toEqual([]);
     expect(with_({ location: 1, disable_reasons: 1 | 2 })).toEqual([]);
@@ -3644,6 +3645,39 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       [OTHER]: { location: 5, state: 1 } } } }));
     const ev = await probe(p.opts(attended));
     expect(ev.extensions).toContainEqual({ id: OTHER, name: null, enabled: true, component: true, location: 5, state: 1, disable_reasons: null });
+  });
+
+  test("0.12.2: Chrome's own component extensions (Web Store Payments at location 10, as Chrome 157 writes it) pass; a user-installed one is still extra_extension", async () => {
+    const { q, id } = oneJob();
+    const PAYMENTS = "nmmhkkegccagdldgiimedpiccmgmieda", WEBSTORE = "ahfgeienlihckogmohjhadlkjgocpleb", USER = "dddddddddddddddddddddddddddddddd";
+    const mine = { active_permissions: { api: ["tabs", "nativeMessaging"] }, creation_flags: 9, from_webstore: true, install_time: "13400000000000000",
+      location: 1, manifest: { key: "x", manifest_version: 3, name: "Claude", version: "1.2.3" }, path: `${EXT}\\1.2.3_0`, state: 1, was_installed_by_default: false, was_installed_by_oem: false };
+    // Chrome's own entries as Chrome 157 writes them: Payments at the external component location (10), the Web Store at
+    // the component location (5), each with its packaged path and no state field.
+    const payments = { active_permissions: { api: ["identity", "webview"] }, creation_flags: 137, first_install_time: "13400000000000000", from_webstore: false,
+      location: 10, manifest: { key: "x", manifest_version: 2, name: "Chrome Web Store Payments", version: "1.0.0.6" },
+      path: `C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments`, was_installed_by_default: true, was_installed_by_oem: false };
+    const webstore = { active_permissions: { api: ["management"] }, location: 5, manifest: { name: "Web Store", version: "0.2" }, path: "...\\resources\\web_store", state: 1 };
+    const write = (others: object) => writeFileSync(join(q.udd, "Default", "Secure Preferences"),
+      JSON.stringify({ extensions: { settings: { [EXT]: mine, ...others } }, protection: { macs: { extensions: { settings: {} } } } }));
+    write({ [PAYMENTS]: payments, [WEBSTORE]: webstore });
+    expect(extensionPrefs(q.inst)).toMatchObject({ others: [], disagree: [] });
+    expect(extensionPrefs(q.inst).extensions.find((x) => x.id === PAYMENTS)).toMatchObject({ name: "Chrome Web Store Payments", enabled: true, component: true, location: 10 });
+    expect(checkHost(q.opts()).extensions.map((x) => x.id)).toEqual([WEBSTORE, EXT, PAYMENTS].sort());
+    expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+    expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    // A known id with no location is Chrome's; a known id at a user location (an unpacked extension can claim any id) is not.
+    write({ [PAYMENTS]: { ...payments, location: undefined } });
+    expect(extensionPrefs(q.inst).others).toEqual([]);
+    write({ [PAYMENTS]: { ...payments, location: 4 } });
+    expect(extensionPrefs(q.inst).others).toEqual([PAYMENTS]);
+    // A user-installed extension from the store (location 1) beside Chrome's own: still refused, naming only it.
+    write({ [PAYMENTS]: payments, [USER]: { ...mine, location: 1, manifest: { name: "Some helper", version: "2.0" }, path: `${USER}\\2.0_0` } });
+    expect(extensionPrefs(q.inst).others).toEqual([USER]);
+    expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+    let err: any = null;
+    try { checkHost(q.opts()); } catch (e) { err = e; }
+    expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [USER] } });
   });
 
   test("Windows' timer: start times equal or within one tick are never later; the chain, the orphan check and the lock all tolerate it", async () => {
@@ -5826,7 +5860,7 @@ describe("eighteenth review: the hook's margin measured on the PC, a strict pars
     expect(HOOK_STALL_MS).toBeGreaterThan(HOOK_TIMEOUT_S * 1000);
     expect(PROBE_GATES).toContain("hook_timing");
     expect(PROBE_GATES).toContain("payload_replay");
-    expect(POLICY_VERSION).toBe("20");
+    expect(POLICY_VERSION).toBe("21");
   });
 
   // The step's four sessions, each a real session process (the stand-in CLI) running the real nav-guard.

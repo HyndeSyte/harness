@@ -673,16 +673,36 @@ export function activeExtensionVersion(inst: Install): string | null {
 // ids in disagree. files names the file(s) the pinned entry was read from, key its key
 // path; no file holding it is extension_entry_missing at preflight (a profile that is right
 // but doesn't list the extension, separate from wrong_profile).
-// others: every other extension that counts as on, which is any extension but one at
-// Chrome's component location (5) and one the owner turned off. Policy installs (7, 9),
-// external installs (2, 3, 6, 10), unpacked (4) and command-line (8) ones all count. An
-// extension counts as off only for a disable reason the user set (Chrome's user-action
-// reason, 1, in its disable_reasons list or bitmask); any other reason, or a state field
-// alone, leaves it counted. Any is extra_extension at preflight. Each line carries the raw
+// others: every other extension that counts as on, which is any extension but one Chrome
+// ships itself and one the owner turned off. Chrome's own (0.12.2): an extension at one of
+// Chrome's internal locations, component (5) or external component (10, how Chrome 157 loads
+// Chrome Web Store Payments), or one of the ids Chrome always installs (CHROME_BUILTIN_IDS)
+// whose entry names no location or an internal one. A known id at any other location is not
+// Chrome's: an unpacked extension can claim any id, so it counts like the rest. Policy installs
+// (7, 9), external installs (2, 3, 6), the store's (1), unpacked (4) and command-line (8) ones
+// all count. An extension counts as off only for a disable reason the user set (Chrome's
+// user-action reason, 1, in its disable_reasons list or bitmask); any other reason, or a state
+// field alone, leaves it counted. Any is extra_extension at preflight. Each line carries the raw
 // location, state and disable_reasons fields as Chrome wrote them (numbers only), and
 // check-host and the probe print them for every extension found.
 export const PREF_FILES = ["Secure Preferences", "Preferences"];
 export const COMPONENT_LOCATION = 5;
+// Chrome's internal locations (its ManifestLocation): kComponent and kExternalComponent.
+export const CHROME_LOCATIONS: readonly number[] = [COMPONENT_LOCATION, 10];
+// The extensions Chrome installs itself, by id: the Web Store, Web Store Payments, the PDF viewer,
+// Google Hangouts, Network Speech, CryptoToken, Feedback and the Cast media router.
+export const CHROME_BUILTIN_IDS: readonly string[] = [
+  "ahfgeienlihckogmohjhadlkjgocpleb", // Web Store
+  "nmmhkkegccagdldgiimedpiccmgmieda", // Chrome Web Store Payments
+  "mhjfbmdgcfjbbpaeojofohoefgiehjai", // Chrome PDF Viewer
+  "nkeimhogjdpnpccoofpliimaahmaaome", // Google Hangouts
+  "neajdppkdcdipfabeoofebfddakdcjhd", // Google Network Speech
+  "kmendfapggjehodndflmmgagdbamhnfd", // CryptoToken
+  "gfdkimpbcpahaombhbimeihdjnejgicl", // Feedback
+  "pkedcjkdefgpdelpbcmbmeomcjbeemfm", // Chrome Media Router
+];
+export const chromeOwn = (id: string, location: number | null) =>
+  (location !== null && CHROME_LOCATIONS.includes(location)) || (CHROME_BUILTIN_IDS.includes(id) && location === null);
 export const USER_DISABLE = 1;
 type RawReasons = number | number[] | null;
 export interface ExtensionLine { id: string; name: string | null; enabled: boolean; component: boolean; location: number | null; state: number | null; disable_reasons: RawReasons }
@@ -714,7 +734,7 @@ export function extensionPrefs(inst: Install): ExtensionPrefs {
     const e = merged[id];
     const reasons = rawReasons(e.disable_reasons), location = num(e.location);
     const name = typeof e.manifest?.name === "string" && /^[\w .,()'&+-]{1,60}$/.test(e.manifest.name) ? e.manifest.name : null;
-    return { id, name, enabled: !userDisabled(reasons), component: location === COMPONENT_LOCATION, location, state: num(e.state), disable_reasons: reasons };
+    return { id, name, enabled: !userDisabled(reasons), component: chromeOwn(id, location), location, state: num(e.state), disable_reasons: reasons };
   });
   return { files, key: `extensions.settings.${p.extension_id}`, extensions, disagree,
     others: extensions.filter((x) => x.id !== p.extension_id && x.enabled && !x.component).map((x) => x.id) };
@@ -1409,9 +1429,10 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // surrogates and unsafe integers, and the hooks' timeout in the pinned settings is 40 seconds; 19:
 // both hooks refuse at once when probe mode shows outside a bound probe session, and read-guard names
 // why a read is unplaced; 20: read-guard's address-field rule counts inside the placement-bearing answer
-// (tool_response) alone and folds keys by NFKC then ASCII lowercase). The pull request check (check_pr.py) wants it above main's whenever the
+// (tool_response) alone and folds keys by NFKC then ASCII lowercase; 21, 0.12.2: the worker file changed for the
+// extension check and the hook's entry points (nav-guard and read-guard themselves unchanged)). The pull request check (check_pr.py) wants it above main's whenever the
 // guard changed against main, so a rebase over another pull request that touched the guard bumps it again.
-export const POLICY_VERSION = "20";
+export const POLICY_VERSION = "21";
 // The hook bundle (the hook's own code: worker.ts, which holds nav-guard and read-guard, the format
 // it imports and the pinned Public Suffix List) plus the pinned session settings, hashed into every
 // confirmation (0.12.0, nineteenth round): the confirmation binds to what the hook is, not to the
