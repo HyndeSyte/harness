@@ -89,17 +89,29 @@ ASK_ALLOWED = [
     ("Then confirm it on the card that follows", "the last step of replacing a key only he can make (a "
                                                  "password, a service account key): his tap on the card "
                                                  "that stores it, a decision, not a check"),
-    ("Please check your calendar to see whether it's there", "twenty-third round: the internal-error card, where "
-                                                             "Harness can't confirm whether a change it may have "
-                                                             "made was made; the one card that asks him to look at "
-                                                             "his calendar (tests/imperative_cases.json \"said\")"),
+]
+# Twenty-fourth round: asks allowed only on one kind of card, never by a substring removal from every message. Each:
+# the ask, the words only that card carries (its lead), and why. The ask is let through only in a text that carries
+# that lead and says the ask exactly once; anywhere else (another card, or said twice) it's reported.
+ASK_SCOPED = [
+    ("Please check your calendar to see whether it's there",
+     "Harness hit an internal error while working out what came of it",
+     "twenty-third round: the internal-error card, where Harness can't confirm whether a change it may have made was "
+     "made; the one card that asks him to look at his calendar (tests/imperative_cases.json \"said\")"),
 ]
 
 
 def asks_in(text: str) -> list[str]:
     for words, _ in ASK_ALLOWED:
         text = text.replace(words, "")
-    return [m.group(0) for m in ASK.finditer(text)]
+    out = []
+    for words, lead, _ in ASK_SCOPED:
+        n = text.count(words)
+        if n == 1 and lead in text:
+            text = text.replace(words, "")
+        elif n > 1:
+            out.append(f"{words} (said {n} times)")
+    return out + [m.group(0) for m in ASK.finditer(text)]
 
 
 def rule_problems(where: str, text: str, labels) -> list[str]:

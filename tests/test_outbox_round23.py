@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from harness.ledger import Ledger
+from harness.ledger import Ledger, TransactionAborted
 from test_handover_round16_taps import m  # noqa: F401
 from test_discord_keeper import OWNER  # noqa: F401
 from test_outbox_round20 import posted
@@ -53,7 +53,8 @@ def test_one_taps_outcome_retry_and_waiting_note_all_go_and_duplicates_of_each_a
     assert len(texts(m, "Harness couldn't read your calendar to tell how far it got")) == 1
     assert len(texts(m, RETRY)) == 1
     assert len(texts(m, WAITING)) == 1
-    for kind, purpose in (("outcome", "unverified"), ("retry", "1"), ("note", "waiting")):
+    # twenty-fourth round: the retry card's key names the card its attempts count on (no relist here: "relist0")
+    for kind, purpose in (("outcome", "unverified"), ("retry", "relist0:1"), ("note", "waiting")):
         assert m.ledger.get_meta("outbox_once:" + Ledger.once_key(key, kind, purpose)) is not None
     # a new attempt (his Go ahead on the retry card) goes, once
     (again,) = retry_targets(m)
@@ -61,18 +62,21 @@ def test_one_taps_outcome_retry_and_waiting_note_all_go_and_duplicates_of_each_a
     m.c._reconfirm_tap(again)
     m.c._reconfirm_tap(again)
     assert len(texts(m, RETRY)) == 2
-    assert m.ledger.get_meta("outbox_once:" + Ledger.once_key(key, "retry", "2")) is not None
+    assert m.ledger.get_meta("outbox_once:" + Ledger.once_key(key, "retry", "relist0:2")) is not None
     before = len(m.link.cards)
     m.c.outbox.flush()
     sent = [c["text"] for c in posted(m, before)]
     assert len(sent) == 4                                                      # outcome, two retries, the note
 
 
-def test_a_retry_card_with_an_unreadable_attempt_counts_as_the_first(m, monkeypatch):
+def test_a_retry_card_with_an_unreadable_attempt_is_its_own_value(m, monkeypatch):
+    """Twenty-fourth round: no longer counted as the first (it collided with a genuine first attempt)."""
     monkeypatch.setattr(m.c, "_tap_read", lambda op: ("unread", []))
     target = json.dumps({"id": "96302", "custom_id": "k:a:r23four", "message_id": "5", "op": {}, "attempt": "x"})
     m.c._reconfirm_tap(target)
-    assert m.ledger.get_meta("outbox_once:" + Ledger.once_key("96302|k:a:r23four", "retry", "1")) is not None
+    key = "96302|k:a:r23four"
+    assert m.ledger.get_meta("outbox_once:" + Ledger.once_key(key, "retry", "relist0:unreadable")) is not None
+    assert m.ledger.get_meta("outbox_once:" + Ledger.once_key(key, "retry", "relist0:1")) is None
 
 
 # -- 4. the savepoint's cleanup ---------------------------------------------------------------------------------------
@@ -103,9 +107,11 @@ def test_a_failing_rollback_keeps_the_original_error_and_a_following_write_commi
         return real_set(key, value, db)
     monkeypatch.setattr(m.ledger, "set_meta", set_meta)
     m.ledger.db = RollbackFails(real_conn)
-    with pytest.raises(RuntimeError, match="the write failed") as got:         # the original, not the rollback's
+    # twenty-fourth round: a distinct TransactionAborted, the original its cause and the cleanup's error the original's
+    with pytest.raises(TransactionAborted) as got:
         m.ledger.enqueue(chat_id=1, kind="notice", text="z", once="tap:9|outcome|z")
-    assert isinstance(got.value.__cause__, sqlite3.OperationalError)           # the cleanup's error, chained
+    assert isinstance(got.value.__cause__, RuntimeError) and "the write failed" in str(got.value.__cause__)
+    assert isinstance(got.value.__cause__.__cause__, sqlite3.OperationalError)
     monkeypatch.undo()
     if isinstance(m.ledger.db, RollbackFails):
         m.ledger.db = real_conn

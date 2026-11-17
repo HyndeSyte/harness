@@ -355,15 +355,20 @@ class Inbox:
             return False
         return self._append({"committed": self.key(press), "at": time.time()})
 
-    def journal_outcome(self, press: dict, kind: str, note: str = "") -> bool:
+    def journal_outcome(self, press: dict, kind: str, note: str = "", error: str = "") -> bool:
         """Sixteenth round: the tap's terminal outcome ("refused", or "found": the calendar already shows it) and the
-        note owed to him, written (fsynced) before the note is posted, so a tap with one is never taken again."""
+        note owed to him, written (fsynced) before the note is posted, so a tap with one is never taken again.
+        Twenty-fourth round: `error`, an internal error's last exception (never shown to him), kept for the copy of
+        the tap the records keep when it's struck."""
         if not self.journal or not press:
             return False
-        return self._append({"outcome": self.key(press), "kind": kind, "note": note, "at": time.time()})
+        row = {"outcome": self.key(press), "kind": kind, "note": note, "at": time.time()}
+        if error:
+            row["error"] = str(error)[:500]
+        return self._append(row)
 
     def journal_check(self, press: dict, n: int, next_at: float, told: bool, kind: str = "first",
-                      seen: str = "") -> bool:
+                      seen: str = "", error: str = "") -> bool:
         """Eighteenth round: an unknown tap read on the calendar by its identity that couldn't settle yet (the read
         couldn't answer, or Harness's own records are still carrying it out): how many reads it has had, when the
         next one is (seconds since the epoch, on the records' clock), and whether he's been told it waits.
@@ -374,8 +379,11 @@ class Inbox:
         state only when it changes."""
         if not self.journal or not press:
             return False
-        return self._append({"check": self.key(press), "n": int(n), "next": float(next_at), "told": bool(told),
-                             "kind": str(kind), "seen": str(seen), "at": time.time()})
+        row = {"check": self.key(press), "n": int(n), "next": float(next_at), "told": bool(told),
+               "kind": str(kind), "seen": str(seen), "at": time.time()}
+        if error:
+            row["error"] = str(error)[:500]     # twenty-fourth round: an error read's last exception, for the copy
+        return self._append(row)
 
     def journal_delivered(self, press: dict) -> bool:
         """Sixteenth round: the note on that tap reached him; at the next start it isn't posted again."""
@@ -440,7 +448,8 @@ class Inbox:
                 taps.setdefault(k, {"press": {a: str(b) for a, b in r["press"].items()}, "at": r.get("at"),
                                     "intent": False, "op": {}, "committed": False, "outcome": "", "note": "",
                                     "delivered": False, "checks": 0, "next_check": None, "told_check": False,
-                                    "hold_checks": 0, "last_kind": "", "last_seen": "", "error_checks": 0})
+                                    "hold_checks": 0, "last_kind": "", "last_seen": "", "error_checks": 0,
+                                    "error": ""})
                 continue
             k = _row_key(r, self.key)
             t = taps.get(k)
@@ -454,6 +463,7 @@ class Inbox:
             elif "outcome" in r and not t["outcome"]:
                 t["outcome"] = str(r.get("kind") or "refused")
                 t["note"] = str(r.get("note") or "")
+                t["error"] = str(r.get("error") or t["error"])
             elif "notice" in r and not t["outcome"]:      # the fifteenth round's pending note
                 t["outcome"], t["note"] = "refused", str(r.get("notice") or "")
             elif "delivered" in r:
@@ -471,20 +481,28 @@ class Inbox:
                     t["hold_checks"] = n
                 if kind in ("calendar", "first"):
                     t["checks"] = n
-                # Twenty-second round: consecutive reads that hit an error in Harness itself, on their own counter.
-                # Twenty-third round: per tap (only this tap's own lines reach here), and started again only by a
-                # read of this tap that answered: never by another tap's read, and never by a hold read that
-                # couldn't read the records either ("hold_unread").
+                # Twenty-second round: reads that hit an error in Harness itself, on their own counter.
+                # Twenty-third round: per tap (only this tap's own lines reach here). Twenty-fourth round: started
+                # again only by a read whose calendar answered, and such a read settles the tap (its card, then the
+                # strike), so it never writes a check line: no check line starts it again. A read that answered the
+                # records but not the calendar (still carrying it out, or the calendar unreadable) leaves it as it is.
                 if kind == "error":
                     t["error_checks"] = n
-                elif not (kind == "hold" and str(r.get("seen") or "") == "hold_unread"):
-                    t["error_checks"] = 0
+                    t["error"] = str(r.get("error") or t["error"])
                 t["next_check"], t["last_kind"], t["last_seen"] = nxt, kind, str(r.get("seen") or "")
                 t["told_check"] = t["told_check"] or bool(r.get("told"))
         for t in taps.values():
             t["state"] = ("committed" if t["committed"] else t["outcome"] if t["outcome"]
                           else "unknown" if t["intent"] else "not_started")
         return list(taps.values())
+
+    def has_lines(self, key: str) -> bool:
+        """Twenty-fourth round: whether any journal line, of any kind, belongs to that tap key."""
+        if not self.journal:
+            return False
+        with self._lock:
+            rows = self._journal_lines()
+        return any(_row_key(r, self.key) == key for r in rows)
 
     def row_for(self, press: dict) -> dict | None:
         """One tap's journal entry (journaled), or None."""

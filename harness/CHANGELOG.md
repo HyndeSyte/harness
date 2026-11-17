@@ -2,6 +2,11 @@
 
 ## 0.24.0
 
+- **A list of taps after a stop comes once**, with one card and one Go ahead per tap, even when Harness can't cross the taps off yet; it only tries crossing them off again, and doesn't read your calendar for them again.
+- **A tap listed a second time gets a Go ahead that works**, and after six tries on one card that still can't read your calendar, one last card says nothing more is done for it.
+- **The card that asks you to check your calendar is the only one that can**, and what Harness was working on is always kept before the tap is crossed off. A cleanup step it can't read is set aside once and left alone after that.
+- If Harness keeps restarting while it can't save, it still keeps its reading schedule and tells you once.
+
 - **When an error inside Harness leaves a change unconfirmed, the card says so plainly**: Harness couldn't confirm whether the change was made, and asks you to check your calendar to see whether it's there. What it was working on is kept in its records so it can be traced.
 - **A note that a tap is waiting comes once**, even when Harness can't note that it told you, and even across a restart. A card bringing Go ahead back comes once for each time you use it.
 - Harness keeps to its 1, 2, 5, 15, 30 and 60 minute schedule for reading your calendars even when its storage can't be written at all, and a tap's leftover cleanup note that can't be read is finished or reported once, not skipped forever.

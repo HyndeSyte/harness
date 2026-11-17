@@ -433,6 +433,14 @@ def cross_thread_writes() -> list[dict]:
         return list(_CROSS)
 
 
+class TransactionAborted(BaseException):
+    """Twenty-fourth round: an enqueue savepoint whose cleanup failed, so the transaction it ran in is gone: rolled
+    back in full (or its connection closed and opened again), any outer work a caller believed pending with it. A
+    BaseException, so no caller's `except Exception` swallows it and runs later statements as if the transaction
+    held: the whole settle (the tick's work) stops there, and the main loop logs it and goes on at the next tick.
+    Its cause is the original exception, whose own cause is the cleanup's."""
+
+
 class Ledger:
     def __init__(self, path: str, clock: Callable[[], datetime] = utcnow):
         self.path = path
@@ -571,7 +579,10 @@ class Ledger:
             try:
                 yield self.db
             except BaseException:
-                self.db.execute("ROLLBACK")
+                # Twenty-fourth round: a transaction already ended under it (TransactionAborted closed and opened the
+                # connection again, or rolled it back) has nothing left to roll back; the error goes on as it was.
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
                 raise
             else:
                 self.db.execute("COMMIT")
@@ -950,8 +961,14 @@ class Ledger:
                     except BaseException as rel:   # noqa: BLE001: kept, chained to the original below
                         cleanup = rel
             if cleanup is not None:
+                # Twenty-fourth round: a distinct error, chained as before (the original, its cause the cleanup's),
+                # since the transaction the caller believed pending is gone.
+                if isinstance(e, TransactionAborted):
+                    raise
                 self._unstick(conn, outer)
-                raise e from cleanup
+                e.__cause__ = cleanup
+                raise TransactionAborted("the records' transaction was aborted: a savepoint couldn't be cleaned up") \
+                    from e
             raise
         conn.execute("RELEASE SAVEPOINT enqueue")
         return oid

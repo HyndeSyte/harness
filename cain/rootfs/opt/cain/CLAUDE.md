@@ -212,7 +212,9 @@ specialist (the Harness add-on) does.
   saying so and that nothing was changed, with no Go ahead; one it keeps hitting an internal error on
   gets one card after a few tries saying it couldn't confirm whether the change was made and asking him
   to check his calendar (the one card of its own that asks him that); each such card comes once, even
-  across a restart, and so does its note that a tap waits and each card that brings Go ahead back. Show those as they come; never hand it
+  across a restart, and so does its note that a tap waits, each card that brings Go ahead back, and each
+  listing of taps after a stop. After six tries on one such card a last one says nothing more is done for
+  that tap; a cleanup step it can't read gets one card and is set aside. Show those as they come; never hand it
   over again, and never ask him to repeat it. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it

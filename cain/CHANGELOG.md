@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- Cain knows the calendar specialist's list of taps after a stop comes once, a last card ends a Go ahead that keeps failing, and a cleanup step it can't read is set aside with one card.
+
 - The cases both sides check name their end-to-end cards in one list, and include the specialist's card that asks you to check your calendar when it couldn't confirm a change.
 
 - The cases both sides check now cover cards that say a change isn't done or couldn't be verified, a card turned down twice, and the calendar specialist's new tap wording.

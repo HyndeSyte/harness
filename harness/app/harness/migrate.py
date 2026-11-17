@@ -1983,6 +1983,55 @@ def accept_lost(ledger_path: str, name: str) -> dict:
             lock.close()
 
 
+TAP_QUARANTINE = "tap_quarantine:"         # twenty-fourth round: the controller's set-aside strike flags
+SET_ASIDE_TAPS = "harness-set-aside-taps.json"
+
+
+def set_aside_taps(ledger_path: str, clear: str | None = None) -> dict:
+    """Twenty-fourth round, from the command line with the App stopped (python3 -m harness.migrate <records>
+    --set-aside --taps [<tap key>]): the taps whose cleanup step (a strike flag) couldn't be read and that the
+    controller set aside, each with the flag's text as it was. With a tap key, that one is cleared: its record is
+    first written whole beside the records (harness-set-aside-taps.json, by key), then removed from them, so it stays
+    recoverable. Refused while Harness runs (it holds harness.lock); nothing else in the records is touched."""
+    import sqlite3 as _sqlite3
+    base = os.path.abspath(ledger_path)
+    folder = os.path.dirname(base)
+    lock = None
+    if folder not in _LOCK:
+        lock = _try_lock(folder)
+        if lock is None:
+            return {"ok": False, "said": "Harness is running (it holds harness.lock beside the records), so nothing "
+                                         "was read or cleared; stop the App first"}
+    try:
+        if not os.path.exists(base):
+            return {"ok": False, "said": "there are no records at that path"}
+        db = _sqlite3.connect(base, isolation_level=None)
+        try:
+            rows = {k[len(TAP_QUARANTINE):]: v for k, v in db.execute(
+                "SELECT key, value FROM meta WHERE substr(key, 1, ?)=?", (len(TAP_QUARANTINE), TAP_QUARANTINE))}
+            if clear is None:
+                return {"ok": True, "taps": rows, "said": f"{len(rows)} set-aside tap record(s)"}
+            if clear not in rows:
+                return {"ok": False, "taps": rows, "said": "that tap isn't set aside, so nothing was cleared"}
+            kept_path = os.path.join(folder, SET_ASIDE_TAPS)
+            kept = _read_json(kept_path) or {}
+            kept[clear] = rows[clear]
+            try:
+                _write_json(kept_path, kept)
+            except OSError as e:
+                return {"ok": False, "said": f"its record couldn't be kept beside the records ({type(e).__name__}), "
+                                             "so nothing was cleared"}
+            db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + clear,))
+        finally:
+            db.close()
+        log.warning("set-aside: a set-aside tap record was cleared; it's kept in %s", SET_ASIDE_TAPS)
+        return {"ok": True, "cleared": clear, "kept_in": SET_ASIDE_TAPS,
+                "said": "cleared from the records and kept beside them"}
+    finally:
+        if lock is not None:
+            lock.close()
+
+
 def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> dict:
     """Fifteenth round, from the command line (python3 -m harness.migrate <records> --set-aside): a swap refused for
     files it doesn't own is sorted by moving them into a folder beside the records (harness-set-aside-<time>-<n>/),
@@ -2566,6 +2615,10 @@ if __name__ == "__main__":
         sys.exit(0)
     if len(args) == 4 and args[1] == "--set-aside" and args[2] == "--accept-lost":
         got = accept_lost(args[0], args[3])                     # twenty-first round: records it; moves nothing
+        print(json.dumps(got, indent=1, sort_keys=True))
+        sys.exit(0 if got.get("ok") else 1)
+    if len(args) in (3, 4) and args[1] == "--set-aside" and args[2] == "--taps":
+        got = set_aside_taps(args[0], args[3] if len(args) == 4 else None)   # twenty-fourth round
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 2 and args[1] == "--set-aside":

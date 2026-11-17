@@ -148,6 +148,9 @@ def test_a_hold_read_that_keeps_raising_ends_as_an_internal_error(m, monkeypatch
 
 @pytest.mark.card_only
 def test_the_error_counter_starts_again_after_a_read_that_answers(m, monkeypatch, clock):
+    """Twenty-fourth round: a read that answered the records but not the calendar ("settling") no longer starts the
+    count again; only a read whose calendar answered does, and that read settles the tap. Its new rule is in
+    tests/test_handover_round24_taps.py."""
     dentist_card(m)
     cut_after(m, monkeypatch)
     real = m.c._records_hold
@@ -165,7 +168,7 @@ def test_the_error_counter_starts_again_after_a_read_that_answers(m, monkeypatch
     mode["raise"] = False
     later(m, clock, 3601)
     (row,) = m.c.handovers.journaled()
-    assert row["error_checks"] == 0 and row["state"] == "unknown"
+    assert row["error_checks"] == 5 and row["state"] == "unknown"             # the records answered, not the calendar
     monkeypatch.setattr(m.c, "_records_hold", real)
 
 

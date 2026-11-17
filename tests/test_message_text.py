@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import message_rules
-from conftest import ASK_ALLOWED, asks_in, labels_of, rule_problems
+from conftest import ASK_ALLOWED, ASK_SCOPED, asks_in, labels_of, rule_problems
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "harness" / "app" / "harness"
@@ -148,6 +148,8 @@ def test_every_allowed_literal_is_still_there_and_has_its_reason():
              for _, text in _strings(ast.parse(path.read_text(encoding="utf-8")))]
     for words, why in ASK_ALLOWED:
         assert why and any(words in text for text in every), words
+    for words, lead, why in ASK_SCOPED:                                    # twenty-fourth round
+        assert why and any(words in text and lead in text for text in every), words
 
 
 @pytest.mark.parametrize("source, what", [

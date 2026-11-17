@@ -31,7 +31,7 @@ from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
 from .family_gmail import FamilyGmail, home_from_options, rules_from_options, school_address_from_options, school_from_options
-from .ledger import Ledger
+from .ledger import Ledger, TransactionAborted
 from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
 from .net import CalDavTransport, GoogleTransport, MapTransport, RedactingFilter, UrllibTransport
@@ -351,7 +351,7 @@ def main() -> int:
                 failures = 0
             except Stop:
                 raise
-            except Exception as e:                 # never die quietly; never spin
+            except (Exception, TransactionAborted) as e:   # never die quietly; never spin
                 failures += 1
                 log.error("tick failed (%d in a row): %s: %s", failures, type(e).__name__, e)
                 time.sleep(min(60, 2 ** min(failures, 6)))
