@@ -32,6 +32,27 @@ const SWITCHED_OFF = [
   "mcp__claude_ai_Slack__slack_schedule_message",
   "mcp__claude_ai_HASS_MCP",
 ];
+// Microsoft 365 (connected Nov 17, 2026, a personal account): Cain reads it and changes nothing.
+// The names are the connector's own; each one that sends, files, changes or deletes is denied by
+// name, so the reading tools stay usable (a bare server name would take reading away too).
+const MS = "mcp__claude_ai_Microsoft_365__";
+const MICROSOFT_READS = [
+  "outlook_email_search", "outlook_calendar_search", "read_resource",
+  "sharepoint_search", "sharepoint_folder_search", "search_people",
+].map((t) => MS + t);
+const MICROSOFT_WRITES = [
+  "outlook_send_mail", "outlook_send_draft", "outlook_forward_mail",
+  "outlook_create_draft", "outlook_create_reply_draft", "outlook_create_reply_all_draft",
+  "outlook_update_draft", "outlook_delete_draft",
+  "outlook_create_event", "outlook_update_event", "outlook_delete_event", "outlook_respond_to_event",
+  "outlook_batch_delete_messages", "outlook_trash_thread", "outlook_untrash_thread",
+  "outlook_batch_modify_labels", "outlook_modify_labels", "outlook_modify_thread_labels",
+  "outlook_create_label", "outlook_update_label", "outlook_delete_label",
+  "outlook_create_filter", "outlook_delete_filter", "outlook_set_vacation",
+  "sharepoint_upload_file", "sharepoint_update_file", "sharepoint_create_folder",
+  "sharepoint_copy_item", "sharepoint_move_item", "sharepoint_rename_item", "sharepoint_delete_item",
+  "teams_create_chat",
+].map((t) => MS + t);
 
 describe("Cain's permissions", () => {
   test("the Discord read tools run without a prompt", () => {
@@ -50,6 +71,20 @@ describe("Cain's permissions", () => {
       // A bare server name ("mcp__claude_ai_Gmail") would allow every tool on it.
       expect(allow.some((a) => a === t || t.startsWith(`${a}__`))).toBe(false);
     }
+  });
+
+  test("Microsoft 365: every tool that sends, files, changes or deletes is denied by name, and the reading tools stay usable", () => {
+    for (const t of MICROSOFT_WRITES) {
+      expect(deny).toContain(t);
+      expect(allow.some((a) => a === t || t.startsWith(`${a}__`))).toBe(false);
+    }
+    for (const t of MICROSOFT_READS) expect(deny).not.toContain(t);
+    // Denying the whole server would take reading away; nothing on it is denied but the writes.
+    expect(deny).not.toContain("mcp__claude_ai_Microsoft_365");
+    expect(deny.filter((d) => d.startsWith("mcp__claude_ai_Microsoft_365")).sort()).toEqual([...MICROSOFT_WRITES].sort());
+    // The old way's rules (as root, before the switch to his own user) deny the same, and only those.
+    const legacy: string[] = JSON.parse(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"), "utf8")).permissions.deny;
+    expect(legacy.filter((d) => d.startsWith("mcp__claude_ai_Microsoft_365")).sort()).toEqual([...MICROSOFT_WRITES].sort());
   });
 
   test("the keys are root's: his deny rules name them too, and nothing allowed touches them", () => {

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.12.1
+## 0.12.2
 
 - Cain now runs as his own user on the Pi instead of as its administrator. The App's keys (GitHub, the review services', the Discord bot's and the Supervisor's) are out of his reach, and the checks on his messages and your Stop live where he can't change them.
 - His Discord replies go through the App, which checks each one before it goes. Discord's "Permission" prompts no longer come to you.
@@ -14,6 +14,11 @@
 - When a question sits on Cain's screen, where no one answers it, he can't take your messages until it's answered. The App now closes it with Esc after 5 minutes, and if that doesn't work, starts his session fresh 5 minutes later, so he's back within about 10 minutes and reads what you sent meanwhile. Something left typed in his box gets cleared too, after it's saved for him. You hear only if it keeps coming back.
 - If nothing the App types gets into his session for half an hour, you hear "Cain isn't getting messages" from his bot and on your phone, once, and again when it's back. If his screen waits at a sign-in for half an hour, you hear how to sign him in.
 - How it was checked: the design went through six rounds of outside review, and tests interrupt the move at every step and check that nothing secret is ever readable by Cain's user.
+
+## 0.12.1
+
+- Cain can read your Microsoft 365 now that it's connected: your OneDrive files and your Outlook mail and calendar.
+- He can't send, change or delete anything there. Mail, drafts, calendar events and invitations, mail rules, and adding, moving, renaming or deleting files are switched off for him, the same as sending through Gmail, Slack and Google Calendar.
 
 ## 0.12.0
 
