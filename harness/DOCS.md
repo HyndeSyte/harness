@@ -407,10 +407,23 @@ how many blocks are on Gmail.
 - **Drive blocks (live):** an event you go to yourself, at a street address, gets its street address
   on its block (only that, never a name or note from Family, so it opens in Maps) and, with
   `home_location` set ("lat, lon" or a street address), separate "Busy (drive there)" and
-  "Busy (drive back)" blocks around it. The event's block keeps its own times. Two events on the same
-  day too close to go home between them get one drive straight from the first to the second. A drive
-  that can't be found is left off, and the digest names the event's day and time. A place you type
-  on a block makes it yours, like any other edit.
+  "Busy (drive back)" blocks around it. The event's block keeps its own times. A location with the
+  place's name on its first line and the street address on the next counts as that street address,
+  and so does a name before a comma; a suite or unit number is left out of the lookup. Your own
+  appointments on your Gmail calendar get the same drive blocks (and no block of their own, since
+  they're already there): events you own, at a place with a street address, your place book or the
+  map can find. Skipped: blocks Harness made, "Busy" holds, events shown as free, all-day events,
+  invitations someone else organized, calls and telehealth or anything online, and events with no
+  location. One at the same time as a Family event you go to is that event. Two events on the same
+  day too close to go home between them, Family or your own, get one drive straight from the first
+  to the second, and only the last one of the stretch drives home. Your own appointments' drives
+  follow them when they move or are cancelled, and each event's new or moved drives get a card with
+  Undo, with the morning digest, once a read of Gmail finds them; Undo keeps that event's drives off.
+  A drive that can't be found is never left off silently: the digest names the event's day and time,
+  and you get one card naming the day, the time and why (no usable address, or the lookup failed
+  on two reads in a row), with Skip, which leaves that event without drive blocks for good. If the
+  place book is already asking where that place is, that question is the card. Nothing here writes
+  to the Family calendar. A place you type on a block makes it yours, like any other edit.
 
 ## Standing rules from before 0.5.1
 

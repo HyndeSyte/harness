@@ -53,10 +53,18 @@ _ONLINE = re.compile(r"://|\b(?:zoom|teams|webex|google meet|telehealth|virtual|
 _IN_BRACKETS = re.compile(r"\((\d[^()]*)\)")
 _ANY_BRACKETS = re.compile(r"\([^()]*\)")
 _SUFFIX = (r"st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|hwy|highway|ct|court|pl|place|way|"
-           r"pike|pkwy|parkway|cir|circle|ter|terrace|trl|trail|loop|run|sq|square")
-_STREET = re.compile(rf"\d+[A-Za-z]?(?:\s+[\w.'-]+){{0,5}}?\s+(?:{_SUFFIX})\b\.?"
-                     r"|\d+[A-Za-z]?\s+(?:us|va|rt|route|hwy|highway)[ -]?\d+\b", re.I)
-_TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z]{2})(?:\s+(\d{5})(?:-\d{4})?)?\b")
+           r"pike|pkwy|parkway|cir|circle|ter|terrace|trl|trail|loop|run|sq|square|"
+           r"xing|crossing|expy|expressway|fwy|freeway|tpke|turnpike|trce|trace|cres|crescent|aly|alley")
+# A street's direction after its type ("Main St NW"), read as part of it.
+_SIDE = r"(?:\s+(?:[NSEW]|NE|NW|SE|SW)\.?(?=\s*(?:,|$)))?"
+_STREET = re.compile(rf"\d+[A-Za-z]?(?:\s+[\w.'-]+){{0,5}}?\s+(?:{_SUFFIX})\b\.?{_SIDE}"
+                     rf"|\d+[A-Za-z]?\s+(?:us|va|rt|rte|route|hwy|highway)\.?[ -]?\d+\b{_SIDE}", re.I)
+# A suite, unit or floor between the street and the town: skipped, never sent.
+_UNIT = re.compile(r"\s*,?\s*(?:suite|ste|unit|apt|bldg|building|floor|fl|room|rm|#)\.?\s*#?\s*[\w-]{1,8}\b", re.I)
+# ", Town, ST 12345", ", ST", or a town and state with no comma between them when a zip
+# code follows ("Town ST 12345", after a comma or not).
+_TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z]{2})(?:\s+(\d{5})(?:-\d{4})?)?\b"
+                         r"|[\s,]+([A-Za-z][A-Za-z .'-]{1,40}?)\s+([A-Z]{2})\s+(\d{5})(?:-\d{4})?\b")
 
 
 def is_online(place: str) -> bool:
@@ -117,16 +125,19 @@ def sound_place(location: str) -> bool:
 def street_address(place: str) -> str:
     """Only the recognized parts of a place: a calendar often has a name in front of them, and
     what's beside them may be a person's. Empty when there's no street in it."""
-    text = re.sub(r"\s*\n\s*", ", ", (place or "").strip())
+    # Each line is a part: a venue's name on the first line and its street address on the next is
+    # the usual shape from a phone's calendar. A newline written as the two characters "\n" too.
+    text = re.sub(r"\s*(?:\n|\\n)\s*", ", ", (place or "").strip())
     inner = _IN_BRACKETS.search(text)
     text = inner.group(1) if inner else _ANY_BRACKETS.sub(" ", text)
     for part_start in (m.end() for m in re.finditer(r"(?:^|,)\s*", text)):
         street = _STREET.match(text, part_start)
         if street:
             address = " ".join(street.group(0).split())
-            tail = _TOWN_STATE.match(text, street.end())
+            unit = _UNIT.match(text, street.end())
+            tail = _TOWN_STATE.match(text, unit.end() if unit else street.end())
             if tail:
-                town, state, code = tail.groups()
+                town, state, code = tail.groups()[:3] if tail.group(2) else tail.groups()[3:]
                 address += "".join(f", {x}" for x in (town, state) if x) + (f" {code}" if code else "")
             return address
     return ""

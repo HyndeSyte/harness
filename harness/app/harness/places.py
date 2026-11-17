@@ -165,6 +165,14 @@ class PlaceBook:
             return "", True
         return found, False
 
+    def findable(self, location: str) -> bool:
+        """A location worth a drive that nothing placed: not empty, not a call or a link, and not
+        a place he said to skip."""
+        if not (location or "").strip() or drive.is_online(location) or not place_key(location):
+            return False
+        row = self.ledger.db.execute("SELECT skip FROM places WHERE key=?", (place_key(location),)).fetchone()
+        return row is None or not row["skip"]
+
     # -- asking him once -------------------------------------------------------------------------
     def begin(self) -> None:
         """A new read of what he goes to: the places waiting are found again."""

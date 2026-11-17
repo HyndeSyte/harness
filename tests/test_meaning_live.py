@@ -1653,3 +1653,285 @@ def test_idle_passes_are_quiet(live, caplog):
         live.tick()
     assert [f"{r.name}: {r.getMessage()}" for r in caplog.records if r.levelno >= logging.INFO] == []
     assert live.ledger.db.total_changes == writes
+
+
+# -- 8. drive blocks for his own appointments on Gmail (0.24.0) --------------------------------------------
+
+def mine(rig, title, start, location, hours=1, **kw):
+    """An appointment of his own on his Gmail calendar (he's its organizer)."""
+    o = occ(title, start, hours=hours, location=location, **kw)
+    rig.feeds.window.occurrences.append(o)
+    return o
+
+
+def quiet_family(rig):
+    """Family isn't empty, and nothing on it ties him up."""
+    seed(rig, "Book club", when(rig, days=9))
+    rig.judge.by["Book club"] = judged()
+
+
+def family_snapshot(rig):
+    return dict(rig.icloud.family())
+
+
+def drive_cards_sent(rig):
+    return [s for s in rig.bot.sent if s[1].startswith("No drive blocks")]
+
+
+def test_his_own_appointment_with_a_street_address_gets_two_drive_blocks(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, "Smile Dental\n" + CLINIC)        # a name, then the street line
+    before = family_snapshot(drives)
+    go(drives)
+    go(drives)
+    # Drive blocks only: the appointment is already on his calendar, so it gets no block of its own.
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 30 * M, start, ""),
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
+    asked = [parse_qs(urlsplit(u).query)["q"][0] for u in drives.maps.urls if drive.GEOCODE_HOST in u]
+    assert asked == [CLINIC]                                        # the street line only, never the name
+    # Nothing new on Family, from any of it.
+    assert family_snapshot(drives) == before
+    assert not [x for x in drives.icloud.log if x[0] in ("PUT", "DELETE")]
+
+
+def test_his_appointment_moving_or_going_takes_its_drives_with_it(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    o = mine(drives, "Dentist", start, CLINIC)
+    go(drives)
+    go(drives)
+    later = when(drives, days=4, hour=13)
+    drives.feeds.window.occurrences.remove(o)
+    o = mine(drives, "Dentist", later, CLINIC)                      # moved: same event, same uid
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", later - 30 * M, later, ""),
+        ("Busy (drive back)", later + 60 * M, later + 90 * M, "")]
+    drives.feeds.window.occurrences.remove(o)                       # cancelled
+    go(drives)
+    assert len(blocks(drives)) == 2                                 # never on one read
+    go(drives)
+    assert blocks(drives) == []
+
+
+def test_his_appointments_drives_get_a_card_with_undo(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, CLINIC)
+    go(drives)                                                      # written: the card waits for a read
+    assert drives.gm.send_drive_receipts() == 0
+    go(drives)                                                      # the read that finds them
+    assert drives.gm.send_drive_receipts() == 1
+    drives.tick()
+    card = drives.with_button("Undo")
+    assert card[1].startswith("Added to your Gmail: Busy (drive there) 9:30 AM to 10:00 AM and "
+                              "Busy (drive back) 11:00 AM to 11:30 AM, ")
+    local = start.astimezone(NY)
+    assert card[1].endswith(f", {local:%a %b} {local.day}, for Dentist at 10:00 AM on your calendar. Nothing to "
+                            "do if that's right; tap Undo only if it's wrong.")
+    drives.press(card, "Undo")
+    drives.tick()                                                   # no new read: the tap does it
+    assert blocks(drives) == []
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []                                     # off for that event from now on
+    assert drives.gm.send_drive_receipts() == 0
+
+
+def test_a_moved_appointments_drives_get_a_moved_card(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    o = mine(drives, "Dentist", start, CLINIC)
+    go(drives)
+    go(drives)
+    go(drives)
+    assert drives.gm.send_drive_receipts() == 1
+    drives.feeds.window.occurrences.remove(o)
+    later = when(drives, days=4, hour=13)
+    mine(drives, "Dentist", later, CLINIC)
+    go(drives)
+    go(drives)
+    assert drives.gm.send_drive_receipts() == 1
+    drives.tick()
+    card = drives.with_button("Undo")
+    assert card[1].startswith("Moved on your Gmail: Busy (drive there) 12:30 PM to 1:00 PM and ")
+
+
+def test_back_to_back_his_drive_starts_at_the_place_before(drives):
+    # A Family event he goes to at the clinic, then his own appointment at the park half an hour
+    # after: no time to go home between, so the drive is clinic to park, and only the last goes home.
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    goes(drives, "Eye doctor", a, CLINIC)
+    mine(drives, "Haircut", b, "Shear Joy, " + PARK)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", a - 30 * M, a, ""),
+        ("Busy (family)", a, a + 60 * M, CLINIC),
+        ("Busy (drive there)", b - 15 * M, b, ""),
+        ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
+
+
+def test_two_of_his_own_back_to_back_chain_too(drives):
+    quiet_family(drives)
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    mine(drives, "Dentist", a, CLINIC)
+    mine(drives, "Haircut", b, PARK)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", a - 30 * M, a, ""),
+        ("Busy (drive there)", b - 15 * M, b, ""),
+        ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]
+
+
+@pytest.mark.parametrize("kw", [
+    dict(location="https://example.com/visit"),                     # a link
+    dict(location="Telehealth"),                                    # a call
+    dict(title="Telehealth check-in"),
+    dict(location=""),                                              # nowhere to drive to
+    dict(organizer="someone@example.com"),                          # someone else's invitation
+    dict(transparent=True),                                         # shown free
+    dict(title="Busy"),                                             # a hold
+    dict(uid="hb0123456789abcdef0123456789abcdef"),                 # a block made here
+])
+def test_what_gets_no_drive_of_its_own(drives, kw):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    title = kw.pop("title", "Dentist")
+    kw.setdefault("location", CLINIC)
+    mine(drives, title, start, **kw)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []
+    assert drive_cards_sent(drives) == []
+
+
+def test_an_all_day_event_gets_no_drive(drives):
+    quiet_family(drives)
+    d = when(drives, days=3).date()
+    drives.feeds.window.occurrences.append(ical.Occurrence(d, d + timedelta(days=1), True, "Conference", GMAIL,
+                                                           False, "conf", "", (), CLINIC, GMAIL))
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []
+
+
+def test_a_failed_lookup_is_named_in_the_digest_and_gets_one_card(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, CLINIC)
+    drives.maps.fail = "timeout"
+    go(drives)
+    go(drives)
+    local = start.astimezone(NY)
+    note = drives.gm.digest_line()
+    assert (f"couldn't look up the drive for the event at {local:%b} {local.day}, 10:00, so a drive "
+            "block is missing") in note
+    assert "Dentist" not in note and "Clinic" not in note
+    go(drives)
+    go(drives)
+    drives.tick()
+    [card] = drive_cards_sent(drives)                               # one, however many reads fail
+    assert card[1] == (f"No drive blocks for the event on {local:%a %b} {local.day} at 10:00 AM: the drive "
+                       "lookup failed. I'll keep trying at each read; tap Skip to leave it without drive blocks.")
+    assert labels(card[2]) == ["Skip"]
+    drives.press(card, "Skip")
+    drives.maps.fail = None
+    go(drives)
+    go(drives)
+    assert blocks(drives) == []                                     # skipped: no drives, no more cards
+    assert len(drive_cards_sent(drives)) == 1
+    assert "couldn't look up" not in (drives.ledger.get_meta("family_gmail_problem") or "")
+
+
+def test_one_failed_read_alone_sends_no_card(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, CLINIC)
+    go(drives)                                                      # Family judged; no lookups yet
+    drives.maps.fail = "timeout"
+    go(drives)
+    drives.maps.fail = None
+    go(drives)
+    drives.tick()
+    assert drive_cards_sent(drives) == []
+    assert [b[0] for b in blocks(drives)] == ["Busy (drive there)", "Busy (drive back)"]
+
+
+def test_a_place_the_map_cant_find_gets_one_card_naming_no_usable_address(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, "40 Nowhere Rd, Town, VA")
+    for _ in range(4):
+        go(drives)
+    drives.tick()
+    local = start.astimezone(NY)
+    [card] = drive_cards_sent(drives)
+    assert card[1].startswith(f"No drive blocks for the event on {local:%a %b} {local.day} at 10:00 AM: "
+                              "no usable address.")
+    assert "couldn't find a drive to the event at" in drives.gm.digest_line()
+
+
+def test_a_place_book_question_is_the_card_never_a_second(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, "Dr Patel's office")             # a name the map doesn't know
+    for _ in range(4):
+        go(drives)
+    drives.tick()
+    asks = [s for s in drives.bot.sent if s[1].startswith("Where is")]
+    assert len(asks) == 1 and "Dr Patel" in asks[0][1]
+    assert drive_cards_sent(drives) == []
+    assert "couldn't find a drive to the event at" in drives.gm.digest_line()
+
+
+def test_a_family_event_with_a_two_line_location_gets_its_address_and_drives(drives):
+    # Nov 19: the venue's name on the first line, its street address on the second.
+    start = when(drives, days=3, hour=14)
+    goes(drives, "Concert", start, "Blue Ridge Music Hall\\n" + CLINIC)
+    go(drives)
+    go(drives)
+    assert blocks(drives) == [
+        ("Busy (drive there)", start - 30 * M, start, ""),
+        ("Busy (family)", start, start + 60 * M, CLINIC),
+        ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
+
+
+def test_a_family_event_whose_drive_fails_gets_one_card_too(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    go(drives)                                                      # judged
+    drives.maps.fail = "timeout"
+    go(drives)
+    go(drives)
+    go(drives)
+    drives.tick()
+    assert len(drive_cards_sent(drives)) == 1
+    assert [b[0] for b in blocks(drives)] == ["Busy (family)"]
+
+
+def test_his_own_appointment_at_a_family_events_time_is_that_event(drives):
+    start = when(drives, days=3, hour=10)
+    goes(drives, "Eye doctor", start, CLINIC)
+    mine(drives, "Eye doctor", start, CLINIC)                       # he put it on Gmail too
+    go(drives)
+    go(drives)
+    titles = [b[0] for b in blocks(drives)]
+    assert titles.count("Busy (drive there)") == 1 and titles.count("Busy (drive back)") == 1
+
+
+def test_a_gmail_read_that_fails_keeps_his_drives(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert len(blocks(drives)) == 2
+    drives.feeds.window.unreadable = 1                              # not all of Gmail could be read
+    go(drives)
+    go(drives)
+    go(drives)
+    assert len(blocks(drives)) == 2

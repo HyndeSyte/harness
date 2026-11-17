@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.24.0
+
+- **Your own appointments get drive blocks.** An appointment on your Gmail calendar with a street address gets "Busy (drive there)" and "Busy (drive back)" around it, sized from the real drive and rounded up to the quarter hour, just like the Family events you go to. Back to back, the drive goes straight from the first place to the next, and only the last one goes home. They move and go with the appointment.
+- **Each appointment's drives get a card with Undo,** with the morning digest, when they're added or moved. Undo takes them off and keeps them off for that appointment.
+- **Skipped on purpose:** blocks Harness made, "Busy" holds, events shown as free, all-day events, invitations someone else organized, calls, telehealth and anything online, and events with no location.
+- **A location with the place's name on one line and the street address on the next is read as that address,** so its block gets the address and its drives. A suite number or a town written without commas no longer cuts the address short.
+- **A drive that can't be found is never left off quietly.** The digest still names the day and time, even beside another problem, and you get one card saying the day, the time and why (no usable address, or the lookup failed), with Skip. If you're already being asked where that place is, that question is the card: never two for one event.
+- **Nothing new is written to the Family calendar.**
+
 ## 0.23.0
 
 - **Nothing asks you to check the calendar or send something again.** When a change's answer is lost, or it can't be read back, Harness reads the calendar itself a minute later. If it went through, you get the usual receipt with Undo, and Undo puts all of it back, even after a restart cut the write short. If it didn't, it's written once more, only over the very version it was first written over, and if it still didn't go through you're told so plainly. If the event was changed on the calendar in the meantime, even back to how it was, it's left as it is and you're told so. If half of it went through, the rest is finished, or that half is put back.

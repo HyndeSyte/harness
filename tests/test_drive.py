@@ -61,6 +61,17 @@ def drives(tmp_path, maps):
     ("", ""),
     ("Suite 4", ""),
     ("1 Long Rd, " + "x" * 300, "1 Long Rd"),
+    # A venue's name on the first line, its street address on the second (a Family event, Nov 19).
+    ("Blue Ridge Music Hall\n1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    # The same, on one line with the name before a comma.
+    ("Blue Ridge Music Hall, 1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Blue Ridge Music Hall\r\n1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Blue Ridge Music Hall\\n1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Clinic\n1234 Main St Suite 200, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Clinic\n1234 Main St Charlottesville VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Clinic\n12 Elm St NW, Town, VA", "12 Elm St NW, Town, VA"),
+    ("Office\n500 Rte. 29 N, Town, VA 22901", "500 Rte. 29 N, Town, VA 22901"),
+    ("The Barn\n40 Old Mill Crossing, Crozet, VA 22932", "40 Old Mill Crossing, Crozet, VA 22932"),
 ])
 def test_only_the_street_address_is_kept(place, want):
     assert street_address(place) == want
@@ -71,7 +82,8 @@ def test_only_the_street_address_is_kept(place, want):
     ("540 555 1212", ""),
     ("2 Clinic Rd (Dr Patel oncology)", "2 Clinic Rd"),
     ("2 Clinic Rd, Attn Dr Patel", "2 Clinic Rd"),
-    ("Dr Patel, 2 Clinic Rd, Suite 4, Town, VA", "2 Clinic Rd"),
+    # A suite is skipped, never sent, and the town after it still counts.
+    ("Dr Patel, 2 Clinic Rd, Suite 4, Town, VA", "2 Clinic Rd, Town, VA"),
     ("3 people from Sarah's team", ""),
 ])
 def test_a_name_or_note_never_goes_along(place, want):

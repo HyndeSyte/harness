@@ -47,7 +47,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import choices, family_rules, meaning, places, render
+from . import choices, drive_cards, family_rules, meaning, places, render
 from .family_gmail import DROP_TITLE, PICK_TITLE, Want, _is_real, _key
 from .ledger import Ledger, iso
 
@@ -257,6 +257,11 @@ class MeaningLive:
         self._none_said: dict[str, str] = {}   # occurrence -> why it got no block, as last logged
         self._revive_tried: tuple = ()     # the read the one-time revive was last tried at
         self.places = places.PlaceBook(ledger, tz=tz)   # where a named place is (places.py)
+        self.drive_cards = drive_cards.DriveCards(ledger, tz=tz)   # his drives' cards (drive_cards.py)
+        self.unjudged: list[tuple[datetime, datetime]] = []   # Family events not judged yet, at the last read
+        # Events he goes to whose place nothing could find, at the last read: key -> (start, said,
+        # why), why being drive_cards.PLACE (the place book asks) or drive_cards.FAILED.
+        self.unplaced: dict[str, tuple[datetime, str, str]] = {}
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -299,12 +304,17 @@ class MeaningLive:
         why: dict[str, dict] = {}
         seen: set = set()
         self.places.begin()
+        self.unplaced = {}
+        self.unjudged = []
         none: dict[str, tuple[datetime, str, str]] = {}
         for ev in evs.values():
             row = meaning.stored(self.ledger, ev.key)
             j = meaning.last_good(row)
             if j is None:
-                continue                   # not judged yet: nothing, and no guess (judged next read)
+                # Not judged yet: nothing, and no guess (judged next read). Its times are kept, so
+                # his own copy of it on Gmail waits too (family_gmail._own_events).
+                self.unjudged.extend((i.occ.start, i.occ.end) for i in ev.occurrences if not i.occ.all_day)
+                continue
             backed = meaning.supported(j, examples)
             for item in ev.occurrences:
                 occ = item.occ
@@ -335,6 +345,7 @@ class MeaningLive:
                     key = _key(occ, run)
                     place = "school" if run in ("drop", "pick") else _place(j, b.type)
                     where = ""
+                    legs = not any(x.type == "transport" for x in blocks)
                     if b.type == "presence" and place not in NOT_THERE:
                         # The event's own location, whether or not the judgment named it: a
                         # street address in it, else his place book, else the map by its name
@@ -342,9 +353,12 @@ class MeaningLive:
                         where, ask = self.places.resolve(occ.location, find)
                         if ask:
                             self.places.unresolved(occ.location, occ.summary, b.start)
+                        if not where and legs and self.places.findable(occ.location):
+                            # No drive for it, never silently (drive_cards.py).
+                            self.unplaced[key] = (b.start, meaning.shown(occ.summary),
+                                                  drive_cards.PLACE if ask else drive_cards.FAILED)
                     out[key] = Want(key, b.title, b.start, b.end,
-                                    "me" if b.type == "presence" else "", b.state, where,
-                                    not any(x.type == "transport" for x in blocks))
+                                    "me" if b.type == "presence" else "", b.state, where, legs)
                     why[key] = {"kind": kind_key(ev), "said": meaning.shown(occ.summary),
                                 "words": sorted(family_rules.words(occ.summary)),
                                 "who": meaning.who_for(occ.summary),
@@ -537,6 +551,8 @@ class MeaningLive:
             return self._undo(rid, code)
         if kind == "place_skip":
             return self.places.on_choice(kind, target)
+        if kind in ("drive_undo", "drive_skip"):
+            return self.drive_cards.on_choice(kind, target)
         return "Nothing changed."
 
     def _example(self, f: dict, source: str, types: list[str], **kw) -> str:

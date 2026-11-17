@@ -331,6 +331,21 @@ CREATE TABLE IF NOT EXISTS place_asks(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS drive_cards(
+  key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  said TEXT NOT NULL,
+  start TEXT NOT NULL,
+  receipt TEXT NOT NULL,
+  what TEXT NOT NULL,
+  rid TEXT NOT NULL,
+  ask TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  aid TEXT NOT NULL,
+  fails INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS family_gmail(
   key TEXT PRIMARY KEY,
   event_id TEXT NOT NULL,
