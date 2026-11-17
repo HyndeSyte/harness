@@ -21,6 +21,10 @@ import { EDIT_TOOL, REPLY_TOOL, sentIds } from "../rootfs/opt/cain/gate/plugin";
 
 const CLAUDE = Bun.which("claude");
 const live = CLAUDE && !process.env.CI ? test : test.skip;
+// A known skip (round 12), tracked in issue #24 (github.com/HyndeSyte/harness/issues/24): the edit-after-
+// reply case fails in the cloud build container (the issue has the details). It is skipped in CI and in
+// cloud sessions until that issue is closed; it still runs on a laptop with the claude CLI.
+const liveKnown = CLAUDE && !process.env.CI && !process.env.CLAUDE_CODE_REMOTE ? test : test.skip;
 const slash = (p: string) => p.replaceAll("\\", "/");
 const HOOK = slash(join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-send.ts"));
 const SENT = slash(join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-sent.ts"));

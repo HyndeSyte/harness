@@ -15,11 +15,30 @@
 #   when the item has more than one; --reply-to <message id> makes it a Discord reply.
 #   keeper.sh show <card id> --item P08 [--question Q2] [--reply-to <id>]
 #                                        show a specialist's card to Dane, unchanged
-#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] "question" "opt" ...
+#   keeper.sh ask --item P08 [--question Q2] [--reply-to <id>] [--checked "what, where, when"] [--reason "why"] "question" "opt" ...
 #                                        ask with up to 5 buttons, one ask open at a time
 #                                        ("held" means it goes out when the open one closes);
 #                                        his tap comes back relayed
-#   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] "text"
+#   --checked (ask and ship, for an item): the source check behind it: one line, at most 300
+#                                        characters, no |, saying when and naming a concrete source:
+#                                        a mail (sender domain and date), a page or portal, a file
+#                                        path, a command or a message ("the receipt from county.gov
+#                                        dated Nov 14, read at 9:40 this morning"). Not "memory",
+#                                        "earlier" or "I recall", and not a repeat of the row's last
+#                                        check. Dates, ISO times, shas, job ids and record codes are
+#                                        fine in it: it goes to the record, never to him. The link
+#                                        posts an ask or Ship card for an item only on a check of the
+#                                        row's current version, no older than source_check_max_days,
+#                                        that the record keeper accepted: one passed here goes to the
+#                                        keeper and the link waits for its answer (up to 30 seconds).
+#                                        --item none needs none, but is refused when it holds an open
+#                                        item's code or whole Item phrase, and is written to the
+#                                        request log as about no open item. One whose words overlap
+#                                        an open item's more loosely answers "needs reason" and posts
+#                                        nothing: ask it under that item with --checked, or send it
+#                                        again with --reason "<one line on why it is about no open
+#                                        item>", which the record keeper logs with it.
+#   keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] [--checked "..."] "text"
 #                                        the Ship card (Ship / Not now) for that one head: the text says
 #                                        what he'll notice, in one line; the link adds the question, a line
 #                                        from GitHub and that review's Reviewed line (none: "No outside review.")
@@ -28,6 +47,126 @@
 #   keeper.sh replied <message id>       what a message of his replied to, if anything
 #   keeper.sh morning "text"             post the one morning message (with Stop)
 #   keeper.sh stopped                    whether everything is stopped (Dane's Stop), and since when
+#   keeper.sh reads [n]                  n fresh reads of the record keeper's files (default 20), 4 seconds
+#                                        apart, the way a tap reads them: p50, p95 and max (it fails loudly,
+#                                        exit 2, when p95 is over half the tap_read_ms limit) and whether it
+#                                        passes; about 80 seconds
+#   keeper.sh slow-read                  the smoke test: the next tap's fresh read is held past its limit,
+#                                        so that tap must answer "Busy, tap again." and keep its buttons
+#   keeper.sh fail-webhook               the smoke test: the next time a busy tap puts a card's buttons back,
+#                                        the interaction's webhook patch is made to fail, so the buttons must
+#                                        come back through the fallback (an edit by channel and message id)
+#   keeper.sh stall-read [seconds]       the smoke test: a fresh read held that long (default 20), ignoring its
+#                                        cancellation; a second read meanwhile must answer busy at once, and a
+#                                        journal write to the link's state must still finish ("pass":true)
+#   keeper.sh clock                      the clock verdict (the record keeper's, with the source that
+#                                        satisfied it, and the box's own), the ledger's generation, whether
+#                                        a push or a reset is outstanding, how many rows are pending re-check
+#                                        (recheck_pending), whether Ship taps are held, and the last tap's read time
+#                                        unresolved_landings (each with the exact settle messages and its age),
+#                                        tombstoned_landings (unresolved past 90 days: kept, no longer blocking)
+#                                        and landings_by_head (the ledger's reconciliation, one landing per head),
+#                                        and install_taps (on, once or off: whether his Ship taps land yet).
+#                                        Round 17: verify_pending (a new link run the keeper's fresh fetch
+#                                        hasn't verified yet, the remote away; after 5 minutes on the link's
+#                                        monotonic clock each waiting card says so and Cain is told once)
+#                                        Round 18: pi_clock (unknown until the link has compared a Discord
+#                                        stamp with the Pi's clock in this run, then in step or off; the restore
+#                                        sweep is marked done only while in step)
+#                                        Round 19: a message read back from Discord (the start mark, each
+#                                        restore sweep page) counts as a comparison too, so pi_clock reads in
+#                                        step after a quiet restart; consumed_verified needs the keeper's
+#                                        verified status to name this link run's number and nonce together
+#                                        Round 20: a status without a run number reads as unverified;
+#                                        replay_open (how many replayed held taps are still open: the keeper
+#                                        answers them a page of 500 a round, continuing where it stopped);
+#                                        a voided Ship landing the ledger couldn't mark settled is listed
+#                                        under unresolved_landings too, so his settle line settles it; pi_clock
+#                                        goes back to off (and the restore sweep reads again) once a post or
+#                                        a tap measures the Pi's clock off
+#                                        Round 21: a legacy card's claim whose voided settle can't be written
+#                                        is listed under unresolved_landings too (a void claim: nothing was
+#                                        pushed); a key the keeper is consuming keeps its replay waiting with
+#                                        no supersede, and the waiting line waits out a page rotation of
+#                                        replay_open as well. If this answers nothing at all and the App's log
+#                                        says the link refused to start (its logs can't be locked), the link
+#                                        isn't running: Dane was told by the App
+#                                        Round 22: unresolved_landings also lists the record keeper's own
+#                                        pushes (what "record push refused": a push its guard held back,
+#                                        retried each round; "record push alarm": a withdrawn request's
+#                                        commit reached GitHub), with no settle line; unresolved_pushes
+#                                        lists the same rows alone
+#                                        Round 23: every row has row, its kind ("landing", "push-refused",
+#                                        "push-alarm", "alarm-check": a check of what a push carried that
+#                                        couldn't be completed, retried each round; "push-unknown": a push
+#                                        whose outcome is unknown until a fresh fetch, with the tap keys it
+#                                        may have carried); switch on row, not on which fields a row has.
+#                                        The remedy for a withdrawn change that can't be taken out cleanly
+#                                        is /opt/cain/record.sh reset-copy
+#                                        Round 24: three more kinds: "fetch-hiccup" (the keeper's fetch from
+#                                        GitHub failing or timing out, rounds counted), "push-slow" (pushes
+#                                        stopped at their time limit three times in a row: the connection's
+#                                        speed) and "landing-held" (a landing window re-based at each keeper
+#                                        start with the boot id unreadable). A push-refused row also carries
+#                                        hiccups, hiccup_since and hiccup_age_min (rounds whose push wasn't
+#                                        confirmed). reset-copy is refused unless a push is held back now
+#                                        Round 25: a push-refused row of kind "deadline" (the checks before a
+#                                        push left it too little time within its bound) and of kind "log" while
+#                                        a lost consumed-key log is rebuilt; a landing skip's cause may be
+#                                        "fetch-failed" (the round's drops wait after one fetch that failed)
+#   keeper.sh settle <tap key> landed|not-landed --said <his message id>
+#                                        the owner's alone: settles by hand a landing the remote can't
+#                                        settle (keeper.sh clock lists it under unresolved_landings, or
+#                                        tombstoned_landings past 90 days), on his own message in his DM,
+#                                        under a day old, that says exactly "settle <tap key> landed" or
+#                                        "settle <tap key> not-landed" for this very key and verdict; the link
+#                                        reads that message itself. One message settles one key once (its id
+#                                        is consumed); one that says both, or "not landed" as two words, is
+#                                        refused with the reason. Copying noise is forgiven: backticks or a
+#                                        code fence around it, Unicode spaces, an en or em dash for the
+#                                        hyphen, capitals; a refusal shows the text as received, normalised.
+#                                        The settle goes to the landing ledger's settle log (fsynced) before
+#                                        anything else happens. An audit line goes to the link's log, and
+#                                        the usual outcome line follows
+#   keeper.sh install-taps on|once|off [--said <his message id>]
+#                                        whether his Ship taps land in main, kept in the record keeper's
+#                                        install log (off when it is missing or damaged). on only proposes:
+#                                        once /data/work/install-tests.json says the smoke test and the
+#                                        resilience run passed (each dated, within 7 days) on a full head
+#                                        sha, the link sends him the exact line "install taps on <code>"
+#                                        (a fresh code, bound to the record's epoch and this start of the
+#                                        link); once he sends it, as a new message, on --said <that
+#                                        message's id> turns it on (his line is single use, written to the
+#                                        landing ledger first, then to the record with an Owner-Line
+#                                        trailer). once (Cain's)
+#                                        lets exactly one Ship tap land (the pull-the-plug case itself);
+#                                        off (Cain's) stops them. Until on, a Ship tap answers that installs
+#                                        wait for the post-install tests, and keeps its buttons. Round 16: on
+#                                        (with or without --said) is refused until the record keeper's status
+#                                        says a fresh fetch verified its consumed set (keeper.sh clock:
+#                                        consumed_verified true); nothing is proposed or used up meanwhile
+#   keeper.sh recover-logs [--said <his message id>]
+#                                        the owner's alone, when the record keeper says it refuses to start
+#                                        for a case no rule explains (or asks for his OK). Without --said it only proposes,
+#                                        sending him the exact line "recover logs <code>" (bound like the
+#                                        install line). keeper.sh recover-logs --said <his message id>: his
+#                                        own message in his DM, sent after the proposal (round 16: within
+#                                        30 minutes of it by Discord's own times, never the Pi's clock),
+#                                        saying exactly that line, single use; the keeper
+#                                        moves the damaged log aside and goes on once its rebuild is
+#                                        verified against GitHub. Round 15: it works in any keeper state
+#                                        (degraded, unverified, GitHub unreachable); a line whose code no
+#                                        longer counts (an earlier start, another epoch, used already)
+#                                        answers "proposed": he is told the cause in one line,
+#                                        with a fresh code at once. Round 16: only a live message counts (one
+#                                        after the link's start); one read back from history draws no reply
+#                                        and no code. It never marks anything verified: only a fresh fetch
+#                                        does. If the Pi's clock is off from Discord's, he is told so.
+#                                        Round 17: a line read back from history that answers a
+#                                        proposal within 30 minutes of it by Discord's times (he sent it
+#                                        while the App was offline) answers "proposed" once, with a fresh
+#                                        code; a stale line always gets its fresh code, whatever the Pi's
+#                                        clock says (the clock line is information only)
 #   keeper.sh card <message id>          a message in his DM as Discord has it now: its first words,
 #                                        the buttons on it, and what the link knows of it
 #   keeper.sh check [--reply-to <id>] [--edit <id>] "text"
@@ -64,24 +203,30 @@ if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 if [ "$cmd" = ship-gate ]; then exec bun "${CAIN_LINK_DIR:-/opt/cain/link}/shipgate.ts" "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|replay|connector|clock|reads|settle) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  slow-read) url="$link/slowread"; ctx=harness-relay-v1 ;;
+  fail-webhook) url="$link/failwebhook"; ctx=harness-relay-v1 ;;
+  stall-read) url="$link/stallread"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
+  install-taps) url="$link/installtaps"; ctx=harness-relay-v1 ;;
+  recover-logs) url="$link/recoverlogs"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" checked="" reason="" said=""
 case "$cmd" in
-  show|ask|ship|answered|check|connector)
+  show|ask|ship|answered|check|connector|settle|install-taps|recover-logs)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
-        --item|--question|--reply-to|--pr|--head|--edit|--review)
+        --item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason|--said)
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           case "$1" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
             --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;; --review) review="$2" ;;
+            --checked) checked="$2" ;; --reason) reason="$2" ;; --said) said="$2" ;;
           esac
           shift 2 ;;
         *) rest+=("$1"); shift ;;
@@ -137,20 +282,35 @@ case "$cmd" in
               "$meta"' + {id: ($i | tonumber? // 0)}') ;;
   ask)      text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" --arg it "$item" --arg q "$question" --arg r "$reply_to" \
-              "$meta"' + {text: $t, options: $ARGS.positional}' --args "$@") ;;
+              --arg c "$checked" --arg w "$reason" "$meta"' + {text: $t, options: $ARGS.positional} + opt("checked"; $c) + opt("reason"; $w)' --args "$@") ;;
   ship)     body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg q "" --arg r "$reply_to" --arg p "$pr" --arg h "$head" --arg v "$review" \
-              "$meta"' + {text: $t, pr: $p, head: $h} + opt("review"; $v)') ;;
+              --arg c "$checked" "$meta"' + {text: $t, pr: $p, head: $h} + opt("review"; $v) + opt("checked"; $c)') ;;
   answered) body=$(jq -nc --arg it "$item" --arg q "$question" --arg r "" "$meta") ;;
   replied)  body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   stopped)  body='{}' ;;
+  clock)    body='{}' ;;
+  slow-read) body='{}' ;;
+  fail-webhook) body='{}' ;;
+  stall-read) body=$(jq -nc --arg n "${1:-20}" '{seconds: ($n | tonumber? // 20)}') ;;
+  reads)    body=$(jq -nc --arg n "${1:-20}" '{n: ($n | tonumber? // 20)}') ;;
   card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
+  settle)   body=$(jq -nc --arg t "${1:-}" --arg h "${2:-}" --arg s "$said" '{tap: $t, how: $h, said: $s}') ;;
+  install-taps) body=$(jq -nc --arg h "${1:-}" --arg s "$said" '{how: $h} + (if $s == "" then {} else {said: $s} end)') ;;
+  recover-logs) body=$(jq -nc --arg s "$said" '{said: $s}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac
-out=$(curl -sS -m 45 -H "@$hdr" -d "$body" "$url" 2>&1) \
+wait=45; [ "$cmd" = reads ] && wait=240; [ "$cmd" = stall-read ] && wait=150   # the reads are spread over more than a keeper round
+out=$(curl -sS -m "$wait" -H "@$hdr" -d "$body" "$url" 2>&1) \
   || { jq -nc --arg e "$out" '{status: "error", said: ("No answer: " + $e)}'; exit 1; }
 echo "$out"
+# The reads fail loudly: p95 over half the tap read limit (or a busy read) is a failure, said on its
+# own line and in the exit status.
+if [ "$cmd" = reads ] && [ "$(printf '%s' "$out" | jq -r '.pass // empty' 2>/dev/null)" = false ]; then
+  printf '%s' "$out" | jq -r '.fail // "FAIL: the reads did not pass"' >&2
+  exit 2
+fi

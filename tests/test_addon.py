@@ -116,18 +116,20 @@ def test_cain_config_denies_every_api_and_mapping():
     assert cfg["init"] == "false"
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
     # password fields, the review caps as bounded numbers, and the panel's owner (a
-    # Home Assistant user id, not a key), and the PC job keeper's token and repo name.
-    # Nothing else.
+    # Home Assistant user id, not a key), how many days a source check counts
+    # (source_check_max_days, 7 by default), how long a tap's fresh read may take
+    # (tap_read_ms, 1500 by default), and the PC job keeper's token and repo name. Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  source_check_max_days: 7\n  tap_read_ms: 1500\n'
         '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n"
+        "  source_check_max_days: int(0,90)\n  tap_read_ms: int(200,2500)\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n")
 
 
@@ -642,6 +644,28 @@ def test_checkin_lists_new_notes_on_cains_items_once_newest_first(tmp_path):
             del os.environ[k]
 
 
+def test_checkin_brings_the_record_keepers_new_audit_lines_once(tmp_path):
+    # The keeper appends audit lines it hasn't surfaced before (a re-declared one-off overlap,
+    # a wait timeout) to a file; the next check-in reads them to Cain, once.
+    import os
+    audit = tmp_path / "record-checkin.txt"
+    audit.write_text("Nov 15, 2026 (link-oneoff-1): \"Is the county packet in?\" may be about P08 (\"County packet\"), "
+                     "shared words: \"county\", \"packet\"; re-declared about no open item: \"his own packet\"\n"
+                     "Nov 15, 2026 (link-check-p08-1): the link gave up waiting after 30 seconds and posted nothing\n",
+                     newline="\n")
+    os.environ["RECORD_CHECKIN"] = str(audit)
+    try:
+        line = _checkin(tmp_path, "0712", IDLE).splitlines()[-2].split(" -l ", 1)[1]
+        assert line.startswith("The record keeper's one-off audit since your last check-in"), line
+        assert '[Nov 15, 2026 (link-oneoff-1): "Is the county packet in?" may be about P08' in line
+        assert "gave up waiting after 30 seconds" in line and "Scheduled check-in" in line
+        assert not audit.exists() and not (tmp_path / "record-checkin.txt.work").exists()
+        (tmp_path / "sent.txt").unlink()
+        assert "one-off audit" not in _checkin(tmp_path, "1240", IDLE)     # once, never again
+    finally:
+        del os.environ["RECORD_CHECKIN"]
+
+
 def test_checkin_waits_while_cain_works_or_outside_its_hours(tmp_path):
     assert _checkin(tmp_path, "0712", IDLE + "\n  esc to interrupt") == ""
     assert _checkin(tmp_path, "0815", IDLE) == ""                  # the hour has passed
@@ -668,7 +692,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # Cain's scripts only, from this machine: the specialist can't show its own cards,
     # ask, put up a Ship card, or close Cain's questions.
     assert ('LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", '
-            '"/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"])' in link)
+            '"/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle", "/installtaps", "/recoverlogs"])' in link)
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

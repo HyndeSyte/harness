@@ -1,0 +1,8 @@
+{
+  "name": "cain-tests",
+  "private": true,
+  "description": "Test-only dependencies for Cain's tests (never shipped in the App): the TypeScript compiler for the lock lint.",
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

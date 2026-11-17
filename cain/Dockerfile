@@ -40,15 +40,18 @@ RUN apt-get update \
     && install -m 0755 "$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude \
     && install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun \
     && rm -rf /root/.local /root/.bun /root/.cache /root/.claude \
-    && claude --version && bun --version && ttyd --version && codex --version
+    && claude --version && bun --version && ttyd --version && codex --version \
+    && { test -x /usr/bin/setsid || test -x /bin/setsid || { echo "the session tool (setsid) is missing: the record keeper's network calls need it"; exit 1; }; }
 
 ENV DISABLE_AUTOUPDATER=1
+# Round 25: the record keeper's network wrapper refuses to run without the session tool (util-linux's setsid), so the
+# image build fails without it (checked above). The image runs as root (a Home Assistant App with no USER).
 
 COPY rootfs /
 RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.12.1" \
+    io.hass.version="0.13.0" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

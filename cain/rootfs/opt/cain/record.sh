@@ -11,6 +11,31 @@
 #                               <since>: only notes after that time (any ISO form or offset).
 #   record.sh submit <file>     queue a request (JSON, see CLAUDE.md); prints its id
 #   record.sh status <id>       done / conflict / rejected / refused / relayed, or "waiting"
+#   record.sh block-push [minutes]
+#                               the device smoke test only: the record keeper's next round (or, with
+#                               minutes, every round for that long) pushes to a wrong remote (its push
+#                               fails, its local commits stay), then it pushes as usual
+#   record.sh clock-test <header-only|none|step:-N|off>
+#                               the device smoke test only: one round with the box's own clock sources
+#                               left out (GitHub's Date header decides), no source synchronized, or the
+#                               keeper's clock N seconds off, until off
+#   record.sh leak-check [files]
+#                               the device smoke test only: the record keeper says per file (its log copy,
+#                               its status, the relay queue, and the files named) whether its token or a
+#                               web address's userinfo is in it, printing yes or no, never the match
+#   record.sh force-conflict    the device smoke test only: the next round with unpushed local commits
+#                               resets the keeper's copy, as a rebase conflict would
+#   record.sh reset-copy        round 23: the remedy when the keeper says a withdrawn change can't be
+#                               taken out of its local commits cleanly (its pushes held back): its next
+#                               round resets its copy to GitHub's, as after a conflict; requests still
+#                               queued are applied again, the withdrawn one never pushed, and its pushes
+#                               go again once one is confirmed. Round 24: refused unless the keeper holds
+#                               back its pushes now; the request is stamped with that hold and the reset
+#                               epoch, the next round uses it up either way, and it acts only if that
+#                               hold is still recorded (a stale request never resets a later round)
+#                               Round 25: before the reset the keeper settles the open intents and writes a
+#                               tombstone for each acted-on tap its discarded commits carry, both fsynced, and
+#                               uses the request up only once the reset is done (a restart in between redoes it)
 set -u
 dir="${RECORD_DIR:-/data/record}"
 queue="${RECORD_QUEUE:-/data/record-queue}"
@@ -69,5 +94,49 @@ case "${1:-}" in
     id="${2:?id}"
     f="$outcomes/$(printf '%s' "$id" | tr -c 'A-Za-z0-9._:-' '_').json"
     if [ -f "$f" ]; then jq -r '"\(.state)\(if .reason then ": " + .reason else "" end)"' "$f"; else echo waiting; fi ;;
-  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id>" >&2; exit 2 ;;
+  block-push)
+    # The keeper removes it once that round's push has failed; with minutes, once they have passed.
+    f="${RECORD_BLOCK_PUSH:-/data/record-block-push}"
+    case "${2:-}" in
+      '') : > "$f" && echo "the record keeper's next round pushes to a wrong remote, once" ;;
+      *[!0-9]*) echo "block-push takes a number of minutes" >&2; exit 2 ;;
+      *) echo $(( ($(date +%s) + 60 * $2) * 1000 )) > "$f" && echo "the record keeper's rounds push to a wrong remote for the next $2 minutes" ;;
+    esac ;;
+  clock-test)
+    # The smoke test's clock switch: header-only (one round, GitHub's Date header alone), none
+    # (no clock source says synchronized), step:-600 (the keeper's clock reads 600 seconds early),
+    # off.
+    f="${RECORD_CLOCK_TEST:-/data/record-clock-test}"
+    case "${2:-}" in
+      header-only|none) printf '%s\n' "$2" > "$f" && echo "clock test: $2" ;;
+      step:-[0-9]*|step:[0-9]*) printf '%s\n' "$2" > "$f" && echo "clock test: $2" ;;
+      off) rm -f "$f" && echo "clock test: off" ;;
+      *) echo "clock-test takes header-only, none, step:-<seconds> or off" >&2; exit 2 ;;
+    esac ;;
+  leak-check)
+    # The record keeper (which alone holds the token) reads its log copy, its status file, the relay
+    # queue and the files named here, and says per file whether the token or a web address's
+    # userinfo is in them: yes or no, never the match.
+    f="${RECORD_LEAK_CHECK:-/data/record-leak-check}"
+    shift
+    rm -f "$f.json"
+    : > "$f.tmp"; for p in "$@"; do case "$p" in /*) printf '%s\n' "$p" >> "$f.tmp" ;; *) printf '%s\n' "$PWD/$p" >> "$f.tmp" ;; esac; done
+    mv "$f.tmp" "$f"
+    for _ in $(seq 1 60); do [ -f "$f.json" ] && break; sleep 2; done
+    if [ -f "$f.json" ]; then jq -c '{clean, files: [.files[] | {path, token, userinfo, header}]}' "$f.json"; else echo '{"clean":null,"said":"the record keeper did not answer within 2 minutes"}'; exit 1; fi ;;
+  force-conflict)
+    # The next round with unpushed local commits treats their rebase as a conflict and resets (the smoke test's switch).
+    printf '{"by":"force-conflict"}\n' > "${RECORD_FORCE_CONFLICT:-/data/record-force-conflict}" && echo "the record keeper's next round with unpushed commits resets its copy, as after a conflict" ;;
+  reset-copy)
+    # Round 23: the documented remedy for pushes held back by a withdrawn change that can't be taken out cleanly.
+    # Round 24: refused unless a push-refused hold is recorded now; stamped with that hold's id and the reset epoch, so the
+    # next round acts only while that very hold is still recorded, and consumes the request either way.
+    state="${RECORD_HOLDS:-/data/record-holds.json}"
+    hold=$(jq -er '.pushRefused.id // empty | select(test("^hold-[0-9]+$"))' "$state" 2>/dev/null) \
+      || { echo "refused: the record keeper isn't holding back its pushes now, so there is nothing to reset; nothing was changed" >&2; exit 1; }
+    epoch=$(jq -r '.epoch.n // 0' "$state" 2>/dev/null) || epoch=0
+    jq -nc --arg hold "$hold" --argjson epoch "${epoch:-0}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{by: "reset-copy", hold: $hold, epoch: $epoch, at: $at}' \
+      > "${RECORD_FORCE_CONFLICT:-/data/record-force-conflict}" \
+      && echo "the record keeper's next round resets its copy to GitHub's, as after a conflict, if it is still holding back its pushes then; the withdrawn change is never pushed" ;;
+  *) echo "usage: record.sh sha <path> | rowsha <item> | holds | notes [<item>|-] [<since>] | submit <file> | status <id> | block-push [minutes] | clock-test <header-only|none|step:-N|off> | force-conflict | reset-copy | leak-check [files]" >&2; exit 2 ;;
 esac

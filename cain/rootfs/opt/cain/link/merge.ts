@@ -30,7 +30,7 @@ export interface MergeDeps {
 }
 export interface Landing { repo: string; pr: number; head: string }
 export type Landed =
-  | { ok: true; already: boolean }
+  | { ok: true; already: boolean; unclaimed?: boolean }   // unclaimed: already in main at claim time, so no claim and no push (round 10)
   | { ok: false; why: string; again: boolean; stopped?: boolean };
 
 const no = (why: string, again = false): Landed => ({ ok: false, why, again });
@@ -325,6 +325,49 @@ export async function inMain(d: MergeDeps, repo: string, head: string): Promise<
   if (r.code !== 0) return null;
   if (!(await sha(d, head))) return false;
   return ancestor(d, head, "refs/ship/main");
+}
+
+// How an orphaned landing (one a restart cut off) is settled against the remote (0.12.0). The
+// landing's token is the pull request's head commit itself: the link pushes exactly that commit to
+// main as a fast-forward, so it writes no trailer or commit of its own (one would change the commit
+// the checks passed on). Its ledger claim records main's tip as the link last fetched it before the
+// push (base). Settlement fetches main from GitHub whole (no depth) and first asks whether head is
+// reachable from the remote tip: if it is, that is landed (true) and needs no base, since the head
+// commit is the token (round 10). Only to decide "did not land" does it deepen a shallow copy to full
+// history and search from base to the remote tip:
+//   - base is in that history and is an ancestor of the tip, and head isn't: did not land (false);
+//   - anything that leaves the range unsearchable (the fetch fails, a shallow copy that can't be
+//     deepened, base missing or no longer an ancestor of the tip: main was rewritten) answers
+//     unresolved, with why. Never "did not land" on a range it couldn't search.
+// Without a base (a claim from before bases were recorded) the whole of main is searched, the same
+// way, after the same deepening.
+export type Settled = { inMain: boolean } | { unresolved: string };
+export async function settledFrom(d: MergeDeps, repo: string, head: string, base?: string | null): Promise<Settled> {
+  const r = await d.git(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", where(d, repo), "+refs/heads/main:refs/ship/main"],
+    { ssh: true, timeoutMs: 60_000 });
+  if (r.code !== 0) return { unresolved: `GitHub couldn't be fetched from (${first(r.err) || `git exit ${r.code}`})` };
+  // Landed needs no base: the head reachable from the remote tip is the whole answer.
+  if ((await sha(d, head)) && (await ancestor(d, head, "refs/ship/main"))) return { inMain: true };
+  const shallow = await d.git(["rev-parse", "--is-shallow-repository"]);
+  if (shallow.code === 0 && shallow.out.trim() === "true") {
+    const deep = await d.git(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--unshallow", where(d, repo), "+refs/heads/main:refs/ship/main"],
+      { ssh: true, timeoutMs: 120_000 });
+    if (deep.code !== 0) return { unresolved: `the link's copy is shallow and couldn't be deepened (${first(deep.err) || `git exit ${deep.code}`})` };
+  }
+  if (base) {
+    if (!(await sha(d, base))) return { unresolved: `the landing's base commit ${base.slice(0, 12)} isn't in main's history any more (main was rewritten)` };
+    if (!(await ancestor(d, base, "refs/ship/main"))) return { unresolved: `the landing's base commit ${base.slice(0, 12)} isn't an ancestor of main any more (main was rewritten)` };
+  }
+  if (!(await sha(d, head))) return { inMain: false };
+  return { inMain: await ancestor(d, head, "refs/ship/main") };
+}
+
+// main's tip as GitHub has it now (fetched over SSH): the base a landing's claim records. null: no answer.
+export async function mainTip(d: MergeDeps, repo: string): Promise<string | null> {
+  const r = await d.git(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", where(d, repo), "+refs/heads/main:refs/ship/main"],
+    { ssh: true, timeoutMs: 60_000 });
+  if (r.code !== 0) return null;
+  return (await sha(d, "refs/ship/main")) || null;
 }
 
 // The first check, in order, that keeps it from landing.

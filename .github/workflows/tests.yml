@@ -31,8 +31,26 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.4"
+      # Round 25: the test-only TypeScript compiler (cain/tests/package.json, pinned by its lockfile) for the lock lint.
+      - run: cd cain/tests && bun install --frozen-lockfile
       - run: bun test cain/tests
 
+  # Round 21: the shared logs' flock (bun:ffi into libc) on arm64, the Pi's architecture: the start probe, the lock and
+  # its errors, in an arm64 container under QEMU. Same Bun as Cain's image.
+  # Round 22: evidence for symbol resolution (flock, errno) and the foreign-function path on arm64, under user-mode
+  # emulation on an x86 host, plus the start probe's contention self-test; not proof of the Pi's kernel. The real arm64
+  # gate is the Pi start probe plus the combined fault scenario. Making this job a required check is the owner's ruleset change.
+  # Round 25: also the link's entry file launched as a non-root user (the container runs as root, so the test drops to nobody).
+  arm64-flock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - run: >-
+          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w oven/bun:1.4.4
+          sh -c 'uname -m && bun test cain/tests/source-check-round21.test.ts -t "flock" && bun test cain/tests/source-check-round20.test.ts -t "OS advisory lock" && bun test cain/tests/source-check-round22.test.ts -t "start probe" && bun test cain/tests/source-check-round25.test.ts -t "non-root"'
   # The PC job worker runs on Dane's Windows PC: its tests run on Windows too. Not a
   # required check (RELEASING.md); pytest and bun above stay the gate.
   pcjobs-windows:

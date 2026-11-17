@@ -52,15 +52,22 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { teeConsole } from "../logfile";
+import { lockRefusal, probeLock } from "../applog";
+import { lockGate } from "../startgate";
+import { localReadings, verdict } from "../clock";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
-import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { ensureStop, readStop, since, TRUST_DIR, TRUST_DIR_REFUSED, writeStop } from "../stop";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { checkRuns, facts, headChecks, inMain, land, mainTip, settledFrom, type MergeDeps } from "./merge";
+import { requestLoggedIn } from "../record/main";
+import { landingLedger } from "./landings";
 import { gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
@@ -76,6 +83,24 @@ const QUEUE = process.env.RELAY_QUEUE ?? "/data/relay.queue";
 const PORT = Number(process.env.RELAY_PORT ?? 8097);
 const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper's copy
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
+const RECORD_QUEUE = process.env.RECORD_QUEUE ?? "/data/record-queue";   // the keeper's local queue (source checks, one-offs)
+const RECORD_OUTCOMES = process.env.RECORD_OUTCOMES ?? "/data/record-outcomes";   // the keeper's outcome per request of Cain's
+const RECORD_WAITS = process.env.RECORD_WAITS ?? "/data/record-waits.jsonl";   // checks the keeper didn't answer in time, for its audit
+const TUNING = process.env.SOURCE_CHECK_TUNING ?? "/data/work/source-check-refusals.jsonl";   // refusals, for tuning the rules
+// The App's source_check_max_days option: how old a source check may be (by the keeper's
+// time for it) before an ask or Ship card can't rest on it. 7 when unset.
+// 0 is allowed (the smoke test's expired check).
+const MAX_CHECK_DAYS = /^\d+$/.test(process.env.SOURCE_CHECK_MAX_DAYS ?? "") ? Number(process.env.SOURCE_CHECK_MAX_DAYS) : undefined;
+const NOTICES = process.env.LINK_NOTICES ?? "/data/work/link-notices.jsonl";   // the notices' rendered words (the leak check reads them)
+const RECORD_STATUS = process.env.RECORD_STATUS ?? "/data/record-ledger.json";   // the keeper's status: generation, push, reset, clock
+// The link's landing ledger (outside the record's working copy): one file per tap key that started a
+// landing. The link's alone: the record keeper never writes or cleans it. Its marker, outside it, is
+// in the link's own folder (a ledger behind the marker came back from a backup).
+const RECORD_LANDINGS = process.env.RECORD_LANDINGS ?? "/data/record-landings";
+const LANDINGS_MARKER = `${DIR}/landings-marker.json`;
+// The App's tap_read_ms option: how long a tap's fresh read may take before it answers busy (the
+// link's own default when unset).
+const TAP_READ = /^\d+$/.test(process.env.TAP_READ_MS ?? "") ? Number(process.env.TAP_READ_MS) : undefined;
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
@@ -85,7 +110,16 @@ const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
 const SWEEP_MS = 60_000;
 
+// Round 25: a trust folder moved outside the test root refuses the start, with its fixed reason, before anything is
+// written (it waits there, so the run loop doesn't restart it every few seconds).
+if (TRUST_DIR_REFUSED) {
+  console.log(`[cain] link: REFUSED TO START: ${TRUST_DIR_REFUSED}`);
+  setInterval(() => console.log(`[cain] link: REFUSED TO START: ${TRUST_DIR_REFUSED}`), 3_600_000);
+  await new Promise(() => {});
+}
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
+// A copy of the link's log lines for the device smoke test (the App log is Home Assistant's).
+teeConsole(process.env.LINK_LOG ?? "/data/work/link.log");
 mkdirSync(TRUST_DIR, { recursive: true, mode: 0o755 });
 // No Stop saved yet (a first start): written as running, so readers that find no file
 // can take it as stopped.
@@ -110,7 +144,21 @@ function paired(): string {
 const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) => console.log(`[cain] link: ${line}`));
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
-function save(s: State): void { stateStore.save(s); }
+function save(s: State, sync = false): void { stateStore.save(s, sync); }
+function saveDurable(s: State): void { stateStore.saveDurable(s); }
+// Round 12: the issued-key log, outside the link's restorable state (../applog.ts).
+const ISSUED_LOG = process.env.LINK_ISSUED_LOG ?? "/data/link-issued.log";
+// Round 13: the compact expired-key index, the keeper-owned install log, the post-install tests' result
+// file, the keeper's mirror of the issued keys (read only) and the owner's recover file for the keeper.
+const EXPIRED_LOG = process.env.LINK_EXPIRED_LOG ?? "/data/link-expired.log";
+const INSTALL_LOG = process.env.RECORD_INSTALL_LOG ?? "/data/record-install.log";
+const INSTALL_RESULTS = process.env.INSTALL_RESULTS ?? "/data/work/install-tests.json";
+const KEEPER_MIRROR = process.env.RECORD_ISSUED_LOG ?? "/data/record-issued.log";
+const RECOVER_FILE = process.env.RECORD_RECOVER ?? "/data/record-recover.json";
+// Round 14: the keeper's consumed-key log (read only), the link's held-tap log and its button-removal queue.
+const CONSUMED_LOG = process.env.RECORD_TAPS_LOG ?? "/data/record-taps.jsonl";
+const HELD_LOG = process.env.LINK_HELD_LOG ?? "/data/link-held.log";
+const STRIP_LOG = process.env.LINK_STRIP_LOG ?? "/data/link-strip.log";
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -120,6 +168,8 @@ async function rest(method: string, path: string, body?: unknown, auth = true, t
     redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
+  // Round 16: a rate limit carries its Retry-After (seconds), which the restore sweep honours.
+  if (r.status === 429) throw new Error(`discord 429: ${String(data?.message ?? "").slice(0, 100)} (retry_after ${Number(data?.retry_after ?? r.headers.get("retry-after") ?? 1)})`);
   if (r.status >= 400) throw new Error(`discord ${r.status}: ${String(data?.message ?? "").slice(0, 100)}`);
   return data;
 }
@@ -140,6 +190,18 @@ function readOr(path: string): string | null {
   try { return readFileSync(path, "utf8"); }
   catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
+// The same, for a tap's fresh read: cancelled through the signal when it runs past its limit
+// (an aborted read rejects, and the tap answers busy).
+async function readOrAsync(path: string, signal: AbortSignal): Promise<string | null> {
+  try { return await readFile(path, { encoding: "utf8", signal }); }
+  catch (e: any) { if (e?.name === "AbortError" || signal.aborted) throw e; return e?.code === "ENOENT" ? null : ""; }
+}
+const outcomeOf = (t: string | null) => {
+  if (t === null) return null;
+  try { const o = JSON.parse(t); return o && typeof o.state === "string" ? { state: o.state, reason: typeof o.reason === "string" ? o.reason : undefined } : null; }
+  catch { return null; }
+};
+const outcomePath = (id: string) => `${RECORD_OUTCOMES}/${id.replace(/[^A-Za-z0-9._:-]/g, "_")}.json`;
 
 // A pull request now. GitHub's API says whether it's open and its head; when that
 // can't be read (it allows 60 asks an hour without a key), the head alone comes from
@@ -192,10 +254,45 @@ const SHIP_REPO = "HyndeSyte/harness";
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
 const link = new Link({
-  rest, load, save, now: Date.now, paired, toHarness,
+  rest, load, save, saveDurable, issuedLog: ISSUED_LOG, expiredLog: EXPIRED_LOG, installLog: INSTALL_LOG, installResults: INSTALL_RESULTS,
+  keeperMirror: KEEPER_MIRROR, recoverFile: RECOVER_FILE, consumedLog: CONSUMED_LOG, heldLog: HELD_LOG, stripLog: STRIP_LOG, now: Date.now, mono: () => performance.now(), paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
-  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
+  record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS), checks: readOr(`${RECORD}/state/checks.json`), status: readOr(RECORD_STATUS) }),
+  // The box's own clock sources at tap time (the keeper's rounds add GitHub's Date header).
+  localClock: () => verdict(localReadings()),
+  // A source check or a one-off's log line, handed to the record keeper through its local
+  // queue as record.sh does; the link waits for a check's outcome before posting.
+  submitRecord: (req) => {
+    mkdirSync(RECORD_QUEUE, { recursive: true });
+    const name = `${new Date().toISOString().replace(/[-:]/g, "").slice(0, 15)}-${String(req.id).replace(/[^A-Za-z0-9._:-]/g, "_")}.json`;
+    writeFileSync(`${RECORD_QUEUE}/.${name}`, JSON.stringify(req));
+    renameSync(`${RECORD_QUEUE}/.${name}`, `${RECORD_QUEUE}/${name}`);
+  },
+  outcome: (id) => outcomeOf(readOr(outcomePath(id))),
+  // A tap's fresh read: the four files at once, each read cancelled when the limit passes.
+  tapReadMs: TAP_READ,
+  // A fresh read past the 30-second ceiling: its file reads were aborted already; the reads run in
+  // this process and start no child processes, so there is no group to kill.
+  killRead: () => { console.log("[cain] link: a hung fresh read was released at its ceiling (its reads aborted; no child processes)"); },
+  // Whether a check request survived a reset: done in log/requests on the keeper's current copy.
+  requestLogged: (id) => requestLoggedIn(RECORD, id),
+  landings: landingLedger(RECORD_LANDINGS, LANDINGS_MARKER, { log: (line) => console.log(`[cain] link: ${line}`) }),
+  // The state file as it is on disk (load() turns one that doesn't parse into an empty state).
+  stateHealth: () => {
+    try { const j = JSON.parse(readFileSync(STATE, "utf8")); return j && typeof j === "object" && !Array.isArray(j) && typeof j.messages === "object" ? { ok: true } : { ok: false, why: "not a state" }; }
+    catch (e: any) { return { ok: false, why: e?.code === "ENOENT" ? "missing" : "corrupt or mid-write" }; }
+  },
+  readFresh: async (id, signal) => {
+    const [pending, holds, checks, status, out] = await Promise.all([readOrAsync(`${RECORD}/state/PENDING.md`, signal), readOrAsync(HOLDS, signal),
+      readOrAsync(`${RECORD}/state/checks.json`, signal), readOrAsync(RECORD_STATUS, signal), id ? readOrAsync(outcomePath(id), signal) : Promise.resolve(null)]);
+    return { files: { pending, holds, checks, status }, outcome: outcomeOf(out) };
+  },
+  maxCheckDays: MAX_CHECK_DAYS,
+  waitTimeout: (w) => appendFileSync(RECORD_WAITS, JSON.stringify(w) + "\n"),
+  // Each notice's rendered words, kept under /data/work for the smoke test's leak check.
+  noticeLog: (text) => { mkdirSync(NOTICES.replace(/\/[^/]*$/, ""), { recursive: true }); appendFileSync(NOTICES, JSON.stringify({ at: new Date().toISOString(), text }) + "\n"); },
+  tune: (r) => { mkdirSync(TUNING.replace(/\/[^/]*$/, ""), { recursive: true }); appendFileSync(TUNING, JSON.stringify(r) + "\n"); },
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
@@ -205,7 +302,14 @@ const link = new Link({
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
     return land({ ...github, stopped }, { repo: p.repo, pr: p.pr, head });
   } : undefined,
-  landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
+  // Settled against the remote: from the landing's recorded base to main's tip (merge.ts settledFrom).
+  landed: deployKey ? async ({ pr, head }, base) => {
+    const p = pullOf(pr);
+    if (!p) return null;
+    const r = await settledFrom(github, p.repo, head, base);
+    return "inMain" in r ? r.inMain : { unresolved: r.unresolved };
+  } : undefined,
+  mainTip: deployKey ? async (pr) => { const p = pullOf(pr); return p ? mainTip(github, p.repo) : null; } : undefined,
   facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
   // A Ship card reads the head's checks as the landing does (merge.ts headChecks, pcjobs-windows
   // included when the head's tests.yml names it), and the review
@@ -218,6 +322,24 @@ const link = new Link({
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
+});
+// The keeper reads this state for its generation floor and posts no new card while it can't:
+// written once at start when there is none yet (a first start).
+try { if (!existsSync(STATE)) save(load()); } catch (e) { console.log(`[cain] link: couldn't write its first state: ${String(e).slice(0, 80)}`); }
+
+// Round 21: flock is probed at start on a probe file in the real log folder. When it can't be loaded or taken, the link
+// refuses to start its sweep and its gateway (no taps taken, no cards posted), logs why, posts him the status line once,
+// and tells Cain; it tries again hourly. Round 22: the gate is ../startgate.ts (tested); the probe also checks errno and
+// runs a contention self-test.
+const LOG_DIR = ISSUED_LOG.replace(/\/[^/]*$/, "") || "/data";
+await lockGate({
+  probe: () => probeLock(LOG_DIR),
+  log: (line) => console.log(`[cain] link: ${line}`),
+  tell: async (why) => {
+    link.relayLine(`The link refuses to start: ${why}. Dane was told by the App. Log a Build item; nothing else to do.`);
+    try { await link.notice(lockRefusal("link", why), NOTICE_TIMEOUT_MS); } catch (e) { console.log(`[cain] link: couldn't post the lock refusal: ${String(e).slice(0, 80)}`); }
+  },
+  sleep: (ms) => Bun.sleep(ms),
 });
 
 // -- the gateway's health, for the Harness page ------------------------------------
@@ -274,7 +396,7 @@ setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
 // The routes themselves are in http.ts (linkFetch), so a test serves exactly this handler (0.12.0, twenty-third round).
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice", "/clock", "/reads", "/slowread", "/stallread", "/failwebhook", "/settle", "/installtaps", "/recoverlogs"]);
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
   port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
@@ -282,6 +404,7 @@ Bun.serve({
     health: () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() }), toHarness, tz: process.env.CHECKIN_TZ, localOnly: LOCAL_ONLY }),
 });
 console.log(`[cain] link listening on ${PORT}`);
+
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)

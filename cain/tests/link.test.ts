@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { INTENTS, Protocol, STOP } from "../rootfs/opt/cain/link/core";
+import { INTENTS, Protocol, STOP, tapKid } from "../rootfs/opt/cain/link/core";
 import { BOT, DM, OWNER, rig } from "./link-rig";
 
 const undoRows = [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", custom_id: "k:c:abc" },
@@ -59,7 +59,7 @@ describe("taps", () => {
     await r.link.show(id, { item: "none" });
     expect(await r.tap(r.last(), "k:c:abc")).toBe("to specialist");
     expect(r.answers()).toEqual([6]);
-    expect(r.harness[0]).toEqual(["/press", { id: "11", token: "t", app: BOT, custom_id: "k:c:abc", message_id: id }]);
+    expect(r.harness[0]).toEqual(["/press", { id: expect.stringMatching(/^\d{15,22}$/), token: "t", app: BOT, custom_id: "k:c:abc", message_id: id }]);
   });
 
   test("on a card someone rewrote are refused", async () => {
@@ -99,7 +99,7 @@ describe("taps", () => {
     expect(r.answers()).toEqual([7]);
     expect(r.updates()[0]).toEqual({ content: "Book the plumber for Tuesday?\n\nYou answered: Yes", components: [],
       allowed_mentions: { parse: [] } });
-    expect(r.relayed).toEqual([`Dane tapped "Yes" on your question: "Book the plumber for Tuesday?" (Discord message ${q.id}; its card shows his answer. If it needs words from you, reply with reply_to ${q.id})`]);
+    expect(r.relayed).toEqual([`Dane tapped "Yes" on your question: "Book the plumber for Tuesday?" (Discord message ${q.id}; its card shows his answer. If it needs words from you, reply with reply_to ${q.id}) Tap key ${tapKid([q.id, "none", "none", "NONE", "Yes"].join("|"))}.`]);
     expect(await r.tap(q, q.components[0].components[1].custom_id)).toBe("dead: answered");
     expect(r.relayed.length).toBe(1);
   });

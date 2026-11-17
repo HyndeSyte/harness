@@ -43,6 +43,11 @@ describe("keeper.sh against a fake link", () => {
       const pr = "https://github.com/HyndeSyte/harness/pull/64", head = "a".repeat(40);
       await keeper("ship", "--item", "P64", "--pr", pr, "--head", head, "--review", "2026-11-14-ship-cards", "Stop stays in reach.");
       await keeper("ship", "--item", "P64", "--pr", pr, "--head", head, "Stop stays in reach.");
+      // The source check (0.12.0): --checked goes through as checked, on asks and Ship cards.
+      const checked = "the county's receipt in his mail, read at 9:40 this morning";
+      await keeper("ask", "--item", "P08", "--question", "Q2", "--checked", checked, "Is the packet filed?", "Filed", "Not filed");
+      await keeper("ask", "--item", "none", "Lunch at noon?", "Yes", "No");
+      await keeper("ship", "--item", "P64", "--pr", pr, "--head", head, "--checked", checked, "Stop stays in reach.");
       expect(seen).toEqual([
         { path: "/look", keyed: true, body: { m: "1234567890123456789" } },
         { path: "/check", keyed: true, body: { text: "Tap Undo if it's wrong.", reply_to: "1234567890123456789" } },
@@ -53,7 +58,11 @@ describe("keeper.sh against a fake link", () => {
         { path: "/show", keyed: true, body: { item: "none", id: 17 } },
         { path: "/ship", keyed: true, body: { item: "P64", text: "Stop stays in reach.", pr, head, review: "2026-11-14-ship-cards" } },
         { path: "/ship", keyed: true, body: { item: "P64", text: "Stop stays in reach.", pr, head } },
+        { path: "/ask", keyed: true, body: { item: "P08", question: "Q2", text: "Is the packet filed?", options: ["Filed", "Not filed"], checked } },
+        { path: "/ask", keyed: true, body: { item: "none", text: "Lunch at noon?", options: ["Yes", "No"] } },
+        { path: "/ship", keyed: true, body: { item: "P64", text: "Stop stays in reach.", pr, head, checked } },
       ]);
+      expect(await keeper("ask", "--item", "P08", "--checked")).toMatchObject({ code: 2 });     // a flag needs its value
       expect(await keeper("ship", "--item", "P64", "--review")).toMatchObject({ code: 2 });   // a flag needs its value
       expect(await keeper("check", "--edit")).toMatchObject({ code: 2 }); // a flag needs its value
     } finally { server.stop(true); }
@@ -78,9 +87,12 @@ describe("keeper.sh against a fake link", () => {
 
   test("ship takes --review and sends it as review, only when given (read here too, for where jq is missing)", async () => {
     const text = (await Bun.file(KEEPER).text()).replace(/\r\n/g, "\n");
-    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review)");
+    expect(text).toContain("--item|--question|--reply-to|--pr|--head|--edit|--review|--checked|--reason|--said)");
     expect(text).toContain('--review) review="$2" ;;');
-    expect(text).toMatch(/ship\)\s+body=\$\(jq -nc [^\n]*--arg v "\$review" \\\n\s+"\$meta"' \+ \{text: \$t, pr: \$p, head: \$h\} \+ opt\("review"; \$v\)'\) ;;/);
-    expect(text).toContain("keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>]");
+    expect(text).toContain('--checked) checked="$2" ;; --reason) reason="$2" ;;');
+    // A one-off's reason goes with an ask, only when given.
+    expect(text).toContain(`--arg w "$reason" "$meta"' + {text: $t, options: $ARGS.positional} + opt("checked"; $c) + opt("reason"; $w)'`);
+    expect(text).toMatch(/ship\)\s+body=\$\(jq -nc [^\n]*--arg v "\$review" \\\n\s+--arg c "\$checked" "\$meta"' \+ \{text: \$t, pr: \$p, head: \$h\} \+ opt\("review"; \$v\) \+ opt\("checked"; \$c\)'\) ;;/);
+    expect(text).toContain("keeper.sh ship --item P41 --pr <pull request url> --head <full sha> [--review <review id>] [--checked");
   });
 });

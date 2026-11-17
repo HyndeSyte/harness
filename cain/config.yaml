@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.12.1"
+version: "0.13.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -41,6 +41,11 @@ timeout: 30
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
+# source_check_max_days: how many days a source check counts (by the record keeper's time
+# for it) before Cain's asks and Ship cards about that item need a new one. 7 by default; 0
+# only for one step of the device smoke test (every check is past it at once).
+# tap_read_ms: how long a tap's fresh read of the record keeper's files may take before the tap
+# answers "Busy, tap again" (1500 by default; Discord wants an answer within 3 seconds).
 options:
   github_token: ""
   gemini_api_key: ""
@@ -52,6 +57,8 @@ options:
   anthropic_monthly_usd: 30
   codex_monthly_runs: 200
   owner_user_id: ""
+  source_check_max_days: 7
+  tap_read_ms: 1500
   pc_jobs_token: ""
   pc_jobs_repo: "HyndeSyte/pc-jobs"
 schema:
@@ -65,5 +72,7 @@ schema:
   anthropic_monthly_usd: float(0,200)
   codex_monthly_runs: int(0,5000)
   owner_user_id: match(^([0-9a-f]{32})?$)?
+  source_check_max_days: int(0,90)
+  tap_read_ms: int(200,2500)
   pc_jobs_token: password?
   pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?

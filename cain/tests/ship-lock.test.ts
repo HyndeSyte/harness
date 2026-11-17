@@ -127,7 +127,9 @@ describe("his Ship tap lands it in main", () => {
     expect(findToken(said)).toBeNull();
   });
 
-  test("a landing the link was cut off from is settled from main by the sweep", async () => {
+  test("a landing the link was cut off from is settled from main by the sweep, never landed a second time", async () => {
+    // Round 7: the tap's key is in the link's landing ledger from its first try, so after a restart
+    // the remote main alone says whether it landed (round 8: not there, the landing is abandoned).
     const r = rig();
     const id = await ship(r);
     r.github.hold = true;
@@ -140,7 +142,26 @@ describe("his Ship tap lands it in main", () => {
     expect(r.github.landings).toHaveLength(1);
     r.later(2 * MIN);
     await sweep(r);
-    expect(r.github.landings).toHaveLength(2);
+    expect(r.github.landings).toHaveLength(1);
+    expect(r.msg(id).content).toBe(`${card}\n\nNot shipped: the install was interrupted by a restart and did not land. Nothing changed in main.`);
+    expect(r.relayed.at(-1)).toStartWith("Landing abandoned:");
+    expect(findToken(r.relayed.at(-1)!)).toBeNull();
+  });
+
+  test("a landing cut off after its push: main has it, so it is settled as landed, with its token", async () => {
+    const r = rig();
+    const id = await ship(r);
+    r.github.hold = true;
+    void r.tap(snap(r.msg(id)), r.ids(id)[0]);
+    await tick();
+    r.github.main.push(SHA1);                                // the push went out just before the restart
+    r.restart();
+    r.github.hold = false;
+    r.later(4 * MIN);
+    await sweep(r);
+    r.later(2 * MIN);
+    await sweep(r);
+    expect(r.github.landings).toHaveLength(1);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:06 AM. Installing it is next.`);
     expect(findToken(r.relayed.at(-1)!)).not.toBeNull();
   });
@@ -190,7 +211,8 @@ describe("the link's own line on a Ship card, from GitHub", () => {
     r.github.main.push(SHA1);
     r.github.answers.push({ ok: true, already: true });
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
-    expect(r.relayed.at(-1)).toContain("The link landed it: main has that commit now (it was there already). Ship token: ship1.");
+    expect(r.relayed.at(-1)).toContain("It is already in main: main had that commit when his tap came (it was there already)");   // round 10: no claim, no push
+    expect(r.relayed.at(-1)).toContain("Ship token: ship1.");
     // Closed without landing, or landed at another head: taken off.
     const r2 = rig();
     const c = await ship(r2);
@@ -371,11 +393,11 @@ describe("review fixes (Fable, Nov 13)", () => {
   test("when Discord doesn't take the card's edit, the sweep makes it", async () => {
     const r = rig();
     const id = await ship(r);
-    r.failing.add("PATCH");
+    r.failing.add("PATCH /channels/");                       // the link's own edits; the tap's answer still goes
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
     expect(r.msg(id).content).toBe(`${card}\n\nYou tapped Ship: landing it in main now.`);
     expect(r.relayed).toHaveLength(1);                      // Cain is told all the same
-    r.failing.delete("PATCH");
+    r.failing.delete("PATCH /channels/");
     await sweep(r);
     expect(r.msg(id).content).toBe(`${card}\n\nShipped: it's in main as of 8:00 AM. Installing it is next.`);
     const edits = r.calls.filter((c) => c.method === "PATCH").length;

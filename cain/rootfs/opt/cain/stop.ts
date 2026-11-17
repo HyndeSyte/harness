@@ -8,10 +8,30 @@
 // folder only root can write (so once Cain's session runs as its own user, it can't
 // remove or swap the file). The link writes it at start if it's missing. A file
 // that's missing or can't be read counts as stopped: when in doubt, nothing runs.
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 
-export const TRUST_DIR = "/data/trust";
+// Round 24: CAIN_TRUST_DIR moves it for a test that launches the link's real entry file (the image never sets it).
+// Round 25: honoured only when it resolves (symbolic links followed, through its nearest existing folder) under the fixed
+// test root, /tmp; set to anything else, the trust folder stays /data/trust and TRUST_DIR_REFUSED says why: the link
+// refuses to start with that fixed reason.
+export const TRUST_TEST_ROOT = "/tmp";
+export const TRUST_DIR_WHY = "CAIN_TRUST_DIR is set to a folder outside the test root, so the link won't move its trust folder (Stop, Ship key) off /data/trust";
+export function trustDirFrom(v: string | undefined): { dir: string; refused: string | null } {
+  if (v === undefined) return { dir: "/data/trust", refused: null };
+  const real = (p: string): string | null => {
+    let base = resolve(p);
+    const rest: string[] = [];
+    while (!existsSync(base)) { const up = dirname(base); if (up === base) return null; rest.unshift(base.slice(up.length).replace(/^\//, "")); base = up; }
+    try { return join(realpathSync(base), ...rest); } catch { return null; }
+  };
+  const root = real(TRUST_TEST_ROOT), dir = v ? real(v) : null;
+  if (!root || !dir || !dir.startsWith(`${root}/`)) return { dir: "/data/trust", refused: TRUST_DIR_WHY };
+  return { dir, refused: null };
+}
+const trust = trustDirFrom(process.env.CAIN_TRUST_DIR);
+export const TRUST_DIR = trust.dir;
+export const TRUST_DIR_REFUSED = trust.refused;
 export const STOP_FILE = process.env.CAIN_STOP_FILE ?? `${TRUST_DIR}/stop.json`;
 
 export interface StopState { stopped: boolean; at: number | null }

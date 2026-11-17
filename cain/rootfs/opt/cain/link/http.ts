@@ -40,10 +40,10 @@ export function linkFetch(d: HttpDeps) {
         case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
         case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
         case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
-        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
+        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to, checked: b.checked, reason: b.reason }));
         case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
           item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to }));
+        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to, checked: b.checked }));
         case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
         case "/replied": return json(await link.replied(b.m));
         case "/look": return json(await link.look(b.m));
@@ -53,6 +53,14 @@ export function linkFetch(d: HttpDeps) {
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
+        case "/clock": return json(link.clockReport());
+        case "/settle": return json(await link.settleKey({ tap: b.tap, how: b.how, said: b.said }));
+        case "/installtaps": return json(await link.installTaps({ how: b.how, said: b.said }));
+        case "/recoverlogs": return json(await link.recoverLogs({ said: b.said }));
+        case "/reads": return json(await link.probeReads(Number(b.n ?? 20)));
+        case "/slowread": return json(link.slowRead());
+        case "/failwebhook": return json(link.failWebhook());
+        case "/stallread": return json(await link.stallRead(Number(b.seconds ?? 20)));
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."
