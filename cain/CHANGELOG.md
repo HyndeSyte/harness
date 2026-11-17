@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.1
+
+- Cain can read your Microsoft 365 now that it's connected: your OneDrive files and your Outlook mail and calendar.
+- He can't send, change or delete anything there. Mail, drafts, calendar events and invitations, mail rules, and adding, moving, renaming or deleting files are switched off for him, the same as sending through Gmail, Slack and Google Calendar.
+
 ## 0.12.0
 
 - Cain can now hand chores that need your browser to your PC: a small job queue that a worker on your PC runs in a locked browser session, in a Chrome profile of its own, and Cain reads the short result.
