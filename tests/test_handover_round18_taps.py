@@ -141,11 +141,14 @@ def test_a_change_the_records_are_still_carrying_out_stays_unknown_until_it_sett
     m.c.outbox.flush()
     assert [r["state"] for r in m.c.handovers.journaled()] == ["unknown"]      # still kept until the next read
     seen = len(m.link.cards)
-    later(m, clock, 61)                                                        # the next read: settled
+    later(m, clock, 121)                                                       # the next read (2 min, 19th round)
     assert m.c.handovers.journaled() == []
     cards = new_cards(m, seen)
     assert any("Harness's records took it" in c["text"] for c in cards)
-    assert "Go ahead" not in card_labels(cards)
+    # Nineteenth round: the records' own job ended without sending the add, so it's a failed outcome, not "the
+    # records took it": the card names Dentist as not done and offers it again (round19 tests cover the rest).
+    assert any("Dentist: not on your calendar" in c["text"] for c in cards)
+    assert "Go ahead" in card_labels(cards)
     assert dentists(m) == []                                                   # the records said nothing changed
 
 
@@ -488,7 +491,7 @@ def test_an_unknown_tap_is_read_again_in_the_running_loop_on_a_backoff(m, monkey
     m.gmail.down = True
     later(m, clock, 61)                                                        # due, but the read can't answer
     waits = [c["text"] for c in new_cards(m, before)]
-    assert len(waits) == 1 and "reads your calendar for it at about" in waits[0]
+    assert len(waits) == 1 and "reads your calendar for it again at about" in waits[0]
     assert not any(label in waits[0] for label in BUTTON_LABELS)
     assert [r["state"] for r in m.c.handovers.journaled()] == ["unknown"]
     later(m, clock, 30)                                                        # not due again yet: nothing more
@@ -518,4 +521,4 @@ def test_the_backoff_is_bounded(m, monkeypatch, clock):
         later(m, clock, wait)
     assert m.c.handovers.journaled() == []                                     # given its card for good
     said = new_said(m, 0)
-    assert any("couldn't be read to tell how far it got" in t for t in said), said
+    assert any("couldn't read your calendar to tell how far it got" in t for t in said), said

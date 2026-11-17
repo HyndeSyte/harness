@@ -129,7 +129,10 @@ _OFFER = re.compile(r"(?i)(\bsave up to \$?\d|\bsave \$?\d+(\.\d+)?\s*%|\d+\s*%\
 _CTA = re.compile(r"(?i)\b(learn more|shop now|sign up|join now|start saving|try it|recommended for you|"
                   r"you might also like|advertisement|sponsored|limited[- ]time)\b")
 _LINK = re.compile(r"(?i)\bhttps?://\S+")
-_BOILERPLATE_URL = re.compile(r"(?i)(unsubscribe|privacy|help|preferences|account|manage|opt-?out)")
+_BOILERPLATE_URL = re.compile(r"(?i)(unsubscribe|privacy|preferences|opt-?out)")
+# Nineteenth round: help, account and manage only in a link's path (or the words before it), never its host, so a
+# promotional link whose domain holds "account" still counts as a call to action.
+_BOILERPLATE_PATH = re.compile(r"(?i)(help|account|manage)")
 _BOILERPLATE_WORDS = re.compile(r"(?i)\b(unsubscribe|manage (your )?account|privacy( policy| notice)?|"
                                 r"help( center)?|preferences|view (it )?in (your )?browser|opt[- ]?out)\b")
 _BOILERPLATE_BEFORE = 40              # characters before a link, on its line, read for boilerplate words
@@ -148,6 +151,13 @@ def _promotional(lead: str) -> bool:
     return len(_CTA.findall(lead)) + _real_links(lead) > 2
 
 
+def _url_path(url: str) -> str:
+    """Nineteenth round: a link's path segment (what follows its host), or "" when it has none."""
+    rest = re.sub(r"(?i)^https?://", "", url)
+    cut = re.search(r"[/?#]", rest)
+    return rest[cut.start():] if cut else ""
+
+
 def _real_links(lead: str) -> int:
     """Eighteenth round: the links in a block that aren't boilerplate: neither the address nor the words just before
     it on its line (up to _BOILERPLATE_BEFORE characters) are an unsubscribe, account, privacy, help, preferences,
@@ -156,7 +166,8 @@ def _real_links(lead: str) -> int:
     for m in _LINK.finditer(lead):
         line_start = lead.rfind("\n", 0, m.start()) + 1
         before = lead[max(line_start, m.start() - _BOILERPLATE_BEFORE):m.start()]
-        if _BOILERPLATE_URL.search(m.group(0)) or _BOILERPLATE_WORDS.search(before):
+        if _BOILERPLATE_URL.search(m.group(0)) or _BOILERPLATE_PATH.search(_url_path(m.group(0))) \
+                or _BOILERPLATE_WORDS.search(before):
             continue
         n += 1
     return n

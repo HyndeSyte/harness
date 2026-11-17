@@ -866,11 +866,26 @@ runs in the running loop (and at a start, through the same code), judged by what
 the tap's decision as well as by the calendar: a tap whose approval or choice was never used up (the error
 came between the tap being taken in and its decision being recorded) didn't run, so its card says so and
 has *Go ahead*; a change whose approval was used up and which Harness's own executor is still carrying out
-stays unknown in the journal, never struck, until that ends; one whose decision the records took and
-finished is said truthfully, with no *Go ahead* (its button is used up and its receipt says what
-happened). A read that can't answer, or a change still being carried out, is read again after 1, 2, 5,
-15, 30 and 60 minutes, and you're told once when the next read is; once that runs out, the tap gets its
-card for good. Only an error before the intent, or a calendar's own answer turning it down,
+stays unknown in the journal, never struck, while its job isn't finished: after the schedule below it's
+read every hour, and at every start, and settled only once its job reads finished. A change whose
+approval was used up and whose job ended while the calendar reads some of it not done is a failed or
+partial outcome, never "the records took it": its card names each part that isn't done; parts safe to do
+again (a Gmail removal whose event is still there, or an add absent at its fixed id that the records' own
+run never sent) get *Go ahead*, which reads each again by its identity and puts those on a new card for
+your approval, written to the first offer's fixed ids; for an add whose write was sent, or may have been,
+absence is ambiguous, and the card asks you to ask again. A choice the records took and finished is said
+truthfully, with no *Go ahead* (its button is used up and its receipt says what happened). A read that
+can't answer is read again after exactly 1, 2, 5, 15, 30 and 60 minutes (six reads), and you're told once
+when the next read is, by the time written down for it (or that it's read at the next start, when that
+time couldn't be written); once the schedule runs out the card says your calendar couldn't be read, and
+the outcome is recorded as unverified. A tap whose decision never reached the records, read while your
+calendar can't be read, says so: its *Go ahead* reads first, and if your calendar still can't be read
+nothing is done and you're told plainly.
+
+The policy split, and why: an add that never landed in Google across a restore gets no *Go ahead*,
+because nothing at a fixed id can't be told apart from an event added and deleted since; a tap whose
+decision never reached the records does get one, because no approval used up is not ambiguous: nothing
+it leads to ran. Only an error before the intent, or a calendar's own answer turning it down,
 is a refusal. A tap on a choice that writes a calendar names its identity too: *Add anyway* the fixed ids
 its adds are written under (made from the receipt it came from, so the same tap taken again writes to
 the same ids, and the writer reads that id before writing: a read that can't answer means nothing is
@@ -879,8 +894,13 @@ and nothing was written), *Undo* and the Family *Undo* each event, the version t
 (Google's etag, iCloud's ETag) and the state it must read in afterwards. A read finding any other version
 says it changed since and Harness can't tell, with no *Go ahead*, and the Undo writer itself sends
 If-Match on that version, so an edit of yours since is refused by the calendar, never overwritten (a day
-of a series whose content still reads exactly as written is the one exception: another day's change
-gives it a new version). *Go ahead* is offered on an allow list: only for a kind that carries a readable
+of a series whose content still reads exactly as the change left it is the one exception: another day's
+change gives it a new version; that compare covers every field an Undo could write: title, times,
+repeat, description, location, guests, reminders, conference details and private properties, so an
+edit of yours to any of them leaves it alone). An Undo step with no version recorded for what its change
+left (journaled before Harness kept one) gets no automatic undo: its receipt says so and asks for the
+change you want on a new card to review, and the log notes where the old content compare would have
+applied, so the smoke run sees it. A write found landed late has its version read and recorded then. *Go ahead* is offered on an allow list: only for a kind that carries a readable
 identity, or one declared as changing only Harness's own records; any other kind, a new one included,
 gets none, and its card says so. A refusal's outcome and its note
 are written before the note is posted, and the note's delivery after it, so after a restart a refused
@@ -893,7 +913,10 @@ swap applied at that start) nothing written in the journal is taken by itself. F
 have reached a calendar, the calendar is read first for its effect by that identity; one it shows is
 marked done, with no button (an Undo already done is said by what it leaves: the event gone, back, or
 as it was). A Google event read as cancelled at its fixed id was added and deleted since: its card says so
-and has no *Go ahead*, and nothing is put back. An add with nothing at its fixed id (Google answering 404
+and has no *Go ahead*, and nothing is put back. A repeating add is read by its fixed id the same way:
+there is done (and left out of a *Go ahead*'s run); nothing there, or read as cancelled, is absent, with
+no *Go ahead*, and it's never written back (on Family a PUT with `If-None-Match: *` to an address you
+emptied would succeed). An add with nothing at its fixed id (Google answering 404
 or 410 there, or an empty Family address) can't be told from one added and deleted since: its card says
 Harness can't tell whether it was added and taken off, with no *Go ahead*, and it's never added again
 from there. A change of several parts is read part by part, each Gmail removal by its own bound event
@@ -910,8 +933,12 @@ or version first, so nothing is made twice. While Harness runs degraded without 
 refused at once and you hear it through Cain's link. The tap journal is a required part of the
 handover service: the App doesn't start without it. No card of Harness's names a button in its prose: where a card has one,
 it says what "the button below" does. If Cain's link refuses a card all the same for telling him to use
-a button it doesn't carry, the card isn't dropped: it goes once more with those sentences taken out (its
-own buttons kept), the refusal is recorded in Harness's log, and the link writes its own gate-report entry. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
+a button it doesn't carry, the card isn't dropped: it goes once more with only the sentences the link's own
+imperative patterns match taken out (the patterns are mirrored from Cain's gate rules, and both sides run
+the same shared cases), so a sentence that merely holds the words stays; if nothing is left, or the card's
+head went with them, a fixed card goes instead: what it's about, when it was written and the outcome, with
+the card's own buttons. The refusal is recorded in Harness's log, and the link writes its own gate-report
+entry. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
 the App such a writer waits in bounded slices, logging each and trying again, and gives up after five
 minutes with an error rather than hang. The hold is always released, even when what it holds fails. The
 checkpoint and the online backup run under the hold strictly before the migration's transaction begins,
@@ -977,7 +1004,13 @@ name and nothing moves. It lists them, asks you to type yes, copies each into
 byte, only then removes the original, and clears the refusal, so the next start finishes the swap. A
 copy or fsync that fails (a full disk, say) or a copy that doesn't match takes back what it made, the
 partial copy and the folder, leaves the originals and the marker as they were, says why in plain words
-and exits non-zero. A swap marker that can't be read (damaged or cut short) is never deleted and
+and exits non-zero. It can be run again after one cut short: its progress is kept beside the swap marker
+(the folder chosen and, per file, the copy's checked digest and whether the original was removed),
+written whole (a temporary file, fsynced, renamed, and its folder fsynced), and each checked copy has its
+digest noted beside it in the folder too. A progress record that's truncated or unreadable is rebuilt
+from those noted digests (each copy read again and compared) and from which originals are still there,
+rather than stopping; a copy that no longer matches its digest, with its original gone, is a hard stop.
+A swap marker that can't be read (damaged or cut short) is never deleted and
 nothing is moved: the start runs degraded, and the page lists the files at the records' live and kept
 names, as `python3 -m harness.migrate /data/harness.sqlite --swap` does, for sorting by hand. The marker
 itself is always written whole (a temporary file, fsynced, renamed, and the folder fsynced). If a start
@@ -1045,7 +1078,10 @@ must come from Amazon and say Subscribe & Save in its subject, or else where its
 is (a header line at the top, or the first block of text before the order's items, after any greeting
 on its own line such as "Hello Alex,", read on the Pi; never in a promotional footer or a quoted section,
 and a first block that reads as an advert by its shape, an offer such as "save 15%" or a run of calls to
-action and links, keeps the mail; one word such as "deals" or "discover" doesn't make it an advert) before a subject like "last day to manage", "manage your delivery" or "delivery date has changed"
+action and links, keeps the mail; one word such as "deals" or "discover" doesn't make it an advert, and
+a boilerplate link doesn't count toward it: unsubscribe, privacy, preferences or opt out anywhere in its
+address, help, account or manage only in its path or the words just before it, never in its domain, so a
+promotional link at a domain with "account" in it still counts) before a subject like "last day to manage", "manage your delivery" or "delivery date has changed"
 counts. Prime, Audible and Kindle renewals, an ordinary order's new delivery date and an order's return
 window all come through ("return" counts only as a whole word, so "returning" doesn't). To skip another
 kind without a new build, add it by name to `/data/mail_skip.json`, read at every pick, for example

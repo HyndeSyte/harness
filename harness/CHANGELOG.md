@@ -2,6 +2,13 @@
 
 ## 0.24.0
 
+- **A tap whose change is still being carried out is never given up on.** Harness keeps reading it every hour, and at every start, and tells you what came of it once the change has finished. A tap whose calendar can't be read is read after 1, 2, 5, 15, 30 and 60 minutes, then its card says your calendar couldn't be read.
+- **A change that didn't all go through says which parts.** Its card names each part that isn't done. Parts that are safe to do again come back on a new card for your approval, written to the same events so nothing is made twice; where Harness can't tell whether an event was added and taken off since, the card asks you to ask for it again.
+- **Undo never guesses.** A change recorded before Harness kept each event's version isn't undone automatically: the receipt says so and asks you for the change you want on a new card. A day of a repeating event you edited in any way since (notes, place, guests, reminders) is left alone.
+- **A repeating event you deleted is never put back** from a tap's card, and one already there is never added twice.
+- **A card Cain's link turns down still reaches you**, with only the sentence that pointed at a missing button taken out, or as a short plain card with its buttons when nothing else would be left.
+- Setting aside files that blocked a restore picks up where it left off even if its progress note was cut short, and a delivery mail with a link at a domain like "myaccount" is judged on its content.
+
 - **Cain's handover acts on the message you meant.** When you send a few messages in a row, Cain names the one your calendar request is in, and Harness acts on that one (from the last 30 minutes), not on whatever you sent last. The same message handed over again gets its own answer, never the answer to another message.
 - **Details Cain spells out are used, with your tap.** A request where Cain passes on the event (a date from an email, or what you asked, spelled out) is no longer turned down as too old after 2 minutes. It comes on a card, and your Approve is the go.
 - **No card asks you to say it again.** When Cain passed details and something is still unclear, the question goes to Cain first.

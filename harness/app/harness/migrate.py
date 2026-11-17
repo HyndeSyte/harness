@@ -1806,17 +1806,78 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+SET_ASIDE_DIGEST = ".digest"           # beside each checked copy in the set-aside folder (nineteenth round)
+
+
+def _write_progress(path: str, record: dict) -> None:
+    """Nineteenth round: the progress record (or a copy's digest) written whole: a temporary file, fsynced, renamed
+    into place, then its folder fsynced, so a cut-off run leaves the old record or the new, never a torn one."""
+    _write_json(path, record)
+    _fsync_dir(os.path.dirname(os.path.abspath(path)))
+
+
+def _digest_note(dest: str, name: str) -> str:
+    return os.path.join(dest, "." + name + SET_ASIDE_DIGEST)
+
+
+def _rebuild_progress(folder: str, swap: str) -> dict:
+    """Nineteenth round: the progress record beside the swap marker is there but unreadable or truncated. It's
+    rebuilt from what's on disk rather than stopping: the newest set-aside folder beside the records holding copies
+    whose digest notes name this very swap marker and whose bytes still match the digest noted when each was
+    checked; for each, whether its original is still beside the records. {} when there's nothing to rebuild from."""
+    try:
+        marker = _sha256(swap)
+        names = sorted((n for n in os.listdir(folder) if n.startswith("harness-set-aside-") and _plain_name(n)
+                        and os.path.isdir(os.path.join(folder, n))), reverse=True)
+    except OSError:
+        return {}
+    for dest in names:
+        files = {}
+        try:
+            entries = os.listdir(os.path.join(folder, dest))
+        except OSError:
+            continue
+        for note in entries:
+            if not (note.startswith(".") and note.endswith(SET_ASIDE_DIGEST)):
+                continue
+            name = note[1:-len(SET_ASIDE_DIGEST)]
+            if not _plain_name(name):
+                continue
+            rec = _read_json(os.path.join(folder, dest, note))
+            copy = os.path.join(folder, dest, name)
+            try:
+                ok = (rec.get("marker") == marker and isinstance(rec.get("digest"), str) and os.path.isfile(copy)
+                      and _sha256(copy) == rec["digest"])
+            except OSError:
+                ok = False
+            if ok:
+                files[name] = {"digest": rec["digest"], "removed": not os.path.lexists(os.path.join(folder, name))}
+        if files:
+            log.warning("the set-aside progress record couldn't be read; rebuilt from %s's checked copies", dest)
+            return {"marker": marker, "dest": dest, "files": files}
+    return {}
+
+
 def _set_aside_progress(folder: str, swap: str, path: str) -> dict:
     """Eighteenth round: the progress an earlier --set-aside left for this same swap, or {} when there's none to
     use. It counts only while the swap marker is byte for byte the one it was made against (the marker is updated
     only once every removal is done), and only when the folder it names is a plain set-aside folder beside the
-    records; anything else is ignored and a fresh folder is chosen."""
+    records; anything else is ignored and a fresh folder is chosen. Nineteenth round: one that's there but can't be
+    read whole (truncated, torn) is rebuilt from the copies' noted digests and the originals' presence
+    (_rebuild_progress)."""
     try:
-        rec = _read_json(path)
-        if not isinstance(rec, dict) or rec.get("marker") != _sha256(swap):
+        if not os.path.lexists(path):
             return {}
-    except (OSError, ValueError):
-        return {}
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        if not isinstance(rec, dict) or not isinstance(rec.get("files"), dict):
+            return _rebuild_progress(folder, swap)
+        if rec.get("marker") != _sha256(swap):
+            return {}
+    except ValueError:
+        return _rebuild_progress(folder, swap)
+    except OSError:
+        return _rebuild_progress(folder, swap)
     dest, files = rec.get("dest"), rec.get("files")
     if not (isinstance(dest, str) and _plain_name(dest) and dest.startswith("harness-set-aside-")
             and isinstance(files, dict)):
@@ -1927,10 +1988,11 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
 
             def take_back() -> None:
                 for c in copied:
-                    try:
-                        os.remove(c)
-                    except OSError:
-                        pass
+                    for gone in (c, _digest_note(os.path.dirname(c), os.path.basename(c))):
+                        try:
+                            os.remove(gone)
+                        except OSError:
+                            pass
                 try:
                     os.rmdir(dest)
                 except OSError:
@@ -1941,11 +2003,11 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                     else:
                         for name in movable:
                             record["files"][name] = {"digest": None, "removed": False}
-                        _write_json(progress_path, record)
+                        _write_progress(progress_path, record)
                 except OSError:
                     pass
             try:
-                _write_json(progress_path, record)              # before the folder: a run cut off here is found again
+                _write_progress(progress_path, record)              # before the folder: a run cut off here is found again
                 os.makedirs(dest, exist_ok=True)
                 for name in movable:
                     src, dst = os.path.join(folder, name), os.path.join(dest, name)
@@ -1959,9 +2021,12 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                         return {"ok": False, "said": f"the copy of {name} didn't match it, so nothing was moved and "
                                                      "the swap marker is as it was", "files": swap_files(base)}
                     record["files"][name] = {"digest": d, "removed": False}
+                    # Nineteenth round: the checked digest beside the copy too, so a progress record that's lost or
+                    # torn can be rebuilt from the folder itself (_rebuild_progress).
+                    _write_progress(_digest_note(dest, name), {"marker": record["marker"], "digest": d})
                 _fsync_dir(dest)
                 _fsync_dir(folder)
-                _write_json(progress_path, record)              # every copy checked, recorded before any removal
+                _write_progress(progress_path, record)              # every copy checked, recorded before any removal
             except OSError as e:
                 take_back()
                 reason = ("the disk is full" if getattr(e, "errno", None) in (errno.ENOSPC, errno.EDQUOT)
@@ -1976,7 +2041,7 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
                     except FileNotFoundError:
                         pass                                    # gone already: its copy is checked
                     record["files"][name]["removed"] = True
-                    _write_json(progress_path, record)          # each removal recorded as it's done
+                    _write_progress(progress_path, record)          # each removal recorded as it's done
                 _fsync_dir(folder)
             except OSError as e:
                 # The copies are whole and checked, so they stay (the folder holds what was taken off); the marker

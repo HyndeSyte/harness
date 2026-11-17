@@ -50,16 +50,50 @@ def refused_labels(e: ChatError) -> list[str]:
     return re.findall(r'"([^"]{1,60})"', m.group(1)) if m else []
 
 
+# Nineteenth round: the link's own imperative patterns, mirrored exactly from cain/rootfs/opt/cain/gate/rules.ts
+# (Q, IMPERATIVE_BEFORE, IMPERATIVE_AFTER; tests/test_outbox_round19.py compares the sources and runs the shared
+# cases in tests/imperative_cases.json, which cain/tests/imperative-cases.test.ts runs through the link's own code).
+# A label is told to be used when the words right before it are "tap", "press", "click" or "hit" (or their -ing
+# forms, "on" and "the" allowed between), or the word right after it is "button"; quotes or bold markup around it.
+Q = "[\"\u201c\u201d'\u2018\u2019*_]*"
+IMPERATIVE_BEFORE = re.compile(r"(?<![A-Za-z])(?:tap|tapping|press|pressing|click|clicking|hit|hitting)\s+(?:on\s+)?"
+                               r"(?:the\s+)?" + Q + r"$", re.I)
+IMPERATIVE_AFTER = re.compile(r"^" + Q + r"\s+buttons?(?![A-Za-z])", re.I)
+
+
+def imperative(text: str, at: int, end: int) -> bool:
+    """The link's imperative(): whether the label at text[at:end] is told to be used."""
+    t = str(text or "")
+    return bool(IMPERATIVE_BEFORE.search(t[:at]) or IMPERATIVE_AFTER.search(t[end:]))
+
+
+def tells_to_use(text: str, label: str) -> bool:
+    """Whether `text` (plain words) tells him to use the button `label`: an occurrence of the label, as a whole
+    word, in an imperative position (imperative)."""
+    for m in re.finditer(r"(?<![A-Za-z0-9])" + re.escape(label) + r"(?![A-Za-z0-9])", text or ""):
+        if imperative(text, m.start(), m.end()):
+            return True
+    return False
+
+
 def strip_button_words(text: str, labels: list[str]) -> str:
-    """The card's text with every sentence that names one of `labels` taken out, line by line, so what's left
-    says what happened without pointing at a button that isn't there."""
+    """The card's text with every sentence that tells him to use one of `labels` taken out, line by line, so what's
+    left says what happened without pointing at a button that isn't there. Nineteenth round: only a sentence that
+    matches the link's own imperative patterns (tells_to_use) goes; a sentence that merely mentions the words ("we'll
+    go ahead with it", "undo this later") stays."""
     out = []
     for line in text.split("\n"):
         parts = re.split(r"(?<=[.!?])\s+", line)
-        keep = [x for x in parts if not any(label.casefold() in _plain(x).casefold() for label in labels)]
+        keep = [x for x in parts if not any(tells_to_use(_plain(x), label) for label in labels)]
         if keep or not line.strip():
             out.append(" ".join(keep))
     return "\n".join(out).strip()
+
+
+def _head(text: str) -> str:
+    """A card's first line, its required fact: what it's about (its bold head, or its first sentence)."""
+    first = next((x for x in (text or "").split("\n") if x.strip()), "")
+    return _plain(re.split(r"(?<=[.!?])\s+", first)[0]).strip()
 
 
 class Outbox:
@@ -69,6 +103,19 @@ class Outbox:
         self.api = api
         self.sleep = sleep
         self.tz = ZoneInfo(tz)
+
+    def _template(self, row, stripped: str, labels: list[str]) -> str:
+        """Nineteenth round: the fixed card for a refusal that left nothing usable: what it's about (his message,
+        quoted, when it's for one), when it was written, and the outcome (what's left of its words, or that its
+        full words couldn't be shown). Nothing in it can tell him to use a button."""
+        what = ""
+        if row["job_id"]:
+            asked = " ".join(self.ledger.job_text(row["job_id"]).split())[:120]
+            if asked and not any(tells_to_use(asked, x) for x in labels):
+                what = f"About your message \u201c{render.escape(asked)}\u201d."
+        when = datetime.fromisoformat(row["created_at"]).astimezone(self.tz).strftime("%a %-I:%M %p")
+        outcome = stripped.strip() or "Harness has an update on this; its full words couldn't be shown here."
+        return "\n".join(x for x in (f"<b>An update from Harness</b>, written {when}.", what, outcome) if x)
 
     def flush(self, *, limit: int = 20) -> int:
         """Send what is due. Returns how many were delivered."""
@@ -109,11 +156,18 @@ class Outbox:
             # Eighteenth round: the link refused it for naming a button it doesn't carry. Not dead: it goes once
             # more as plain words with those sentences taken out, its own buttons kept, and the refusal is
             # recorded here (the link writes its gate-report entry), so the relay's "logged for a fix" holds.
-            text = render.fit(strip_button_words(text, labels))
-            log.error("Cain's link refused a card for naming %s; it goes without those words", ", ".join(labels))
+            # Nineteenth round: only the sentences matching the link's own imperative patterns go; if nothing is
+            # left, or the card's head (its required fact) went with them, a fixed template from its structured
+            # fields goes instead (_template), its buttons kept.
+            stripped = strip_button_words(text, labels)
+            head = _head(text)
+            templated = not stripped.strip() or bool(head and head not in _plain(stripped))
+            text = render.fit(self._template(row, stripped, labels) if templated else stripped)
+            log.error("Cain's link refused a card for naming %s; it goes %s", ", ".join(labels),
+                      "as a fixed template" if templated else "without those words")
             if not self.ledger.fenced:
                 self.ledger.event("link_refused_card", {"outbox": row["id"], "labels": labels[:5],
-                                                        "said": e.description[:200]})
+                                                        "said": e.description[:200], "template": bool(templated)})
             try:
                 mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
             except ChatError as e2:

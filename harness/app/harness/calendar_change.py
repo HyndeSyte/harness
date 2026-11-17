@@ -87,6 +87,10 @@ AFTER_RESET = "calendar_change_after_reset"
 _CLEARED_WHEN_OFF = (TAP_BACK, AFTER_RESET)
 _RESTORED = ("summary", "description", "location", "start", "end", "recurrence", "transparency",
              "visibility", "reminders", "extendedProperties", "colorId")
+# Nineteenth round: every field an Undo can write back on a Gmail event, compared whole before a day of a series
+# whose version moved is undone (the series-day exception): an edit of his to any of them since leaves it alone.
+SERIES_COMPARE = ("summary", "start", "end", "recurrence", "description", "location", "attendees", "reminders",
+                  "conferenceData", "extendedProperties")
 _WORD = re.compile(r"[^\W_]+")
 # An outcome no read has settled yet (_settle): read again on family_add.read_gap's schedule, and
 # once reads have failed this many times over at least this long, he hears it isn't confirmed
@@ -141,6 +145,10 @@ WORDS = {"unknown": "I couldn't confirm it yet",
          "exists": "that one is already there",
          "not_made": "that event was there before the add, so Undo leaves it",
          "read_back": "the calendar doesn't read back that way",
+         # Nineteenth round: an undo step journaled with no version of what the change left.
+         "legacy": "this change was made before Harness kept the version each change leaves, so it can't be "
+                   "undone safely from here; ask Harness for the change you want and it comes on a new card for "
+                   "you to review",
          "unverified": "the calendar doesn't read back that way"}
 # 0.24.0, fourth to sixth rounds: the three paths that apply with no card (his own fresh, clear words;
 # a date from his mail he tapped Add to Family on; Family adds after his tap on the bake-in card,
@@ -3903,6 +3911,8 @@ class CalendarChange:
             mine = [rec["entry"] for part in _plan(row).get("parts", []) for rec in part.get("steps", [])
                     if rec.get("entry") and rec.get("status") in ("trying", "unsure") and hits(rec["entry"])]
             if mine and all(self._seen_as(e)[0] == "landed" for e in mine):
+                for e in mine:
+                    self._version_now(e)       # nineteenth round: Undo's version, read now
                 found[old] = mine
         if not found:
             return []
@@ -4272,6 +4282,8 @@ class CalendarChange:
         # Seventh round: every open card of the change family comes off, not only the one it was
         # offered again on: the fresh card after a stale refusal is one of them.
         members = [x for x in self.family_members(pid) if x != pid]
+        for e in entries:
+            self._version_now(e)
         revert_ok = bool(entries) and all(e.get("how") in ("drop", "delete") and self._add_as_written(e)
                                           for e in entries)
         undo_now = json.loads(row["undo_json"] or "[]")
@@ -5959,6 +5971,8 @@ class CalendarChange:
 
     @classmethod
     def combine(cls, got: list[str]) -> str:
+        """One verdict for several parts. Nineteenth round, pinned: when every part is settled, "changed" wins over
+        "absent", which wins over "removed" (the one that most needs his eyes is said)."""
         if not got:
             return "unchecked"
         if all(v == "done" for v in got):
@@ -5982,7 +5996,11 @@ class CalendarChange:
         off since, so it's never made again from here. A Gmail removal by the event id the card bound to that very
         change ("done" when that event is gone or cancelled, "not_done" when it's still there); eighteenth round:
         each removal reads only its own bound event (the bound entry's change index), so a sibling's removal never
-        stands in for it. "unread"; "unchecked" for a change that carries no identity to read by."""
+        stands in for it. "unread"; "unchecked" for a change that carries no identity to read by. Nineteenth
+        round: a repeating add is read by its fixed id again, as the eighteenth round's narrowing to plain adds
+        lost it: there it's "done"; nothing there (404 or 410), or read as cancelled, is "absent" (a Family PUT with
+        If-None-Match to an address its owner emptied succeeds, so a deleted series would be written back), never
+        offered again and left out of a Go ahead's run."""
         changes = list((op or {}).get("changes") or [])
         pid = str((op or {}).get("proposal") or "")
         keys = [str(k) for k in (op or {}).get("keys") or []]
@@ -5991,10 +6009,13 @@ class CalendarChange:
         got = []
         for i, c in enumerate(changes):
             kind, calendar = c.get("op"), c.get("calendar")
-            if kind == "add" and calendar in ("gmail", "family"):
+            if kind in ("add", "add_series") and calendar in ("gmail", "family"):
                 key = keys[i] if i < len(keys) else f"{pid}:{i}"
                 there = self._there_by_id(calendar, self._uid(key, "hm-" if calendar == "family" else "cm"))
-                got.append("absent" if there == "not_done" else there)
+                if kind == "add_series":
+                    got.append("absent" if there in ("not_done", "removed") else there)
+                else:
+                    got.append("absent" if there == "not_done" else there)
             elif kind == "remove" and calendar == "gmail":
                 gm = [b for b in bound if b.get("op") == "remove" and b.get("calendar") == "gmail"]
                 mine = [b for b in gm if b.get("change") == i]
@@ -6010,6 +6031,39 @@ class CalendarChange:
             else:
                 got.append("unchecked")
         return got
+
+    # Nineteenth round: a step whose write was sent, or may have been (or read back and later given up on): an add
+    # absent at its fixed id after one of these may have been made and taken off since.
+    _SENT = ("trying", "unsure", "landed", "unconfirmed")
+
+    def _plan_of(self, pid: str) -> dict:
+        """A change's record of its writes (settle_json), or {} when none was kept."""
+        row = self.ledger.db.execute("SELECT settle_json FROM calendar_changes WHERE proposal_id=?",
+                                     (pid,)).fetchone() if pid else None
+        return _plan(row) if row is not None else {}
+
+    def retry_safe(self, op: dict, got: list[str]) -> list[int]:
+        """Nineteenth round: for an approved change whose job ended with parts not done (`got`, tap_parts's
+        verdicts), the parts that are safe to do again: a Gmail removal whose bound event is still there
+        ("not_done"), and an add absent at its fixed id that the records' own run never sent (each of its steps
+        pending, failed with nothing written, or found in its very version), so absent there can only mean it was
+        never made. An add whose write was sent, or may have been, is ambiguous when absent and isn't offered."""
+        pid = str((op or {}).get("proposal") or "")
+        changes = list((op or {}).get("changes") or [])
+        keys = [str(k) for k in (op or {}).get("keys") or []]
+        plan = self._plan_of(pid)
+        steps = [rec for part in plan.get("parts", []) for rec in part.get("steps", [])]
+        out = []
+        for i, v in enumerate(got):
+            c = changes[i] if i < len(changes) else {}
+            if v == "not_done" and c.get("op") == "remove":
+                out.append(i)
+            elif v == "absent" and c.get("op") in ("add", "add_series"):
+                key = keys[i] if i < len(keys) else f"{pid}:{i}"
+                mine = [r for r in steps if (r.get("spec") or {}).get("key") == key]
+                if not any(r.get("status") in self._SENT or r.get("entry") for r in mine):
+                    out.append(i)
+        return out
 
     def _there_by_id(self, calendar: str, ident: str) -> str:
         """One event read by its id: "done" (there, not cancelled), "removed" (a Google event read as cancelled:
@@ -6803,6 +6857,9 @@ class CalendarChange:
         if kind != "ok":
             raise Stopped("unknown", undo=entry)
         entry["etag"] = now.get("etag")
+        # Nineteenth round: the event's content as the change left it, so the series-day exception compares every
+        # field an Undo could write (SERIES_COMPARE), not only the ones the change wrote.
+        entry["after"] = {k: now.get(k) for k in SERIES_COMPARE}
         if entry.get("how") == "change" and entry.get("was") and now.get("etag") == entry["was"] \
                 and self._gmail_content_moved(entry, now):
             # Eleventh round: only a write whose read back shows changed content under the same version.
@@ -7163,6 +7220,10 @@ class CalendarChange:
                 entry["etag"] = read["etag"]
             if entry.get("cal") == "family" and entry.get("how") in ("put", "delete") and read.get("body"):
                 entry["after"] = read["body"]
+            elif entry.get("cal") == "gmail" and read.get("event"):
+                entry["after"] = {k: read["event"].get(k) for k in SERIES_COMPARE}
+        elif not entry.get("etag"):
+            entry["changed_since"] = True      # nineteenth round: no version because it changed, not an old record
         rec["status"] = "landed"
         rec["back"] = iso(self.ledger.now())
         self._note_verified(plan, rec)
@@ -7174,6 +7235,22 @@ class CalendarChange:
             db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
                        (json.dumps(self._undo_entries(plan)), pid))
             self._save_plan(pid, plan, db)
+
+    def _version_now(self, entry: dict) -> None:
+        """Nineteenth round: a write found landed late carries no version of what it left (its answer was lost),
+        and Undo no longer falls back to comparing content. It's read now: when it reads as written, the version
+        read is Undo's own; otherwise it's marked changed since, and Undo leaves it."""
+        if entry.get("etag") or entry.get("cal") not in ("gmail", "family"):
+            return
+        seen, read = self._seen_as(entry)
+        if seen == "landed" and read.get("etag") and self._reads_as_written(entry, read):
+            entry["etag"] = read["etag"]
+            if entry.get("cal") == "gmail" and read.get("event"):
+                entry["after"] = {k: read["event"].get(k) for k in SERIES_COMPARE}
+            elif entry.get("how") in ("put", "delete") and read.get("body"):
+                entry["after"] = read["body"]
+        elif seen != "unread":
+            entry["changed_since"] = True
 
     def _reads_as_written(self, entry: dict, read: dict) -> bool:
         """What a read found is what the write made, as far as a read can say: on Gmail, every field
@@ -7603,6 +7680,18 @@ class CalendarChange:
         done = [part["done"] for row in rows for part in _plan(row).get("parts", []) if part.get("done")]
         return ("\u201c" + "; ".join(done) + "\u201d") if done else "that calendar change"
 
+    def _no_undo(self, row, words: str) -> None:
+        """Nineteenth round: an Undo that can't be done safely from here (a step journaled with no version of what
+        the change left): no automatic undo and no Undo button again; the receipt says why and asks for a new
+        change to review."""
+        plan = _plan(row)
+        plan.pop("undo", None)
+        with self.ledger.tx() as db:
+            db.execute("UPDATE calendar_changes SET undo_state='none', settle_json=?, updated_at=? WHERE proposal_id=?",
+                       (json.dumps(plan) if plan else "", iso(self.ledger.now()), row["proposal_id"]))
+            self.ledger.event("calendar_change_undo_refused_legacy", {"proposal": row["proposal_id"]}, db=db)
+            self._say(db, self.chat_id, row["job_id"], words)
+
     def _reopen(self, row, words: str) -> None:
         """Undo offered again, as a new request: its tries start over (_undo_attempt)."""
         plan = _plan(row)
@@ -7645,6 +7734,9 @@ class CalendarChange:
         problem = self._undo_ready(steps)
         if problem == "unknown":
             self._undo_not_yet(row)
+            return
+        if problem == "legacy":
+            self._no_undo(row, f"<b>Not undone:</b> {_safe(WORDS['legacy'])}. Nothing changed.")
             return
         if problem == "changed" and row["state"] == "landed_late":
             # A late landing's Undo is fenced by the event's version now (sixth round): changed since,
@@ -7720,6 +7812,9 @@ class CalendarChange:
             return
         if problem == "unknown":
             self._undo_not_yet(row)
+            return
+        if problem == "legacy":
+            self._no_undo(row, f"<b>Not fully undone:</b> {_safe(WORDS['legacy'])}. What was put back stays back.")
             return
         with self.ledger.tx() as db:
             self.ledger.set_meta(PROBLEM, "Calendar change: an undo didn't finish", db)
@@ -7934,7 +8029,9 @@ class CalendarChange:
             return _read_kind(out.kind)
         if step["how"] == "put" and caldav._unchanged(body, step["before"]):
             return "ok"                      # already back: an undo cut short after its write
-        if out.etag != step.get("etag") and not caldav._unchanged(body, step.get("after", "")):
+        if not step.get("etag"):
+            return self._legacy(step)        # nineteenth round: no version journaled, no automatic undo
+        if out.etag != step.get("etag"):
             return "changed"
         return "ok"
 
@@ -7952,9 +8049,37 @@ class CalendarChange:
             return "ok" if step["how"] == "drop" else "gone"
         if step["how"] == "change" and self._as_written(cur, step.get("fields") or {}):
             return "ok"                      # already back: an undo cut short after its write
-        if cur.get("etag") != step.get("etag") and not self._as_written(cur, step.get("wrote") or {}):
+        if not step.get("etag"):
+            return self._legacy(step)        # nineteenth round: no version journaled, no automatic undo
+        if cur.get("etag") != step.get("etag") and not self._series_day_unchanged(cur, step):
             return "changed"
         return "ok"
+
+    def _legacy(self, step: dict) -> str:
+        """Nineteenth round: an undo step journaled with no version of what the change left (written before the
+        eighteenth round, or by a calendar that gave none). The old content compare guarded on the version read now
+        could undo his edit since, so there's no automatic undo: its receipt says why and asks for a new change to
+        review. Logged, so the smoke run sees where the old compare would have applied. A step that has no version
+        because a read found it changed since (_landed_by_read marks it) is "changed", as before."""
+        if step.get("changed_since"):
+            return "changed"
+        log.warning("legacy undo fallback: an undo step with no journaled version (%s %s) is refused; the old "
+                    "content compare would have applied", step.get("cal"), step.get("how"))
+        return "legacy"
+
+    def _series_day_unchanged(self, cur: dict, step: dict) -> bool:
+        """Nineteenth round: the series-day exception, only where it's whole. A day of a series (Google gives a day
+        a new version when another day of its series changes) whose every field in SERIES_COMPARE reads exactly as
+        the change left it: what the change wrote, and for the rest the content journaled at its read back
+        (entry "after"). A field with nothing journaled to compare against, or any that differs, is "changed"."""
+        if not (step.get("series") or cur.get("recurringEventId")):
+            return False
+        wrote, after = step.get("wrote") or {}, step.get("after")
+        if not isinstance(after, dict):
+            return False
+        expect = {k: after.get(k) for k in SERIES_COMPARE}
+        expect.update({k: v for k, v in wrote.items() if k in SERIES_COMPARE})
+        return self._as_written(cur, expect, whole=True)
 
     def _series_there(self, address: str, step: dict) -> str:
         """Google will put one day back under a series that's gone, as an event on its own."""
@@ -8004,10 +8129,10 @@ class CalendarChange:
             latest[href] = out.etag or ""
             return "ok"                      # already back: an undo cut short after its write
         expected = latest.get(href, step.get("etag")) or ""
-        if expected and out.etag != expected:
+        if not expected:
+            return self._legacy(step)            # nineteenth round: no version journaled, no automatic undo
+        if out.etag != expected:
             return "changed"                     # eighteenth round: any version but the one the change left
-        if not expected and not caldav._unchanged(body, step.get("after", "")):
-            return "changed"
         if not self._undo_attempt(step):
             return "not_landed"
         guard = self._send_guard("family", expected or out.etag or "")   # If-Match: the journaled version
@@ -8023,9 +8148,10 @@ class CalendarChange:
             latest[href] = back.etag or out.etag or ""
         return out.kind
 
-    def _as_written(self, now: dict, wrote: dict) -> bool:
+    def _as_written(self, now: dict, wrote: dict, whole: bool = False) -> bool:
         """Still what the harness wrote, when the version can't say: another day's change can
-        give this one a new version."""
+        give this one a new version. `whole` (nineteenth round): every key given is compared, an absent one
+        included, so a field he set since where there was none is a difference."""
         if not wrote:
             return False
         for key, value in wrote.items():
@@ -8037,6 +8163,9 @@ class CalendarChange:
                     return False
             elif key in ("recurrence", "attendees", "attachments"):
                 if list(now.get(key) or []) != list(value or []):
+                    return False
+            elif whole and key in ("reminders", "conferenceData", "extendedProperties"):
+                if json.dumps(now.get(key) or None, sort_keys=True) != json.dumps(value or None, sort_keys=True):
                     return False
             elif now.get(key) != value:
                 return False
@@ -8068,16 +8197,17 @@ class CalendarChange:
                 latest[uid] = cur.get("etag") or ""
                 return "ok"                  # already back: an undo cut short after its write
             journaled = latest.get(uid, step.get("etag")) or ""
-            if journaled and cur.get("etag") != journaled:
+            if not journaled:
+                return self._legacy(step)        # nineteenth round: no version journaled, no automatic undo
+            if cur.get("etag") != journaled:
                 # Eighteenth round: any version but the one the change left is his edit since, and is left alone.
-                # The one exception is a day of a series whose content still reads exactly as written: Google gives
-                # a day a new version when another day of its series changes. Then the version just read guards.
-                if not (step.get("series") or cur.get("recurringEventId")) \
-                        or not self._as_written(cur, step.get("wrote") or {}):
+                # The one exception is a day of a series whose content still reads exactly as the change left it:
+                # Google gives a day a new version when another day of its series changes. Nineteenth round: that
+                # compare covers every field an Undo could write (_series_day_unchanged). Then the version just
+                # read guards.
+                if not self._series_day_unchanged(cur, step):
                     return "changed"
                 journaled = cur.get("etag") or ""
-            if not journaled and not self._as_written(cur, step.get("wrote") or {}):
-                return "changed"
             if not self._undo_attempt(step):
                 return "not_landed"
             # Eighteenth round: sent over the version the change left (journaled with its step), so his edit

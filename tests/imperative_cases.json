@@ -1,0 +1,18 @@
+[
+  ["Tap Go ahead to see it.", "Go ahead", true],
+  ["tap on the Undo button", "Undo", true],
+  ["Press “Approve” now.", "Approve", true],
+  ["Clicking **Undo** takes it off.", "Undo", true],
+  ["hit the Stop", "Stop", true],
+  ["The Undo button takes it off.", "Undo", true],
+  ["Use the \"Add anyway\" buttons below.", "Add anyway", true],
+  ["There's no Go ahead here.", "Go ahead", false],
+  ["We'll go ahead with it.", "go ahead", false],
+  ["You can undo this later.", "undo", false],
+  ["Pick Undo if it's wrong.", "Undo", false],
+  ["It ends with Undo.", "Undo", false],
+  ["Go ahead does it now.", "Go ahead", false],
+  ["Tapping elsewhere, Undo stays.", "Undo", false],
+  ["retap Undo", "Undo", false],
+  ["Undo buttonless", "Undo", false]
+]
