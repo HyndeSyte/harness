@@ -996,7 +996,10 @@ export function listLine(j: Job, r: Result | null): string {
 // (chrome_version_changed). null otherwise. Never free text.
 // worker_changed: the worker's own files, the Cain App version they came with, or the
 // hook's policy version changed since the confirmation (a new release needs a new probe).
-export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed", "worker_changed"] as const;
+// hold_clear_unrecorded (twenty-seventh round), with version_hold_unwritable only: the worker couldn't write its record
+// of a version hold clear made without a version floor (version-hold-cleared.json), so the hold stays; the keeper sends
+// the owner a notice for it (pcjobs/main.ts holdClearNotice).
+export const REASONS = ["extension_version_changed", "cli_version_changed", "extension_version_unknown", "chrome_version_changed", "worker_changed", "hold_clear_unrecorded"] as const;
 export type Reason = typeof REASONS[number];
 export interface Heartbeat { v: 1; worker_clock: string; code: Code | "idle" | "stopped" | "busy" | "queue_misconfigured" | "git_failed";
   job: string | null; stale_lock: boolean; skew_ms: number | null; reason: Reason | null }

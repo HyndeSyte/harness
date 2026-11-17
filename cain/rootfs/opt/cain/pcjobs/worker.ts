@@ -984,9 +984,15 @@ export function holdCleared(o: Opts, inst: Install, had: VersionHold): { cleared
 export const holdClearedFile = (o: Opts) => join(o.home, "version-hold-cleared.json");
 let floorNote: string | null = null;
 export const takeFloorNote = () => { const n = floorNote; floorNote = null; return n; };
+// Twenty-seventh round: the last version_hold_unwritable came from a floorless clear whose record couldn't be written
+// (not from the hold itself), so the run's hint and the heartbeat's reason name the cleared-record file and the
+// condition, not the hold file.
+let clearUnrecorded = false;
+export const VERSION_HOLD_CLEAR_UNRECORDED_HINT = "the worker couldn't write its record of a version hold clear made without a version floor (version-hold-cleared.json in the worker folder), so the hold stays and no run starts: that file's folder can't be written (the disk is full, or the folder or file is read-only or blocked). Free disk space or fix the worker folder's permissions so version-hold-cleared.json can be written, then run again";
 export type HoldFail = "version_hold_unwritable" | "version_hold_cannot_invalidate";
 export const holdFailed = (x: unknown): x is HoldFail => x === "version_hold_unwritable" || x === "version_hold_cannot_invalidate";
 export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode | null = null): HoldCode | HoldFail | null {
+  clearUnrecorded = false;
   const folders = extensionFolders(inst);
   const code: HoldCode | null = updatePending(inst) ? "update_pending" : folders.length > 1 ? "extension_versions_ambiguous" : after;
   let had = readVersionHold(o);
@@ -1009,6 +1015,7 @@ export function versionHold(o: Opts, inst: Install, now: Date, after: HoldCode |
     if (cl.floorless && !writeWhole(holdClearedFile(o), JSON.stringify({ at: now.toISOString(), code: had.code, without_floor: cl.floorless }) + "\n")) {
       try { appendFileSync(P.log(o), `${now.toISOString()} version_hold_clear_unrecorded ${had.code}: the record of a clear without a version floor (${holdClearedFile(o)}) couldn't be written, so the hold stays\n`); } catch { /* never stops it */ }
       floorNote = "version_hold_clear_unrecorded";
+      clearUnrecorded = true;
       return "version_hold_unwritable";
     }
     rmSync(P.versionHold(o), { force: true });
@@ -1590,7 +1597,8 @@ interface RunState { stale: boolean; skew: number | null; reason?: Reason | null
 function beat(o: Opts, code: Heartbeat["code"], job: string | null, now: Date, st: RunState, more: string[] = []): Heartbeat {
   const note = takeFloorNote();
   const warnings = [...(st.warnings ?? []), ...more, ...(note ? [note] : [])];
-  const reason = code === "probe_stale" || code === "extension_version_unknown" ? st.reason ?? null : null;
+  const reason = code === "probe_stale" || code === "extension_version_unknown" ? st.reason ?? null
+    : code === "version_hold_unwritable" && clearUnrecorded ? "hold_clear_unrecorded" : null;
   const h: Heartbeat = { v: 1, worker_clock: now.toISOString(), code, job, stale_lock: st.stale, skew_ms: st.skew, reason };
   try {
     mkdirSync(o.home, { recursive: true });
@@ -4697,7 +4705,7 @@ export async function run(o: Opts): Promise<RunOut> {
     if (n.code === "chrome_version_timeout") detail = CHROME_VERSION_TIMEOUT_HINT;
     if (n.code === "chrome_version_unreadable") detail = CHROME_VERSION_UNREADABLE_HINT;
     if (n.code === "update_pending" || n.code === "extension_versions_ambiguous") detail = VERSION_HOLD_HINT;
-    if (n.code === "version_hold_unwritable") detail = VERSION_HOLD_UNWRITABLE_HINT;
+    if (n.code === "version_hold_unwritable") detail = clearUnrecorded ? VERSION_HOLD_CLEAR_UNRECORDED_HINT : VERSION_HOLD_UNWRITABLE_HINT;
     if (n.code === "version_hold_cannot_invalidate") detail = VERSION_HOLD_CANNOT_INVALIDATE_HINT;
     if (n.code === "versions_changed") detail = VERSIONS_CHANGED_HINT;
     return { code: n.code, job: null, closed: n.closed, ...(detail ? { detail } : {}) };
@@ -5190,13 +5198,27 @@ export const PROBE_GATE_HINT: Record<string, string> = {
 // which returns the listing's text and is parsed and checked like the real one), and the exeVersion stand-in
 // without one refuses the step by name (listing_stand_in), wherever the worker runs.
 export const LISTING_STAND_IN = "listing_stand_in";
-// Twenty-sixth round: the listing runner (chromePs) is honoured only in a test build, named by the explicit flag
-// PC_WORKER_TEST_BUILD=1 in the worker's own process environment (set by the test files, never by setup); anywhere
-// else a caller that sets the field gets the step refused by name (listing_runner_refused), and a run's version read
-// fails as unreadable, so a fabricated listing is never parsed as the real one.
+// Twenty-sixth round: the listing runner (chromePs) is honoured only in a test build; anywhere else a caller that sets
+// the field gets the step refused by name (listing_runner_refused), and a run's version read fails as unreadable, so a
+// fabricated listing is never parsed as the real one.
+// Twenty-seventh round: the test build is no longer named by an environment variable (a user or system variable on the
+// PC, an inherited shell or a scheduled task's definition could set one). It is a global symbol set only by the
+// test-only module cain/tests/pcworker-testbuild.ts, which this file and its production entry point never import. The
+// old variable now does the opposite: the worker refuses to start while it is set outside the test harness
+// (testBuildFlagRefusal, below), with a loud worker-log line and its status line.
 export const TEST_BUILD_FLAG = "PC_WORKER_TEST_BUILD";
 export const LISTING_RUNNER_REFUSED = "listing_runner_refused";
-const testBuild = () => process.env[TEST_BUILD_FLAG] === "1";
+export const TEST_BUILD_FLAG_REFUSED = "test_build_flag_refused";
+const TEST_BUILD_MARK = Symbol.for("cain.pc-worker.test-build");
+const testBuild = () => (globalThis as any)[TEST_BUILD_MARK] === true;
+export const TEST_BUILD_FLAG_HINT = `the variable ${TEST_BUILD_FLAG} is set where the worker runs (a user or system environment variable, the terminal it was started from, or a scheduled task's settings): it belongs to the tests alone, so the worker doesn't start. Remove it (in PowerShell: Remove-Item Env:${TEST_BUILD_FLAG}, and delete it from Windows' environment variables if it is set there), open a new terminal and run again`;
+// The refusal at the start (twenty-seventh round): the variable present outside the test harness. Logged loudly in
+// worker.log and returned as the command's status line; null when the worker may start.
+export function testBuildFlagRefusal(o: Pick<Opts, "home">, env: Record<string, string | undefined> = process.env): { error: string; detail: string } | null {
+  if (env[TEST_BUILD_FLAG] === undefined || testBuild()) return null;
+  try { mkdirSync(o.home, { recursive: true }); appendFileSync(join(o.home, "worker.log"), `${new Date().toISOString()} ${TEST_BUILD_FLAG_REFUSED} ATTENTION: ${TEST_BUILD_FLAG_HINT}\n`); } catch { /* the refusal stands */ }
+  return { error: TEST_BUILD_FLAG_REFUSED, detail: TEST_BUILD_FLAG_HINT };
+}
 const runnerRefused = (o: Opts) => !!o.chromePs && !testBuild();
 export interface ChromeListingLine { applies: boolean; lines: number; mismatched: number[]; dedicated: boolean; same_process: boolean;
   version: string | null; failure: string | null; passed: boolean }
@@ -6560,6 +6582,9 @@ if (isMain && process.argv[2] === "nav-guard") {
     say(e instanceof WorkerError ? { error: e.code, ...(e.detail !== undefined ? { detail: e.detail } : {}) } : { error: "worker_failed" });
     process.exit(1);
   };
+  // Twenty-seventh round: the tests' build variable set where the worker runs: it doesn't start.
+  const refused = testBuildFlagRefusal(o);
+  if (refused) { say(refused); process.exit(1); }
   try {
     const [cmd, a1] = args;
     if (cmd === "run") run(o).then(say, fail);

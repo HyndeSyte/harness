@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ACTIONS_APP, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, RATE_WAIT_CAP_MS, refusalOf, WATCH_CAP_MS, watchAccepted, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
+import { ACTIONS_APP, GATE_RECORD_FORMAT, bumpsAt, checkRuns, facts, gateReport, headChecks, inMain, judgeChecks, judgeShipGate, keyAnswer, land, RATE_WAIT_CAP_MS, refusalOf, WATCH_CAP_MS, watchAccepted, watchShipGate, windowsAttempts, type GateReport, type MergeDeps } from "../rootfs/opt/cain/link/merge.ts";
 
 const REPO = "HyndeSyte/harness";
 const M0 = "a".repeat(40), M1 = "b".repeat(40), H1 = "c".repeat(40), H2 = "d".repeat(40), X1 = "e".repeat(40);
@@ -741,7 +741,8 @@ describe("seventeenth review: the Windows gate reads every run and every attempt
     expect(line.reports.every((r) => r.head === H1)).toBe(true);
     expect(w.read.some((p) => p.includes(OLD))).toBe(false);                // the old head's gate was never read
     expect(watchAccepted(JSON.stringify(line))).toBeNull();                                // twenty-sixth round: no generation is never current
-    expect(watchAccepted(JSON.stringify({ ...line, gen: 1 }))).toEqual({ pr: 21, head: H1, gen: 1 });
+    expect(watchAccepted(JSON.stringify({ ...line, gen: 1 }))).toBeNull();                 // twenty-seventh round: no record format is never current
+    expect(watchAccepted(JSON.stringify({ ...line, gen: 1, format: GATE_RECORD_FORMAT }))).toEqual({ pr: 21, head: H1, gen: 1 });
     expect(watchAccepted(JSON.stringify({ ...line, superseded: { at: "x" } }))).toBeNull();
     expect(watchAccepted("not json")).toBeNull();
   });

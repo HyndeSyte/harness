@@ -537,7 +537,13 @@ export const watchFile = (dir: string, sha: string) => `${dir}/ship-gate-${sha}.
 // alone (the dry run's report only; the Ship card and the watch always pass it).
 // Twenty-sixth round: a record with no generation (from before the twenty-sixth round) or generation 0 is never
 // current: generation files start at 1, so pre-round acceptances are void and the watch is run again once.
-export const recordGen = (x: any): number | null => Number.isInteger(x?.gen) && x.gen >= 1 ? x.gen : null;
+// Twenty-seventh round: and only a record written in this round's record format (format: GATE_RECORD_FORMAT, written
+// with every record from this round on) is ever current. A record from before it carries no format and counts for
+// nothing, whatever generation it carries (a record written after an earlier round's takeover carries generation 1 and
+// would otherwise match a generation file holding 1), so the changelog's "acceptances from before this round are void"
+// holds in code.
+export const GATE_RECORD_FORMAT = 27;
+export const recordGen = (x: any): number | null => x?.format === GATE_RECORD_FORMAT && Number.isInteger(x?.gen) && x.gen >= 1 ? x.gen : null;
 export function watchAccepted(text: string | null, current?: number | null): { pr: number | null; head: string; gen: number } | null {
   try {
     const x = JSON.parse(text ?? "");

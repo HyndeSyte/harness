@@ -10,8 +10,8 @@ import { createHmac } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { cleared, linkNotify, noticeRound, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { parseHeartbeat, jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
+import { ageWords, holdClearNotice, HOLD_CLEAR_KEY, SILENT_ROUNDS, cleared, linkNotify, noticeRound, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
 import { askValues, PC_NOTICES, pcQueuedWords } from "../rootfs/opt/cain/link/core";
 import { linkFetch } from "../rootfs/opt/cain/link/http";
@@ -704,7 +704,7 @@ describe("twentieth review: the once-only notices, delivered and kept beside the
     expect(first).toMatchObject({ posted: false });                                 // not marked: the link didn't acknowledge it (its id kept)
     expect(round(cfg()).ok).toBe(true);
     expect(n.calls).toEqual(["reuse_store_unreadable", "reuse_store_unreadable"]);
-    expect(JSON.parse(readFileSync(told, "utf8")).told.store).toEqual({ id: first.id, posted: true, clear: 0, code: "reuse_store_unreadable" });   // marked once the link said posted, same id
+    expect(JSON.parse(readFileSync(told, "utf8")).told.store).toEqual({ id: first.id, posted: true, clear: 0, code: "reuse_store_unreadable", since: expect.any(String) });   // marked once the link said posted, same id
     expect(round(cfg()).ok).toBe(true);
     expect(n.calls.length).toBe(2);
   });
@@ -1099,7 +1099,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     const calls = [...main.matchAll(/\b(tell|waited)\(cfg, ([^;]*?)\);/g)].map((m) => m[2]).filter((a) => !a.startsWith("code, key"));
     expect(calls.length).toBeGreaterThanOrEqual(8);
     for (const a of calls) {
-      const tapNotice = !/^"reuse_store_unreadable"|^empty \?/.test(a);                  // the store and the queue's branch aren't about a job
+      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"/.test(a);   // the store, the queue's branch and the PC's hold clear aren't about a job
       if (tapNotice) expect(a).toMatch(/, whatOf\(cfg, (l|t)\)$/);
     }
     const w = world();
@@ -1270,7 +1270,7 @@ describe("twenty-fifth review: the configuration refusal as the keeper's deliver
     expect(kept.config).toBe(true);
     expect(Object.values(kept.told).every((m: any) => m.posted === false && !m.refused && m.config === undefined)).toBe(true);
     const lines = noticeTrouble({ used: w.used });
-    expect(lines[0]).toStartWith("Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); 2 notices for Dane wait (reuse_fetch_failed, reuse_unsettled).");
+    expect(lines[0]).toStartWith("Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); 2 notices for Dane wait (reuse_fetch_failed, reuse_unsettled), the oldest for about a minute.");
     // More rounds with everything still owed: no sends, and the file is left alone (same inode, same bytes).
     const before = { ino: ino(file), text: readFileSync(file, "utf8") };
     quiet(() => { resendOwed(cfg); resendOwed(cfg); tell(cfg, "reuse_fetch_failed", "fetch:a"); });
@@ -1408,5 +1408,91 @@ describe("twenty-sixth review: the configuration flag clears only on a real answ
     // The next round tries it once more.
     quiet(() => { resendOwed(cfg); tell(cfg, "reuse_unsettled", "unsettled:b"); });
     expect(calls).toEqual(["reuse_unsettled", "reuse_unsettled"]);
+  });
+});
+describe("twenty-seventh review: the unrecorded hold clear told through the keeper, the oldest owed notice's age, a local escalation when the link stays silent, and delivery across a restart", () => {
+  const quiet = <T>(f: () => T): T => {
+    const was = console.log;
+    console.log = () => {};
+    try { return f(); } finally { console.log = was; }
+  };
+  const hb = (code: string, reason: string | null) => parseHeartbeat(JSON.stringify({ v: 1, worker_clock: "2026-11-15T10:00:00Z", code, job: null, stale_lock: false, skew_ms: null, reason }));
+
+  test("a hold clear the PC refused as unrecorded is told to the owner once, under the attempted-set rules, in the link's own words, and seen clear when it goes", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const calls: string[] = [];
+    let answer: any = false;
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { calls.push(c); return answer; }) as any });
+    const refused = hb("version_hold_unwritable", "hold_clear_unrecorded");
+    expect(refused).not.toBeNull();
+    quiet(() => { noticeRound(); holdClearNotice(cfg, refused); holdClearNotice(cfg, refused); resendOwed(cfg, false); });
+    expect(calls).toEqual(["hold_clear_unrecorded"]);                                  // one try this round
+    answer = true;
+    quiet(() => { resendOwed(cfg); holdClearNotice(cfg, refused); });
+    expect(calls).toEqual(["hold_clear_unrecorded", "hold_clear_unrecorded"]);
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[HOLD_CLEAR_KEY]).toMatchObject({ posted: true, code: "hold_clear_unrecorded" });
+    quiet(() => { noticeRound(); holdClearNotice(cfg, refused); });
+    expect(calls.length).toBe(2);                                                    // told once while it lasts
+    // A hold that can't be written for its own reason isn't this notice; three clear rounds drop the mark.
+    for (let i = 0; i < 3; i++) quiet(() => { noticeRound(); holdClearNotice(cfg, hb("version_hold_unwritable", null)); });
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[HOLD_CLEAR_KEY]).toBeUndefined();
+    // The keeper's round reads the PC's heartbeat for it.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    expect(main).toContain("holdClearNotice(cfg, readHeartbeat(cfg.dir))");
+    // The link's words: what happened and the fix at the PC; never a job id, a sha, a time, or a check, resend or tap.
+    const words = PC_NOTICES.hold_clear_unrecorded;
+    expect(words).toContain("version-hold-cleared.json");
+    expect(words).not.toMatch(/\bcheck|resend|send it again|tap again|\b[0-9a-f]{40}\b|\d{4}-\d{2}-\d{2}T|j-\d{8}/i);
+  });
+
+  test("the attention line gives the owed count and the oldest owed notice's age in words; rounds in a row with no answer from the link raise a local escalation on the keeper's status", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    let answer: any = "config";
+    const cfg = w.cfg("pi-1", { notify: (() => answer) as any });
+    quiet(() => { noticeRound(); tell(cfg, "reuse_unsettled", "unsettled:a", { queued: "2026-11-15" }); });
+    const f = `${w.used}.told.json`;
+    const t = JSON.parse(readFileSync(f, "utf8"));
+    t.told["unsettled:a"].since = new Date(Date.now() - 3 * 3_600_000).toISOString();
+    writeFileSync(f, JSON.stringify(t));
+    const line = noticeTrouble({ used: w.used })[0];
+    expect(line).toContain("1 notice for Dane waits (reuse_unsettled), the oldest for about 3 hours.");
+    expect(line).not.toMatch(/\d{4}-\d{2}-\d{2}T/);
+    expect(ageWords(90 * 60_000)).toBe("about 2 hours");
+    // The link unreachable: one count per round, however many marks are tried.
+    resetNoticeProcess();
+    answer = false;
+    quiet(() => tell(cfg, "reuse_fetch_failed", "fetch:b", { site: "example.com", action: "read_account_settings" }));
+    for (let i = 0; i < SILENT_ROUNDS - 2; i++) quiet(() => resendOwed(cfg));
+    expect(JSON.parse(readFileSync(f, "utf8")).silent).toBe(SILENT_ROUNDS - 1);
+    expect(noticeTrouble({ used: w.used }).some((l) => l.includes("hasn't answered"))).toBe(false);
+    quiet(() => resendOwed(cfg));
+    const esc = noticeTrouble({ used: w.used }).find((l) => l.includes("hasn't answered"));
+    expect(esc).toStartWith(`Keeper: ATTENTION: the link hasn't answered the keeper's notices for ${SILENT_ROUNDS} rounds in a row; 2 notices for Dane wait`);
+    expect(esc).toContain("the oldest for about 3 hours");
+    // Any answer from the link ends it.
+    answer = "http";
+    quiet(() => resendOwed(cfg));
+    expect(JSON.parse(readFileSync(f, "utf8")).silent).toBeUndefined();
+    expect(noticeTrouble({ used: w.used }).some((l) => l.includes("hasn't answered"))).toBe(false);
+  });
+
+  test("a keeper restarted mid-round tries a mark once more with its saved notice id: at least once, deduplicated by the link", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: { code: string; id?: string }[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string, n?: { id: string }) => { sent.push({ code: c, id: n?.id }); return false; }) as any });
+    quiet(() => { noticeRound(); tell(cfg, "reuse_unsettled", "unsettled:c", { queued: "2026-11-15" }); resendOwed(cfg, false); });
+    expect(sent.length).toBe(1);
+    // The keeper restarts before the round ends: the attempted set was in memory only, so the new round tries again.
+    resetNoticeProcess();
+    quiet(() => resendOwed(cfg));
+    expect(sent.length).toBe(2);
+    expect(sent[1]).toEqual({ code: "reuse_unsettled", id: sent[0].id });
+    expect(sent[0].id).toMatch(/^[0-9a-f]{16,64}$/);
   });
 });

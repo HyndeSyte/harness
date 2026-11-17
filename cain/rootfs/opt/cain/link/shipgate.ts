@@ -20,23 +20,33 @@
 //   bun shipgate.ts --supersede <full sha>     records that the acceptance kept for that sha is replaced
 //                                              (after a rebase), so a card for the pull request's new
 //                                              head can go once a new watch accepts it
+//   bun shipgate.ts --recover-generation <n> [--floor <number>]
+//                                              rewrites pull request n's watch generation above every one recorded,
+//                                              under the gate lock (twenty-seventh round)
+//   bun shipgate.ts --quarantine <full sha>    sets aside a record that can't be read or doesn't parse, recorded
 // Every watch ends with a named failure past its caps (merge.ts): one wait GitHub asks for over 15
 // minutes (rate_wait_cap), or 2 hours in all (watch_cap).
-import { closeSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
+// Every GitHub API read here goes through one wrapper (ghGet, twenty-seventh round). Without a token GitHub allows 60
+// reads an hour from this address, shared with the link: a watch reads about 4 to 8 pages every 10 minutes (the pull
+// request's head, the head's check runs and the workflow's runs), so a watch running beside the link's own reads can
+// expect a rate-limit refusal now and then in a busy hour; each is told apart (a hold, or head_not_current naming the
+// rate limit, or an owed supersede), never read as a moved head or a failed check.
+import { appendFileSync, closeSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
-import { gateReport, shaBound, watchAccepted, watchFile, watchShipGate, type MergeDeps, type WatchLine } from "./merge";
+import { GATE_RECORD_FORMAT, gateReport, shaBound, watchAccepted, watchFile, watchShipGate, type MergeDeps, type WatchLine } from "./merge";
 
 export const SHIP_REPO = "HyndeSyte/harness";
 export const WATCH_DIR = "/data/work";
 const SHA = /^[0-9a-f]{40}$/;
-async function api(path: string): Promise<{ status: number; body: any; headers: Record<string, string> }> {
-  const r = await fetch(`https://api.github.com${path}`, { redirect: "error", signal: AbortSignal.timeout(15000),
-    headers: { accept: "application/vnd.github+json", "user-agent": "cain-link", "x-github-api-version": "2022-11-28" } });
-  const headers: Record<string, string> = {};
-  for (const k of ["retry-after", "x-ratelimit-remaining", "x-ratelimit-reset"]) { const v = r.headers.get(k); if (v !== null) headers[k] = v; }
-  return { status: r.status, body: await r.json().catch(() => null), headers };
-}
+// Twenty-seventh round: every GitHub API read this file makes (the watch's gate reports and head reads, the
+// acceptance's head checks, the supersede's head read) goes through the one request wrapper, ghGet below, so a rate
+// limit is classified and retried the same way everywhere. api is that wrapper for merge.ts's readers.
+const api = async (path: string): Promise<{ status: number; body: any; headers: Record<string, string> }> => {
+  const r = ghGet(path, { token: githubToken(), maxS: API_READ_S });
+  if ("miss" in r) throw new Error(r.miss === "no_curl" ? "curl isn't installed" : r.miss === "deadline" ? "the read's time ran out" : "GitHub didn't answer");
+  return { status: r.status, body: r.body, headers: r.headers };
+};
 // Every unsuperseded acceptance a watch of this pull request kept (ship-gate-<sha>.json), as the
 // Ship card reads them (link/main.ts gateWatch). An unreadable file counts as none.
 // Twenty-fifth round: only those written under the pull request's generation as it is now (merge.ts
@@ -46,6 +56,14 @@ async function api(path: string): Promise<{ status: number; body: any; headers: 
 // no acceptance) when the generation can't be read (unreadable, or missing while any lock or record of the pull
 // request carries a generation), the folder can't be listed, or a kept record can't be read or parsed.
 export type GateState = { heads: string[] } | { unknown: string };
+// Twenty-seventh round: which pull request a record belongs to. Parsed, its pr; a record that doesn't parse, the
+// "pr" its text still shows; else unknown (null). A record that can't be read or parsed counts against a pull
+// request only when it is that pull request's own or can't be told apart (one garbled record of another pull
+// request never blocks this one), and the refusal names it with its recovery (quarantineRecord).
+const prInText = (text: string): number | null => { const m = /"pr"\s*:\s*(\d{1,7})\b/.exec(text); return m ? Number(m[1]) : null; };
+export const recordName = /^ship-gate-([0-9a-f]{40})\.json$/;
+export const quarantineWhy = (f: string, sha: string, how: string) =>
+  `a record of the gate (${f}) ${how}, and it may be this pull request's: once no watch runs, set it aside with: /opt/cain/keeper.sh ship-gate --quarantine ${sha}, then try again`;
 export function gateState(dir: string, pr: number): GateState {
   let names: string[] = [];
   try { names = readdirSync(dir); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? { heads: [] } : { unknown: `the folder of the gate's records (${dir}) can't be listed` }; }
@@ -53,24 +71,31 @@ export function gateState(dir: string, pr: number): GateState {
   if (gen === null) return { unknown: genUnreadable(dir, pr) };
   const out: string[] = [];
   for (const n of names) {
-    const m = /^ship-gate-([0-9a-f]{40})\.json$/.exec(n);
+    const m = recordName.exec(n);
     if (!m) continue;
     let text: string;
-    try { text = readFileSync(`${dir}/${n}`, "utf8"); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return { unknown: `a record of the gate (${dir}/${n}) can't be read` }; }
-    try { JSON.parse(text); } catch { return { unknown: `a record of the gate (${dir}/${n}) doesn't parse` }; }
+    try { text = readFileSync(`${dir}/${n}`, "utf8"); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") continue; return { unknown: quarantineWhy(`${dir}/${n}`, m[1], "can't be read") }; }
+    try { JSON.parse(text); } catch { const p = prInText(text); if (p !== null && p !== pr) continue; return { unknown: quarantineWhy(`${dir}/${n}`, m[1], "doesn't parse") }; }
     const a = watchAccepted(text, gen);
     if (a && a.pr === pr && a.head === m[1]) out.push(a.head);
   }
   return { heads: out.sort() };
 }
-export function acceptedFor(dir: string, pr: number): string[] {
+// Twenty-seventh round: no lossy mapping. The live acceptances of a pull request, or the gate state unknown, tagged:
+// every caller handles the unknown answer itself (Accepted is GateState's own shape with the heads as a plain list).
+export type Accepted = string[] | { unknown: string };
+export function acceptedFor(dir: string, pr: number): Accepted {
   const st = gateState(dir, pr);
-  return "heads" in st ? st.heads : [];
+  if ("heads" in st) return st.heads;
+  if ("unknown" in st) return { unknown: st.unknown };
+  return unreachable(st);
 }
+export function unreachable(x: never): never { throw new Error(`ship gate: an answer no caller handles (${JSON.stringify(x)})`); }
 // One live acceptance per pull request (0.12.0, twenty-first round): the live (not superseded)
 // acceptances of a pull request other than this head. A watch refuses to accept while any stands
-// (live_acceptance, naming it), so the Ship card always reads exactly one.
-export const otherLive = (dir: string, pr: number, head: string): string[] => acceptedFor(dir, pr).filter((h) => h !== head);
+// (live_acceptance, naming it), so the Ship card always reads exactly one. Twenty-seventh round: or the gate state
+// unknown, which the caller must handle (a watch accepts nothing on it).
+export const otherLive = (dir: string, pr: number, head: string): Accepted => { const a = acceptedFor(dir, pr); return Array.isArray(a) ? a.filter((h) => h !== head) : a; };
 export const liveWhy = (other: string[]) =>
   `another live acceptance of this pull request stands (${other.join(", ")}): supersede it first (keeper.sh ship-gate --supersede ${other[0]}, once the pull request's head has moved past it), then watch again`;
 // The watch's line as it is kept: an acceptance is kept only when no other live acceptance of its pull
@@ -89,14 +114,20 @@ export const liveWhy = (other: string[]) =>
 //   renamer may lose the exclusive create to another watch, which is fine: that watch holds it), and it checks
 //   the live acceptances again after it has the lock (keepWatch). A rename that turns out to have caught a fresh lock
 //   (one made between the stat and the rename) puts it back where it was, and backs off;
-// - the critical section is bounded (one directory read and one write) far below LOCK_STALE_MS: a holder that
-//   took longer than CRITICAL_MAX_MS to reach its write doesn't write (lock_unavailable), so a slow live holder
-//   is never mistaken for a dead one (CRITICAL_MAX_MS * 4 <= LOCK_STALE_MS, asserted below);
+// - the critical section is bounded far below LOCK_STALE_MS. Twenty-seventh round: by one deadline for the whole
+//   section, CRITICAL_MAX_MS from the moment the lock is held, not by a check before the head reads. Both head reads
+//   (before and after the write) take their curl time and their rate-limit waits from what is left of it (never per
+//   try), and after the head reads, immediately before the fenced write, the elapsed bound, the lock's token and the
+//   generation are checked again; past the deadline nothing is accepted (lock_unavailable, criticalNotice), and an
+//   acceptance already written is taken back. The worst case a live holder keeps the lock is the deadline plus the
+//   last small file writes (CRITICAL_SLACK_MS), at most a quarter of LOCK_STALE_MS (asserted below), so a slow live
+//   holder is never mistaken for a dead one;
 // - a lock that can't be read (its time or its holder) counts as held: the taker backs off until its deadline,
 //   then fails lock_unavailable with a notice.
 export const LOCK_STALE_MS = 60_000;
 export const CRITICAL_MAX_MS = 10_000;
-if (CRITICAL_MAX_MS * 4 > LOCK_STALE_MS) throw new Error("ship gate: the lock's stale threshold must be well above its critical section");
+export const CRITICAL_SLACK_MS = 1_000;
+if ((CRITICAL_MAX_MS + CRITICAL_SLACK_MS) * 4 > LOCK_STALE_MS) throw new Error("ship gate: the lock's stale threshold must be at least four times its critical section's worst case");
 const lockFile = (dir: string, pr: number) => `${dir}/ship-gate-pr-${pr}.lock`;
 const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 // Twenty-fifth round, the generation (a fencing token): the pull request's watch generation is kept beside its lock
@@ -121,25 +152,39 @@ function genRaw(f: string): GenRaw {
 }
 // What the pull request's locks and records say about its generations: whether any carries one (or can't be read, so
 // might), and the highest recorded (a record's gen, or gen_floor: the generation a watch knew when it wrote its line).
-export function genRecorded(dir: string, pr: number): { any: boolean; max: number } {
+// Twenty-seventh round: only this round's records (GATE_RECORD_FORMAT) and locks make a missing file fail closed;
+// records from before it never count (watchAccepted) and so never block, though their numbers still raise max. A
+// record that can't be read or parsed counts only when it is this pull request's own or can't be told apart, and is
+// named (blocker), with its recovery: set it aside (quarantineRecord). Quarantined records' numbers raise max too.
+export function genRecorded(dir: string, pr: number): { any: boolean; max: number; blocker?: string } {
   let names: string[];
   try { names = readdirSync(dir); } catch (e) { return { any: (e as NodeJS.ErrnoException).code !== "ENOENT", max: 0 }; }
-  let any = false, max = 0;
-  const num = (v: unknown) => { if (Number.isInteger(v) && (v as number) >= 1) { any = true; max = Math.max(max, v as number); } };
+  let any = false, max = 0, blocker: string | undefined;
+  const num = (v: unknown, counts: boolean) => { if (Number.isInteger(v) && (v as number) >= 1) { if (counts) any = true; max = Math.max(max, v as number); } };
   const lock = `ship-gate-pr-${pr}.lock`;
   for (const n of names) {
     const isLock = n === lock || n.startsWith(`${lock}.stale-`);
-    const isRecord = /^ship-gate-[0-9a-f]{40}\.json$/.test(n);
-    if (!isLock && !isRecord) continue;
+    const rec = recordName.exec(n);
+    if (!isLock && !rec) continue;
     let text: string;
-    try { text = readFileSync(`${dir}/${n}`, "utf8"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") any = true; continue; }
+    try { text = readFileSync(`${dir}/${n}`, "utf8"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { any = true; blocker ??= rec ? quarantineWhy(`${dir}/${n}`, rec[1], "can't be read") : `the pull request's watch lock (${dir}/${n}) can't be read`; } continue; }
     if (isLock && text.trim() === "") continue;                   // the twenty-second round's empty lock: no generation
     let x: any;
-    try { x = JSON.parse(text); } catch { any = true; continue; }  // can't tell: it might carry one
-    if (isRecord && x?.pr !== pr) continue;
-    num(x?.gen); num(x?.gen_floor);
+    try { x = JSON.parse(text); }
+    catch {
+      if (isLock) { any = true; blocker ??= `the pull request's watch lock (${dir}/${n}) doesn't parse`; continue; }
+      const p = prInText(text);
+      if (p !== null && p !== pr) continue;                       // another pull request's garbled record
+      any = true; blocker ??= quarantineWhy(`${dir}/${n}`, rec![1], "doesn't parse");
+      continue;
+    }
+    if (rec && x?.pr !== pr) continue;
+    const counts = isLock || x?.format === GATE_RECORD_FORMAT;
+    num(x?.gen, counts); num(x?.gen_floor, counts);
   }
-  return { any, max };
+  for (const q of quarantined(dir)) if (q.pr === null || q.pr === pr) num(q.gen_max, false);
+  return { any, max, ...(blocker ? { blocker } : {}) };
 }
 function genOf(f: string): number | null {
   const raw = genRaw(f);
@@ -148,7 +193,14 @@ function genOf(f: string): number | null {
   return m && genRecorded(dirname(f), Number(m[1])).any ? null : 0;
 }
 export const readGen = (dir: string, pr: number) => genOf(genFile(dir, pr));
-export const genUnreadable = (dir: string, pr: number) => `the pull request's watch generation (${genFile(dir, pr)}) can't be read, or is missing while its locks or records carry one, so no acceptance counts; once no watch of this pull request is running, rewrite it with: /opt/cain/keeper.sh ship-gate --recover-generation ${pr}, then watch the pull request's head again`;
+export function genUnreadable(dir: string, pr: number): string {
+  const recover = `once no watch of this pull request is running, rewrite it with: /opt/cain/keeper.sh ship-gate --recover-generation ${pr}, then watch the pull request's head again`;
+  if (genRaw(genFile(dir, pr)) === "missing") {
+    const r = genRecorded(dir, pr);
+    if (r.blocker) return `the pull request's watch generation (${genFile(dir, pr)}) is missing and ${r.blocker}; if the refusal then names the generation file, ${recover}`;
+  }
+  return `the pull request's watch generation (${genFile(dir, pr)}) can't be read, or is missing while its locks or records carry one, so no acceptance counts; ${recover}`;
+}
 function writeGen(f: string, n: number, exclusive = false): boolean {
   const tmp = `${f}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   try {
@@ -172,20 +224,65 @@ function bumpGen(f: string): boolean {
   if (g === null) return false;
   return writeGen(f, g + 1);
 }
-// keeper.sh ship-gate --recover-generation <number>: the documented recovery for a generation file that is missing
-// (while records carry one) or can't be read. Refused while the pull request's lock looks current (a watch running);
-// otherwise the file is rewritten whole, a temporary file renamed into place, with a number above any generation
-// the file or the pull request's locks and records hold, so every acceptance kept before it no longer counts.
-export function recoverGen(dir: string, pr: number, o: { staleMs?: number } = {}): { ok: true; gen: number } | { ok: false; why: string } {
-  const lock = lockFile(dir, pr);
-  try { if (Date.now() - statSync(lock).mtimeMs <= (o.staleMs ?? LOCK_STALE_MS)) return { ok: false, why: `a watch of pull request ${pr} looks to be running (its lock, ${lock}, is current): run this again once it is done` }; }
-  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, why: `the pull request's watch lock (${lock}) can't be read: nothing was changed` }; }
-  const raw = genRaw(genFile(dir, pr));
-  const n = Math.max(genRecorded(dir, pr).max, typeof raw === "number" ? raw : 0) + 1;
-  mkdirSync(dir, { recursive: true });
-  return writeGen(genFile(dir, pr), n) ? { ok: true, gen: n } : { ok: false, why: `the generation file (${genFile(dir, pr)}) couldn't be written: nothing was changed` };
+// keeper.sh ship-gate --quarantine <sha> (twenty-seventh round): the recovery for a record that can't be read or
+// doesn't parse. It is set aside by rename (ship-gate-<sha>.json.quarantined-<random>, which no reader takes for a
+// record), and the quarantine is recorded in ship-gate-quarantine.jsonl with the pull request its text still shows
+// and the highest generation its text still shows, so a later recovery of the generation starts above it. A record
+// that reads and parses is never set aside.
+export const quarantineLog = (dir: string) => `${dir}/ship-gate-quarantine.jsonl`;
+export function quarantined(dir: string): { file: string; pr: number | null; gen_max: number | null }[] {
+  let text = "";
+  try { text = readFileSync(quarantineLog(dir), "utf8"); } catch { return []; }
+  const out: { file: string; pr: number | null; gen_max: number | null }[] = [];
+  for (const l of text.split("\n")) { try { const x = JSON.parse(l); if (typeof x?.file === "string") out.push({ file: x.file, pr: Number.isInteger(x.pr) ? x.pr : null, gen_max: Number.isInteger(x.gen_max) ? x.gen_max : null }); } catch { /* a torn line */ } }
+  return out;
 }
-export interface HeldLock { file: string; token: string; since: number; gen: number }
+export function quarantineRecord(dir: string, sha: string): { ok: true; as: string } | { ok: false; why: string } {
+  if (!SHA.test(sha)) return { ok: false, why: "that isn't a full commit sha" };
+  const f = watchFile(dir, sha);
+  let text: string | null = null;
+  try { text = readFileSync(f, "utf8"); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, why: `no record is kept for ${sha} (${f})` }; }
+  if (text !== null) { try { JSON.parse(text); return { ok: false, why: `the record kept for ${sha} (${f}) reads and parses: it is never set aside` }; } catch { /* garbled: set aside */ } }
+  const nums = text === null ? [] : [...text.matchAll(/"gen(?:_floor)?"\s*:\s*(\d{1,15})\b/g)].map((m) => Number(m[1]));
+  const as = `${f}.quarantined-${randomBytes(4).toString("hex")}`;
+  try { appendFileSync(quarantineLog(dir), JSON.stringify({ file: f, as, pr: text === null ? null : prInText(text), gen_max: nums.length ? Math.max(...nums) : null, at: new Date().toISOString() }) + "\n"); }
+  catch { return { ok: false, why: `the quarantine couldn't be recorded (${quarantineLog(dir)}): nothing was changed` }; }
+  try { renameSync(f, as); } catch { return { ok: false, why: `the record (${f}) couldn't be set aside: nothing was changed` }; }
+  return { ok: true, as };
+}
+// keeper.sh ship-gate --recover-generation <number> [--floor <number>]: the documented recovery for a generation file
+// that is missing (while records carry one) or can't be read. Twenty-seventh round: it takes the gate lock itself,
+// through the same rename-then-exclusive-create takeover as a watch (a lock that looks current refuses it: a watch is
+// running), so a watch taking over a stale lock at the same moment can't read the old generation while this renames a
+// higher one into place. Holding it, it reads the highest generation the file, the pull request's locks (the one it
+// took over included), its records and its quarantined records hold, writes one above it (and above --floor, an
+// explicit floor for what can't be read) whole, a temporary file renamed into place, then reads the file, the locks
+// and the records again and fails if anything is above what it wrote (run it again), and lets go. A record of the
+// pull request that can't be read or parsed refuses it until that record is set aside (quarantineRecord), unless a
+// floor is given.
+export function recoverGen(dir: string, pr: number, o: { staleMs?: number; waitMs?: number; floor?: number; afterWrite?: () => void } = {}): { ok: true; gen: number } | { ok: false; why: string } {
+  const lock = lockFile(dir, pr);
+  try { mkdirSync(dir, { recursive: true }); } catch { return { ok: false, why: `the folder of the gate's records (${dir}) can't be made: nothing was changed` }; }
+  const got = takeLock(lock, o.waitMs ?? 2_000, { staleMs: o.staleMs, recovery: true });
+  if (!("token" in got)) return { ok: false, why: got.miss === "held"
+    ? `a watch of pull request ${pr} looks to be running (its lock, ${lock}, is current): run this again once it is done`
+    : `the pull request's watch lock (${lock}) can't be read or taken: nothing was changed` };
+  try {
+    const rec = genRecorded(dir, pr);
+    if (rec.blocker && o.floor === undefined) return { ok: false, why: `${rec.blocker}; nothing was changed` };
+    const raw = genRaw(genFile(dir, pr));
+    const n = Math.max(rec.max, typeof raw === "number" ? raw : 0, got.seen ?? 0, o.floor ?? 0) + 1;
+    if (!writeGen(genFile(dir, pr), n)) return { ok: false, why: `the generation file (${genFile(dir, pr)}) couldn't be written: nothing was changed` };
+    o.afterWrite?.();
+    const now = genRaw(genFile(dir, pr)), again = genRecorded(dir, pr);
+    if (now !== n || again.max > n || !ownsLock(got))
+      return { ok: false, why: `something moved the pull request's watch generation while it was being recovered (the file now reads ${typeof now === "number" ? now : "unreadable"}, the highest recorded is ${again.max}, written ${n}): run this again` };
+    return { ok: true, gen: n };
+  } finally { letGo(got); }
+}
+// gen: the generation the lock was made under (null for the recovery's own lock, which makes none); seen: the highest
+// generation a lock this taker took over carried (twenty-seventh round, for the recovery).
+export interface HeldLock { file: string; token: string; since: number; gen: number; seen?: number }
 // Twenty-fourth round, the legacy rule: a lock with no token (the empty file the twenty-second round made, or
 // JSON without a token) is "legacy". Older than the stale bound, it is taken over through the same rename then
 // exclusive create, with a loud log line; one that looks current still counts as held. A file whose content
@@ -212,18 +309,23 @@ export function agoWords(ms: number): string {
   if (h < 36) return `about ${h} hours ago`;
   return `about ${Math.round(h / 24)} days ago`;
 }
-export function takeLock(f: string, waitMs: number, o: { staleMs?: number } = {}): HeldLock | LockMiss {
+// Twenty-seventh round, recovery: the generation recovery takes the lock the same way, but makes it under no
+// generation (it writes the generation itself) and doesn't move the generation on when it takes a stale lock over:
+// it notes the generation that lock carried (seen) and writes above it.
+export function takeLock(f: string, waitMs: number, o: { staleMs?: number; recovery?: boolean } = {}): HeldLock | LockMiss {
   const staleMs = o.staleMs ?? LOCK_STALE_MS;
   const until = Date.now() + waitMs;
   const token = `${process.pid}-${randomBytes(8).toString("hex")}`;
   let last: "held" | "unreadable" = "held";
+  let seen = 0;
   for (;;) {
     try {
       const fd = openSync(f, "wx");
       // The generation this lock is made under, read once it is this holder's: a takeover that moved it on
       // meanwhile is seen by the holder's own checks (keepWatch), which then accept nothing.
-      const gen = genForLock(genOfLock(f));
-      try { writeSync(fd, JSON.stringify({ pid: process.pid, token, gen, at: new Date().toISOString() })); } finally { closeSync(fd); }
+      const gen = o.recovery ? null : genForLock(genOfLock(f));
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, token, gen, ...(o.recovery ? { recovery: true } : {}), at: new Date().toISOString() })); } finally { closeSync(fd); }
+      if (o.recovery) return { file: f, token, since: Date.now(), gen: 0, ...(seen ? { seen } : {}) };
       if (gen === null) { rmSync(f, { force: true }); return { miss: "unreadable" }; }
       return { file: f, token, since: Date.now(), gen };
     } catch (e) {
@@ -243,7 +345,9 @@ export function takeLock(f: string, waitMs: number, o: { staleMs?: number } = {}
         if (same && Date.now() - (caught as { mtimeMs: number }).mtimeMs > staleMs) {
           // The fence: the generation moves on before the lock can be made again, so whatever the holder taken
           // over writes from now on is no acceptance. A generation that can't be moved on puts the lock back.
-          if (!bumpGen(genOfLock(f))) {
+          if (o.recovery) {
+            try { const g = JSON.parse(readFileSync(aside, "utf8"))?.gen; if (Number.isInteger(g) && g > seen) seen = g; } catch { /* a legacy lock: no generation */ }
+          } else if (!bumpGen(genOfLock(f))) {
             try { linkSync(aside, f); } catch { /* a newer lock stands */ }
             rmSync(aside, { force: true });
             return { miss: "unreadable" };
@@ -276,17 +380,24 @@ export const lockNotice = (f: string) => `the pull request's watch lock (${f}) c
 // must be run again for this head.
 export const takeBackNotice = (f: string) => `the pull request's watch lock (${f}) was taken over while this watch was keeping its acceptance: no acceptance stands for this head, and the watch must be run again for it`;
 // The pull request's head as GitHub has it now, read synchronously (the watch's checks run under its lock, which is
-// held only briefly): one GET of the pull request through curl, at most HEAD_READ_S seconds a try.
-// Twenty-sixth round, the real request wrapper (ghHeadRead): authenticated with a GitHub token when one is given (on
-// curl's standard input, never its command line, and never printed); a refused read (403 with GitHub's rate-limit
-// signs, or 429) is tried again at most HEAD_READ_RETRIES times, each wait as GitHub's Retry-After or rate-limit
-// reset asks, but only while that wait fits HEAD_RETRY_WAIT_MS (the lock is held meanwhile); otherwise it comes back
-// as a rate limit, told apart from a head that moved and from a read that failed (a 5xx, malformed JSON, no answer).
-// curl missing comes back as its own answer, and the watch checks for curl before it starts (curlPresent).
-export const HEAD_READ_S = 4;
+// held only briefly): one GET of the pull request through curl.
+// Twenty-sixth round, the real request wrapper: authenticated with a GitHub token when one is given (on curl's standard
+// input, never its command line, and never printed); a refused read (403 with GitHub's rate-limit signs, or 429) is
+// tried again at most HEAD_READ_RETRIES times, each wait as GitHub's Retry-After or rate-limit reset asks, but only
+// while that wait fits HEAD_RETRY_WAIT_MS; otherwise it comes back as a rate limit, told apart from a head that moved
+// and from a read that failed (a 5xx, malformed JSON, no answer). curl missing comes back as its own answer, and the
+// watch checks for curl before it starts (curlPresent).
+// Twenty-seventh round: the one wrapper for every GitHub API read here (ghGet; ghHeadRead and api are built on it), and
+// a deadline: under the lock the read takes its curl time and its waits from what is left of the critical section
+// (o.deadline), never per try. Each try's curl limit is the smaller of HEAD_READ_S and the time left; a wait that
+// doesn't fit the time left, or a try with too little time left to make, ends the read as { miss: "deadline" }, which
+// the watch treats as its section running out (lock_unavailable), never as a moved head.
+export const HEAD_READ_S = 3;
 export const HEAD_READ_RETRIES = 2;
 export const HEAD_RETRY_WAIT_MS = 2_000;
-export type HeadMiss = { miss: "rate_limit"; wait_ms: number | null } | { miss: "unreadable"; why: string } | { miss: "no_curl" };
+export const API_READ_S = 15;
+const MIN_TRY_MS = 250;
+export type HeadMiss = { miss: "rate_limit"; wait_ms: number | null } | { miss: "unreadable"; why: string } | { miss: "no_curl" } | { miss: "deadline" };
 export type HeadRead = string | HeadMiss;
 export const curlPresent = (): boolean => Bun.which("curl") !== null;
 function splitHttp(out: string): { status: number; headers: Record<string, string>; body: string } | null {
@@ -303,33 +414,55 @@ function splitHttp(out: string): { status: number; headers: Record<string, strin
   }
   return status ? { status, headers, body: rest } : null;
 }
-export function ghHeadRead(repo: string, pr: number, o: { token?: string; base?: string; retries?: number; retryWaitMs?: number; sleep?: (ms: number) => void; now?: () => number } = {}): HeadRead {
+export interface GhOpts { token?: string; base?: string; retries?: number; retryWaitMs?: number; sleep?: (ms: number) => void; now?: () => number; deadline?: number; maxS?: number }
+export type GhAnswer = { status: number; body: any; text: string; headers: Record<string, string> } | { miss: "no_answer" | "unparsed" | "no_curl" | "deadline" };
+// GitHub's rate-limit signs on a refused answer (429, or a 403 with them), and the wait it asked for.
+export const limitedOf = (r: { status: number; headers: Record<string, string>; text: string }) =>
+  r.status === 429 || (r.status === 403 && (r.headers["x-ratelimit-remaining"] === "0" || r.headers["retry-after"] !== undefined || /secondary rate limit/i.test(r.text)));
+const waitOf = (h: Record<string, string>, now: number): number | null => {
+  const ra = Number(h["retry-after"]), reset = Number(h["x-ratelimit-reset"]);
+  return Number.isFinite(ra) && ra >= 0 && h["retry-after"] !== undefined ? ra * 1000 : Number.isFinite(reset) && reset > 0 ? Math.max(0, reset * 1000 - now) : null;
+};
+export function ghGet(path: string, o: GhOpts = {}): GhAnswer {
   const base = o.base ?? "https://api.github.com";
   const now = o.now ?? Date.now;
   const sleep = o.sleep ?? pause;
   const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-  const conf = [`url = ${q(`${base}/repos/${repo}/pulls/${pr}`)}`, `header = "accept: application/vnd.github+json"`, `header = "user-agent: cain-link"`,
-    `header = "x-github-api-version: 2022-11-28"`, ...(o.token ? [`header = ${q(`authorization: Bearer ${o.token}`)}`] : []),
-    `max-time = ${HEAD_READ_S}`, `silent`, `include`, ...(base.startsWith("http://127.0.0.1") ? [`noproxy = "127.0.0.1"`] : [])].join("\n") + "\n";
   const retries = o.retries ?? HEAD_READ_RETRIES;
   for (let i = 0; ; i++) {
+    const left = o.deadline !== undefined ? o.deadline - now() : Infinity;
+    if (left < MIN_TRY_MS) return { miss: "deadline" };
+    const maxS = Math.min(o.maxS ?? HEAD_READ_S, left / 1000);
+    const conf = [`url = ${q(`${base}${path}`)}`, `header = "accept: application/vnd.github+json"`, `header = "user-agent: cain-link"`,
+      `header = "x-github-api-version: 2022-11-28"`, ...(o.token ? [`header = ${q(`authorization: Bearer ${o.token}`)}`] : []),
+      `max-time = ${maxS.toFixed(2)}`, `silent`, `include`, ...(base.startsWith("http://127.0.0.1") ? [`noproxy = "127.0.0.1"`] : [])].join("\n") + "\n";
     let p: ReturnType<typeof Bun.spawnSync>;
-    try { p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore" }); }
+    try { p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore", timeout: Math.ceil(maxS * 1000) + 500 }); }
     catch { return { miss: "no_curl" }; }
-    if (p.exitCode !== 0) return { miss: "unreadable", why: "GitHub didn't answer" };
+    if (p.exitCode !== 0) return o.deadline !== undefined && o.deadline - now() < MIN_TRY_MS ? { miss: "deadline" } : { miss: "no_answer" };
     const r = splitHttp(p.stdout.toString());
-    if (!r) return { miss: "unreadable", why: "GitHub's answer couldn't be read" };
-    if (r.status === 200) {
-      try { const h = JSON.parse(r.body)?.head?.sha; return typeof h === "string" && SHA.test(h.toLowerCase()) ? h.toLowerCase() : { miss: "unreadable", why: "GitHub's answer named no head" }; }
-      catch { return { miss: "unreadable", why: "GitHub's answer wasn't JSON" }; }
-    }
-    const limited = r.status === 429 || (r.status === 403 && (r.headers["x-ratelimit-remaining"] === "0" || r.headers["retry-after"] !== undefined || /secondary rate limit/i.test(r.body)));
-    if (!limited) return { miss: "unreadable", why: r.status >= 500 ? `GitHub answered with a server error (${r.status})` : `GitHub refused the read (${r.status})` };
-    const ra = Number(r.headers["retry-after"]), reset = Number(r.headers["x-ratelimit-reset"]);
-    const wait = Number.isFinite(ra) && ra >= 0 && r.headers["retry-after"] !== undefined ? ra * 1000 : Number.isFinite(reset) && reset > 0 ? Math.max(0, reset * 1000 - now()) : null;
-    if (i >= retries || wait === null || wait > (o.retryWaitMs ?? HEAD_RETRY_WAIT_MS)) return { miss: "rate_limit", wait_ms: wait };
+    if (!r) return { miss: "unparsed" };
+    let body: any = null;
+    try { body = JSON.parse(r.body); } catch { body = null; }
+    const a = { status: r.status, body, text: r.body, headers: r.headers };
+    if (!limitedOf(a)) return a;
+    const wait = waitOf(r.headers, now());
+    if (i >= retries || wait === null || wait > (o.retryWaitMs ?? HEAD_RETRY_WAIT_MS)) return a;
+    if (o.deadline !== undefined && wait > o.deadline - now() - MIN_TRY_MS) return { miss: "deadline" };
     sleep(wait);
   }
+}
+export function ghHeadRead(repo: string, pr: number, o: GhOpts = {}): HeadRead {
+  const r = ghGet(`/repos/${repo}/pulls/${pr}`, o);
+  if ("miss" in r) return r.miss === "no_curl" ? { miss: "no_curl" } : r.miss === "deadline" ? { miss: "deadline" }
+    : { miss: "unreadable", why: r.miss === "no_answer" ? "GitHub didn't answer" : "GitHub's answer couldn't be read" };
+  if (r.status === 200) {
+    if (r.body === null) return { miss: "unreadable", why: "GitHub's answer wasn't JSON" };
+    const h = r.body?.head?.sha;
+    return typeof h === "string" && SHA.test(h.toLowerCase()) ? h.toLowerCase() : { miss: "unreadable", why: "GitHub's answer named no head" };
+  }
+  if (limitedOf(r)) return { miss: "rate_limit", wait_ms: waitOf(r.headers, (o.now ?? Date.now)()) };
+  return { miss: "unreadable", why: r.status >= 500 ? `GitHub answered with a server error (${r.status})` : `GitHub refused the read (${r.status})` };
 }
 // The watch's head read (twenty-fifth round's name kept): the head, or null with the reason left out. keepWatch takes
 // ghHeadRead's whole answer, to word a rate limit apart from a moved head.
@@ -341,11 +474,18 @@ export const githubToken = (env = process.env): string | undefined => { const t 
 export const headMissWords = (m: HeadMiss | null) => !m ? "the pull request's head couldn't be read from GitHub"
   : m.miss === "rate_limit" ? `GitHub's rate limit stopped the read of the pull request's head${m.wait_ms !== null ? ` (it asked to wait about ${Math.max(1, Math.ceil(m.wait_ms / 60_000))} minutes)` : ""}, so the head isn't known to have moved`
   : m.miss === "no_curl" ? "curl isn't installed, so the pull request's head couldn't be read from GitHub"
+  : m.miss === "deadline" ? "the watch's time under its lock ran out while it read the pull request's head from GitHub"
   : `the pull request's head couldn't be read from GitHub (${m.why})`;
 export interface KeepOpts {
-  headNow: (pr: number, checking: string) => string | null | HeadMiss;   // the pull request's head from GitHub at check time (ghHeadRead in the watch)
-  waitMs?: number; staleMs?: number; beforeWrite?: () => void; atWrite?: () => void; afterWrite?: () => void;
+  // The pull request's head from GitHub at check time (ghHeadRead in the watch). deadline: when the critical section
+  // ends (twenty-seventh round), for the read to take its time and waits from.
+  headNow: (pr: number, checking: string, deadline: number) => string | null | HeadMiss;
+  waitMs?: number; staleMs?: number; criticalMs?: number; beforeWrite?: () => void; atWrite?: () => void; afterWrite?: () => void;
 }
+// The critical section past its deadline (twenty-seventh round), named.
+export const criticalNotice = (f: string, ms: number, after = false) => after
+  ? `the watch's work under the pull request's watch lock (${f}) ran past its ${Math.round(ms / 1000)} second bound just after its acceptance was written: it is taken back, and no acceptance stands for this head; run the watch again`
+  : `the watch's work under the pull request's watch lock (${f}) ran past its ${Math.round(ms / 1000)} second bound before its acceptance was written: nothing was accepted; run the watch again`;
 export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts): WatchLine {
   let kept = line;
   mkdirSync(dirname(out), { recursive: true });
@@ -358,16 +498,20 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts
     if (was?.superseded && was.accepted_head === sha) { console.error(`ship gate: the record kept for this sha was superseded; it is left as it is (${out})`); return; }
     // Twenty-sixth round: every line kept for a pull request carries the generation the watch knew (gen_floor), so a
     // generation file deleted later is fail-closed and its recovery starts above it.
+    // Twenty-seventh round: and the record format (format), without which no record is ever current.
     const floor = held ? held.gen : l.pr !== null ? readGen(dir, l.pr) : null;
-    const stamped = floor !== null && floor >= 1 ? { ...l, gen_floor: floor } : l;
+    const stamped = { ...l, format: GATE_RECORD_FORMAT, ...(floor !== null && floor >= 1 ? { gen_floor: floor } : {}) };
     writeFileSync(`${out}.tmp`, JSON.stringify(stamped, null, 2) + "\n"); renameSync(`${out}.tmp`, out);
   };
   const lockPath = line.pr !== null && line.accepted_head ? lockFile(dir, line.pr) : null;
   if (lockPath) mkdirSync(dir, { recursive: true });
   const got = lockPath ? takeLock(lockPath, o.waitMs ?? 10_000, { staleMs: o.staleMs }) : null;
   const held = got && "token" in got ? got : null;
+  const criticalMs = o.criticalMs ?? CRITICAL_MAX_MS;
+  const deadline = held ? held.since + criticalMs : 0;
   const unavailable = (why = lockNotice(lockPath!)): WatchLine => ({ ...line, accepted_head: null, passed: false, failure: "lock_unavailable", failure_why: why });
   const refuse = (failure: WatchLine["failure"], why: string): WatchLine => ({ ...line, accepted_head: null, passed: false, failure, failure_why: why });
+  const unknownWhy = (u: { unknown: string }) => `the Ship gate's state can't be read (${u.unknown}): nothing was accepted`;
   if (lockPath && !held) {
     // Another watch's readable lock held to the deadline: that watch is being kept (live_acceptance, as before);
     // a lock that couldn't be read, or made: lock_unavailable.
@@ -383,13 +527,14 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts
   try {
     if (line.pr !== null && line.accepted_head) {
       const other = otherLive(dir, line.pr, line.accepted_head);
-      if (other.length) kept = refuse("live_acceptance", liveWhy(other));
+      if (!Array.isArray(other)) kept = unavailable(unknownWhy(other));
+      else if (other.length) kept = refuse("live_acceptance", liveWhy(other));
     }
     if (held) beat(held);
     o.beforeWrite?.();
     // Still this watch's own lock, refreshed, and the section within its bound: otherwise nothing is accepted.
-    if (held && kept.accepted_head && (Date.now() - held.since > CRITICAL_MAX_MS || !beat(held))) {
-      kept = unavailable();
+    if (held && kept.accepted_head && (Date.now() > deadline || !beat(held))) {
+      kept = unavailable(Date.now() > deadline ? criticalNotice(lockPath!, criticalMs) : undefined);
       console.error(`ship gate: ${kept.failure_why}`);
     }
     if (!held || !kept.accepted_head || kept.pr === null) { write(kept); return kept; }
@@ -401,7 +546,7 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts
     if (!fenced(held)) { kept = unavailable(readGen(dir, pr) === null ? genUnreadable(dir, pr) : undefined); console.error(`ship gate: ${kept.failure_why}`); write(kept); return kept; }
     // Twenty-sixth round: a gate state that can't be read (a record that doesn't parse, say) accepts nothing.
     const st = gateState(dir, pr);
-    if ("unknown" in st) { kept = unavailable(`the Ship gate's state can't be read (${st.unknown}): nothing was accepted`); console.error(`ship gate: ${kept.failure_why}`); write(kept); return kept; }
+    if ("unknown" in st) { kept = unavailable(unknownWhy(st)); console.error(`ship gate: ${kept.failure_why}`); write(kept); return kept; }
     const textOf = () => { try { return readFileSync(out, "utf8"); } catch { return null; } };
     const pre = shaBound(textOf(), pr, head, held.gen);
     if (pre === "kept") return JSON.parse(textOf()!) as WatchLine;
@@ -410,7 +555,10 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts
       console.error(`ship gate: ${kept.failure_why}`);
       return kept;
     }
-    const now1 = o.headNow(pr, head);
+    const now1 = o.headNow(pr, head, deadline);
+    if (now1 !== null && typeof now1 === "object" && now1.miss === "deadline") {
+      kept = unavailable(criticalNotice(lockPath!, criticalMs)); console.error(`ship gate: ${kept.failure_why}`); write(kept); return kept;
+    }
     if (now1 !== head) {
       kept = refuse("head_not_current", typeof now1 === "string" ? `the pull request's head on GitHub is now ${now1}, not ${head}: nothing is accepted; watch its current head`
         : `${headMissWords(now1)} just before the acceptance was kept: nothing is accepted; run the watch again`);
@@ -419,18 +567,30 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts
       return kept;
     }
     const other = otherLive(dir, pr, head);
+    if (!Array.isArray(other)) { kept = unavailable(unknownWhy(other)); console.error(`ship gate: ${kept.failure_why}`); write(kept); return kept; }
     if (other.length) { kept = refuse("live_acceptance", liveWhy(other)); write(kept); return kept; }
+    // Twenty-seventh round: after the head read, immediately before the fenced write, the elapsed bound, the lock's
+    // token and the generation once more; past the deadline, or no longer this holder's, nothing is accepted. (What
+    // can still happen between this check and the write is what the post-write checks below take back.)
+    if (Date.now() > deadline || !fenced(held) || !beat(held)) {
+      kept = unavailable(Date.now() > deadline ? criticalNotice(lockPath!, criticalMs) : readGen(dir, pr) === null ? genUnreadable(dir, pr) : undefined);
+      console.error(`ship gate: ${kept.failure_why}`);
+      write(kept);
+      return kept;
+    }
     o.atWrite?.();
     kept = { ...kept, gen: held.gen } as WatchLine;
     write(kept);
     o.afterWrite?.();
     // After the write: the same checks again. A holder taken over (or whose generation moved on) between its checks
     // and its write has written no acceptance that counts (the consumer reads it under the new generation already);
-    // it rewrites its record as a failure, saying so. A head that moved meanwhile takes it back too.
+    // it rewrites its record as a failure, saying so. A head that moved meanwhile takes it back too, and so (twenty-
+    // seventh round) does the section running out of time during or before this second head read.
     const post = fenced(held) ? shaBound(textOf(), pr, head, held.gen) : "stale";
-    const now2 = post === "kept" ? o.headNow(pr, head) : head;
-    if (post !== "kept" || now2 !== head) {
-      kept = post !== "kept" ? unavailable(takeBackNotice(lockPath!)) : refuse("head_not_current", typeof now2 === "string"
+    const now2 = post === "kept" ? o.headNow(pr, head, deadline) : head;
+    const late = post === "kept" && ((now2 !== null && typeof now2 === "object" && now2.miss === "deadline") || Date.now() > deadline);
+    if (post !== "kept" || late || now2 !== head) {
+      kept = post !== "kept" ? unavailable(takeBackNotice(lockPath!)) : late ? unavailable(criticalNotice(lockPath!, criticalMs, true)) : refuse("head_not_current", typeof now2 === "string"
         ? `the pull request's head on GitHub moved to ${now2} while the acceptance of ${head} was being kept: it is taken back, and no acceptance stands for this head`
         : `${headMissWords(now2)} just after the acceptance was kept: it is taken back, and no acceptance stands for this head; run the watch again`);
       console.error(`ship gate: ${kept.failure_why}`);
@@ -445,7 +605,12 @@ export function keepWatch(dir: string, line: WatchLine, out: string, o: KeepOpts
 // when; the file stays, as the record of what was accepted. Written whole, then renamed into place.
 // Only once the pull request's head has moved past it (twenty-first round): headOf reads the pull
 // request's current head; the same sha, or a head that can't be read, refuses, naming it.
-export async function supersede(dir: string, sha: string, headOf: (pr: number) => Promise<string | null>, now = () => new Date()): Promise<{ ok: true; pr: number | null } | { ok: false; why: string }> {
+// Twenty-seventh round: headOf is the one request wrapper's head read (ghHeadRead), so a rate limit is told apart from
+// a failed read. A rate-limited read never leaves a silent no-op: the record keeps the supersede as owed
+// (supersede_owed, with the wait GitHub asked for, in minutes), the answer says so (owed), and the command exits with
+// its own status; a later supersede that goes through removes it.
+export type SupersedeAnswer = { ok: true; pr: number | null } | { ok: false; why: string; owed?: true };
+export async function supersede(dir: string, sha: string, headOf: (pr: number) => Promise<string | null | HeadMiss>, now = () => new Date()): Promise<SupersedeAnswer> {
   if (!SHA.test(sha)) return { ok: false, why: "that isn't a full commit sha" };
   const f = watchFile(dir, sha);
   let x: any;
@@ -453,12 +618,18 @@ export async function supersede(dir: string, sha: string, headOf: (pr: number) =
   if (x?.accepted_head !== sha) return { ok: false, why: `the watch kept for ${sha} accepted nothing: there is nothing to supersede` };
   if (x.superseded) return { ok: true, pr: typeof x.pr === "number" ? x.pr : null };
   if (typeof x.pr !== "number") return { ok: false, why: `the watch kept for ${sha} names no pull request, so its head can't be checked: nothing is superseded` };
-  const now_head = await headOf(x.pr).catch(() => null);
-  if (!now_head || !SHA.test(now_head)) return { ok: false, why: `the head of pull request ${x.pr} couldn't be read from GitHub: nothing is superseded; try again` };
+  const read = await headOf(x.pr).catch((): HeadMiss => ({ miss: "unreadable", why: "the read failed" }));
+  const keep = (y: any) => { writeFileSync(`${f}.tmp`, JSON.stringify(y, null, 2) + "\n"); renameSync(`${f}.tmp`, f); };
+  if (read !== null && typeof read === "object" && read.miss === "rate_limit") {
+    const minutes = read.wait_ms !== null ? Math.max(1, Math.ceil(read.wait_ms / 60_000)) : null;
+    try { keep({ ...x, supersede_owed: { reason: "rate_limit", ...(minutes !== null ? { wait_minutes: minutes } : {}) } }); } catch { /* the answer still says it is owed */ }
+    return { ok: false, owed: true, why: `GitHub's rate limit stopped the read of pull request ${x.pr}'s head${minutes !== null ? ` (it asked to wait about ${minutes} minutes)` : ""}: nothing is superseded yet, and the supersede is owed (kept on ${f}); run this again once the wait is over` };
+  }
+  const now_head = typeof read === "string" ? read : null;
+  if (!now_head || !SHA.test(now_head.toLowerCase())) return { ok: false, why: `${read !== null && typeof read === "object" ? headMissWords(read) : "the pull request's head couldn't be read from GitHub"}: nothing is superseded on pull request ${x.pr}; try again` };
   if (now_head.toLowerCase() === sha) return { ok: false, why: `pull request ${x.pr}'s head is still ${now_head.toLowerCase()}, the sha being replaced: supersede only once a new head has been pushed` };
-  x.superseded = { at: now().toISOString() };
-  writeFileSync(`${f}.tmp`, JSON.stringify(x, null, 2) + "\n");
-  renameSync(`${f}.tmp`, f);
+  const { supersede_owed: _owed, ...rest } = x;
+  keep({ ...rest, superseded: { at: now().toISOString() } });
   return { ok: true, pr: typeof x.pr === "number" ? x.pr : null };
 }
 
@@ -467,22 +638,30 @@ if (import.meta.main) {
   const flag = (n: string) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined; };
   const dir = flag("--dir") ?? WATCH_DIR;
   const usage = () => {
-    console.error("usage: shipgate.ts <full head sha> [--watch [--every <minutes>] [--hours <hours>] [--out <file>]] [--repo owner/name]\n       shipgate.ts --pr <number> --head <full sha> --watch [...]\n       shipgate.ts --supersede <full sha>\n       shipgate.ts --recover-generation <pull request number>");
+    console.error("usage: shipgate.ts <full head sha> [--watch [--every <minutes>] [--hours <hours>] [--out <file>]] [--repo owner/name]\n       shipgate.ts --pr <number> --head <full sha> --watch [...]\n       shipgate.ts --supersede <full sha>\n       shipgate.ts --recover-generation <pull request number> [--floor <number>]\n       shipgate.ts --quarantine <full sha>");
     process.exit(2);
   };
+  const quar = flag("--quarantine");
+  if (quar !== undefined) {
+    const r = quarantineRecord(dir, quar.toLowerCase());
+    if (!r.ok) { console.error(r.why); process.exit(1); }
+    console.log(`the record was set aside as ${r.as} (recorded in ${quarantineLog(dir)}); run the refused command again`);
+    process.exit(0);
+  }
   const rec = flag("--recover-generation");
   if (rec !== undefined) {
-    if (!/^\d{1,7}$/.test(rec)) usage();
-    const r = recoverGen(dir, Number(rec));
+    const fl = flag("--floor");
+    if (!/^\d{1,7}$/.test(rec) || (fl !== undefined && !/^\d{1,15}$/.test(fl))) usage();
+    const r = recoverGen(dir, Number(rec), fl !== undefined ? { floor: Number(fl) } : {});
     if (!r.ok) { console.error(r.why); process.exit(1); }
     console.log(`the watch generation of pull request ${rec} is now ${r.gen}: every acceptance kept before it no longer counts; watch the pull request's head again`);
     process.exit(0);
   }
   const sup = flag("--supersede");
   if (sup !== undefined) {
-    const headOf = async (n: number) => { const r = await api(`/repos/${flag("--repo") ?? SHIP_REPO}/pulls/${n}`); return r.status === 200 && typeof r.body?.head?.sha === "string" ? r.body.head.sha : null; };
+    const headOf = async (n: number) => ghHeadRead(flag("--repo") ?? SHIP_REPO, n, { token: githubToken(), maxS: API_READ_S });
     const r = await supersede(dir, sup.toLowerCase(), headOf);
-    if (!r.ok) { console.error(r.why); process.exit(1); }
+    if (!r.ok) { console.error(r.why); process.exit(r.owed ? 3 : 1); }
     console.log(JSON.stringify({ superseded: sup.toLowerCase(), pr: r.pr }, null, 2));
     process.exit(0);
   }
@@ -495,7 +674,11 @@ if (import.meta.main) {
   if (args.includes("--watch") && pr !== null && !curlPresent()) { console.error("ship gate: curl isn't installed, so the pull request's head can't be read from GitHub at the acceptance: nothing is watched"); process.exit(1); }
   if (!SHA.test(head) || (prArg !== undefined && (pr === null || !args.includes("--watch"))) || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) usage();
   // One live acceptance per pull request: a watch doesn't start while another stands.
-  if (pr !== null) { const other = otherLive(dir, pr, head); if (other.length) { console.error(liveWhy(other)); process.exit(1); } }
+  if (pr !== null) {
+    const other = otherLive(dir, pr, head);
+    if (!Array.isArray(other)) { console.error(`the Ship gate's state can't be read (${other.unknown}): nothing is watched`); process.exit(1); }
+    if (other.length) { console.error(liveWhy(other)); process.exit(1); }
+  }
   if (!args.includes("--watch")) {
     console.log(JSON.stringify(await gateReport(d, repo, head), null, 2));
   } else {
@@ -507,7 +690,7 @@ if (import.meta.main) {
     let line = watched;
     // Twenty-fifth round: the acceptance is checked against the pull request's head as GitHub has it at check time.
     // A watch that couldn't keep its line at all accepted nothing (never the unkept acceptance).
-    try { line = keepWatch(dir, watched, out, { headNow: (n) => ghHeadRead(repo, n, { token: githubToken() }) }); }
+    try { line = keepWatch(dir, watched, out, { headNow: (n, _h, deadline) => ghHeadRead(repo, n, { token: githubToken(), deadline }) }); }
     catch { line = watched.accepted_head ? { ...watched, accepted_head: null, passed: false, failure: "lock_unavailable", failure_why: "the watch's line couldn't be kept: nothing was accepted; run the watch again" } : watched; }
     console.log(JSON.stringify({ step: line.step, pr: line.pr, head: line.bound_head, accepted_head: line.accepted_head, passed: line.passed, failure: line.failure, failure_why: line.failure_why,
       refused_while_pending: line.refused_while_pending, accepted_early: line.accepted_early, accepted_after_pass: line.accepted_after_pass, attempts_seen: line.attempts_seen, kept: out }, null, 2));

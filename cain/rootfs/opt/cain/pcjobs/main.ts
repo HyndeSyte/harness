@@ -244,10 +244,19 @@ export function recordAnswer(cfg: Pick<Config, "used">, t: Tap, answer: PushAnsw
 //     them, by when it was queued ({queued}: the job's created time, else the day in its id); the link words
 //     that "a PC browser job seen by the keeper at ..." (twenty-fifth round wording). A job given any other way (a string, a queue id) is a bug: logged
 //     as an error, and the notice still goes, named by when it was queued where the id says so.
+//   - twenty-seventh round: hold_clear_unrecorded, told while the PC worker's heartbeat says a version hold clear was
+//     refused because its record couldn't be written (holdClearNotice), under the same once-per-round rules; every mark
+//     keeps when it was first made (since), so the attention line gives the age of the oldest notice still owed, and
+//     rounds in a row with no answer at all from the link are counted (silent) and, past SILENT_ROUNDS, shown on the
+//     keeper's own status as a local escalation (never through the link).
+//   - twenty-seventh round, delivery across a restart: the per-round attempted set lives in the keeper's memory only. A
+//     keeper restarted mid-round starts a new round, so a mark tried just before the restart is tried once more after
+//     it: delivery is at least once, and the retry carries the mark's saved notice id, on which the link deduplicates,
+//     so the owner never sees it twice.
 export type PcNotice = "reuse_migrated" | "reuse_shallow" | "queue_branch_missing" | "queue_empty_pending" | "reuse_store_unreadable" | "reuse_unsettled" | "reuse_push_refused"
-  | "reuse_record_unreadable" | "reuse_fetch_failed" | "notice_undelivered";
+  | "reuse_record_unreadable" | "reuse_fetch_failed" | "notice_undelivered" | "hold_clear_unrecorded";
 const PC_NOTICE_CODES: readonly PcNotice[] = ["reuse_migrated", "reuse_shallow", "queue_branch_missing", "queue_empty_pending", "reuse_store_unreadable", "reuse_unsettled",
-  "reuse_push_refused", "reuse_record_unreadable", "reuse_fetch_failed", "notice_undelivered"];
+  "reuse_push_refused", "reuse_record_unreadable", "reuse_fetch_failed", "notice_undelivered", "hold_clear_unrecorded"];
 // The job a notice is about, by what it does (twenty-second round): its site and action, never its id; or,
 // when those can't be told (twenty-third round), when it was queued.
 export type JobWhat = { site: string; action: string } | { queued: string };
@@ -267,7 +276,7 @@ export const WAIT_ROUNDS = 3;
 // again with its saved id until the link confirms it, whether or not its condition is still here.
 // fails: server errors in a row; skip: rounds still to wait before the next try (twenty-fourth round, the backoff).
 // (The twenty-fourth round's per-mark config flag is read once into the file's own config, below, and dropped.)
-interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean; fails?: number; skip?: number }
+interface ToldMark { id: string; posted: boolean; clear: number; code?: PcNotice; job?: JobWhat; refused?: boolean; fails?: number; skip?: number; since?: string }
 // Twenty-fourth round, kept for this process: the link refused the keeper's key or setup (no more sends until the
 // keeper starts again), and whether the notice file's upgrade couldn't be saved (logged once, shown on the status).
 let configStopped = false;
@@ -279,7 +288,8 @@ export function resetNoticeProcess(): void { configStopped = false; migrationUns
 // delivery state for the whole keeper, not on the one mark that got the answer: every mark still owed stays owed
 // (pending, never flagged or dropped), the status line counts them all from this file, and the flag goes only once
 // the link answers a send with anything else (after the fix and a restart, when sends start again).
-interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true }
+interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number }
+export const SILENT_ROUNDS = 30;
 const toldFile = (cfg: Pick<Config, "used">) => `${cfg.used ?? USED_REUSE}.told.json`;
 const NOTICE_ID = /^[0-9a-f]{16,64}$/;
 const SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
@@ -316,12 +326,12 @@ function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "di
         const job = jobWhat(m.job);
         const n = (v: unknown) => Number.isInteger(v) && (v as number) > 0 ? { v: v as number } : null;
         told[k] = { id: m.id, posted: m.posted === true, clear: Number.isInteger(m.clear) && m.clear >= 0 ? m.clear : 0, ...(code ? { code } : {}), ...(job ? { job } : {}),
-          ...(m.refused === true ? { refused: true } : {}),
+          ...(m.refused === true ? { refused: true } : {}), ...(typeof m.since === "string" && Number.isFinite(Date.parse(m.since)) ? { since: m.since } : {}),
           ...(n(m.fails) ? { fails: n(m.fails)!.v } : {}), ...(n(m.skip) ? { skip: Math.min(n(m.skip)!.v, BACKOFF_MAX_ROUNDS) } : {}) };
       }
   if (a && typeof a === "object" && a.waits && typeof a.waits === "object")
     for (const [k, n] of Object.entries(a.waits as Record<string, unknown>)) if (Number.isInteger(n) && (n as number) > 0) waits[k] = n as number;
-  const t: Told = { told, waits, ...(config ? { config: true as const } : {}) };
+  const t: Told = { told, waits, ...(config ? { config: true as const } : {}), ...(Number.isInteger(a?.silent) && a.silent > 0 ? { silent: a.silent } : {}) };
   if (a?.v !== 3) {
     migrateTold(cfg, t);
     if (!saveTold(cfg, t, true)) {
@@ -351,7 +361,7 @@ const newNoticeId = () => randomBytes(12).toString("hex");
 // Twenty-fifth round: written only when its content changes (a round that only finds the same marks still owed
 // leaves the file alone), and then whole: a temporary file, then renamed into place.
 function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
-  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}) });
+  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}) });
   try { if (readFileSync(toldFile(cfg), "utf8") === text) return true; } catch { /* not there yet, or unreadable: written */ }
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
@@ -374,7 +384,13 @@ function send(cfg: Config, t: Told, m: ToldMark, code: PcNotice): "posted" | "re
   let job = m.job === undefined ? undefined : jobWhat(m.job);
   if (m.job !== undefined && !job) { log(`error: notice ${code} carries a job that isn't a site and action or a queued time: named by the time instead`); job = m.job = queuedNow(); }
   try { a = (cfg.notify ?? linkNotify(cfg))(code, { id: m.id, ...(job ? { job } : {}) }); } catch { a = false; }
-  if (a === false) { log(`couldn't tell the owner (${code}): the link didn't answer; trying again next round, with the same notice id`); return "retry"; }
+  if (a === false) {
+    // Twenty-seventh round: one more round with no answer at all from the link, counted once a round.
+    if (!silentCounted) { silentCounted = true; t.silent = (t.silent ?? 0) + 1; }
+    log(`couldn't tell the owner (${code}): the link didn't answer; trying again next round, with the same notice id`);
+    return "retry";
+  }
+  delete t.silent;
   if (a === "config") {
     configStopped = true;
     t.config = true;
@@ -419,7 +435,7 @@ export function tell(cfg: Config, code: PcNotice, key: string = code, job?: JobW
   // mark the direct tell made and sent isn't tried again by a second tell or the resend in the same round.
   if (m && triedThisRound.has(`${toldFile(cfg)}\0${key}`)) { if (m.clear) { m.clear = 0; saveTold(cfg, t); } return; }
   const what = checkedJob(cfg, code, job);
-  if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0, code, ...(what ? { job: what } : {}) }; saveTold(cfg, t); }
+  if (!m) { m = t.told[key] = { id: newNoticeId(), posted: false, clear: 0, code, ...(what ? { job: what } : {}), since: new Date().toISOString() }; saveTold(cfg, t); }
   triedThisRound.add(`${toldFile(cfg)}\0${key}`);
   m.clear = 0;
   m.code ??= code;
@@ -436,7 +452,8 @@ const ackedThisRound = new Set<string>();
 const triedThisRound = new Set<string>();
 // A new round of the keeper (twenty-sixth round, named): the attempted and acknowledged sets start empty. resendOwed
 // starts one unless told it runs inside a round already started (fresh false).
-export function noticeRound(): void { ackedThisRound.clear(); triedThisRound.clear(); }
+let silentCounted = false;
+export function noticeRound(): void { ackedThisRound.clear(); triedThisRound.clear(); silentCounted = false; }
 export function resendOwed(cfg: Config, fresh = true): void {
   if (fresh) noticeRound();
   const t = readTold(cfg);
@@ -461,13 +478,34 @@ export function noticeTrouble(cfg: Pick<Config, "used">): string[] {
   // Twenty-fifth round: every mark still owed counts (never posted, never refused for good), not only the one that
   // got the answer; read from the notice file, so a restarted keeper shows it until a send gets through.
   const owed = marks.filter((m) => !m.posted && !m.refused && m.code);
-  if (t.config) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${owed.length} notice${owed.length === 1 ? "" : "s"} for Dane wait${owed.length === 1 ? "s" : ""}${owed.length ? ` (${[...new Set(owed.map((m) => m.code))].join(", ")})` : ""}. Check the link and the keeper share the relay key, then restart the App: they go then.`);
+  // Twenty-seventh round: the count and the age of the oldest notice still owed, in words.
+  const oldest = owed.map((m) => Date.parse(m.since ?? "")).filter(Number.isFinite).sort((x, y) => x - y)[0];
+  const waiting = `${owed.length} notice${owed.length === 1 ? "" : "s"} for Dane wait${owed.length === 1 ? "s" : ""}${owed.length ? ` (${[...new Set(owed.map((m) => m.code))].join(", ")})` : ""}${oldest !== undefined ? `, the oldest for ${ageWords(Date.now() - oldest)}` : ""}`;
+  if (t.config) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${waiting}. Check the link and the keeper share the relay key, then restart the App: they go then.`);
+  // Twenty-seventh round, the local escalation: the link hasn't answered at all for SILENT_ROUNDS rounds in a row.
+  if ((t.silent ?? 0) >= SILENT_ROUNDS) out.push(`Keeper: ATTENTION: the link hasn't answered the keeper's notices for ${t.silent} rounds in a row; ${waiting}. Check the link is running; they go once it answers.`);
   out.push(...marks.filter((m) => m.refused && m.code).map((m) =>
     `Keeper: the link refused a notice for Dane for good (${m.code}); it isn't sent again. The keeper's log says why; tell him in your own words if it matters.`));
   out.push(...marks.filter((m) => !m.posted && m.code && (m.fails ?? 0) >= SERVER_FAILS_SHOWN).map((m) =>
     `Keeper: the link answered a notice for Dane with a server error ${m.fails} times in a row (${m.code}); it is tried again less often until the link answers.`));
   if (migrationUnsaved) out.push("Keeper: the notice file's one-time upgrade couldn't be saved; it is tried again each round, and notices still go. The keeper's log says why.");
   return out;
+}
+// How long ago, as people say it (twenty-seventh round, for the attention line: never an ISO time).
+export function ageWords(ms: number): string {
+  const m = Math.round(Math.max(0, ms) / 60_000);
+  if (m < 2) return "about a minute";
+  if (m < 90) return `about ${m} minutes`;
+  const h = Math.round(m / 60);
+  return h < 36 ? `about ${h} hours` : `about ${Math.round(h / 24)} days`;
+}
+// The floorless hold clear refused as unrecorded (twenty-seventh round): told to the owner through the link while the
+// PC worker's heartbeat says so (version_hold_unwritable for hold_clear_unrecorded), once, under the same attempted-set
+// and clear-round rules as every notice; seen clear otherwise.
+export const HOLD_CLEAR_KEY = "holdclear";
+export function holdClearNotice(cfg: Config, h: Heartbeat | null): void {
+  if (h?.code === "version_hold_unwritable" && h.reason === "hold_clear_unrecorded") tell(cfg, "hold_clear_unrecorded", HOLD_CLEAR_KEY);
+  else cleared(cfg, HOLD_CLEAR_KEY);
 }
 // A condition seen clear this round. A mark whose post was never acknowledged (posted false) is never
 // counted down or deleted (twenty-second round): it is sent again with its saved id until the link answers
@@ -846,6 +884,8 @@ export function heartbeatNotice(h: Heartbeat | null): string | null {
     return `The PC didn't take jobs because its worker couldn't read Chrome's version from the PowerShell listing. At the PC: run ${REPROBE}; if its chrome_listing step refuses, follow that row in Troubleshooting.`;
   if (h?.code === "versions_changed")
     return `The PC stopped taking jobs because Claude in Chrome or Chrome changed version during a run, and a version change needs a new probe. At the PC: restart the Cain jobs Chrome, then run ${REPROBE}.`;
+  if (h?.code === "version_hold_unwritable" && h.reason === "hold_clear_unrecorded")
+    return "The PC isn't taking jobs because its worker couldn't write its record of clearing a version hold (version-hold-cleared.json in the worker folder), so the hold stays. At the PC: free disk space or fix the worker folder's permissions so that file can be written, then start a run.";
   if (h?.code === "version_hold_unwritable")
     return "The PC stopped taking jobs because its worker couldn't write a note that Claude in Chrome's version changed. At the PC: free disk space or check the worker folder can be written, then start a run; it then asks for a new probe.";
   if (h?.code === "version_hold_cannot_invalidate")
@@ -987,6 +1027,8 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
       throw e;
     }
     const now = cfg.now?.() ?? new Date();
+    // Twenty-seventh round: a floorless hold clear the PC refused as unrecorded is told to the owner.
+    try { holdClearNotice(cfg, readHeartbeat(cfg.dir)); } catch (e) { log(`couldn't read the PC worker's heartbeat for its notices: ${(e as Error).message}`); }
     const over = stale(readJobs(cfg.dir), now);
     if (over.length) {
       for (const { job, result } of over) {

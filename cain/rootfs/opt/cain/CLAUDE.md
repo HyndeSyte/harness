@@ -313,7 +313,8 @@ in the harness repo; until then the keeper says it is waiting).
   unreadable tap record, a tap it can't settle, and a tap whose settling has waited three
   rounds on an unreadable record or a failed fetch from GitHub (that line names the job by
   what it does, its action and site, and its code; or, when the keeper can't tell those, as
-  a job seen by the keeper at a time; never its id). Each is told once while it lasts, and again only if it clears for three rounds
+  a job seen by the keeper at a time; never its id), and a version hold the PC couldn't clear
+  because it couldn't write its record of the clear. Each is told once while it lasts, and again only if it clears for three rounds
   in a row and comes back; a code your App has no words for comes as "a stop
   condition the App does not know" with its code. After an update, a notice an earlier
   keeper never delivered may come as "an earlier notice could not be delivered". Don't repeat it; if he asks, the fix is in
@@ -322,8 +323,10 @@ in the harness repo; until then the keeper says it is waiting).
   in your own words if it matters. If it says, marked ATTENTION, that the link refused the
   keeper's notices as not allowed, that is your App's own setup, not his: the line counts
   every notice waiting, and they all wait until the App restarts with it fixed, so log it as a Build item (Cloud jobs) and tell him
-  only if a notice he needs is waiting. A line counting server errors means the notice is
-  still being retried: nothing to tell him.
+  only if a notice he needs is waiting. An ATTENTION line saying the link hasn't answered the
+  keeper's notices for some rounds in a row means the link is down for the keeper: the
+  notices wait and go once it answers; log it as a Build item if it lasts an hour. A line
+  counting server errors means the notice is still being retried: nothing to tell him.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
   `blocked_captcha`, `pending_email_confirmation`. `already_gone` counts as done.
   `in_doubt` is never retried, by you or the PC, without asking him. Failures have
@@ -364,9 +367,13 @@ in the harness repo; until then the keeper says it is waiting).
   `extension_versions_ambiguous` (the Cain jobs profile holds more than one Claude in Chrome
   version: he restarts the Cain jobs Chrome and probes again), `version_hold_unwritable` (the
   worker couldn't write its note that Claude in Chrome's version changed: he frees disk space
-  or fixes the worker folder, then runs again and probes), `version_hold_cannot_invalidate`
-  (the same, and the worker couldn't set its old confirmation aside either: he frees disk
-  space or fixes the worker folder's permissions, then runs again and probes), `boundary_not_accepted` (he hasn't accepted the stated
+  or fixes the worker folder, then runs again and probes; with `hold_clear_unrecorded` it
+  couldn't write its record of clearing the hold: he frees disk space or fixes the worker
+  folder, then starts a run), `version_hold_cannot_invalidate`
+  (the note couldn't be written, and the worker couldn't set its old confirmation aside either: he frees disk
+  space or fixes the worker folder's permissions, then runs again and probes), `test_build_flag_refused` (a
+  tests-only variable is set on his PC, so the worker doesn't start: he removes it, opens a new
+  terminal and runs again), `boundary_not_accepted` (he hasn't accepted the stated
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
@@ -488,7 +495,7 @@ create, update or run any other routine.
      it refuses while the pull request's head is still that sha), then watch the new head the
      same way before its card. A pull request has one live acceptance at a time: a watch won't
      accept while another stands (`live_acceptance`, naming it), and a watch that can't take or
-     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. A watch also refuses a sha whose acceptance was superseded (`superseded`), or that isn't the pull request's head on GitHub when it is kept (`head_not_current`). A watch that took over a stopped watch's lock says the acceptances kept before it no longer count: watch the pull request's head again. A card refused because "the Ship gate's state is unknown" means the gate's own records can't be read: if the refusal names the generation file, run the `--recover-generation <number>` command it gives once no watch of that pull request runs, then watch the head again; never delete the file. A watch that says GitHub's rate limit stopped its head read didn't see a new head: wait and watch again. While a watch's acceptance stands, a Ship card is refused if GitHub's head for the pull request can't be read: show it again in a minute. One wait for GitHub is at most 15 minutes and a watch at most 2
+     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. A watch also refuses a sha whose acceptance was superseded (`superseded`), or that isn't the pull request's head on GitHub when it is kept (`head_not_current`). A watch that took over a stopped watch's lock says the acceptances kept before it no longer count: watch the pull request's head again. A card refused because "the Ship gate's state is unknown" means the gate's own records can't be read: if the refusal names the generation file, run the `--recover-generation <number>` command it gives once no watch of that pull request runs, then watch the head again; never delete the file. If the refusal names a gate record that can't be read or doesn't parse, run the `--quarantine <sha>` command it gives once no watch runs, then try again. A watch that says it ran past its bound accepted nothing: run it again in a minute. A watch that says GitHub's rate limit stopped its head read didn't see a new head: wait and watch again, and a supersede that says it is owed was stopped the same way: run it again after the wait. While a watch's acceptance stands, a Ship card is refused if GitHub's head for the pull request can't be read: show it again in a minute. One wait for GitHub is at most 15 minutes and a watch at most 2
      hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the

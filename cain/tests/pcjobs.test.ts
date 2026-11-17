@@ -46,7 +46,7 @@ import {
   newCallTable, trackCall, watchCalls, readHookLog, CALL_TABLE_CAP, startDeadlineMs, HOOK_LIMITS, guardMatchers, hookedBy, pinnedHooked, versionHold, versionsAfter,
   VERSION_HOLD_UNWRITABLE_HINT, addressListing, probeTail, runPreflight, inChromePhase,
   evidenceSha, persistHold, holdCleared, BROKEN_GUARD, VERSIONS_CHANGED_HINT, writeVersionHold,
-  regAnswer, chromeListingStep, LISTING_STAND_IN, LISTING_RUNNER_REFUSED, TEST_BUILD_FLAG, chromeReadFailWhy, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
+  regAnswer, chromeListingStep, LISTING_STAND_IN, LISTING_RUNNER_REFUSED, TEST_BUILD_FLAG, TEST_BUILD_FLAG_REFUSED, testBuildFlagRefusal, VERSION_HOLD_CLEAR_UNRECORDED_HINT, chromeReadFailWhy, holdClearedFile, listingMismatches, uddArgs, normDir, sameProfileDir, invalidatedFile, CHROME_VERSION_UNREADABLE_HINT, VERSION_HOLD_CANNOT_INVALIDATE_HINT, parseChromeExeListing, chromeExeVersions, CHROME_PS_COMMAND, CHROME_PS_TIMEOUT_MS, CHROME_VERSION_TIMEOUT_HINT, callWhy,
   type Install, type Instruction, type Opts, type Session, type Gate, type KillEnd,
 } from "../rootfs/opt/cain/pcjobs/worker.ts";
 import { get as httpGet } from "node:http";
@@ -55,8 +55,9 @@ import { makeToken, publicKey as shipPublicKey, readToken } from "../rootfs/opt/
 import { publicOf } from "../rootfs/opt/cain/link/shipkey.ts";
 import { b64url } from "../rootfs/opt/cain/ship-token.ts";
 import { cleanEnv, sh } from "./rig.ts";
-// Twenty-sixth round: the worker honours a listing runner (chromePs) only in a test build, named by this flag.
-process.env.PC_WORKER_TEST_BUILD = "1";
+// Twenty-sixth round: the worker honours a listing runner (chromePs) only in a test build. Twenty-seventh round: marked
+// by this test-only module, never by an environment variable.
+import { outsideTestBuild, TEST_BUILD_MARK } from "./pcworker-testbuild.ts";
 
 // Each test drives real git repos; git on a Windows runner is slow, so give them time.
 setDefaultTimeout(120_000);
@@ -7284,11 +7285,6 @@ describe("twenty-fifth review: the listing step never passes on a stand-in, a fl
 });
 
 describe("twenty-sixth review: the listing runner only in a test build, and a floorless hold clear refused unless recorded", () => {
-  const outsideTestBuild = <T>(f: () => T): T => {
-    const was = process.env[TEST_BUILD_FLAG];
-    delete process.env[TEST_BUILD_FLAG];
-    try { return f(); } finally { if (was !== undefined) process.env[TEST_BUILD_FLAG] = was; }
-  };
   test("a production configuration with the listing runner set refuses the listing step by name, and the run's version read doesn't parse it", () => {
     const q = queueRig();
     expect(chromeListingStep(q.opts(), q.inst)).toMatchObject({ applies: true, passed: true });     // the test build: parsed and checked
@@ -7321,5 +7317,61 @@ describe("twenty-sixth review: the listing runner only in a test build, and a fl
     expect((await run(q.opts(attended))).code).toBe("ok");
     expect(JSON.parse(readFileSync(holdClearedFile(q.opts()), "utf8"))).toMatchObject({ without_floor: ["Chrome"] });
     expect(readVersionHold(q.opts())).toBeNull();
+  });
+});
+describe("twenty-seventh review: the test build only from a test-only module, the worker refusing to start under the tests' variable, and the unrecorded clear named", () => {
+  test("the tests' variable alone, outside the test harness, never enables a listing runner", () => {
+    const q = queueRig();
+    const was = process.env[TEST_BUILD_FLAG];
+    process.env[TEST_BUILD_FLAG] = "1";
+    try {
+      const step = outsideTestBuild(() => chromeListingStep(q.opts(), q.inst));
+      expect(step).toMatchObject({ applies: true, passed: false });
+      expect(step.failure).toStartWith(`${LISTING_RUNNER_REFUSED}:`);
+    } finally { if (was === undefined) delete process.env[TEST_BUILD_FLAG]; else process.env[TEST_BUILD_FLAG] = was; }
+    expect(chromeListingStep(q.opts(), q.inst)).toMatchObject({ applies: true, passed: true });   // the harness's own mark
+    expect((globalThis as any)[TEST_BUILD_MARK]).toBe(true);
+    // The production entry point never imports the test-only module.
+    const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/worker.ts"), "utf8");
+    expect(src).not.toMatch(/^\s*import[^\n]*(pcworker-testbuild|tests\/)/m);
+    expect(src).not.toMatch(/(require|import)\([^)]*(pcworker-testbuild|tests\/)/);
+    expect(src).not.toMatch(/process\.env\[TEST_BUILD_FLAG\] === "1"/);
+  });
+
+  test("the worker refuses to start while the tests' variable is set outside the test harness, with a loud worker-log line and its status line", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pcw27-"));
+    expect(testBuildFlagRefusal({ home }, { [TEST_BUILD_FLAG]: "1" })).toBeNull();                 // inside the harness
+    expect(testBuildFlagRefusal({ home }, {})).toBeNull();
+    const r = outsideTestBuild(() => testBuildFlagRefusal({ home }, { [TEST_BUILD_FLAG]: "0" }));    // any value counts
+    expect(r).toMatchObject({ error: TEST_BUILD_FLAG_REFUSED, detail: expect.stringContaining(`Remove-Item Env:${TEST_BUILD_FLAG}`) });
+    expect(readFileSync(join(home, "worker.log"), "utf8")).toContain(`${TEST_BUILD_FLAG_REFUSED} ATTENTION:`);
+    // The real entry point, started as on the PC with the variable inherited.
+    const home2 = mkdtempSync(join(tmpdir(), "pcw27-"));
+    const p = Bun.spawn([process.execPath, join(import.meta.dir, "../rootfs/opt/cain/pcjobs/worker.ts"), "check-cli", "--home", home2],
+      { env: { ...cleanEnv(), [TEST_BUILD_FLAG]: "1" }, stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(p.stdout).text();
+    expect(await p.exited).toBe(1);
+    expect(JSON.parse(out.trim().split("\n")[0])).toMatchObject({ error: TEST_BUILD_FLAG_REFUSED });
+    expect(readFileSync(join(home2, "worker.log"), "utf8")).toContain(`${TEST_BUILD_FLAG_REFUSED} ATTENTION:`);
+  });
+
+  test("a floorless hold clear refused as unrecorded: the run's hint names the cleared-record file and its condition, and the heartbeat carries the reason the keeper tells the owner by", async () => {
+    const { q } = oneJob();
+    const fp = fingerprint(q.opts(), q.inst)!;
+    const hold = { at: new Date(T0.getTime() - 60_000).toISOString(), code: "versions_changed" as const, folders: [],
+      seen: { extension_version: fp.extension_version, chrome_version: null, chrome_version_source: null } };
+    expect(writeVersionHold(q.opts(), hold)).toBe(true);
+    probeConfirmed(q, new Date(Date.parse(hold.at) + 30_000).toISOString());
+    mkdirSync(join(holdClearedFile(q.opts()), "blocker"), { recursive: true });
+    const out = await run(q.opts(attended));
+    expect(out).toMatchObject({ code: "version_hold_unwritable", detail: VERSION_HOLD_CLEAR_UNRECORDED_HINT });
+    expect(out.detail).toContain("version-hold-cleared.json");
+    expect(out.detail).not.toContain("version-hold.json ");
+    const hb = parseHeartbeat(readFileSync(join(q.home, "heartbeat.json"), "utf8"));
+    expect(hb).toMatchObject({ code: "version_hold_unwritable", reason: "hold_clear_unrecorded" });
+    expect(heartbeatNotice(hb)).toContain("version-hold-cleared.json");
+    // A hold that itself can't be written keeps its own hint and no reason.
+    rmSync(holdClearedFile(q.opts()), { recursive: true });
+    expect((await run(q.opts(attended))).code).toBe("ok");
   });
 });
