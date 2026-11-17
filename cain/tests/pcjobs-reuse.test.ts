@@ -1056,11 +1056,14 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
     try { resendOwed(w.cfg("pi-1", { notify: ((code: string, n?: any) => { sent.push({ code, id: n.id, job: n.job }); return true; }) as any })); }
     finally { console.log = was; }
+    // Twenty-ninth round: these marks carry no age, so each goes once under a new id, as a repeat (never its old id).
+    const fresh = expect.stringMatching(/^[0-9a-f]{24}$/);
     expect(sent).toEqual([
-      { code: "reuse_record_unreadable", id: id("1"), job: { site: "example.com", action: "read_account_settings" } },
-      { code: "reuse_fetch_failed", id: id("2"), job: { queued: "2026-11-14" } },        // no site and action anywhere: when it was queued
-      { code: "notice_undelivered", id: id("3"), job: undefined },
+      { code: "reuse_record_unreadable", id: fresh, job: { site: "example.com", action: "read_account_settings" } },
+      { code: "reuse_fetch_failed", id: fresh, job: { queued: "2026-11-14" } },        // no site and action anywhere: when it was queued
+      { code: "notice_undelivered", id: fresh, job: undefined },
     ]);
+    expect(sent.map((x) => x.id)).not.toContain(id("1"));
     expect(logs.join("\n")).toContain("was never delivered and its code can't be told");
     const file = JSON.parse(readFileSync(`${used}.told.json`, "utf8"));
     expect(file.v).toBe(3);
@@ -1101,7 +1104,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     const calls = [...main.matchAll(/\b(tell|waited)\(cfg, ([^;]*?)\);/g)].map((m) => m[2]).filter((a) => !a.startsWith("code, key"));
     expect(calls.length).toBeGreaterThanOrEqual(8);
     for (const a of calls) {
-      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
+      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"worker_not_starting"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
       if (tapNotice) expect(a).toMatch(/, whatOf\(cfg, (l|t)\)$/);
     }
     const w = world();
@@ -1520,14 +1523,15 @@ describe("twenty-eighth review: the PC's notices recorded before the fetch, a si
     const calls: string[] = [];
     const cfg = w.cfg("pi-1", { notify: ((c: string) => { calls.push(c); return false; }) as any });
     for (let i = 0; i < SILENT_ROUNDS; i++) expect(quiet(() => round(cfg)).ok).toBe(false);
-    expect(calls.length).toBe(SILENT_ROUNDS);
-    expect(new Set(calls)).toEqual(new Set(["hold_clear_unrecorded"]));
+    expect(calls.filter((c) => c === "hold_clear_unrecorded").length).toBe(SILENT_ROUNDS);
+    // Twenty-ninth round: the fetch's own streak raises the queue-unreachable notice at its thirtieth failure too.
+    expect(new Set(calls)).toEqual(new Set(["hold_clear_unrecorded", "queue_unreachable"]));
     const told = JSON.parse(readFileSync(`${w.used}.told.json`, "utf8"));
     expect(told.told[HOLD_CLEAR_KEY]).toMatchObject({ posted: false, code: "hold_clear_unrecorded" });
     expect(told.silent).toBe(SILENT_ROUNDS);
     const esc = noticeTrouble({ used: w.used }).find((l) => l.includes("no answer for"));
     expect(esc).toStartWith(`Keeper: ATTENTION: the keeper has had no answer for ${SILENT_ROUNDS} rounds in a row`);
-    expect(esc).toContain("1 notice for Dane waits (hold_clear_unrecorded)");
+    expect(esc).toContain("2 notices for Dane wait (hold_clear_unrecorded, queue_unreachable)");
     // The keeper reads the heartbeat before the fetch.
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
     expect(main.indexOf("heartbeatNotices(cfg, readHeartbeat(cfg.dir))")).toBeLessThan(main.indexOf("fetched = sync(cfg, seen)"));
@@ -1607,5 +1611,103 @@ describe("twenty-eighth review: the PC's notices recorded before the fetch, a si
     delete t.told["unsettled:u"].since;
     writeFileSync(f, JSON.stringify(t));
     expect(noticeTrouble({ used: w.used })[0]).toContain("1 notice for Dane waits (reuse_unsettled), age unknown for 1 from before the age was kept");
+  });
+});
+
+describe("twenty-ninth review: a mark of unknown age re-minted once, the worker not starting told, and the queue unreachable told on its own streak", () => {
+  const k = keeper28 as any;
+  const lc = linkcore28 as any;
+  const quiet = <T>(f: () => T): T => {
+    const was = console.log;
+    console.log = () => {};
+    try { return f(); } finally { console.log = was; }
+  };
+  const ownerWords = /\bcheck|resend|send it again|tap again|try again|\b[0-9a-f]{40}\b|\d{4}-\d{2}-\d{2}T|j-\d{8}/i;
+
+  test("a legacy mark with no minted or since time, against a link whose record of its id has expired, goes once as a repeat under a new id, its mint time stamped", async () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const r = rig();
+    // The legacy mark's first post reached the link long ago; the link's record of that id has since expired.
+    const legacy = "a".repeat(24);
+    const firstPost = await r.link.pcNotice("reuse_unsettled", undefined, legacy);
+    r.t.now += lc.PC_NOTICE_RETAIN_MS + 86_400_000;
+    // Sent again under its old id, the link would post it as new: that is what the re-mint prevents.
+    const sent: { code: string; id: string; repeat?: boolean }[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string, n: any) => { sent.push({ code: c, id: n.id, ...(n.repeat ? { repeat: true } : {}) }); return false; }) as any });
+    const f = `${w.used}.told.json`;
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, JSON.stringify({ v: 3, told: { "unsettled:r": { id: legacy, posted: false, clear: 0, code: "reuse_unsettled" } }, waits: {} }));
+    quiet(() => resendOwed(cfg));
+    quiet(() => resendOwed(cfg));
+    expect(sent.length).toBe(2);
+    expect(sent[0].id).not.toBe(legacy);
+    expect(sent[0].repeat).toBe(true);
+    expect(sent[1]).toEqual(sent[0]);                                              // once: the stamped mint time is used after
+    const mark = JSON.parse(readFileSync(f, "utf8")).told["unsettled:r"];
+    expect(Number.isFinite(Date.parse(mark.minted))).toBe(true);
+    expect(mark.repeat).toBe(true);
+    const again = await r.link.pcNotice("reuse_unsettled", undefined, sent[0].id, true);
+    expect(again.message).not.toBe(firstPost.message);
+    expect(r.posted[again.message].content).toStartWith(lc.PC_NOTICE_REPEAT);
+  });
+
+  test("the queue's fetch failing for 30 rounds while the link answers raises the queue-unreachable notice once, in the link's words, cleared once the fetch works again", async () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    renameSync(w.remote, `${w.remote}.gone`);
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS - 1; i++) quiet(() => round(cfg));
+    expect(sent).toEqual([]);
+    quiet(() => round(cfg));
+    expect(sent).toEqual(["queue_unreachable"]);
+    for (let i = 0; i < 3; i++) quiet(() => round(cfg));
+    expect(sent).toEqual(["queue_unreachable"]);                                   // told once while it lasts
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).fetchFails).toBe(k.FETCH_FAIL_ROUNDS + 3);
+    renameSync(`${w.remote}.gone`, w.remote);
+    quiet(() => round(cfg));
+    const t = JSON.parse(readFileSync(`${w.used}.told.json`, "utf8"));
+    expect(t.fetchFails).toBeUndefined();
+    expect(t.told[k.QUEUE_UNREACHABLE_KEY].clear).toBe(1);
+    const words = PC_NOTICES.queue_unreachable;
+    expect(words).not.toMatch(ownerWords);
+    const r = rig();
+    const a = await r.link.pcNotice("queue_unreachable");
+    expect(r.posted[a.message].content).toBe(words);
+  }, 120_000);
+
+  test("a stale heartbeat while a job has waited past the bound raises the worker-not-starting notice once, and it clears once the worker is heard from", async () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const now = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const job = (hoursAgo: number) => ({ state: "pending", created: new Date(now.getTime() - hoursAgo * 3_600_000).toISOString() }) as any;
+    const beat = (hoursAgo: number, code = "idle") => parseHeartbeat(JSON.stringify({ v: 1, worker_clock: new Date(now.getTime() - hoursAgo * 3_600_000).toISOString().replace(/\.\d{3}Z$/, "Z"), code, job: null, stale_lock: false, skew_ms: null, reason: null }));
+    // A job that hasn't waited long, or a worker heard from lately: nothing.
+    quiet(() => { noticeRound(); k.workerQuietNotice(cfg, beat(10), [job(1)], now); });
+    quiet(() => { noticeRound(); k.workerQuietNotice(cfg, beat(1), [job(10)], now); });
+    expect(sent).toEqual([]);
+    // No heartbeat at all, or an old one, while a job has waited past the bound: told, once.
+    quiet(() => { noticeRound(); k.workerQuietNotice(cfg, null, [job(7)], now); });
+    quiet(() => { noticeRound(); k.workerQuietNotice(cfg, beat(8), [job(7)], now); });
+    expect(sent).toEqual(["worker_not_starting"]);
+    for (let i = 0; i < 3; i++) quiet(() => { noticeRound(); k.workerQuietNotice(cfg, beat(0), [job(9)], now); });
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    // A start refusal already told by its own notice isn't told twice.
+    quiet(() => { noticeRound(); k.workerQuietNotice(cfg, beat(8, "start_refused"), [job(9)], now); });
+    expect(sent).toEqual(["worker_not_starting"]);
+    // The round reads it with the heartbeat, before the fetch.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    expect(main).toContain("workerQuietNotice(cfg, h, jobs, cfg.now?.() ?? new Date())");
+    const words = PC_NOTICES.worker_not_starting;
+    expect(words).not.toMatch(ownerWords);
+    const r = rig();
+    const a = await r.link.pcNotice("worker_not_starting");
+    expect(r.posted[a.message].content).toBe(words);
   });
 });

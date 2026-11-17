@@ -5226,14 +5226,29 @@ export function testBuildFlagRefusal(o: Pick<Opts, "home">, env: Record<string, 
 // only a preload can have), with the same ATTENTION line and the removal command.
 export const PRELOAD_FLAG_REFUSED = "preload_flag_refused";
 const PRELOAD_FLAG = /(^|\s)(-r|--require|--import|--preload|--loader|--experimental-loader|--experimental-specifier-resolution)(=|\s|$)/;
-export const PRELOAD_FLAG_HINT = "a preload is set where the worker runs (a require, import, preload or loader flag in NODE_OPTIONS or BUN_OPTIONS or in the runtime's own arguments, or a preload in a bunfig.toml in the folder it starts from or its worker folder): it could load test code into the worker, so the worker doesn't start. Remove it (in PowerShell: Remove-Item Env:NODE_OPTIONS and Remove-Item Env:BUN_OPTIONS, and delete them from Windows' environment variables if they are set there; delete or fix the bunfig.toml), open a new terminal and run again";
+// Twenty-ninth round: a config-file flag (Bun's -c or --config, Node's --experimental-config-file) in the options
+// variables or the runtime's arguments is refused too (a config file named there can carry a preload), and so is a
+// preload in Bun's user-level configuration file (.bunfig.toml in XDG_CONFIG_HOME or the user's home folder).
+const CONFIG_FLAG = /(^|\s)(-c|--config|--experimental-config-file)(=|\s|$)/;
+export const PRELOAD_FLAG_HINT = "a preload is set where the worker runs (a require, import, preload, loader or config-file flag in NODE_OPTIONS or BUN_OPTIONS or in the runtime's own arguments, or a preload in a bunfig.toml in the folder it starts from or its worker folder, or in Bun's user-level .bunfig.toml in the home folder): it could load test code into the worker, so the worker doesn't start. Remove it (in PowerShell: Remove-Item Env:NODE_OPTIONS and Remove-Item Env:BUN_OPTIONS, and delete them from Windows' environment variables if they are set there; delete or fix the bunfig.toml or .bunfig.toml), open a new terminal and run again";
 export function preloadRefusal(o: Pick<Opts, "home">, env: Record<string, string | undefined> = process.env, execArgv: string[] = process.execArgv, cwd = process.cwd(),
-  symbolSet = testBuild()): { error: string; detail: string } | null {
-  const bunfig = [cwd, o.home].some((d) => { try { return /^\s*preload\s*=/m.test(readFileSync(join(d, "bunfig.toml"), "utf8")); } catch { return false; } });
-  const flagged = PRELOAD_FLAG.test(env.NODE_OPTIONS ?? "") || PRELOAD_FLAG.test(env.BUN_OPTIONS ?? "") || execArgv.some((a) => PRELOAD_FLAG.test(a));
+  symbolSet = testBuild(), userHome = homedir()): { error: string; detail: string } | null {
+  const hasPreload = (f: string) => { try { return /^\s*preload\s*=/m.test(readFileSync(f, "utf8")); } catch { return false; } };
+  const bunfig = [cwd, o.home].some((d) => hasPreload(join(d, "bunfig.toml")))
+    || [env.XDG_CONFIG_HOME, userHome].some((d) => !!d && hasPreload(join(d, ".bunfig.toml")));
+  const flag = (v: string) => PRELOAD_FLAG.test(v) || CONFIG_FLAG.test(v);
+  const flagged = flag(env.NODE_OPTIONS ?? "") || flag(env.BUN_OPTIONS ?? "") || execArgv.some(flag);
   if (!symbolSet && !flagged && !bunfig) return null;
   try { mkdirSync(o.home, { recursive: true }); appendFileSync(join(o.home, "worker.log"), `${new Date().toISOString()} ${PRELOAD_FLAG_REFUSED} ATTENTION: ${PRELOAD_FLAG_HINT}\n`); } catch { /* the refusal stands */ }
   return { error: PRELOAD_FLAG_REFUSED, detail: PRELOAD_FLAG_HINT };
+}
+// Twenty-ninth round, the test symbol sealed: the production entry point defines it as false, non-writable and
+// non-configurable, before anything else runs, so a later assignment (an asynchronous preload, a timer) throws instead
+// of switching the test build on. A symbol already defined (by a preload) or one that can't be sealed refuses the start.
+export function sealTestBuild(g: any = globalThis): boolean {
+  if (Object.getOwnPropertyDescriptor(g, TEST_BUILD_MARK) !== undefined) return false;
+  try { Object.defineProperty(g, TEST_BUILD_MARK, { value: false, writable: false, configurable: false, enumerable: false }); } catch { return false; }
+  return g[TEST_BUILD_MARK] === false;
 }
 // Twenty-eighth round: a start refusal leaves a heartbeat (start_refused, with its reason) before the worker exits, in
 // the worker folder and, when the queue copy is there, pushed to the queue, so the keeper tells the owner
@@ -6607,11 +6622,13 @@ if (isMain && process.argv[2] === "nav-guard") {
     say(e instanceof WorkerError ? { error: e.code, ...(e.detail !== undefined ? { detail: e.detail } : {}) } : { error: "worker_failed" });
     process.exit(1);
   };
+  // Twenty-ninth round: the test symbol sealed first (sealTestBuild); one already defined counts as set by a preload.
+  const sealed = sealTestBuild();
   // Twenty-seventh round: the tests' build variable set where the worker runs: it doesn't start.
   const refused = testBuildFlagRefusal(o);
   if (refused) { startRefusedBeat(o, "test_build_flag_set"); say(refused); process.exit(1); }
   // Twenty-eighth round: and a preload that could set the test symbol in the production worker.
-  const preloaded = preloadRefusal(o);
+  const preloaded = preloadRefusal(o, process.env, process.execArgv, process.cwd(), !sealed);
   if (preloaded) { startRefusedBeat(o, "preload_flag_set"); say(preloaded); process.exit(1); }
   try {
     const [cmd, a1] = args;

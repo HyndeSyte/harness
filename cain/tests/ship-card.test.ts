@@ -1115,9 +1115,10 @@ describe("twenty-eighth review: the quarantine under the gate lock, curl's limit
   const valid = (head: string, pr = 5, gen = 1) => JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: head, failure: null, gen, gen_floor: gen, format: GATE_RECORD_FORMAT }) + "\n";
   const logLines = (dir: string) => { try { return readFileSync(quarantineLog(dir), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
   // A curl that ignores its time limit (and says it is 7.29 when asked), counting its calls.
-  const slowCurl = () => {
+  // Twenty-ninth round: the wrapper checks curl's version before any read, so the stub that is to be killed says 8.5.0.
+  const slowCurl = (version = "7.29.0") => {
     const d = mkdtempSync(join(tmpdir(), "slow-curl-"));
-    writeFileSync(join(d, "curl"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "curl 7.29.0 (x86_64-pc-linux-gnu)"; exit 0; fi\necho x >> ${JSON.stringify(join(d, "calls"))}\nexec sleep 30\n`, { mode: 0o755 });
+    writeFileSync(join(d, "curl"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "curl ${version} (x86_64-pc-linux-gnu)"; exit 0; fi\necho x >> ${JSON.stringify(join(d, "calls"))}\nexec sleep 30\n`, { mode: 0o755 });
     return { dir: d, bin: join(d, "curl"), calls: () => { try { return readFileSync(join(d, "calls"), "utf8").trim().split("\n").length; } catch { return 0; } } };
   };
 
@@ -1161,7 +1162,7 @@ describe("twenty-eighth review: the quarantine under the gate lock, curl's limit
   });
 
   test("a curl that ignores its time limit is killed from this side at the deadline plus a small margin; a try under one second is skipped, never handed to curl", () => {
-    const c = slowCurl();
+    const c = slowCurl("8.5.0");
     const t0 = Date.now();
     const r = g.ghGet("/repos/o/r/pulls/8", { base: "http://127.0.0.1:9", curl: c.bin, deadline: t0 + 2_000 });
     const took = Date.now() - t0;
@@ -1296,7 +1297,8 @@ describe("twenty-eighth review: the quarantine under the gate lock, curl's limit
     const r2 = quietly(() => recoverGen(dir2, 5, { waitMs: 300, afterTakeover: () => { holder = takeLock(lock2, 0); } } as any));
     expect("token" in holder).toBe(true);
     expect(r2).toMatchObject({ ok: false, why: expect.stringContaining("looks to be running") });
-    expect(readGen(dir2, 5)).toBe(1);
+    expect(readGen(dir2, 5)).toBe(2);                                               // twenty-ninth round: its takeover moved it on
+    expect(acceptedFor(dir2, 5)).toEqual([]);
     letGo(holder);
   });
 
@@ -1347,3 +1349,174 @@ describe("twenty-eighth review: the quarantine under the gate lock, curl's limit
     expect(src).toContain("the holding is unbounded");
   });
 });
+
+describe("twenty-ninth review: every takeover moves the generation on, the quarantine never deletes what it moved, an owed supersede cleared on an unchanged head, curl checked by the wrapper for every read, and the deadline re-checked after the write", () => {
+  const g = gate28 as any;
+  const line = (head: string, pr = 5): any => ({ step: "ship_gate", head, workflow: null, reports: [], attempts_seen: [], refused_while_pending: true, accepted_early: false,
+    accepted_after_pass: true, passed: true, pr, bound_head: head, accepted_head: head, failure: null, failure_why: null });
+  const echo = { headNow: (_p: number, h: string) => h };
+  const quietly = <T>(f: () => T): T => { const was = console.error; console.error = () => {}; try { return f(); } finally { console.error = was; } };
+  const pauseMs = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const garbled = (pr: number, gen: number) => `{"step": "ship_gate", "pr": ${pr}, "gen": ${gen}, "accepted_head": "torn`;
+  const valid = (head: string, pr = 5, gen = 1) => JSON.stringify({ step: "ship_gate", pr, bound_head: head, accepted_head: head, failure: null, gen, gen_floor: gen, format: GATE_RECORD_FORMAT }) + "\n";
+  const logLines = (dir: string) => { try { return readFileSync(quarantineLog(dir), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  // A curl stub: its version line, then what it prints and how it exits (or sleeps past any limit).
+  const stubCurl = (version: string, body = "", exit: number | "sleep" = 0) => {
+    const d = mkdtempSync(join(tmpdir(), "stub-curl-"));
+    writeFileSync(join(d, "out"), body);
+    writeFileSync(join(d, "curl"), `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "curl ${version} (x86_64-pc-linux-gnu)"; exit 0; fi\necho x >> ${JSON.stringify(join(d, "calls"))}\ncat ${JSON.stringify(join(d, "out"))}\n${exit === "sleep" ? "exec sleep 30" : `exit ${exit}`}\n`, { mode: 0o755 });
+    return { dir: d, bin: join(d, "curl"), calls: () => { try { return readFileSync(join(d, "calls"), "utf8").trim().split("\n").length; } catch { return 0; } } };
+  };
+  const cardOf = (dir: string) => () => { const x = gateState(dir, 5) as any; return "heads" in x ? (x.owed ? { owed: x.owed } : x.heads) : x; };
+
+  test("a holder stalled past the stale bound that writes after a quarantine's takeover and dies before its take-back leaves nothing kept: the next watch of that head reads the head again", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    writeFileSync(genFile(dir, 5), "1\n");
+    let q: any = null;
+    expect(() => quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { ...echo, staleMs: 300, criticalMs: 8_000,
+      atWrite: () => {
+        // Past its last fence check, the holder stalls; a garbled record of the pull request is quarantined meanwhile,
+        // taking the stale lock over.
+        pauseMs(500);
+        writeFileSync(watchFile(dir, SHA2), garbled(5, 1));
+        q = g.quarantineRecord(dir, SHA2, { staleMs: 300 });
+      },
+      afterWrite: () => { throw new Error("the holder dies before its take-back"); } }))).toThrow("dies before its take-back");
+    expect(q.ok).toBe(true);
+    expect(readGen(dir, 5)).toBe(2);                                                // the quarantine's takeover moved it on
+    expect(JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8")).gen).toBe(1);     // the stalled holder's late write
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    let reads = 0;
+    const next = keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { headNow: (_p, h) => { reads++; return h; } });
+    expect(reads).toBeGreaterThan(0);                                               // read again, never returned as kept
+    expect(next).toMatchObject({ accepted_head: SHA1, gen: 2 });
+  });
+
+  test("the lock-file quarantine moving the pull request's lock aside moves the generation on too", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    writeFileSync(genFile(dir, 5), "3\n");
+    writeFileSync(join(dir, "ship-gate-pr-5.lock"), `{"pid": 1, "token": "x", "gen": 3`);
+    expect(g.quarantineLock(dir, 5).ok).toBe(true);
+    expect(readGen(dir, 5)).toBe(4);
+  });
+
+  test("a put-back that fails never deletes: a fresh record at the destination between the rename and the restore leaves the moved one under its quarantine name, logged with its generations and the failure, with the restore command", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    const f = watchFile(dir, SHA1);
+    writeFileSync(f, garbled(5, 3));
+    writeFileSync(genFile(dir, 5), "3\n");
+    let as = "";
+    const r = g.quarantineRecord(dir, SHA1, { rename: (from: string, to: string) => {
+      as = to;
+      writeFileSync(from, valid(SHA1, 5, 3));      // a watch rewrote it just before the rename: what is moved parses
+      renameSync29(from, to);
+      writeFileSync(from, valid(SHA1, 5, 3).replace(`"gen":3`, `"gen":3,"fresh":true`)); // and a fresh record stands there before the restore
+    } });
+    expect(r.ok).toBe(false);
+    expect(r.why).toContain("couldn't be put back");
+    expect(r.why).toContain(`mv -n ${as} ${f}`);
+    expect(existsSync(as)).toBe(true);                                              // never deleted
+    expect(JSON.parse(readFileSync(as, "utf8"))).toMatchObject({ accepted_head: SHA1, gen: 3 });
+    expect(logLines(dir)).toEqual([expect.objectContaining({ file: f, as, pr: 5, gen_max: 3, put_back_failed: expect.stringContaining("a newer file now stands") })]);
+    expect(JSON.parse(readFileSync(f, "utf8")).fresh).toBe(true);
+  });
+
+  test("the card refuses while a record is away from its path: during the quarantine's rename, and after a quarantine cut off before its log entry", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    // A live acceptance of another head stands; its record is set aside mid-quarantine.
+    expect(keepWatch(dir, line(SHA2), watchFile(dir, SHA2), echo).accepted_head).toBe(SHA2);
+    const f = watchFile(dir, SHA2);
+    writeFileSync(f, readFileSync(f, "utf8").replace(/\}\s*$/, ""));             // torn: the quarantine's to set aside
+    let during: any = null;
+    const r0 = g.quarantineRecord(dir, SHA2, { rename: (from: string, to: string) => {
+      writeFileSync(from, valid(SHA2, 5, readGen(dir, 5)!));                        // rewritten whole by a watch: it will be put back
+      renameSync29(from, to);
+      during = cardOf(dir)();
+    } });
+    expect(r0.why).toContain("put back");
+    expect(during).toMatchObject({ unknown: expect.stringContaining("is at work") });
+    const r = rig({ facts: true, gateWatch: () => during });
+    r.github.facts = facts();
+    r.reviews.list = [REVIEW];
+    await expect(ship(r)).rejects.toThrow("state is unknown");
+    // A quarantine cut off between its rename and its log entry: the card stays refused, with the restore.
+    const as = `${f}.quarantined-abcd1234`;
+    renameSync29(f, as);
+    const st = gateState(dir, 5) as any;
+    expect(st.unknown).toContain(`mv -n ${as} ${f}`);
+    const r2 = rig({ facts: true, gateWatch: cardOf(dir) });
+    r2.github.facts = facts();
+    r2.reviews.list = [REVIEW];
+    await expect(ship(r2)).rejects.toThrow("without being recorded or put back");
+    renameSync29(as, f);
+    expect(gateState(dir, 5)).toEqual({ heads: [SHA2] });
+  });
+
+  test("an owed supersede re-run while the head is unchanged clears the mark under the lock, logged, and the card then passes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    expect(await supersede(dir, SHA1, async () => ({ miss: "rate_limit" as const, wait_ms: 60_000 }))).toMatchObject({ ok: false, owed: true });
+    expect((gateState(dir, 5) as any).owed).toBeDefined();
+    const again = await quietly(() => supersede(dir, SHA1, async () => SHA1));
+    expect(again).toMatchObject({ ok: false, cleared: true, why: expect.stringContaining("no longer owed: head unchanged") });
+    const rec = JSON.parse(readFileSync(watchFile(dir, SHA1), "utf8"));
+    expect(rec.supersede_owed).toBeUndefined();
+    expect(rec.owed_cleared).toMatchObject({ why: "no longer owed: head unchanged" });
+    expect(gateState(dir, 5)).toEqual({ heads: [SHA1] });
+    expect(existsSync(join(dir, "ship-gate-pr-5.lock"))).toBe(false);
+    const r = rig({ facts: true, gateWatch: cardOf(dir) });
+    r.github.facts = facts();
+    r.reviews.list = [REVIEW];
+    expect(lines(r, await ship(r))[0]).toBe("Ship Cain 0.11.0?");
+    // With no owed mark, the head unchanged still refuses as before.
+    expect(await supersede(dir, SHA1, async () => SHA1)).toEqual({ ok: false, why: expect.stringContaining("supersede only once a new head has been pushed") });
+  });
+
+  test("the supersede and a page read with an unsupported curl refuse by name, naming the local cause, never as GitHub not answering", async () => {
+    const old = stubCurl("7.29.0", "HTTP/1.1 200 OK\r\n\r\n{}");
+    const page = g.ghPage("/repos/o/r/actions/runs", { base: "http://127.0.0.1:9", env: {}, curl: old.bin });
+    expect(page).toMatchObject({ miss: "local", why: expect.stringContaining("older than 7.32") });
+    await expect(g.pageApi({ base: "http://127.0.0.1:9", env: {}, curl: old.bin })("/repos/o/r/actions/runs")).rejects.toThrow("older than 7.32");
+    expect(old.calls()).toBe(0);                                                    // no read is made at all
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    expect(keepWatch(dir, line(SHA1), watchFile(dir, SHA1), echo).accepted_head).toBe(SHA1);
+    const s = await supersede(dir, SHA1, async (n) => ghHeadRead("o/r", n, { base: "http://127.0.0.1:9", curl: old.bin }));
+    expect(s.ok).toBe(false);
+    expect((s as any).why).toContain("older than 7.32");
+    expect((s as any).why).toContain("the cause is on the Pi");
+    expect((s as any).why).not.toContain("didn't answer");
+    // A curl that fails on an option it doesn't know is named as that.
+    const bad = stubCurl("8.5.0", "", 48);
+    expect(g.ghPage("/x", { base: "http://127.0.0.1:9", env: {}, curl: bad.bin })).toMatchObject({ miss: "local", why: expect.stringContaining("an option it doesn't know") });
+    // The command refuses at its start, by name.
+    const p = Bun.spawn(["bun", join(import.meta.dir, "../rootfs/opt/cain/link/shipgate.ts"), "--supersede", SHA1, "--dir", dir],
+      { env: { ...process.env, PATH: `${old.dir}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
+    const err = await new Response(p.stderr).text();
+    expect(await p.exited).toBe(1);
+    expect(err).toContain("curl 7.29.0 is older than 7.32");
+    expect(old.calls()).toBe(0);
+  }, 20_000);
+
+  test("a write that finishes past the window is voided under the same generation and reported as the deadline, without another read of GitHub", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ship-gate29-"));
+    let reads = 0;
+    const k = quietly(() => keepWatch(dir, line(SHA1), watchFile(dir, SHA1), { criticalMs: 1_500, headNow: (_p, h) => { reads++; return h; },
+      afterWrite: () => pauseMs(1_700) }));
+    expect(k).toMatchObject({ accepted_head: null, failure: "lock_unavailable" });
+    expect(k.failure_why).toContain("just after its acceptance was written");
+    expect(reads).toBe(1);
+    expect(acceptedFor(dir, 5)).toEqual([]);
+    expect(readGen(dir, 5)).toBe(1);
+  });
+
+  test("a killed curl's partial output, or a failed curl's, is never parsed as a page", () => {
+    const page = `HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n${JSON.stringify({ head: { sha: SHA1 } })}`;
+    const slow = stubCurl("8.5.0", page, "sleep");
+    const r = g.ghGet("/repos/o/r/pulls/5", { base: "http://127.0.0.1:9", curl: slow.bin, deadline: Date.now() + 1_500 });
+    expect(r).toEqual({ miss: "deadline" });
+    expect(g.ghHeadRead("o/r", 5, { base: "http://127.0.0.1:9", curl: slow.bin, maxS: 1 })).not.toBe(SHA1);
+    const failed = stubCurl("8.5.0", page, 7);
+    expect(g.ghGet("/repos/o/r/pulls/5", { base: "http://127.0.0.1:9", curl: failed.bin })).toEqual({ miss: "no_answer" });
+  }, 20_000);
+});
+const renameSync29 = (a: string, b: string) => require("node:fs").renameSync(a, b);

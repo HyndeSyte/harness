@@ -7400,7 +7400,9 @@ describe("twenty-eighth review: a preload refused at the start, and every start 
     expect(readFileSync(join(home, "worker.log"), "utf8")).toContain(`${w.PRELOAD_FLAG_REFUSED} ATTENTION:`);
   });
 
-  test("the real entry point started with the options variable pointing at the test module exits with the refusal and leaves its heartbeat", async () => {
+  // Twenty-ninth round: labelled for what it covers, the environment flag only (the Node options variable); a preload Bun's
+  // own start fails on before the worker's entry is the keeper's worker-not-starting notice (pcjobs-reuse.test.ts).
+  test("the real entry point started with the options variable pointing at the test module exits with the refusal and leaves its heartbeat (covers the environment flag only)", async () => {
     const home = mkdtempSync(join(tmpdir(), "pcw28-"));
     const p = Bun.spawn([process.execPath, ENTRY, "check-cli", "--home", home],
       // The Node options variable only (BUN_OPTIONS is covered above: on Windows Bun itself can fail to start on its preload path,
@@ -7431,5 +7433,48 @@ describe("twenty-eighth review: a preload refused at the start, and every start 
     expect(hb).toMatchObject({ code: "start_refused" });
     expect(heartbeatNotice(hb)).toContain("refused to start");
     expect(heartbeatNotice(hb)).not.toMatch(/\bcheck|resend|send it again|tap again|\b[0-9a-f]{40}\b|\d{4}-\d{2}-\d{2}T|j-\d{8}/i);
+  });
+});
+
+describe("twenty-ninth review: the preload scan reads Bun's user-level configuration and a config-file flag, and the test symbol is sealed by the entry point", () => {
+  const w = worker28 as any;
+  const ENTRY = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/worker.ts");
+  const TESTBUILD = join(import.meta.dir, "pcworker-testbuild.ts");
+
+  test("a preload in Bun's user-level .bunfig.toml, or a config-file flag in the options variables or the runtime's arguments, refuses the start", () => {
+    const home = mkdtempSync(join(tmpdir(), "pcw29-"));
+    const cwd = mkdtempSync(join(tmpdir(), "pcw29-cwd-"));
+    const user = mkdtempSync(join(tmpdir(), "pcw29-user-"));
+    const xdg = mkdtempSync(join(tmpdir(), "pcw29-xdg-"));
+    const scan = (env: Record<string, string>, argv: string[] = []) => w.preloadRefusal({ home }, env, argv, cwd, false, user);
+    expect(scan({})).toBeNull();
+    expect(scan({ BUN_OPTIONS: "--smol" })).toBeNull();
+    for (const env of [{ BUN_OPTIONS: "--config=C:/x/bunfig.toml" }, { BUN_OPTIONS: "-c C:/x/bunfig.toml" }, { NODE_OPTIONS: "--experimental-config-file=x.json" }])
+      expect(scan(env)).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+    expect(scan({}, ["--config", "x/bunfig.toml"])).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+    expect(scan({}, ["-c", "x/bunfig.toml"])).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+    writeFileSync(join(xdg, ".bunfig.toml"), `preload = ["${TESTBUILD}"]\n`);
+    expect(scan({ XDG_CONFIG_HOME: xdg })).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED, detail: expect.stringContaining(".bunfig.toml") });
+    writeFileSync(join(user, ".bunfig.toml"), `[test]\npreload = ["${TESTBUILD}"]\n`);
+    expect(scan({})).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED });
+  });
+
+  test("the entry point seals the test symbol as false, non-writable and non-configurable: a later assignment throws, and one already defined refuses", () => {
+    const g: any = {};
+    expect(w.sealTestBuild(g)).toBe(true);
+    expect(() => { g[TEST_BUILD_MARK] = true; }).toThrow();
+    expect(g[TEST_BUILD_MARK]).toBe(false);
+    expect(() => Object.defineProperty(g, TEST_BUILD_MARK, { value: true })).toThrow();
+    const pre: any = { [TEST_BUILD_MARK]: true };
+    expect(w.sealTestBuild(pre)).toBe(false);
+    const getter: any = {};
+    Object.defineProperty(getter, TEST_BUILD_MARK, { get: () => false, configurable: false });
+    expect(w.sealTestBuild(getter)).toBe(false);
+    // The production entry seals it before its refusals, and a symbol that couldn't be sealed refuses as a preload.
+    const src = readFileSync(ENTRY, "utf8");
+    const main = src.slice(src.indexOf("} else if (isMain) {"));
+    expect(main.indexOf("const sealed = sealTestBuild();")).toBeGreaterThan(0);
+    expect(main.indexOf("const sealed = sealTestBuild();")).toBeLessThan(main.indexOf("testBuildFlagRefusal(o)"));
+    expect(main).toContain("preloadRefusal(o, process.env, process.execArgv, process.cwd(), !sealed)");
   });
 });
