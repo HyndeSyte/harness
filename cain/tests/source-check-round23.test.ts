@@ -385,7 +385,13 @@ describe("8. the drop reads GitHub afresh under the lock (invariants: the consum
     k.cfg.beforePush = undefined;
     let failFetch = false;
     k.cfg.gitHook = (a) => {
-      if (a[0] === "push" && !failFetch) { failFetch = true; g(k, "push", "--quiet", k.remote, "HEAD:main"); throw new Error("fatal: the remote end hung up unexpectedly (injected)"); }
+      if (a[0] === "push" && !failFetch) {
+        failFetch = true;
+        const was = localTrack(k);
+        g(k, "push", "--quiet", k.remote, "HEAD:main");
+        g(k, "update-ref", "refs/remotes/origin/main", was);             // a newer git may update the tracking ref for a push to the remote's url
+        throw new Error("fatal: the remote end hung up unexpectedly (injected)");
+      }
       if ((a[0] === "fetch" || a[0] === "ls-remote") && failFetch) throw new Error("fetch: no answer (injected)");
     };
     cycle(k.cfg);
