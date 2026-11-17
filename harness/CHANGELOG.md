@@ -13,11 +13,19 @@
 - **Repeating appointments:** each week of a series gets its own drives. Moving one week moves its drives, cancelling one takes them off, and editing the whole series never leaves two sets of drives on a day.
 - **Calls, read better:** a place that's only a phone number gets no drives in any of its usual shapes (a tel: link, an extension, a country code, letters like 1-800-FLOWERS, or a dial-in with its PIN). A street address wins over the title, so an outing called "Curtain call" at a theater keeps its drives.
 - **When Gmail can't be read in full,** only your own appointments' drives stay as they are. A Family event that moves or is cancelled meanwhile takes its drives with it, and after a day without a full read the digest says so.
-- **An appointment beside a Family event that's never judged** no longer waits for good: after a day, or 12 hours before it starts if that's sooner, it gets its drives from home, and they're worked out again once the judgment lands.
-- **The nearest drives are looked up first,** and one still waiting within 12 hours is named in the digest.
+- **An appointment beside a Family event that's never judged** no longer waits for good: after a day, or a day before it starts if that's sooner, it gets its drives from home, and they're worked out again once the judgment lands.
+- **The nearest drives are looked up first,** and one still waiting within a day is named in the digest and gets its card.
 - **No impossible drive from home:** when the place before an appointment can't be found, the drive from home is used only if you can get home and leave in time without crossing another drive; otherwise the digest names it and you get a card.
 - **A block you made yourself called "Busy (drive there)"** counts as your appointment. Harness knows its own blocks by a hidden mark, and drive blocks carry no guests and send no updates.
 - **A new setting, own_drive_days,** says how many days ahead your own appointments get drive blocks. It starts at 3, so you can check a few real ones first, then widen it (up to 60).
+- **A dry run first: a new setting, own_drive_dry_run, starts on.** While it's on, the drives your own appointments would get are only written to Harness's log, with each appointment's day and time, never to your Gmail, and no card goes out for them. Read the log against your calendar for a day, then turn it off.
+- **Your appointments' drives only come off when your calendar clearly says so:** a week taken out of a series, a series ended before it, or an appointment that no longer needs a drive. One that's just missing from a read keeps its drives until two full reads in a row agree. A read that's cut short, or much smaller than the last, changes nothing, and so does one where more than three appointments seem to vanish at once (the digest says so).
+- **Splitting a repeating appointment ("this and following")** keeps one set of drives a day, with no new cards.
+- **Drives put back just as you were last told** don't send another card.
+- **Events you declined or marked as maybe get no drives.**
+- **When Gmail isn't read in full, a Family event's drives still go on.** Your own appointment's place isn't used for them until a full read confirms it, and a drive of yours they cross shows as "Maybe busy" until then.
+- **A drive left off within a day of its event always gets its card,** with the reason, straight away.
+- **The digest says when Google's copy of your calendar is more than 6 hours old.**
 - **Nothing new is written to the Family calendar.**
 
 ## 0.23.0

@@ -2031,7 +2031,7 @@ def test_new_addresses_past_the_lookup_allowance_wait_and_raise_no_card(drives):
     assert drives.ledger.db.execute("SELECT COUNT(*) FROM drive_cards WHERE fails>0").fetchone()[0] == 0
 
 
-def test_a_partial_gmail_read_keeps_the_whole_chain(drives):
+def test_a_partial_gmail_read_keeps_his_drives_but_never_chains_the_family_event_to_them(drives):
     a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
     goes(drives, "Eye doctor", a, CLINIC)
     mine(drives, "Haircut", b, PARK)
@@ -2043,7 +2043,11 @@ def test_a_partial_gmail_read_keeps_the_whole_chain(drives):
     drives.feeds.window.unreadable = 1                              # not all of Gmail could be read
     for _ in range(3):
         go(drives)
-        assert blocks(drives) == before                             # no drive home beside the drive on
+        # The eye doctor, read in full on Family, gets its own drive home: the haircut wasn't read, so
+        # its place is no stop for it. The haircut's drive there it crosses stays, unconfirmed.
+        assert blocks(drives) == [before[0], before[1],
+                                  ("Busy (drive back)", a + 60 * M, a + 90 * M, ""),
+                                  ("Maybe busy (drive there)", *before[2][1:]), before[3]]
     drives.feeds.window.unreadable = 0
     go(drives)
     go(drives)
@@ -2087,7 +2091,9 @@ def test_a_place_he_skipped_isnt_named_in_the_digest(drives):
 # -- 10. drive blocks for his own appointments, third round (0.24.0) ---------------------------------------
 
 def weekly(rig, title, first, location, weeks=4, uid="weekly-pt", hours=1):
-    """A weekly series of his own on Gmail: one uid, each instance its own (its original start)."""
+    """A weekly series of his own on Gmail: one uid, each instance its own (its original start), its
+    master read in full (ical.Window.series), as the feed's expander gives it."""
+    rig.feeds.window.series.add(uid)
     out = []
     for n in range(weeks):
         start = first + timedelta(weeks=n)
@@ -2171,8 +2177,10 @@ def test_the_whole_series_edited_never_leaves_two_drive_sets_for_a_day(drives):
     for o in occs:
         drives.feeds.window.occurrences.remove(o)
     new = weekly(drives, "PT", when(drives, days=2, hour=14), CLINIC)    # every week now at 2: new instances
-    for _ in range(3):
+    for n in range(7):
         go(drives)
+        if n == 0:                      # four gone at once: held as a bad read for a while, and said
+            assert "4 of your own appointments look gone from your Gmail calendar at once" in drives.gm.digest_line()
         for day, legs in legs_by_day(drives).items():
             assert [t for t, _ in legs].count("Busy (drive there)") <= 1, day
             assert [t for t, _ in legs].count("Busy (drive back)") <= 1, day
@@ -2474,3 +2482,395 @@ def test_the_own_drive_days_option_is_read_short_by_default(tmp_path, text, days
     (tmp_path / "options.json").write_text(text)
     assert own_days_from_options(str(tmp_path)) == days
     assert own_days_from_options(str(tmp_path / "missing")) == 3
+
+
+# -- 11. drive blocks for his own appointments, fourth round (0.24.0) -------------------------------------
+# Through the real reader of his calendar's secret iCal feed (calendar_feed.fetch_one and ical.window: repeat
+# rules, excluded dates, overrides) and the real sync loop. Only Google's answers are fakes.
+
+from harness import calendar_feed                                     # noqa: E402
+from harness.family_gmail import own_dry_run_from_options            # noqa: E402
+
+FEED_URL = "https://calendar.google.com/calendar/ical/parent%40gmail.com/private-0123456789abcdef/basic.ics"
+UTC_FMT = "%Y%m%dT%H%M%SZ"
+
+
+def _u(t):
+    return t.astimezone(timezone.utc).strftime(UTC_FMT)
+
+
+def vev(uid, title, start, hours=1, place="", rrule="", exdates=(), rid=None, extra=()):
+    """One VEVENT as Google's feed writes it."""
+    lines = ["BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{_u(start)}", f"DTSTART:{_u(start)}",
+             f"DTEND:{_u(start + timedelta(hours=hours))}", f"SUMMARY:{title}"]
+    if place:
+        lines.append("LOCATION:" + place.replace(",", "\\,"))
+    if rrule:
+        lines.append("RRULE:" + rrule)
+    lines += [f"EXDATE:{_u(x)}" for x in exdates]
+    if rid is not None:
+        lines.append(f"RECURRENCE-ID:{_u(rid)}")
+    return "\r\n".join([*lines, *extra, "END:VEVENT"])
+
+
+def padding(n):
+    """Old events, long over: what makes a real feed's size."""
+    return [vev(f"old-{i}", f"Old thing {i}", datetime(2020, 1, 1, 9, tzinfo=NY) + timedelta(days=i))
+            for i in range(n)]
+
+
+class FeedServer:
+    """Google's secret-address server: one answer, as set."""
+
+    def __init__(self):
+        self.status, self.headers, self.body = 200, {}, b""
+
+    def request(self, method, url, *, headers=None, timeout=30, **kw):
+        return HttpResponse(self.status, dict(self.headers), self.body)
+
+
+def feed_rig(rig, api=None):
+    """His Gmail calendar read by the add-on's own feed reader, not set by hand."""
+    rig.server = FeedServer()
+    rig.cal = calendar_feed.CalendarFeeds(rig.ledger, rig.server, SyncExecutor(), lambda: FEED_URL, TZ,
+                                          ahead_days=60, ahead_from=api)
+    return rig
+
+
+def fetch(rig, *events, pad=40, cut=False, headers=None):
+    """One download of the feed, read as the add-on reads it, then a tick that looks at it."""
+    body = "\r\n".join(["BEGIN:VCALENDAR", "VERSION:2.0", "X-WR-CALNAME:" + GMAIL, *events, *padding(pad),
+                        "END:VCALENDAR"]) + "\r\n"
+    if cut:
+        body = body[:len(body) * 3 // 5]       # the download stopped part way: it still parses
+    rig.server.body = body.encode()
+    rig.server.headers = headers or {}
+    rig.cal.start()
+    rig.cal.collect()
+    rig.feeds.snapshot = rig.cal.snapshot
+    rig.feeds.generation += 1
+    rig.tick()
+
+
+def drives_each_day(rig):
+    """Each day's (drive there, drive back) count on Gmail."""
+    out = {}
+    for title, start, _, _ in blocks(rig):
+        if title in ("Busy (drive there)", "Busy (drive back)"):
+            there, back = out.get(start.astimezone(NY).date(), (0, 0))
+            out[start.astimezone(NY).date()] = (there + (title == "Busy (drive there)"),
+                                                back + (title == "Busy (drive back)"))
+    return out
+
+
+def flush_receipts(rig):
+    while rig.gm.send_drive_receipts():
+        pass
+    rig.tick()
+
+
+def outbox(rig):
+    return rig.ledger.db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+
+
+def gmail_writes(rig):
+    return len(rig.google.writes())
+
+
+def test_a_series_split_this_and_following_keeps_one_drive_pair_a_day_and_sends_no_card(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    day1 = when(drives, days=1, hour=10)
+    whole = vev("series-u", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;COUNT=6")
+    fetch(drives, whole)
+    fetch(drives, whole)
+    assert list(drives_each_day(drives).values()) == [(1, 1)] * 6
+    flush_receipts(drives)
+    sent, written = outbox(drives), gmail_writes(drives)
+    # "This and following" from day 4: the old series ends after day 3, a new uid has days 4 to 6.
+    old = vev("series-u", "PT", day1, place=CLINIC, rrule=f"FREQ=DAILY;UNTIL={_u(day1 + timedelta(days=2, hours=1))}")
+    new = vev("series-v", "PT", day1 + timedelta(days=3), place=CLINIC, rrule="FREQ=DAILY;COUNT=3")
+    for _ in range(3):
+        fetch(drives, old, new)
+        assert list(drives_each_day(drives).values()) == [(1, 1)] * 6     # exactly one pair a day, every read
+        assert drives.gm.send_drive_receipts() == 0
+    drives.tick()
+    assert outbox(drives) == sent and not drive_cards_sent(drives)[sent:]
+    assert gmail_writes(drives) == written                               # nothing written or taken off
+
+
+@pytest.mark.parametrize("how", ["cut", "small"])
+def test_a_feed_cut_short_or_much_smaller_than_the_last_keeps_his_drives(drives, how):
+    feed_rig(drives)
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    dentist = vev("dentist", "Dentist", start, place=CLINIC)
+    fetch(drives, dentist)
+    fetch(drives, dentist)
+    before = blocks(drives)
+    assert len(before) == 2
+    flush_receipts(drives)
+    sent, written = outbox(drives), gmail_writes(drives)
+    for _ in range(4):
+        if how == "cut":
+            fetch(drives, cut=True)                 # no END:VCALENDAR: the download was cut off
+        else:
+            # Ends as it should and has this month's events, but it's a quarter of the last one's size.
+            fetch(drives, vev("errand", "Errand", when(drives, days=20, hour=15)), pad=10)
+        assert blocks(drives) == before
+    fetch(drives, dentist)
+    fetch(drives, dentist)
+    assert blocks(drives) == before and gmail_writes(drives) == written
+    drives.tick()
+    assert outbox(drives) == sent
+
+
+def test_an_instance_missing_from_one_read_and_back_on_the_next_keeps_its_drives_and_sends_no_card(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    first = when(drives, days=2, hour=10)
+    master = vev("weekly-pt", "PT", first, place=CLINIC, rrule="FREQ=WEEKLY;COUNT=4")
+    week2 = first.astimezone(timezone.utc) + timedelta(weeks=1)
+    moved = vev("weekly-pt", "PT", week2 + timedelta(hours=4), place=CLINIC, rid=week2)   # week 2 moved to 2 PM
+    fetch(drives, master, moved)
+    fetch(drives, master, moved)
+    before = blocks(drives)
+    assert len(before) == 8
+    flush_receipts(drives)
+    sent, written = outbox(drives), gmail_writes(drives)
+    fetch(drives, moved)                            # the master missing from this one read; its override kept
+    assert blocks(drives) == before
+    fetch(drives, master, moved)                    # back
+    fetch(drives, master, moved)
+    assert blocks(drives) == before and gmail_writes(drives) == written
+    assert drives.gm.send_drive_receipts() == 0
+    drives.tick()
+    assert outbox(drives) == sent
+
+
+def test_an_override_with_no_master_is_kept_and_gets_its_drives(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    orig = when(drives, days=3, hour=10)
+    alone = vev("lone-series", "PT", orig + timedelta(hours=3), place=CLINIC, rid=orig)
+    fetch(drives, alone)
+    fetch(drives, alone)
+    start = orig + timedelta(hours=3)
+    assert blocks(drives) == [("Busy (drive there)", start - 30 * M, start, ""),
+                              ("Busy (drive back)", start + 60 * M, start + 90 * M, "")]
+    keys = {r["key"] for r in drives.ledger.db.execute("SELECT key FROM drive_cards WHERE kind='own'")}
+    # Keyed by the series uid and its original start (its recurrence id).
+    assert keys == {hashlib.sha256(f"lone-series|{_u(orig)}|own".encode()).hexdigest()[:32]}
+
+
+@pytest.mark.parametrize("week", [1, 3])
+def test_an_excluded_date_takes_that_instances_drives_off_at_that_read(drives, week):
+    feed_rig(drives)
+    quiet_family(drives)
+    first = when(drives, days=2, hour=10)
+    fetch(drives, vev("weekly-pt", "PT", first, place=CLINIC, rrule="FREQ=WEEKLY;COUNT=4"))
+    fetch(drives, vev("weekly-pt", "PT", first, place=CLINIC, rrule="FREQ=WEEKLY;COUNT=4"))
+    assert len(blocks(drives)) == 8
+    utc = first.astimezone(timezone.utc)                                # the series is in UTC, as Google sends it
+    gone = utc + timedelta(weeks=week)
+    fetch(drives, vev("weekly-pt", "PT", first, place=CLINIC, rrule="FREQ=WEEKLY;COUNT=4", exdates=[gone]))
+    starts = [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"]
+    assert starts == [utc + timedelta(weeks=n) for n in range(4) if n != week]      # off at that one read
+
+
+def test_his_own_appointments_are_read_from_the_feed_never_the_api(drives):
+    a, b = when(drives, days=3, hour=10), when(drives, days=4, hour=10)
+    api_only = ical.Window(GMAIL, [occ("Dentist", a, location=CLINIC, uid="api-only")])
+    feed_rig(drives, api=lambda address, start, until: api_only)
+    quiet_family(drives)
+    fetch(drives, vev("feed-only", "Haircut", b, place=PARK))
+    fetch(drives, vev("feed-only", "Haircut", b, place=PARK))
+    res = drives.cal.snapshot.feeds[calendar_feed.feed_id(FEED_URL)]
+    assert res.ahead is api_only                                    # elsewhere, the API read stands in
+    assert [x[2] for x in blocks(drives) if x[0] == "Busy (drive there)"] == [b]     # his drives: the feed
+
+
+def test_a_stale_appointment_is_never_a_stop_for_a_family_events_drive(drives):
+    feed_rig(drives)
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=11, minute=30)
+    haircut = vev("haircut", "Haircut", a, place=PARK)
+    goes(drives, "Eye doctor", b, CLINIC)
+    fetch(drives, haircut)
+    fetch(drives, haircut)
+    assert ("Busy (drive there)", b - 15 * M, b, "") in blocks(drives)       # straight on from the haircut
+    for _ in range(3):
+        fetch(drives, haircut, cut=True)                                     # Gmail not read in full
+        got = blocks(drives)
+        assert ("Busy (drive there)", b - 30 * M, b, "") in got              # from home: 20 minutes, rounded
+        assert ("Busy (drive there)", b - 15 * M, b, "") not in got
+        assert ("Busy (drive there)", a - 30 * M, a, "") in got              # the haircut's own, kept
+
+
+def test_a_drive_left_off_within_a_day_gets_its_card_at_once(drives):
+    quiet_family(drives)
+    soon = when(drives, days=1, hour=8)                                      # 23 hours away
+    mine(drives, "Dentist", soon, CLINIC)
+    drives.maps.fail = "down"
+    go(drives)                                                               # one failed lookup is enough
+    drives.tick()
+    texts = [s[1] for s in drive_cards_sent(drives)]
+    assert texts == [f"No drive blocks for the event on {day(soon)} at 8:00 AM: the drive lookup failed. "
+                     "I'll keep trying at each read; tap Skip to leave it without drive blocks."]
+
+
+def test_a_lookup_still_waiting_within_a_day_gets_its_card(drives, monkeypatch):
+    quiet_family(drives)
+    monkeypatch.setattr(drive, "MAX_REQUESTS_PER_READ", 0)
+    soon = when(drives, days=0, hour=20)
+    mine(drives, "Dentist", soon, CLINIC)
+    go(drives)
+    drives.tick()
+    texts = [s[1] for s in drive_cards_sent(drives)]
+    assert texts == [f"No drive blocks for the event on {day(soon)} at 8:00 PM: its drive time hasn't been "
+                     "looked up yet. I'll keep trying at each read; tap Skip to leave it without drive blocks."]
+    far = when(drives, days=3, hour=10)
+    mine(drives, "Haircut", far, PARK)                                       # days away: a quiet wait
+    go(drives)
+    drives.tick()
+    assert len(drive_cards_sent(drives)) == 1
+
+
+def test_with_no_state_the_add_ons_own_blocks_get_no_drives_and_no_card(drives):
+    """The state file deleted: what the add-on wrote is still on Gmail, and comes back in the feed."""
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    old = [("Busy (drive there)", start - 30 * M, start), ("Busy (drive back)", start + 60 * M, start + 90 * M),
+           ("Maybe busy (drive there)", start + 5 * 60 * M, start + 5 * 60 * M + 30 * M)]
+    for n, (title, s, e) in enumerate(old):
+        uid = google_cal.event_id(f"before:{n}")
+        assert drives.gm.google.add(GMAIL, uid, title, s, e, "").kind == "ok"
+        drives.feeds.window.occurrences.append(occ(title, s, hours=0.5, uid=uid + "@google.com"))
+    # A drive's title with no place and an id the feed spells otherwise, and a plain "Busy" hold.
+    drives.feeds.window.occurrences.append(occ("Busy (drive back)", start + 3 * 60 * M, hours=0.5, uid="x9@google.com"))
+    drives.feeds.window.occurrences.append(occ("Busy", start + 6 * 60 * M, hours=1, uid="hold@google.com"))
+    before = sorted(drives.google.titles())
+    for _ in range(3):
+        go(drives)
+    assert sorted(drives.google.titles()) == before                          # no drive written on a drive block
+    assert drives.gm.send_drive_receipts() == 0
+    drives.tick()
+    assert not drive_cards_sent(drives)
+    assert drives.ledger.db.execute("SELECT COUNT(*) FROM drive_cards").fetchone()[0] == 0
+    assert not [r for r in drives.ledger.db.execute("SELECT text FROM outbox")
+                if r["text"].startswith(("Added to your Gmail", "Moved on your Gmail", "No drive blocks", "Where is"))]
+
+
+@pytest.mark.parametrize("extra,all_day", [
+    (("ORGANIZER:mailto:" + GMAIL, "ATTENDEE;PARTSTAT=DECLINED:mailto:" + GMAIL), False),
+    (("ORGANIZER:mailto:" + GMAIL, "ATTENDEE;PARTSTAT=TENTATIVE:mailto:" + GMAIL), False),
+    (("TRANSP:TRANSPARENT",), False),                                       # shown free
+    ((), True),
+])
+def test_declined_tentative_free_and_all_day_get_no_drives(drives, extra, all_day):
+    feed_rig(drives)
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    if all_day:
+        d = start.date()
+        event = "\r\n".join(["BEGIN:VEVENT", "UID:allday", f"DTSTAMP:{_u(start)}", f"DTSTART;VALUE=DATE:{d:%Y%m%d}",
+                             f"DTEND;VALUE=DATE:{d + timedelta(days=1):%Y%m%d}", "SUMMARY:Conference",
+                             "LOCATION:" + CLINIC.replace(",", "\\,"), "END:VEVENT"])
+    else:
+        event = vev("one", "Dentist", start, place=CLINIC, extra=extra)
+    accepted = vev("two", "Haircut", when(drives, days=4, hour=10), place=PARK,
+                   extra=("ORGANIZER:mailto:" + GMAIL, "ATTENDEE;PARTSTAT=ACCEPTED:mailto:" + GMAIL))
+    fetch(drives, event, accepted)
+    fetch(drives, event, accepted)
+    assert [b[2] for b in blocks(drives) if b[0] == "Busy (drive there)"] == [when(drives, days=4, hour=10)]
+    drives.tick()
+    assert not drive_cards_sent(drives)
+
+
+def test_the_feeds_etag_and_last_modified_are_kept_and_an_old_feed_is_named(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    old = email_date(drives.clock() - timedelta(hours=8))
+    fetch(drives, vev("dentist", "Dentist", start, place=CLINIC), headers={"etag": '"v1"', "last-modified": old})
+    kept = json.loads(drives.ledger.get_meta(f"calendar_headers:{calendar_feed.feed_id(FEED_URL)}"))
+    assert kept["etag"] == '"v1"' and kept["last_modified"] == old and kept["size"] > 0
+    assert ("Google's copy of your Gmail calendar is 8 hours old, so the drives around your own appointments "
+            "may be behind it.") in drives.gm.digest_line()
+    fresh = email_date(drives.clock() - timedelta(hours=1))
+    fetch(drives, vev("dentist", "Dentist", start, place=CLINIC), headers={"etag": '"v2"', "last-modified": fresh})
+    assert "hours old" not in (drives.gm.digest_line() or "")
+
+
+def email_date(t):
+    import email.utils
+    return email.utils.format_datetime(t.astimezone(timezone.utc), usegmt=True)
+
+
+def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(drives, caplog, tmp_path):
+    (tmp_path / "options.json").write_text("{}")
+    drives.gm.own_dry_fn = lambda: own_dry_run_from_options(str(tmp_path))   # on by default
+    a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=12)
+    goes(drives, "Eye doctor", b, CLINIC)
+    dentist = mine(drives, "Dentist", a, PARK)
+    mine(drives, "Checkup", when(drives, days=1, hour=8), "Dr Patel's office")   # a place to ask about
+    caplog.set_level(logging.INFO, logger="harness.family_gmail")
+    go(drives)
+    go(drives)
+    titles = [x[0] for x in blocks(drives)]
+    assert titles == ["Busy (drive there)", "Busy (family)", "Busy (drive back)"]   # the Family event's only
+    assert [x[1] for x in blocks(drives)][0] == b - 30 * M
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("drive dry run")]
+    local = a.astimezone(NY)
+    assert (f"drive dry run: would write Busy (drive there), {local:%a %b} {local.day} 9:30 AM to "
+            f"{local:%a %b} {local.day} 10:00 AM, for the appointment on {local:%a %b} {local.day} 10:00 AM") in lines
+    assert drives.gm.send_drive_receipts() == 0
+    drives.tick()
+    assert not drive_cards_sent(drives) and not [s for s in drives.bot.sent if s[1].startswith("Where is")]
+    drives.feeds.window.occurrences.remove(dentist)                          # cancelled
+    go(drives)
+    go(drives)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("drive dry run")]
+    assert f"drive dry run: would remove the drive blocks for the appointment on {local:%a %b} {local.day} 10:00 AM" \
+        in lines
+    assert len([x for x in lines if x.startswith("drive dry run: would remove")]) == 1     # said once
+    go(drives)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("drive dry run: would remove")]
+    assert len(lines) == 1
+    (tmp_path / "options.json").write_text('{"own_drive_dry_run": false}')   # he's read the log: off
+    drives.feeds.window.occurrences.append(dentist)
+    go(drives)
+    assert ("Busy (drive there)", a - 30 * M, a, "") in blocks(drives)
+
+
+@pytest.mark.parametrize("text,dry", [("{}", True), ('{"own_drive_dry_run": false}', False),
+                                      ('{"own_drive_dry_run": true}', True), ('{"own_drive_dry_run": "no"}', True),
+                                      ("not json", True)])
+def test_the_dry_run_option_is_on_unless_it_reads_as_off(tmp_path, text, dry):
+    (tmp_path / "options.json").write_text(text)
+    assert own_dry_run_from_options(str(tmp_path)) is dry
+
+
+def test_drives_put_back_as_he_was_told_send_no_second_card(drives):
+    quiet_family(drives)
+    start = when(drives, days=3, hour=10)
+    dentist = mine(drives, "Dentist", start, CLINIC)
+    go(drives)
+    go(drives)
+    assert drives.gm.send_drive_receipts() == 1
+    drives.tick()
+    before = blocks(drives)
+    drives.feeds.window.occurrences.remove(dentist)
+    go(drives)
+    assert blocks(drives) == before                                          # one read says nothing
+    go(drives)
+    assert blocks(drives) == []                                              # two full reads in a row do
+    drives.feeds.window.occurrences.append(dentist)                          # back, as it was
+    for _ in range(3):
+        go(drives)
+    assert blocks(drives) == before
+    assert drives.gm.send_drive_receipts() == 0
+    assert drives_cards_receipt_states(drives) == {"shown"}
+
+
+def drives_cards_receipt_states(rig):
+    return {r["receipt"] for r in rig.ledger.db.execute("SELECT receipt FROM drive_cards WHERE kind='own'")}

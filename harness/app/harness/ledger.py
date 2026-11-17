@@ -347,6 +347,10 @@ CREATE TABLE IF NOT EXISTS drive_cards(
   until TEXT NOT NULL DEFAULT '',
   place TEXT NOT NULL DEFAULT '',
   wait_since TEXT NOT NULL DEFAULT '',
+  inst TEXT NOT NULL DEFAULT '',
+  missed INTEGER NOT NULL DEFAULT 0,
+  missed_read TEXT NOT NULL DEFAULT '',
+  shown TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

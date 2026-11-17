@@ -15,8 +15,10 @@ dead feed is named in the digest instead of quietly shrinking the agenda.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
+import secrets
 from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -87,6 +89,17 @@ class FeedResult:
     # The same feed over the mirror's horizon (shadow mode), when asked for.
     ahead: ical.Window | None = None
     ahead_error: str = ""      # why the ahead parse failed; today's window is unaffected
+    # The feed's own ahead parse, kept when `ahead` is replaced by a read through Google's API
+    # (CalendarFeeds.ahead_from). His own appointments' drives read this one only (family_gmail.py).
+    feed_ahead: ical.Window | None = None
+    # What the download itself says, for telling a full read from one cut short (family_gmail.py).
+    status: int = 0
+    size: int = 0              # bytes
+    complete: bool = False     # the body ends with END:VCALENDAR
+    etag: str = ""
+    last_modified: str = ""    # Google's Last-Modified header, as sent
+    read_id: str = field(default_factory=lambda: secrets.token_hex(6))   # this download, and no other
+    fetched_at: datetime | None = None
 
 
 @dataclass
@@ -119,6 +132,8 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
         return FeedResult(fid, False, error="Google answered with an error")
     if len(resp.body) > MAX_BYTES:
         return FeedResult(fid, False, error="the calendar is larger than this reads")
+    headers = resp.headers or {}
+    etag, modified = str(headers.get("etag", ""))[:200], str(headers.get("last-modified", ""))[:100]
     text = resp.body.decode("utf-8", "replace").lstrip("\ufeff")
     if "BEGIN:VCALENDAR" not in text[:2000]:
         return FeedResult(fid, False, error="the answer wasn't a calendar")
@@ -140,7 +155,8 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
             ahead_error = type(e).__name__
     return FeedResult(fid, True, window=w,
                       day=start.astimezone(ZoneInfo(tz)).date().isoformat(), ahead=ahead,
-                      ahead_error=ahead_error)
+                      ahead_error=ahead_error, feed_ahead=ahead, status=resp.status, size=len(resp.body),
+                      complete=text.rstrip().endswith("END:VCALENDAR"), etag=etag, last_modified=modified)
 
 
 def today_bounds(now: datetime, tz: str) -> tuple[datetime, datetime, str]:
@@ -278,8 +294,15 @@ class CalendarFeeds:
             if fid not in live:
                 continue
             if res.ok:
+                res.fetched_at = now
                 # Its own name kept too, for his messages after midnight or a restart.
                 self.ledger.input_ok(f"calendar:{fid}", label=res.window.calendar if res.window else "")
+                # Each download's ETag and Last-Modified, as Google sent them: the feed is Google's
+                # cache, and these say how old it is.
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(f"calendar_headers:{fid}", json.dumps(
+                        {"etag": res.etag, "last_modified": res.last_modified, "size": res.size,
+                         "at": now.isoformat()}), db)
                 if res.ahead_error:
                     with self.ledger.tx() as db:
                         self.ledger.event("calendar_ahead_failed",
@@ -295,6 +318,7 @@ class CalendarFeeds:
                     # ahead window does not: a feed whose latest read failed
                     # is unread for the shadow (no delete from stale data).
                     prev.ahead = None
+                    prev.feed_ahead = None
 
     def _want_ahead(self) -> bool:
         if self.ahead_when is None:

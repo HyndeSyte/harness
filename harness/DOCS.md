@@ -421,22 +421,40 @@ how many blocks are on Gmail.
   yours: Harness knows its own blocks by a hidden mark, not their titles. Each event of a repeating
   series gets its own drives, and a series edited or one week moved or cancelled takes them along,
   never leaving two sets for one trip. One at the same time as a Family event you go to is that
-  event; one beside a Family event not judged yet waits for the judgment up to a day (or until 12
-  hours before it), then gets its drives from home, worked out again once the judgment lands. Two events on the same
+  event; one beside a Family event not judged yet waits for the judgment up to a day (or until a
+  day before it), then gets its drives from home, worked out again once the judgment lands. Two events on the same
   day too close to go home between them, Family or your own, get one drive straight from the first
   to the second, and only the last one of the stretch drives home. Your own appointments' drives
   follow them when they move or are cancelled, and each event's new or moved drives get a card with
   Undo, with the morning digest, once a read of Gmail finds them; Undo keeps that event's drives off.
   A drive that can't be found is never left off silently: the digest names the event's day and time,
-  and you get one card naming the day, the time and why (no usable address, or the lookup failed
-  on two reads in a row), with Skip, which leaves that event without drive blocks for good. If the
+  and you get one card naming the day, the time and why (no usable address, the lookup failed on
+  two reads in a row, or, within a day of the event, at once, with a lookup still waiting counted
+  too), with Skip, which leaves that event without drive blocks for good. If the
   place book is already asking where that place is, that question is the card. Lookups go soonest
-  first, and one still waiting within 12 hours of its event is named in the digest. When the place
+  first, and one still waiting within a day of its event is named in the digest. When the place
   of the event before can't be found, the drive from home is used only if you can get home after it
   and leave in time without crossing another drive; otherwise that one is named too, with a card.
-  When Gmail can't be read in full, your own appointments' drives stay as they are, and Family
-  events around them are still worked out, moved or taken off; after a day of that the digest says
-  so. Nothing here writes to the Family calendar, and drive blocks carry no guests and send no
+  Your own appointments are read from your Gmail calendar's secret iCal feed only (repeat rules,
+  excluded dates and moved instances read by Harness itself; each instance keyed by its series and
+  its original start), never from the read through Google's service account. An appointment's
+  drives come off only when the feed says it's gone (a date taken out of its series, a cancelled
+  instance, the series ended before it, or it's there but no longer wants drives) or when it's
+  missing from two full reads in a row. A full read is Google answering 200 with a body that ends
+  as a calendar does and isn't under half the size of the last full one. When more than three
+  appointments look gone at once, that read is taken as a bad one and the digest says so (six reads
+  in a row saying the same are believed). A series split with "this and following" keeps its drives
+  as they are. When Gmail isn't read in full, your own appointments' drives stay as they are, but
+  they are no stop for anything else: Family events, read in full, are still worked out, moved or
+  taken off without them, and a drive of yours that one of theirs crosses shows as "Maybe busy" until
+  a full read. After a day of that the digest says so. Each download's ETag and Last-Modified are
+  kept, and when Google's copy is more than 6 hours old the digest says so. Events you declined or
+  marked tentative get no drives. Drives put back just as the last card said send no new card.
+- **First live run (`own_drive_dry_run`, on by default):** while it's on, your own appointments'
+  drive blocks are only written to the add-on's log ("drive dry run: would write ..." and "would
+  remove ...", each with the appointment's day and time), never to Gmail, and no card goes out for
+  them; Family events' drives work as before. Read the log against your real calendar for a day,
+  then turn the option off in Harness's settings. Nothing here writes to the Family calendar, and drive blocks carry no guests and send no
   updates. A place you type on a block makes it yours, like any other edit.
 
 ## Standing rules from before 0.5.1
