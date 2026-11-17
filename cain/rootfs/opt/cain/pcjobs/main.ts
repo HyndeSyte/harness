@@ -21,7 +21,7 @@
 //   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
 //   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
@@ -56,6 +56,15 @@ export type ReuseCheck = (r: OwnerReuse) => { ok: true; via: string } | { ok: fa
 // can open ("unix:<path>"), so being root is the keeper's key and it needs no bot token. An http
 // address (the tests' link) is keyed with the relay key, as keeper.sh keyed it before C1.
 export const LINK = `unix:${process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock"}`;
+// A request file in the queue folder, read only when it is a plain file (C1: Cain's own user writes
+// that folder and the keeper reads it as root, so a link or anything else there is never followed,
+// as the record keeper reads its queue). null for anything but a plain file; one over 8000 bytes is
+// read no further than that.
+export function requestText(file: string): string | null {
+  const st = lstatSync(file);
+  if (!st.isFile()) return null;
+  return st.size > 8_000 ? "x".repeat(8_001) : readFileSync(file, "utf8");
+}
 // The curl lines that reach one route of the link: its socket, or the address and the key (none
 // without a bot token).
 export function linkTarget(cfg: Pick<Config, "link" | "discordEnv">, path: string): string[] | null {
@@ -391,9 +400,28 @@ function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
     writeFileSync(`${toldFile(cfg)}.tmp`, text);
+    hisToRead(`${toldFile(cfg)}.tmp`);
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
     return true;
   } catch (e) { if (!quiet) log(`couldn't keep which notices went out: ${(e as Error).message}`); return false; }
+}
+// The notice marks are for Cain's eyes too (pcjobs.sh list and worker run as his own user since C1):
+// each new copy goes into his group, read-only to him, as the lockdown left the one before (the App's
+// umask 027 would leave it root's group). Without a cain group (the tests, an App from before C1) or
+// when not root, nothing changes; a failure only delays his reading to the next start's lockdown.
+let cainGid: number | null | undefined;
+function hisToRead(file: string): void {
+  if (process.getuid?.() !== 0) return;
+  if (cainGid === undefined) {
+    try {
+      const line = readFileSync("/etc/group", "utf8").split("\n").find((l) => l.startsWith("cain:"));
+      const g = line ? Number(line.split(":")[2]) : NaN;
+      cainGid = Number.isInteger(g) && g > 0 ? g : null;
+    } catch { cainGid = null; }
+  }
+  if (cainGid === null) return;
+  try { chownSync(file, 0, cainGid); chmodSync(file, 0o640); }
+  catch (e) { log(`couldn't give the notice marks to Cain's group: ${(e as Error).message}`); }
 }
 // One send of a mark, with its saved id: "posted" once the link confirms it posted (or had already posted it),
 // "refused" on a permanent refusal (logged loudly, never sent again), "retry" otherwise.
@@ -1165,7 +1193,7 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     names = names.filter((n) => {
       const rid = n.replace(/\.json$/, "");
       if (waitRid.has(rid)) return false;
-      if (!ledger) { try { const r = JSON.parse(readFileSync(join(cfg.queue, n), "utf8")); if (r?.job?.owner_reuse) return false; } catch { /* checked below */ } }
+      if (!ledger) { try { const r = JSON.parse(requestText(join(cfg.queue, n)) ?? ""); if (r?.job?.owner_reuse) return false; } catch { /* checked below */ } }
       return existsSync(join(cfg.queue, n));
     });
     if (!names.length) return { ok: true, queued: 0, refused: 0 };
@@ -1175,13 +1203,15 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     for (const n of names) {
       const file = join(cfg.queue, n);
       const rid = n.replace(/\.json$/, "");
-      if (!RID.test(rid)) { rmSync(file, { force: true }); continue; }
-      let raw = "";
-      try { raw = readFileSync(file, "utf8"); } catch { continue; }
-      const c = raw.length > 8_000 ? { why: "a job request is at most 8000 bytes" } : check(cfg, raw, jobs, now);
+      // recursive: a folder planted under a request's name goes too (a link is removed, never followed).
+      if (!RID.test(rid)) { rmSync(file, { force: true, recursive: true }); continue; }
+      let raw: string | null = "";
+      try { raw = requestText(file); } catch { continue; }
+      const c = raw === null ? { why: "a job request is a plain file" }
+        : raw.length > 8_000 ? { why: "a job request is at most 8000 bytes" } : check(cfg, raw, jobs, now);
       if ("why" in c) {
         writeOutcome(cfg, { request: rid, state: "refused", reason: c.why });
-        rmSync(file, { force: true });
+        rmSync(file, { force: true, recursive: true });
         refused++;
         log(`refused ${rid}: ${c.why}`);
         continue;

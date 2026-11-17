@@ -88,7 +88,10 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
     [ -e "$D/$f" ] && { chown root:root "$D/$f"; chmod go-rwx "$D/$f"; }
   done
   # The record keeper's copy, and the PC job keeper's copy of its queue (pcjobs.sh list, result
-  # and worker read it): his to read, not to write. Their folders keep the group (setgid).
+  # and worker read it): his to read, not to write. Their folders keep the group (setgid). The
+  # queue copy's folder is made here when it isn't there yet, so a copy the keeper clones after
+  # this start (into the empty folder) is in his group too, under the App's umask 027.
+  install -d -m 2750 -o root -g cain "$D/pc-jobs" || die "/data/pc-jobs"
   for r in record pc-jobs; do
     if [ -d "$D/$r" ]; then
       chgrp -R cain "$D/$r" && chmod -R g+rX,g-w,o-rwx "$D/$r" \

@@ -45,7 +45,8 @@
       "Edit(//data/record-holds.json)",
       "Edit(//data/record-holds.json.next)",
       "Edit(//data/pc-jobs/**)",
-      "Edit(//data/pc-jobs-outcomes/**)"
+      "Edit(//data/pc-jobs-outcomes/**)",
+      "Edit(//data/pc-jobs-reuse-used.jsonl*)"
     ]
   },
   "hooks": {

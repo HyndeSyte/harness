@@ -45,7 +45,8 @@
       "Edit(//data/record-holds.json.next)",
       "Edit(//etc/claude-code/**)",
       "Edit(//data/pc-jobs/**)",
-      "Edit(//data/pc-jobs-outcomes/**)"
+      "Edit(//data/pc-jobs-outcomes/**)",
+      "Edit(//data/pc-jobs-reuse-used.jsonl*)"
     ],
     "disableBypassPermissionsMode": "disable"
   },

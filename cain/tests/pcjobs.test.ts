@@ -4,7 +4,7 @@
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash, createHmac, generateKeyPairSync } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -888,6 +888,23 @@ describe("Cain's keeper", () => {
     expect(q.outcome(stranger)).toMatchObject({ state: "refused", reason: "only Cain's jobs are accepted" });
     expect(readdirSync(q.cfg.queue)).toEqual([]);
     expect(readJobs(q.cfg.dir).map((j) => j.id)).toEqual([o.id]);
+  });
+
+  // C1: Cain's own user writes the queue folder and the keeper reads it as root, so anything but a
+  // plain file there (a link to a root-only file, a folder) is refused unread and removed, its target untouched.
+  test.skipIf(WIN)("a link or a folder in the queue folder is refused unread, and what a link points at is left alone", () => {
+    const q = queueRig({ attributes: false });
+    const secret = join(dirname(q.cfg.queue), "root-only.env");
+    writeFileSync(secret, `{"from": "cain", "job": ${JSON.stringify(READ)}}`);   // even one that would parse as a good job
+    symlinkSync(secret, join(q.cfg.queue, "pc-0901.json"));
+    mkdirSync(join(q.cfg.queue, "pc-0902.json"));
+    const good = q.ask(READ);
+    expect(round(q.cfg)).toEqual({ ok: true, queued: 1, refused: 2 });
+    for (const rid of ["pc-0901", "pc-0902"]) expect(q.outcome(rid)).toEqual(expect.objectContaining({ state: "refused", reason: "a job request is a plain file" }));
+    expect(q.outcome(good)).toMatchObject({ state: "queued" });
+    expect(readdirSync(q.cfg.queue)).toEqual([]);
+    expect(readFileSync(secret, "utf8")).toContain('"from": "cain"');          // the link's target is still there, untouched
+    expect(readJobs(q.cfg.dir)).toHaveLength(1);                                // only the plain file's job went in
   });
 
   test("refuses every irreversible job, even with a good token, until the confirm path ships", () => {
