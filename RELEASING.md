@@ -166,9 +166,25 @@ an acceptance's supersede is owed. Without a token page reads are never retried 
 how many reads are left; a fine-grained read-only token in `SHIP_GATE_GITHUB_TOKEN` is the
 recommended default.
 
+Takeovers, the quarantine's put-back and the curl rule (0.12.0, twenty-ninth round). Every takeover
+of a stale lock moves the generation on before it acts: a watch's, the generation recovery's, and
+both quarantines' (the lock quarantine's moving of the pull request's own lock aside included), so a
+holder stalled past the stale bound that writes after the takeover leaves nothing that counts. A
+quarantine never deletes what it moved: a put-back that fails leaves the file under its quarantine
+name, logged with its generations and the failure (`put_back_failed`), and prints the restore command
+(`mv -n <quarantined file> <record path>`, run once no watch runs). A missing record is a refusal, not
+"no gate": the Ship card is refused while a quarantine or recovery holds the lock, or while a
+quarantined record isn't in the log. An owed supersede run again while the head is still the sha
+being replaced clears its mark under the lock ("no longer owed: head unchanged"). curl's version
+check and child kill are in the one request wrapper, so every gate read has them; the dry run, the
+watch and the supersede refuse to start below curl 7.32, and a read that fails on the Pi's side is
+named as that. After the fenced write the deadline is checked again at once.
+
 Owner's ship checklist, for the gate: rerun the watch after any takeover (the watch's output
-says when one happened), after a generation recovery, after a quarantine (of a record or a lock
-file), and once after installing this round.
+says when one happened, and since the twenty-ninth round a quarantine's or recovery's takeover
+counts too), after a generation recovery, after a quarantine (of a record or a lock file), after
+restoring a quarantined record with its `mv -n` command, and once after installing this round. Never
+delete a `.quarantined-` file: restore it or leave it.
 
   Run it before pushing (needs PyYAML):
   `python .github/scripts/check_pr.py --base origin/main --head HEAD --body-file <your description>`.

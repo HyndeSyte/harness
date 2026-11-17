@@ -1688,7 +1688,36 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     name with the wait. Without a token, page reads are never retried and each refusal printed
     says how many reads are left this hour; a fine-grained, read-only GitHub token handed in as
     `SHIP_GATE_GITHUB_TOKEN` is the recommended default (wiring it through an App option is a later
-    decision). The recovery deletes temporary generation files a cut-off write left. A
+    decision). The recovery deletes temporary generation files a cut-off write left.
+    **Twenty-ninth round:** every takeover of a stale lock moves the generation on before it acts,
+    the recovery's and both quarantines' included (and the lock quarantine's moving of the pull
+    request's own lock aside), so a holder stalled past the stale bound after its last check, that
+    writes after the takeover and dies before its take-back, leaves no acceptance under the
+    generation that counts, and the next watch of that head reads the head again. A quarantine's
+    put-back that fails (a newer file stands at the record's path, or the link back fails) never
+    deletes what it moved: the file stays under its quarantine name, a log entry in
+    `/data/work/ship-gate-quarantine.jsonl` records its generations and the failure
+    (`put_back_failed`), and the answer prints the restore command (`mv -n <quarantined file>
+    <record path>`, once no watch runs and whatever stands there is set aside). A missing record is
+    a refusal, not "no gate": while a quarantine or a generation recovery holds the pull request's
+    lock the Ship card is refused (a record may be away from its path), and so is it while a record
+    set aside under a quarantine name isn't in the log (a quarantine cut off between its rename and
+    its log entry), with the restore command. An owed supersede run again after the wait while the
+    pull request's head is still the sha being replaced is no longer owed: under the gate lock, when
+    the live acceptance is for that head, the mark is cleared, logged on the record as "no longer
+    owed: head unchanged" (`owed_cleared`), and the command exits 0 saying so, so the card passes on
+    that acceptance again. curl's version check and its child kill belong to the one request wrapper
+    (`ghGet`), so every read of the gate has them: the watch's head reads, the supersede's, and the
+    page reads of the gate's report. Every mode that reads GitHub (the dry run, the watch and the
+    supersede) refuses to start with curl missing or older than 7.32, by name; a read that fails on
+    the Pi's side (curl too old, or curl exiting with one of its own local failures, such as an
+    option it doesn't know) is named as that ("the cause is on the Pi, not GitHub", and a report's
+    `local_cause`), never as GitHub not answering; only a curl that exited 0 is ever parsed, so a
+    killed curl's partial output is never read as a page. After the fenced write and the
+    post-write sha check the deadline is checked again at once: a write that couldn't be
+    interrupted and finished past the window voids the acceptance under the same generation and is
+    reported as the deadline, without reading GitHub again. (Moving the link's own Ship-card reads
+    of GitHub onto the same wrapper is a later change.) A
     watch of a single sha with no `--pr` never blocks a card. It reads the gate now and then every 10
     minutes (`--every`) for up to 2 hours (`--hours`, at most 2), printing one line per reading, and
     keeps the step in `/data/work/ship-gate-<sha>.json`: the workflow file read, the head
@@ -1698,6 +1727,18 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     attempt it saw had passed. If the Windows run hasn't been listed yet when you start,
     it is watched on until it is. It doesn't gate a Ship by itself: it shows you the real
     gate doing what it says on a real head.
+
+14. **The worker not starting, told (twenty-ninth round, a probe step at the PC).** With a job
+    queued and the worker not running, set the Bun options variable in Windows' own environment
+    settings (System Properties, Environment Variables, a user variable `BUN_OPTIONS` with the
+    value `--preload C:/pc-worker-k7q2xz/none.ts`, a file that need not exist), open a new
+    terminal and start `worker.ts run --attended`: note what the terminal shows (Bun's own error,
+    or the worker's `preload_flag_refused` line). Leave it set and the worker stopped for a little
+    over 6 hours with the job still waiting: Cain's App should then post the "worker hasn't been
+    heard from" line (`worker_not_starting`) once, with no job, sha or time in it. Then delete the
+    variable in the same settings, open a new terminal, start a run, and tell Cain what the
+    terminal showed and whether the line came. Until this step has been run, a preload Bun fails
+    on before the worker's entry is known only from the tests.
 
 **What the tests show, and what they don't.** The worker's tests (`cain/tests/pcjobs.test.ts`)
 run against a stand-in browser and a stand-in `claude` command that emulate the
@@ -1838,6 +1879,31 @@ its request, if still waiting, is refused with that reason.
   and the keeper tells Dane (`worker_start_refused`). Exactly-once display is bounded: the link
   remembers the notice ids it posted for 30 days; a notice still owed after that is sent under a
   new id, worded as said again. Marks from before the twenty-seventh round show "age unknown".
+  **Twenty-ninth round:** a mark with no minted or since time (from before the age was kept) counts
+  as past the link's retention: it is re-minted once, under a new id worded as said again, and its
+  mint time is stamped then and used for later renewals, so a mark whose first id the link has
+  forgotten never shows as new. The queue's fetch failures are counted as their own streak,
+  whatever the sends do: after 30 failed fetches in a row the keeper owes Dane a "queue
+  unreachable" notice through the link (`queue_unreachable`, under the usual mark rules, cleared
+  after three rounds whose fetch worked), so an unreachable queue is told even while the link
+  answers other notices. A runtime that dies before the worker's entry (Bun on Windows under a
+  preload in `BUN_OPTIONS`) writes neither the refusal heartbeat nor a notice, so the keeper raises
+  one itself: `worker_not_starting`, owed while the PC's heartbeat is more than 6 hours old (or
+  missing) and a job has waited at least that long, cleared once the worker is heard from or
+  nothing waits that long (a heartbeat that already says `start_refused` is told by its own
+  notice). Its words name no job, sha or time and ask nothing back. The worker's preload scan also
+  reads Bun's user-level configuration (`.bunfig.toml` in `XDG_CONFIG_HOME` or the home folder)
+  and refuses a config-file flag (`-c`, `--config`, or Node's `--experimental-config-file`) in the
+  options variables or the runtime's arguments, and the production entry point seals the test
+  symbol as false, non-writable and non-configurable before anything else runs, so a later
+  assignment (an asynchronous preload) throws instead of switching the test build on. **Checked:**
+  the options variables (`NODE_OPTIONS`, `BUN_OPTIONS`) and the runtime's own arguments for a
+  require, import, preload, loader or config-file flag; a `preload` in `bunfig.toml` in the folder
+  the worker starts from or its worker folder, or in the user-level `.bunfig.toml`; the symbol
+  already defined at the start, or assigned later. **Not checked:** a preload Bun itself fails on
+  before the worker's entry runs (told instead by the keeper's `worker_not_starting`), a bunfig in
+  any other folder Bun might read in a later version, a changed Bun or Node binary, and code
+  injected from outside the process (a debugger attached, another program writing its memory).
 - **The Pi loses power right after a tap is written.** Run this on the Pi (in Cain's
   App terminal, or have Cain run it), against a scratch store on the same disk (the code
   path the keeper uses, not its live store). **Repeat it several times (at least three
@@ -1981,8 +2047,12 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | A Ship card refused: "the Ship gate's state is unknown for this pull request" (twenty-sixth round) | the refusal's words name the file | The generation file or a kept watch record in `/data/work` can't be read (or the generation file is missing while records carry one), so the card can't tell what was accepted and refuses rather than passing. For the generation file, run the recovery the refusal names once no watch runs, then watch the head again; for a record that doesn't parse, move it aside and watch the head again. Needs a code change: no. |
 | A refusal naming a watch lock that "doesn't parse" or "can't be read", with `--quarantine-lock <number>` (twenty-eighth round) | the refusal's words; `/data/work/ship-gate-pr-<number>.lock` or `.lock.stale-<token>` | A lock file of that pull request is damaged (a cut-off write, a full disk). Once no watch of it runs: `/opt/cain/keeper.sh ship-gate --quarantine-lock <number>` (renamed aside, never deleted, its generations recorded in `/data/work/ship-gate-quarantine.jsonl`; a lock that parses is never moved). Then watch the head again. Needs a code change: no. |
 | A Ship card refused as "waiting on a supersede" (twenty-eighth round) | `supersede_owed` on `/data/work/ship-gate-<sha>.json` | An earlier acceptance's supersede was stopped by GitHub's rate limit and is still owed, so that acceptance isn't current. After the wait the refusal names, run the `--supersede <sha>` command it gives, then watch the head again. Needs a code change: no. |
-| A watch refused because "curl ... is older than 7.32" (twenty-eighth round) | the watch's output | The watch's time limits under its lock need curl 7.32 or newer. Update curl on the Pi (the App's base image), then watch again. Needs a code change: no. |
-| `preload_flag_refused` (the worker's status line; `worker.log`, marked ATTENTION; twenty-eighth round), or `worker_start_refused` (a Discord line) | `worker.log` on the PC; `heartbeat.json`: `start_refused` | A preload that could load test code into the worker is set where it runs: a require, import, preload or loader flag in `NODE_OPTIONS` or `BUN_OPTIONS` (or in the command's own arguments), or a `preload` in a `bunfig.toml` in the folder the worker starts from or its worker folder. Remove it (`Remove-Item Env:NODE_OPTIONS`, `Remove-Item Env:BUN_OPTIONS`, and from Windows' environment variables if set there; delete or fix the `bunfig.toml`), open a new terminal and run again. The same Discord line comes for `test_build_flag_refused`. Needs a code change: no. |
+| A watch refused because "curl ... is older than 7.32" (twenty-eighth round; since the twenty-ninth, the dry run and the supersede too, and any read whose answer says "the cause is on the Pi, not GitHub") | the command's output; a report's `local_cause` | The gate's reads need curl 7.32 or newer for their time limits, and every read of the gate goes through one wrapper that checks it. Update curl on the Pi (the App's base image), then run the command again. A read named as curl failing on the Pi (an option it doesn't know, a failed start) is the Pi's curl, not GitHub: the same fix. Needs a code change: no. |
+| A supersede that says the supersede that was owed is "no longer owed: head unchanged" (twenty-ninth round) | `owed_cleared` on `/data/work/ship-gate-<sha>.json` | The supersede was run again after GitHub's wait while the pull request's head is still that sha, and that sha's acceptance is the live one: nothing needed replacing, so the owed mark was cleared under the gate lock and the Ship card reads that acceptance again. Nothing to do; supersede it after a new head is pushed. If it says the acceptance no longer counts, watch the pull request's head again. Needs a code change: no. |
+| A refusal saying a quarantine "couldn't be put back", or a Ship card refused because a record "was set aside without being recorded or put back", or because a quarantine or generation recovery "is at work" (twenty-ninth round) | the refusal's words; `put_back_failed` in `/data/work/ship-gate-quarantine.jsonl`; a `ship-gate-<sha>.json.quarantined-<random>` file | The quarantine moved a record it then found was valid and a newer file stood in its place, or it was cut off mid-way; nothing was deleted. Once no watch of that pull request runs, look at both files, set aside or remove whatever stands at the record's path if the moved one should win, and run the `mv -n` restore command the words give; then try again. "At work" means the quarantine or recovery is still running: try again in a minute. Needs a code change: no. |
+| `preload_flag_refused` (the worker's status line; `worker.log`, marked ATTENTION; twenty-eighth round), or `worker_start_refused` (a Discord line) | `worker.log` on the PC; `heartbeat.json`: `start_refused` | A preload that could load test code into the worker is set where it runs: a require, import, preload, loader or (twenty-ninth round) config-file flag in `NODE_OPTIONS` or `BUN_OPTIONS` (or in the command's own arguments), or a `preload` in a `bunfig.toml` in the folder the worker starts from or its worker folder, or in Bun's user-level `.bunfig.toml` (in the home folder or `XDG_CONFIG_HOME`). Remove it (`Remove-Item Env:NODE_OPTIONS`, `Remove-Item Env:BUN_OPTIONS`, and from Windows' environment variables if set there; delete or fix the `bunfig.toml` or `.bunfig.toml`), open a new terminal and run again. The same Discord line comes for `test_build_flag_refused`. Needs a code change: no. |
+| `worker_not_starting` (a Discord line: jobs are waiting and the worker hasn't been heard from for hours; twenty-ninth round) | the keeper's log; `heartbeat.json` in the queue older than 6 hours, or none | Jobs have waited more than 6 hours and the PC's worker hasn't written a heartbeat in that time. If you started it and its window closed with no status line of its own, Bun itself may be failing before the worker runs: usually a `--preload` or `--config` in `BUN_OPTIONS` or `NODE_OPTIONS` set in Windows' environment settings (System Properties, Environment Variables). Remove it there, open a new terminal and start a run. If you simply haven't been at the PC, nothing is wrong: the line clears once the worker runs. Needs a code change: no. |
+| `queue_unreachable` (a Discord line: the keeper can't reach the PC job queue on GitHub; twenty-ninth round) | the keeper's log: a round that didn't finish on the fetch, 30 in a row | The queue's fetch has failed for 30 rounds in a row (about half an hour), whatever the link answered. Usually the Pi's network, GitHub, or the `pc_jobs_token` option (expired or without access to the queue repository). Fix the cause; the keeper goes on by itself and the line clears after three rounds whose fetch worked. Needs a code change: no. |
 | `lock_unavailable` saying the watch "ran past its 10 second bound" (twenty-seventh round) | the watch's output and `/data/work/ship-gate-<sha>.json`: `failure_why` | The watch's work under the lock (both reads of the pull request's head, any rate-limit wait, the write) has one 10 second deadline; it ran out, so nothing was accepted, or an acceptance just written was taken back. Usually GitHub was slow or asked to wait. Run the watch again in a minute. Needs a code change: no. |
 | A refusal naming a gate record that "can't be read" or "doesn't parse" (twenty-seventh round) | the refusal's words name the file, `/data/work/ship-gate-<sha>.json` | A kept record of the gate is damaged. It blocks only the pull request its text still names (every pull request when it names none). Once no watch runs, set it aside: `/opt/cain/keeper.sh ship-gate --quarantine <sha>` (renamed, never deleted, and recorded in `/data/work/ship-gate-quarantine.jsonl`; a record that reads is refused). Then run the refused command again; if it then names the generation file, run `--recover-generation <number>` (add `--floor <number>` only if told a number can't be read), and watch the head again. The only full reset of one pull request's gate is deleting all its gate files at once (`ship-gate-pr-<number>.lock`, `ship-gate-pr-<number>.gen`, and every `ship-gate-<sha>.json` naming it), and only while no watch of it runs: a watch still running could otherwise write into the fresh start. Needs a code change: no. |
 | A supersede that says it "is owed" (exit status 3; twenty-seventh round) | the supersede's output; `supersede_owed` on `/data/work/ship-gate-<sha>.json` | GitHub's rate limit stopped the read of the pull request's head, so nothing was superseded yet; the record keeps the supersede as owed with the wait GitHub asked for. Without a token GitHub allows 60 reads an hour from the Pi, shared with the link, so this happens now and then in a busy hour. Run the supersede again after the wait; it clears the owed mark. Needs a code change: no. |

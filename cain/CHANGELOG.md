@@ -159,6 +159,13 @@
 - When the PC worker refuses to start because a setting meant only for its tests is found on the PC, you get one message saying so with the fix. It now also refuses to start when something could load test code into it.
 - A message for you about the PC waiting while the queue can't be fetched is still recorded and tried every round, and Cain's status warns once nothing has answered for a while.
 - A message for you that waited longer than Cain's App remembers what it posted comes once more marked as said again, never as if new.
+- A message for you from before the keeper kept its age also comes once more marked as said again, never as if new.
+- If jobs wait for hours and your PC's worker hasn't been heard from, you get one message saying so, with the usual cause and where the fix is.
+- If the PC job queue on GitHub can't be reached for about half an hour, you get one message saying so, even while other messages still get through.
+- The PC worker also refuses to start when Bun's own settings file in your home folder, or a settings-file option, could load test code into it.
+- The Ship gate keeps a record it set aside when it can't put it back, and says how to restore it, instead of losing it; a Ship card waits while a record is away.
+- A replacement the Ship gate still owed is cleared by itself when the pull request turns out not to have moved, so the card can go.
+- Every Ship gate command now refuses by name when the Pi's curl is too old, and says when a failure is on the Pi rather than GitHub.
 
 ## 0.11.0
 
