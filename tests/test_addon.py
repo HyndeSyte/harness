@@ -1045,12 +1045,12 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
 
     # Every alarm: plain words for him, the way back, nothing he can't read; a cause in its words.
     for kind in ("breach", "switch-stopped", "switch-blocked", "damaged", "setup", "restart", "switch-restart", "exited", "session", "held",
-                 "switch-failed", "switch-waits", "waiting"):
+                 "switch-failed", "switch-waits", "waiting", "stalled", "signin", "phone"):
         title, text = call("text", kind, "the smoke test failed").splitlines()
         for words in (title, text):
             assert "—" not in words and "add-on" not in words.lower(), kind
             assert not re.search(r"\b([PQ]\d+|[CDF]\d|wave \d)\b", words), kind
-        assert "Settings, " in text or "Nothing for you to do" in text, kind
+        assert "Settings, " in text or "Nothing for you to do" in text or "Open Cain in Home Assistant, tap Sign in" in text, kind
     assert "didn't pass its checks (the smoke test failed), so it was undone" in call("text", "switch-failed", "the smoke test failed")
     # A failed switch is told before his session has started: it says where his App went, never
     # that he answers (C1 sixth outside round); and a move that never began isn't "part way".
@@ -2651,11 +2651,23 @@ def test_the_watchdog_tells_dane_when_nothing_goes_in(tmp_path):
     mine = "❯ [1a2b3c4d] Relayed by the add-on: x\n  ? for shortcuts"
     for dt in (60000, 62000, 64000):
         w(dt, mine, WATCH_HM="0000")
+    # A sign-in waiting on his screen (a login menu, no question's keys): with the run script's own
+    # sign-in alarm out, nothing more; without it, told at 30 minutes, with the way to sign in
+    # (outside round 24).
     signin = "Welcome to Claude Code\n Select login method:"
     (tmp_path / "try").unlink()
+    (tmp_path / "alerted-login").touch()
     for dt in (70000, 72000, 74000):
-        w(dt, signin)
+        w(dt, signin, WATCH_ALERTED=(tmp_path / "alerted-login").as_posix())
     assert len(read()) == 2
+    (tmp_path / "alerted-login").unlink()
+    for dt in (75000, 76799):
+        w(dt, signin, WATCH_ALERTED=(tmp_path / "alerted-login").as_posix())
+    assert len(read()) == 2
+    w(76800, signin, WATCH_ALERTED=(tmp_path / "alerted-login").as_posix())
+    assert read()[-1] == "tell signin for 30 minutes"
+    w(76900, IDLE)
+    assert read()[-1] == "clear delivered"
     odd = "Some view the App doesn't know\n  with rows of its own"
     w(80000, odd)
     w(81800, odd)
@@ -2724,15 +2736,31 @@ def test_the_alarm_channel_is_read_back_without_dane(tmp_path):
     assert f"into {reading.as_posix()} (the whole file)" in asked()[0] and asked()[0].endswith("Nothing to tell him.")
     call("tick")
     call("proven", want=1)                                                         # nothing read yet
+    reading.write_text((datetime.now(timezone.utc) + timedelta(days=1)).isoformat() + "\n")
+    call("tick")
+    call("proven", want=1)                                    # a time later than his file proves nothing
+    assert said() == [] and len(asked()) == 1
     reading.write_text(datetime.now(timezone.utc).isoformat() + "\n")
     call("tick")
     call("proven")
-    assert int((data / "c1/notice-proven").read_text()) == probed and said() == [] and len(asked()) == 1
-    # A new hook: a new probe; read back and not moved, Dane hears from his bot, once; Cain files it.
+    import hashlib
+    fp = lambda h: hashlib.sha256(h.encode()).hexdigest()[:16]
+    assert (data / "c1/notice-proven").read_text() == f"{probed} {fp('a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6')}\n"
+    assert said() == [] and len(asked()) == 1
+    # The proof is the hook's it was made with: with the hook removed, or another set, it proves nothing
+    # (outside round 24).
+    options.write_text(json.dumps({"notice_hook": ""}))
+    call("proven", want=1)
+    # A new hook: not proven until its own probe is read back; read back and not moved, Dane hears
+    # from his bot, once; Cain files it.
     options.write_text(json.dumps({"notice_hook": "f" * 32}))
+    call("proven", want=1)
     call("tick")
     assert len(asked()) == 2
-    reading.write_text((datetime.now(timezone.utc) - timedelta(hours=1)).isoformat() + "\n")
+    # The helper still at a time half a minute before this probe (an earlier one's): not moved, with
+    # no slack to pass it (outside round 24).
+    probed2 = int((data / "c1/notice-probed").read_text().split()[0])
+    reading.write_text(datetime.fromtimestamp(probed2 - 30, timezone.utc).isoformat() + "\n")
     call("tick")
     call("tick")
     assert len(said()) == 1 and "Cain's alarms to your phone through Home Assistant didn't pass their test (the helper didn't move)" in said()[0]
@@ -2742,8 +2770,9 @@ def test_the_alarm_channel_is_read_back_without_dane(tmp_path):
     call("tick")
     call("proven")
     assert said()[-1] == "Cain's alarms to your phone through Home Assistant passed their test again."
+    assert (data / "c1/notice-proven").read_text().split()[1] == fp("f" * 32)
     # A proof older than two days doesn't count.
-    (data / "c1/notice-proven").write_text(f"{probed - 3 * 86400}\n")
+    (data / "c1/notice-proven").write_text(f"{probed - 3 * 86400} {fp('f' * 32)}\n")
     env["NOTICE_DAY_S"] = "86400"
     call("proven", want=1)
 
@@ -3059,6 +3088,7 @@ def test_a_try_that_cant_be_known_in_is_set_aside_for_cain_never_typed_again(tmp
     try:
         out = _checkin(tmp_path, "0300", IDLE, runs=2, STUB_LOSE="1")
         assert out.count("Enter") == 1 and _in(tmp_path) == [] and tr.exists()
+        kept = tr.read_text()
         assert _checkin(tmp_path, "0300", IDLE, runs=3) == out and tr.exists()       # not two minutes yet
         _checkin(tmp_path, "0300", IDLE, runs=2, CHECKIN_CONFIRM_S="0")
         assert not tr.exists() and out.count(" -l ") == 1
@@ -3066,12 +3096,96 @@ def test_a_try_that_cant_be_known_in_is_set_aside_for_cain_never_typed_again(tmp
         assert len(head) == 2 and head[1] == '{"text": "later"}' and "can't tell whether it reached you" in head[0]
         f = re.search(r"/from-app/(unsure-[0-9a-f]{8}\.txt)", head[0]).group(1)
         assert (tmp_path / "from-app" / f).read_text() == 'Relayed by the add-on: Dane tapped "Approve"\n'
+        # The App stopped after the line took its place, before the try was forgotten: the next run
+        # finds the line there and only finishes, never blocking what comes after (outside round 24).
+        tr.write_text(kept, newline="\n")
+        assert _checkin(tmp_path, "0300", IDLE, runs=2, CHECKIN_CONFIRM_S="0") == out and not tr.exists()
+        assert work.read_text().splitlines() == head
         out = _checkin(tmp_path, "0300", IDLE, runs=4)
         typed = [l for l in out.splitlines() if " -l " in l]
         assert len(typed) == 3 and "If you've already acted on it, leave it" in _said(tmp_path, typed[1])
         assert _in(tmp_path)[1] == "Relayed by the add-on: later" and work.read_text() == ""
     finally:
         del os.environ["RELAY_QUEUE"]
+
+
+def test_a_try_set_aside_finishes_after_a_stop_for_every_kind(tmp_path):
+    """Outside round 24: setting aside a try that can't be known in or not runs again over its own work.
+    Stopped after its line about it went first in the queue and before the try was forgotten (for a
+    nudge and a check-in as for a relayed line, tested above), the next run finds that line, puts in
+    no second one, finishes what the try was for, and forgets the try: nothing after it is held up."""
+    import json
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        pytest.skip("no jq")
+    for kind, key, fin in (("jobs", "jobs", "-"), ("checkin", "2026-11-08-0710", "2026-11-08-0710 0 -")):
+        d = tmp_path / kind
+        d.mkdir()
+        q, work, tr = d / "relay.queue", d / "relay.queue.work", d / "checkin.try"
+        os.environ["RELAY_QUEUE"], os.environ["JOBS_NUDGED"] = str(q), str(d / "jobs.nudged")
+        try:
+            tr.write_text(f"mark 1a2b3c4d\ntyped 1000\nentered 1001\nkind {kind}\nkey {key}\nfin {fin}\n"
+                          "want [1a2b3c4d] the line itself\n", newline="\n")
+            (d / "from-app").mkdir()
+            (d / "from-app/unsure-1a2b3c4d.txt").write_text("the line itself\n")
+            line = json.dumps({"text": f"A line ... Its text is in {(d / 'from-app').as_posix()}/unsure-1a2b3c4d.txt. If ..."})
+            work.write_text(line + "\n" + '{"text": "after it"}\n', newline="\n")
+            assert _checkin(d, "0300", IDLE, runs=2, CHECKIN_CONFIRM_S="0") == "" and not tr.exists(), kind
+            assert work.read_text().splitlines() == [line, '{"text": "after it"}'], kind
+            assert (d / "jobs.nudged").exists() if kind == "jobs" else (d / "done/2026-11-08-0710").exists()
+            out = _checkin(d, "0300", IDLE, runs=4)
+            assert [l.split("] ", 1)[1] for l in out.splitlines() if " -l " in l][-1] == "Relayed by the add-on: after it"
+        finally:
+            del os.environ["RELAY_QUEUE"], os.environ["JOBS_NUDGED"]
+
+
+def test_his_transcripts_and_files_are_found_where_his_session_keeps_them():
+    """Outside round 24: checkin.sh, unstick.sh, watch.sh and notice.sh find his transcripts and his
+    files where his session, as it runs, keeps them. The run script exports their places for each way
+    of running (the old way: root, HOME /data; his own user: HOME /data/cain, read as him) before it
+    starts anything that types or reads them; typing.sh's own default is his own user's."""
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text(encoding="utf-8").replace("\r\n", "\n")
+    old = run.split('if [ "$mode" = old ]; then\n  export LINK_MODE=old', 1)[1].split("\nelse\n", 1)[0]
+    new = run.split("\nelse\n  export CAIN_GATE_LOG=", 1)[1].split("export TMUX_CMD\n", 1)[0]
+    assert "CAIN_TRANSCRIPTS=/data/.claude/projects" in old and 'export CAIN_AS=""' in old
+    assert "CAIN_TRANSCRIPTS=/data/cain/.claude/projects" in new and 'export CAIN_AS="$OPT/as-cain"' in new
+    exported = run.index("export TMUX_CMD\n")
+    for start in ('"$OPT/checkin.sh" || true; sleep 5', '"$OPT/unstick.sh"', '"$OPT/watch.sh"', '"$OPT/notice.sh" tick'):
+        assert run.index(start) > exported, start
+    session = (CAIN / "rootfs/opt/cain/session.sh").read_text(encoding="utf-8")
+    assert "export HOME=/data/cain" in session and "export HOME=/data\n" in session and "cd /data/work" in session
+    typing = (CAIN / "rootfs/opt/cain/typing.sh").read_text(encoding="utf-8")
+    assert 'TRANSCRIPTS="${CAIN_TRANSCRIPTS:-/data/cain/.claude/projects}"' in typing
+    assert 'FROM_APP="${CAIN_FROM_APP:-/data/work/from-app}"' in typing
+
+
+def test_a_checkin_finished_twice_moves_on_only_what_it_named(tmp_path):
+    """Outside round 24: what's done once a check-in is in can run again over its own work (the App
+    stopped after it, before its try was forgotten). The records it named move on once; one set aside
+    since stays to be named at the next."""
+    import os
+    import shutil
+    if not shutil.which("jq"):
+        pytest.skip("no jq")
+    bad = tmp_path / "relay.bad"
+    os.environ["RELAY_BAD"] = str(bad)
+    try:
+        bad.write_text('{"text": 1}\n', newline="\n")
+        line = _said(tmp_path, _checkin(tmp_path, "0712", IDLE, day="2026-11-09").splitlines()[-2])
+        assert "Relayed records the App couldn't read: 1" in line and bad.read_text() == ""
+        mark = re.search(r'"content":"\[([0-9a-f]{8})\]', (tmp_path / "transcripts/session.jsonl").read_text()).group(1)
+        bad.write_text('{"text": 2}\n', newline="\n")                       # set aside since
+        (tmp_path / "checkin.try").write_text(
+            f"mark {mark}\ntyped 1000\nentered 1001\nkind checkin\nkey 2026-11-09-0710\nfin 2026-11-09-0710 1 -\n"
+            f"want [{mark}] x\n", newline="\n")
+        assert _checkin(tmp_path, "0712", IDLE, day="2026-11-09", runs=1).count(" -l ") == 1
+        assert not (tmp_path / "checkin.try").exists() and bad.read_text() == '{"text": 2}\n'
+        assert (tmp_path / "relay.bad.named").read_text() == '{"text": 1}\n'
+        line = _said(tmp_path, _checkin(tmp_path, "1240", IDLE, day="2026-11-09").splitlines()[-2])
+        assert "Relayed records the App couldn't read: 1" in line and bad.read_text() == ""
+    finally:
+        del os.environ["RELAY_BAD"]
 
 
 def test_a_long_or_unusual_text_goes_as_a_file_of_his(tmp_path):

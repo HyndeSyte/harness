@@ -35,7 +35,6 @@ lastin="${CHECKIN_LAST:-/data/checkin.last}"   # the last check-in known to be i
 nudged="${JOBS_NUDGED:-/data/jobs.nudged}"
 seen="${NOTES_SEEN:-/data/notes.seen}"          # not in $dir: that's cleared of week-old files
 PS="${PROMPT_STATE:-$OPT/prompt-state.sh}"
-. "${TYPING_SH:-$OPT/typing.sh}" || { echo "[cain] no typing.sh: nothing typed"; exit 0; }
 mkdir -p "$dir" "$state" 2>/dev/null
 now=$(date +%s)
 
@@ -62,6 +61,8 @@ send_table meanings "${MEANINGS_FILE:-/data/record/areas/family/calendar-meaning
 send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
   "${PLACES_SENT:-/data/places.sent}" "${PLACES_TRIED:-/data/places.tried}" "place book"
 
+# What follows types into his session: with what it shares with the way out and the watchdog.
+. "${TYPING_SH:-$OPT/typing.sh}" || { echo "[cain] no typing.sh: nothing typed"; exit 0; }
 # Nothing goes into a session that hasn't passed its check of his own user: the run script takes
 # the mark away before every start of his session and sets it, with the process his pane runs,
 # when the check passes (typing.sh, checked).
@@ -107,10 +108,14 @@ drop_head() {   # drop_head <the line's cksum>: the queue's first line leaves it
   tail -n +2 "$work" > "$work.tmp" && mv -f "$work.tmp" "$work"
 }
 checkin_done() {   # checkin_done <day>-<slot> <records named> <newest note listed, or ->
+  # Run again over its own work (an App stopped before its try was forgotten), it moves nothing on:
+  # the records it named stay to be named again, never ones it didn't name (outside round 24).
+  local again=""
+  [ -f "$dir/$1" ] && again=1
   touch "$dir/$1"
   { printf '%s\n' "$1" > "$lastin.tmp" && mv -f "$lastin.tmp" "$lastin"; } 2>/dev/null \
     || echo "[cain] the last check-in in couldn't be kept ($lastin): the next may name some again"
-  if [ "$2" -gt 0 ]; then   # the records just named move on, kept; any after them stay to be named
+  if [ -z "$again" ] && [ "$2" -gt 0 ]; then   # the records just named move on, kept; any after them stay to be named
     if head -n "$2" "$bad" >> "$bad.named" 2>/dev/null \
        && tail -n +"$(($2 + 1))" "$bad" > "$bad.tmp" 2>/dev/null && mv -f "$bad.tmp" "$bad" 2>/dev/null; then
       # Named ones are kept a while: the newest 500 (Cain's fourth service review, fix soon 9).
@@ -176,19 +181,24 @@ unsure() {
     echo "[cain] a try that can't be known in or not couldn't be set aside ($FROM_APP): looked at again"
     return 0
   fi
-  if [ "$t_kind" = relay ]; then   # in its line's place
-    if [ "$(head -n 1 "$work" 2>/dev/null | cksum | cut -d' ' -f1)" != "$t_key" ] \
-       || ! { { printf '%s\n' "$line"; tail -n +2 "$work"; } > "$work.tmp" && mv -f "$work.tmp" "$work"; }; then
+  # Each step can run again over its own work: an App stopped between them (its line already put
+  # first, the try not yet forgotten) finds its line there and only finishes, never blocking what
+  # comes after (outside round 24).
+  if head -n 1 "$work" 2>/dev/null | grep -qF -- "/$f."; then :
+  elif [ "$t_kind" = relay ] && [ "$(head -n 1 "$work" 2>/dev/null | cksum | cut -d' ' -f1)" = "$t_key" ]; then
+    if ! { { printf '%s\n' "$line"; tail -n +2 "$work"; } > "$work.tmp" && mv -f "$work.tmp" "$work"; }; then   # in its line's place
+      rm -f "$work.tmp" 2>/dev/null
       echo "[cain] a try that can't be known in or not couldn't take its line's place: looked at again"
       return 0
     fi
-  else
+  else   # put first (a relay line already gone from its place too: the line about it goes all the same)
     if ! { { printf '%s\n' "$line"; cat "$work" 2>/dev/null; } > "$work.tmp" && mv -f "$work.tmp" "$work"; }; then
+      rm -f "$work.tmp" 2>/dev/null
       echo "[cain] a try that can't be known in or not couldn't be put first: looked at again"
       return 0
     fi
-    finish "$t_kind" "$t_key" "$t_fin"
   fi
+  [ "$t_kind" = relay ] || finish "$t_kind" "$t_key" "$t_fin"
   rm -f "$TRY"
   unsteady ready again empty
   echo "[cain] a try got its Enter and can't be known in or not: set aside, and Cain hears, to check before acting on it"

@@ -8,8 +8,11 @@
 #     check-in within its hour) and nothing has gone in for 30 minutes in which his screen was
 #     neither at work nor showing a question (unstick.sh's), or for 2 hours in all; or
 #   - his input box has held a draft that isn't the App's own try, unchanged, or his screen has
-#     been one the App doesn't know (a sign-in aside: that has its own alarm), for 30 minutes on
-#     end; the way out (unstick.sh) saves and clears it at 15.
+#     been one the App doesn't know, for 30 minutes on end; the way out (unstick.sh) saves and
+#     clears it at 15;
+#   - his screen has waited at a sign-in (a login menu, a code to paste) for 30 minutes on end and
+#     no sign-in alarm went out for it (the run script's, for a sign-in that expired): notice.sh
+#     tell signin, with the way to sign in; never a fresh start for it (outside round 24).
 # It comes down, with a line saying so (notice.sh clear delivered), once nothing is stuck and
 # something has gone in since, or nothing waits. Its state is root's, in $WATCH_DIR, for this
 # container. Prints nothing; always exits 0.
@@ -19,6 +22,7 @@ DIR="${WATCH_DIR:-/run/cain/watch}"
 QUEUE="${RELAY_QUEUE:-/data/relay.queue}"
 CHECKINS="${CHECKIN_DIR:-/data/checkins}"
 DELIVERED="${CHECKIN_DELIVERED:-/data/checkin.delivered}"
+ALERTED="${WATCH_ALERTED:-/data/alerted-login}"   # the run script's sign-in alarm went out
 IDLE_S="${WATCH_IDLE_S:-1800}"; ALL_S="${WATCH_ALL_S:-7200}"; ODD_S="${WATCH_ODD_S:-1800}"; STEP_S="${WATCH_STEP_S:-60}"
 now="${WATCH_NOW:-$(date +%s)}"
 export TZ="${CHECKIN_TZ:-America/New_York}"
@@ -55,16 +59,19 @@ else
   rm -f "$DIR/since" "$DIR/idle"; since=""; idle=0
 fi
 
-# A draft that isn't the App's own try (unchanged), or a screen the App doesn't know.
+# A draft that isn't the App's own try (unchanged), a screen the App doesn't know, or a sign-in.
 odd=""
 if [ "$at" = draft ]; then
   lines="$(printf '%s\n' "$screen" | PROMPT_DRAFT_TEXT=1 "$PS" 2>/dev/null | sed 1d)"
   rc=0; own_try "$lines" "$(width)" || rc=$?
   [ "$rc" != 2 ] || odd="draft $(printf '%s' "$lines" | cksum | cut -d' ' -f1)"
-elif [ "$at" = other ] && [ -n "$(printf '%s' "$screen" | tr -d '[:space:]')" ] \
-     && ! printf '%s\n' "$screen" | awk 'NF' | tail -n 16 | sed 's/^[[:space:]│]*//' \
+elif [ "$at" = other ] && [ -n "$(printf '%s' "$screen" | tr -d '[:space:]')" ]; then
+  if printf '%s\n' "$screen" | awk 'NF' | tail -n 16 | sed 's/^[[:space:]│]*//' \
        | grep -Eqi '^(paste code here|select login method|do you trust the files|choose the text style)|run /login|not logged in|invalid api key|token has expired|login expired'; then
-  odd=other
+    [ -f "$ALERTED" ] || odd=signin
+  else
+    odd=other
+  fi
 fi
 odd_since=""
 if [ -n "$odd" ]; then
@@ -74,8 +81,10 @@ else
   rm -f "$DIR/odd"
 fi
 
-cause=""
-if [ -n "$waiting" ] && { [ "$idle" -ge "$IDLE_S" ] || [ $((now - since)) -ge "$ALL_S" ]; }; then
+cause=""; kind=stalled
+if [ -n "$odd_since" ] && [ "$odd" = signin ] && [ $((now - odd_since)) -ge "$ODD_S" ]; then
+  kind=signin; cause="for $(( (now - odd_since) / 60 )) minutes"
+elif [ -n "$waiting" ] && { [ "$idle" -ge "$IDLE_S" ] || [ $((now - since)) -ge "$ALL_S" ]; }; then
   cause="nothing has gone in for $(( (now - since) / 60 )) minutes"
 elif [ -n "$odd_since" ] && [ $((now - odd_since)) -ge "$ODD_S" ]; then
   case "$odd" in draft*) cause="a draft has sat in his input box for $(( (now - odd_since) / 60 )) minutes" ;;
@@ -87,7 +96,7 @@ if [ -n "$cause" ]; then
   # Once a stretch: notice.sh sends its repeats itself; one that couldn't be raised (its lock
   # busy, a write failed) is raised again at the next run.
   if [ -z "$told" ]; then
-    rc=0; alarm tell stalled "$cause" || rc=$?
+    rc=0; alarm tell "$kind" "$cause" || rc=$?
     if [ "$rc" -le 1 ]; then keep told "$now"; say "Dane is told that what the App types doesn't go in: $cause"; fi
   fi
 elif [ -n "$told" ] && { [ "$last_in" -gt "$told" ] || [ -z "$waiting" ]; } && [ -z "$odd_since" ]; then

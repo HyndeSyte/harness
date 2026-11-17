@@ -21,7 +21,7 @@
 #   - his prompt back for 5 minutes: that alarm comes down if it stands (notice.sh clear screen, once
 #     for each stretch his prompt is back; the alarm itself is notice.sh's, kept across restarts);
 #   - a draft in his box that isn't the App's own try (checkin.sh's), unchanged, or a screen the App
-#     doesn't know (a sign-in aside: that has its own alarm), for 15 minutes on end: its text saved
+#     doesn't know (a sign-in aside: watch.sh tells Dane of one that waits), for 15 minutes on end: its text saved
 #     in a file of his, then the draft cleared (Ctrl+U), or, for such a screen or a draft Ctrl+U
 #     doesn't clear, his session started fresh, at most once an hour as above. Cain is told each
 #     time (Cain's fourth service review, must-fix 2); watch.sh tells Dane at 30 minutes.
