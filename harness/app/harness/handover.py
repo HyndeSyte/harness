@@ -471,9 +471,14 @@ class Inbox:
                     t["hold_checks"] = n
                 if kind in ("calendar", "first"):
                     t["checks"] = n
-                # Twenty-second round: consecutive reads that hit an error in Harness itself, on their own counter;
-                # any other read starts it again.
-                t["error_checks"] = n if kind == "error" else 0
+                # Twenty-second round: consecutive reads that hit an error in Harness itself, on their own counter.
+                # Twenty-third round: per tap (only this tap's own lines reach here), and started again only by a
+                # read of this tap that answered: never by another tap's read, and never by a hold read that
+                # couldn't read the records either ("hold_unread").
+                if kind == "error":
+                    t["error_checks"] = n
+                elif not (kind == "hold" and str(r.get("seen") or "") == "hold_unread"):
+                    t["error_checks"] = 0
                 t["next_check"], t["last_kind"], t["last_seen"] = nxt, kind, str(r.get("seen") or "")
                 t["told_check"] = t["told_check"] or bool(r.get("told"))
         for t in taps.values():

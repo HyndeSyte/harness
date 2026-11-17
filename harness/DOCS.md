@@ -874,8 +874,13 @@ it's struck only once a read answers with a finished job or a used-up choice. Th
 when what it waits on changes, not at every hourly read. Any other error on that read (a fault in Harness
 itself, not in the records) is counted per tap, consecutive reads only, on its own schedule of 1, 2, 5, 15,
 30 and 60 minutes; after those six reads its outcome is recorded as an internal error: one card, with no
-*Go ahead*, says Harness hit an internal error working out what came of it (never that the records
-couldn't be read), and it's struck; it's never read hourly. A tap whose own id can't be read is a permanent
+*Go ahead*, says Harness hit an internal error working out what came of it, so it couldn't confirm whether
+the change was made, and asks you to check your calendar to see whether it's there (never that the records
+couldn't be read), and it's struck; it's never read hourly. Its write may have landed in full or in part,
+so the struck press is kept in the records (its request, its identity without the interaction token, and
+the last error) for tracing and to recover the request. That count is the tap's own: it starts again only
+when a read of that tap answers, never on another tap's read, and never on a read of that tap that couldn't
+read the records either. A tap whose own id can't be read is a permanent
 outcome, not a wait: one card leads with "Harness couldn't tell which request this tap was for; nothing was
 changed", with no *Go ahead*, and it's struck. The records' schedule and the calendar's keep their own
 counts: once the records read again, a calendar that can't be read still gets its own six reads. The
@@ -913,10 +918,24 @@ again after 1, 2, 5, 15, 30 and then every 60 minutes, never every few seconds, 
 records so a restart waits for it too. The mark, and the outbox's own key for that card (the tap, the
 card's kind and its outcome, so another card with a purpose of its own for the same tap still goes), mean
 no tap ever gets the same card twice, however many are left (more than ten included) and whichever of them
-fails. If the unverified outcome itself can't be written to the tap journal, the tap's next read is put off
-in the records on the same 1, 2, 5, 15, 30 and 60 minutes, at a start too, so your calendars aren't read
-for it at every tick. A message's outcome for the fixed card is checked before anything is queued, and the
-message, its key and its outcome are written together or not at all. You're told a tap waits only once that note is queued, so a note that couldn't be
+fails. Exactly three cards about a tap carry such a key: that final card (the tap, "outcome", its
+outcome), the note that a tap waits (the tap, "note", "waiting": a note whose told mark can't be written to
+the tap journal is still queued only once, across a restart too), and the card that brings *Go ahead* back
+when your calendar still couldn't be read (the tap, "retry", which attempt: the same attempt sent twice is
+refused, the next attempt goes). Other cards (the list of taps after a stop or a restore, and the new
+approval card for parts done again, which belongs to its own job) carry none. A strike flag that can't be
+read (unparseable, or with no tap in it) is struck by the tap's id when its card is there, its flag
+written again whole; with no card there, one card says Harness found a cleanup step it couldn't read and
+left the tap as it is; the log says so at most once an hour. If the unverified outcome itself can't be
+written to the tap journal, the tap's next read is put off in the records on the same 1, 2, 5, 15, 30 and
+60 minutes, at a start too, so your calendars aren't read for it at every tick; when the records can't take
+that either (a full or read-only card takes both down at once), it's held in memory on the same schedule,
+so the reads stay bounded while the records stay unwritable (a restart reads once more, then the schedule
+again). A tap that settles normally clears its put-off read in the same transaction as its card. A
+message's outcome for the fixed card is checked before anything is queued, and the message, its key and its
+outcome are written together or not at all; if undoing a failed write itself fails, the records' connection
+is rolled back in full (or opened again) so later writes still commit, and the first error is the one
+reported. You're told a tap waits only once that note is queued, so a note that couldn't be
 queued goes at the next read, or after a restart. A tap whose decision never reached the records, read
 while your calendar can't be read, says so: its *Go ahead* reads first, and if your calendar still can't
 be read nothing is done, you're told plainly, and the same *Go ahead* comes back on a new card that reads

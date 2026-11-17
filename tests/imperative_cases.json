@@ -307,10 +307,10 @@
   }
  ],
  "said": {
-  "_note": "Twenty-second round: owner-facing tap words checked by both suites against the link's filter with every known label (the Python suite checks they are the controller's own): the unidentified card, the internal-error card, and a part with no reason recorded and no read.",
+  "_note": "Twenty-second round: owner-facing tap words checked by both suites against the link's filter with every known label (the Python suite checks they are the controller's own): the unidentified card, the internal-error card, and a part with no reason recorded and no read. Twenty-third round: the internal-error card says Harness couldn't confirm whether the change was made and asks him to check his calendar, the one ask a card may make here.",
   "texts": [
    "Harness couldn't tell which request this tap was for; nothing was changed. It couldn't identify this tap in its records, so nothing more is done for it from here.",
-   "Harness hit an internal error while working out what came of it, so it can't tell how far it got. It isn't taken again from here, and nothing more is done for it.",
+   "Harness hit an internal error while working out what came of it, so it couldn't confirm whether the change was made. Please check your calendar to see whether it's there. It isn't taken again from here, and nothing more is done for it.",
    "For Swim, Harness can't tell how far it got; nothing more is done for it from here.",
    "For Swim, Lunch, Harness can't tell how far they got; nothing more is done for them from here."
   ]
@@ -339,5 +339,15 @@
     "Leave it"
    ]
   }
- ]
+ ],
+ "end_to_end_names": {
+  "_note": "Twenty-third round: the one canonical list of the end-to-end case names; both suites assert the cases' names equal it.",
+  "names": [
+   "bold head without terminal punctuation",
+   "code span holding a label",
+   "link with a label in its text",
+   "bold head without terminal punctuation, not done",
+   "link with a label in its text, couldn't verify"
+  ]
+ }
 }

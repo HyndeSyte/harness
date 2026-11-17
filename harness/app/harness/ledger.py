@@ -911,6 +911,7 @@ class Ledger:
         if outcome is not None and outcome not in self.OUTCOMES:
             raise ValueError(f"not an outcome: {outcome}")
         conn = db or self.db
+        outer = conn.in_transaction            # twenty-third round: whether a caller's transaction holds it
         conn.execute("SAVEPOINT enqueue")
         try:
             if once is not None:
@@ -931,12 +932,54 @@ class Ledger:
                 self.set_meta(f"outbox_once:{once}", str(oid), conn)
             if outcome is not None:
                 self.set_meta(f"outbox_outcome:{oid}", outcome, conn)
-        except BaseException:
-            conn.execute("ROLLBACK TO SAVEPOINT enqueue")
-            conn.execute("RELEASE SAVEPOINT enqueue")
+        except BaseException as e:
+            # Twenty-third round: the rollback-to and then the release, in a finally, so a failing rollback never
+            # replaces the original exception, and never leaves the autocommit connection inside a transaction
+            # holding the write lock. If the rollback-to fails the savepoint isn't released (on the autocommit
+            # connection that would commit what it holds): its own transaction is rolled back in full (or the
+            # connection closed and opened again), and the original exception is raised with the cleanup's chained.
+            cleanup: BaseException | None = None
+            try:
+                conn.execute("ROLLBACK TO SAVEPOINT enqueue")
+            except BaseException as rb:        # noqa: BLE001: kept, chained to the original below
+                cleanup = rb
+            finally:
+                if cleanup is None:
+                    try:
+                        conn.execute("RELEASE SAVEPOINT enqueue")
+                    except BaseException as rel:   # noqa: BLE001: kept, chained to the original below
+                        cleanup = rel
+            if cleanup is not None:
+                self._unstick(conn, outer)
+                raise e from cleanup
             raise
         conn.execute("RELEASE SAVEPOINT enqueue")
         return oid
+
+    def _unstick(self, conn, outer: bool) -> None:
+        """Twenty-third round: after a savepoint whose cleanup failed. Inside a caller's transaction, that
+        transaction's own rollback (its exception reaches it) ends it. On the autocommit connection the savepoint
+        opened the transaction, so it's rolled back here in full; if even that fails, the connection is closed and
+        opened again, so later writes commit."""
+        if outer or not conn.in_transaction:
+            return
+        try:
+            conn.rollback()
+            if not conn.in_transaction:
+                return
+        except BaseException:                  # noqa: BLE001: closed and opened again below
+            pass
+        if conn is not self.db:
+            return
+        logging.getLogger("harness.ledger").error("the records' connection was left inside a transaction; it's "
+                                                  "opened again")
+        try:
+            conn.close()
+        except BaseException:                  # noqa: BLE001: replaced whatever its state
+            pass
+        self.db = sqlite3.connect(self.path, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
 
     @staticmethod
     def once_key(tap: str, kind: str, purpose: str) -> str:

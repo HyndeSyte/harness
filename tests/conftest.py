@@ -89,6 +89,10 @@ ASK_ALLOWED = [
     ("Then confirm it on the card that follows", "the last step of replacing a key only he can make (a "
                                                  "password, a service account key): his tap on the card "
                                                  "that stores it, a decision, not a check"),
+    ("Please check your calendar to see whether it's there", "twenty-third round: the internal-error card, where "
+                                                             "Harness can't confirm whether a change it may have "
+                                                             "made was made; the one card that asks him to look at "
+                                                             "his calendar (tests/imperative_cases.json \"said\")"),
 ]
 
 

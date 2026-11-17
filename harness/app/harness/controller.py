@@ -732,7 +732,7 @@ class Controller:
             p = row["press"]
             if self.handovers.key(p) in queued or self.handovers.key(p) in flags:
                 continue
-            if row["state"] == "unknown" and not self._due(rereads.get(self.handovers.key(p)), now):
+            if row["state"] == "unknown" and not self._reread_due(self.handovers.key(p), rereads, now):
                 continue                        # read again by the running loop once its time comes
             if row["state"] in ("refused", "found"):
                 self._post_pending_notice(row)
@@ -1018,7 +1018,8 @@ class Controller:
                               "an internal error", type(e).__name__)
                     if not self.handovers.journal_outcome(p, "internal_error"):
                         log.error("a tap's internal error couldn't be written to the tap journal")
-                    terminal.append(dict(row, state="internal_error"))
+                    # Twenty-third round: the last exception goes with it, for the diagnostic copy in the records.
+                    terminal.append(dict(row, state="internal_error", error=f"{type(e).__name__}: {e}"[:500]))
                     continue
                 if row.get("last_seen") != "hold_error":
                     log.error("a tap's hold read hit an error in Harness (%s); it's read again", type(e).__name__)
@@ -1099,10 +1100,12 @@ class Controller:
                 else:
                     when = datetime.fromtimestamp(at, timezone.utc).astimezone(tz)
                     next_read = f"at about {render.clock_words(when, suffix=True)}"
+                # Twenty-third round: keyed on (tap, "note", "waiting"), so a note whose told mark can't be
+                # written (an unwritable journal) is refused as a duplicate at every later read and every start.
                 self.ledger.enqueue(chat_id=owner, kind="notice", db=db, text=render.fit(
                     f"{self._tap_head(row)} Harness can't tell yet whether it went through: {why}. It reads "
                     f"your calendar for it again {next_read} and tells you what it finds; nothing is done "
-                    "twice."))
+                    "twice."), once=Ledger.once_key(self.handovers.key(row["press"]), "note", "waiting"))
             self.ledger.event("taps_waiting", {"count": len(waits)}, db=db)
 
     def _wait_check(self, row: dict, seen: str, n: int, now: float, waits: list, kind: str = "calendar") -> None:
@@ -1183,7 +1186,7 @@ class Controller:
             rows = [r for r in rows if self.handovers.key(r["press"]) not in flags]
             due = [r for r in rows
                    if r["state"] == "unknown" and r.get("next_check") is not None and r["next_check"] <= now
-                   and self._due(rereads.get(self.handovers.key(r["press"])), now)]
+                   and self._reread_due(self.handovers.key(r["press"]), rereads, now)]
             # Twentieth round: one left recorded as unverified (its card or strike didn't happen) is finished too.
             # Twenty-first round: and one recorded as unidentified; each at most on its strike's back-off.
             unverified = [r for r in rows if r["state"] in self.TAP_TERMINAL]
@@ -1203,6 +1206,15 @@ class Controller:
     STRIKE_BACKOFF_S = (60, 120, 300, 900, 1800, 3600)
     STRIKE_FLAG = "tap_strike:"                 # twenty-second round: a strike pending, in the records
     REREAD_FLAG = "tap_reread:"                 # twenty-second round: an unverified outcome not journaled
+    DIAG_FLAG = "tap_diag:"                     # twenty-third round: a struck internal error, kept for tracing
+
+    def _diagnostic(self, row: dict) -> dict:
+        """Twenty-third round: what's kept of a tap struck as an internal error. Never the interaction token."""
+        press = row.get("press") or {}
+        return {"state": row.get("state"), "at": self._clock(), "tapped_at": row.get("at"),
+                "identity": {k: str(press.get(k, "")) for k in ("id", "custom_id", "message_id", "app")},
+                "request": row.get("op") or {}, "error_checks": int(row.get("error_checks") or 0),
+                "error": str(row.get("error") or "not kept: the tap was finished after a restart")}
 
     def _backoff(self, fails: int) -> int:
         return self.STRIKE_BACKOFF_S[min(max(fails, 1), len(self.STRIKE_BACKOFF_S)) - 1]
@@ -1232,17 +1244,35 @@ class Controller:
         next read past. So its next read is put off in the records instead, on STRIKE_BACKOFF_S (1, 2, 5, 15, 30
         and 60 minutes), and a start respects it too: the calendars aren't read for it at every tick."""
         key = self.handovers.key(row["press"])
+        # Twenty-third round: the deferral is kept in memory too, on the same schedule, so when the records can't
+        # take it either (a full or read-only card takes the journal and the records down together) the calendars
+        # still aren't read at every tick: the running loop gates on whichever of the two is later.
+        mem = self.__dict__.setdefault("_reread_mem", {})
         try:
             old = self._flags(self.REREAD_FLAG + key).get("", {})
-            fails = int(old.get("fails") or 0) + 1
-            delay = self._backoff(fails)
+            stored = int(old.get("fails") or 0)
+        except Exception:                       # noqa: BLE001: unreadable: the count in memory goes on
+            stored = 0
+        try:
+            held = int((mem.get(key) or {}).get("fails") or 0)
+        except (TypeError, ValueError):
+            held = 0
+        fails = max(stored, held) + 1
+        delay = self._backoff(fails)
+        mem[key] = {"fails": fails, "due": self._clock() + delay}
+        try:
             with self.ledger.tx() as db:
-                self.ledger.set_meta(self.REREAD_FLAG + key, json.dumps({"fails": fails, "due": self._clock() + delay}),
-                                     db)
+                self.ledger.set_meta(self.REREAD_FLAG + key, json.dumps(mem[key]), db)
             log.error("a tap's unverified outcome couldn't be written to the tap journal; it's read again in %d "
                       "minutes", delay // 60)
-        except Exception as e:                  # noqa: BLE001: the records too: read at its next schedule
-            log.error("a tap's next read couldn't be put off in the records either (%s)", type(e).__name__)
+        except Exception as e:                  # noqa: BLE001: the records too: the deferral held in memory
+            log.error("a tap's next read couldn't be put off in the records either (%s); it's held in memory and "
+                      "read again in %d minutes", type(e).__name__, delay // 60)
+
+    def _reread_due(self, key: str, rereads: dict, now: float) -> bool:
+        """Twenty-third round: a tap's next read is due only once both its deferral in the records and the one held
+        in memory (when the records couldn't take it) have come."""
+        return self._due(rereads.get(key), now) and self._due(self.__dict__.get("_reread_mem", {}).get(key), now)
 
     def _finish_terminal(self, rows: list[dict]) -> None:
         """Twentieth round: taps whose outcome is terminal (an approval used up and the calendar never readable;
@@ -1288,8 +1318,13 @@ class Controller:
         "unidentified": ("Harness couldn't tell which request this tap was for; nothing was changed. It couldn't "
                          "identify this tap in its records, so nothing more is done for it from here."),
         # Twenty-second round: an error in Harness itself, said as that, never as records that can't be read.
-        "internal_error": ("Harness hit an internal error while working out what came of it, so it can't tell how "
-                           "far it got. It isn't taken again from here, and nothing more is done for it."),
+        # Twenty-third round: its write may have landed, in full or in part, so the card says plainly that Harness
+        # couldn't confirm whether the change was made and asks him to look at his calendar (the one thing a card
+        # may ask of him here; tests/imperative_cases.json "said").
+        "internal_error": ("Harness hit an internal error while working out what came of it, so it couldn't "
+                           "confirm whether the change was made. "
+                           "Please check your calendar to see whether it's there. "
+                           "It isn't taken again from here, and nothing more is done for it."),
     }
 
     def _queue_terminal(self, row: dict) -> dict:
@@ -1309,6 +1344,11 @@ class Controller:
                                     once=Ledger.once_key(key, "outcome", str(state)), outcome="unverified")
                 self.ledger.set_meta(mark, "1", db)
                 self.ledger.event("tap_finished", {"state": state}, db=db)
+                if state == "internal_error":
+                    # Twenty-third round: a durable diagnostic copy of the struck press (its request, its identity
+                    # without the interaction token, the last exception), so the fault can be traced and the request
+                    # recovered after the journal line is gone.
+                    self.ledger.set_meta(self.DIAG_FLAG + key, json.dumps(self._diagnostic(row)), db)
             had = db.execute("SELECT value FROM meta WHERE key=?", (self.STRIKE_FLAG + key,)).fetchone()
             if had is None:
                 self.ledger.set_meta(self.STRIKE_FLAG + key, json.dumps(flag), db)
@@ -1341,6 +1381,7 @@ class Controller:
         try:
             with self.ledger.tx() as db:
                 db.execute("DELETE FROM meta WHERE key IN (?, ?)", (self.STRIKE_FLAG + key, self.REREAD_FLAG + key))
+            self.__dict__.get("_reread_mem", {}).pop(key, None)
         except Exception as e:                  # noqa: BLE001: the next tick finds the flag, strikes nothing, clears it
             log.warning("a strike's flag couldn't be cleared (%s); it's cleared at the next tick", type(e).__name__)
         return True
@@ -1354,9 +1395,46 @@ class Controller:
                 continue
             press = flag.get("press")
             if not isinstance(press, dict) or not press:
-                log.error("a pending strike's tap couldn't be read from the records")
+                self._unreadable_strike(key, now)
                 continue
             self._strike(key, press, flag)
+
+    UNREADABLE_STRIKE_WORDS = ("Harness found a cleanup step in its records for a tap of yours that it couldn't "
+                               "read, and no card about that tap, so it left the tap as it is. It isn't taken "
+                               "again from here.")
+
+    def _unreadable_strike(self, key: str, now: float) -> None:
+        """Twenty-third round: a strike-pending flag whose JSON can't be parsed or holds no press. If the tap's card
+        is there (its "card queued" mark, or an outcome card under its once-key), the tap is struck by its id (the
+        tap key is its id and custom id) and the flag is rewritten whole with the default back-off, so it's struck
+        or settled, never skipped forever. If neither is there, one operator card says so (once-keyed). The log
+        line says it at most once an hour per tap."""
+        seen = self.__dict__.setdefault("_unreadable_logged", {})
+        if now - seen.get(key, float("-inf")) >= 3600:
+            seen[key] = now
+            log.error("a pending strike's tap couldn't be read from the records")
+        tap_id, _, custom = key.partition("|")
+        press = {"id": tap_id, "custom_id": custom}
+        try:
+            carded = (self.ledger.db.execute("SELECT 1 FROM meta WHERE key=?",
+                                             (f"tap_card_queued:{key}",)).fetchone() is not None
+                      or self.ledger.db.execute(
+                          "SELECT 1 FROM meta WHERE substr(key, 1, ?)=?",
+                          (len("outbox_once:" + Ledger.once_key(key, "outcome", "")),
+                           "outbox_once:" + Ledger.once_key(key, "outcome", ""))).fetchone() is not None)
+            if not carded:
+                with self.ledger.tx() as db:
+                    self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
+                                        text=render.fit(self.UNREADABLE_STRIKE_WORDS),
+                                        once=Ledger.once_key(key, "operator", "unreadable_strike"))
+                return
+            flag = {"press": press, "fails": 0, "due": 0.0}
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(self.STRIKE_FLAG + key, json.dumps(flag), db)
+        except Exception as e:                  # noqa: BLE001: the records can't take it now: the next tick
+            log.debug("an unreadable strike flag couldn't be handled now (%s)", type(e).__name__)
+            return
+        self._strike(key, press, flag)
 
     def _tap_head(self, row: dict) -> str:
         try:
@@ -1494,7 +1572,11 @@ class Controller:
                     + "\n".join(lines)))
             self.ledger.event("taps_relisted", {"count": n, "shown": len(shown), "listed": len(rest),
                                                 "found": len(found), "restored": restored, **counts}, db=db)
+            # Twenty-third round: a settled tap's deferred re-read goes with its cards, in the same transaction.
+            for row in rows:
+                db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + self.handovers.key(row["press"]),))
         for row in rows:
+            self.__dict__.get("_reread_mem", {}).pop(self.handovers.key(row["press"]), None)
             self.handovers.journal_done(row["press"])
 
     @staticmethod
@@ -1667,16 +1749,22 @@ class Controller:
             # Nineteenth round: the card said it reads first; a read that still can't answer does nothing.
             # Twentieth round: never asks him to send it again (the failure isn't his): the same Go ahead comes
             # back on a new card, which reads his calendar again when he uses it.
+            # Twenty-third round: the retry card is keyed on (tap, "retry", attempt), the attempt counted in its
+            # target: a retransmission of the same attempt is refused (and mints nothing), a new attempt goes.
+            attempt = self._attempt(t) + 1
+            once = Ledger.once_key(f"{t.get('id', '')}|{cid}", "retry", str(attempt))
             with self.ledger.tx() as db:
                 self.ledger.event("tap_reconfirm_unread", {}, db=db)
-                again = choices.mint(self.ledger, kind="tap_reconfirm", chat_id=self.config.owner_user_id,
-                                     ttl_s=self.TAP_RELIST_TTL_S, target=target, db=db)
-                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=render.fit(
-                    "Your calendar still couldn't be read, so nothing was done for that tap. The button below "
-                    "reads your calendar again first and does it only if it isn't there; if your calendar still "
-                    "can't be read, nothing is done."),
-                    buttons=[[("Go ahead", choices.callback_data(again))]],
-                    binds=[{"type": "choice", "nonce": again}])
+                if db.execute("SELECT 1 FROM meta WHERE key=?", (f"outbox_once:{once}",)).fetchone() is None:
+                    again = choices.mint(self.ledger, kind="tap_reconfirm", chat_id=self.config.owner_user_id,
+                                         ttl_s=self.TAP_RELIST_TTL_S, target=json.dumps(dict(t, attempt=attempt)),
+                                         db=db)
+                    self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=render.fit(
+                        "Your calendar still couldn't be read, so nothing was done for that tap. The button below "
+                        "reads your calendar again first and does it only if it isn't there; if your calendar "
+                        "still can't be read, nothing is done."),
+                        buttons=[[("Go ahead", choices.callback_data(again))]],
+                        binds=[{"type": "choice", "nonce": again}], once=once)
             return ("Your calendar still couldn't be read, so nothing was done. Harness reads it again when you tap "
                     "Go ahead on the card that follows.")
         if retry is not None:
@@ -1707,6 +1795,14 @@ class Controller:
         if got == "ok" or got == "stopped":
             return ""
         return render.escape(callbacks.REFUSALS.get(got, "Not valid.")) + " Nothing changed."
+
+    @staticmethod
+    def _attempt(t: dict) -> int:
+        """Twenty-third round: which retry card a Go ahead came from (0 for the first card)."""
+        try:
+            return max(0, int(t.get("attempt") or 0))
+        except (TypeError, ValueError):
+            return 0
 
     def _retry_ended(self, op: dict, parts: list, retry: list[int]) -> str:
         """Nineteenth round: his Go ahead on a change whose job ended with parts not done. Each part offered is read

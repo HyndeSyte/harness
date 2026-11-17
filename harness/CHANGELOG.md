@@ -2,6 +2,10 @@
 
 ## 0.24.0
 
+- **When an error inside Harness leaves a change unconfirmed, the card says so plainly**: Harness couldn't confirm whether the change was made, and asks you to check your calendar to see whether it's there. What it was working on is kept in its records so it can be traced.
+- **A note that a tap is waiting comes once**, even when Harness can't note that it told you, and even across a restart. A card bringing Go ahead back comes once for each time you use it.
+- Harness keeps to its 1, 2, 5, 15, 30 and 60 minute schedule for reading your calendars even when its storage can't be written at all, and a tap's leftover cleanup note that can't be read is finished or reported once, not skipped forever.
+
 - **A tap Harness couldn't finish always gets its card.** The card is saved first and the tap crossed off after, so a stop in between never leaves a tap gone with nothing said. A note that can't be crossed off waits its turn, even across a restart.
 - **An error inside Harness on a tap ends after a few tries** with one card saying so, instead of being read every hour. It never says your records couldn't be read when that isn't what happened.
 - **A tap Harness can't match to a request says just that**, and that nothing was changed. A part Harness can't tell anything about says it can't tell, never that it may have reached your calendar.

@@ -100,8 +100,12 @@ def test_real_mirror_and_link_differences_go_as_the_template_with_the_cards_butt
 
 
 def test_the_shared_end_to_end_cases_cover_each_difference():
-    names = {c["name"] for c in SHARED["end_to_end"]}
-    assert names >= {"bold head without terminal punctuation", "code span holding a label",
-                     "link with a label in its text"}                          # twenty-second round: and more
+    # Twenty-third round: equality again, against the one canonical list in tests/imperative_cases.json (the bun
+    # suite asserts the same list).
+    names = [c["name"] for c in SHARED["end_to_end"]]
+    assert names == SHARED["end_to_end_names"]["names"]
+    assert len(set(names)) == len(names)
+    assert set(names) >= {"bold head without terminal punctuation", "code span holding a label",
+                          "link with a label in its text"}
     assert any("`" in c["html"] for c in SHARED["end_to_end"])
     assert any("](" in c["html"] for c in SHARED["end_to_end"])

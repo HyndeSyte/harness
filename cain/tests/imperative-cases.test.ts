@@ -19,6 +19,7 @@ const shared: {
   refused_twice: { name: string; html: string; buttons: string[]; known_first: string[]; known_second: string[];
     first: string; refused_first: string[]; second: string; refused_second: string[]; outcome: string }[];
   said: { texts: string[] };
+  end_to_end_names: { names: string[] };
 } = JSON.parse(readFileSync(join(import.meta.dir, "..", "..", "tests", "imperative_cases.json"), "utf8"));
 
 function tellsToUse(text: string, label: string): boolean {
@@ -123,4 +124,11 @@ describe("the specialist's tap words", () => {
 // Twenty-second round: the end-to-end cases cover each outcome phrase: done, not done and couldn't verify.
 test("the end-to-end cases cover every outcome", () => {
   expect([...new Set(shared.end_to_end.map((c) => c.outcome))].sort()).toEqual(["done", "not_done", "unverified"]);
+});
+
+// Twenty-third round: the end-to-end case names equal the one canonical list in tests/imperative_cases.json, which
+// tests/test_outbox_round21.py asserts too.
+test("the end-to-end case names are the canonical list", () => {
+  expect(shared.end_to_end.map((c) => c.name)).toEqual(shared.end_to_end_names.names);
+  expect(new Set(shared.end_to_end_names.names).size).toEqual(shared.end_to_end_names.names.length);
 });

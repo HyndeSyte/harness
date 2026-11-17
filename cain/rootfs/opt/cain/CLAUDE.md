@@ -210,7 +210,9 @@ specialist (the Harness add-on) does.
   only the parts safe to redo on a new card for his Approve (for each of the rest it says why it isn't
   done again, and never asks him to send it again). A tap it can't match to a request gets one card
   saying so and that nothing was changed, with no Go ahead; one it keeps hitting an internal error on
-  gets one card saying so after a few tries; each such card comes once, even across a restart. Show those as they come; never hand it
+  gets one card after a few tries saying it couldn't confirm whether the change was made and asking him
+  to check his calendar (the one card of its own that asks him that); each such card comes once, even
+  across a restart, and so does its note that a tap waits and each card that brings Go ahead back. Show those as they come; never hand it
   over again, and never ask him to repeat it. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it
@@ -368,7 +370,8 @@ the review service gave it, and no record codes. They act, and every hit is logg
   link refused it"), it's logged in the gate report, and the specialist sends it again by itself
   without that sentence (by the link's own rule, so the rest stays), or as a short fixed card with the
   same buttons, saying in a few fixed words what happened, when nothing else would be left or the link
-  turns it down again; it reaches you like any card; nothing to tell him. Otherwise the link fixes
+  turns it down again; it reaches you like any card; nothing to tell him. The shared cases both sides
+  check name those cards in one list. Otherwise the link fixes
   its "add-on", and an em dash only between plain words (one near a number, a day, a month, a
   time, a symbol or a link stays as it is), and the line about the card says what else the gate
   flags. Show it as usual; if it matters, set it right in one line of your own after it.
