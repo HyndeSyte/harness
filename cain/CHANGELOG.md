@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- The calendar specialist strips from a card the link turns down only the sentence that told you to use a missing button, using the very same rule the link does, so the rest of the card reaches you.
+
 - When you send a few messages in a row, Cain can tell the calendar specialist which one your calendar request is in, so it acts on that one and not on your newest.
 - A slip in Cain's tools can no longer pass a calendar request on by accident: run with nothing, the tool only lists what it does.
 - Cain names your message with every calendar request, answers the calendar specialist's questions himself on the same message, and never asks you to repeat a change you already made in words.
