@@ -6,7 +6,7 @@
 // write a power cut tore), is truncated off the file and reported as torn, once: what came before
 // it stands. A bad record before the last one is skipped and counted. No log is ever rewritten.
 import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, truncateSync, writeSync } from "node:fs";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const TABLE = (() => {
   const t = new Uint32Array(256);
@@ -37,8 +37,17 @@ export interface LogRead<T = any> {
   bad: number;               // bad records before the last one, skipped
 }
 
-// Reads a log. repair: a torn final record is truncated off the file (the default).
-export function readLog<T = any>(file: string, o: { repair?: boolean } = {}): LogRead<T> {
+// Reads a log. Round 21: repair is off by default (a reader only skips a torn final record and reports it). repair: true
+// truncates a torn final record under the log's flock (withLogLock), re-read inside it, so a repair never races a writer;
+// repair: "mirror" truncates without the lock, and only the keeper's single-writer mirror (record-issued.log) may ask for
+// it (any other file throws).
+export const SINGLE_WRITER_MIRROR = "record-issued.log";
+export function readLog<T = any>(file: string, o: { repair?: boolean | "mirror" } = {}): LogRead<T> {
+  if (o.repair === "mirror" && basename(file) !== SINGLE_WRITER_MIRROR) throw new Error(`only the keeper's single-writer mirror (${SINGLE_WRITER_MIRROR}) is repaired without the lock, not ${file}`);
+  if (o.repair === true && existsSync(file)) return withLogLock(file, () => readOnce<T>(file, true));
+  return readOnce<T>(file, o.repair === "mirror");
+}
+function readOnce<T>(file: string, repair: boolean): LogRead<T> {
   const out: LogRead<T> = { records: [], missing: false, torn: false, tornBytes: 0, bad: 0 };
   let buf: Buffer;
   try { buf = readFileSync(file); }
@@ -64,7 +73,7 @@ export function readLog<T = any>(file: string, o: { repair?: boolean } = {}): Lo
     pos = end + 1;
   }
   if (out.torn) reportTorn(file, out.tornBytes, buf.length);
-  if (out.torn && o.repair !== false) truncateSync(file, good);
+  if (out.torn && repair) truncateSync(file, good);
   return out;
 }
 
@@ -156,70 +165,133 @@ export function fitRecord<T>(rec: T): T {
 // Round 20: shared-log writers are serialised by an OS advisory lock (flock, exclusive) on a file beside the log
 // (<log>.flock), held through the torn-tail repair, the append and the fsync. The kernel releases it when its holder
 // dies, so a dead holder is recovered by whichever waiter gets the lock next: no takeover, and no two waiters can both
-// hold it. A waiter gives up after LOCK_WAIT_MS (nothing written). flock comes from libc through bun:ffi; where it
-// can't be loaded, no shared log is written (the append throws).
+// hold it. Round 21: a waiter that gets would-block for lockWait.ms (LOCK_WAIT_MS) gives up with a LockTimeout, nothing
+// written, and every caller holds what it was doing and retries (LOCK_CALLERS); any other flock error is reported at once
+// with its real cause (errno and its name), never as "another writer holds it". flock comes from libc through bun:ffi,
+// resolved through a soname fallback list (LIBC_NAMES); the link and the keeper each probe it at start (probeLock) on a
+// probe file in the real log folder and refuse to start, with a status line he sees, when it fails.
 export const LOCK_WAIT_MS = 5_000;
+export const lockWait = { ms: LOCK_WAIT_MS };
+export class LockTimeout extends Error { constructor(file: string, ms: number) { super(`the log ${file} is locked by another writer (waited ${ms / 1000} seconds); nothing was written, and it is tried again`); this.name = "LockTimeout"; } }
+export class LockError extends Error { constructor(msg: string) { super(msg); this.name = "LockError"; } }
+// Round 21: every append caller and what it does on a LockTimeout (hold and retry, never a dropped record or a crashed
+// loop). Listed in the invariant table; a test checks each.
+export const LOCK_CALLERS: Record<string, string> = {
+  "consumed-key log: consuming intent (keeper intendConsume)": "the request stays queued and is tried again next round",
+  "consumed-key log: consumed record (keeper appendConsumed)": "the state keeps it, and the intent is resolved from the commit's trailers next round",
+  "consumed-key log: dropped intent (keeper dropIntent)": "the intent stays open and is resolved from the record's history next round",
+  "consumed-key log: landed and unlanded marks (keeper unlandedConsumes)": "nothing is marked; looked at again next round",
+  "held log: held (link holdTap)": "the tap answers busy and the card keeps its buttons",
+  "held log: releasing, released, replay marks (link releaseHeldTaps, replayWatch)": "the release or mark is retried next sweep",
+  "landing ledger settle log (link landings.ts settleHand, ownerLine)": "it answers false: nothing is settled and his message isn't used up, so Cain runs the same command again with the same message",
+};
+export const LIBC_NAMES = ["libc.so.6", "libc.so", "libc", "libc.dylib", "libSystem.B.dylib"];
+// A test's view of the FFI: names to try instead of LIBC_NAMES, or a flock stand-in returning [rc, errno].
+export const lockTest: { names: string[] | null; call: null | ((fd: number, op: number) => [number, number]) } = { names: null, call: null };
 const sleepSync = (ms: number) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* spin */ } };
-let flockFn: ((fd: number, op: number) => number) | null = null;
-function flock(): (fd: number, op: number) => number {
+type Flock = (fd: number, op: number) => [number, number];
+let flockFn: Flock | null = null;
+export function resetFlockForTest(): void { flockFn = null; }
+function flock(): Flock {
+  if (lockTest.call) return lockTest.call;
   if (flockFn) return flockFn;
-  const { dlopen, FFIType } = require("bun:ffi");
-  let lib: any = null;
-  for (const name of ["libc.so.6", "libc.dylib", "libSystem.B.dylib"]) { try { lib = dlopen(name, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }); break; } catch { /* the next name */ } }
-  if (!lib) throw new Error("flock isn't available here, so no shared log is written");
-  flockFn = (fd, op) => lib.symbols.flock(fd, op);
+  const { dlopen, FFIType, read } = require("bun:ffi");
+  let lib: any = null, errno: (() => number) | null = null;
+  const tried: string[] = [];
+  for (const name of lockTest.names ?? LIBC_NAMES) {
+    try { lib = dlopen(name, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }); }
+    catch (e) { tried.push(`${name}: ${String((e as Error)?.message ?? e).slice(0, 60)}`); continue; }
+    for (const sym of ["__errno_location", "__error"]) {
+      try { const l = dlopen(name, { [sym]: { args: [], returns: FFIType.ptr } }); errno = () => read.i32(l.symbols[sym]()); break; } catch { /* the other name */ }
+    }
+    break;
+  }
+  if (!lib) throw new LockError(`flock couldn't be loaded from libc (tried ${tried.join("; ")}), so no shared log is written`);
+  flockFn = (fd, op) => { const rc = lib.symbols.flock(fd, op); return [rc, rc === 0 ? 0 : errno ? errno() : -1]; };
   return flockFn;
 }
 const LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
+const EINTR = 4, WOULD_BLOCK = new Set([11, 35]);   // EAGAIN/EWOULDBLOCK on Linux, on macOS
+const ERRNO: Record<number, string> = { 1: "EPERM", 4: "EINTR", 5: "EIO", 9: "EBADF", 12: "ENOMEM", 13: "EACCES", 22: "EINVAL", 37: "ENOLCK", 38: "ENOSYS", 77: "ENOLCK", 95: "EOPNOTSUPP" };
 export const lockFile = (file: string) => `${file}.flock`;
 export function withLogLock<T>(file: string, fn: () => T): T {
   const f = flock();
   mkdirSync(dirname(file), { recursive: true });
   const fd = openSync(lockFile(file), "a+", 0o600);
   try {
-    const until = performance.now() + LOCK_WAIT_MS;   // the monotonic clock: a bound inside this process
-    while (f(fd, LOCK_EX | LOCK_NB) !== 0) {
-      if (performance.now() > until) throw new Error(`the log ${file} is locked by another writer (waited ${LOCK_WAIT_MS / 1000} seconds)`);
+    const until = performance.now() + lockWait.ms;   // the monotonic clock: a bound inside this process
+    for (;;) {
+      const [rc, err] = f(fd, LOCK_EX | LOCK_NB);
+      if (rc === 0) break;
+      if (err === EINTR) continue;
+      if (!WOULD_BLOCK.has(err)) throw new LockError(`the log ${file} couldn't be locked: flock failed with errno ${err}${ERRNO[err] ? ` (${ERRNO[err]})` : ""}, a lock error of its own (not would-block); nothing was written`);
+      if (performance.now() > until) throw new LockTimeout(file, lockWait.ms);
       sleepSync(5);
     }
     try { return fn(); } finally { f(fd, LOCK_UN); }
   } finally { closeSync(fd); }
 }
+// Round 21: the start probe: flock loaded, and taken and released on a probe file in the real log folder. null: fine;
+// otherwise the specific cause, for the refusal line.
+export function probeLock(dir: string): string | null {
+  try {
+    mkdirSync(dir, { recursive: true });
+    withLogLock(join(dir, ".lock-probe"), () => undefined);
+    return null;
+  } catch (e) { return String((e as Error)?.message ?? e).slice(0, 300); }
+}
+// The status line he sees when the probe fails (the link's notice; the keeper's line through Cain).
+export const lockRefusal = (who: "link" | "record keeper", why: string) =>
+  `Cain's ${who === "link" ? "App" : "record keeper"} can't lock its logs on this box, so it isn't ${who === "link" ? "taking taps or posting cards" : "applying anything"}. Nothing was lost. It needs a fix in a new version of the App. (${why.replace(/(?:\/[\w.@+-]+)+/g, "its log folder").slice(0, 160)})`;
 // Round 19: a test's short write: returns how many bytes the write puts down (null: all of them).
 export const shortWriteSpy: { on: null | ((file: string) => number | null) } = { on: null };
 export function appendLog(file: string, rec: unknown): void {
-  const buf = Buffer.from(frame(fitRecord(rec)), "utf8");
-  if (buf.length > MAX_RECORD_BYTES) throw new Error(`a log record over ${MAX_RECORD_BYTES} bytes (${buf.length}) isn't written: one record is one write`);
+  const buf = encode(rec);
   const fresh = !existsSync(file);
   if (fresh) mkdirSync(dirname(file), { recursive: true });
-  withLogLock(file, () => {
-    const fd = openSync(file, "a+", 0o600);
-    try {
-      // Round 19: a torn final line (a write cut short) is cut off before this record goes on, so the new record never
-      // lands glued to it (where every reader would skip it as torn too).
-      let pre = fstatSync(fd).size;
-      if (pre > 0) {
-        const last = Buffer.alloc(1);
-        readSync(fd, last, 0, 1, pre - 1);
-        if (last[0] !== 0x0a) {
-          const all = readFileSync(file);
-          const keep = all.lastIndexOf(0x0a) + 1;
-          reportTorn(file, pre - keep, pre);
-          ftruncateSync(fd, keep);
-          pre = keep;
-        }
-      }
-      let n = 0;
-      try { const cut = shortWriteSpy.on?.(file); n = writeSync(fd, typeof cut === "number" ? buf.subarray(0, Math.max(0, Math.min(cut, buf.length))) : buf); }
-      catch (e) { try { ftruncateSync(fd, pre); } catch { /* the reader skips it as torn */ } throw e; }
-      // Round 19: a short write is truncated back to the file's length before it, then refused.
-      if (n !== buf.length) { try { ftruncateSync(fd, pre); } catch { /* the reader skips it as torn */ } throw new Error(`a log record was written short (${n} of ${buf.length} bytes)`); }
-      crashSpy.on?.(file);
-      fsyncSync(fd); syncSpy.on?.(`file ${file}`);
-    } finally { closeSync(fd); }
-  });
+  withLogLock(file, () => appendBuf(file, buf));
   // A new log's directory entry is fsynced too, so a power cut can't lose the whole file.
   if (fresh) syncDir(dirname(file));
+}
+// Round 21: an append by a caller that already holds the log's flock (withLogLock), for a step that must be atomic with
+// a read of the same log (the keeper's unlanded drop).
+export function appendLogHeld(file: string, rec: unknown): void {
+  const buf = encode(rec);
+  const fresh = !existsSync(file);
+  appendBuf(file, buf);
+  if (fresh) syncDir(dirname(file));
+}
+function encode(rec: unknown): Buffer {
+  const buf = Buffer.from(frame(fitRecord(rec)), "utf8");
+  if (buf.length > MAX_RECORD_BYTES) throw new Error(`a log record over ${MAX_RECORD_BYTES} bytes (${buf.length}) isn't written: one record is one write`);
+  return buf;
+}
+function appendBuf(file: string, buf: Buffer): void {
+  mkdirSync(dirname(file), { recursive: true });
+  const fd = openSync(file, "a+", 0o600);
+  try {
+    // Round 19: a torn final line (a write cut short) is cut off before this record goes on, so the new record never
+    // lands glued to it (where every reader would skip it as torn too).
+    let pre = fstatSync(fd).size;
+    if (pre > 0) {
+      const last = Buffer.alloc(1);
+      readSync(fd, last, 0, 1, pre - 1);
+      if (last[0] !== 0x0a) {
+        const all = readFileSync(file);
+        const keep = all.lastIndexOf(0x0a) + 1;
+        reportTorn(file, pre - keep, pre);
+        ftruncateSync(fd, keep);
+        pre = keep;
+      }
+    }
+    let n = 0;
+    try { const cut = shortWriteSpy.on?.(file); n = writeSync(fd, typeof cut === "number" ? buf.subarray(0, Math.max(0, Math.min(cut, buf.length))) : buf); }
+    catch (e) { try { ftruncateSync(fd, pre); } catch { /* the reader skips it as torn */ } throw e; }
+    // Round 19: a short write is truncated back to the file's length before it, then refused.
+    if (n !== buf.length) { try { ftruncateSync(fd, pre); } catch { /* the reader skips it as torn */ } throw new Error(`a log record was written short (${n} of ${buf.length} bytes)`); }
+    crashSpy.on?.(file);
+    fsyncSync(fd); syncSpy.on?.(`file ${file}`);
+  } finally { closeSync(fd); }
 }
 export function syncDir(dir: string): void {
   try { const d = openSync(dir, "r"); try { fsyncSync(d); syncSpy.on?.(`dir ${dir}`); } finally { closeSync(d); } } catch { /* a directory that can't be opened to sync (not on Linux) */ }

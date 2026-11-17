@@ -344,8 +344,8 @@ describe("6. append logs: free text cut to fit, short writes undone, torn tails 
     const f = join(mkdtempSync(join(tmpdir(), "r19-log-")), "settled.log");
     appendLog(f, { key: "k", how: "not landed", reason: "GitHub said: ".concat("x".repeat(3 * MAX_RECORD_BYTES)), at: "x" });
     const rec = readLog<any>(f).records[0];
-    expect(Buffer.byteLength(rec.reason)).toBeLessThanOrEqual(FREE_TEXT_BUDGET);   // round 20: a byte budget
-    expect(rec.reason.endsWith("\u2026")).toBe(true);
+    // Round 21: the exact cut: FREE_TEXT_BUDGET bytes in all, the cut mark (3 bytes) included.
+    expect(rec.reason).toBe("GitHub said: ".concat("x".repeat(FREE_TEXT_BUDGET - 3 - 13), "\u2026"));
     expect(readFileSync(f).length).toBeLessThan(MAX_RECORD_BYTES);
   });
 
@@ -450,6 +450,7 @@ describe("8. the check before asking him again reads a per-key answer (invariant
     expect(onThread(r, id, TAP_REPLAY_AGAIN)).toHaveLength(0);
     r.t.mono! += REPLAY_WAIT_MS + 1;
     await r.link.sweep();
+    r.keeperVerified({ superseded: [kid] });                          // round 21: a keeper round passes (a full page rotation)
     await r.link.sweep();
     expect(onThread(r, id, TAP_REPLAY_WAITING)).toHaveLength(1);
     r.keeperVerified({ replay_keys: { [kid]: { mirrored: true, consumed: "no" } } });   // the per-key answer, no list at all

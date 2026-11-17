@@ -84,6 +84,13 @@
 #                                        under unresolved_landings too, so his settle line settles it; pi_clock
 #                                        goes back to off (and the restore sweep reads again) once a post or
 #                                        a tap measures the Pi's clock off
+#                                        Round 21: a legacy card's claim whose voided settle can't be written
+#                                        is listed under unresolved_landings too (a void claim: nothing was
+#                                        pushed); a key the keeper is consuming keeps its replay waiting with
+#                                        no supersede, and the waiting line waits out a page rotation of
+#                                        replay_open as well. If this answers nothing at all and the App's log
+#                                        says the link refused to start (its logs can't be locked), the link
+#                                        isn't running: Dane was told by the App
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

@@ -82,6 +82,10 @@
 - A tap on a card whose earlier answer Cain's record is still acting on does nothing, keeps the buttons, and says it settles by itself.
 - A Ship that didn't go ahead because the record had to start over, and that the App couldn't note in its landing record right away, says so under its card; the App keeps trying by itself, and the daily settle reminder covers it if it can't.
 - A question already up when you install this whose check can't be dated reliably (its date unreadable, or not the check the card was asked on) says a new check is needed instead.
+- A change from your tap that didn't land and was dropped can never reach your record later: once Cain asks again, only your new answer counts. The App waits a full two hours of its own running time, over several checks with GitHub, before it decides a change didn't land, whatever the box's clock says.
+- If a change of the box's clock jumps it forward, questions keep their buttons and your taps still count: how long a question is kept follows Discord's own times.
+- If the box can't lock the App's logs, the App says so in one notice and takes no taps until that is fixed, rather than failing quietly.
+- A question whose earlier answer Cain's record is still acting on, after a restart, waits and says it settles by itself, and is never asked again in the meantime.
 - The App's logs take turns properly even if something dies in the middle of writing one, and long messages with emoji or accents are cut cleanly.
 - One known gap, said plainly: if a tap was used while GitHub was down, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.

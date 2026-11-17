@@ -693,7 +693,11 @@ never reached GitHub): treat it as not done, he was told on the card; check the 
 with --checked if it still needs him. A line saying the record keeper couldn't resolve whether tap requests were acted
 on: nothing to do, the link holds those taps and he was told it settles by itself. "Landing voided but not yet
 settled": nothing was pushed; nothing to do unless it later shows under unresolved_landings, then it is settled as any
-unresolved landing is.
+unresolved landing is. A "Landing unresolved for over 7 days" line that says it is a void claim means nothing was pushed:
+only his not-landed settle line settles it, never a look at main. A change dropped as not landed is never pushed later,
+even if an old push is retried: act only on his new answer. If you hear the record keeper or the link refuses to start
+because it can't lock its logs, tell him that line in your own words, once, and log a Build item; nothing else to do, it
+tries again by itself.
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

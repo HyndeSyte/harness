@@ -9,7 +9,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { appendLog, readLog, writeLogForTest } from "../rootfs/opt/cain/applog.ts";
+import { appendLog, frame, readLog, writeLogForTest } from "../rootfs/opt/cain/applog.ts";
 import { INSTALL_WAIT, settleForm, settleNormalise, settleWordsProblem, TAP_REFUSED, TAP_RESTORE_LOST, TAP_ISSUED_KEEP_MS, tapKid,
   unresolvedReminder } from "../rootfs/opt/cain/link/core";
 import { landingLedger, SETTLED_LOG } from "../rootfs/opt/cain/link/landings";
@@ -373,8 +373,11 @@ describe("9. framed append-only logs", () => {
     appendFileSync(tapsLogFile(k.cfg), '61:deadbeef:{"tap":"tap-00000000f902","id":"x"');   // cut short
     k.cain({ id: "cain-r9", ops: [{ op: "note", item: "P44", text: "a round" }] });
     expect(cycle(k.cfg).ok).toBe(true);
-    // Round 20: the keeper's landed marks for consumed keys aside (a record type of its own), the torn record is gone.
-    expect(readFileSync(tapsLogFile(k.cfg), "utf8").split("\n").filter((l) => !l.includes('"t":"landed"')).join("\n")).toBe(good);
+    // Round 21: the file compared exactly: what stood before, then the keeper's one landed mark for the consumed key (its
+    // exact form asserted on its own); the torn record is gone.
+    const landed = { t: "landed", tap: "tap-00000000f901", id: "cain-ship-t", at: k.cfg.now!().toISOString() };
+    expect(readLog<any>(tapsLogFile(k.cfg)).records.filter((x) => x.t === "landed")).toEqual([landed]);
+    expect(readFileSync(tapsLogFile(k.cfg), "utf8")).toBe(good + frame(landed));
     expect(lines.filter((l) => l.includes("TORN:"))).toHaveLength(1);
     expect(k.relayed().split(" / ").filter((l) => l.includes("torn final record"))).toHaveLength(1);
     k.cain({ id: "cain-r9b", ops: [{ op: "note", item: "P44", text: "another round" }] });
@@ -405,7 +408,7 @@ describe("9. framed append-only logs", () => {
     writeLogForTest(f, [{ a: 1 }], "3:00000000:{}\n");
     appendLog(f, { b: 2 });
     appendFileSync(f, "9:");
-    const r = readLog(f);
+    const r = readLog(f, { repair: true });                           // round 21: repair is asked for (off by default)
     expect(r.records).toEqual([{ a: 1 }, { b: 2 }]);
     expect(r.bad).toBe(1);
     expect(r.torn).toBe(true);

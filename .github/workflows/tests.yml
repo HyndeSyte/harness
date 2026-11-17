@@ -32,3 +32,16 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
+
+  # Round 21: the shared logs' flock (bun:ffi into libc) on arm64, the Pi's architecture: the start probe, the lock and
+  # its errors, in an arm64 container under QEMU. Same Bun as Cain's image.
+  arm64-flock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - run: >-
+          docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w oven/bun:1.4.4
+          sh -c 'uname -m && bun test cain/tests/source-check-round21.test.ts -t "flock" && bun test cain/tests/source-check-round20.test.ts -t "OS advisory lock"'

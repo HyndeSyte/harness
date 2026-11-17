@@ -393,11 +393,12 @@ describe("8. records cut to a byte budget for the whole serialised record (invar
     const raw = readFileSync(f);
     expect(raw.length).toBeLessThanOrEqual(MAX_RECORD_BYTES);
     const rec = readLog<any>(f).records[0];
-    for (const v of [rec.reason, rec.why, rec.note[0]]) {
-      expect(Buffer.byteLength(v)).toBeLessThanOrEqual(FREE_TEXT_BUDGET);
-      expect(v.endsWith("…")).toBe(true);
-      expect(/[\ud800-\udfff]/.test(v.replace(/[\ud800-\udbff][\udc00-\udfff]/g, ""))).toBe(false);   // no lone surrogate
-    }
+    // Round 21: the exact cut output: each field cut to FREE_TEXT_BUDGET bytes on a code-point boundary, the cut mark (3
+    // bytes) included: 149 emoji of 4 bytes, 298 accented letters of 2, 199 CJK characters of 3.
+    expect(rec.reason).toBe("😀".repeat(149) + "…");
+    expect(rec.why).toBe("é".repeat(298) + "…");
+    expect(rec.note[0]).toBe("日本".repeat(99) + "日" + "…");
+    for (const v of [rec.reason, rec.why, rec.note[0]]) expect(/[\ud800-\udfff]/.test(v.replace(/[\ud800-\udbff][\udc00-\udfff]/g, ""))).toBe(false);   // no lone surrogate
     expect(rec.note[1]).toBe("short");
   });
 

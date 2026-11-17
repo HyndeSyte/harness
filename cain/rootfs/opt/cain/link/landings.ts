@@ -157,7 +157,7 @@ export function landingLedger(dir: string, marker: string, o: { sync?: (what: st
       const r = readLog(join(dir, SETTLED_LOG), { repair: false });
       return r.records.filter((x: any) => x?.t === "owner" && typeof x.kind === "string" && typeof x.said === "string" && typeof x.at === "string");
     },
-    repair() { const r = readLog(join(dir, SETTLED_LOG)); return { torn: r.torn, bytes: r.tornBytes }; },
+    repair() { const r = readLog(join(dir, SETTLED_LOG), { repair: true }); return { torn: r.torn, bytes: r.tornBytes }; },
     entries() {
       if (!existsSync(dir)) return [];
       try {

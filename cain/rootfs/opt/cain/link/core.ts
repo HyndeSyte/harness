@@ -319,7 +319,8 @@ export interface TapClaim { at: number; msg: string; label: string; stage: "clai
   why?: string;                      // stage "lost": why (a reset, or not acted after a restart)
   it?: string }                      // round 18: the tap's interaction id: Discord's time for it, by which a claim is judged after a restart
 export interface Unresolved { since: number; fails: number; last: string; next: number; what: "orphan" | "ledger" | "void"; msg?: string; told?: boolean;
-  toldAt?: number; reminded?: number; alerted?: number }   // round 11: when he was first told, last reminded, and Cain alerted (7 days)
+  toldAt?: number; reminded?: number; alerted?: number;   // round 11: when he was first told, last reminded, and Cain alerted (7 days)
+  why?: string }                      // round 21: a void's reason, carried to its retried settle
 // Round 11: an issued tap key's structured target: the card's item and the kinds of write its tap allows.
 export type TapWrite = "row-close" | "ship-take" | "decision";
 export interface TapTarget { item: string; writes: TapWrite[] }
@@ -412,6 +413,8 @@ export const CARD_CHECKING = "Its buttons go on once Cain's record has checked w
 // Round 15: a held tap whose time the App's clock and Discord's disagree on.
 // Round 16: a replayed held tap with no keeper request within REPLAY_WAIT_MS: the card asks for a fresh tap.
 export const REPLAY_WAIT_MS = 10 * 60_000;
+// Round 21: the keeper's page of replay answers a round (record/main.ts REPLAY_PAGE; a test holds them equal).
+export const KEEPER_REPLAY_PAGE = 500;
 export const TAP_REPLAY_AGAIN = "Your held answer may not have reached Cain after a restart, so nothing was done from it. Please answer again on the fresh card Cain sends.";
 // Round 16: a Ship card from before a detected restore stays buttonless until Cain reissues it.
 export const SHIP_RESTORE_REISSUE = "Its buttons are off after a restore of the App: a Ship card from before the restore isn't tappable. Cain sends a new one if it still needs you.";
@@ -1456,7 +1459,7 @@ export class Link {
 
   // A card with buttons still on is never forgotten: the sweep takes them off first.
   private prune(s: State, now: number): void {
-    for (const [k, v] of Object.entries(s.messages)) if (v.until <= now && !v.buttons) delete s.messages[k];
+    for (const [k, v] of Object.entries(s.messages)) if (!v.buttons && this.forgetBy(k, v, now, 0)) delete s.messages[k];
   }
 
   // -- the link's own state: its high-water mark and its self-heal (0.12.0) -----------------
@@ -2064,12 +2067,14 @@ export class Link {
   // Round 20: a voided claim (nothing pushed) whose ledger file couldn't be marked settled stays open and would block its
   // key: it is kept as unresolved ("void"), so the owner's settle line can settle it by hand (his reminders list it),
   // he gets one line on the card now, Cain is told, and each sweep tries the settle again (retryVoids).
-  private async voidUnsettled(key: string, msg: string): Promise<void> {
+  // Round 21: also a legacy card's claim with no trustworthy anchor whose voided settle couldn't be written (why: its
+  // reason, kept for the retried settle).
+  private async voidUnsettled(key: string, msg: string, why?: string): Promise<void> {
     const now = this.d.now(), s = this.d.load();
     if (s.unresolved?.[key]) return;
-    (s.unresolved ??= {})[key] = { since: now, fails: 1, last: "a voided claim couldn't be marked settled in the landing ledger", next: now, what: "void", msg, told: true, toldAt: now };
+    (s.unresolved ??= {})[key] = { since: now, fails: 1, last: "a voided claim couldn't be marked settled in the landing ledger", next: now, what: "void", msg, told: true, toldAt: now, ...(why ? { why } : {}) };
     this.d.save(s);
-    this.d.relay(`Landing voided but not yet settled: the Ship tap's landing for tap key ${tapKid(key)} was voided before any push (the record was reset meanwhile), but the landing ledger couldn't mark it settled, so the link retries each sweep. Nothing was pushed. If it can't, it is listed under unresolved_landings and his settle line settles it. Nothing to do: his card says so.`);
+    this.d.relay(`Landing voided but not yet settled: the Ship tap's landing for tap key ${tapKid(key)} was voided before any push (${why ? clip(why, 160) : "the record was reset meanwhile"}), but the landing ledger couldn't mark it settled, so the link retries each sweep. Nothing was pushed. If it can't, it is listed under unresolved_landings and his settle line settles it. Nothing to do: his card says so.`);
     try { await this.post(VOID_UNSETTLED, [], { replyTo: msg }); } catch (e) { this.log(`couldn't tell him on card ${msg} that its voided landing isn't settled yet: ${String(e).slice(0, 80)}`); }
     this.log(`voided landing claim ${tapKid(key)} couldn't be marked settled: kept unresolved, retried each sweep, and settleable by hand`);
   }
@@ -2079,7 +2084,7 @@ export class Link {
     for (const [k, u] of Object.entries(this.d.load().unresolved ?? {})) {
       if (u.what !== "void") continue;
       const open = L.entries()?.find((e) => e.key === k);
-      if (open && !open.settled && L.settle(k, "not landed", new Date(this.d.now()).toISOString(), { voided: true }) === false) continue;
+      if (open && !open.settled && L.settle(k, "not landed", new Date(this.d.now()).toISOString(), { voided: true, ...(u.why ? { why: u.why } : {}) }) === false) continue;
       this.unresolvedClear(k);
     }
   }
@@ -2982,7 +2987,7 @@ export class Link {
     // the invariant table.
     if (tapSf !== null && /^\d{15,22}$/.test(msgId)) {
       if (tapSf >= snowflakeTime(msgId) + (typeof m.keep === "number" && m.keep > 0 ? m.keep : REMEMBER_MS) - DAY) return "forgetting";
-    } else if (m.until - DAY <= now) return "forgetting";
+    } else if (this.forgetBy(msgId, m, now)) return "forgetting";
     const item = boundItem(m);
     if (item) {
       const f = this.files();
@@ -4205,7 +4210,9 @@ export class Link {
         if (!s.unresolved?.[key]) continue;
         s.unresolved[key].alerted = now;
         this.d.save(s);
-        this.d.relay(`Landing unresolved for over 7 days: tap key ${kid} (failures ${u0.fails}; last error: ${u0.last}). Only he can settle it: he checks main on GitHub from his PC and sends "${settleForm(kid, "landed")}" or "${settleForm(kid, "not-landed")}"; then run keeper.sh settle with that message's id. He is reminded daily; at 90 days it becomes a tombstone.`);
+        // Round 21: a void claim's alert says nothing was pushed (there is nothing on main to check).
+        if (u0.what === "void") this.d.relay(`Landing unresolved for over 7 days: tap key ${kid} is a void claim: nothing was pushed, and the landing ledger still can't mark it settled (failures ${u0.fails}; last error: ${u0.last}). Only he can settle the void claim: he sends "${settleForm(kid, "not-landed")}"; then run keeper.sh settle with that message's id. He is reminded daily; at 90 days it becomes a tombstone.`);
+        else this.d.relay(`Landing unresolved for over 7 days: tap key ${kid} (failures ${u0.fails}; last error: ${u0.last}). Only he can settle it: he checks main on GitHub from his PC and sends "${settleForm(kid, "landed")}" or "${settleForm(kid, "not-landed")}"; then run keeper.sh settle with that message's id. He is reminded daily; at 90 days it becomes a tombstone.`);
       }
       // Round 12: the per-thread line goes once, on the first day it stays unconfirmed after he was told.
       if (u0.told && !u0.reminded && now - (u0.toldAt ?? u0.since) >= UNRESOLVED_REMIND_MS) {
@@ -4516,9 +4523,16 @@ export class Link {
   private async tapNotices(): Promise<void> {
     const st = keeperStatus(this.files().status);
     const list = Array.isArray((st as any)?.tap_notices) ? (st as any).tap_notices as { tap: string; why: string; msg?: string }[] : [];
+    // Round 21: a waiting notice is told once per (tap key, request id, episode); its mark goes once the keeper no longer
+    // lists it (the intent resolved or was dropped), so a later stuck episode on the same key is told again.
+    const waitId = (n: any) => `${n.tap}:waiting:${String(n.id ?? "")}:${String(n.ep ?? "")}`;
+    const listed = new Set(list.filter((n) => n?.why === "waiting").map(waitId));
+    { const s = this.d.load(); let gone = false;
+      for (const k of Object.keys(s.tapNoticed ?? {})) if (/:waiting:/.test(k) && !listed.has(k)) { delete s.tapNoticed![k]; gone = true; }
+      if (gone) this.d.save(s); }
     for (const n of list) {
       if (!n || typeof n.tap !== "string" || !["refused", "lost", "expired", "time", "hold", "superseded", "unstamped", "unlanded", "waiting"].includes(n.why)) continue;
-      const id = `${n.tap}:${n.why}`;
+      const id = n.why === "waiting" ? waitId(n) : `${n.tap}:${n.why}`;
       const s = this.d.load();
       if (s.tapNoticed?.[id]) continue;
       (s.tapNoticed ??= {})[id] = this.d.now();
@@ -5095,7 +5109,7 @@ export class Link {
   private repairLogs(): void {
     const torn: string[] = [];
     if (this.d.issuedLog) {
-      try { const r = readLog(this.d.issuedLog); if (r.torn) torn.push(`the issued-key log (${r.tornBytes} bytes)`); }
+      try { const r = readLog(this.d.issuedLog, { repair: true }); if (r.torn) torn.push(`the issued-key log (${r.tornBytes} bytes)`); }
       catch (e) { this.log(`couldn't read the issued-key log: ${String(e).slice(0, 80)}`); }
     }
     try { const r = this.d.landings?.repair?.(); if (r?.torn) torn.push(`the landing ledger's settle log (${r.bytes} bytes)`); }
@@ -5200,6 +5214,15 @@ export class Link {
   private expiresBy(id: string, m: Shown, now: number): boolean {
     const e = this.cardExpirySf(id, m);
     return e !== null ? e <= this.discordNow() : m.expires != null && m.expires <= now;
+  }
+  // Round 21: a card's retention as a Discord time: its post snowflake plus keep (REMEMBER_MS, a duration), never the
+  // record's wall-clock until; the Pi's clock (until) only for a card with no snowflake id.
+  private forgetAt(id: string, m: Shown): number | null {
+    return /^\d{15,22}$/.test(id) ? snowflakeTime(id) + (typeof m.keep === "number" && m.keep > 0 ? m.keep : REMEMBER_MS) : null;
+  }
+  private forgetBy(id: string, m: Shown, now: number, margin = DAY): boolean {
+    const f = this.forgetAt(id, m);
+    return f !== null ? f - margin <= this.discordNow() : m.until - margin <= now;
   }
   // Round 12: one key's record in the issued-key log.
   private issuedKid(kid: string): any | null {
@@ -5512,20 +5535,26 @@ export class Link {
   }
   // Round 19: each key's place in the consumed-key log: consumed, or consuming (an open intent: the keeper may be
   // acting on it now, so nothing asks him again until it resolves).
+  // Round 21: the view is keyed on (tap key, request id): each consumed record stands on its own, a landed mark and an
+  // unlanded drop apply to their own record alone, and a key is "consumed" while any of its records is live (not
+  // dropped), so the link's view and the keeper's never disagree about a key with two consumed records.
   private consumeStates(): Map<string, "consumed" | "consuming"> {
     const out = new Map<string, "consumed" | "consuming">();
     if (!this.d.consumedLog) return out;
-    const open = new Map<string, string>(), by = new Map<string, string>();
+    const open = new Map<string, string>();
+    const live = new Map<string, Set<string>>();              // tap key -> the request ids of its live consumed records
     try {
       for (const r of readLog<any>(this.d.consumedLog, { repair: false }).records) {
         if (typeof r?.tap !== "string") continue;
-        if (r.t === undefined) { out.set(r.tap, "consumed"); if (!by.has(r.tap)) by.set(r.tap, String(r.id)); open.delete(r.tap); }
+        const id = String(r.id);
+        if (r.t === undefined) { (live.get(r.tap) ?? live.set(r.tap, new Set()).get(r.tap)!).add(id); if (open.get(r.tap) === id) open.delete(r.tap); }
         else if (r.t === "consuming" && typeof r.id === "string") open.set(r.tap, r.id);
         // Round 20: a consumed record whose commit didn't land (an "unlanded" drop for the same request) no longer counts.
-        else if (r.t === "dropped" && r.unlanded === true && by.get(r.tap) === r.id) { out.delete(r.tap); by.delete(r.tap); }
-        else if (r.t === "dropped" && open.get(r.tap) === r.id) open.delete(r.tap);
+        else if (r.t === "dropped" && r.unlanded === true) live.get(r.tap)?.delete(id);
+        else if (r.t === "dropped" && open.get(r.tap) === id) open.delete(r.tap);
       }
     } catch { /* none */ }
+    for (const [k, ids] of live) if (ids.size) out.set(k, "consumed");
     for (const k of open.keys()) if (!out.has(k)) out.set(k, "consuming");
     return out;
   }
@@ -5729,6 +5758,28 @@ export class Link {
   // consumed, or a request the keeper refused (its tap notices). If none appears within REPLAY_WAIT_MS, his
   // card gets one line asking him to answer again on a fresh card, and Cain hears it.
   private replaySeen = new Map<string, number>();
+  // Round 19: waiting on the keeper's answer: one line on the card once the wait passes REPLAY_WAIT_MS more (on the
+  // monotonic clock, from when this process first waited), asking nothing of him. Round 21: a key the keeper's status
+  // hasn't answered at all (paged: it may only be queued behind the page rotation) gets the line only once it has missed a
+  // full rotation as well: ceil(replay_open / REPLAY_PAGE) keeper rounds (distinct statuses seen) since the wait began.
+  private replayRounds = new Map<string, { at: string; n: number }>();
+  private async replayWaiting(kid: string, held: any, recs: any[], st: any, f: string, paged: boolean): Promise<void> {
+    const w = `wait:${kid}`;
+    if (!this.replaySeen.has(w)) this.replaySeen.set(w, this.mono());
+    const stamp = `${st?.at ?? ""}|${st?.clock?.at ?? ""}|${st?.start?.nonce ?? ""}`;   // one keeper round: one status written
+    const rr = this.replayRounds.get(w) ?? { at: stamp, n: 0 };
+    if (stamp && stamp !== rr.at) { rr.at = stamp; rr.n++; }
+    this.replayRounds.set(w, rr);
+    if (paged) {
+      const open = Number(st?.replay_open ?? 0);
+      const rotation = Math.max(1, Math.ceil((Number.isFinite(open) ? open : 0) / KEEPER_REPLAY_PAGE));
+      if (rr.n < rotation) return;
+    }
+    if (this.mono() - this.replaySeen.get(w)! < REPLAY_WAIT_MS || recs.some((x) => x?.t === "replay-waiting" && x.kid === kid)) return;
+    try { appendLog(f, { t: "replay-waiting", kid, at: this.d.now() }); } catch { return; }
+    if (held?.msg) { try { await this.post(TAP_REPLAY_WAITING, [], { replyTo: held.msg }); } catch (e) { this.log(`couldn't tell him on card ${held.msg} that his answer is still being confirmed: ${String(e).slice(0, 80)}`); } }
+    this.log(`replayed held tap ${kid}: the record keeper hasn't answered for it within ${REPLAY_WAIT_MS / 60_000} minutes; he was told on the card it settles by itself`);
+  }
   private async replayWatch(): Promise<void> {
     const f = this.heldFile();
     if (!f || !existsSync(f) || !this.consumedVerified()) return;
@@ -5737,7 +5788,6 @@ export class Link {
     const settled = new Set(recs.filter((r) => r?.t === "replay-done").map((r) => r.kid));
     const replays = recs.filter((r) => r?.t === "released" && r.replay === true && typeof r.kid === "string" && !settled.has(r.kid));
     if (!replays.length) return;
-    const consumed = this.consumedKids();
     const st = keeperStatus(this.files().status) as any;
     const notes = st?.tap_notices;
     const noticed = new Set<string>(Array.isArray(notes) ? notes.map((n: any) => String(n?.tap ?? "")) : []);
@@ -5752,10 +5802,14 @@ export class Link {
     for (const r of replays) {
       const held = recs.find((x) => x?.t === "held" && x.kid === r.kid);
       if (!ours.has(r.kid)) {
-        if (consumed.has(r.kid) || noticed.has(r.kid)) {
+        // Round 21: read through the one consumed-or-consuming function: a key the keeper is consuming now stays held with
+        // the waiting line, and no supersede is appended for an action in flight.
+        const use = this.keyUse(r.kid);
+        if (use === "consumed" || noticed.has(r.kid)) {
           try { appendLog(f, { t: "replay-done", kid: r.kid, how: "the keeper has a request for it", at: this.d.now() }); } catch { /* the next sweep */ }
           continue;
         }
+        if (use === "consuming") { await this.replayWaiting(r.kid, held, recs, st, f, false); continue; }
         // Round 17: the 10-minute bound runs on the monotonic clock, from when this process first saw the replay
         // (a restart starts it again, so it is never shorter), never on the Pi's clock.
         if (!this.replaySeen.has(r.kid)) this.replaySeen.set(r.kid, this.mono());
@@ -5774,15 +5828,7 @@ export class Link {
       const ans = answers[r.kid];
       const where = this.keyUse(r.kid);
       if (!ans?.mirrored || where === "consuming" || ans.consumed === "consuming") {
-        // Round 19: waiting on the keeper's answer: one line on the card once the wait passes REPLAY_WAIT_MS more (on the
-        // monotonic clock, from when this process first waited), asking nothing of him.
-        const w = `wait:${r.kid}`;
-        if (!this.replaySeen.has(w)) this.replaySeen.set(w, this.mono());
-        if (this.mono() - this.replaySeen.get(w)! >= REPLAY_WAIT_MS && !recs.some((x) => x?.t === "replay-waiting" && x.kid === r.kid)) {
-          try { appendLog(f, { t: "replay-waiting", kid: r.kid, at: this.d.now() }); } catch { continue; }
-          if (held?.msg) { try { await this.post(TAP_REPLAY_WAITING, [], { replyTo: held.msg }); } catch (e) { this.log(`couldn't tell him on card ${held.msg} that his answer is still being confirmed: ${String(e).slice(0, 80)}`); } }
-          this.log(`replayed held tap ${r.kid}: the record keeper hasn't answered for it within ${REPLAY_WAIT_MS / 60_000} minutes; he was told on the card it settles by itself`);
-        }
+        await this.replayWaiting(r.kid, held, recs, st, f, !ans && where !== "consuming");
         continue;
       }
       if (where === "consumed" || ans.consumed === "consumed") {
@@ -6207,7 +6253,12 @@ export class Link {
         // doesn't stay blocked.
         const L = this.d.landings;
         const open = L?.entries()?.find((e) => e.key === k && !e.settled);
-        if (open && L!.settle(k, "not landed", new Date(this.d.now()).toISOString(), { voided: true, why: CHECK_UNANCHORED_WHY }) === false) { this.log(`couldn't settle the landing claim of tap key ${tapKid(k)} (no trustworthy anchor): tried again next sweep`); continue; }
+        // Round 21: a voided settle that can't be written goes to the void-unsettled path (kept as void, one line on the
+        // card, Cain told, retried each sweep, listed under unresolved landings), never left to block the key.
+        if (open && L!.settle(k, "not landed", new Date(this.d.now()).toISOString(), { voided: true, why: CHECK_UNANCHORED_WHY }) === false) {
+          this.log(`couldn't settle the landing claim of tap key ${tapKid(k)} (no trustworthy anchor): kept as an unsettled void, retried each sweep`);
+          await this.voidUnsettled(k, t.msg, CHECK_UNANCHORED_WHY);
+        }
         await this.notActedTap(k, t, CHECK_UNANCHORED_WHY);
         this.log(`claim ${tapKid(k)} on card ${t.msg} not acted at its migration: ${CHECK_UNANCHORED_WHY}${open ? "; its landing claim settled as voided" : ""}`);
         continue;
@@ -6245,7 +6296,8 @@ export class Link {
           labels: labelsOf(m.components) };
         continue;
       }
-      const posted = rec.until - REMEMBER_MS;
+      // Round 21: the post time from its snowflake, never from the wall-clock until.
+      const posted = SNOWFLAKE.test(id) ? snowflakeTime(id) : rec.until - REMEMBER_MS;
       Object.assign(rec, { item: "none", question: "", posted, buttons: true, labels: rec.labels ?? labelsOf(m.components) });
       // Every ask from before 0.7.0 expires now, answered or not, even one from this
       // morning: it was asked the old way, and the morning check-in asks again exactly.
@@ -6259,7 +6311,7 @@ export class Link {
       if (rec.kind || seen.has(id)) continue;
       const ask = !!rec.q;
       Object.assign(rec, { kind: rec.card !== undefined ? "card" : ask ? "ask" : "morning", item: "none",
-        posted: rec.until - REMEMBER_MS, buttons: ask && !rec.q!.used },
+        posted: SNOWFLAKE.test(id) ? snowflakeTime(id) : rec.until - REMEMBER_MS, buttons: ask && !rec.q!.used },
         ask ? { outcome: "expired", why: "posted before 0.7.0" } : {});
     }
     s.migrated = true;
@@ -6308,7 +6360,7 @@ export class Link {
       // Round 18: a card's buttons come off at its expiry as a Discord time, through the measured offset; the
       // record's own Pi clock expiry only for a card the link can't place.
       if (m.expires != null && this.expiresBy(id, m, now)) why = "expired";
-      else if (m.until - DAY <= now) why = "forgetting";
+      else if (this.forgetBy(id, m, now)) why = "forgetting";
       else if (pulls.has(id)) why = pulls.get(id)!;
       else if (item && closed.has(item.toUpperCase())) why = "item closed";
       else if (item && holds && heldElsewhere(holds, item)) why = "held elsewhere";

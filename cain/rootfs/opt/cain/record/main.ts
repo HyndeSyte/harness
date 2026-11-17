@@ -22,7 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { AFTER_RENAME, appendLog, crashSpy, readLog, syncDir } from "../applog.ts";
+import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, lockRefusal, probeLock, readLog, syncDir, withLogLock } from "../applog.ts";
 import { installState } from "../installflag.ts";
 
 export type Config = {
@@ -381,8 +381,11 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   linesDone?: string[]; historyLines?: string[]; recoverLines?: { nonce: string; said: string }[];
   tapNotices?: TapNotice[];
   // Round 20: consecutive rounds whose consuming intents couldn't be resolved, and whether that was told.
-  intentStuck?: { rounds: number; told?: boolean } };
-type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded" | "unstamped" | "unlanded" | "waiting"; reason: string; msg?: string; at: string };
+  intentStuck?: { rounds: number; told?: boolean; ep?: number };
+  // Round 21: the number of the last stuck-intent episode (each new run of stuck rounds is one more).
+  intentEp?: number };
+// Round 21: a "waiting" notice names its request (id) and its stuck episode (ep): deduplicated per (tap, request, episode).
+type TapNotice = { tap: string; why: "refused" | "lost" | "expired" | "time" | "hold" | "superseded" | "unstamped" | "unlanded" | "waiting"; reason: string; msg?: string; at: string; id?: string; ep?: number };
 const TAPS_KEPT = 1000;
 // Round 9: a consumed tap key is pruned once it is older than the longest card lifetime (an ask or
 // Ship card lasts until the next morning check-in, or the one after: under two days) plus a margin.
@@ -417,10 +420,15 @@ export function readConsumed(cfg: Config): Map<string, string> {
   // Round 19: only consumed records ({tap, id, at}, no t); a "consuming" intent and its "dropped" resolution aren't.
   // Round 20: a consumed record later found not to have landed (an "unlanded" drop for the same key and request: its
   // commit was lost to a reset or rebuild, or never reached the remote) no longer counts.
+  // Round 21: per (tap key, request id), as the link reads it: a drop applies to its own record alone, and a key stands
+  // consumed while any of its records is live (by its first live request, a real one before the landing ledger's mark).
+  const live = new Map<string, string[]>();
   for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records) {
-    if (j?.t === undefined && TAP_KEY.test(j?.tap) && typeof j.id === "string" && (!out.has(j.tap) || out.get(j.tap) === LEDGER_CONSUMER)) out.set(j.tap, j.id);
-    else if (j?.t === "dropped" && j.unlanded === true && TAP_KEY.test(j?.tap) && out.get(j.tap) === j.id) out.delete(j.tap);
+    if (!TAP_KEY.test(j?.tap) || typeof j?.id !== "string") continue;
+    if (j.t === undefined) { const a = live.get(j.tap) ?? []; if (!a.includes(j.id)) a.push(j.id); live.set(j.tap, a); }
+    else if (j.t === "dropped" && j.unlanded === true) { const a = live.get(j.tap); if (a) live.set(j.tap, a.filter((x) => x !== j.id)); }
   }
+  for (const [k, a] of live) if (a.length) out.set(k, a.find((x) => x !== LEDGER_CONSUMER) ?? a[0]);
   return out;
 }
 // Round 19: supersede and consumption meet at one durable arbitration point, the consumed-key log. Before the keeper
@@ -473,36 +481,85 @@ export function resolveIntents(cfg: Config, nowIso: string): { consumed: string[
 }
 // Round 20: a consumed record is "landed" once the remote's branch (as just fetched) carries a commit with its tap key
 // and request id. One whose commit is unreachable (on no ref of the local copy: lost to a reset of the copy, or a
-// rebuild), or not on the remote within LANDED_WINDOW_MS while the copy is in step with it, is dropped explicitly (an
+// rebuild), or not on the remote within the landing window while the copy is in step with it, is dropped explicitly (an
 // "unlanded" drop), and he and Cain are told the change did not land. Landed marks keep each round's look to the new ones.
+// Round 21: the window is timed by the monotonic clock of this keeper run (from when it first saw the record unlanded)
+// plus at least LANDED_MIN_ROUNDS fetch rounds with the copy in step, never by the wall clock (a restart starts it again,
+// so it is never shorter). The drop is one locked step on the consumed-key log (its flock held): the record re-read, the
+// drop appended (it is the tombstone), and the commit abandoned: taken out of the local branch when it is there
+// (abandonCommits). The push path checks the tombstones too (abandonCommits before every push) and never pushes a commit
+// whose request was dropped, so a late push can't apply an answer that was dropped and asked again.
 export const LANDED_WINDOW_MS = 2 * 3_600_000;
+export const LANDED_MIN_ROUNDS = 3;
+const landWatch = new Map<string, { since: number; rounds: number }>();
 export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boolean; now: number; queued?: Set<string> }): { landed: string[]; unlanded: { tap: string; id: string; why: string }[] } {
   const out = { landed: [] as string[], unlanded: [] as { tap: string; id: string; why: string }[] };
   let recs: any[] = [];
   try { recs = readLog<any>(tapsLogFile(cfg), { repair: false }).records; } catch { return out; }
-  const state = new Map<string, { tap: string; id: string; at: string; s: "open" | "landed" | "gone" }>();
-  for (const j of recs) {
-    if (!TAP_KEY.test(j?.tap) || typeof j.id !== "string") continue;
-    const k = tapPair(j.tap, j.id);
-    if (j.t === undefined) { if (j.id === LEDGER_CONSUMER || j.id.startsWith("the commit ")) continue; const was = state.get(k); state.set(k, { tap: j.tap, id: j.id, at: String(j.at ?? ""), s: was?.s === "landed" ? "landed" : "open" }); }
-    else if (j.t === "landed" && state.has(k)) state.get(k)!.s = "landed";
-    else if (j.t === "dropped" && j.unlanded === true && state.has(k)) state.get(k)!.s = "gone";
-  }
+  const open = (rs: any[]) => {
+    const state = new Map<string, { tap: string; id: string; at: string; s: "open" | "landed" | "gone" }>();
+    for (const j of rs) {
+      if (!TAP_KEY.test(j?.tap) || typeof j.id !== "string") continue;
+      const k = tapPair(j.tap, j.id);
+      if (j.t === undefined) { if (j.id === LEDGER_CONSUMER || j.id.startsWith("the commit ")) continue; const was = state.get(k); state.set(k, { tap: j.tap, id: j.id, at: String(j.at ?? ""), s: was?.s === "landed" ? "landed" : was?.s === "gone" ? "gone" : "open" }); }
+      else if (j.t === "landed" && state.has(k)) state.get(k)!.s = "landed";
+      else if (j.t === "dropped" && j.unlanded === true && state.has(k)) state.get(k)!.s = "gone";
+    }
+    return state;
+  };
   // A request still queued is applied again after a reset (its commit made again), so it isn't judged until it leaves.
-  const pending = [...state.values()].filter((x) => x.s === "open" && !o.queued?.has(x.id));
+  const pending = [...open(recs).values()].filter((x) => x.s === "open" && !o.queued?.has(x.id));
   if (!pending.length || !o.fetched) return out;
   try { git(cfg, ["rev-parse", "--verify", "HEAD"]); } catch { return out; }
   const all = new Set<string>(), remote = new Set<string>();
   historyTaps(cfg, { pairs: all });
   historyTaps(cfg, { pairs: remote, refs: [`origin/${cfg.branch}`] });
+  const mono = cfg.mono ? cfg.mono() : performance.now();
   for (const x of pending) {
-    const k = tapPair(x.tap, x.id), age = o.now - Date.parse(x.at);
-    if (remote.has(k)) { appendLog(tapsLogFile(cfg), { t: "landed", tap: x.tap, id: x.id, at: new Date(o.now).toISOString() }); out.landed.push(x.tap); continue; }
+    const k = tapPair(x.tap, x.id), w = `${cfg.dir}\u0000${k}`;
+    if (remote.has(k)) { landWatch.delete(w); appendLog(tapsLogFile(cfg), { t: "landed", tap: x.tap, id: x.id, at: new Date(o.now).toISOString() }); out.landed.push(x.tap); continue; }
+    if (!landWatch.has(w)) landWatch.set(w, { since: mono, rounds: 0 });
+    const lw = landWatch.get(w)!;
+    if (o.inStep) lw.rounds++;
     const why = !all.has(k) ? "its commit is on no ref of the record's copy any more (a reset or a rebuild discarded it)"
-      : o.inStep && Number.isFinite(age) && age > LANDED_WINDOW_MS ? `its commit isn't on GitHub's ${cfg.branch} ${Math.round(LANDED_WINDOW_MS / 3_600_000)} hours after it, with the copy in step` : null;
+      : o.inStep && mono - lw.since > LANDED_WINDOW_MS && lw.rounds >= LANDED_MIN_ROUNDS ? `its commit isn't on GitHub's ${cfg.branch} ${Math.round(LANDED_WINDOW_MS / 3_600_000)} hours after the keeper first saw it unlanded, over ${lw.rounds} fetch rounds with the copy in step` : null;
     if (!why) continue;
-    appendLog(tapsLogFile(cfg), { t: "dropped", tap: x.tap, id: x.id, unlanded: true, why, at: new Date(o.now).toISOString() });
-    out.unlanded.push({ tap: x.tap, id: x.id, why });
+    // One locked step: re-read under the flock (a landed mark or a drop since counts), the drop (the tombstone) appended,
+    // and the commit abandoned.
+    const dropped = withLogLock(tapsLogFile(cfg), () => {
+      const now = open(readLog<any>(tapsLogFile(cfg), { repair: false }).records).get(k);
+      if (now?.s !== "open") return false;
+      appendLogHeld(tapsLogFile(cfg), { t: "dropped", tap: x.tap, id: x.id, unlanded: true, why, at: new Date(o.now).toISOString() });
+      try { abandonCommits(cfg); } catch (e) { log(`couldn't take the dropped commit for tap key ${x.tap} out of the local branch yet (${(e as Error).message}): the push path refuses it`); }
+      return true;
+    });
+    landWatch.delete(w);
+    if (dropped) out.unlanded.push({ tap: x.tap, id: x.id, why });
+  }
+  return out;
+}
+// Round 21: the push path's tombstone check. Every unpushed commit (on the local branch, not on the remote's) whose Tap-Key
+// and Tap-Request pair has an unlanded drop is taken out of the local branch (the commits after it replayed onto its
+// parent); when that can't be done cleanly (a conflict), the push is refused this round (refused says why), so a commit
+// whose request was dropped is never pushed.
+export function abandonCommits(cfg: Config): { abandoned: string[]; refused?: string } {
+  const out = { abandoned: [] as string[] } as { abandoned: string[]; refused?: string };
+  let tomb: Set<string>;
+  try { readLog<any>(tapsLogFile(cfg), { repair: false }); tomb = tombstones(cfg); }
+  catch (e) { return { abandoned: [], refused: `the consumed-key log can't be read to check for dropped requests (${clean((e as Error).message, 120)})` }; }
+  if (!tomb.size) return out;
+  for (let guard = 0; guard < 50; guard++) {
+    let text = "";
+    try { text = git(cfg, ["log", "--reverse", "--format=%x1e%H%x1f%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", `origin/${cfg.branch}..HEAD`]); }
+    catch { return out; }                                   // no remote branch known yet: nothing of it was pushed
+    const hit = text.split("\x1e").map((r) => r.split("\x1f").map((x) => (x ?? "").trim())).find(([sha, k, id]) => sha && k && id && tomb.has(tapPair(k, id)));
+    if (!hit) return out;
+    try { git(cfg, ["rebase", "--quiet", "--onto", `${hit[0]}^`, hit[0]]); out.abandoned.push(hit[0]); log(`took the commit of dropped request ${hit[2]} (tap key ${hit[1]}) out of the local branch: it is never pushed`); }
+    catch (e) {
+      try { git(cfg, ["rebase", "--abort"]); } catch { /* none in progress */ }
+      out.refused = `an unpushed commit carries dropped request ${hit[2]} (tap key ${hit[1]}) and couldn't be taken out of the local branch (${clean((e as Error).message, 120)}), so nothing is pushed`;
+      return out;
+    }
   }
   return out;
 }
@@ -646,7 +703,7 @@ export function readIssued(cfg: Config, now: number): { keys: Map<string, Issued
   const files: [string, any[]][] = [];
   for (const f of [issuedMirrorFile(cfg), linkIssuedFile(cfg)]) {
     let recs: any[] = [];
-    try { recs = readLog<any>(f, { repair: f === issuedMirrorFile(cfg) ? undefined : false }).records; } catch { /* unreadable: the other file */ }
+    try { recs = readLog<any>(f, { repair: f === issuedMirrorFile(cfg) ? "mirror" : false }).records; } catch { /* unreadable: the other file */ }
     files.push([f, recs]);
   }
   // Round 17: a key ages out by Discord's times (its card's post snowflake more than ISSUED_KEEP_MS before the newest
@@ -697,7 +754,7 @@ export function readIssued(cfg: Config, now: number): { keys: Map<string, Issued
 function mirrorIssued(cfg: Config): number {
   let link: any[] = [], mine: any[] = [];
   try { link = readLog<any>(linkIssuedFile(cfg), { repair: false }).records; } catch { return 0; }
-  try { mine = readLog<any>(issuedMirrorFile(cfg)).records; } catch { /* none yet */ }
+  try { mine = readLog<any>(issuedMirrorFile(cfg), { repair: "mirror" }).records; } catch { /* none yet */ }
   const have = new Set(mine.filter((r) => r?.t === "key").map((r) => r.kid));
   let n = 0;
   for (const r of link) if (r?.t === "key" && TAP_KEY.test(r.kid) && !have.has(r.kid)) { appendLog(issuedMirrorFile(cfg), r); have.add(r.kid); n++; }
@@ -715,13 +772,24 @@ function mirrorIssued(cfg: Config): number {
 // branch and the local copy's head.
 // Round 14: from every ref of the local copy (its branches, unpushed commits included, and the remote's
 // branch as last fetched), and with the Owner-Line trailers (lines).
+// Round 21: the keeper's start probe of flock, on a probe file in the folder of its shared logs. null: fine.
+export function keeperLockProbe(cfg: Config): string | null { return probeLock(dirname(tapsLogFile(cfg))); }
+// Round 21: a commit whose Tap-Key and Tap-Request pair has an unlanded drop (its tombstone in the consumed-key log) counts
+// for nothing here: the rebuild never brings a dropped consumption back, and it never resolves an intent.
+function tombstones(cfg: Config): Set<string> {
+  const out = new Set<string>();
+  try { for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records) if (j?.t === "dropped" && j.unlanded === true && TAP_KEY.test(j.tap) && typeof j.id === "string") out.add(tapPair(j.tap, j.id)); } catch { /* none readable */ }
+  return out;
+}
 export function historyTaps(cfg: Config, o: { cards?: string[]; once?: Set<string>; refs?: string[]; lines?: Set<string>; pairs?: Set<string> } = {}): Map<string, string> {
   const out = new Map<string, string>();
+  const tomb = tombstones(cfg);
   for (const ref of o.refs ?? ["--all"]) {
     let text = "";
     try { text = git(cfg, ["log", "--reverse", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)%x1f%h%x1f%(trailers:key=Tap-Card,valueonly,separator=%x2C)%x1f%(trailers:key=Install-Once,valueonly,separator=%x2C)%x1f%(trailers:key=Owner-Line,valueonly,separator=%x2C)", ref]); } catch { continue; }
     for (const rec of text.split("\x1e")) {
       const [k, id, sha, card, once, line] = rec.split("\x1f").map((x) => (x ?? "").trim());
+      if (k && id && tomb.has(tapPair(k, id))) continue;
       if (k && TAP_KEY.test(k) && !out.has(k)) out.set(k, id || `the commit ${sha}`);
       if (k && TAP_KEY.test(k) && id) o.pairs?.add(tapPair(k, id));
       if (card && /^\d{15,22}$/.test(card) && o.cards && !o.cards.includes(card)) o.cards.push(card);
@@ -884,7 +952,8 @@ function revive(j: any): State | null {
     ...(Array.isArray(j.recoverLines) ? { recoverLines: j.recoverLines.filter((x: any) => typeof x?.nonce === "string" && typeof x?.said === "string").slice(-50) } : {}),
     ...(Array.isArray(j.tapNotices) ? { tapNotices: j.tapNotices.filter((n: any) => n && TAP_KEY.test(n.tap) && ["refused", "lost", "expired", "time", "hold", "superseded", "unstamped", "unlanded", "waiting"].includes(n.why) && typeof n.at === "string")
       .map((n: any) => ({ tap: n.tap, why: n.why, reason: String(n.reason ?? ""), ...(typeof n.msg === "string" ? { msg: n.msg } : {}), at: n.at })) } : {}),
-    ...(j.intentStuck && Number.isInteger(j.intentStuck.rounds) ? { intentStuck: { rounds: j.intentStuck.rounds, ...(j.intentStuck.told === true ? { told: true } : {}) } } : {}) };
+    ...(j.intentStuck && Number.isInteger(j.intentStuck.rounds) ? { intentStuck: { rounds: j.intentStuck.rounds, ...(j.intentStuck.told === true ? { told: true } : {}), ...(Number.isInteger(j.intentStuck.ep) ? { ep: j.intentStuck.ep } : {}) } } : {}),
+    ...(Number.isInteger(j.intentEp) ? { intentEp: j.intentEp } : {}) };
 }
 
 function publishedHolds(cfg: Config): string | null {
@@ -1322,7 +1391,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       const nowIso = clock().toISOString();
       for (const [what, f] of [["consumed tap keys", tapsLogFile(cfg)], ["issued tap keys (the keeper's mirror)", issuedMirrorFile(cfg)]] as const) {
         try {
-          const r = readLog(f);
+          const r = readLog(f, { repair: f === issuedMirrorFile(cfg) ? "mirror" : true });
           if (r.torn) { log(`TORN: a torn final record (${r.tornBytes} bytes) in the log of ${what} was truncated; the records before it stand`); relay(cfg, `The record keeper found a torn final record in its log of ${what} (a write cut short, as by a power cut) and truncated it; every record before it stands. Nothing to tell him.`); }
         } catch (e) { log(`couldn't read the log of ${what}: ${(e as Error).message}`); }
       }
@@ -1434,6 +1503,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 20: a consumed key whose commit didn't land: dropped (above), and he (on the card) and Cain are told.
       for (const u of unlandedNow) {
         if (S.taps?.[u.tap]?.id === u.id) delete S.taps[u.tap];
+        // Round 21: a dropped request is never run again by a reset either.
+        if (S.settled?.some((w) => w.req === u.id)) S.settled = S.settled.filter((w) => w.req !== u.id);
         const r = reg.keys.get(u.tap);
         const reason = clean(`the change from tap key ${u.tap} (request ${u.id}) did not land: ${u.why}. Record nothing from it as done; check ${r?.item && r.item !== "NONE" ? r.item : "its item"} again at its source and ask again with --checked if it still needs him`, 600);
         notice({ tap: u.tap, why: "unlanded", reason, ...(r?.msg ? { msg: r.msg } : {}) });
@@ -1442,15 +1513,25 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       }
       // Round 20: intents that stayed open INTENT_STUCK_ROUNDS rounds in a row: a keeper notice to Cain, and one line on
       // each card to him (it settles by itself).
+      // Round 21: deduplicated per (tap key, request id, episode): each new run of stuck rounds is an episode of its own,
+      // and an intent's waiting mark is cleared once that intent resolves or is dropped, so a second stuck episode on the
+      // same key (after a drop and a re-ask) is told again.
+      const openNow = intentsLeft > 0 ? openIntents(cfg) : new Map<string, string>();
+      S.tapNotices = S.tapNotices!.filter((n) => n.why !== "waiting" || (n.id !== undefined && openNow.get(n.tap) === n.id));
       if (intentsLeft > 0) {
-        const was = S.intentStuck ?? { rounds: 0 };
+        const was = S.intentStuck ?? { rounds: 0, ep: (S.intentEp ?? 0) + 1 };
+        S.intentEp = Math.max(S.intentEp ?? 0, was.ep ?? 0);
         S.intentStuck = { ...was, rounds: was.rounds + 1 };
-        if (S.intentStuck.rounds >= INTENT_STUCK_ROUNDS && !S.intentStuck.told) {
-          S.intentStuck.told = true;
-          const open = [...openIntents(cfg).keys()];
-          for (const k of open) { const r = reg.keys.get(k); notice({ tap: k, why: "waiting", reason: "its consuming intent couldn't be resolved yet", ...(r?.msg ? { msg: r.msg } : {}) }); }
-          relay(cfg, `The record keeper couldn't resolve whether ${open.length} tap request(s) were acted on (tap key${open.length === 1 ? "" : "s"} ${open.join(", ")}) for ${S.intentStuck.rounds} rounds: the record's history can't be read. It keeps trying each round, and the link holds those taps meanwhile. He is told on each card that it settles by itself. Nothing to do.`);
-          log(`consuming intents unresolved for ${S.intentStuck.rounds} rounds: ${open.join(", ")}; told`);
+        if (S.intentStuck.rounds >= INTENT_STUCK_ROUNDS) {
+          const ep = S.intentStuck.ep ?? 0;
+          const fresh = [...openNow].filter(([k, id]) => !S.tapNotices!.some((x) => x.why === "waiting" && x.tap === k && x.id === id && x.ep === ep));
+          for (const [k, id] of fresh) { const r = reg.keys.get(k); S.tapNotices!.push({ tap: k, why: "waiting", reason: "its consuming intent couldn't be resolved yet", id, ep, at: nowIso, ...(r?.msg ? { msg: r.msg } : {}) }); }
+          if (fresh.length) {
+            S.intentStuck.told = true;
+            const open = fresh.map(([k]) => k);
+            relay(cfg, `The record keeper couldn't resolve whether ${open.length} tap request(s) were acted on (tap key${open.length === 1 ? "" : "s"} ${open.join(", ")}) for ${S.intentStuck.rounds} rounds: the record's history can't be read. It keeps trying each round, and the link holds those taps meanwhile. He is told on each card that it settles by itself. Nothing to do.`);
+            log(`consuming intents unresolved for ${S.intentStuck.rounds} rounds: ${open.join(", ")}; told`);
+          }
         }
       } else if (S.intentStuck) { if (S.intentStuck.told) log("the consuming intents resolve again"); delete S.intentStuck; }
       // Round 16: a held tap with Discord's time for it is judged by snowflakes alone: its interaction's time,
@@ -1683,6 +1764,9 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
     let why = "";
     try {
       cfg.beforePush?.();
+      // Round 21: never push a commit whose request was dropped as not landed (its tombstone in the consumed-key log).
+      const ab = abandonCommits(cfg);
+      if (ab.refused) throw new Error(ab.refused);
       const blocked = blockFile(cfg);
       if (existsSync(blocked)) {
         log("the smoke test's push block is on: pushing to a wrong remote this round");
@@ -2173,6 +2257,16 @@ if (import.meta.main) {
   // Round 13: the start check is each round's (cycle): a log missing or shorter than its high-water count
   // starts the keeper degraded; only a case no rule explains refuses, round by round, until the owner's
   // recover-logs line, so the keeper never has to be restarted by hand.
+  // Round 21: flock is probed at start on a probe file in the real log folder; when it can't be loaded or taken, the
+  // keeper refuses to start (nothing is applied), says why in its log, and Cain gets the status line for him. It tries
+  // again hourly, so a fixed box needs no restart by hand.
+  for (let told = false; ; ) {
+    const why = keeperLockProbe(cfg);
+    if (!why) break;
+    log(`REFUSED TO START: ${why}`);
+    if (!told) { told = true; relay(cfg, `The record keeper refuses to start: ${why}. Tell Dane this line, in your own words and once: "${lockRefusal("record keeper", why)}" Log a Build item. Nothing else to do: it tries again by itself every hour.`); }
+    await Bun.sleep(3_600_000);
+  }
   log("keeping the record");
   await keep(cfg, { fullMs: Number(process.env.RECORD_INTERVAL_S ?? 60) * 1000, pollMs: Number(process.env.RECORD_POLL_MS ?? 2000) });
 }

@@ -1198,6 +1198,38 @@ What Cain's link enforces:
   Ship cards included. A Ship landing voided before its push whose ledger file couldn't be marked settled is
   kept unresolved, retried each sweep, said once under its card, and settleable by your settle line.
 
+  Round 21 (the twenty-first review's fixes, to defects in round 20's own additions; the design stays frozen
+  for the combined fault scenario, which is unchanged, and no new durable store: the tombstone is the
+  existing unlanded drop record). The table in `cain/docs/source-check-invariants.md` is updated for every
+  row this round touches.
+
+  A consumption dropped as not landed can't come back: the drop is one locked step on the consumed-key log
+  that also takes its commit out of the keeper's local branch, the drop is a tombstone, and before every
+  push the keeper takes any commit whose request was dropped out of the branch (or refuses the push when it
+  can't), so a late push never applies an answer that was dropped and asked again; the rebuild and intent
+  resolution skip a tombstoned commit. The two-hour window runs on the keeper's monotonic clock from when it
+  first saw the record unlanded, over at least three fetch rounds with the copy in step, never the wall clock.
+  Both views of the consumed-key log (the link's and the keeper's) are keyed on tap key and request id, so a
+  second consumed record for one key is marked landed or dropped on its own and the views agree. The replay
+  check reads "consumed or consuming" from the one function: a key the keeper is consuming stays held with
+  the waiting line and gets no supersede; the waiting line for a key the keeper hasn't answered yet waits out
+  a full page rotation of the open replays too. A legacy card's claim whose voided settle can't be written
+  goes into the void-unsettled path (kept as void, one line on the card, Cain told, retried each sweep,
+  listed under unresolved landings), and a void claim's seven-day alert says nothing was pushed.
+
+  flock is resolved through a soname list (libc.so.6, libc.so, libc) and probed at start by the link and the
+  keeper on a probe file in the real log folder; when it can't be loaded or taken, each refuses to start
+  with one status line (the link posts it to you; the keeper's goes through Cain) and tries again hourly.
+  A lock error that isn't would-block is told at once by its errno; a lock wait past five seconds is a
+  timeout every caller holds and retries (a tap answers busy with its buttons kept, a release waits for the
+  next sweep, a keeper request stays queued), never a dropped record. An arm64 run of the lock tests is a CI
+  job (`arm64-flock`, an arm64 container under QEMU); the Pi smoke test's first step exercises the real
+  lock on the Pi. A reader never truncates a torn tail by default; a repair takes the log's lock, and only
+  the keeper's single-writer mirror repairs without it. Retention is clock-free for a card with a snowflake
+  id: the sweep's forgetting, pruning and the restore's post time come from the post snowflake plus 35
+  days; the Pi's clock decides those only for a card with no snowflake id. The stuck-intent waiting notice
+  is told once per tap, request and episode, and cleared when the intent resolves.
+
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
   predicate. A reset of the record that wins before that point (checked right before the claim)

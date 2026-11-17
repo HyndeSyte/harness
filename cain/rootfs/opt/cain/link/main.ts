@@ -48,6 +48,7 @@ import { sign as edSign, timingSafeEqual } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { teeConsole } from "../logfile";
+import { lockRefusal, probeLock } from "../applog";
 import { localReadings, verdict } from "../clock";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
@@ -307,6 +308,18 @@ const link = new Link({
 // written once at start when there is none yet (a first start).
 try { if (!existsSync(STATE)) save(load()); } catch (e) { console.log(`[cain] link: couldn't write its first state: ${String(e).slice(0, 80)}`); }
 
+// Round 21: flock is probed at start on a probe file in the real log folder. When it can't be loaded or taken, the link
+// refuses to start its sweep and its gateway (no taps taken, no cards posted), logs why, posts him the status line once,
+// and tells Cain; it tries again hourly.
+const LOCK_REFUSED = probeLock(ISSUED_LOG.replace(/\/[^/]*$/, "") || "/data");
+if (LOCK_REFUSED) {
+  console.log(`[cain] link: REFUSED TO START: ${LOCK_REFUSED}`);
+  link.relayLine(`The link refuses to start: ${LOCK_REFUSED}. Dane was told by the App. Log a Build item; nothing else to do.`);
+  try { await link.notice(lockRefusal("link", LOCK_REFUSED), NOTICE_TIMEOUT_MS); } catch (e) { console.log(`[cain] link: couldn't post the lock refusal: ${String(e).slice(0, 80)}`); }
+  while (probeLock(ISSUED_LOG.replace(/\/[^/]*$/, "") || "/data")) await Bun.sleep(3_600_000);
+  console.log("[cain] link: its logs can be locked now; starting");
+}
+
 // -- the gateway's health, for the Harness page ------------------------------------
 let connected = false;
 let lastHeard = 0;                       // ms: the last thing Discord's gateway sent
@@ -429,6 +442,7 @@ Bun.serve({
   },
 });
 console.log(`[cain] link listening on ${PORT}`);
+
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)
