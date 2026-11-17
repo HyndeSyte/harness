@@ -868,9 +868,13 @@ came between the tap being taken in and its decision being recorded) didn't run,
 has *Go ahead*; a change whose approval was used up and which Harness's own executor is still carrying out
 stays unknown in the journal, never struck, while its job isn't finished: after the schedule below it's
 read every hour, and at every start, and settled only once its job reads finished. A read of the records
-that fails (a database error) counts the same way: the tap is kept, you're told once that Harness's records
-couldn't be read just now, and it's read again on that schedule and at every start; it's struck only once a
-read answers with a finished job or a used-up choice. A change whose
+that fails (a database or disk error, and only that) counts the same way: the tap is kept, you're told once
+that Harness's records couldn't be read just now, and it's read again on that schedule and at every start;
+it's struck only once a read answers with a finished job or a used-up choice. The log says a tap waits only
+when what it waits on changes, not at every hourly read. A tap whose own id can't be read is a permanent
+outcome, not a wait: one card says Harness couldn't identify this tap in its records, with no *Go ahead*,
+and it's struck. The records' schedule and the calendar's keep their own counts: once the records read
+again, a calendar that can't be read still gets its own six reads. A change whose
 approval was used up and whose job ended while the calendar reads some of it not done is a failed or
 partial outcome, never "the records took it": its card names each part that isn't done; parts safe to do
 again (a Gmail removal whose event is still there, or an add absent at its fixed id that the records' own
@@ -878,8 +882,10 @@ run never sent) get *Go ahead*, which reads each again by its identity and puts 
 your approval, written to the first offer's fixed ids, which are set with the new card and are the ids
 its preview reads, so what it shows is what the write finds. Parts not offered again are told apart, none
 with *Go ahead*, and nothing asks you to send anything again: an add whose write was sent, or may have
-been (absence is ambiguous, so it isn't done again); a change that leaves nothing Harness can read (a
-Family removal); and a part whose read failed. An add whose step was found in its very version also gets
+been (absence or a change since is ambiguous, so it isn't done again; only these say its write may have
+reached your calendar); a change that leaves nothing Harness can read (a Family removal); a part whose read
+failed; and a part read plainly as not done that isn't safe to do again by itself, whose card says it was
+checked and isn't done, and to ask for it again if you still want it. An add whose step was found in its very version also gets
 no *Go ahead*: the settle record keeps that step's entry, so absence after it reads as gone since. A choice the records took and finished is said
 truthfully, with no *Go ahead* (its button is used up and its receipt says what happened). A read that
 can't answer is read again after exactly 1, 2, 5, 15, 30 and 60 minutes (six reads), and you're told once
@@ -888,7 +894,11 @@ time couldn't be written); once the schedule runs out the card says your calenda
 the outcome is recorded as unverified. That outcome is final: a tap left recorded as unverified (the
 outcome written, then a stop before its card or strike) is finished at the next start, or by the running
 loop, with the same card saying your calendar couldn't be read, and struck; it's never taken for a tap
-Harness didn't get to. You're told a tap waits only once that note is queued, so a note that couldn't be
+Harness didn't get to. Each such tap is finished on its own: its card and its strike go in one
+transaction, so a strike that can't be written to the tap journal takes its card back with it, and it's
+tried again after 1, 2, 5, 15, 30 and then every 60 minutes, never every few seconds; a mark written with
+the card, and the outbox's own key for that tap, mean no tap ever gets its card twice, however many are
+left (more than ten included) and whichever of them fails. You're told a tap waits only once that note is queued, so a note that couldn't be
 queued goes at the next read, or after a restart. A tap whose decision never reached the records, read
 while your calendar can't be read, says so: its *Go ahead* reads first, and if your calendar still can't
 be read nothing is done, you're told plainly, and the same *Go ahead* comes back on a new card that reads
@@ -950,8 +960,11 @@ rule would refuse taken out (its imperative patterns and its label finder are mi
 rules: the verbs it looks for, labels across a line break, quoted and bold labels, every label it knows;
 both sides run the same shared cases), so a sentence that merely holds the words stays; if nothing is left,
 or the card's head went with them, or the link turns it down a second time, a fixed card goes instead, in
-fixed words only (when it was written, whether it's about a message of yours, and that its full words
-couldn't be shown), with the card's own buttons, so a card is never lost to a refusal. The refusal is recorded in Harness's log, and the link writes its own gate-report
+fixed words only (when it was written, whether it's about a message of yours, what happened where the card
+carries it, from three fixed phrases: done, not done, or Harness couldn't verify how it went, and that its
+full words couldn't be shown), with the card's own buttons, so a card is never lost to a refusal. Every line
+of it, each phrase included, is in the shared cases both sides check against the link's own rule, and each
+use is logged, so how often it's needed shows. The refusal is recorded in Harness's log, and the link writes its own gate-report
 entry. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
 the App such a writer waits in bounded slices, logging each and trying again, and gives up after five
 minutes with an error rather than hang. The hold is always released, even when what it holds fails. The
@@ -1026,7 +1039,11 @@ progress record that's truncated or unreadable is rebuilt from those noted diges
 and compared) and from which originals are still there, rather than stopping. A file with neither a good
 copy (never checked, or no longer matching) nor its original is never dropped silently: the loss is
 written into the progress record, the answer names that file, and nothing more is moved, the swap marker
-and the live records left as they were. This is the command line's alone; nothing of it runs at a start.
+and the live records left as they were. A copy with no digest note can't be checked, so it's named as
+unverified, never skipped. If a lost file isn't needed, `python3 -m harness.migrate /data/harness.sqlite
+--set-aside --accept-lost <name>` records it as accepted (moving nothing, the swap marker and the live
+records untouched), and the next `--set-aside` finishes the rest without it; a name that isn't recorded as
+lost is refused. This is the command line's alone; nothing of it runs at a start.
 A swap marker that can't be read (damaged or cut short) is never deleted and
 nothing is moved: the start runs degraded, and the page lists the files at the records' live and kept
 names, as `python3 -m harness.migrate /data/harness.sqlite --swap` does, for sorting by hand. The marker

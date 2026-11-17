@@ -1807,6 +1807,7 @@ def _sha256(path: str) -> str:
 
 
 SET_ASIDE_DIGEST = ".digest"           # beside each checked copy in the set-aside folder (nineteenth round)
+SET_ASIDE_ACCEPTED = ".accepted"       # beside a lost copy he accepted as not needed (twenty-first round)
 
 
 def _digest_note(dest: str, name: str) -> str:
@@ -1825,11 +1826,23 @@ def _rebuild_progress(folder: str, swap: str) -> dict:
     except OSError:
         return {}
     for dest in names:
-        files, lost = {}, []
+        files, lost, unverified, accepted = {}, [], [], []
         try:
             entries = os.listdir(os.path.join(folder, dest))
         except OSError:
             continue
+        noted = {e[1:-len(SET_ASIDE_DIGEST)] for e in entries if e.startswith(".") and e.endswith(SET_ASIDE_DIGEST)}
+        for e in entries:
+            if e.startswith(".") and e.endswith(SET_ASIDE_ACCEPTED) and _plain_name(e[1:-len(SET_ASIDE_ACCEPTED)]):
+                if _read_json(os.path.join(folder, dest, e)).get("marker") == marker:
+                    accepted.append(e[1:-len(SET_ASIDE_ACCEPTED)])
+        for e in entries:
+            # Twenty-first round: a copy with no digest note can't be checked, so it's unverified; when its original
+            # is gone too, it's named (as lost, and why), never skipped.
+            if (not e.startswith(".") and _plain_name(e) and e not in noted
+                    and os.path.isfile(os.path.join(folder, dest, e))
+                    and not os.path.lexists(os.path.join(folder, e))):
+                unverified.append(e)
         for note in entries:
             if not (note.startswith(".") and note.endswith(SET_ASIDE_DIGEST)):
                 continue
@@ -1849,9 +1862,10 @@ def _rebuild_progress(folder: str, swap: str) -> dict:
                 # Twentieth round: noted for this swap, but its copy is damaged (or gone) and its original is gone
                 # too: neither a good copy nor an original. Never dropped silently: it's named as lost.
                 lost.append(name)
-        if files or lost:
+        if files or lost or unverified:
             log.warning("the set-aside progress record couldn't be read; rebuilt from %s's checked copies", dest)
-            return {"marker": marker, "dest": dest, "files": files, "lost": sorted(lost)}
+            return {"marker": marker, "dest": dest, "files": files, "lost": sorted(set(lost) | set(unverified)),
+                    "unverified": sorted(unverified), "accepted": sorted(accepted)}
     return {}
 
 
@@ -1888,7 +1902,10 @@ def _set_aside_progress(folder: str, swap: str, path: str) -> dict:
         d = r.get("digest")
         clean[name] = {"digest": d if isinstance(d, str) else None, "removed": bool(r.get("removed"))}
     lost = [str(n) for n in rec.get("lost") or [] if isinstance(n, str) and _plain_name(n)]
-    return {"marker": rec["marker"], "dest": dest, "files": clean, "lost": lost}
+    accepted = [str(n) for n in rec.get("accepted") or [] if isinstance(n, str) and _plain_name(n)]
+    unverified = [str(n) for n in rec.get("unverified") or [] if isinstance(n, str) and _plain_name(n)]
+    return {"marker": rec["marker"], "dest": dest, "files": clean, "lost": lost, "accepted": accepted,
+            "unverified": unverified}
 
 
 def _set_aside_lost(base: str, progress: dict, lost: list[str], progress_path: str) -> dict:
@@ -1899,20 +1916,71 @@ def _set_aside_lost(base: str, progress: dict, lost: list[str], progress_path: s
     stopped), never at a start."""
     log.error("set-aside: %s has neither a good copy in %s/ nor its original beside the records", ", ".join(lost),
               progress.get("dest"))
+    unverified = sorted(set(progress.get("unverified") or []) & set(lost))
     try:
         _write_json(progress_path, {"marker": progress.get("marker"), "dest": progress.get("dest"),
-                                    "files": progress.get("files") or {}, "lost": lost})
+                                    "files": progress.get("files") or {}, "lost": lost,
+                                    "accepted": list(progress.get("accepted") or []), "unverified": unverified})
     except OSError as e:
         log.error("set-aside: the loss couldn't be written to the progress record (%s)", type(e).__name__)
     each = ", ".join(lost)
-    return {"ok": False, "lost": lost,
+    # Twenty-first round: a copy with no digest note is named as unverified, and the answer gives the command that
+    # accepts a loss that isn't needed (--accept-lost), so later runs can go on.
+    why = (f" ({', '.join(unverified)}: the copy has no digest note, so it can't be checked)" if unverified else "")
+    return {"ok": False, "lost": lost, "unverified": unverified,
             "said": f"{each} {'has' if len(lost) == 1 else 'have'} neither a good copy in {progress.get('dest')}/ "
-                    "(its copy there was never checked or no longer matches) nor "
+                    f"(its copy there was never checked or no longer matches){why} nor "
                     f"{'its original' if len(lost) == 1 else 'their originals'} beside the records. That's recorded "
                     "in the progress record beside the swap marker; nothing more was moved, the swap marker is as it "
-                    "was and the live records are untouched. Sort it by hand: restore it from a backup, or leave it out "
-                    "if it isn't needed",
+                    "was and the live records are untouched. Sort it by hand: restore it from a backup, or, if it "
+                    "isn't needed, accept its loss with python3 -m harness.migrate <records> --set-aside "
+                    "--accept-lost <name>, and run --set-aside again to finish the rest",
             "files": swap_files(base)}
+
+
+def accept_lost(ledger_path: str, name: str) -> dict:
+    """Twenty-first round, from the command line (python3 -m harness.migrate <records> --set-aside --accept-lost
+    <name>, with the App stopped): a file an earlier --set-aside recorded as lost (neither a good copy nor its
+    original) is acknowledged as not needed. It's recorded as accepted in the progress record (and in a note beside
+    the copies, so a torn record keeps it), so the next --set-aside goes on without it. Nothing is moved: the live
+    records and the swap marker are left exactly as they are. Refused for a name that isn't recorded as lost."""
+    base = os.path.abspath(ledger_path)
+    folder = os.path.dirname(base)
+    swap = base + SWAP_MARKER
+    lock = None
+    if folder not in _LOCK:
+        lock = _try_lock(folder)
+        if lock is None:
+            return {"ok": False, "said": "Harness is running (it holds harness.lock beside the records), so nothing "
+                                         "was recorded; stop the App first"}
+    try:
+        if not _plan_ok(base, _read_json(swap)):
+            return {"ok": False, "said": "there's no readable restore swap beside the records to sort"}
+        progress_path = swap + SET_ASIDE_PROGRESS
+        progress = _set_aside_progress(folder, swap, progress_path)
+        lost = list(progress.get("lost") or []) if progress else []
+        if not _plain_name(str(name or "")) or name not in lost:
+            return {"ok": False, "said": f"{name} isn't recorded as lost by an earlier --set-aside, so nothing was "
+                                         "recorded", "lost": lost}
+        accepted = sorted(set(progress.get("accepted") or []) | {name})
+        record = {"marker": progress["marker"], "dest": progress["dest"], "files": progress.get("files") or {},
+                  "lost": [n for n in lost if n != name], "accepted": accepted,
+                  "unverified": [n for n in progress.get("unverified") or [] if n != name]}
+        try:
+            _write_json(progress_path, record)
+            dest = os.path.join(folder, progress["dest"])
+            if os.path.isdir(dest):
+                _write_json(os.path.join(dest, "." + name + SET_ASIDE_ACCEPTED), {"marker": progress["marker"]})
+        except OSError as e:
+            return {"ok": False, "said": f"the acceptance couldn't be written ({type(e).__name__}), so nothing was "
+                                         "recorded"}
+        log.warning("set-aside: %s is accepted as lost; the next --set-aside goes on without it", name)
+        return {"ok": True, "accepted": accepted,
+                "said": f"{name} is recorded as accepted as lost. Nothing was moved; the swap marker and the live "
+                        "records are untouched. Run --set-aside again to finish the rest"}
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> dict:
@@ -1961,9 +2029,11 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
         settled: list[str] = []
         if progress:
             dest = os.path.join(folder, progress["dest"])
-            lost = list(progress.get("lost") or [])
+            accepted = set(progress.get("accepted") or [])
+            lost = [n for n in progress.get("lost") or [] if n not in accepted]
+            settled.extend(sorted(accepted))       # twenty-first round: a loss he accepted no longer stops a run
             for name, rec in progress["files"].items():
-                if name in movable or os.path.lexists(os.path.join(folder, name)):
+                if name in movable or os.path.lexists(os.path.join(folder, name)) or name in accepted:
                     continue
                 d = rec.get("digest")
                 copy = os.path.join(dest, name)
@@ -2004,7 +2074,8 @@ def set_aside(ledger_path: str, confirm=None, now: datetime | None = None) -> di
             files = dict(progress["files"]) if progress else {}
             for name in movable:
                 files[name] = {"digest": None, "removed": False}
-            record = {"marker": _sha256(swap), "dest": os.path.basename(dest), "files": files}
+            record = {"marker": _sha256(swap), "dest": os.path.basename(dest), "files": files,
+                      "accepted": list(progress.get("accepted") or []) if progress else []}
             # Seventeenth round: a copy or fsync that fails (a full disk, most likely) or a copy that doesn't match
             # takes back what it made (the partial copies, then the folder while empty) and leaves the originals
             # and the marker as they were, with a plain reason; the command line then exits non-zero. Eighteenth
@@ -2483,6 +2554,10 @@ if __name__ == "__main__":
                           "refusal_not_recorded": bool(readable and (movable or protected) and not plan.get("refused")),
                           "files": swap_files(args[0])}, indent=1, sort_keys=True))
         sys.exit(0)
+    if len(args) == 4 and args[1] == "--set-aside" and args[2] == "--accept-lost":
+        got = accept_lost(args[0], args[3])                     # twenty-first round: records it; moves nothing
+        print(json.dumps(got, indent=1, sort_keys=True))
+        sys.exit(0 if got.get("ok") else 1)
     if len(args) == 2 and args[1] == "--set-aside":
         got = set_aside(args[0])
         print(json.dumps(got, indent=1, sort_keys=True))
@@ -2498,7 +2573,8 @@ if __name__ == "__main__":
     if len(args) != 1:
         print(json.dumps({"ok": False, "said": "usage: python3 -m harness.migrate <ledger file path> "
                                                "[--candidate <source tree or image path>] "
-                                               "[--restore <schema> <build>] [--swap] [--set-aside]"}))
+                                               "[--restore <schema> <build>] [--swap] [--set-aside "
+                                               "[--accept-lost <name>]]"}))
         sys.exit(2)
     got = dry_run(args[0])
     print(json.dumps(got, indent=1, sort_keys=True))

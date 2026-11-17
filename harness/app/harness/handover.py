@@ -362,14 +362,18 @@ class Inbox:
             return False
         return self._append({"outcome": self.key(press), "kind": kind, "note": note, "at": time.time()})
 
-    def journal_check(self, press: dict, n: int, next_at: float, told: bool) -> bool:
+    def journal_check(self, press: dict, n: int, next_at: float, told: bool, kind: str = "first",
+                      seen: str = "") -> bool:
         """Eighteenth round: an unknown tap read on the calendar by its identity that couldn't settle yet (the read
         couldn't answer, or Harness's own records are still carrying it out): how many reads it has had, when the
-        next one is (seconds since the epoch, on the records' clock), and whether he's been told it waits."""
+        next one is (seconds since the epoch, on the records' clock), and whether he's been told it waits.
+        Twenty-first round: `kind`, whose schedule the read counts on: "hold" (the records couldn't be read, or are
+        still carrying it out), "calendar" (the calendar couldn't be read), or "first" (the tap's first read,
+        counted on both); and `seen`, what that read found, so the log says a state only when it changes."""
         if not self.journal or not press:
             return False
         return self._append({"check": self.key(press), "n": int(n), "next": float(next_at), "told": bool(told),
-                             "at": time.time()})
+                             "kind": str(kind), "seen": str(seen), "at": time.time()})
 
     def journal_delivered(self, press: dict) -> bool:
         """Sixteenth round: the note on that tap reached him; at the next start it isn't posted again."""
@@ -377,8 +381,11 @@ class Inbox:
             return False
         return self._append({"delivered": self.key(press), "at": time.time()})
 
-    def journal_done(self, press: dict) -> None:
-        """Strikes a tap off (all its lines) once what it did is committed, or he has been told it wasn't taken."""
+    def journal_done(self, press: dict, *, strict: bool = False) -> None:
+        """Strikes a tap off (all its lines) once what it did is committed, or he has been told it wasn't taken.
+        Twenty-first round: strict=True raises the OSError when the journal couldn't be rewritten without it (the
+        caller's transaction rolls back what it queued with the strike); once the file is replaced the strike holds,
+        and a failed folder sync after that is only logged."""
         if not self.journal or not press:
             return
         key = self.key(press)
@@ -391,18 +398,29 @@ class Inbox:
             if len(keep) == len(rows):
                 return
             try:
-                if not keep:
-                    os.remove(self.journal)
-                else:
-                    tmp = self.journal + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        f.write("".join(json.dumps(r) + "\n" for r in keep))
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(tmp, self.journal)
-                _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+                self._rewrite(keep)
             except OSError as e:
                 log.error("the tap journal couldn't be updated: %s", type(e).__name__)
+                if strict:
+                    raise
+                return
+            try:
+                _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+            except OSError as e:
+                log.error("the tap journal's folder couldn't be synced: %s", type(e).__name__)
+
+    def _rewrite(self, keep: list[dict]) -> None:
+        """The journal rewritten with only `keep` (removed when empty), whole: a temporary file, fsynced, renamed
+        into place. Raises OSError when it couldn't be."""
+        if not keep:
+            os.remove(self.journal)
+            return
+        tmp = self.journal + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in keep))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.journal)
 
     def journaled(self) -> list[dict]:
         """The taps written down and not yet struck off, oldest first, each {"press", "at", "intent", "op",
@@ -419,7 +437,8 @@ class Inbox:
                 k = self.key(r["press"])
                 taps.setdefault(k, {"press": {a: str(b) for a, b in r["press"].items()}, "at": r.get("at"),
                                     "intent": False, "op": {}, "committed": False, "outcome": "", "note": "",
-                                    "delivered": False, "checks": 0, "next_check": None, "told_check": False})
+                                    "delivered": False, "checks": 0, "next_check": None, "told_check": False,
+                                    "hold_checks": 0, "last_kind": "", "last_seen": ""})
                 continue
             k = _row_key(r, self.key)
             t = taps.get(k)
@@ -438,10 +457,19 @@ class Inbox:
             elif "delivered" in r:
                 t["delivered"] = True
             elif "check" in r:
+                # Twenty-first round: two counters. The hold schedule (the records couldn't be read, or are still
+                # carrying it out) and the calendar's own; the tap's first read (and a line from before this round,
+                # which had one counter) counts on both.
+                kind = str(r.get("kind") or "first")
                 try:
-                    t["checks"], t["next_check"] = int(r.get("n") or 0), float(r.get("next"))
+                    n, nxt = int(r.get("n") or 0), float(r.get("next"))
                 except (TypeError, ValueError):
-                    t["checks"], t["next_check"] = t["checks"] + 1, 0.0
+                    n, nxt = max(t["checks"], t["hold_checks"]) + 1, 0.0
+                if kind in ("hold", "first"):
+                    t["hold_checks"] = n
+                if kind in ("calendar", "first"):
+                    t["checks"] = n
+                t["next_check"], t["last_kind"], t["last_seen"] = nxt, kind, str(r.get("seen") or "")
                 t["told_check"] = t["told_check"] or bool(r.get("told"))
         for t in taps.values():
             t["state"] = ("committed" if t["committed"] else t["outcome"] if t["outcome"]

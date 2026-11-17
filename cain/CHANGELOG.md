@@ -2,6 +2,8 @@
 
 ## 0.12.0
 
+- A card from the calendar specialist that the link turns down still says what happened, in a few fixed words both sides check, and the cases they share now come from real differences between how each reads a card.
+
 - The calendar specialist now reads a card the way the link does in full (the same words for buttons, a button named across a line break, every button the link knows), and a card turned down twice still reaches you as a short fixed card with its buttons.
 - Why a specialist's card has Go ahead or not: an add that never showed up in Google across a restore gets none (an empty spot can't be told apart from an event added and deleted since); a tap whose decision never reached the specialist's records gets one (nothing it leads to ran).
 

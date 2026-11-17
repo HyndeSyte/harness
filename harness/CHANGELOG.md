@@ -2,6 +2,12 @@
 
 ## 0.24.0
 
+- **A tap Harness couldn't finish gets its card once, never again and again.** If its note can't be crossed off, the card waits with it and Harness tries again later, after a few minutes and then hourly. Any number of such taps all get their own card.
+- **The records and your calendar each get their own tries.** If Harness's records couldn't be read for a while, your calendar still gets its full six reads once they can.
+- **A tap Harness can't identify says so once**, with no Go ahead, instead of being read again every hour.
+- **A part that was checked and isn't done says just that**, and to ask for it again if you still want it. "May have reached your calendar" is only said when Harness can't tell.
+- A card Cain's link turns down now still says what happened (done, not done, or couldn't verify). Setting aside files can accept a lost file that isn't needed, so the rest can finish.
+
 - **A tap is never written off because Harness's own records couldn't be read.** It's kept and read again on the same schedule, and at every start, until the records answer.
 - **A tap whose calendar couldn't be read keeps its true card** even if Harness stopped right after deciding that: the next start says again that your calendar couldn't be read, never that Harness didn't get to your tap.
 - **A retry card shows what its write will find.** It reads the very events the first card was for, so an event that turned up there in the meantime shows as already there.

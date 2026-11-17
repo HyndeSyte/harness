@@ -210,13 +210,36 @@ class Outbox:
     TEMPLATE_BODY = "Harness has an update on this; its full words couldn't be shown here."
     TEMPLATE_JOB = "It's about a message of yours."
 
+    # Twenty-first round: what happened, in one of a few pre-vetted phrases chosen by the card's outcome (an enum,
+    # Ledger.OUTCOMES, set when it was queued), never its own words. Each is in tests/imperative_cases.json, which
+    # both suites check against the link's filter.
+    TEMPLATE_OUTCOMES = {"done": "What it was about is done.",
+                         "not_done": "What it was about isn't done.",
+                         "unverified": "Harness couldn't verify how it went."}
+
+    def _outcome(self, row) -> str:
+        try:
+            got = self.ledger.get_meta(f"outbox_outcome:{row['id']}")
+        except Exception:                       # noqa: BLE001: no outcome read: the template says none
+            return ""
+        return self.TEMPLATE_OUTCOMES.get(got or "", "")
+
     def _template(self, row) -> str:
         """Twentieth round: the fixed card posted when a refused card's stripped words would lose its head, leave
         nothing, or are refused again: when it was written, whether it's about a message of his, and that its full
-        words couldn't be shown, all fixed text. The card keeps its own buttons."""
+        words couldn't be shown, all fixed text. The card keeps its own buttons. Twenty-first round: with what
+        happened (TEMPLATE_OUTCOMES) when the card carries an outcome; each use is logged and recorded."""
         when = datetime.fromisoformat(row["created_at"]).astimezone(self.tz).strftime("%a %-I:%M %p")
+        outcome = self._outcome(row)
+        log.warning("a card went as the fixed template (outcome: %s)", outcome and "given" or "none")
+        if not self.ledger.fenced:
+            try:
+                self.ledger.event("outbox_template", {"outbox": row["id"], "outcome": bool(outcome)})
+            except Exception:                   # noqa: BLE001: the card still goes
+                pass
         return "\n".join(x for x in (self.TEMPLATE_HEAD.format(when=when),
-                                      self.TEMPLATE_JOB if row["job_id"] else "", self.TEMPLATE_BODY) if x)
+                                      self.TEMPLATE_JOB if row["job_id"] else "", outcome,
+                                      self.TEMPLATE_BODY) if x)
 
     def flush(self, *, limit: int = 20) -> int:
         """Send what is due. Returns how many were delivered."""

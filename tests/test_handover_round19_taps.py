@@ -58,15 +58,17 @@ def cut_after(m, monkeypatch, *, run=True, before_run=None):
     return press
 
 
-def journal_checks(m):
+def journal_checks(m, kinds=None):
     got = []
+    kinds = [] if kinds is None else kinds
     real = m.c.handovers.journal_check
 
-    def check(press, n, next_at, told):
-        step = (n, round(next_at - m.c._clock()))
-        if not got or got[-1] != step:          # twentieth round: the told mark rewrites the same read once queued
-            got.append(step)
-        return real(press, n, next_at, told)
+    def check(press, n, next_at, told, kind="first", seen=""):
+        # Twenty-first round: every step recorded, duplicates included (the told mark rewrites the same read once
+        # its note is queued), with the schedule it counts on.
+        got.append((n, round(next_at - m.c._clock())))
+        kinds.append((kind, n, bool(told)))
+        return real(press, n, next_at, told, kind, seen)
     m.c.handovers.journal_check = check
     return got
 
@@ -77,7 +79,8 @@ def journal_checks(m):
 def test_a_job_that_finishes_after_the_schedule_ends_is_then_settled(m, monkeypatch, clock):
     dentist_card(m)
     cut_after(m, monkeypatch)                                                  # the write lands with the tap
-    checks = journal_checks(m)
+    kinds = []
+    checks = journal_checks(m, kinds)
     real_hold = Controller._records_hold
     running = {"on": True}                                                     # its job reads unfinished till off
     monkeypatch.setattr(Controller, "_records_hold",
@@ -86,7 +89,10 @@ def test_a_job_that_finishes_after_the_schedule_ends_is_then_settled(m, monkeypa
     for wait in (61, 121, 301, 901, 1801, 3601, 3601, 3601):                   # the schedule, then two cap reads
         later(m, clock, wait)
         assert [r["state"] for r in m.c.handovers.journaled()] == ["unknown"]  # never struck while it runs
-    assert [d for _, d in checks] == [120, 300, 900, 1800, 3600, 3600, 3600, 3600]
+    # Twenty-first round: every step, the told mark's rewrite of the first included, all on the hold schedule.
+    assert [d for _, d in checks] == [120, 120, 300, 900, 1800, 3600, 3600, 3600, 3600]
+    assert [k for k, _, _ in kinds] == ["hold"] * 9
+    assert [t for _, _, t in kinds] == [False, True] + [True] * 7
     said = new_said(m, before)
     assert len([t for t in said if "still carrying it out" in t]) == 1         # told once
     assert not any("Harness's records took it" in t for t in said)             # no card for good while it runs
@@ -124,7 +130,9 @@ def test_the_backoff_is_exactly_one_two_five_fifteen_thirty_sixty_minutes(m, mon
     m.gmail.down = True
     for wait in (61, 121, 301, 901, 1801, 3601):
         later(m, clock, wait)
-    assert checks == [(1, 60), (2, 120), (3, 300), (4, 900), (5, 1800), (6, 3600)]
+    # Twenty-first round: every step, duplicates included: the told mark rewrites the second read once its note
+    # is queued.
+    assert checks == [(1, 60), (2, 120), (2, 120), (3, 300), (4, 900), (5, 1800), (6, 3600)]
     assert len(reads) == 6
     assert m.c.handovers.journaled() == [] and outcomes == ["unverified"]      # struck, recorded as unverified
     said = new_said(m, 0)

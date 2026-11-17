@@ -209,5 +209,71 @@
    "known": [],
    "refused": []
   }
+ ],
+ "template": {
+  "_note": "Twenty-first round: the fixed template's every line as the link sees it, and its outcome phrases by enum. Both suites check each against the link's filter with every known label; the Python suite checks they are the outbox's own.",
+  "head": "**An update from Harness**, written Mon 9:00 AM.",
+  "job": "It's about a message of yours.",
+  "body": "Harness has an update on this; its full words couldn't be shown here.",
+  "outcomes": {
+   "done": "What it was about is done.",
+   "not_done": "What it was about isn't done.",
+   "unverified": "Harness couldn't verify how it went."
+  },
+  "known": [
+   "Go ahead",
+   "Add anyway",
+   "Leave it",
+   "Approve",
+   "Decline",
+   "Undo"
+  ]
+ },
+ "end_to_end": [
+  {
+   "name": "bold head without terminal punctuation",
+   "html": "<b>Your change is ready</b> Tap Go ahead to add it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "first": "**Your change is ready** Tap Go ahead to add it.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "outcome": "done"
+  },
+  {
+   "name": "code span holding a label",
+   "html": "<b>Done</b> Use `Go ahead` here, or tap Go ahead.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "first": "**Done** Use \\`Go ahead\\` here, or tap Go ahead.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "outcome": "done"
+  },
+  {
+   "name": "link with a label in its text",
+   "html": "<b>Done</b> See [tap Go ahead](https://example.com) for it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "first": "**Done** See \\[tap Go ahead\\]\\(https://example.com\\) for it.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "outcome": "done"
+  }
  ]
 }

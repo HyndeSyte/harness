@@ -893,18 +893,37 @@ class Ledger:
     # written in ONE transaction. Sending happens afterwards and is retried,
     # so a chat outage delays a reply but never loses one, and a crash
     # between the two leaves a queued message, not a silent job.
+    # Twenty-first round: what a card's fixed template may say happened, by enum (outbox.Outbox.TEMPLATE_OUTCOMES).
+    OUTCOMES = ("done", "not_done", "unverified")
+
     def enqueue(self, *, chat_id: int, kind: str, text: str, job_id: str | None = None,
                 buttons: list | None = None, binds: list | None = None,
-                held: bool = False, db=None) -> int:
+                held: bool = False, db=None, once: str | None = None, outcome: str | None = None) -> int:
+        """One message queued. Twenty-first round: `once`, a key naming what it's about (a tap's journal row): a
+        message already queued under that key, in any state, is never queued again, and its id is returned (the
+        key and the new row are written in the same transaction). `outcome`, one of OUTCOMES, for the fixed
+        template a refused card falls back to."""
+        conn = db or self.db
+        if once is not None:
+            had = conn.execute("SELECT value FROM meta WHERE key=?", (f"outbox_once:{once}",)).fetchone()
+            if had is not None:
+                return int(had[0])
         now = iso(self.now())
-        cur = (db or self.db).execute(
+        cur = conn.execute(
             "INSERT INTO outbox(chat_id, job_id, kind, text, buttons_json, binds_json,"
             " state, not_before, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
             (chat_id, job_id, kind, text,
              json.dumps(buttons) if buttons else None,
              json.dumps(binds) if binds else None,
              "held" if held else "queued", now, now))
-        return int(cur.lastrowid)
+        oid = int(cur.lastrowid)
+        if once is not None:
+            self.set_meta(f"outbox_once:{once}", str(oid), conn)
+        if outcome is not None:
+            if outcome not in self.OUTCOMES:
+                raise ValueError(f"not an outcome: {outcome}")
+            self.set_meta(f"outbox_outcome:{oid}", outcome, conn)
+        return oid
 
     def release_held(self, db=None) -> int:
         cur = (db or self.db).execute(

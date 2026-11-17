@@ -112,7 +112,7 @@ def unverified_then_killed(m, monkeypatch, clock):
     def die(*a, **kw):
         raise Killed()
     with monkeypatch.context() as mp:
-        mp.setattr(m.c, "_relist_taps", die)
+        mp.setattr(m.c, "_finish_terminal", die)            # twenty-first round: the per-tap finish
         with pytest.raises(Killed):
             later(m, clock, 3601)
     assert states(m) == ["unverified"]
