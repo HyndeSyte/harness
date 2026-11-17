@@ -2,6 +2,11 @@
 
 ## 0.24.0
 
+- **The card that taps are waiting comes once for each outage**, even when Harness restarts in the middle of one.
+- **A requeued tap always gets a fresh *Go ahead***, even when its count was lost, and a tap stopped for good stays stopped.
+- Event names like "Token: pickup" stay as you wrote them when Harness saves a card's words and shows them later.
+- Harness won't start with its tap journal on network storage, and never writes a tap down without its lock.
+
 - **When taps wait because Harness can't read part of its records, you get one card saying so**, and that it keeps retrying by itself. Nothing is needed from you.
 - **A set-aside tap you put back can get a *Go ahead* again**, and a tap Harness stopped after six listings stays stopped for good.
 - A tap of yours that comes in while a set-aside tap is being discarded is never lost.

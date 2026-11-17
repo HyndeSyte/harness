@@ -184,38 +184,81 @@ def journal_lock(journal: str):
     """Twenty-ninth round: the tap journal's exclusive lock, shared by every process that writes it (an flock on
     the file beside it, JOURNAL_LOCK, which a rename of the journal never replaces): each append, each strike's
     rewrite and the set-aside tool's rewrite hold it, so an append blocks until a rewrite has read, filtered,
-    written, fsynced, renamed and synced the folder. Raises OSError when the lock file can't be opened."""
+    written, fsynced, renamed and synced the folder. Raises OSError when the lock file can't be opened.
+
+    Thirtieth round: the lock file is the App's, group-writable (0o660 whatever the umask), and owned like the
+    journal beside it, so a tool run by root never leaves the App unable to open it."""
     import fcntl
-    fd = os.open(journal + JOURNAL_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(journal + JOURNAL_LOCK, os.O_RDWR | os.O_CREAT, 0o660)
     try:
+        _lock_file_owned(fd, journal)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)                      # closing the last descriptor releases the flock
 
 
-@contextlib.contextmanager
-def _journal_lock_or_none(journal: str):
-    """The journal's lock where it can be taken; an append goes on without it when the lock file can't be opened
-    (a read-only or full folder fails the append itself anyway)."""
+def _lock_file_owned(fd: int, journal: str) -> None:
+    """Thirtieth round: the lock file group-writable, and, when root holds it, owned by the journal's owner."""
     try:
-        cm = journal_lock(journal)
-        cm.__enter__()
-    except OSError as e:
-        log.warning("the tap journal's lock couldn't be taken: %s", type(e).__name__)
-        yield False
-        return
+        st = os.fstat(fd)
+        if st.st_uid == os.geteuid() and (st.st_mode & 0o777) != 0o660:
+            os.fchmod(fd, 0o660)
+        if os.geteuid() == 0:
+            try:
+                j = os.stat(journal)
+            except FileNotFoundError:
+                return
+            if (st.st_uid, st.st_gid) != (j.st_uid, j.st_gid):
+                os.fchown(fd, j.st_uid, j.st_gid)
+    except OSError:
+        pass                              # best effort: an flock needs only the open descriptor
+
+
+LOCK_STORAGE = "taps unsaved: the tap journal's lock can't be taken"   # thirtieth round: /health's storage flag
+
+# Thirtieth round: file systems the tap journal mustn't sit on: its flock and its fsynced renames are only sound on
+# local storage, so the App refuses to start (degraded, every tap refused) when the journal's folder is on one.
+NETWORK_FS = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "ceph", "glusterfs", "lustre",
+                        "gfs2", "ocfs2", "davfs", "fuse.sshfs", "fuse.glusterfs", "fuse.rclone", "fuse.s3fs",
+                        "fuse.cephfs", "sshfs", "9p"})
+
+
+class NetworkJournal(RuntimeError):
+    """Thirtieth round: the tap journal's folder is on a network mount."""
+
+
+def mount_type(path: str, mountinfo: str = "/proc/self/mountinfo") -> str:
+    """The file system type of the mount holding `path` ("" when it can't be told)."""
+    real = os.path.realpath(path)
+    best, kind = "", ""
     try:
-        yield True
-    finally:
-        cm.__exit__(None, None, None)
+        with open(mountinfo, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if " - " not in line or len(parts) < 5:
+                    continue
+                point = parts[4].replace("\\040", " ")
+                fstype = line.split(" - ", 1)[1].split()[0]
+                if (real == point or real.startswith(point.rstrip("/") + "/")) and len(point) >= len(best):
+                    best, kind = point, fstype
+    except OSError:
+        return ""
+    return kind
+
+
+def check_local(journal: str, mountinfo: str = "/proc/self/mountinfo") -> None:
+    """Thirtieth round: raises NetworkJournal when the tap journal's folder is on a network mount."""
+    kind = mount_type(os.path.dirname(os.path.abspath(journal)) or ".", mountinfo)
+    if kind in NETWORK_FS or kind.startswith(("nfs", "fuse.sshfs")):
+        raise NetworkJournal(f"the tap journal is on a network mount ({kind}); it must be on local storage")
 
 
 def _row_key(r: dict, key: Callable[[dict], str]) -> str:
     """The tap a journal line belongs to."""
     if isinstance(r.get("press"), dict):
         return key(r["press"])
-    for field_ in ("intent", "committed", "outcome", "delivered", "check", "cleared"):
+    for field_ in ("intent", "committed", "outcome", "delivered", "check", "cleared", "struck"):
         if field_ in r:
             return str(r.get(field_) or "")
     return str(r.get("key") or "")
@@ -250,6 +293,7 @@ class Inbox:
         self.degraded = ""                   # thirteenth round: why it started without its records, or ""
         self.storage = ""                    # twenty-fifth round: taps' progress can't be saved anywhere, or ""
         self.waiting = ""                    # twenty-eighth round: the start replay can't read the set-aside taps
+        self.lock_storage = ""               # thirtieth round: an append refused for want of the journal's lock
 
     @classmethod
     def for_tests(cls, token_fn: Callable[[], str], wake: threading.Event | None = None, **kw) -> "Inbox":
@@ -262,8 +306,9 @@ class Inbox:
 
     def health(self) -> dict:
         extra = {"migration": dict(self.migration)} if self.migration else {}
-        if self.storage:
-            extra["storage"] = self.storage     # twenty-fifth round: said where no storage is needed
+        if self.storage or self.lock_storage:
+            # twenty-fifth round: said where no storage is needed; thirtieth round: or the journal's lock refused
+            extra["storage"] = self.storage or self.lock_storage
         if self.waiting:
             extra["waiting"] = self.waiting     # twenty-eighth round: the start replay's taps wait on the records
         if self.degraded:
@@ -338,38 +383,75 @@ class Inbox:
         except OSError:
             log.error("the tap journal couldn't be read")
             return []
-        return rows
+        return self._unstruck(rows)
+
+    def _unstruck(self, rows: list[dict]) -> list[dict]:
+        """Thirtieth round: a strike tombstone ({"struck": key}, appended when the journal's lock couldn't be taken
+        to rewrite it) takes out every line of that tap written before it, and itself; every reader honours it."""
+        if not any("struck" in r for r in rows):
+            return rows
+        out: list[dict] = []
+        for r in rows:
+            if "struck" in r:
+                k = str(r.get("struck") or "")
+                out = [x for x in out if _row_key(x, self.key) != k]
+                continue
+            out.append(r)
+        return out
+
+    def _take_lock(self):
+        """Thirtieth round: the journal's lock entered, or None when it can't be taken (logged)."""
+        try:
+            cm = journal_lock(self.journal)
+            cm.__enter__()
+        except OSError as e:
+            log.error("the tap journal's lock couldn't be taken: %s", type(e).__name__)
+            return None
+        return cm
 
     def _append(self, row: dict) -> bool:
         """One line appended, written whole and fsynced, or not at all: a short write or a failed fsync is cut
         back off (best effort) and counts as not written."""
-        data = (json.dumps(_scrub.scrub_fields(row)) + "\n").encode()   # twenty-sixth round: scrubbed at the sink
-        with self._lock, _journal_lock_or_none(self.journal):
-            try:
-                new = not os.path.exists(self.journal)
-                fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-            except OSError as e:
-                log.error("the tap journal couldn't be opened: %s", type(e).__name__)
+        data = (_scrub.dumps(row) + "\n").encode()   # twenty-sixth round: scrubbed at the sink
+        with self._lock:
+            # Thirtieth round: fail closed. An append that can't take the journal's lock is refused (the journal is
+            # left as it is) and /health's storage flag says so, never written unlocked beside a rewrite.
+            cm = self._take_lock()
+            if cm is None:
+                self.lock_storage = LOCK_STORAGE
                 return False
             try:
-                size = os.fstat(fd).st_size
-                try:
-                    wrote = os.write(fd, data)
-                    if wrote != len(data):
-                        raise OSError(f"short write ({wrote} of {len(data)} bytes)")
-                    os.fsync(fd)
-                except OSError as e:
-                    log.error("the tap journal couldn't be written: %s", e)
-                    try:
-                        os.ftruncate(fd, size)
-                        os.fsync(fd)
-                    except OSError:
-                        pass
-                    return False
+                return self._append_locked(data)
             finally:
-                os.close(fd)
-            if new:
-                _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+                cm.__exit__(None, None, None)
+
+    def _append_locked(self, data: bytes) -> bool:
+        try:
+            new = not os.path.exists(self.journal)
+            fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        except OSError as e:
+            log.error("the tap journal couldn't be opened: %s", type(e).__name__)
+            return False
+        try:
+            size = os.fstat(fd).st_size
+            try:
+                wrote = os.write(fd, data)
+                if wrote != len(data):
+                    raise OSError(f"short write ({wrote} of {len(data)} bytes)")
+                os.fsync(fd)
+            except OSError as e:
+                log.error("the tap journal couldn't be written: %s", e)
+                try:
+                    os.ftruncate(fd, size)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+                return False
+        finally:
+            os.close(fd)
+        if new:
+            _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+        self.lock_storage = ""
         return True
 
     def journal_add(self, h: Handover) -> bool:
@@ -444,22 +526,54 @@ class Inbox:
 
         def mine(r: dict) -> bool:
             return _row_key(r, self.key) == key
-        with self._lock, _journal_lock_or_none(self.journal):
-            rows = self._journal_lines()
-            keep = [r for r in rows if not mine(r)]
-            if len(keep) == len(rows):
-                return
-            try:
-                self._rewrite(keep)
-            except OSError as e:
-                log.error("the tap journal couldn't be updated: %s", type(e).__name__)
+        with self._lock:
+            # Thirtieth round: fail closed. With no lock to take the journal isn't rewritten: a strike tombstone is
+            # appended instead (every reader honours it), and read back, so a rewrite that raced it can't lose it.
+            cm = self._take_lock()
+            if cm is None:
+                if self._tombstone({"struck": key}):
+                    return
+                log.error("the tap journal's lock couldn't be taken and its strike couldn't be written")
                 if strict:
-                    raise
+                    raise OSError("the tap journal's strike couldn't be written")
                 return
             try:
-                _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
-            except OSError as e:
-                log.error("the tap journal's folder couldn't be synced: %s", type(e).__name__)
+                self._strike_locked(mine, strict)
+            finally:
+                cm.__exit__(None, None, None)
+
+    def _tombstone(self, row: dict, tries: int = 3) -> bool:
+        """Thirtieth round: a tombstone appended with no lock (O_APPEND, one fsynced write) and read back, appended
+        again (up to `tries` times) when a rewrite that raced it replaced the file without it. The caller holds
+        self._lock."""
+        for _ in range(tries):
+            mark = dict(row, at=time.time(), nonce=os.urandom(6).hex())
+            if not self._append_raw(mark):
+                return False
+            try:
+                with open(self.journal, encoding="utf-8", errors="replace") as f:
+                    if any(mark["nonce"] in line for line in f):
+                        return True
+            except OSError:
+                return False
+        return False
+
+    def _strike_locked(self, mine, strict: bool) -> None:
+        rows = self._journal_lines()
+        keep = [r for r in rows if not mine(r)]
+        if len(keep) == len(rows):
+            return
+        try:
+            self._rewrite(keep)
+        except OSError as e:
+            log.error("the tap journal couldn't be updated: %s", type(e).__name__)
+            if strict:
+                raise
+            return
+        try:
+            _fsync_dir(os.path.dirname(os.path.abspath(self.journal)))
+        except OSError as e:
+            log.error("the tap journal's folder couldn't be synced: %s", type(e).__name__)
 
     def _rewrite(self, keep: list[dict]) -> None:
         """The journal rewritten with only `keep` (removed when empty), whole: a temporary file, fsynced, renamed
@@ -490,7 +604,7 @@ class Inbox:
             except OSError as e:
                 log.warning("the tap journal's lock couldn't be taken (%s); a tombstone is appended",
                             type(e).__name__)
-                return bool(tombstone) and self._append_raw(tombstone)
+                return bool(tombstone) and self._tombstone(tombstone)
             try:
                 return self._drop_locked(drop)
             finally:
@@ -531,7 +645,7 @@ class Inbox:
     def _append_raw(self, row: dict) -> bool:
         """The tombstone's append when the journal's lock can't be taken (O_APPEND, one write, fsynced); the caller
         holds self._lock."""
-        data = (json.dumps(_scrub.scrub_fields(row)) + "\n").encode()
+        data = (_scrub.dumps(row) + "\n").encode()
         try:
             fd = os.open(self.journal, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         except OSError:

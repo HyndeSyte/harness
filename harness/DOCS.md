@@ -993,7 +993,11 @@ the third such try in a row Harness's health (a "waiting" note), its status page
 problems say taps from before its last start wait, with the log saying so at most once an hour, and that
 clears at the first replay that reads them, which settles every tap it had put off that's due. When that note
 first comes on, Harness also queues one card for you (once for that outage, and only where its outbox takes
-it) saying taps are waiting and it keeps retrying by itself; nothing is asked of you. While the records stay
+it) saying taps are waiting and it keeps retrying by itself; nothing is asked of you. The outage is kept in the
+small file beside the tap journal (whether one is open, its number from a counter there, never the clock, and
+whether its card is queued), so a restart in the middle of it, or the clock stepping, sends no second card; a
+card the outbox refuses is tried again at the next failed read under the same key, so exactly one goes, and the next
+read that works closes the outage. While the records stay
 unreadable the running loop reads no calendar and writes nothing for those taps, and its own log line about
 it comes once and then at most hourly. Discard also
 takes out of the tap journal an intent that a refused requeue left for that tap (every other line, torn ones
@@ -1001,19 +1005,33 @@ included, stays as it was). A requeue leaves at most one such intent for a tap, 
 rewrite holds the tap journal's own lock (`<journal>.lock`, the one every append takes, in Harness and in the
 tool) from its read to its rename and the folder's sync, so a tap written down meanwhile waits for it and is
 never lost; where that lock can't be taken the journal isn't rewritten, and a tombstone line is added instead,
-which every reader honours. If the rewrite fails after the discard is committed, the intent stays as an orphan:
+which every reader honours. The lock fails closed for Harness's own writers too: a strike that can't take it
+appends a tombstone for that tap (read back, and appended again if a rewrite raced it) instead of rewriting,
+and a tap or progress line that can't take it is refused (the journal left as it was, the tap answered as not
+taken) and Harness's health says `storage` until an append takes the lock again. The lock file is Harness's
+own, group-writable, and the set-aside tool refuses to run as any user but the tap journal's owner (the App's
+own user), so it never leaves a lock file Harness can't open. The tap journal must be on local storage: its
+lock and its renames aren't sound on a network mount, so Harness refuses to start (degraded, every tap refused,
+the status page saying why) when the journal's folder is one. If the rewrite fails after the discard is committed, the intent stays as an orphan:
 the discard record means it's never read on your calendar, carded or acted on (by the start's replay, the
 running loop or either resume), and the tool says so; running the same discard again clears it (and only
 that). Requeue starts the tap's listing count afresh and discard clears it, each in the same step as its
 listing mark: the count beside the tap journal is changed first and the records' transaction second, and a
 transaction the records refuse puts the count beside the journal back, so the larger of the two never brings
 back a count that was lowered. A requeued tap's cards are keyed on its new count, so a requeued tap gets a
-fresh *Go ahead*, up to six again. A tap ended after six listings (or stopped because its count couldn't be
-read) is ended for good: its mark says so whatever count it holds, and it's never counted on or carded again.
-A struck mark whose count couldn't be read is kept with no count, and stays that way: such a tap, if it's
-ever listed again, is stopped with its own card rather than counted from one. Once, at a start, marks written
-by earlier builds are put into this form (an ended mark at the old count of seven, or a struck mark written
-as nought, which takes the count beside the journal, or no count when there's none). Requeue checks the tap's journal
+fresh *Go ahead*, up to six again. That count's round (its epoch) comes from one counter in the records for
+every tap, never pruned, so even a tap whose mark and count beside the journal were both lost gets cards it
+never had before after a requeue, never ones refused as duplicates. There's no limit on requeues: each gives
+the tap up to six *Go ahead*s again, which is fine because each requeue is your own explicit act at the Pi. A tap ended after six listings (or stopped because its count couldn't be
+read) is ended for good: its mark says so whatever count or round it holds (the ended state is read before
+any other field, so a damaged round or count beside it is only logged), and it's never counted on or carded
+again. A struck mark whose count couldn't be read is kept in a "no count" state, read ahead of any count beside
+the journal, and stays that way: such a tap, if it's ever listed again, is stopped with its own card rather
+than counted from one or from a count that appears beside the journal later; only a requeue clears it. (A mark
+whose count is damaged without that state is damage, and counts on from beside the journal.) Once, at a start,
+marks written by earlier builds are put into this form (an ended mark at the old count of seven; a struck mark
+written as nought, which takes the count beside the journal, is ended at six when that count is over six, and
+gets the no-count state when there's none). Requeue checks the tap's journal
 lines carry one press for that very key (otherwise it's refused and stays set aside); a tap with an outcome
 gets its strike back with that press and is only crossed off. One with none goes by its journal alone: if it
 holds an intent, or any other sign the tap was started (a read, a delivery, or a line that can't be read but
@@ -1051,9 +1069,15 @@ wording and your events' fields; the refusals that carry them keep their message
 else handed to that light scrub (an error's text, a calendar service's answer, plain text) gets the whole scrub
 instead. That type can only be built by its factory (a fixed template filled with your event's fields) or a
 refusal's message, and the records' and tap journal's writers go by it too: only that type keeps your titles in
-the field for your words; anything else there, and any record already kept as text, gets the whole scrub. The
-source check finds the light scrub by what it was imported as, under any name, and flags any other way of
-building that type. A source check makes sure no error, traceback or service answer is built into them, and that the light
+the field for your words. A record kept as text keeps that type with a tag beside the field, written only from
+the type itself; the records' writer gives a tagged field the light scrub and anything else there the whole
+scrub (other error fields are scrubbed whole before the record is written), and reading the record back gives
+the tagged words back as that type, so a title like "Token: pickup" saved, read back and shown on a card
+reaches you as written. That type copies and pickles like any text. The source check finds the light scrub by
+what it was imported as, under any name, and flags any other way of building that type; it reads every module
+of Harness, subpackages included, and refuses the ways of reaching the scrub it can't follow (a star import, a
+lookup by name, the scrub module or its protected names rebound other than by a plain name, passed on as an
+argument, or subclassed). That's what's enforced: the check is a source scan, not a sandbox. A source check makes sure no error, traceback or service answer is built into them, and that the light
 scrub is only ever handed one of those refusals. The source check for errors covers format calls, an error's
 attributes, joins over its arguments, traceback formatting, the message of a refusal raised with it, and a name
 it's rebound to (simply, in a tuple, or by adding to it), and counts a call as logged or scrubbed only when it's

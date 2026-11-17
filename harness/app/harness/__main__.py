@@ -63,6 +63,9 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
     # held), and all swapping is done here, before the ledger opens.
     from . import migrate
     path = os.path.join(data_dir, "harness.sqlite")
+    # Thirtieth round: the tap journal's lock and fsynced renames hold only on local storage, so a journal folder on
+    # a network mount is refused at the start (degraded: every tap refused, the status page says why).
+    handover.check_local(path + handover.TAP_JOURNAL)
     # Fourteenth round: the lock is taken before any marker is read, waiting while the restore command line
     # stages (it holds the same lock); a swap that can't finish safely starts degraded rather than open the
     # records beside a log that isn't theirs.
@@ -327,6 +330,8 @@ def main() -> int:
             log.error("the specialist couldn't start (%s): serving the status page and health only", type(e).__name__)
             from . import migrate
             why = (f"the records weren't opened: {scrub.scrub(e)}" if isinstance(e, migrate.SwapRefused)
+                   else "the tap journal must be on local storage, and its folder is a network mount"
+                   if isinstance(e, handover.NetworkJournal)
                    else f"the records couldn't be opened ({type(e).__name__})")
             got = degraded(data_dir, port, why, lock_wait=isinstance(e, migrate.LockBusy),
                            files=getattr(e, "files", None), marker_unwritten=getattr(e, "marker_unwritten", ""))

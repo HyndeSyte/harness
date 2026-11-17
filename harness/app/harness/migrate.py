@@ -2097,6 +2097,23 @@ def _drop_requeue_intents(journal: str, key: str) -> bool:
                             tombstone={"cleared": key, "op": dict(REQUEUE_OP), "at": _time.time()})
 
 
+def _not_journal_owner(journal: str) -> str:
+    """Thirtieth round: why the set-aside tool won't run as this user ("" when it may): its user isn't the tap
+    journal's owner (nor its lock file's)."""
+    me = os.geteuid()
+    for path in (journal, journal + ".lock"):
+        try:
+            owner = os.stat(path).st_uid
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "the tap journal couldn't be checked, so nothing was done"
+        if owner != me:
+            return ("it must run as the tap journal's owner (the App's own user), and this user isn't, so nothing "
+                    "was done")
+    return ""
+
+
 def _side_file(journal: str) -> str:
     """Twenty-ninth round: the controller's file beside the journal (Controller.REREAD_SIDE)."""
     return journal + ".reread"
@@ -2143,7 +2160,8 @@ def _side_relist(journal: str, key: str, gen: int | None, epoch: int = 0) -> tup
 def _side_write(path: str, data) -> bool:
     from . import handover
     try:
-        if data is None or (isinstance(data, dict) and not data.get("taps") and not data.get("gens")):
+        if data is None or (isinstance(data, dict) and not data.get("taps") and not data.get("gens")
+                            and not data.get("outage")):
             if os.path.exists(path):
                 os.remove(path)
         else:
@@ -2157,6 +2175,20 @@ def _side_write(path: str, data) -> bool:
     except OSError:
         return False
     return True
+
+
+RELIST_EPOCHS = "tap_relist_epochs"     # thirtieth round: the last epoch a requeue drew, for every tap
+
+
+def _epoch_counter(db) -> int:
+    """Thirtieth round: the last epoch any requeue drew (RELIST_EPOCHS in the records; 0 when there's none or it
+    doesn't read). Raised in the requeue's own transaction, never lowered or pruned."""
+    row = db.execute("SELECT value FROM meta WHERE key=?", (RELIST_EPOCHS,)).fetchone()
+    try:
+        n = int(row[0]) if row else 0
+    except (TypeError, ValueError):
+        return 0
+    return max(n, 0)
 
 
 def _side_epoch(journal: str, key: str) -> int:
@@ -2197,8 +2229,17 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
       folder sync; with no lock to take it appends a tombstone line instead, which every reader honours.
     - if that rewrite fails after the discard committed, the intent is an orphan: never read, carded or acted on
       (the discard record skips it everywhere), and the result says so; the same discard run again clears it.
-    - a struck relist mark whose count couldn't be read keeps no count for good: if that tap is ever listed again
-      it's stopped with its own card, never counted from one."""
+    - a struck relist mark whose count couldn't be read keeps no count for good (thirtieth round: written as the
+      "nocount" state, read ahead of any count beside the journal): if that tap is ever listed again it's stopped
+      with its own card, never counted from one or from a count beside the journal; only a requeue clears it.
+
+    Thirtieth round:
+    - the tool runs only as the tap journal's owner (the App's own user); as any other user it refuses and does
+      nothing, so a lock file or journal it leaves is always one the App can open.
+    - a requeue's epoch comes from one counter in the records for every tap (RELIST_EPOCHS), never pruned, so a
+      requeued tap's new cards never reuse an earlier once-key even when its mark and its count beside the journal
+      were both lost. Each requeue gives the tap up to six Go aheads again, and requeues have no limit: unbounded
+      runs of six per tap are acceptable because each requeue is an operator's explicit act."""
     import sqlite3 as _sqlite3
     import time as _time
     if action not in SET_ASIDE_ACTIONS:
@@ -2224,6 +2265,11 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                 return {"ok": True, "taps": rows, "discarded": gone, "said": f"{len(rows)} set-aside tap record(s)"}
             from . import handover
             jpath = journal or base + handover.TAP_JOURNAL
+            # Thirtieth round: the tool runs as the tap journal's owner (the App's user) or not at all, so a lock file
+            # or a rewritten journal it leaves is never one the App can't open.
+            stranger = _not_journal_owner(jpath)
+            if stranger:
+                return {"ok": False, "said": stranger}
             if key not in rows and action == "discard" and db.execute(
                     "SELECT 1 FROM meta WHERE key=?", (TAP_DISCARDED + key,)).fetchone() is not None:
                 # Twenty-ninth round: a discard done again on a discarded tap only clears what the first one
@@ -2291,8 +2337,11 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
             else:
                 e = old_mark.get("epoch", 0) if old_mark else 0
                 e = e if isinstance(e, int) and not isinstance(e, bool) and e > 0 else 0
-                epoch = max(e, _side_epoch(jpath, key)) + 1
-                new_mark = {k: v for k, v in (old_mark or {}).items() if k != "ended"}
+                # Thirtieth round: drawn from one counter in the records for every tap (RELIST_EPOCHS), never
+                # pruned and never lowered, so a requeued tap whose mark and count beside the journal were both
+                # lost still gets an epoch it never had, and its new cards never reuse an earlier once-key.
+                epoch = max(e, _side_epoch(jpath, key), _epoch_counter(db)) + 1
+                new_mark = {k: v for k, v in (old_mark or {}).items() if k not in ("ended", "nocount")}
                 new_mark.update(gen=0, epoch=epoch, pending=bool(new_mark.get("pending")))
                 side_ok, side_old = _side_relist(jpath, key, 0, epoch)
             if not side_ok:
@@ -2327,6 +2376,8 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                     if new_mark is not None:
                         db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                                    ("tap_relist:" + key, json.dumps(new_mark)))
+                        db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                                   (RELIST_EPOCHS, str(new_mark["epoch"])))
                     db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + key,))
                     db.execute("COMMIT")
                 except BaseException:
@@ -2944,7 +2995,9 @@ if __name__ == "__main__":
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 4 and args[1] == "--set-aside" and args[2] == "--taps":
         got = {"ok": False, "said": "name an operation first: --taps export|discard|requeue <tap key> (discard "
-                                    "again on a discarded tap clears what its first discard couldn't)"}
+                                    "again on a discarded tap clears what its first discard couldn't; run it as the "
+                                    "App's own user, the tap journal's owner; each requeue gives the tap up to six "
+                                    "Go aheads again, with no limit on requeues, since each is your own explicit act)"}
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 2 and args[1] == "--set-aside":

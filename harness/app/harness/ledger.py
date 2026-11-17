@@ -728,6 +728,17 @@ class Ledger:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def meta_record(self, key: str):
+        """Thirtieth round: a record kept as JSON text read back with his words as OwnerText (scrub.loads); None when
+        there's none or it doesn't read."""
+        raw = self.get_meta(key)
+        if raw is None:
+            return None
+        try:
+            return _scrub.loads(raw)
+        except ValueError:
+            return None
+
     def set_meta(self, key: str, value: str, db=None) -> None:
         (db or self.db).execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
@@ -735,8 +746,8 @@ class Ledger:
 
     def event(self, kind: str, detail: dict | str, db=None) -> None:
         # Twenty-sixth round: exception text in an event's fields is scrubbed here, at the sink.
-        text = _scrubbed_json(detail) if isinstance(detail, str) else json.dumps(_scrub.scrub_fields(detail),
-                                                                                sort_keys=True)
+        # Thirtieth round: his words in it (OwnerText) kept with their tag (scrub.dumps), so they read back as his.
+        text = _scrubbed_json(detail) if isinstance(detail, str) else _scrub.dumps(detail, sort_keys=True)
         (db or self.db).execute(
             "INSERT INTO events(at, kind, detail) VALUES(?, ?, ?)",
             (iso(self.now()), kind, text))

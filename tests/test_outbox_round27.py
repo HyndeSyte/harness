@@ -70,7 +70,9 @@ def test_a_refusal_card_names_his_event_as_written(m, monkeypatch, title):
     assert title in said and scrub.REDACTED not in said
 
 
-def test_a_stopped_parts_words_are_kept_as_written_at_the_records_sink(m):
+def test_untyped_words_get_the_whole_scrub_at_the_records_sink(m):
+    # Thirtieth round: renamed to what it asserts (his words as OwnerText keep his titles as values; the same text
+    # kept as JSON with no type tag gets the whole scrub; tagged words: tests/test_outbox_round30.py).
     # Twenty-ninth round: the sinks go by type. His words as OwnerText keep his titles at a sink that has them as
     # values (the tap journal's, scrub_fields); a record kept as JSON text has no types, so its words get the whole
     # scrub there, as anything that isn't his words does.

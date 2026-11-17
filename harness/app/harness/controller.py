@@ -882,41 +882,66 @@ class Controller:
         n = self.__dict__["_setaside_fails"] = self.__dict__.get("_setaside_fails", 0) + 1
         delay = self.SETASIDE_BACKOFF_S[min(n, len(self.SETASIDE_BACKOFF_S)) - 1]
         now = self._clock()
-        self.__dict__.setdefault("_setaside_since", int(now))
         self.__dict__["_replay_put_off"].append(now + delay)
         if n < self.SETASIDE_ALARM_AT:
             log.warning("the set-aside taps couldn't be read (%s); the start replay waits %d minutes",
                         type(e).__name__, delay // 60)
             return
-        first = "tap_setaside" not in self.notes
         self.notes["tap_setaside"] = self.SETASIDE_WORDS
         if self.handovers is not None:
             self.handovers.waiting = "taps waiting: the records' set-aside list can't be read"
-        if first:
-            self._setaside_card(now)
+        self._setaside_card()
         if now - self.__dict__.get("_setaside_said", float("-inf")) >= 3600:
             self.__dict__["_setaside_said"] = now
             log.error("the set-aside taps still can't be read (%s, %d tries in a row); the start replay waits, and "
                       "Harness's health says so until they can", type(e).__name__, n)
 
-    def _setaside_card(self, now: float) -> None:
-        """Twenty-ninth round: when the waiting flag first sets, one card for him, once-keyed on this outage (its
-        first failure's time), queued only where the outbox takes it: a refused write is logged, and the flag on
-        /health and the status page stay (Cain's link polling those flags is a precondition of enabling this beyond
-        the smoke run)."""
-        started = self.__dict__.setdefault("_setaside_since", int(now))
+    def _setaside_card(self) -> None:
+        """Twenty-ninth round: when the waiting flag sets, one card for him, queued only where the outbox takes it: a
+        refused write is logged, and the flag on /health and the status page stay (Cain's link polling those flags
+        is a precondition of enabling this beyond the smoke run).
+
+        Thirtieth round: once per outage, not per process. The outage is kept beside the tap journal (the side
+        file's "outage": its number, whether it's open, whether its card is queued), since the records are what
+        can't be read: a restart in the middle of one finds it open and its card queued, and sends none. Its number
+        comes from a counter there, never the clock, so a clock step can't mint a second key; the card is once-keyed
+        on it, and tried again at each alarm while the outbox refuses it, so exactly one goes. Closed (its number
+        kept) at the first read that works."""
+        side = self._side_load()
+        outage = side.get("outage") if isinstance(side.get("outage"), dict) else {}
+        try:
+            n = int(outage.get("n") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if not outage.get("open"):
+            outage = {"n": n + 1, "open": True, "carded": False}
+            side["outage"] = outage
+            if not self._side_save(side):
+                log.warning("the outage of the set-aside list couldn't be kept beside the tap journal")
+                return                          # no card without a kept outage: a restart can't send a second
+        elif outage.get("carded"):
+            return
         try:
             with self.ledger.tx() as db:
                 self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
-                                    text=render.fit(self.SETASIDE_CARD_WORDS), once=f"setaside_waiting:{started}")
-        except (Exception, TransactionAborted) as e:  # noqa: BLE001: the flags still say it
+                                    text=render.fit(self.SETASIDE_CARD_WORDS), once=f"setaside_waiting:{outage['n']}")
+        except (Exception, TransactionAborted) as e:  # noqa: BLE001: the flags still say it; tried at the next alarm
             self._reraise_dead(e)
             log.warning("the card that taps are waiting couldn't be queued (%s)", type(e).__name__)
+            return
+        side["outage"] = dict(outage, carded=True)
+        if not self._side_save(side):
+            log.warning("the waiting card's mark couldn't be kept beside the tap journal; its once-key holds it")
 
     def _setaside_read(self) -> None:
         """Twenty-eighth round: the set-aside taps read: the failure count starts again and the flag is cleared."""
         self.__dict__["_setaside_fails"] = 0
-        self.__dict__.pop("_setaside_since", None)
+        # Thirtieth round: the outage kept beside the journal is closed (its number kept for the next one).
+        side = self._side_load()
+        if isinstance(side.get("outage"), dict) and side["outage"].get("open"):
+            side["outage"] = {"n": side["outage"].get("n") or 0, "open": False, "carded": False}
+            if not self._side_save(side):
+                log.warning("the outage of the set-aside list couldn't be closed beside the tap journal")
         if self.notes.pop("tap_setaside", None) is not None and self.handovers is not None:
             self.handovers.waiting = ""
 
@@ -1421,13 +1446,34 @@ class Controller:
             # Twenty-ninth round: an ended mark is terminal whatever its generation (a null one included), so it
             # reads by its state first and never counts as unreadable for its generation; an epoch (a requeue's
             # fresh count) must read too.
+            # Thirtieth round: the state is decided before any other field is parsed: a mark with the ended state is
+            # terminal whatever its epoch or generation (malformed, a string, a bool or missing), so it's never
+            # unreadable and never falls through to the count beside the journal; its bad fields are only logged.
+            if prefix == self.RELIST_FLAG and isinstance(v, dict) and v.get("ended") is True:
+                if self._epoch_of(v.get("epoch", 0)) is None or ("gen" in v and v.get("gen") is not None
+                                                                 and self._gen_of(v.get("gen")) is None):
+                    log.warning("an ended relisted tap's mark has a field that doesn't read; it stays ended")
+                out[r["key"][len(prefix):]] = v
+                continue
+            # Thirtieth round: a struck mark that keeps no count ("nocount") reads as that state, ahead of any count
+            # beside the journal: never unreadable, so a side entry that appears later can't give it a count.
+            if prefix == self.RELIST_FLAG and self._nocount(v):
+                out[r["key"][len(prefix):]] = v
+                continue
             bad = not isinstance(v, dict) or (prefix == self.RELIST_FLAG and (
-                self._epoch_of(v.get("epoch", 0)) is None
-                or (v.get("ended") is not True and self._gen_of(v.get("gen")) is None)))
+                self._epoch_of(v.get("epoch", 0)) is None or self._gen_of(v.get("gen")) is None))
             if bad and unreadable is not None:
                 unreadable.add(r["key"][len(prefix):])
             out[r["key"][len(prefix):]] = v if isinstance(v, dict) else {}
         return out
+
+    @staticmethod
+    def _nocount(mark) -> bool:
+        """Thirtieth round: a relist mark that keeps no count for good: written with "nocount" (true) by the strike of
+        a count that couldn't be read anywhere, or by the one-time repair of an earlier build's nought mark with no
+        count beside it. Read ahead of any count beside the journal; only a requeue (a new epoch) clears it. A mark
+        whose count is null without that state is damage, and counts on from beside the journal as before."""
+        return isinstance(mark, dict) and mark.get("ended") is not True and mark.get("nocount") is True
 
     @classmethod
     def _gen_of(cls, value) -> int | None:
@@ -1467,6 +1513,9 @@ class Controller:
         mark = (marks or {}).get(key) if marks is not None and key not in unreadable else None
         if isinstance(mark, dict) and mark.get("ended") is True:
             return self.RELIST_GEN_CAP, self._epoch_of(mark.get("epoch", 0)) or 0, True
+        if self._nocount(mark):
+            # Thirtieth round: no count for good, whatever the side file holds (only a requeue clears it).
+            return None, self._epoch_of(mark.get("epoch", 0)) or 0, False
         s_gen = self._gen_of(side_gens.get(key)) if key in side_gens else None
         s_epoch = self._epoch_of(side_epochs.get(key, 0))
         side_ok = s_gen is not None and s_epoch is not None
@@ -1509,7 +1558,15 @@ class Controller:
                     fixed[k] = dict(v, gen=self.RELIST_GEN_CAP, ended=True)
                 elif gen == 0 and not isinstance(gen, bool) and not v.get("pending") and not v.get("epoch") \
                         and v.get("ended") is not True:
-                    fixed[k] = dict(v, gen=self._gen_of(side_gens.get(k)))
+                    g = side_gens.get(k)
+                    if isinstance(g, int) and not isinstance(g, bool) and g > self.RELIST_GEN_CAP:
+                        # Thirtieth round: a nought mark beside an over-cap count is ended at the cap, as an
+                        # over-cap mark is.
+                        fixed[k] = dict(v, gen=self.RELIST_GEN_CAP, ended=True)
+                    elif self._gen_of(g) is None:
+                        fixed[k] = dict(v, gen=None, nocount=True)   # thirtieth round: no count, kept so
+                    else:
+                        fixed[k] = dict(v, gen=self._gen_of(g))
             over = {k: g for k, g in side_gens.items()
                     if isinstance(g, int) and not isinstance(g, bool) and g > self.RELIST_GEN_CAP}
             if over:
@@ -1576,7 +1633,7 @@ class Controller:
         if not path:
             return False
         try:
-            if not data.get("taps") and not data.get("gens"):
+            if not data.get("taps") and not data.get("gens") and not data.get("outage"):
                 if os.path.exists(path):
                     os.remove(path)
                 self._storage_clear()
@@ -2060,6 +2117,8 @@ class Controller:
                     struck["epoch"] = mark["epoch"]
                 if mark.get("ended") is True:
                     struck["ended"] = True
+                elif struck["gen"] is None:
+                    struck["nocount"] = True    # thirtieth round: no count for good, ahead of any side entry
                 self.ledger.set_meta(self.RELIST_FLAG + key, json.dumps(struck), db)
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + key,))
         except Exception as e:                  # noqa: BLE001: the next tick strikes nothing and settles it

@@ -103,6 +103,17 @@ class OwnerText(str):
             raise TypeError("words for him are built with OwnerText.template or an owner refusal")
         return super().__new__(cls, value)
 
+    # Thirtieth round: copy, deep copy and pickling go through the private minting path (a plan or an outbox row
+    # holding his words is copied or pickled like any other text, and never raises on its constructor).
+    def __reduce__(self):
+        return (_owner, (str(self),))
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
     @classmethod
     def template(cls, fmt: str, /, **fields) -> "OwnerText":
         """A literal template (the scan checks it's a string literal at every call) filled with his events' own
@@ -159,20 +170,107 @@ ERROR_FIELDS = frozenset({"error", "errors", "last_error", "exception", "detail"
 OWNER_FIELDS = frozenset({"words"})
 
 
+# Thirtieth round: a record kept as JSON text keeps the type of his words with a tag: the key OWNER_TAG beside them,
+# listing which owner fields hold his words ("words" for the field, "words[2]" for one item of a list there). Only
+# dumps() writes it, from OwnerText values (any tag already in what it's handed is dropped); the records' sink gives
+# a tagged field the light scrub and anything else the whole scrub; loads() gives tagged fields back as OwnerText.
+OWNER_TAG = "__owner__"
+
+
+def _tags(value: dict) -> set:
+    tags = value.get(OWNER_TAG)
+    return {t for t in tags if isinstance(t, str)} if isinstance(tags, list) else set()
+
+
 def scrub_fields(value):
     """A record (dicts and lists, any depth) with every string under an ERROR_FIELDS key scrubbed (an OWNER_FIELDS
-    key's OwnerText with scrub_owner, anything else there with the whole scrub)."""
+    key's OwnerText with scrub_owner, anything else there with the whole scrub). Thirtieth round: in a record read
+    back from JSON text, an owner field its tag names (OWNER_TAG) is his words too, and keeps its tag."""
     if isinstance(value, dict):
-        def one(k, x):
-            # Twenty-ninth round: type-gated: the light scrub only for OwnerText in an owner field.
-            return _owner(_known(x)) if k in OWNER_FIELDS and isinstance(x, OwnerText) else scrub(x)
-        return {k: (one(k, v) if isinstance(v, str) and k in ERROR_FIELDS
-                    else [one(k, x) if isinstance(x, str) else scrub_fields(x) for x in v]
-                    if isinstance(v, list) and k in ERROR_FIELDS else scrub_fields(v))
+        tags = _tags(value)
+
+        def one(k, x, at):
+            # Twenty-ninth round: type-gated: the light scrub only for OwnerText in an owner field (thirtieth round:
+            # or one its tag names, in a record kept as JSON text).
+            if k in OWNER_FIELDS and (isinstance(x, OwnerText) or at in tags):
+                return _owner(_known(x))
+            return scrub(x)
+        return {k: (one(k, v, k) if isinstance(v, str) and k in ERROR_FIELDS
+                    else [one(k, x, f"{k}[{i}]") if isinstance(x, str) else scrub_fields(x) for i, x in enumerate(v)]
+                    if isinstance(v, list) and k in ERROR_FIELDS else v if k == OWNER_TAG else scrub_fields(v))
                 for k, v in value.items()}
     if isinstance(value, list):
         return [scrub_fields(x) for x in value]
     return value
+
+
+def _for_storage(value):
+    """Thirtieth round: a record made ready to be kept as JSON text: every ERROR_FIELDS string scrubbed (his words,
+    OwnerText in an owner field, with the light scrub, anything else with the whole scrub, before it's serialised),
+    and his words tagged (OWNER_TAG) so they read back as his words. Any tag already in it is dropped."""
+    if isinstance(value, dict):
+        out, tags = {}, []
+        for k, v in value.items():
+            if k == OWNER_TAG:
+                continue
+            if isinstance(v, str) and k in ERROR_FIELDS:
+                if k in OWNER_FIELDS and isinstance(v, OwnerText):
+                    out[k] = str(_known(v))
+                    tags.append(k)
+                else:
+                    out[k] = scrub(v)
+            elif isinstance(v, list) and k in ERROR_FIELDS:
+                items = []
+                for i, x in enumerate(v):
+                    if isinstance(x, str) and k in OWNER_FIELDS and isinstance(x, OwnerText):
+                        items.append(str(_known(x)))
+                        tags.append(f"{k}[{i}]")
+                    elif isinstance(x, str):
+                        items.append(scrub(x))
+                    else:
+                        items.append(_for_storage(x))
+                out[k] = items
+            else:
+                out[k] = _for_storage(v)
+        if tags:
+            out[OWNER_TAG] = tags
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_for_storage(x) for x in value]
+    return str(value) if isinstance(value, OwnerText) else value
+
+
+def dumps(value, **kw) -> str:
+    """Thirtieth round: a record as JSON text for the records, scrubbed and with his words tagged (_for_storage)."""
+    import json
+    return json.dumps(_for_storage(value), **kw)
+
+
+def _rehydrate(value):
+    if isinstance(value, dict):
+        tags = _tags(value)
+        out = {}
+        for k, v in value.items():
+            if k == OWNER_TAG:
+                continue
+            if k in OWNER_FIELDS and isinstance(v, str) and k in tags:
+                out[k] = _owner(v)
+            elif k in OWNER_FIELDS and isinstance(v, list):
+                out[k] = [_owner(x) if isinstance(x, str) and f"{k}[{i}]" in tags else _rehydrate(x)
+                          for i, x in enumerate(v)]
+            else:
+                out[k] = _rehydrate(v)
+        return out
+    if isinstance(value, list):
+        return [_rehydrate(x) for x in value]
+    return value
+
+
+def loads(text):
+    """Thirtieth round: a record kept as JSON text read back, its tagged fields his words again (OwnerText, through
+    the module's own minting), the tags themselves left out."""
+    import json
+    return _rehydrate(json.loads(text))
 
 
 class ScrubFilter(net.RedactingFilter):
