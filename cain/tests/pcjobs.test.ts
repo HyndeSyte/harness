@@ -7403,7 +7403,9 @@ describe("twenty-eighth review: a preload refused at the start, and every start 
   test("the real entry point started with the options variable pointing at the test module exits with the refusal and leaves its heartbeat", async () => {
     const home = mkdtempSync(join(tmpdir(), "pcw28-"));
     const p = Bun.spawn([process.execPath, ENTRY, "check-cli", "--home", home],
-      { env: { ...cleanEnv(), NODE_OPTIONS: `--require ${TESTBUILD}`, BUN_OPTIONS: `--preload ${TESTBUILD}` }, stdout: "pipe", stderr: "pipe" });
+      // The Node options variable only (BUN_OPTIONS is covered above: on Windows Bun itself can fail to start on its preload path,
+      // before the worker runs); the path with forward slashes, which every platform reads.
+      { env: { ...cleanEnv(), NODE_OPTIONS: `--require ${TESTBUILD.replace(/\\/g, "/")}` }, stdout: "pipe", stderr: "pipe" });
     const out = await new Response(p.stdout).text();
     expect(await p.exited).toBe(1);
     expect(JSON.parse(out.trim().split("\n")[0])).toMatchObject({ error: w.PRELOAD_FLAG_REFUSED, detail: expect.stringContaining("open a new terminal") });
