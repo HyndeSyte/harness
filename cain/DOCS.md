@@ -1230,6 +1230,37 @@ What Cain's link enforces:
   days; the Pi's clock decides those only for a card with no snowflake id. The stuck-intent waiting notice
   is told once per tap, request and episode, and cleared when the intent resolves.
 
+  Round 22 (the twenty-second review's fixes, to defects in round 21's own additions; the design stays
+  frozen for the combined fault scenario, and no new durable store: the keeper state already written each
+  round carries the new fields). The table in `cain/docs/source-check-invariants.md` is updated for every
+  row this round touches, and now tracks the remaining wall-clock housekeeping (tap notice pruning, the
+  landing prune, unresolved reminders, the push alarms' listing) with what each decides.
+
+  The keeper's check before a push fails closed: only a verified absence of withdrawn commits lets a push
+  go. If GitHub's branch isn't known to its copy, a git command fails, or a withdrawn commit can't be taken
+  out cleanly (a conflict), nothing is pushed, the cause is logged, Cain is told (no sha or job id), it is
+  listed under unresolved landings in `keeper.sh clock`, and every round tries again; a conflict stays
+  refused until the commit is taken out or the copy is reset. A held push is unsaved work like any
+  other: Ship taps wait, and over half an hour you get the usual notice that the record isn't saving. The drop and the push can no longer overlap:
+  the push holds the consumed-key log's lock from that check until its result is known, and a drop takes
+  the same lock and looks at GitHub's branch again under it, so a record whose commit just landed is marked
+  landed instead of dropped. After every push the range it carried is checked against the withdrawn
+  requests; a match is a push alarm to Cain, listed under unresolved landings. The two-hour landing window's
+  first reading (the box's own time since boot) and its round count are kept in the keeper's state per boot,
+  so a keeper that restarts often still decides, and only a reboot starts the count over. The stuck-intent
+  line to Cain goes once per episode however long it stays stuck (the saved notice keeps its request and
+  episode). Every lock caller is listed, each with what it does when the lock is busy past five seconds,
+  and a test checks the list against the source. The keeper's per-round torn check tries the lock once and
+  skips to the next round when it is busy, so a round never stalls there.
+
+  The start probe now also needs errno to resolve and runs a contention self-test (a helper process holds
+  the probe lock and the probe must see would-block); either failing refuses the start with its precise
+  reason. The refusal, its line and the hourly retry live in `startgate.ts`, which the tests drive. The
+  `arm64-flock` CI job is evidence for symbol resolution and the foreign-function path on arm64, under
+  user-mode emulation on an x86 host; it is not proof of the Pi's kernel. The Pi start probe plus the
+  combined fault scenario are the real arm64 gate. Making the job a required check is a change to the
+  repository's ruleset that only you can make.
+
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap
   predicate. A reset of the record that wins before that point (checked right before the claim)

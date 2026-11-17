@@ -646,6 +646,9 @@ export function spanWords(ms: number): string {
 export function plainPush(why: string | undefined, reset: boolean): string {
   const w = why ?? "";
   if (/no-such-remote|smoke test/i.test(w)) return "the smoke test is blocking it on purpose";
+  // Round 22: the push guard's refusals, in plain words (no ids).
+  if (/dropped request|dropped change|dropped requests/i.test(w)) return "a change that was withdrawn is held back from GitHub until the box can take it out";
+  if (/couldn't be locked for the push/i.test(w)) return "the box's own logs were busy";
   if (/conflict|couldn't be rebased/i.test(w)) return "GitHub's copy changed in a way the box couldn't merge";
   if (/authentication|could not read username|terminal prompts disabled|denied|\b40[13]\b/i.test(w)) return "GitHub turned down the box's sign-in (the GitHub token in the App's options may have expired)";
   if (/could not resolve|timed out|timeout|connection|unable to access|failed to connect|network/i.test(w)) return "GitHub didn't answer";
@@ -2162,7 +2165,10 @@ export class Link {
         next_try: new Date(u.next).toISOString(), told: u.told === true,
         // Round 11: the exact message he sends to settle it, and the docs section that says how to check.
         settle: [settleForm(tapKid(k), "landed"), settleForm(tapKid(k), "not-landed")], how: "DOCS.md, Reconciling a landing by hand",
-        reminded: u.reminded ? new Date(u.reminded).toISOString() : null, alerted: !!u.alerted })),
+        reminded: u.reminded ? new Date(u.reminded).toISOString() : null, alerted: !!u.alerted } as Record<string, unknown>)).concat(this.keeperPushes()),
+      // Round 22: the record keeper's own unresolved pushes (listed with the landings, no settle line: nothing of his to
+      // settle): a push its guard refused (retried each round) and a push alarm (a dropped request's commit reached GitHub).
+      unresolved_pushes: this.keeperPushes(),
       // Round 11: keys unresolved past 90 days, kept as tombstones (they no longer block a new card).
       tombstoned_landings: Object.entries(this.d.load().tombstones ?? {}).map(([k, u]) => ({ tap_key: tapKid(k), tombstone: true,
         since: new Date(u.since).toISOString(), tombstoned: new Date(u.tomb).toISOString(), failures: u.fails, last_error: u.last })),
@@ -2174,6 +2180,17 @@ export class Link {
       replay_open: Number((keeperStatus(this.files().status) as any)?.replay_open ?? 0),
       recheck_queue: Object.entries(this.d.load().recheck ?? {}).map(([item, r]) => ({ item, why: r.why, since: new Date(r.at).toISOString() })),
     };
+  }
+
+  // Round 22: the keeper's refused push and push alarms from its status, as unresolved_landings rows (what: "record push
+  // refused" or "record push alarm"), also given as unresolved_pushes.
+  private keeperPushes(): Record<string, unknown>[] {
+    const st = keeperStatus(this.files().status) as any;
+    const out: Record<string, unknown>[] = [];
+    const r = st?.push_refused;
+    if (r && typeof r.why === "string") out.push({ what: "record push refused", kind: String(r.kind ?? ""), since: String(r.since ?? ""), failures: Number(r.tries ?? 1), last_error: r.why, retried: "each keeper round", told: r.told === true });
+    for (const a of Array.isArray(st?.push_alarms) ? st.push_alarms : []) if (a && typeof a.why === "string") out.push({ what: "record push alarm", tap_key: String(a.tap ?? ""), since: String(a.at ?? ""), last_error: a.why });
+    return out;
   }
 
   // The accepted source check an ask or Ship card for the item rests on now, or null: the

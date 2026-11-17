@@ -5,7 +5,7 @@
 // is new). On read, a final record that is cut short, or whose length or checksum doesn't match (a
 // write a power cut tore), is truncated off the file and reported as torn, once: what came before
 // it stands. A bad record before the last one is skipped and counted. No log is ever rewritten.
-import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, truncateSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, readSync, rmSync, truncateSync, writeFileSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 const TABLE = (() => {
@@ -42,9 +42,12 @@ export interface LogRead<T = any> {
 // repair: "mirror" truncates without the lock, and only the keeper's single-writer mirror (record-issued.log) may ask for
 // it (any other file throws).
 export const SINGLE_WRITER_MIRROR = "record-issued.log";
-export function readLog<T = any>(file: string, o: { repair?: boolean | "mirror" } = {}): LogRead<T> {
+// Round 22: repair: "try" takes the flock with one non-blocking try (no wait): on would-block it throws a LockTimeout at
+// once, nothing truncated, and the caller skips the repair to its next round (the keeper's per-round torn check).
+export function readLog<T = any>(file: string, o: { repair?: boolean | "mirror" | "try" } = {}): LogRead<T> {
   if (o.repair === "mirror" && basename(file) !== SINGLE_WRITER_MIRROR) throw new Error(`only the keeper's single-writer mirror (${SINGLE_WRITER_MIRROR}) is repaired without the lock, not ${file}`);
   if (o.repair === true && existsSync(file)) return withLogLock(file, () => readOnce<T>(file, true));
+  if (o.repair === "try" && existsSync(file)) return withLogLock(file, () => readOnce<T>(file, true), { wait: 0 });
   return readOnce<T>(file, o.repair === "mirror");
 }
 function readOnce<T>(file: string, repair: boolean): LogRead<T> {
@@ -176,22 +179,62 @@ export class LockTimeout extends Error { constructor(file: string, ms: number) {
 export class LockError extends Error { constructor(msg: string) { super(msg); this.name = "LockError"; } }
 // Round 21: every append caller and what it does on a LockTimeout (hold and retry, never a dropped record or a crashed
 // loop). Listed in the invariant table; a test checks each.
+// Round 22: the list is complete: every call site of appendLog, appendLogHeld, appendInstall and withLogLock in the
+// link and the keeper is named by one entry's sites (a source fragment on that call's line), and a test checks that
+// every call site in the source matches an entry and every entry's sites are in the source (LOCK_SITES).
 export const LOCK_CALLERS: Record<string, string> = {
   "consumed-key log: consuming intent (keeper intendConsume)": "the request stays queued and is tried again next round",
   "consumed-key log: consumed record (keeper appendConsumed)": "the state keeps it, and the intent is resolved from the commit's trailers next round",
   "consumed-key log: dropped intent (keeper dropIntent)": "the intent stays open and is resolved from the record's history next round",
-  "consumed-key log: landed and unlanded marks (keeper unlandedConsumes)": "nothing is marked; looked at again next round",
+  "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": "nothing is marked or dropped and no commit is abandoned; looked at again next round",
+  "consumed-key log: the push guard (keeper guardedPush)": "nothing is pushed this round (refused: the lock); the local commits stay and the next round tries again",
   "held log: held (link holdTap)": "the tap answers busy and the card keeps its buttons",
-  "held log: releasing, released, replay marks (link releaseHeldTaps, replayWatch)": "the release or mark is retried next sweep",
+  "held log: releasing, released, dropped, replay marks (link releaseHeldTaps, replayWatch, replayWaiting)": "the release or mark is retried next sweep",
   "landing ledger settle log (link landings.ts settleHand, ownerLine)": "it answers false: nothing is settled and his message isn't used up, so Cain runs the same command again with the same message",
+  "issued-key log: key (link issueKeys)": "no key is logged, so the card is never made tappable (withdrawn, Cain asks again): no tap can count without its key",
+  "issued-key log: run (link start)": "the run isn't logged yet; the link logs it at its next start, and the keeper reads the run from the link's state meanwhile",
+  "issued-key log: void and armed marks (link voidCard, armCard, a tap on an unsaved card)": "the mark isn't written: an unarmed card stays without buttons, and a void is retried by the sweep that finds the card again",
+  "issued-key log: supersede (link replayWatch)": "nothing is superseded and nothing is asked again; the replay is looked at again next sweep",
+  "expired-key index (link expiry sweep, unarm)": "the card isn't indexed yet; its buttons still come off, and the next sweep indexes it",
+  "strip queue (link queueStrip, stripDone)": "the removal isn't queued (or marked done); the sweep edits the card again, which is idempotent",
+  "keeper's mirror of the issued-key log (keeper mirrorIssued)": "the round mirrors nothing more; the next round mirrors what is still missing",
+  "install log (keeper restore flag, once-used rebuild; link install-taps through appendInstall)": "nothing is written: install taps stay as they were, and the rebuild or flag is tried again next round",
+  "torn check (keeper cycle, readLog repair try)": "one non-blocking try: on would-block the repair is skipped to the next round, the round goes on",
+  "repair at start (link repairLogs, landings repair; readLog repair true)": "the repair waits for the lock up to the timeout, then is skipped and tried at the next start; readers skip a torn tail anyway",
+};
+// Round 22: for each LOCK_CALLERS entry, the source fragments of its call sites (file: fragments on the call's line).
+export const LOCK_SITES: Record<string, Record<string, string[]>> = {
+  "consumed-key log: consuming intent (keeper intendConsume)": { "record/main.ts": ['{ t: "consuming", tap, id, at }'] },
+  "consumed-key log: consumed record (keeper appendConsumed)": { "record/main.ts": ["appendLog(tapsLogFile(cfg), { tap, id, at })"] },
+  "consumed-key log: dropped intent (keeper dropIntent)": { "record/main.ts": ['{ t: "dropped", tap, id, at, why }'] },
+  "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": { "record/main.ts": ['{ t: "landed", tap: x.tap', 'withLogLock(tapsLogFile(cfg), () => { // dropUnlanded', '{ t: "landed", tap, id, at, how', '{ t: "dropped", tap, id, unlanded: true'] },
+  "consumed-key log: the push guard (keeper guardedPush)": { "record/main.ts": ["withLogLock(tapsLogFile(cfg), () => { // guardedPush"] },
+  "held log: held (link holdTap)": { "link/core.ts": ['appendLog(this.heldFile()!, { t: "held"'] },
+  "held log: releasing, released, dropped, replay marks (link releaseHeldTaps, replayWatch, replayWaiting)": { "link/core.ts": ['appendLog(this.heldFile()!, { t: "dropped"', 'appendLog(this.heldFile()!, { t: "released"', 'appendLog(this.heldFile()!, { t: "releasing"', '{ t: "replay-waiting"', '{ t: "replay-done"'] },
+  "landing ledger settle log (link landings.ts settleHand, ownerLine)": { "link/landings.ts": ["{ key, how, at, said }", '{ t: "owner", kind, said, at }'] },
+  "issued-key log: key (link issueKeys)": { "link/core.ts": ['{ t: "key", kid: tapKid(key)'] },
+  "issued-key log: run (link start)": { "link/core.ts": ['{ t: "run", run: s.run'] },
+  "issued-key log: void and armed marks (link voidCard, armCard, a tap on an unsaved card)": { "link/core.ts": ['{ t: "void", msg: msgId, at: now }', '{ t: "void", msg: msgId, at: this.d.now() }', '{ t: "void", msg, at: this.d.now(), why }', '{ t: "armed", msg: msgId'] },
+  "issued-key log: supersede (link replayWatch)": { "link/core.ts": ['{ t: "supersede", kid: r.kid'] },
+  "expired-key index (link expiry sweep, unarm)": { "link/core.ts": ['this.indexRecord(msg, r, false, "unarmed")', 'this.indexRecord(id, undefined, old, "swept")', 'this.indexRecord(msg, rec, false, "swept")'] },
+  "strip queue (link queueStrip, stripDone)": { "link/core.ts": ['{ t: "strip", msg, line', '{ t: "done", msg, at'] },
+  "keeper's mirror of the issued-key log (keeper mirrorIssued)": { "record/main.ts": ["appendLog(issuedMirrorFile(cfg), r)"] },
+  "install log (keeper restore flag, once-used rebuild; link install-taps through appendInstall)": { "record/main.ts": ['{ t: "flag", how: "off", by: "keeper"', '{ t: "once-used", kid: k, by: "keeper"'], "installflag.ts": ["appendLog(file, rec)"], "link/core.ts": ['{ t: "once-used", kid, msg: msgId', '{ t: "flag", how, by: "cain"', '{ t: "flag", how: "on", by: "owner"'] },
+  "torn check (keeper cycle, readLog repair try)": { "record/main.ts": ['repair: f === issuedMirrorFile(cfg) ? "mirror" : "try"'] },
+  "repair at start (link repairLogs, landings repair; readLog repair true)": { "link/core.ts": ["readLog(this.d.issuedLog, { repair: true })"], "link/landings.ts": ["readLog(join(dir, SETTLED_LOG), { repair: true })"] },
 };
 export const LIBC_NAMES = ["libc.so.6", "libc.so", "libc", "libc.dylib", "libSystem.B.dylib"];
 // A test's view of the FFI: names to try instead of LIBC_NAMES, or a flock stand-in returning [rc, errno].
-export const lockTest: { names: string[] | null; call: null | ((fd: number, op: number) => [number, number]) } = { names: null, call: null };
+// Round 22: errnoSyms, the errno symbols to try instead of ERRNO_SYMS (a test's libc that loads with no errno symbol).
+export const ERRNO_SYMS = ["__errno_location", "__error"];
+export const lockTest: { names: string[] | null; call: null | ((fd: number, op: number) => [number, number]); errnoSyms: string[] | null } = { names: null, call: null, errnoSyms: null };
 const sleepSync = (ms: number) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* spin */ } };
 type Flock = (fd: number, op: number) => [number, number];
 let flockFn: Flock | null = null;
-export function resetFlockForTest(): void { flockFn = null; }
+// Round 22: whether errno resolved (null: flock not loaded yet). Without it every flock failure reads as errno -1, so a
+// contention would be told at once as a lock error instead of waited for: the start probe refuses then.
+let errnoResolved: boolean | null = null;
+export function resetFlockForTest(): void { flockFn = null; errnoResolved = null; }
 function flock(): Flock {
   if (lockTest.call) return lockTest.call;
   if (flockFn) return flockFn;
@@ -201,12 +244,13 @@ function flock(): Flock {
   for (const name of lockTest.names ?? LIBC_NAMES) {
     try { lib = dlopen(name, { flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 } }); }
     catch (e) { tried.push(`${name}: ${String((e as Error)?.message ?? e).slice(0, 60)}`); continue; }
-    for (const sym of ["__errno_location", "__error"]) {
+    for (const sym of lockTest.errnoSyms ?? ERRNO_SYMS) {
       try { const l = dlopen(name, { [sym]: { args: [], returns: FFIType.ptr } }); errno = () => read.i32(l.symbols[sym]()); break; } catch { /* the other name */ }
     }
     break;
   }
   if (!lib) throw new LockError(`flock couldn't be loaded from libc (tried ${tried.join("; ")}), so no shared log is written`);
+  errnoResolved = errno !== null;
   flockFn = (fd, op) => { const rc = lib.symbols.flock(fd, op); return [rc, rc === 0 ? 0 : errno ? errno() : -1]; };
   return flockFn;
 }
@@ -214,18 +258,20 @@ const LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8;
 const EINTR = 4, WOULD_BLOCK = new Set([11, 35]);   // EAGAIN/EWOULDBLOCK on Linux, on macOS
 const ERRNO: Record<number, string> = { 1: "EPERM", 4: "EINTR", 5: "EIO", 9: "EBADF", 12: "ENOMEM", 13: "EACCES", 22: "EINVAL", 37: "ENOLCK", 38: "ENOSYS", 77: "ENOLCK", 95: "EOPNOTSUPP" };
 export const lockFile = (file: string) => `${file}.flock`;
-export function withLogLock<T>(file: string, fn: () => T): T {
+// Round 22: o.wait, the wait in ms instead of lockWait.ms (0: one non-blocking try, a LockTimeout at once on would-block).
+export function withLogLock<T>(file: string, fn: () => T, o: { wait?: number } = {}): T {
   const f = flock();
   mkdirSync(dirname(file), { recursive: true });
   const fd = openSync(lockFile(file), "a+", 0o600);
   try {
-    const until = performance.now() + lockWait.ms;   // the monotonic clock: a bound inside this process
+    const wait = o.wait ?? lockWait.ms;
+    const until = performance.now() + wait;   // the monotonic clock: a bound inside this process
     for (;;) {
       const [rc, err] = f(fd, LOCK_EX | LOCK_NB);
       if (rc === 0) break;
       if (err === EINTR) continue;
       if (!WOULD_BLOCK.has(err)) throw new LockError(`the log ${file} couldn't be locked: flock failed with errno ${err}${ERRNO[err] ? ` (${ERRNO[err]})` : ""}, a lock error of its own (not would-block); nothing was written`);
-      if (performance.now() > until) throw new LockTimeout(file, lockWait.ms);
+      if (performance.now() >= until) throw new LockTimeout(file, wait);
       sleepSync(5);
     }
     try { return fn(); } finally { f(fd, LOCK_UN); }
@@ -233,12 +279,34 @@ export function withLogLock<T>(file: string, fn: () => T): T {
 }
 // Round 21: the start probe: flock loaded, and taken and released on a probe file in the real log folder. null: fine;
 // otherwise the specific cause, for the refusal line.
+// Round 22: the probe also requires errno to resolve, and runs a contention self-test: a child process (this file run as
+// a script, --hold) takes the probe file's lock, and the probe's own non-blocking try must answer would-block. Either
+// failing refuses the start with its precise reason.
+export const PROBE_HOLD_MS = 4_000;
 export function probeLock(dir: string): string | null {
+  let child: { kill: () => void } | null = null;
   try {
     mkdirSync(dir, { recursive: true });
-    withLogLock(join(dir, ".lock-probe"), () => undefined);
+    const probe = join(dir, ".lock-probe");
+    withLogLock(probe, () => undefined);
+    if (!lockTest.call && errnoResolved === false) return `flock loaded from libc, but errno couldn't be resolved (tried ${(lockTest.errnoSyms ?? ERRNO_SYMS).join(", ")}), so a lock held by another writer couldn't be told from a lock error`;
+    // The contention self-test.
+    const flag = join(dir, `.lock-probe.${process.pid}.held`);
+    try { rmSync(flag, { force: true }); } catch { /* none */ }
+    const p = Bun.spawn([process.execPath, import.meta.path, "--hold", probe, flag, String(PROBE_HOLD_MS)], { stdio: ["ignore", "ignore", "ignore"] });
+    child = p;
+    const until = performance.now() + 5_000;
+    while (!existsSync(flag) && p.exitCode === null && performance.now() < until) sleepSync(10);
+    if (!existsSync(flag)) return "the lock self-test's helper process couldn't take the probe lock, so contention couldn't be checked";
+    const fd = openSync(lockFile(probe), "a+", 0o600);
+    let rc = 0, err = 0;
+    try { [rc, err] = flock()(fd, LOCK_EX | LOCK_NB); if (rc === 0) flock()(fd, LOCK_UN); } finally { closeSync(fd); }
+    try { rmSync(flag, { force: true }); } catch { /* left */ }
+    if (rc === 0) return "the lock self-test took a lock another process held, so flock doesn't exclude other writers here";
+    if (!WOULD_BLOCK.has(err)) return `the lock self-test got errno ${err}${ERRNO[err] ? ` (${ERRNO[err]})` : ""} for a lock another process held, not would-block`;
     return null;
   } catch (e) { return String((e as Error)?.message ?? e).slice(0, 300); }
+  finally { try { child?.kill(); } catch { /* gone */ } }
 }
 // The status line he sees when the probe fails (the link's notice; the keeper's line through Cain).
 export const lockRefusal = (who: "link" | "record keeper", why: string) =>
@@ -302,4 +370,11 @@ export function writeLogForTest(file: string, recs: unknown[], tail = ""): void 
   mkdirSync(dirname(file), { recursive: true });
   const fd = openSync(file, "w", 0o600);
   try { writeSync(fd, recs.map(frame).join("") + tail); fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+// Round 22: the start probe's contention helper: `bun applog.ts --hold <probe file> <flag file> <ms>` takes the probe
+// file's lock, writes the flag, and holds the lock for ms (or until it is killed).
+if (import.meta.main && process.argv[2] === "--hold") {
+  const [file, flag, ms] = process.argv.slice(3);
+  withLogLock(file, () => { writeFileSync(flag, "held"); sleepSync(Number(ms) || PROBE_HOLD_MS); }, { wait: 5_000 });
 }

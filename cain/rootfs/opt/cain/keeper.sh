@@ -91,6 +91,11 @@
 #                                        replay_open as well. If this answers nothing at all and the App's log
 #                                        says the link refused to start (its logs can't be locked), the link
 #                                        isn't running: Dane was told by the App
+#                                        Round 22: unresolved_landings also lists the record keeper's own
+#                                        pushes (what "record push refused": a push its guard held back,
+#                                        retried each round; "record push alarm": a withdrawn request's
+#                                        commit reached GitHub), with no settle line; unresolved_pushes
+#                                        lists the same rows alone
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

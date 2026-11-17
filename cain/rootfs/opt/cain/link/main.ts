@@ -49,6 +49,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { readFile } from "node:fs/promises";
 import { teeConsole } from "../logfile";
 import { lockRefusal, probeLock } from "../applog";
+import { lockGate } from "../startgate";
 import { localReadings, verdict } from "../clock";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
@@ -310,15 +311,18 @@ try { if (!existsSync(STATE)) save(load()); } catch (e) { console.log(`[cain] li
 
 // Round 21: flock is probed at start on a probe file in the real log folder. When it can't be loaded or taken, the link
 // refuses to start its sweep and its gateway (no taps taken, no cards posted), logs why, posts him the status line once,
-// and tells Cain; it tries again hourly.
-const LOCK_REFUSED = probeLock(ISSUED_LOG.replace(/\/[^/]*$/, "") || "/data");
-if (LOCK_REFUSED) {
-  console.log(`[cain] link: REFUSED TO START: ${LOCK_REFUSED}`);
-  link.relayLine(`The link refuses to start: ${LOCK_REFUSED}. Dane was told by the App. Log a Build item; nothing else to do.`);
-  try { await link.notice(lockRefusal("link", LOCK_REFUSED), NOTICE_TIMEOUT_MS); } catch (e) { console.log(`[cain] link: couldn't post the lock refusal: ${String(e).slice(0, 80)}`); }
-  while (probeLock(ISSUED_LOG.replace(/\/[^/]*$/, "") || "/data")) await Bun.sleep(3_600_000);
-  console.log("[cain] link: its logs can be locked now; starting");
-}
+// and tells Cain; it tries again hourly. Round 22: the gate is ../startgate.ts (tested); the probe also checks errno and
+// runs a contention self-test.
+const LOG_DIR = ISSUED_LOG.replace(/\/[^/]*$/, "") || "/data";
+await lockGate({
+  probe: () => probeLock(LOG_DIR),
+  log: (line) => console.log(`[cain] link: ${line}`),
+  tell: async (why) => {
+    link.relayLine(`The link refuses to start: ${why}. Dane was told by the App. Log a Build item; nothing else to do.`);
+    try { await link.notice(lockRefusal("link", why), NOTICE_TIMEOUT_MS); } catch (e) { console.log(`[cain] link: couldn't post the lock refusal: ${String(e).slice(0, 80)}`); }
+  },
+  sleep: (ms) => Bun.sleep(ms),
+});
 
 // -- the gateway's health, for the Harness page ------------------------------------
 let connected = false;
