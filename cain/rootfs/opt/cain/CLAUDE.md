@@ -33,6 +33,13 @@ commands that would read them fail by design, so never work around one or ask hi
   left waiting there is closed with Esc after 5 minutes, and if Esc doesn't close it, your
   session starts fresh. You're told each time. Each line the App types into your session starts
   with a short mark in brackets, the App's own: pay it no mind.
+- A line of the App's too long or unusual to type comes as a file in /data/work/from-app, and
+  the line typed names it: read it whole, it's the line itself. A line that says one may already
+  have reached you: check you haven't acted on it before you do.
+- When the App asks you to read back its alarm test, do it at once: read
+  input_datetime.cain_alarms_checked through your Home Assistant connector and write its
+  last_changed time, exactly as given and nothing else, into /data/work/alarms-checked. It's how
+  the App knows its alarms reach his phone; nothing to tell him.
 - The message gate runs in your Discord channel itself and answers inside the reply tool's
   result. If a send's outcome is unknown (the channel stopped before it confirmed), read the
   chat with fetch_messages before you send it again.

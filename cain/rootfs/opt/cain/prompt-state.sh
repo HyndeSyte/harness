@@ -24,6 +24,9 @@
 #           leading and trailing blanks (the wrap's indent), and the box's edges when it's boxed.
 #           checkin.sh presses Enter only when those lines, joined by single spaces, are exactly
 #           what it typed (outside review, rounds 17 and 18).
+#           With PROMPT_ABOVE set (ready or draft), every line above his input box follows instead,
+#           as drawn, its top border left out: where Claude Code shows a line once it's sent, so
+#           checkin.sh can see its try went in (Cain's fourth service review, must-fix 1).
 #   dialog  no input area, and a screen showing key hints ("Esc to cancel", "Enter to continue",
 #           "Enter to confirm" and the like) in those lines: a screen waiting for an answer, which
 #           typing would answer. Nov 16, Claude Code's offer to set up auto mode said "auto mode"
@@ -92,10 +95,17 @@ awk '
     }
     if (foot && hint < foot) {
       print (empty ? "ready" : "draft")
-      if (!empty && ENVIRON["PROMPT_DRAFT_LINE"] != "") print words(line[at])
-      if (!empty && ENVIRON["PROMPT_DRAFT_TEXT"] != "") {
-        s = orig[at]; sub(/^([[:space:]]|\302\240)*/, "", s); boxed = (s ~ /^│/)
-        for (x = at; x <= last; x++) print drawn(orig[x], x == at, boxed)
+      if (ENVIRON["PROMPT_ABOVE"] != "") {
+        t = at - 1
+        if (t >= 1 && border(line[t])) t--
+        for (x = 1; x <= t; x++) print orig[x]
+      }
+      else {
+        if (!empty && ENVIRON["PROMPT_DRAFT_LINE"] != "") print words(line[at])
+        if (!empty && ENVIRON["PROMPT_DRAFT_TEXT"] != "") {
+          s = orig[at]; sub(/^([[:space:]]|\302\240)*/, "", s); boxed = (s ~ /^│/)
+          for (x = at; x <= last; x++) print drawn(orig[x], x == at, boxed)
+        }
       }
     }
     else if (hint) print "dialog"

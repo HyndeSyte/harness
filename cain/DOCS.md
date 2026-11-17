@@ -181,8 +181,8 @@ and checked at every start. The whole design, and its review, is in the record:
 `projects/org-v2/c1-plan.md`.
 
 The move happens once, at the first start after the calendar App signs its requests (the
-calendar App 0.24.0): the App restarts itself, checks the new setup on the Pi, and only then
-switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then Cain runs as
+calendar App 0.24.0) and the App's alarms to your phone are shown to work (below): the App
+restarts itself, checks the new setup on the Pi, and only then switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then Cain runs as
 0.11.0 did. After the move there is no way back to root but restoring the backup taken before
 the update. `/data/trust/c1check.json` holds the check that runs as `cain` at every start.
 
@@ -200,12 +200,21 @@ on the panel if you're at it), and if that doesn't close it, starts his session 
 later (at most once an hour, and he's told to read your messages he may have missed). You hear
 only when that can't clear it (a question back within the hour of a fresh start, three closed
 with Esc within an hour, or a step the App can't keep track of), and it comes down once his
-prompt has been back 5 minutes.
+prompt has been back 5 minutes. A draft left in his input box (not the App's own), unchanged
+for 15 minutes, is saved in his folder and cleared, and a screen the App doesn't know is saved
+and his session started fresh; he's told each time.
 The App types your taps and his check-ins into his session only after that session has passed
 its check of his own user (at every start, and every start is the App's: when Claude Code ends,
 his session ends and the App starts it again), only at his prompt, empty and steady, and it
-presses Enter only once what it typed sits in his input box. A tap that can't go in waits, never
-lost, and a check-in that misses its hour is named in the next one.
+presses Enter only once what it typed sits whole in his input box. Each line it types carries its
+own random mark, and leaves its queue only once that mark shows in his session's transcript or
+on his screen above his input box: a question that takes the Enter leaves the line to go in later,
+once, and a line that can't be known in or not is never typed again as new (he gets it as a file,
+told to check first). A text too long or unusual to type goes as a file in his folder, the line
+typed naming it. A tap that can't go in waits, never lost, and check-ins that miss their hour
+are named in the next one, however many. If nothing goes in for half an hour while something
+waits (his screen not busy), or for two hours in all, or a draft or a screen the App doesn't know
+stays half an hour, you hear "Cain isn't getting messages", once, and when it's back.
 If a try of the move fails, he keeps running the old way (after a restart of the App, when the
 try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
 session (`/opt/cain/notice.sh`), what happened and the way back:
@@ -217,8 +226,9 @@ session (`/opt/cain/notice.sh`), what happened and the way back:
   only: no Home Assistant notification, which everyone in the house would see.
 
 Alarms are kept apart by what they're about (whether he's running, whether his session keeps
-ending, whether his move went through, whether a question keeps coming back on his screen),
-so one never takes down another.
+ending, whether his move went through, whether a question keeps coming back on his screen,
+whether what the App types goes in, whether its alarms reach your phone), so one never takes
+down another.
 
 The Home Assistant side is one automation with a webhook trigger. The App has no Home
 Assistant API access, on purpose: the Supervisor's route to a notification would give every
@@ -228,9 +238,13 @@ Its id is a long random one (32 to 128 letters, digits, `-` or `_`) in this App'
 `notice_hook` option, which only the App's root and Home Assistant's admins can read, never
 Cain's own user: an id he could work out would let him send or take down an alarm. Until it's
 set, the alarms go to Discord only, and those still standing reach Home Assistant once it is
-(the App reads it at its next start). The App also posts a probe (`state: test`) at each start
-and daily, which notifies no one: the automation notes its time in a helper, the proof from
-Home Assistant's side that the channel works.
+(the App reads it at its next start). The App also posts a probe (`state: test`) daily, and
+at once when the hook is set or changed, which notifies no one: the automation notes its time
+in a helper. The App can't read Home Assistant, so it asks Cain to read that helper through his
+read-only connector and write what it says into his folder, and checks it against the probe:
+moved, the channel counts as working (the move to his own user waits for that); read and not
+moved, you hear it from his bot ("Cain's alarms reach you here only"), and Cain files it for a
+fix. No one needs to check it by hand.
 
 ```yaml
 alias: Cain App alarms
@@ -264,8 +278,9 @@ The tag is what lets "Cain is back", or a newer alarm about the same thing, repl
 your phone. `input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
 Assistant can't be reached is sent once it can; one that clears while it can't stays to be
 taken down. Home Assistant answers every webhook post alike, found or not, so the probe's time
-in the helper is the only proof the channel works end to end: after an update, set
-`notice_hook`, restart the App if it hasn't restarted since, and see the helper move.
+in the helper is the only proof the channel works end to end, and the App has Cain read it back
+each time (above): after an update, set `notice_hook` and restart the App if it hasn't restarted
+since; the probe and its readback follow by themselves.
 
 **The way back** (the alarms say which applies): restart the Cain App (Settings, Apps,
 Cain, Restart); or restore two backups from just before the update, Cain's first and then the

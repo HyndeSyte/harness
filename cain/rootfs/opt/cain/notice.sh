@@ -10,14 +10,22 @@
 #     all the webhook can reach (DOCS.md, "If Cain stops"). The App keeps homeassistant_api off on
 #     purpose: the Supervisor's own route to a notification needs it, and it would hand every
 #     root process here, and the old way's root session, the run of all of Home Assistant. Sent
-#     again daily while the alarm lasts, and at once when the hook is set or changed. A probe at
-#     each start and daily (no notification: the automation only notes the time in a helper)
-#     shows from Home Assistant's side that the channel works. Until notice_hook is set, alarms
-#     go to Discord only, and reach Home Assistant once it is.
+#     again daily while the alarm lasts, and at once when the hook is set or changed. A probe
+#     daily, and at once when the hook is set or changed (no notification: the automation only
+#     notes the time in a helper, input_datetime.cain_alarms_checked), is read back without Dane
+#     (Cain's fourth service review, must-fix 6): the App can't read Home Assistant itself (no API
+#     access, above), so it asks Cain to read the helper through his read-only connector and write
+#     what it says into his folder ($READ), and checks that against the probe's time. Shown to
+#     move, the channel counts as proven ($PROVEN, which the move to his own user waits for: the
+#     run script); read and not moved, Dane hears from his bot (the "phone" group) and Cain files
+#     it for the laptop session. Until notice_hook is set, alarms go to Discord only, and reach
+#     Home Assistant once it is.
 # Alarms are kept per group, so one never erases another: "stop" (why he isn't running now:
 # stopped, paused, or restarting), "session" (his session keeps ending), "switch" (his move to his
-# own user failed; he runs the old way), and "screen" (a question keeps coming back on his screen,
-# where no one answers it: unstick.sh). Within a group a newer alarm replaces the last.
+# own user failed; he runs the old way), "screen" (a question keeps coming back on his screen,
+# where no one answers it: unstick.sh), "deliver" (what the App types into his session doesn't go
+# in: watch.sh) and "phone" (its alarms to his phone failed their test). Within a group a newer
+# alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
 # is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
@@ -27,8 +35,12 @@
 #   notice.sh clear running          Cain runs again: the stop and session groups clear
 #   notice.sh clear switched         Cain runs as his own user: those and the switch group clear
 #   notice.sh clear screen           his prompt is back (unstick.sh): the screen group clears
-#   notice.sh tick                   the repeats, retries and the daily probe (every 10 minutes)
+#   notice.sh clear delivered        what the App types goes in again (watch.sh): the deliver group
+#   notice.sh clear phone            the probe was read back moved: the phone group clears
+#   notice.sh tick                   the repeats, retries, the probe and its readback (every 10 minutes)
 #   notice.sh probe                  the probe, now
+#   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
+#   notice.sh hooked                 0 when notice_hook is set, well formed (no lock)
 #   notice.sh text <alarm> [cause]   an alarm's title and text, one line each (tests, docs)
 # Exits 0 when done, 1 when something stays to be kept or sent (said on stderr), 2 on a wrong
 # use, 75 when it couldn't have the lock.
@@ -37,11 +49,15 @@ umask 077
 OPT="${NOTICE_OPT:-/opt/cain}"
 D="${NOTICE_DATA:-/data}"
 DIR="${NOTICE_DIR:-$D/c1/notice.d}"
-PROBED="${NOTICE_PROBED:-$D/c1/notice-probed}"
+PROBED="${NOTICE_PROBED:-$D/c1/notice-probed}"   # "<when> <hook's hash>": the last probe Home Assistant took
+PROVEN="${NOTICE_PROVEN:-$D/c1/notice-proven}"   # the last probe read back moved: its time
+READ="${NOTICE_READ:-$D/work/alarms-checked}"    # Cain's reading of the helper: his file
+QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen"
+GROUPS_ALL="stop session switch screen deliver phone"
+export TZ="${CHECKIN_TZ:-America/New_York}"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
 RESTART="restart the Cain App: Settings, Apps, Cain, Restart"
@@ -52,6 +68,8 @@ group_of() {
     session) echo session ;;
     switch-failed|switch-waits) echo switch ;;
     waiting) echo screen ;;
+    stalled) echo deliver ;;
+    phone) echo phone ;;
     *) return 1 ;;
   esac
 }
@@ -84,12 +102,18 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
     waiting) T="Cain isn't answering"
       M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and the App couldn't clear it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    stalled) T="Cain isn't getting messages"
+      M="Cain isn't getting messages: what the App types into his session (your taps, his check-ins) hasn't gone in for a while${c}. The App keeps trying, and clears what it can by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    phone) T="Cain's alarms reach you here only"
+      M="Cain's alarms to your phone through Home Assistant didn't pass their test${c}, so for now they reach you only here, from his bot. Nothing for you to do: Cain has it filed for a fix." ;;
     *) return 1 ;;
   esac
 }
 cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
   case "$1" in switch) CT="Cain moved to his own user"; CM="Cain now runs as his own user, the safer setup in his update." ;;
     screen) CT="Cain is back"; CM="Cain is answering again: nothing waits on his screen." ;;
+    deliver) CT="Cain is getting messages again"; CM="Cain is getting messages again: what the App types goes in." ;;
+    phone) CT="Cain's alarms reach your phone again"; CM="Cain's alarms to your phone through Home Assistant passed their test again." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -178,7 +202,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting|stalled|phone) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -196,10 +220,11 @@ tell() {   # tell <kind> [cause]
   G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0
   deliver
 }
-clear_groups() {   # clear_groups running|switched|screen
+clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   local groups g rc=0
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
-    *) echo "notice: clear running, switched or screen" >&2; return 2 ;; esac
+    delivered) groups="deliver" ;; phone) groups="phone" ;;
+    *) echo "notice: clear running, switched, screen, delivered or phone" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -211,17 +236,65 @@ clear_groups() {   # clear_groups running|switched|screen
   done
   return "$rc"
 }
-probe() {   # no notification: Home Assistant's automation only notes the time
-  local now; now="$(date +%s)"
+# A line for Cain, typed into his session by checkin.sh once his prompt is free.
+relay() { local l; l="$(jq -cn --arg t "$1" '{text: $t}')" && printf '%s\n' "$l" >> "$QUEUE"; }
+# His files are read as him the new way (the run script sets CAIN_AS), so no link of his leads root.
+as_him() { if [ -n "${CAIN_AS:-}" ]; then timeout -k 2 20 $CAIN_AS "$@"; else timeout -k 2 20 "$@"; fi; }
+probe() {   # no notification: Home Assistant's automation only notes the time, which Cain reads back
+  local now h
+  now="$(date +%s)"
   G="probe"; kind="probe"
-  if ha_send test "" ""; then printf '%s\n' "$now" > "$PROBED.tmp" && mv -f "$PROBED.tmp" "$PROBED"; echo "[cain] alarms: Home Assistant's webhook took the probe"; return 0; fi
+  if ha_send test "" ""; then
+    h="$(hook)" || h=""
+    printf '%s %s\n' "$now" "$(hash16 "$h")" > "$PROBED.tmp" && mv -f "$PROBED.tmp" "$PROBED"
+    echo "[cain] alarms: Home Assistant's webhook took the probe; Cain is asked to read it back"
+    relay "The App sent its alarm channel's daily test to Home Assistant at $(date -d "@$now" '+%-I:%M %p'). Through your Home Assistant connector, read input_datetime.cain_alarms_checked, and write its last_changed time, exactly as the connector gives it and nothing else, into $READ (the whole file). Nothing to tell him." \
+      || echo "[cain] alarms: the readback couldn't be asked of Cain ($QUEUE)" >&2
+    return 0
+  fi
   echo "[cain] alarms: Home Assistant's webhook didn't take the probe (no notice_hook set, or Home Assistant didn't answer)" >&2
   return 1
 }
+# What Cain read back for the last probe Home Assistant took: 0 it moved (to the probe's time or
+# later, a minute's slack for the clocks), 1 it didn't (his reading, written after the probe, is
+# older), 2 nothing to go on yet (no probe, no reading since it, or one that isn't a time).
+readback() {
+  local t m r s
+  t="$(head -n 1 "$PROBED" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"; [ -n "$t" ] || return 2
+  m="$(as_him stat -c %Y "$READ" 2>/dev/null | tr -cd '0-9')"
+  { [ -n "$m" ] && [ "$m" -ge "$t" ]; } || return 2
+  r="$(as_him head -c 100 "$READ" 2>/dev/null | head -n 1 | tr -cd '0-9:T .+Z-')"
+  [ -n "$r" ] && s="$(date -d "$r" +%s 2>/dev/null)" || return 2
+  [ "$s" -ge $((t - 60)) ] && return 0
+  return 1
+}
+check_readback() {
+  local t rb=0
+  readback || rb=$?
+  t="$(head -n 1 "$PROBED" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"
+  case "$rb" in
+    0) if [ "$(head -n 1 "$PROVEN" 2>/dev/null)" != "$t" ]; then
+         { printf '%s\n' "$t" > "$PROVEN.tmp" && mv -f "$PROVEN.tmp" "$PROVEN"; } 2>/dev/null \
+           && echo "[cain] alarms: Cain read the helper moved by the probe: the channel to his phone works"
+       fi
+       clear_groups phone ;;
+    1) # Once for each probe: Dane hears from his bot (the phone group), Cain files it.
+       [ "$(head -n 1 "$DIR/phone-told" 2>/dev/null)" = "$t" ] && return 0
+       tell phone "the helper didn't move" || return 1
+       relay "The App's daily test of its alarm channel to his phone failed: input_datetime.cain_alarms_checked didn't move. File it as a note on P33 for the laptop session. Nothing to tell him: the App told him itself." \
+         || echo "[cain] alarms: the failed test couldn't be passed to Cain ($QUEUE)" >&2
+       printf '%s\n' "$t" > "$DIR/phone-told" ;;
+  esac
+  return 0
+}
 tick() {
-  local rc=0 last g
-  last="$(head -c 20 "$PROBED" 2>/dev/null | tr -cd '0-9' || true)"
-  if [ $(( $(date +%s) - ${last:-0} )) -ge "$DAY" ]; then probe || true; fi
+  local rc=0 last fp="" fp_last g h
+  last="$(head -n 1 "$PROBED" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9' || true)"
+  fp_last="$(head -n 1 "$PROBED" 2>/dev/null | cut -s -d' ' -f2 || true)"
+  if h="$(hook)"; then fp="$(hash16 "$h")"; fi
+  # Daily, and at once when the hook is set or changed (the move to his own user waits for it).
+  if [ $(( $(date +%s) - ${last:-0} )) -ge "$DAY" ] || { [ -n "$fp" ] && [ "$fp" != "$fp_last" ]; }; then probe || true; fi
+  check_readback || rc=1
   for g in $GROUPS_ALL; do
     load "$g" || continue
     if [ "$clear" = 1 ]; then finish_clear || rc=1; else deliver || rc=1; fi
@@ -230,7 +303,9 @@ tick() {
 }
 
 case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}")" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen | tick | probe | text <alarm> [cause]" >&2; exit 2 ;; esac
+  proven) t="$(head -n 1 "$PROVEN" 2>/dev/null | tr -cd '0-9')"; [ -n "$t" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
+  hooked) hook >/dev/null; exit ;;
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \
