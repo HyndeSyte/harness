@@ -220,9 +220,11 @@ specialist (the Harness add-on) does.
   card and is set aside (sorting set-aside taps with its command-line tool is Dane's, at the Pi). One tap it
   can't save doesn't hold up the others in that listing, and the taps finished one by one then share one
   summary card. A set-aside tap Dane discards is left alone for good; one he puts back that had been started
-  gets a card after a calendar read, never an action by itself. If it can't save anywhere, its /health says
+  gets a card after a calendar read, never an action by itself; a tap listed six times never gets a seventh
+  Go ahead, however its count was damaged. If it can't save anywhere, its /health says
   "storage" beside its status (its digest can't reach him then): tell Dane plainly that it can't save where
-  it got to with a tap. Show those as they come; never hand it
+  it got to with a tap. If its /health says "waiting", it can't read its list of set-aside taps, so taps from
+  before its last start wait (it checks back less often and finishes them once it can): tell Dane plainly. Show those as they come; never hand it
   over again, and never ask him to repeat it. While the
   specialist runs degraded without its records, a restore staged from its command line is the way back
   without stopping it; that's Dane's to run, and a swap that couldn't finish safely also starts it

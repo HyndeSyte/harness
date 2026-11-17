@@ -215,6 +215,7 @@ class Inbox:
         self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
         self.degraded = ""                   # thirteenth round: why it started without its records, or ""
         self.storage = ""                    # twenty-fifth round: taps' progress can't be saved anywhere, or ""
+        self.waiting = ""                    # twenty-eighth round: the start replay can't read the set-aside taps
 
     @classmethod
     def for_tests(cls, token_fn: Callable[[], str], wake: threading.Event | None = None, **kw) -> "Inbox":
@@ -229,6 +230,8 @@ class Inbox:
         extra = {"migration": dict(self.migration)} if self.migration else {}
         if self.storage:
             extra["storage"] = self.storage     # twenty-fifth round: said where no storage is needed
+        if self.waiting:
+            extra["waiting"] = self.waiting     # twenty-eighth round: the start replay's taps wait on the records
         if self.degraded:
             return {"status": "degraded", "why": self.degraded, "loop_age_s": None, **extra}
         if self.beat_at is None:

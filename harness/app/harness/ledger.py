@@ -419,9 +419,10 @@ class LedgerBusy(TimeoutError):
 _OUTBOX_PASS = object()     # sixteenth round: the one key to the fence exemption, handed only by Ledger.outbox_tx
 
 
-class LedgerFenced(RuntimeError):
+class LedgerFenced(_scrub.OwnerRefusal, RuntimeError):
     """Fourteenth round: a restore is staged, so the ledger takes no write (Ledger.fence): it fails at once with
-    the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (Ledger.outbox_tx)."""
+    the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (Ledger.outbox_tx). Twenty-eighth
+    round: that reason is owner text (scrub.OwnerRefusal), the fence's own words."""
 
 
 # Fourteenth round: the staged restore's fence is a mode flag per ledger file, not a held lock.

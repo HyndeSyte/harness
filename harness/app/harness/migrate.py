@@ -2062,7 +2062,50 @@ def _journal_intent(journal: str, press: dict) -> bool:
     """Twenty-sixth round: an intent with no calendar effect named appended for a requeued tap that was started
     without one readable, so it reads as unknown (read first, never taken by itself)."""
     from . import handover
-    return handover.Inbox(lambda: "", journal=journal).journal_intent(press, {"requeued": True})
+    return handover.Inbox(lambda: "", journal=journal).journal_intent(press, dict(REQUEUE_OP))
+
+
+REQUEUE_OP = {"requeued": True}
+
+
+def _requeue_intents(lines: list[dict], key: str) -> int:
+    """Twenty-eighth round: the intents a requeue appended for that tap (REQUEUE_OP) among its journal lines."""
+    return sum(1 for r in lines if r.get("intent") == key and r.get("op") == REQUEUE_OP)
+
+
+def _drop_requeue_intents(journal: str, key: str) -> bool:
+    """Twenty-eighth round: a discarded tap's intents that a refused requeue left (REQUEUE_OP, that very key) taken
+    out of the tap journal; every other line kept byte for byte, torn ones included. Written whole (a temporary
+    file, fsynced, renamed). Whether the journal holds none of them now."""
+    try:
+        with open(journal, encoding="utf-8", errors="surrogateescape", newline="") as f:
+            raw = f.readlines()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    keep = []
+    for line in raw:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            keep.append(line)
+            continue
+        if isinstance(r, dict) and r.get("intent") == key and r.get("op") == REQUEUE_OP:
+            continue
+        keep.append(line)
+    if len(keep) == len(raw):
+        return True
+    tmp = journal + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            f.write("".join(keep))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, journal)
+    except OSError:
+        return False
+    return True
 
 
 def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "discard", *,
@@ -2141,8 +2184,10 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                 carded = db.execute("SELECT 1 FROM meta WHERE key=? OR substr(key, 1, ?)=?",
                                     (f"tap_card_queued:{key}", len(f"outbox_once:tap:{key}|outcome|"),
                                      f"outbox_once:tap:{key}|outcome|")).fetchone() is not None
+                # Twenty-eighth round: an intent a refused requeue left for this tap stands for this requeue too
+                # (it's never appended twice), so the tap holds one intent whichever requeue goes through.
                 if route == "unknown" and not (state in _TAP_OUTCOMES or carded) and state != "unknown" \
-                        and not _journal_intent(journal or base + handover.TAP_JOURNAL, entry[0]["press"]):
+                        and not _requeue_intents(lines, key) and not _journal_intent(journal or base + handover.TAP_JOURNAL, entry[0]["press"]):
                     return {"ok": False, "said": "its intent couldn't be written to the tap journal, so it stays set "
                                                  "aside"}
             # Twenty-seventh round: a transaction the records refuse leaves the tap set aside and says so (an intent
@@ -2178,6 +2223,11 @@ def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "disc
                     raise
             except _sqlite3.Error as e:
                 return {"ok": False, "said": f"the records refused it ({type(e).__name__}), so it stays set aside"}
+            # Twenty-eighth round: a discarded tap keeps no intent a refused requeue left, so nothing (a later
+            # change to the discard record included) has an intent of his to act on. Its other lines stay.
+            if action == "discard" and not _drop_requeue_intents(journal or base + handover.TAP_JOURNAL, key):
+                log.error("set-aside: a discarded tap's requeue intent couldn't be cleared from the tap journal")
+                said += "; an intent a refused requeue left in the tap journal couldn't be cleared"
         finally:
             db.close()
         log.warning("set-aside: a set-aside tap was handled (%s); its copy is kept in %s", action, SET_ASIDE_TAPS)

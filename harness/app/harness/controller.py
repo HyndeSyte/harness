@@ -754,12 +754,15 @@ class Controller:
         # Twenty-seventh round: the set-aside and discarded taps are read on their own first; a pass that can't
         # tell which they are does nothing and is taken up again on the back-off, so a set-aside tap's journal
         # lines (an intent a requeue appended before its transaction failed, say) never get a card or a strike.
+        # Twenty-eighth round: consecutive failures of that read back off on SETASIDE_BACKOFF_S (1, 5, 15 minutes),
+        # and from SETASIDE_ALARM_AT of them on, the App's health and status say the taps wait (said in the log at
+        # most once an hour); cleared by the first pass that reads them.
         try:
             held = self._quarantined()
         except Exception as e:                  # noqa: BLE001: can't tell which are set aside: this pass waits
-            log.warning("the set-aside taps couldn't be read (%s); the start replay waits", type(e).__name__)
-            self.__dict__["_replay_put_off"].append(self._clock() + self.STRIKE_BACKOFF_S[0])
+            self._setaside_unread(e)
             return
+        self._setaside_read()
         try:
             flags, rereads = self._flags(self.STRIKE_FLAG), self._flags(self.REREAD_FLAG)
             relists = self._relist_marks()
@@ -860,6 +863,37 @@ class Controller:
                 # Sixteenth round: the clock card's own tap can't be aged while the clock is flagged, so the card
                 # is issued again rather than left dead.
                 migrate.post_clock_card(self.ledger, self.config.owner_user_id, force=True)
+
+    SETASIDE_BACKOFF_S = (60, 300, 900)         # twenty-eighth round: start replay waits on the set-aside list
+    SETASIDE_ALARM_AT = 3                       # twenty-eighth round: failures in a row before health says so
+    SETASIDE_WORDS = ("Harness can't read its list of set-aside taps, so taps of yours from before its last start "
+                      "wait until it can. Nothing is done twice.")
+
+    def _setaside_unread(self, e: BaseException) -> None:
+        """Twenty-eighth round: the start replay couldn't read the set-aside taps. The pass waits on the back-off
+        (SETASIDE_BACKOFF_S, by failures in a row), and from SETASIDE_ALARM_AT failures on the App's health (Cain's
+        watch reads /health) and its status say the taps wait; the log says so at most once an hour."""
+        n = self.__dict__["_setaside_fails"] = self.__dict__.get("_setaside_fails", 0) + 1
+        delay = self.SETASIDE_BACKOFF_S[min(n, len(self.SETASIDE_BACKOFF_S)) - 1]
+        now = self._clock()
+        self.__dict__["_replay_put_off"].append(now + delay)
+        if n < self.SETASIDE_ALARM_AT:
+            log.warning("the set-aside taps couldn't be read (%s); the start replay waits %d minutes",
+                        type(e).__name__, delay // 60)
+            return
+        self.notes["tap_setaside"] = self.SETASIDE_WORDS
+        if self.handovers is not None:
+            self.handovers.waiting = "taps waiting: the records' set-aside list can't be read"
+        if now - self.__dict__.get("_setaside_said", float("-inf")) >= 3600:
+            self.__dict__["_setaside_said"] = now
+            log.error("the set-aside taps still can't be read (%s, %d tries in a row); the start replay waits, and "
+                      "Harness's health says so until they can", type(e).__name__, n)
+
+    def _setaside_read(self) -> None:
+        """Twenty-eighth round: the set-aside taps read: the failure count starts again and the flag is cleared."""
+        self.__dict__["_setaside_fails"] = 0
+        if self.notes.pop("tap_setaside", None) is not None and self.handovers is not None:
+            self.handovers.waiting = ""
 
     def _choice_kind(self, p: dict) -> str:
         cid = str((p or {}).get("custom_id") or "")
@@ -1340,7 +1374,11 @@ class Controller:
         """Twenty-second round: the records' per-tap flags under `prefix`, by tap key, each a dict (a value that
         can't be read is {}: due now). Twenty-seventh round: `unreadable`, a set, takes the keys whose value
         couldn't be read (not JSON, or not an object), so a caller that counts on a value (a relist's generation)
-        can tell one that can't be read from one that's empty."""
+        can tell one that can't be read from one that's empty.
+
+        Twenty-eighth round: a relist mark (RELIST_FLAG) is checked against its schema here too: an object whose
+        "gen" is an integer from 0 to RELIST_GEN_CAP (_gen_of). One that isn't (missing, null, not an integer, out of
+        range) is reported in `unreadable` as well, its object kept as it is (so its pending strike still reads)."""
         out = {}
         for r in self.ledger.db.execute("SELECT key, value FROM meta WHERE substr(key, 1, ?)=?",
                                         (len(prefix), prefix)).fetchall():
@@ -1348,12 +1386,34 @@ class Controller:
                 v = json.loads(r["value"])
             except (TypeError, ValueError):
                 v = None
-            if not isinstance(v, dict):
-                if unreadable is not None:
-                    unreadable.add(r["key"][len(prefix):])
-                v = {}
-            out[r["key"][len(prefix):]] = v
+            bad = not isinstance(v, dict) or (prefix == self.RELIST_FLAG and self._gen_of(v.get("gen")) is None)
+            if bad and unreadable is not None:
+                unreadable.add(r["key"][len(prefix):])
+            out[r["key"][len(prefix):]] = v if isinstance(v, dict) else {}
         return out
+
+    @classmethod
+    def _gen_of(cls, value) -> int | None:
+        """Twenty-eighth round: a relist generation as the records or the file beside the journal hold it, when it
+        reads: an integer (never a bool) from 0 to RELIST_GEN_CAP. None for anything else."""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if 0 <= value <= cls.RELIST_GEN_CAP else None
+
+    def _relist_count(self, key: str, marks: dict | None, unreadable: set, side_gens: dict) -> int | None:
+        """Twenty-eighth round: how many times a tap was relisted, or None when it can't be told. `marks` the
+        records' marks (None when they couldn't be read), `unreadable` the keys whose mark failed its schema,
+        `side_gens` the counts kept beside the journal. The larger of the mark and the count beside the journal
+        when both read; the one that reads otherwise; none (no mark and no count beside it) is 0. A mark that
+        doesn't read with no count beside it, or a count beside it that doesn't read with no mark, is None."""
+        side = self._gen_of(side_gens.get(key)) if key in side_gens else None
+        side_bad = key in side_gens and side is None
+        if marks is not None and key not in unreadable:
+            mark = self._gen_of((marks.get(key) or {}).get("gen")) if key in marks else None
+            if mark is None and key not in marks:
+                return None if side_bad else (side or 0)
+            return max(mark, side) if side is not None else mark
+        return side
 
     @staticmethod
     def _due_at(flag: dict | None, now: float) -> float:
@@ -1796,7 +1856,18 @@ class Controller:
         """The relisted taps whose strike is still pending, by tap key: the records' marks, each held back by the
         later of its own next try and the one in memory (when the records couldn't take it)."""
         mem = self.__dict__.get("_relist_mem", {})
-        out = {k: v for k, v in self._flags(self.RELIST_FLAG).items() if v.get("pending")}
+        # Twenty-eighth round: read with the schema check, and a pending mark whose generation doesn't read takes
+        # the count beside the journal (None when there's none), so the strike settles it with that count, never
+        # with a count of nought.
+        unreadable: set = set()
+        flags = self._flags(self.RELIST_FLAG, unreadable)
+        out = {k: v for k, v in flags.items() if v.get("pending")}
+        if unreadable & set(out):
+            side = self._side_load().get("gens")
+            side = side if isinstance(side, dict) else {}
+            for k in unreadable & set(out):
+                log.warning("a relisted tap's mark couldn't be read; its count beside the journal is used")
+                out[k] = dict(out[k], gen=self._relist_count(k, None, unreadable, side))
         for k, v in mem.items():
             if v.get("pending"):
                 out[k] = dict(out.get(k) or v, due=max(float((out.get(k) or {}).get("due") or 0),
@@ -1834,7 +1905,11 @@ class Controller:
                 held = int((mem.get(key) or {}).get("fails") or 0)
             except (TypeError, ValueError):
                 held = 0
-            fails = max(int(mark.get("fails") or 0), held) + 1
+            try:
+                own = int(mark.get("fails") or 0)
+            except (TypeError, ValueError):
+                own = 0
+            fails = max(own, held) + 1
             delay = self._backoff(fails)
             mem[key] = dict(mark, press=dict(press), pending=True, fails=fails, due=now + delay)
             try:
@@ -1848,7 +1923,8 @@ class Controller:
         mem.pop(key, None)
         try:
             with self.ledger.tx() as db:
-                self.ledger.set_meta(self.RELIST_FLAG + key, json.dumps({"gen": int(mark.get("gen") or 0),
+                # Twenty-eighth round: the generation kept as it reads (None when it doesn't), never nought.
+                self.ledger.set_meta(self.RELIST_FLAG + key, json.dumps({"gen": self._gen_of(mark.get("gen")),
                                                                          "pending": False}), db)
                 db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + key,))
         except Exception as e:                  # noqa: BLE001: the next tick strikes nothing and settles it
@@ -2026,33 +2102,30 @@ class Controller:
         # Twenty-seventh round: a mark whose value can't be read (not JSON) counts as unreadable too, not as empty,
         # so a corrupt mark goes to the count beside the journal as well; and a tap whose count can't be read
         # anywhere ends with its own card (UNKNOWN_COUNT_WORDS), which doesn't say it was brought back before.
+        # Twenty-eighth round: each mark checked against its schema (_flags, _gen_of), and the count is the larger
+        # of the mark and the count beside the journal whenever both read (_relist_count): a mark with a missing,
+        # null, non-integer or out-of-range generation goes to the count beside the journal, and with neither the
+        # tap ends with UNKNOWN_COUNT_WORDS.
         unreadable: set = set()
         try:
-            old_gens = {k: v.get("gen") for k, v in self._flags(self.RELIST_FLAG, unreadable).items()}
-        except Exception as e:                  # noqa: BLE001: the count beside the journal, else at the cap
+            old_marks = self._flags(self.RELIST_FLAG, unreadable)
+        except Exception as e:                  # noqa: BLE001: the count beside the journal, else stopped
             log.warning("the relisted taps' marks couldn't be read (%s); their count beside the journal is used",
                         type(e).__name__)
-            old_gens = None
+            old_marks = None
         side_gens = self._side_load().get("gens")
         side_gens = side_gens if isinstance(side_gens, dict) else {}
         gens, unknown = {}, set()
         for row in rows:
             k = self.handovers.key(row["press"])
-            if old_gens is not None and k not in unreadable:
-                was = old_gens.get(k)
-                fallback = 0
-            else:
-                if k in unreadable:
-                    log.warning("a relisted tap's mark couldn't be read; its count beside the journal is used")
-                was, fallback = side_gens.get(k), None
-            if was is None and fallback is None:
+            if k in unreadable:
+                log.warning("a relisted tap's mark couldn't be read; its count beside the journal is used")
+            was = self._relist_count(k, old_marks, unreadable, side_gens)
+            if was is None:
                 unknown.add(k)                  # no count anywhere: stopped, never counted from one again
                 gens[k] = self.RELIST_GEN_CAP + 1
                 continue
-            try:
-                gens[k] = int(was if was is not None else fallback) + 1
-            except (TypeError, ValueError):
-                gens[k] = self.RELIST_GEN_CAP + 1
+            gens[k] = was + 1
         capped = [r for r in rows if gens[self.handovers.key(r["press"])] > self.RELIST_GEN_CAP]
         if capped:
             self._relist_ended(capped, gens, unknown=unknown)
@@ -2240,8 +2313,11 @@ class Controller:
         it's struck: never read on the calendar or relisted again. Twenty-seventh round: a tap in `unknown` (no
         readable count anywhere) gets UNKNOWN_COUNT_WORDS instead, with no Go ahead either."""
         owner = self.config.owner_user_id
-        marks = {self.handovers.key(r["press"]): {"press": dict(r["press"]), "gen": gens[self.handovers.key(
-            r["press"])], "pending": True, "fails": 0, "due": 0.0, "ended": True} for r in rows}
+        # Twenty-eighth round: an ended mark holds the cap as its generation (a count that reads), or none when the
+        # tap's count couldn't be read anywhere, so a later read of it ends it the same way again.
+        marks = {self.handovers.key(r["press"]): {"press": dict(r["press"]), "gen": (
+            None if self.handovers.key(r["press"]) in unknown else self.RELIST_GEN_CAP), "pending": True, "fails": 0,
+            "due": 0.0, "ended": True} for r in rows}
         with self.ledger.tx() as db:
             for row in rows:
                 k = self.handovers.key(row["press"])

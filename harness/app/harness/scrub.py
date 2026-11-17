@@ -84,12 +84,35 @@ def _known(text) -> str:
     return out
 
 
+class OwnerText(str):
+    """Twenty-eighth round: words for him, built by the specialist from its own word constants and his events' own
+    fields (a title, a time), never from an exception's text or a provider's response (tests/test_outbox_round28.py
+    checks every place one is built). The one type scrub_owner takes as his words."""
+    __slots__ = ()
+
+
+class OwnerRefusal(Exception):
+    """Twenty-eighth round: a refusal whose message is words for him (calendar_change.Refuse, rules.RuleError,
+    ics_edit.Cant, ledger.LedgerFenced): its message kept as OwnerText (.owner) when it's given as text. Every place
+    one is raised is checked like an OwnerText built (tests/test_outbox_round28.py)."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.owner = OwnerText(args[0]) if args and isinstance(args[0], str) else None
+
+
 def scrub_owner(text) -> str:
     """Twenty-seventh round: owner-facing words (a "Nothing changed" refusal, which names his events) with only the
     registered and providers' secrets replaced. The heuristic patterns are left out here, so an event called
-    "Token: pickup", a note that reads like key=value, or a long mixed-case word reaches him as written. Exception
-    text that isn't his own words goes through scrub() instead."""
-    return _known(text)
+    "Token: pickup", a note that reads like key=value, or a long mixed-case word reaches him as written.
+
+    Twenty-eighth round: only OwnerText, or an OwnerRefusal carrying it, is taken as his words. Anything else
+    (exception text, a provider's answer, plain text) gets the whole scrub, as scrub() does."""
+    if isinstance(text, OwnerRefusal) and text.owner is not None:
+        text = text.owner
+    if isinstance(text, OwnerText):
+        return OwnerText(_known(text))
+    return scrub(text)
 
 
 def scrub(text) -> str:
@@ -112,7 +135,9 @@ def scrub_fields(value):
     key's with scrub_owner)."""
     if isinstance(value, dict):
         def one(k, x):
-            return scrub_owner(x) if k in OWNER_FIELDS else scrub(x)
+            # Twenty-eighth round: a field that holds his words holds them as written whether or not they were read
+            # back from storage (where OwnerText becomes plain text), so it gets the known secrets replaced only.
+            return _known(x) if k in OWNER_FIELDS else scrub(x)
         return {k: (one(k, v) if isinstance(v, str) and k in ERROR_FIELDS
                     else [one(k, x) if isinstance(x, str) else scrub_fields(x) for x in v]
                     if isinstance(v, list) and k in ERROR_FIELDS else scrub_fields(v))

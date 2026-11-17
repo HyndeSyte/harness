@@ -45,7 +45,8 @@ TITLES = [
 @pytest.mark.parametrize("title", TITLES)
 def test_the_owner_scrub_leaves_his_titles(title):
     assert scrub.scrub(title) != title                                         # the heuristic would redact it
-    assert scrub.scrub_owner(f"Nothing changed: “{title}” isn't on your calendar.") == \
+    # Twenty-eighth round: his words as the owner-text type (plain text now gets the whole scrub).
+    assert scrub.scrub_owner(scrub.OwnerText(f"Nothing changed: “{title}” isn't on your calendar.")) == \
         f"Nothing changed: “{title}” isn't on your calendar."
 
 

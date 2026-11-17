@@ -2,6 +2,10 @@
 
 ## 0.24.0
 
+- **A tap Harness has brought back to you six times stays at six**, however its count is damaged, so it never gets a seventh *Go ahead*.
+- **When Harness can't read its list of set-aside taps for a while, it says so** on its status page and in your digest, checks back less often, and finishes the waiting taps as soon as it can read the list again.
+- A set-aside tap you discard leaves nothing behind for Harness to act on later.
+
 - **A tap whose calendar couldn't be read during an outage is read again once your calendar answers**, and its card says what Harness found then.
 - **A tap Harness can't safely try again says just that**: it was stopped and nothing more is done for it, never that it was brought back several times when it wasn't.
 - Your event names show in Harness's cards as you wrote them, even ones like "Token: pickup".

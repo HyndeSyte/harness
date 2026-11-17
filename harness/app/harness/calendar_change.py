@@ -60,7 +60,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from . import (caldav, choices, commands, effects, family_copy, family_rules, google_cal, ical, ics_edit,
-               net, provenance, render)
+               net, provenance, render, scrub)
 from .scrub import scrub_owner as owner_scrubbed   # twenty-seventh round: his own words, known secrets only
 from .canonical import canonical_hash
 from .family_add import GAVE_UP_WORDS, _looks_pasted, gave_up, read_due
@@ -960,8 +960,9 @@ def add_anyway_key(proposal_id: str, index: int) -> str:
     return f"anyway:{proposal_id}:{index}"
 
 
-class Refuse(Exception):
-    """Nothing was written. His words, as plain text: escaped where they're sent."""
+class Refuse(scrub.OwnerRefusal):
+    """Nothing was written. His words, as plain text: escaped where they're sent. Twenty-eighth round: owner text
+    (scrub.OwnerRefusal), so the owner scrub takes it as his words."""
 
 
 class Unclear(Refuse):
@@ -970,7 +971,7 @@ class Unclear(Refuse):
 
     def __init__(self, words: str, ask: str = ""):
         super().__init__(words)
-        self.ask = ask
+        self.ask = scrub.OwnerText(ask)
 
 
 class Stopped(Exception):
@@ -4548,11 +4549,10 @@ class CalendarChange:
             entry, stopped = s.undo or (rec["entry"] if rec["status"] == "trying" else None), s
             if entry is None and guard is not None and s.kind in ("changed", "gone"):
                 entry = rec.get("entry")       # a retry that finds it moved on: a read says whose change
-        except Refuse as e:
+        except (Refuse, ics_edit.Cant) as e:
             entry, stopped = None, Stopped("failed", words=owner_scrubbed(e))
-        except (ValueError, KeyError, TypeError, ical.Unreadable) as e:
-            entry, stopped = None, Stopped("failed", words=owner_scrubbed(e) if isinstance(e, ics_edit.Cant)
-                                           else "I couldn't read that event")
+        except (ValueError, KeyError, TypeError, ical.Unreadable):
+            entry, stopped = None, Stopped("failed", words="I couldn't read that event")
         else:
             stopped = None
         finally:
