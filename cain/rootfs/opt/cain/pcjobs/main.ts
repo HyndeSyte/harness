@@ -21,7 +21,7 @@
 //   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
 //   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
-import { chmodSync, chownSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createHmac, randomBytes } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
@@ -57,13 +57,22 @@ export type ReuseCheck = (r: OwnerReuse) => { ok: true; via: string } | { ok: fa
 // address (the tests' link) is keyed with the relay key, as keeper.sh keyed it before C1.
 export const LINK = `unix:${process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock"}`;
 // A request file in the queue folder, read only when it is a plain file (C1: Cain's own user writes
-// that folder and the keeper reads it as root, so a link or anything else there is never followed,
-// as the record keeper reads its queue). null for anything but a plain file; one over 8000 bytes is
-// read no further than that.
+// that folder and the keeper reads it as root, so a link or anything else there is never followed).
+// Opened once, without following a link and without waiting on a pipe, then checked and read through
+// that same descriptor, so nothing swapped in between the check and the read counts; at most 8001
+// bytes are read (one more than a request may hold). null for anything but a plain file.
+const NOT_PLAIN = new Set(["ELOOP", "EMLINK", "EISDIR", "ENXIO", "EPERM", "EACCES"]);
 export function requestText(file: string): string | null {
-  const st = lstatSync(file);
-  if (!st.isFile()) return null;
-  return st.size > 8_000 ? "x".repeat(8_001) : readFileSync(file, "utf8");
+  let fd: number;
+  try { fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)); }
+  catch (e) { if (NOT_PLAIN.has((e as NodeJS.ErrnoException).code ?? "")) return null; throw e; }
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    const buf = Buffer.alloc(8_001);
+    let n = 0;
+    while (n < buf.length) { const r = readSync(fd, buf, n, buf.length - n, null); if (r <= 0) break; n += r; }
+    return buf.subarray(0, n).toString("utf8");
+  } finally { closeSync(fd); }
 }
 // The curl lines that reach one route of the link: its socket, or the address and the key (none
 // without a bot token).

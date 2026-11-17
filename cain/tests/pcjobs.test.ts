@@ -15,7 +15,7 @@ import {
   addressCtxFor, PLANS, resultLines, reportValues, carriesReport, riskyEntry, unapprovedValues,
   type Allow, type Job, type Result,
 } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { heartbeatLine, heartbeatNotice, readHeartbeat, readJobs, readResult, round, type Config } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { heartbeatLine, heartbeatNotice, readHeartbeat, readJobs, readResult, requestText, round, type Config } from "../rootfs/opt/cain/pcjobs/main.ts";
 import {
   allowedTools, canaryOk, confirmProfile, fingerprint, inventory, launchSession, navGuard, next, outsideConfig, parseInstall, parseStream, probe,
   hookMain, navDecide, guardCheck, endCheck, tabsFrom, envProblem, baseEnv, sessionEnv, chromeBusy, claudeSessions, readNavLog, allowedEnd,
@@ -898,9 +898,15 @@ describe("Cain's keeper", () => {
     writeFileSync(secret, `{"from": "cain", "job": ${JSON.stringify(READ)}}`);   // even one that would parse as a good job
     symlinkSync(secret, join(q.cfg.queue, "pc-0901.json"));
     mkdirSync(join(q.cfg.queue, "pc-0902.json"));
+    // A pipe never blocks the keeper (opened without waiting), and a big file is read no further than 8001 bytes.
+    const fifo = Bun.which("mkfifo") ? Bun.spawnSync(["mkfifo", join(q.cfg.queue, "pc-0903.json")]).exitCode === 0 : false;
+    writeFileSync(join(q.cfg.queue, "pc-0904.json"), "x".repeat(1_000_000));
     const good = q.ask(READ);
-    expect(round(q.cfg)).toEqual({ ok: true, queued: 1, refused: 2 });
-    for (const rid of ["pc-0901", "pc-0902"]) expect(q.outcome(rid)).toEqual(expect.objectContaining({ state: "refused", reason: "a job request is a plain file" }));
+    expect(round(q.cfg)).toEqual({ ok: true, queued: 1, refused: fifo ? 4 : 3 });
+    for (const rid of ["pc-0901", "pc-0902", ...(fifo ? ["pc-0903"] : [])])
+      expect(q.outcome(rid)).toEqual(expect.objectContaining({ state: "refused", reason: "a job request is a plain file" }));
+    expect(q.outcome("pc-0904")).toEqual(expect.objectContaining({ state: "refused", reason: "a job request is at most 8000 bytes" }));
+    expect(requestText(join(q.cfg.queue, "..", "root-only.env"))).toContain('"from": "cain"');   // a plain file reads as it is
     expect(q.outcome(good)).toMatchObject({ state: "queued" });
     expect(readdirSync(q.cfg.queue)).toEqual([]);
     expect(readFileSync(secret, "utf8")).toContain('"from": "cain"');          // the link's target is still there, untouched
