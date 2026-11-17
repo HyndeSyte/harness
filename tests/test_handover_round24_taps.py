@@ -131,7 +131,7 @@ def test_an_unreadable_strike_flag_with_no_card_is_set_aside_and_never_written_a
     got = migrate.set_aside_taps(m.ledger.path, key)                           # and clears it, keeping a copy
     assert got["ok"] and m.ledger.get_meta(Controller.QUARANTINE_FLAG + key) is None
     beside = json.loads((tmp_path / migrate.SET_ASIDE_TAPS).read_text())
-    assert json.loads(beside[key])["flag"] == value
+    assert json.loads(beside[key]["record"])["flag"] == value                # twenty-fifth round: with its lines
 
 
 @pytest.mark.card_only
@@ -293,7 +293,8 @@ def test_a_rebuilt_press_that_doesnt_match_the_journal_is_set_aside_not_struck(m
     later(m, clock, 3)
     assert [r["press"]["id"] for r in m.c.handovers.journaled()] == ["12|34"]  # left as it is
     assert flags(m) == [] and m.ledger.get_meta("tap_quarantine:" + key) is not None
-    assert queued(m, Controller.UNREADABLE_STRIKE_WORDS) == []                 # its card is already there
+    # twenty-fifth round: one operator card for the set-aside tap (tests/test_handover_round25_taps.py)
+    assert len(queued(m, Controller.UNREADABLE_STRIKE_WORDS)) == 1
 
 
 # -- 9. the error counter and reads that answered the records but not the calendar ------------------------------------

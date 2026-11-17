@@ -1984,16 +1984,47 @@ def accept_lost(ledger_path: str, name: str) -> dict:
 
 
 TAP_QUARANTINE = "tap_quarantine:"         # twenty-fourth round: the controller's set-aside strike flags
+TAP_DISCARDED = "tap_discarded:"           # twenty-fifth round: set-aside taps discarded: never taken again
 SET_ASIDE_TAPS = "harness-set-aside-taps.json"
+SET_ASIDE_ACTIONS = ("export", "discard", "requeue")
+_TAP_OUTCOMES = ("committed", "refused", "found", "unverified", "unidentified", "internal_error")
 
 
-def set_aside_taps(ledger_path: str, clear: str | None = None) -> dict:
+def _tap_lines(journal: str, key: str) -> tuple[list[dict], list[dict]]:
+    """One tap's own lines in the tap journal (any kind, the interaction token left out) and its journaled entry
+    (handover.Inbox.journaled), read with the App stopped."""
+    from . import handover
+    inbox = handover.Inbox(lambda: "", journal=journal)
+    lines = []
+    for r in inbox.lines_for(key):
+        r = dict(r)
+        if isinstance(r.get("press"), dict):
+            r["press"] = {k: v for k, v in r["press"].items() if k != "token"}
+        lines.append(r)
+    return lines, [r for r in inbox.journaled() if inbox.key(r["press"]) == key]
+
+
+def set_aside_taps(ledger_path: str, key: str | None = None, action: str = "discard", *,
+                   journal: str | None = None) -> dict:
     """Twenty-fourth round, from the command line with the App stopped (python3 -m harness.migrate <records>
-    --set-aside --taps [<tap key>]): the taps whose cleanup step (a strike flag) couldn't be read and that the
-    controller set aside, each with the flag's text as it was. With a tap key, that one is cleared: its record is
-    first written whole beside the records (harness-set-aside-taps.json, by key), then removed from them, so it stays
-    recoverable. Refused while Harness runs (it holds harness.lock); nothing else in the records is touched."""
+    --set-aside --taps [export|discard|requeue <tap key>]): the taps the controller set aside (a cleanup step it
+    couldn't use), each with what was kept of it. Refused while Harness runs (it holds harness.lock).
+
+    Twenty-fifth round, three operations on one tap, each writing its copy first (the record and the tap's own
+    journal lines, without the interaction token) whole beside the records (harness-set-aside-taps.json, by key):
+    - export: only that copy; the tap stays set aside.
+    - discard: then, in one transaction of the records, the set-aside record is replaced by a lasting discard record
+      (TAP_DISCARDED), so the controller never reads the calendar for that tap or takes it again, even though its
+      journal lines stay.
+    - requeue: the tap's journal lines are checked first: they must carry one press whose id and custom id make that
+      very key. A tap with an outcome (in the journal, or its card in the records) gets a strike flag with that
+      press, so the controller only strikes it and never acts on it again; one with none is handed back to the
+      running loop, which reads the calendar for it before anything. A press that doesn't check out is refused and
+      the tap stays set aside."""
     import sqlite3 as _sqlite3
+    import time as _time
+    if action not in SET_ASIDE_ACTIONS:
+        return {"ok": False, "said": "the operation must be export, discard or requeue, so nothing was done"}
     base = os.path.abspath(ledger_path)
     folder = os.path.dirname(base)
     lock = None
@@ -2009,24 +2040,63 @@ def set_aside_taps(ledger_path: str, clear: str | None = None) -> dict:
         try:
             rows = {k[len(TAP_QUARANTINE):]: v for k, v in db.execute(
                 "SELECT key, value FROM meta WHERE substr(key, 1, ?)=?", (len(TAP_QUARANTINE), TAP_QUARANTINE))}
-            if clear is None:
-                return {"ok": True, "taps": rows, "said": f"{len(rows)} set-aside tap record(s)"}
-            if clear not in rows:
-                return {"ok": False, "taps": rows, "said": "that tap isn't set aside, so nothing was cleared"}
+            if key is None:
+                gone = [k[len(TAP_DISCARDED):] for (k,) in db.execute(
+                    "SELECT key FROM meta WHERE substr(key, 1, ?)=?", (len(TAP_DISCARDED), TAP_DISCARDED))]
+                return {"ok": True, "taps": rows, "discarded": gone, "said": f"{len(rows)} set-aside tap record(s)"}
+            if key not in rows:
+                return {"ok": False, "taps": rows, "said": "that tap isn't set aside, so nothing was done"}
+            from . import handover
+            lines, entry = _tap_lines(journal or base + handover.TAP_JOURNAL, key)
             kept_path = os.path.join(folder, SET_ASIDE_TAPS)
             kept = _read_json(kept_path) or {}
-            kept[clear] = rows[clear]
+            kept[key] = {"record": rows[key], "journal": lines, "at": _time.time(), "action": action}
             try:
                 _write_json(kept_path, kept)
             except OSError as e:
                 return {"ok": False, "said": f"its record couldn't be kept beside the records ({type(e).__name__}), "
-                                             "so nothing was cleared"}
-            db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + clear,))
+                                             "so nothing was done"}
+            if action == "export":
+                return {"ok": True, "exported": key, "kept_in": SET_ASIDE_TAPS, "said": "kept beside the records; "
+                                                                                       "still set aside"}
+            if action == "requeue":
+                presses = [r["press"] for r in lines if isinstance(r.get("press"), dict)]
+                tap_id, custom = (str(presses[0].get("id", "")), str(presses[0].get("custom_id", ""))) \
+                    if presses else ("", "")
+                if lines and (not presses or not tap_id or not custom or f"{tap_id}|{custom}" != key
+                              or any((str(p.get("id", "")), str(p.get("custom_id", ""))) != (tap_id, custom)
+                                     for p in presses)):
+                    return {"ok": False, "said": "its journal lines don't carry one press for that tap, so it stays "
+                                                 "set aside"}
+                state = entry[0]["state"] if entry else ""
+                carded = db.execute("SELECT 1 FROM meta WHERE key=? OR substr(key, 1, ?)=?",
+                                    (f"tap_card_queued:{key}", len(f"outbox_once:tap:{key}|outcome|"),
+                                     f"outbox_once:tap:{key}|outcome|")).fetchone() is not None
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                if action == "discard":
+                    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                               (TAP_DISCARDED + key, json.dumps({"at": _time.time(), "record": rows[key]})))
+                    db.execute("DELETE FROM meta WHERE key IN (?, ?)", ("tap_strike:" + key, "tap_reread:" + key))
+                    said = "discarded: it's never taken again, and its copy is kept beside the records"
+                elif entry and (state in _TAP_OUTCOMES or carded):
+                    full = next(dict(r["press"]) for r in entry if r.get("press"))
+                    db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("tap_strike:" + key, json.dumps(
+                        {"press": full, "fails": 0, "due": 0.0, "state": state if state in _TAP_OUTCOMES else ""})))
+                    said = "requeued to be struck: it has an outcome, so it's only crossed off"
+                else:
+                    said = ("requeued: it has no outcome, so the running loop reads your calendar for it first"
+                            if entry else "requeued: nothing of it is left in the tap journal")
+                db.execute("DELETE FROM meta WHERE key=?", (TAP_QUARANTINE + key,))
+                db.execute("COMMIT")
+            except BaseException:
+                db.execute("ROLLBACK")
+                raise
         finally:
             db.close()
-        log.warning("set-aside: a set-aside tap record was cleared; it's kept in %s", SET_ASIDE_TAPS)
-        return {"ok": True, "cleared": clear, "kept_in": SET_ASIDE_TAPS,
-                "said": "cleared from the records and kept beside them"}
+        log.warning("set-aside: a set-aside tap was handled (%s); its copy is kept in %s", action, SET_ASIDE_TAPS)
+        return {"ok": True, {"discard": "discarded", "requeue": "requeued"}[action]: key, "kept_in": SET_ASIDE_TAPS,
+                "said": said}
     finally:
         if lock is not None:
             lock.close()
@@ -2617,8 +2687,13 @@ if __name__ == "__main__":
         got = accept_lost(args[0], args[3])                     # twenty-first round: records it; moves nothing
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
-    if len(args) in (3, 4) and args[1] == "--set-aside" and args[2] == "--taps":
-        got = set_aside_taps(args[0], args[3] if len(args) == 4 else None)   # twenty-fourth round
+    if len(args) in (3, 5) and args[1] == "--set-aside" and args[2] == "--taps":
+        # twenty-fourth round; twenty-fifth round: an operation (export, discard or requeue) and the tap key
+        got = set_aside_taps(args[0], args[4], args[3]) if len(args) == 5 else set_aside_taps(args[0])
+        print(json.dumps(got, indent=1, sort_keys=True))
+        sys.exit(0 if got.get("ok") else 1)
+    if len(args) == 4 and args[1] == "--set-aside" and args[2] == "--taps":
+        got = {"ok": False, "said": "name an operation first: --taps export|discard|requeue <tap key>"}
         print(json.dumps(got, indent=1, sort_keys=True))
         sys.exit(0 if got.get("ok") else 1)
     if len(args) == 2 and args[1] == "--set-aside":

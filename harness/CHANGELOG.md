@@ -2,6 +2,11 @@
 
 ## 0.24.0
 
+- **One tap that Harness can't save no longer holds up the others**: the rest are still listed and finished in the same minute, and that tap is tried again on the 1 to 60 minute schedule without reading your calendar again.
+- **A tap Harness set aside always gets one card**, and the set-aside taps tool on its command line can now keep a copy of one, discard it for good, or put it back, checked first, so a cleared tap is never acted on twice.
+- A tap brought back to you six times gets one last card saying nothing more is done for it, and a copy Harness can't save is set aside with a card instead of being retried forever.
+- If Harness can't save anywhere, its status says so. Error details it keeps never hold your keys or web addresses' private parts.
+
 - **A list of taps after a stop comes once**, with one card and one Go ahead per tap, even when Harness can't cross the taps off yet; it only tries crossing them off again, and doesn't read your calendar for them again.
 - **A tap listed a second time gets a Go ahead that works**, and after six tries on one card that still can't read your calendar, one last card says nothing more is done for it.
 - **The card that asks you to check your calendar is the only one that can**, and what Harness was working on is always kept before the tap is crossed off. A cleanup step it can't read is set aside once and left alone after that.

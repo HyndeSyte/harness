@@ -361,7 +361,8 @@ def test_while_the_clock_is_flagged_a_tap_is_reported_not_taken(m, clock, tmp_pa
 
 
 def test_the_replay_reads_the_queue_under_its_mutex():
-    src = inspect.getsource(controller_mod.Controller._replay_taps)
+    src = (inspect.getsource(controller_mod.Controller._replay_taps)        # twenty-fifth round: its body apart
+           + inspect.getsource(controller_mod.Controller._replay_body))
     assert "self.handovers.queued_keys()" in src and "_front" not in src
     assert "self.queue.mutex" in inspect.getsource(handover.Inbox.queued_keys)
 

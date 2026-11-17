@@ -90,14 +90,22 @@ ASK_ALLOWED = [
                                                  "password, a service account key): his tap on the card "
                                                  "that stores it, a decision, not a check"),
 ]
-# Twenty-fourth round: asks allowed only on one kind of card, never by a substring removal from every message. Each:
-# the ask, the words only that card carries (its lead), and why. The ask is let through only in a text that carries
-# that lead and says the ask exactly once; anywhere else (another card, or said twice) it's reported.
+# Twenty-fourth round: asks allowed only on one kind of card, never by a substring removal from every message.
+# Twenty-fifth round: bound to that card's builder, not to its lead appearing somewhere: each entry is the ask, the
+# card it's allowed on (named), a pattern the whole text must match (that builder's output: the card's head, then
+# its own words, or its words alone as the literal), and why. The ask is let through only in such a text, said
+# exactly once; anywhere else (another card that quotes the lead, or said twice) it's reported.
+def _internal_error_card():
+    from harness.controller import Controller
+    head = r"(?:A tap of yours (?:from [^.\n]{1,40}|\(time unknown\))\.\s+)?"
+    return re.compile(head + re.escape(Controller.TERMINAL_WORDS["internal_error"]).replace(r"\ ", r"\s+"))
+
+
 ASK_SCOPED = [
-    ("Please check your calendar to see whether it's there",
-     "Harness hit an internal error while working out what came of it",
-     "twenty-third round: the internal-error card, where Harness can't confirm whether a change it may have made was "
-     "made; the one card that asks him to look at his calendar (tests/imperative_cases.json \"said\")"),
+    ("Please check your calendar to see whether it's there", "internal_error", _internal_error_card(),
+     "twenty-third round: the internal-error card (Controller._queue_terminal with TERMINAL_WORDS[\"internal_error\"]), "
+     "where Harness can't confirm whether a change it may have made was made; the one card that asks him to look at "
+     "his calendar (tests/imperative_cases.json \"said\")"),
 ]
 
 
@@ -105,9 +113,9 @@ def asks_in(text: str) -> list[str]:
     for words, _ in ASK_ALLOWED:
         text = text.replace(words, "")
     out = []
-    for words, lead, _ in ASK_SCOPED:
+    for words, _card, builder, _ in ASK_SCOPED:
         n = text.count(words)
-        if n == 1 and lead in text:
+        if n == 1 and builder.fullmatch(text.strip()):
             text = text.replace(words, "")
         elif n > 1:
             out.append(f"{words} (said {n} times)")

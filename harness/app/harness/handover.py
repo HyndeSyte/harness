@@ -212,6 +212,7 @@ class Inbox:
         self.beat_at: float | None = None    # the controller loop's last turn; None: not yet
         self.migration: dict = {}            # twelfth round: the ledger waiting for its move (migrate.waiting_summary)
         self.degraded = ""                   # thirteenth round: why it started without its records, or ""
+        self.storage = ""                    # twenty-fifth round: taps' progress can't be saved anywhere, or ""
 
     @classmethod
     def for_tests(cls, token_fn: Callable[[], str], wake: threading.Event | None = None, **kw) -> "Inbox":
@@ -224,6 +225,8 @@ class Inbox:
 
     def health(self) -> dict:
         extra = {"migration": dict(self.migration)} if self.migration else {}
+        if self.storage:
+            extra["storage"] = self.storage     # twenty-fifth round: said where no storage is needed
         if self.degraded:
             return {"status": "degraded", "why": self.degraded, "loop_age_s": None, **extra}
         if self.beat_at is None:
@@ -495,6 +498,14 @@ class Inbox:
             t["state"] = ("committed" if t["committed"] else t["outcome"] if t["outcome"]
                           else "unknown" if t["intent"] else "not_started")
         return list(taps.values())
+
+    def lines_for(self, key: str) -> list[dict]:
+        """Twenty-fifth round: that tap key's own journal lines, of any kind, as written."""
+        if not self.journal:
+            return []
+        with self._lock:
+            rows = self._journal_lines()
+        return [r for r in rows if _row_key(r, self.key) == key]
 
     def has_lines(self, key: str) -> bool:
         """Twenty-fourth round: whether any journal line, of any kind, belongs to that tap key."""

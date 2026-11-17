@@ -128,9 +128,10 @@ def test_a_caller_that_catches_the_enqueue_error_cant_go_on_in_a_dead_transactio
     assert m.ledger.db.execute("SELECT COUNT(*) FROM outbox WHERE text='z24'").fetchone()[0] == 0
 
 
-def test_an_aborted_transaction_stops_the_whole_settle(m, monkeypatch):
+def test_an_aborted_transaction_rolls_back_that_taps_work(m, monkeypatch):
     """Through a production caller: a terminal tap's card, mark and strike flag go together or not at all, and the
-    tap isn't struck."""
+    tap isn't struck. (Twenty-fifth round: the tap's own boundary holds the error and puts that tap off instead of
+    ending the settle; tests/test_outbox_round25.py.)"""
     press = {"id": "96403", "custom_id": "k:a:r24abort", "token": "t", "app": "999", "message_id": "5"}
     h = m.c.handovers
     assert h.journal_add(Handover(kind="press", press=press)) and h.journal_outcome(press, "unverified")
@@ -138,8 +139,7 @@ def test_an_aborted_transaction_stops_the_whole_settle(m, monkeypatch):
     real_conn = m.ledger.db
     outbox_once_fails(m, monkeypatch)
     m.ledger.db = RollbackFails(real_conn)
-    with pytest.raises(TransactionAborted):
-        m.c._finish_terminal([row])                                            # its `except Exception` doesn't stop it
+    m.c._finish_terminal([row])                                                # held at the tap's own boundary
     monkeypatch.undo()
     m.ledger.db = real_conn
     key = h.key(press)

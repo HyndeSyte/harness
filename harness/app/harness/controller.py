@@ -33,14 +33,14 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from . import (approvals, callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
-               handover, policy, provenance, render, rules, watch)
+               handover, net, policy, provenance, render, rules, vault, watch)
 from .calendar_change import CalendarChange
 from .chat import Decision, Incoming
 from .config import Config
 from .discord_api import DiscordError, escape
 from .discord_chat import PREFIX as DISCORD_PREFIX, RESUME, STOP
 from .engines import Engine
-from .ledger import TERMINAL, Ledger, LedgerBusy, LedgerFenced, iso
+from .ledger import TERMINAL, Ledger, LedgerBusy, LedgerFenced, TransactionAborted, iso
 from .outbox import Outbox
 from .runner import CLARIFY_WAIT_S, Runner
 from .vault import LABELS, Vault
@@ -709,9 +709,28 @@ class Controller:
         is done twice); a tap never acted on is taken now if it's from the last TAP_REPLAY_S, else struck off and
         he's told nothing changed. A tap's age is unknown while the clock is flagged (then it's reported, not
         taken, and the clock card goes out again if that tap was on it). The queue is read under its own mutex."""
-        if getattr(self, "_taps_replayed", False) or self.handovers is None:
+        if self.handovers is None:
             return
+        if getattr(self, "_taps_replayed", False):
+            # Twenty-fifth round: a start replay a tap's own boundary put off (or that an aborted transaction with
+            # no working connection cut short) is taken up again from the main loop once its time comes. Taps it
+            # already finished are gone from the journal or marked, so nothing is done twice.
+            again = self.__dict__.get("_replay_again_at")
+            if again is None or self._clock() < again:
+                return
+            self.__dict__["_replay_again_at"] = None
         self._taps_replayed = True
+        self.__dict__["_in_replay"] = True
+        try:
+            self._replay_body()
+        except BaseException:
+            n = self.__dict__["_replay_fails"] = self.__dict__.get("_replay_fails", 0) + 1
+            self.__dict__["_replay_again_at"] = self._clock() + self._backoff(n)
+            raise
+        finally:
+            self.__dict__["_in_replay"] = False
+
+    def _replay_body(self) -> None:
         queued = self.handovers.queued_keys()
         boundary = bool(getattr(self, "restored_at_start", False))
         try:
@@ -736,16 +755,25 @@ class Controller:
         journaled = self.handovers.journaled()
         # Twenty-fourth round: deferrals the records refused, kept beside the journal, held again; and an unknown tap
         # whose last deferral was in memory only waits one schedule step after this start.
-        self._side_start(journaled, rereads, now)
+        if not self.__dict__.get("_side_started"):
+            self.__dict__["_side_started"] = True   # twenty-fifth round: once per process, even when resumed
+            self._side_start([r for r in journaled if self.handovers.key(r["press"]) not in held], rereads, now)
+        mem = self.__dict__.get("_reread_mem", {})
         for row in journaled:
             p = row["press"]
             if self.handovers.key(p) in queued or self.handovers.key(p) in flags \
                     or self.handovers.key(p) in relists or self.handovers.key(p) in held:
                 continue
+            if row["state"] != "unknown" and not self._due(mem.get(self.handovers.key(p)), now):
+                continue                        # twenty-fifth round: put off at its own boundary; resumed later
             if row["state"] == "unknown" and not self._reread_due(self.handovers.key(p), rereads, now):
                 continue                        # read again by the running loop once its time comes
             if row["state"] in ("refused", "found"):
-                self._post_pending_notice(row)
+                try:
+                    self._post_pending_notice(row)
+                except (Exception, TransactionAborted) as e:  # noqa: BLE001: twenty-fifth round: this tap put off
+                    self._reraise_dead(e)
+                    self._defer_tap(self.handovers.key(p), e, "a tap's note couldn't be queued")
                 continue
             if row["state"] in self.TAP_TERMINAL:
                 # Twentieth round: terminal. Its approval was used up and its calendar couldn't be read; the last
@@ -777,19 +805,26 @@ class Controller:
                 late.append(p)
                 clock_tap = clock_tap or (stalled and self._choice_kind(p) == "migration_clock")
         if relist and self.config is not None:
-            self._relist_taps(relist)
+            self._relist_guarded(relist)
         if unverified and self.config is not None:
             self._finish_terminal(unverified)
         if unsure and self.config is not None:
             self._settle_unknown(unsure)
         if late and self.config is not None:
-            with self.ledger.tx() as db:
-                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=(
-                    f"Harness stopped before it took {'a tap' if len(late) == 1 else f'{len(late)} taps'} of yours, "
-                    "so nothing changed from "
-                    f"{'it' if len(late) == 1 else 'them'}."
-                    + (" The clock card follows again." if clock_tap else " A card still works until it runs out.")))
-                self.ledger.event("taps_not_taken", {"count": len(late), "clock_stalled": stalled}, db=db)
+            try:
+                with self.ledger.tx() as db:
+                    self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db, text=(
+                        f"Harness stopped before it took {'a tap' if len(late) == 1 else f'{len(late)} taps'} of "
+                        "yours, so nothing changed from "
+                        f"{'it' if len(late) == 1 else 'them'}."
+                        + (" The clock card follows again." if clock_tap
+                           else " A card still works until it runs out.")))
+                    self.ledger.event("taps_not_taken", {"count": len(late), "clock_stalled": stalled}, db=db)
+            except (Exception, TransactionAborted) as e:  # noqa: BLE001: twenty-fifth round: these taps put off
+                self._reraise_dead(e)
+                for p in late:
+                    self._defer_tap(self.handovers.key(p), e, "a note on taps not taken couldn't be queued")
+                late = []
             for p in late:
                 self.handovers.journal_done(p)
             if clock_tap:
@@ -1014,8 +1049,16 @@ class Controller:
         out it gets its card saying the calendar couldn't be read, its outcome recorded as unverified. A tap is
         struck only once its card is queued."""
         now, owner, final, waits, terminal = self._clock(), self.config.owner_user_id, [], [], []
+        cache = self.__dict__.get("_relist_verdicts", {})
         for row in rows:
             p, op = row["press"], row.get("op") or {}
+            # Twenty-fifth round: a tap whose relist the records refused is tried again with the verdict its last
+            # read gave (within CHECK_CAP_S), so the calendar isn't read again for it.
+            hit = cache.get(self.handovers.key(p))
+            if hit and now - hit[0] < self.CHECK_CAP_S:
+                seen_, parts_, *more_ = hit[1]
+                final.append((row, seen_, parts_, (more_[0] if more_ else None) or {}))
+                continue
             try:
                 hold = self._records_hold(p)
             except Exception as e:              # noqa: BLE001: a fault in Harness, not a state of the records
@@ -1023,7 +1066,9 @@ class Controller:
                 # six-read schedule; after that its outcome is a terminal internal error: one card with no Go
                 # ahead saying so (never that the records couldn't be read), and it's struck. Never read hourly.
                 errs = int(row.get("error_checks") or 0)
-                error = f"{type(e).__name__}: {e}"[:500]
+                # Twenty-fifth round: scrubbed of secrets (registered ones, auth headers, URL queries) before it's
+                # journaled or kept.
+                error = self._scrub(f"{type(e).__name__}: {e}")[:500]
                 if errs >= len(self.CHECK_BACKOFF_S):
                     log.error("a tap's hold read kept hitting an error in Harness (%s); its outcome is recorded as "
                               "an internal error", type(e).__name__)
@@ -1074,7 +1119,8 @@ class Controller:
             tz = ZoneInfo(self.config.timezone)
             try:
                 self._tell_waits(waits, tz, owner)
-            except Exception as e:              # noqa: BLE001: not told now, so not marked: told at the next read
+            except (Exception, TransactionAborted) as e:  # noqa: BLE001: not told now, so not marked: next read
+                self._reraise_dead(e)
                 log.error("a note that a tap waits couldn't be queued (%s); it goes at its next read",
                           type(e).__name__)
             else:
@@ -1094,8 +1140,8 @@ class Controller:
                 terminal.append(dict(row, state="unverified"))
         final = [x for x in final if x[1] != "records_unread"]
         if final:
-            self._relist_taps([r for r, _, _, _ in final], restored=False,
-                              verdicts={self.handovers.key(r["press"]): (s, pt, x) for r, s, pt, x in final})
+            self._relist_guarded([r for r, _, _, _ in final], restored=False,
+                                 verdicts={self.handovers.key(r["press"]): (s, pt, x) for r, s, pt, x in final})
         if terminal:
             self._finish_terminal(terminal)
 
@@ -1241,7 +1287,37 @@ class Controller:
         return {"state": row.get("state") or "internal_error", "at": self._clock(), "tapped_at": row.get("at"),
                 "identity": {k: str(press.get(k, "")) for k in ("id", "custom_id", "message_id", "app")},
                 "request": row.get("op") or {}, "error_checks": int(row.get("error_checks") or 0),
-                "error": str(row.get("error") or "unknown")}
+                "error": self._scrub(row.get("error") or "unknown")[:500]}
+
+    _SCRUB = (
+        (re.compile(r"(?i)\b(authorization|proxy-authorization|x-api-key|api[-_]?key|cookie|set-cookie|password|"
+                    r"access_token|refresh_token|client_secret)(['\"]?\s*[:=]\s*['\"]?)([^'\"\s,;}&]+(?:\s+[^'\"\s,;}&]+)?)"),
+         r"\1\2[redacted]"),
+        (re.compile(r"(?i)\b(bearer|basic|bot)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
+        (re.compile(r"(?i)\b((?:https?|webcals?)://)[^/\s@]+@"), r"\1[redacted]@"),
+        (re.compile(r"(?i)\b((?:https?|webcals?)://[^\s?#'\"<>]*)\?[^\s#'\"<>]*"), r"\1?[redacted]"),
+    )
+
+    def _scrub(self, text) -> str:
+        """Twenty-fifth round: an exception's message as the journal and the kept copy may hold it: every secret
+        Harness has loaded (net.REDACT), the keys it keeps and the link's token replaced, then auth headers, a
+        URL's query and its user part."""
+        out = net.REDACT(str(text))
+        secrets = set()
+        for f in (*vault.FIELDS, *vault.FAMILY_FIELDS):
+            try:
+                secrets.add(str(self.vault.get(f) or ""))
+            except Exception:                   # noqa: BLE001: a key that can't be read isn't in the text
+                pass
+        try:
+            secrets.add(str(self.handovers._token_fn() or "") if self.handovers is not None else "")
+        except Exception:                       # noqa: BLE001: likewise
+            pass
+        for sec in sorted((x for x in secrets if len(x) >= 8), key=len, reverse=True):
+            out = out.replace(sec, "[redacted]")
+        for pattern, repl in self._SCRUB:
+            out = pattern.sub(repl, out)
+        return out
 
     def _backoff(self, fails: int) -> int:
         return self.STRIKE_BACKOFF_S[min(max(fails, 1), len(self.STRIKE_BACKOFF_S)) - 1]
@@ -1298,6 +1374,7 @@ class Controller:
             if not data.get("taps"):
                 if os.path.exists(path):
                     os.remove(path)
+                self._storage_clear()
                 return True
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -1305,9 +1382,10 @@ class Controller:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
-            return True
         except OSError:
             return False
+        self._storage_clear()
+        return True
 
     def _side_forget(self, key: str) -> None:
         """A settled tap's deferral beside the journal goes with it (nothing is written when there's none)."""
@@ -1343,6 +1421,7 @@ class Controller:
         side["restarts"] = int(side.get("restarts") or 0) + 1
         if not self._side_save(side):
             log.debug("a deferral couldn't be written beside the journal either; it's held in memory")
+            self._storage_alarm()               # twenty-fifth round: the restart count can't persist: said elsewhere
         if side["restarts"] < self.RESTART_CARD_AT or self.config is None:
             return
         try:
@@ -1351,7 +1430,10 @@ class Controller:
                     self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
                                         text=render.fit(self.RESTARTS_WORDS),
                                         once=Ledger.once_key(key, "operator", "reread_restarts"))
-        except Exception as e:                  # noqa: BLE001: the records can't take it now: at the next start
+        except (Exception, TransactionAborted) as e:  # noqa: BLE001: the records can't take it: at the next start
+            # Twenty-fifth round: an aborted transaction too (after the savepoint's rollback or reopen), so the rest
+            # of the start replay goes on.
+            self._reraise_dead(e)
             log.error("Harness restarted several times with a tap's next read unsaved, and the card saying so "
                       "couldn't be queued (%s)", type(e).__name__)
 
@@ -1389,22 +1471,56 @@ class Controller:
         except Exception as e:                  # noqa: BLE001: the records too: held in memory and beside the journal
             # Twenty-fourth round: kept beside the journal too, so a start respects it, and the log line is said at
             # most once an hour against the time kept there (once per start when that can't be written either).
-            side = self._side_load()
-            side.setdefault("taps", {})[key] = dict(mem[key])
-            now = self._clock()
+            self._hold_deferral(key, type(e).__name__, "a tap's next read couldn't be put off in the records either")
+
+    def _hold_deferral(self, key: str, why: str, said: str) -> None:
+        """Twenty-fifth round, shared by every deferral the records refused: the tap's next try, already in memory
+        (_reread_mem), kept beside the journal (the side file) too, so a start respects it; the log line said at
+        most once an hour against the time kept there (and in memory). When the side file can't be written either,
+        the App's health and its status say so (_storage_alarm), since nothing written can carry it."""
+        mem = self.__dict__.setdefault("_reread_mem", {})
+        side = self._side_load()
+        side.setdefault("taps", {})[key] = dict(mem.get(key) or {})
+        now = self._clock()
+        try:
+            last = float(side.get("logged") or float("-inf"))
+        except (TypeError, ValueError):
+            last = float("-inf")
+        last = max(last, self.__dict__.get("_reread_logged", float("-inf")))
+        say = now - last >= 3600
+        if say:
+            side["logged"] = now
+            self.__dict__["_reread_logged"] = now
+        if not self._side_save(side):
+            self._storage_alarm()
+        if say:
             try:
-                last = float(side.get("logged") or float("-inf"))
+                delay = max(0, int(float((mem.get(key) or {}).get("due") or now) - now))
             except (TypeError, ValueError):
-                last = float("-inf")
-            last = max(last, self.__dict__.get("_reread_logged", float("-inf")))
-            say = now - last >= 3600
-            if say:
-                side["logged"] = now
-                self.__dict__["_reread_logged"] = now
-            self._side_save(side)
-            if say:
-                log.error("a tap's next read couldn't be put off in the records either (%s); it's held in memory "
-                          "and read again in %d minutes", type(e).__name__, delay // 60)
+                delay = 0
+            log.error("%s (%s); it's held in memory and read again in %d minutes", said, why, delay // 60)
+
+    STORAGE_WORDS = ("Harness can't save where it got to with a tap of yours, in its records or beside them, so it "
+                     "goes back to that tap only now and then until it can. The tap is kept, and nothing is done "
+                     "twice.")
+
+    def _storage_alarm(self) -> None:
+        """Twenty-fifth round: the side file refused too (the storage that refused the records), so a restart's
+        count may never persist and its card never come. Said where no storage is needed: the App's health
+        (Cain's watch reads /health), its status page and the digest's standing problems, and the log at most once
+        an hour per process. Cleared once the side file takes a write again."""
+        self.notes["tap_storage"] = self.STORAGE_WORDS
+        if self.handovers is not None:
+            self.handovers.storage = "taps unsaved: the records and the file beside the tap journal refused writes"
+        now = self._clock()
+        if now - self.__dict__.get("_storage_said", float("-inf")) >= 3600:
+            self.__dict__["_storage_said"] = now
+            log.error("neither the records nor the file beside the tap journal could be written; Harness's health "
+                      "says so until one can")
+
+    def _storage_clear(self) -> None:
+        if self.notes.pop("tap_storage", None) is not None and self.handovers is not None:
+            self.handovers.storage = ""
 
     def _reread_due(self, key: str, rereads: dict, now: float) -> bool:
         """Twenty-third round: a tap's next read is due only once both its deferral in the records and the one held
@@ -1445,7 +1561,10 @@ class Controller:
                 continue
             try:
                 flag = self._queue_terminal(row)
-            except Exception as e:              # noqa: BLE001: the records couldn't take it now: tried again later
+            except (Exception, TransactionAborted) as e:  # noqa: BLE001: the records refused: tried again later
+                # Twenty-fifth round: an aborted transaction too (after the savepoint's rollback or reopen), so
+                # one tap's failing cleanup never stops the taps after it.
+                self._reraise_dead(e)
                 fails += 1
                 backoff[key] = (fails, now + self._backoff(fails))
                 log.error("a finished tap's card couldn't be queued (%s); it's tried again in %d minutes",
@@ -1504,10 +1623,47 @@ class Controller:
                     pass
         return flag
 
+    def _copy_failed(self, key: str, press: dict, flag: dict, e: Exception) -> bool:
+        """Twenty-fifth round: a kept copy that couldn't be built or written. Counted in the strike flag (and in
+        memory when the records refuse that too) and tried again on STRIKE_BACKOFF_S; after as many failures as
+        that schedule has steps, the tap is set aside with its raw journal lines and one operator card, and never
+        tried again. Returns False: nothing was struck."""
+        now = self._clock()
+        mem = self.__dict__.setdefault("_copy_fails", {})
+        try:
+            stored = int((flag or {}).get("copy_fails") or 0)
+        except (TypeError, ValueError):
+            stored = 0
+        n = max(stored, mem.get(key, 0)) + 1
+        mem[key] = n
+        if n >= len(self.STRIKE_BACKOFF_S):
+            log.error("a finished tap's kept copy couldn't be written after %d tries (%s); it's set aside", n,
+                      type(e).__name__)
+            try:
+                self._quarantine_strike(key, operator=False, why="kept copy failed")
+            except (Exception, TransactionAborted) as e2:  # noqa: BLE001: kept flagged; tried again on the back-off
+                self._reraise_dead(e2)
+                log.error("a tap whose kept copy failed couldn't be set aside (%s)", type(e2).__name__)
+            else:
+                mem.pop(key, None)
+                return False
+        fails = int((flag or {}).get("fails") or 0) + 1
+        delay = self._backoff(fails)
+        try:
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(self.STRIKE_FLAG + key, json.dumps(
+                    dict(flag or {}, press=dict(press), fails=fails, due=now + delay, copy_fails=n)), db)
+        except Exception as e2:                 # noqa: BLE001: tried again at the next tick instead
+            log.error("a strike's next try couldn't be written to the records (%s)", type(e2).__name__)
+        log.error("a finished tap's kept copy couldn't be written (%s); it isn't struck, and it's tried again in %d "
+                  "minutes", type(e).__name__, delay // 60)
+        return False
+
     def _copy_kept(self, key: str, press: dict, flag: dict) -> bool:
         """Twenty-fourth round: before an internal error's tap is struck, its kept copy is there: written now from
-        the journal's rows when it isn't (a flag from before this round, or one queued without it). False when
-        it can't be written: the tap isn't struck."""
+        the journal's rows when it isn't (a flag from before this round, or one queued without it). Twenty-fifth
+        round: it raises when the copy can't be built or written (the caller counts it, _copy_failed, and the tap
+        isn't struck); True otherwise, including when there's nothing to copy."""
         state = str((flag or {}).get("state") or "")
         row = None
         if not state:
@@ -1531,8 +1687,10 @@ class Controller:
         STRIKE_BACKOFF_S. Twenty-fourth round: never an internal error's tap whose kept copy isn't committed."""
         now = self._clock()
         try:
-            if not self._copy_kept(key, press, flag):
-                raise RuntimeError("the tap's kept copy isn't there")
+            self._copy_kept(key, press, flag)
+        except Exception as e:                  # noqa: BLE001: twenty-fifth round: counted; set aside past the cap
+            return self._copy_failed(key, press, flag, e)
+        try:
             self.handovers.journal_done(press, strict=True)
         except Exception as e:                  # noqa: BLE001: kept flagged; tried again on the back-off
             fails = int((flag or {}).get("fails") or 0) + 1
@@ -1552,20 +1710,35 @@ class Controller:
             self._forget_deferral(key)
         except Exception as e:                  # noqa: BLE001: the next tick finds the flag, strikes nothing, clears it
             log.warning("a strike's flag couldn't be cleared (%s); it's cleared at the next tick", type(e).__name__)
+        self.__dict__.get("_strike_mem", {}).pop(key, None)
         return True
 
     def _resume_strikes(self, flags: dict, skip=()) -> None:
         """Twenty-second round: every strike the records hold as pending and due, at each tick and at a start,
         whether or not its journal row still reads as terminal: no card, only the strike."""
         now = self._clock()
+        held = self.__dict__.get("_strike_mem", {})
         for key, flag in flags.items():
-            if key in skip or not self._due(flag, now):
+            if key in skip or not self._due(flag, now) or not self._due(held.get(key), now):
                 continue
             press = flag.get("press")
-            if not isinstance(press, dict) or not press:
-                self._unreadable_strike(key, now)
-                continue
-            self._strike(key, press, flag)
+            try:
+                if not isinstance(press, dict) or not press:
+                    self._unreadable_strike(key, now)
+                    continue
+                self._strike(key, press, flag)
+            except (Exception, TransactionAborted) as e:  # noqa: BLE001: twenty-fifth round: this tap put off
+                self._reraise_dead(e)
+                self._defer_strike(key, e)
+
+    def _defer_strike(self, key: str, e: BaseException) -> None:
+        """Twenty-fifth round: a strike flag whose handling the records refused (an operator card's aborted
+        transaction), held back in memory on STRIKE_BACKOFF_S so it's not tried at every tick; the next flag goes on."""
+        mem = self.__dict__.setdefault("_strike_mem", {})
+        fails = int((mem.get(key) or {}).get("fails") or 0) + 1
+        mem[key] = {"fails": fails, "due": self._clock() + self._backoff(fails)}
+        log.error("a pending strike couldn't be handled (%s); it's tried again in %d minutes", type(e).__name__,
+                  self._backoff(fails) // 60)
 
     # -- a relisted tap's strike, pending in the records (twenty-fourth round) -------------------------------------
 
@@ -1630,29 +1803,53 @@ class Controller:
 
     # -- a strike flag that can't be read --------------------------------------------------------------------------
 
+    # Twenty-fifth round: one text for every set-aside tap, naming the tool that exports, discards or requeues it.
     UNREADABLE_STRIKE_WORDS = ("Harness found a cleanup step in its records for a tap of yours that it couldn't "
-                               "read, and no card about that tap, so it left the tap as it is. It isn't taken "
-                               "again from here.")
+                               "use, so it left the tap as it is and set it aside. It isn't taken again from here; "
+                               "its record is kept for the set-aside taps tool on Harness's command line.")
 
     def _quarantined(self) -> set[str]:
-        """Twenty-fourth round: the taps whose strike flag was set aside: never taken again, never written for."""
-        return {r[0][len(self.QUARANTINE_FLAG):] for r in self.ledger.db.execute(
-            "SELECT key FROM meta WHERE substr(key, 1, ?)=?", (len(self.QUARANTINE_FLAG), self.QUARANTINE_FLAG))}
+        """Twenty-fourth round: the taps whose strike flag was set aside: never taken again, never written for.
+        Twenty-fifth round: and the set-aside taps discarded with the set-aside tool (migrate.TAP_DISCARDED), whose
+        journal lines stay: never read on the calendar or taken again."""
+        out = set()
+        for prefix in (self.QUARANTINE_FLAG, migrate.TAP_DISCARDED):
+            out |= {r[0][len(prefix):] for r in self.ledger.db.execute(
+                "SELECT key FROM meta WHERE substr(key, 1, ?)=?", (len(prefix), prefix))}
+        return out
 
-    def _quarantine_strike(self, key: str, *, operator: bool) -> None:
+    def _quarantine_strike(self, key: str, *, operator: bool, why: str = "") -> None:
         """Twenty-fourth round: an unreadable strike flag set aside, in one transaction with its operator card when
         there's no card about the tap: the flag's text moved whole under QUARANTINE_FLAG (kept for recovery: the
-        set-aside tooling lists and clears it), so later ticks and starts skip it with no write."""
+        set-aside tooling lists, exports, discards or requeues it), so later ticks and starts skip it with no write.
+        Twenty-fifth round: every set-aside tap gets that operator card (a press that doesn't match its journal
+        lines, keyed on the tap and "quarantine", as a kept copy that can't be written), and the record keeps the
+        tap's own journal lines, without the interaction token and with errors scrubbed."""
         raw = self.ledger.db.execute("SELECT value FROM meta WHERE key=?", (self.STRIKE_FLAG + key,)).fetchone()
+        try:
+            lines = [self._kept_line(r) for r in self.handovers.lines_for(key)]
+        except Exception:                       # noqa: BLE001: the record without them; the journal keeps them
+            lines = None
         with self.ledger.tx() as db:
-            if operator:
-                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
-                                    text=render.fit(self.UNREADABLE_STRIKE_WORDS),
-                                    once=Ledger.once_key(key, "operator", "unreadable_strike"))
-            self.ledger.set_meta(self.QUARANTINE_FLAG + key, json.dumps(
-                {"flag": raw[0] if raw is not None else None, "at": self._clock(),
-                 "why": "no card" if operator else "journal mismatch"}), db)
+            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="notice", db=db,
+                                text=render.fit(self.UNREADABLE_STRIKE_WORDS),
+                                once=Ledger.once_key(key, "operator",
+                                                     "unreadable_strike" if operator else "quarantine"))
+            record = {"flag": raw[0] if raw is not None else None, "at": self._clock(),
+                      "why": why or ("no card" if operator else "journal mismatch")}
+            if lines is not None:
+                record["rows"] = lines
+            self.ledger.set_meta(self.QUARANTINE_FLAG + key, json.dumps(record), db)
             db.execute("DELETE FROM meta WHERE key=?", (self.STRIKE_FLAG + key,))
+
+    def _kept_line(self, r: dict) -> dict:
+        """Twenty-fifth round: a journal line as a kept copy holds it: no interaction token, errors scrubbed."""
+        r = dict(r)
+        if isinstance(r.get("press"), dict):
+            r["press"] = {k: v for k, v in r["press"].items() if k != "token"}
+        if r.get("error"):
+            r["error"] = self._scrub(r["error"])
+        return r
 
     def _journal_match(self, key: str, press: dict) -> bool | None:
         """Twenty-fourth round: the press rebuilt from a tap key (split on its first bar) checked against the tap
@@ -1736,7 +1933,7 @@ class Controller:
         return self.TAP_STATE_WORDS["found"]
 
     def _relist_taps(self, rows: list[dict], *, restored: bool = True,
-                     verdicts: dict | None = None) -> None:
+                     verdicts: dict | None = None, reads: dict | None = None) -> None:
         """Fifteenth round: the records were put back from a backup at this start, so no tap written down before it
         is taken by itself. Sixteenth round, truthfully: each tap's recorded state (carried out before the records
         were put back; outcome unknown; not carried out) and, for one that reaches a calendar, a read of the
@@ -1747,8 +1944,31 @@ class Controller:
         safe); a tap whose time can't be read sorts as newest and always gets a card, marked "time unknown".
         restored=False: the taps a stop or an error left with their outcome unknown, at a start that put nothing
         back. Eighteenth round: those come here only through _settle_unknown, with their verdicts read there; an
-        Undo already done is said by what it leaves (gone, back, as it was); and no card names a button."""
+        Undo already done is said by what it leaves (gone, back, as it was); and no card names a button.
+
+        Twenty-fifth round: `reads` gathers each calendar read made here, so a relist the records refused is tried
+        again without reading the calendar again (_relist_guarded). A tap relisted RELIST_GEN_CAP times already
+        isn't relisted again: it gets one card saying nothing more is done for it, and it's struck."""
         owner, tz = self.config.owner_user_id, ZoneInfo(self.config.timezone)
+        # Twenty-fourth round: each tap's relist generation (one more than its last relist's), stored with its
+        # relisted mark. Twenty-fifth round: read first, so a tap past the cap is never read on the calendar.
+        try:
+            old_marks = self._flags(self.RELIST_FLAG)
+        except Exception:                       # noqa: BLE001: unreadable: the first generation
+            old_marks = {}
+        gens = {}
+        for row in rows:
+            k = self.handovers.key(row["press"])
+            try:
+                gens[k] = int((old_marks.get(k) or {}).get("gen") or 0) + 1
+            except (TypeError, ValueError):
+                gens[k] = 1
+        capped = [r for r in rows if gens[self.handovers.key(r["press"])] > self.RELIST_GEN_CAP]
+        if capped:
+            self._relist_ended(capped, gens)
+            rows = [r for r in rows if gens[self.handovers.key(r["press"])] <= self.RELIST_GEN_CAP]
+            if not rows:
+                return
 
         def stamp(row):
             try:
@@ -1772,6 +1992,8 @@ class Controller:
                 extras[self.handovers.key(row["press"])] = (more[0] if more else None) or {}
             elif row["state"] in ("committed", "unknown"):
                 seen, parts = self._tap_read(row.get("op") or {})
+                if reads is not None:
+                    reads[self.handovers.key(row["press"])] = (seen, parts, {})
             if seen == "done":
                 if not self.handovers.journal_outcome(row["press"], "found"):
                     log.error("a tap's outcome couldn't be written to the tap journal")
@@ -1808,20 +2030,8 @@ class Controller:
                           else f"The newest {len(shown)} are on the cards below")
                          + ", each saying what Harness found."
                          + (f" The other {len(rest)} are listed after them by time and state." if rest else ""))
-        # Twenty-fourth round: each tap's relist generation (one more than its last relist's), stored with its
-        # relisted mark; its card is keyed on (tap, "relist", generation), and the summary and the list on the batch's
-        # taps and generations, so a relist done again is refused as a duplicate and mints nothing.
-        try:
-            old_marks = self._flags(self.RELIST_FLAG)
-        except Exception:                       # noqa: BLE001: unreadable: the first generation
-            old_marks = {}
-        gens = {}
-        for row in rows:
-            k = self.handovers.key(row["press"])
-            try:
-                gens[k] = int((old_marks.get(k) or {}).get("gen") or 0) + 1
-            except (TypeError, ValueError):
-                gens[k] = 1
+        # Twenty-fourth round: each tap's card is keyed on (tap, "relist", generation), and the summary and the list
+        # on the batch's taps and generations, so a relist done again is refused as a duplicate and mints nothing.
         batch = hashlib.sha256("\n".join(sorted(f"{k}#{g}" for k, g in gens.items())).encode()).hexdigest()[:24]
         marks = {k: {"press": dict(row["press"]), "gen": gens[k], "pending": True, "fails": 0, "due": 0.0}
                  for row in rows for k in [self.handovers.key(row["press"])]}
@@ -1878,6 +2088,108 @@ class Controller:
             mem[k] = dict(marks[k])
             self.__dict__.get("_reread_mem", {}).pop(k, None)
             self._strike_relisted(k, row["press"], marks[k])
+
+    RELIST_GEN_CAP = 6                          # twenty-fifth round: relists of one tap before its ended card
+    RELIST_ENDED_WORDS = ("Harness has brought this tap back to you several times without finishing it, so nothing "
+                          "more is done for it from here.")
+
+    def _relist_ended(self, rows: list[dict], gens: dict) -> None:
+        """Twenty-fifth round: taps past RELIST_GEN_CAP generations. Each gets one card (once-keyed on the tap,
+        "relist", "ended") with no Go ahead, in one transaction with its relisted mark (its strike pending), then
+        it's struck: never read on the calendar or relisted again."""
+        owner = self.config.owner_user_id
+        marks = {self.handovers.key(r["press"]): {"press": dict(r["press"]), "gen": gens[self.handovers.key(
+            r["press"])], "pending": True, "fails": 0, "due": 0.0, "ended": True} for r in rows}
+        with self.ledger.tx() as db:
+            for row in rows:
+                k = self.handovers.key(row["press"])
+                self.ledger.enqueue(chat_id=owner, kind="notice", db=db, outcome="unverified",
+                                    text=render.fit(f"{self._tap_head(row)} {self.RELIST_ENDED_WORDS}"),
+                                    once=Ledger.once_key(k, "relist", "ended"))
+                db.execute("DELETE FROM meta WHERE key=?", (self.REREAD_FLAG + k,))
+                self.ledger.set_meta(self.RELIST_FLAG + k, json.dumps(marks[k]), db)
+            self.ledger.event("taps_relist_ended", {"count": len(rows)}, db=db)
+        mem = self.__dict__.setdefault("_relist_mem", {})
+        for row in rows:
+            k = self.handovers.key(row["press"])
+            mem[k] = dict(marks[k])
+            self.__dict__.get("_reread_mem", {}).pop(k, None)
+            self._strike_relisted(k, row["press"], marks[k])
+
+    def _relist_guarded(self, rows: list[dict], *, restored: bool = True, verdicts: dict | None = None) -> None:
+        """Twenty-fifth round: each tap's relist is its own boundary. The batch goes as one (its summary, cards and
+        marks in one transaction); if the records refuse it (an error, or TransactionAborted after the savepoint's
+        rollback or reopen), each tap is tried alone, with the calendar reads already made, and a tap the records
+        still refuse is put off on STRIKE_BACKOFF_S in memory and beside the journal (_defer_tap), its verdict kept
+        in memory so its next try doesn't read the calendar again; the other taps go on. Only a TransactionAborted
+        whose reopen failed (no working connection) still ends the tick."""
+        if not rows:
+            return
+        cache = self.__dict__.setdefault("_relist_verdicts", {})
+        now = self._clock()
+        verdicts = dict(verdicts) if verdicts is not None else None
+        for row in rows:
+            k = self.handovers.key(row["press"])
+            hit = cache.get(k)
+            if hit and (verdicts is None or k not in verdicts) and now - hit[0] < self.CHECK_CAP_S:
+                verdicts = {} if verdicts is None else verdicts
+                verdicts[k] = hit[1]
+        reads: dict = {}
+        try:
+            self._relist_taps(rows, restored=restored, verdicts=verdicts, reads=reads)
+        except (Exception, TransactionAborted) as e:  # noqa: BLE001: each tap alone below
+            self._reraise_dead(e)
+            log.warning("a relist couldn't be written to the records (%s); each tap is tried alone",
+                        type(e).__name__)
+            first = e
+        else:
+            for row in rows:
+                cache.pop(self.handovers.key(row["press"]), None)
+            return
+        known = dict(verdicts or {})
+        known.update(reads)
+        alone = len(rows) == 1
+        for row in rows:
+            k = self.handovers.key(row["press"])
+            try:
+                if alone:
+                    raise first
+                self._relist_taps([row], restored=restored, verdicts=known if k in known else verdicts)
+            except (Exception, TransactionAborted) as e:  # noqa: BLE001: this tap put off; the next goes on
+                self._reraise_dead(e)
+                if k in known:
+                    cache[k] = (now, known[k])
+                self._defer_tap(k, e, "a tap's relist couldn't be written to the records")
+            else:
+                cache.pop(k, None)
+
+    @staticmethod
+    def _reraise_dead(e: BaseException) -> None:
+        """Twenty-fifth round: the one error a per-tap boundary doesn't hold: the records left with no working
+        connection (a TransactionAborted whose reopen failed), or anything that isn't an ordinary error."""
+        if isinstance(e, TransactionAborted):
+            if getattr(e, "reopen_failed", False):
+                raise e
+            return
+        if not isinstance(e, Exception):
+            raise e
+
+    def _defer_tap(self, key: str, e: BaseException, said: str) -> None:
+        """Twenty-fifth round: one tap the records refused at its own boundary, put off on STRIKE_BACKOFF_S (1, 2,
+        5, 15, 30, 60 minutes) in memory (the running loop and a start replay gate on it) and beside the journal,
+        logged at the deferrals' hourly rate. During a start replay, the replay is taken up again from the main
+        loop once that tap is due."""
+        mem = self.__dict__.setdefault("_reread_mem", {})
+        try:
+            fails = int((mem.get(key) or {}).get("fails") or 0) + 1
+        except (TypeError, ValueError):
+            fails = 1
+        due = self._clock() + self._backoff(fails)
+        mem[key] = {"fails": fails, "due": due}
+        self._hold_deferral(key, type(e).__name__, said)
+        if self.__dict__.get("_in_replay"):
+            again = self.__dict__.get("_replay_again_at")
+            self.__dict__["_replay_again_at"] = due if again is None else min(again, due)
 
     @staticmethod
     def _card_outcome(state: str, seen: str) -> str | None:

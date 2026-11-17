@@ -438,7 +438,12 @@ class TransactionAborted(BaseException):
     back in full (or its connection closed and opened again), any outer work a caller believed pending with it. A
     BaseException, so no caller's `except Exception` swallows it and runs later statements as if the transaction
     held: the whole settle (the tick's work) stops there, and the main loop logs it and goes on at the next tick.
-    Its cause is the original exception, whose own cause is the cleanup's."""
+    Its cause is the original exception, whose own cause is the cleanup's.
+
+    Twenty-fifth round: each tap's work is its own boundary. The controller catches it by name around one tap (after
+    the rollback or reopen here), puts that tap off on its back-off and goes on with the next; only reopen_failed
+    (the records were left with no working connection) still ends the tick."""
+    reopen_failed = False
 
 
 class Ledger:
@@ -965,38 +970,49 @@ class Ledger:
                 # since the transaction the caller believed pending is gone.
                 if isinstance(e, TransactionAborted):
                     raise
-                self._unstick(conn, outer)
+                reopened = self._unstick(conn, outer)
                 e.__cause__ = cleanup
-                raise TransactionAborted("the records' transaction was aborted: a savepoint couldn't be cleaned up") \
-                    from e
+                aborted = TransactionAborted("the records' transaction was aborted: a savepoint couldn't be cleaned "
+                                             "up")
+                aborted.reopen_failed = not reopened
+                raise aborted from e
             raise
         conn.execute("RELEASE SAVEPOINT enqueue")
         return oid
 
-    def _unstick(self, conn, outer: bool) -> None:
+    def _unstick(self, conn, outer: bool) -> bool:
         """Twenty-third round: after a savepoint whose cleanup failed. Inside a caller's transaction, that
         transaction's own rollback (its exception reaches it) ends it. On the autocommit connection the savepoint
         opened the transaction, so it's rolled back here in full; if even that fails, the connection is closed and
-        opened again, so later writes commit."""
+        opened again, so later writes commit. Twenty-fifth round: False only when that reopen itself failed (the
+        records have no working connection), which the TransactionAborted it raises carries as reopen_failed."""
         if outer or not conn.in_transaction:
-            return
+            return True
         try:
             conn.rollback()
             if not conn.in_transaction:
-                return
-        except BaseException:                  # noqa: BLE001: closed and opened again below
+                return True
+        except Exception:                      # noqa: BLE001: closed and opened again below
+            # Twenty-fifth round: ordinary errors only; anything else (an interrupt) goes on as it is.
             pass
         if conn is not self.db:
-            return
+            return True
         logging.getLogger("harness.ledger").error("the records' connection was left inside a transaction; it's "
                                                   "opened again")
         try:
             conn.close()
-        except BaseException:                  # noqa: BLE001: replaced whatever its state
+        except Exception:                      # noqa: BLE001: replaced whatever its state
             pass
-        self.db = sqlite3.connect(self.path, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
+        try:
+            db = sqlite3.connect(self.path, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+        except Exception as e:                 # noqa: BLE001: said by the caller's TransactionAborted
+            logging.getLogger("harness.ledger").error("the records' connection couldn't be opened again (%s)",
+                                                      type(e).__name__)
+            return False
+        self.db = db
+        return True
 
     @staticmethod
     def once_key(tap: str, kind: str, purpose: str) -> str:
