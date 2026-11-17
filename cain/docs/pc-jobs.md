@@ -1721,8 +1721,28 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     killed curl's partial output is never read as a page. After the fenced write and the
     post-write sha check the deadline is checked again at once: a write that couldn't be
     interrupted and finished past the window voids the acceptance under the same generation and is
-    reported as the deadline, without reading GitHub again. (Moving the link's own Ship-card reads
-    of GitHub onto the same wrapper is a later change.) A
+    reported as the deadline, without reading GitHub again. **0.12.2:** the deadline is also
+    checked before the acceptance is published (after its temporary file is written, before the
+    rename that makes it visible): past it nothing is published (`lock_unavailable`, "ran past its
+    bound before its acceptance was written"), the post-write void kept as the backstop. The link's
+    own Ship-card read of the pull request's head now goes through the same curl wrapper, reading
+    curl's version anew on every read (the blocking reader forgets its cached version after any
+    failure on the Pi's side); a read stopped at its time limit refuses the card as "the Ship gate's
+    state is unknown" naming the timeout. The quarantine log is read in three states: entries,
+    absent (nothing set aside) or unreadable, which refuses the card naming the log file with no
+    restore command (and blocks `--recover-generation` unless `--floor` is given). A quarantined
+    record is named `ship-gate-<sha>.json.quarantined-pr<N>-<random>` and the pull request is read
+    from its name; one whose name names none (left by an earlier version) refuses every card with
+    `/opt/cain/keeper.sh ship-gate --set-aside <file> --pr <number>`, which takes that pull
+    request's gate lock, links the file into `/data/work/ship-gate-set-aside/`, logs it and only
+    then drops the old name: nothing is deleted. An owed supersede run again re-reads the head under
+    the gate lock before clearing the mark; a head that moved (or a read that fails) keeps the mark
+    and exits 1. The lock quarantine takes the lock in recovery mode first and moves the generation
+    on as at every takeover; the one exception, documented in the code and its output, is that a
+    garbled lock sits at the lock's path, so the takeover's rename moves it aside before the lock is
+    held, and the log entry follows once it is. `SHIP_GATE_GITHUB_TOKEN` stays the recommended
+    default: without it every gate read, the Ship card's included, shares GitHub's 60
+    unauthenticated reads an hour from the Pi's address. A
     watch of a single sha with no `--pr` never blocks a card. It reads the gate now and then every 10
     minutes (`--every`) for up to 2 hours (`--hours`, at most 2), printing one line per reading, and
     keeps the step in `/data/work/ship-gate-<sha>.json`: the workflow file read, the head

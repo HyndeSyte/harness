@@ -180,6 +180,16 @@ check and child kill are in the one request wrapper, so every gate read has them
 watch and the supersede refuse to start below curl 7.32, and a read that fails on the Pi's side is
 named as that. After the fenced write the deadline is checked again at once.
 
+The follow-ups (0.12.2). The watch checks its deadline before it publishes an acceptance, as well as
+after. The Ship card reads the pull request's head through the gate's own curl wrapper, and a read
+stopped at its time limit refuses it as "the Ship gate's state is unknown". An unreadable quarantine
+log refuses the card naming the log, with no restore command. A quarantined record carries its pull
+request in its name; one whose name names none (from 0.12.0) blocks every card until
+`/opt/cain/keeper.sh ship-gate --set-aside <file> --pr <number>` moves it into
+`/data/work/ship-gate-set-aside/` and logs it (never a delete). An owed supersede re-reads the head
+under the lock before clearing its mark. The lock quarantine takes the lock in recovery mode and moves
+the generation on. `SHIP_GATE_GITHUB_TOKEN` is the recommended default for every gate read.
+
 Owner's ship checklist, for the gate: rerun the watch after any takeover (the watch's output
 says when one happened, and since the twenty-ninth round a quarantine's or recovery's takeover
 counts too), after a generation recovery, after a quarantine (of a record or a lock file), after

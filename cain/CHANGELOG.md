@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.2
+
+- PC jobs run again with Chrome 157: Chrome's own built-in extensions, such as Chrome Web Store Payments, no longer count as an extra extension in the Cain jobs profile. Any extension you or anything else installed still stops runs, as before.
+- After installing, run the probe and confirm again at your PC once: the worker changed, so nothing runs until you do.
+- The worker's two checks inside each run (before every browser action and after every page read) now refuse to work if a preload setting or the tests' variable is set where they run, like the worker itself.
+- Cain now tells you the PC's worker isn't starting for short jobs too: a job that waits out its whole time, or expires without being picked up, while the PC hasn't been heard from.
+- During an outage of the PC job queue you only hear that the queue can't be reached, not also that the PC isn't starting. That line clears only after the queue answers a few times in a row, and if it comes back within a day it says so.
+- The Ship gate's follow-ups: its records, quarantine and supersede steps are stricter, a stuck read of GitHub refuses the Ship card by name, and nothing it sets aside is ever deleted.
+
 ## 0.12.1
 
 - Cain can read your Microsoft 365 now that it's connected: your OneDrive files and your Outlook mail and calendar.
