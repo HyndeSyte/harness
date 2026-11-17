@@ -81,6 +81,9 @@ export TAP_READ_MS
   RECORD_TOKEN="$(bashio::config 'github_token' 2>/dev/null || true)"
   [ "$RECORD_TOKEN" = "null" ] && RECORD_TOKEN=""
   export RECORD_TOKEN
+  # Round 24: the keeper's wall-clock ceiling for one network git call, in seconds (git's own low-speed limit aborts a
+  # stalled transfer first). The keeper keeps it below the consumed-key log's 90-second wait whatever is set here.
+  export RECORD_PUSH_TIMEOUT_S=75
   while true; do bun /opt/cain/record/main.ts 2>&1; sleep 10; done
 ) &
 # The review runner (review/main.ts): outside-model reviews (Codex on his ChatGPT

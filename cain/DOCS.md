@@ -1270,7 +1270,7 @@ What Cain's link enforces:
   read back right after it, is the commit the keeper pushed (or a fresh fetch finds nothing waiting to
   push). A push that passes the check but fails on the network, times out or can't be read back leaves the
   held-back record in place, with nothing said to Cain. The push itself now runs under a hard time limit
-  (20 seconds, well below the 30 seconds the consumed-key log's other writers wait for its lock), with
+  (20 seconds then, below the 30 seconds the consumed-key log's other writers waited; round 24 raises both), with
   git's low-speed limit and no prompt of any kind to wait on; on expiry git and everything it started are
   stopped and the lock is released. A push that timed out, or failed with GitHub unreadable after it, has an
   unknown outcome: kept in the keeper's state, listed under unresolved landings, and no drop of the taps it
@@ -1290,6 +1290,50 @@ What Cain's link enforces:
   unresolved_landings now names its kind (row: landing, push-refused, push-alarm, alarm-check,
   push-unknown). The start probe's helper runs under the same runtime and flags as the App's own process,
   and a helper that can't start is its own refusal reason.
+
+  Round 24 (the twenty-fourth review's fixes, to defects in round 23's own additions; the design stays
+  frozen, and no new durable store: the keeper state carries the new fields). The table in
+  `cain/docs/source-check-invariants.md` is updated for every row this round touches.
+
+  Every network call the keeper makes now runs under the same timed, no-prompt wrapper as the push: the
+  round's opening fetch, a clone, the read-back after a push, the drop's fresh fetch and the request for
+  GitHub's Date header. Each runs in its own session, and on expiry that whole session is stopped. A
+  fetch that hangs or fails makes a hiccup round: the round works on the box's copy, the hiccup is kept in
+  the keeper's state and its status, the next round tries again, and after five such rounds Cain hears
+  once that the keeper can't read GitHub (and once when it reads again). The push's wall-clock limit is
+  now a ceiling, 75 seconds (set in the App's run script, kept below the consumed-key log's 90-second
+  wait); git's own low-speed limit is what normally stops a stalled push. Each push's duration is logged,
+  and three pushes in a row stopped at the ceiling are their own row (push-slow): the box's connection to
+  GitHub is too slow. The keeper refuses to start without the session tool (setsid), with a fixed reason.
+
+  A push whose outcome is unknown and whose own check then fails (its commit gone from the copy, or a
+  listing error) is no longer forgotten: each failed round counts a try, its row says in fixed words that
+  the outcome couldn't be settled yet, Cain hears once, and after three tries (at once if the commit is
+  gone) the keeper reads GitHub's whole history: settled as landed when the commit is there, as not
+  landed only when neither the commit nor any of its tap keys is there; otherwise it stays unresolved.
+
+  A missing consumed-key log is taken as "no withdrawn changes" only when the keeper's state proves the
+  log never existed (its created flag, written once the log exists, is unset and no record was ever
+  counted, or there is no keeper state at all, a first start). Otherwise the alarm check is incomplete and
+  the push guard holds pushes back. A landing check that skips a record says why in fixed words
+  (lock-timeout, read-failed, git-failed or other); the error itself goes to the keeper's log only. After
+  the first lock timeout in a round, the remaining records are skipped at once with the same cause, so a
+  busy lock costs one wait, not one per record.
+
+  `/opt/cain/record.sh reset-copy` is refused unless the keeper is holding back its pushes right now. The
+  request is stamped with that hold's id and the reset epoch, the next round uses it up whether or not
+  there are local commits, and it acts only if that very hold is still recorded; it logs, in fixed words,
+  how many local commits it discarded and which consumed tap keys they carried, and settles their open
+  intents first. A request made with no hold, or left from an old hold, can never reset a later round.
+  (The smoke test's forced-conflict switch works as before.) Rounds whose push isn't confirmed
+  while pushes are held back now count on the hold (hiccups, with their age, in the status), and past six
+  such rounds Cain hears once.
+
+  With the box's boot id unreadable, each keeper start that re-bases a landing window is counted; after
+  three re-bases without the window passing, the hold shows as a landing-held row in `keeper.sh clock`'s
+  unresolved_landings. A source test bans re-exporting, aliasing or generic-form calls of the lock
+  primitives (so the call-site scan can't miss one), and the link's real entry file is launched in a test
+  the way the keeper's is.
 
   The authorization boundary for an in-flight landing (round 9). A Ship tap's landing starts at its
   ledger claim, made right before the first push attempt and only after the tap passed the live-tap

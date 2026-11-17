@@ -116,7 +116,7 @@ describe("1. the push path's tombstone check fails closed (invariants: the consu
     // The copy reset to GitHub's (the dropped request has left the queue): later landings resume. Round 23: through the
     // documented path only, record.sh reset-copy.
     dropQueued(k, "cain-r22-1-c");
-    const sh = Bun.spawnSync(["bash", join(import.meta.dir, "../rootfs/opt/cain/record.sh"), "reset-copy"], { env: { ...process.env, RECORD_FORCE_CONFLICT: join(dirname(k.cfg.queue), "record-force-conflict") } });
+    const sh = Bun.spawnSync(["bash", join(import.meta.dir, "../rootfs/opt/cain/record.sh"), "reset-copy"], { env: { ...process.env, RECORD_FORCE_CONFLICT: join(dirname(k.cfg.queue), "record-force-conflict"), RECORD_HOLDS: k.cfg.holds! } });   // round 24: stamped with the recorded hold
     expect(sh.exitCode).toBe(0);
     expect(round(k, "cain-r22-1-after").ok).toBe(true);
     expect(remoteHas(k, "a round cain-r22-1-after")).toBe(true);

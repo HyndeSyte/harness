@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { appendLog, LOCK_CALLERS, LOCK_SITES, LOCK_WAIT_MS, lockTest, lockWait, probeHelperArgv, probeLock, readLog, resetFlockForTest, shortWriteSpy, withLogLock } from "../rootfs/opt/cain/applog.ts";
 import { keeperPushRows, outageWhy, plainPush } from "../rootfs/opt/cain/link/core";
-import { alarmCheckLine, consumedWait, cycle, dropUnlanded, GUARD_WHY, LANDED_MIN_ROUNDS, LANDED_WINDOW_MS, nightly, openIntents, pushAlarmLine, pushedTombstoned, pushRefusedLine, PUSHES_AGAIN_LINE, PUSH_TIMEOUT_MS, readConsumed, RESET_COPY_CMD, tapsLogFile } from "../rootfs/opt/cain/record/main.ts";
+import { alarmCheckLine, consumedWait, cycle, LAND_SKIP_WHY, dropUnlanded, GUARD_WHY, LANDED_MIN_ROUNDS, LANDED_WINDOW_MS, nightly, openIntents, pushAlarmLine, pushedTombstoned, pushRefusedLine, PUSHES_AGAIN_LINE, PUSH_TIMEOUT_MS, readConsumed, RESET_COPY_CMD, tapsLogFile } from "../rootfs/opt/cain/record/main.ts";
 import { DAY, MIN, pendingWith, rig as linkRig } from "./link-rig";
 import { rig as keeperRig } from "./rig.ts";
 
@@ -255,7 +255,8 @@ describe("4. the alarm check fails closed (invariants: the record trailers, the 
   test("an unreadable tombstone log after the push: incomplete, kept, listed and told; a clean scan the next round clears it", () => {
     const k = pushedWithTomb("tap-0000003f2341", "cain-r23-4-a");
     const f = tapsLogFile(k.cfg);
-    expect(pushedTombstoned({ ...k.cfg, tapsLog: join(k.root, "no-such-dir", "x") } as any, null, "x").incomplete).toBeUndefined();   // a missing log is no tombstones
+    // Round 24: a missing log isn't verified absence once the keeper's state shows the log existed (source-check-round24 3).
+    expect(pushedTombstoned({ ...k.cfg, tapsLog: join(k.root, "no-such-dir", "x") } as any, null, "x").incomplete).toBe("the consumed-key log couldn't be read to check what the push carried");
     let swapped = false;
     k.cfg.gitHook = (a) => { if (a[0] === "push" && !swapped) { swapped = true; renameSync(f, `${f}.aside`); mkdirSync(f); } };
     cycle(k.cfg);
@@ -302,7 +303,7 @@ describe("5. the hold's remedy is a shipped switch, record.sh reset-copy (invari
     expect(line).toContain(RESET_COPY_CMD);
     clean(line);
     // The documented path: the script itself, as Cain runs it.
-    const sh = Bun.spawnSync(["bash", join(ROOT, "record.sh"), "reset-copy"], { env: { ...process.env, RECORD_FORCE_CONFLICT: join(dirname(k.cfg.queue), "record-force-conflict") }, stdout: "pipe", stderr: "pipe" });
+    const sh = Bun.spawnSync(["bash", join(ROOT, "record.sh"), "reset-copy"], { env: { ...process.env, RECORD_FORCE_CONFLICT: join(dirname(k.cfg.queue), "record-force-conflict"), RECORD_HOLDS: k.cfg.holds! }, stdout: "pipe", stderr: "pipe" });   // round 24: stamped with the recorded hold
     expect(sh.exitCode).toBe(0);
     expect(sh.stdout.toString()).toContain("resets its copy");
     for (let n = 0; n < 3 && keeperStatus(k).push_refused; n++) cycle(k.cfg);
@@ -462,7 +463,8 @@ describe("10. a lock timeout at one landing mark skips only that record (invaria
     shortWriteSpy.on = null;
     const landed = () => readLog<any>(f).records.filter((x) => x.t === "landed").map((x) => x.tap);
     expect(landed()).toHaveLength(1);
-    expect(keeperStatus(k).landing_skipped).toEqual([expect.objectContaining({ why: expect.stringContaining("written short") })]);
+    // Round 24: the cause in fixed words (a short write is "other"); git's or the log's own text stays in the keeper's log.
+    expect(keeperStatus(k).landing_skipped).toEqual([expect.objectContaining({ cause: "other", why: LAND_SKIP_WHY.other })]);
     cycle(k.cfg);
     expect(landed().sort()).toEqual(["tap-0000003f23a1", "tap-0000003f23a2"]);
     expect(keeperStatus(k).landing_skipped).toBeUndefined();

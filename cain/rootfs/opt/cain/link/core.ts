@@ -664,17 +664,28 @@ export type UnresolvedRow =
   | { row: "push-refused"; what: "record push refused"; kind: string; since: string; failures: number; last_error: string; retried: string; told: boolean }
   | { row: "push-alarm"; what: "record push alarm"; tap_key: string; item: string | null; since: string; last_error: string }
   | { row: "alarm-check"; what: "record push alarm check incomplete"; since: string; failures: number; last_error: string; retried: string; told: boolean }
-  | { row: "push-unknown"; what: "record push outcome unknown"; since: string; failures: number; last_error: string; tap_keys: string[]; retried: string };
+  | { row: "push-unknown"; what: "record push outcome unknown"; since: string; failures: number; last_error: string; tap_keys: string[]; retried: string }
+  // Round 24: the opening fetch's hiccups, pushes stopped at the time limit (the connection's speed), and landing watches
+  // held by re-bases at each keeper start (the boot id unreadable).
+  | { row: "fetch-hiccup"; what: "record fetch from GitHub failing"; since: string; failures: number; last_error: string; retried: string; told: boolean }
+  | { row: "push-slow"; what: "record pushes too slow"; since: string; failures: number; last_error: string; retried: string; told: boolean }
+  | { row: "landing-held"; what: "record landing watch held"; tap_key: string; failures: number; last_error: string; retried: string };
 export function keeperPushRows(st: KeeperStatus | null | undefined): UnresolvedRow[] {
   const s = st as any;
   const out: UnresolvedRow[] = [];
   const r = s?.push_refused;
-  if (r && typeof r.why === "string") out.push({ row: "push-refused", what: "record push refused", kind: String(r.kind ?? ""), since: String(r.since ?? ""), failures: Number(r.tries ?? 1), last_error: r.why, retried: "each keeper round", told: r.told === true });
+  if (r && typeof r.why === "string") out.push({ row: "push-refused", what: "record push refused", kind: String(r.kind ?? ""), since: String(r.since ?? ""), failures: Number(r.tries ?? 1), last_error: r.why, retried: "each keeper round", told: r.told === true,
+    ...(Number.isInteger(r.hiccups) ? { hiccups: r.hiccups, hiccup_since: String(r.hiccupSince ?? ""), hiccup_age_min: Number(r.hiccup_age_min ?? 0) } : {}) } as UnresolvedRow);
   for (const a of Array.isArray(s?.push_alarms) ? s.push_alarms : []) if (a && typeof a.why === "string") out.push({ row: "push-alarm", what: "record push alarm", tap_key: String(a.tap ?? ""), item: typeof a.item === "string" ? a.item : null, since: String(a.at ?? ""), last_error: a.why });
   const c = s?.alarm_check;
   if (c && typeof c.why === "string") out.push({ row: "alarm-check", what: "record push alarm check incomplete", since: String(c.since ?? ""), failures: Number(c.tries ?? 1), last_error: c.why, retried: "each keeper round", told: c.told === true });
   const u = s?.push_unknown;
   if (u && typeof u.why === "string") out.push({ row: "push-unknown", what: "record push outcome unknown", since: String(u.since ?? ""), failures: Number(u.tries ?? 1), last_error: u.why, tap_keys: Array.isArray(u.keys) ? u.keys.map(String) : [], retried: "settled by the keeper's next fresh fetch" });
+  const f = s?.fetch_hiccup;
+  if (f && typeof f.why === "string") out.push({ row: "fetch-hiccup", what: "record fetch from GitHub failing", since: String(f.since ?? ""), failures: Number(f.rounds ?? 1), last_error: f.why, retried: "each keeper round", told: f.told === true });
+  const p = s?.push_slow;
+  if (p && typeof p.why === "string") out.push({ row: "push-slow", what: "record pushes too slow", since: String(p.since ?? ""), failures: Number(p.count ?? 1), last_error: p.why, retried: "each keeper round", told: p.told === true });
+  for (const h of Array.isArray(s?.landing_held) ? s.landing_held : []) if (h && typeof h.why === "string") out.push({ row: "landing-held", what: "record landing watch held", tap_key: String(h.tap ?? ""), failures: Number(h.rebases ?? 0), last_error: h.why, retried: "each keeper round; it drops once a whole window passes within one keeper run" });
   return out;
 }
 // Round 23: the owner's outage notice's reason, switching on the row kinds: a refused push says why it is held back;
@@ -684,7 +695,9 @@ export function outageWhy(rows: UnresolvedRow[], st: KeeperStatus): string {
     switch (r.row) {
       case "push-refused": return plainPush(r.last_error, false);
       case "push-unknown": return "GitHub didn't answer";
-      case "push-alarm": case "alarm-check": case "landing": break;
+      case "push-slow": return "the box's connection to GitHub is too slow for a save to finish in time";
+      case "fetch-hiccup": return "GitHub didn't answer";
+      case "push-alarm": case "alarm-check": case "landing": case "landing-held": break;
     }
   }
   return plainPush(st.push_failed?.why, !!st.reset);

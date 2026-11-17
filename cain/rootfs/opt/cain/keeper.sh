@@ -103,6 +103,13 @@
 #                                        may have carried); switch on row, not on which fields a row has.
 #                                        The remedy for a withdrawn change that can't be taken out cleanly
 #                                        is /opt/cain/record.sh reset-copy
+#                                        Round 24: three more kinds: "fetch-hiccup" (the keeper's fetch from
+#                                        GitHub failing or timing out, rounds counted), "push-slow" (pushes
+#                                        stopped at their time limit three times in a row: the connection's
+#                                        speed) and "landing-held" (a landing window re-based at each keeper
+#                                        start with the boot id unreadable). A push-refused row also carries
+#                                        hiccups, hiccup_since and hiccup_age_min (rounds whose push wasn't
+#                                        confirmed). reset-copy is refused unless a push is held back now
 #   keeper.sh settle <tap key> landed|not-landed --said <his message id>
 #                                        the owner's alone: settles by hand a landing the remote can't
 #                                        settle (keeper.sh clock lists it under unresolved_landings, or

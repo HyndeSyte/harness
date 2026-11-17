@@ -705,8 +705,14 @@ GitHub is seen to have them, and you hear it then. A "Push alarm" line means an 
 reached the record anyway: check that item at its source, record what it is now, and if his two answers differ tell him
 in one line which one stands, with no codes or ids. A "Push alarm check incomplete" line means the keeper couldn't yet
 check whether a push carried a withdrawn change: nothing to do, it checks again each round and you hear the result (a
-"Push alarm check complete" line); log a Build item only if it lasts a day. keeper.sh clock lists each of these under
-unresolved_landings with its kind in row.
+"Push alarm check complete" line); log a Build item only if it lasts a day. A "Push outcome unsettled" line means the
+keeper couldn't yet tell whether one of its pushes reached GitHub: nothing to do, it tries again each round and you hear
+"Push outcome settled". A line saying the keeper can't read GitHub (its fetch keeps failing or running out of time) or
+that its pushes keep running out of time because the connection is too slow for a push, or that its pushes still aren't
+confirmed: nothing to tell him, it tries again each round; log a Build item only if it lasts a day. `record.sh
+reset-copy` answers refused when the keeper isn't holding back its pushes: nothing to reset then, so don't retry it.
+keeper.sh clock lists each of these under unresolved_landings with its kind in row (fetch-hiccup, push-slow and
+landing-held among them).
 
 A card withdrawn or expired. An ask or Ship card that answers "withdrawn" (its record couldn't be
 saved, so it went up without buttons and says so) or "couldn't be made tappable" was never asked:

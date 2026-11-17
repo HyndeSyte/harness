@@ -11,7 +11,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-export const TRUST_DIR = "/data/trust";
+// Round 24: CAIN_TRUST_DIR moves it for a test that launches the link's real entry file (the image never sets it).
+export const TRUST_DIR = process.env.CAIN_TRUST_DIR ?? "/data/trust";
 export const STOP_FILE = process.env.CAIN_STOP_FILE ?? `${TRUST_DIR}/stop.json`;
 
 export interface StopState { stopped: boolean; at: number | null }
