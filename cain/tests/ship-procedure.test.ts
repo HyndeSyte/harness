@@ -117,6 +117,28 @@ describe("Cain's rules", () => {
     expect(step5).not.toContain("so that session is live");
   });
 
+  test("reviews converge: only a serious finding holds a piece, three rounds at most (his word, Nov 17)", () => {
+    // Nov 16 to 17: pieces went 26 to 31 review rounds, each finding a smaller edge case, while
+    // what he asked for waited. A piece ships once a review finds nothing serious left.
+    const reviews = section(rules, "## Outside reviews").replace(/\s+/g, " ");
+    for (const must of ["Reviews converge: a review catches harm, it doesn't polish.",
+      "could lose or corrupt something of his (a message, a tap, a card, a calendar change, a record, money), act wrongly or "
+        + "without his go, expose a secret or widen what anyone can reach, or let something fail without anyone hearing.",
+      "is a follow-up Build item, never a hold. Fix only what's serious, have only those fixes checked, then the Ship card.",
+      "Three review rounds a piece at most: if the third still finds something serious, bring him one decision with your "
+        + "recommendation (ship it with that risk named, or hold it), never a fourth round on your own."])
+      expect(reviews).toContain(must);
+    const jobs = section(rules, "## Cloud jobs (building, without his laptop)").replace(/\s+/g, " ");
+    expect(jobs).toContain("If the review found something serious (Reviews converge, under Outside reviews), run Build again "
+      + "on the same branch with only those fixes first, file the rest as a follow-up Build item, and have only the fixes checked.");
+    expect(jobs).not.toContain("something worth fixing");
+    const registry = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/standards/registry.md"), "utf8").replace(/\r\n/g, "\n");
+    const s070 = registry.split("## S-070 ")[1].split("\n## ")[0].replace(/\s+/g, " ");
+    expect(s070).toContain("record rules/R-013 (Nov 17)");
+    expect(s070).toContain("Reviews converge: only a serious finding holds a piece");
+    expect(s070).toContain("Three rounds a piece at most");
+  });
+
   test("a Reviewed line is the relay's, word for word, and the gate refuses any other", () => {
     const reviews = section(rules, "## Outside reviews").replace(/\s+/g, " ");
     expect(reviews).toContain('end with its Reviewed line exactly as the relay gave it ("Say it as: Reviewed: OpenAI, approve with changes; Gemini, approve."), '

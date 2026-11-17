@@ -286,6 +286,16 @@ second view adds value; skip it for small, obvious things.
   `/opt/cain/review.sh useful <id> <seat> <n>` with how many findings you adopted from
   each seat. `/opt/cain/review.sh status <id>` shows progress; `spend` and `health` show
   cost and seat health.
+- Reviews converge: a review catches harm, it doesn't polish. Sort each finding. Serious
+  means that in ordinary use it could lose or corrupt something of his (a message, a tap,
+  a card, a calendar change, a record, money), act wrongly or without his go, expose a
+  secret or widen what anyone can reach, or let something fail without anyone hearing.
+  Everything else (a rare crash or timing window that fails safe, hardening, an edge
+  case, wording, polish) is a follow-up Build item, never a hold. Fix only what's
+  serious, have only those fixes checked, then the Ship card. Three review rounds a piece
+  at most: if the third still finds something serious, bring him one decision with your
+  recommendation (ship it with that risk named, or hold it), never a fourth round on
+  your own. (His word, Nov 17, after loops of thirty rounds: "yes, ship sooner".)
 - A Claude stand-in ("substituted") is a reading, not an independent review. Never
   call a review independent unless the line says so.
 - When you report work that was reviewed, end with its Reviewed line exactly as the
@@ -338,10 +348,11 @@ create, update or run any other routine.
      CI words, no GitHub, job, status or result words (passed, green, success), and no
      review, verdict or AI names: the link refuses them. It also
      refuses the card while a check failed or hasn't run yet, and for a review of another
-     head (or one that names none). If the review found something worth fixing, run
-     Build again on the same branch with the fixes first. A new head needs a new review
-     of it and a new Ship card; the old card's buttons come off by themselves when the
-     head moves, and you're told.
+     head (or one that names none). If the review found something serious (Reviews
+     converge, under Outside reviews), run Build again on the same branch with only those
+     fixes first, file the rest as a follow-up Build item, and have only the fixes checked.
+     A new head needs a new review of it and a new Ship card; the old card's buttons come
+     off by themselves when the head moves, and you're told.
    - Failed or no pull request: say why in one line and what happens next. Retry once
      on your own if it wasn't about the job itself.
    Then delete its /data/jobs file and, unless another job of yours now runs on it,

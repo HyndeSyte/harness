@@ -311,9 +311,9 @@ CLAUDE.md, and the laptop's memory), each of which held some of them, several tw
 - kind: procedure
 - applies: all
 - home: role:Cain; journey:outside reviews
-- source: record rules/R-004 item 4 (Nov 8); laptop correction Nov 10; record core requirement 22
-- checked-at: the review service (Cain); the pull request's How it was tested section (laptop)
-- rule: Building, planning, design, research and any change to a rule or process get outside review, scaled to the stakes, from separate angles (can it run, does it meet his bar, a red team). He never picks models or rounds, never asks for it and never confirms it happened. It's reported in one line, "Reviewed: who, verdict" (Cain: only the review service's own line).
+- source: record rules/R-004 item 4 (Nov 8); laptop correction Nov 10; record core requirement 22; record rules/R-013 (Nov 17)
+- checked-at: the review service (Cain); the pull request's How it was tested section (laptop); the Ship card, after at most three review rounds (Cain and laptop)
+- rule: Building, planning, design, research and any change to a rule or process get outside review, scaled to the stakes, from separate angles (can it run, does it meet his bar, a red team). He never picks models or rounds, never asks for it and never confirms it happened. It's reported in one line, "Reviewed: who, verdict" (Cain: only the review service's own line). Reviews converge: only a serious finding holds a piece (in ordinary use it could lose or corrupt something of his, act wrongly or without his go, expose a secret or widen access, or fail without anyone hearing); everything else is a follow-up item. Fix only the serious ones, have only those fixes checked, then ship. Three rounds a piece at most: a third that still finds something serious goes to him as one decision with a recommendation, never a fourth round.
 
 ## S-071 No churn either way
 - kind: principle
