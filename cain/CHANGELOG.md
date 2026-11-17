@@ -151,6 +151,14 @@
 - The PC worker won't start if the tests' own setting is found on the PC, and only the tests can turn on their stand-in listing.
 - When the PC can't write down a cleared hold, you get one message saying so with the fix, and the run names the right file.
 - If Cain's App stops answering the keeper's messages for a while, Cain's own status says how many are waiting and for how long.
+- Setting a damaged Ship gate record aside now waits for the gate's lock, so it can never move a fresh acceptance a watch was just writing, and it is only written down once the record has really moved.
+- A Ship gate lock file that is damaged can be set aside the same way (`keeper.sh ship-gate --quarantine-lock <number>`), instead of blocking its pull request with no way out.
+- The Ship gate watch refuses to start on a Pi whose curl is too old for its time limits, and stops a GitHub read that runs over its time itself.
+- A Ship card is refused by name while the replacement of an earlier acceptance is still owed, with how long GitHub asked to wait.
+- Without a GitHub token, the Ship gate no longer retries refused page reads, and each refusal says how many reads are left this hour.
+- When the PC worker refuses to start because a setting meant only for its tests is found on the PC, you get one message saying so with the fix. It now also refuses to start when something could load test code into it.
+- A message for you about the PC waiting while the queue can't be fetched is still recorded and tried every round, and Cain's status warns once nothing has answered for a while.
+- A message for you that waited longer than Cain's App remembers what it posted comes once more marked as said again, never as if new.
 
 ## 0.11.0
 

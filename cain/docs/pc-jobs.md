@@ -1650,8 +1650,9 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     3 seconds a try) and any rate-limit wait from what is left of it, never per try, and just
     before the acceptance is written the time, the lock's token and the generation are checked
     again. Past the deadline nothing is accepted (`lock_unavailable`, saying the watch ran past its
-    bound), and an acceptance already written is taken back. The longest a live watch holds the
-    lock is 11 seconds, under a quarter of the one-minute stale bound. The recovery
+    bound), and an acceptance already written is taken back. A live watch normally lets go of the
+    lock within 11 seconds, under a quarter of the one-minute stale bound (not a hard bound: see
+    the twenty-eighth round below). The recovery
     (`--recover-generation <number>`, with `--floor <number>` for a number it can't read) takes the
     gate lock itself through the same takeover a watch uses, writes above every generation in the
     file, the locks (a stale one it took over included), the records and the quarantined records,
@@ -1665,7 +1666,29 @@ once on a head whose Windows run failed and was then re-run green: it must say `
     classified the same way everywhere; a supersede stopped by one is kept as owed on its record
     (`supersede_owed`), says so, and exits with status 3. Without a token GitHub allows 60 reads
     an hour from the Pi, shared with the link, and a watch reads about 4 to 8 pages every 10
-    minutes, so expect a rate-limit refusal now and then in a busy hour: wait and run it again. A
+    minutes, so expect a rate-limit refusal now and then in a busy hour: wait and run it again.
+    **Twenty-eighth round:** the bound, said as it is: what the 10 second deadline bounds is the
+    acceptance window (nothing is accepted past it), not how long the lock is held. A live watch
+    normally lets go within 11 seconds, a quarter of the stale bound, but its file reads and writes
+    can't be interrupted, so under a disk stall the holding is unbounded; the deadline is checked
+    before each record is parsed and before each live check, so the overshoot is one file's read,
+    and a holder stalled past the stale bound is taken over and fenced by the token and the
+    generation (its later write and take-back count for nothing). curl's own time limit is not
+    trusted alone: the watch refuses to start with curl older than 7.32 (fractional limits), a try
+    with under a second left is skipped as the deadline, and the curl child is killed from the
+    watch's side at its limit plus a quarter second. The quarantine
+    (`--quarantine <sha>`, with `--pr <number>` when the record's text names no pull request) takes
+    the pull request's gate lock as the recovery does (a current lock refuses it), checks again
+    under it that the record still doesn't parse, renames it first and logs it only after the
+    rename, with the generations of what it actually moved; a record rewritten meanwhile is put
+    back. A lock file of the pull request that doesn't parse (the lock, or a takeover's leftover
+    `ship-gate-pr-<number>.lock.stale-<token>`) is set aside with
+    `/opt/cain/keeper.sh ship-gate --quarantine-lock <number>`, its generations logged. An
+    acceptance whose supersede is owed is not current for the Ship card: the card is refused by
+    name with the wait. Without a token, page reads are never retried and each refusal printed
+    says how many reads are left this hour; a fine-grained, read-only GitHub token handed in as
+    `SHIP_GATE_GITHUB_TOKEN` is the recommended default (wiring it through an App option is a later
+    decision). The recovery deletes temporary generation files a cut-off write left. A
     watch of a single sha with no `--pr` never blocks a card. It reads the gate now and then every 10
     minutes (`--every`) for up to 2 hours (`--hours`, at most 2), printing one line per reading, and
     keeps the step in `/data/work/ship-gate-<sha>.json`: the workflow file read, the head
@@ -1803,6 +1826,18 @@ its request, if still waiting, is refused with that reason.
   set of notices tried this round lives in the keeper's memory: a keeper restarted mid-round
   starts a new round and tries an owed notice once more with its saved notice id, so delivery
   across a restart is at least once, and the link, which deduplicates on that id, posts it once.
+  **Twenty-eighth round:** the PC's heartbeat is read from the queue copy as it stands, and its
+  notices recorded and tried, at the start of every round, before and independently of the fetch,
+  so a fetch that fails never keeps a hold-clear (or start-refusal) notice from being owed and
+  tried. A round counts as silent when any contact the keeper makes, a send to the link or the
+  queue's fetch, gets no answer and no send got one; after 30 in a row the keeper's status shows
+  "the keeper has had no answer for N rounds in a row". The worker refusing to start (the tests'
+  variable, or a preload, require, import or loader flag in `NODE_OPTIONS` or `BUN_OPTIONS`, in the
+  runtime's arguments, or a `bunfig.toml` preload) writes a heartbeat (`start_refused`, with reason
+  `test_build_flag_set` or `preload_flag_set`) before it exits, pushed to the queue when it can,
+  and the keeper tells Dane (`worker_start_refused`). Exactly-once display is bounded: the link
+  remembers the notice ids it posted for 30 days; a notice still owed after that is sent under a
+  new id, worded as said again. Marks from before the twenty-seventh round show "age unknown".
 - **The Pi loses power right after a tap is written.** Run this on the Pi (in Cain's
   App terminal, or have Cain run it), against a scratch store on the same disk (the code
   path the keeper uses, not its live store). **Repeat it several times (at least three
@@ -1944,12 +1979,16 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `superseded` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`; twenty-fifth round) | the watch's output | The sha being watched had an acceptance that was superseded: a superseded head is never accepted again, and its record stays as it was. Watch the pull request's current head instead. Needs a code change: no. |
 | `head_not_current` (`keeper.sh ship-gate --pr <number> --head <sha> --watch`; twenty-fifth round) | the watch's output and `/data/work/ship-gate-<sha>.json`: `failure_why` | The pull request's head on GitHub, read just before or just after the acceptance was kept, wasn't the watched sha (or couldn't be read): nothing is accepted, or the acceptance was taken back. Watch the head the pull request has now. Twenty-sixth round: `failure_why` says when GitHub's rate limit stopped the read ("the head isn't known to have moved"), apart from a head that moved: wait out the limit and watch again. Needs a code change: no. |
 | A Ship card refused: "the Ship gate's state is unknown for this pull request" (twenty-sixth round) | the refusal's words name the file | The generation file or a kept watch record in `/data/work` can't be read (or the generation file is missing while records carry one), so the card can't tell what was accepted and refuses rather than passing. For the generation file, run the recovery the refusal names once no watch runs, then watch the head again; for a record that doesn't parse, move it aside and watch the head again. Needs a code change: no. |
+| A refusal naming a watch lock that "doesn't parse" or "can't be read", with `--quarantine-lock <number>` (twenty-eighth round) | the refusal's words; `/data/work/ship-gate-pr-<number>.lock` or `.lock.stale-<token>` | A lock file of that pull request is damaged (a cut-off write, a full disk). Once no watch of it runs: `/opt/cain/keeper.sh ship-gate --quarantine-lock <number>` (renamed aside, never deleted, its generations recorded in `/data/work/ship-gate-quarantine.jsonl`; a lock that parses is never moved). Then watch the head again. Needs a code change: no. |
+| A Ship card refused as "waiting on a supersede" (twenty-eighth round) | `supersede_owed` on `/data/work/ship-gate-<sha>.json` | An earlier acceptance's supersede was stopped by GitHub's rate limit and is still owed, so that acceptance isn't current. After the wait the refusal names, run the `--supersede <sha>` command it gives, then watch the head again. Needs a code change: no. |
+| A watch refused because "curl ... is older than 7.32" (twenty-eighth round) | the watch's output | The watch's time limits under its lock need curl 7.32 or newer. Update curl on the Pi (the App's base image), then watch again. Needs a code change: no. |
+| `preload_flag_refused` (the worker's status line; `worker.log`, marked ATTENTION; twenty-eighth round), or `worker_start_refused` (a Discord line) | `worker.log` on the PC; `heartbeat.json`: `start_refused` | A preload that could load test code into the worker is set where it runs: a require, import, preload or loader flag in `NODE_OPTIONS` or `BUN_OPTIONS` (or in the command's own arguments), or a `preload` in a `bunfig.toml` in the folder the worker starts from or its worker folder. Remove it (`Remove-Item Env:NODE_OPTIONS`, `Remove-Item Env:BUN_OPTIONS`, and from Windows' environment variables if set there; delete or fix the `bunfig.toml`), open a new terminal and run again. The same Discord line comes for `test_build_flag_refused`. Needs a code change: no. |
 | `lock_unavailable` saying the watch "ran past its 10 second bound" (twenty-seventh round) | the watch's output and `/data/work/ship-gate-<sha>.json`: `failure_why` | The watch's work under the lock (both reads of the pull request's head, any rate-limit wait, the write) has one 10 second deadline; it ran out, so nothing was accepted, or an acceptance just written was taken back. Usually GitHub was slow or asked to wait. Run the watch again in a minute. Needs a code change: no. |
 | A refusal naming a gate record that "can't be read" or "doesn't parse" (twenty-seventh round) | the refusal's words name the file, `/data/work/ship-gate-<sha>.json` | A kept record of the gate is damaged. It blocks only the pull request its text still names (every pull request when it names none). Once no watch runs, set it aside: `/opt/cain/keeper.sh ship-gate --quarantine <sha>` (renamed, never deleted, and recorded in `/data/work/ship-gate-quarantine.jsonl`; a record that reads is refused). Then run the refused command again; if it then names the generation file, run `--recover-generation <number>` (add `--floor <number>` only if told a number can't be read), and watch the head again. The only full reset of one pull request's gate is deleting all its gate files at once (`ship-gate-pr-<number>.lock`, `ship-gate-pr-<number>.gen`, and every `ship-gate-<sha>.json` naming it), and only while no watch of it runs: a watch still running could otherwise write into the fresh start. Needs a code change: no. |
 | A supersede that says it "is owed" (exit status 3; twenty-seventh round) | the supersede's output; `supersede_owed` on `/data/work/ship-gate-<sha>.json` | GitHub's rate limit stopped the read of the pull request's head, so nothing was superseded yet; the record keeps the supersede as owed with the wait GitHub asked for. Without a token GitHub allows 60 reads an hour from the Pi, shared with the link, so this happens now and then in a busy hour. Run the supersede again after the wait; it clears the owed mark. Needs a code change: no. |
 | `hold_clear_unrecorded` (a Discord line; `pcjobs.sh worker` shows `version_hold_unwritable (hold_clear_unrecorded)`; twenty-seventh round) | `worker.log` on the PC: `version_hold_clear_unrecorded`; the run's detail names `version-hold-cleared.json` | The worker could clear its version hold only without a version floor, and that needs a record of the clear (`version-hold-cleared.json` in the worker folder), which couldn't be written (the disk is full, or that path is read-only or blocked, for example by a folder of that name). The hold stays and nothing runs. Free disk space or fix the worker folder's permissions so that file can be written, then start a run. Needs a code change: no. |
 | `test_build_flag_refused` (the worker's status line; `worker.log`, marked ATTENTION; twenty-seventh round) | `worker.log` on the PC | The variable `PC_WORKER_TEST_BUILD` is set where the worker runs (a user or system environment variable, the terminal, or a scheduled task's settings). It belongs to the tests alone, so the worker doesn't start. Remove it (`Remove-Item Env:PC_WORKER_TEST_BUILD` in PowerShell, and from Windows' environment variables if set there), open a new terminal and run again. Needs a code change: no. |
-| "the link hasn't answered the keeper's notices for N rounds in a row" (`pcjobs.sh worker` or `list`, marked ATTENTION; twenty-seventh round) | the keeper's log: `the link didn't answer` | For 30 rounds in a row no notice send got any answer from the link (it is down or unreachable from the keeper). The line counts the notices waiting and the age of the oldest. Nothing goes to Dane through the link while it lasts; this line is the local escalation. Restart the Cain App if the link doesn't come back; the owed notices go once it answers, each at least once (a keeper restarted mid-round sends a notice again with its saved id, and the link posts it only once). Needs a code change: no. |
+| "the keeper has had no answer for N rounds in a row" (`pcjobs.sh worker` or `list`, marked ATTENTION; twenty-seventh round, worded so in the twenty-eighth) | the keeper's log: `the link didn't answer`, or a round that didn't finish on the fetch | For 30 rounds in a row no contact the keeper made got any answer: the link didn't answer its notices, or the queue couldn't be fetched from GitHub, and no notice send got an answer (the link is down, or the Pi can't reach GitHub). The line says "age unknown" for a notice from before the age was kept. The line counts the notices waiting and the age of the oldest. Nothing goes to Dane through the link while it lasts; this line is the local escalation. Restart the Cain App if the link doesn't come back; the owed notices go once it answers, each at least once (a keeper restarted mid-round sends a notice again with its saved id, and the link posts it only once). Needs a code change: no. |
 | A Ship card refused: "the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked" (twenty-fifth round) | the refusal's words | A watch's acceptance stands for the pull request, and GitHub didn't answer with its head, so the card can't check the acceptance against it. Cain shows the card again once GitHub answers. Needs a code change: no. |
 | a Ship card refused: "the Ship gate's watch of this pull request accepted `<sha>`, not this head" | `/data/work/ship-gate-<sha>.json` | An earlier watch accepted another head of this pull request (often before a rebase). If this head replaces it, run `keeper.sh ship-gate --supersede <sha>`, then watch this head with `--pr <number> --head <head> --watch`. |
 | `rate_wait_cap` or `watch_cap` (the gate watch) | the watch's lines: the last reading's `why` | GitHub asked for a wait past 15 minutes (or sent a wait it couldn't read), or the watch reached its 2 hour cap unsettled. Nothing was accepted. Wait for GitHub's limit to reset, then watch again. |
