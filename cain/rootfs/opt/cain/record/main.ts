@@ -22,7 +22,7 @@ import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, hol
 import { projectChecked, TAP_KEY, tapDerived, tapIssuedProblem, voidChecks, type IssuedTap } from "./core.ts";
 import { dateHeaderReading, localReadings, verdict, verdictKey, type Reading, type Verdict } from "../clock.ts";
 import { teeConsole } from "../logfile.ts";
-import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, LockTimeout, lockRefusal, lockWait, probeLock, readLog, syncDir, withLogLock, type LogRead } from "../applog.ts";
+import { AFTER_RENAME, appendLog, appendLogHeld, crashSpy, frame, LockTimeout, lockRefusal, lockWait, probeLock, readLog, syncDir, withLogLock, type LogRead } from "../applog.ts";
 import { installState } from "../installflag.ts";
 import { lockGate } from "../startgate.ts";
 
@@ -306,6 +306,9 @@ function sync(cfg: Config, now: () => number = Date.now, o: { conflictFile?: boo
   // hiccup round (the copy as it is), never a wedged keeper.
   try { git(cfg, ["fetch", "--quiet", "origin", cfg.branch], cfg.dir, netTimeout(cfg)); }
   catch (e) { fetched = false; fetchTimedOut = e instanceof GitTimeout; log(`couldn't fetch from GitHub (${redact(cfg, (e as Error).message)}); working on the local copy`); }
+  // Round 27: which remote refs this round fetched (a clone fetched all of them), for the pristine proof and the rebuild.
+  if (fetched || cloned) fetchedThisRound(cfg, cloned);
+  else fetchFailed(cfg);
   const fetchedAt = now();
   // Round 24: the reset-copy request is consumed by this round, local commits or not.
   let rc: ResetCopyDone | undefined;
@@ -545,6 +548,11 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
   // Round 25: the created flag is monotonic (never cleared, a detected loss included), and a lost or shortened log is
   // marked "lost, rebuilding" until the rebuild has rewritten it and fsynced it: meanwhile every push is refused.
   tapsLogRebuild?: { since: string; why: string };
+  // Round 27: the consumed-key log's high-water record count (every record: consumptions, intents, drops, tombstones and
+  // marks), written to this state and fsynced before each append, so a loss shows as a shortfall whatever it held.
+  tapsLogLen?: number;
+  // Round 27: a state written at a first start before the round's holds are known (only the monotonic fields count).
+  bootstrap?: boolean;
   fetchHiccup?: { since: string; rounds: number; cause: "fetch-timeout" | "fetch-failed"; told?: boolean };   // round 24
   pushSlow?: { since: string; count: number; told?: boolean };   // round 24: consecutive pushes stopped at the ceiling
 };
@@ -621,11 +629,11 @@ export function openIntents(cfg: Config): Map<string, string> {
   return open;
 }
 function intendConsume(cfg: Config, tap: string, id: string, at: string) {
-  tapsLogBornFirst(cfg);
+  tapsLogBefore(cfg);
   appendLog(tapsLogFile(cfg), { t: "consuming", tap, id, at }, { wait: consumedWait() });
   cfg.crashPoint?.("taps-append");
 }
-function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { tapsLogBornFirst(cfg); appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }, { wait: consumedWait() }); }
+function dropIntent(cfg: Config, tap: string, id: string, at: string, why: string) { tapsLogBefore(cfg); appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, at, why }, { wait: consumedWait() }); }
 // Round 19: each intent a crash left open is resolved from the record's history: consumed when a commit carries its
 // Tap-Key trailer (the request's local commit happened), else dropped. A crash after the commit never leads to a re-ask.
 // Round 20: only from a commit that carries both the tap key and the intent's own request id (Tap-Key and Tap-Request):
@@ -747,7 +755,7 @@ export function unlandedConsumes(cfg: Config, o: { fetched: boolean; inStep: boo
       if (remote.has(k)) {
         if (lockedOut) { skip(x, "lock-timeout"); continue; }
         cfg.crashPoint?.("landing-mark");
-        tapsLogBornFirst(cfg);
+        tapsLogBefore(cfg);
         appendLog(tapsLogFile(cfg), { t: "landed", tap: x.tap, id: x.id, at: new Date(o.now).toISOString() }, { wait: consumedWait() }); delete watch[k]; out.landed.push(x.tap); continue;
       }
       const rk = `${cfg.dir}\0${k}`;
@@ -815,6 +823,7 @@ export function dropUnlanded(cfg: Config, tap: string, id: string, why: string, 
     catch (e) { log(`didn't drop tap key ${tap} (request ${id}): GitHub didn't answer the fetch under the lock (${clean(redact(cfg, (e as Error).message), 160)}); the round's other drops wait too, looked at again next round`); return "net"; }
     try { remote = remotePairs(cfg); }
     catch (e) { log(`didn't drop tap key ${tap} (request ${id}): GitHub's copy couldn't be read again under the lock (${clean(redact(cfg, (e as Error).message), 160)}); looked at again next round`); return "retry"; }
+    tapsLogBefore(cfg);
     if (remote.has(k)) { appendLogHeld(tapsLogFile(cfg), { t: "landed", tap, id, at, how: "on GitHub when its drop came to be written" }); return "landed"; }
     appendLogHeld(tapsLogFile(cfg), { t: "dropped", tap, id, unlanded: true, why, at });
     const ab = abandonCommits(cfg);
@@ -840,11 +849,12 @@ export const GUARD_WHY: Record<GuardKind, string> = {
 // or a known remote branch and a readable range with none in it. The consumed-key log unreadable, the remote branch
 // unknown, any git error and a removal that conflicts each refuse the push (refused says why, kind which).
 // Round 23: refused is the kind's fixed words (GUARD_WHY); detail, git's own text, is for the keeper's log only.
-export function abandonCommits(cfg: Config): { abandoned: string[]; refused?: string; kind?: GuardKind; detail?: string } {
+// Round 27: tombs, the tombstones to take out by (the rebuild's, just written under the same lock) instead of the log's.
+export function abandonCommits(cfg: Config, tombs?: Set<string>): { abandoned: string[]; refused?: string; kind?: GuardKind; detail?: string } {
   const out = { abandoned: [] as string[] } as { abandoned: string[]; refused?: string; kind?: GuardKind; detail?: string };
   const no = (kind: GuardKind, detail: string) => ({ ...out, kind, refused: GUARD_WHY[kind], detail: clean(redact(cfg, detail), 300) });
   let tomb: Set<string>;
-  try { tomb = tombstonesStrict(cfg); }
+  try { tomb = tombs ?? tombstonesStrict(cfg); }
   catch (e) { return no("log", `the consumed-key log can't be read: ${(e as Error).message}`); }
   if (!tomb.size) return out;
   const ref = `refs/remotes/origin/${cfg.branch}`;
@@ -985,7 +995,7 @@ function tombstoneDiscarded(cfg: Config, at: string): { tap: string; id: string;
     if (!tap || !id || !TAP_KEY.test(tap) || queued.has(id)) continue;
     const k = tapPair(tap, id), now = states.get(k);
     if (now?.s === "open") {
-      tapsLogBornFirst(cfg);
+      tapsLogBefore(cfg);
       appendLog(tapsLogFile(cfg), { t: "dropped", tap, id, unlanded: true, why: RESET_COPY_DROP_WHY, at }, { wait: consumedWait() });
       out.push({ tap, id, why: RESET_COPY_DROP_WHY });
     } else if (now?.s === "gone" && tombs.has(k)) out.push({ tap, id, why: RESET_COPY_DROP_WHY });
@@ -1073,7 +1083,7 @@ export function holdLapsed(cfg: Config, k: string, h: Hold, at: Date, downtime: 
   if (holdSeen.size > 5000) holdSeen.delete(holdSeen.keys().next().value!);
   return mono - holdSeen.get(key)! > HOLD_IDLE_MS || expired(h, at, downtime);
 }
-function appendConsumed(cfg: Config, tap: string, id: string, at: string) { tapsLogBornFirst(cfg); appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() }); }
+function appendConsumed(cfg: Config, tap: string, id: string, at: string) { tapsLogBefore(cfg); appendLog(tapsLogFile(cfg), { tap, id, at }, { wait: consumedWait() }); }
 // Round 18: whether the link has superseded a key, read from its issued-key log now (its tail, as it stands at this
 // instant), just before the keeper consumes that key: a supersede the link appended after this round's mirror is
 // still seen, so a key is either consumed or superseded, never both.
@@ -1219,54 +1229,218 @@ export function keeperLockProbe(cfg: Config): string | null { return sessionTool
 // it carrying a Tap-Key trailer (no consumed record could ever have been written).
 export const TAPS_LOG_MISSING = "the consumed-key log is missing, and the keeper's state doesn't show it never existed";
 export const TAPS_LOG_REBUILDING = "the consumed-key log was lost and is being rebuilt, so its withdrawn changes can't be checked yet";
+// Round 27: a shortfall against the high-water record count (or the file missing once the created flag is set) is a loss,
+// whatever the log held: a tombstone-only log lost is caught as surely as one holding consumed records.
+export const TAPS_LOG_SHORT = "the consumed-key log holds fewer records than the keeper's state says were written to it";
+// Round 27: the tombstone a rebuild writes for a local commit whose tap key GitHub doesn't have, whose request isn't queued:
+// it can't be told from a change dropped in the lost part of the log, so it is withdrawn, never pushed.
+export const TAPS_REBUILD_DROP_WHY = "its commit was local only when the consumed-key log was lost, so the rebuild couldn't prove it wasn't dropped";
 export function tapsLogNeverExisted(cfg: Config): boolean {
   if (!existsSync(stateFile(cfg))) return freshStartProof(cfg);
   const j = rawState(cfg);
   if (!j || typeof j !== "object") return false;
   if (j.tapsLogRebuild) return false;
-  return j.tapsLogBorn !== true && !(Number.isInteger(j.logHigh?.consumed) && j.logHigh.consumed > 0);
+  if (j.bootstrap === true && j.tapsLogBorn !== true) return freshStartProof(cfg);
+  return j.tapsLogBorn !== true && !(Number.isInteger(j.logHigh?.consumed) && j.logHigh.consumed > 0) && !(Number.isInteger(j.tapsLogLen) && j.tapsLogLen > 0);
 }
-function freshStartProof(cfg: Config): boolean {
+// Round 27: the remote refs each copy fetched, by the round that fetched them (a clone fetched every ref): the pristine
+// proof and the rebuild take only refs fetched from GitHub in the round at hand.
+const fetchedRefs = new Map<string, { round: number; refs: Set<string> }>();
+export function fetchedThisRound(cfg: Config, cloned = false): void {
+  const refs = new Set<string>([`refs/remotes/origin/${cfg.branch}`]);
+  if (cloned) { try { for (const r of git(cfg, ["for-each-ref", "--format=%(refname)", "refs/remotes"]).split("\n").map((x) => x.trim()).filter(Boolean)) refs.add(r); } catch { /* the branch alone */ } }
+  fetchedRefs.set(cfg.dir, { round: roundSeq, refs });
+}
+// A round whose fetch failed: no ref counts as fetched in it.
+export function fetchFailed(cfg: Config): void { fetchedRefs.delete(cfg.dir); }
+// The copy's remote refs (symbolic ones like origin/HEAD left out), or null when they can't be listed.
+function remoteRefs(cfg: Config): string[] | null {
+  try { return git(cfg, ["for-each-ref", "--format=%(refname) %(symref)", "refs/remotes"]).split("\n").map((l) => l.trim().split(" ")).filter(([r, sym]) => r && !sym).map(([r]) => r); }
+  catch { return null; }
+}
+// Round 27: every remote ref of the copy fetched in this round (and the record's branch among them), else null.
+function remoteRefsFetched(cfg: Config): string[] | null {
+  const f = fetchedRefs.get(cfg.dir);
+  if (!f || f.round !== roundSeq) return null;
+  const refs = remoteRefs(cfg);
+  if (!refs || !refs.includes(`refs/remotes/origin/${cfg.branch}`) || refs.some((r) => !f.refs.has(r))) return null;
+  return refs;
+}
+// Round 27: no keeper state counts as the pristine first start only with real proof: the copy whole (not shallow, no
+// partial-clone filter), every remote ref fetched from GitHub in this round, and the trailer scan over the full history of
+// each of them (and of every local ref) finding no Tap-Key. Anything less is "lost, rebuilding" (TAPS_LOG_MISSING).
+export function freshStartProof(cfg: Config): boolean {
   if (!existsSync(join(cfg.dir, ".git"))) return false;
-  try { return git(cfg, ["log", "--all", "--format=%(trailers:key=Tap-Key,valueonly)"]).trim() === ""; } catch { return false; }
+  if (existsSync(join(cfg.dir, ".git", "shallow"))) return false;
+  try { if (git(cfg, ["rev-parse", "--is-shallow-repository"]).trim() !== "false") return false; } catch { return false; }
+  let filter = "";
+  try { filter = git(cfg, ["config", "--get-regexp", "^(remote\\..*\\.partialclonefilter|extensions\\.partialclone|remote\\..*\\.promisor)$"]).trim(); } catch { /* none set: git exits 1 */ }
+  if (filter) return false;
+  const refs = remoteRefsFetched(cfg);
+  if (!refs) return false;
+  try { return git(cfg, ["log", "--all", "--format=%(trailers:key=Tap-Key,valueonly)"]).trim() === "" && refs.every((r) => git(cfg, ["log", "--format=%(trailers:key=Tap-Key,valueonly)", r]).trim() === ""); }
+  catch { return false; }
 }
-// The state file's monotonic fields patched in place (fsynced). No state file yet (a first start): nothing is written,
-// and the first round's state carries the flag (the fresh-start proof covers the gap).
+// Whether any ref of the copy carries a Tap-Key trailer (false when there is no copy or it can't be read).
+function copyHasTrailer(cfg: Config): boolean {
+  if (!existsSync(join(cfg.dir, ".git"))) return false;
+  try { return git(cfg, ["log", "--all", "--format=%(trailers:key=Tap-Key,valueonly)"]).trim() !== ""; } catch { return false; }
+}
+// The consumed-key log's intact records (the strict framed reader: a torn tail skipped), null when the file is missing.
+function tapsLogRecords(cfg: Config): any[] | null {
+  const r = readLog<any>(tapsLogFile(cfg), { repair: false });
+  return r.missing ? null : r.records;
+}
+// Round 27: the loss check against the state's high-water count: why the log is short, or null. Throws when the log
+// can't be read.
+export function tapsLogShort(cfg: Config, j: any = rawState(cfg)): string | null {
+  const recs = tapsLogRecords(cfg);
+  if (recs === null) return j?.tapsLogBorn === true ? `${TAPS_LOG_SHORT} (it is missing, and its created flag is set)` : null;
+  if (Number.isInteger(j?.tapsLogLen) && recs.length < j.tapsLogLen) return `${TAPS_LOG_SHORT} (${recs.length} of ${j.tapsLogLen})`;
+  return null;
+}
+// Round 27: the one keeper-state serialiser. Every write of the keeper state goes through writeState, which keeps the
+// monotonic fields the file already has: the created flag is never written false once true, the high-water count never
+// goes down, and the "lost, rebuilding" mark is never dropped (only the rebuild clears it and lowers the count, through
+// rebuiltState).
+export function stateText(cfg: Config, text: string): string {
+  const f = rawState(cfg);
+  let j: any;
+  try { j = JSON.parse(text); } catch { return text; }
+  if (!j || typeof j !== "object" || Array.isArray(j)) return text;
+  if (f?.tapsLogBorn === true || j.tapsLogBorn === true) j.tapsLogBorn = true; else delete j.tapsLogBorn;
+  if (Number.isInteger(f?.tapsLogLen) && !(Number.isInteger(j.tapsLogLen) && j.tapsLogLen >= f.tapsLogLen)) j.tapsLogLen = f.tapsLogLen;
+  if (f?.tapsLogRebuild && !j.tapsLogRebuild) j.tapsLogRebuild = f.tapsLogRebuild;
+  return JSON.stringify(j);
+}
+export function writeState(cfg: Config, text: string): void { writeAtomic(stateFile(cfg), stateText(cfg, text)); }
+// The state file's monotonic fields patched in place (fsynced, through writeState). No state file yet: a bootstrap state
+// (only its monotonic fields count until the first round's state replaces it). A state file that doesn't parse is set
+// aside first, as loading it would.
 function patchStateFile(cfg: Config, f: (j: any) => boolean): void {
-  const j = rawState(cfg);
-  if (!j || typeof j !== "object") return;
-  if (f(j)) writeAtomic(stateFile(cfg), JSON.stringify(j));
+  let j = rawState(cfg);
+  if (!j || typeof j !== "object" || Array.isArray(j)) {
+    if (existsSync(stateFile(cfg))) { renameSync(stateFile(cfg), `${stateFile(cfg)}.bad-${Date.now()}`); log("the keeper's state couldn't be read; set aside, starting from the record's copy"); }
+    j = { bootstrap: true };
+  }
+  if (f(j)) writeState(cfg, JSON.stringify(j));
 }
-const bornSeen = new Set<string>();
-function tapsLogBornFirst(cfg: Config): void {
-  const k = `${stateFile(cfg)}\0${tapsLogFile(cfg)}`;
-  if (bornSeen.has(k)) return;
-  patchStateFile(cfg, (j) => { if (j.tapsLogBorn === true) return false; j.tapsLogBorn = true; return true; });
-  if (rawState(cfg)?.tapsLogBorn === true) bornSeen.add(k);
+// The rebuild's own write: the mark cleared or the count set to the rebuilt log's (the only writes that lower them).
+function rebuiltState(cfg: Config, f: (j: any) => void): void {
+  let j = rawState(cfg);
+  if (!j || typeof j !== "object" || Array.isArray(j)) j = { bootstrap: true };
+  f(j);
+  writeAtomic(stateFile(cfg), JSON.stringify(j));
 }
-// Every write of the keeper state keeps the created flag the file already has (it is never cleared).
-function stateText(cfg: Config, text: string): string {
-  if (rawState(cfg)?.tapsLogBorn !== true) return text;
-  try { const j = JSON.parse(text); if (j && typeof j === "object" && j.tapsLogBorn !== true) { j.tapsLogBorn = true; return JSON.stringify(j); } } catch { /* written as given */ }
-  return text;
+const tapsLogCount = (cfg: Config): number => tapsLogRecords(cfg)?.length ?? 0;
+// Round 27: before each append to the consumed-key log, the created flag and the high-water count (one more than the
+// state's count, or than the file's when the state has none yet) are written to the keeper state and fsynced. No cache:
+// the state is read at each append.
+function tapsLogBefore(cfg: Config): void {
+  patchStateFile(cfg, (j) => {
+    const prev = Number.isInteger(j.tapsLogLen) ? j.tapsLogLen : tapsLogCount(cfg);
+    j.tapsLogBorn = true; j.tapsLogLen = prev + 1;
+    return true;
+  });
 }
-// The rebuilt log made durable (an empty file when the rebuild added nothing), then the mark cleared in the state file.
-function finishTapsLogRebuild(cfg: Config): void {
-  const f = tapsLogFile(cfg);
-  if (!existsSync(f)) { mkdirSync(dirname(f), { recursive: true }); const fd = openSync(f, "a"); try { fsyncSync(fd); } finally { closeSync(fd); } }
-  else { const fd = openSync(f, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } }
-  syncDir(dirname(f));
-  patchStateFile(cfg, (j) => { if (!j.tapsLogRebuild) return false; delete j.tapsLogRebuild; j.tapsLogBorn = true; return true; });
+// Round 27: the created flag set and fsynced before anything else on any start (a fresh one included) that finds the log
+// present or a Tap-Key trailer in the copy, with the high-water count the log holds when the state has none.
+export function createdFlagFirst(cfg: Config): void {
+  const has = existsSync(tapsLogFile(cfg));
+  if (!has && !copyHasTrailer(cfg)) return;
+  patchStateFile(cfg, (j) => {
+    let changed = false;
+    if (j.tapsLogBorn !== true) { j.tapsLogBorn = true; changed = true; }
+    if (!Number.isInteger(j.tapsLogLen) && has) { try { j.tapsLogLen = tapsLogCount(cfg); changed = true; } catch { /* the start check reports it */ } }
+    return changed;
+  });
 }
 function tombstonesStrict(cfg: Config): Set<string> {
   const out = new Set<string>();
-  if (rawState(cfg)?.tapsLogRebuild) throw new Error(TAPS_LOG_REBUILDING);
+  const j = rawState(cfg);
+  if (j?.tapsLogRebuild) throw new Error(TAPS_LOG_REBUILDING);
+  const short = tapsLogShort(cfg, j);
+  if (short) throw new Error(`${TAPS_LOG_REBUILDING} (${short})`);
   if (!existsSync(tapsLogFile(cfg))) { if (tapsLogNeverExisted(cfg)) return out; throw new Error(TAPS_LOG_MISSING); }
-  for (const j of readLog<any>(tapsLogFile(cfg), { repair: false }).records) if (j?.t === "dropped" && j.unlanded === true && TAP_KEY.test(j.tap) && typeof j.id === "string") out.add(tapPair(j.tap, j.id));
+  for (const r of readLog<any>(tapsLogFile(cfg), { repair: false }).records) if (r?.t === "dropped" && r.unlanded === true && TAP_KEY.test(r.tap) && typeof r.id === "string") out.add(tapPair(r.tap, r.id));
   return out;
 }
 function tombstones(cfg: Config): Set<string> {
   try { return tombstonesStrict(cfg); } catch { return new Set<string>(); }
+}
+// Round 27: the rebuild of a lost or shortened consumed-key log, under its flock, once GitHub answered this round. The
+// surviving prefix is read with the strict framed reader and every intact record but a consumption is carried forward
+// (each tombstone among them); consumptions are rebuilt only from the history of the remote refs fetched this round (and
+// the link's settled landings), never from local-only commits; each local unpushed commit whose tap key GitHub doesn't
+// have gets a tombstone, unless its request is still queued (held: it is applied and pushed as usual, an intent holding its
+// key meanwhile). The log is written whole to a temporary file, fsynced, renamed into place and its folder fsynced; then
+// the count is set; the tombstoned commits are taken out of the local branch; and the mark is cleared only once no
+// unpushed commit carries an unproven key that is neither tombstoned nor held.
+export function rebuildTapsLog(cfg: Config, at: string): { cleared: boolean; added: number; tombstoned: number; held: number; count: number; why?: string } {
+  const f = tapsLogFile(cfg);
+  const refs = remoteRefsFetched(cfg);
+  if (!refs) return { cleared: false, added: 0, tombstoned: 0, held: 0, count: 0, why: "GitHub's copy wasn't fetched whole this round" };
+  return withLogLock(tapsLogFile(cfg), () => { // rebuildTapsLog
+    const prefix = readLog<any>(f, { repair: false });
+    if (prefix.bad) throw new Error(`the surviving consumed-key log has ${prefix.bad} damaged record(s) before its end`);
+    const recs: any[] = prefix.records.filter((r) => r && typeof r === "object" && r.t !== undefined);
+    const tomb = new Set<string>();
+    for (const r of recs) if (r.t === "dropped" && r.unlanded === true && TAP_KEY.test(r.tap) && typeof r.id === "string") tomb.add(tapPair(r.tap, r.id));
+    const remote = new Set<string>(), keys = new Set<string>();
+    let added = 0;
+    for (const ref of refs) {
+      const text = git(cfg, ["log", "--reverse", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", ref]);
+      for (const rec of text.split("\x1e")) {
+        const [k, id] = rec.split("\x1f").map((x) => (x ?? "").trim());
+        if (!k || !TAP_KEY.test(k) || !id) continue;
+        const p = tapPair(k, id);
+        if (remote.has(p)) continue;
+        remote.add(p);
+        if (tomb.has(p)) continue;
+        recs.push({ tap: k, id, at }); keys.add(k); added++;
+      }
+    }
+    for (const k of ledgerStarted(cfg)) if (!keys.has(k)) { recs.push({ tap: k, id: LEDGER_CONSUMER, at }); keys.add(k); added++; }
+    const queued = new Set<string>();
+    for (const p of pending(cfg)) if (p.req?.id) queued.add(p.req.id);
+    for (const w of Array.isArray(rawState(cfg)?.settled) ? rawState(cfg).settled : []) if (typeof w?.req?.id === "string") queued.add(w.req.id);
+    const local = unpushedPairs(cfg);
+    let tombstoned = 0, held = 0;
+    const openIntent = new Set<string>();
+    for (const r of recs) if (r.t === "consuming") openIntent.add(tapPair(r.tap, r.id)); else if ((r.t === undefined || r.t === "dropped")) openIntent.delete(tapPair(r.tap, r.id));
+    for (const { tap, id } of local) {
+      const p = tapPair(tap, id);
+      if (remote.has(p) || tomb.has(p)) continue;
+      if (queued.has(id)) { held++; if (!openIntent.has(p)) { recs.push({ t: "consuming", tap, id, at }); openIntent.add(p); } continue; }
+      recs.push({ t: "dropped", tap, id, unlanded: true, why: TAPS_REBUILD_DROP_WHY, at }); tomb.add(p); tombstoned++;
+    }
+    // The rebuilt log, whole: a temporary file, fsynced, renamed into place, the folder fsynced.
+    const tmp = `${f}.rebuild.tmp`;
+    mkdirSync(dirname(f), { recursive: true });
+    const fd = openSync(tmp, "w", 0o600);
+    try { writeSync(fd, recs.map(frame).join("")); cfg.crashPoint?.("taps-rebuild-write"); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, f);
+    syncDir(dirname(f));
+    cfg.crashPoint?.("taps-rebuild-fsync");
+    rebuiltState(cfg, (j) => { j.tapsLogBorn = true; j.tapsLogLen = recs.length; });
+    // The tombstoned commits out of the local branch (the guard's own removal, against the tombstones just written).
+    const ab = abandonCommits(cfg, tomb);
+    const left = unpushedPairs(cfg).filter(({ tap, id }) => !remote.has(tapPair(tap, id)) && !queued.has(id));
+    if (ab.refused || left.length) {
+      const why = ab.refused ? `${ab.refused}${ab.detail ? ` (${ab.detail})` : ""}` : `${left.length} unpushed commit(s) still carry a tap key GitHub doesn't have`;
+      return { cleared: false, added, tombstoned, held, count: recs.length, why };
+    }
+    cfg.crashPoint?.("taps-rebuild-clear");
+    rebuiltState(cfg, (j) => { delete j.tapsLogRebuild; j.tapsLogBorn = true; j.tapsLogLen = Math.max(recs.length, Number.isInteger(j.tapsLogLen) ? j.tapsLogLen : 0); });
+    return { cleared: true, added, tombstoned, held, count: recs.length };
+  }, { wait: consumedWait() });
+}
+// The (tap key, request id) pairs of the commits on the local branch that GitHub's branch (as last fetched) doesn't have.
+function unpushedPairs(cfg: Config): { tap: string; id: string }[] {
+  const text = git(cfg, ["log", "--reverse", "--format=%x1e%(trailers:key=Tap-Key,valueonly,separator=%x2C)%x1f%(trailers:key=Tap-Request,valueonly,separator=%x2C)", `refs/remotes/origin/${cfg.branch}..HEAD`]);
+  const out: { tap: string; id: string }[] = [];
+  for (const r of text.split("\x1e")) { const [tap, id] = r.split("\x1f").map((x) => (x ?? "").trim()); if (tap && id && TAP_KEY.test(tap)) out.push({ tap, id }); }
+  return out;
 }
 export function historyTaps(cfg: Config, o: { cards?: string[]; once?: Set<string>; refs?: string[]; lines?: Set<string>; pairs?: Set<string> } = {}): Map<string, string> {
   const out = new Map<string, string>();
@@ -1303,7 +1477,7 @@ const starts = new Map<string, { nonce: string; at: string }>();
 const verifiedBy = new Map<string, { start: string; at: string; link: string | null; run?: number; fetches: number }>();
 // Round 17: a new link run the keeper saw that no fresh fetch has verified for yet.
 const verifyPending = new Map<string, { link: string; since: string }>();
-export function forgetRebuild(cfg: Config) { rebuilt.delete(cfg.dir); starts.delete(cfg.dir); verifiedBy.delete(cfg.dir); verifyPending.delete(cfg.dir); }
+export function forgetRebuild(cfg: Config) { fetchedRefs.delete(cfg.dir); rebuilt.delete(cfg.dir); starts.delete(cfg.dir); verifiedBy.delete(cfg.dir); verifyPending.delete(cfg.dir); }
 // Round 16: a new keeper start is written into the status at once (its nonce, consumed_unverified, and no
 // verified fetch), before anything else in the round, so a status from an earlier start never stands.
 function markStart(cfg: Config, nowIso: string) {
@@ -1336,6 +1510,14 @@ export function logsCheck(cfg: Config, st: State): { lost: string[]; installLost
     try { r = readLog(f, { repair: false }); }
     catch (e) { if (!out.fatal) { out.fatal = `its log of ${what} (${f}) can't be read (${(e as Error).message.slice(0, 120)})`; out.fatalFile = f; } continue; }
     if (r.bad) { if (!out.fatal) { out.fatal = `its log of ${what} (${f}) has ${r.bad} damaged record(s) before its end, which no power cut explains`; out.fatalFile = f; } continue; }
+    // Round 27: the consumed-key log against its high-water record count (every record) and its created flag, so a loss
+    // is detected whatever the log held (a tombstone-only log included); not again while its rebuild mark stands.
+    // (The consumed-record count's own words come first when it is short too.)
+    const consumedShort = f === tapsLogFile(cfg) && !!high && (r.missing || r.records.filter((x: any) => x?.t === undefined).length < high);
+    if (f === tapsLogFile(cfg) && !st.tapsLogRebuild && !consumedShort) {
+      if (r.missing && st.tapsLogBorn === true) { out.lost.push(`its log of ${what} is missing, but its created flag is set`); continue; }
+      if (!r.missing && Number.isInteger(st.tapsLogLen) && r.records.length < st.tapsLogLen!) { out.lost.push(`its log of ${what} holds ${r.records.length} records, fewer than the ${st.tapsLogLen} its state says were written to it`); continue; }
+    }
     if (!high) continue;
     // Round 19: the consumed-key log's count is of consumed records alone (its intents and their drops are transient).
     const count = f === tapsLogFile(cfg) ? r.records.filter((x: any) => x?.t === undefined).length : r.records.length;
@@ -1457,6 +1639,7 @@ function revive(j: any): State | null {
     // Round 24: the hold ids' counter, the consumed-key log's created flag, the fetch hiccups, slow pushes.
     ...(Number.isInteger(j.holdSeq) ? { holdSeq: j.holdSeq } : {}),
     ...(j.tapsLogBorn === true ? { tapsLogBorn: true } : {}),
+    ...(Number.isInteger(j.tapsLogLen) && j.tapsLogLen >= 0 ? { tapsLogLen: j.tapsLogLen } : {}),
     ...(j.tapsLogRebuild && typeof j.tapsLogRebuild.since === "string" ? { tapsLogRebuild: { since: j.tapsLogRebuild.since, why: String(j.tapsLogRebuild.why ?? TAPS_LOG_REBUILDING) } } : {}),
     ...(j.fetchHiccup && typeof j.fetchHiccup.since === "string" && Number.isInteger(j.fetchHiccup.rounds) && (j.fetchHiccup.cause === "fetch-timeout" || j.fetchHiccup.cause === "fetch-failed")
       ? { fetchHiccup: { since: j.fetchHiccup.since, rounds: j.fetchHiccup.rounds, cause: j.fetchHiccup.cause, ...(j.fetchHiccup.told === true ? { told: true } : {}) } } : {}),
@@ -1508,6 +1691,14 @@ function loadState(cfg: Config): State {
 function loadState0(cfg: Config): State {
   const file = stateFile(cfg);
   let st: State | null = null;
+  // Round 27: a bootstrap state (written for the created flag before a first round's state) counts as a first start: only
+  // its monotonic fields are taken.
+  const boot = rawState(cfg);
+  if (boot?.bootstrap === true) {
+    return { holds: parseHolds(publishedHolds(cfg)) ?? {}, waiting: [], downtime: [], ...(boot.tapsLogBorn === true ? { tapsLogBorn: true } : {}),
+      ...(Number.isInteger(boot.tapsLogLen) ? { tapsLogLen: boot.tapsLogLen } : {}),
+      ...(boot.tapsLogRebuild && typeof boot.tapsLogRebuild.since === "string" ? { tapsLogRebuild: { since: boot.tapsLogRebuild.since, why: String(boot.tapsLogRebuild.why ?? TAPS_LOG_REBUILDING) } } : {}) };
+  }
   if (existsSync(file)) {
     try { st = revive(JSON.parse(readFileSync(file, "utf8"))); } catch { st = null; }
     if (!st) {
@@ -1529,7 +1720,7 @@ function loadState0(cfg: Config): State {
       if (typeof j.commit !== "string" || !/^[0-9a-f]{40}$/.test(j.commit)) throw new Error("no commit");
       git(cfg, ["merge-base", "--is-ancestor", j.commit, `origin/${cfg.branch}`]);
       const landed = revive(j.state);
-      if (landed) { st = { ...landed, pushed: j.commit }; writeAtomic(file, JSON.stringify(st)); }
+      if (landed) { st = { ...landed, pushed: j.commit }; writeState(cfg, JSON.stringify(st)); }
     } catch { /* never landed */ }
     rmSync(next, { force: true });
   }
@@ -1648,9 +1839,12 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 12: a log missing or shorter than its high-water count refuses the round (and the start).
       // Round 13: one missing or shorter is a detected restore: a degraded start that rebuilds; only a case
       // no rule explains refuses, until the owner's recover-logs line.
+      // Round 27: the created flag first, before anything else, on any start (a fresh one included) that finds the log or a
+      // Tap-Key trailer in the copy; a bootstrap state (written for it before the first round's state) is still a fresh start.
+      const fresh = !existsSync(stateFile(cfg)) || rawState(cfg)?.bootstrap === true;
+      createdFlagFirst(cfg);
       markStart(cfg, clock().toISOString());
-      { const fresh = !existsSync(stateFile(cfg));
-        const st0 = loadState(cfg);
+      { const st0 = loadState(cfg);
         const lc = logsCheck(cfg, st0);
         const nowIso0 = clock().toISOString();
         if (lc.fatal) {
@@ -1680,7 +1874,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           if (asked) {
             st0.recovered = [...(st0.recovered ?? []), asked.said].slice(-50);
             if (asked.nonce) st0.recoverLines = [...(st0.recoverLines ?? []), { nonce: asked.nonce, said: asked.said }].slice(-50);
-            writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st0)));
+            writeState(cfg, JSON.stringify(st0));
             rmSync(recoverTaken(cfg), { force: true });
             forgetRebuild(cfg);
             log(`RECOVER: the owner's recover-logs line (message ${asked.said}) accepted with no damaged log to move aside: the consumed set is rebuilt and verified against a fresh fetch`);
@@ -1694,7 +1888,14 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           // Round 25: the created flag is never cleared here; a lost or shortened consumed-key log (or one missing at a
           // start with no state) is marked "lost, rebuilding" until the rebuild has rewritten it and fsynced it.
           if (existsSync(tapsLogFile(cfg))) st0.tapsLogBorn = true;
-          if (lc.lost.some((l) => l.includes("consumed tap keys")) || (fresh && !existsSync(tapsLogFile(cfg)))) st0.tapsLogRebuild = { since: nowIso0, why: TAPS_LOG_REBUILDING };
+          const lostTaps = lc.lost.some((l) => l.includes("consumed tap keys")) || (fresh && !existsSync(tapsLogFile(cfg)));
+          // Round 27: the mark is written to the keeper state and fsynced (a fresh start's too, as a bootstrap state) before
+          // the rebuild writes anything; until the rebuild clears it every push is refused.
+          if (lostTaps) {
+            cfg.crashPoint?.("taps-rebuild-detect");
+            st0.tapsLogRebuild = rawState(cfg)?.tapsLogRebuild ?? { since: nowIso0, why: TAPS_LOG_REBUILDING };
+            if (fresh) patchStateFile(cfg, (j) => { j.tapsLogRebuild = st0.tapsLogRebuild; if (existsSync(tapsLogFile(cfg))) j.tapsLogBorn = true; return true; });
+          }
           // Install taps default to off after any restore that lost install records.
           if (lc.installLost) {
             try { appendLog(installLogFile(cfg), { t: "flag", how: "off", by: "keeper", why: "a restore lost install-log records", at: nowIso0 }); st0.logHigh.install = (st0.logHigh.install ?? 0) + 1; }
@@ -1702,7 +1903,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           }
           // A keeper with no state takes its holds from the record after the sync, so its state isn't written
           // here: the rebuild mark is carried into this round's state below (startRebuild).
-          if (!fresh) writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st0)));
+          if (!fresh) writeState(cfg, JSON.stringify(st0));
+          if (lostTaps) cfg.crashPoint?.("taps-rebuild-mark");
           startRebuild.set(cfg.dir, { rebuild: st0.rebuild!, logHigh: st0.logHigh, ...(st0.tapsLogRebuild ? { tapsLogRebuild: st0.tapsLogRebuild } : {}) });
           forgetRebuild(cfg);
           if (lc.lost.length) {
@@ -1714,6 +1916,8 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       markStart(cfg, clock().toISOString());
       linkRun0 = readLinkTaps(cfg)?.nonce ?? null;
       synced0 = sync(cfg, () => clock().getTime());
+      // Round 27: again once the copy is there (a first start clones it): a trailer in it sets the created flag first.
+      createdFlagFirst(cfg);
       st = loadState(cfg);
       { const sr = startRebuild.get(cfg.dir);
         if (sr) { startRebuild.delete(cfg.dir); if (!st.rebuild) st.rebuild = sr.rebuild; st.logHigh = sr.logHigh; if (sr.tapsLogRebuild && !st.tapsLogRebuild) st.tapsLogRebuild = sr.tapsLogRebuild; } }
@@ -1970,6 +2174,18 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 14: every start of the keeper treats its consumed set as unverified until a fresh fetch has
       // merged the record remote's trailers: tap-derived requests are held meanwhile, as after a restore.
       if (!rebuilt.has(cfg.dir) && !S.rebuild) S.rebuild = { since: nowIso, why: KEEPER_START_WHY, tries: 0 };
+      // Round 27: a lost consumed-key log is rebuilt first, whole (rebuildTapsLog); while its mark stands, the history read
+      // below takes only the remote refs fetched this round.
+      if (S.tapsLogRebuild && synced0.fetched) {
+        try {
+          const r = rebuildTapsLog(cfg, nowIso);
+          if (!r.why || r.count) { S.tapsLogLen = r.count; S.tapsLogBorn = true; }
+          if (r.cleared) {
+            log(`the consumed-key log, lost since ${S.tapsLogRebuild.since}, is rebuilt and fsynced (${r.added} consumption(s) from GitHub, ${r.tombstoned} local commit(s) withdrawn, ${r.held} held in the queue): pushes are checked against it again`);
+            delete S.tapsLogRebuild;
+          } else log(`the consumed-key log is rebuilt, but stays marked lost, rebuilding: ${r.why}; pushes stay refused and it is tried again next round`);
+        } catch (e) { log(`couldn't rebuild the consumed-key log yet (${clean(redact(cfg, (e as Error).message), 200)}): pushes stay refused, tried again next round`); }
+      }
       if (S.rebuild || restored || synced0.reset || synced0.cloned || !rebuilt.has(cfg.dir)) {
         if (S.rebuild && !synced0.fetched) {
           const tries = S.rebuild.tries + 1;
@@ -1982,20 +2198,17 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
           let n = 0;
           // Round 14: the union of the local copy's trailers on every ref (unpushed commits included), the
           // remote's (just fetched) and the link's landing ledger (a started landing consumes its key).
-          for (const [k, id] of historyTaps(cfg, { cards, once, lines })) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); have.set(k, id); n++; }
-          for (const k of ledgerStarted(cfg)) if (!have.has(k)) { appendConsumed(cfg, k, LEDGER_CONSUMER, nowIso); have.set(k, LEDGER_CONSUMER); n++; }
+          // Round 27: while the consumed-key log is marked lost, rebuilding, only the remote refs fetched this round.
+          const marked = !!S.tapsLogRebuild || !!rawState(cfg)?.tapsLogRebuild;
+          const hist = historyTaps(cfg, { cards, once, lines });
+          if (!marked) for (const [k, id] of hist) if (!have.has(k)) { appendConsumed(cfg, k, id, nowIso); have.set(k, id); n++; }
+          if (!marked) for (const k of ledgerStarted(cfg)) if (!have.has(k)) { appendConsumed(cfg, k, LEDGER_CONSUMER, nowIso); have.set(k, LEDGER_CONSUMER); n++; }
           S.historyCards = cards.slice(-1000);
           S.historyLines = [...lines].slice(-200);
           // The one Ship tap an install-taps once let through, as the remote's Install-Once trailers have it.
           const used = new Set(installState(installLogFile(cfg)).onceUsed);
           for (const k of once) if (!used.has(k)) appendLog(installLogFile(cfg), { t: "once-used", kid: k, by: "keeper", why: "rebuilt from the record's history", at: nowIso });
           rebuilt.add(cfg.dir);
-          // Round 25: a lost consumed-key log counts as rebuilt only from a fresh fetch, once rewritten and fsynced.
-          if (S.tapsLogRebuild && synced0.fetched) {
-            finishTapsLogRebuild(cfg);
-            log(`the consumed-key log, lost since ${S.tapsLogRebuild.since}, is rebuilt and fsynced: pushes are checked against it again`);
-            delete S.tapsLogRebuild;
-          }
           log(`rebuilt the consumed tap keys from the record's history${n ? `: ${n} key(s) not in the log added` : ": nothing missing"}`);
           if (S.rebuild) {
             const was = S.rebuild;
@@ -2301,7 +2514,11 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
       // Round 12: the logs' high-water counts, kept in the state. Round 13: counted from the logs after
       // every append of the round returned (each append is fsynced first), so a count is never ahead of
       // its records; the state carrying it is written after.
-      try { S.logHigh = logCounts(cfg); if (existsSync(tapsLogFile(cfg))) S.tapsLogBorn = true; }
+      try {
+        S.logHigh = logCounts(cfg); if (existsSync(tapsLogFile(cfg))) S.tapsLogBorn = true;
+        // Round 27: the high-water count rises to the log's own (never lowered here; never while the log is marked lost).
+        if (!S.tapsLogRebuild && !rawState(cfg)?.tapsLogRebuild && existsSync(tapsLogFile(cfg))) { const c = tapsLogCount(cfg); if (!Number.isInteger(S.tapsLogLen) || c > S.tapsLogLen!) S.tapsLogLen = c; }
+      }
       catch (e) { log(`couldn't count the append-only logs: ${(e as Error).message}`); }
       if (commits === 0 && !ahead(cfg)) {
         // Nothing to push: a good round all the same, in step with GitHub as last fetched.
@@ -2316,7 +2533,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         return { applied: items.length, ok: true };
       }
       // Saved before the push: the holds and the ledger's generation are the local commits'.
-      writeAtomic(stateFile(cfg), stateText(cfg, unlanded(S)));
+      writeState(cfg, unlanded(S));
       appliedNames = new Set(items.filter((it) => it.local && !held.has(it.name)).map((it) => it.name));
     } catch (e) {
       log(`stopped this round, nothing let go: ${redact(cfg, (e as Error).message)}`);
@@ -2359,7 +2576,7 @@ export function cycle(cfg: Config): { applied: number; ok: boolean; pushFailed?:
         // Round 23: nor one that timed out (its hard timeout already spent this round's wait).
         const retry = answered && !existsSync(blockFile(cfg)) && attempt < 2 && !guard?.refused && !guard?.timedOut;
         if (!retry) { tally(st!, clock()); releaseBlock(cfg, clock()); }
-        writeAtomic(stateFile(cfg), stateText(cfg, unlanded(st!)));
+        writeState(cfg, unlanded(st!));
         writeStatus(cfg, st!, cv!, clock());
         if (retry) continue;
         return { applied: items.length, ok: false, pushFailed: true };
@@ -2502,7 +2719,7 @@ function resetCopy(cfg: Config, st: State, why: string, now: Date, lf: { floor: 
   st.owed = [];
   if (lost.length) relay(cfg, `The record keeper had to reset its copy of the record (${clean(why, 160)}). These changes may not have reached GitHub: ${lost.map((w) => w.o.id).join(", ")}. Check each in /data/record and send it again if it's missing.`);
   delete st.unpushed;
-  writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st)));
+  writeState(cfg, JSON.stringify(st));
 }
 
 // A new reset epoch: one generation above the keeper's count and the link's floor (both read now),
@@ -2756,7 +2973,7 @@ function nightlyOutcome(cfg: Config, g: GuardOutcome, now: Date): void {
     pushGuardOutcome(cfg, st, g, now, "nightly");
     notePushSpeed(cfg, st, g, now);
     if (g.timedOut || (g.error && !g.refused)) notePushUnknown(cfg, st, g, now);
-    writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st)));
+    writeState(cfg, JSON.stringify(st));
     patchStatus(cfg, st, now);
   } catch (e) { log(`couldn't keep the nightly push's outcome in the keeper state: ${clean((e as Error).message, 160)}`); }
 }
@@ -2910,7 +3127,7 @@ function local(cfg: Config, o: Outcome, round_ms: number, waited: Map<string, Om
 // Cain's queued requests let go. One that was applied in an earlier round that
 // stopped before writing its status file gets that file from the log.
 function finish(cfg: Config, st: State, items: Pending[], outcomes: (Outcome | null)[], book: Map<string, Outcome>) {
-  writeAtomic(stateFile(cfg), stateText(cfg, JSON.stringify(st)));
+  writeState(cfg, JSON.stringify(st));
   mkdirSync(cfg.outcomes, { recursive: true });
   items.forEach((it, i) => {
     if (!it.local || held.has(it.name)) return;   // round 13: a held request stays in the queue

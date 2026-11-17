@@ -12,7 +12,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendLog, LOCK_SITES, lockTest, lockWait, LOCK_WAIT_MS, readLog, resetFlockForTest } from "../rootfs/opt/cain/applog.ts";
-import { abandonCommits, consumedWait, cycle, GUARD_WHY, LAND_SKIP_WHY, lockedBound, NET_SESSION_WHY, netRun, netTest, openIntents, pushedTombstoned, rangeTapKeys,
+import { abandonCommits, consumedWait, cycle, fetchedThisRound, GUARD_WHY, LAND_SKIP_WHY, lockedBound, NET_SESSION_WHY, netRun, netTest, openIntents, pushedTombstoned, rangeTapKeys,
   readConsumed, RESET_COPY_DROP_WHY, RESET_COPY_WHY, TapKeysError, TAPS_LOG_REBUILDING, tapsLogFile, unlandedConsumes } from "../rootfs/opt/cain/record/main.ts";
 import { TRUST_DIR_WHY, trustDirFrom } from "../rootfs/opt/cain/stop.ts";
 import { DAY, MIN } from "./link-rig";
@@ -128,8 +128,13 @@ describe("1. the consumed-key log's created flag is monotonic and written before
     const cfg: any = { queue: join(d, "queue"), holds: join(d, "holds.json"), tapsLog: join(d, "taps.jsonl"), dir: join(d, "record"), branch: "main" };
     expect(pushedTombstoned(cfg, null, "x").incomplete).toBeDefined();          // no copy: no proof
     const sh = (...a: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd: cfg.dir });
-    mkdirSync(cfg.dir, { recursive: true });
-    sh("init", "--quiet", "-b", "main"); sh("commit", "--quiet", "--allow-empty", "-m", "first");
+    // Round 27: the proof needs a whole copy with every remote ref fetched this round: a clone of a remote, marked fetched.
+    const seed = join(d, "seed");
+    mkdirSync(seed, { recursive: true });
+    const at = (cwd: string, ...a: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...a], { cwd });
+    at(seed, "init", "--quiet", "-b", "main"); at(seed, "commit", "--quiet", "--allow-empty", "-m", "first");
+    at(d, "clone", "--quiet", seed, cfg.dir);
+    fetchedThisRound(cfg, true);
     expect(pushedTombstoned(cfg, null, "x")).toEqual({ alarms: [] });            // a copy with no tap key ever
     sh("commit", "--quiet", "--allow-empty", "-m", "a tap\n\nTap-Key: tap-0000003f2513\nTap-Request: cain-r25-1-c");
     expect(pushedTombstoned(cfg, null, "x").incomplete).toBeDefined();          // a consumed record must have existed

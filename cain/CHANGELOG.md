@@ -96,6 +96,8 @@
 - The App's logs take turns properly even if something dies in the middle of writing one, and long messages with emoji or accents are cut cleanly.
 - One known gap, said plainly: if a tap was used while saving to GitHub was failing, and then the whole App is restored from a backup taken before it, a tap on that card can count again.
 - After that, Cain offers once, with buttons, a longer resilience run that breaks things on purpose (a stuck save, a restart, a wrong clock, a forced restart of the record, then a restore from your backup and a reinstall). He offers it only once he can see that backup, and you can decline it.
+- If the box ever loses or cuts short the record keeper's list of used taps, even one that held only withdrawn answers, it now always notices, and saves nothing to GitHub until it has rebuilt the list from GitHub. A withdrawn answer stays withdrawn through that rebuild, and an answer the box can't prove reached GitHub is withdrawn rather than saved. Nothing to set up.
+- This version also includes everything in 0.12.0 (the PC job worker).
 
 ## 0.12.0
 

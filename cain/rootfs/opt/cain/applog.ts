@@ -188,6 +188,8 @@ export const LOCK_CALLERS: Record<string, string> = {
   "consumed-key log: dropped intent (keeper dropIntent)": "the intent stays open and is resolved from the record's history next round",
   "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": "nothing is marked or dropped and no commit is abandoned; looked at again next round (round 25: a reset-copy's tombstones, tombstoneDiscarded: nothing is discarded and the request waits for the next round)",
   "consumed-key log: the push guard (keeper guardedPush)": "nothing is pushed this round (refused: the lock); the local commits stay and the next round tries again",
+  // Round 27: the rebuild of a lost consumed-key log, written whole under the log's flock.
+  "consumed-key log: the rebuild (keeper rebuildTapsLog)": "nothing is rewritten and the mark stays, so every push stays refused; the rebuild is tried again next round",
   "held log: held (link holdTap)": "the tap answers busy and the card keeps its buttons",
   "held log: releasing, released, dropped, replay marks (link releaseHeldTaps, replayWatch, replayWaiting)": "the release or mark is retried next sweep",
   "landing ledger settle log (link landings.ts settleHand, ownerLine)": "it answers false: nothing is settled and his message isn't used up, so Cain runs the same command again with the same message",
@@ -212,6 +214,7 @@ export const LOCK_SITES: Record<string, Record<string, string[]>> = {
   "consumed-key log: landed and unlanded marks (keeper unlandedConsumes, dropUnlanded)": { "record/main.ts": ['{ t: "landed", tap: x.tap', 'withLogLock(tapsLogFile(cfg), () => { // dropUnlanded', '{ t: "landed", tap, id, at, how', '{ t: "dropped", tap, id, unlanded: true'] },
   // Round 25: the reset-copy's tombstones are on the same line form ('{ t: "dropped", tap, id, unlanded: true, why: RESET_COPY_DROP_WHY').
   "consumed-key log: the push guard (keeper guardedPush)": { "record/main.ts": ["withLogLock(tapsLogFile(cfg), () => { // guardedPush"] },
+  "consumed-key log: the rebuild (keeper rebuildTapsLog)": { "record/main.ts": ["withLogLock(tapsLogFile(cfg), () => { // rebuildTapsLog"] },
   "held log: held (link holdTap)": { "link/core.ts": ['appendLog(this.heldFile()!, { t: "held"'] },
   "held log: releasing, released, dropped, replay marks (link releaseHeldTaps, replayWatch, replayWaiting)": { "link/core.ts": ['appendLog(this.heldFile()!, { t: "dropped"', 'appendLog(this.heldFile()!, { t: "released"', 'appendLog(this.heldFile()!, { t: "releasing"', '{ t: "replay-waiting"', '{ t: "replay-done"'] },
   "landing ledger settle log (link landings.ts settleHand, ownerLine)": { "link/landings.ts": ["{ key, how, at, said }", '{ t: "owner", kind, said, at }'] },
