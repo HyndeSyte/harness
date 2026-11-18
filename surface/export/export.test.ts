@@ -13,6 +13,12 @@ import {
   properNounGate,
   whoOf,
   firstSentence,
+  leftoverLine,
+  leftoverPlace,
+  matchesBounded,
+  MATCH_SPAN,
+  namesLongNumber,
+  riskyPattern,
   isExcluded,
   makeKeyPair,
   makePolicy,
@@ -25,7 +31,7 @@ import {
   signSnapshot,
   strip,
 } from "./lib";
-import { main } from "./index";
+import { main, PRIVATE_REPORT } from "./index";
 import { tempRecord } from "./fixtures/temp-record";
 
 const FIX = join(import.meta.dir, "fixtures");
@@ -243,8 +249,8 @@ describe("exclusions", () => {
   });
   test("the snapshot counts what it leaves out and skips", () => {
     // P46, P47, P50, P51 by stems, P52 by a term, P53 by the marker, P57 to P76 by money,
-    // health and the normal form.
-    expect(snap.excluded_rows).toBe(26);
+    // health and the normal form, P78 to P97 by the fifth round's stems, P98 by a long number.
+    expect(snap.excluded_rows).toBe(47);
     // The row with no id and the row with no valid time.
     expect(snap.skipped_rows).toBe(2);
     expect(built.warnings.length).toBe(2);
@@ -388,7 +394,7 @@ describe("the command line fails closed", () => {
     }
     const s = JSON.parse(out.join("\n"));
     expect(s.sig).toBeUndefined();
-    expect(s.excluded_rows).toBe(26);
+    expect(s.excluded_rows).toBe(47);
   });
 });
 
@@ -494,23 +500,28 @@ describe("the proper-noun gate", () => {
       }
   });
   test("the fixture's leftovers are named by row, field and word", () => {
-    expect(built.leftovers.some((l) => /PENDING\.md:45: title: Kestrel$/.test(l))).toBe(true);
-    expect(built.leftovers.some((l) => /PENDING\.md:24: step: Robinsons$/.test(l))).toBe(true);
+    const lines = built.leftovers.map(leftoverLine);
+    expect(lines.some((l) => /PENDING\.md:45: title: Kestrel$/.test(l))).toBe(true);
+    expect(lines.some((l) => /PENDING\.md:24: step: Robinsons$/.test(l))).toBe(true);
+    // The place alone carries no word.
+    expect(built.leftovers.map(leftoverPlace).join("\n")).not.toMatch(/Kestrel|Robinsons/);
   });
 
   const dir = mkdtempSync(join(tmpdir(), "surface-gate-"));
   const key = join(dir, "surface.key");
   const rec = tempRecord(["| P1 | Return the drill to Kestrel next door, then lunch. | Cain | Ring at noon. | | Drill back. | 2026-11-01 |"]);
   const run = ["--record", rec, "--private-terms", TERMS, "--config", CONFIG];
-  test("under --strict a leftover fails the run: exit 1, nothing written, the word by field and row only", async () => {
+  test("under --strict a leftover fails the run: exit 1, nothing written, the field and row only, never the word", async () => {
     await capture(() => main(["--keygen", dir]));
     const out = join(dir, "strict.json");
     const r = await capture(() => main([...run, "--strict", "--out", out, "--key", key]));
     expect(r.code).toBe(1);
     expect(existsSync(out)).toBe(false);
-    expect(r.err).toMatch(/PENDING\.md:5: title: Kestrel/);
+    expect(r.err).toMatch(/PENDING\.md:5: title$/m);
+    expect(r.err).not.toContain("Kestrel");
     expect(r.err).not.toContain("drill");
     expect(r.err).not.toContain("next door");
+    expect(r.out).toBe("");
   });
   test("without --strict it is replaced and written", async () => {
     const out = join(dir, "plain.json");
@@ -518,10 +529,28 @@ describe("the proper-noun gate", () => {
     const s = JSON.parse(readFileSync(out, "utf8"));
     expect(s.threads[0].title).toBe("Return the drill to someone next door, then lunch.");
   });
-  test("a dry run prints the leftover words for the owner to read", async () => {
+  test("a dry run prints the leftover words on stderr only, under the private line", async () => {
     const r = await capture(() => main([...run, "--dry-run"]));
     expect(r.code).toBe(0);
-    expect(r.err).toContain("title: Kestrel");
+    const err = r.err.split("\n");
+    const at = err.indexOf(PRIVATE_REPORT);
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(err.slice(at + 1).some((l) => /PENDING\.md:5: title: Kestrel$/.test(l))).toBe(true);
+    expect(err.slice(0, at).join("\n")).not.toContain("Kestrel");
+    expect(r.out).not.toContain("Kestrel");
+    expect(JSON.parse(r.out).threads[0].title).toBe("Return the drill to someone next door, then lunch.");
+  });
+  test("a dry run under --strict fails on a leftover with no word and no snapshot", async () => {
+    const r = await capture(() => main([...run, "--dry-run", "--strict"]));
+    expect(r.code).toBe(1);
+    expect(r.out).toBe("");
+    expect(r.err).not.toContain("Kestrel");
+  });
+  test("a plain run says only how many words were replaced", async () => {
+    const r = await capture(() => main([...run, "--out", join(dir, "count.json"), "--key", key]));
+    expect(r.code).toBe(0);
+    expect(r.err).toMatch(/1 capitalised word\(s\) replaced/);
+    expect(r.err).not.toContain("Kestrel");
   });
 });
 
@@ -616,5 +645,189 @@ describe("the synthetic record", () => {
     const s = JSON.parse(readFileSync(out, "utf8"));
     expect(s.threads.map((t: { id: string }) => t.id)).toEqual(["S1", "S2"]);
     expect(s.excluded_rows + s.skipped_rows).toBe(0);
+  });
+});
+
+describe("fifth round: the gate takes sentence starts too", () => {
+  test("a capitalised word at a sentence start is a candidate unless it is a common word or allowed", () => {
+    const g = properNounGate("Ottoline wants it. Then Penrose rings. Read it on Monday.", policy.allowWords);
+    expect(g.text).toBe("someone wants it. Then someone rings. Read it on Monday.");
+    expect(g.words).toEqual(["Ottoline", "Penrose"]);
+    expect(properNounGate("Follow-up for Re-Kestrel.", policy.allowWords).words).toEqual(["Re-Kestrel"]);
+    expect(properNounGate("Don't wait; Let's go. It’s done.", policy.allowWords).words).toEqual([]);
+  });
+  test("the bundled list is common words only and the defaults no longer carry the weekdays", () => {
+    expect(policy.allowWords.has("monday")).toBe(true);
+    expect(policy.allowWords.has("december")).toBe(true);
+    for (const name of ["will", "mark", "bill", "grace", "hope", "rose", "kestrel"]) expect(policy.allowWords.has(name)).toBe(false);
+  });
+  test("a sentence never ends after Mr, Mrs, Ms, Dr or St", () => {
+    expect(firstSentence("Waiting on Mr. Penrose. Then paint.", 140)).toBe("Waiting on Mr. Penrose.");
+    for (const a of ["Mrs", "Ms", "Dr", "St", "mr"]) expect(firstSentence(`Ask ${a}. Vale now. More.`, 140)).toBe(`Ask ${a}. Vale now.`);
+    expect(firstSentence("Fix it. Dr. Vale.", 140)).toBe("Fix it.");
+  });
+  test("the fixture rows: a name at a title's start, leading waits_for, after an abbreviation", () => {
+    expect(byId.P100.title).toBe("someone wants the ladder back.");
+    expect(byId.P101.waits_for).toBe("someone to send the draft");
+    expect(byId.P102.title).toBe("Fix the gate, waiting on Mr. someone.");
+    const words = built.leftovers.map(leftoverLine);
+    expect(words.some((l) => /:68: title: Ottoline$/.test(l))).toBe(true);
+    expect(words.some((l) => /:69: waits_for: Thessaly$/.test(l))).toBe(true);
+    expect(words.some((l) => /:70: title: Penrose$/.test(l))).toBe(true);
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), "surface-start-"));
+  const key = join(dir, "surface.key");
+  const cases: [string, string, keyof (typeof snap.threads)[number], string][] = [
+    ["a name starting the title", "| P1 | Ottoline wants the ladder back. | Cain | Fetch it. | | Ladder returned. | 2026-11-01 |", "title", "someone wants the ladder back."],
+    ["a name leading waits_for", "| P1 | Read the draft. | Cain | Read it. | Thessaly to send the draft | Draft read. | 2026-11-01 |", "waits_for", "someone to send the draft"],
+    ["a name after an abbreviation", "| P1 | Fix the gate, waiting on Mr. Penrose. | Cain | Ask. | | Gate shut. | 2026-11-01 |", "title", "Fix the gate, waiting on Mr. someone."],
+    ["a full-width name mid-sentence", "| P1 | Return the ladder to Ｏｔｔｏｌｉｎｅ today. | Cain | Ask. | | Ladder returned. | 2026-11-01 |", "title", "Return the ladder to someone today."],
+    ["an accented name mid-sentence", "| P1 | Return the ladder to Ásta today. | Cain | Ask. | | Ladder returned. | 2026-11-01 |", "title", "Return the ladder to someone today."],
+  ];
+  for (const [what, row, field, want] of cases) {
+    test(`${what}: fails --strict without the word; becomes someone otherwise`, async () => {
+      await capture(() => main(["--keygen", dir]));
+      const run = ["--record", tempRecord([row]), "--private-terms", TERMS, "--config", CONFIG];
+      const out = join(mkdtempSync(join(dir, "case-")), "s.json");
+      const r = await capture(() => main([...run, "--strict", "--out", out, "--key", key]));
+      expect(r.code).toBe(1);
+      expect(existsSync(out)).toBe(false);
+      expect(r.err).toMatch(new RegExp(`PENDING\\.md:5: ${field}$`, "m"));
+      expect(r.err).not.toMatch(/Ottoline|Thessaly|Penrose|Ásta|Ｏ/);
+      expect((await capture(() => main([...run, "--out", out, "--key", key]))).code).toBe(0);
+      expect(JSON.parse(readFileSync(out, "utf8")).threads[0][field]).toBe(want);
+    });
+  }
+  test("the gate reads the case-preserved form: normalising doesn't lose a capital", () => {
+    expect(normalise("Ｏｔｔｏ")).toBe("Otto");
+    expect(properNounGate(normalise("ask Ｏｔｔｏ"), policy.allowWords).words).toEqual(["Otto"]);
+  });
+});
+
+describe("fifth round: the dry run and failed runs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "surface-dry-"));
+  const key = join(dir, "surface.key");
+  const write = (name: string, text: string) => (writeFileSync(join(dir, name), text), join(dir, name));
+  const exit2 = () => [
+    ["no real owner name", ["--private-terms", TERMS, "--config", write("noowner.json", '{"owner_names": ["owner"], "names": []}')]],
+    ["no names list", ["--private-terms", TERMS, "--config", write("nonames.json", '{"owner_names": ["Robin"]}')]],
+    ["bad config JSON", ["--private-terms", TERMS, "--config", write("bad.json", "{nope")]],
+    ["a missing config", ["--private-terms", TERMS, "--config", join(dir, "nope.json")]],
+    ["no config at all", ["--private-terms", TERMS]],
+    ["a missing terms file", ["--private-terms", join(dir, "nope.txt"), "--config", CONFIG]],
+    ["an empty terms file", ["--private-terms", write("empty.txt", "# notes only\n\n"), "--config", CONFIG]],
+    ["no terms flag", ["--config", CONFIG]],
+    ["an invalid re: term", ["--private-terms", write("badre.txt", "Juniper\nre:(unclosed\n"), "--config", CONFIG]],
+  ] as [string, string[]][];
+  test("each exit-2 check runs under --dry-run and prints no snapshot", async () => {
+    for (const [what, args] of exit2()) {
+      const r = await capture(() => main(["--record", RECORD, ...args, "--dry-run"]));
+      expect([what, r.code, r.out]).toEqual([what, 2, ""]);
+    }
+  });
+  test("--dry-run with --put or --out is refused before anything", async () => {
+    let calls = 0;
+    const io = { fetch: async () => (calls++, new Response("{}")), env: {} };
+    const a = await capture(() => main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--dry-run", "--put", "https://x.example/snapshot"], io));
+    expect([a.code, a.out, calls]).toEqual([2, "", 0]);
+    const b = await capture(() => main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--dry-run", "--out", join(dir, "x.json")]));
+    expect([b.code, b.out, existsSync(join(dir, "x.json"))]).toEqual([2, "", false]);
+  });
+  test("a failed run, in any mode, writes no file, keeps an existing one and makes no network call", async () => {
+    await capture(() => main(["--keygen", dir]));
+    const env = {
+      SURFACE_PUT_HOST: "surface.example.com",
+      SURFACE_ACCESS_CLIENT_ID: "id-example",
+      SURFACE_ACCESS_CLIENT_SECRET: "secret-example",
+      SURFACE_PUBLISHER_TOKEN: "publisher-example",
+    };
+    const leftover = tempRecord(["| P1 | Ottoline wants the ladder back. | Cain | Fetch it. | | Done. | 2026-11-01 |"]);
+    const runs: [string, string[]][] = [
+      ...exit2().map(([w, a]) => [w, ["--record", RECORD, ...a]] as [string, string[]]),
+      ["a leftover under --strict", ["--record", leftover, "--private-terms", TERMS, "--config", CONFIG, "--strict"]],
+      ["the fixture under --strict", ["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--strict"]],
+      ["a bad key", ["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--key-override"]],
+      ["no record", ["--record", join(dir, "no-record"), "--private-terms", TERMS, "--config", CONFIG]],
+    ];
+    for (const [what, args] of runs) {
+      for (const put of [false, true]) {
+        const fresh = join(dir, "fresh.json");
+        const kept = write("kept.json", "earlier\n");
+        let calls = 0;
+        const io = { fetch: async () => (calls++, new Response("{}")), env };
+        const k = what === "a bad key" ? write("bad.key", "not a key") : key;
+        const base = args.filter((a) => a !== "--key-override");
+        const tail = put ? ["--put", "https://surface.example.com/snapshot"] : [];
+        const r1 = await capture(() => main([...base, "--key", k, "--out", fresh, ...tail], io));
+        const r2 = await capture(() => main([...base, "--key", k, "--out", kept, ...tail], io));
+        expect([what, put, r1.code === 0, r2.code === 0]).toEqual([what, put, false, false]);
+        expect([what, put, existsSync(fresh), readFileSync(kept, "utf8"), calls]).toEqual([what, put, false, "earlier\n", 0]);
+      }
+    }
+  });
+});
+
+describe("fifth round: the terms file", () => {
+  test("an invalid re: line exits 2 naming the line, with no stack trace and nothing written", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-terms-"));
+    await capture(() => main(["--keygen", dir]));
+    const terms = join(dir, "terms.txt");
+    writeFileSync(terms, "# note\nJuniper\nre:[unclosed\n");
+    const out = join(dir, "o.json");
+    const r = await capture(() => main(["--record", RECORD, "--private-terms", terms, "--config", CONFIG, "--out", out, "--key", join(dir, "surface.key")]));
+    expect(r.code).toBe(2);
+    expect(r.err).toMatch(/:3: not a valid regular expression/);
+    expect(r.err).not.toContain("unclosed");
+    expect(r.err).not.toMatch(/\n\s+at /);
+    expect(r.err.split("\n").length).toBe(1);
+    expect(existsSync(out)).toBe(false);
+  });
+  test("a pattern that could backtrack without bound is refused at load", () => {
+    for (const bad of ["(a+)+", "(\\w*x)*", "(a|aa)+", "((ab)*)+", "(x{2,})*", "(a)\\1", "(?<n>a)\\k<n>"])
+      expect([bad, riskyPattern(bad)]).not.toEqual([bad, null]);
+    for (const ok of ["surprise\\w*", "(foo|bar)s?", "a+b+", "[(+*)]+", "(ab)+", "\\(a+\\)+"])
+      expect([ok, riskyPattern(ok)]).toEqual([ok, null]);
+    expect(() => parseTerms("re:(a+)+$")).toThrow(/:1: .*without bound/);
+    expect(() => parseTerms("re:a)|(b")).toThrow(/:1: not a valid regular expression/);
+  });
+  test("a match runs over at most MATCH_SPAN characters at a time; the whole cell is still checked", () => {
+    const seen: number[] = [];
+    const spy = { test: (t: string) => (seen.push(t.length), /needle/.test(t)) } as unknown as RegExp;
+    const long = "x ".repeat(10000) + "needle";
+    expect(matchesBounded(spy, long)).toBe(true);
+    expect(Math.max(...seen)).toBeLessThanOrEqual(MATCH_SPAN);
+    expect(matchesBounded(/needle/, "x".repeat(MATCH_SPAN - 3) + " needle " + "y".repeat(9000))).toBe(true);
+    expect(isExcluded(makePolicy("Juniper"), "a ".repeat(6000) + "Juniper")).toBe(true);
+  });
+});
+
+describe("fifth round: stems and long numbers", () => {
+  const stems: [string, string][] = [
+    ["bill", "the water bill"], ["fee", "a late fee"], ["cost", "the cost"], ["price", "price it"], ["quote", "a quote"],
+    ["deposit", "the deposit"], ["venmo", "Venmo them"], ["cash", "some cash"], ["owe", "what we owe"],
+    ["symptom", "the symptoms"], ["scan", "the scan"], ["mri", "an MRI"], ["blood", "blood test"],
+    ["vaccin", "the vaccination"], ["pregnan", "pregnancy class"], ["allerg", "an allergy"], ["pill", "the pills"],
+    ["dose", "second dose"], ["sick", "sick note"], ["counsel", "counselling"],
+  ];
+  test("each new stem leaves its text out", () => {
+    for (const [stem, text] of stems) expect([stem, isExcluded(policy, text)]).toEqual([stem, true]);
+  });
+  test("each new stem's fixture row is left out", () => {
+    for (let i = 78; i <= 97; i++) expect([`P${i}`, byId[`P${i}`]]).toEqual([`P${i}`, undefined]);
+  });
+  test("a run of four or more digits that isn't a date leaves the row out", () => {
+    expect(namesLongNumber("the card ending 4421")).toBe(true);
+    expect(namesLongNumber("ref 12345")).toBe(true);
+    expect(namesLongNumber("call +1 555 201 7788")).toBe(true);
+    expect(namesLongNumber("ending ４４２１")).toBe(true);
+    for (const t of ["on 2026-11-18", "by 11/20/2026", "in 2026", "since 1999", "at 7:30, 3 boxes", "after P1040", "row p12345"])
+      expect([t, namesLongNumber(t)]).toEqual([t, false]);
+    expect(byId.P98).toBeUndefined();
+    expect(JSON.stringify(snap)).not.toContain("4421");
+  });
+  test("a row with only dates in it is kept", () => {
+    expect(byId.P99.title).toBe("Move the skip to 11/20/2026, then 2026-11-21.");
+    expect(byId.P99.step).toBe("Ring on 2026-11-19 in 2026.");
   });
 });

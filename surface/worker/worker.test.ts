@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main as exporter, REDIRECTED } from "../export/index";
@@ -326,6 +326,23 @@ describe("Access on PUT", () => {
   test("the owner's own assertion can't upload", async () => {
     expect((await worker.fetch(await put(s(), { "cf-access-jwt-assertion": await ownerJwt() }), env())).status).toBe(403);
   });
+  test("the client id in common_name or in sub uploads; neither a string is refused", async () => {
+    const withSub = await put(s(), { "cf-access-jwt-assertion": await serviceJwt({ common_name: undefined, sub: CLIENT_ID }) });
+    expect((await worker.fetch(withSub, env())).status).toBe(200);
+    const withName = await put(s(), { "cf-access-jwt-assertion": await serviceJwt({ common_name: CLIENT_ID, sub: "" }) });
+    expect((await worker.fetch(withName, env())).status).toBe(200);
+    const wrongSub = await put(s(), { "cf-access-jwt-assertion": await serviceJwt({ common_name: undefined, sub: "other.access" }) });
+    expect((await worker.fetch(wrongSub, env())).status).toBe(403);
+    for (const odd of [{ common_name: undefined, sub: undefined }, { common_name: 7, sub: ["x"] }, { common_name: null, sub: {} }]) {
+      const e = env();
+      const r = await put(s(), { "cf-access-jwt-assertion": await serviceJwt(odd) });
+      expect((await worker.fetch(r, e)).status).toBe(403);
+      expect(e.SNAPSHOTS.m.size).toBe(0);
+    }
+    // The publisher header is still required with the id in sub.
+    const r = await put(s(), { "cf-access-jwt-assertion": await serviceJwt({ common_name: undefined, sub: CLIENT_ID }), "x-surface-publisher": "wrong" });
+    expect((await worker.fetch(r, env())).status).toBe(403);
+  });
   test("another service token can't upload", async () => {
     const r = await put(s(), { "cf-access-jwt-assertion": await serviceJwt({ common_name: "other.access" }) });
     expect((await worker.fetch(r, env())).status).toBe(403);
@@ -447,6 +464,25 @@ describe("the exporter's --put, against this Worker in-process", () => {
     expect(h.calls.length).toBe(0);
   });
 
+  test("a failed upload leaves an existing --out file as it was", async () => {
+    const out = join(dir, "kept.json");
+    writeFileSync(out, "the earlier file\n");
+    for (const f of [
+      async () => new Response(JSON.stringify({ error: "no" }), { status: 500 }),
+      async () => {
+        throw new Error("connection refused");
+      },
+    ]) {
+      const r = await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_], { fetch: f, env: putEnv }));
+      expect(r.code).toBe(1);
+      expect(readFileSync(out, "utf8")).toBe("the earlier file\n");
+    }
+    // A stored upload writes it.
+    const h = harness(workerEnv());
+    expect((await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_], { fetch: h.fetch, env: putEnv }))).code).toBe(0);
+    expect(JSON.parse(readFileSync(out, "utf8")).sig).toBeString();
+  });
+
   test("an older snapshot is 409, exit 1", async () => {
     const e = workerEnv();
     e.SNAPSHOTS.m.set("latest", JSON.stringify({ made_at: "2999-01-01T00:00:00.000Z" }));
@@ -480,13 +516,20 @@ describe("the exporter's --put, against this Worker in-process", () => {
     expect(out).toContain("no answer");
   });
 
-  test("the URL must be https, on SURFACE_PUT_HOST, with no credentials: else exit 2 before any request", async () => {
+  test("the URL must be https, on SURFACE_PUT_HOST, exactly /snapshot, with no credentials, query or fragment: else exit 2 before any request", async () => {
     const cases: [string, Record<string, string | undefined>, RegExp][] = [
       ["http://surface.example.com/snapshot", putEnv, /must be https/],
       ["https://elsewhere.example.com/snapshot", putEnv, /host is not SURFACE_PUT_HOST/],
       ["https://user:pw@surface.example.com/snapshot", putEnv, /credentials/],
       [URL_, { ...putEnv, SURFACE_PUT_HOST: undefined }, /SURFACE_PUT_HOST/],
       ["not a url", putEnv, /not a URL/],
+      ["https://surface.example.com/other", putEnv, /path must be exactly \/snapshot/],
+      ["https://surface.example.com/snapshot/", putEnv, /path must be exactly \/snapshot/],
+      ["https://surface.example.com/", putEnv, /path must be exactly \/snapshot/],
+      ["https://surface.example.com/snapshot?x=1", putEnv, /query string or fragment/],
+      ["https://surface.example.com/snapshot?", putEnv, /query string or fragment/],
+      ["https://surface.example.com/snapshot#a", putEnv, /query string or fragment/],
+      ["https://surface.example.com/snapshot#", putEnv, /query string or fragment/],
     ];
     for (const [url, env2, why] of cases) {
       const h = harness(workerEnv());

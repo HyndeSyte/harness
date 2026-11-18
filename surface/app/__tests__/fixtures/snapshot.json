@@ -122,10 +122,54 @@
       "outcome": "Drill returned to someone.",
       "last_moved": "2026-11-03T00:00:00.000Z",
       "state": "moving"
+    },
+    {
+      "id": "P99",
+      "title": "Move the skip to 11/20/2026, then 2026-11-21.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Ring on 2026-11-19 in 2026.",
+      "waits_for": null,
+      "outcome": "Skip moved.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P100",
+      "title": "someone wants the ladder back.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Fetch it from the shed.",
+      "waits_for": null,
+      "outcome": "Ladder returned.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P101",
+      "title": "Read the club newsletter draft.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Read it once it comes.",
+      "waits_for": "someone to send the draft",
+      "outcome": "Draft read.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P102",
+      "title": "Fix the gate, waiting on Mr. someone.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Ask for the latch.",
+      "waits_for": null,
+      "outcome": "Gate shut.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
     }
   ],
-  "excluded_rows": 26,
+  "excluded_rows": 47,
   "skipped_rows": 2,
-  "sig": "kFuXM1m+4NmTY2D5+eb5Pp5OOdQ1RDdudgApgR6LCZ7UrWyrn9goGMHRp5O0fAAfg3Gcix7k+VmgLsXzh/huDg==",
-  "key_id": "0478c64e689ac18e"
+  "sig": "eFLHl/jTqXOQyB8aJd5JwQSlJ070Alaz+7g5ZxXOyJjXja5zFpepS92oP++uxMtTmRSKtMez6KwX4ByHdHSsDQ==",
+  "key_id": "c4295a2dd501cdfe"
 }

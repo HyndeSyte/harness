@@ -8,10 +8,10 @@
 // bun run surface/export --verify <file> --pub <public key: PEM or raw base64>
 // bun run surface/export --keygen <dir>   (writes surface.key, surface.pub, surface.pub.b64)
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { verifySnapshot } from "../shared/snapshot";
-import { buildSnapshot, configProblem, makeKeyPair, makePolicy, privateKey, rawPublicKey, signSnapshot, type ExporterConfig } from "./lib";
+import { buildSnapshot, configProblem, leftoverLine, leftoverPlace, makeKeyPair, makePolicy, privateKey, rawPublicKey, signSnapshot, type ExporterConfig } from "./lib";
 
 function arg(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -28,6 +28,8 @@ export const PUT_HOST_ENV = "SURFACE_PUT_HOST";
 export const REDIRECTED = "Access redirected: the service token or its Service Auth policy is wrong";
 // How much of the Worker's message is printed.
 export const MESSAGE_MAX = 200;
+// The first line of the dry run's leftover-word report, which holds words from the record.
+export const PRIVATE_REPORT = "PRIVATE, not for posting: capitalised words from the record that the gate replaced (path:row: field: word). Read them here; never paste them anywhere.";
 
 const USAGE = `usage:
   bun run surface/export --record <record checkout> --private-terms <file> --out <file> --key <private key PEM>
@@ -36,7 +38,7 @@ const USAGE = `usage:
       [--out <file>] [--config <exporter config JSON>] [--strict]
       (with SURFACE_PUT_HOST, SURFACE_ACCESS_CLIENT_ID, SURFACE_ACCESS_CLIENT_SECRET and
       SURFACE_PUBLISHER_TOKEN set; --put implies --strict)
-  bun run surface/export --record <record checkout> --private-terms <file> --dry-run [--config <file>]
+  bun run surface/export --record <record checkout> --private-terms <file> --dry-run [--config <file>] [--strict]
   bun run surface/export --verify <file> --pub <public key file>
   bun run surface/export --keygen <dir>`;
 
@@ -47,8 +49,8 @@ export interface IO {
 
 const defaultIO: IO = { fetch: (url, init) => fetch(url, init), env: process.env };
 
-// The --put URL's own checks, before any request: https, no credentials in it, and its host is
-// exactly SURFACE_PUT_HOST. Returns a one-line reason, or null.
+// The --put URL's own checks, before any request: https, no credentials in it, its host is
+// exactly SURFACE_PUT_HOST, and its path is exactly /snapshot with no query or fragment. Returns a one-line reason, or null.
 export function putUrlProblem(raw: string, env: Record<string, string | undefined>): string | null {
   let u: URL;
   try {
@@ -58,6 +60,9 @@ export function putUrlProblem(raw: string, env: Record<string, string | undefine
   }
   if (u.username || u.password) return "--put: credentials in the URL are refused";
   if (u.protocol !== "https:") return "--put: the URL must be https";
+  // Exactly /snapshot: no other path, no query string, no fragment (an empty "?" or "#" included).
+  if (u.pathname !== "/snapshot") return "--put: the URL's path must be exactly /snapshot";
+  if (u.search || u.hash || raw.includes("?") || raw.includes("#")) return "--put: a query string or fragment in the URL is refused";
   const want = (env[PUT_HOST_ENV] ?? "").trim().toLowerCase();
   if (!want) return `--put needs ${PUT_HOST_ENV} in the environment`;
   if (u.host.toLowerCase() !== want) return `--put: the URL's host is not ${PUT_HOST_ENV}`;
@@ -138,8 +143,10 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
   const dryRun = args.includes("--dry-run");
   // --put implies --strict: nothing leaves with a malformed row or a capitalised word left.
   const strict = args.includes("--strict") || args.includes("--put");
+  // A dry run writes and sends nothing, so --put and --out don't go with it.
+  if (dryRun && args.includes("--put")) return (console.error("--put and --dry-run don't go together; nothing sent.\n" + USAGE), 2);
+  if (dryRun && args.includes("--out")) return (console.error("--out and --dry-run don't go together; nothing written.\n" + USAGE), 2);
   if (args.includes("--put") && (!putUrl || putUrl.startsWith("--"))) return (console.error(USAGE), 2);
-  if (putUrl && dryRun) return (console.error("--put and --dry-run don't go together; nothing sent.\n" + USAGE), 2);
   if (!record || (!dryRun && (!key || (!out && !putUrl)))) return (console.error(USAGE), 2);
   if (putUrl) {
     // Every value the upload needs is checked before anything is read or sent.
@@ -151,7 +158,8 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
       return 2;
     }
   }
-  // Fail closed: no private terms file, or one with no terms, and nothing is written.
+  // Every check below runs the same in a dry run. Fail closed: no private terms file, or one with
+  // no terms, and nothing is written or printed.
   if (!termsFile) return (console.error("--private-terms <file> is required; nothing written.\n" + USAGE), 2);
   if (!existsSync(termsFile)) return (console.error(`${termsFile}: no such private terms file; nothing written.`), 2);
   // The config fails closed too: it must parse, name the owner and carry `names`.
@@ -173,32 +181,72 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
     console.error(`${String(e?.message ?? e)}; nothing written.`);
     return 2;
   }
-  const built = buildSnapshot(record, policy);
-  for (const w of built.warnings) console.error("warning: " + w);
-  // A capitalised word the gate replaced is named (field, row number and the word only) under
-  // --strict, where it fails the run, and in a dry run, for the owner to read.
-  if (strict || dryRun) for (const l of built.leftovers) console.error("capitalised: " + l);
-  if (strict && (built.warnings.length || built.leftovers.length)) {
-    console.error(
-      `--strict: ${built.warnings.length} malformed row(s), ${built.leftovers.length} capitalised word(s) not on the allow list; nothing written.`,
-    );
+  let signingKey;
+  if (!dryRun) {
+    try {
+      signingKey = privateKey(readFileSync(key!, "utf8"));
+    } catch {
+      return (console.error(`${key}: not a readable Ed25519 private key; nothing written.`), 2);
+    }
+  }
+  // The whole pipeline runs before anything is printed, written or sent.
+  let built;
+  try {
+    built = buildSnapshot(record, policy);
+  } catch (e: any) {
+    // Never the record's text: only our own message about its shape, or that it couldn't be read.
+    const own = /^PENDING\.md has no open table/.test(String(e?.message)) ? String(e.message) : "the record could not be read (state/PENDING.md, state/holds.json or a note)";
+    console.error(`${own}; nothing written.`);
     return 1;
   }
   const s = built.snapshot;
+  if (strict && (built.warnings.length || built.leftovers.length)) {
+    for (const w of built.warnings) console.error("warning: " + w);
+    // The field and the row number only, never the word.
+    for (const l of built.leftovers) console.error("capitalised word not on the allow list: " + leftoverPlace(l));
+    console.error(
+      `--strict: ${built.warnings.length} malformed row(s), ${built.leftovers.length} capitalised word(s) not on the allow list; nothing written.` +
+        (built.leftovers.length ? " A dry run lists the words privately." : ""),
+    );
+    return 1;
+  }
+  for (const w of built.warnings) console.error("warning: " + w);
   if (dryRun) {
     // For the owner to read before the first upload: exactly what would be signed.
     console.log(JSON.stringify(s, null, 2));
     console.error(`Dry run: ${s.threads.length} threads, ${s.excluded_rows} rows left out, ${s.skipped_rows} skipped. Nothing written.`);
+    if (built.leftovers.length) {
+      // Words from the record: stderr only, under a line that says so.
+      console.error(PRIVATE_REPORT);
+      for (const l of built.leftovers) console.error(leftoverLine(l));
+    }
     return 0;
   }
-  const snapshot = signSnapshot(s, privateKey(readFileSync(key!, "utf8")));
+  if (built.leftovers.length)
+    console.error(`${built.leftovers.length} capitalised word(s) replaced by "someone"; a dry run lists them privately.`);
+  const snapshot = signSnapshot(s, signingKey!);
   const body = JSON.stringify(snapshot, null, 2) + "\n";
+  // With --put the file is written only once the upload is stored, so a failed run leaves it as it was.
+  if (putUrl) {
+    const code = await upload(putUrl, body, io);
+    if (code !== 0) return code;
+  }
   if (out) {
-    writeFileSync(out, body);
+    writeWhole(out, body);
     console.log(`Wrote ${snapshot.threads.length} threads to ${out} (${s.excluded_rows} left out, ${s.skipped_rows} skipped).`);
   }
-  if (putUrl) return upload(putUrl, body, io);
   return 0;
+}
+
+// Written whole or not at all: a temporary file beside it, then a rename.
+function writeWhole(path: string, text: string) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, text);
+    renameSync(tmp, path);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
 }
 
 if (import.meta.main) {

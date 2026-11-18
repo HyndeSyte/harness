@@ -44,12 +44,21 @@ bun run surface/export --verify snapshot.json --pub <dir>/surface.pub
 (checked by the Worker). Their values come only from the environment variables
 `SURFACE_ACCESS_CLIENT_ID`, `SURFACE_ACCESS_CLIENT_SECRET` and `SURFACE_PUBLISHER_TOKEN`, never
 from flags or files. A missing one stops it with exit 2 before anything is read or sent. So does a
-URL that isn't https, carries credentials (`user:pass@`), or whose host isn't exactly
-`SURFACE_PUT_HOST`. It never follows a redirect: any 3xx (Access sending the request to sign in, or
+URL that isn't https, carries credentials (`user:pass@`), whose host isn't exactly
+`SURFACE_PUT_HOST`, whose path isn't exactly `/snapshot`, or that has a query string or a fragment
+(an empty `?` or `#` included). It never follows a redirect: any 3xx (Access sending the request to sign in, or
 anywhere else) is refused with "Access redirected: the service token or its Service Auth policy is
 wrong", exit 1, and nothing goes to the redirect's target. It prints the response status and at
 most 200 characters of the Worker's own JSON message (no other body, never a header); a 2xx is
-exit 0, anything else, or no answer, exit 1. `--put` implies `--strict`.
+exit 0, anything else, or no answer, exit 1. `--put` implies `--strict`. With `--put` and `--out`
+the file is written only once the upload is stored, whole (a temporary file, then a rename), so a
+failed run, in any mode, writes no file and leaves an existing one as it was.
+
+`--dry-run` runs every check a real run does (the exit-2 checks: no real owner name, no `names`
+list, config JSON that doesn't parse, a missing or empty terms file, a term that doesn't compile)
+and the whole pipeline before it prints anything; then it prints the snapshot it would sign on
+stdout. With `--put` or `--out` it is refused (exit 2). With `--strict` a leftover fails it like a
+real run, and no snapshot is printed.
 
 What it keeps, per open row: `id`, `title` (the Item's first sentence, at most 140 code points),
 `area` (the project folder the Item names, as in `projects/surface`, when it passes the privacy
@@ -69,7 +78,13 @@ is.
 - **The private terms file is required** (`--private-terms <file>`). One term a line; a line
   starting `re:` is a regular expression; a line starting `#` is a note. Every term matches any
   case, as a whole word. It has the same shape as the owner's review privacy list. A missing
-  file, or one with no terms, stops the exporter before it writes anything.
+  file, or one with no terms, stops the exporter before it writes anything. Every term is
+  compiled when the file is loaded: a `re:` line that isn't a valid regular expression, or one
+  that could backtrack without bound (a quantified group holding a quantifier or an alternation,
+  like `(a+)+` or `(a|aa)*`, or a backreference), exits 2 naming the line number only, never the
+  term, with no stack trace. A term runs over at most 4,000 characters at a time: a longer cell
+  is checked in overlapping chunks, the whole of it still checked. That bounds the text, not
+  every pattern; the load check is what keeps the known runaway shapes out.
 - **One normal form.** Before any check, text is put in NFKC form with invisible formatting
   characters taken out (zero-width spaces and joiners, bidi controls, soft hyphens), and matched
   case-folded with accents off: "Jünîper", "ｂａｎｋ" and "ba<zero-width space>nk" are caught by
@@ -80,9 +95,15 @@ is.
   generic money and health stems in the code: money, financ, debt, bank, budget, pay, paid, owed,
   invoice, tax, rent, loan, mortgage, credit, card, salar, insur, refund, irs, health, therap, pt,
   doctor, gp, appointment, hospital, surgery, mental, psychiatr, dentist, dental, orthodont,
-  periodont, endodont, denture, tooth, teeth, prescri, clinic, pharmac, medic, diagnos
-  ("banking", "therapist", "payment", "cardboard" and "taxi" count too). Config adds more; it
-  can't remove these.
+  periodont, endodont, denture, tooth, teeth, prescri, clinic, pharmac, medic, diagnos, bill,
+  fee, cost, price, quote, deposit, venmo, cash, owe, symptom, scan, mri, blood, vaccin, pregnan,
+  allerg, pill, dose, sick, counsel ("banking", "therapist", "payment", "cardboard" and "taxi"
+  count too, and so do "feel", "costume" and "pillow": a stem is a word start, so it leaves out
+  more than it must). Config adds more; it can't remove these.
+- **Long numbers.** A row is left out whole when any cell has a run of four or more digits that
+  isn't part of a date (`YYYY-MM-DD`, `M/D/YYYY`, or a year alone, 1900 to 2099): a card's last
+  four, an account or a reference number, most phone numbers. A record code (one to three
+  letters then digits, like P1040) isn't such a run.
 - **Money in any form.** A row is left out whole when any cell has a currency symbol, an ISO
   currency code next to a number ("USD 40", "40EUR"), or a number with a currency word ("50
   dollars", "five quid", "2k euros").
@@ -100,12 +121,20 @@ is.
   to a name part by a hyphen or an apostrophe goes with it, so a double name is one "someone",
   never "someone-X", and a full name written out is one "someone". A name inside a longer word
   is left alone.
-- **The proper-noun gate.** After that, in every exported text, any capitalised word that
-  doesn't start a sentence and isn't on the allow list (weekdays, months, "I", "OK", and the
-  config's `allow_words`: the product and place words the owner lists) becomes "someone". Under
-  `--strict` (and so under `--put`) such a word fails the run: exit 1, nothing written, each one
-  named on stderr by row number, field and the word alone. `--dry-run` lists them for the owner
-  to read.
+- **The proper-noun gate.** After that, in every exported text, every capitalised word, at the
+  start of a sentence or not, becomes "someone" unless it is on the allow list: the bundled
+  common English words (`export/common-words.txt`: function words, pronouns, common imperative
+  and ordinary verbs, weekdays and months, a few hundred, no names), "I", "OK", and the config's
+  `allow_words` (the product, place and ordinary words the owner lists; a record's sentence-start
+  nouns like "Fence" or "Ladder" go here). A hyphenated word stays only when the whole of it or
+  each part is listed. Sentences never end after Mr, Mrs, Ms, Dr or St, so "waiting on Mr. Vale"
+  keeps "Mr." and gates the name. The gate runs on the case-preserved normal form (NFKC, so a
+  full-width or styled capital is a capital); only the stems, terms and names are matched on the
+  case-folded copy. So a name written in lower case, or in a script with no case, is caught only
+  by the names list and the terms file. Under `--strict` (and so under `--put`) a gated word
+  fails the run: exit 1, nothing written, each one named on stderr by field and row number
+  only, never the word. A plain run prints only how many it replaced. `--dry-run` lists the
+  words on stderr only, under a first line saying the list is private and not for posting.
 - **The area** is checked too: the private marker, the stems, the terms and money, then the
   config's `areas` list. Anything else is `other`.
 - **Counts.** `excluded_rows` (left out on purpose) and `skipped_rows` (no valid id or Since
@@ -274,6 +303,31 @@ through) and by the Worker's own check of Access's assertion (the owner's email,
 key gates PUT only: it proves an upload was signed by the exporter's private key, and does nothing
 for who can read.
 
+### Deploy follow-ups
+
+To settle before or during the deploy, beside the checklist above:
+
+- **One public key, checked.** The public key built into the app bundle
+  (`EXPO_PUBLIC_SURFACE_PUBLIC_KEY`) is checked against the exporter's (`surface.pub.b64`) and the
+  Worker's `SNAPSHOT_PUBLIC_KEY` before the first real upload (all three carry the same `key_id`).
+  Rotation goes by `key_id`: today the app and the Worker each hold one key, so the rotation path
+  (both accepting the key named by a snapshot's `key_id` from a short list, the new key added
+  before the exporter switches, the old one removed after) is to be built before the first
+  rotation.
+- **Pages serves what CI built.** Pages deploys the `dist` that CI built and checked (uploaded as
+  the workflow's artifact and deployed from it), not a second build on the Pages side, so the dist
+  checks run on the bytes served. The build command in step 1 stands until then.
+- **The public key gates PUT only.** An earlier note said GET refuses everything without the
+  public key; that was wrong. Without `SNAPSHOT_PUBLIC_KEY` the Worker refuses PUT (500); GET is
+  gated by Access and the owner's email alone.
+- **An equal `made_at` is accepted.** A PUT whose `made_at` equals the stored one replaces it;
+  only an older one is 409.
+- **workers.dev and previews, on the account.** The `workers_dev` and `preview_urls` checks in CI
+  read only `wrangler.toml`; the smoke test (step 4) checks the live account, where the dashboard
+  can turn either on whatever the file says.
+- **Piece two's writes.** Every write route added in piece two needs a custom header plus an exact
+  `Origin` check, beside Access.
+
 ### The Worker's settings
 
 All from Worker variables and secrets; none is in the code.
@@ -289,7 +343,9 @@ All from Worker variables and secrets; none is in the code.
   more than one).
 - `OWNER_EMAIL` (secret): the one identity whose assertion may GET.
 - `PUBLISHER_CLIENT_ID` (secret): the exporter's service token Client ID; Access puts it in the
-  assertion's `common_name`, and only that may PUT.
+  assertion's `common_name` (or, on some assertions, `sub`), and only that may PUT. The Worker
+  compares whichever is a non-empty string, `common_name` first, in constant time, and refuses
+  with 403 when neither is.
 - `PUBLISHER_TOKEN` (secret): the value `--put` sends in `X-Surface-Publisher` (the exporter's
   `SURFACE_PUBLISHER_TOKEN`).
 
@@ -299,7 +355,7 @@ What it checks:
   for that audience, from that issuer, not expired and not before its start (each with 60 seconds
   of leeway for clock skew), and the owner's email. Anything else, a header or payload that isn't
   a JSON object included, is 403.
-- **PUT** needs the same assertion check with the exporter's `common_name`, the right
+- **PUT** needs the same assertion check with the exporter's client id (`common_name` or `sub`), the right
   `X-Surface-Publisher` value, a signature that verifies against `SNAPSHOT_PUBLIC_KEY`, a body of
   at most 512 KiB counted in bytes (else 413), a `made_at` no more than 5 minutes ahead of the
   Worker's clock (else 400, saying so), and a snapshot no older than the one it holds (else 409).

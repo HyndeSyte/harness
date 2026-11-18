@@ -9,7 +9,7 @@ Open items, one row each. Who has it, the next step, what it waits for, when it 
 | P42 | Calendar digest wording for projects/harness. Short lines only. | Build | Tighten the digest lines, see https://example.com/digest-notes for the draft. | CI on the branch | Digest reads in one glance. | 2026-11-12 |
 | P43 | Laptop setup for the workshop printer. | laptop:desk | Install the driver and print a test page; mail the log to someone@example.org. | | A test page prints. | 2026-11-10 |
 | P44 | Back up the photo drive. | At his PC | Plug in the spare drive and run the copy. | | Two copies exist. | 2026-11-14 |
-| P45 | Ask the landlord about the fence at 12 Elm Street. | Cain | Draft the note; call +1 555 201 7788 if no reply by Friday. | Robin's OK on the draft | Fence repair is booked. | 2026-11-11 |
+| P45 | Ask the landlord about the fence at 12 Elm Street. | Cain | Draft the note; call +1 555 201 778 if no reply by Friday. | Robin's OK on the draft | Fence repair is booked. | 2026-11-11 |
 | P46 | Monthly budget check. | Robin | Review the spending summary. | | Summary reviewed. | 2026-11-15 |
 | P47 | Book the next PT session. | Cain | Find a slot after work. | | Session booked. | 2026-11-13 |
 | P48 | Tidy the garage shelves. | Cain | Sort the bins after P41 and Q7 are done. | | Shelves sorted. | 2026-10-20 |
@@ -18,7 +18,7 @@ Open items, one row each. Who has it, the next step, what it waits for, when it 
 | P51 | Doctoral friend's thesis party RSVP. | Robin | Reply yes or no. | | Reply sent. | 2026-11-09 |
 | P52 | Plan the visit for Juniper at the lake house. | Cain | Book the cabin quietly. | | Cabin booked. | 2026-11-08 |
 | P53 | Sort the winter coats. #private | Cain | Box the ones that no longer fit. | | Coats boxed. | 2026-11-07 |
-| P54 | Ring Morgan Vale at 555-201-4433 about projects/garden, see www.example.com. | Cain | After P41, mail morgan@example.com. | A reply at 7 Birch Lane | Notes saved at https://example.com/n?q=1 for Q12. | 2026-11-06 |
+| P54 | Ring Morgan Vale at 555-201-443 about projects/garden, see www.example.com. | Cain | After P41, mail morgan@example.com. | A reply at 7 Birch Lane | Notes saved at https://example.com/n?q=1 for Q12. | 2026-11-06 |
 | ?? | A row with no id. | Cain | Nothing. | | Nothing. | 2026-11-05 |
 | P55 | A row with no valid time. | Cain | Nothing. | | Nothing. | someday |
 | P56 | Robin's school form, for ROBIN to sign. | Cain | Put the form where robin sees it; ask the Robinsons and Morgan Vale's sister too. | Robin's pick | Robin’s form signed and Morgan Vale told. | 2026-11-04 |
@@ -43,6 +43,31 @@ Open items, one row each. Who has it, the next step, what it waits for, when it 
 | P75 | Ba​nk run on the way home. | Cain | Nothing yet. | | Done. | 2026-11-03 |
 | P76 | Drop the ｂａｎｋ slip off. | Cain | Nothing yet. | | Done. | 2026-11-03 |
 | P77 | Return the drill to Kestrel and Vale-Smith next door. | Kestrel | Ask Morgan if the Vale garden gate is fixed. | Mórgan's reply | Drill returned to MORGAN. | 2026-11-03 |
+| P78 | Split the water bill. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P79 | Late fee on the library book. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P80 | Cost of the new fence. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P81 | Price the old bike. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P82 | Get a quote for the roof. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P83 | Return the deposit form. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P84 | Venmo the neighbour back. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P85 | Cash for the school trip. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P86 | Find out what we owe the club. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P87 | Note the symptoms each morning. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P88 | Book the scan. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P89 | Read the MRI letter. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P90 | Blood test on Friday. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P91 | Vaccination reminder for the cat. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P92 | Pregnancy class sign-up. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P93 | Allergy list for the party. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P94 | Pick up the pills. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P95 | Second dose on Tuesday. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P96 | Sick note for school. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P97 | Counselling session time. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P98 | Cancel the gym plan ending 4421. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P99 | Move the skip to 11/20/2026, then 2026-11-21. | Cain | Ring on 2026-11-19 in 2026. | | Skip moved. | 2026-11-03 |
+| P100 | Ottoline wants the ladder back. | Cain | Fetch it from the shed. | | Ladder returned. | 2026-11-03 |
+| P101 | Read the club newsletter draft. | Cain | Read it once it comes. | Thessaly to send the draft | Draft read. | 2026-11-03 |
+| P102 | Fix the gate, waiting on Mr. Penrose. Then paint it. | Cain | Ask for the latch. | | Gate shut. | 2026-11-03 |
 
 ## Done
 

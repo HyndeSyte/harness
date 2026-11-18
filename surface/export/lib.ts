@@ -22,6 +22,8 @@ export const DEFAULT_STEMS = [
   "health", "therap", "pt", "doctor", "gp", "appointment", "hospital", "surgery", "mental", "psychiatr",
   "dentist", "dental", "orthodont", "periodont", "endodont", "denture", "tooth", "teeth",
   "prescri", "clinic", "pharmac", "medic", "diagnos",
+  "bill", "fee", "cost", "price", "quote", "deposit", "venmo", "cash", "owe",
+  "symptom", "scan", "mri", "blood", "vaccin", "pregnan", "allerg", "pill", "dose", "sick", "counsel",
 ];
 
 // --- one normal form ----------------------------------------------------------------------
@@ -56,6 +58,23 @@ const AMOUNT = new RegExp(
   String.raw`(?<![\p{L}\p{N}_])${NUMBER}\s*(?:k|m|bn|hundred|thousand|million|billion)?\s*${CURRENCY_WORD}(?![\p{L}\p{N}_])`,
   "u",
 );
+// A run of four or more digits that is not part of a date (YYYY-MM-DD, M/D/YYYY, or a year alone,
+// 1900 to 2099) leaves the row out: a card's last four, an account or a reference number. A record
+// code (one to three letters then digits, like P1040) is not such a run.
+const DATE_ISO = /(?<!\p{Nd})\d{4}-\d{2}-\d{2}(?!\p{Nd})/gu;
+const DATE_SLASH = /(?<!\p{Nd})\d{1,2}\/\d{1,2}\/\d{4}(?!\p{Nd})/gu;
+const CODE_TOKEN = /(?<![\p{L}\p{N}_])\p{L}{1,3}\p{Nd}+(?![\p{L}\p{N}_])/gu;
+const DIGIT_RUN = /\p{Nd}{4,}/gu;
+export function namesLongNumber(text: string): boolean {
+  const t = normalise(text).replace(DATE_ISO, " ").replace(DATE_SLASH, " ").replace(CODE_TOKEN, " ");
+  for (const m of t.matchAll(DIGIT_RUN)) {
+    const run = m[0];
+    const year = /^\d{4}$/.test(run) && Number(run) >= 1900 && Number(run) <= 2099;
+    if (!year) return true;
+  }
+  return false;
+}
+
 export function namesMoney(text: string): boolean {
   const n = normalise(text);
   return CURRENCY_SYMBOL.test(n) || ISO_AMOUNT.test(n) || AMOUNT.test(fold(text));
@@ -65,14 +84,18 @@ export function namesMoney(text: string): boolean {
 // name comes from config (owner_names).
 export const DEFAULT_OWNER_NAMES = ["owner", "the owner"];
 
-// Capitalised words that may stay in an exported text (see properNounGate). The owner's config
-// adds product and place words (allow_words).
-export const DEFAULT_ALLOW_WORDS = [
-  "I", "OK",
-  "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-  "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
-  "November", "December",
-];
+// Capitalised words that may stay in an exported text (see properNounGate): the bundled common
+// English words (common-words.txt: function words, pronouns, common verbs, weekdays and months, no
+// names) and these. The owner's config adds product and place words (allow_words).
+export const DEFAULT_ALLOW_WORDS = ["I", "OK"];
+export function parseWordList(text: string): string[] {
+  return text
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#"));
+}
+export const COMMON_WORDS: readonly string[] = parseWordList(readFileSync(join(import.meta.dir, "common-words.txt"), "utf8"));
 
 export interface Policy {
   terms: RegExp[];
@@ -85,7 +108,7 @@ export interface Policy {
   names: string[];
   // The only areas exported (config `areas`), folded; any other is "other".
   areas: string[];
-  // Capitalised words that may stay (DEFAULT_ALLOW_WORDS and config `allow_words`), folded.
+  // Capitalised words that may stay (COMMON_WORDS, DEFAULT_ALLOW_WORDS and config `allow_words`), folded.
   allowWords: Set<string>;
 }
 
@@ -101,9 +124,44 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // Whole word, Unicode-aware: no letter, digit or underscore on either side.
 const wholeWord = (body: string) => new RegExp(`(?<![\\p{L}\\p{N}_])(?:${body})(?![\\p{L}\\p{N}_])`, "iu");
 
+// A re: term that could backtrack without bound is refused at load: a quantified group that
+// itself holds a quantifier ("(a+)+", "(\w*x)*"), or a backreference. Returns a reason, or null.
+export function riskyPattern(body: string): string | null {
+  if (/\\(?:[1-9]|k<)/.test(body)) return "a backreference";
+  // One frame per open group: whether a quantifier (*, + or {n,...}) or an alternation is inside it.
+  type Frame = { quant: boolean; alt: boolean };
+  const stack: Frame[] = [{ quant: false, alt: false }];
+  const top = () => stack[stack.length - 1];
+  const quantAt = (i: number) => body[i] === "*" || body[i] === "+" || (body[i] === "{" && /^\{\d*,?\d*\}/.test(body.slice(i)));
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "[") {
+      // Skip the class, escapes included.
+      for (i++; i < body.length && body[i] !== "]"; i++) if (body[i] === "\\") i++;
+      continue;
+    }
+    if (c === "(") stack.push({ quant: false, alt: false });
+    else if (c === "|") top().alt = true;
+    else if (c === ")") {
+      const inner = stack.length > 1 ? stack.pop()! : { quant: false, alt: false };
+      if (quantAt(i + 1)) {
+        if (inner.quant) return "a quantifier inside a quantified group";
+        if (inner.alt) return "an alternation inside a quantified group";
+      }
+      if (inner.quant || quantAt(i + 1)) top().quant = true;
+    } else if (quantAt(i)) top().quant = true;
+  }
+  return null;
+}
+
 // The owner's private terms file: one term a line, `re:` for a regular expression, `#` for a
-// note line. Every term matches case-insensitive and as a whole word. A file with no terms
-// is refused: the exporter fails closed rather than export with no list.
+// note line. Every term matches case-insensitive and as a whole word, and is compiled here, at
+// load. A file with no terms, or a term that doesn't compile or could backtrack without bound,
+// is refused (by line number, never the term): the exporter fails closed.
 export function parseTerms(text: string, where = "the private terms file"): RegExp[] {
   const terms: RegExp[] = [];
   text.replace(/\r\n/g, "\n").split("\n").forEach((line, i) => {
@@ -112,11 +170,17 @@ export function parseTerms(text: string, where = "the private terms file"): RegE
     if (t.startsWith("re:")) {
       const body = t.slice(3).trim();
       if (!body) throw new Error(`${where}:${i + 1}: an empty re: term`);
+      let re: RegExp;
       try {
-        terms.push(wholeWord(body));
+        // The body alone first: wrapped, "[x" or "a)|(b" could compile into something else.
+        new RegExp(body, "iu");
+        re = wholeWord(body);
       } catch {
         throw new Error(`${where}:${i + 1}: not a valid regular expression`);
       }
+      const risky = riskyPattern(body);
+      if (risky) throw new Error(`${where}:${i + 1}: a regular expression with ${risky} (it could run without bound)`);
+      terms.push(re);
     } else {
       // The term as written, and folded when that differs (an accented term matches plain text).
       terms.push(wholeWord(escapeRe(t)));
@@ -144,7 +208,7 @@ export function makePolicy(termsText: string, config: ExporterConfig = {}, env: 
   );
   const names = [...list(config.names, "names"), ...envList(env.SURFACE_NAMES)];
   const areas = list(config.areas, "areas").map(fold);
-  const allow = [...DEFAULT_ALLOW_WORDS, ...list(config.allow_words, "allow_words")].map(fold);
+  const allow = [...COMMON_WORDS, ...DEFAULT_ALLOW_WORDS, ...list(config.allow_words, "allow_words")].map(fold);
   return {
     terms: parseTerms(termsText),
     stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map((x) => escapeRe(fold(x))).join("|")})`, "iu"),
@@ -208,18 +272,22 @@ export function replaceNames(text: string, policy: Pick<Policy, "ownerNames" | "
     .replace(/\u0001(?:\s+\u0001)*(?:\s+\u0002)?|\u0002/g, (m) => (m.endsWith(YOUR) ? "your" : "you"));
 }
 
-// The proper-noun gate: in an exported text, a capitalised word that doesn't start a sentence
-// and isn't on the allow list (DEFAULT_ALLOW_WORDS and config allow_words) becomes "someone"
-// (its possessive "someone's"). Returns the text and the words it replaced.
+// The proper-noun gate: in an exported text, every capitalised word, at the start of a sentence
+// or not, becomes "someone" (its possessive "someone's") unless it is on the allow list (the
+// bundled common words, DEFAULT_ALLOW_WORDS and config allow_words). A hyphenated word stays only
+// when the whole of it, or each part, is on the list. It runs on the case-preserved normal form;
+// a lower-case or uncased name is caught only by the names list and the terms file. Returns the
+// text and the words it replaced.
 export function properNounGate(text: string, allow: Set<string>): { text: string; words: string[] } {
   const words: string[] = [];
-  const out = text.replace(TOKEN, (tok, offset: number, whole: string) => {
+  const allowed = (w: string) => allow.has(fold(w).replace(/\u2019/g, "'"));
+  const out = text.replace(TOKEN, (tok) => {
     if (!/^\p{Lu}/u.test(tok)) return tok;
-    const before = whole.slice(0, offset).trimEnd();
-    if (before === "" || /[.!?]["'\u2019\u201D)\]]*$/.test(before)) return tok;
     const poss = /['\u2019][sS]$/.test(tok);
     const bare = poss ? tok.slice(0, -2) : tok;
-    if (allow.has(fold(tok)) || allow.has(fold(bare))) return tok;
+    if (allowed(tok) || allowed(bare)) return tok;
+    const parts = bare.split("-");
+    if (parts.length > 1 && parts.every(allowed)) return tok;
     words.push(tok);
     return poss ? "someone's" : "someone";
   });
@@ -242,8 +310,21 @@ export function isExcluded(policy: Policy, ...texts: (string | null | undefined)
     if (!t) return false;
     const n = normalise(t);
     const f = fold(t);
-    return policy.stems.test(f) || policy.terms.some((re) => re.test(n) || re.test(f)) || namesMoney(t);
+    return policy.stems.test(f) || policy.terms.some((re) => matchesBounded(re, n) || matchesBounded(re, f)) || namesMoney(t) || namesLongNumber(t);
   });
+}
+
+// A private term runs over at most MATCH_SPAN characters at a time: a longer cell is checked in
+// overlapping chunks, so one pattern never runs over the whole of a huge cell.
+export const MATCH_SPAN = 4000;
+const MATCH_OVERLAP = 400;
+export function matchesBounded(re: RegExp, text: string): boolean {
+  if (text.length <= MATCH_SPAN) return re.test(text);
+  for (let i = 0; i < text.length; i += MATCH_SPAN - MATCH_OVERLAP) {
+    if (re.test(text.slice(i, i + MATCH_SPAN))) return true;
+    if (i + MATCH_SPAN >= text.length) break;
+  }
+  return false;
 }
 
 // --- strippers ----------------------------------------------------------------------------
@@ -279,10 +360,19 @@ export function strip(text: string): string {
 
 // --- small text helpers -------------------------------------------------------------------
 
+// A sentence never ends after these (with or without the full stop): "waiting on Mr. Vale".
+export const ABBREVIATIONS = ["mr", "mrs", "ms", "dr", "st"];
 export function firstSentence(text: string, max: number): string {
   const t = text.trim();
-  const m = t.match(/^.*?[.!?](?=\s|$)/);
-  return cutCodePoints((m ? m[0] : t).trim(), max);
+  const end = /[.!?](?=\s|$)/g;
+  let cut = t.length;
+  for (const m of t.matchAll(end)) {
+    const word = t.slice(0, m.index).match(/[\p{L}]+$/u)?.[0] ?? "";
+    if (m[0] === "." && ABBREVIATIONS.includes(word.toLowerCase())) continue;
+    cut = m.index! + 1;
+    break;
+  }
+  return cutCodePoints(t.slice(0, cut).trim(), max);
 }
 
 function empty(cell: string | undefined): boolean {
@@ -519,13 +609,22 @@ export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], 
   };
 }
 
+// A capitalised word the gate replaced, where it was: the path and row number, the field and the word.
+export interface LeftoverAt extends Leftover {
+  where: string;
+}
+
 export interface Built {
   snapshot: Signed;
   // One line per malformed row: path and row number, never the row's text.
   warnings: string[];
-  // One line per capitalised word the gate replaced: path, row number, field and the word only.
-  leftovers: string[];
+  // Each capitalised word the gate replaced. Only the private dry-run report prints the word;
+  // a --strict failure prints the place and the field (leftoverPlace).
+  leftovers: LeftoverAt[];
 }
+
+export const leftoverPlace = (l: LeftoverAt) => `${l.where}: ${l.field}`;
+export const leftoverLine = (l: LeftoverAt) => `${l.where}: ${l.field}: ${l.word}`;
 
 export function buildSnapshot(record: string, policy: Policy, now = new Date()): Built {
   const path = join(record, "state", "PENDING.md");
@@ -533,7 +632,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
   const holds = readHolds(record);
   const threads: Thread[] = [];
   const warnings: string[] = [];
-  const leftovers: string[] = [];
+  const leftovers: LeftoverAt[] = [];
   let excluded = 0;
   let skipped = 0;
   for (const r of openTable(pending).rows) {
@@ -542,7 +641,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
     const out = threadOf(row, okId ? holds[row.id] : undefined, okId ? noteTimes(record, row.id) : [], policy);
     if (out.kind === "thread") {
       threads.push(out.thread);
-      for (const l of out.leftovers) leftovers.push(`${path}:${row.line}: ${l.field}: ${l.word}`);
+      for (const l of out.leftovers) leftovers.push({ ...l, where: `${path}:${row.line}` });
     } else if (out.kind === "excluded") excluded++;
     else {
       skipped++;

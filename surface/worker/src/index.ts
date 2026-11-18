@@ -106,7 +106,7 @@ async function signingKey(team: string, kid: string, deps: Deps): Promise<JsonWe
   return keys.get(kid);
 }
 
-export type Identity = { email?: string; common_name?: string };
+export type Identity = { email?: unknown; common_name?: unknown; sub?: unknown };
 
 // Checks Access's assertion: signed by one of the team's keys (RS256), for our audience, from our
 // team, not expired. Returns its claims, or a reason it is refused.
@@ -150,7 +150,13 @@ export async function accessClaims(request: Request, env: Env, deps: Deps): Prom
   // Both times allow the same minute of clock skew.
   if (typeof claims.exp !== "number" || claims.exp + SKEW_S <= nowS) return "an expired Access assertion";
   if (typeof claims.nbf === "number" && claims.nbf > nowS + SKEW_S) return "an Access assertion not valid yet";
-  return { email: claims.email, common_name: claims.common_name };
+  return { email: claims.email, common_name: claims.common_name, sub: claims.sub };
+}
+
+export function publisherClient(who: Identity): string | null {
+  if (typeof who.common_name === "string" && who.common_name) return who.common_name;
+  if (typeof who.sub === "string" && who.sub) return who.sub;
+  return null;
 }
 
 function sameSecret(a: string, b: string): boolean {
@@ -190,7 +196,11 @@ async function readStored(env: Env): Promise<{ made_at: string } | null> {
 async function put(request: Request, env: Env, deps: Deps): Promise<Response> {
   const who = await accessClaims(request, env, deps);
   if (typeof who === "string") return json(403, { error: who });
-  if (!who.common_name || !sameSecret(who.common_name, env.PUBLISHER_CLIENT_ID.trim()))
+  // Access names a service token's client id in common_name, and on some assertions in sub: the
+  // one present (a non-empty string, common_name first) is compared in constant time. Neither a
+  // string: refused.
+  const client = publisherClient(who);
+  if (client === null || !sameSecret(client, env.PUBLISHER_CLIENT_ID.trim()))
     return json(403, { error: "only the exporter's service token may upload" });
   if (!sameSecret(request.headers.get(PUBLISHER_HEADER) ?? "", env.PUBLISHER_TOKEN.trim()))
     return json(403, { error: "the publisher header is missing or wrong" });
@@ -240,7 +250,7 @@ async function put(request: Request, env: Env, deps: Deps): Promise<Response> {
 async function get(request: Request, env: Env, deps: Deps): Promise<Response> {
   const who = await accessClaims(request, env, deps);
   if (typeof who === "string") return json(403, { error: who });
-  if (!who.email || who.email.trim().toLowerCase() !== env.OWNER_EMAIL.trim().toLowerCase())
+  if (typeof who.email !== "string" || !who.email || who.email.trim().toLowerCase() !== env.OWNER_EMAIL.trim().toLowerCase())
     return json(403, { error: "not the owner" });
   const current = await readStored(env);
   if (!current) return json(404, { error: "no snapshot yet" });
