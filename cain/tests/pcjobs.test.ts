@@ -4514,6 +4514,9 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
         write(q, { ...reported(), [PAYMENTS]: { ...payments, path: odd } });
         expect([odd, line(q, PAYMENTS)?.kind]).toEqual([odd, "foreign"]);
       }
+      // Inside the user data folder a path is the profile's whatever its form, an 8.3 one included (a Windows temp folder
+      // under C:\Users\RUNNER~1, say): never Chrome's own either way.
+      expect(pathKind("C:\\Users\\RUNNER~1\\T\\User Data\\WebStorePayments\\1.0.0.6", "C:\\Users\\RUNNER~1\\T\\User Data")).toBe("profile");
       // A real path that resolves to an 8.3 form, or a worker Chrome that does: other.
       const shortReal: Disk = { ...FAKE_DISK, real: (p) => p === ok ? "C:\\PROGRA~1\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments" : FAKE_DISK.real(p) };
       expect(pathKind(ok, udd, "Default", FAKE_ENV, shortReal)).toBe("other");

@@ -817,14 +817,15 @@ export function pathKind(path: unknown, userDataDir: string, _profileDirectory?:
   if (typeof path !== "string") return "unreadable";
   if (!path) return "absent";
   const p = prefDir(path);
-  // Eighth pass: a device path, a UNC share or an 8.3 short name is never resolved into a kind.
-  if (oddForm(path)) return "other";
   const segs = pathSegs(path);
   if (!segs) return /(^|\/)default_apps(\/|$)/.test(p) ? "default_apps" : "profile";
   // Seventh pass: an absolute path with a "." or ".." segment is never resolved into a kind: other, never Chrome's own.
   if (segs.includes("..") || segs.includes(".")) return "other";
   // Inside the user data folder, as given or resolved: the profile's own files, whatever else the path says.
   if ([prefDir(userDataDir), prefDir(resolve(userDataDir))].some((u) => p === u || p.startsWith(`${u}/`))) return "profile";
+  // Eighth pass: outside it, a device path, a UNC share or an 8.3 short name is never resolved into a kind (a path in the
+  // user data folder is the profile's whatever its form, and never Chrome's own).
+  if (oddForm(path)) return "other";
   if (segs.includes("default_apps")) return "default_apps";
   const kind = segKind(segs, env);
   // Fully resolved (eighth pass): Chrome's own only when the path exists, its real form (a junction or link followed) is in
