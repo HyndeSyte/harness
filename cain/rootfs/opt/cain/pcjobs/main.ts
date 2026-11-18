@@ -296,7 +296,9 @@ export function resetNoticeProcess(): void { configStopped = false; migrationUns
 // queueBack: when that notice last cleared, so one raised again within QUEUE_AGAIN_MS is worded as coming back.
 // quietPending (0.12.2, fourth pass): a worker-not-starting condition held back (a heartbeat that looked fresh, or the
 // queue's fetch failing): since when, and the jobs it is for. Kept across restarts until a job is acknowledged, or told.
-interface QuietPending { since: string; jobs: string[] }
+// held (0.12.2, seventh pass): per held job, when it was held (the keeper's clock) and the queue time it had then, so a
+// heartbeat stamped before the hold, or a requeued job under the same id, never clears it.
+interface QuietPending { since: string; jobs: string[]; held?: Record<string, { at: string; created: string }> }
 interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number; queueBack?: string; quietPending?: QuietPending }
 export const SILENT_ROUNDS = 30;
 // Twenty-eighth round, the bound on exactly-once display: the link remembers the notice ids it posted for
@@ -381,7 +383,14 @@ const newNoticeId = () => randomBytes(12).toString("hex");
 // (its deadline still runs), with no jobs, so it is told at its deadline.
 function quietPendingOf(x: any): QuietPending | null {
   if (!x || typeof x !== "object" || typeof x.since !== "string" || !Number.isFinite(Date.parse(x.since))) return null;
-  return { since: x.since, jobs: Array.isArray(x.jobs) ? x.jobs.filter((j: unknown): j is string => typeof j === "string").slice(0, 200) : [] };
+  const jobs: string[] = Array.isArray(x.jobs) ? x.jobs.filter((j: unknown): j is string => typeof j === "string").slice(0, 200) : [];
+  const held: Record<string, { at: string; created: string }> = {};
+  if (x.held && typeof x.held === "object" && !Array.isArray(x.held))
+    for (const k of jobs) {
+      const v = x.held[k];
+      if (v && typeof v.at === "string" && Number.isFinite(Date.parse(v.at)) && typeof v.created === "string") held[k] = { at: v.at, created: v.created };
+    }
+  return { since: x.since, jobs, ...(Object.keys(held).length ? { held } : {}) };
 }
 // Twenty-fifth round: written only when its content changes (a round that only finds the same marks still owed
 // leaves the file alone), and then whole: a temporary file, then renamed into place.
@@ -658,6 +667,15 @@ export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[],
   // 0.12.2, sixth pass: a heartbeat whose job field names the job shows the worker has it, whatever the clocks say, so it
   // counts even inside the margin.
   const acked = (j: Job) => !!j.attempt || (!!h?.job && h.job === j.id) || (Number.isFinite(heard) && heard - Date.parse(j.created) > SKEW_MS);
+  // 0.12.2, seventh pass: a held job clears only on its own acknowledgment after the hold. A heartbeat counts only when
+  // it was stamped more than SKEW_MS after the job was held (a stale heartbeat naming the job, one the keeper may simply
+  // not have seen at the hold, never does); a job under the same id with another queue time (requeued) is another job
+  // and never clears the held one.
+  const ackedSince = (j: Job, mark: { at: string; created?: string }) => {
+    if (mark.created !== undefined && String(j.created) !== mark.created) return false;
+    if (j.attempt) return true;
+    return Number.isFinite(heard) && heard - Date.parse(mark.at) > SKEW_MS && acked(j);
+  };
   const t = readTold(cfg);
   const held = !!t.fetchFails;
   // A start refusal is told by its own notice: nothing held for it here.
@@ -665,14 +683,23 @@ export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[],
   const live = refused ? [] : jobs.map((j) => ({ j, at: waitedAt(j) })).filter((x): x is { j: Job; at: number } => x.at !== null && !acked(x.j));
   const quiet = live.filter((x) => !Number.isFinite(heard) || x.at - heard > HEARTBEAT_FRESH_MS + SKEW_MS);
   const looksFresh = live.filter((x) => !quiet.includes(x));
-  let pend: QuietPending | undefined = t.quietPending ? { since: t.quietPending.since, jobs: [...t.quietPending.jobs] } : undefined;
+  let pend: QuietPending | undefined = t.quietPending ? { since: t.quietPending.since, jobs: [...t.quietPending.jobs], ...(t.quietPending.held ? { held: { ...t.quietPending.held } } : {}) } : undefined;
   if (pend && refused) pend = undefined;
   if (pend) {
     const byKey = new Map(jobs.map((j) => [keyOf(j), j] as const));
-    const left = pend.jobs.filter((k) => { const j = byKey.get(k); return !(j && acked(j)); });
-    pend = left.length || !pend.jobs.length ? { since: pend.since, jobs: left } : undefined;
+    const p0 = pend;
+    const left = p0.jobs.filter((k) => { const j = byKey.get(k); return !(j && ackedSince(j, p0.held?.[k] ?? { at: p0.since })); });
+    const held = Object.fromEntries(Object.entries(p0.held ?? {}).filter(([k]) => left.includes(k)));
+    pend = left.length || !p0.jobs.length ? { since: p0.since, jobs: left, ...(Object.keys(held).length ? { held } : {}) } : undefined;
   }
-  const hold = (xs: { j: Job }[]) => { for (const { j } of xs) { pend ??= { since: now.toISOString(), jobs: [] }; if (!pend.jobs.includes(keyOf(j))) pend.jobs.push(keyOf(j)); } };
+  const hold = (xs: { j: Job }[]) => {
+    for (const { j } of xs) {
+      pend ??= { since: now.toISOString(), jobs: [] };
+      if (pend.jobs.includes(keyOf(j))) continue;
+      pend.jobs.push(keyOf(j));
+      (pend.held ??= {})[keyOf(j)] = { at: now.toISOString(), created: String(j.created) };
+    }
+  };
   hold(held ? live : looksFresh);
   let code: "worker_not_starting" | "worker_not_starting_unconfirmed" | null = null;
   if (!held && quiet.length) code = "worker_not_starting";

@@ -325,7 +325,22 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     value whose name holds `token`, such as `dmtoken`) under
     `HKLM\Software\WOW6432Node\Google\Enrollment` or `HKLM\Software\Google\Chrome\Enrollment`.
     One of those keys that can't be read stops runs as `policy_unreadable` (policy
-    `CloudManagement` or `Enrollment`), as for any hive.
+    `CloudManagement` or `Enrollment`), as for any hive. **Seventh pass:** every registry read
+    names its view (`reg query ... /reg:64`, or `/reg:32`; a call without one is refused before it
+    runs and counts as unreadable), so a 32-bit process can't have a read silently redirected to
+    the `WOW6432Node` view. The token locations, each read in both views under its plain path:
+    `CloudManagementEnrollmentToken` and `EnrollmentToken` under
+    `HKLM\Software\Policies\Google\Chrome` and `HKLM\Software\Policies\Google\CloudManagement`;
+    a device token (`dmtoken`, any value name holding `token`) under `HKLM\Software\Google\Enrollment`
+    and `HKLM\Software\Google\Chrome\Enrollment`; `CloudManagementEnrollmentToken` under
+    `HKLM\Software\Google\Update\ClientState\{430FD4D0-B729-4F61-AA34-91526481799D}` (policy
+    `ClientState`). The explicit `WOW6432Node` paths above are still read, through the 64-bit
+    view. Each token found refuses as `policy_enrollment` with `hive`, `view` (`64` or `32`), `key`
+    and `name`, never the token; the fix names `<hive>, <view>-bit view, key <key> (<name>)`, and
+    `worker.log` carries `extension_policy_enrollment=<key>:reg<view>:<name>`. A token key that
+    can't be read refuses as `policy_unreadable` with its `view` and `key` too. A cloud policy cache
+    folder that holds anything (or can't be listed) under `Program Files (x86)\Google\Policies`
+    refuses as `policy_cache` with its `path` (`extension_policy_cache=` in `worker.log`).
   - **Chrome's own** (`chrome`): an id on Chrome's built-in list (the Web Store, Web Store
     Payments, the PDF viewer, Hangouts, Network Speech, CryptoToken, Feedback, the Cast media
     router) **and** at an internal location, component (`location` 5) or external component
@@ -339,7 +354,16 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     Chrome's own is refused with its exact `path_kind` and its `path`, the user name redacted
     (`Users\<user>\...`), in `refusals` and in the `fix`, and `dump-extensions` prints the same
     `path` for every `location` 10 entry, so the real-PC run can name the one folder to allow
-    later.
+    later. **Seventh pass:** Chrome's install folder is judged by whole path segments,
+    case-insensitively, against `Program Files\Google\Chrome\Application` and
+    `Program Files (x86)\Google\Chrome\Application` (as the environment names them), then a
+    version folder, then `resources`, then the entry's own folder: a sibling such as
+    `Application2`, a path with a `.` or `..` segment (`other`), and a relative path (`profile`)
+    are never Chrome's own, and a path that exists is judged by its real form too (a junction
+    or link out of the folder is `other`). A per-user Chrome install folder (`Google\Chrome\Application`
+    under your profile, such as LocalAppData) is its own kind, `per_user_install`, and is never a
+    component root: an entry there is foreign, refused by name with its path kind and redacted
+    path at any location (the fix: "has its path in a per-user Chrome install").
   - **Google's default apps** (`default_app`, fourth pass): an id on a fixed list (Google Docs
     Offline's), or one install.json's optional `default_app_ids` adds (ids the setup session's
     `dump-extensions` shows; at most 10). Exempt **only while off**: an enabled one stops runs,
@@ -352,13 +376,21 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   What counts as on or off (fifth pass; Chrome 157 decides from `disable_reasons`, `state` is
   the cross-check): a `state` of 1 is **on** whatever `disable_reasons` holds. **Present, off**,
   listed, never counted: a `disable_reasons` list of whole numbers that is non-empty and
-  non-zero (yours, the external-install prompt's 8192, and the rest) with no `state` 1, or
-  (sixth pass) a `state` of 2 (an external extension you uninstalled) when its id is in
-  `extensions.external_uninstalls` (read from both preference files) or its list is non-empty.
+  non-zero (yours, the external-install prompt's 8192, and the rest) with no `state` 1, a
+  `state` of 2 (an external extension you uninstalled) included. **Seventh pass:** `state` 2
+  follows that same rule: off only with a non-empty list of non-negative integers holding at
+  least one non-zero value; `extensions.external_uninstalls` never makes a present entry off.
+  That marker is only checked for its shape: in either preference file, anything but a list of
+  32-letter `a` to `p` ids (a string, a dict, a list holding anything else) stops runs, naming
+  the file (`refusals`: `uninstalls_unrecognised` with `field` `extensions.external_uninstalls`
+  and `name` the file; `extension_uninstalls_unrecognised=<file>` in `worker.log`). Each element
+  of `disable_reasons` must be a non-negative integer: a boolean, a fraction, a negative number
+  or a string makes the entry unrecognised, and such a list is printed as `null`, never filtered
+  down to its numbers.
   No `state` field with an empty or missing `disable_reasons` is **on** (Chrome's own built-ins
   are written that way, and are then exempt as Chrome's own). A `state` of 0 with an empty or
-  missing `disable_reasons` is **unrecognised**, not off, and so (sixth pass) is a `state` of 2
-  with an empty or missing list and its id not in `external_uninstalls`; so is any other `state`
+  missing `disable_reasons` is **unrecognised**, not off, and so is a `state` of 2 with an
+  empty, missing or all-zero list (seventh pass: whatever `external_uninstalls` says); so is any other `state`
   value (null, a string, 3) or a `disable_reasons` that isn't a list of whole numbers (null, a
   string, and since the sixth pass a whole number, the old bitmask, zero included): the run
   stops,
@@ -380,13 +412,17 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   `chrome`, `default_app`, `foreign`), its `status` (`on`, `present, off` or `unrecognised`, with
   the fields in `unrecognised`), the hives whose
   policy names it (`policy`), the folder kind of its `path` (`path_kind`: `absent`,
-  `chrome_install`, `default_apps`, `profile`, `other`; the path itself only for a refused `location` 10 entry) and the raw
+  `chrome_install`, `per_user_install` (seventh pass), `default_apps`, `profile`, `other`; the path itself only for a refused `location` 10 or `per_user_install` entry) and the raw
   `location`, `state` and `disable_reasons` fields as Chrome wrote them. **`worker.ts
   dump-extensions --home C:/pc-worker-k7q2xz`** prints each entry, sanitized for pasting into
   the record as a regression fixture: its id, the file(s) holding it, `location`, `state`,
   `disable_reasons`, whether Chrome marked it installed by default (`by_default`) and
   `path_kind`, and (sixth pass) Chrome's version and, at `location` 10 only, the `path` with the
-  user name redacted; never another path's text, a name or any other value. It reads only. Chrome unpacks an update into a newer version folder and
+  user name redacted; never another path's text, a name or any other value. **Seventh pass:** it
+  also prints the type of `extensions.external_uninstalls` in each preference file
+  (`external_uninstalls`: `absent`, `list`, `string`, `dict`, `number`, `boolean` or `null`, never
+  its content) and every enrollment or cloud management token's hive, view, key and value name
+  (`enrollment_names`), never a value. It reads only. Chrome unpacks an update into a newer version folder and
   switches to it only when it restarts: while the newest folder isn't the active version,
   every run stops (`update_pending`) until you restart the Cain jobs Chrome. Where the
   init data doesn't carry it, a run (every run is attended in this version) goes on with
@@ -2031,7 +2067,11 @@ its request, if still waiting, is refused with that reason.
   least hourly), and a heartbeat after a job was queued means the worker started since (fifth
   pass: more than the clocks' margin, 2 minutes, after it; one within the margin either side
   doesn't count, whichever clock is ahead; sixth pass: a heartbeat whose `job` field names the
-  job counts at once, even inside the margin, since the worker has it). A
+  job counts at once, even inside the margin, since the worker has it; seventh pass: for a job
+  already held, only a heartbeat stamped more than the clocks' margin after the hold was made
+  counts, so a stale heartbeat, even one naming the job, never clears it, and a job requeued
+  under the same id with another queue time is another job, which never clears the held one;
+  `quietPending.held` keeps each held job's hold time and queue time). A
   condition held back, by a heartbeat before the job that looked fresh (the worker may have died
   right after it) or by a failing fetch, is kept pending in the notice file (`quietPending`, so a
   restart keeps it) until each of its jobs is claimed (or closed with a result after a claim) or
@@ -2140,7 +2180,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `session_cleanup_failed` | `worker.ts check-cli --home C:/pc-worker-k7q2xz`: `transcripts`; `C:/pc-worker-k7q2xz/claude-config` | What a session wrote in `claude-config` couldn't be deleted, after retries. On Windows the message names what holds it where the worker can read it (its image name, process id and the image name of the process that started it, from the Restart Manager through the Job Object helper; `worker.log`'s `session_cleanup_failed held_by` line too). Something holds it open: an editor, Windows Search (setup step 9's `attrib +I`), an antivirus scan, a backup or sync client. Close it, delete everything in `claude-config` but `.credentials.json`, `settings.json` and `CLAUDE.md` by hand, then run `check-cli` until `swept` is true. No run starts while they remain. Needs a code change: no. |
 | Your own `claude` is logged out after a run | `claude` in a terminal of your own; `echo $env:CLAUDE_CONFIG_DIR` there; `worker.ts check-cli` | This design should make that impossible: the worker's sessions sign in from `C:/pc-worker-k7q2xz/claude-config` and never read, copy or write your `~/.claude`, so nothing a run does reaches your own sign-in. Check that your terminal doesn't still have `CLAUDE_CONFIG_DIR` set from setup step 9 (then your `claude` is using the worker's folder: close that terminal); that you aren't running an earlier draft of this worker (one copied your sign-in into each session, where a refresh could replace yours); and whether you were signed out for another reason (an expired session, a password change, signing out elsewhere). Sign your own `claude` in again; the worker's sign-in is unaffected. If it happens again with this version, report it: needs a code change: yes. |
 | `extension_entry_missing` | `worker.ts check-host --home C:/pc-worker-k7q2xz`; the profile folder's `Secure Preferences` and `Preferences` | Neither preferences file of the dedicated profile has `extensions.settings.<your extension id>`: `profile_directory` or `extension_id` in `install.json` doesn't match where Claude in Chrome is installed, or Chrome hasn't written its entry yet (open the Cain jobs Chrome once, then close and reopen it). Not `wrong_profile`: the profile's name was right. `check-host` prints which file and key path it read when it works. Needs a code change: no. |
-| `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled`, `by_policy`, `refusals` (each with `why`: `on`, `default_app_on`, `policy`, `unrecognised` with its `field`, `policy_unreadable` with its `hive`, `policy_unrecognised` with its `hive`, `policy` and `key`, or `policy_enrollment` with its `hive` and `name`, and its `key` for a cloud management source; a refused `location` 10 entry also carries `path_kind` and `path`), `chrome_version`, `fix`, `extension_policy` and `extensions`, each with its `kind`, `status`, `policy`, `path_kind`, `unrecognised` and raw `location`, `state` and `disable_reasons`; the `extension=<id>:...`, `extension_unrecognised=`, `extension_policy_unreadable=`, `extension_policy_unrecognised=` and `extension_policy_enrollment=` notes on the heartbeat lines in `worker.log`; `worker.ts dump-extensions` for the sanitized entries and the file(s) each came from | An extension other than Claude in Chrome and Chrome's own is **on** in the dedicated profile (Google Docs Offline included), or a Chrome policy installs one (a policy location, 7 or 9, or its id in `ExtensionInstallForcelist` or `ExtensionSettings` with `force_installed` or `normal_installed`, under `HKLM`, `HKCU` or their `WOW6432Node` paths), whatever its state and even before it is in the profile; or the worker can't read an entry's `state` or `disable_reasons`, or a policy hive. Since the fifth pass: or a policy entry isn't an extension id, or an enrollment token sits under Chrome's policy key (sixth pass: or a cloud management token under `CloudManagement` or `Enrollment`). Off is a non-empty, non-zero `disable_reasons` list without `state` 1, or `state` 2 with its id in `external_uninstalls` or a non-empty list; `state` 1 is always on; `state` 0 with no reason, `state` 2 with neither, and a whole-number `disable_reasons` are unrecognised. Chrome's own are built-in ids at `location` 5 or 10 with their path in Chrome's install folder (no path, or any other, is foreign; a refused `location` 10 entry names its path kind and path). The worker writes nothing to the profile. Follow `fix`: turn each one in `other_enabled` off in that Chrome's chrome://extensions, or remove it (Docs Offline: turn it off once; `worker.ts open-chrome` only stops default apps being installed, the refusal is the protection), and run `check-host` again. One in `by_policy`: the policy that names it must stop (the program or administrator that set it); the worker can't. `policy_unreadable`: check that the worker runs as your own Windows account and that the named key reads (`reg query <key>`). `policy_unrecognised` or `policy_enrollment`: the program or administrator that set that policy must change it or remove the token; the worker can't. `unrecognised`: restart the Cain jobs Chrome; if it stays, file a Build item with the `dump-extensions` output. If one comes back on after a restart, the program that installed it turned it on again: say so in a Build item, with the `dump-extensions` output. Needs a code change: only for `unrecognised` that stays. |
+| `extra_extension` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `other_enabled`, `by_policy`, `refusals` (each with `why`: `on`, `default_app_on`, `policy`, `unrecognised` with its `field`, `policy_unreadable` with its `hive`, `policy_unrecognised` with its `hive`, `policy` and `key`, or `policy_enrollment` with its `hive`, `view`, `key` and `name`, `policy_cache` with its `path`, or `uninstalls_unrecognised` with the file in `name`; a refused `location` 10 or `per_user_install` entry also carries `path_kind` and `path`), `chrome_version`, `fix`, `extension_policy` and `extensions`, each with its `kind`, `status`, `policy`, `path_kind`, `unrecognised` and raw `location`, `state` and `disable_reasons`; the `extension=<id>:...`, `extension_unrecognised=`, `extension_policy_unreadable=`, `extension_policy_unrecognised=` and `extension_policy_enrollment=` notes on the heartbeat lines in `worker.log`; `worker.ts dump-extensions` for the sanitized entries and the file(s) each came from | An extension other than Claude in Chrome and Chrome's own is **on** in the dedicated profile (Google Docs Offline included), or a Chrome policy installs one (a policy location, 7 or 9, or its id in `ExtensionInstallForcelist` or `ExtensionSettings` with `force_installed` or `normal_installed`, under `HKLM`, `HKCU` or their `WOW6432Node` paths), whatever its state and even before it is in the profile; or the worker can't read an entry's `state` or `disable_reasons`, or a policy hive. Since the fifth pass: or a policy entry isn't an extension id, or an enrollment token sits under Chrome's policy key (sixth pass: or a cloud management token under `CloudManagement` or `Enrollment`; seventh pass: or a token under Google Update's `ClientState` for Chrome, in either registry view, or a cloud policy cache folder under `Program Files (x86)\Google\Policies`, or an `external_uninstalls` that isn't a list of ids). Off is a non-empty `disable_reasons` list of non-negative integers with a non-zero value and no `state` 1, `state` 2 included; `state` 1 is always on; `state` 0 or 2 with no reason, a whole-number `disable_reasons`, and an element that isn't a non-negative integer are unrecognised. A path in a per-user Chrome install is never Chrome's own. Chrome's own are built-in ids at `location` 5 or 10 with their path in Chrome's install folder (no path, or any other, is foreign; a refused `location` 10 entry names its path kind and path). The worker writes nothing to the profile. Follow `fix`: turn each one in `other_enabled` off in that Chrome's chrome://extensions, or remove it (Docs Offline: turn it off once; `worker.ts open-chrome` only stops default apps being installed, the refusal is the protection), and run `check-host` again. One in `by_policy`: the policy that names it must stop (the program or administrator that set it); the worker can't. `policy_unreadable`: check that the worker runs as your own Windows account and that the named key reads (`reg query <key>`). `policy_unrecognised` or `policy_enrollment`: the program or administrator that set that policy must change it or remove the token; the worker can't. `policy_cache`: the cloud policy cache folder it names must be removed (by whoever enrolled the machine). `uninstalls_unrecognised`: restart the Cain jobs Chrome; if it stays, file a Build item with the `dump-extensions` output. `unrecognised`: restart the Cain jobs Chrome; if it stays, file a Build item with the `dump-extensions` output. If one comes back on after a restart, the program that installed it turned it on again: say so in a Build item, with the `dump-extensions` output. Needs a code change: only for `unrecognised` that stays. |
 | `host_parent_gone` | Task Manager, Details, with the PID, Command line and Start time columns: Claude in Chrome's native host and the PID it names as its parent | The process that started Claude in Chrome's native host is gone, or its process id now belongs to a process that started after the host (or, in the same tick, to another program): the host is left over from a Chrome that closed. Restart the Cain jobs Chrome (close every window of it, open it again on its profile); its hosts end with it and fresh ones start. If a host survives that, end it in Task Manager. The worker ends nothing itself here. Needs a code change: no. |
 | `host_parent_gone`, or a stale-lock clearing, again and again while the Cain jobs Chrome is healthy (just restarted, one window, its extension working) | `probe-evidence.json`'s `restart.chain_before` and `chain_after`, or the `probe restart` line in `worker.log`; Task Manager, Details, with the PID, Parent PID (add it with Select columns), Command line and Start time columns for `chrome.exe` (the one with `--user-data-dir=C:/pc-worker-k7q2xz/chrome` and no `--type`), the `cmd.exe` naming the native host, and the host; the worker's `heartbeat.json` and the last lines of `worker.log` | The worker compares process start times allowing one tick of Windows' 15.6 ms timer (equal or within 16 ms is never "later"). Repeated refusals on a healthy Chrome mean the times Windows reports differ by more than that, or a parent id really was reused. Capture the three processes' ids, parent ids and start times (to the millisecond: `Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" \| Select ProcessId,ParentProcessId,CreationDate`) and the probe's chain lines, and file them for a fix. Don't loosen anything by hand. Needs a code change: maybe. |
 | `prefs_disagree` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `ids` and `extensions`; the profile folder's `Secure Preferences` and `Preferences` | Chrome's two preference files hold the same extension with a different state or manifest version, usually in the middle of an update or after Chrome was ended without closing. The worker merges nothing on a disagreement. Close every window of the Cain jobs Chrome, open it again on its profile (it rewrites both), then run `check-host` again. If it stays, the profile may be damaged: make a new dedicated profile (setup step 7 on). Needs a code change: no. |
