@@ -1,0 +1,14 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "types": [
+      "jest",
+      "node"
+    ]
+  },
+  "exclude": [
+    "node_modules",
+    "__tests__/fixtures/make.ts"
+  ]
+}

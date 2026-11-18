@@ -1,0 +1,46 @@
+{
+  "name": "surface",
+  "version": "1.0.0",
+  "main": "expo-router/entry",
+  "dependencies": {
+    "@noble/ed25519": "^3.2.0",
+    "@noble/hashes": "^2.4.0",
+    "expo": "~58.0.26",
+    "expo-constants": "~58.0.16",
+    "expo-linking": "~58.0.17",
+    "expo-router": "~58.0.32",
+    "expo-status-bar": "~58.0.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-safe-area-context": "~5.11.1",
+    "react-native-screens": "~4.30.1",
+    "react-native-web": "~0.21.4"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "@types/jest": "^30.0.0",
+    "@types/node": "22",
+    "@types/react": "~19.3.0",
+    "jest": "^30.5.2",
+    "jest-expo": "^58.0.15",
+    "typescript": "~6.0.3"
+  },
+  "scripts": {
+    "start": "expo start",
+    "web": "expo start --web",
+    "build:web": "expo export --platform web",
+    "test": "TZ=UTC jest",
+    "typecheck": "tsc --noEmit"
+  },
+  "private": true,
+  "jest": {
+    "preset": "jest-expo/web",
+    "testMatch": [
+      "<rootDir>/__tests__/**/*.test.ts?(x)"
+    ],
+    "transformIgnorePatterns": [
+      "node_modules/(?!((jest-)?react-native|@react-native(-community)?)|expo(nent)?|@expo(nent)?/.*|expo-router|react-native-web|@noble/.*)"
+    ]
+  }
+}

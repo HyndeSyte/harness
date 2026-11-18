@@ -1,0 +1,18 @@
+# The surface's Worker (surface/README.md, Deploy). Not deployed yet: no account exists.
+# Cain fills in the KV namespace id and the public key when he sets it up. Both routes are
+# behind Cloudflare Access; the policy is in the README.
+name = "surface-snapshot"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+workers_dev = false
+
+# The route sits on the app's own hostname, so the app reads /snapshot from where it is served.
+# routes = [{ pattern = "surface.example.com/snapshot", zone_name = "example.com" }]
+
+[[kv_namespaces]]
+binding = "SNAPSHOTS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# The exporter's Ed25519 public key, raw 32 bytes in base64 (bun run surface/export --keygen prints it).
+SNAPSHOT_PUBLIC_KEY = "REPLACE_WITH_PUBLIC_KEY_BASE64"
