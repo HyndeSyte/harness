@@ -47,20 +47,81 @@ _NOT_NAME_WORDS = frozenset({"the", "a", "an", "of", "at", "and", "in", "on"})
 
 NO_ADDRESS = "no address"
 FAILED = "failed"
+FAMILY, OWN = "family", "own"        # whose drives a lookup is for (Drives.path)
+LATER = "later"                   # this read's allowance of lookups is spent: the next read asks
 HOME = "home"                     # between(): his home, from the add-on's settings
 
 _ONLINE = re.compile(r"://|\b(?:zoom|teams|webex|google meet|telehealth|virtual|online)\b", re.I)
 _IN_BRACKETS = re.compile(r"\((\d[^()]*)\)")
 _ANY_BRACKETS = re.compile(r"\([^()]*\)")
 _SUFFIX = (r"st|street|ave|avenue|rd|road|dr|drive|ln|lane|blvd|boulevard|hwy|highway|ct|court|pl|place|way|"
-           r"pike|pkwy|parkway|cir|circle|ter|terrace|trl|trail|loop|run|sq|square")
-_STREET = re.compile(rf"\d+[A-Za-z]?(?:\s+[\w.'-]+){{0,5}}?\s+(?:{_SUFFIX})\b\.?"
-                     r"|\d+[A-Za-z]?\s+(?:us|va|rt|route|hwy|highway)[ -]?\d+\b", re.I)
-_TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z]{2})(?:\s+(\d{5})(?:-\d{4})?)?\b")
+           r"pike|pkwy|parkway|cir|circle|ter|terrace|trl|trail|loop|run|sq|square|"
+           r"xing|crossing|expy|expressway|fwy|freeway|tpke|turnpike|trce|trace|cres|crescent|aly|alley")
+# A street's direction after its type ("Main St NW"), read as part of it.
+_SIDE = r"(?:\s+(?:[NSEW]|NE|NW|SE|SW)\.?(?=\s*(?:,|$)))?"
+_STREET = re.compile(rf"\d+[A-Za-z]?(?:\s+[\w.'-]+){{0,5}}?\s+(?:{_SUFFIX})\b\.?{_SIDE}"
+                     rf"|\d+[A-Za-z]?\s+(?:us|va|rt|rte|route|hwy|highway)\.?[ -]?\d+\b{_SIDE}", re.I)
+# A suite, unit or floor between the street and the town: skipped, never sent.
+# The unit word ends at a word boundary and a unit number or letter follows it ("Suite 4",
+# "Unit B", "#12"), so a town that starts with one ("Sterling", "Florence") stays a town.
+_UNIT = re.compile(r"\s*,?\s*(?:(?:suite|ste|unit|apt|bldg|building|floor|fl|room|rm)\b\.?|#)\s*#?\s*"
+                   r"(?=[\w-]{1,8}\b)(?:[A-Za-z-]*\d[\w-]*|[A-Za-z])\b", re.I)
+# ", Town, ST 12345", ", ST", or a town and state with no comma between them when a zip
+# code follows ("Town ST 12345", after a comma or not).
+_TOWN_STATE = re.compile(r"\s*,\s*(?:([A-Za-z][A-Za-z .'-]{1,40}?)\s*,\s*)?([A-Z]{2})(?:\s+(\d{5})(?:-\d{4})?)?\b"
+                         r"|[\s,]+([A-Za-z][A-Za-z .'-]{1,40}?)\s+([A-Z]{2})\s+(\d{5})(?:-\d{4})?\b")
 
 
 def is_online(place: str) -> bool:
     return bool(_ONLINE.search(place or ""))
+
+
+# A phone call: a location that is only a phone number (with a label, an extension or a PIN), or
+# words naming a call. A number is a tel: address, seven digits or more with a country code or
+# not, or a vanity number with letters ("1-800-FLOWERS", "540-555-CALL").
+_TEL = re.compile(r"\btel:[+\w().;=,-]+", re.I)
+_NUMBER = re.compile(r"\+?\(?\d[\d\s().-]{5,}\d")
+_VANITY = re.compile(r"(?<![\w-])(?:\+?1[\s.-]?)?(?:8\d\d[\s.-]?(?=[A-Z0-9-]*[A-Z])[A-Z0-9][A-Z0-9-]{3,10}"
+                     r"|\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?[A-Z]{4})(?![\w-])")
+_DIAL_WORDS = re.compile(r"\b(?:dial[\s-]*in|dial|phone|telephone|tel|mobile|cell|call|conference|conf|line|"
+                         r"bridge|number|num|no|pin|passcode|password|pw|access|code|meeting|id|ext|extension|"
+                         r"x|or|and|then|press|enter|us|toll|free)\b", re.I)
+_CALL = re.compile(r"\b(?:phone|call|calls|facetime|dial[\s-]*in|conference call)\b", re.I)
+
+
+def _phone_only(text: str) -> bool:
+    """Nothing but a phone number, with its label, extension or PIN: no place in it."""
+    found = False
+
+    def number(m: re.Match) -> str:
+        nonlocal found
+        if sum(ch.isdigit() for ch in m.group(0)) >= 7:
+            found = True
+            return " "
+        return m.group(0)
+    rest, tel = _TEL.subn(" ", text)
+    rest, vanity = _VANITY.subn(" ", rest)
+    rest = _NUMBER.sub(number, rest)
+    if not (found or tel or vanity):
+        return False
+    rest = _DIAL_WORDS.sub(" ", re.sub(r"\d+", " ", rest))
+    return not re.sub(r"[\s:#,;*()+./=_-]+", "", rest)
+
+
+def is_call(text: str) -> bool:
+    """A phone call, not a place to drive to: a location that is a phone number in any of its
+    shapes, or words naming a call. Whole words only ("Callahan's" isn't one). A street address
+    beside it wins (is_a_call, below)."""
+    return bool(text) and (_phone_only(text) or bool(_CALL.search(text)))
+
+
+def is_a_call(title: str, location: str) -> bool:
+    """An appointment that's a call: its location is a phone number or names a call, or its title
+    names one, unless the location has a street address, which means he goes there ("Curtain
+    call" at a theater)."""
+    if street_address(location):
+        return False
+    return is_call(location) or is_call(title)
 
 
 _COORDS = re.compile(r"\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*")
@@ -117,16 +178,19 @@ def sound_place(location: str) -> bool:
 def street_address(place: str) -> str:
     """Only the recognized parts of a place: a calendar often has a name in front of them, and
     what's beside them may be a person's. Empty when there's no street in it."""
-    text = re.sub(r"\s*\n\s*", ", ", (place or "").strip())
+    # Each line is a part: a venue's name on the first line and its street address on the next is
+    # the usual shape from a phone's calendar. A newline written as the two characters "\n" too.
+    text = re.sub(r"\s*(?:\n|\\n)\s*", ", ", (place or "").strip())
     inner = _IN_BRACKETS.search(text)
     text = inner.group(1) if inner else _ANY_BRACKETS.sub(" ", text)
     for part_start in (m.end() for m in re.finditer(r"(?:^|,)\s*", text)):
         street = _STREET.match(text, part_start)
         if street:
             address = " ".join(street.group(0).split())
-            tail = _TOWN_STATE.match(text, street.end())
+            unit = _UNIT.match(text, street.end())
+            tail = _TOWN_STATE.match(text, unit.end() if unit else street.end())
             if tail:
-                town, state, code = tail.groups()
+                town, state, code = tail.groups()[:3] if tail.group(2) else tail.groups()[3:]
                 address += "".join(f", {x}" for x in (town, state) if x) + (f" {code}" if code else "")
             return address
     return ""
@@ -141,13 +205,37 @@ class Drives:
         self.home_fn = home_fn             # his home: "lat, lon" or a street address, the same
         self.sleep = sleep
         self.clock = clock
+        # "" in live use. The drive dry run (family_gmail.py) sets its own: it reads every kept answer
+        # but keeps what it looks up apart, so nothing it asks can change a Family event's drives.
+        self.side = ""
+        # Whose drives the lookups being made are for: "family" (a Family event's, and in live use the
+        # chain they share with his own appointments) or "own" (his own appointments: their places, and
+        # every drive the dry run works out for them). Counted per path, from the start, never reset.
+        self.path = FAMILY
+        self.lookups = {FAMILY: 0, OWN: 0}
         self.begin()
+
+    def _kept(self, key: str):
+        found = self.ledger.get_meta(self.side + key) if self.side else None
+        return found if found is not None else self.ledger.get_meta(key)
+
+    def _keep(self, key: str, value: str, db) -> None:
+        self.ledger.set_meta(self.side + key, value, db)
 
     def begin(self) -> None:
         """A new read. A service that's down isn't asked again until the next."""
         self._requests = 0
         self._down = False
+        self._refused = False
         self._started = self.clock()
+
+    def capped(self) -> bool:
+        """This read's allowance of lookups ran out with the service still answering: what wasn't
+        asked waits for the next read, and isn't a failed lookup."""
+        return self._refused and not self._down
+
+    def _later(self, found):
+        return LATER if found == FAILED and self.capped() else found
 
     def on(self) -> bool:
         return bool(street_address(self.school_fn()))
@@ -174,6 +262,11 @@ class Drives:
         return (address.casefold(), "", address) if address else None
 
     def between(self, origin: str, destination: str) -> float | str:
+        """The drive from one place to another, or NO_ADDRESS, or FAILED, or LATER (the lookups
+        for this read are spent: asked at the next)."""
+        return self._later(self._between(origin, destination))
+
+    def _between(self, origin: str, destination: str) -> float | str:
         """The drive from one place to another, or NO_ADDRESS, or FAILED. Either can be HOME,
         map coordinates, or an event's place. Home that can't be used is FAILED: that's the
         setting's trouble, not the event's."""
@@ -187,7 +280,7 @@ class Drives:
         if a_id == b_id:
             return 0.0
         key = "drive_between:" + _hash(a_id + "|" + b_id)
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return self._read(kept)
         near = self._near()
@@ -201,10 +294,14 @@ class Drives:
         if found == FAILED:
             return FAILED
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found, db)
+            self._keep(key, found, db)
         return self._read(found)
 
     def find_place(self, text: str) -> str:
+        """As _find_place, or LATER when this read's lookups are spent before it was asked."""
+        return self._later(self._find_place(text))
+
+    def _find_place(self, text: str) -> str:
         """A place named on Family, by its name on the map near home: "Name, street address",
         or "lat, lon" when the map has no street for it, or NO_ADDRESS, or FAILED (ask again at
         the next read). Only the text goes out, cleaned and cut short."""
@@ -219,7 +316,7 @@ class Drives:
         if near in (NO_ADDRESS, FAILED):
             return FAILED
         key = "drive_name:" + _hash(" ".join(sorted(want)) + "|" + near)
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return NO_ADDRESS if kept == "none" else kept
         lon, lat = (float(x) for x in near.split(","))
@@ -248,10 +345,10 @@ class Drives:
                 found = point_text(f"{r_lat}, {r_lon}")
             break
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found or "none", db)
+            self._keep(key, found or "none", db)
             if found != "none" and street_address(found):
                 # Its point too, so the drive to it isn't a second lookup.
-                self.ledger.set_meta("drive_place:" + _hash(street_address(found).casefold()), point, db)
+                self._keep("drive_place:" + _hash(street_address(found).casefold()), point, db)
         return NO_ADDRESS if found in ("none", "") else found
 
     def _near(self) -> str:
@@ -273,7 +370,7 @@ class Drives:
             return NO_ADDRESS
         school = street_address(self.school_fn())
         key = "drive_minutes:" + _hash(school.casefold() + "|" + address.casefold())
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return self._read(kept)
         home = self._locate(school)
@@ -286,7 +383,7 @@ class Drives:
         if found == FAILED:
             return FAILED
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found, db)
+            self._keep(key, found, db)
         return self._read(found)
 
     @staticmethod
@@ -299,7 +396,7 @@ class Drives:
     def _locate(self, address: str, near: str = "") -> str:
         """"lon,lat", which is how the route service wants it."""
         key = "drive_place:" + _hash(address.casefold())
-        kept = self.ledger.get_meta(key)
+        kept = self._kept(key)
         if kept is not None:
             return NO_ADDRESS if kept == "none" else kept
         fields = {"format": "jsonv2", "limit": "1", "q": address}
@@ -315,7 +412,7 @@ class Drives:
         except (KeyError, IndexError, TypeError, ValueError):
             return FAILED
         with self.ledger.tx() as db:
-            self.ledger.set_meta(key, found, db)
+            self._keep(key, found, db)
         return NO_ADDRESS if found == "none" else found
 
     def _route(self, start: str, end: str) -> str:
@@ -331,12 +428,15 @@ class Drives:
         return str(minutes) if minutes >= 0 else FAILED
 
     def _get(self, url: str, *, no_route_ok: bool = False):
-        if self._down or self._requests >= MAX_REQUESTS_PER_READ \
-                or self.clock() - self._started > MAX_SECONDS_PER_READ:
+        if self._down:
+            return None
+        if self._requests >= MAX_REQUESTS_PER_READ or self.clock() - self._started > MAX_SECONDS_PER_READ:
+            self._refused = True           # not asked: not a failure (capped())
             return None
         if self._requests:
             self.sleep(1)
         self._requests += 1
+        self.lookups[self.path] = self.lookups.get(self.path, 0) + 1
         try:
             response = self.transport.request("GET", url, headers=AGENT, timeout=TIMEOUT_S)
             if no_route_ok and response.status == 400:

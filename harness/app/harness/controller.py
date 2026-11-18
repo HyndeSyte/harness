@@ -739,6 +739,8 @@ class Controller:
                         log.warning("input watch: after the digest: %s", type(e).__name__)
                 if self.meaning_live:
                     self.meaning_live.send_receipts()  # each new block's card, with Undo
+                if self.family_gmail is not None:
+                    self.family_gmail.send_drive_receipts()   # his own appointments' drives, with Undo
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:
