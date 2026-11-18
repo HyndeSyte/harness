@@ -2,4 +2,4 @@
 # calendar specialist uses Python's standard library only). Pinned, so Dependabot proposes
 # each update and the audit job checks exactly these.
 pytest==9.2.0
-PyYAML==6.0.2
+PyYAML==6.0.3
