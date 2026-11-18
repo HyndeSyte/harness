@@ -341,6 +341,19 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     can't be read refuses as `policy_unreadable` with its `view` and `key` too. A cloud policy cache
     folder that holds anything (or can't be listed) under `Program Files (x86)\Google\Policies`
     refuses as `policy_cache` with its `path` (`extension_policy_cache=` in `worker.log`).
+    **Eighth pass:** a registry read counts as "not there" only on reg.exe's own not-found answer,
+    recognised exactly: exit code 1, nothing on stdout, and the whole line `ERROR: The system was
+    unable to find the specified registry key or value.` on stderr. Any other failure, access
+    denied or a message the worker doesn't know included, refuses as `policy_unreadable` (so on a
+    Windows that answers in another language every missing key refuses: report it). The device
+    token match ignores case (`DMToken`, `dmtoken`, `TOKEN`) and a device token key's default value
+    counts as a token too, named `(default)`, whatever label reg.exe prints for it. The cache rule
+    covers three folders: `Program Files\Google\Policies`, `Program Files (x86)\Google\Policies`
+    (each where the environment's `ProgramFiles` and `ProgramFiles(x86)` say, no drive assumed; one
+    the environment doesn't name refuses) and the Cain jobs profile's own `Policy` folder. Each
+    that holds anything or can't be listed refuses as `policy_cache` with its path (the user name
+    redacted), and `dump-extensions` lists all three with what each held (`policy_caches`:
+    `absent`, `empty`, `holds` or `unreadable`).
   - **Chrome's own** (`chrome`): an id on Chrome's built-in list (the Web Store, Web Store
     Payments, the PDF viewer, Hangouts, Network Speech, CryptoToken, Feedback, the Cast media
     router) **and** at an internal location, component (`location` 5) or external component
@@ -364,6 +377,15 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     under your profile, such as LocalAppData) is its own kind, `per_user_install`, and is never a
     component root: an entry there is foreign, refused by name with its path kind and redacted
     path at any location (the fix: "has its path in a per-user Chrome install").
+    **Eighth pass:** the spelling is no longer enough. The entry's folder must exist on disk, and its
+    real path (junctions and links followed) must be under the folder the worker's own `chrome.exe`
+    resolves to (the first of `ProgramFiles`, `ProgramFiles(x86)`, then LocalAppData, as the
+    environment names them), with a version folder and `resources` below it. A path spelled in the
+    install folder that doesn't exist is a new kind, `missing`, and foreign; one whose real path
+    leaves that folder, or that is in the other Program Files folder than the worker's Chrome, is
+    `other`. An absolute path in 8.3 short form (a folder name with `~` and a digit, such as
+    `PROGRA~1`), a `\\?\` or `\\.\` device path and a UNC share (`\\server\share`) are `other`, never
+    resolved. The Program Files folders come only from the environment; no `C:` is assumed.
   - **Google's default apps** (`default_app`, fourth pass): an id on a fixed list (Google Docs
     Offline's), or one install.json's optional `default_app_ids` adds (ids the setup session's
     `dump-extensions` shows; at most 10). Exempt **only while off**: an enabled one stops runs,
@@ -412,7 +434,7 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   `chrome`, `default_app`, `foreign`), its `status` (`on`, `present, off` or `unrecognised`, with
   the fields in `unrecognised`), the hives whose
   policy names it (`policy`), the folder kind of its `path` (`path_kind`: `absent`,
-  `chrome_install`, `per_user_install` (seventh pass), `default_apps`, `profile`, `other`; the path itself only for a refused `location` 10 or `per_user_install` entry) and the raw
+  `chrome_install`, `per_user_install` (seventh pass), `missing` (eighth pass), `default_apps`, `profile`, `other`; the path itself only for a refused `location` 10 or `per_user_install` entry) and the raw
   `location`, `state` and `disable_reasons` fields as Chrome wrote them. **`worker.ts
   dump-extensions --home C:/pc-worker-k7q2xz`** prints each entry, sanitized for pasting into
   the record as a regression fixture: its id, the file(s) holding it, `location`, `state`,
@@ -422,7 +444,13 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
   also prints the type of `extensions.external_uninstalls` in each preference file
   (`external_uninstalls`: `absent`, `list`, `string`, `dict`, `number`, `boolean` or `null`, never
   its content) and every enrollment or cloud management token's hive, view, key and value name
-  (`enrollment_names`), never a value. It reads only. Chrome unpacks an update into a newer version folder and
+  (`enrollment_names`), never a value. **Eighth pass:** its first two lines, before the record,
+  name the Chrome the component rule is judged against: `chrome install: <folder> (<kind>)`, the
+  folder the worker's own `chrome.exe` resolves to (user name redacted) and whether it is
+  `machine-wide` (Program Files) or `per-user`, then `chrome version folder: <version folder(s)>`;
+  the record carries the same as `chrome_install`, and the cache folders as `policy_caches`. A
+  missing `extensions.external_uninstalls` in either or both preference files counts as an empty
+  list; an explicit `null` refuses as `uninstalls_unrecognised`, naming the file. It reads only. Chrome unpacks an update into a newer version folder and
   switches to it only when it restarts: while the newest folder isn't the active version,
   every run stops (`update_pending`) until you restart the Cain jobs Chrome. Where the
   init data doesn't carry it, a run (every run is attended in this version) goes on with
@@ -2071,7 +2099,14 @@ its request, if still waiting, is refused with that reason.
   already held, only a heartbeat stamped more than the clocks' margin after the hold was made
   counts, so a stale heartbeat, even one naming the job, never clears it, and a job requeued
   under the same id with another queue time is another job, which never clears the held one;
-  `quietPending.held` keeps each held job's hold time and queue time). A
+  `quietPending.held` keeps each held job's hold time and queue time; eighth pass: heartbeats are
+  timed by the keeper's clock, never the PC's: the keeper keeps the last heartbeat it saw (a hash
+  of its fields, `beat` in the notice file) and stamps a new one's arrival with its own clock; the
+  first one seen with no earlier record has no arrival time. A held job clears only on a heartbeat
+  that arrived after the hold began, or on a claim of that same job, matched by id and queue time
+  (a hold kept without its queue time is never cleared by a claim), so a heartbeat from before the
+  hold stamped by a fast PC clock never clears it; and a heartbeat counts as after a job was queued
+  only when it both arrived and was stamped more than the margin after the queue time). A
   condition held back, by a heartbeat before the job that looked fresh (the worker may have died
   right after it) or by a failing fetch, is kept pending in the notice file (`quietPending`, so a
   restart keeps it) until each of its jobs is claimed (or closed with a result after a claim) or

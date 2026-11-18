@@ -26,7 +26,7 @@ import {
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, DEFAULT_APP_IDS, readPolicy, parseSettingsValue, parseSettingsKey,
-  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, policyCacheRoot, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -372,15 +372,24 @@ const EXT = "abcdefghijklmnopabcdefghijklmnop";
 // answers are keyed by the arguments with their flag, and a key without a flag answers the 64-bit view only. calls, when
 // given, records every call.
 const REG_VIEW_FLAGS = ["/reg:64", "/reg:32"];
-function regStandIn(answers: Record<string, { status: number | null; stdout: string; error?: boolean }>, calls: string[][] = []) {
+function regStandIn(answers: Record<string, { status: number | null; stdout: string; stderr?: string; error?: boolean }>, calls: string[][] = []) {
   return (args: string[]) => {
     calls.push(args);
     const flag = args[args.length - 1];
     if (!REG_VIEW_FLAGS.includes(flag)) throw new Error(`reg stand-in: no /reg flag on ${args.join(" ")}`);
     const bare = args.slice(0, -1).join(" ");
-    return answers[`${bare} ${flag}`] ?? (flag === "/reg:64" ? answers[bare] : undefined) ?? { status: 1, stdout: "" };
+    return answers[`${bare} ${flag}`] ?? (flag === "/reg:64" ? answers[bare] : undefined) ?? { status: 1, stdout: "", stderr: `${REG_NOT_FOUND}\r\n` };
   };
 }
+// 0.12.2, eighth pass: the disk the gate's component path rule reads, stood in for the whole file: Chrome installed per machine
+// under C:\Program Files, every path in that Application folder there and resolving to itself (but one with a "missing"
+// segment), anything else read from the real disk. A test of the real disk hands in realDisk() itself.
+const FAKE_APP = "C:\\Program Files\\Google\\Chrome\\Application";
+const FAKE_ENV = { ProgramFiles: "C:\\Program Files", "ProgramFiles(x86)": "C:\\Program Files (x86)", LOCALAPPDATA: "C:\\Users\\o\\AppData\\Local" };
+const FAKE_DISK: Disk = {
+  real: (p) => /^c:[\\/]program files( \(x86\))?[\\/]google[\\/]chrome[\\/]application([\\/]|$)/i.test(p) ? (/[\\/]missing([\\/]|$)/i.test(p) ? null : p) : realDisk().real(p),
+  chromeExe: () => `${FAKE_APP}\\chrome.exe`, env: FAKE_ENV };
+setDiskStandIn(FAKE_DISK);
 const OWNER_FPR = keyFingerprint(parseKeys(OWNER_PUB).get("owner-1")!);
 // Windows: the ACL lines a well set up worker folder has, by SID: the current user's
 // first, then SYSTEM, Administrators and the user with write, none inherited, and
@@ -3869,7 +3878,9 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
         path: payments.path });
       expect(d.entries.find((x) => x.id === REG1)).toEqual({ id: REG1, files: ["Secure Preferences", "Preferences"], location: 6, state: null, disable_reasons: [8192], by_default: false, path_kind: "profile" });
       expect(d.entries.find((x) => x.id === DOCS)).toEqual({ id: DOCS, files: ["Secure Preferences"], location: 1, state: null, disable_reasons: [1], by_default: false, path_kind: "profile" });
-      const text = JSON.stringify({ ...d, entries: d.entries.map(({ path: _p, ...x }) => x) });
+      // Eighth pass: Chrome's install folder is named on purpose, in its own field (the user name redacted).
+      expect(d.chrome_install.kind).toBe("machine-wide");
+      const text = JSON.stringify({ ...d, chrome_install: null, entries: d.entries.map(({ path: _p, ...x }) => x) });
       expect(d.entries.filter((x) => "path" in x).map((x) => x.id)).toEqual([PAYMENTS]);
       for (const leak of ["Program Files", "web_store_payments", "Google Docs Offline", "Vendor helper", "Claude", "1.97.1", "0123ABCD", "Cain jobs", "\\\\"]) expect([leak, text.includes(leak)]).toEqual([leak, false]);
     });
@@ -3959,7 +3970,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(POLICY_HIVES).toEqual(["HKLM", "HKCU", "HKLM\\WOW6432Node", "HKCU\\WOW6432Node"]);
       expect(CHROME_POLICY_KEYS["HKLM\\WOW6432Node"]).toBe("HKLM\\SOFTWARE\\WOW6432Node\\Policies\\Google\\Chrome");
       expect(CHROME_POLICY_KEYS["HKCU\\WOW6432Node"]).toBe("HKCU\\SOFTWARE\\WOW6432Node\\Policies\\Google\\Chrome");
-      const absent = { status: 1, stdout: "" };
+      const absent = { status: 1, stdout: "", stderr: REG_NOT_FOUND };
       // A fake reg: what each key answers; anything not listed isn't there.
       const fake = (answers: Record<string, { status: number | null; stdout: string; error?: boolean }>) => regStandIn(answers);
       const value = (hive: string, json: string) => ({ [`${CHROME_POLICY_KEYS[hive as keyof typeof CHROME_POLICY_KEYS]} /v ExtensionSettings`]:
@@ -4136,7 +4147,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     test("fifth pass: policy parsing: the forcelist id before \";\", ExtensionSettings keys that aren't ids, and an enrollment token, each refused by name", () => {
       const { q } = oneJob();
       const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-      const absent = { status: 1, stdout: "" };
+      const absent = { status: 1, stdout: "", stderr: REG_NOT_FOUND };
       const fake = (answers: Record<string, { status: number | null; stdout: string }>) => regStandIn(answers);
       // The forcelist: the id is the part before ";", whatever the value's name; a value whose id isn't one is unrecognised.
       const fl = `\r\nHKEY_X\\ExtensionInstallForcelist\r\n    first one    REG_SZ    ${OTHER};https://clients2.google.com/x;more\r\n    2    REG_SZ    ${STORE}\r\n    3    REG_SZ    not-an-id;https://evil.example/u\r\n`;
@@ -4375,18 +4386,16 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       const dir = join(root, "Google", "Policies");
       expect(policyCache(root)).toBe(dir);
       expect(policyCache(root, () => { throw new Error("denied"); })).toBe(dir);     // can't be listed: refused
-      const pol = readPolicy("win32", regStandIn({}), root);
-      expect(pol.cache).toBe(dir);
+      const pol = readPolicy("win32", regStandIn({}), [dir]);
+      expect(pol.cache).toEqual([dir]);
       write(q, reported());
       const o = q.opts({ ...attended, forcelist: () => pol });
       expect(browserPreflight(o, q.inst)).toBe("extra_extension");
       const r = refusal(o);
-      expect(r.detail.refusals).toEqual([{ why: "policy_cache", path: dir }]);
-      expect(r.detail.fix).toContain(`cloud policy cache folder ${dir}`);
-      // Through forcelistOf on Windows, with the root handed in.
-      expect(forcelistOf(q.opts({ platform: "win32", forcelist: undefined, reg: regStandIn({}), policyCacheRoot: root })).cache).toBe(dir);
-      expect(policyCacheRoot({ "ProgramFiles(x86)": "E:\\PF86" })).toBe("E:\\PF86");
-      expect(policyCacheRoot({})).toBe("C:\\Program Files (x86)");
+      expect(r.detail.refusals).toEqual([{ why: "policy_cache", path: externalPath(dir) }]);
+      expect(r.detail.fix).toContain(`cloud policy cache folder ${externalPath(dir)}`);
+      // Through forcelistOf on Windows, with the folders handed in.
+      expect(forcelistOf(q.opts({ platform: "win32", forcelist: undefined, reg: regStandIn({}), policyCacheDirs: [dir] })).cache).toEqual([dir]);
       rmSync(root, { recursive: true, force: true });
     });
 
@@ -4409,7 +4418,8 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(pathKind("C:\\Temp\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\x", udd, "Default", env)).toBe("other");
       // Mixed case, and forward slashes: the same folder.
       expect(pathKind("c:\\PROGRAM FILES\\google\\CHROME\\Application\\157.0.0.0\\Resources\\pdf", udd, "Default", env)).toBe("chrome_install");
-      expect(pathKind("C:/Program Files (x86)/Google/Chrome/Application/157.0.0.0/resources/pdf", udd, "Default", env)).toBe("chrome_install");
+      // Eighth pass: Program Files (x86) is a machine-wide install folder, but not the one the worker's own chrome.exe is in: other.
+      expect(pathKind("C:/Program Files (x86)/Google/Chrome/Application/157.0.0.0/resources/pdf", udd, "Default", env)).toBe("other");
       // A per-user install (LocalAppData, or any Users folder): its own kind, never a component root.
       const perUser = "C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments";
       expect(pathKind(perUser, udd, "Default", env)).toBe("per_user_install");
@@ -4431,19 +4441,205 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
         const pf = realpathSync(mkdtempSync(join(tmpdir(), "pcw-pf-")));
         const out = mkdtempSync(join(tmpdir(), "pcw-out-"));
         const ver = join(pf, "Google", "Chrome", "Application", "157.0.0.0");
+        mkdirSync(ver, { recursive: true });
+        writeFileSync(join(pf, "Google", "Chrome", "Application", "chrome.exe"), "");
         mkdirSync(join(ver, "real", "x"), { recursive: true });
         mkdirSync(join(out, "x"), { recursive: true });
         symlinkSync(join(ver, "real"), join(ver, "resources"));
-        expect(pathKind(join(ver, "resources", "x"), "/nowhere", "Default", { ProgramFiles: pf })).toBe("other");    // resolves to ...\real\x
+        expect(pathKind(join(ver, "resources", "x"), "/nowhere", "Default", { ProgramFiles: pf }, realDisk())).toBe("other");    // resolves to ...\real\x
         rmSync(join(ver, "resources"));
         mkdirSync(join(ver, "resources"));
         symlinkSync(join(out, "x"), join(ver, "resources", "x"));
-        expect(pathKind(join(ver, "resources", "x"), "/nowhere", "Default", { ProgramFiles: pf })).toBe("other");    // leads out
+        expect(pathKind(join(ver, "resources", "x"), "/nowhere", "Default", { ProgramFiles: pf }, realDisk())).toBe("other");    // leads out
         rmSync(join(ver, "resources", "x"));
         mkdirSync(join(ver, "resources", "x"));
-        expect(pathKind(join(ver, "resources", "x"), "/nowhere", "Default", { ProgramFiles: pf })).toBe("chrome_install");
+        expect(pathKind(join(ver, "resources", "x"), "/nowhere", "Default", { ProgramFiles: pf }, realDisk())).toBe("chrome_install");
         rmSync(pf, { recursive: true, force: true }); rmSync(out, { recursive: true, force: true });
       }
+    });
+
+    test("eighth pass: a registry read counts as absent only on reg.exe's exact not-found answer; access denied or any other failure refuses as unreadable", () => {
+      const { q } = oneJob();
+      expect(regAbsent({ status: 1, stdout: "", stderr: `${REG_NOT_FOUND}\r\n` })).toBe(true);
+      expect(regAbsent({ status: 1, stdout: "", stderr: "ERROR: Access is denied.\r\n" })).toBe(false);
+      expect(regAbsent({ status: 1, stdout: "", stderr: "FEHLER: Das System konnte den angegebenen Registrierungsschlüssel nicht finden.\r\n" })).toBe(false);
+      expect(regAbsent({ status: 1, stdout: "" })).toBe(false);
+      expect(regAbsent({ status: 1, stdout: "something", stderr: REG_NOT_FOUND })).toBe(false);
+      expect(regAbsent({ status: 1, stdout: "", stderr: REG_NOT_FOUND, error: true })).toBe(false);
+      expect(regAbsent({ status: 2, stdout: "", stderr: REG_NOT_FOUND })).toBe(false);
+      // Every read answering with the not-found marker: nothing there, nothing refused.
+      expect(readPolicy("win32", regStandIn({}))).toEqual({ entries: [], unreadable: [] });
+      // The same exit code with access denied, or with text the worker doesn't know, on one key: that read is unreadable.
+      for (const stderr of ["ERROR: Access is denied.\r\n", "ERROR: something new\r\n", ""]) {
+        const pol = readPolicy("win32", regStandIn({ [FORCELIST_KEYS.HKLM]: { status: 1, stdout: "", stderr } }));
+        expect([stderr, pol.unreadable]).toEqual([stderr, [{ hive: "HKLM", policy: "ExtensionInstallForcelist" }]]);
+        write(q, reported());
+        expect(browserPreflight(q.opts({ ...attended, forcelist: () => pol }), q.inst)).toBe("extra_extension");
+        expect(refusal(q.opts({ forcelist: () => pol })).detail.refusals).toEqual([{ why: "policy_unreadable", hive: "HKLM", policy: "ExtensionInstallForcelist" }]);
+      }
+      // A token key that can't be read refuses too, with its view and key.
+      const enr = CLOUD_KEYS.find((c) => c.policy === "Enrollment")!;
+      const pol = readPolicy("win32", regStandIn({ [`${enr.key} /reg:32`]: { status: 1, stdout: "", stderr: "ERROR: Access is denied." } }));
+      expect(pol.unreadable).toEqual([{ hive: enr.hive, policy: "Enrollment", view: "32", key: enr.key }]);
+      // The real reader keeps reg.exe's stderr for this.
+      const src = readFileSync(join(OPT, "pcjobs/worker.ts"), "utf8");
+      expect(src).toContain(`spawnSync("reg", ["query", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]`);
+    });
+
+    test("eighth pass: a built-in id is Chrome's own only when its folder exists and resolves under the worker's own Chrome; missing, 8.3, \\\\?\\ and UNC forms are refused", () => {
+      const { q } = oneJob();
+      const udd = "C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\User Data";
+      const ok = `${FAKE_APP}\\157.0.0.0\\resources\\web_store_payments`;
+      expect(pathKind(ok, udd)).toBe("chrome_install");
+      // A path spelled in the install folder that isn't on disk: missing, never Chrome's own.
+      const gone = `${FAKE_APP}\\157.0.0.0\\resources\\missing\\web_store_payments`;
+      expect(pathKind(gone, udd)).toBe("missing");
+      expect(pathKind(`${FAKE_APP}\\157.0.0.0\\resources\\web_store_payments`, udd, "Default", FAKE_ENV, realDisk())).toBe("missing");
+      for (const location of [10, 5]) {
+        write(q, { ...reported(), [PAYMENTS]: { ...payments, location, path: gone } });
+        expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", path_kind: "missing" });
+        expect(extensionPrefs(q.inst).refusals).toEqual([{ id: PAYMENTS, why: "on", ...(location === 10 ? { path_kind: "missing", path: externalPath(gone) } : {}) }]);
+        expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      }
+      // 8.3 short names, device paths and UNC shares: never resolved into a kind.
+      for (const odd of [
+        "C:\\PROGRA~1\\Google\\Chrome\\Application\\157.0.0.0\\resources\\pdf",
+        `${FAKE_APP}\\157.0.0.0\\RESOUR~1\\pdf`,
+        `\\\\?\\${FAKE_APP}\\157.0.0.0\\resources\\pdf`,
+        `\\\\.\\${FAKE_APP}\\157.0.0.0\\resources\\pdf`,
+        "\\\\server\\share\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\pdf",
+        "//server/share/Program Files/Google/Chrome/Application/157.0.0.0/resources/pdf",
+      ]) {
+        expect([odd, pathKind(odd, udd)]).toEqual([odd, "other"]);
+        write(q, { ...reported(), [PAYMENTS]: { ...payments, path: odd } });
+        expect([odd, line(q, PAYMENTS)?.kind]).toEqual([odd, "foreign"]);
+      }
+      // A real path that resolves to an 8.3 form, or a worker Chrome that does: other.
+      const shortReal: Disk = { ...FAKE_DISK, real: (p) => p === ok ? "C:\\PROGRA~1\\Google\\Chrome\\Application\\157.0.0.0\\resources\\web_store_payments" : FAKE_DISK.real(p) };
+      expect(pathKind(ok, udd, "Default", FAKE_ENV, shortReal)).toBe("other");
+      // The Program Files roots come from the environment: none named, nothing is Chrome's own; another drive named, it is.
+      expect(pathKind(ok, udd, "Default", {})).toBe("other");
+      const onE: Disk = { real: (p) => p, chromeExe: () => "E:\\Apps\\Google\\Chrome\\Application\\chrome.exe", env: { ProgramFiles: "E:\\Apps" } };
+      expect(pathKind("E:\\Apps\\Google\\Chrome\\Application\\157.0.0.0\\resources\\pdf", udd, "Default", undefined, onE)).toBe("chrome_install");
+      expect(pathKind(ok, udd, "Default", undefined, onE)).toBe("other");
+      // The worker's own chrome.exe resolving somewhere else, or not found: nothing is Chrome's own.
+      const elsewhere: Disk = { ...FAKE_DISK, real: (p) => /chrome\.exe$/i.test(p) ? "D:\\Elsewhere\\Application\\chrome.exe" : FAKE_DISK.real(p) };
+      expect(pathKind(ok, udd, "Default", FAKE_ENV, elsewhere)).toBe("other");
+      expect(pathKind(ok, udd, "Default", FAKE_ENV, { ...FAKE_DISK, chromeExe: () => null })).toBe("other");
+      // A path whose real form leaves the install folder (a junction or link): other.
+      const outward: Disk = { ...FAKE_DISK, real: (p) => p === ok ? "C:\\Users\\o\\Evil\\web_store_payments" : FAKE_DISK.real(p) };
+      expect(pathKind(ok, udd, "Default", FAKE_ENV, outward)).toBe("other");
+      write(q, reported());
+      expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+    });
+
+    test.skipIf(process.platform !== "win32")("eighth pass, Windows: a directory junction out of a fake Application tree is foreign; the real folder beside it is Chrome's own", () => {
+      const base = realpathSync.native(mkdtempSync(join(tmpdir(), "pcw-j-")));
+      const pf = join(base, "PF"), app = join(pf, "Google", "Chrome", "Application"), res = join(app, "157.0.0.0", "resources");
+      mkdirSync(join(res, "pdf"), { recursive: true });
+      writeFileSync(join(app, "chrome.exe"), "");
+      const out = join(base, "out", "x");
+      mkdirSync(out, { recursive: true });
+      const mk = spawnSync("cmd", ["/d", "/c", "mklink", "/J", join(res, "x"), out], { encoding: "utf8" });
+      expect([mk.status, mk.stderr]).toEqual([0, ""]);
+      const env = { ProgramFiles: pf };
+      expect(pathKind(join(res, "pdf"), "C:\\nowhere", "Default", env, realDisk())).toBe("chrome_install");
+      expect(pathKind(join(res, "x"), "C:\\nowhere", "Default", env, realDisk())).toBe("other");
+      expect(pathKind(join(res, "gone"), "C:\\nowhere", "Default", env, realDisk())).toBe("missing");
+      // A junction standing in for the whole version folder, out of the tree: other too.
+      mkdirSync(join(base, "out", "ver", "resources", "pdf"), { recursive: true });
+      expect(spawnSync("cmd", ["/d", "/c", "mklink", "/J", join(app, "158.0.0.0"), join(base, "out", "ver")], { encoding: "utf8" }).status).toBe(0);
+      expect(pathKind(join(app, "158.0.0.0", "resources", "pdf"), "C:\\nowhere", "Default", env, realDisk())).toBe("other");
+      spawnSync("cmd", ["/d", "/c", "rmdir", join(res, "x")]);
+      spawnSync("cmd", ["/d", "/c", "rmdir", join(app, "158.0.0.0")]);
+      rmSync(base, { recursive: true, force: true });
+    });
+
+    test("eighth pass: a token value name in any case, and a device token key's default value, refuse; the data is never kept", () => {
+      const { q } = oneJob();
+      const enr = CLOUD_KEYS.find((c) => c.key === "HKLM\\SOFTWARE\\Google\\Enrollment")!;
+      const SECRET = "fake-token-0000";
+      const listing = (name: string) => ({ [enr.key]: { status: 0, stdout: `\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Google\\Enrollment\r\n    ${name}    REG_SZ    ${SECRET}\r\n\r\n` } });
+      for (const [name, shown] of [["DMToken", "DMToken"], ["dmtoken", "dmtoken"], ["TOKEN", "TOKEN"], ["(Default)", DEFAULT_VALUE], ["(Standard)", DEFAULT_VALUE]]) {
+        const pol = readPolicy("win32", regStandIn(listing(name)));
+        expect([name, pol.enrollment]).toEqual([name, [{ hive: "HKLM", view: "64", key: enr.key, name: shown }]]);
+        expect(JSON.stringify(pol)).not.toContain(SECRET);
+        write(q, reported());
+        const r = refusal(q.opts({ forcelist: () => pol }));
+        expect(r.detail.refusals).toEqual([{ why: "policy_enrollment", hive: "HKLM", view: "64", key: enr.key, name: shown }]);
+        expect(JSON.stringify(r.detail)).not.toContain(SECRET);
+        expect(JSON.stringify(dumpExtensions(q.inst, null, pol))).not.toContain(SECRET);
+      }
+      // Every device token key reads its default value; a Chrome policy key's default value isn't a token.
+      expect(CLOUD_KEYS.filter((c) => c.policy === "Enrollment").every((c) => c.defaultToo)).toBe(true);
+      const chromeKey = { [CHROME_POLICY_KEYS.HKCU]: { status: 0, stdout: `\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\\Google\\Chrome\r\n    (Default)    REG_SZ    x\r\n` } };
+      expect(readPolicy("win32", regStandIn(chromeKey)).enrollment).toBeUndefined();
+    });
+
+    test("eighth pass: Program Files\\Google\\Policies, Program Files (x86)\\Google\\Policies and the profile's own Policy folder each refuse when they hold anything, all three in the dump", () => {
+      const { q } = oneJob();
+      const pfA = mkdtempSync(join(tmpdir(), "pcw-pf-")), pfB = mkdtempSync(join(tmpdir(), "pcw-pf86-"));
+      const env = { ...process.env, ProgramFiles: pfA, "ProgramFiles(x86)": pfB };
+      const prof = join(q.udd, "Default");
+      expect(policyCacheDirs(env, prof)).toEqual([join(pfA, "Google", "Policies"), join(pfB, "Google", "Policies"), join(prof, "Policy")]);
+      // The environment names no Program Files: that check can't be made, so it refuses, named.
+      expect(policyCacheDirs({}, prof)).toEqual([null, null, join(prof, "Policy")]);
+      expect(readPolicy("win32", regStandIn({}), [null]).cache).toEqual([NO_PROGRAM_FILES]);
+      const opts = () => q.opts({ platform: "win32", forcelist: undefined, reg: regStandIn({}), env });
+      write(q, reported());
+      // None there: nothing refused, and the dump lists all three as absent.
+      expect(forcelistOf(opts()).cache).toBeUndefined();
+      expect(dumpExtensions(q.inst, null, forcelistOf(opts())).policy_caches.map((c) => c.state)).toEqual(["absent", "absent", "absent"]);
+      // Each one holding something refuses on its own, named.
+      for (const dir of [join(pfA, "Google", "Policies"), join(pfB, "Google", "Policies"), join(prof, "Policy")]) {
+        mkdirSync(dir, { recursive: true });
+        expect(forcelistOf(opts()).cache).toBeUndefined();                                 // there but empty
+        writeFileSync(join(dir, "User Policy"), "x");
+        const pol = forcelistOf(opts());
+        expect(pol.cache).toEqual([dir]);
+        expect(browserPreflight(q.opts({ ...attended, forcelist: () => pol }), q.inst)).toBe("extra_extension");
+        expect(refusal(q.opts({ forcelist: () => pol })).detail.refusals).toEqual([{ why: "policy_cache", path: externalPath(dir) }]);
+        const d = dumpExtensions(q.inst, null, pol);
+        expect(d.policy_caches.length).toBe(3);
+        expect(d.policy_caches.find((c) => c.path === externalPath(dir))?.state).toBe("holds");
+        rmSync(dir, { recursive: true, force: true });
+      }
+      rmSync(pfA, { recursive: true, force: true }); rmSync(pfB, { recursive: true, force: true });
+    });
+
+    test("eighth pass: a missing extensions.external_uninstalls in either or both files is an empty list; an explicit null refuses by name", () => {
+      const { q } = oneJob();
+      const prefsWith = (xu: unknown) => JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { ...(xu === undefined ? {} : { external_uninstalls: xu }), settings: {} } });
+      const secureWith = (xu: unknown) => JSON.stringify({ extensions: { ...(xu === undefined ? {} : { external_uninstalls: xu }), settings: { [EXT]: mine, ...reported() } },
+        protection: { macs: { extensions: { settings: {} } } } });
+      for (const [a, b] of [[undefined, undefined], [undefined, []], [[], undefined], [[STORE], undefined]] as const) {
+        writeFileSync(sec(q), secureWith(a)); writeFileSync(pre(q), prefsWith(b));
+        expect([a, b, extensionPrefs(q.inst).refusals]).toEqual([a, b, []]);
+        expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+      }
+      writeFileSync(sec(q), secureWith(undefined)); writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" } }));
+      expect(extensionPrefs(q.inst).refusals).toEqual([]);
+      for (const [a, b, named] of [[null, undefined, ["Secure Preferences"]], [undefined, null, ["Preferences"]], [null, null, ["Secure Preferences", "Preferences"]]] as const) {
+        writeFileSync(sec(q), secureWith(a)); writeFileSync(pre(q), prefsWith(b));
+        expect(extensionPrefs(q.inst).refusals).toEqual(named.map((name) => ({ why: "uninstalls_unrecognised", field: "extensions.external_uninstalls", name })));
+        expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      }
+    });
+
+    test("eighth pass: dump-extensions starts with Chrome's install location, its kind and the version folder", () => {
+      const { q } = oneJob();
+      write(q, reported());
+      const list = () => ["157.0.0.0", "chrome.exe", "SetupMetrics", "156.0.1.2"];
+      expect(chromeInstall(FAKE_DISK, FAKE_ENV, list)).toEqual({ location: FAKE_APP, kind: "machine-wide", version_folders: ["156.0.1.2", "157.0.0.0"] });
+      const perUser: Disk = { real: (p) => p, chromeExe: () => "C:\\Users\\o\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe", env: FAKE_ENV };
+      expect(chromeInstall(perUser, FAKE_ENV, list)).toMatchObject({ location: "C:\\Users\\<user>\\AppData\\Local\\Google\\Chrome\\Application", kind: "per-user" });
+      expect(chromeInstall({ ...FAKE_DISK, chromeExe: () => null }, FAKE_ENV, list)).toEqual({ location: null, kind: "not found", version_folders: [] });
+      const d = dumpExtensions(q.inst, null, { entries: [], unreadable: [] }, chromeInstall(FAKE_DISK, FAKE_ENV, () => ["157.0.0.0"]));
+      expect(Object.keys(d)[0]).toBe("chrome_install");
+      expect(dumpHead(d)).toEqual([`chrome install: ${FAKE_APP} (machine-wide)`, "chrome version folder: 157.0.0.0"]);
+      // The command prints those two lines first, then the record.
+      const src = readFileSync(join(OPT, "pcjobs/worker.ts"), "utf8");
+      expect(src).toContain(`for (const l of dumpHead(d)) console.log(l); say(d);`);
     });
 
     test("sixth pass: Chrome's version is in check-host's answer, its refusal, the unrecognised shape's line, and dump-extensions", () => {

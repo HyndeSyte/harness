@@ -23,7 +23,7 @@
 //   bun main.ts worker          the PC worker's last heartbeat
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
   DEFAULT_REPO, HEARTBEAT_INTERVAL_MS, QUEUE_ATTRIBUTES, SKEW_MS, TERMINAL, type Heartbeat, type Job, type OwnerReuse, type Result } from "./core.ts";
 
@@ -298,8 +298,12 @@ export function resetNoticeProcess(): void { configStopped = false; migrationUns
 // queue's fetch failing): since when, and the jobs it is for. Kept across restarts until a job is acknowledged, or told.
 // held (0.12.2, seventh pass): per held job, when it was held (the keeper's clock) and the queue time it had then, so a
 // heartbeat stamped before the hold, or a requeued job under the same id, never clears it.
+// beat (0.12.2, eighth pass): the PC worker's heartbeat as the keeper last saw it (key, a hash of its fields) and when it
+// arrived by the keeper's own clock (seen); null when it was first seen with no earlier record (an upgrade, a new notice
+// file), so a heartbeat already there never counts as arriving after anything.
 interface QuietPending { since: string; jobs: string[]; held?: Record<string, { at: string; created: string }> }
-interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number; queueBack?: string; quietPending?: QuietPending }
+interface Beat { key: string; seen: string | null }
+interface Told { told: Record<string, ToldMark>; waits: Record<string, number>; config?: true; silent?: number; fetchFails?: number; queueBack?: string; quietPending?: QuietPending; beat?: Beat }
 export const SILENT_ROUNDS = 30;
 // Twenty-eighth round, the bound on exactly-once display: the link remembers the notice ids it posted for
 // PC_NOTICE_RETAIN_MS (link/core.ts, 30 days). A mark still owed whose id is older than that is re-minted before its
@@ -352,7 +356,8 @@ function readTold(cfg: Pick<Config, "used"> & Partial<Pick<Config, "queue" | "di
   const t: Told = { told, waits, ...(config ? { config: true as const } : {}), ...(Number.isInteger(a?.silent) && a.silent > 0 ? { silent: a.silent } : {}),
     ...(Number.isInteger(a?.fetchFails) && a.fetchFails > 0 ? { fetchFails: a.fetchFails } : {}),
     ...(typeof a?.queueBack === "string" && Number.isFinite(Date.parse(a.queueBack)) ? { queueBack: a.queueBack } : {}),
-    ...(quietPendingOf(a?.quietPending) ? { quietPending: quietPendingOf(a.quietPending)! } : {}) };
+    ...(quietPendingOf(a?.quietPending) ? { quietPending: quietPendingOf(a.quietPending)! } : {}),
+    ...(beatOf(a?.beat) ? { beat: beatOf(a.beat)! } : {}) };
   if (a?.v !== 3) {
     migrateTold(cfg, t);
     if (!saveTold(cfg, t, true)) {
@@ -392,10 +397,15 @@ function quietPendingOf(x: any): QuietPending | null {
     }
   return { since: x.since, jobs, ...(Object.keys(held).length ? { held } : {}) };
 }
+// The heartbeat arrival record as the notice file keeps it, or null.
+function beatOf(x: any): Beat | null {
+  if (!x || typeof x !== "object" || typeof x.key !== "string" || !/^[0-9a-f]{16,64}$/.test(x.key)) return null;
+  return { key: x.key, seen: typeof x.seen === "string" && Number.isFinite(Date.parse(x.seen)) ? x.seen : null };
+}
 // Twenty-fifth round: written only when its content changes (a round that only finds the same marks still owed
 // leaves the file alone), and then whole: a temporary file, then renamed into place.
 function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
-  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}), ...(t.fetchFails ? { fetchFails: t.fetchFails } : {}), ...(t.queueBack ? { queueBack: t.queueBack } : {}), ...(t.quietPending ? { quietPending: t.quietPending } : {}) });
+  const text = JSON.stringify({ v: 3, told: t.told, waits: t.waits, ...(t.config ? { config: true } : {}), ...(t.silent ? { silent: t.silent } : {}), ...(t.fetchFails ? { fetchFails: t.fetchFails } : {}), ...(t.queueBack ? { queueBack: t.queueBack } : {}), ...(t.quietPending ? { quietPending: t.quietPending } : {}), ...(t.beat ? { beat: t.beat } : {}) });
   try { if (readFileSync(toldFile(cfg), "utf8") === text) return true; } catch { /* not there yet, or unreadable: written */ }
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
@@ -648,6 +658,7 @@ export const WORKER_QUIET_MS = 6 * 3_600_000;
 export const HEARTBEAT_FRESH_MS = 3 * HEARTBEAT_INTERVAL_MS;
 export const QUIET_PENDING_MAX_MS = 12 * 3_600_000;
 export const WORKER_QUIET_KEY = "workerquiet";
+const NO_BEAT = "0".repeat(32);
 export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[], now: Date): void {
   const heard = h ? Date.parse(h.worker_clock) : NaN;
   const keyOf = (j: Job) => typeof j.id === "string" ? j.id : String(j.created);
@@ -666,17 +677,32 @@ export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[],
   // only when it is more than SKEW_MS after it; one within the margin, before or after, doesn't show the worker started.
   // 0.12.2, sixth pass: a heartbeat whose job field names the job shows the worker has it, whatever the clocks say, so it
   // counts even inside the margin.
-  const acked = (j: Job) => !!j.attempt || (!!h?.job && h.job === j.id) || (Number.isFinite(heard) && heard - Date.parse(j.created) > SKEW_MS);
+
   // 0.12.2, seventh pass: a held job clears only on its own acknowledgment after the hold. A heartbeat counts only when
   // it was stamped more than SKEW_MS after the job was held (a stale heartbeat naming the job, one the keeper may simply
   // not have seen at the hold, never does); a job under the same id with another queue time (requeued) is another job
   // and never clears the held one.
-  const ackedSince = (j: Job, mark: { at: string; created?: string }) => {
-    if (mark.created !== undefined && String(j.created) !== mark.created) return false;
-    if (j.attempt) return true;
-    return Number.isFinite(heard) && heard - Date.parse(mark.at) > SKEW_MS && acked(j);
-  };
+  // 0.12.2, eighth pass: heartbeats are timed by the keeper's clock, never the PC's. Each round the keeper keeps the
+  // heartbeat it sees (a hash of its fields) and, when it differs from the last one kept, stamps its arrival with its own
+  // clock; the first one seen with no earlier record has no arrival time. A held job clears only on a heartbeat that
+  // arrived after the hold began (by the keeper's clock, whatever the PC's stamp says, so a pre-hold heartbeat stamped by a
+  // fast PC clock never clears it), or on a claim of that same job: the same id and the same queue time, the identity the
+  // hold was made under. A hold kept without its queue time (an older notice file) is never cleared by a claim.
   const t = readTold(cfg);
+  // No heartbeat at all is kept as NO_BEAT, so the first one after it is an arrival.
+  const beatKey = h ? createHash("sha256").update(JSON.stringify(h)).digest("hex").slice(0, 32) : NO_BEAT;
+  const beat: Beat = t.beat?.key === beatKey ? t.beat : { key: beatKey, seen: t.beat && h ? now.toISOString() : null };
+  const arrived = beat?.seen ? Date.parse(beat.seen) : NaN;
+  // Eighth pass: a heartbeat counts as after a job was queued only when it arrived more than SKEW_MS after the queue time by
+  // the keeper's clock (the clock the queue time is on) as well as being stamped that late by the PC's, so a fast PC clock
+  // alone can't make a heartbeat written before the job look like the worker started since.
+  const acked = (j: Job) => !!j.attempt || (!!h?.job && h.job === j.id)
+    || (Number.isFinite(arrived) && arrived - Date.parse(j.created) > SKEW_MS && Number.isFinite(heard) && heard - Date.parse(j.created) > SKEW_MS);
+  const ackedSince = (j: Job, mark: { at: string; created?: string }) => {
+    if (mark.created === undefined || String(j.created) !== mark.created) return mark.created === undefined && Number.isFinite(arrived) && arrived > Date.parse(mark.at);
+    if (j.attempt) return true;
+    return Number.isFinite(arrived) && arrived > Date.parse(mark.at);
+  };
   const held = !!t.fetchFails;
   // A start refusal is told by its own notice: nothing held for it here.
   const refused = h?.code === "start_refused";
@@ -705,8 +731,9 @@ export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[],
   if (!held && quiet.length) code = "worker_not_starting";
   else if (pend && now.getTime() - Date.parse(pend.since) >= QUIET_PENDING_MAX_MS) code = held ? "worker_not_starting_unconfirmed" : "worker_not_starting";
   if (code) pend = undefined;
-  if (JSON.stringify(pend ?? null) !== JSON.stringify(t.quietPending ?? null)) {
+  if (JSON.stringify(pend ?? null) !== JSON.stringify(t.quietPending ?? null) || JSON.stringify(beat) !== JSON.stringify(t.beat ?? null)) {
     if (pend) t.quietPending = pend; else delete t.quietPending;
+    t.beat = beat;
     saveTold(cfg, t);
   }
   if (code === "worker_not_starting_unconfirmed") tell(cfg, "worker_not_starting_unconfirmed", WORKER_QUIET_KEY);

@@ -129,7 +129,7 @@ export interface Opts {
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
   forcelist?: () => ForceList;                      // Windows: Chrome's extension policies as read now (readPolicy unless a test stands in)
   reg?: RegQuery;                                   // Windows: one reg query call, for readPolicy (the real reg.exe unless a test stands in)
-  policyCacheRoot?: string | null;                  // Windows: the folder whose Google\Policies cloud policy cache refuses (Program Files (x86) unless a test stands in)
+  policyCacheDirs?: (string | null)[];              // Windows: the cloud policy cache folders checked (policyCacheDirs unless a test stands in; null: one the environment doesn't name)
   startChrome?: (exe: string, args: string[]) => void; // starts the dedicated Chrome (a detached spawn unless a test stands in)
   killPid?: (pid: number) => void;                  // ends one process (a stuck bridge's), killTree unless a test stands in
   platform?: string;
@@ -738,7 +738,10 @@ export const CHROME_BUILTIN_IDS: readonly string[] = [
 // 0.12.2, sixth pass: the fifth pass's user_data_component is gone; a path in the user data folder is profile again.
 // 0.12.2, seventh pass: per_user_install, a path in a per-user Chrome install (Google\Chrome\Application under the user's
 // profile, such as LocalAppData), never a component root; and chrome_install is now judged by whole path segments.
-export type PathKind = "absent" | "chrome_install" | "per_user_install" | "default_apps" | "profile" | "other" | "unreadable";
+// 0.12.2, eighth pass: chrome_install only for a path that exists on disk and whose real path is under the folder the worker's
+// own chrome.exe resolves to; missing, a path spelled in Chrome's install folder that doesn't exist (never Chrome's own). An
+// absolute path in 8.3 short form (a segment with "~" and a digit), or a \\?\, \\.\ or UNC form, is other.
+export type PathKind = "absent" | "chrome_install" | "per_user_install" | "default_apps" | "profile" | "missing" | "other" | "unreadable";
 const prefDir = (s: string) => s.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "").toLowerCase();
 // An absolute path's segments, lower-cased, the root first ("c:", or "" for a POSIX root); null for a relative path.
 function pathSegs(s: string): string[] | null {
@@ -749,11 +752,12 @@ function pathSegs(s: string): string[] | null {
 }
 const startsWithSegs = (p: string[], root: string[]) => root.length <= p.length && root.every((x, i) => p[i] === x);
 const CHROME_APP = ["google", "chrome", "application"];
-// Chrome's machine-wide install folders: Program Files and Program Files (x86) (as the environment names them, and their
-// usual places), each with Google\Chrome\Application.
-export function chromeInstallRoots(env: Record<string, string | undefined> = process.env): string[][] {
-  const bases = [env.ProgramFiles ?? env.PROGRAMFILES, env["ProgramFiles(x86)"] ?? env["PROGRAMFILES(X86)"], env.ProgramW6432 ?? env.PROGRAMW6432,
-    "C:\\Program Files", "C:\\Program Files (x86)"];
+// Chrome's machine-wide install folders: Program Files and Program Files (x86), each with Google\Chrome\Application.
+// Eighth pass: only as the environment names them; no drive is assumed.
+export const programFilesRoots = (env: Record<string, string | undefined>): string[] =>
+  [env.ProgramFiles ?? env.PROGRAMFILES, env["ProgramFiles(x86)"] ?? env["PROGRAMFILES(X86)"], env.ProgramW6432 ?? env.PROGRAMW6432].filter((b): b is string => !!b);
+export function chromeInstallRoots(env: Record<string, string | undefined> = diskNow().env): string[][] {
+  const bases = programFilesRoots(env);
   const out: string[][] = [];
   for (const b of bases) {
     if (!b) continue;
@@ -782,11 +786,39 @@ function segKind(segs: string[], env: Record<string, string | undefined>): "chro
   const at = segs.findIndex((x, i) => x === "google" && /^chrome/.test(segs[i + 1] ?? "") && segs[i + 2] === "application");
   return at >= 0 && underUser(segs, env) ? "per_user_install" : "other";
 }
-export function pathKind(path: unknown, userDataDir: string, _profileDirectory?: string, env: Record<string, string | undefined> = process.env): PathKind {
+// 0.12.2, eighth pass: what the gate reads from the disk, for the component path rule. real is a path's real form (junctions
+// and links followed) or null when it doesn't exist or can't be resolved; chromeExe the worker's own chrome.exe as the
+// environment's install folders hold it (Program Files, either view, then LocalAppData), or null. The tests hand in a
+// stand-in (setDiskStandIn); the worker never does.
+export interface Disk { real: (p: string) => string | null; chromeExe: (env: Record<string, string | undefined>) => string | null; env: Record<string, string | undefined> }
+export function workerChromeExe(env: Record<string, string | undefined>): string | null {
+  for (const r of [...programFilesRoots(env).slice(0, 2), env.LOCALAPPDATA ?? env.LocalAppData]) if (r) {
+    const f = join(r, "Google", "Chrome", "Application", "chrome.exe");
+    if (existsSync(f)) return f;
+  }
+  return null;
+}
+export const realDisk = (): Disk => ({ real: (p) => { try { return realpathSync.native(p); } catch { return null; } }, chromeExe: workerChromeExe, env: process.env });
+let diskStandIn: Disk | null = null;
+export const setDiskStandIn = (d: Disk | null) => { diskStandIn = d; };
+export const diskNow = (): Disk => diskStandIn ?? realDisk();
+// An absolute path in a form the gate never resolves: \\?\ or \\.\ (device paths), a UNC share, or an 8.3 short name segment.
+const oddForm = (s: string) => /^[\\/]{2}/.test(s) || (pathSegs(s) ?? []).some((x) => /~\d/.test(x));
+// The folder the worker's own chrome.exe resolves to (its real path, then its parent), as segments; null when there is none.
+export function chromeAppSegs(disk: Disk, env: Record<string, string | undefined>): string[] | null {
+  const exe = disk.chromeExe(env);
+  const real = exe ? disk.real(exe) : null;
+  const segs = real && !oddForm(real) ? pathSegs(real) : null;
+  return segs && segs.length > 2 ? segs.slice(0, -1) : null;
+}
+export function pathKind(path: unknown, userDataDir: string, _profileDirectory?: string, env?: Record<string, string | undefined>, disk: Disk = diskNow()): PathKind {
+  env ??= disk.env;
   if (path === undefined || path === null) return "absent";
   if (typeof path !== "string") return "unreadable";
   if (!path) return "absent";
   const p = prefDir(path);
+  // Eighth pass: a device path, a UNC share or an 8.3 short name is never resolved into a kind.
+  if (oddForm(path)) return "other";
   const segs = pathSegs(path);
   if (!segs) return /(^|\/)default_apps(\/|$)/.test(p) ? "default_apps" : "profile";
   // Seventh pass: an absolute path with a "." or ".." segment is never resolved into a kind: other, never Chrome's own.
@@ -795,11 +827,18 @@ export function pathKind(path: unknown, userDataDir: string, _profileDirectory?:
   if ([prefDir(userDataDir), prefDir(resolve(userDataDir))].some((u) => p === u || p.startsWith(`${u}/`))) return "profile";
   if (segs.includes("default_apps")) return "default_apps";
   const kind = segKind(segs, env);
-  // Fully resolved: a path that exists is judged by its real form too (a junction or link out of the install folder is
-  // other), and Chrome's own only when both forms are.
+  // Fully resolved (eighth pass): Chrome's own only when the path exists, its real form (a junction or link followed) is in
+  // Chrome's install folder too, and that real form is under the folder the worker's own chrome.exe resolves to, with a
+  // version folder and resources below it. A path that doesn't exist is missing; anything else is other.
   if (kind === "chrome_install") {
-    const real = realOr(path);
-    if (real !== path) { const rs = pathSegs(real); if (!rs || segKind(rs, env) !== "chrome_install") return "other"; }
+    const real = disk.real(path);
+    if (real === null) return "missing";
+    const rs = oddForm(real) ? null : pathSegs(real);
+    if (!rs || segKind(rs, env) !== "chrome_install") return "other";
+    const app = chromeAppSegs(disk, env);
+    if (!app || !startsWithSegs(rs, app)) return "other";
+    const rest = rs.slice(app.length);
+    if (!(rest.length >= 3 && /^\d+(\.\d+){3}$/.test(rest[0]) && rest[1] === "resources")) return "other";
   }
   return kind;
 }
@@ -854,7 +893,10 @@ export interface PolicyOddity { hive: PolicyHive; policy: PolicyName; key: strin
 // and key too; cache, the cloud policy cache folder under Program Files (x86)\Google\Policies, when it holds anything.
 export interface Enrollment { hive: PolicyHive; view: RegView; key: string; name: string }
 export interface ForceList { entries: PolicyEntry[]; unreadable: { hive: PolicyHive; policy: PolicyName; view?: RegView; key?: string }[]; unrecognised?: PolicyOddity[];
-  enrollment?: Enrollment[]; cache?: string }
+  enrollment?: Enrollment[]; cache?: string[]; caches?: CacheState[] }
+// 0.12.2, eighth pass: every cloud policy cache folder checked and what it held: absent, empty, holds (anything in it) or
+// unreadable (it can't be listed, isn't a folder, or the environment doesn't name it); the last two refuse.
+export interface CacheState { path: string; state: "absent" | "empty" | "holds" | "unreadable" }
 export const POLICY_HIVES: readonly PolicyHive[] = ["HKLM", "HKCU", "HKLM\\WOW6432Node", "HKCU\\WOW6432Node"];
 export const CHROME_POLICY_KEYS: Record<PolicyHive, string> = {
   HKLM: "HKLM\\SOFTWARE\\Policies\\Google\\Chrome",
@@ -870,13 +912,15 @@ export const CHROME_POLICY_KEYS: Record<PolicyHive, string> = {
 // holding "token") under Google\Enrollment and Google\Chrome\Enrollment; CloudManagementEnrollmentToken under Google
 // Update's ClientState for Chrome's app id.
 export const CHROME_UPDATE_APP = "{430FD4D0-B729-4F61-AA34-91526481799D}";
-export const CLOUD_KEYS: readonly { hive: PolicyHive; policy: PolicyName; key: string; match: RegExp; views: readonly RegView[] }[] = [
+// Eighth pass: the token match ignores case (DMToken, dmtoken, TOKEN), and a device token key's default value counts as a
+// token too (defaultToo), whatever label reg.exe gives it ("(Default)" in English): named "(default)".
+export const CLOUD_KEYS: readonly { hive: PolicyHive; policy: PolicyName; key: string; match: RegExp; views: readonly RegView[]; defaultToo?: true }[] = [
   { hive: "HKLM", policy: "EnrollmentToken", key: "HKLM\\SOFTWARE\\Policies\\Google\\Chrome", match: /enrollmenttoken/i, views: ["64", "32"] },
   { hive: "HKLM", policy: "CloudManagement", key: "HKLM\\SOFTWARE\\Policies\\Google\\CloudManagement", match: /enrollmenttoken/i, views: ["64", "32"] },
   { hive: "HKLM\\WOW6432Node", policy: "CloudManagement", key: "HKLM\\SOFTWARE\\WOW6432Node\\Policies\\Google\\CloudManagement", match: /enrollmenttoken/i, views: ["64"] },
-  { hive: "HKLM", policy: "Enrollment", key: "HKLM\\SOFTWARE\\Google\\Enrollment", match: /token/i, views: ["64", "32"] },
-  { hive: "HKLM\\WOW6432Node", policy: "Enrollment", key: "HKLM\\SOFTWARE\\WOW6432Node\\Google\\Enrollment", match: /token/i, views: ["64"] },
-  { hive: "HKLM", policy: "Enrollment", key: "HKLM\\SOFTWARE\\Google\\Chrome\\Enrollment", match: /token/i, views: ["64", "32"] },
+  { hive: "HKLM", policy: "Enrollment", key: "HKLM\\SOFTWARE\\Google\\Enrollment", match: /token/i, views: ["64", "32"], defaultToo: true },
+  { hive: "HKLM\\WOW6432Node", policy: "Enrollment", key: "HKLM\\SOFTWARE\\WOW6432Node\\Google\\Enrollment", match: /token/i, views: ["64"], defaultToo: true },
+  { hive: "HKLM", policy: "Enrollment", key: "HKLM\\SOFTWARE\\Google\\Chrome\\Enrollment", match: /token/i, views: ["64", "32"], defaultToo: true },
   { hive: "HKLM", policy: "ClientState", key: `HKLM\\SOFTWARE\\Google\\Update\\ClientState\\${CHROME_UPDATE_APP}`, match: /enrollmenttoken/i, views: ["64", "32"] },
 ];
 export const REG_FLAG: Record<RegView, string> = { "64": "/reg:64", "32": "/reg:32" };
@@ -888,7 +932,10 @@ const REG_VALUE = /^ {4}(\S.*?) {4}(REG_[A-Z_]+)(?: {4}(.*?))?\s*$/;
 const regValues = (text: string) => text.split(/\r?\n/).map((l) => REG_VALUE.exec(l)).filter((m): m is RegExpExecArray => !!m)
   .map((m) => ({ name: m[1], type: m[2], data: m[3] ?? "" }));
 // A key's text, kept only when it is plain (letters, digits, commas, "*", "_" and "-"); otherwise a placeholder.
-const plainKey = (k: string) => /^[\w,*-]{1,80}$/.test(k) ? k : "(not an extension id)";
+const plainKey = (k: string) => /^[\w,*-]{1,80}$/.test(k) || k === DEFAULT_VALUE ? k : "(not an extension id)";
+// A key's default value, as the gate names it: reg.exe lists it under a label in parentheses, "(Default)" in English.
+export const DEFAULT_VALUE = "(default)";
+const isDefaultLabel = (name: string) => /^\(.*\)$/.test(name);
 // The forcelist key's string values: each id is the part before ";" (an entry is "<id>" or "<id>;<update address>").
 const forcelistValues = (text: string) => regValues(text).filter((v) => v.type === "REG_SZ" || v.type === "REG_EXPAND_SZ")
   .map((v) => v.data.split(";")[0].trim());
@@ -947,31 +994,53 @@ function settingsKeyDict(text: string): Record<string, Record<string, string>> {
   return dict;
 }
 export const parseSettingsKey = (hive: PolicyHive, text: string): PolicyEntry[] => settingsEntries(hive, settingsKeyDict(text));
-export interface RegAnswer { status: number | null; stdout: string; error?: boolean }
+export interface RegAnswer { status: number | null; stdout: string; stderr?: string; error?: boolean }
 export type RegQuery = (args: string[]) => RegAnswer;
+// 0.12.2, eighth pass: absent only on reg.exe's own not-found answer, recognised exactly: exit code 1, nothing on stdout,
+// and this line, whole, on stderr (reg.exe's English text: a Windows in another language answers in its own words, which
+// refuse as unreadable). Any other failure (access denied, an unfamiliar message, no message) is unreadable.
+export const REG_NOT_FOUND = "ERROR: The system was unable to find the specified registry key or value.";
+export const regAbsent = (r: RegAnswer) => r.status === 1 && !r.error && (r.stdout ?? "").trim() === "" && (r.stderr ?? "").trim() === REG_NOT_FOUND;
 // Seventh pass: the caller passes the view flag (/reg:64 or /reg:32) as the last argument; a call without one is refused
 // here, unrun, and reads as unreadable (fail closed), so no read can fall to the process's own view.
 const regQuery: RegQuery = (args) => {
   if (!["/reg:64", "/reg:32"].includes(args[args.length - 1] ?? "")) return { status: null, stdout: "", error: true };
-  const r = spawnSync("reg", ["query", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000, windowsHide: true });
-  return { status: r.status, stdout: r.stdout ?? "", error: !!r.error };
+  const r = spawnSync("reg", ["query", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000, windowsHide: true });
+  return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "", error: !!r.error };
 };
 // 0.12.2, seventh pass: Chrome's cloud policy cache, Program Files (x86)\Google\Policies: a folder there holding anything
 // (or one that can't be listed) refuses the run, named; null when it isn't there or is empty.
+// Eighth pass: the same rule for Program Files\Google\Policies and the dedicated profile's own Policy folder (cacheState
+// checks one folder), each named in dump-extensions; the Program Files folders as the environment names them, no drive assumed.
+export const NO_PROGRAM_FILES = "(Program Files, not named by the environment)";
+export function cacheState(dir: string | null, list: (d: string) => string[] = (d) => readdirSync(d)): CacheState {
+  if (!dir) return { path: NO_PROGRAM_FILES, state: "unreadable" };
+  let st;
+  try { st = statSync(dir); } catch (e: any) { return { path: dir, state: e?.code === "ENOENT" || e?.code === "ENOTDIR" ? "absent" : "unreadable" }; }
+  if (!st.isDirectory()) return { path: dir, state: "unreadable" };
+  try { return { path: dir, state: list(dir).length ? "holds" : "empty" }; } catch { return { path: dir, state: "unreadable" }; }
+}
 export function policyCache(root: string | null, list: (d: string) => string[] = (d) => readdirSync(d)): string | null {
   if (!root) return null;
-  const dir = join(root, "Google", "Policies");
-  let st;
-  try { st = statSync(dir); } catch (e: any) { return e?.code === "ENOENT" || e?.code === "ENOTDIR" ? null : dir; }
-  if (!st.isDirectory()) return dir;
-  try { return list(dir).length ? dir : null; } catch { return dir; }
+  const c = cacheState(join(root, "Google", "Policies"), list);
+  return c.state === "holds" || c.state === "unreadable" ? c.path : null;
 }
-export const policyCacheRoot = (env: Record<string, string | undefined> = process.env) => env["ProgramFiles(x86)"] ?? env["PROGRAMFILES(X86)"] ?? "C:\\Program Files (x86)";
+// The folders checked: Program Files\Google\Policies and Program Files (x86)\Google\Policies (null for one the environment
+// doesn't name), then the dedicated profile's Policy folder.
+export function policyCacheDirs(env: Record<string, string | undefined>, profileDir: string | null): (string | null)[] {
+  const pf = env.ProgramFiles ?? env.PROGRAMFILES, pf86 = env["ProgramFiles(x86)"] ?? env["PROGRAMFILES(X86)"];
+  const out: (string | null)[] = [pf ? join(pf, "Google", "Policies") : null];
+  const x86 = pf86 ? join(pf86, "Google", "Policies") : null;
+  if (x86 === null || x86 !== out[0]) out.push(x86);
+  out.push(profileDir ? join(profileDir, "Policy") : null);
+  return out;
+}
 // Every hive's ExtensionInstallForcelist and ExtensionSettings (as a value and as a key). Fail closed: a reg call that
 // fails, answers anything but 0 or 1 (not there), or an ExtensionSettings value that doesn't parse, is unreadable.
 // Seventh pass: every call carries its view flag (/reg:64 for the hive reads, both views for the token keys), and cacheRoot,
-// when given, is where the cloud policy cache folder is looked for.
-export function readPolicy(plat = process.platform, reg: RegQuery = regQuery, cacheRoot: string | null = null): ForceList {
+// when given, is where the cloud policy cache folder is looked for. Eighth pass: cacheDirs, the cache folders checked
+// (policyCacheDirs); a reg answer counts as absent only by regAbsent.
+export function readPolicy(plat = process.platform, reg: RegQuery = regQuery, cacheDirs: (string | null)[] = []): ForceList {
   if (plat !== "win32") return { entries: [], unreadable: [] };
   const out: ForceList = { entries: [], unreadable: [] };
   const add = (es: PolicyEntry[]) => { for (const e of es) if (!out.entries.some((x) => x.hive === e.hive && x.id === e.id && x.policy === e.policy)) out.entries.push(e); };
@@ -981,8 +1050,8 @@ export function readPolicy(plat = process.platform, reg: RegQuery = regQuery, ca
     const lost = { hive, policy, ...(where ? { view: where.view, key: where.key } : {}) };
     try {
       const r = reg([...args, REG_FLAG[view]]);
-      if (r.error || (r.status !== 0 && r.status !== 1)) { out.unreadable.push(lost); return; }
-      if (r.status === 1) return;
+      if (regAbsent(r)) return;
+      if (r.error || r.status !== 0) { out.unreadable.push(lost); return; }
       const es = parse(r.stdout ?? "");
       if (es === null) { if (!out.unreadable.some((x) => x.hive === hive && x.policy === policy)) out.unreadable.push(lost); return; }
       add(es);
@@ -1012,18 +1081,23 @@ export function readPolicy(plat = process.platform, reg: RegQuery = regQuery, ca
   // 0.12.2, sixth pass: the cloud management sources. A value whose name matches (EnrollmentToken; a device token's name
   // holds "token") refuses, named by hive and key; the data is never read into anything kept. Seventh pass: in each view.
   for (const c of CLOUD_KEYS) for (const view of c.views) ask(c.hive, c.policy, [c.key], (t) => {
-    for (const name of regValues(t).map((v) => v.name).filter((n) => c.match.test(n)))
+    for (const name of regValues(t).map((v) => c.defaultToo && isDefaultLabel(v.name) ? DEFAULT_VALUE : v.name).filter((n) => n === DEFAULT_VALUE || c.match.test(n)))
       if (!(out.enrollment ??= []).some((x) => x.key === c.key && x.view === view && x.name === plainKey(name)))
         out.enrollment.push({ hive: c.hive, view, key: c.key, name: plainKey(name) });
     return [];
   }, { view, key: c.key });
-  const cache = policyCache(cacheRoot);
-  if (cache) out.cache = cache;
+  const states = cacheDirs.map((d) => cacheState(d));
+  if (states.length) out.caches = states;
+  const refused = states.filter((c) => c.state === "holds" || c.state === "unreadable").map((c) => c.path);
+  if (refused.length) out.cache = refused;
   return out;
 }
 export const readForcelist = (plat = process.platform): ForceList => readPolicy(plat);
-export const forcelistOf = (o: Opts): ForceList => (o.forcelist ?? (() => readPolicy(platform(o), o.reg ?? regQuery,
-  o.policyCacheRoot !== undefined ? o.policyCacheRoot : policyCacheRoot(envOf(o)))))();
+export const forcelistOf = (o: Opts): ForceList => (o.forcelist ?? (() => {
+  const inst = loadInstall(o);
+  return readPolicy(platform(o), o.reg ?? regQuery,
+    o.policyCacheDirs ?? policyCacheDirs(envOf(o), inst ? join(inst.profile.user_data_dir, inst.profile.profile_directory) : null));
+}))();
 // refusals: each reason the gate refuses, by name (the entry and the field, the policy id, or the hive).
 export interface Refusal { id?: string; why: "on" | "default_app_on" | "policy" | "unrecognised" | "policy_unreadable" | "policy_unrecognised" | "policy_enrollment"
   | "uninstalls_unrecognised" | "policy_cache";
@@ -1168,7 +1242,7 @@ export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST):
   for (const u of policy.unreadable) refusals.push({ why: "policy_unreadable", hive: u.hive, policy: u.policy, ...(u.view ? { view: u.view, key: u.key } : {}) });
   for (const u of policy.unrecognised ?? []) refusals.push({ why: "policy_unrecognised", hive: u.hive, policy: u.policy, key: u.key });
   for (const u of policy.enrollment ?? []) refusals.push({ why: "policy_enrollment", hive: u.hive, view: u.view, key: u.key, name: u.name });
-  if (policy.cache) refusals.push({ why: "policy_cache", path: policy.cache });
+  for (const c of policy.cache ?? []) refusals.push({ why: "policy_cache", path: externalPath(c) });
   const others = [...new Set(refusals.filter((r) => r.id).map((r) => r.id!))];
   return { files, key: `extensions.settings.${p.extension_id}`, extensions, disagree, policy, others, refusals };
 }
@@ -1195,7 +1269,7 @@ export const extensionNotes = (prefs: ExtensionPrefs): string[] => [
   ...(prefs.policy.unrecognised ?? []).map((u) => `extension_policy_unrecognised=${u.hive.replace(/\\/g, "/")}:${u.policy}:${u.key}`),
   ...(prefs.policy.enrollment ?? []).map((u) => `extension_policy_enrollment=${u.key.replace(/\\/g, "/")}:reg${u.view}:${plainKey(u.name)}`),
   ...prefs.refusals.filter((r) => r.why === "uninstalls_unrecognised").map((r) => `extension_uninstalls_unrecognised=${r.name}`),
-  ...(prefs.policy.cache ? [`extension_policy_cache=${prefs.policy.cache.replace(/\\/g, "/")}`] : [])];
+  ...(prefs.policy.cache ?? []).map((c) => `extension_policy_cache=${(externalPath(c) ?? c).replace(/\\/g, "/")}`)];
 // The refusal's own words for check-host: which extension, and the fix for each kind.
 // Sixth pass: chrome, Chrome's version as read now, named in the line for an unrecognised shape.
 export function gateFix(prefs: ExtensionPrefs, chrome: ChromeRead | null = null): string {
@@ -1218,7 +1292,8 @@ export function gateFix(prefs: ExtensionPrefs, chrome: ChromeRead | null = null)
   if (enr.length) out.push(`${enr.map((u) => `${u.hive}, ${u.view}-bit view, key ${u.key} (${plainKey(u.name)})`).join("; ")} holds an enrollment token (a cloud management or device token), so Chrome can take policy from a cloud source the worker doesn't read: refused; the token must be removed`);
   const xu = prefs.refusals.filter((r) => r.why === "uninstalls_unrecognised");
   if (xu.length) out.push(`extensions.external_uninstalls in ${xu.map((r) => r.name).join(" and ")} isn't a list of extension ids, so the worker can't read that profile: refused; restart the Cain jobs Chrome, run dump-extensions and report it`);
-  if (prefs.policy.cache) out.push(`Chrome's cloud policy cache folder ${prefs.policy.cache} holds policy from a cloud source the worker doesn't read: refused; it must be removed`);
+  const caches = prefs.policy.cache ?? [];
+  if (caches.length) out.push(`Chrome's cloud policy cache folder${caches.length > 1 ? "s" : ""} ${caches.map((c) => externalPath(c)).join(" and ")} hold${caches.length > 1 ? "" : "s"} policy from a cloud source the worker doesn't read, or can't be listed: refused; it must be removed (Chrome fully closed), or the environment must name Program Files`);
   return out.join("; ") + "; the worker never changes the profile";
 }
 // dump-extensions (0.12.2, third pass): every entry in the dedicated profile's preferences, sanitized for pasting into the
@@ -1231,10 +1306,31 @@ export interface DumpLine { id: string; files: string[]; location: number | null
   by_default: boolean | null; path_kind: PathKind; path?: string | null }
 // Seventh pass: also the type of extensions.external_uninstalls in each preference file (external_uninstalls), and every
 // enrollment or cloud management token's hive, view, key and value name the registry holds (enrollment_names), never a value.
-export interface DumpOut { chrome_version: ChromeRead | null; external_uninstalls: Record<string, string>; enrollment_names: Enrollment[]; entries: DumpLine[] }
-export function dumpExtensions(inst: Install, chrome: ChromeRead | null = null, policy: ForceList = NO_FORCELIST): DumpOut {
+// Eighth pass: its first lines name the Chrome the worker's component rule is judged against (chrome_install: the folder the
+// worker's own chrome.exe resolves to, the user name redacted, whether that is machine-wide (Program Files) or per-user, and
+// the version folders in it), and policy_caches lists every cloud policy cache folder checked with what it held.
+export interface ChromeInstall { location: string | null; kind: "machine-wide" | "per-user" | "other" | "not found"; version_folders: string[] }
+export interface DumpOut { chrome_install: ChromeInstall; chrome_version: ChromeRead | null; external_uninstalls: Record<string, string>; enrollment_names: Enrollment[];
+  policy_caches: CacheState[]; entries: DumpLine[] }
+export function chromeInstall(disk: Disk = diskNow(), env: Record<string, string | undefined> = disk.env, list: (d: string) => string[] = (d) => readdirSync(d)): ChromeInstall {
+  const exe = disk.chromeExe(env);
+  const real = exe ? disk.real(exe) : null;
+  const app = chromeAppSegs(disk, env);
+  if (!real || !app) return { location: null, kind: "not found", version_folders: [] };
+  const dir = real.replace(/[\\/][^\\/]*$/, "");
+  const kind = chromeInstallRoots(env).some((r) => r.length === app.length && startsWithSegs(app, r)) ? "machine-wide" : underUser(app, env) ? "per-user" : "other";
+  let folders: string[] = [];
+  try { folders = list(dir).filter((x) => /^\d+(\.\d+){3}$/.test(x)).sort(); } catch { folders = []; }
+  return { location: externalPath(dir, env), kind, version_folders: folders };
+}
+// dump-extensions' first lines, before its record: where Chrome is installed and of which kind, and its version folder(s).
+export const dumpHead = (d: DumpOut): string[] => [
+  `chrome install: ${d.chrome_install.location ?? "not found"} (${d.chrome_install.kind})`,
+  `chrome version folder: ${d.chrome_install.version_folders.length ? d.chrome_install.version_folders.join(", ") : "none"}`];
+export function dumpExtensions(inst: Install, chrome: ChromeRead | null = null, policy: ForceList = NO_FORCELIST, install: ChromeInstall = chromeInstall()): DumpOut {
   const { merged, held, uninstalls } = readPrefs(inst);
-  return { chrome_version: chrome, external_uninstalls: uninstalls, enrollment_names: (policy.enrollment ?? []).map((u) => ({ hive: u.hive, view: u.view, key: u.key, name: plainKey(u.name) })), entries: Object.keys(merged).sort().filter((id) => ID32.test(id)).map((id) => {
+  return { chrome_install: install, chrome_version: chrome, external_uninstalls: uninstalls,
+    policy_caches: (policy.caches ?? []).map((c) => ({ path: externalPath(c.path) ?? c.path, state: c.state })), enrollment_names: (policy.enrollment ?? []).map((u) => ({ hive: u.hive, view: u.view, key: u.key, name: plainKey(u.name) })), entries: Object.keys(merged).sort().filter((id) => ID32.test(id)).map((id) => {
     const e = merged[id], location = num(e.location);
     return { id, files: held[id] ?? [], location, state: num(e.state), disable_reasons: rawReasons(e.disable_reasons),
       by_default: typeof e.was_installed_by_default === "boolean" ? e.was_installed_by_default : null, path_kind: pathKind(e.path, inst.profile.user_data_dir, inst.profile.profile_directory),
@@ -7234,7 +7330,7 @@ if (isMain && process.argv[2] === "nav-guard") {
       say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, versions: versionsOf(c.fingerprint, (readJson(P.evidence(o)) as any)?.versions?.chrome_version_source ?? null), hook_worst: readHookWorst(o), boundary_cases: ev.boundary ?? [], ...probeCases(ev),
         extensions: extensionPrefs(mustInstall(o), forcelistOf(o)).extensions });
     } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
-    else if (cmd === "dump-extensions") { const inst = mustInstall(o); say(dumpExtensions(inst, chromeVersionRead(o, inst), forcelistOf(o))); }
+    else if (cmd === "dump-extensions") { const inst = mustInstall(o); const d = dumpExtensions(inst, chromeVersionRead(o, inst), forcelistOf(o)); for (const l of dumpHead(d)) console.log(l); say(d); }
     else if (cmd === "open-chrome") say(openChrome(o));
     else if (cmd === "check-cli") say({ cli: checkCli(o) });
     else if (cmd === "clean-probe") say(cleanProbe(o));
