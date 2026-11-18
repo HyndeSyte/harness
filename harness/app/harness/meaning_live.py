@@ -32,8 +32,10 @@ turns them into his calendar and lets him correct it, all model-free:
     changes nothing.
   * Where an event he goes to is: a street address in its location, else his place book
     (places.py), else the map by the location's name near home (drive.find_place), whether
-    or not the judgment named the place, unless it was judged to be at home or school. A
-    place none of them knows gets one card asking him where it is.
+    or not the judgment named the place, unless it was judged to be at home. A place none of
+    them knows gets one card asking him where it is. Judged to be at school (a school play, a
+    class visit), only a street address in the event's own location places it: no place book,
+    map or question for a classroom's name.
 """
 from __future__ import annotations
 
@@ -47,7 +49,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import choices, drive_cards, family_rules, meaning, places, render
+from . import choices, drive, drive_cards, family_rules, meaning, places, render
 from .family_gmail import DROP_TITLE, PICK_TITLE, Want, _is_real, _key
 from .ledger import Ledger, iso
 
@@ -175,8 +177,9 @@ def _occ_id(occ) -> str:
     return f"{occ.uid}|{occ.instance}"
 
 
-# Where a presence block is held, as judged: at home or school, the event's location isn't
-# where he goes. Anything else ("event_location", or no place said) is the event's location.
+# Where a presence block is held, as judged: at home, the event's location isn't where he goes.
+# At school, only a street address in the event's location counts (wants). Anything else
+# ("event_location", or no place said) is the event's location.
 NOT_THERE = ("home", "school")
 
 
@@ -353,7 +356,12 @@ class MeaningLive:
                     place = "school" if run in ("drop", "pick") else _place(j, b.type)
                     where = ""
                     legs = not any(x.type == "transport" for x in blocks)
-                    if b.type == "presence" and place not in NOT_THERE:
+                    if b.type == "presence" and place == "school":
+                        # At school: he still drives there. The event's own street address, when it
+                        # has one ("EarthSong Community School" then the street on the next line),
+                        # and nothing looked up or asked for a room's name.
+                        where = drive.street_address(occ.location)
+                    elif b.type == "presence" and place not in NOT_THERE:
                         # The event's own location, whether or not the judgment named it: a
                         # street address in it, else his place book, else the map by its name
                         # (`find`). A place none of them knows is asked about once (places.py).

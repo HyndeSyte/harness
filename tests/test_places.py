@@ -149,14 +149,23 @@ def test_a_presence_judged_with_no_place_takes_the_book_too(drives):
     assert blocks(drives) == drove_to(start, CLINIC)
 
 
-@pytest.mark.parametrize("judged_place", ["home", "school"])
-def test_a_presence_judged_at_home_or_school_takes_no_address(drives, judged_place):
+def test_a_presence_judged_at_home_takes_no_address(drives):
     start = when(drives, days=3, hour=10)
-    at(drives, "Call with Pat", start, CLINIC, judged_place=judged_place)
+    at(drives, "Call with Pat", start, CLINIC, judged_place="home")
     go(drives)
     go(drives)
     assert blocks(drives) == [("Busy (family)", start, start + 60 * M, "")]
     assert drives.maps.urls == [] and place_cards(drives) == []
+
+
+def test_a_presence_judged_at_school_takes_the_street_address_in_its_location(drives):
+    """He still drives to school (0.24.1): the event's own street address, never a name looked up."""
+    start = when(drives, days=3, hour=10)
+    at(drives, "Class play", start, CLINIC, judged_place="school")
+    go(drives)
+    go(drives)
+    assert blocks(drives) == drove_to(start, CLINIC)
+    assert place_cards(drives) == []
 
 
 # -- asking him once ----------------------------------------------------------------------------------

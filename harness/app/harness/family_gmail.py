@@ -50,7 +50,10 @@ with a card and Undo for each event's drives (drive_cards.py). They are read fro
 secret iCal feed only, never the API read, and come off only when the feed says so or after two
 full reads without them (FamilyGmail._own_events). With the own_drive_dry_run option on, they're
 only logged. A drive that can't be found gets the
-digest's line and one card (drive_cards.py). Nothing here writes Family. The event's own block carries its street address
+digest's line and one card (drive_cards.py), and an event he goes to left without its drives for
+any reason not already said gets them too, and a log line by its title and day. A block written
+before its place could be read gets the place and its drives at the next read, like a new one. A
+drive not yet written that a drive he put on Gmail himself already covers isn't added. Nothing here writes Family. The event's own block carries its street address
 (after the place's name, when the map found it by name) or map point, and only that, so it opens
 in Maps; that place is ours, and it's compared with what was written,
 so it never makes the block look edited.
@@ -127,6 +130,7 @@ SAMPLE_FORMAT = "7"                 # samples written by any other build are rem
 SAMPLES_META = "family_gmail_sample_format"
 _SAMPLE_RE = re.compile(r"(?P<kind>[a-z]+)-(?P<day>\d{8})-[0-9a-f]{10}\.ics")
 ADOPT_GENERATIONS = 20              # a block's id, from its key and generation, looked for this far
+_DRIVE_WORD = re.compile(r"\bdriv(?:e|es|ing)\b", re.I)   # his own drive on Gmail (_his_drives)
 _TITLE_RE = re.compile(r"[^\W_]+(?:[ '&()+,.-]+[^\W_]+)*[ )]*")
 
 
@@ -688,7 +692,7 @@ class FamilyGmail:
                     if self.drives is not None:
                         self.drives.path = drive.FAMILY
                 legs = self._drive_legs({**own, **mine}, now)
-            legs = {**self._kept_own, **legs}      # a kept drive stays exactly as it is
+            legs = self._his_drives({**self._kept_own, **legs})   # a kept drive stays exactly as it is
             wants = {k: w for k, w in {**named, **legs, **self._school_runs(family.items, runs)}.items()
                      if w.end > now}
             self.asking = []               # questions go on their own cards (meaning_live.py)
@@ -847,6 +851,28 @@ class FamilyGmail:
         return {k: w for k, w in wants.items() if k not in mine or not any(
             _is_real(o) and not o.all_day and not o.transparent and o.start <= w.start and o.end >= w.end
             for o in ahead.occurrences)}
+
+    def _his_drives(self, legs: dict[str, Want]) -> dict[str, Want]:
+        """A drive not written yet that a drive he put on Gmail himself already covers (his own
+        timed, busy event with "drive" in its title, crossing it) is left to his: never a second one
+        beside it. One already written stays as it is."""
+        ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
+                      and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        if ahead is None or not ahead.occurrences:
+            return legs
+        his = [o for o in ahead.occurrences if not o.all_day and not o.transparent and _DRIVE_WORD.search(o.summary)
+               and not google_cal.made_here(o.uid.removesuffix("@google.com"), o.summary, o.transparent)]
+        if not his:
+            return legs
+        out = {}
+        for key, want in legs.items():
+            if any(o.start < want.end and want.start < o.end for o in his) and self.ledger.db.execute(
+                    "SELECT 1 FROM family_gmail WHERE key=?", (key,)).fetchone() is None:
+                log.info("family to gmail: a drive on %s is already on Gmail, so none is added",
+                         _at(want.start, ZoneInfo(self.tz)))
+                continue
+            out[key] = want
+        return out
 
     def _too_far(self, occ: ical.Occurrence, want: Want) -> bool:
         """An event before or after a run that he can't get to or from in time. With no answer
@@ -1727,7 +1753,10 @@ class FamilyGmail:
                 return math.ceil(found / DRIVE_ROUND) * DRIVE_ROUND
             return None
 
+        worked: set[tuple[str, str]] = set()   # (event, leg) worked out at this read, even a zero-minute one
+
         def leg(event: Want, which: str, start: datetime, end: datetime) -> None:
+            worked.add((event.key, which))
             if end > start:
                 key = leg_key(event.key, which)
                 out[key] = Want(key, _leg_title(which, event.state), start, end, "", event.state)
@@ -1767,6 +1796,7 @@ class FamilyGmail:
                         there_from = None          # can't tell which way he goes: no drive between
                     elif event.start - prev.end < timedelta(minutes=back + out_again):
                         there_from = prev.place    # no time to go home: straight on
+                        worked.add((prev.key, "back"))   # its way on is this one's drive there
                     else:
                         leg(prev, "back", prev.end, prev.end + timedelta(minutes=back))
                 if there_from is not None:
@@ -1788,6 +1818,15 @@ class FamilyGmail:
                     parent = events.get(self._leg_parent.get(k, ""))
                     if k not in kept and parent is not None and w.start < want.end and want.start < w.end:
                         self._conflicts.append((parent.key, parent.start, want.start))
+        # A placed event left with no drive there, or the day's last with no drive back, and no reason
+        # for it said above: never silent (an old block, say, from before its address was read).
+        for events in days.values():
+            for n, event in enumerate(events):
+                short = (event.key, "there") not in worked or (
+                    n == len(events) - 1 and (event.key, "back") not in worked)
+                if short and event.key not in trouble and event.key not in waiting:
+                    failed.add(event.start)
+                    trouble[event.key] = (event.start, drive_cards.FAILED)
         # Events nothing could place: the place book asks where (that's their card), or the map
         # couldn't be reached.
         unplaced = {**(self.live.unplaced if self.live is not None else {}), **self._own_unplaced}
@@ -1812,9 +1851,25 @@ class FamilyGmail:
             return out
         self.leg_note = " ".join(x for x in (self._leg_note(failed, not_found, chained, now),
                                              self._conflict_note(now), self._own_notes()) if x)
+        self._log_missing(trouble, unplaced, now)
         if cards is not None:
             self._drive_cards(cards, placed, trouble, unplaced, now, set(waiting))
         return out
+
+    def _log_missing(self, trouble: dict, unplaced: dict, now: datetime) -> None:
+        """Each event he goes to that ends this read without its drive blocks, in the log by its title
+        (cleaned and cut short, meaning.shown) and day, once per event, day and reason while the add-on
+        runs. The digest names it by its day and time (_leg_note)."""
+        why = getattr(self.live, "_why", {})
+        zone = ZoneInfo(self.tz)
+        logged = self.__dict__.setdefault("_logged_missing", set())
+        for key, (start, reason) in sorted(trouble.items(), key=lambda kv: kv[1][0]):
+            if not now < start < now + NOTE_AHEAD or (key, start, reason) in logged:
+                continue
+            logged.add((key, start, reason))
+            said = self._own_said.get(key) or (unplaced.get(key) or (None, ""))[1] \
+                or why.get(key, {}).get("said", "") or "(title not shown)"
+            log.warning("family to gmail: no drive blocks for %s on %s (%s)", said, _at(start, zone), reason)
 
     def _conflict_note(self, now: datetime) -> str:
         """Times only: a Family event's drive that crosses a drive kept for his own appointment."""

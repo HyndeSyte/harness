@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.1
+
+- **A block made before Harness could read its address now gets it, with its drives.** On the next read, an event you go to whose block has no address or no drive blocks gets both, the same as a new one: the street address on the block and "Busy (drive there)" and "Busy (drive back)" around it, sized from the real drive. Thursday's school event is the first one this fixes.
+- **An event you go to at school gets its drives** when its location has a street address (the school's name on one line and the address on the next included). Before, an event at school never got drives, and nothing said so.
+- **A drive block you deleted stays deleted,** and one that's already there isn't written again. If you put a drive on Gmail yourself, Harness doesn't add a second one beside it.
+- **A missing drive is never quiet.** An event you go to that's left without its drive blocks is named in the morning digest by its day and time, and in Harness's log by its title and day.
+
 ## 0.24.0
 
 - **Your own appointments get drive blocks.** An appointment on your Gmail calendar with a street address gets "Busy (drive there)" and "Busy (drive back)" around it, sized from the real drive and rounded up to the quarter hour, just like the Family events you go to. Back to back, the drive goes straight from the first place to the next, and only the last one goes home. They move and go with the appointment.
