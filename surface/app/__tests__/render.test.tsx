@@ -5,7 +5,7 @@ import type { Loaded, Thread } from "../src/snapshot";
 
 const now = new Date("2026-11-18T12:00:00Z");
 const thread = (id: string, over: Partial<Thread>): Thread => ({
-  id, title: `Title ${id}`, area: "other", who: "cain", step: `Step ${id}.`, waits_for: null,
+  id, title: `Title ${id}`, area: "other", who: "the assistant", step: `Step ${id}.`, waits_for: null,
   outcome: "Done.", last_moved: "2026-11-18T09:00:00Z", state: "moving", ...over,
 });
 
@@ -62,6 +62,34 @@ describe("In motion", () => {
     expect(container.textContent).toBe("Sign in again");
     fireEvent.click(screen.getByText("Sign in again"));
     expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  test("offline is one line with a Retry that fetches again, never a reload", () => {
+    const retry = jest.fn();
+    const reload = jest.fn();
+    const { container } = render(
+      <Surface loaded={{ ok: false, reason: "offline" }} now={now} talkUrl="x" onRetry={retry} onReload={reload} />,
+    );
+    expect(container.textContent).toBe("Offline.Retry");
+    fireEvent.click(screen.getByText("Retry"));
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  test("the Worker's 403 is one line, not allowed, with no reload", () => {
+    const reload = jest.fn();
+    const { container } = render(<Surface loaded={{ ok: false, reason: "notallowed" }} now={now} talkUrl="x" onReload={reload} />);
+    expect(container.textContent).toBe("This account is not allowed to read the snapshot.");
+    expect(screen.queryByText("Sign in again")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  test("the assistant and someone are labelled; the snapshot names no one", () => {
+    const rows = [thread("P7", { who: "the assistant" }), thread("P8", { who: "someone" })];
+    render(<Surface loaded={{ ok: true, snapshot: { made_at: "2026-11-18T10:00:00Z", threads: rows, hidden: 0 } }} now={now} talkUrl="x" />);
+    expect(screen.getByTestId("row-P7").textContent).toContain("Cain · Step P7.");
+    expect(screen.getByTestId("row-P8").textContent).toContain("Someone · Step P8.");
   });
 
   test("an unknown who or state is a plain other label", () => {

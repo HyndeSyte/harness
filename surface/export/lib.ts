@@ -17,14 +17,62 @@ export const STEP_MAX = 200;
 // "bank" also catches "banking", "therap" catches "therapist". The owner's config adds more
 // (exclude_stems); it can't take these away.
 export const DEFAULT_STEMS = [
-  "money", "financ", "debt", "bank", "budget", "pay", "invoice", "tax", "rent", "loan", "salar",
-  "insur", "refund", "health", "therap", "pt", "doctor", "dentist", "prescri", "clinic",
-  "pharmac", "medic", "diagnos",
+  "money", "financ", "debt", "bank", "budget", "pay", "paid", "owed", "invoice", "tax", "rent", "loan",
+  "mortgage", "credit", "card", "salar", "insur", "refund", "irs",
+  "health", "therap", "pt", "doctor", "gp", "appointment", "hospital", "surgery", "mental", "psychiatr",
+  "dentist", "dental", "orthodont", "periodont", "endodont", "denture", "tooth", "teeth",
+  "prescri", "clinic", "pharmac", "medic", "diagnos",
 ];
+
+// --- one normal form ----------------------------------------------------------------------
+
+// Every check reads text in one form: NFKC (so a full-width or styled letter is the plain one)
+// with the invisible formatting characters taken out (zero-width spaces and joiners, bidi
+// controls, soft hyphens: Unicode's format class). The strippers and the name replacement run on
+// this same text, and it is what is exported.
+const INVISIBLE = /\p{Cf}/gu;
+export function normalise(text: string): string {
+  return text.normalize("NFKC").replace(INVISIBLE, "");
+}
+
+// For matching only: the normal form, case-folded, with accents taken off, so "Jünîper" is
+// matched by the term "Juniper" and "MÓRGAN" by the name "Morgan".
+export function fold(text: string): string {
+  return normalise(text).normalize("NFD").replace(/\p{M}/gu, "").normalize("NFC").toLowerCase();
+}
+
+// Money in any form leaves the row out: a currency symbol anywhere, an ISO currency code next to
+// a number ("USD 40", "40 EUR"), or a number with a currency word ("40 dollars", "5 quid").
+const CURRENCY_SYMBOL = /\p{Sc}/u;
+const ISO_CODES =
+  "USD|EUR|GBP|AUD|NZD|CAD|JPY|CHF|CNY|RMB|HKD|SGD|INR|SEK|NOK|DKK|ISK|PLN|CZK|HUF|RON|BGN|ZAR|BRL|MXN|KRW|TRY|RUB|UAH|ILS|AED|SAR|QAR|THB|IDR|MYR|PHP|VND|TWD|ARS|CLP|COP|PEN|NGN|KES|EGP|PKR|BDT|BTC|ETH|USDT|USDC";
+const ISO_AMOUNT = new RegExp(
+  `(?<![\\p{L}\\p{N}_])(?:${ISO_CODES})\\s?\\d|\\d\\s?(?:${ISO_CODES})(?![\\p{L}\\p{N}_])`,
+  "u",
+);
+const NUMBER = String.raw`(?:\d[\d,.]*|a|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|few|couple of)`;
+const CURRENCY_WORD = String.raw`(?:dollars?|bucks?|euros?|pounds?|quid|cents?|pence|penny|pennies|yen|yuan|renminbi|rupees?|francs?|kron(?:a|or|e|er)|zloty|pesos?|rand|reais|grand|sterling)`;
+const AMOUNT = new RegExp(
+  String.raw`(?<![\p{L}\p{N}_])${NUMBER}\s*(?:k|m|bn|hundred|thousand|million|billion)?\s*${CURRENCY_WORD}(?![\p{L}\p{N}_])`,
+  "u",
+);
+export function namesMoney(text: string): boolean {
+  const n = normalise(text);
+  return CURRENCY_SYMBOL.test(n) || ISO_AMOUNT.test(n) || AMOUNT.test(fold(text));
+}
 
 // Who the owner is called in the record. The code knows only the role word; the owner's own
 // name comes from config (owner_names).
 export const DEFAULT_OWNER_NAMES = ["owner", "the owner"];
+
+// Capitalised words that may stay in an exported text (see properNounGate). The owner's config
+// adds product and place words (allow_words).
+export const DEFAULT_ALLOW_WORDS = [
+  "I", "OK",
+  "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+  "January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+  "November", "December",
+];
 
 export interface Policy {
   terms: RegExp[];
@@ -35,12 +83,18 @@ export interface Policy {
   ownerNames: string[];
   // Other people's names (config `names`), replaced by "someone" in every exported text.
   names: string[];
+  // The only areas exported (config `areas`), folded; any other is "other".
+  areas: string[];
+  // Capitalised words that may stay (DEFAULT_ALLOW_WORDS and config `allow_words`), folded.
+  allowWords: Set<string>;
 }
 
 export interface ExporterConfig {
   owner_names?: string[];
   names?: string[];
   exclude_stems?: string[];
+  areas?: string[];
+  allow_words?: string[];
 }
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -63,7 +117,11 @@ export function parseTerms(text: string, where = "the private terms file"): RegE
       } catch {
         throw new Error(`${where}:${i + 1}: not a valid regular expression`);
       }
-    } else terms.push(wholeWord(escapeRe(t)));
+    } else {
+      // The term as written, and folded when that differs (an accented term matches plain text).
+      terms.push(wholeWord(escapeRe(t)));
+      if (fold(t) !== t.toLowerCase()) terms.push(wholeWord(escapeRe(fold(t))));
+    }
   });
   if (!terms.length) throw new Error(`${where} has no terms, so nothing is exported`);
   return terms;
@@ -80,31 +138,92 @@ const envList = (v: string | undefined) => (v ?? "").split(",").map((x) => x.tri
 // SURFACE_EXCLUDE_STEMS (comma-separated). Both add to the generic defaults.
 export function makePolicy(termsText: string, config: ExporterConfig = {}, env: Record<string, string | undefined> = {}): Policy {
   const stems = [...DEFAULT_STEMS, ...list(config.exclude_stems, "exclude_stems"), ...envList(env.SURFACE_EXCLUDE_STEMS)];
-  const ownerNames = [...list(config.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)];
+  // The role words are never name parts ("the" would otherwise become "you" everywhere).
+  const ownerNames = [...list(config.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)].filter(
+    (n) => !DEFAULT_OWNER_NAMES.includes(fold(n)),
+  );
   const names = [...list(config.names, "names"), ...envList(env.SURFACE_NAMES)];
+  const areas = list(config.areas, "areas").map(fold);
+  const allow = [...DEFAULT_ALLOW_WORDS, ...list(config.allow_words, "allow_words")].map(fold);
   return {
     terms: parseTerms(termsText),
-    stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map(escapeRe).join("|")})`, "iu"),
-    owners: [...DEFAULT_OWNER_NAMES, ...ownerNames].map((o) => o.toLowerCase()),
+    stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map((x) => escapeRe(fold(x))).join("|")})`, "iu"),
+    owners: [...DEFAULT_OWNER_NAMES, ...ownerNames].map(fold),
     ownerNames,
     names,
+    areas,
+    allowWords: new Set(allow),
   };
 }
 
-// Names never leave. After a row is classified, each configured owner name becomes "you" (its
-// possessive, "<name>'s", becomes "your") and each listed name becomes "someone" ("someone's"),
-// whole word, any case, longest name first so "Robin Lee" goes before "Robin".
-export function replaceNames(text: string, policy: Pick<Policy, "ownerNames" | "names">): string {
-  const all = [
-    ...policy.ownerNames.map((n) => ({ n, plain: "you", poss: "your" })),
-    ...policy.names.map((n) => ({ n, plain: "someone", poss: "someone's" })),
-  ].sort((a, b) => b.n.length - a.n.length);
-  let out = text;
-  for (const { n, plain, poss } of all) {
-    const re = new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(n)}(?:(['\u2019]s)(?![\\p{L}\\p{N}_]))?(?![\\p{L}\\p{N}_])`, "giu");
-    out = out.replace(re, (_m, s: string | undefined) => (s ? poss : plain));
+// The config's own checks, before anything is read, written or sent. Returns a one-line reason,
+// or null. The owner must be named for real (the role words alone don't count), and `names` must
+// be there (an empty list is allowed: no one else is named in the record).
+export function configProblem(config: unknown, env: Record<string, string | undefined> = {}): string | null {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return "the config is not a JSON object";
+  const c = config as ExporterConfig;
+  try {
+    for (const k of ["owner_names", "names", "exclude_stems", "areas", "allow_words"] as const) list(c[k], k);
+  } catch (e: any) {
+    return String(e?.message ?? e);
   }
-  return out;
+  if (!("names" in c)) return 'config: "names" is missing (an empty list is allowed)';
+  const owners = [...list(c.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)].filter(
+    (n) => !DEFAULT_OWNER_NAMES.includes(fold(n)),
+  );
+  if (!owners.length) return "config: no owner name (owner_names, or SURFACE_OWNER_NAMES); the role words alone don't count";
+  return null;
+}
+
+// A word, with any parts joined to it by a hyphen or an apostrophe ("Vale-Smith", "O'Neill",
+// "Robin's"): one token, so a name joined to another word goes whole.
+const TOKEN = /[\p{L}\p{M}\p{N}_]+(?:[-'\u2019][\p{L}\p{M}\p{N}_]+)*/gu;
+const partsOf = (names: string[]) =>
+  new Set(names.flatMap((n) => fold(n).split(/[\s\-'\u2019]+/)).filter(Boolean));
+
+// Names never leave. After a row is classified, each part of a configured name (first, last) is
+// replaced on its own, whole word, any case and any accent: the owner's become "you" ("your" for
+// "<name>'s"), everyone else's "someone" ("someone's"). A word joined to a name part by a hyphen
+// or an apostrophe goes with it, so a double name is one "someone", never "someone-X"; a full
+// name written out ("Morgan Vale") is one "someone" too. A name inside a longer word is left.
+export function replaceNames(text: string, policy: Pick<Policy, "ownerNames" | "names">): string {
+  const owner = partsOf(policy.ownerNames);
+  const other = partsOf(policy.names);
+  // Placeholders first, so the runs of a full name can be joined.
+  const [YOU, YOUR, SOME, SOMES] = ["\u0001", "\u0002", "\u0003", "\u0004"];
+  const out = text.replace(/[\u0001-\u0004]/g, "").replace(TOKEN, (tok) => {
+    let parts = tok.split(/[-'\u2019]/);
+    let poss = false;
+    if (parts.length > 1 && /['\u2019][sS]$/.test(tok)) {
+      parts = parts.slice(0, -1);
+      poss = true;
+    }
+    const f = parts.map(fold);
+    if (f.some((p) => other.has(p))) return poss ? SOMES : SOME;
+    if (f.some((p) => owner.has(p))) return poss ? YOUR : YOU;
+    return tok;
+  });
+  return out
+    .replace(/\u0003(?:\s+\u0003)*(?:\s+\u0004)?|\u0004/g, (m) => (m.endsWith(SOMES) ? "someone's" : "someone"))
+    .replace(/\u0001(?:\s+\u0001)*(?:\s+\u0002)?|\u0002/g, (m) => (m.endsWith(YOUR) ? "your" : "you"));
+}
+
+// The proper-noun gate: in an exported text, a capitalised word that doesn't start a sentence
+// and isn't on the allow list (DEFAULT_ALLOW_WORDS and config allow_words) becomes "someone"
+// (its possessive "someone's"). Returns the text and the words it replaced.
+export function properNounGate(text: string, allow: Set<string>): { text: string; words: string[] } {
+  const words: string[] = [];
+  const out = text.replace(TOKEN, (tok, offset: number, whole: string) => {
+    if (!/^\p{Lu}/u.test(tok)) return tok;
+    const before = whole.slice(0, offset).trimEnd();
+    if (before === "" || /[.!?]["'\u2019\u201D)\]]*$/.test(before)) return tok;
+    const poss = /['\u2019][sS]$/.test(tok);
+    const bare = poss ? tok.slice(0, -2) : tok;
+    if (allow.has(fold(tok)) || allow.has(fold(bare))) return tok;
+    words.push(tok);
+    return poss ? "someone's" : "someone";
+  });
+  return { text: out, words };
 }
 
 // The private marker: a `#private` tag anywhere in the row, or a Private column whose cell is
@@ -116,8 +235,15 @@ export function markedPrivate(cells: Record<string, string>, raw: string): boole
   return ["yes", "y", "true", "x", "private"].includes(col);
 }
 
+// A row is left out when any text, in its normal form and folded, has a stem, a private term or
+// money in it.
 export function isExcluded(policy: Policy, ...texts: (string | null | undefined)[]): boolean {
-  return texts.some((t) => !!t && (policy.stems.test(t) || policy.terms.some((re) => re.test(t))));
+  return texts.some((t) => {
+    if (!t) return false;
+    const n = normalise(t);
+    const f = fold(t);
+    return policy.stems.test(f) || policy.terms.some((re) => re.test(n) || re.test(f)) || namesMoney(t);
+  });
 }
 
 // --- strippers ----------------------------------------------------------------------------
@@ -301,40 +427,57 @@ function toTime(s: string | undefined): number | null {
 
 // --- one row to one thread ----------------------------------------------------------------
 
-const isOwner = (cell: string, owners: string[]) => owners.includes(cell.trim().toLowerCase());
+const isOwner = (cell: string, owners: string[]) => owners.includes(fold(cell).trim());
 const namesOwner = (s: string | null, owners: string[]) =>
-  !!s && owners.some((o) => wholeWord(escapeRe(o) + "(?:'s)?").test(s));
+  !!s && owners.some((o) => wholeWord(escapeRe(o) + "(?:['\u2019]s)?").test(fold(s)));
 
+// The assistant's own Who cell; any other person is "someone".
+const ASSISTANT = ["cain", "the assistant", "assistant"];
+
+// Who has it, as one of the fixed words in WHO; never the Who cell itself.
 export function whoOf(row: OpenRow, hold: Hold | undefined, owners: string[] = DEFAULT_OWNER_NAMES): Who {
-  const cell = row.who.toLowerCase();
+  const cell = fold(row.who).trim();
   if (hold?.job) return "a build job";
   if (isOwner(cell, owners)) return "you";
   if (cell === "at his pc") return "at his PC";
   if (cell.startsWith("laptop") || hold?.holder?.startsWith("laptop:")) return "a laptop session";
   if (cell === "build") return "a build job";
-  return "cain";
+  if (ASSISTANT.includes(cell)) return "the assistant";
+  return "someone";
 }
 
 export function stateOf(row: OpenRow, hold: Hold | undefined, owners: string[] = DEFAULT_OWNER_NAMES): State {
   if (hold?.job) return "running";
   if (isOwner(row.who, owners) || namesOwner(row.waits, owners)) return "waiting on you";
-  if (row.who.toLowerCase() === "at his pc") return "at his PC";
+  if (fold(row.who).trim() === "at his pc") return "at his PC";
   return "moving";
 }
 
-export function areaOf(item: string): string {
-  const m = item.match(/\bprojects\/([A-Za-z0-9][A-Za-z0-9_-]*)/);
-  if (!m) return "other";
+// The area: the project folder the Item names, only when it passes the same checks as the cells
+// (the private marker, the stems and terms, money) and is on the config's `areas` list; any other
+// folder, or none, is "other".
+export function areaOf(item: string, policy?: Policy): string {
+  const m = normalise(item).match(/\bprojects\/([A-Za-z0-9][A-Za-z0-9_-]*)/);
+  if (!m || !policy) return "other";
+  const folder = m[1];
   // A folder name that is itself an identifier (a code, a number) is not shown.
-  if (strip(m[1]) !== m[1] || /^[a-z]{1,3}\d+$/i.test(m[1]) || /\d{3,}/.test(m[1])) return "other";
-  return m[1].toLowerCase();
+  if (strip(folder) !== folder || /^[a-z]{1,3}\d+$/i.test(folder) || /\d{3,}/.test(folder)) return "other";
+  if (PRIVATE_TAG.test(folder) || isExcluded(policy, folder, folder.replace(/[-_]+/g, " "))) return "other";
+  const f = fold(folder);
+  return policy.areas.includes(f) ? f : "other";
 }
 
 // Every cell of a row, for the privacy checks: all columns, the id included.
 const allCells = (row: OpenRow) => [row.raw, ...Object.values(row.cells)];
 
+// A capitalised word the proper-noun gate replaced: its field and the word, never more.
+export interface Leftover {
+  field: "title" | "step" | "waits_for" | "outcome";
+  word: string;
+}
+
 export type Outcome =
-  | { kind: "thread"; thread: Thread }
+  | { kind: "thread"; thread: Thread; leftovers: Leftover[] }
   | { kind: "excluded" }
   | { kind: "skipped"; reason: string };
 
@@ -347,22 +490,32 @@ export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], 
   const times = [since, ...notes.map(toTime), toTime(hold?.taken), toTime(hold?.renewed)].filter(
     (t): t is number => t !== null,
   );
-  // Classified first (who and state read the names), then every name is replaced.
-  const clean = (t: string) => replaceNames(strip(t), policy);
-  const waits = row.waits === null ? null : clean(row.waits) || null;
+  // Classified first (who and state read the names), then, on the one normal form, the
+  // identifiers stripped, every name replaced, and any capitalised word left gated.
+  const leftovers: Leftover[] = [];
+  // Title and step are cut to their first sentence before the gate, so only what is exported counts.
+  const clean = (field: Leftover["field"], t: string, max?: number) => {
+    const named = replaceNames(strip(normalise(t)), policy);
+    const g = properNounGate(max ? firstSentence(named, max) : named, policy.allowWords);
+    for (const word of g.words) leftovers.push({ field, word });
+    // A replaced word is longer than most, so the cap holds again after the gate.
+    return max ? cutCodePoints(g.text, max) : g.text;
+  };
+  const waits = row.waits === null ? null : clean("waits_for", row.waits) || null;
   return {
     kind: "thread",
     thread: {
       id: row.id,
-      title: firstSentence(clean(row.item), TITLE_MAX),
-      area: areaOf(row.item),
+      title: clean("title", row.item, TITLE_MAX),
+      area: areaOf(row.item, policy),
       who: whoOf(row, hold, policy.owners),
-      step: firstSentence(clean(row.next), STEP_MAX),
+      step: clean("step", row.next, STEP_MAX),
       waits_for: waits,
-      outcome: clean(row.done_when),
+      outcome: clean("outcome", row.done_when),
       last_moved: new Date(Math.max(...times)).toISOString(),
       state: stateOf(row, hold, policy.owners),
     },
+    leftovers,
   };
 }
 
@@ -370,6 +523,8 @@ export interface Built {
   snapshot: Signed;
   // One line per malformed row: path and row number, never the row's text.
   warnings: string[];
+  // One line per capitalised word the gate replaced: path, row number, field and the word only.
+  leftovers: string[];
 }
 
 export function buildSnapshot(record: string, policy: Policy, now = new Date()): Built {
@@ -378,14 +533,17 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
   const holds = readHolds(record);
   const threads: Thread[] = [];
   const warnings: string[] = [];
+  const leftovers: string[] = [];
   let excluded = 0;
   let skipped = 0;
   for (const r of openTable(pending).rows) {
     const row = toOpenRow(r);
     const okId = ID_RE.test(row.id);
     const out = threadOf(row, okId ? holds[row.id] : undefined, okId ? noteTimes(record, row.id) : [], policy);
-    if (out.kind === "thread") threads.push(out.thread);
-    else if (out.kind === "excluded") excluded++;
+    if (out.kind === "thread") {
+      threads.push(out.thread);
+      for (const l of out.leftovers) leftovers.push(`${path}:${row.line}: ${l.field}: ${l.word}`);
+    } else if (out.kind === "excluded") excluded++;
     else {
       skipped++;
       warnings.push(`${path}:${row.line}: row skipped, ${out.reason}`);
@@ -394,6 +552,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
   return {
     snapshot: { version: 1, made_at: now.toISOString(), threads, excluded_rows: excluded, skipped_rows: skipped },
     warnings,
+    leftovers,
   };
 }
 

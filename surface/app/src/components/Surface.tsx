@@ -19,6 +19,7 @@ export function Surface({
   needsYou = [],
   next = [],
   onReload = reloadPage,
+  onRetry,
 }: {
   loaded: Loaded | null;
   now: Date;
@@ -26,6 +27,8 @@ export function Surface({
   needsYou?: Thread[];
   next?: Thread[];
   onReload?: () => void;
+  // Fetches the snapshot again, for the offline line's Retry.
+  onRetry?: () => void;
 }) {
   const theme = useTheme();
   if (!loaded) return <View style={[styles.fill, { backgroundColor: theme.bg }]} />;
@@ -38,13 +41,29 @@ export function Surface({
       </View>
     );
   }
+  if (!loaded.ok && loaded.reason === "offline") {
+    return (
+      <View style={[styles.fill, styles.center, { backgroundColor: theme.bg }]}>
+        <View style={styles.line}>
+          <Text style={[styles.notice, { color: theme.muted }]} testID="notice">
+            Offline.
+          </Text>
+          <Pressable accessibilityRole="button" onPress={onRetry} testID="retry" style={[styles.retry, { borderColor: theme.rule }]}>
+            <Text style={[styles.notice, { color: theme.text }]}>Retry</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
   if (!loaded.ok) {
     return (
       <View style={[styles.fill, styles.center, { backgroundColor: theme.bg }]}>
         <Text style={[styles.notice, { color: theme.muted }]} testID="notice">
           {loaded.reason === "unverified"
             ? "This snapshot could not be verified, so nothing is shown."
-            : "No snapshot could be read."}
+            : loaded.reason === "notallowed"
+              ? "This account is not allowed to read the snapshot."
+              : "No snapshot could be read."}
         </Text>
       </View>
     );
@@ -117,6 +136,8 @@ const styles = StyleSheet.create({
   center: { alignItems: "center", justifyContent: "center", padding: 24 },
   notice: { fontSize: 15 },
   signIn: { borderWidth: 1, borderRadius: 10, paddingVertical: 10, paddingHorizontal: 18 },
+  line: { flexDirection: "row", alignItems: "center", gap: 12 },
+  retry: { borderWidth: 1, borderRadius: 10, paddingVertical: 6, paddingHorizontal: 14 },
   scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 24 },
   // Phone first; on a wide screen the same list sits in a readable column.
   column: { width: "100%", maxWidth: 640, alignSelf: "center" },

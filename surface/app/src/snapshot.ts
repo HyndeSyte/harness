@@ -5,7 +5,7 @@ import { fromBase64, hex, signedBytes } from "../../shared/canonical";
 
 ed.hashes.sha512 = sha512;
 
-export const WHO = ["you", "cain", "a build job", "a laptop session", "at his PC"] as const;
+export const WHO = ["you", "the assistant", "a build job", "a laptop session", "at his PC", "someone"] as const;
 export const STATES = ["running", "waiting on you", "at his PC", "moving"] as const;
 // A who or state the app doesn't know shows as a plain "other" label, never dropped.
 export type Who = (typeof WHO)[number] | "other";
@@ -30,8 +30,11 @@ export interface Snapshot {
   hidden: number;
 }
 
-// signin: the read was redirected or blocked, as when the Access session has expired.
-export type Loaded = { ok: true; snapshot: Snapshot } | { ok: false; reason: "unreadable" | "unverified" | "signin" };
+// signin: the read was redirected or refused as unauthenticated (an expired Access session).
+// notallowed: the Worker itself refused it (a 403 with its JSON message). offline: no HTTP answer
+// at all (no network, DNS, a timeout).
+export type Reason = "unreadable" | "unverified" | "signin" | "notallowed" | "offline";
+export type Loaded = { ok: true; snapshot: Snapshot } | { ok: false; reason: Reason };
 
 const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 
@@ -104,17 +107,26 @@ type FetchLike = (
 ) => Promise<{ ok: boolean; status: number; type?: string; redirected?: boolean; json(): Promise<unknown> }>;
 
 // The snapshot is read from the app's own origin. A redirect (Access sending an expired session
-// to sign in) is never followed: it, an Access refusal, or a request the browser blocks all mean
-// the owner should sign in again. Anything else that fails is unreadable.
+// to sign in) is never followed. Only an opaque redirect, a 3xx, a 401 or a redirect flag means
+// the owner should sign in again; a 403 carrying the Worker's own JSON message is "not allowed"; a
+// fetch that throws without any HTTP answer is "offline". Anything else that fails is unreadable.
 export async function loadSnapshot(url: string, publicKeyB64: string, fetchImpl: FetchLike = (u, init) => fetch(u, init)): Promise<Loaded> {
   let res: Awaited<ReturnType<FetchLike>>;
   try {
     res = await fetchImpl(url, { cache: "no-store", credentials: "same-origin", redirect: "manual" });
   } catch {
-    return { ok: false, reason: "signin" };
+    return { ok: false, reason: "offline" };
   }
-  if (res.type === "opaqueredirect" || res.redirected || res.status === 0 || res.status === 401 || res.status === 403 || (res.status >= 300 && res.status < 400))
+  if (res.type === "opaqueredirect" || res.redirected || res.status === 401 || (res.status >= 300 && res.status < 400))
     return { ok: false, reason: "signin" };
+  if (res.status === 403) {
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {}
+    const fromWorker = !!body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string";
+    return { ok: false, reason: fromWorker ? "notallowed" : "unreadable" };
+  }
   if (!res.ok) return { ok: false, reason: "unreadable" };
   let raw: unknown;
   try {

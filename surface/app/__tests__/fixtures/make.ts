@@ -22,7 +22,7 @@ const vector = signSnapshot(
         id: "P1",
         title: firstSentence("a".repeat(138) + "😀😀😀", 140),
         area: "other",
-        who: "cain",
+        who: "the assistant",
         step: "Café, 中文, 𝄞 and \u{1F469}‍\u{1F4BB} … \"quoted\" \\ back",
         waits_for: null,
         outcome: "é vs é",

@@ -9,6 +9,7 @@
   },
   "exclude": [
     "node_modules",
-    "__tests__/fixtures/make.ts"
+    "__tests__/fixtures/make.ts",
+    "scripts/check-dist.test.ts"
   ]
 }

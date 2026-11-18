@@ -2,11 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { verifySnapshot, canonical, fromBase64 } from "../shared/snapshot";
+import { verifySnapshot, canonical, fromBase64, WHO } from "../shared/snapshot";
 import { cutCodePoints, signedBytes } from "../shared/canonical";
 import {
   areaOf,
   buildSnapshot,
+  configProblem,
+  fold,
+  normalise,
+  properNounGate,
+  whoOf,
   firstSentence,
   isExcluded,
   makeKeyPair,
@@ -21,6 +26,7 @@ import {
   strip,
 } from "./lib";
 import { main } from "./index";
+import { tempRecord } from "./fixtures/temp-record";
 
 const FIX = join(import.meta.dir, "fixtures");
 const RECORD = join(FIX, "record");
@@ -72,18 +78,18 @@ describe("who and state", () => {
     expect(byId.P44.who).toBe("at his PC");
     expect(byId.P44.state).toBe("at his PC");
   });
-  test("Cain's, waiting on the owner by its Waits for", () => {
-    expect(byId.P45.who).toBe("cain");
+  test("the assistant's, waiting on the owner by its Waits for", () => {
+    expect(byId.P45.who).toBe("the assistant");
     expect(byId.P45.state).toBe("waiting on you");
   });
-  test("Cain's, moving", () => {
-    expect(byId.P49.who).toBe("cain");
+  test("the assistant's, moving", () => {
+    expect(byId.P49.who).toBe("the assistant");
     expect(byId.P49.state).toBe("moving");
     expect(byId.P49.waits_for).toBe("The registrar's notice");
   });
   test("every who and every state is covered by the fixtures", () => {
     expect(new Set(snap.threads.map((t) => t.who))).toEqual(
-      new Set(["you", "cain", "a build job", "a laptop session", "at his PC"]),
+      new Set(["you", "the assistant", "a build job", "a laptop session", "at his PC", "someone"]),
     );
     expect(new Set(snap.threads.map((t) => t.state))).toEqual(
       new Set(["running", "waiting on you", "at his PC", "moving"]),
@@ -148,9 +154,10 @@ describe("names never leave", () => {
   test("the owner's name becomes you or your in every field, still waiting on you", () => {
     const t = byId.P56;
     expect(t.state).toBe("waiting on you");
-    expect(t.who).toBe("cain");
+    expect(t.who).toBe("the assistant");
     expect(t.title).toBe("your school form, for you to sign.");
-    expect(t.step).toBe("Put the form where you sees it; ask the Robinsons and someone's sister too.");
+    // "Robinsons" is not a listed name, but a capitalised word mid-sentence: the gate takes it.
+    expect(t.step).toBe("Put the form where you sees it; ask the someone and someone's sister too.");
     expect(t.waits_for).toBe("your pick");
     expect(t.outcome).toBe("your form signed and someone told.");
     expect(byId.P41.who).toBe("you");
@@ -167,7 +174,7 @@ describe("names never leave", () => {
     expect(all).not.toMatch(/morgan vale/i);
   });
   test("a name inside a longer word is untouched", () => {
-    expect(byId.P56.step).toContain("Robinsons");
+    expect(replaceNames("ask the Robinsons", policy)).toBe("ask the Robinsons");
     const p = makePolicy("x", { owner_names: ["Al"], names: ["Sam"] });
     expect(replaceNames("Alice, Sammy, Salsa and Al's van; SAM and al", p)).toBe("Alice, Sammy, Salsa and your van; someone and you");
   });
@@ -235,8 +242,9 @@ describe("exclusions", () => {
     expect(markedPrivate({}, "| P9 | not#private |")).toBe(false);
   });
   test("the snapshot counts what it leaves out and skips", () => {
-    // P46, P47, P50, P51 by stems, P52 by a term, P53 by the marker.
-    expect(snap.excluded_rows).toBe(6);
+    // P46, P47, P50, P51 by stems, P52 by a term, P53 by the marker, P57 to P76 by money,
+    // health and the normal form.
+    expect(snap.excluded_rows).toBe(26);
     // The row with no id and the row with no valid time.
     expect(snap.skipped_rows).toBe(2);
     expect(built.warnings.length).toBe(2);
@@ -279,7 +287,7 @@ describe("strippers", () => {
     expect(t.outcome).toContain("a link");
     expect(t.outcome).toContain("another item");
     expect(t.area).toBe("garden");
-    expect(areaOf("see projects/P41")).toBe("other");
+    expect(areaOf("see projects/P41", policy)).toBe("other");
   });
 });
 
@@ -380,7 +388,7 @@ describe("the command line fails closed", () => {
     }
     const s = JSON.parse(out.join("\n"));
     expect(s.sig).toBeUndefined();
-    expect(s.excluded_rows).toBe(6);
+    expect(s.excluded_rows).toBe(26);
   });
 });
 
@@ -398,5 +406,215 @@ describe("one canonical form", () => {
     expect(await verifySnapshot({ ...signed, excluded_rows: 0 }, raw)).toBe(false);
     const { skipped_rows, ...noCount } = signed;
     expect(await verifySnapshot(noCount, raw)).toBe(false);
+  });
+});
+
+const capture = async (f: () => Promise<number>) => {
+  const err: string[] = [], out: string[] = [];
+  const e = console.error, l = console.log;
+  console.error = (m: string) => void err.push(String(m));
+  console.log = (m: string) => void out.push(String(m));
+  try {
+    return { code: await f(), err: err.join("\n"), out: out.join("\n") };
+  } finally {
+    console.error = e;
+    console.log = l;
+  }
+};
+
+describe("who is a fixed word", () => {
+  const row = (who: string) => openRows(readFileSync(join(tempRecord([`| P1 | Plain. | ${who} | Go. | | Done. | 2026-11-01 |`]), "state", "PENDING.md"), "utf8"))[0];
+  test("any other person is someone; the assistant is the assistant", () => {
+    expect(whoOf(row("Kestrel"), undefined, policy.owners)).toBe("someone");
+    expect(whoOf(row("Morgan Vale"), undefined, policy.owners)).toBe("someone");
+    expect(whoOf(row("Cain"), undefined, policy.owners)).toBe("the assistant");
+    expect(whoOf(row("robin"), undefined, policy.owners)).toBe("you");
+  });
+  test("every exported who is on the shared list, never the Who cell", () => {
+    for (const t of snap.threads) expect(WHO as readonly string[]).toContain(t.who);
+    expect(byId.P77.who).toBe("someone");
+    expect(JSON.stringify(snap)).not.toMatch(/kestrel/i);
+  });
+});
+
+describe("the area", () => {
+  test("only an area on the config's list is exported", () => {
+    expect(areaOf("for projects/garden", policy)).toBe("garden");
+    expect(areaOf("for projects/Garden", policy)).toBe("garden");
+    expect(areaOf("for projects/shed", policy)).toBe("other");
+    expect(areaOf("for projects/garden", makePolicy("x"))).toBe("other");
+  });
+  test("a folder named with a private term or a stem is not exported as an area", () => {
+    const p = makePolicy(readFileSync(TERMS, "utf8"), { areas: ["juniper", "banking", "surprise-party", "garden"] });
+    expect(areaOf("see projects/juniper", p)).toBe("other");
+    expect(areaOf("see projects/banking", p)).toBe("other");
+    expect(areaOf("see projects/surprise-party", p)).toBe("other");
+    expect(areaOf("see projects/garden", p)).toBe("garden");
+    // And the row itself never exports.
+    const rec = tempRecord(["| P1 | Tidy projects/juniper. | Cain | Go. | | Done. | 2026-11-01 |"]);
+    const b = buildSnapshot(rec, p, NOW);
+    expect(b.snapshot.threads.length).toBe(0);
+    expect(b.snapshot.excluded_rows).toBe(1);
+  });
+});
+
+describe("each part of a name", () => {
+  const p = makePolicy("x", { owner_names: ["Robin Ash"], names: ["Morgan Vale"] });
+  test("a first name alone, a surname alone", () => {
+    expect(replaceNames("ask Morgan today", p)).toBe("ask someone today");
+    expect(replaceNames("ask Vale today", p)).toBe("ask someone today");
+    expect(replaceNames("for Ash to sign", p)).toBe("for you to sign");
+    expect(replaceNames("ask Morgan Vale's sister", p)).toBe("ask someone's sister");
+  });
+  test("a hyphenated or apostrophe-joined name is one someone", () => {
+    expect(replaceNames("ask Ann-Vale today", p)).toBe("ask someone today");
+    expect(replaceNames("ask Vale-Smith's dog", p)).toBe("ask someone's dog");
+    expect(replaceNames("ask O'Morgan", p)).toBe("ask someone");
+    expect(replaceNames("ask Morgan-Vale now", p)).not.toContain("-");
+  });
+  test("an accented or styled variant is matched by the plain name", () => {
+    expect(replaceNames("ask Mórgan and VALÉ", p)).toBe("ask someone and someone");
+    expect(replaceNames(normalise("ask \uff2d\uff4f\uff52\uff47\uff41\uff4e"), p)).toBe("ask someone");
+    expect(byId.P77.waits_for).toBe("someone's reply");
+    expect(byId.P77.title).toBe("Return the drill to someone and someone next door.");
+  });
+});
+
+describe("the proper-noun gate", () => {
+  test("a capitalised word mid-sentence becomes someone; sentence starts and the allow list stay", () => {
+    const g = properNounGate("Meet Kestrel on Friday at the Worker. Then Paris's train, OK.", policy.allowWords);
+    expect(g.text).toBe("Meet someone on Friday at the Worker. Then someone's train, OK.");
+    expect(g.words).toEqual(["Kestrel", "Paris's"]);
+  });
+  test("no capitalised word is left in the fixture snapshot but on the allow list", () => {
+    for (const t of snap.threads)
+      for (const field of ["title", "step", "waits_for", "outcome"] as const) {
+        const g = properNounGate(t[field] ?? "", policy.allowWords);
+        expect([t.id, field, g.words]).toEqual([t.id, field, []]);
+      }
+  });
+  test("the fixture's leftovers are named by row, field and word", () => {
+    expect(built.leftovers.some((l) => /PENDING\.md:45: title: Kestrel$/.test(l))).toBe(true);
+    expect(built.leftovers.some((l) => /PENDING\.md:24: step: Robinsons$/.test(l))).toBe(true);
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), "surface-gate-"));
+  const key = join(dir, "surface.key");
+  const rec = tempRecord(["| P1 | Return the drill to Kestrel next door, then lunch. | Cain | Ring at noon. | | Drill back. | 2026-11-01 |"]);
+  const run = ["--record", rec, "--private-terms", TERMS, "--config", CONFIG];
+  test("under --strict a leftover fails the run: exit 1, nothing written, the word by field and row only", async () => {
+    await capture(() => main(["--keygen", dir]));
+    const out = join(dir, "strict.json");
+    const r = await capture(() => main([...run, "--strict", "--out", out, "--key", key]));
+    expect(r.code).toBe(1);
+    expect(existsSync(out)).toBe(false);
+    expect(r.err).toMatch(/PENDING\.md:5: title: Kestrel/);
+    expect(r.err).not.toContain("drill");
+    expect(r.err).not.toContain("next door");
+  });
+  test("without --strict it is replaced and written", async () => {
+    const out = join(dir, "plain.json");
+    expect((await capture(() => main([...run, "--out", out, "--key", key]))).code).toBe(0);
+    const s = JSON.parse(readFileSync(out, "utf8"));
+    expect(s.threads[0].title).toBe("Return the drill to someone next door, then lunch.");
+  });
+  test("a dry run prints the leftover words for the owner to read", async () => {
+    const r = await capture(() => main([...run, "--dry-run"]));
+    expect(r.code).toBe(0);
+    expect(r.err).toContain("title: Kestrel");
+  });
+});
+
+describe("the config fails closed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "surface-config-"));
+  const key = join(dir, "surface.key");
+  const write = (name: string, text: string) => (writeFileSync(join(dir, name), text), join(dir, name));
+  test("its checks", () => {
+    expect(configProblem({ owner_names: ["Robin"], names: [] })).toBeNull();
+    expect(configProblem({ owner_names: ["owner", "The Owner"], names: [] })).toMatch(/no owner name/);
+    expect(configProblem({ names: [] })).toMatch(/no owner name/);
+    expect(configProblem({ names: [] }, { SURFACE_OWNER_NAMES: "Robin" })).toBeNull();
+    expect(configProblem({ owner_names: ["Robin"] })).toMatch(/"names" is missing/);
+    expect(configProblem([])).toMatch(/not a JSON object/);
+    expect(replaceNames("the van", makePolicy("x", { owner_names: ["the owner", "Robin"], names: [] }))).toBe("the van");
+    expect(configProblem({ owner_names: ["Robin"], names: [], areas: "garden" })).toMatch(/areas/);
+  });
+  const bad = () => [
+    ["no owner", write("noowner.json", '{"owner_names": ["owner"], "names": []}')],
+    ["no names", write("nonames.json", '{"owner_names": ["Robin"]}')],
+    ["bad JSON", write("bad.json", '{"owner_names": ["Robin"], names: }')],
+  ];
+  test("a bad config is exit 2 with one clean line, and nothing is written", async () => {
+    await capture(() => main(["--keygen", dir]));
+    for (const [what, cfg] of bad()) {
+      const out = join(dir, "out.json");
+      const r = await capture(() => main(["--record", RECORD, "--private-terms", TERMS, "--config", cfg, "--out", out, "--key", key]));
+      expect([what, r.code]).toEqual([what, 2]);
+      expect(existsSync(out)).toBe(false);
+      expect(r.err.split("\n").length).toBe(1);
+      expect(r.err).not.toMatch(/\n\s+at /);
+    }
+    const none = await capture(() => main(["--record", RECORD, "--private-terms", TERMS, "--out", join(dir, "o.json"), "--key", key]));
+    expect(none.code).toBe(2);
+  });
+  test("a bad config with --put makes no network call and writes nothing", async () => {
+    for (const [what, cfg] of bad()) {
+      let calls = 0;
+      const out = join(dir, "put.json");
+      const env = {
+        SURFACE_PUT_HOST: "surface.example.com",
+        SURFACE_ACCESS_CLIENT_ID: "id-example",
+        SURFACE_ACCESS_CLIENT_SECRET: "secret-example",
+        SURFACE_PUBLISHER_TOKEN: "publisher-example",
+      };
+      const r = await capture(() =>
+        main(["--record", RECORD, "--private-terms", TERMS, "--config", cfg, "--key", key, "--out", out, "--put", "https://surface.example.com/snapshot"], {
+          fetch: async () => (calls++, new Response("{}")),
+          env,
+        }),
+      );
+      expect([what, r.code, calls, existsSync(out)]).toEqual([what, 2, 0, false]);
+    }
+  });
+});
+
+describe("money and health, in any form", () => {
+  test("currency symbols, ISO codes by a number, and amounts", () => {
+    for (const t of ["€40 left", "it was $5", "£12", "¥300", "₹500", "USD 120", "120 EUR", "40GBP", "50 dollars", "five quid", "a hundred bucks", "2k euros", "10 pence"])
+      expect([t, isExcluded(policy, t)]).toEqual([t, true]);
+    for (const t of ["USB stick", "EURO trip planning", "pounds the table", "a few more", "the 2 dogs", "Ten minutes"])
+      expect([t, isExcluded(policy, t)]).toEqual([t, false]);
+  });
+  test("the new stems", () => {
+    for (const t of ["got paid", "what is owed", "the mortgage", "credit line", "the lost card", "hospital visit", "after surgery", "ring the GP", "the appointment", "mental load", "psychiatrist", "IRS letter", "dental check", "orthodontist", "periodontal", "dentures", "a tooth", "teeth cleaning"])
+      expect([t, isExcluded(policy, t)]).toEqual([t, true]);
+  });
+  test("every money and health fixture row is left out", () => {
+    for (let i = 57; i <= 76; i++) expect([`P${i}`, byId[`P${i}`]]).toEqual([`P${i}`, undefined]);
+  });
+  test("one normal form: accents, zero-width and bidi characters, full-width letters", () => {
+    expect(isExcluded(policy, "Wrap the Jünîper gift")).toBe(true); // a plain term matches its accented variant
+    expect(isExcluded(makePolicy("Jünîper"), "wrap the juniper gift")).toBe(true);
+    expect(isExcluded(policy, "Ba\u200Bnk run")).toBe(true);
+    expect(isExcluded(policy, "the \u202Ebank\u202C run")).toBe(true);
+    expect(isExcluded(policy, "the \uff42\uff41\uff4e\uff4b slip")).toBe(true);
+    expect(isExcluded(policy, "the ｄｏｃｔｏｒ")).toBe(true);
+    expect(fold("MÓRGAN")).toBe("morgan");
+    expect(normalise("a\u200Bb\u2066c\u2069\u200Fd\uFEFF")).toBe("abcd");
+    expect(JSON.stringify(snap)).not.toMatch(/[\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/);
+  });
+});
+
+describe("the synthetic record", () => {
+  test("passes --strict with the fixture config, made-up rows only", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-synthetic-"));
+    await capture(() => main(["--keygen", dir]));
+    const out = join(dir, "synthetic.json");
+    const run = ["--record", join(FIX, "synthetic"), "--private-terms", TERMS, "--config", CONFIG, "--strict"];
+    const r = await capture(() => main([...run, "--out", out, "--key", join(dir, "surface.key")]));
+    expect(r.code).toBe(0);
+    const s = JSON.parse(readFileSync(out, "utf8"));
+    expect(s.threads.map((t: { id: string }) => t.id)).toEqual(["S1", "S2"]);
+    expect(s.excluded_rows + s.skipped_rows).toBe(0);
   });
 });

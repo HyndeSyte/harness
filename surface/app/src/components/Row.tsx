@@ -5,10 +5,12 @@ import { relative } from "../time";
 
 const WHO_LABEL: Record<Who, string> = {
   you: "You",
-  cain: "Cain",
+  // The snapshot never names anyone; the app knows the assistant by name.
+  "the assistant": "Cain",
   "a build job": "A build job",
   "a laptop session": "A laptop session",
   "at his PC": "At his PC",
+  someone: "Someone",
   other: "Other",
 };
 

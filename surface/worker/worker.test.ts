@@ -1,10 +1,12 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { main as exporter } from "../export/index";
+import { main as exporter, REDIRECTED } from "../export/index";
+import { tempRecord } from "../export/fixtures/temp-record";
+import { wranglerProblems } from "./check-wrangler";
 import { buildSnapshot, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../export/lib";
-import { createWorker, MAX_BYTES, type Env } from "./src/index";
+import { createWorker, MAX_BYTES, teamOf, type Env } from "./src/index";
 
 // Made-up values only.
 const TEAM = "https://example-team.cloudflareaccess.com";
@@ -259,6 +261,66 @@ describe("Access on GET", () => {
   });
 });
 
+describe("the team domain, in one form", () => {
+  test("with or without https://, or with http://, the keys come from the https form", () => {
+    for (const v of [TEAM, "example-team.cloudflareaccess.com", "http://example-team.cloudflareaccess.com/", " HTTPS://Example-Team.cloudflareaccess.com/ "])
+      expect(teamOf({ ACCESS_TEAM_DOMAIN: v })).toBe(TEAM);
+  });
+  test("given without https://, the owner still reads, and the issuer must be the https form", async () => {
+    const e = { ...env(), ACCESS_TEAM_DOMAIN: "example-team.cloudflareaccess.com" };
+    const read = async (token: string) =>
+      (await worker.fetch(new Request("https://surface.example.com/snapshot", { headers: { "cf-access-jwt-assertion": token } }), e)).status;
+    expect(await read(await ownerJwt())).toBe(404); // through Access's check: no snapshot yet
+    expect(await read(await ownerJwt({ iss: "example-team.cloudflareaccess.com" }))).toBe(403);
+    expect(await read(await ownerJwt({ iss: "http://example-team.cloudflareaccess.com" }))).toBe(403);
+  });
+});
+
+describe("an unknown key id", () => {
+  // A team of its own, so the caches start empty.
+  const team = "https://kid-team.cloudflareaccess.com";
+  let t = NOW;
+  let fetches = 0;
+  const w = createWorker({
+    now: () => t,
+    fetch: async () => (fetches++, new Response(JSON.stringify({ keys: [jwk] }))),
+  });
+  const e = () => ({ ...env(), ACCESS_TEAM_DOMAIN: team });
+  const read = async (kid: string) => {
+    const token = await jwt({ ...base, iss: team, exp: t / 1000 + 3600, email: OWNER }, { kid });
+    return (await w.fetch(new Request("https://surface.example.com/snapshot", { headers: { "cf-access-jwt-assertion": token } }), e())).status;
+  };
+  test("is remembered for a minute: 403 without fetching the key set again", async () => {
+    expect(await read("kid-1")).toBe(404);
+    expect(fetches).toBe(1);
+    expect(await read("unknown-a")).toBe(403);
+    expect(await read("unknown-a")).toBe(403);
+    expect(await read("unknown-b")).toBe(403); // a new kid under a minute after a fetch: no fetch either
+    expect(fetches).toBe(1);
+    t += 61_000;
+    expect(await read("unknown-a")).toBe(403);
+    expect(fetches).toBe(2);
+    expect(await read("unknown-a")).toBe(403);
+    expect(await read("unknown-c")).toBe(403);
+    expect(fetches).toBe(2);
+    expect(await read("kid-1")).toBe(404); // the known key still reads, from the cache
+    expect(fetches).toBe(2);
+  });
+});
+
+describe("wrangler.toml", () => {
+  test("has workers_dev and preview_urls false", () => {
+    expect(wranglerProblems(readFileSync(join(import.meta.dir, "wrangler.toml"), "utf8"))).toEqual([]);
+  });
+  test("the check fails if either is missing or true", () => {
+    expect(wranglerProblems('name = "x"\nworkers_dev = false\n')).toEqual(["preview_urls is missing (it must be false)"]);
+    expect(wranglerProblems('workers_dev = true\npreview_urls = false\n')).toEqual(["workers_dev is true (it must be false)"]);
+    expect(wranglerProblems('workers_dev = false\npreview_urls = false\n[env.dev]\nworkers_dev = true\n')).toEqual([
+      "env.dev.workers_dev is true (it must be false)",
+    ]);
+  });
+});
+
 describe("Access on PUT", () => {
   const s = () => snap("2026-11-18T12:00:00Z");
   test("the owner's own assertion can't upload", async () => {
@@ -294,10 +356,20 @@ describe("the exporter's --put, against this Worker in-process", () => {
   // with the service token's two headers, drops them, and adds its assertion, as Access does.
   const ID = "service-token-id-example";
   const SECRET = "service-token-secret-example";
-  const putEnv = { SURFACE_ACCESS_CLIENT_ID: ID, SURFACE_ACCESS_CLIENT_SECRET: SECRET, SURFACE_PUBLISHER_TOKEN: PUBLISHER };
+  const putEnv = {
+    SURFACE_PUT_HOST: "surface.example.com",
+    SURFACE_ACCESS_CLIENT_ID: ID,
+    SURFACE_ACCESS_CLIENT_SECRET: SECRET,
+    SURFACE_PUBLISHER_TOKEN: PUBLISHER,
+  };
   const dir = mkdtempSync(join(tmpdir(), "surface-put-"));
   const keyFile = join(dir, "surface.key");
-  const run = ["--record", join(FIX, "record"), "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json")];
+  // --put implies --strict, so it uploads a clean record: no malformed row, no capitalised word left.
+  const record = tempRecord([
+    "| P1 | Tidy the garage shelves. | Cain | Sort the bins. | | Shelves sorted. | 2026-11-01 |",
+    "| P2 | Pick the reminder time. | Robin | Choose a time on Friday. | Robin's pick | The reminder fires. | 2026-11-02 |",
+  ]);
+  const run = ["--record", record, "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json")];
   const URL_ = "https://surface.example.com/snapshot";
   // The exporter dates its snapshot now, so this Worker reads the real clock.
   const live = createWorker({ now: () => Date.now(), fetch: deps.fetch });
@@ -362,7 +434,17 @@ describe("the exporter's --put, against this Worker in-process", () => {
     const env2 = { ...putEnv, SURFACE_ACCESS_CLIENT_SECRET: "wrong" };
     const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
     expect(code).toBe(1);
-    expect(out).toContain(": 403 Forbidden");
+    expect(out).toContain(": 403");
+    // Only the Worker's JSON message is ever printed, never another body.
+    expect(out).not.toContain("Forbidden");
+  });
+
+  test("the fixture record, with its malformed rows and leftovers, is refused under --put before any request", async () => {
+    const h = harness(workerEnv());
+    const fixtureRun = ["--record", join(FIX, "record"), ...run.slice(2)];
+    const { code } = await capture(() => exporter([...fixtureRun, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
+    expect(code).toBe(1);
+    expect(h.calls.length).toBe(0);
   });
 
   test("an older snapshot is 409, exit 1", async () => {
@@ -396,6 +478,73 @@ describe("the exporter's --put, against this Worker in-process", () => {
     );
     expect(code).toBe(1);
     expect(out).toContain("no answer");
+  });
+
+  test("the URL must be https, on SURFACE_PUT_HOST, with no credentials: else exit 2 before any request", async () => {
+    const cases: [string, Record<string, string | undefined>, RegExp][] = [
+      ["http://surface.example.com/snapshot", putEnv, /must be https/],
+      ["https://elsewhere.example.com/snapshot", putEnv, /host is not SURFACE_PUT_HOST/],
+      ["https://user:pw@surface.example.com/snapshot", putEnv, /credentials/],
+      [URL_, { ...putEnv, SURFACE_PUT_HOST: undefined }, /SURFACE_PUT_HOST/],
+      ["not a url", putEnv, /not a URL/],
+    ];
+    for (const [url, env2, why] of cases) {
+      const h = harness(workerEnv());
+      const out = join(dir, "never.json");
+      const r = await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", url], { fetch: h.fetch, env: env2 }));
+      expect([url, r.code]).toEqual([url, 2]);
+      expect(r.out).toMatch(why);
+      expect(r.out).not.toContain("pw@");
+      expect(h.calls.length).toBe(0);
+      expect(existsSync(out)).toBe(false);
+    }
+  });
+
+  // A fetch that follows redirects unless told not to, as fetch does, recording every request.
+  function redirecting(location: string) {
+    const calls: { url: string; headers: Headers }[] = [];
+    const f = async (url: string, init: RequestInit): Promise<Response> => {
+      calls.push({ url, headers: new Headers(init.headers) });
+      if (url === URL_) {
+        const res = new Response(null, { status: 307, headers: { location } });
+        return init.redirect === "manual" ? res : f(location, init);
+      }
+      return new Response(JSON.stringify({ stored: "x" }));
+    };
+    return { calls, fetch: f };
+  }
+
+  test("a 307 to another host is refused: the other host gets no request and no header", async () => {
+    const r = redirecting("https://elsewhere.example.net/collect");
+    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: r.fetch, env: putEnv }));
+    expect(code).toBe(1);
+    expect(out).toContain(REDIRECTED);
+    expect(r.calls.length).toBe(1);
+    expect(r.calls.some((c) => c.url.includes("elsewhere"))).toBe(false);
+    for (const v of [ID, SECRET, PUBLISHER]) expect(out).not.toContain(v);
+  });
+
+  test("a redirect from the first host to itself (an Access login) is refused likewise", async () => {
+    const r = redirecting("https://surface.example.com/cdn-cgi/access/login?x=1");
+    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: r.fetch, env: putEnv }));
+    expect(code).toBe(1);
+    expect(out).toContain("Access redirected: the service token or its Service Auth policy is wrong");
+    expect(r.calls.length).toBe(1);
+    expect(r.calls[0].url).toBe(URL_);
+  });
+
+  test("the printed message is the Worker's JSON message only, at most 200 characters", async () => {
+    const long = "x".repeat(500);
+    const f = async () => new Response(JSON.stringify({ error: long, extra: "not printed" }), { status: 400 });
+    const r1 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: f, env: putEnv }));
+    expect(r1.code).toBe(1);
+    expect(r1.out).toContain("x".repeat(200));
+    expect(r1.out).not.toContain("x".repeat(201));
+    expect(r1.out).not.toContain("not printed");
+    const html = async () => new Response("<html>secret-ish page</html>", { status: 502 });
+    const r2 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: html, env: putEnv }));
+    expect(r2.code).toBe(1);
+    expect(r2.out).not.toContain("secret-ish");
   });
 
   test("--put with no url, or with --dry-run, is exit 2", async () => {

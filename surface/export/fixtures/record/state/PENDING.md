@@ -22,6 +22,27 @@ Open items, one row each. Who has it, the next step, what it waits for, when it 
 | ?? | A row with no id. | Cain | Nothing. | | Nothing. | 2026-11-05 |
 | P55 | A row with no valid time. | Cain | Nothing. | | Nothing. | someday |
 | P56 | Robin's school form, for ROBIN to sign. | Cain | Put the form where robin sees it; ask the Robinsons and Morgan Vale's sister too. | Robin's pick | Robin’s form signed and Morgan Vale told. | 2026-11-04 |
+| P57 | Pick up the drill, €40 still owing on it. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P58 | Send USD 120 to the club. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P59 | Lend the neighbour 50 dollars for the trailer. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P60 | Check the plumber got paid. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P61 | Chase what is owed for the bike. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P62 | Read the mortgage letter. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P63 | Cancel the old credit line. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P64 | Replace the lost card. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P65 | Visiting hours at the hospital. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P66 | Lift home after the surgery. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P67 | Ring the GP back. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P68 | Move the appointment to Thursday. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P69 | Mental load list for the week. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P70 | Psychiatrist forms to fill in. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P71 | IRS letter in the drawer. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P72 | Dental check for the kids. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P73 | Orthodontist review for the brace. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P74 | Wrap the Jünîper gift. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P75 | Ba​nk run on the way home. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P76 | Drop the ｂａｎｋ slip off. | Cain | Nothing yet. | | Done. | 2026-11-03 |
+| P77 | Return the drill to Kestrel and Vale-Smith next door. | Kestrel | Ask Morgan if the Vale garden gate is fixed. | Mórgan's reply | Drill returned to MORGAN. | 2026-11-03 |
 
 ## Done
 

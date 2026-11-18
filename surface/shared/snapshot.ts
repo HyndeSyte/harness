@@ -4,7 +4,9 @@ import { fromBase64, hex, signedBytes } from "./canonical";
 
 export { canonical, fromBase64, signedBytes, toBase64 } from "./canonical";
 
-export const WHO = ["you", "cain", "a build job", "a laptop session", "at his PC"] as const;
+// Who has a thread, as one of these fixed words only: the exporter never sends the Who cell.
+// "someone" is any other person.
+export const WHO = ["you", "the assistant", "a build job", "a laptop session", "at his PC", "someone"] as const;
 export const STATES = ["running", "waiting on you", "at his PC", "moving"] as const;
 
 export type Who = (typeof WHO)[number];

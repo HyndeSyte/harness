@@ -5,7 +5,10 @@
 name = "surface-snapshot"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
+# No workers.dev host and no preview URLs: the Worker answers only on its route, behind Access.
+# CI (surface/worker/check-wrangler.ts) fails if either is missing or true.
 workers_dev = false
+preview_urls = false
 
 # The route sits on the app's own Pages hostname, so the app reads /snapshot from its own origin
 # (connect-src 'self', no CORS).

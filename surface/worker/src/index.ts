@@ -18,7 +18,8 @@ export interface Env {
   SNAPSHOTS: KV;
   // The exporter's Ed25519 public key, raw 32 bytes in base64. A variable.
   SNAPSHOT_PUBLIC_KEY: string;
-  // The Zero Trust team domain, like https://<team>.cloudflareaccess.com. A variable.
+  // The Zero Trust team domain, like https://<team>.cloudflareaccess.com (the https:// may be left
+  // off; it is normalised to that form). A variable.
   ACCESS_TEAM_DOMAIN: string;
   // The Access application's audience tag (AUD); several may be given, comma-separated. A variable.
   ACCESS_AUD: string;
@@ -39,6 +40,10 @@ const KEY = "latest";
 export const MAX_BYTES = 512 * 1024;
 export const MAX_AHEAD_MS = 5 * 60_000;
 const CERTS_TTL_MS = 10 * 60_000;
+// A kid the fetched key set lacked is refused for a minute without fetching again, and the key
+// set is fetched at most once a minute for keys it doesn't have.
+export const UNKNOWN_KID_TTL_MS = 60_000;
+const UNKNOWN_KIDS_MAX = 256;
 const SKEW_S = 60;
 export const PUBLISHER_HEADER = "x-surface-publisher";
 
@@ -54,14 +59,38 @@ class Unavailable extends Error {}
 
 const b64url = (s: string) => fromBase64(s.replace(/-/g, "+").replace(/_/g, "/"));
 const decodeJson = (s: string) => JSON.parse(new TextDecoder().decode(b64url(s)));
-const teamOf = (env: Env) => (env.ACCESS_TEAM_DOMAIN || "").trim().replace(/\/+$/, "");
+
+// The team domain in one form, whichever way the variable is given: https://<host>, lower case,
+// no trailing slash. "<team>.cloudflareaccess.com" and "http://..." both become the https form.
+export function teamOf(env: Pick<Env, "ACCESS_TEAM_DOMAIN">): string {
+  const t = (env.ACCESS_TEAM_DOMAIN || "").trim().replace(/\/+$/, "");
+  if (!t) return "";
+  return ("https://" + t.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")).toLowerCase();
+}
 
 type Certs = { at: number; keys: Map<string, JsonWebKey> };
 const certCache = new Map<string, Certs>();
+const unknownKids = new Map<string, number>();
+
+function rememberUnknown(team: string, kid: string, at: number) {
+  if (unknownKids.size >= UNKNOWN_KIDS_MAX) {
+    for (const [k, t] of unknownKids) if (at - t >= UNKNOWN_KID_TTL_MS) unknownKids.delete(k);
+    if (unknownKids.size >= UNKNOWN_KIDS_MAX) unknownKids.clear();
+  }
+  unknownKids.set(`${team} ${kid}`, at);
+}
 
 async function signingKey(team: string, kid: string, deps: Deps): Promise<JsonWebKey | undefined> {
+  const now = deps.now();
   const cached = certCache.get(team);
-  if (cached && deps.now() - cached.at < CERTS_TTL_MS && cached.keys.has(kid)) return cached.keys.get(kid);
+  if (cached && now - cached.at < CERTS_TTL_MS && cached.keys.has(kid)) return cached.keys.get(kid);
+  const missedAt = unknownKids.get(`${team} ${kid}`);
+  if (missedAt !== undefined && now - missedAt < UNKNOWN_KID_TTL_MS) return undefined;
+  // Fetched under a minute ago and this kid wasn't in it: refuse without fetching again.
+  if (cached && now - cached.at < UNKNOWN_KID_TTL_MS) {
+    rememberUnknown(team, kid, now);
+    return undefined;
+  }
   let body: any;
   try {
     const res = await deps.fetch(`${team}/cdn-cgi/access/certs`);
@@ -72,7 +101,8 @@ async function signingKey(team: string, kid: string, deps: Deps): Promise<JsonWe
   }
   const keys = new Map<string, JsonWebKey>();
   for (const k of Array.isArray(body?.keys) ? body.keys : []) if (k && typeof k.kid === "string") keys.set(k.kid, k);
-  certCache.set(team, { at: deps.now(), keys });
+  certCache.set(team, { at: now, keys });
+  if (!keys.has(kid)) rememberUnknown(team, kid, now);
   return keys.get(kid);
 }
 
@@ -114,7 +144,8 @@ export async function accessClaims(request: Request, env: Env, deps: Deps): Prom
   const auds = (env.ACCESS_AUD || "").split(",").map((a) => a.trim()).filter(Boolean);
   const got = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
   if (!got.some((a: unknown) => typeof a === "string" && auds.includes(a))) return "an Access assertion for another application";
-  if (typeof claims.iss !== "string" || claims.iss.replace(/\/+$/, "") !== team) return "an Access assertion from another team";
+  // The issuer must be the team's full https form.
+  if (typeof claims.iss !== "string" || claims.iss.replace(/\/+$/, "").toLowerCase() !== team) return "an Access assertion from another team";
   const nowS = deps.now() / 1000;
   // Both times allow the same minute of clock skew.
   if (typeof claims.exp !== "number" || claims.exp + SKEW_S <= nowS) return "an expired Access assertion";

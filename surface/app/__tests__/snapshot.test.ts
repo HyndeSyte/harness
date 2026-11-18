@@ -82,20 +82,35 @@ describe("the loader", () => {
     expect(await loadSnapshot("/s", pub, broken)).toEqual({ ok: false, reason: "unreadable" });
   });
 
-  test("a redirect or a blocked request (an expired Access session) asks to sign in again", async () => {
+  test("only an opaque redirect, a 3xx, a 401 or a redirect flag asks to sign in again", async () => {
     const signin = { ok: false, reason: "signin" };
     expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { type: "opaqueredirect", status: 0 }))).toEqual(signin);
     expect(await loadSnapshot("/s", pub, fetchOf(raw, true, { redirected: true }))).toEqual(signin);
     expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { status: 302 }))).toEqual(signin);
-    expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { status: 403 }))).toEqual(signin);
-    const blocked = async () => { throw new TypeError("Failed to fetch"); };
-    expect(await loadSnapshot("/s", pub, blocked)).toEqual(signin);
+    expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { status: 307 }))).toEqual(signin);
+    expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { status: 401 }))).toEqual(signin);
+  });
+
+  test("a fetch that throws without an HTTP answer is offline", async () => {
+    for (const err of [new TypeError("Failed to fetch"), new Error("getaddrinfo ENOTFOUND"), new DOMException("timed out", "TimeoutError")]) {
+      const thrown = async () => { throw err; };
+      expect(await loadSnapshot("/s", pub, thrown)).toEqual({ ok: false, reason: "offline" });
+    }
+  });
+
+  test("a 403 from the Worker itself, with its JSON message, is not allowed", async () => {
+    const worker403 = fetchOf(null, false, { status: 403, json: async () => ({ error: "not the owner" }) });
+    expect(await loadSnapshot("/s", pub, worker403)).toEqual({ ok: false, reason: "notallowed" });
+    // A 403 without the Worker's message is not the Worker's: unreadable, never sign in.
+    const html403 = fetchOf(null, false, { status: 403, json: async () => { throw new SyntaxError("not JSON"); } });
+    expect(await loadSnapshot("/s", pub, html403)).toEqual({ ok: false, reason: "unreadable" });
+    expect(await loadSnapshot("/s", pub, fetchOf({ other: 1 }, false, { status: 403 }))).toEqual({ ok: false, reason: "unreadable" });
   });
 });
 
 describe("unknown fields", () => {
   const base = {
-    id: "P1", title: "t", area: "other", who: "cain", step: "s", waits_for: null,
+    id: "P1", title: "t", area: "other", who: "the assistant", step: "s", waits_for: null,
     outcome: "o", last_moved: "2026-11-18T09:00:00Z", state: "moving",
   };
   test("are dropped from each thread and from the snapshot", () => {
@@ -105,7 +120,7 @@ describe("unknown fields", () => {
     expect(s.hidden).toBe(0);
   });
   test("an unknown who or state shows as other, never dropped", () => {
-    const s = sanitize({ made_at: "x", threads: [{ ...base, who: "someone" }, { ...base, state: "urgent" }, base] });
+    const s = sanitize({ made_at: "x", threads: [{ ...base, who: "a stranger" }, { ...base, state: "urgent" }, base] });
     expect(s.threads.length).toBe(3);
     expect(s.threads[0].who).toBe("other");
     expect(s.threads[1].state).toBe("other");
@@ -120,7 +135,7 @@ describe("unknown fields", () => {
 
 describe("the sort", () => {
   const t = (id: string, last_moved: string): Thread => ({
-    id, title: id, area: "other", who: "cain", step: "", waits_for: null, outcome: "", last_moved, state: "moving",
+    id, title: id, area: "other", who: "the assistant", step: "", waits_for: null, outcome: "", last_moved, state: "moving",
   });
   test("newest move first, ties keep their order", () => {
     const sorted = sortThreads([
