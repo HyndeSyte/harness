@@ -630,7 +630,8 @@ export function heartbeatNotices(cfg: Config, h: Heartbeat | null): void {
 // worker that won't start. A condition held back, because the heartbeat before the job looked fresh (the worker may have
 // died right after it) or because the queue's fetch is failing, isn't dropped: it stays pending (quietPending, in the
 // notice file, so it survives a restart) until each of its jobs is acknowledged (claimed, so it has an attempt, whatever
-// result it then has, or a heartbeat more than SKEW_MS after it was queued), or until QUIET_PENDING_MAX_MS from when it was first
+// result it then has, a heartbeat more than SKEW_MS after it was queued, or (sixth pass) a heartbeat whose job field names
+// it, even inside the margin), or until QUIET_PENDING_MAX_MS from when it was first
 // held (12 hours worst case, any queue hold included): then it is told, as worker_not_starting_unconfirmed while the
 // queue's fetch is failing, worker_not_starting otherwise. A told mark stays owed until the link acknowledges it (resent
 // each round with its saved id), never sent once and forgotten.
@@ -654,7 +655,9 @@ export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[],
   };
   // 0.12.2, fifth pass: the clocks may differ by SKEW_MS either way, so a heartbeat counts as after the job was queued
   // only when it is more than SKEW_MS after it; one within the margin, before or after, doesn't show the worker started.
-  const acked = (j: Job) => !!j.attempt || (Number.isFinite(heard) && heard - Date.parse(j.created) > SKEW_MS);
+  // 0.12.2, sixth pass: a heartbeat whose job field names the job shows the worker has it, whatever the clocks say, so it
+  // counts even inside the margin.
+  const acked = (j: Job) => !!j.attempt || (!!h?.job && h.job === j.id) || (Number.isFinite(heard) && heard - Date.parse(j.created) > SKEW_MS);
   const t = readTold(cfg);
   const held = !!t.fetchFails;
   // A start refusal is told by its own notice: nothing held for it here.

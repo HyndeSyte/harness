@@ -1904,6 +1904,38 @@ describe("0.12.2 review: a short job's worker-not-starting notice, held through 
     expect(held(SKEW_MS + 1_000)).toBeNull();
   });
 
+  test("sixth pass: a heartbeat naming the held job clears the hold even inside the skew window; an idle one there doesn't", () => {
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const created = at(T, 5);
+    const JOB = "j-20261116-abc123";
+    const short = (state = "pending") => ({ id: JOB, state, attempt: null, created: created.toISOString(), expires: at(T, 20).toISOString() }) as any;
+    const beat = (offsetMs: number, job: string | null) => parseHeartbeat(JSON.stringify({ v: 1,
+      worker_clock: new Date(created.getTime() + offsetMs).toISOString().replace(/\.\d{3}Z$/, "Z"), code: job ? "busy" : "idle", job,
+      stale_lock: false, skew_ms: null, reason: null }));
+    const held = (offsetMs: number, job: string | null) => {
+      resetNoticeProcess();
+      const w = world();
+      w.first();
+      const sent: string[] = [];
+      const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(T), [short()], at(T, 20)); });
+      expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending.jobs).toEqual([JOB]);
+      const b = beat(offsetMs, job);
+      expect(b).not.toBeNull();
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, b, [short("failed")], at(T, 21)); });
+      expect(sent).toEqual([]);
+      return JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending?.jobs ?? null;
+    };
+    // A heartbeat naming the job 30 seconds after the queue time: the worker has it. The hold ends.
+    expect(held(30_000, JOB)).toBeNull();
+    // An idle heartbeat 30 seconds after: inside the margin, so it doesn't count. Still held.
+    expect(held(30_000, null)).toEqual([JOB]);
+    // A heartbeat naming another job inside the margin doesn't count for this one.
+    expect(held(30_000, "j-20261116-zzz999")).toEqual([JOB]);
+    // An idle heartbeat past the margin still clears it, as before.
+    expect(held(SKEW_MS + 1_000, null)).toBeNull();
+  });
+
   test("fourth pass: a queue outage longer than the cap is told as unconfirmed at 12 hours, and that notice stays owed until delivered", () => {
     resetNoticeProcess();
     const w = world();

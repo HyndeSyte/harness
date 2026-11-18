@@ -26,7 +26,7 @@ import {
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, DEFAULT_APP_IDS, readPolicy, parseSettingsValue, parseSettingsKey,
-  chromeLaunchArgs, openChrome, chromeExe, entryStatus, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -3427,8 +3427,9 @@ await runSession({ home, noIndex: () => {}, launch: async (_a, _c, _m, env) => {
     secure({ [OTHER]: { disable_reasons: [1] }, [COMPONENT]: { location: 5, state: 1, path: "C:\\Program Files\\Google\\Chrome\\Application\\157.0.0.0\\resources\\pdf" } });
     expect(extensionPrefs(q.inst).others).toEqual([]);
     expect(await run(q.opts(attended))).toMatchObject({ code: "ok", job: id });
+    // Sixth pass: a whole number (the old bitmask) is unrecognised, refused by name, zero included.
     secure({ [OTHER]: { disable_reasons: 1 | 4 } });
-    expect(extensionPrefs(q.inst).others).toEqual([]);
+    expect(extensionPrefs(q.inst).others).toEqual([OTHER]);
     secure({ [OTHER]: { disable_reasons: 0 } });
     expect(extensionPrefs(q.inst).others).toEqual([OTHER]);
     // What check-host and confirm-profile print: every extension found, with whether it is on and its raw fields.
@@ -3648,13 +3649,14 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     // on; state 0 with no reason is unrecognised (refused); no reason with no state is on. A policy location counts
     // whatever its reasons.
     expect(with_(OTHER, { location: 1, disable_reasons: [1] })).toEqual([]);
-    expect(with_(OTHER, { location: 1, disable_reasons: 1 | 2 })).toEqual([]);
+    expect(with_(OTHER, { location: 1, disable_reasons: 1 | 2 })).toEqual([OTHER]);             // sixth pass: a whole number is unrecognised
     expect(with_(OTHER, { location: 1, disable_reasons: [2] })).toEqual([]);
     expect(with_(OTHER, { location: 6, disable_reasons: [8192] })).toEqual([]);
     expect(with_(OTHER, { location: 9, disable_reasons: 1024 })).toEqual([OTHER]);
     expect(with_(OTHER, { location: 7, state: 0 })).toEqual([OTHER]);
     expect(with_(OTHER, { location: 1, state: 0 })).toEqual([OTHER]);
-    expect(with_(OTHER, { location: 1, state: 2 })).toEqual([]);
+    expect(with_(OTHER, { location: 1, state: 2 })).toEqual([OTHER]);                          // sixth pass: state 2 alone is unrecognised
+    expect(with_(OTHER, { location: 1, state: 2, disable_reasons: [1] })).toEqual([]);
     expect(with_(OTHER, { location: 1, state: 1, disable_reasons: [1] })).toEqual([OTHER]);
     expect(with_(OTHER, { location: 1, state: 1, disable_reasons: [] })).toEqual([OTHER]);
     expect(with_(OTHER, { location: 1, state: 1, disable_reasons: 0 })).toEqual([OTHER]);
@@ -3842,16 +3844,19 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(readFileSync(join(q.home, "worker.log"), "utf8")).toContain(`extension=${STORE}:present_off`);
     });
 
-    test("dump-extensions prints each entry's id, location, state, disable reasons and path's folder kind, never a path, name or other value", () => {
+    test("dump-extensions prints each entry's id, location, state, disable reasons and path's folder kind, never a name or other value, and a path only at location 10", () => {
       const { q } = oneJob();
       write(q, { ...reported(), [STORE]: store({ disable_reasons: [1] }) });
       writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" }, extensions: { settings: { [REG1]: { disable_reasons: [8192] } } } }));
       const d = dumpExtensions(q.inst);
       expect(d.entries.map((x) => x.id)).toEqual([EXT, STORE, REG1, REG2, DOCS, PAYMENTS].sort());
-      expect(d.entries.find((x) => x.id === PAYMENTS)).toEqual({ id: PAYMENTS, files: ["Secure Preferences"], location: 10, state: null, disable_reasons: null, by_default: true, path_kind: "chrome_install" });
+      // Sixth pass: an external component (10) carries its path (the user name redacted), so the real-PC run can name its folder.
+      expect(d.entries.find((x) => x.id === PAYMENTS)).toEqual({ id: PAYMENTS, files: ["Secure Preferences"], location: 10, state: null, disable_reasons: null, by_default: true, path_kind: "chrome_install",
+        path: payments.path });
       expect(d.entries.find((x) => x.id === REG1)).toEqual({ id: REG1, files: ["Secure Preferences", "Preferences"], location: 6, state: null, disable_reasons: [8192], by_default: false, path_kind: "profile" });
       expect(d.entries.find((x) => x.id === DOCS)).toEqual({ id: DOCS, files: ["Secure Preferences"], location: 1, state: null, disable_reasons: [1], by_default: false, path_kind: "profile" });
-      const text = JSON.stringify(d);
+      const text = JSON.stringify({ ...d, entries: d.entries.map(({ path: _p, ...x }) => x) });
+      expect(d.entries.filter((x) => "path" in x).map((x) => x.id)).toEqual([PAYMENTS]);
       for (const leak of ["Program Files", "web_store_payments", "Google Docs Offline", "Vendor helper", "Claude", "1.97.1", "0123ABCD", "Cain jobs", "\\\\"]) expect([leak, text.includes(leak)]).toEqual([leak, false]);
     });
 
@@ -3895,12 +3900,13 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
 
     test("fourth pass: an unknown preference shape fails closed: refused or unrecognised, never off", () => {
       const { q } = oneJob();
-      // The raw rule (fifth pass): off for a non-empty, non-zero disable_reasons list or bitmask without state 1, or state 2.
+      // The raw rule (fifth pass): off for a non-empty, non-zero disable_reasons list without state 1. Sixth pass: a whole
+      // number (the old bitmask) is unrecognised, and state 2 is off only when uninstalled or with a non-empty list.
       expect(entryStatus({ state: 0 })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
       expect(entryStatus({ disable_reasons: [8192] }).status).toBe("present, off");
-      expect(entryStatus({ disable_reasons: 1 }).status).toBe("present, off");
+      expect(entryStatus({ disable_reasons: 1 }).status).toBe("unrecognised");
       expect(entryStatus({ disable_reasons: [] }).status).toBe("on");
-      expect(entryStatus({ disable_reasons: 0 }).status).toBe("on");
+      expect(entryStatus({ disable_reasons: 0 }).status).toBe("unrecognised");
       expect(entryStatus({}).status).toBe("on");
       expect(entryStatus({ disable_reasons: null })).toEqual({ status: "unrecognised", unrecognised: ["disable_reasons"] });
       expect(entryStatus({ disable_reasons: "1" })).toEqual({ status: "unrecognised", unrecognised: ["disable_reasons"] });
@@ -3911,7 +3917,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(entryStatus({ state: "0" })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
       // On a foreign entry, through the gate: each refused (on) or unrecognised (refused naming the entry and the field).
       const cases: [object, string, string | null][] = [
-        [{ disable_reasons: [] }, "on", null], [{ disable_reasons: 0 }, "on", null], [{ disable_reasons: null }, "unrecognised", "disable_reasons"],
+        [{ disable_reasons: [] }, "on", null], [{ disable_reasons: 0 }, "unrecognised", "disable_reasons"], [{ disable_reasons: null }, "unrecognised", "disable_reasons"],
         [{}, "on", null], [{ disable_reasons: "8192" }, "unrecognised", "disable_reasons"], [{ state: 3 }, "unrecognised", "state"]];
       for (const [extra, status, field] of cases) {
         write(q, { ...reported(), [STORE]: store(extra) });
@@ -4028,7 +4034,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(line(q, STORE)).toMatchObject({ status: "on" });
       expect(extensionPrefs(q.inst).disagree).toEqual([STORE]);
       // Docs Offline off in one file, on in the other: on, refused by name.
-      both({ [DOCS]: { ...docs, disable_reasons: [1] } }, { [DOCS]: { disable_reasons: 0 } });
+      both({ [DOCS]: { ...docs, disable_reasons: [1] } }, { [DOCS]: { disable_reasons: [] } });
       expect(extensionPrefs(q.inst).refusals).toEqual([{ id: DOCS, why: "default_app_on" }]);
       // An unreadable field in either: unrecognised.
       both({ [STORE]: store({ disable_reasons: [1] }) }, { [STORE]: { disable_reasons: "x" } });
@@ -4081,20 +4087,22 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       const { q } = oneJob();
       // state 1 is never off, whatever disable_reasons holds: on, refused.
       expect(entryStatus({ state: 1, disable_reasons: [1] })).toEqual({ status: "on", unrecognised: [] });
-      expect(entryStatus({ state: 1, disable_reasons: 1 })).toEqual({ status: "on", unrecognised: [] });
+      expect(entryStatus({ state: 1, disable_reasons: 1 })).toEqual({ status: "unrecognised", unrecognised: ["disable_reasons"] });     // sixth pass
       // state 0 with an empty or missing disable_reasons: unrecognised, not off.
       expect(entryStatus({ state: 0, disable_reasons: [] })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
       expect(entryStatus({ state: 0 })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
       expect(entryStatus({ state: 0, disable_reasons: [1] }).status).toBe("present, off");
-      // state 2 (an external extension the user uninstalled): off with any list.
-      for (const r of [[], [1], [8192], 0, undefined]) expect([r, entryStatus(r === undefined ? { state: 2 } : { state: 2, disable_reasons: r }).status]).toEqual([r, "present, off"]);
+      // state 2 (an external extension the user uninstalled): sixth pass, off with a non-empty list, or when uninstalled.
+      for (const r of [[1], [8192]]) expect([r, entryStatus({ state: 2, disable_reasons: r }).status]).toEqual([r, "present, off"]);
+      for (const r of [[], undefined]) expect([r, entryStatus(r === undefined ? { state: 2 } : { state: 2, disable_reasons: r }, true).status]).toEqual([r, "present, off"]);
+      for (const r of [[], undefined]) expect([r, entryStatus(r === undefined ? { state: 2 } : { state: 2, disable_reasons: r }).status]).toEqual([r, "unrecognised"]);
       // No state: an empty list is on, a non-empty one off.
       expect(entryStatus({ disable_reasons: [] }).status).toBe("on");
       expect(entryStatus({ disable_reasons: [1] }).status).toBe("present, off");
       // Through the gate, on a foreign entry.
       const cases: [object, string, string[] | null][] = [
         [{ state: 1, disable_reasons: [1] }, "on", [STORE]], [{ state: 0, disable_reasons: [] }, "unrecognised", [STORE]], [{ state: 0 }, "unrecognised", [STORE]],
-        [{ state: 2, disable_reasons: [] }, "present, off", null], [{ state: 2, disable_reasons: [1] }, "present, off", null],
+        [{ state: 2, disable_reasons: [] }, "unrecognised", [STORE]], [{ state: 2, disable_reasons: [1] }, "present, off", null],
         [{ disable_reasons: [] }, "on", [STORE]], [{ disable_reasons: [1] }, "present, off", null]];
       for (const [extra, status, others] of cases) {
         write(q, { ...reported(), [STORE]: store(extra) });
@@ -4110,31 +4118,6 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", status: "on", unrecognised: [] });
       expect(extensionPrefs(q.inst).refusals).toEqual([]);
       expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
-    });
-
-    test("fifth pass: an external component is Chrome's own under Chrome's install folder or the user data folder's component folders; no path stays foreign", () => {
-      const { q } = oneJob();
-      // Under Chrome's install folder.
-      write(q, { ...reported(), [PAYMENTS]: payments });
-      expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", path_kind: "chrome_install" });
-      // Where the component updater unpacks: <user data>\<component folder>\<version>\...
-      const unpacked = join(q.udd, "WebStorePayments", "1.0.0.6", "web_store_payments");
-      expect(pathKind(unpacked, q.udd, "Default")).toBe("user_data_component");
-      write(q, { ...reported(), [PAYMENTS]: { ...payments, path: unpacked } });
-      expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", status: "on", path_kind: "user_data_component" });
-      expect(extensionPrefs(q.inst).others).toEqual([]);
-      expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
-      // Only at location 10: a component (5) there is foreign.
-      write(q, { ...reported(), [PAYMENTS]: { ...payments, path: unpacked, location: 5 } });
-      expect(extensionPrefs(q.inst).others).toEqual([PAYMENTS]);
-      // A profile's folder, or no version folder, is the profile's, not a component folder.
-      for (const p of [join(q.udd, "Default", "1.0.0.6", "x"), join(q.udd, "Profile 2", "1.0", "x"), join(q.udd, "WebStorePayments", "x", "y"), join(q.udd, "WebStorePayments", "1.0")])
-        expect([p, pathKind(p, q.udd, "Default")]).toEqual([p, "profile"]);
-      // No path: foreign.
-      const { path: _p, ...noPath } = payments;
-      write(q, { ...reported(), [PAYMENTS]: noPath });
-      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", path_kind: "absent" });
-      expect(extensionPrefs(q.inst).others).toEqual([PAYMENTS]);
     });
 
     test("fifth pass: policy parsing: the forcelist id before \";\", ExtensionSettings keys that aren't ids, and an enrollment token, each refused by name", () => {
@@ -4180,6 +4163,138 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
       expect(r.detail.fix).toContain("HKLM (ExtensionSettings: ABC)");
       // None of it: nothing extra, the plain shape kept.
       expect(readPolicy("win32", fake({}))).toEqual({ entries: [], unreadable: [] });
+    });
+
+    test("sixth pass: a whole-number disable_reasons (the old bitmask) is unrecognised and refused by name, zero included", () => {
+      const { q } = oneJob();
+      for (const r of [1, 8192, 0]) {
+        expect([r, entryStatus({ disable_reasons: r })]).toEqual([r, { status: "unrecognised", unrecognised: ["disable_reasons"] }]);
+        expect([r, entryStatus({ state: 1, disable_reasons: r })]).toEqual([r, { status: "unrecognised", unrecognised: ["disable_reasons"] }]);
+        write(q, { ...reported(), [STORE]: store({ disable_reasons: r }) });
+        expect(line(q, STORE)).toMatchObject({ status: "unrecognised", unrecognised: ["disable_reasons"] });
+        expect(extensionPrefs(q.inst).refusals).toEqual([{ id: STORE, why: "unrecognised", field: "disable_reasons" }]);
+        expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+        const e = refusal(q.opts());
+        expect(e.code).toBe("extra_extension");
+        expect(e.detail.fix).toContain(`${STORE}'s disable_reasons`);
+      }
+      // Off still needs a non-empty list of whole numbers.
+      expect(entryStatus({ disable_reasons: [1] }).status).toBe("present, off");
+      expect(entryStatus({ disable_reasons: [] }).status).toBe("on");
+    });
+
+    test("sixth pass: state 2 is off only when the id is in external_uninstalls (either file) or disable_reasons is a non-empty list", () => {
+      const { q } = oneJob();
+      const withUninstalls = (file: string, ids: string[]) => {
+        const f = file === "Preferences" ? pre(q) : sec(q);
+        const doc = existsSync(f) ? JSON.parse(readFileSync(f, "utf8")) : { profile: { name: "Cain jobs" } };
+        doc.extensions = { ...(doc.extensions ?? {}), external_uninstalls: ids };
+        writeFileSync(f, JSON.stringify(doc));
+      };
+      expect(entryStatus({ state: 2, disable_reasons: [] }, true).status).toBe("present, off");
+      expect(entryStatus({ state: 2, disable_reasons: [] })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
+      expect(entryStatus({ state: 2 })).toEqual({ status: "unrecognised", unrecognised: ["state"] });
+      expect(entryStatus({ state: 2, disable_reasons: [1] }).status).toBe("present, off");
+      // Listed in external_uninstalls, in Secure Preferences or in Preferences: off.
+      for (const file of ["Secure Preferences", "Preferences"]) {
+        write(q, { ...reported(), [STORE]: store({ state: 2, disable_reasons: [] }) });
+        writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" } }));
+        withUninstalls(file, [STORE]);
+        expect([file, line(q, STORE)!.status]).toEqual([file, "present, off"]);
+        expect(extensionPrefs(q.inst).refusals).toEqual([]);
+        expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+      }
+      // Not listed (another id is): unrecognised, refused by name.
+      write(q, { ...reported(), [STORE]: store({ state: 2, disable_reasons: [] }) });
+      writeFileSync(pre(q), JSON.stringify({ profile: { name: "Cain jobs" } }));
+      withUninstalls("Preferences", [REG1]);
+      expect(line(q, STORE)).toMatchObject({ status: "unrecognised", unrecognised: ["state"] });
+      expect(extensionPrefs(q.inst).refusals).toEqual([{ id: STORE, why: "unrecognised", field: "state" }]);
+      expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      // A non-empty list: off, listed or not.
+      write(q, { ...reported(), [STORE]: store({ state: 2, disable_reasons: [8192] }) });
+      expect(line(q, STORE)!.status).toBe("present, off");
+      expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+    });
+
+    test("sixth pass: an external component is Chrome's own only under Chrome's install folder; a user data path or no path is refused with its path kind and path", () => {
+      const { q } = oneJob();
+      // Under Chrome's install folder: passes.
+      write(q, { ...reported(), [PAYMENTS]: payments });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "chrome", path_kind: "chrome_install" });
+      expect(browserPreflight(q.opts(attended), q.inst)).toBeNull();
+      // Where the fifth pass let the component updater's folder through: now the profile's, foreign, refused by name.
+      const unpacked = join(q.udd, "WebStorePayments", "1.0.0.6", "web_store_payments");
+      expect(pathKind(unpacked, q.udd, "Default")).toBe("profile");
+      write(q, { ...reported(), [PAYMENTS]: { ...payments, path: unpacked } });
+      expect(line(q, PAYMENTS)).toMatchObject({ kind: "foreign", status: "on", path_kind: "profile" });
+      expect(extensionPrefs(q.inst).refusals).toEqual([{ id: PAYMENTS, why: "on", path_kind: "profile", path: externalPath(unpacked) }]);
+      expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      let e = refusal(q.opts());
+      expect(e.detail.fix).toContain(`${PAYMENTS} is at the external component location (10) with path kind profile and path ${externalPath(unpacked)}`);
+      const d = dumpExtensions(q.inst).entries.find((x) => x.id === PAYMENTS)!;
+      expect(d).toMatchObject({ location: 10, path_kind: "profile", path: externalPath(unpacked) });
+      // No path: foreign, refused, named as absent.
+      const { path: _p, ...noPath } = payments;
+      write(q, { ...reported(), [PAYMENTS]: noPath });
+      expect(extensionPrefs(q.inst).refusals).toEqual([{ id: PAYMENTS, why: "on", path_kind: "absent", path: null }]);
+      e = refusal(q.opts());
+      expect(e.detail.fix).toContain("with path kind absent and path (none)");
+      expect(browserPreflight(q.opts(attended), q.inst)).toBe("extra_extension");
+      // The user name is redacted from the printed path.
+      const win = "C:\\Users\\SomeOwner\\AppData\\Local\\Google\\Chrome\\User Data\\WebStorePayments\\1.0.0.6\\x";
+      expect(externalPath(win, {})).toBe("C:\\Users\\<user>\\AppData\\Local\\Google\\Chrome\\User Data\\WebStorePayments\\1.0.0.6\\x");
+      expect(externalPath("D:\\SomeOwner\\x", { USERNAME: "SomeOwner" })).toBe("D:\\<user>\\x");
+      expect(externalPath("/home/someone/x", {})).toBe("/home/<user>/x");
+      expect(externalPath(undefined)).toBeNull();
+    });
+
+    test("sixth pass: a cloud management token (CloudManagement's EnrollmentToken, or an Enrollment device token) refuses by hive and key; no token text appears", () => {
+      const { q } = oneJob();
+      const absent = { status: 1, stdout: "" };
+      const fake = (answers: Record<string, { status: number | null; stdout: string }>) => (args: string[]) => answers[args.join(" ")] ?? absent;
+      const SECRET = "tok-SECRET-9f8e7d";
+      const cases: [string, string, string, string][] = [
+        ["HKLM", "HKLM\\SOFTWARE\\Policies\\Google\\CloudManagement", "EnrollmentToken", "CloudManagement"],
+        ["HKLM\\WOW6432Node", "HKLM\\SOFTWARE\\WOW6432Node\\Policies\\Google\\CloudManagement", "EnrollmentToken", "CloudManagement"],
+        ["HKLM\\WOW6432Node", "HKLM\\SOFTWARE\\WOW6432Node\\Google\\Enrollment", "dmtoken", "Enrollment"],
+        ["HKLM", "HKLM\\SOFTWARE\\Google\\Chrome\\Enrollment", "dmtoken", "Enrollment"],
+      ];
+      expect(CLOUD_KEYS.map((c) => [c.hive, c.key])).toEqual(cases.map(([h, k]) => [h, k]));
+      for (const [hive, key, name, policy] of cases) {
+        const text = `\r\n${key.replace(/^HKLM/, "HKEY_LOCAL_MACHINE")}\r\n    ${name}    REG_SZ    ${SECRET}\r\n    Other    REG_SZ    x\r\n`;
+        const pol = readPolicy("win32", fake({ [key]: { status: 0, stdout: text } }));
+        expect([key, pol.enrollment]).toEqual([key, [{ hive, name, key }]]);
+        expect(pol.unreadable).toEqual([]);
+        write(q, reported());
+        const o = q.opts({ ...attended, forcelist: () => pol });
+        expect(browserPreflight(o, q.inst)).toBe("extra_extension");
+        const r = refusal(o);
+        expect(r.detail.refusals).toEqual([{ why: "policy_enrollment", hive, name, key }]);
+        expect(r.detail.fix).toContain(`${hive}, key ${key} (${name})`);
+        // No token text anywhere: the policy read, the refusal, the run log, the heartbeat.
+        expect(JSON.stringify(pol)).not.toContain(SECRET);
+        expect(JSON.stringify(r)).not.toContain(SECRET);
+        for (const f of ["worker.log", "heartbeat.json"]) if (existsSync(join(q.home, f))) expect(readFileSync(join(q.home, f), "utf8")).not.toContain(SECRET);
+        // A key that can't be read refuses, as in the fourth pass.
+        const un = readPolicy("win32", fake({ [key]: { status: 5, stdout: "" } }));
+        expect(un.unreadable).toContainEqual({ hive, policy });
+        expect(browserPreflight(q.opts({ ...attended, forcelist: () => un }), q.inst)).toBe("extra_extension");
+      }
+      // The key present with no token value: nothing.
+      expect(readPolicy("win32", fake({ [cases[0][1]]: { status: 0, stdout: `\r\nHKEY_X\r\n    Other    REG_SZ    x\r\n` } }))).toEqual({ entries: [], unreadable: [] });
+    });
+
+    test("sixth pass: Chrome's version is in check-host's answer, its refusal, the unrecognised shape's line, and dump-extensions", () => {
+      const { q } = oneJob();
+      write(q, reported());
+      const ok = checkHost(q.opts());
+      expect(ok.chrome_version).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
+      write(q, { ...reported(), [STORE]: store({ disable_reasons: 4 }) });
+      const e = refusal(q.opts());
+      expect(e.detail.chrome_version).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
+      expect(e.detail.fix).toContain("written by Chrome 131.0.6778.86 (last_version_file)");
+      expect(dumpExtensions(q.inst, ok.chrome_version).chrome_version).toEqual({ version: "131.0.6778.86", source: "last_version_file" });
     });
   });
 
