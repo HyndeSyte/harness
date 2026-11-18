@@ -29,11 +29,17 @@ export const DEFAULT_OWNER_NAMES = ["owner", "the owner"];
 export interface Policy {
   terms: RegExp[];
   stems: RegExp;
+  // Every word that classifies a row as the owner's: the role words and the configured names.
   owners: string[];
+  // The owner's configured names only, replaced by "you" in every exported text.
+  ownerNames: string[];
+  // Other people's names (config `names`), replaced by "someone" in every exported text.
+  names: string[];
 }
 
 export interface ExporterConfig {
   owner_names?: string[];
+  names?: string[];
   exclude_stems?: string[];
 }
 
@@ -70,16 +76,35 @@ const list = (v: unknown, name: string): string[] => {
 };
 const envList = (v: string | undefined) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
-// The config: a JSON file (--config) and/or SURFACE_OWNER_NAMES and SURFACE_EXCLUDE_STEMS
-// (comma-separated). Both add to the generic defaults.
+// The config: a JSON file (--config) and/or SURFACE_OWNER_NAMES, SURFACE_NAMES and
+// SURFACE_EXCLUDE_STEMS (comma-separated). Both add to the generic defaults.
 export function makePolicy(termsText: string, config: ExporterConfig = {}, env: Record<string, string | undefined> = {}): Policy {
   const stems = [...DEFAULT_STEMS, ...list(config.exclude_stems, "exclude_stems"), ...envList(env.SURFACE_EXCLUDE_STEMS)];
-  const owners = [...DEFAULT_OWNER_NAMES, ...list(config.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)];
+  const ownerNames = [...list(config.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)];
+  const names = [...list(config.names, "names"), ...envList(env.SURFACE_NAMES)];
   return {
     terms: parseTerms(termsText),
     stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map(escapeRe).join("|")})`, "iu"),
-    owners: owners.map((o) => o.toLowerCase()),
+    owners: [...DEFAULT_OWNER_NAMES, ...ownerNames].map((o) => o.toLowerCase()),
+    ownerNames,
+    names,
   };
+}
+
+// Names never leave. After a row is classified, each configured owner name becomes "you" (its
+// possessive, "<name>'s", becomes "your") and each listed name becomes "someone" ("someone's"),
+// whole word, any case, longest name first so "Robin Lee" goes before "Robin".
+export function replaceNames(text: string, policy: Pick<Policy, "ownerNames" | "names">): string {
+  const all = [
+    ...policy.ownerNames.map((n) => ({ n, plain: "you", poss: "your" })),
+    ...policy.names.map((n) => ({ n, plain: "someone", poss: "someone's" })),
+  ].sort((a, b) => b.n.length - a.n.length);
+  let out = text;
+  for (const { n, plain, poss } of all) {
+    const re = new RegExp(`(?<![\\p{L}\\p{N}_])${escapeRe(n)}(?:(['\u2019]s)(?![\\p{L}\\p{N}_]))?(?![\\p{L}\\p{N}_])`, "giu");
+    out = out.replace(re, (_m, s: string | undefined) => (s ? poss : plain));
+  }
+  return out;
 }
 
 // The private marker: a `#private` tag anywhere in the row, or a Private column whose cell is
@@ -322,17 +347,19 @@ export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], 
   const times = [since, ...notes.map(toTime), toTime(hold?.taken), toTime(hold?.renewed)].filter(
     (t): t is number => t !== null,
   );
-  const waits = row.waits === null ? null : strip(row.waits) || null;
+  // Classified first (who and state read the names), then every name is replaced.
+  const clean = (t: string) => replaceNames(strip(t), policy);
+  const waits = row.waits === null ? null : clean(row.waits) || null;
   return {
     kind: "thread",
     thread: {
       id: row.id,
-      title: firstSentence(strip(row.item), TITLE_MAX),
+      title: firstSentence(clean(row.item), TITLE_MAX),
       area: areaOf(row.item),
       who: whoOf(row, hold, policy.owners),
-      step: firstSentence(strip(row.next), STEP_MAX),
+      step: firstSentence(clean(row.next), STEP_MAX),
       waits_for: waits,
-      outcome: strip(row.done_when),
+      outcome: clean(row.done_when),
       last_moved: new Date(Math.max(...times)).toISOString(),
       state: stateOf(row, hold, policy.owners),
     },

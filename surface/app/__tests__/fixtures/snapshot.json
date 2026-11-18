@@ -19,7 +19,7 @@
       "area": "other",
       "who": "you",
       "step": "Choose 7:30 or 7:45 for the weekday ping.",
-      "waits_for": "Robin's pick",
+      "waits_for": "your pick",
       "outcome": "The reminder fires at the chosen time.",
       "last_moved": "2026-11-17T18:22:00.000Z",
       "state": "waiting on you"
@@ -63,7 +63,7 @@
       "area": "other",
       "who": "cain",
       "step": "Draft the note; call a phone number if no reply by Friday.",
-      "waits_for": "Robin's OK on the draft",
+      "waits_for": "your OK on the draft",
       "outcome": "Fence repair is booked.",
       "last_moved": "2026-11-11T10:00:00.000Z",
       "state": "waiting on you"
@@ -92,7 +92,7 @@
     },
     {
       "id": "P54",
-      "title": "Ring Morgan Vale at a phone number about projects/garden, see a link",
+      "title": "Ring someone at a phone number about projects/garden, see a link",
       "area": "garden",
       "who": "cain",
       "step": "After another item, mail an email address.",
@@ -100,10 +100,21 @@
       "outcome": "Notes saved at a link for another item.",
       "last_moved": "2026-11-06T00:00:00.000Z",
       "state": "moving"
+    },
+    {
+      "id": "P56",
+      "title": "your school form, for you to sign.",
+      "area": "other",
+      "who": "cain",
+      "step": "Put the form where you sees it; ask the Robinsons and someone's sister too.",
+      "waits_for": "your pick",
+      "outcome": "your form signed and someone told.",
+      "last_moved": "2026-11-04T00:00:00.000Z",
+      "state": "waiting on you"
     }
   ],
   "excluded_rows": 6,
   "skipped_rows": 2,
-  "sig": "gFcBpbPQdNyh5Roe3+LeWQifjAvWnQGGUHlZuaA/vIlWjHMg/5IyImKsISCChKXF2p0DhIKp/RkZXEE4oZmUDw==",
-  "key_id": "7866a409afb21a98"
+  "sig": "V0O49EVi2xuwscWs+Kg8o+YYJC8qGQTeri4tQgrPO8FIj5NsVp5RUbrXePryHRhurRFPMb333633ygd1BWZuAQ==",
+  "key_id": "970992bfa7840dc5"
 }

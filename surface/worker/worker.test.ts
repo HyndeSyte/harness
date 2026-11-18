@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { main as exporter } from "../export/index";
 import { buildSnapshot, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../export/lib";
 import { createWorker, MAX_BYTES, type Env } from "./src/index";
 
@@ -204,7 +206,7 @@ describe("Access on GET", () => {
     expect(await status(await ownerJwt({ email: "someone@example.com" }))).toBe(403);
     expect(await status(await ownerJwt({ aud: ["another-aud"] }))).toBe(403);
     expect(await status(await ownerJwt({ iss: "https://other.cloudflareaccess.com" }))).toBe(403);
-    expect(await status(await ownerJwt({ exp: NOW / 1000 - 1 }))).toBe(403);
+    expect(await status(await ownerJwt({ exp: NOW / 1000 - 61 }))).toBe(403);
     expect(await status(await serviceJwt())).toBe(403); // the exporter can't read
     const forger = (await crypto.subtle.generateKey(
       { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
@@ -225,8 +227,35 @@ describe("Access on GET", () => {
     const res = await w.fetch(await get(), env());
     expect(res.status).toBe(503);
   });
-  test("missing Access settings refuse", async () => {
-    expect((await worker.fetch(await get(), { ...env(), OWNER_EMAIL: "" })).status).toBe(500);
+  test("blank Access settings are 503, naming the setting", async () => {
+    for (const name of ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "OWNER_EMAIL", "PUBLISHER_CLIENT_ID", "PUBLISHER_TOKEN"]) {
+      for (const r of [await get(), await put(snap("2026-11-18T12:00:00Z"))]) {
+        const res = await worker.fetch(r, { ...env(), [name]: " " });
+        expect(res.status).toBe(503);
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        expect(((await res.json()) as any).error).toContain(name);
+      }
+    }
+    const res = await worker.fetch(await get(), { ...env(), OWNER_EMAIL: "", ACCESS_AUD: "" });
+    expect(((await res.json()) as any).error).toMatch(/ACCESS_AUD, OWNER_EMAIL are blank/);
+  });
+  test("a payload that is null, or not an object, is 403, not 503", async () => {
+    const forged = async (payload: string) => {
+      const head = b64u(JSON.stringify({ alg: "RS256", kid: "kid-1", typ: "JWT" }));
+      const body = b64u(payload);
+      const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", rsa.privateKey, new TextEncoder().encode(head + "." + body));
+      return `${head}.${body}.${b64u(new Uint8Array(sig))}`;
+    };
+    for (const payload of ["null", "42", '"text"', "[1,2]", "true"]) expect(await status(await forged(payload))).toBe(403);
+    const nullHead = `${b64u("null")}.${b64u(JSON.stringify({ ...base, email: OWNER }))}.${b64u("sig")}`;
+    expect(await status(nullHead)).toBe(403);
+  });
+  test("exp has the same 60 seconds of leeway as nbf", async () => {
+    expect(await status(await ownerJwt({ exp: NOW / 1000 - 59 }))).toBe(200);
+    expect(await status(await ownerJwt({ exp: NOW / 1000 - 60 }))).toBe(403);
+    expect(await status(await ownerJwt({ exp: NOW / 1000 - 3600 }))).toBe(403);
+    expect(await status(await ownerJwt({ nbf: NOW / 1000 + 59 }))).toBe(200);
+    expect(await status(await ownerJwt({ nbf: NOW / 1000 + 61 }))).toBe(403);
   });
 });
 
@@ -257,5 +286,122 @@ describe("Access on PUT", () => {
       headers: { "x-surface-publisher": PUBLISHER },
     });
     expect((await worker.fetch(r, env())).status).toBe(403);
+  });
+});
+
+describe("the exporter's --put, against this Worker in-process", () => {
+  // Made-up values only. Access is played by the fetch below: it lets the request through only
+  // with the service token's two headers, drops them, and adds its assertion, as Access does.
+  const ID = "service-token-id-example";
+  const SECRET = "service-token-secret-example";
+  const putEnv = { SURFACE_ACCESS_CLIENT_ID: ID, SURFACE_ACCESS_CLIENT_SECRET: SECRET, SURFACE_PUBLISHER_TOKEN: PUBLISHER };
+  const dir = mkdtempSync(join(tmpdir(), "surface-put-"));
+  const keyFile = join(dir, "surface.key");
+  const run = ["--record", join(FIX, "record"), "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json")];
+  const URL_ = "https://surface.example.com/snapshot";
+  // The exporter dates its snapshot now, so this Worker reads the real clock.
+  const live = createWorker({ now: () => Date.now(), fetch: deps.fetch });
+
+  function harness(e: Env) {
+    const calls: { url: string; headers: Headers }[] = [];
+    const fetchVia = async (url: string, init: RequestInit) => {
+      const h = new Headers(init.headers);
+      calls.push({ url, headers: h });
+      if (h.get("cf-access-client-id") !== ID || h.get("cf-access-client-secret") !== SECRET)
+        return new Response("Forbidden", { status: 403 });
+      h.delete("cf-access-client-id");
+      h.delete("cf-access-client-secret");
+      h.set("cf-access-jwt-assertion", await serviceJwt({ exp: Date.now() / 1000 + 3600 }));
+      return live.fetch(new Request(url, { method: init.method, body: init.body, headers: h }), e);
+    };
+    return { calls, fetch: fetchVia };
+  }
+  const capture = async (f: () => Promise<number>) => {
+    const lines: string[] = [];
+    const err = console.error, log = console.log;
+    console.error = console.log = (m: string) => void lines.push(String(m));
+    try {
+      return { code: await f(), out: lines.join("\n") };
+    } finally {
+      console.error = err;
+      console.log = log;
+    }
+  };
+
+  beforeAll(async () => {
+    await capture(() => exporter(["--keygen", dir]));
+  });
+  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEY: readFileSync(join(dir, "surface.pub.b64"), "utf8").trim() });
+
+  test("a signed snapshot is stored: 200, exit 0, the status and the Worker's message printed", async () => {
+    const e = workerEnv();
+    const h = harness(e);
+    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
+    expect(code).toBe(0);
+    expect(out).toMatch(/PUT https:\/\/surface\.example\.com\/snapshot: 200 stored /);
+    expect(h.calls.length).toBe(1);
+    expect(h.calls[0].headers.get("x-surface-publisher")).toBe(PUBLISHER);
+    const stored = JSON.parse(e.SNAPSHOTS.m.get("latest")!);
+    expect(stored.threads.length).toBeGreaterThan(0);
+    expect(out).not.toContain(SECRET);
+    expect(out).not.toContain(PUBLISHER);
+  });
+
+  test("a refusal is exit 1 with the Worker's message", async () => {
+    const e = workerEnv();
+    const h = harness(e);
+    const env2 = { ...putEnv, SURFACE_PUBLISHER_TOKEN: "wrong" };
+    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
+    expect(code).toBe(1);
+    expect(out).toContain("403 the publisher header is missing or wrong");
+    expect(e.SNAPSHOTS.m.size).toBe(0);
+  });
+
+  test("Access refusing the token is exit 1", async () => {
+    const h = harness(workerEnv());
+    const env2 = { ...putEnv, SURFACE_ACCESS_CLIENT_SECRET: "wrong" };
+    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
+    expect(code).toBe(1);
+    expect(out).toContain(": 403 Forbidden");
+  });
+
+  test("an older snapshot is 409, exit 1", async () => {
+    const e = workerEnv();
+    e.SNAPSHOTS.m.set("latest", JSON.stringify({ made_at: "2999-01-01T00:00:00.000Z" }));
+    const h = harness(e);
+    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
+    expect(code).toBe(1);
+    expect(out).toContain("409 older than the stored snapshot");
+  });
+
+  test("a missing variable is exit 2 before any request", async () => {
+    for (const name of Object.keys(putEnv)) {
+      const h = harness(workerEnv());
+      const env2: Record<string, string | undefined> = { ...putEnv, [name]: undefined };
+      const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
+      expect(code).toBe(2);
+      expect(out).toContain(name);
+      expect(h.calls.length).toBe(0);
+    }
+  });
+
+  test("no answer is exit 1", async () => {
+    const { code, out } = await capture(() =>
+      exporter([...run, "--key", keyFile, "--put", URL_], {
+        fetch: async () => {
+          throw new Error("connection refused");
+        },
+        env: putEnv,
+      }),
+    );
+    expect(code).toBe(1);
+    expect(out).toContain("no answer");
+  });
+
+  test("--put with no url, or with --dry-run, is exit 2", async () => {
+    const h = harness(workerEnv());
+    expect((await capture(() => exporter([...run, "--key", keyFile, "--put"], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
+    expect((await capture(() => exporter([...run, "--dry-run", "--put", URL_], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
+    expect(h.calls.length).toBe(0);
   });
 });

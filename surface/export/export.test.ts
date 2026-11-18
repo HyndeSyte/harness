@@ -14,6 +14,7 @@ import {
   markedPrivate,
   parseTerms,
   openRows,
+  replaceNames,
   privateKey,
   rawPublicKey,
   signSnapshot,
@@ -106,6 +107,27 @@ describe("fields", () => {
     expect(Array.from(cutCodePoints(nonBmp, 200)).length).toBe(200);
     expect(cutCodePoints("𝄞𝄞", 2)).toBe("𝄞𝄞");
   });
+  test("a joiner sequence or a flag at the cut is never split", () => {
+    const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}";
+    const flag = "\u{1F1F3}\u{1F1FF}";
+    expect(cutCodePoints("ab" + family + family + "cd", 4)).toBe("ab" + family + "…");
+    expect(cutCodePoints("ab" + family + "c", 3)).toBe("ab…");
+    expect(cutCodePoints("a" + flag + flag + "z", 3)).toBe("a" + flag + "…");
+    expect(cutCodePoints("ab" + family, 3)).toBe("ab" + family);
+    const cut = firstSentence("a".repeat(138) + family + family + family, 140);
+    expect(cut).toBe("a".repeat(138) + family + "…");
+  });
+  test("without Intl.Segmenter the cut falls back to code points", () => {
+    const seg = (Intl as any).Segmenter;
+    try {
+      delete (Intl as any).Segmenter;
+      expect(cutCodePoints("ab😀😀😀", 4)).toBe("ab😀…");
+      expect(cutCodePoints("𝄞".repeat(5), 3)).toBe("𝄞𝄞…");
+    } finally {
+      (Intl as any).Segmenter = seg;
+    }
+    expect(typeof (Intl as any).Segmenter).toBe("function");
+  });
   test("title and step are first sentences, capped", () => {
     expect(byId.P40.title).toBe("Surface piece one for projects/surface.");
     const long = "word ".repeat(80) + ". Second.";
@@ -119,6 +141,41 @@ describe("fields", () => {
     expect(byId.P40.last_moved).toBe("2026-11-18T09:40:00.000Z"); // hold renewed
     expect(byId.P41.last_moved).toBe("2026-11-17T18:22:00.000Z"); // newest note
     expect(byId.P44.last_moved).toBe("2026-11-14T00:00:00.000Z"); // Since only
+  });
+});
+
+describe("names never leave", () => {
+  test("the owner's name becomes you or your in every field, still waiting on you", () => {
+    const t = byId.P56;
+    expect(t.state).toBe("waiting on you");
+    expect(t.who).toBe("cain");
+    expect(t.title).toBe("your school form, for you to sign.");
+    expect(t.step).toBe("Put the form where you sees it; ask the Robinsons and someone's sister too.");
+    expect(t.waits_for).toBe("your pick");
+    expect(t.outcome).toBe("your form signed and someone told.");
+    expect(byId.P41.who).toBe("you");
+    expect(byId.P41.waits_for).toBe("your pick");
+    expect(byId.P45.state).toBe("waiting on you");
+    expect(byId.P45.waits_for).toBe("your OK on the draft");
+  });
+  test("a listed name becomes someone", () => {
+    expect(byId.P54.title).toBe("Ring someone at a phone number about projects/garden, see a link");
+  });
+  test("no configured name is left anywhere in the snapshot", () => {
+    const all = JSON.stringify(snap.threads);
+    expect(all).not.toMatch(/(?<![\p{L}])robin(?![\p{L}])/iu);
+    expect(all).not.toMatch(/morgan vale/i);
+  });
+  test("a name inside a longer word is untouched", () => {
+    expect(byId.P56.step).toContain("Robinsons");
+    const p = makePolicy("x", { owner_names: ["Al"], names: ["Sam"] });
+    expect(replaceNames("Alice, Sammy, Salsa and Al's van; SAM and al", p)).toBe("Alice, Sammy, Salsa and your van; someone and you");
+  });
+  test("SURFACE_NAMES adds names; the default is none", () => {
+    expect(makePolicy("x").names).toEqual([]);
+    const p = makePolicy("x", {}, { SURFACE_NAMES: "Kim, Lee", SURFACE_OWNER_NAMES: "Jo" });
+    expect(replaceNames("Kim and Lee's dog for Jo", p)).toBe("someone and someone's dog for you");
+    expect(() => makePolicy("x", { names: "Kim" as any })).toThrow();
   });
 });
 

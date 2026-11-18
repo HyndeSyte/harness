@@ -27,12 +27,24 @@ export function signedBytes(s: SignedFields): Uint8Array {
   return new TextEncoder().encode(canonical(picked));
 }
 
-// Cuts text to at most `max` whole code points, never splitting a surrogate pair; a cut
-// text ends in an ellipsis, counted in the limit.
+// Cuts text to at most `max` whole characters; a cut text ends in an ellipsis, counted in the
+// limit. Where Intl.Segmenter exists a character is a grapheme cluster, so a joiner sequence
+// (a family emoji), a flag or a letter with its combining mark is never split; elsewhere it is
+// a code point, so a surrogate pair is never split.
 export function cutCodePoints(text: string, max: number): string {
-  const points = Array.from(text);
+  const points = characters(text);
   if (points.length <= max) return text;
   return points.slice(0, max - 1).join("").trimEnd() + "…";
+}
+
+function characters(text: string): string[] {
+  const Segmenter = (globalThis as any).Intl?.Segmenter;
+  if (typeof Segmenter === "function") {
+    const out: string[] = [];
+    for (const s of new Segmenter(undefined, { granularity: "grapheme" }).segment(text)) out.push(s.segment);
+    return out;
+  }
+  return Array.from(text);
 }
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

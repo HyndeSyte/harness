@@ -92,7 +92,9 @@ export async function accessClaims(request: Request, env: Env, deps: Deps): Prom
   } catch {
     return "a malformed Access assertion";
   }
-  if (header?.alg !== "RS256" || typeof header.kid !== "string") return "an unexpected Access assertion";
+  const isObject = (v: unknown) => !!v && typeof v === "object" && !Array.isArray(v);
+  if (!isObject(header) || !isObject(claims)) return "a malformed Access assertion";
+  if (header.alg !== "RS256" || typeof header.kid !== "string") return "an unexpected Access assertion";
   const team = teamOf(env);
   const jwk = await signingKey(team, header.kid, deps);
   if (!jwk) return "an Access assertion signed by an unknown key";
@@ -114,7 +116,8 @@ export async function accessClaims(request: Request, env: Env, deps: Deps): Prom
   if (!got.some((a: unknown) => typeof a === "string" && auds.includes(a))) return "an Access assertion for another application";
   if (typeof claims.iss !== "string" || claims.iss.replace(/\/+$/, "") !== team) return "an Access assertion from another team";
   const nowS = deps.now() / 1000;
-  if (typeof claims.exp !== "number" || claims.exp <= nowS) return "an expired Access assertion";
+  // Both times allow the same minute of clock skew.
+  if (typeof claims.exp !== "number" || claims.exp + SKEW_S <= nowS) return "an expired Access assertion";
   if (typeof claims.nbf === "number" && claims.nbf > nowS + SKEW_S) return "an Access assertion not valid yet";
   return { email: claims.email, common_name: claims.common_name };
 }
@@ -127,9 +130,10 @@ function sameSecret(a: string, b: string): boolean {
   return diff === 0;
 }
 
-const configured = (env: Env) =>
-  !!(teamOf(env) && (env.ACCESS_AUD || "").trim() && (env.OWNER_EMAIL || "").trim() &&
-    (env.PUBLISHER_CLIENT_ID || "").trim() && (env.PUBLISHER_TOKEN || "").trim());
+// The Access settings the Worker can't run without, by name, so a blank one is named.
+export const ACCESS_SETTINGS = ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "OWNER_EMAIL", "PUBLISHER_CLIENT_ID", "PUBLISHER_TOKEN"] as const;
+const missingSettings = (env: Env) =>
+  ACCESS_SETTINGS.filter((k) => typeof env[k] !== "string" || !env[k].trim().replace(/\/+$/, ""));
 
 // --- the store --------------------------------------------------------------------------------
 
@@ -219,7 +223,9 @@ export function createWorker(deps: Deps) {
       if (url.pathname !== "/snapshot") return json(404, { error: "not found" });
       if (request.method !== "GET" && request.method !== "PUT")
         return new Response(null, { status: 405, headers: { allow: "GET, PUT", "cache-control": "no-store" } });
-      if (!configured(env)) return json(500, { error: "the Worker's Access settings are not configured" });
+      const missing = missingSettings(env);
+      if (missing.length)
+        return json(503, { error: `the Worker's Access settings are not configured: ${missing.join(", ")} ${missing.length > 1 ? "are" : "is"} blank` });
       try {
         return request.method === "PUT" ? await put(request, env, deps) : await get(request, env, deps);
       } catch (e) {
