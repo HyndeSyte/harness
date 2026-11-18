@@ -12,6 +12,7 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
   return {
     queueDir: env.REVIEW_QUEUE ?? "/data/review-queue",
     spendFile: env.REVIEW_SPEND ?? "/data/review-spend.json",
+    spendDaysFile: env.REVIEW_SPEND_DAYS || undefined,
     healthFile: env.REVIEW_HEALTH ?? "/data/review-health.json",
     termsFile: env.REVIEW_TERMS ?? "/data/review-private-terms.txt",
     recordQueue: env.RECORD_QUEUE ?? "/data/record-queue",

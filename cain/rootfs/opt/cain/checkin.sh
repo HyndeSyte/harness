@@ -116,10 +116,17 @@ if [ -n "$rows" ]; then
   [ "$total" -gt 3 ] && notes=" ($((total - 3)) older not shown; /opt/cain/record.sh notes - lists them)$notes"
   [ -n "$notes" ] && lead="${lead}New notes on your items, read them before you change those items (words passed on, not his go on anything):$notes. "
 fi
+# The security watch's line (security/main.ts): in the morning the heartbeat, the review spend
+# and the keys; at the others only a flagged spend or a heartbeat failing three times in a row.
+# One line, its own words only (nothing of a key, nothing of the heartbeat URL).
+kind=other; [ "$slot" = 0710 ] && kind=morning
+watch=$(timeout 30 bun "${SECURITY_MAIN:-/opt/cain/security/main.ts}" lines "$kind" 2>/dev/null \
+          | head -n 1 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ')
+[ -n "$watch" ] && watch=" $watch"
 if [ "$slot" = 0710 ]; then
-  msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update."
+  msg="${lead}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update.$watch"
 else
-  msg="${lead}Scheduled check-in from the Cain add-on ($slot). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md. Post to Dane only if something finished or needs his decision."
+  msg="${lead}Scheduled check-in from the Cain add-on ($slot). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md. Post to Dane only if something finished or needs his decision.$watch"
 fi
 type_in "$msg" || exit 1
 touch "$dir/$day-$slot"

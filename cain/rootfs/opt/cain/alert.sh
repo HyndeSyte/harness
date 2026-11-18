@@ -18,5 +18,5 @@ auth=(-H "@$hdr")
 channel=$(curl -fsS -m 20 "${auth[@]}" -d "$(jq -nc --arg r "$owner" '{recipient_id: $r}')" \
   "$api/users/@me/channels" | jq -r '.id // empty') || true
 [ -n "$channel" ] || { echo "alert: could not open the DM" >&2; exit 1; }
-curl -fsS -m 20 -o /dev/null "${auth[@]}" -d "$(jq -nc --arg c "$1" '{content: $c}')" \
+curl -fsS -m 20 -o /dev/null "${auth[@]}" -d "$(jq -nc --arg c "$1" '{content: $c, flags: 4}')" \
   "$api/channels/$channel/messages" || { echo "alert: send failed" >&2; exit 1; }

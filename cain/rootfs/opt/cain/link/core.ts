@@ -198,6 +198,20 @@ const SHA = /^[0-9a-f]{40}$/;
 export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
 export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
+// Link previews off on everything the link puts in his DM (security watch, Cain 0.13.0): a
+// post, an ephemeral answer, a tap's message update, and every edit of its words carry Discord's
+// SUPPRESS_EMBEDS flag, so a link in a message never unfurls into a preview fetched from
+// its site. Ephemeral answers keep their own flag beside it.
+export function quiet(method: string, path: string, body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const b = body as Record<string, any>;
+  const withFlag = (o: Record<string, any>) => ({ ...o, flags: (Number(o.flags) || 0) | SUPPRESS_EMBEDS });
+  if (method === "POST" && (/^\/channels\/\d+\/messages$/.test(path) || /^\/webhooks\//.test(path))) return withFlag(b);
+  // An edit that sets words (or only the flag): one that moves buttons alone keeps the post's own.
+  if (method === "PATCH" && /^\/channels\/\d+\/messages\/\d+$/.test(path) && ("content" in b || "flags" in b)) return withFlag(b);
+  if (method === "POST" && /^\/interactions\//.test(path) && b.data && typeof b.data === "object") return { ...b, data: withFlag(b.data) };
+  return body;
+}
 
 export interface Card {
   text: string; rows: any[]; kind: string; created: number; shown: string | null; expires?: number | null;
@@ -769,7 +783,8 @@ export class Link {
   constructor(private d: Deps) {
     // Every call to Discord, noting a rate limit: the moving Stop waits a minute after one.
     this.rest = async (...a) => {
-      try { return await d.rest(...a); }
+      const [method, path, body, ...more] = a;
+      try { return await d.rest(method, path, quiet(method, path, body), ...more); }
       catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
     };
   }
@@ -2045,11 +2060,29 @@ export class Link {
       catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
       this.d.relay(`Your edit changed Discord message ${theirs}, ${m.kind === "notice" || m.kind === "morning" ? "a message" : "a card"} your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     }
+    // His replies go out through the Discord plugin, which sets no flags: the link turns the
+    // preview off on one with a link in it (the reply hook says which), right after, best effort.
+    if (tool === "reply" && n?.links === true) void this.quietReplies(ids.filter((id) => !this.linkPosted(s, id)));
     const net = netOf(n?.net);
     if (net && this.firstTime(call, tool, ids, net)) this.d.relay(netLine(tool, last, net));
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;
     return { status: "ok", said: "Noted." };
+  }
+
+  async quietReplies(ids: string[]): Promise<number> {
+    let done = 0;
+    for (const id of ids) {
+      try {
+        const { dm } = await this.identity();
+        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: SUPPRESS_EMBEDS });
+        done++;
+      } catch (e) {
+        if (/discord 429/.test(String(e))) break;
+        this.log(`couldn't turn a reply's link preview off: ${String(e).slice(0, 80)}`);
+      }
+    }
+    return done;
   }
 
   // Cain's replies from his transcripts (at start, and every few hours): his edit allowlist.

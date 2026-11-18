@@ -44,6 +44,31 @@ Settings, People, **Users** and open your user: the id is the 32 letters and dig
 shown there. Put it in `owner_user_id` in this App's Configuration, save, and restart
 the App.
 
+## Security watch
+
+Cain's App keeps an eye on what it can see of the system's health, and Cain brings you
+anything that needs you in his morning update, one thing at a time. Nothing here acts on
+its own.
+
+- **Outside heartbeat** (`heartbeat_url`, empty by default). Make a free account at
+  Healthchecks.io (or a service like it), add a check with a 5 minute period, and paste its
+  ping URL into `heartbeat_url` in this App's Configuration, then restart the App. The App
+  pings it every 5 minutes and says so at once when it stops on an error; the service emails
+  or pushes to you itself when the pings stop, so a dead Pi reaches you without going through
+  the App. Each ping carries only how long the App has been up. Treat the URL like a key: the
+  App never shows or logs it.
+- **Review spend.** The morning check-in has yesterday's spend per review seat and the month
+  so far against each cap, and flags a day that jumps (over 3 times the week before, or over
+  a fifth of the month's cap): the cheapest sign of a stolen key or a loop. A seat at its
+  monthly cap runs no reviews until the month turns.
+- **Key ages.** The App notes the day each key or token it holds first appeared (by a hash of
+  it, never the key itself) in `/data/keys.json`. The morning check-in names a key within 14
+  days of an expiry noted for it (`/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`), and
+  one with no expiry noted that has been the same for over 90 days.
+- **Links.** Messages from Cain's bot no longer unfold link previews, and a reply of Cain's
+  with a link to a bare IP address, a punycode host, a link shortener, or with a user name or
+  password in it, is held for him to rewrite.
+
 ## Cards and questions
 
 - Cain asks one question at a time. The next one comes when you answer.

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.0
+
+- A dead Pi can now warn you from outside the house: make a free Healthchecks.io account, add a check, and paste its ping URL into heartbeat_url in Cain's App options. The App pings it every 5 minutes, and the service emails or pushes to you itself if the pings stop. Until you do, the morning check-in reminds Cain to bring you that one step.
+- The morning check-in now names a jump in review spending (a day far above the week before, or over a fifth of a month's cap), the cheapest sign of a stolen key or a runaway loop, and says when a seat has reached its monthly cap. A review is refused at once when every seat it needs is at its cap.
+- The morning check-in also names a key or token the App holds that is within 14 days of an expiry Cain noted, or has been the same for over 90 days. The App only keeps a fingerprint of each key, never the key.
+- Links in messages from Cain's bot no longer unfold into previews, and Cain can't send you a link to a bare IP address, a disguised (punycode) address, a link shortener, or one with a password in it.
+- Nothing in the security watch acts on its own: it only tells Cain, and he brings you one thing at a time.
+
 ## 0.12.2
 
 - PC jobs run again with Chrome 157: Chrome's own built-in extensions, such as Chrome Web Store Payments, no longer count as an extra extension in the Cain jobs profile. Any extension you or anything else installed still stops runs, as before.

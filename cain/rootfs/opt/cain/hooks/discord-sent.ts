@@ -19,7 +19,7 @@ import { readFileSync } from "node:fs";
 import { claimsReview, reviewedHits } from "../gate/cain";
 import { appendGate } from "../gate/log";
 import { answerText, asksSomething, SENDS, sentIds } from "../gate/plugin";
-import { check } from "../gate/rules";
+import { check, linkSpans } from "../gate/rules";
 import { readReviewed, type Reviewed } from "../reviewed";
 import { keyOf, readTries, textHash, type Tries, wasReleased } from "./discord-send";
 
@@ -36,6 +36,7 @@ export interface SentNote {
   call: string;                     // the tool call's own id (tool_use_id), else a hash of its text: one send, however often its note goes
   chat?: string; reply_to?: string;
   net?: { hits: NetHit[]; released: boolean };
+  links?: boolean;                  // it has a link in it: the link turns its preview off (Cain 0.13.0)
 }
 const CALL = /^[A-Za-z0-9_-]{1,100}$/;
 
@@ -55,7 +56,8 @@ export function noteOf(input: any, now: number, tries: Tries = readTries()): Sen
   const r = check(text, { rules: ["dash", "app", "count", "machine"], answersHim: !!replyTo, refusable: true });
   // Which send this is: a retried note keeps it, and a second edit of the same message has its own.
   const call = typeof input?.tool_use_id === "string" && CALL.test(input.tool_use_id) ? input.tool_use_id : textHash(text);
-  const note: SentNote = { tool, ids, question: asksSomething(text), call, ...(chat ? { chat } : {}), ...(replyTo ? { reply_to: replyTo } : {}) };
+  const note: SentNote = { tool, ids, question: asksSomething(text), call, ...(chat ? { chat } : {}), ...(replyTo ? { reply_to: replyTo } : {}),
+    ...(linkSpans(text).length || /\]\([^)\s]+\)/.test(text) ? { links: true } : {}) };
   // A third try the reply hook let through is always told, hits here or not (a button the
   // card lacks is one only the cards can show).
   const released = wasReleased(tries, keyOf(String(input?.session_id ?? ""), chat), text, now);

@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { readStop, stoppedWhy } from "../stop.ts";
 import { FINAL, LABEL, SEATS, markBlocked, newReview, parseBrief, privacyCheck, resultJson, shownId, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
-import { existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
+import { atCap, existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
 
 const cfg = configFromEnv();
 const usefulFile = process.env.REVIEW_USEFUL ?? join(dirname(cfg.spendFile), "review-useful.jsonl");
@@ -39,8 +39,17 @@ switch (cmd) {
       saveReview(cfg.queueDir, r);
       fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
     }
+    // A seat whose monthly cap is reached runs nothing until the month turns (the runner
+    // checks before every call). A review whose seats are all there is refused here, at once.
+    let ledger: Ledger = {};
+    try { ledger = JSON.parse(readFileSync(cfg.spendFile, "utf8")); } catch { /* none yet */ }
+    const month = new Date().toLocaleDateString("en-CA", { timeZone: cfg.tz }).slice(0, 7);
+    const capped = [...new Set(r.seats.map((s) => s.seat))].filter((s) => atCap(ledger, month, cfg.caps, s));
+    if (capped.length && capped.length === new Set(r.seats.map((s) => s.seat)).size)
+      fail(`blocked: the monthly cap is reached for ${capped.map((s) => LABEL[s]).join(", ")}. Nothing was queued; raise the cap in the App's options if wanted, or wait for the month to turn.`, 3);
     saveReview(cfg.queueDir, r);
     out(b.id);
+    if (capped.length) console.error(`Queued, but ${capped.map((s) => LABEL[s]).join(", ")} won't run: its monthly cap is reached.`);
     // While stopped it's queued all the same, and nothing goes out until he turns it back on.
     const st = readStop();
     if (st.stopped) console.error(`Queued, not sent: ${stoppedWhy(st, "no review is sent")} It goes out by itself once he does.`);

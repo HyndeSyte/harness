@@ -23,7 +23,13 @@
 //                ("Q4 taxes", "vitamin D3", "a P100 filter") pass; with no record to read,
 //                nothing is a code. Held for good (no third try lets one through): he asked
 //                that none reach him, and the thing can always be named instead.
-// All three read the words as he'd see them, so nothing slips past by its spelling:
+//   links        (Cain 0.13.0, his replies and edits) a link he couldn't judge by its look: its
+//                host a bare IP address (also as one number or hex), punycode (a label that
+//                starts "xn--") or letters outside plain ASCII, a link shortener's, or a link
+//                carrying a user name or password before its host (user:pass@). Masked link
+//                targets count: they're what a tap opens. Held for good (no third try): a plain
+//                https link to the named site always says the same. Every hit is logged.
+// The first three read the words as he'd see them, so nothing slips past by its spelling:
 // compatibility forms folded (NFKC, full-width letters and digits too), invisible characters
 // and combining marks dropped, Cyrillic and Greek letters that look like Latin ones read as
 // those, markdown emphasis, quote marks and code marks dropped (code is read, not skipped).
@@ -31,8 +37,8 @@
 import type { Reviewed } from "../reviewed";
 import { around, linkSpans } from "./rules";
 
-export type CainRule = "reviewed" | "ship words" | "codes";
-export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes"];
+export type CainRule = "reviewed" | "ship words" | "codes" | "links";
+export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes", "links"];
 export interface CainHit { rule: CainRule; result: "refuse" | "unsure"; at: number; end: number; around: string }
 
 // -- reading the words as he'd see them -----------------------------------------------------
@@ -202,7 +208,52 @@ export function codesHits(text: string, items: ReadonlySet<string> | null | unde
   return out;
 }
 
+// -- links he can't judge by their look ------------------------------------------------------------
+// Link shorteners: where they lead can't be seen. A host counts when it is one of these or under one.
+export const SHORTENERS: readonly string[] = [
+  "bit.ly", "bitly.com", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "v.gd", "buff.ly", "rebrand.ly", "cutt.ly",
+  "shorturl.at", "tiny.cc", "rb.gy", "lnkd.in", "s.id", "t.ly", "bl.ink", "short.io", "shorturl.com", "trib.al",
+  "dlvr.it", "soo.gd", "clck.ru", "qr.ae", "tr.im", "x.co", "lc.chat", "tiny.one", "surl.li", "shorte.st", "adf.ly",
+  "bc.vc", "ouo.io", "cli.re", "chilp.it", "u.to", "y2u.be", "aka.ms",
+];
+export type LinkWhy = "ip" | "punycode" | "shortener" | "userinfo";
+// Why a link is held, or null for one that passes. link: as found in the text.
+export function linkProblem(link: string): LinkWhy | null {
+  const s = String(link ?? "").replace(/^<|[>)\].,;:!?'"]+$/g, "");
+  const m = /^(?:([A-Za-z][A-Za-z0-9+.\-]*):\/\/)?([^/?#\\]*)/.exec(s);
+  if (!m) return null;
+  const auth = m[2];
+  if (auth.includes("@")) return "userinfo";
+  let host = auth.replace(/:\d*$/, "").replace(/\.$/, "");
+  if (/^\[[0-9A-Fa-f:.]+\]$/.test(host)) return "ip";
+  host = host.toLowerCase();
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || /^\d+$/.test(host) || /^0x[0-9a-f]+$/.test(host)) return "ip";
+  if (/^(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+)){1,3}$/.test(host)) return "ip";
+  if (host.split(".").some((l) => l.startsWith("xn--")) || /[^\x00-\x7f]/.test(host)) return "punycode";
+  if (SHORTENERS.some((d) => host === d || host.endsWith(`.${d}`))) return "shortener";
+  return null;
+}
+const LINK_WORDS: Record<LinkWhy, string> = {
+  ip: "a bare IP address", punycode: "a punycode or non-ASCII host", shortener: "a link shortener", userinfo: "a user name or password in it",
+};
+// Every link in his words (bare, and the targets of masked links), each held link once.
+export function linksHits(text: string): CainHit[] {
+  const t = String(text ?? "").normalize("NFKC").replace(INVISIBLE, "");
+  const out: CainHit[] = [];
+  const seen: [number, number][] = [];
+  const add = (at: number, end: number, link: string) => {
+    if (seen.some(([a, b]) => a < end && at < b)) return;
+    seen.push([at, end]);
+    const why = linkProblem(link);
+    if (why) out.push({ rule: "links", result: "refuse", at, end, around: `${LINK_WORDS[why]}: ${link.slice(0, 60)}` });
+  };
+  for (const m of t.matchAll(/\]\(<?([^)\s>]+)>?\)/g)) { const at = m.index! + 2; add(at, at + m[1].length, m[1]); }
+  for (const [a, b] of linkSpans(t)) add(a, b, t.slice(a, b));
+  return out.sort((x, y) => x.at - y.at);
+}
+
 // -- what each asks of him, for the line that says why his words were held back -----------------
+export const LINKS_WHY = "a link he can't judge by its look (a bare IP address, a punycode host, a link shortener, or a user name or password in it) is held: link to the named site itself, over https";
 export const CODES_WHY = "name it by what it does for him, not by its record code: he can't tell what those are";
 export const SHIP_WORDS_WHY = "on a Ship card your line says only what he'll notice: no checks, tests, builds, CI, GitHub, jobs or status, no results (passed, green, success, failed), and no reviews, verdicts or AI names, since the link adds those lines itself";
 export const REVIEWED_UNSURE = "reviews can't be checked right now: leave the Reviewed line out, or send it in a minute";
@@ -215,6 +266,7 @@ export function reviewedWhy(published: readonly Reviewed[] | null | undefined, n
 export function cainWhy(h: Pick<CainHit, "rule" | "result">, published?: readonly Reviewed[] | null, n = 3): string {
   if (h.rule === "ship words") return SHIP_WORDS_WHY;
   if (h.rule === "codes") return CODES_WHY;
+  if (h.rule === "links") return LINKS_WHY;
   return h.result === "unsure" ? REVIEWED_UNSURE : reviewedWhy(published, n);
 }
 

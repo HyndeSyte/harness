@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.12.2"
+version: "0.13.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -38,6 +38,10 @@ timeout: 30
 # plan's monthly API credit). Caps: per review, and per seat per month.
 # pc_jobs_token: the PC job keeper's fine-grained token for the PC job queue repo only
 # (pc_jobs_repo, Contents read and write). Empty: no PC jobs.
+# heartbeat_url: the security watch's outside heartbeat (a Healthchecks.io ping URL, or any
+# https URL of that kind). Pinged every 5 minutes, and <url>/fail when the App stops on an
+# error; the service warns the owner itself when the pings stop. A secret like a key: never shown
+# or logged. Empty: no heartbeat, and the morning check-in says so.
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
@@ -54,6 +58,7 @@ options:
   owner_user_id: ""
   pc_jobs_token: ""
   pc_jobs_repo: "HyndeSyte/pc-jobs"
+  heartbeat_url: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -67,3 +72,4 @@ schema:
   owner_user_id: match(^([0-9a-f]{32})?$)?
   pc_jobs_token: password?
   pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?
+  heartbeat_url: password?

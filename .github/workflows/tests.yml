@@ -19,8 +19,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      # PyYAML for tests/test_check_pr.py (the pr check parses YAML); the Apps don't use it.
-      - run: pip install pytest "PyYAML==6.0.2"
+      # pytest, and PyYAML for tests/test_check_pr.py (the pr check parses YAML); the Apps
+      # don't use either. Pinned in .github/ci/requirements.txt (Dependabot and the audit read it).
+      - run: pip install -r .github/ci/requirements.txt
       - run: python -m pytest -q -p no:cacheprovider
 
   # Cain's tests. Same Bun as Cain's image (cain/Dockerfile BUN_VERSION).
@@ -43,3 +44,57 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests/pcjobs.test.ts
+
+  # The security watch's checks on the repository (Cain 0.13.0). Not required checks: the
+  # rulesets require pytest, bun and pr only (RELEASING.md), and these two stay optional.
+  # A known vulnerability with a fix, rated high or critical, in what CI installs fails
+  # `audit`. Cain has no npm or Bun manifest; its step audits one if a package.json appears.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "pip-audit==2.10.1"
+      - name: Python (what CI installs; the calendar specialist installs nothing)
+        run: |
+          pip-audit -r .github/ci/requirements.txt --format json --output pip-audit.json || true
+          test -s pip-audit.json
+          python -I .github/scripts/audit_gate.py pip-audit.json
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+      - name: Cain (Bun)
+        working-directory: cain
+        run: |
+          if [ -f package.json ]; then bun install --frozen-lockfile && bun audit --audit-level=high
+          else echo "cain/ has no package.json: nothing to audit."; fi
+
+  # A secret scan over the pull request's own commits (gitleaks, pinned and checked by hash):
+  # any finding fails. Only on pull requests; a push to a branch is scanned in its pull request.
+  secrets:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.28.0"
+      GITLEAKS_SHA256: "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: |
+          curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks" && tar -xzf gitleaks.tgz -C "$RUNNER_TEMP/gitleaks" gitleaks && rm gitleaks.tgz
+      - name: Scan the pull request's commits
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 --log-opts="$BASE..$HEAD" .
+      - name: Not a pull request
+        if: github.event_name != 'pull_request'
+        run: echo "Not a pull request event; the scan runs on the pull request."

@@ -2,6 +2,10 @@
 declare APP_EXIT_CODE=${1}
 if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
   bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
+  # The outside heartbeat hears it at once (<heartbeat_url>/fail), when one is set. The URL
+  # goes only into that one command's environment and is never logged.
+  HEARTBEAT_URL="$(bashio::config 'heartbeat_url' 2>/dev/null || true)" \
+    timeout 20 bun /opt/cain/security/main.ts fail 2>&1 || true
   echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
   exec /run/s6/basedir/bin/halt
 fi

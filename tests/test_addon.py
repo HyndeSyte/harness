@@ -117,19 +117,20 @@ def test_cain_config_denies_every_api_and_mapping():
     assert cfg["init"] == "false"
     # Keys (the record keeper's GitHub token, the review runner's three API keys) as
     # password fields, the review caps as bounded numbers, and the panel's owner (a
-    # Home Assistant user id, not a key), and the PC job keeper's token and repo name.
-    # Nothing else.
+    # Home Assistant user id, not a key), the PC job keeper's token and repo name, and the
+    # security watch's heartbeat URL (a secret like a key: a password field). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
         '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n'
-        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\nschema:\n'
+        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n"
-        "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n")
+        "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
+        "  heartbeat_url: password?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():

@@ -105,9 +105,31 @@ bashio::log.info "Cain is running"
   mkdir -p -m 700 /data/codex
   while true; do bun /opt/cain/review/main.ts 2>&1; sleep 10; done
 ) &
-# Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
-# without Dane. checkin.sh decides when, and only types into an idle session.
+# The security watch (security/main.ts): the outside heartbeat (a ping every 5 minutes to
+# heartbeat_url, when set) and the key record (/data/keys.json: when each key was first seen,
+# by a hash of its value, never the value). The URL goes only into its environment and is
+# never logged; the App's keys reach it only as hashes, made here.
 (
+  opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
+  for k in github_token pc_jobs_token gemini_api_key perplexity_api_key anthropic_api_key; do
+    v="$(opt "$k")"
+    if [ -n "$v" ]; then export "KEY_SHA_$k=$(printf '%s' "$v" | sha256sum | cut -d' ' -f1)"; else export "KEY_SHA_$k="; fi
+  done
+  unset v
+  HEARTBEAT_URL="$(opt heartbeat_url)"
+  export HEARTBEAT_URL
+  while true; do bun /opt/cain/security/main.ts run 2>&1; sleep 10; done
+) &
+# Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM so open work moves
+# without Dane. checkin.sh decides when, and only types into an idle session. The review
+# caps go in too (not keys), for the security watch's spend lines.
+(
+  opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
+  REVIEW_CAP_GEMINI_USD="$(opt gemini_monthly_usd)"
+  REVIEW_CAP_PERPLEXITY_USD="$(opt perplexity_monthly_usd)"
+  REVIEW_CAP_ANTHROPIC_USD="$(opt anthropic_monthly_usd)"
+  REVIEW_CAP_CODEX_RUNS="$(opt codex_monthly_runs)"
+  export REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS
   while true; do /opt/cain/checkin.sh || true; sleep 5; done
 ) &
 # The sign-in link is longer than a terminal line, and tmux breaks it, so a

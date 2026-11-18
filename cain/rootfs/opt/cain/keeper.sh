@@ -49,6 +49,11 @@
 #   keeper.sh ship-gate --supersede <full sha>
 #                                        records that the acceptance kept for that sha is replaced (a rebase),
 #                                        so a new watch can accept the pull request's new head for its card
+#   keeper.sh key-expiry <name> <YYYY-MM-DD|none>
+#                                        note when a key the App holds expires (the security watch
+#                                        names it 14 days ahead in the morning check-in); names:
+#                                        github_token, pc_jobs_token, discord_bot_token, gemini_api_key,
+#                                        perplexity_api_key, anthropic_api_key, deploy_key, ship_key
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
@@ -62,6 +67,8 @@ cmd="${1:-handover}"; shift || true
 if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 # Needs no key and no link either: it reads GitHub's public API only, and changes nothing.
 if [ "$cmd" = ship-gate ]; then exec bun "${CAIN_LINK_DIR:-/opt/cain/link}/shipgate.ts" "$@"; fi
+# Needs no key and no link: the key record is the security watch's own file (never a key in it).
+if [ "$cmd" = key-expiry ]; then exec bun "${CAIN_SECURITY:-/opt/cain/security/main.ts}" key-expiry "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
