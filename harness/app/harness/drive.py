@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import time
 from urllib.parse import quote, urlencode
@@ -194,6 +195,100 @@ def street_address(place: str) -> str:
                 address += "".join(f", {x}" for x in (town, state) if x) + (f" {code}" if code else "")
             return address
     return ""
+
+
+# One street said two ways ("St" and "Street", "N" and "North"): the same street (address_parts).
+_SAME_WORD = {"st": "street", "ave": "avenue", "av": "avenue", "rd": "road", "dr": "drive", "ln": "lane",
+              "blvd": "boulevard", "hwy": "highway", "ct": "court", "pl": "place", "pkwy": "parkway",
+              "cir": "circle", "ter": "terrace", "trl": "trail", "sq": "square", "xing": "crossing",
+              "expy": "expressway", "fwy": "freeway", "tpke": "turnpike", "trce": "trace", "cres": "crescent",
+              "aly": "alley", "rt": "route", "rte": "route", "n": "north", "s": "south", "e": "east",
+              "w": "west", "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest"}
+SAME_POINT_METERS = 40             # two map points this near are one place, when they decide (same_place)
+
+
+def address_parts(place: str) -> tuple[str, str, str, str] | None:
+    """A place's street address in parts, through street_address: (house number, street, town,
+    postcode), each lower case with the street's words in one spelling; a unit is never part of it.
+    None when there's no street address in it."""
+    address = street_address(place)
+    if not address:
+        return None
+    street, *rest = [p.strip() for p in address.split(",")]
+    m = re.match(r"(\d+[A-Za-z]?)\s+(.*)", street)
+    if not m:
+        return None
+    words = [w.strip(".").casefold() for w in m.group(2).split()]
+    name = " ".join(_SAME_WORD.get(w, w) for w in words if w)
+    town = code = ""
+    if rest:
+        last = re.fullmatch(r"([A-Za-z]{2})(?:\s+(\d{5}))?", rest[-1])
+        if last:
+            code = last.group(2) or ""
+            rest = rest[:-1]
+        town = " ".join(rest[0].casefold().split()) if rest else ""
+    if not (town and code):
+        # What street_address leaves out: a postcode alone ("227 N Lewis St, 24450") or a town with no
+        # state ("12 Main St, Othertown"), read from what follows the street in the place's own text.
+        text = " ".join(re.sub(r"\s*(?:\n|\\n)\s*", ", ", place or "").split())
+        at = text.find(street)
+        tail = text[at + len(street):] if at >= 0 else ""
+        unit = _UNIT.match(tail)
+        tail = tail[unit.end():] if unit else tail
+        if not code:
+            found = re.search(r"\b(\d{5})(?:-\d{4})?\b", tail)
+            code = found.group(1) if found else ""
+        if not town:
+            first = next((p.strip() for p in tail.split(",") if p.strip()), "")
+            if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{2,40}", first) \
+                    and first.casefold() not in ("usa", "united states", "us"):
+                town = " ".join(first.casefold().split())
+    return m.group(1).casefold(), name, town, code
+
+
+def _meters(a: str, b: str) -> float:
+    """Between two "lon,lat" points, near enough for a few hundred meters."""
+    (lon1, lat1), (lon2, lat2) = ((float(x) for x in p.split(",")) for p in (a, b))
+    x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
+    return 6371000 * math.hypot(x, math.radians(lat2 - lat1))
+
+
+def same_place(a: str, b: str, points: tuple[str, str] = ("", "")) -> bool:
+    """Two places are one. When both have a street address (address_parts), its parts decide: a different
+    house number or street is another place whatever the map says (a theatre across the road from the
+    school is not the school); the same number and street are one place when the town or the postcode,
+    where both sides say one, agree (differing towns with an agreeing postcode still are), and when neither
+    can be compared (missing on a side), only when both have a kept map point ("lon,lat") and they lie
+    within SAME_POINT_METERS (else not: the safe way, a drive block too many). When a side has no street
+    address, the map points decide, within that radius; else, last, their text with case, commas and
+    spacing left out. "227 N Lewis St" and "227 North Lewis Street, Lexington, VA 24450" are one."""
+    if not (a or "").strip() or not (b or "").strip():
+        return False
+    pa, pb = (points[0] or coordinates(a)), (points[1] or coordinates(b))
+    near = None
+    if pa and pb:
+        try:
+            near = _meters(pa, pb) <= SAME_POINT_METERS
+        except ValueError:
+            near = None
+    one, two = address_parts(a), address_parts(b)
+    if one is not None and two is not None:
+        if one[:2] != two[:2]:
+            return False
+        codes = bool(one[3] and two[3])
+        if codes and one[3] != two[3]:
+            return False
+        if one[2] and two[2]:
+            return one[2] == two[2] or codes
+        return True if codes else near is True
+    if near is not None:
+        return near
+    if (one is None) != (two is None):
+        return False
+
+    def norm(text: str) -> str:
+        return " ".join(text.casefold().replace(",", " ").split())
+    return norm(a) == norm(b)
 
 
 class Drives:
@@ -392,6 +487,17 @@ class Drives:
             return NO_ADDRESS
         minutes = float(kept)
         return minutes if minutes <= MAX_MINUTES else NO_ADDRESS
+
+    def kept_point(self, place: str) -> str:
+        """A place's map point ("lon,lat") from its own text or a lookup already kept, never asked for
+        now: empty when there's none (same_place)."""
+        spot = self._spot(place) if place else None
+        if spot is None:
+            return ""
+        if spot[1]:
+            return spot[1]
+        kept = self._kept("drive_place:" + _hash(spot[2].casefold()))
+        return kept if kept and kept != "none" else ""
 
     def _locate(self, address: str, near: str = "") -> str:
         """"lon,lat", which is how the route service wants it."""

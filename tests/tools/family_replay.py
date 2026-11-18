@@ -39,10 +39,10 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 FIXTURE = HERE / "family_replay_main.json"
 # The installed release. The repository has no release tags yet, so its commit is hard-coded: the last
-# commit on main that changed harness/ (its config.yaml says 0.23.0). Once the tag exists it's used.
-RELEASE = "Harness 0.23.0"
-RELEASE_TAG = "harness-0.23.0"
-RELEASE_COMMIT = "e448e6db20746524238f11010f55924228279a26"
+# commit on main that changed harness/ (its config.yaml says 0.24.0). Once the tag exists it's used.
+RELEASE = "Harness 0.24.0"
+RELEASE_TAG = "harness-0.24.0"
+RELEASE_COMMIT = "27e53e8cef5c463a94149d4178389e6bb57ea798"
 OUT_ENV = "FAMILY_REPLAY_OUT"
 FEED_URL = "https://calendar.google.com/calendar/ical/parent%40gmail.com/private-0123456789abcdef/basic.ics"
 

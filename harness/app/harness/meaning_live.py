@@ -32,8 +32,14 @@ turns them into his calendar and lets him correct it, all model-free:
     changes nothing.
   * Where an event he goes to is: a street address in its location, else his place book
     (places.py), else the map by the location's name near home (drive.find_place), whether
-    or not the judgment named the place, unless it was judged to be at home or school. A
-    place none of them knows gets one card asking him where it is.
+    or not the judgment named the place, unless it was judged to be at home. A place none of
+    them knows gets one card asking him where it is. Judged to be at school (a school play, a
+    class visit), a street address in the event's own location places it, else his place book
+    by the location's name, else, only for an empty location or a room's name (room_like), the
+    school's own address the school runs drive to, said in the digest: no map or question for
+    a classroom's name, and a place of its own nothing knows has no address. One held online
+    (its location is only a link or only says online; with no location, or only a link, its
+    title says so; with no location, its description does) gets no drive, wherever it is.
 """
 from __future__ import annotations
 
@@ -47,7 +53,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import choices, drive_cards, family_rules, meaning, places, render
+from . import choices, drive_cards, family_rules, ical, meaning, places, render
 from .family_gmail import DROP_TITLE, PICK_TITLE, Want, _is_real, _key
 from .ledger import Ledger, iso
 
@@ -175,8 +181,105 @@ def _occ_id(occ) -> str:
     return f"{occ.uid}|{occ.instance}"
 
 
-# Where a presence block is held, as judged: at home or school, the event's location isn't
-# where he goes. Anything else ("event_location", or no place said) is the event's location.
+# An event held online. Its place says so: a location that is only a link (a Zoom or Meet link), or only
+# says online, virtual, Zoom or Google Meet ("Online", "Zoom meeting"). With no location, or one that is
+# only a link, its title may say so ("Online parent conference"), and with no location its description
+# too. A title word beside a room, a street or a place he named ("Online safety evening" in the hall,
+# "Virtual Reality Lab, Room 4", a club called Zoom at a street) never does: he still drives there. A Meet
+# link or "virtual option" in the description of an event with a place doesn't make it online either:
+# schools' conferences and assemblies carry an auto-attached Meet link. "Meet" alone is a school's own
+# word ("Meet the teacher").
+_ONLINE_TITLE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|webinar|live[\s-]?stream(?:ed|ing)?)\b",
+                           re.I)
+_ONLINE_PLACE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|webinar|live[\s-]?stream(?:ed|ing)?)\b"
+                           r"|zoom\.us/|meet\.google\.com", re.I)
+_LINK = re.compile(r"\s*(?:https?://|www\.)\S+\s*", re.I)
+_ANY_LINK = re.compile(r"(?:https?://|www\.)\S+", re.I)
+_ONLINE_WORD = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|microsoft\s+teams|ms\s+teams|webex|webinar|"
+                          r"live[\s-]?stream(?:ed|ing)?)\b", re.I)
+# "Teams" or "Meet" alone is online only with nothing but filler beside it ("Teams", "Teams meeting", "On
+# Meet"): "Away teams pitch" and "Meet at the gate" are places.
+_BARE_ONLINE = re.compile(r"\b(?:teams|meet)\b", re.I)
+# What may stand beside the online word in a location that only says it's online ("Zoom meeting", "Online
+# only", "Virtual - link to follow").
+_ONLINE_FILLER = re.compile(r"\b(?:meeting|event|call|session|link|links|only|via|on|the|a|an|by|and|or|"
+                            r"see|in|description|details|below|above|to|follow|tbd|tba|join|here|id)\b", re.I)
+
+
+def _descriptions(item) -> list[str]:
+    """The event's DESCRIPTION, as the calendar parser reads it: unfolded and unescaped."""
+    out = []
+    for line in ical.unfold(item.data or ""):
+        prop = ical.parse_line(line)
+        if prop is not None and prop.name == "DESCRIPTION":
+            out.append(ical.unescape(prop.value))
+    return out
+
+
+def online_place(location: str) -> bool:
+    """A location that holds nothing but a link, or nothing but saying it's online (_ONLINE_WORD, a bare
+    "Teams" or "Meet" (_BARE_ONLINE), and _ONLINE_FILLER), links beside it left out."""
+    text = (location or "").strip()
+    if not text:
+        return False
+    if _LINK.fullmatch(text):
+        return True
+    rest = _ANY_LINK.sub(" ", text)
+    if not _ONLINE_WORD.search(rest) and not _BARE_ONLINE.search(rest):
+        return False
+    rest = _ONLINE_FILLER.sub(" ", _BARE_ONLINE.sub(" ", _ONLINE_WORD.sub(" ", rest)))
+    return not re.sub(r"[\W_]+", "", rest)
+
+
+def _online_event(item) -> bool:
+    """An event (caldav.Item) held online: its location says so (online_place), or, with no location
+    or one that is only a link, its title does; with no location, its description may."""
+    location = (item.occ.location or "").strip()
+    if location:
+        return online_place(location)
+    if _ONLINE_TITLE.search(item.occ.summary or ""):
+        return True
+    try:
+        return any(_ONLINE_PLACE.search(x) for x in _descriptions(item))
+    except Exception:
+        return False
+
+
+# A location at school that names a room, not a place of its own: the school's own address is its place
+# (MeaningLive.wants). Only a room or class word, or a teacher's or year's class ("Mrs Lee's class", "Year 4",
+# "Reception", "Grade 3"); anything else nothing places ("Pizza Express", "St Mary's", "The Red Lion") has no
+# address and is named. A room word in a place of its own ("Riverside Leisure Centre Hall") is that place's.
+_ROOM_WORD = re.compile(r"\b(?:room|rm|hall|gym|gymnasium|library|cafeteria|classroom|auditorium|lab|laboratory|"
+                        r"office|playground|field|court)\b", re.I)
+_CLASS = re.compile(r"\b(?:mr|mrs|ms|miss|mx)\.?\s+[^\W\d_][\w-]*(?:['\u2019]s)?\s+class(?:room)?\b"
+                    r"|\b(?:year|grade|yr)\s*\d{1,2}[a-z]?\b|^reception(?:\s+class)?$", re.I)
+_PLACE_WORD = re.compile(r"\b(?:centre|center|park|church|chapel|cathedral|temple|mosque|synagogue|theat(?:re|er)|"
+                         r"stadium|arena|museum|leisure|pool|aquatic|ymca|ywca|complex|hospital|clinic|mall|"
+                         r"university|college|school|academy|rink|zoo|farm|restaurant|cafe|hotel|inn|club|"
+                         r"street|st|road|rd|avenue|ave|lane|ln|drive|dr|boulevard|blvd|way|place|"
+                         r"town|city|county|village|beach|lake|river|pub|tavern|bar|rooms)\b", re.I)
+_HOUSE_NUMBER = re.compile(r"(?:^|[\s,])\d+[A-Za-z]?\s+[A-Za-z]")
+
+
+def room_like(location: str) -> bool:
+    """A location at school that's only a room's name (_ROOM_WORD) with no place word beside it, or a
+    teacher's or year's class (_CLASS). Empty is not a room (the caller takes empty on its own)."""
+    text = " ".join(re.sub(r"\s*(?:\n|\\n)\s*", ", ", location or "").split())
+    if not text or _ANY_LINK.search(text) or _HOUSE_NUMBER.search(text):
+        return False
+    if _CLASS.search(text):
+        return True
+    if _ROOM_WORD.search(text):
+        # A room's word in a place of its own ("Riverside Leisure Centre Hall", "Lexington High School
+        # Gym") is that place's. "School Hall" alone is the school's own.
+        rest = _ROOM_WORD.sub(" ", text)
+        return not _PLACE_WORD.search(rest) or [w.casefold() for w in re.findall(r"[^\W\d_]+", rest)] == ["school"]
+    return False
+
+
+# Where a presence block is held, as judged: at home, the event's location isn't where he goes.
+# At school, a street address in the event's location, else the place book by its name (wants). Anything else
+# ("event_location", or no place said) is the event's location.
 NOT_THERE = ("home", "school")
 
 
@@ -262,6 +365,8 @@ class MeaningLive:
         # Events he goes to whose place nothing could find, at the last read: key -> (start, said,
         # why), why being drive_cards.PLACE (the place book asks) or drive_cards.FAILED.
         self.unplaced: dict[str, tuple[datetime, str, str]] = {}
+        self.online: dict[str, datetime] = {}   # events held online at the last read: key -> start
+        self.assumed: dict[str, datetime] = {}  # at school, the school's address assumed: key -> start
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -299,9 +404,10 @@ class MeaningLive:
                     else datetime.combine(o.occ.start, time(), zone) for o in ev.occurrences),
                    default=datetime.max.replace(tzinfo=zone))
 
-    def wants(self, items, now: datetime, *, find=None) -> dict[str, Want]:
+    def wants(self, items, now: datetime, *, find=None, school: str = "") -> dict[str, Want]:
         """From the judgments alone, with no model: the same judgment and the same Family give
-        the same wants. The usual skips first (his copies, holds, his own name)."""
+        the same wants. The usual skips first (his copies, holds, his own name). school: the
+        school's street address the school runs drive to, for an event at school with no other."""
         evs = meaning.events_of(items, self.tz, self.name_fn())
         examples = {e.id: e for e in meaning.active_examples(self.ledger)}
         answers = self._answers()
@@ -311,6 +417,8 @@ class MeaningLive:
         seen: set = set()
         self.places.begin()
         self.unplaced = {}
+        self.online = {}
+        self.assumed = {}
         self.unjudged = []
         none: dict[str, tuple[datetime, str, str]] = {}
         # Soonest first, so the map's allowance for this read goes to the nearest places.
@@ -353,25 +461,53 @@ class MeaningLive:
                     place = "school" if run in ("drop", "pick") else _place(j, b.type)
                     where = ""
                     legs = not any(x.type == "transport" for x in blocks)
-                    if b.type == "presence" and place not in NOT_THERE:
+                    where_from = ""
+                    if b.type == "presence" and place != "home" and legs and _online_event(item):
+                        legs = False               # held online (a Zoom conference): no drive
+                        self.online[key] = b.start
+                    elif b.type == "presence" and place == "school":
+                        # Judged at school: he still drives there. The event's own street address, when
+                        # it has one ("EarthSong Community School" then the street on the next line),
+                        # else his place book by the location's name; never the map, and no "where is"
+                        # card. Where the location is empty or only a room's name (room_like), the
+                        # school's own address the school runs drive to, and the digest says it was
+                        # assumed. Anything else (a place of its own nothing knows, "Riverside Leisure
+                        # Centre") or no school address: no drive, and the digest says so.
+                        where, _ = self.places.resolve(occ.location)
+                        where_from = "own" if where else ""
+                        location = (occ.location or "").strip()
+                        if not where and school and (not location or room_like(location)):
+                            where, where_from = school, "assumed"
+                            if legs:
+                                self.assumed[key] = b.start
+                        if not where and legs:
+                            self.unplaced[key] = (b.start, meaning.shown(occ.summary), drive_cards.NO_ADDRESS)
+                    elif b.type == "presence" and place not in NOT_THERE:
                         # The event's own location, whether or not the judgment named it: a
                         # street address in it, else his place book, else the map by its name
                         # (`find`). A place none of them knows is asked about once (places.py).
                         where, ask = self.places.resolve(occ.location, find)
+                        where_from = "own" if where else ""
                         if ask:
                             self.places.unresolved(occ.location, occ.summary, b.start)
-                        if not where and legs and not self.places.later \
-                                and self.places.findable(occ.location):
-                            # No drive for it, never silently (drive_cards.py).
-                            self.unplaced[key] = (b.start, meaning.shown(occ.summary),
-                                                  drive_cards.PLACE if ask else drive_cards.FAILED)
+                        if not where and legs and not self.places.later:
+                            if self.places.findable(occ.location):
+                                # No drive for it, never silently (drive_cards.py).
+                                self.unplaced[key] = (b.start, meaning.shown(occ.summary),
+                                                      drive_cards.PLACE if ask else drive_cards.FAILED)
+                            elif self.places.findable(occ.location, online_words=True):
+                                # A place with an online word in it that isn't online ("Virtual Reality
+                                # Lab, Room 4"): kept from the map, and named, never quiet.
+                                self.unplaced[key] = (b.start, meaning.shown(occ.summary),
+                                                      drive_cards.NO_ADDRESS)
                     out[key] = Want(key, b.title, b.start, b.end,
                                     "me" if b.type == "presence" else "", b.state, where, legs)
                     why[key] = {"kind": kind_key(ev), "said": meaning.shown(occ.summary),
                                 "words": sorted(family_rules.words(occ.summary)),
                                 "who": meaning.who_for(occ.summary),
                                 "series": occ.uid if ev.kind == "series" else "",
-                                "month": sp.anchor.month, "type": b.type, "place": place}
+                                "month": sp.anchor.month, "type": b.type, "place": place,
+                                "where_from": where_from}
         self._why = why
         self._say_none(none, now)
         return out

@@ -50,7 +50,18 @@ with a card and Undo for each event's drives (drive_cards.py). They are read fro
 secret iCal feed only, never the API read, and come off only when the feed says so or after two
 full reads without them (FamilyGmail._own_events). With the own_drive_dry_run option on, they're
 only logged. A drive that can't be found gets the
-digest's line and one card (drive_cards.py). Nothing here writes Family. The event's own block carries its street address
+digest's line and one card (drive_cards.py), and an event he goes to left without its drives for
+any reason not already said gets them too, and a log line by its title and day. A block written
+before its place could be read gets the place and its drives at the next read, like a new one. A
+drive that something else already is isn't written beside it, and counts as handled (no failure, no
+card): for an event at school only (by its own address first, the label only when it has none, and then
+the digest says so: FamilyGmail._at_school), a school run the add-on writes starting or ending within 15
+minutes of the event or crossing the leg (_run_covers; a run crossing a drive of an event elsewhere covers
+nothing, and the digest names it; one written before comes off, named once in the next digest), or, for a
+drive not written yet, a drive already on his Gmail, his own (named in the digest by its title) or one
+this system put there at his word (_his_drive_cover). An event held online gets no drive, and the digest
+names it (meaning_live._online_event). His calendar is chosen in one place: the option, then the
+record, then where the add-on's own blocks are (FamilyGmail._his_feed). Nothing here writes Family. The event's own block carries its street address
 (after the place's name, when the map found it by name) or map point, and only that, so it opens
 in Maps; that place is ours, and it's compared with what was written,
 so it never makes the block look edited.
@@ -127,6 +138,34 @@ SAMPLE_FORMAT = "7"                 # samples written by any other build are rem
 SAMPLES_META = "family_gmail_sample_format"
 _SAMPLE_RE = re.compile(r"(?P<kind>[a-z]+)-(?P<day>\d{8})-[0-9a-f]{10}\.ics")
 ADOPT_GENERATIONS = 20              # a block's id, from its key and generation, looked for this far
+# His own drive on Gmail (_his_drives): a title with one of these words is a candidate, unless it's one of
+# the things that only share the word (a test drive, a blood drive, Google Drive, a street named Drive).
+_DRIVE_WORD = re.compile(r"\b(?:driv(?:e|es|ing)|travel(?:s|ing|ling)?|commut(?:e|es|ing))\b", re.I)
+_NOT_A_DRIVE = re.compile(
+    r"\btest[\s-]*driv|\bdriv(?:ing|er'?s?)[\s-]+(?:lesson|test|school|range|ed|license|licence|exam|class)"
+    r"|\b(?:blood|food|toy|coat|book|clothing|clothes|canned|donation|fund\s*rais(?:er|ing)|charity|supply|"
+    r"diaper|sock|shoe|school\s+supply|membership|recruit(?:ing|ment)?|voter\s+registration)\s+drive"
+    r"|\bdrive[\s-]*(?:in|thru|through)\b|\b(?:google|hard|flash|thumb|disk|usb|shared|one)\s*drive\b"
+    r"|\d+\s+(?:[A-Z][\w.']*\s+)+Drive\b|\btravel\s+(?:agent|insurance|soccer|team|ball|league|baseball|"
+    r"basketball|hockey|softball|volleyball|plans?)\b|\btime\s+travel|\btravel\s+size|\bdrive\s+shaft", re.I)
+_SYSTEM_ID = re.compile(r"cm[0-9a-f]{32}")      # calendar_change._uid: an event this system added for him
+LEG_NEAR_RUN = timedelta(minutes=15)            # a school run this near an event is its drive (_run_covers)
+HIS_DRIVE_NEAR = timedelta(minutes=10)          # his drive ending as it starts (or starting as it ends)
+# Each drive leg's outcome at a read (FamilyGmail._drive_legs), by the event's occurrence (its key and
+# start) and the leg: only a leg with none is a failure.
+COMPUTED, COVERED, SKIPPED, WAITING, LEG_FAILED, LEG_NO_ADDRESS, UNRESOLVED, ONLINE = (
+    "computed", "covered", "skipped", "waiting", "failed", "no address", "unresolved chain", "online")
+WAIT_READS = 3                      # reads a leg can wait for its lookup before it's a failure (its own)
+WAIT_NEAR = timedelta(hours=6)      # and never this near the event (NEAR_LATER names it sooner still)
+HIS_CALENDAR = "family_gmail_his_calendar"  # the calendar the add-on's own blocks are on (_his_feed)
+TWO_FEEDS = "family_gmail_two_feeds"        # the pair of calendars his notice was last sent for
+HIS_GONE = "family_gmail_his_gone"          # the calendar of his that isn't read, his notice sent for
+HIS_RETRY = "family_gmail_his_retry"        # reads his calendar has been missing while a feed failed its read
+HIS_RETRY_READS = 3                         # such reads waited quietly before the stand-down is said
+WAIT_COUNTS = "family_gmail_wait_counts"    # reads each drive leg has waited for its lookup (_drive_legs)
+RUN_REMOVED = "family_gmail_run_removed"    # a drive block taken off because a school run is that drive
+RUN_PENDING = "family_gmail_run_pending"    # those removals not yet named in a digest that was sent
+RUN_NAMED = "family_gmail_run_named"        # the removals the last composed digest named, and when
 _TITLE_RE = re.compile(r"[^\W_]+(?:[ '&()+,.-]+[^\W_]+)*[ )]*")
 
 
@@ -193,6 +232,12 @@ def _text_option(data_dir: str, name: str) -> str:
 
 def school_address_from_options(data_dir: str) -> str:
     return _text_option(data_dir, "family_school_address")
+
+
+def his_calendar_from_options(data_dir: str) -> str:
+    """The his_calendar option: the address of his own Gmail calendar among those read, or "" (chosen
+    from where the add-on's own blocks are: FamilyGmail._his_feed)."""
+    return _text_option(data_dir, "his_calendar")
 
 
 OWN_DAYS_DEFAULT, OWN_DAYS_MAX = 3, 60
@@ -348,6 +393,71 @@ def _is_real(occ: ical.Occurrence) -> bool:
                 or occ.summary.strip().casefold().startswith("busy"))
 
 
+def _run_covers(which: str, event: Want, start: datetime, end: datetime, runs, at_school: bool) -> bool:
+    """A school run the add-on writes is this leg's drive: the one rule, for the writes and for what the
+    digest and the cards say. Only for an event at school (FamilyGmail._at_school): a drive back is left
+    off when a run starts within LEG_NEAR_RUN of the event's end or crosses the leg; a drive there when a
+    run ends within LEG_NEAR_RUN of its start or crosses the leg (he drives on to school, or comes from
+    it). An event anywhere else keeps its drives, whatever run is near (_run_crosses names a crossing)."""
+    if not at_school:
+        return False
+    for run in runs:
+        if run.start < end and start < run.end:
+            return True
+        if which == "back" and abs(run.start - event.end) <= LEG_NEAR_RUN:
+            return True
+        if which == "there" and abs(run.end - event.start) <= LEG_NEAR_RUN:
+            return True
+    return False
+
+
+def _run_crosses(start: datetime, end: datetime, runs) -> bool:
+    """A school run that overlaps this leg (for an event not at school: both stay, and he's told)."""
+    return any(run.start < end and start < run.end for run in runs)
+
+
+def _his_drive_cover(which: str, event: Want, start: datetime, end: datetime, drives):
+    """The drive already on his Gmail that is this leg, or None. One this system put there at his word
+    (_system_drive) is it when it meets the leg and covers at least half of it, or ends within
+    HIS_DRIVE_NEAR of the event's start (a drive there) or starts within it of the event's end (a drive
+    back). One he put there himself must do both: cover at least half the leg and sit at its edge, so a
+    short drive of his near the event never blanks a long leg. A short crossing is not his drive."""
+    for o in drives:
+        if o.end < start or end < o.start:
+            continue                       # doesn't meet the leg
+        half = end > start and 2 * (min(o.end, end) - max(o.start, start)) >= end - start
+        edge = (which == "there" and abs(o.end - event.start) <= HIS_DRIVE_NEAR) \
+            or (which == "back" and abs(o.start - event.end) <= HIS_DRIVE_NEAR)
+        if (half and edge) if _own_drive(o) else (half or edge):
+            return o
+    return None
+
+
+def _his_drive_covers(which: str, event: Want, start: datetime, end: datetime, drives) -> bool:
+    return _his_drive_cover(which, event, start, end, drives) is not None
+
+
+def _system_drive(occ: ical.Occurrence) -> bool:
+    """A drive another part of this system put on his Gmail at his word (calendar_change.py: its id is
+    "cm" and 32 hex digits), busy and titled as a drive."""
+    return bool(_SYSTEM_ID.fullmatch(occ.uid.removesuffix("@google.com"))) and not occ.all_day \
+        and not occ.transparent and bool(_DRIVE_WORD.search(occ.summary))
+
+
+def _drive_words(title: str) -> bool:
+    """A title that says drive, travel or commute once what only shares the word is taken out (a test
+    drive, a food drive, Google Drive, a street named Drive): "Drive to 12 Oak Drive" still says it."""
+    return bool(_DRIVE_WORD.search(_NOT_A_DRIVE.sub(" ", title or "")))
+
+
+def _own_drive(occ: ical.Occurrence) -> bool:
+    """A drive he put on Gmail himself: his own timed, busy event whose title says drive, travel or
+    commute (_drive_words)."""
+    uid = occ.uid.removesuffix("@google.com")
+    return not occ.all_day and not occ.transparent and not _SYSTEM_ID.fullmatch(uid) \
+        and not google_cal.made_here(uid, occ.summary, occ.transparent) and _drive_words(occ.summary)
+
+
 def _ties_him_up(occ: ical.Occurrence, want: Want, tz: str) -> bool:
     """A real event of his during the trip to school, which means the other parent has the run.
     The way back doesn't count: he can go straight on from there. Not an all-day event unless
@@ -423,7 +533,9 @@ class FamilyGmail:
     def __init__(self, ledger: Ledger, family_add, calendar, google: google_cal.GoogleCalendar,
                  *, rules_fn=lambda: (), school_fn=lambda: (), said_fn=lambda: (), drives=None, tz: str,
                  live=None, live_fn=lambda: False, own_days_fn=lambda: OWN_DAYS_MAX,
-                 own_dry_fn=lambda: False, cleanup_fn=lambda: False, samples_dir: str | None = None):
+                 own_dry_fn=lambda: False, cleanup_fn=lambda: False, samples_dir: str | None = None,
+                 his_fn=lambda: ""):
+        self.his_fn = his_fn               # the his_calendar option: his calendar's address, or ""
         self.cleanup_fn = cleanup_fn       # the remove_all_blocks option
         self.samples_dir = samples_dir     # the dry run's anonymised feed samples go under it
         self.own_days_fn = own_days_fn     # how far ahead his own appointments get drives
@@ -483,7 +595,58 @@ class FamilyGmail:
                 parts.append(f"{n} {label}")
         line = "Blocks on Gmail from Family: " + ", ".join(parts) + "." if parts else ""
         problem = self.ledger.get_meta(PROBLEM)
-        return " ".join(x for x in (line, problem, self._ask_line(), self._dry_line()) if x)
+        return " ".join(x for x in (line, problem, self._removed_line(since), self._ask_line(),
+                                    self._dry_line()) if x)
+
+    def _removed_line(self, since) -> str:
+        """Each drive block taken off because a school run is that drive, by its event's day and time (only
+        times: nothing from the event itself), until a digest that named it has been sent: its record
+        (RUN_PENDING) is deleted only then (_settle_removed), so a digest held back or composed before the
+        removal never loses it, and one sent names it once."""
+        self._settle_removed()
+        zone = ZoneInfo(self.tz)
+        out, named = [], []
+        for detail in self._pending_removed():
+            try:
+                t = datetime.fromisoformat(detail["event_start"]).astimezone(zone)
+            except (ValueError, KeyError, TypeError):
+                continue
+            named.append(detail.get("id", ""))
+            run = "pickup" if detail.get("which") == "back" else "drop-off"
+            out.append(f"Blocks on Gmail from Family: removed the drive {detail.get('which', 'back')} for "
+                       f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M}: the {run} is that drive.")
+        record = json.dumps({"at": iso(self.ledger.now()), "ids": named}) if named else ""
+        if record != (self.ledger.get_meta(RUN_NAMED) or ""):
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(RUN_NAMED, record, db)
+        return " ".join(out)
+
+    def _pending_removed(self) -> list[dict]:
+        try:
+            kept = json.loads(self.ledger.get_meta(RUN_PENDING) or "[]")
+        except ValueError:
+            return []
+        return [x for x in kept if isinstance(x, dict)] if isinstance(kept, list) else []
+
+    def _settle_removed(self) -> None:
+        """The removal records the last composed digest named are deleted once that digest was sent (the
+        digest's own record, daily.deliver: last_digest_at at or after the compose, and not held silent).
+        A record added after that compose stays for the next one."""
+        try:
+            named = json.loads(self.ledger.get_meta(RUN_NAMED) or "{}")
+            at = datetime.fromisoformat(named["at"]) if named else None
+        except (ValueError, KeyError, TypeError):
+            named, at = {}, None
+        if at is None:
+            return
+        sent_at = self.ledger.meta_time("last_digest_at")
+        if sent_at is None or sent_at < at or self.ledger.get_meta("last_digest_sent") == "no":
+            return
+        ids = set(named.get("ids") or ())
+        left = [x for x in self._pending_removed() if x.get("id", "") not in ids]
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(RUN_PENDING, json.dumps(left) if left else "", db)
+            self.ledger.set_meta(RUN_NAMED, "", db)
 
     def _ask_line(self) -> str:
         """Titles come from Family, which anyone with it can write, so they're defanged. The digest
@@ -592,16 +755,216 @@ class FamilyGmail:
                     f"block{'' if len(spared) == 1 else 's'} you changed on Gmail: {whens}.")
         self._problem(note)
 
+    def _his_feed(self):
+        """His own Gmail calendar's feed as last read: (feed id, calendar_feed.FeedResult), or None.
+        Every reading of his calendar here goes through this one choice, in this order:
+          1. the his_calendar option, when set: that calendar, and no other;
+          2. the record (HIS_CALENDAR): the calendar the add-on's blocks were found on before;
+          3. with no record only, the one feed read that holds the add-on's own blocks (the blocks its
+             record says it wrote, each with its private mark, found in the feed by their ids), which then
+             becomes the record; two or more such feeds is a stand-down naming them all, never a pick;
+          4. with no record and no feed holding them, the one feed whose address is a Gmail address.
+        A feed holding the add-on's ids never overrides the option or the record. The option's calendar, or
+        the recorded one, not read now is never left for another: none is his at this read. When a
+        configured feed failed its read (it may be that one), the next reads wait quietly (HIS_RETRY_READS)
+        before the stand-down is said; one simply not among the calendars on the Harness page is said at
+        once (_calendar_notice). The record is never changed by a failed read. Two Gmail addresses with
+        nothing to choose by is a guess: none is his, nothing that needs his calendar is done, the digest
+        names both, and the log says so once per pair. A stand-down writes and removes nothing. When one is
+        chosen beside another that looks like his, the digest names both and the one in use."""
+        feeds = self.calendar.snapshot.feeds
+        read = [(fid, res) for fid, res in feeds.items() if res.window is not None]
+        gmail = [(fid, res) for fid, res in read if res.window.calendar.casefold().endswith("@gmail.com")]
+        names = tuple(sorted({res.window.calendar.casefold() for _, res in gmail}))
+        self._two_feeds: tuple[str, ...] = ()
+        self._in_use: tuple[tuple[str, ...], str, str] | None = None
+        self._his_gone: tuple[str, str] = ("", "")
+        marked = self._marked_feeds(read)       # looked for at every read: its log line says what's seen
+
+        def chosen(found, why: str):
+            mine = found[1].window.calendar.casefold()
+            others = tuple(sorted(set(names) | {mine}))
+            if len(others) > 1:
+                self._in_use = (others, mine, why)
+            self._his_retry(None)
+            return found
+
+        def gone(name: str, how: str):
+            # Not read now: a feed that failed this read may be it, so wait a few reads quietly first.
+            if self._his_retry(name) < HIS_RETRY_READS:
+                return None
+            self._his_gone = (name, how)
+            return None
+
+        wanted = (self.his_fn() or "").strip().casefold()
+        if wanted:
+            same = [x for x in read if x[1].window.calendar.casefold() == wanted]
+            return chosen(same[0], "option") if same else gone(wanted, "option")
+        known = (self.ledger.get_meta(HIS_CALENDAR) or "").casefold()
+        if known:
+            same = [x for x in read if x[1].window.calendar.casefold() == known]
+            if not same:
+                return gone(known, "record")
+            return chosen(same[0], "blocks" if any(fid == same[0][0] for fid, _ in marked) else "record")
+        if len(marked) > 1:
+            self._two_feeds = tuple(sorted({res.window.calendar.casefold() for _, res in marked}))
+            self._two_warn(self._two_feeds, "hold Harness's own blocks")
+            return None
+        if len(marked) == 1:
+            mine = marked[0][1].window.calendar
+            with self.ledger.tx() as db:       # where the add-on's own blocks are, with no record before
+                self.ledger.set_meta(HIS_CALENDAR, mine, db)
+            return chosen(marked[0], "blocks")
+        if len(gmail) > 1:
+            self._two_feeds = names
+            self._two_warn(names, "look like his Gmail calendar")
+            return None
+        if gmail:
+            self._his_retry(None)
+        return gmail[0] if gmail else None
+
+    def _two_warn(self, names: tuple, why: str) -> None:
+        warned = self.__dict__.setdefault("_two_feeds_warned", set())
+        if names not in warned:
+            warned.add(names)
+            log.warning("family to gmail: %d calendars read %s, so none is taken for his: nothing that "
+                        "needs his calendar is done until one is left", len(names), why)
+
+    def _unread_feeds(self) -> bool:
+        """A calendar on the Harness page whose read failed (nothing read of it now): a fetch error, not a
+        calendar missing from the page."""
+        urls = getattr(self.calendar, "urls", None)
+        try:
+            configured = {calendar_feed.feed_id(u) for u in urls()} if callable(urls) else set()
+        except Exception:
+            return False
+        feeds = self.calendar.snapshot.feeds
+        return any(fid not in feeds or feeds[fid].window is None for fid in configured)
+
+    def _his_retry(self, name: str | None) -> int:
+        """Reads in a row his calendar (name) hasn't been read while a feed failed its read, this one
+        counted once (by the calendar's read generation); HIS_RETRY_READS when none failed (it's not on
+        the page: said at once). None: found, the count goes."""
+        if name is None:
+            if self.ledger.get_meta(HIS_RETRY):
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(HIS_RETRY, "", db)
+            return 0
+        if not self._unread_feeds():
+            return HIS_RETRY_READS
+        try:
+            kept = json.loads(self.ledger.get_meta(HIS_RETRY) or "{}")
+            kept = kept if isinstance(kept, dict) and kept.get("name") == name else {}
+        except ValueError:
+            kept = {}
+        gen = getattr(self.calendar, "generation", 0)
+        n = int(kept.get("n", 0) or 0)
+        if kept.get("gen") != gen:
+            n += 1
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(HIS_RETRY, json.dumps({"name": name, "gen": gen, "n": n}), db)
+            if n < HIS_RETRY_READS:
+                log.info("family to gmail: your calendar isn't read now and a calendar's read failed; "
+                         "waiting for the next read (%d of %d)", n, HIS_RETRY_READS)
+        return n
+
+    def _marked_feeds(self, read: list) -> list:
+        """The feeds read that hold any block the add-on's record says it wrote (each carries its private
+        mark), found by its id: Google's iCal feed names an event "<id>@google.com". The form the first
+        one found has is logged once, so that is seen on the device."""
+        ids = {r["event_id"] for r in self.ledger.db.execute(
+            "SELECT event_id FROM family_gmail WHERE state='live'").fetchall()}
+        if not ids:
+            return []
+        out = []
+        for fid, res in read:
+            windows = [w for w in (res.window, res.ahead, getattr(res, "feed_ahead", None)) if w is not None]
+            hit = next((o.uid for w in windows for o in w.occurrences
+                        if o.uid.removesuffix("@google.com") in ids), None)
+            if hit is None:
+                continue
+            out.append((fid, res))
+            if not getattr(self, "_uid_form_logged", False):
+                self._uid_form_logged = True
+                base = hit.removesuffix("@google.com")
+                log.info("family to gmail: Harness's own blocks found in a calendar read, their ids in the "
+                         "form %s", "<id>" + hit[len(base):])
+        return out
+
+    def _calendar_notice(self) -> None:
+        """No calendar is his at this read: his calendar not read (the option's or the recorded one), or
+        two that look like his. The digest says so at every read while it lasts, and he gets one notice,
+        with no buttons."""
+        gone, how = getattr(self, "_his_gone", ("", ""))
+        if gone:
+            where = "the his_calendar setting" if how == "option" else "the one Harness's blocks are on"
+            self._problem(f"Blocks on Gmail from Family: your calendar {gone} ({where}) isn't read now, so "
+                          "nothing that needs your calendar is done, and no other calendar is used instead.")
+            chat = self.live.chat_id if self.live is not None else None
+            others = [res for res in self.calendar.snapshot.feeds.values() if res.window is not None]
+            if chat is None or not others or self.ledger.get_meta(HIS_GONE) == gone:
+                return
+            with self.ledger.tx() as db:
+                self.ledger.enqueue(chat_id=chat, kind="reply", text=render.fit(
+                    f"Your Gmail calendar {gone} isn't read now, so Harness has stopped writing blocks rather "
+                    "than use another calendar. Its secret iCal address on the Harness page may need "
+                    "replacing, or his_calendar in Harness's settings can name the calendar to use."), db=db)
+                self.ledger.set_meta(HIS_GONE, gone, db)
+            return
+        self._two_feeds_notice()
+
+    def _two_feeds_notice(self) -> None:
+        """Two calendars that look like his: the digest names both at every read while it lasts, and he
+        gets one notice for the pair, with no buttons (nothing to choose here: he removes one)."""
+        names = getattr(self, "_two_feeds", ())
+        if len(names) < 2:
+            return
+        shown = " and ".join([", ".join(names[:-1]), names[-1]] if len(names) > 2 else list(names))
+        text = (f"Blocks on Gmail from Family: two calendars look like yours: {shown}; nothing that needs "
+                "your calendar is done until one is removed or named in his_calendar in Harness's settings.")
+        self._problem(text)
+        chat = self.live.chat_id if self.live is not None else None
+        pair = "|".join(names)
+        if chat is None or self.ledger.get_meta(TWO_FEEDS) == pair:
+            return
+        with self.ledger.tx() as db:
+            self.ledger.enqueue(chat_id=chat, kind="reply", text=render.fit(
+                f"Two calendars on the Harness page look like your Gmail calendar: {shown}. Nothing that "
+                "needs your calendar is done until one of them is removed there."), db=db)
+            self.ledger.set_meta(TWO_FEEDS, pair, db)
+
+    def _in_use_note(self) -> str:
+        """Two or more calendars that look like his, one in use: the digest names them all and that one."""
+        found = getattr(self, "_in_use", None)
+        if not found:
+            return ""
+        names, mine, why = found
+        shown = " and ".join([", ".join(names[:-1]), names[-1]] if len(names) > 2 else list(names))
+        because = {"option": "the one in the his_calendar setting", "blocks": "the one Harness's blocks are on",
+                   "record": "the one Harness's blocks were on"}[why]
+        return (f"Blocks on Gmail from Family: {shown} {'both' if len(names) == 2 else 'all'} look like your "
+                f"Gmail calendar; using {mine}, "
+                f"{because}.")
+
+    def _his_ahead(self):
+        """His Gmail calendar's events ahead (ical.Window), or None (_his_feed)."""
+        found = self._his_feed()
+        return found[1].ahead if found is not None else None
+
     def _address(self) -> str | None:
         """Whose calendar: the feed names itself by his address (ical.py). Two is a guess."""
-        found = [res.window.calendar for res in self.calendar.snapshot.feeds.values()
-                 if res.window is not None and res.window.calendar.casefold().endswith("@gmail.com")]
-        return found[0] if len(found) == 1 else None
+        found = self._his_feed()
+        return found[1].window.calendar if found is not None else None
 
     def _sync(self) -> None:
         address = self._address()
         if address is None:
+            self._calendar_notice()
             return
+        if self.ledger.get_meta(HIS_GONE) and not self._his_gone[0]:
+            with self.ledger.tx() as db:      # read again: a later lapse is told again
+                self.ledger.set_meta(HIS_GONE, "", db)
+        in_use = self._in_use_note()
         rules = self.rules_fn()
         now = self.ledger.now()
         day_start, _, _ = calendar_feed.today_bounds(now, self.tz)
@@ -637,6 +1000,8 @@ class FamilyGmail:
         self._adopt_note = ""
         self._approved_legs: dict[str, list] = {}   # drive key -> [id, title, start, end] as his card listed it
         self._spared: list[datetime] = []
+        self._runs_now: list[Want] = []    # the school runs the add-on writes at this read (_run_covers)
+        self._run_covered: dict[str, datetime] = {}   # drive legs a school run is -> their event's start
         self._dry = False
         # The add-on's blocks, by its record (any block it wrote) and by the own-drive kind on its mark (a
         # private extended property that list_ours asks Google for, so a drive block is known after the
@@ -652,12 +1017,17 @@ class FamilyGmail:
             if not self._dry:
                 self._warm_near(now)
             # What each event was judged to mean, model-free here: the judgments are stored.
-            judged = self.live.wants(family.items, now, find=getattr(self.drives, "find_place", None))
+            judged = self.live.wants(family.items, now, find=getattr(self.drives, "find_place", None),
+                                     school=self._school_place())
             self.dropped = set()
             self._last = None
             runs = {k: w for k, w in judged.items() if w.title in _RUN_TITLES}
             own = {k: w for k, w in judged.items() if k not in runs}
             named = self._not_busy(own)
+            # The school runs the add-on writes, before any drive: a drive that a run already is
+            # isn't written beside it (_run_covers).
+            school = self._school_runs(family.items, runs)
+            self._runs_now = [w for w in school.values() if w.end > now]
             # From every event he goes to, even one Gmail already has him busy for: he often
             # puts it there himself, and the drive is still his. His own appointments on Gmail
             # too, chained with them; theirs are drive blocks only.
@@ -689,8 +1059,7 @@ class FamilyGmail:
                         self.drives.path = drive.FAMILY
                 legs = self._drive_legs({**own, **mine}, now)
             legs = {**self._kept_own, **legs}      # a kept drive stays exactly as it is
-            wants = {k: w for k, w in {**named, **legs, **self._school_runs(family.items, runs)}.items()
-                     if w.end > now}
+            wants = {k: w for k, w in {**named, **legs, **school}.items() if w.end > now}
             self.asking = []               # questions go on their own cards (meaning_live.py)
         else:
             said = self.said_fn()
@@ -713,7 +1082,7 @@ class FamilyGmail:
         added = self._add_new(address, wants)
         # A missing drive is named even beside another problem: it's never left off silently.
         self._problem(" ".join(x for x in (problem or added or self.school_note or self.me_note,
-                                           self.leg_note, self._adopt_note) if x) or self._unwritten(now))
+                                           self.leg_note, self._adopt_note, in_use) if x) or self._unwritten(now))
         confirm_soon(self.ledger, "family_gmail", self.calendar)
 
     def _proven_before(self, address: str, since: datetime, until: datetime) -> bool:
@@ -810,8 +1179,7 @@ class FamilyGmail:
             runs = school_plan(items, self.school_fn(), self.said_fn())
         if not runs:
             return {}
-        ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
-                      and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        ahead = self._his_ahead()
         live = {r["key"] for r in self._live()}
         if ahead is None or not ahead.occurrences:
             self.school_note = ("Blocks on Gmail from Family: couldn't read your Gmail calendar, so "
@@ -836,8 +1204,7 @@ class FamilyGmail:
         mine = {k for k, w in wants.items() if w.kind == "me"}
         if not mine:
             return wants
-        ahead = next((res.ahead for res in self.calendar.snapshot.feeds.values() if res.window is not None
-                      and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        ahead = self._his_ahead()
         live = {r["key"] for r in self._live()}
         if ahead is None or not ahead.occurrences or ahead.unreadable:
             # Not knowing whether he's busy isn't knowing he's free, so nothing is added or taken.
@@ -847,6 +1214,109 @@ class FamilyGmail:
         return {k: w for k, w in wants.items() if k not in mine or not any(
             _is_real(o) and not o.all_day and not o.transparent and o.start <= w.start and o.end >= w.end
             for o in ahead.occurrences)}
+
+    def _his_drives(self) -> list[ical.Occurrence]:
+        """The drives already on his Gmail that a drive leg not yet written can be (_leg_cover): ones this
+        system put there at his word (_system_drive) and ones he put there himself (_own_drive). Empty
+        when his calendar can't be told (_his_feed) or wasn't read: nothing is left off for them."""
+        ahead = self._his_ahead()
+        if ahead is None or not ahead.occurrences:
+            return []
+        return [o for o in ahead.occurrences if _system_drive(o) or _own_drive(o)]
+
+    def _school_place(self) -> str:
+        """The school's street address the school-run code drives to (drive.Drives.school_fn), or ""."""
+        fn = getattr(self.drives, "school_fn", None)
+        try:
+            return drive.street_address(fn() or "") if fn is not None else ""
+        except Exception:
+            return ""
+
+    def _at_school(self, event: Want) -> tuple[bool, bool]:
+        """Whether an event is held at school, and whether that rests on the judgment's label alone.
+        By evidence first: a school run itself is; an event whose own location gave a street address (or
+        his place book did) is at school only when that address is the school's (drive.same_place: by the
+        map points kept for both, else by the address's parts, so "St" and "Street", a postcode on one side
+        only or a unit are still the school); a school concert at a theatre is not. Only when the event's
+        location gave no address (empty, or a room's name: the school's own was assumed), or there's no
+        school address in the settings to compare with, does the label "school" (meaning_live's presence
+        place) decide, and then the digest says so (_leg_cover)."""
+        if event.title in _RUN_TITLES:
+            return True, False
+        why = getattr(self.live, "_why", {}).get(event.key, {}) if self.live is not None else {}
+        school = self._school_place()
+        if event.place and why.get("where_from") != "assumed" and school:
+            points = ("", "")
+            if hasattr(self.drives, "kept_point"):
+                points = (self.drives.kept_point(event.place), self.drives.kept_point(school))
+            return drive.same_place(event.place, school, points), False
+        if why.get("place") == "school":
+            return True, True
+        return False, False
+
+    def _leg_cover(self, which: str, event: Want, start: datetime, end: datetime, runs, his,
+                   notes: dict | None = None) -> str:
+        """Why this leg isn't written, when something else is its drive: a school run the add-on writes,
+        for an event at school only (_run_covers, whether or not the leg was written before: one written
+        before comes off, the add-on's own block only), or a drive already on his Gmail
+        (_his_drive_cover, only for a leg not written yet: one already written stays as it is). "" when
+        it is to be written. A run that crosses the leg of an event elsewhere covers nothing: the leg is
+        written and the digest names the crossing (notes["cross"]). A cover by a drive of his own is named
+        in the digest by its title (notes["his"]). Logged once per leg while the add-on runs."""
+        notes = notes if notes is not None else {}
+        key = leg_key(event.key, which)
+        why = ""
+        at_school, by_label = self._at_school(event)
+        if _run_covers(which, event, start, end, runs, at_school):
+            why = "a school run is that drive"
+            notes.setdefault("run", {})[key] = event.start
+            if by_label:
+                # Nothing but the label put it at school: said in the digest, never quiet.
+                notes.setdefault("assumed", set()).add(event.start)
+        else:
+            if not at_school and _run_crosses(start, end, runs):
+                notes.setdefault("cross", set()).add(event.start)
+            found = _his_drive_cover(which, event, start, end, his) if his else None
+            if found is not None and self.ledger.db.execute(
+                    "SELECT 1 FROM family_gmail WHERE key=?", (key,)).fetchone() is None:
+                why = "a drive is already on Gmail"
+                if _own_drive(found):
+                    notes.setdefault("his", {})[(event.start, which)] = found.summary
+        if why:
+            said = self.__dict__.setdefault("_cover_logged", set())
+            if (key, why) not in said:
+                said.add((key, why))
+                log.info("family to gmail: no drive %s for the event on %s: %s", which,
+                         _at(event.start, ZoneInfo(self.tz)), why)
+        return why
+
+    def _cover_note(self, notes: dict, now: datetime) -> str:
+        """Times only for a school run crossing a drive of an event elsewhere; his own drive's title for
+        a leg it was taken for, so a wrong match shows."""
+        zone = ZoneInfo(self.tz)
+
+        def at(t: datetime) -> str:
+            t = t.astimezone(zone)
+            return f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M}"
+        out = []
+        cross = sorted(t for t in notes.get("cross", ()) if now < t < now + NOTE_AHEAD)
+        if cross:
+            which = (f"the event at {at(cross[0])} crosses" if len(cross) == 1
+                     else f"the events at {'; '.join(at(t) for t in cross)} cross")
+            out.append(f"Blocks on Gmail from Family: the drive for {which} a school run block, and the event "
+                       "isn't at school, so both stay on your calendar.")
+        for t in sorted(t for t in notes.get("school address", ()) if now < t < now + NOTE_AHEAD):
+            out.append(f"Blocks on Gmail from Family: the school's address assumed for the event at {at(t)}, "
+                       "which names only a room or no place.")
+        for t in sorted(t for t in notes.get("online", ()) if now < t < now + NOTE_AHEAD):
+            out.append(f"Blocks on Gmail from Family: no drive: online, {at(t)}.")
+        for t in sorted(t for t in notes.get("assumed", ()) if now < t < now + NOTE_AHEAD):
+            out.append(f"Blocks on Gmail from Family: left off: assumed at school for {at(t)}.")
+        for (t, which), title in sorted(notes.get("his", {}).items()):
+            if now < t < now + NOTE_AHEAD:
+                out.append(f"Blocks on Gmail from Family: the drive {which} for the event at {at(t)} left off: "
+                           f"covered by your '{render.defang(_short(title))}'.")
+        return " ".join(out)
 
     def _too_far(self, occ: ical.Occurrence, want: Want) -> bool:
         """An event before or after a run that he can't get to or from in time. With no answer
@@ -889,8 +1359,8 @@ class FamilyGmail:
 
     def _gmail_feed(self):
         """His Gmail calendar's feed as last read (calendar_feed.FeedResult), or None."""
-        return next((res for res in self.calendar.snapshot.feeds.values() if res.window is not None
-                     and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        found = self._his_feed()
+        return found[1] if found is not None else None
 
     # -- the dry run kept apart ------------------------------------------------------------
     def _m(self, name: str) -> str:
@@ -1424,8 +1894,8 @@ class FamilyGmail:
         return True
 
     def _gmail_fid(self) -> str | None:
-        return next((fid for fid, res in self.calendar.snapshot.feeds.items() if res.window is not None
-                     and res.window.calendar.casefold().endswith("@gmail.com")), None)
+        found = self._his_feed()
+        return found[0] if found is not None else None
 
     def _feed_age(self, res, now: datetime) -> str:
         """Named in the digest when the last successful download (Google answering 200) is more than 6
@@ -1685,7 +2155,18 @@ class FamilyGmail:
         any chain, and never keep a drive off. A kept drive stays exactly as it is, busy: one that a
         drive worked out now crosses is named in the digest, with a card when that event is within a
         day, and nothing on Gmail changes for it.
+        A leg that something else already is (a school run the add-on writes beside an event at school,
+        a drive already on his Gmail: _leg_cover) is left off, and counts as handled. Every leg the
+        planner expects (each event's drive there, and each drive back no chain took) ends the read with
+        an outcome, by the event's occurrence (its key and start) and the leg: computed, covered,
+        skipped, online, waiting, failed, no address or unresolved chain. A drive back a chain took
+        is covered only when the next event's drive there was found; else it takes that one's outcome,
+        and is named with it. A leg left with none is a failure, never quiet; one waiting WAIT_READS
+        reads in a row, or near, is one too (_leg_outcomes keeps them for the read).
         quiet: the dry run's preview, with no card and no digest line."""
+        outcome: dict[tuple[str, datetime, str], str] = {}
+        if not quiet:
+            self._leg_outcomes = outcome
         drives = self.drives
         if drives is None or not hasattr(drives, "between"):
             return {}
@@ -1700,11 +2181,51 @@ class FamilyGmail:
         kept = getattr(self, "_kept_own", {})
         zone = ZoneInfo(self.tz)
         days: dict = {}
-        # Soonest first, so a limit on lookups leaves the far-off days for the next read.
-        placed = sorted((w for w in wants.values() if w.place and w.legs and w.end > now and w.key not in off),
-                        key=lambda w: w.start)
+        online = getattr(self.live, "online", {}) if self.live is not None else {}
+        # Only events with a place to drive to make a day's chain, decided after what's online, skipped
+        # or has no address: one of those between two events is no stop, so the one before it drives
+        # home (or straight on) as if it weren't there. Soonest first, so a limit on lookups leaves the
+        # far-off days for the next read.
+        placed = sorted((w for w in wants.values() if w.place and w.legs and w.end > now and w.key not in off
+                         and w.key not in online), key=lambda w: w.start)
+
+        def oc(event: Want, which: str) -> tuple[str, datetime, str]:
+            return (event.key, event.start, which)
+
+        for w in wants.values():
+            if w.key in off and w.place and w.legs:
+                # Undo or Skip on its drives: never in a day's chain, and nothing to say about it.
+                outcome[oc(w, "there")] = outcome[oc(w, "back")] = SKIPPED
+        logged_online = self.__dict__.setdefault("_online_logged", set())
+        held_online: set[datetime] = set()
+        for w in wants.values():
+            if w.key in online and w.end > now:
+                # Held online (meaning_live._online_event): no drive, nothing to ask, and the digest
+                # says so, one line for each (_online_note).
+                outcome[oc(w, "there")] = outcome[oc(w, "back")] = ONLINE
+                held_online.add(w.start)
+                if not quiet and (w.key, w.start) not in logged_online:
+                    logged_online.add((w.key, w.start))
+                    log.info("family to gmail: no drives for the event on %s: it's held online", _at(w.start, zone))
         for want in placed:
             days.setdefault(want.start.astimezone(zone).date(), []).append(want)
+        # One his tap took off never reaches a chain (placed leaves it out). Should one ever get here, it's
+        # an error said once, its legs are skipped, and the read goes on without it.
+        for day in list(days):
+            stray = [e for e in days[day] if e.key in off]
+            for e in stray:
+                log.error("family to gmail: an event with its drives skipped reached the day's drives "
+                          "(on %s); left out", _at(e.start, zone))
+                outcome[oc(e, "there")] = outcome[oc(e, "back")] = SKIPPED
+            if stray:
+                days[day] = [e for e in days[day] if e.key not in off]
+                placed = [e for e in placed if e.key not in off]
+                if not days[day]:
+                    del days[day]
+        runs = list(getattr(self, "_runs_now", []))
+        his = self._his_drives()
+        notes: dict = {}
+        after: dict[tuple, tuple[Want, bool]] = {}   # a drive back -> (the next event, chained straight on)
         out: dict[str, Want] = {}
         failed: set[datetime] = set()
         not_found: set[datetime] = set()
@@ -1728,6 +2249,10 @@ class FamilyGmail:
             return None
 
         def leg(event: Want, which: str, start: datetime, end: datetime) -> None:
+            if self._leg_cover(which, event, start, end, runs, his, notes):
+                outcome[oc(event, which)] = COVERED
+                return
+            outcome[oc(event, which)] = COMPUTED         # even a zero-minute one
             if end > start:
                 key = leg_key(event.key, which)
                 out[key] = Want(key, _leg_title(which, event.state), start, end, "", event.state)
@@ -1765,8 +2290,11 @@ class FamilyGmail:
                             trouble.setdefault(event.key, (event.start, drive_cards.FAILED))
                     elif back is None or out_again is None:
                         there_from = None          # can't tell which way he goes: no drive between
+                        if back is not None:
+                            after[oc(prev, "back")] = (event, False)   # this one's lookup decides it
                     elif event.start - prev.end < timedelta(minutes=back + out_again):
                         there_from = prev.place    # no time to go home: straight on
+                        after[oc(prev, "back")] = (event, True)    # its way on is this one's drive there
                     else:
                         leg(prev, "back", prev.end, prev.end + timedelta(minutes=back))
                 if there_from is not None:
@@ -1788,16 +2316,74 @@ class FamilyGmail:
                     parent = events.get(self._leg_parent.get(k, ""))
                     if k not in kept and parent is not None and w.start < want.end and want.start < w.end:
                         self._conflicts.append((parent.key, parent.start, want.start))
+        # Every leg the planner expects gets an outcome: each event's drive there, then each drive back.
+        # One with none and no reason said above is a failure, never silent (an old block, say, from
+        # before its address was read).
+        reasons = {drive_cards.FAILED: LEG_FAILED, drive_cards.NO_ADDRESS: LEG_NO_ADDRESS,
+                   drive_cards.CHAIN: UNRESOLVED, drive_cards.LATER: WAITING}
+
+        def settle(event: Want, which: str) -> None:
+            if oc(event, which) in outcome:
+                return
+            if event.key in waiting:
+                outcome[oc(event, which)] = WAITING
+            elif event.key in trouble:
+                outcome[oc(event, which)] = reasons.get(trouble[event.key][1], LEG_FAILED)
+            else:
+                outcome[oc(event, which)] = LEG_FAILED
+                failed.add(event.start)
+                trouble[event.key] = (event.start, drive_cards.FAILED)
+
+        for events in days.values():
+            for event in events:
+                settle(event, "there")
+        for events in days.values():
+            for event in events:
+                k = oc(event, "back")
+                if k in outcome:
+                    continue
+                nxt, chained_on = after.get(k, (None, False))
+                if nxt is None:
+                    settle(event, "back")
+                    continue
+                got = outcome[oc(nxt, "there")]
+                if got in (COMPUTED, COVERED) and chained_on:
+                    outcome[k] = COVERED       # its way on is the next one's drive there
+                    continue
+                if got in (COMPUTED, COVERED):
+                    settle(event, "back")
+                    continue
+                # The next one's drive there wasn't found, so neither is this way on: the same outcome,
+                # and named the same way.
+                outcome[k] = got
+                if got == WAITING:
+                    waiting.setdefault(event.key, event.start)
+                else:
+                    failed.add(event.start)
+                    trouble.setdefault(event.key, (event.start, trouble.get(nxt.key, (None, drive_cards.FAILED))[1]))
         # Events nothing could place: the place book asks where (that's their card), or the map
         # couldn't be reached.
         unplaced = {**(self.live.unplaced if self.live is not None else {}), **self._own_unplaced}
         for key, (start, _, why) in unplaced.items():
             if key in off or start <= now:
                 continue
-            (failed if why in (drive_cards.FAILED, drive_cards.LATER) else not_found).add(start)
+            gone_wrong = why in (drive_cards.FAILED, drive_cards.LATER)
+            (failed if gone_wrong else not_found).add(start)
             trouble[key] = (start, why)
-        # A lookup still waiting this near is no longer a quiet wait: the digest names it, and it
-        # gets its card.
+            for which in ("there", "back"):
+                outcome.setdefault((key, start, which), LEG_FAILED if gone_wrong else LEG_NO_ADDRESS)
+        # A lookup still waiting this near, or for WAIT_READS reads of its own (counted for each leg, kept
+        # across restarts: _wait_counts), is no longer a quiet wait: the digest names it, and it gets its
+        # card. Others getting through meanwhile don't start its count again.
+        still = {k for k, o in outcome.items() if o == WAITING}
+        counts = self._wait_counts(still, quiet, set(outcome), now)
+        for k in still:
+            n = counts.get(k, 0)
+            key, start, _ = k
+            if n >= WAIT_READS or start < now + max(NEAR_LATER, WAIT_NEAR):
+                outcome[k] = LEG_FAILED
+                failed.add(start)
+                trouble.setdefault(key, (start, drive_cards.LATER))
         for key, start in waiting.items():
             if start < now + NEAR_LATER:
                 failed.add(start)
@@ -1810,11 +2396,70 @@ class FamilyGmail:
                         cards.seen(self._ck(event.key), self._own_kind(), self._own_said.get(event.key, ""),
                                    event.start, event.end, place, uid, inst)
             return out
+        self._run_covered = notes.get("run", {})
+        assumed = getattr(self.live, "assumed", {}) if self.live is not None else {}
+        notes["online"] = held_online
+        notes["school address"] = {t for k, t in assumed.items() if k not in off}
         self.leg_note = " ".join(x for x in (self._leg_note(failed, not_found, chained, now),
-                                             self._conflict_note(now), self._own_notes()) if x)
+                                             self._conflict_note(now), self._cover_note(notes, now),
+                                             self._own_notes()) if x)
+        self._log_missing(trouble, unplaced, now)
         if cards is not None:
             self._drive_cards(cards, placed, trouble, unplaced, now, set(waiting))
         return out
+
+    def _wait_counts(self, still: set, quiet: bool, seen: set = frozenset(), now: datetime | None = None) -> dict:
+        """How many reads in a row each drive leg now waiting (by its event's key and start, and the leg)
+        has waited for its lookup, this one counted, kept in the ledger (WAIT_COUNTS) so a restart doesn't
+        start it again, and counted for each leg on its own, so others getting through never resets a
+        starved one. An entry goes once its leg resolves (it has an outcome at this read other than
+        waiting: seen) or its event has started (now); a leg this read didn't reach keeps its count. The
+        dry run's preview (quiet) only reads them."""
+        try:
+            kept = json.loads(self.ledger.get_meta(WAIT_COUNTS) or "{}")
+            kept = kept if isinstance(kept, dict) else {}
+        except ValueError:
+            kept = {}
+
+        def name(k: tuple) -> str:
+            key, start, which = k
+            return f"{key}|{iso(start)}|{which}"
+        if quiet:
+            return {k: int(kept.get(name(k), 0) or 0) for k in still}
+        counts = {k: int(kept.get(name(k), 0) or 0) + 1 for k in still}
+        names = {name(k) for k in seen}
+        left: dict[str, int] = {}
+        for n, v in kept.items():
+            if n in names:
+                continue                   # resolved at this read, or waiting and counted below
+            try:
+                start, count = datetime.fromisoformat(n.rsplit("|", 2)[1]), int(v or 0)
+            except (ValueError, IndexError, TypeError):
+                continue
+            if now is not None and start <= now:
+                continue                   # its event has passed
+            left[n] = count
+        left.update({name(k): n for k, n in counts.items()})
+        stored = json.dumps(dict(sorted(left.items())), sort_keys=True) if left else "{}"
+        if stored != (self.ledger.get_meta(WAIT_COUNTS) or "{}"):
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(WAIT_COUNTS, stored, db)
+        return counts
+
+    def _log_missing(self, trouble: dict, unplaced: dict, now: datetime) -> None:
+        """Each event he goes to that ends this read without its drive blocks, in the log by its title
+        (cleaned and cut short, meaning.shown) and day, once per event, day and reason while the add-on
+        runs. The digest names it by its day and time (_leg_note)."""
+        why = getattr(self.live, "_why", {})
+        zone = ZoneInfo(self.tz)
+        logged = self.__dict__.setdefault("_logged_missing", set())
+        for key, (start, reason) in sorted(trouble.items(), key=lambda kv: kv[1][0]):
+            if not now < start < now + NOTE_AHEAD or (key, start, reason) in logged:
+                continue
+            logged.add((key, start, reason))
+            said = self._own_said.get(key) or (unplaced.get(key) or (None, ""))[1] \
+                or why.get(key, {}).get("said", "") or "(title not shown)"
+            log.warning("family to gmail: no drive blocks for %s on %s (%s)", said, _at(start, zone), reason)
 
     def _conflict_note(self, now: datetime) -> str:
         """Times only: a Family event's drive that crosses a drive kept for his own appointment."""
@@ -2246,6 +2891,19 @@ class FamilyGmail:
                 self._set(row, "cancelled")
                 self._log("family_gmail_cancelled", row["key"])
                 self.writes += 1
+                if row["key"] in getattr(self, "_run_covered", ()):
+                    # A drive block of its own, written before, beside a school run at school: the run is
+                    # that drive. Only ever the add-on's own block (its record, its mark, as listed).
+                    log.info("family to gmail: took off the %s block on %s: a school run is that drive",
+                             row["title"], _at(self._when(row["start"]), ZoneInfo(self.tz)))
+                    # And the next digest says so once (digest_line, RUN_REMOVED).
+                    detail = {"key": row["key"], "event_start": iso(self._run_covered[row["key"]]),
+                              "which": "back" if "drive back" in row["title"] else "there"}
+                    detail["id"] = f"{row['key']}|{row['generation']}|{detail['event_start']}"
+                    pending = [x for x in self._pending_removed() if x.get("id") != detail["id"]] + [detail]
+                    with self.ledger.tx() as db:
+                        self.ledger.event(RUN_REMOVED, detail, db=db)
+                        self.ledger.set_meta(RUN_PENDING, json.dumps(pending), db)
             elif out.kind == "changed":
                 self._set(row, "hands_off")
             else:
