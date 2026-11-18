@@ -77,7 +77,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const refusing = new Set<string>();            // the same, refused by Discord (a 403)
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
   const limitN: Record<string, number> = {};     // the next n calls to a path prefix are rate limited
-  const refuseFlag = { on: false };              // Discord answers 400 to any edit that carries flags
+  // Discord answers 400 to any edit that carries flags (naming the field, as its errors do); interactions:
+  // to a tap's answer that carries flags too; other: a 400 that names some other field instead; readOnly:
+  // to any flags value that has a bit outside the editable ones (third round).
+  const refuseFlag = { on: false, interactions: false, other: false, readOnly: false };
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
   const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
   // Discord is slow: posts to his DM, reads of it, or whose bot this is, wait until release()
@@ -130,7 +133,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     if (one && method === "PATCH") {
       const m = posted[one[1]];
       if (!m) throw new Error("discord 404: Unknown Message");
-      if (refuseFlag.on && body.flags !== undefined) throw new Error("discord 400: Invalid Form Body");
+      if (refuseFlag.readOnly && body.flags !== undefined && (body.flags & ~(4 | 4096 | 32768))) throw new Error("discord 400: Invalid Form Body (fields: flags)");
+      if (refuseFlag.other) throw new Error("discord 400: Invalid Form Body (fields: content)");
+      if (refuseFlag.on && body.flags !== undefined) throw new Error("discord 400: Invalid Form Body (fields: flags)");
       if (body.content !== undefined) m.content = body.content;
       if (body.components !== undefined) m.components = body.components;
       if (body.flags !== undefined) m.flags = body.flags;
@@ -139,6 +144,9 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     }
     if (method === "POST" && path.startsWith("/interactions/")) {
       if (hang.interactions) return new Promise(() => {});
+      if (refuseFlag.readOnly && body?.data?.flags !== undefined && (body.data.flags & ~(4 | 64 | 4096 | 32768))) throw new Error("discord 400: Invalid Form Body (fields: data.flags)");
+      if (refuseFlag.interactions && body?.data?.flags !== undefined && (body.data.flags & 4)) throw new Error("discord 400: Invalid Form Body (fields: data.flags)");
+      if (refuseFlag.other) throw new Error("discord 400: Invalid Form Body (fields: data.content)");
       if (body?.type === 7 && posted[tapped]) {
         if (body.data.content !== undefined) posted[tapped].content = body.data.content;
         posted[tapped].components = body.data.components;

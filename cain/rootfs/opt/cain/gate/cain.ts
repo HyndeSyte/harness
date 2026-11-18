@@ -293,6 +293,9 @@ export function linksIn(text: string): LinkFound[] {
   for (const [a, b] of linkSpans(t)) add(a, b, t.slice(a, b));
   return out.sort((x, y) => x.at - y.at);
 }
+// The one link detector (third round): the reply hook's hold, the gate's links rule and the after-post
+// note (hooks/discord-sent.ts) all ask this, so nothing the gate would hold slips past the hook.
+export const hasLink = (text: string): boolean => linksIn(text).length > 0;
 // Whether a masked link's visible text is itself an address on another host than where the tap goes.
 export function maskedElsewhere(shown: string, target: string): boolean {
   const v = normalLink(shown);
@@ -302,6 +305,9 @@ export function maskedElsewhere(shown: string, target: string): boolean {
   const strip = (h: string) => h.replace(/^www\./, "");
   return strip(hostOf(a)) !== strip(hostOf(b));
 }
+// The gate report's words for a link to a host off the list (third round): the list is the known hosts,
+// noted not blocked, and a link to an unknown host is never held.
+export const UNKNOWN_HOST = "unknown host (known hosts, noted not blocked)";
 // The hits for his words: each held link ("refuse"), and each https link to a host off the list, a notice only
 // ("note": logged, never held). hosts: the list (LINK_HOSTS and what was added); not given: notices off.
 export function linksHits(text: string, hosts?: ReadonlySet<string> | readonly string[] | null): CainHit[] {
@@ -310,7 +316,7 @@ export function linksHits(text: string, hosts?: ReadonlySet<string> | readonly s
     const why = linkProblem(f.link) ?? (f.shown !== undefined && maskedElsewhere(f.shown, f.link) ? "masked" : null);
     if (why) { out.push({ rule: "links", result: "refuse", at: f.at, end: f.end, around: `${LINK_WORDS[why]}: ${f.link.slice(0, 60)}` }); continue; }
     const u = parseLink(f.link);
-    if (hosts && u && !under(hostOf(u), hosts)) out.push({ rule: "links", result: "note", at: f.at, end: f.end, around: `a host off the list: ${hostOf(u).slice(0, 60)}` });
+    if (hosts && u && !under(hostOf(u), hosts)) out.push({ rule: "links", result: "note", at: f.at, end: f.end, around: `${UNKNOWN_HOST}: ${hostOf(u).slice(0, 60)}` });
   }
   return out;
 }

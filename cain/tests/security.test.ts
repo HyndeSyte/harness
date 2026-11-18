@@ -61,7 +61,9 @@ describe("the outside heartbeat", () => {
     expect(st.fails).toBe(3);
     const everything = [...logs, readFileSync(file, "utf8")].join("\n");
     expect(everything).not.toContain(PING_PATH);
-    expect(everything).not.toContain("hc-ping");
+    // Third round: a logged failure names the host and the error's code, nothing more; the state file not even the host.
+    expect(readFileSync(file, "utf8")).not.toContain("hc-ping");
+    for (const l of logs) expect(l.replace("hc-ping.example.net", "")).not.toContain("hc-ping");
     expect(logs.some((l) => l.includes("told the outside heartbeat the App stopped"))).toBe(true);
     // An HTTP failure is named by its status, nothing else.
     const { f: f2 } = fakeFetch(() => ({ ok: false, status: 404 }));
@@ -317,9 +319,9 @@ describe("link previews off on everything the link posts", () => {
     expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" })).toEqual({ body: { content: "x" }, added: false });
     expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 4)).toEqual({ body: { content: "x" }, added: false });
     expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 0)).toEqual({ body: { content: "x", flags: 4 }, added: true });
-    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 2)).toEqual({ body: { content: "x", flags: 6 }, added: true });
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 4096)).toEqual({ body: { content: "x", flags: 4100 }, added: true });
     // An edit that carries flags: ORed onto them and onto what the message has.
-    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { flags: 4 }, 32)).toEqual({ body: { flags: 36 }, added: true });
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { flags: 4 }, 32768)).toEqual({ body: { flags: 32772 }, added: true });
     expect(quiet("PATCH", `/channels/${DM}/messages/123`, { components: [] }, 0)).toEqual({ body: { components: [] }, added: false });   // buttons alone
     // A tap's update never gets a flags field it didn't carry; a tap's new message does.
     expect(quiet("POST", "/interactions/1/tok/callback", { type: 7, data: { content: "x" } })).toEqual({ body: { type: 7, data: { content: "x" } }, added: false });
@@ -360,14 +362,14 @@ describe("link previews off on everything the link posts", () => {
     const r = rig();
     const reply = r.his("See https://www.example.com/x").id;     // stands in for a reply the plugin posted
     (r.posted[reply] as any).author = { id: "bot" };
-    (r.posted[reply] as any).flags = 32;
+    (r.posted[reply] as any).flags = 4096;           // an editable bit it has (third round: read-only ones never go back)
     const plain = r.his("Moved swim to 4:30.").id;
     await r.link.sent({ tool: "reply", ids: [plain], question: false });   // no link in it: nothing to turn off
     await r.link.sent({ tool: "reply", ids: [reply], question: false, links: true });
     await Bun.sleep(20);
-    expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${reply}` && c.body.flags === 36)).toBe(true);
+    expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${reply}` && c.body.flags === 4100)).toBe(true);
     expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${plain}` && "flags" in c.body)).toBe(false);
-    expect((r.posted[reply] as any).flags).toBe(36);
+    expect((r.posted[reply] as any).flags).toBe(4100);
   });
 
   test("the reply hook tells the link which replies carry a link", () => {

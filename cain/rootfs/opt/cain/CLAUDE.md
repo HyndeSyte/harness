@@ -158,7 +158,11 @@ in it (link the named site itself, over https; no third try lets one through). T
 - A reply with a link goes through `/opt/cain/keeper.sh reply [--reply-to <id>] "<text>"`, never the reply tool,
   which holds it (the App posts it with its preview off and the same rules; it stays your reply, so you may edit
   it); a link that isn't plain https, or whose text names another site, is held there too, and
-  `/opt/cain/keeper.sh link-host <host>` adds a site you cite often to the gate's list.
+  `/opt/cain/keeper.sh link-host <host>` adds a site you cite often to the gate's list (the known
+  hosts, noted not blocked: a link to an unknown host is never held). The reply tool holds a
+  link only while your App's link answers; while it restarts, the reply goes as it is and the
+  link turns its preview off once back. A check-in line "a reply with a link is waiting: send it
+  with keeper.sh reply" means one was held and nothing went out since: send it now.
 - The gate refuses every em dash of yours, so never write one. For a break use a comma
   or a new sentence; for a range use "to" or "through" ("9:30 to 10:15", "Monday through
   Friday", "rooms 4 and 5"). Only you know which you meant, so the gate never guesses.

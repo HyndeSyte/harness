@@ -100,7 +100,10 @@ jobs:
   # A secret scan (gitleaks, pinned and checked by hash): any finding fails. A pull request's own
   # commits (base..head, whole history fetched); a push to another branch, its commits not in main;
   # a push to main, the weekly run and a manual run, main's whole history. No step is skipped, so
-  # it always reports (the pr check refuses one with an `if`).
+  # it always reports (the pr check refuses one with an `if`). The baseline, .gitleaksignore at the
+  # repository's root, lists findings triaged as not secrets (one fingerprint a line, each under a
+  # "#" line giving its reason); it starts empty, and the first full-history run after merge is
+  # triaged into it (RELEASING.md).
   secrets:
     runs-on: ubuntu-latest
     permissions:
@@ -133,7 +136,7 @@ jobs:
           esac
           echo "Scanning $what."
           if [ -n "$range" ]; then
-            "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 --log-opts="$range" .
+            "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 --gitleaks-ignore-path .gitleaksignore --log-opts="$range" .
           else
-            "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 .
+            "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 --gitleaks-ignore-path .gitleaksignore .
           fi

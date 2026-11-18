@@ -47,7 +47,8 @@ import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { claimsReview, linksIn, mayHaveCode, recordItems } from "../gate/cain";
+import { claimsReview, hasLink, mayHaveCode, recordItems } from "../gate/cain";
+import { LINK_HELD, noteAt } from "../gate/held";
 import { readHosts } from "../gate/hosts";
 import { appendGate } from "../gate/log";
 import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
@@ -234,7 +235,7 @@ async function askLink(): Promise<CardsView | null> {
 }
 
 // The whole hook, for one input: what it prints (nothing, or one JSON object).
-export async function run(raw: string, o: { ask?: () => Promise<CardsView | null>; file?: () => string | null; now?: number } = {}): Promise<string> {
+export async function run(raw: string, o: { ask?: () => Promise<CardsView | null>; file?: () => string | null; now?: number; held?: string } = {}): Promise<string> {
   const input = JSON.parse(raw);
   const call = callOf(input);
   if (!call) return "";
@@ -250,10 +251,15 @@ export async function run(raw: string, o: { ask?: () => Promise<CardsView | null
     ...(claimsReview(call.text) ? { reviewed: readReviewed() } : {}),
     ...(mayHaveCode(call.text) ? { items: readItems() } : {}),
     // Links: the plugin's replies hold any (keeper.sh reply sends them with the preview off), and an
-    // https link off the cited hosts is noted in the report (0.13.0, second round).
-    plugin: true, ...(linksIn(call.text).length ? { hosts: readHosts() } : {}) });
+    // https link to an unknown host is noted in the report (0.13.0, second round). Third round: held
+    // only while the link answers (its /cards answer above, within LINK_MS): keeper.sh reply has no
+    // path while it is down, so the reply goes as it is, noted, and the link turns its preview off
+    // once it is back. The same detector as the gate's (hasLink), so nothing slips past here.
+    plugin: true, linkDown: got.from !== "link", ...(hasLink(call.text) ? { hosts: readHosts() } : {}) });
   const tries = readTries();
   let out = act(call, d, tries, now);
+  // A reply held for the keeper: its time noted, for the check-in's "waiting" line (gate/held.ts).
+  if (out.did === "refused" && d.hits.some((h) => h.rule === "keeper" && h.result === "refuse")) noteAt(o.held ?? LINK_HELD, now);
   if (!writeTries(tries, now) && out.counted) out = { output: null, did: "passed, tries not counted" };
   const line = entry(call, d, out, got.from, now);
   if (line) await appendGate(line);

@@ -58,9 +58,10 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { KEEPER_SENT, noteAt } from "../gate/held";
 import { readHosts } from "../gate/hosts";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
+import { discordError, Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
@@ -123,7 +124,9 @@ async function rest(method: string, path: string, body?: unknown, auth = true, t
     redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
-  if (r.status >= 400) throw new Error(`discord ${r.status}: ${String(data?.message ?? "").slice(0, 100)}`);
+  // With the names of the fields Discord refused (never their values): a 400 that names flags is the
+  // only one the link sends again, without its added preview flag (core.ts quiet, third round).
+  if (r.status >= 400) throw new Error(discordError(r.status, data));
   return data;
 }
 
@@ -224,6 +227,7 @@ const link = new Link({
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   linkHosts: () => readHosts(),
+  keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),

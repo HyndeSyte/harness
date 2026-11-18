@@ -58,8 +58,10 @@ its own.
   the App. Each ping carries only how long the App has been up. The URL is not logged, not in
   any child's environment (only the heartbeat's own process has it, and the stop ping reads it
   through curl's standard input, never a command line); it is stored only in the App's options,
-  which is where Supervisor keeps every option, and that is fine. A leaked URL can mask an outage
-  or fake a failure: keep it like a key. Give the check a grace period of 10 to 15 minutes, so
+  which is where Supervisor keeps every option, and that is fine. Cain's own Claude session can
+  read that options file too, so a compromised session could read the URL: the risk that a leaked
+  URL masks an outage or fakes a failure includes that case. Keep it like a key, and make a new
+  one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
   one late ping doesn't page you.
 - **Review spend.** The morning check-in has yesterday's spend per review seat and the month
   so far against each cap, and flags a day that jumps (over 3 times the week before and at
@@ -76,8 +78,13 @@ its own.
   link goes out through the App with the preview off from the start. A link that isn't plain
   https on its usual port, points to a bare IP address, a punycode host or a link shortener,
   has a user name or password in it, or whose text names another site than where it leads, is
-  held for him to rewrite. A link to a site off the short list Cain usually cites goes out as
-  usual and is only noted in the App's gate report.
+  held for him to rewrite. The short list of sites Cain usually cites is the known hosts, noted
+  not blocked: a link to an unknown host is never held, it goes out as usual and is only noted
+  in the App's gate report ("unknown host"), apart from the report's "preview flag refused"
+  lines (Discord refused the no-preview setting on a card update, which then went without it).
+  While the App's link is restarting, a reply of Cain's with a link goes out through Discord's
+  own plugin rather than wait, noted in the report as "link down: preview not suppressed at
+  post", and its preview is turned off once the link is back.
 
 ## Cards and questions
 

@@ -4,7 +4,12 @@
 # Errors from this script (not the session's screen) go to /data/session.log.
 export HOME=/data
 # The outside heartbeat's URL is the security watch's alone (services.d/cain/run): never Claude's.
+# No xtrace around it (third round), put back as it was after.
+case $- in *x*) hb_xtrace=1 ;; *) hb_xtrace= ;; esac
+{ set +x; } 2>/dev/null
 unset HEARTBEAT_URL
+if [ -n "${hb_xtrace}" ]; then set -x; fi
+unset hb_xtrace
 exec 2>>/data/session.log
 echo "$(date -Is) session.sh starting" >&2
 cd /data/work || { echo "no /data/work" >&2; exit 1; }

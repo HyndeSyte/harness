@@ -16,10 +16,10 @@
 // per message. Nothing is kept beyond that: Cain's next reply places Stop again.
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { claimsReview, reviewedHits } from "../gate/cain";
+import { claimsReview, hasLink, reviewedHits } from "../gate/cain";
 import { appendGate } from "../gate/log";
 import { answerText, asksSomething, SENDS, sentIds } from "../gate/plugin";
-import { check, linkSpans } from "../gate/rules";
+import { check } from "../gate/rules";
 import { readReviewed, type Reviewed } from "../reviewed";
 import { keyOf, readTries, textHash, type Tries, wasReleased } from "./discord-send";
 
@@ -57,7 +57,7 @@ export function noteOf(input: any, now: number, tries: Tries = readTries()): Sen
   // Which send this is: a retried note keeps it, and a second edit of the same message has its own.
   const call = typeof input?.tool_use_id === "string" && CALL.test(input.tool_use_id) ? input.tool_use_id : textHash(text);
   const note: SentNote = { tool, ids, question: asksSomething(text), call, ...(chat ? { chat } : {}), ...(replyTo ? { reply_to: replyTo } : {}),
-    ...(linkSpans(text).length || /\]\([^)\s]+\)/.test(text) ? { links: true } : {}) };
+    ...(hasLink(text) ? { links: true } : {}) };
   // A third try the reply hook let through is always told, hits here or not (a button the
   // card lacks is one only the cards can show).
   const released = wasReleased(tries, keyOf(String(input?.session_id ?? ""), chat), text, now);

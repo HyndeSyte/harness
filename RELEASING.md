@@ -59,7 +59,13 @@ branch is up to date with `main` and these checks passed on it:
     `tests.yml` defines it, and (Cain 0.13.0) for `secrets`, the secret scan, which must
     always be there. The pr check only keeps it there and reporting; refusing a merge while it
     is red needs `secrets` added to the "Checks and history" ruleset's required checks, which
-    takes admin rights (Dane, once). `audit` stays optional.
+    takes admin rights (Dane, once). `audit` stays optional for one week, until Nov 25, 2026,
+    since it rests on network lookups: it becomes required (in the pr check's list and the
+    ruleset) once a week of its runs shows no network failures. The `secrets` scan honours a
+    baseline, `.gitleaksignore` at the repository's root (one finding's fingerprint a line, each
+    under a `#` line with its reason), empty to start: the first full-history run after this lands
+    on `main` may surface old findings, and they are triaged into it (a real secret is revoked and
+    replaced, never listed).
 
 `pcjobs-windows` is not a required check in the rulesets (making it one needs the
 repository's rulesets, which take admin rights no session has). The link enforces it

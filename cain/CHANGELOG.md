@@ -6,7 +6,8 @@
 - The morning check-in now names a jump in review spending (a day far above a busy week before, at least $1, or over a fifth of a month's cap), the cheapest sign of a stolen key or a runaway loop. It also says when a seat is on pace to pass its monthly cap, and when it has reached it. A review is refused at once when every seat it needs is at its cap.
 - On Mondays the morning check-in names a key or token that has been the same for over 90 days, and any morning one within 14 days of an expiry Cain noted. A key that never expires by design can be marked as known until a date, so it stays quiet. The App only keeps a fingerprint of each key, never the key.
 - Links in messages from Cain's bot no longer unfold into previews: Cain's own replies with a link now go out through the App with the preview off from the start. Cain can't send you a link that isn't plain https, points to a bare IP address, a disguised (punycode) address or a link shortener, has a password in it, or whose words name a different site than where it leads.
-- Card updates keep working even if Discord ever refuses the no-preview setting: the card is updated without it.
+- Card updates keep working even if Discord ever refuses the no-preview setting: the card is updated without it. A tap never fails because of a message's own settings, and an unrelated refusal is never sent twice.
+- A reply of Cain's with a link never gets stuck: while the App's link is restarting it goes out at once, and its preview is turned off once the link is back. If one was held and never sent, the next check-in reminds Cain.
 - Nothing in the security watch acts on its own: it only tells Cain, and he brings you one thing at a time.
 
 ## 0.12.2

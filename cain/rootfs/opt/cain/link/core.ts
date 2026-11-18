@@ -210,21 +210,44 @@ export type Rest = (method: string, path: string, body?: unknown, auth?: boolean
 //   - a tap's update of its message (type 7): ORed onto flags it carries, never added alone
 //     (answer() puts the tapped message's own flags in first when it sets words);
 //   - anything else as it was.
-// added: whether a flags value went that the caller didn't write, so a refusal of it (a 400) is
-// tried once more as the caller wrote it, with a "preview flag refused" line in the gate report:
-// a flag problem shows a preview, never a dead card.
+// added: whether a flags value went that the caller didn't write, so a refusal of it (a 400 whose
+// body names flags) is tried once more without the added bit, with a "preview flag refused" line in
+// the gate report: a flag problem shows a preview, never a dead card.
+// Third round: every flags value that goes out is masked to the bits Discord takes on a post, an
+// edit or a tap's answer (EDITABLE_FLAGS; EPHEMERAL too on an interaction's own answer or webhook).
+// Bits Discord sets itself and only reports (HAS_THREAD, CROSSPOSTED, LOADING, HAS_SNAPSHOT and the
+// rest) never go back. known: the message's flags as last read; null: the read before an edit
+// failed or timed out, so the edit goes as the caller wrote it (masked), without the added bit.
+export const SUPPRESS_NOTIFICATIONS = 1 << 12;
+export const IS_COMPONENTS_V2 = 1 << 15;
+export const EDITABLE_FLAGS = SUPPRESS_EMBEDS | SUPPRESS_NOTIFICATIONS | IS_COMPONENTS_V2;
+export function maskFlags(flags: unknown, interaction = false): number {
+  return (Number(flags) || 0) & (EDITABLE_FLAGS | (interaction ? EPHEMERAL : 0));
+}
 export interface Quieted { body: unknown; added: boolean }
 export const MESSAGE_PATH = /^\/channels\/\d+\/messages\/(\d+)$/;
-export function quiet(method: string, path: string, body: unknown, known?: number): Quieted {
+const isInteraction = (path: string) => /^\/interactions\//.test(path) || /^\/webhooks\//.test(path);
+// The caller's own body with its flags masked and nothing added: what a retry sends after a refusal
+// that names flags, and what an edit sends when the message's flags couldn't be read.
+export function masked(path: string, body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const b = body as Record<string, any>, i = isInteraction(path);
+  const m = (o: Record<string, any>) => ("flags" in o ? { ...o, flags: maskFlags(o.flags, i) } : o);
+  return /^\/interactions\//.test(path) && b.data && typeof b.data === "object" ? { ...b, data: m(b.data) } : m(b);
+}
+export function quiet(method: string, path: string, body: unknown, known?: number | null): Quieted {
   const same = { body, added: false };
   if (!body || typeof body !== "object" || Array.isArray(body)) return same;
   const b = body as Record<string, any>;
+  const interaction = isInteraction(path);
   const or = (o: Record<string, any>, more = 0) => {
-    const flags = (Number(o.flags) || 0) | more | SUPPRESS_EMBEDS;
-    return { body: { ...o, flags }, added: !("flags" in o) || flags !== Number(o.flags) };
+    const base = maskFlags(o.flags, interaction);
+    const flags = maskFlags(base | more | SUPPRESS_EMBEDS, interaction);
+    return { body: { ...o, flags }, added: !("flags" in o) || flags !== base };
   };
   if (method === "POST" && (/^\/channels\/\d+\/messages$/.test(path) || /^\/webhooks\/[^/]+\/[^/]+$/.test(path))) return or(b);
   if (method === "PATCH" && MESSAGE_PATH.test(path)) {
+    if (known === null) return { body: masked(path, b), added: false };
     if ("flags" in b) return or(b, known ?? 0);
     if (!("content" in b) || known === undefined || (known & SUPPRESS_EMBEDS)) return same;
     return or(b, known);
@@ -232,8 +255,29 @@ export function quiet(method: string, path: string, body: unknown, known?: numbe
   if (method === "POST" && /^\/interactions\//.test(path) && b.data && typeof b.data === "object") {
     if (b.type === 4 || "flags" in b.data) { const q = or(b.data); return { body: { ...b, data: q.body }, added: q.added }; }
   }
-  return same;
+  return { body: masked(path, b), added: false };
 }
+// A refusal that names the flags field (Discord's 400 lists the fields it refused; the link's rest
+// puts their names after the message): only that is tried again without the added bit.
+export const namesFlags = (e: unknown) => /discord 400\b/.test(String(e)) && /\bflags\b/i.test(String(e));
+// Discord's error as the link throws it: the status, its message, and the names of the fields it
+// refused (errors: {flags: {_errors: [...]}, data: {flags: ...}}), never values.
+export function discordError(status: number, data: any): string {
+  const names: string[] = [];
+  const walk = (o: any, at: string, depth: number) => {
+    if (!o || typeof o !== "object" || depth > 4 || names.length >= 6) return;
+    for (const k of Object.keys(o)) {
+      if (k === "_errors") continue;
+      const here = at ? `${at}.${k}` : k;
+      if (/^[A-Za-z0-9_]{1,40}$/.test(k)) { if (o[k] && typeof o[k] === "object" && "_errors" in o[k]) names.push(here); walk(o[k], here, depth + 1); }
+    }
+  };
+  walk(data?.errors, "", 0);
+  return `discord ${status}: ${String(data?.message ?? "").slice(0, 100)}${names.length ? ` (fields: ${names.join(", ")})` : ""}`;
+}
+export const PRE_EDIT_READ_MS = 1_500;   // the read of a message's flags before an edit, at most
+// A path for a log line: an interaction's or webhook's token cut short.
+const shortPath = (path: string) => path.replace(/\/[^/]{40,}/g, "/…");
 
 export interface Card {
   text: string; rows: any[]; kind: string; created: number; shown: string | null; expires?: number | null;
@@ -626,7 +670,8 @@ export interface Deps {
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
-  linkHosts?: () => ReadonlySet<string>;                           // the hosts Cain normally cites (gate/hosts.ts); absent: no notices
+  linkHosts?: () => ReadonlySet<string>;
+  keeperSent?: (at: number) => void;                               // a keeper.sh reply went out (gate/held.ts: the check-in's waiting line)                           // the hosts Cain normally cites (gate/hosts.ts); absent: no notices
   // The replay: Cain's own replies and edits as his transcripts have them (since a time),
   // where its report goes, and the pause between pages of his DM (tests: 0).
   transcripts?: (since: number) => Sent | Promise<Sent>;
@@ -808,15 +853,20 @@ export class Link {
     this.rest = async (...a) => {
       const [method, path, body, ...more] = a;
       try {
-        const q = quiet(method, path, body, await this.flagsFor(method, path, body));
+        const known = await this.flagsFor(method, path, body);
+        const q = quiet(method, path, body, known);
+        if (known === null) {
+          // The read failed: the edit goes as the caller wrote it, and the report notes it.
+          this.reportFlag("flags unread", path, "the message's flags couldn't be read before the edit: sent without the preview flag");
+        }
         try { return this.sawFlags(path, await d.rest(method, path, q.body, ...more)); }
         catch (e) {
-          // The flag refused (a 400): once more as the caller wrote it, and the gate report says so.
           if (!q.added || !/discord 400/.test(String(e))) throw e;
-          this.log(`Discord refused the preview flag on ${method} ${path.replace(/\/[^/]{40,}/g, "/…")}: sent again without it`);
-          try { d.report?.({ point: "preview flag", writer: "link", hits: [], did: "preview flag refused", ...(MESSAGE_PATH.exec(path) ? { message: MESSAGE_PATH.exec(path)![1] } : {}) }); }
-          catch (r) { this.log(`couldn't log the gate's report: ${String(r).slice(0, 80)}`); }
-          return this.sawFlags(path, await d.rest(method, path, body, ...more));
+          // Only a 400 that names flags is the flag's: anything else is logged, and nothing is sent twice.
+          if (!namesFlags(e)) { this.log(`Discord refused ${method} ${shortPath(path)}: ${String(e).slice(0, 160)}`); throw e; }
+          this.log(`Discord refused the preview flag on ${method} ${shortPath(path)}: sent again without it`);
+          this.reportFlag("preview flag refused", path);
+          return this.sawFlags(path, await d.rest(method, path, masked(path, body), ...more));
         }
       } catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
     };
@@ -834,19 +884,28 @@ export class Link {
     }
     return msg;
   }
+  private reportFlag(did: string, path: string, note?: string) {
+    try { this.d.report?.({ point: "preview flag", writer: "link", hits: [], did, ...(note ? { note } : {}), ...(MESSAGE_PATH.exec(path) ? { message: MESSAGE_PATH.exec(path)![1] } : {}) }); }
+    catch (r) { this.log(`couldn't log the gate's report: ${String(r).slice(0, 80)}`); }
+  }
   // The flags an edit has to keep: as last seen, or read from Discord now for an edit that sets words
-  // or flags of a message the link hasn't seen. undefined: not known (the words go without the flag).
-  private async flagsFor(method: string, path: string, body: unknown): Promise<number | undefined> {
+  // or flags of a message the link hasn't seen. undefined: nothing to keep; null: the read failed or ran
+  // past PRE_EDIT_READ_MS (third round), so the edit goes as the caller wrote it, without the added bit.
+  private async flagsFor(method: string, path: string, body: unknown): Promise<number | null | undefined> {
     const m = method === "PATCH" ? MESSAGE_PATH.exec(path) : null;
     if (!m || !body || typeof body !== "object" || !("content" in body || "flags" in body)) return undefined;
     if (this.flags.has(m[1])) return this.flags.get(m[1]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const cur = this.sawFlags(path, await this.d.rest("GET", path));
+      const cur = this.sawFlags(path, await Promise.race([
+        this.d.rest("GET", path, undefined, true, PRE_EDIT_READ_MS),
+        new Promise((_, no) => { timer = setTimeout(() => no(new Error("TimeoutError: the read of its flags ran out of time")), PRE_EDIT_READ_MS + 100); }),
+      ]));
       return typeof cur?.flags === "number" ? cur.flags : undefined;
     } catch (e) {
       this.log(`couldn't read a message's flags before an edit: ${String(e).slice(0, 80)}`);
-      return undefined;
-    }
+      return null;
+    } finally { if (timer) clearTimeout(timer); }
   }
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
@@ -973,6 +1032,7 @@ export class Link {
     if (d.would === "refuse") throw new Refusal(d.said);
     const words = d.would === "fix" ? d.fixed : text;
     const msg = await this.post(words, [], replyTo ? { replyTo } : {});
+    try { this.d.keeperSent?.(this.d.now()); } catch (e) { this.log(`couldn't note a keeper reply: ${String(e).slice(0, 80)}`); }
     await this.sent({ tool: "reply", ids: [String(msg.id)], question: asksSomething(words), call: `keeper-${String(msg.id)}`,
       ...(replyTo ? { reply_to: replyTo } : {}) }, { background: true });
     return { status: "posted", message: String(msg.id), said: d.would === "fix" ? `Posted, with its wording fixed: ${fixedWhat(d.hits as Hit[])}.` : "Posted." };
@@ -1844,9 +1904,11 @@ export class Link {
 
   private async answer(it: any, kind: number, data?: unknown): Promise<boolean> {
     try {
-      // A tap's update that sets words keeps the tapped message's own flags, with the preview flag.
+      // A tap's update that sets words keeps the tapped message's own flags (only the ones an answer may
+      // carry: masked, third round); the rest wrapper adds the preview flag, so a refusal of it that
+      // names flags is tried once more without it.
       const keep = kind === 7 && data && typeof data === "object" && "content" in (data as object) && !("flags" in (data as object))
-        && typeof it?.message?.flags === "number" ? { ...(data as object), flags: it.message.flags | SUPPRESS_EMBEDS } : data;
+        && typeof it?.message?.flags === "number" ? { ...(data as object), flags: maskFlags(it.message.flags) } : data;
       await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, keep ? { type: kind, data: keep } : { type: kind }, false);
       return true;
     } catch (e) {
@@ -2172,7 +2234,7 @@ export class Link {
         const cur = await this.rest("GET", `/channels/${dm}/messages/${id}`);
         const had = Number(cur?.flags) || 0;
         if (had & SUPPRESS_EMBEDS) { done++; continue; }
-        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: had | SUPPRESS_EMBEDS });
+        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: maskFlags(had | SUPPRESS_EMBEDS) });
         done++;
       } catch (e) {
         if (/discord 429/.test(String(e))) break;

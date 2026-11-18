@@ -47,12 +47,14 @@ describe("the preview flag never kills a card update", () => {
   test("an edit of a message that carries other flags keeps them: the flag is ORed on, never put in their place", async () => {
     const r = rig();
     const ask = (await r.link.ask({ text: "Filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
-    (r.posted[ask] as any).flags = 2 | 32;       // bits Discord set that the link never wrote
+    // An editable bit the link never wrote, and one Discord sets itself (HAS_THREAD): the third round
+    // keeps the editable one and never sends the read-only one back.
+    (r.posted[ask] as any).flags = 4096 | 32;
     r.restart();
     await r.link.answered({ item: "P08", question: "Q2" });
     const edit = r.calls.find((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${ask}`)!;
-    expect(edit.body.flags).toBe(2 | 32 | 4);
-    expect((r.posted[ask] as any).flags).toBe(38);
+    expect(edit.body.flags).toBe(4096 | 4);
+    expect((r.posted[ask] as any).flags).toBe(4100);
     // Once it has the bit, an edit of its words sends no flags field at all.
     const again = (await r.link.ask({ text: "Filed now?", options: ["Filed", "Not filed"], item: "P08", question: "Q3" }) as any).message;
     await r.link.answered({ item: "P08", question: "Q3" });
@@ -244,7 +246,7 @@ describe("links parsed as a browser would", () => {
     expect(off[0].result).toBe("note");
     const d = decideSend({ tool: "reply", text: "https://www.example.com/x", chat: DM }, CARDS, { hosts });
     expect(d.would).toBe("pass");
-    expect(d.hits).toEqual([{ rule: "links", result: "note", around: "a host off the list: www.example.com" }]);
+    expect(d.hits).toEqual([{ rule: "links", result: "note", around: "unknown host (known hosts, noted not blocked): www.example.com" }]);
     const dir = tmp(), file = join(dir, "hosts.txt");
     expect(addHost("https://x.example/", file).ok).toBe(false);
     expect(addHost("Example.com", file)).toEqual({ ok: true, said: "Added example.com: links to it (and under it) no longer note the gate report." });

@@ -20,9 +20,14 @@
 //           plugin that carries a link at all (plugin: true, the reply hook and keeper.sh check):
 //           the plugin sets no flags, so its preview would unfold before the link could turn it
 //           off. Links go through keeper.sh reply, which posts with the preview off.
-//   note    (not a result of its own) an https link to a host off the list: logged, never held
+//           Third round: the reply hook asks for that hold only while the link answers (linkDown
+//           otherwise): with the link down the reply goes through the plugin as it is, with a
+//           "link down: preview not suppressed at post" note, and the link turns its preview off
+//           once it is back (core.ts quietReplies).
+//   note    (not a result of its own) an https link to an unknown host (the list is the known hosts,
+//           noted not blocked), or a link-bearing reply let through while the link was down: logged, never held
 import type { Reviewed } from "../reviewed";
-import { cainReasons, codesHits, linksHits, linksIn, LINKS_KEEPER_WHY, reviewedHits } from "./cain";
+import { cainReasons, codesHits, hasLink, linksHits, LINKS_KEEPER_WHY, reviewedHits } from "./cain";
 import { snowflakeTime } from "./plugin";
 import { AT, check, type Hit, reasonParts, type Result } from "./rules";
 
@@ -53,6 +58,8 @@ export const HELD = "The message gate held this:";
 export const REWRITE = "Rewrite and send now; don't mention it to him.";
 // A message the link doesn't know, made this recently, can be a reply of Cain's whose
 // PostToolUse word hasn't reached the link yet (it's sent in the background).
+// The gate report's note for a reply with a link that went through the plugin while the link was down.
+export const LINK_DOWN = "link down: preview not suppressed at post";
 export const EDIT_WINDOW_MS = 10 * 60_000;
 
 // cards: the link's view now, or null when it can't be had (the link down and its file
@@ -69,7 +76,7 @@ export const EDIT_WINDOW_MS = 10 * 60_000;
 export function decideSend(call: SendCall, cards: CardsView | null,
                            o: { tz?: string; dm?: string | null; now?: number; replied?: ReadonlySet<string>;
                                 reviewed?: readonly Reviewed[] | null; items?: ReadonlySet<string> | null;
-                                hosts?: ReadonlySet<string> | null; plugin?: boolean } = {}): Decision {
+                                hosts?: ReadonlySet<string> | null; plugin?: boolean; linkDown?: boolean } = {}): Decision {
   const tz = o.tz ?? "America/New_York";
   const now = o.now ?? Date.now();
   const dm = cards ? cards.dm ?? null : o.dm ?? null;
@@ -117,8 +124,9 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   // A reply through the plugin with any link in it (0.13.0, second round): the plugin posts with no
   // flags, so Discord fetches the preview as the message lands. Held for good: keeper.sh reply says
   // the same words with the preview off, so no third try is needed.
-  const viaKeeper = !!o.plugin && call.tool === "reply" && linksIn(call.text).length > 0;
-  if (viaKeeper) { hits.push({ rule: "keeper", result: "refuse", around: "" }); hard = true; }
+  const viaKeeper = !!o.plugin && call.tool === "reply" && hasLink(call.text);
+  if (viaKeeper && o.linkDown) hits.push({ rule: "keeper", result: "note", around: LINK_DOWN });
+  else if (viaKeeper) { hits.push({ rule: "keeper", result: "refuse", around: "" }); hard = true; }
   const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];
@@ -149,6 +157,7 @@ export function decideSend(call: SendCall, cards: CardsView | null,
       if (!codesSaid) for (const part of cainReasons(codes, null, 3)) lines.push(`${part.charAt(0).toUpperCase()}${part.slice(1)}.`);
       codesSaid = true;
     } else if (h.rule === "keeper") {
+      if (h.result === "note") continue;
       lines.push(`${LINKS_KEEPER_WHY.charAt(0).toUpperCase()}${LINKS_KEEPER_WHY.slice(1)}.`);
     } else if (h.rule === "links") {
       if (h.result === "note") continue;

@@ -15,6 +15,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { heldLine, KEEPER_SENT, LINK_HELD, readAt } from "../gate/held.ts";
 import { configFromEnv } from "../review/config.ts";
 import { daysFileOf, type DayLedger, type Ledger } from "../review/runner.ts";
 import {
@@ -62,11 +63,14 @@ export async function ping(raw: string | undefined, o: { fetch: Fetch; now: numb
     ok = r.ok;
     if (!ok) why = errorName(null, r.status);
   } catch (e) { why = errorName(e); }
-  if (o.fail) { o.log(ok ? "told the outside heartbeat the App stopped on an error" : `couldn't tell the outside heartbeat the App stopped (${why})`); return prev; }
+  // A logged failure names the host and the error's code only (third round): never the URL, its path or
+  // query, and never the error's own message, which can carry the URL.
+  const said = `${b.url.hostname}, ${why}`;
+  if (o.fail) { o.log(ok ? "told the outside heartbeat the App stopped on an error" : `couldn't tell the outside heartbeat the App stopped (${said})`); return prev; }
   const st = afterPing(prev.state === "ok" ? prev : { state: "ok", fails: 0 }, ok, o.now, why || undefined);
   writeWhole(o.file, JSON.stringify(st));
   if (ok && (prev.state !== "ok" || prev.fails > 0)) o.log("outside heartbeat sent");
-  else if (!ok && (st.fails === 1 || st.fails % 12 === 0)) o.log(`outside heartbeat failed (${why}), ${st.fails} in a row`);
+  else if (!ok && (st.fails === 1 || st.fails % 12 === 0)) o.log(`outside heartbeat failed (${said}), ${st.fails} in a row`);
   return st;
 }
 
@@ -119,6 +123,8 @@ export function lines(kind: "morning" | "other", env: Record<string, string | un
     ...heartbeatLines(readBeat(p.beat), morning, cfg.tz),
     ...spendLines({ ledger: json<Ledger>(cfg.spendFile, {}), days: json<DayLedger>(daysFileOf(cfg), {}), caps: cfg.caps, today, morning }),
     ...(morning ? keyLines(parseKeys(read(p.keys)), today) : []),
+    // A reply held for keeper.sh reply over 10 minutes ago, with no keeper reply since (third round).
+    ...[heldLine(readAt(env.CAIN_LINK_HELD ?? LINK_HELD), readAt(env.CAIN_KEEPER_SENT ?? KEEPER_SENT), now.getTime())].filter((l): l is string => !!l),
   ];
   return section(out);
 }
