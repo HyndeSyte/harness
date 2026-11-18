@@ -42,8 +42,9 @@ timeout: 30
 # Starts short, so the first run is a few days he can check; widen it once they look right.
 # own_drive_dry_run: on, those drive blocks are only written to the log (day and time), never to
 # Gmail, and no card goes out for them. Read the log against his calendar, then turn it off.
-# remove_all_blocks: on, every block on Gmail carrying Harness's mark comes off and nothing new is
-# written while it stays on. For a clean start; off again, blocks are written as before.
+# remove_all_blocks: on, the drive blocks Harness made around his own appointments come off Gmail
+# (Family events' blocks stay; ones he edited stay) and nothing new is written while it stays on. For a
+# clean start; off again, blocks are written as before.
 options:
   family_copy_name: ""
   family_to_gmail: ""

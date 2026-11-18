@@ -100,8 +100,13 @@ class FeedResult:
     last_modified: str = ""    # Google's Last-Modified header, as sent (kept, never used for the feed's age)
     read_id: str = field(default_factory=lambda: secrets.token_hex(6))   # this download, and no other
     fetched_at: datetime | None = None   # when this 200 arrived: the feed's age is counted from it
-    # What the body was: a read counts as new evidence only with a new ETag or body hash.
     body_hash: str = ""
+    # The body with what changes on every download left out (normalised, below): the same calendar
+    # gives the same hash, whatever Google stamped on it this time.
+    norm_hash: str = ""
+    # Each answer from Google about this read: a new one for the 200 itself, and again for each 304
+    # that confirms it, so a 304 counts as another read of the same state (family_gmail.py).
+    answer_id: str = field(default_factory=lambda: secrets.token_hex(6))
     raw: str = field(default="", repr=False)   # the body, for anonymised samples in the dry run only
 
 
@@ -112,15 +117,47 @@ class Snapshot:
     feeds: dict[str, FeedResult] = field(default_factory=dict)
 
 
-_UNSHOWN_HEADERS = frozenset({"set-cookie", "cookie", "authorization", "proxy-authorization"})
+# The only response headers the drive dry run logs, each by name: never Location (a redirect can carry
+# the feed's secret address), cookies, authorization, or anything else Google adds.
+LOGGED_HEADERS = ("etag", "last-modified", "content-length", "content-type", "date", "cache-control")
+
+
+# Lines Google writes afresh on each download, or that say nothing about the calendar itself.
+_VOLATILE = frozenset({"DTSTAMP", "LAST-MODIFIED", "SEQUENCE", "CREATED"})
+
+
+def normalised(text: str) -> str:
+    """A hash of the feed's events with what changes on every download left out: lines unfolded, the
+    volatile lines (DTSTAMP and the like, and Google's own X- lines) dropped, and the VEVENTs sorted by
+    uid and recurrence id. Two downloads of the same calendar give the same hash."""
+    text = re.sub(r"\r?\n[ \t]", "", text)
+    events, block = [], None
+    for line in text.splitlines():
+        bare = line.strip()
+        if bare.upper() == "BEGIN:VEVENT":
+            block = []
+            continue
+        if bare.upper() == "END:VEVENT":
+            if block is not None:
+                fields = {n: v for n, v in ((ln.split(":", 1)[0].split(";", 1)[0].upper(), ln) for ln in block)}
+                order = (fields.get("UID", ""), fields.get("RECURRENCE-ID", ""))
+                events.append((order, "\n".join(block)))
+            block = None
+            continue
+        if block is None or not bare:
+            continue
+        name = bare.split(":", 1)[0].split(";", 1)[0].upper()
+        if name in _VOLATILE or name.startswith("X-"):
+            continue
+        block.append(bare)
+    return hashlib.sha256("\n\n".join(b for _, b in sorted(events)).encode()).hexdigest()[:32]
 
 
 def headers_line(status: int, headers: dict) -> str:
-    """A response's headers, names and values, never its body. A cookie's value isn't kept."""
-    parts = []
-    for name, value in sorted((str(k).lower(), str(v)) for k, v in (headers or {}).items()):
-        shown = "(not logged)" if name in _UNSHOWN_HEADERS else " ".join(value.split())[:300]
-        parts.append(f"{name}: {shown}")
+    """A response's status and its allowlisted headers (LOGGED_HEADERS), never its body, never the
+    request's address."""
+    kept = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    parts = [f"{name}: {' '.join(kept[name].split())[:300]}" for name in LOGGED_HEADERS if name in kept]
     return f"{status}; " + "; ".join(parts)
 
 
@@ -177,7 +214,7 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
                       day=start.astimezone(ZoneInfo(tz)).date().isoformat(), ahead=ahead,
                       ahead_error=ahead_error, feed_ahead=ahead, status=resp.status, size=len(resp.body),
                       complete=text.rstrip().endswith("END:VCALENDAR"), etag=etag, last_modified=modified,
-                      body_hash=hashlib.sha256(resp.body).hexdigest()[:32], raw=text)
+                      body_hash=hashlib.sha256(resp.body).hexdigest()[:32], norm_hash=normalised(text), raw=text)
 
 
 def today_bounds(now: datetime, tz: str) -> tuple[datetime, datetime, str]:
@@ -329,7 +366,9 @@ class CalendarFeeds:
                 continue
             if res.kind == "not_modified" and fid in self.snapshot.feeds:
                 # Google says nothing changed: the last full read stands as it was, with its own
-                # download time, and counts as no new read.
+                # download time. It isn't a new download, but it is another answer confirming that
+                # state (an anomaly's evidence counts it: family_gmail.py).
+                self.snapshot.feeds[fid].answer_id = secrets.token_hex(6)
                 self.ledger.input_ok(f"calendar:{fid}", label=self.snapshot.feeds[fid].window.calendar
                                      if self.snapshot.feeds[fid].window else "")
                 continue

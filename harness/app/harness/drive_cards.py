@@ -17,9 +17,11 @@ around his own appointments, and one card when a drive can't be found, with Skip
     card. Each event is asked about once, ever; Skip leaves it without drive blocks for good.
   * A receipt for drives put back just as the last card told him (the same key, times and place)
     isn't sent again.
-  * Removals on odd data wait for his go: when Gmail's feed shrank and that was believed, or more
-    than 3 appointments lose their drives at once, one card lists them by day and time, with
-    "Take them off" and "Keep them", and nothing comes off until he taps Take them off (family_gmail.py).
+  * Removals on odd data wait for his go: when Gmail's feed shrank and that was believed, more than
+    3 appointments lose their drives at once, or a repeating appointment changed in a way that can't
+    be matched to a new series, one card lists them by day and time, with "Take them off" and "Keep
+    them", and nothing comes off until he taps Take them off, and then only the drives it listed
+    (family_gmail.py).
   * A Family event's drive that crosses a drive kept for his own appointment while his calendar
     isn't read in full is named in the digest, and gets one card when it's within a day. Both stay
     busy; nothing is retitled.
@@ -305,21 +307,28 @@ class DriveCards:
     def clear_hold(self, key: str) -> None:
         """Back in a read: a later removal asks again."""
         row = self._row(key)
-        if row is not None and (row["hold"] or row["bid"]):
-            self._set(key, hold="", bid="")
+        if row is not None and (row["hold"] or row["bid"] or row["listed"]):
+            self._set(key, hold="", bid="", listed="")
+
+    def still_listed(self, key: str, legs: str) -> bool:
+        """His go was for the drives the card listed: they're still exactly those (legs as listed)."""
+        row = self._row(key)
+        return row is not None and row["listed"] == legs
 
     def ask_removals(self, chat_id: int | None, items: list[tuple[str, datetime]], why: str, now: datetime,
-                     *, send: bool = True) -> bool:
+                     *, send: bool = True, listed: dict | None = None) -> bool:
         """One card listing the appointments by day and time, with Take them off and Keep them. Nothing
-        comes off until he taps Take them off. send False (the dry run): marked asked, nothing sent. False:
-        there's no one to ask yet."""
+        comes off until he taps Take them off, and then only the drives listed (listed: key -> its drives
+        as they were when asked; family_gmail.py checks them again before any comes off). send False (the
+        dry run): marked asked, nothing sent. False: there's no one to ask yet."""
         if not items or (send and chat_id is None):
             return False
         bid = secrets.token_hex(8)
         zone = ZoneInfo(self.tz)
         whens = [f"{_day(s.astimezone(zone))} at {_time(s.astimezone(zone))}" for _, s in sorted(items, key=lambda x: x[1])]
         head = ("Your Gmail calendar came back much smaller than before" if why == "shrink" else
-                f"{len(items)} of your appointments look gone from your Gmail calendar at once")
+                "A repeating appointment of yours changed in a way I can't match to the new one" if why == "series"
+                else f"{len(items)} of your appointments look gone from your Gmail calendar at once")
         text = (f"{head}. Should their drive blocks come off? {'; '.join(whens)}. They stay until you tap "
                 "Take them off.")
         with self.ledger.tx() as db:
@@ -332,7 +341,8 @@ class DriveCards:
                                     binds=[{"type": "choice", "nonce": ok}, {"type": "choice", "nonce": keep}])
                 self.ledger.event("drive_removals_asked", {"n": len(items), "why": why}, db=db)
             for key, _ in items:
-                db.execute("UPDATE drive_cards SET hold='asked', bid=?, updated_at=? WHERE key=?", (bid, iso(now), key))
+                db.execute("UPDATE drive_cards SET hold='asked', bid=?, listed=?, updated_at=? WHERE key=?",
+                           (bid, (listed or {}).get(key, ""), iso(now), key))
         return True
 
     # -- a Family drive crossing a kept drive of his -----------------------------------------------------

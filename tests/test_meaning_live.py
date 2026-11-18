@@ -2184,7 +2184,7 @@ def test_the_whole_series_edited_never_leaves_two_drive_sets_for_a_day(drives):
     go(drives)
     for o in occs:
         drives.feeds.window.occurrences.remove(o)
-    new = weekly(drives, "PT", when(drives, days=2, hour=14), CLINIC)    # every week now at 2: new instances
+    new = weekly(drives, "PT", when(drives, days=2, hour=12), CLINIC)    # every week now at noon: new instances
     removed = len([w for w in drives.google.writes() if w[0] == "DELETE"])
     for n in range(7):
         go(drives)
@@ -2453,11 +2453,11 @@ def test_drive_blocks_have_no_guests_no_updates_and_the_add_ons_mark(drives):
     assert len(made) == 2
     for e in made:
         assert not e.get("attendees")
-        assert e["extendedProperties"]["private"] == {"harness": "family_gmail"}
+        assert e["extendedProperties"]["private"] == {"harness": "family_gmail", "harness_kind": "own_drive"}
         assert e["guestsCanInviteOthers"] is False and e["guestsCanSeeOtherGuests"] is False
     assert drives.google.queries and all(q.get("sendUpdates") == "none" for m, q in drives.google.queries
                                          if m != "GET")
-    # A drive block he made himself, by hand, at a street address: his own appointment, not skipped.
+    # A block titled exactly as the add-on's, even his own at a street address: never an appointment (sixth round).
     hand = when(drives, days=4, hour=10)
     mine(drives, "Busy (drive there)", hand, PARK, uid="his-own-block")
     # The add-on's own blocks read back from his calendar: never an appointment of his.
@@ -2468,8 +2468,8 @@ def test_drive_blocks_have_no_guests_no_updates_and_the_add_ons_mark(drives):
     go(drives)
     go(drives)
     titles = [b[0] for b in blocks(drives)]
-    assert titles.count("Busy (drive there)") == 2 and titles.count("Busy (drive back)") == 2
-    assert ("Busy (drive there)", hand - 30 * M, hand, "") in blocks(drives)
+    assert titles.count("Busy (drive there)") == 1 and titles.count("Busy (drive back)") == 1
+    assert ("Busy (drive there)", hand - 30 * M, hand, "") not in blocks(drives)
 
 
 def test_his_own_appointments_get_drives_only_as_far_ahead_as_the_option_says(drives, tmp_path):
@@ -2811,6 +2811,7 @@ def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(d
     goes(drives, "Eye doctor", b, CLINIC)
     dentist = mine(drives, "Dentist", a, PARK)
     mine(drives, "Checkup", when(drives, days=1, hour=8), "Dr Patel's office")   # a place to ask about
+    assert drives.gm.drives.between(drive.HOME, PARK) == 25         # kept from before: the dry run looks nothing up
     caplog.set_level(logging.INFO, logger="harness.family_gmail")
     go(drives)
     go(drives)
@@ -3008,10 +3009,17 @@ def test_a_partial_read_never_retitles_a_kept_drive_and_a_crossing_is_told(drive
     assert haircut_there in before
     writes = list(drives.google.writes())
     drives.feeds.window.unreadable = 1                                              # Gmail not read in full
+    # Sixth round: a new appointment of his appears, and a duplicate of a kept drive block (the add-on's mark,
+    # no record) is there: neither gets any write while the read isn't full.
+    mine(drives, "Checkup", when(drives, days=2, hour=10), CLINIC)
+    assert drives.gm.google.add(GMAIL, google_cal.event_id("duplicate:0"), *haircut_there[:3], "",
+                                google_cal.OWN_DRIVE).kind == "ok"
+    writes = list(drives.google.writes())
     for _ in range(3):
         go(drives)
     got = blocks(drives)
-    assert haircut_there in got and not [x for x in got if x[0].startswith("Maybe busy")]
+    assert got.count(haircut_there) == 2 and not [x for x in got if x[0].startswith("Maybe busy")]
+    assert not [x for x in got if x[1].astimezone(NY).date() == when(drives, days=2).date()]   # nothing for the checkup
     assert ("Busy (drive back)", a + 60 * M, a + 90 * M, "") in got                 # the eye doctor's, from home
     new = drives.google.writes()[len(writes):]
     assert [w[0] for w in new] == ["POST"]                                          # that one drive, nothing else
@@ -3072,15 +3080,22 @@ def test_with_no_state_blocks_beside_his_appointment_are_taken_back_and_an_exact
     quiet_family(drives)
     a = when(drives, days=3, hour=10)
     mine(drives, "Dentist", a, CLINIC)
-    for n, (title, s, e) in enumerate([("Busy (drive there)", a - 30 * M, a), ("Busy (drive back)", a + 60 * M, a + 90 * M),
-                                       ("Busy (drive there)", a - 30 * M, a)]):   # the last, a duplicate
-        assert drives.gm.google.add(GMAIL, google_cal.event_id(f"from-before:{n}"), title, s, e, "").kind == "ok"
+    for n, (title, s, e) in enumerate([("Busy (drive there)", a - 30 * M, a), ("Busy (drive back)", a + 60 * M, a + 90 * M)]):
+        assert drives.gm.google.add(GMAIL, google_cal.event_id(f"from-before:{n}"), title, s, e, "",
+                                    google_cal.OWN_DRIVE).kind == "ok"
     written = len(drives.google.writes())
     for _ in range(3):
         go(drives)
     assert blocks(drives) == [("Busy (drive there)", a - 30 * M, a, ""), ("Busy (drive back)", a + 60 * M, a + 90 * M, "")]
-    assert [w[0] for w in drives.google.writes()[written:]] == ["DELETE"]           # the duplicate only
+    assert len(drives.google.writes()) == written                    # taken back: nothing written
     assert drives.ledger.db.execute("SELECT COUNT(*) FROM family_gmail WHERE state='live'").fetchone()[0] == 2
+    # A duplicate of a block kept (same title, times and place, the add-on's mark) comes off.
+    assert drives.gm.google.add(GMAIL, google_cal.event_id("from-before:9"), "Busy (drive there)", a - 30 * M, a, "",
+                                google_cal.OWN_DRIVE).kind == "ok"
+    written = len(drives.google.writes())
+    go(drives)
+    assert blocks(drives) == [("Busy (drive there)", a - 30 * M, a, ""), ("Busy (drive back)", a + 60 * M, a + 90 * M, "")]
+    assert [w[0] for w in drives.google.writes()[written:]] == ["DELETE"]           # the duplicate only
 
 
 def test_the_remove_all_blocks_option_takes_off_every_marked_block_and_writes_nothing_new(drives, tmp_path):
@@ -3092,11 +3107,13 @@ def test_the_remove_all_blocks_option_takes_off_every_marked_block_and_writes_no
     go(drives)
     go(drives)
     assert len(blocks(drives)) == 5
-    (tmp_path / "options.json").write_text('{"remove_all_blocks": true}')
+    family = [b for b in blocks(drives) if b[1] >= when(drives, days=4, hour=0)]
+    assert len(family) == 3
+    (tmp_path / "options.json").write_text('{"remove_all_blocks": true, "own_drive_dry_run": false}')
     drives.gm.cleanup_fn = lambda: cleanup_from_options(str(tmp_path))
     for _ in range(3):
         go(drives)
-    assert blocks(drives) == []
+    assert blocks(drives) == family                                 # his own appointment's drives only (sixth round)
     assert drives.gm.status_line().startswith("Blocks on Gmail from Family: clearing.")
     (tmp_path / "options.json").write_text('{"remove_all_blocks": false}')
     go(drives)
@@ -3131,12 +3148,12 @@ def test_more_than_three_gone_at_once_asks_him_first_and_nothing_comes_off_befor
     fetch(drives, dentist, headers={"etag": '"v4"'})               # and a second: five at once
     drives.tick()
     assert not asked() and "may be a bad read" in drives.gm.digest_line()
-    drives.clock.advance(hours=3)
-    fetch_status(drives, 304)                                       # not modified: no new evidence
-    fetch(drives, dentist, headers={"etag": '"v4"'})               # the same body again: none either
+    drives.clock.advance(hours=1)
+    fetch_status(drives, 304)                                       # the same state, only an hour on: not yet
     drives.tick()
     assert not asked() and blocks(drives) == before
-    fetch(drives, dentist, headers={"etag": '"v5"'})               # a new one, 3 hours after the first
+    drives.clock.advance(hours=2)
+    fetch(drives, dentist, headers={"etag": '"v4"'})               # the same state again, 3 hours after the first
     drives.tick()
     assert len(asked()) == 1
     card = drives.with_button("Take them off")
@@ -3197,6 +3214,7 @@ def test_a_split_by_continuity_keeps_or_moves_the_drives_and_removes_none(drives
     assert len(drives_each_day(drives)) == 10
     flush_receipts(drives)
     written = len(drives.google.writes())
+    before = sorted(b[1:3] for b in blocks(drives) if b[0] == "Busy (drive there)")
     # "This and following" from day 4: the old series ends after day 3 (its override vanishes with it), a new
     # series has days 4 to 10, at the same time and place, a new time, or a new place.
     hour, place = {"same": (0, CLINIC), "time": (4, CLINIC), "place": (0, PARK)}[change]
@@ -3207,14 +3225,34 @@ def test_a_split_by_continuity_keeps_or_moves_the_drives_and_removes_none(drives
         assert list(drives_each_day(drives).values()) == [(1, 1)] * 10
     drives.tick()
     methods = [w[0] for w in drives.google.writes()[written:]]
-    assert "DELETE" not in methods and "POST" not in methods       # moved in place, never removed and made again
+    assert "DELETE" not in methods and "POST" not in methods       # never removed and made again unasked
+
+    def asked():
+        return [s for s in drives.bot.sent if "Should their drive blocks come off" in s[1]]
+
     there = sorted(b[1:3] for b in blocks(drives) if b[0] == "Busy (drive there)")
     lead = 45 * M if change == "place" else 30 * M
+    if change == "same":                                            # moved in place
+        for n in range(3, 10):
+            start = day1 + timedelta(days=n, hours=hour)
+            assert (start - lead, start) in there
+        assert not asked() and "look gone" not in (drives.gm.digest_line() or "")
+        return
+    # Sixth round: 7 instances moved more than 2 hours, or to a new place, aren't moved unasked: they count
+    # toward the gate, as removals and new ones, and wait for his go.
+    assert there == before
+    drives.clock.advance(hours=2)
+    fetch(drives, old, new)
+    drives.tick()
+    assert len(asked()) == 1 and there == sorted(b[1:3] for b in blocks(drives) if b[0] == "Busy (drive there)")
+    drives.press(drives.with_button("Take them off"), "Take them off")
+    fetch(drives, old, new)
+    fetch(drives, old, new)
+    assert list(drives_each_day(drives).values()) == [(1, 1)] * 10
+    there = sorted(b[1:3] for b in blocks(drives) if b[0] == "Busy (drive there)")
     for n in range(3, 10):
         start = day1 + timedelta(days=n, hours=hour)
         assert (start - lead, start) in there
-    assert not [s for s in drives.bot.sent if "Should their drive blocks come off" in s[1]]
-    assert "look gone" not in (drives.gm.digest_line() or "")
 
 
 def test_the_feeds_age_is_from_the_last_full_download_not_last_modified(drives):
@@ -3247,8 +3285,7 @@ def test_the_dry_run_logs_each_answers_headers_and_keeps_anonymised_samples(driv
     headers = {"etag": '"v1"', "content-type": "text/calendar; charset=UTF-8", "set-cookie": "NID=cookievalue"}
     fetch(drives, whole, headers=headers)
     lines = [r.getMessage() for r in caplog.records if "headers" in r.getMessage()]
-    assert lines and lines[-1].endswith('headers 200; content-type: text/calendar; charset=UTF-8; etag: "v1"; '
-                                         'set-cookie: (not logged)')
+    assert lines and lines[-1].endswith('headers 200; etag: "v1"; content-type: text/calendar; charset=UTF-8')
     assert not [r for r in caplog.records if "cookievalue" in r.getMessage() or "BEGIN:VCALENDAR" in r.getMessage()]
     second = day1 + timedelta(days=1)
     edit = vev("series-u", "Physio with Dr Smith", second + timedelta(hours=5), place=secret_place, rid=second)
@@ -3277,6 +3314,9 @@ def test_the_digest_counts_the_dry_runs_would_write_and_would_remove(drives):
     drives.gm.own_dry_fn = lambda: True
     dentist = mine(drives, "Dentist", when(drives, days=3, hour=10), CLINIC)
     mine(drives, "Haircut", when(drives, days=4, hour=10), PARK)
+    for place in (CLINIC, PARK):                                    # kept from before: the dry run looks nothing up
+        drives.gm.drives.between(drive.HOME, place)
+        drives.gm.drives.between(place, drive.HOME)
     go(drives)
     go(drives)
     assert ("Drive dry run since the last digest: 4 drive blocks would be written and 0 appointments would lose "
@@ -3286,3 +3326,319 @@ def test_the_digest_counts_the_dry_runs_would_write_and_would_remove(drives):
     go(drives)
     assert ("Drive dry run since the last digest: 2 drive blocks would be written and 1 appointment would lose its "
             "drive blocks.") in drives.gm.digest_line()
+
+
+# -- the sixth round: the header log's allowlist, remove-all for his own drives only, evidence on a normalised
+#    body, family writes as the installed release (test_family_replay.py), the add-on's own blocks in the feed,
+#    unambiguous splits, adoption for any unknown marked block, and no writes on partial reads (0.24.0) -----
+
+def test_the_header_log_keeps_only_its_allowlist_never_a_redirects_address_or_a_cookie(drives, caplog):
+    feed_rig(drives, headers_fn=lambda: True)
+    quiet_family(drives)
+    drives.gm.own_dry_fn = lambda: True
+    caplog.set_level(logging.INFO)
+    drives.server.status, drives.server.body = 302, b""
+    drives.server.headers = {"location": FEED_URL + "?redirected=1", "set-cookie": "NID=cookievalue; path=/",
+                             "cookie": "SID=othercookie", "authorization": "Bearer tokenvalue",
+                             "etag": '"v1"', "date": "Wed, 18 Nov 2026 13:00:00 GMT", "x-other": "kept-out"}
+    drives.cal.start()
+    drives.cal.collect()
+    lines = [r.getMessage() for r in caplog.records if "headers" in r.getMessage()]
+    assert lines == [f"calendar {calendar_feed.feed_id(FEED_URL)[:4]}: headers 302; etag: \"v1\"; "
+                     "date: Wed, 18 Nov 2026 13:00:00 GMT"]
+    text = " ".join(r.getMessage() for r in caplog.records)
+    for secret in ("private-0123456789abcdef", "parent%40gmail.com", "cookievalue", "othercookie", "tokenvalue",
+                   "location", "set-cookie", "kept-out"):
+        assert secret not in text
+
+
+def test_the_samples_folder_goes_when_the_dry_run_is_turned_off(drives, tmp_path):
+    quiet_family(drives)
+    dry = [True]
+    drives.gm.own_dry_fn = lambda: dry[0]
+    drives.gm.samples_dir = str(tmp_path)
+    mine(drives, "Dentist", when(drives, days=3, hour=10), CLINIC)
+    go(drives)
+    folder = tmp_path / "drive_samples"
+    folder.mkdir()
+    (folder / "split-abc.ics").write_text("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")   # one kept by the dry run
+    go(drives)
+    assert folder.exists()
+    dry[0] = False
+    go(drives)
+    assert not folder.exists()
+
+
+def own_and_family(rig):
+    """His dentist (his own appointment) and a Family event he goes to, written live: 2 + 3 blocks."""
+    quiet_family(rig)
+    a = when(rig, days=3, hour=10)
+    mine(rig, "Dentist", a, CLINIC)
+    goes(rig, "Eye doctor", when(rig, days=4, hour=10), CLINIC)
+    go(rig)
+    go(rig)
+    assert len(blocks(rig)) == 5
+    return a
+
+
+def test_remove_all_under_the_dry_run_only_logs_what_it_would_remove(drives, caplog):
+    a = own_and_family(drives)
+    before, written = blocks(drives), len(drives.google.writes())
+    drives.gm.own_dry_fn = lambda: True
+    drives.gm.cleanup_fn = lambda: True
+    caplog.set_level(logging.INFO, logger="harness.family_gmail")
+    go(drives)
+    assert blocks(drives) == before and len(drives.google.writes()) == written
+    local = a.astimezone(NY)
+    lines = [r.getMessage() for r in caplog.records if "would remove" in r.getMessage()]
+    assert lines == [f"drive dry run: would remove Busy (drive there), {local:%a %b} {local.day} 9:30 AM to "
+                     f"{local:%a %b} {local.day} 10:00 AM (remove_all_blocks)",
+                     f"drive dry run: would remove Busy (drive back), {local:%a %b} {local.day} 11:00 AM to "
+                     f"{local:%a %b} {local.day} 11:30 AM (remove_all_blocks)"]
+    assert drives.ledger.db.execute("SELECT COUNT(*) FROM family_gmail WHERE state='live'").fetchone()[0] == 5
+
+
+def test_remove_all_spares_a_drive_block_he_edited_and_names_it(drives):
+    a = own_and_family(drives)
+    there = next(k for k, e in drives.google.live().items() if e["summary"] == "Busy (drive there)"
+                 and datetime.fromisoformat(e["start"]["dateTime"]) == a - 30 * M)
+    drives.google.hand_edit(there, summary="Busy (drive there, via the bank)")
+    drives.gm.cleanup_fn = lambda: True
+    go(drives)
+    got = blocks(drives)
+    assert ("Busy (drive there, via the bank)", a - 30 * M, a, "") in got        # his: stays
+    assert ("Busy (drive back)", a + 60 * M, a + 90 * M, "") not in got          # the other comes off
+    assert len(got) == 4                                                          # Family's three stay
+    local = a.astimezone(NY)
+    assert (f"remove_all_blocks left 1 drive block you changed on Gmail: {local:%a %b} {local.day} 9:30 AM."
+            in drives.gm.digest_line())
+
+
+def odd_rig(rig):
+    """His dentist and five other appointments with drives, then a feed that has the dentist only, read twice:
+    the second read is the first with all five gone (each missing from two full reads)."""
+    feed_rig(rig)
+    quiet_family(rig)
+    dentist = vev("dentist", "Dentist", when(rig, days=2, hour=10), place=CLINIC)
+    things = [vev(f"one-{i}", f"Thing {i}", when(rig, days=3 + i, hour=10), place=PARK) for i in range(5)]
+    fetch(rig, dentist, *things, headers={"etag": '"v1"'})
+    fetch(rig, dentist, *things, headers={"etag": '"v2"'})
+    assert len(blocks(rig)) == 12
+    flush_receipts(rig)
+    fetch(rig, dentist, headers={"etag": '"cut"'})
+    fetch(rig, dentist, headers={"etag": '"cut"'})                  # the same corrected body and ETag
+    rig.tick()
+    return dentist, things
+
+
+def removal_cards(rig):
+    return [s for s in rig.bot.sent if "Should their drive blocks come off" in s[1]]
+
+
+def test_a_stable_reduced_body_and_etag_gets_the_card_at_the_second_read_two_hours_later(drives):
+    dentist, _ = odd_rig(drives)
+    before, written = blocks(drives), len(drives.google.writes())
+    assert not removal_cards(drives)
+    drives.clock.advance(hours=1)
+    fetch(drives, dentist, headers={"etag": '"cut"'})
+    drives.tick()
+    assert not removal_cards(drives)                                # an hour on: not yet
+    drives.clock.advance(hours=1)
+    fetch(drives, dentist, headers={"etag": '"cut"'})               # 2 hours after the first: the same state
+    drives.tick()
+    assert len(removal_cards(drives)) == 1
+    assert blocks(drives) == before and len(drives.google.writes()) == written
+
+
+def test_repeated_304s_count_as_reads_of_the_same_state(drives):
+    odd_rig(drives)
+    before = blocks(drives)
+    drives.clock.advance(hours=1)
+    fetch_status(drives, 304)
+    drives.tick()
+    assert not removal_cards(drives)
+    drives.clock.advance(hours=1)
+    fetch_status(drives, 304)
+    drives.tick()
+    assert len(removal_cards(drives)) == 1 and blocks(drives) == before
+
+
+def test_an_approval_after_the_feed_recovers_deletes_nothing(drives):
+    dentist, things = odd_rig(drives)
+    before = blocks(drives)
+    drives.clock.advance(hours=2)
+    fetch_status(drives, 304)
+    drives.tick()
+    card = drives.with_button("Take them off")
+    written = len(drives.google.writes())
+    fetch(drives, dentist, *things, headers={"etag": '"v3"'})      # the feed is whole again
+    drives.press(card, "Take them off")
+    for n in range(3):
+        fetch(drives, dentist, *things, headers={"etag": f'"v{4 + n}"'})
+    assert blocks(drives) == before
+    assert not [w for w in drives.google.writes()[written:] if w[0] == "DELETE"]
+
+
+def test_an_anomaly_that_persists_a_day_gets_its_card_whatever_it_shows(drives):
+    dentist, _ = odd_rig(drives)
+    before = blocks(drives)
+    for n in range(7):                                              # every 3 hours a different body, still odd
+        drives.clock.advance(hours=3)
+        fetch(drives, dentist, pad=41 + n, headers={"etag": f'"c{n}"'})
+        drives.tick()
+        assert not removal_cards(drives), n
+    drives.clock.advance(hours=3)                                   # 24 hours since it was first seen
+    fetch(drives, dentist, pad=50, headers={"etag": '"c9"'})
+    drives.tick()
+    assert len(removal_cards(drives)) == 1 and blocks(drives) == before
+
+
+@pytest.mark.parametrize("wiped", [False, True])
+def test_the_add_ons_own_blocks_in_the_feed_never_count_as_his_appointments(drives, wiped):
+    feed_rig(drives)
+    quiet_family(drives)
+    a = when(drives, days=3, hour=10)
+    dentist = vev("dentist", "Dentist", a, place=CLINIC)
+    ours = [vev("hb" + "0123456789abcdef" * 2 + "@google.com", "Haircut", when(drives, days=4, hour=10), place=PARK),
+            vev("typed-1", "Busy (drive there)", when(drives, days=5, hour=10), place=PARK),
+            vev("typed-2", "Maybe busy (drive back)", when(drives, days=6, hour=10), place=PARK),
+            vev("typed-3", " busy (school pickup) ", when(drives, days=7, hour=10), place=PARK)]
+    fetch(drives, dentist, *ours)
+    fetch(drives, dentist, *ours)
+    expected = [("Busy (drive there)", a - 30 * M, a, ""), ("Busy (drive back)", a + 60 * M, a + 90 * M, "")]
+    assert blocks(drives) == expected
+    written = len(drives.google.writes())
+    if wiped:
+        wipe_state(drives)
+    for n in range(3):
+        fetch(drives, dentist, *ours, headers={"etag": f'"w{n}"'})
+    assert blocks(drives) == expected and len(drives.google.writes()) == written
+
+
+def test_two_series_ending_the_same_day_are_removals_and_new_ones_through_the_card(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    day1 = when(drives, days=1, hour=10)
+    pt = vev("series-pt", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;COUNT=6")
+    yoga = vev("series-yoga", "Yoga", day1 + timedelta(hours=5), place=PARK, rrule="FREQ=DAILY;COUNT=6")
+    fetch(drives, pt, yoga)
+    fetch(drives, pt, yoga)
+    flush_receipts(drives)
+    before, written = blocks(drives), len(drives.google.writes())
+    until = f"FREQ=DAILY;UNTIL={_u(day1 + timedelta(days=2, hours=13))}"
+    pt_old = vev("series-pt", "PT", day1, place=CLINIC, rrule=until)
+    yoga_old = vev("series-yoga", "Yoga", day1 + timedelta(hours=5), place=PARK, rrule=until)
+    new = vev("series-pt_R20261024", "PT", day1 + timedelta(days=3), place=CLINIC, rrule="FREQ=DAILY;COUNT=3")
+    fetch(drives, pt_old, yoga_old, new)
+    drives.tick()
+    cards = removal_cards(drives)
+    assert [s[1].split(".")[0] for s in cards] == ["A repeating appointment of yours changed in a way I can't match "
+                                                   "to the new one"]
+    assert blocks(drives) == before and len(drives.google.writes()) == written   # nothing moved, removed or made
+    drives.press(drives.with_button("Take them off"), "Take them off")
+    fetch(drives, pt_old, yoga_old, new)
+    fetch(drives, pt_old, yoga_old, new)
+    got = blocks(drives)
+    for n in range(3, 6):                                           # PT's new days get drives; Yoga's go
+        start = day1 + timedelta(days=n)
+        assert ("Busy (drive there)", start - 30 * M, start, "") in got
+        assert not [b for b in got if b[1] == start + timedelta(hours=5) - 30 * M]
+
+
+def test_an_unrelated_series_starting_as_another_ends_isnt_a_split(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    day1 = when(drives, days=1, hour=10)
+    pt = vev("series-pt", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;COUNT=5")
+    fetch(drives, pt)
+    fetch(drives, pt)
+    flush_receipts(drives)
+    before, written = blocks(drives), len(drives.google.writes())
+    pt_old = vev("series-pt", "PT", day1, place=CLINIC, rrule=f"FREQ=DAILY;UNTIL={_u(day1 + timedelta(days=2, hours=13))}")
+    guitar = vev("series-guitar", "Guitar lesson", day1 + timedelta(days=3), place=CLINIC, rrule="FREQ=DAILY;COUNT=2")
+    fetch(drives, pt_old, guitar)
+    drives.tick()
+    assert len(removal_cards(drives)) == 1                          # asked, not taken for PT moved
+    assert blocks(drives) == before and len(drives.google.writes()) == written
+    assert drives.ledger.db.execute("SELECT COUNT(*) FROM drive_cards WHERE uid='series-guitar'").fetchone()[0] == 0
+
+
+def test_a_split_with_a_missing_middle_instance_pairs_by_the_schedule_not_by_count(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    day1 = when(drives, days=1, hour=10)
+    whole = vev("series-u", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;COUNT=8")
+    fetch(drives, whole)
+    fetch(drives, whole)
+    flush_receipts(drives)
+
+    def ids_by_day():
+        return {datetime.fromisoformat(e["end"]["dateTime"]).astimezone(NY).date(): k
+                for k, e in drives.google.live().items() if e["summary"] == "Busy (drive there)"}
+
+    before, written = ids_by_day(), len(drives.google.writes())
+    old = vev("series-u", "PT", day1, place=CLINIC, rrule=f"FREQ=DAILY;UNTIL={_u(day1 + timedelta(days=2, hours=13))}")
+    sixth = day1 + timedelta(days=5)
+    new = vev("series-u_R20261024", "PT", day1 + timedelta(days=3), place=CLINIC, rrule="FREQ=DAILY;COUNT=5",
+              exdates=[sixth])                                      # the split, with its middle day taken out
+    fetch(drives, old, new)
+    fetch(drives, old, new)
+    after = ids_by_day()
+    assert sixth.date() not in after
+    assert after == {d: k for d, k in before.items() if d != sixth.date()}      # each day keeps its own blocks
+    assert [w[0] for w in drives.google.writes()[written:]] == ["DELETE", "DELETE"]   # the middle day's only
+    assert not removal_cards(drives)
+
+
+def test_an_older_state_file_restored_takes_back_the_blocks_it_doesnt_know(drives):
+    quiet_family(drives)
+    a, b = when(drives, days=3, hour=10), when(drives, days=4, hour=10)
+    mine(drives, "Dentist", a, CLINIC)
+    go(drives)
+    go(drives)
+    assert len(blocks(drives)) == 2                                 # the state file knows these
+    # Written after that copy of the state was kept, under ids it can't work out: the haircut's drives.
+    mine(drives, "Haircut", b, PARK)
+    for n, (title, s, e) in enumerate([("Busy (drive there)", b - 30 * M, b), ("Busy (drive back)", b + 60 * M, b + 90 * M)]):
+        assert drives.gm.google.add(GMAIL, google_cal.event_id(f"restored:{n}"), title, s, e, "",
+                                    google_cal.OWN_DRIVE).kind == "ok"
+    written = len(drives.google.writes())
+    for _ in range(3):
+        go(drives)
+    assert len(blocks(drives)) == 4 and len(drives.google.writes()) == written
+    assert drives.ledger.db.execute("SELECT COUNT(*) FROM family_gmail WHERE state='live'").fetchone()[0] == 4
+
+
+def test_two_marked_blocks_for_one_slot_adopt_nothing_and_are_named(drives):
+    quiet_family(drives)
+    a = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", a, CLINIC)
+    for n, (title, s, e) in enumerate([("Busy (drive there)", a - 30 * M, a), ("Busy (drive there)", a - 45 * M, a),
+                                       ("Busy (drive back)", a + 60 * M, a + 90 * M)]):
+        assert drives.gm.google.add(GMAIL, google_cal.event_id(f"lost:{n}"), title, s, e, "",
+                                    google_cal.OWN_DRIVE).kind == "ok"
+    before, written = blocks(drives), len(drives.google.writes())
+    for _ in range(3):
+        go(drives)
+    assert blocks(drives) == before and len(drives.google.writes()) == written    # none taken off, none written
+    live = drives.ledger.db.execute("SELECT title FROM family_gmail WHERE state='live'").fetchall()
+    assert [r["title"] for r in live] == ["Busy (drive back)"]                     # the other slot, taken back
+    local = a.astimezone(NY)
+    assert (f"two blocks Harness made fit the same place on your calendar ({local:%a %b} {local.day} 9:30 AM)"
+            in drives.gm.digest_line())
+
+
+def test_an_unmarked_lookalike_is_never_touched(drives):
+    quiet_family(drives)
+    a = when(drives, days=3, hour=10)
+    mine(drives, "Dentist", a, CLINIC)
+    drives.google.events["hislookalike1"] = {
+        "id": "hislookalike1", "status": "confirmed", "summary": "Busy (drive there)", "etag": '"0"',
+        "start": {"dateTime": (a - 30 * M).isoformat()}, "end": {"dateTime": a.isoformat()},
+        "visibility": "private", "transparency": "opaque", "reminders": {"useDefault": False}}
+    lookalike = dict(drives.google.events["hislookalike1"])
+    for _ in range(3):
+        go(drives)
+    assert drives.google.events["hislookalike1"] == lookalike
+    assert not [c for c in drives.google.calls if c[0] != "GET" and c[1].endswith("hislookalike1")]
+    assert ("Busy (drive back)", a + 60 * M, a + 90 * M, "") in blocks(drives)
