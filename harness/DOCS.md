@@ -418,8 +418,10 @@ how many blocks are on Gmail.
   tel: address, an extension, a country code, letters, or a dial-in with its PIN; or a title or
   place naming a phone call, unless the place has a street address) and telehealth or anything
   online, and events with no location. An event whose title is exactly one of Harness's block
-  titles ("Busy (drive there)", "Maybe busy (drive back)" and the rest), or whose id is of the form
-  Harness gives its own events, is never taken for your appointment, whatever Harness's records say.
+  titles ("Busy (drive there)", "Maybe busy (drive back)" and the rest), whose id is one of Harness's
+  recorded blocks, or whose id is a drive block Harness finds on your Gmail by its mark (so after a lost
+  state file too), is never taken for your appointment. A timed appointment Harness wrote from your
+  mail ("Appt: ...") is yours and gets drives like any other.
   Each event of a repeating
   series gets its own drives, and a series edited or one week moved or cancelled takes them along,
   never leaving two sets for one trip. One at the same time as a Family event you go to is that
@@ -458,15 +460,22 @@ how many blocks are on Gmail.
   feed asks about every appointment that had drives when it was believed. Your go is for the drives
   the card listed: before any comes off they're checked again against Gmail, and the appointment
   must still be missing from the current full read; an appointment back in the feed keeps its
-  drives, and a later removal asks again.
+  drives, and a later removal asks again. A go more than 72 hours old isn't acted on: the card asks
+  again. At deletion each drive's id, title, start and end must be what the card listed, and its mark
+  must still say it's a drive around your own appointment; one that differs stays and the digest
+  names it.
 - **Splits, only when it's clear:** a series split with "this and following" is the old series
   ending (by its UNTIL or COUNT) where a new series starts: after the old one's last instance and
   before its second lost one. Its drives go on under the new series only when exactly one series
   ended and exactly one new series starts there, with the same title (case and spaces at the ends
-  aside). Each lost instance pairs with the new series' instance at the same place in the schedule,
-  so a week missing from the new series shifts nothing: that week's drives come off. Otherwise (two
-  series ending with a new one starting, or a new series with another title) it's treated as
-  removals and new appointments, and the removals wait for your go on the card. A whole series moved
+  aside). Each lost instance pairs with the new series' instance at the same place in the schedule
+  (the one shift that matches most of them), so a week missing from the new series shifts nothing:
+  that week's drives come off. Only the new series' instances inside the old tail's span (its first
+  lost day to its last) vote and pair; any after it are new appointments under the usual rules. A tie
+  between shifts, or a winning shift matching no more than half of the lost instances, isn't clear.
+  Otherwise (not clear, two series ending with a new one starting, or a new series with another
+  title) it's treated as removals and new appointments: the removals wait for your go on the card,
+  and the new series' days inside the span wait with them. A whole series moved
   to a new time ("all events") is matched day by day. Either way, moves of more than 2 hours or to a
   new place on more than 3 instances of one series aren't made as moves: they count toward the card
   as removals and new appointments.
@@ -488,7 +497,8 @@ how many blocks are on Gmail.
   place) comes off, its mark read again just before. A block without Harness's mark is never
   touched. Nothing else is written, and no test event is needed again.
 - **`remove_all_blocks` (off by default):** on, the drive blocks around your own appointments, from
-  yesterday on, come off at the next read, each known by its mark and read again just before. A
+  yesterday on, come off at the next read, each known by its mark and read again by its id just before: it must
+  still carry the own-drive mark, with the title and times it was listed with. A
   Family event's blocks and drives stay. One you edited (its title or times not as written) stays and
   is named in the digest. With `own_drive_dry_run` on, each is only logged as "would remove". Nothing
   new is written while it stays on. Off again, blocks are written as before.
@@ -497,16 +507,21 @@ how many blocks are on Gmail.
   ..." and "would ask before removing ...", each with the appointment's day and time), never to
   Gmail, no card goes out for them and nothing is kept as written. Family events' drives are worked
   out first, from Family alone, so they come out exactly as they would without your appointments:
-  the same writes to Google and the same number of map lookups as 0.23.0. The dry run looks nothing
-  up on the map itself: it uses drive times already kept, and an appointment with none gets a "no
-  drive time kept yet" line instead. Its counts, removal evidence and feed-size baseline are its own
+  the same writes to Google and the same number of map lookups on their path as 0.23.0. The dry run
+  then looks your appointments' drives up on the map (read only, under the same per-read allowance
+  and kept answers as live use), so its lines carry real times; what it finds is kept apart, so no
+  Family drive gains from it, and its lookups are counted apart from the Family path's. An
+  appointment whose drive can't be worked out at that read gets a "no drive worked out yet" line. Its counts, removal evidence and feed-size baseline are its own
   and are cleared when it's turned off. The digest gives the counts of drive blocks that would be
   written and appointments that would lose theirs since the last digest. The log also gets each
   download's status and only these headers: ETag, Last-Modified, Content-Length, Content-Type, Date
-  and Cache-Control (never a redirect's address, a cookie or the feed's address), and up to three
-  anonymised samples each of a real split, a cancelled week and a moved week are kept in
-  `drive_samples` in Harness's data folder (titles and places replaced, guests, notes and links left
-  out), for test fixtures later; that folder is deleted when the dry run is turned off. Turn it off only after a week with at least one real split, one
+  and Cache-Control (never a redirect's address, a cookie or the feed's address; the ETag only as the
+  first 8 characters of its SHA-256). A download that fails is logged with the server's name only,
+  never the feed's path or query. Up to three anonymised samples each of a real split, a cancelled
+  week and a moved week are kept in `drive_samples` in Harness's data folder (titles and places
+  replaced, guests, notes and links left out), for test fixtures later, none older than 14 days;
+  samples left by an earlier version are removed when the dry run starts, and the folder is deleted
+  when the dry run is turned off. Turn it off only after a week with at least one real split, one
   cancellation, one partial read and one feed-size change seen in the log and no wrong would-write or
   would-remove line; keep `own_drive_days` at 3 for the first live days, then widen it. Nothing here writes to the Family calendar, and drive blocks carry no guests and send no
   updates. A place you type on a block makes it yours, like any other edit.

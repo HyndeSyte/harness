@@ -1805,7 +1805,6 @@ def test_two_of_his_own_back_to_back_chain_too(drives):
     dict(organizer="someone@example.com"),                          # someone else's invitation
     dict(transparent=True),                                         # shown free
     dict(title="Busy"),                                             # a hold
-    dict(uid="hb0123456789abcdef0123456789abcdef"),                 # a block made here
 ])
 def test_what_gets_no_drive_of_its_own(drives, kw):
     quiet_family(drives)
@@ -3285,7 +3284,8 @@ def test_the_dry_run_logs_each_answers_headers_and_keeps_anonymised_samples(driv
     headers = {"etag": '"v1"', "content-type": "text/calendar; charset=UTF-8", "set-cookie": "NID=cookievalue"}
     fetch(drives, whole, headers=headers)
     lines = [r.getMessage() for r in caplog.records if "headers" in r.getMessage()]
-    assert lines and lines[-1].endswith('headers 200; etag: "v1"; content-type: text/calendar; charset=UTF-8')
+    assert lines and lines[-1].endswith(f'headers 200; etag: {calendar_feed.etag_print(chr(34) + "v1" + chr(34))}; '
+                                        'content-type: text/calendar; charset=UTF-8')
     assert not [r for r in caplog.records if "cookievalue" in r.getMessage() or "BEGIN:VCALENDAR" in r.getMessage()]
     second = day1 + timedelta(days=1)
     edit = vev("series-u", "Physio with Dr Smith", second + timedelta(hours=5), place=secret_place, rid=second)
@@ -3344,7 +3344,8 @@ def test_the_header_log_keeps_only_its_allowlist_never_a_redirects_address_or_a_
     drives.cal.start()
     drives.cal.collect()
     lines = [r.getMessage() for r in caplog.records if "headers" in r.getMessage()]
-    assert lines == [f"calendar {calendar_feed.feed_id(FEED_URL)[:4]}: headers 302; etag: \"v1\"; "
+    assert lines == [f"calendar {calendar_feed.feed_id(FEED_URL)[:4]}: headers 302; "
+                     f"etag: {calendar_feed.etag_print(chr(34) + 'v1' + chr(34))}; "
                      "date: Wed, 18 Nov 2026 13:00:00 GMT"]
     text = " ".join(r.getMessage() for r in caplog.records)
     for secret in ("private-0123456789abcdef", "parent%40gmail.com", "cookievalue", "othercookie", "tokenvalue",
@@ -3499,8 +3500,7 @@ def test_the_add_ons_own_blocks_in_the_feed_never_count_as_his_appointments(driv
     quiet_family(drives)
     a = when(drives, days=3, hour=10)
     dentist = vev("dentist", "Dentist", a, place=CLINIC)
-    ours = [vev("hb" + "0123456789abcdef" * 2 + "@google.com", "Haircut", when(drives, days=4, hour=10), place=PARK),
-            vev("typed-1", "Busy (drive there)", when(drives, days=5, hour=10), place=PARK),
+    ours = [vev("typed-1", "Busy (drive there)", when(drives, days=5, hour=10), place=PARK),
             vev("typed-2", "Maybe busy (drive back)", when(drives, days=6, hour=10), place=PARK),
             vev("typed-3", " busy (school pickup) ", when(drives, days=7, hour=10), place=PARK)]
     fetch(drives, dentist, *ours)
@@ -3642,3 +3642,266 @@ def test_an_unmarked_lookalike_is_never_touched(drives):
     assert drives.google.events["hislookalike1"] == lookalike
     assert not [c for c in drives.google.calls if c[0] != "GET" and c[1].endswith("hislookalike1")]
     assert ("Busy (drive back)", a + 60 * M, a + 90 * M, "") in blocks(drives)
+
+
+# -- the seventh round: the dry run looks drives up again, a tie rule for splits, drives for entries from his
+#    mail, approvals that expire and match exactly, and no feed secret in any log line (0.24.0) -------------
+
+def test_the_dry_run_looks_up_a_drive_never_kept_and_logs_it_with_real_times_writing_nothing(drives, caplog):
+    quiet_family(drives)
+    drives.gm.own_dry_fn = lambda: True
+    a = when(drives, days=3, hour=10)
+    mine(drives, "Haircut", a, PARK)                                # no drive time kept for this address
+    assert drives.ledger.db.execute("SELECT COUNT(*) FROM meta WHERE key LIKE '%drive_between%'").fetchone()[0] == 0
+    writes = record_writes(drives)
+    caplog.set_level(logging.INFO, logger="harness.family_gmail")
+    go(drives)
+    go(drives)
+    local = a.astimezone(NY)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("drive dry run")]
+    assert (f"drive dry run: would write Busy (drive there), {local:%a %b} {local.day} 9:30 AM to "
+            f"{local:%a %b} {local.day} 10:00 AM, for the appointment on {local:%a %b} {local.day} 10:00 AM") in lines
+    assert (f"drive dry run: would write Busy (drive back), {local:%a %b} {local.day} 11:00 AM to "
+            f"{local:%a %b} {local.day} 11:30 AM, for the appointment on {local:%a %b} {local.day} 10:00 AM") in lines
+    assert not [x for x in lines if "no drive" in x]
+    assert drives.gm.drives.lookups["own"] > 0 and drives.gm.drives.lookups["family"] == 0
+    assert not [w for w in writes if "harness test" not in (w[1] or "")]   # no Google write for him
+    assert not [b for b in blocks(drives) if "drive" in b[0]]
+
+
+def test_a_split_whose_shifts_tie_is_asked_on_the_card_and_its_new_days_wait(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    day1 = when(drives, days=1, hour=10)
+    whole = vev("series-u", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;INTERVAL=2;COUNT=5")   # days 1 3 5 7 9
+    fetch(drives, whole)
+    fetch(drives, whole)
+    flush_receipts(drives)
+    before, written = blocks(drives), len(drives.google.writes())
+    assert len(before) == 10
+    # Split after day 3; the new series is every other day from day 4 (4 6 8): one day earlier and one day later
+    # match the lost days 5, 7 and 9 equally often (day 4 is before the old tail and doesn't vote).
+    old = vev("series-u", "PT", day1, place=CLINIC,
+              rrule=f"FREQ=DAILY;INTERVAL=2;UNTIL={_u(day1 + timedelta(days=2, hours=13))}")
+    new = vev("series-u_R20261024", "PT", day1 + timedelta(days=3), place=CLINIC, rrule="FREQ=DAILY;INTERVAL=2;COUNT=3")
+    fetch(drives, old, new)
+    drives.tick()
+    cards = removal_cards(drives)
+    assert [s[1].split(".")[0] for s in cards] == ["A repeating appointment of yours changed in a way I can't match "
+                                                   "to the new one"]
+    got = blocks(drives)
+
+    def on(n):
+        return [b for b in got if b[1].astimezone(NY).date() == (day1 + timedelta(days=n - 1)).astimezone(NY).date()]
+
+    for n in (6, 8):                                                # inside the tail: nothing moved or made there
+        assert not on(n)
+    assert len(on(4)) == 2                                          # before it: a new appointment, as usual
+    assert not [w for w in drives.google.writes()[written:] if w[0] != "POST"]   # nothing moved or removed
+    assert [b for b in got if b in before] == before                # every old drive still there
+    drives.press(drives.with_button("Take them off"), "Take them off")
+    fetch(drives, old, new)
+    fetch(drives, old, new)
+    days = sorted({b[2].astimezone(NY).date() for b in blocks(drives) if b[0] == "Busy (drive there)"})
+    assert days == [(day1 + timedelta(days=n - 1)).astimezone(NY).date() for n in (1, 3, 4, 6, 8)]
+
+
+def test_a_new_series_longer_than_the_lost_tail_pairs_only_inside_it(drives):
+    feed_rig(drives)
+    quiet_family(drives)
+    day1 = when(drives, days=1, hour=10)
+    whole = vev("series-u", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;COUNT=6")    # days 1 to 6
+    fetch(drives, whole)
+    fetch(drives, whole)
+    flush_receipts(drives)
+
+    def ids_by_day():
+        return {datetime.fromisoformat(e["end"]["dateTime"]).astimezone(NY).date(): k
+                for k, e in drives.google.live().items() if e["summary"] == "Busy (drive there)"}
+
+    before, written = ids_by_day(), len(drives.google.writes())
+    # Split after day 3 into a series from day 4 to day 10, with day 5 taken out: inside the lost tail (days 4 to
+    # 6) days 4 and 6 stay where they were; days 7 to 10 are new appointments and don't take part in the vote.
+    old = vev("series-u", "PT", day1, place=CLINIC, rrule=f"FREQ=DAILY;UNTIL={_u(day1 + timedelta(days=2, hours=13))}")
+    fifth = day1 + timedelta(days=4)
+    new = vev("series-u_R20261024", "PT", day1 + timedelta(days=3), place=CLINIC, rrule="FREQ=DAILY;COUNT=7",
+              exdates=[fifth])
+    fetch(drives, old, new)
+    fetch(drives, old, new)
+    after = ids_by_day()
+    local = lambda n: (day1 + timedelta(days=n - 1)).astimezone(NY).date()   # noqa: E731
+    for n in (1, 2, 3, 4, 6):
+        assert after[local(n)] == before[local(n)]                  # each kept day keeps its own blocks
+    assert local(5) not in after
+    assert sorted(after) == [local(n) for n in (1, 2, 3, 4, 6, 7, 8, 9, 10)]
+    methods = [w[0] for w in drives.google.writes()[written:]]
+    assert methods.count("DELETE") == 2 and methods.count("POST") == 8 and set(methods) == {"DELETE", "POST"}
+    assert not removal_cards(drives)
+
+
+def test_a_timed_entry_made_from_his_mail_gets_drives_and_a_drive_block_after_state_loss_still_doesnt(drives):
+    from harness import mail_dates
+    feed_rig(drives)
+    quiet_family(drives)
+    a = when(drives, days=3, hour=10)
+    appt = vev(mail_dates.note_id("msg-1:appointment") + "@google.com", "Appt: Dentist", a, place=CLINIC)
+    fetch(drives, appt)
+    fetch(drives, appt)
+    expected = [("Busy (drive there)", a - 30 * M, a, ""), ("Busy (drive back)", a + 60 * M, a + 90 * M, "")]
+    assert blocks(drives) == expected                               # the add-on's id form, and his appointment
+    flush_receipts(drives)
+    written = len(drives.google.writes())
+    # The state lost, and the feed showing the drive blocks themselves (one with a title and a place that would
+    # otherwise pass for an appointment): known by their kind on Gmail, never his.
+    ids = {e["summary"]: k for k, e in drives.google.live().items()}
+    wipe_state(drives)
+    there = vev(ids["Busy (drive there)"] + "@google.com", "Busy (drive there)", a - 30 * M, hours=0.5)
+    back = vev(ids["Busy (drive back)"] + "@google.com", "Drive home from the clinic", a + 60 * M, hours=0.5,
+               place=PARK)
+    for n in range(3):
+        fetch(drives, appt, there, back, headers={"etag": f'"w{n}"'})
+    assert blocks(drives) == expected and len(drives.google.writes()) == written
+
+
+def asked_rig(rig, first_day=3):
+    """odd_rig, with the six further out if asked, and its card sent: (dentist, things, card)."""
+    feed_rig(rig)
+    quiet_family(rig)
+    dentist = vev("dentist", "Dentist", when(rig, days=2 if first_day == 3 else first_day + 6, hour=10), place=CLINIC)
+    things = [vev(f"one-{i}", f"Thing {i}", when(rig, days=first_day + i, hour=10), place=PARK) for i in range(5)]
+    fetch(rig, dentist, *things, headers={"etag": '"v1"'})
+    fetch(rig, dentist, *things, headers={"etag": '"v2"'})
+    assert len(blocks(rig)) == 12
+    flush_receipts(rig)
+    fetch(rig, dentist, headers={"etag": '"cut"'})
+    fetch(rig, dentist, headers={"etag": '"cut"'})
+    rig.clock.advance(hours=2)
+    fetch(rig, dentist, headers={"etag": '"cut"'})
+    rig.tick()
+    assert len(removal_cards(rig)) == 1
+    return dentist, things, rig.with_button("Take them off")
+
+
+def test_an_approval_older_than_72_hours_deletes_nothing_and_the_card_asks_again(drives):
+    dentist, _, card = asked_rig(drives, first_day=8)
+    before, written = blocks(drives), len(drives.google.writes())
+    drives.press(card, "Take them off")
+    drives.clock.advance(hours=73)
+    fetch(drives, dentist, headers={"etag": '"cut"'})
+    drives.tick()
+    assert blocks(drives) == before
+    assert not [w for w in drives.google.writes()[written:] if w[0] == "DELETE"]
+    assert len(removal_cards(drives)) == 2                          # asked again
+    drives.press(drives.with_button("Take them off"), "Take them off")   # a fresh go is acted on
+    fetch(drives, dentist, headers={"etag": '"cut"'})
+    assert len(blocks(drives)) == 2
+
+
+def test_a_drive_moved_since_the_card_is_spared_and_named(drives):
+    dentist, _, card = asked_rig(drives)
+    first = when(drives, days=3, hour=10)
+    there = next(k for k, e in drives.google.live().items() if e["summary"] == "Busy (drive there)"
+                 and datetime.fromisoformat(e["end"]["dateTime"]) == first)
+    drives.google.hand_edit(there, start={"dateTime": (first - 45 * M).isoformat()},
+                            end={"dateTime": (first - 15 * M).isoformat()})
+    drives.press(card, "Take them off")
+    fetch(drives, dentist, headers={"etag": '"cut"'})
+    got = blocks(drives)
+    assert ("Busy (drive there)", first - 45 * M, first - 15 * M, "") in got     # moved since: spared
+    assert len(got) == 3                                                         # the rest came off
+    local = (first - 45 * M).astimezone(NY)
+    assert (f"1 drive block changed on Gmail since you said to take it off, so it stays: "
+            f"{local:%a %b} {local.day} 9:15 AM." in drives.gm.digest_line())
+
+
+def test_remove_all_fetches_by_id_and_spares_a_block_whose_title_or_times_read_back_differently(drives):
+    a = own_and_family(drives)
+    there = next(k for k, e in drives.google.live().items() if e["summary"] == "Busy (drive there)"
+                 and datetime.fromisoformat(e["end"]["dateTime"]) == a)
+    orig = drives.google.request
+
+    def request(method, url, **kw):                                 # read by id: retitled, the etag the same
+        answer = orig(method, url, **kw)
+        if method == "GET" and unquote_path(url) == there:
+            found = json.loads(answer.body)
+            found["summary"] = "Busy (drive there, via the bank)"
+            return HttpResponse(answer.status, dict(answer.headers), json.dumps(found).encode())
+        return answer
+
+    drives.google.request = request
+    drives.gm.cleanup_fn = lambda: True
+    go(drives)
+    got = blocks(drives)
+    assert ("Busy (drive there)", a - 30 * M, a, "") in got                     # not deleted
+    assert ("Busy (drive back)", a + 60 * M, a + 90 * M, "") not in got
+
+
+SECRETS_OF_THE_FEED = ("private-0123456789abcdef", "parent%40gmail.com", "/calendar/ical/", "basic.ics")
+
+
+@pytest.mark.parametrize("how", ["connection", "text", "500"])
+def test_a_failed_feed_read_logs_the_host_only_never_the_feeds_path(drives, caplog, how):
+    feed_rig(drives, headers_fn=lambda: True)
+    quiet_family(drives)
+    drives.gm.own_dry_fn = lambda: True
+    caplog.set_level(logging.DEBUG)
+    if how == "500":
+        fetch_status(drives, 500)
+    else:
+        def refuse(method, url, **kw):
+            if how == "connection":
+                raise TransportError("network", "ConnectionRefusedError")
+            raise ValueError(f"bad answer from {url}?x=1")          # an exception whose text holds the address
+        drives.server.request = refuse
+        drives.cal.start()
+        drives.cal.collect()
+        drives.feeds.snapshot = drives.cal.snapshot
+        drives.feeds.generation += 1
+        drives.tick()
+    lines = [r.getMessage() for r in caplog.records]
+    named = [x for x in lines if x.startswith(f"calendar {calendar_feed.feed_id(FEED_URL)[:4]}:")]
+    word = "answered 500" if how == "500" else "no answer from"
+    assert [x for x in named if word in x and "calendar.google.com" in x]       # the host, by name
+    for secret in SECRETS_OF_THE_FEED:
+        assert not [x for x in lines if secret in x], secret
+
+
+def test_the_feeds_address_in_an_etag_never_reaches_the_log(drives, caplog):
+    feed_rig(drives, headers_fn=lambda: True)
+    quiet_family(drives)
+    drives.gm.own_dry_fn = lambda: True
+    caplog.set_level(logging.DEBUG)
+    etag = f'"{FEED_URL}"'
+    fetch(drives, vev("dentist", "Dentist", when(drives, days=2, hour=10), place=CLINIC), headers={"etag": etag})
+    lines = [r.getMessage() for r in caplog.records]
+    assert [x for x in lines if f"etag: {hashlib.sha256(etag.encode()).hexdigest()[:8]}" in x]   # a fingerprint
+    for secret in SECRETS_OF_THE_FEED:
+        assert not [x for x in lines if secret in x], secret
+
+
+def test_samples_from_an_earlier_build_go_when_the_dry_run_starts_and_the_rest_are_capped(drives, tmp_path):
+    from harness import family_gmail
+    feed_rig(drives)
+    quiet_family(drives)
+    dry = [False]
+    drives.gm.own_dry_fn = lambda: dry[0]
+    drives.gm.samples_dir = str(tmp_path)
+    folder = tmp_path / "drive_samples"
+    folder.mkdir()
+    (folder / "split-0123456789.ics").write_text("BEGIN:VCALENDAR\r\nSUMMARY:Physio\r\nEND:VCALENDAR\r\n")  # an earlier build's
+    day1 = when(drives, days=1, hour=10)
+    whole = vev("series-u", "PT", day1, place=CLINIC, rrule="FREQ=DAILY;COUNT=8")
+    dry[0] = True
+    fetch(drives, whole)
+    assert not (folder / "split-0123456789.ics").exists()
+    today = drives.ledger.now().strftime("%Y%m%d")
+    old = (drives.ledger.now() - timedelta(days=15)).strftime("%Y%m%d")
+    names = [f"edit-{old}-aaaaaaaaaa.ics"] + [f"edit-{today}-{c * 10}.ics" for c in "bcde"]
+    folder.mkdir(exist_ok=True)
+    for name in names:
+        (folder / name).write_text("BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+    second = day1 + timedelta(days=1)
+    fetch(drives, whole, vev("series-u", "PT", second + timedelta(hours=5), place=CLINIC, rid=second))  # an edit
+    kept = sorted(f.name for f in folder.iterdir())
+    assert f"edit-{old}-aaaaaaaaaa.ics" not in kept                 # over 14 days old
+    assert len([k for k in kept if k.startswith("edit-")]) == family_gmail.MAX_SAMPLES == 3

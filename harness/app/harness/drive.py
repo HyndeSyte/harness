@@ -47,6 +47,7 @@ _NOT_NAME_WORDS = frozenset({"the", "a", "an", "of", "at", "and", "in", "on"})
 
 NO_ADDRESS = "no address"
 FAILED = "failed"
+FAMILY, OWN = "family", "own"        # whose drives a lookup is for (Drives.path)
 LATER = "later"                   # this read's allowance of lookups is spent: the next read asks
 HOME = "home"                     # between(): his home, from the add-on's settings
 
@@ -207,9 +208,11 @@ class Drives:
         # "" in live use. The drive dry run (family_gmail.py) sets its own: it reads every kept answer
         # but keeps what it looks up apart, so nothing it asks can change a Family event's drives.
         self.side = ""
-        # True only in the drive dry run: kept answers are read, nothing is looked up (what isn't kept
-        # waits, LATER), so the dry run makes no map lookup the installed release wouldn't.
-        self.offline = False
+        # Whose drives the lookups being made are for: "family" (a Family event's, and in live use the
+        # chain they share with his own appointments) or "own" (his own appointments: their places, and
+        # every drive the dry run works out for them). Counted per path, from the start, never reset.
+        self.path = FAMILY
+        self.lookups = {FAMILY: 0, OWN: 0}
         self.begin()
 
     def _kept(self, key: str):
@@ -232,7 +235,7 @@ class Drives:
         return self._refused and not self._down
 
     def _later(self, found):
-        return LATER if found == FAILED and (self.capped() or self.offline) else found
+        return LATER if found == FAILED and self.capped() else found
 
     def on(self) -> bool:
         return bool(street_address(self.school_fn()))
@@ -425,7 +428,7 @@ class Drives:
         return str(minutes) if minutes >= 0 else FAILED
 
     def _get(self, url: str, *, no_route_ok: bool = False):
-        if self._down or self.offline:
+        if self._down:
             return None
         if self._requests >= MAX_REQUESTS_PER_READ or self.clock() - self._started > MAX_SECONDS_PER_READ:
             self._refused = True           # not asked: not a failure (capped())
@@ -433,6 +436,7 @@ class Drives:
         if self._requests:
             self.sleep(1)
         self._requests += 1
+        self.lookups[self.path] = self.lookups.get(self.path, 0) + 1
         try:
             response = self.transport.request("GET", url, headers=AGENT, timeout=TIMEOUT_S)
             if no_route_ok and response.status == 400:

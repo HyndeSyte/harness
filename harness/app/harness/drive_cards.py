@@ -307,8 +307,25 @@ class DriveCards:
     def clear_hold(self, key: str) -> None:
         """Back in a read: a later removal asks again."""
         row = self._row(key)
-        if row is not None and (row["hold"] or row["bid"] or row["listed"]):
-            self._set(key, hold="", bid="", listed="")
+        if row is not None and (row["hold"] or row["bid"] or row["listed"] or row["approved_at"]):
+            self._set(key, hold="", bid="", listed="", approved_at="")
+
+    def approved_at(self, key: str) -> datetime | None:
+        """When he tapped Take them off for this appointment's drives, or None."""
+        row = self._row(key)
+        try:
+            return datetime.fromisoformat(row["approved_at"]) if row is not None and row["approved_at"] else None
+        except ValueError:
+            return None
+
+    def listed(self, key: str) -> list:
+        """The drives his card listed for this appointment: [[id, title, start, end], ...] (UTC ISO times)."""
+        row = self._row(key)
+        try:
+            found = json.loads(row["listed"]) if row is not None and row["listed"] else []
+        except ValueError:
+            return []
+        return [x for x in found if isinstance(x, list) and len(x) == 4] if isinstance(found, list) else []
 
     def still_listed(self, key: str, legs: str) -> bool:
         """His go was for the drives the card listed: they're still exactly those (legs as listed)."""
@@ -374,7 +391,7 @@ class DriveCards:
                 return "Already settled. Nothing changed."
             to = "approved" if kind == "drive_remove" else "kept"
             for r in asked:
-                self._set(r["key"], hold=to)
+                self._set(r["key"], hold=to, approved_at=iso(self.ledger.now()) if to == "approved" else "")
             if to == "approved":
                 return "Taking those drive blocks off your Gmail at the next read."
             return "Keeping those drive blocks on your Gmail."

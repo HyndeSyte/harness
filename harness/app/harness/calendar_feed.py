@@ -23,6 +23,7 @@ from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import NamedTuple
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from . import ical, inputs
@@ -157,8 +158,23 @@ def headers_line(status: int, headers: dict) -> str:
     """A response's status and its allowlisted headers (LOGGED_HEADERS), never its body, never the
     request's address."""
     kept = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    if "etag" in kept:                           # free text from the server: a short fingerprint, never raw
+        kept["etag"] = etag_print(kept["etag"])
     parts = [f"{name}: {' '.join(kept[name].split())[:300]}" for name in LOGGED_HEADERS if name in kept]
     return f"{status}; " + "; ".join(parts)
+
+
+def etag_print(etag: str) -> str:
+    """An ETag as the log shows it: the first 8 hex digits of its SHA-256."""
+    return hashlib.sha256(str(etag).encode()).hexdigest()[:8]
+
+
+def host_of(url: str) -> str:
+    """The host alone, for a log line: never the path or the query, where a feed's secret is."""
+    try:
+        return urlsplit(url).hostname or "?"
+    except ValueError:
+        return "?"
 
 
 def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
@@ -169,12 +185,15 @@ def fetch_one(transport: Transport, url: str, *, start: datetime, end: datetime,
         resp = transport.request("GET", url, headers={"accept": "text/calendar"},
                                  timeout=TIMEOUT_S)
     except TransportError as e:
-        log.info("calendar %s: no answer (%s)", fid[:4], e.kind)
+        log.info("calendar %s: no answer from %s (%s)", fid[:4], host_of(url), e.kind)
+        return FeedResult(fid, False, error="couldn't reach Google", kind="unreachable")
+    except Exception as e:                       # whatever its text says (an address, say), only its type
+        log.info("calendar %s: no answer from %s (%s)", fid[:4], host_of(url), type(e).__name__)
         return FeedResult(fid, False, error="couldn't reach Google", kind="unreachable")
     if log_headers:                              # the drive dry run: each answer's headers, for later
         log.info("calendar %s: headers %s", fid[:4], headers_line(resp.status, resp.headers or {}))
     if resp.status != 200:
-        log.info("calendar %s: Google answered %s", fid[:4], resp.status)
+        log.info("calendar %s: %s answered %s", fid[:4], host_of(url), resp.status)
     if resp.status == 304:
         # Not modified: the last full read again. No new evidence, and no new download time.
         return FeedResult(fid, False, error="not modified", kind="not_modified", status=304)

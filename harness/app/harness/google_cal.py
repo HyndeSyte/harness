@@ -800,7 +800,8 @@ class GoogleCalendar:
 
     def still_ours(self, address: str, block: Block) -> bool:
         """The block read again by its id just before it's taken off: still carrying the add-on's mark,
-        of the same kind, not cancelled, and unchanged since it was listed (its etag). Only a clear yes."""
+        of the same kind, not cancelled, unchanged since it was listed (its etag), and its title, start
+        and end still the ones listed. Only a clear yes."""
         url = self._events(address)
         if url is None or not _ID_RE.fullmatch(block.id):
             return False
@@ -814,8 +815,15 @@ class GoogleCalendar:
             found = r.json()
         except (TransportError, ValueError):
             return False
-        return isinstance(found, dict) and _ours(found) and found.get("status") != "cancelled" \
-            and _kind(found) == block.kind and found.get("etag") == block.etag
+        if not (isinstance(found, dict) and _ours(found) and found.get("status") != "cancelled"
+                and _kind(found) == block.kind and found.get("etag") == block.etag
+                and str(found.get("summary") or "") == block.title):
+            return False
+        try:
+            start, end = _when(found.get("start") or {}), _when(found.get("end") or {})
+        except (KeyError, TypeError, ValueError):
+            return False
+        return start == block.start and end == block.end
 
     def remove(self, address: str, block: Block) -> Outcome:
         """Only as it was just read."""
