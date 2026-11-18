@@ -204,7 +204,7 @@ _SAME_WORD = {"st": "street", "ave": "avenue", "av": "avenue", "rd": "road", "dr
               "expy": "expressway", "fwy": "freeway", "tpke": "turnpike", "trce": "trace", "cres": "crescent",
               "aly": "alley", "rt": "route", "rte": "route", "n": "north", "s": "south", "e": "east",
               "w": "west", "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest"}
-SAME_POINT_METERS = 150            # two map points this near are one place (same_place)
+SAME_POINT_METERS = 40             # two map points this near are one place, when they decide (same_place)
 
 
 def address_parts(place: str) -> tuple[str, str, str, str] | None:
@@ -227,6 +227,22 @@ def address_parts(place: str) -> tuple[str, str, str, str] | None:
             code = last.group(2) or ""
             rest = rest[:-1]
         town = " ".join(rest[0].casefold().split()) if rest else ""
+    if not (town and code):
+        # What street_address leaves out: a postcode alone ("227 N Lewis St, 24450") or a town with no
+        # state ("12 Main St, Othertown"), read from what follows the street in the place's own text.
+        text = " ".join(re.sub(r"\s*(?:\n|\\n)\s*", ", ", place or "").split())
+        at = text.find(street)
+        tail = text[at + len(street):] if at >= 0 else ""
+        unit = _UNIT.match(tail)
+        tail = tail[unit.end():] if unit else tail
+        if not code:
+            found = re.search(r"\b(\d{5})(?:-\d{4})?\b", tail)
+            code = found.group(1) if found else ""
+        if not town:
+            first = next((p.strip() for p in tail.split(",") if p.strip()), "")
+            if re.fullmatch(r"[A-Za-z][A-Za-z .'-]{2,40}", first) \
+                    and first.casefold() not in ("usa", "united states", "us"):
+                town = " ".join(first.casefold().split())
     return m.group(1).casefold(), name, town, code
 
 
@@ -238,27 +254,35 @@ def _meters(a: str, b: str) -> float:
 
 
 def same_place(a: str, b: str, points: tuple[str, str] = ("", "")) -> bool:
-    """Two places are one: by their map points within SAME_POINT_METERS when both have one ("lon,lat"),
-    else by their street addresses' parts (address_parts: the house number and the street the same, and
-    the town or the postcode, where both sides say one), else, last, by their text with case, commas and
+    """Two places are one. When both have a street address (address_parts), its parts decide: a different
+    house number or street is another place whatever the map says (a theatre across the road from the
+    school is not the school); the same number and street are one place when the town or the postcode,
+    where both sides say one, agree (differing towns with an agreeing postcode still are), and when neither
+    can be compared (missing on a side), only when both have a kept map point ("lon,lat") and they lie
+    within SAME_POINT_METERS (else not: the safe way, a drive block too many). When a side has no street
+    address, the map points decide, within that radius; else, last, their text with case, commas and
     spacing left out. "227 N Lewis St" and "227 North Lewis Street, Lexington, VA 24450" are one."""
     if not (a or "").strip() or not (b or "").strip():
         return False
     pa, pb = (points[0] or coordinates(a)), (points[1] or coordinates(b))
+    near = None
     if pa and pb:
         try:
-            return _meters(pa, pb) <= SAME_POINT_METERS
+            near = _meters(pa, pb) <= SAME_POINT_METERS
         except ValueError:
-            pass
+            near = None
     one, two = address_parts(a), address_parts(b)
     if one is not None and two is not None:
         if one[:2] != two[:2]:
             return False
-        if one[2] and two[2] and one[2] != two[2] and not (one[3] and one[3] == two[3]):
+        codes = bool(one[3] and two[3])
+        if codes and one[3] != two[3]:
             return False
-        if one[3] and two[3] and one[3] != two[3]:
-            return False
-        return True
+        if one[2] and two[2]:
+            return one[2] == two[2] or codes
+        return True if codes else near is True
+    if near is not None:
+        return near
     if (one is None) != (two is None):
         return False
 

@@ -35,7 +35,7 @@ def test_the_address_parts():
     for other in ("12 Oak St, Lexington, VA 24450", "229 N Lewis St, Lexington, VA 24450",
                   "227 N Lewis St, Staunton, VA 24401", "227 S Lewis St, Lexington, VA 24450", ""):
         assert not drive.same_place(other, SCHOOL), other
-    assert drive.same_place("38.45, -78.45", "38.4505, -78.4502")                  # within the radius
+    assert drive.same_place("38.45, -78.45", "38.4502, -78.4501")                  # within the radius (40 m since round 5)
     assert not drive.same_place("38.45, -78.45", "38.46, -78.45")
     assert drive.same_place("Riverside Hall", "riverside  hall")                     # the last resort
 

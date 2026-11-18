@@ -189,12 +189,17 @@ def _occ_id(occ) -> str:
 # link or "virtual option" in the description of an event with a place doesn't make it online either:
 # schools' conferences and assemblies carry an auto-attached Meet link. "Meet" alone is a school's own
 # word ("Meet the teacher").
-_ONLINE_TITLE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet)\b", re.I)
-_ONLINE_PLACE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet)\b|zoom\.us/|meet\.google\.com", re.I)
+_ONLINE_TITLE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|webinar|live[\s-]?stream(?:ed|ing)?)\b",
+                           re.I)
+_ONLINE_PLACE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|webinar|live[\s-]?stream(?:ed|ing)?)\b"
+                           r"|zoom\.us/|meet\.google\.com", re.I)
 _LINK = re.compile(r"\s*(?:https?://|www\.)\S+\s*", re.I)
 _ANY_LINK = re.compile(r"(?:https?://|www\.)\S+", re.I)
-_ONLINE_WORD = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|microsoft\s+teams|ms\s+teams|webex)\b",
-                          re.I)
+_ONLINE_WORD = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|microsoft\s+teams|ms\s+teams|webex|webinar|"
+                          r"live[\s-]?stream(?:ed|ing)?)\b", re.I)
+# "Teams" or "Meet" alone is online only with nothing but filler beside it ("Teams", "Teams meeting", "On
+# Meet"): "Away teams pitch" and "Meet at the gate" are places.
+_BARE_ONLINE = re.compile(r"\b(?:teams|meet)\b", re.I)
 # What may stand beside the online word in a location that only says it's online ("Zoom meeting", "Online
 # only", "Virtual - link to follow").
 _ONLINE_FILLER = re.compile(r"\b(?:meeting|event|call|session|link|links|only|via|on|the|a|an|by|and|or|"
@@ -212,17 +217,17 @@ def _descriptions(item) -> list[str]:
 
 
 def online_place(location: str) -> bool:
-    """A location that holds nothing but a link, or nothing but saying it's online (_ONLINE_WORD and
-    _ONLINE_FILLER), links beside it left out."""
+    """A location that holds nothing but a link, or nothing but saying it's online (_ONLINE_WORD, a bare
+    "Teams" or "Meet" (_BARE_ONLINE), and _ONLINE_FILLER), links beside it left out."""
     text = (location or "").strip()
     if not text:
         return False
     if _LINK.fullmatch(text):
         return True
     rest = _ANY_LINK.sub(" ", text)
-    if not _ONLINE_WORD.search(rest):
+    if not _ONLINE_WORD.search(rest) and not _BARE_ONLINE.search(rest):
         return False
-    rest = _ONLINE_FILLER.sub(" ", _ONLINE_WORD.sub(" ", rest))
+    rest = _ONLINE_FILLER.sub(" ", _BARE_ONLINE.sub(" ", _ONLINE_WORD.sub(" ", rest)))
     return not re.sub(r"[\W_]+", "", rest)
 
 
@@ -241,34 +246,35 @@ def _online_event(item) -> bool:
 
 
 # A location at school that names a room, not a place of its own: the school's own address is its place
-# (MeaningLive.wants). One of these words, or a short name (up to four words) with no word for a place
-# of its own and no house number. "Riverside Leisure Centre" is a place of its own, never the school.
-_ROOM_WORD = re.compile(r"\b(?:room|rm|hall|gym|gymnasium|library|cafeteria|cafetorium|classroom|auditorium|"
-                        r"lab|laboratory|studio|office|lobby|stage|commons|multipurpose|mpr|courtyard|"
-                        r"playground|quad|atrium|foyer|annex|wing|block|portable|suite)\b", re.I)
+# (MeaningLive.wants). Only a room or class word, or a teacher's or year's class ("Mrs Lee's class", "Year 4",
+# "Reception", "Grade 3"); anything else nothing places ("Pizza Express", "St Mary's", "The Red Lion") has no
+# address and is named. A room word in a place of its own ("Riverside Leisure Centre Hall") is that place's.
+_ROOM_WORD = re.compile(r"\b(?:room|rm|hall|gym|gymnasium|library|cafeteria|classroom|auditorium|lab|laboratory|"
+                        r"office|playground|field|court)\b", re.I)
+_CLASS = re.compile(r"\b(?:mr|mrs|ms|miss|mx)\.?\s+[^\W\d_][\w-]*(?:['\u2019]s)?\s+class(?:room)?\b"
+                    r"|\b(?:year|grade|yr)\s*\d{1,2}[a-z]?\b|^reception(?:\s+class)?$", re.I)
 _PLACE_WORD = re.compile(r"\b(?:centre|center|park|church|chapel|cathedral|temple|mosque|synagogue|theat(?:re|er)|"
                          r"stadium|arena|museum|leisure|pool|aquatic|ymca|ywca|complex|hospital|clinic|mall|"
                          r"university|college|school|academy|rink|zoo|farm|restaurant|cafe|hotel|inn|club|"
-                         r"street|st|road|rd|avenue|ave|lane|ln|drive|dr|boulevard|blvd|way|court|place|"
-                         r"town|city|county|village|beach|lake|river)\b", re.I)
+                         r"street|st|road|rd|avenue|ave|lane|ln|drive|dr|boulevard|blvd|way|place|"
+                         r"town|city|county|village|beach|lake|river|pub|tavern|bar|rooms)\b", re.I)
 _HOUSE_NUMBER = re.compile(r"(?:^|[\s,])\d+[A-Za-z]?\s+[A-Za-z]")
 
 
 def room_like(location: str) -> bool:
-    """A location at school that's only a room's name (_ROOM_WORD), or a short name with no place word
-    and no house number. Empty is not a room (the caller takes empty on its own)."""
+    """A location at school that's only a room's name (_ROOM_WORD) with no place word beside it, or a
+    teacher's or year's class (_CLASS). Empty is not a room (the caller takes empty on its own)."""
     text = " ".join(re.sub(r"\s*(?:\n|\\n)\s*", ", ", location or "").split())
-    if not text or _ANY_LINK.search(text):
+    if not text or _ANY_LINK.search(text) or _HOUSE_NUMBER.search(text):
         return False
-    words = re.findall(r"[^\W_]+", text)
-    if _HOUSE_NUMBER.search(text):
-        return False
+    if _CLASS.search(text):
+        return True
     if _ROOM_WORD.search(text):
         # A room's word in a place of its own ("Riverside Leisure Centre Hall", "Lexington High School
         # Gym") is that place's. "School Hall" alone is the school's own.
         rest = _ROOM_WORD.sub(" ", text)
         return not _PLACE_WORD.search(rest) or [w.casefold() for w in re.findall(r"[^\W\d_]+", rest)] == ["school"]
-    return 0 < len(words) <= 4 and not _PLACE_WORD.search(text)
+    return False
 
 
 # Where a presence block is held, as judged: at home, the event's location isn't where he goes.

@@ -60,8 +60,8 @@ minutes of the event or crossing the leg (_run_covers; a run crossing a drive of
 nothing, and the digest names it; one written before comes off, named once in the next digest), or, for a
 drive not written yet, a drive already on his Gmail, his own (named in the digest by its title) or one
 this system put there at his word (_his_drive_cover). An event held online gets no drive, and the digest
-names it (meaning_live._online_event). His calendar is chosen in one place, by where the add-on's own
-blocks are (FamilyGmail._his_feed). Nothing here writes Family. The event's own block carries its street address
+names it (meaning_live._online_event). His calendar is chosen in one place: the option, then the
+record, then where the add-on's own blocks are (FamilyGmail._his_feed). Nothing here writes Family. The event's own block carries its street address
 (after the place's name, when the map found it by name) or map point, and only that, so it opens
 in Maps; that place is ours, and it's compared with what was written,
 so it never makes the block look edited.
@@ -160,8 +160,12 @@ WAIT_NEAR = timedelta(hours=6)      # and never this near the event (NEAR_LATER 
 HIS_CALENDAR = "family_gmail_his_calendar"  # the calendar the add-on's own blocks are on (_his_feed)
 TWO_FEEDS = "family_gmail_two_feeds"        # the pair of calendars his notice was last sent for
 HIS_GONE = "family_gmail_his_gone"          # the calendar of his that isn't read, his notice sent for
+HIS_RETRY = "family_gmail_his_retry"        # reads his calendar has been missing while a feed failed its read
+HIS_RETRY_READS = 3                         # such reads waited quietly before the stand-down is said
 WAIT_COUNTS = "family_gmail_wait_counts"    # reads each drive leg has waited for its lookup (_drive_legs)
 RUN_REMOVED = "family_gmail_run_removed"    # a drive block taken off because a school run is that drive
+RUN_PENDING = "family_gmail_run_pending"    # those removals not yet named in a digest that was sent
+RUN_NAMED = "family_gmail_run_named"        # the removals the last composed digest named, and when
 _TITLE_RE = re.compile(r"[^\W_]+(?:[ '&()+,.-]+[^\W_]+)*[ )]*")
 
 
@@ -595,21 +599,54 @@ class FamilyGmail:
                                     self._dry_line()) if x)
 
     def _removed_line(self, since) -> str:
-        """Each drive block taken off since the last digest because a school run is that drive, once, by
-        its event's day and time (only times: nothing from the event itself)."""
+        """Each drive block taken off because a school run is that drive, by its event's day and time (only
+        times: nothing from the event itself), until a digest that named it has been sent: its record
+        (RUN_PENDING) is deleted only then (_settle_removed), so a digest held back or composed before the
+        removal never loses it, and one sent names it once."""
+        self._settle_removed()
         zone = ZoneInfo(self.tz)
-        out = []
-        for r in self.ledger.db.execute("SELECT detail FROM events WHERE kind=? AND at>=? ORDER BY id",
-                                        (RUN_REMOVED, iso(since) if since else "")):
+        out, named = [], []
+        for detail in self._pending_removed():
             try:
-                detail = json.loads(r["detail"])
                 t = datetime.fromisoformat(detail["event_start"]).astimezone(zone)
             except (ValueError, KeyError, TypeError):
                 continue
+            named.append(detail.get("id", ""))
             run = "pickup" if detail.get("which") == "back" else "drop-off"
             out.append(f"Blocks on Gmail from Family: removed the drive {detail.get('which', 'back')} for "
                        f"{t:%b} {t.day}, {t.hour % 12 or 12}:{t:%M}: the {run} is that drive.")
+        record = json.dumps({"at": iso(self.ledger.now()), "ids": named}) if named else ""
+        if record != (self.ledger.get_meta(RUN_NAMED) or ""):
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(RUN_NAMED, record, db)
         return " ".join(out)
+
+    def _pending_removed(self) -> list[dict]:
+        try:
+            kept = json.loads(self.ledger.get_meta(RUN_PENDING) or "[]")
+        except ValueError:
+            return []
+        return [x for x in kept if isinstance(x, dict)] if isinstance(kept, list) else []
+
+    def _settle_removed(self) -> None:
+        """The removal records the last composed digest named are deleted once that digest was sent (the
+        digest's own record, daily.deliver: last_digest_at at or after the compose, and not held silent).
+        A record added after that compose stays for the next one."""
+        try:
+            named = json.loads(self.ledger.get_meta(RUN_NAMED) or "{}")
+            at = datetime.fromisoformat(named["at"]) if named else None
+        except (ValueError, KeyError, TypeError):
+            named, at = {}, None
+        if at is None:
+            return
+        sent_at = self.ledger.meta_time("last_digest_at")
+        if sent_at is None or sent_at < at or self.ledger.get_meta("last_digest_sent") == "no":
+            return
+        ids = set(named.get("ids") or ())
+        left = [x for x in self._pending_removed() if x.get("id", "") not in ids]
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(RUN_PENDING, json.dumps(left) if left else "", db)
+            self.ledger.set_meta(RUN_NAMED, "", db)
 
     def _ask_line(self) -> str:
         """Titles come from Family, which anyone with it can write, so they're defanged. The digest
@@ -720,67 +757,121 @@ class FamilyGmail:
 
     def _his_feed(self):
         """His own Gmail calendar's feed as last read: (feed id, calendar_feed.FeedResult), or None.
-        Every reading of his calendar here goes through this one choice, by evidence first:
+        Every reading of his calendar here goes through this one choice, in this order:
           1. the his_calendar option, when set: that calendar, and no other;
-          2. the one feed read that holds the add-on's own blocks (the blocks its record says it wrote,
-             each with its private mark, found in the feed by their ids), which is kept as the record
-             (HIS_CALENDAR); never set from where it last wrote, so a wrong first choice can't feed itself;
-          3. the record, when no feed holds those blocks;
-          4. the one feed whose address is a Gmail address.
-        The option's calendar, or the recorded one, not read now is never left for another: none is his
-        at this read, the digest says so, and he gets one notice for it when another calendar is read
-        (_calendar_notice). Two Gmail addresses with nothing to choose by is a guess: none is his, nothing
-        that needs his calendar is done, the digest names both, and the log says so once per pair. When
-        one is chosen beside another that looks like his, the digest names both and the one in use."""
-        read = [(fid, res) for fid, res in self.calendar.snapshot.feeds.items() if res.window is not None]
+          2. the record (HIS_CALENDAR): the calendar the add-on's blocks were found on before;
+          3. with no record only, the one feed read that holds the add-on's own blocks (the blocks its
+             record says it wrote, each with its private mark, found in the feed by their ids), which then
+             becomes the record; two or more such feeds is a stand-down naming them all, never a pick;
+          4. with no record and no feed holding them, the one feed whose address is a Gmail address.
+        A feed holding the add-on's ids never overrides the option or the record. The option's calendar, or
+        the recorded one, not read now is never left for another: none is his at this read. When a
+        configured feed failed its read (it may be that one), the next reads wait quietly (HIS_RETRY_READS)
+        before the stand-down is said; one simply not among the calendars on the Harness page is said at
+        once (_calendar_notice). The record is never changed by a failed read. Two Gmail addresses with
+        nothing to choose by is a guess: none is his, nothing that needs his calendar is done, the digest
+        names both, and the log says so once per pair. A stand-down writes and removes nothing. When one is
+        chosen beside another that looks like his, the digest names both and the one in use."""
+        feeds = self.calendar.snapshot.feeds
+        read = [(fid, res) for fid, res in feeds.items() if res.window is not None]
         gmail = [(fid, res) for fid, res in read if res.window.calendar.casefold().endswith("@gmail.com")]
         names = tuple(sorted({res.window.calendar.casefold() for _, res in gmail}))
         self._two_feeds: tuple[str, ...] = ()
         self._in_use: tuple[tuple[str, ...], str, str] | None = None
         self._his_gone: tuple[str, str] = ("", "")
+        marked = self._marked_feeds(read)       # looked for at every read: its log line says what's seen
 
         def chosen(found, why: str):
             mine = found[1].window.calendar.casefold()
             others = tuple(sorted(set(names) | {mine}))
             if len(others) > 1:
                 self._in_use = (others, mine, why)
+            self._his_retry(None)
             return found
+
+        def gone(name: str, how: str):
+            # Not read now: a feed that failed this read may be it, so wait a few reads quietly first.
+            if self._his_retry(name) < HIS_RETRY_READS:
+                return None
+            self._his_gone = (name, how)
+            return None
 
         wanted = (self.his_fn() or "").strip().casefold()
         if wanted:
             same = [x for x in read if x[1].window.calendar.casefold() == wanted]
-            if same:
-                return chosen(same[0], "option")
-            self._his_gone = (wanted, "option")
-            return None
-        marked = self._marked_feeds(read)
+            return chosen(same[0], "option") if same else gone(wanted, "option")
         known = (self.ledger.get_meta(HIS_CALENDAR) or "").casefold()
-        if len(marked) == 1:
-            mine = marked[0][1].window.calendar
-            if mine.casefold() != known:
-                with self.ledger.tx() as db:   # where the add-on's own blocks are (never where it wrote last)
-                    self.ledger.set_meta(HIS_CALENDAR, mine, db)
-            return chosen(marked[0], "blocks")
         if known:
             same = [x for x in read if x[1].window.calendar.casefold() == known]
-            if same:
-                return chosen(same[0], "record")
-            self._his_gone = (known, "record")
+            if not same:
+                return gone(known, "record")
+            return chosen(same[0], "blocks" if any(fid == same[0][0] for fid, _ in marked) else "record")
+        if len(marked) > 1:
+            self._two_feeds = tuple(sorted({res.window.calendar.casefold() for _, res in marked}))
+            self._two_warn(self._two_feeds, "hold Harness's own blocks")
             return None
+        if len(marked) == 1:
+            mine = marked[0][1].window.calendar
+            with self.ledger.tx() as db:       # where the add-on's own blocks are, with no record before
+                self.ledger.set_meta(HIS_CALENDAR, mine, db)
+            return chosen(marked[0], "blocks")
         if len(gmail) > 1:
             self._two_feeds = names
-            warned = self.__dict__.setdefault("_two_feeds_warned", set())
-            if names not in warned:
-                warned.add(names)
-                log.warning("family to gmail: %d calendars read look like his Gmail calendar, so none is "
-                            "taken for his: nothing that needs his calendar is done until one is left",
-                            len(gmail))
+            self._two_warn(names, "look like his Gmail calendar")
             return None
+        if gmail:
+            self._his_retry(None)
         return gmail[0] if gmail else None
+
+    def _two_warn(self, names: tuple, why: str) -> None:
+        warned = self.__dict__.setdefault("_two_feeds_warned", set())
+        if names not in warned:
+            warned.add(names)
+            log.warning("family to gmail: %d calendars read %s, so none is taken for his: nothing that "
+                        "needs his calendar is done until one is left", len(names), why)
+
+    def _unread_feeds(self) -> bool:
+        """A calendar on the Harness page whose read failed (nothing read of it now): a fetch error, not a
+        calendar missing from the page."""
+        urls = getattr(self.calendar, "urls", None)
+        try:
+            configured = {calendar_feed.feed_id(u) for u in urls()} if callable(urls) else set()
+        except Exception:
+            return False
+        feeds = self.calendar.snapshot.feeds
+        return any(fid not in feeds or feeds[fid].window is None for fid in configured)
+
+    def _his_retry(self, name: str | None) -> int:
+        """Reads in a row his calendar (name) hasn't been read while a feed failed its read, this one
+        counted once (by the calendar's read generation); HIS_RETRY_READS when none failed (it's not on
+        the page: said at once). None: found, the count goes."""
+        if name is None:
+            if self.ledger.get_meta(HIS_RETRY):
+                with self.ledger.tx() as db:
+                    self.ledger.set_meta(HIS_RETRY, "", db)
+            return 0
+        if not self._unread_feeds():
+            return HIS_RETRY_READS
+        try:
+            kept = json.loads(self.ledger.get_meta(HIS_RETRY) or "{}")
+            kept = kept if isinstance(kept, dict) and kept.get("name") == name else {}
+        except ValueError:
+            kept = {}
+        gen = getattr(self.calendar, "generation", 0)
+        n = int(kept.get("n", 0) or 0)
+        if kept.get("gen") != gen:
+            n += 1
+            with self.ledger.tx() as db:
+                self.ledger.set_meta(HIS_RETRY, json.dumps({"name": name, "gen": gen, "n": n}), db)
+            if n < HIS_RETRY_READS:
+                log.info("family to gmail: your calendar isn't read now and a calendar's read failed; "
+                         "waiting for the next read (%d of %d)", n, HIS_RETRY_READS)
+        return n
 
     def _marked_feeds(self, read: list) -> list:
         """The feeds read that hold any block the add-on's record says it wrote (each carries its private
-        mark), found by its id: Google's iCal feed names an event "<id>@google.com"."""
+        mark), found by its id: Google's iCal feed names an event "<id>@google.com". The form the first
+        one found has is logged once, so that is seen on the device."""
         ids = {r["event_id"] for r in self.ledger.db.execute(
             "SELECT event_id FROM family_gmail WHERE state='live'").fetchall()}
         if not ids:
@@ -788,8 +879,16 @@ class FamilyGmail:
         out = []
         for fid, res in read:
             windows = [w for w in (res.window, res.ahead, getattr(res, "feed_ahead", None)) if w is not None]
-            if any(o.uid.removesuffix("@google.com") in ids for w in windows for o in w.occurrences):
-                out.append((fid, res))
+            hit = next((o.uid for w in windows for o in w.occurrences
+                        if o.uid.removesuffix("@google.com") in ids), None)
+            if hit is None:
+                continue
+            out.append((fid, res))
+            if not getattr(self, "_uid_form_logged", False):
+                self._uid_form_logged = True
+                base = hit.removesuffix("@google.com")
+                log.info("family to gmail: Harness's own blocks found in a calendar read, their ids in the "
+                         "form %s", "<id>" + hit[len(base):])
         return out
 
     def _calendar_notice(self) -> None:
@@ -2277,7 +2376,7 @@ class FamilyGmail:
         # across restarts: _wait_counts), is no longer a quiet wait: the digest names it, and it gets its
         # card. Others getting through meanwhile don't start its count again.
         still = {k for k, o in outcome.items() if o == WAITING}
-        counts = self._wait_counts(still, quiet)
+        counts = self._wait_counts(still, quiet, set(outcome), now)
         for k in still:
             n = counts.get(k, 0)
             key, start, _ = k
@@ -2309,11 +2408,13 @@ class FamilyGmail:
             self._drive_cards(cards, placed, trouble, unplaced, now, set(waiting))
         return out
 
-    def _wait_counts(self, still: set, quiet: bool) -> dict:
+    def _wait_counts(self, still: set, quiet: bool, seen: set = frozenset(), now: datetime | None = None) -> dict:
         """How many reads in a row each drive leg now waiting (by its event's key and start, and the leg)
         has waited for its lookup, this one counted, kept in the ledger (WAIT_COUNTS) so a restart doesn't
         start it again, and counted for each leg on its own, so others getting through never resets a
-        starved one. A leg not waiting now is forgotten. The dry run's preview (quiet) only reads them."""
+        starved one. An entry goes once its leg resolves (it has an outcome at this read other than
+        waiting: seen) or its event has started (now); a leg this read didn't reach keeps its count. The
+        dry run's preview (quiet) only reads them."""
         try:
             kept = json.loads(self.ledger.get_meta(WAIT_COUNTS) or "{}")
             kept = kept if isinstance(kept, dict) else {}
@@ -2326,8 +2427,20 @@ class FamilyGmail:
         if quiet:
             return {k: int(kept.get(name(k), 0) or 0) for k in still}
         counts = {k: int(kept.get(name(k), 0) or 0) + 1 for k in still}
-        stored = json.dumps({name(k): n for k, n in sorted(counts.items(), key=lambda kv: name(kv[0]))},
-                            sort_keys=True)
+        names = {name(k) for k in seen}
+        left: dict[str, int] = {}
+        for n, v in kept.items():
+            if n in names:
+                continue                   # resolved at this read, or waiting and counted below
+            try:
+                start, count = datetime.fromisoformat(n.rsplit("|", 2)[1]), int(v or 0)
+            except (ValueError, IndexError, TypeError):
+                continue
+            if now is not None and start <= now:
+                continue                   # its event has passed
+            left[n] = count
+        left.update({name(k): n for k, n in counts.items()})
+        stored = json.dumps(dict(sorted(left.items())), sort_keys=True) if left else "{}"
         if stored != (self.ledger.get_meta(WAIT_COUNTS) or "{}"):
             with self.ledger.tx() as db:
                 self.ledger.set_meta(WAIT_COUNTS, stored, db)
@@ -2784,10 +2897,13 @@ class FamilyGmail:
                     log.info("family to gmail: took off the %s block on %s: a school run is that drive",
                              row["title"], _at(self._when(row["start"]), ZoneInfo(self.tz)))
                     # And the next digest says so once (digest_line, RUN_REMOVED).
+                    detail = {"key": row["key"], "event_start": iso(self._run_covered[row["key"]]),
+                              "which": "back" if "drive back" in row["title"] else "there"}
+                    detail["id"] = f"{row['key']}|{row['generation']}|{detail['event_start']}"
+                    pending = [x for x in self._pending_removed() if x.get("id") != detail["id"]] + [detail]
                     with self.ledger.tx() as db:
-                        self.ledger.event(RUN_REMOVED, {
-                            "key": row["key"], "event_start": iso(self._run_covered[row["key"]]),
-                            "which": "back" if "drive back" in row["title"] else "there"}, db=db)
+                        self.ledger.event(RUN_REMOVED, detail, db=db)
+                        self.ledger.set_meta(RUN_PENDING, json.dumps(pending), db)
             elif out.kind == "changed":
                 self._set(row, "hands_off")
             else:
