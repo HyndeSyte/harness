@@ -626,11 +626,11 @@ export function heartbeatNotices(cfg: Config, h: Heartbeat | null): void {
 // heartbeat missing or not fresh there. Held, neither told nor seen clear, while the queue's fetch is failing
 // (fetchFails): the keeper's copy of the heartbeat is then old because of the outage, not the worker.
 // 0.12.2, fourth pass: a heartbeat is fresh for three heartbeat intervals (HEARTBEAT_FRESH_MS), not WORKER_QUIET_MS, and
-// a heartbeat at or after a job was queued (SKEW_MS allowed) means the worker started since: that job isn't waiting on a
+// a heartbeat after a job was queued (by more than SKEW_MS, fifth pass) means the worker started since: that job isn't waiting on a
 // worker that won't start. A condition held back, because the heartbeat before the job looked fresh (the worker may have
 // died right after it) or because the queue's fetch is failing, isn't dropped: it stays pending (quietPending, in the
 // notice file, so it survives a restart) until each of its jobs is acknowledged (claimed, so it has an attempt, whatever
-// result it then has, or a heartbeat at or after it was queued), or until QUIET_PENDING_MAX_MS from when it was first
+// result it then has, or a heartbeat more than SKEW_MS after it was queued), or until QUIET_PENDING_MAX_MS from when it was first
 // held (12 hours worst case, any queue hold included): then it is told, as worker_not_starting_unconfirmed while the
 // queue's fetch is failing, worker_not_starting otherwise. A told mark stays owed until the link acknowledges it (resent
 // each round with its saved id), never sent once and forgotten.
@@ -652,7 +652,9 @@ export function workerQuietNotice(cfg: Config, h: Heartbeat | null, jobs: Job[],
     if (j.state !== "pending" && !unclaimedExpiry) return null;
     return at - created >= bound ? at : null;
   };
-  const acked = (j: Job) => !!j.attempt || (Number.isFinite(heard) && heard + SKEW_MS >= Date.parse(j.created));
+  // 0.12.2, fifth pass: the clocks may differ by SKEW_MS either way, so a heartbeat counts as after the job was queued
+  // only when it is more than SKEW_MS after it; one within the margin, before or after, doesn't show the worker started.
+  const acked = (j: Job) => !!j.attempt || (Number.isFinite(heard) && heard - Date.parse(j.created) > SKEW_MS);
   const t = readTold(cfg);
   const held = !!t.fetchFails;
   // A start refusal is told by its own notice: nothing held for it here.

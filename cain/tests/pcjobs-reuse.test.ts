@@ -10,7 +10,7 @@ import { createHmac } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { parseHeartbeat, HEARTBEAT_INTERVAL_MS, jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
+import { parseHeartbeat, HEARTBEAT_INTERVAL_MS, SKEW_MS, jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
 import { ageWords, holdClearNotice, HOLD_CLEAR_KEY, SILENT_ROUNDS, cleared, linkNotify, noticeRound, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
 import * as keeper28 from "../rootfs/opt/cain/pcjobs/main.ts";
@@ -1872,6 +1872,36 @@ describe("0.12.2 review: a short job's worker-not-starting notice, held through 
     expect(sent).toEqual([]);
     run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("g", { state: "failed" })], at(T, 20 + 12 * 60)); });
     expect(sent).toEqual(["worker_not_starting"]);
+  });
+
+  test("fifth pass: a heartbeat within the clock skew margin of the job's queue time, either side, doesn't count as started", () => {
+    expect(SKEW_MS).toBe(2 * 60_000);
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const created = at(T, 5);
+    const short = (state = "pending") => ({ id: "s", state, attempt: null, created: created.toISOString(), expires: at(T, 20).toISOString() }) as any;
+    const beat = (offsetMs: number) => beatAt(new Date(created.getTime() + offsetMs));
+    const held = (offsetMs: number) => {
+      resetNoticeProcess();
+      const w = world();
+      w.first();
+      const sent: string[] = [];
+      const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+      // Held at the job's deadline (the worker's last heartbeat, before the job, still looked fresh).
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(T), [short()], at(T, 20)); });
+      expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending.jobs).toEqual(["s"]);
+      // Then the newest heartbeat, stamped by the PC's clock.
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, beat(offsetMs), [short("failed")], at(T, 21)); });
+      expect(sent).toEqual([]);
+      return JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending?.jobs ?? null;
+    };
+    // The PC's clock ahead: a heartbeat stamped 90 seconds after the queue time may have been sent before it. Still held.
+    expect(held(90_000)).toEqual(["s"]);
+    expect(held(SKEW_MS)).toEqual(["s"]);
+    // The PC's clock behind: one stamped a minute before the queue time doesn't count either. Still held.
+    expect(held(-60_000)).toEqual(["s"]);
+    expect(held(-SKEW_MS)).toEqual(["s"]);
+    // Past the margin after the queue time: the worker started since. The hold ends.
+    expect(held(SKEW_MS + 1_000)).toBeNull();
   });
 
   test("fourth pass: a queue outage longer than the cap is told as unconfirmed at 12 hours, and that notice stays owed until delivered", () => {

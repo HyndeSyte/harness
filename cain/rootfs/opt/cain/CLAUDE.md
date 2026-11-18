@@ -390,7 +390,7 @@ in the harness repo; until then the keeper says it is waiting).
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
-  `extra_extension` (another extension is on in the Cain jobs profile, Google Docs Offline included, a Chrome policy installs one, or the PC can't read an extension's settings or a policy: he runs check-host, which names it and the fix, and turns it off in that Chrome; a policy one stays until its policy stops naming it; the worker never changes his profile, and he starts that Chrome with worker.ts open-chrome so default apps stay off),
+  `extra_extension` (another extension is on in the Cain jobs profile, Google Docs Offline included, a Chrome policy installs one, or the PC can't read an extension's settings or a policy: he runs check-host, which names it and the fix, and turns it off in that Chrome; a policy one stays until its policy stops naming it; the worker never changes his profile, and he starts that Chrome with worker.ts open-chrome, which only stops default apps being installed: the refusal while one is on is the protection),
   `prefs_disagree` (Chrome's two preference files disagree about an extension: he
   restarts the Cain jobs Chrome),
   `unattended_unsupported` (his install file asks for unattended runs),
