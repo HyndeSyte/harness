@@ -1,13 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifySnapshot, canonical, fromBase64 } from "../shared/snapshot";
+import { cutCodePoints, signedBytes } from "../shared/canonical";
 import {
+  areaOf,
   buildSnapshot,
   firstSentence,
   isExcluded,
   makeKeyPair,
+  makePolicy,
+  markedPrivate,
+  parseTerms,
   openRows,
   privateKey,
   rawPublicKey,
@@ -16,9 +21,14 @@ import {
 } from "./lib";
 import { main } from "./index";
 
-const RECORD = join(import.meta.dir, "fixtures", "record");
+const FIX = join(import.meta.dir, "fixtures");
+const RECORD = join(FIX, "record");
+const TERMS = join(FIX, "private-terms.txt");
+const CONFIG = join(FIX, "exporter.json");
 const NOW = new Date("2026-11-18T12:00:00Z");
-const snap = buildSnapshot(RECORD, NOW);
+const policy = makePolicy(readFileSync(TERMS, "utf8"), JSON.parse(readFileSync(CONFIG, "utf8")));
+const built = buildSnapshot(RECORD, policy, NOW);
+const snap = built.snapshot;
 const byId = Object.fromEntries(snap.threads.map((t) => [t.id, t]));
 
 describe("the open list", () => {
@@ -36,6 +46,7 @@ describe("the open list", () => {
       expect(Object.keys(t).sort()).toEqual(
         ["area", "id", "last_moved", "outcome", "state", "step", "title", "waits_for", "who"].sort(),
       );
+    expect(Object.keys(snap).sort()).toEqual(["excluded_rows", "made_at", "skipped_rows", "threads", "version"]);
   });
 });
 
@@ -44,7 +55,7 @@ describe("who and state", () => {
     expect(byId.P40.who).toBe("a build job");
     expect(byId.P40.state).toBe("running");
   });
-  test("Dane is you, waiting on you", () => {
+  test("the owner (named in config) is you, waiting on you", () => {
     expect(byId.P41.who).toBe("you");
     expect(byId.P41.state).toBe("waiting on you");
   });
@@ -60,7 +71,7 @@ describe("who and state", () => {
     expect(byId.P44.who).toBe("at his PC");
     expect(byId.P44.state).toBe("at his PC");
   });
-  test("Cain's, waiting on Dane by its Waits for", () => {
+  test("Cain's, waiting on the owner by its Waits for", () => {
     expect(byId.P45.who).toBe("cain");
     expect(byId.P45.state).toBe("waiting on you");
   });
@@ -85,6 +96,16 @@ describe("fields", () => {
     expect(byId.P42.area).toBe("harness");
     expect(byId.P41.area).toBe("other");
   });
+  test("cuts count whole code points, never half an emoji", () => {
+    const emoji = "a".repeat(138) + "😀😀😀";
+    const cut = firstSentence(emoji, 140);
+    expect(Array.from(cut).length).toBe(140);
+    expect(cut).toBe("a".repeat(138) + "😀…");
+    expect(cut).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    const nonBmp = "𝄞".repeat(300);
+    expect(Array.from(cutCodePoints(nonBmp, 200)).length).toBe(200);
+    expect(cutCodePoints("𝄞𝄞", 2)).toBe("𝄞𝄞");
+  });
   test("title and step are first sentences, capped", () => {
     expect(byId.P40.title).toBe("Surface piece one for projects/surface.");
     const long = "word ".repeat(80) + ". Second.";
@@ -102,6 +123,7 @@ describe("fields", () => {
 });
 
 describe("exclusions", () => {
+  const p = policy;
   test("a money row and a health row never appear", () => {
     expect(byId.P46).toBeUndefined(); // budget
     expect(byId.P47).toBeUndefined(); // PT
@@ -112,12 +134,58 @@ describe("exclusions", () => {
   });
   test("whole words and prefixes, any case", () => {
     for (const t of ["MONEY", "Finances", "financial", "debts", "Banking", "budgeting", "healthcare", "therapist", "pt", "PT", "doctors", "medication", "medical", "diagnosis", "diagnosed"])
-      expect(isExcluded(t)).toBe(true);
-    for (const t of ["embankment", "spending time", "adept", "opt in", "the script"])
-      expect(isExcluded(t)).toBe(false);
+      expect(isExcluded(p, t)).toBe(true);
+    for (const t of ["embankment", "spending time", "adept", "opt in", "the script", "the current plan", "a parent"])
+      expect(isExcluded(p, t)).toBe(false);
+  });
+  test("the broadened money and health stems", () => {
+    for (const t of ["pay the plumber", "Payment due", "the invoice", "Taxes", "rent day", "a loan", "salary review", "car insurance", "a refund", "the doctor", "dentist visit", "a prescription", "therapy", "the clinic", "pharmacy run", "a diagnosis"])
+      expect(isExcluded(p, t)).toBe(true);
+  });
+  test("config adds stems; the defaults stay", () => {
+    expect(isExcluded(p, "call the lawyers")).toBe(true);
+    expect(isExcluded(makePolicy("x"), "call the lawyers")).toBe(false);
+    expect(isExcluded(makePolicy("x"), "the bank")).toBe(true);
   });
   test("a word in the id excludes the row", () => {
-    expect(isExcluded("PT3")).toBe(true);
+    expect(isExcluded(p, "PT3")).toBe(true);
+  });
+  test("a private term the stems miss leaves the row out whole", () => {
+    expect(isExcluded(makePolicy("nothing-here"), "Plan the visit for Juniper at the lake house.")).toBe(false);
+    expect(byId.P52).toBeUndefined();
+    expect(JSON.stringify(snap)).not.toMatch(/juniper|lake house|cabin/i);
+  });
+  test("terms are whole-word, any case, with re: for expressions and # for notes", () => {
+    const terms = parseTerms("# a note\nJuniper\nre:surprise\\w*\n\n  ");
+    expect(terms.length).toBe(2);
+    const q = makePolicy("Juniper\nre:surprise\\w*");
+    expect(isExcluded(q, "for JUNIPER")).toBe(true);
+    expect(isExcluded(q, "junipers")).toBe(false);
+    expect(isExcluded(q, "Surprises ahead")).toBe(true);
+    expect(isExcluded(q, "unsurprised")).toBe(false);
+  });
+  test("no terms, or a bad expression, is refused", () => {
+    expect(() => parseTerms("")).toThrow();
+    expect(() => parseTerms("# only notes\n\n")).toThrow();
+    expect(() => parseTerms("re:(")).toThrow();
+  });
+  test("the private marker is final", () => {
+    expect(byId.P53).toBeUndefined();
+    expect(JSON.stringify(snap)).not.toMatch(/winter coats/i);
+    expect(markedPrivate({ private: "yes" }, "| P9 | Plain |")).toBe(true);
+    expect(markedPrivate({ private: "" }, "| P9 | Plain |")).toBe(false);
+    expect(markedPrivate({}, "| P9 | Plain #PRIVATE |")).toBe(true);
+    expect(markedPrivate({}, "| P9 | not#private |")).toBe(false);
+  });
+  test("the snapshot counts what it leaves out and skips", () => {
+    // P46, P47, P50, P51 by stems, P52 by a term, P53 by the marker.
+    expect(snap.excluded_rows).toBe(6);
+    // The row with no id and the row with no valid time.
+    expect(snap.skipped_rows).toBe(2);
+    expect(built.warnings.length).toBe(2);
+    for (const w of built.warnings) expect(w).toMatch(/PENDING\.md:\d+: row skipped/);
+    expect(built.warnings[0]).toContain("PENDING.md:22:");
+    expect(built.warnings[1]).toContain("PENDING.md:23:");
   });
 });
 
@@ -137,6 +205,24 @@ describe("strippers", () => {
   test("nothing stripped leaks into the fixture snapshot", () => {
     const all = JSON.stringify(snap.threads.map(({ id, ...rest }) => rest));
     expect(all).not.toMatch(/https?:|@example|555|Elm Street|\bP4\d\b|\bQ7\b/);
+  });
+  test("identifiers are stripped from every exported field", () => {
+    const t = byId.P54;
+    expect(t).toBeDefined();
+    const { id, ...rest } = t;
+    expect(id).toBe("P54");
+    for (const [field, value] of Object.entries(rest)) {
+      const v = String(value);
+      expect([field, v]).not.toEqual([field, expect.stringMatching(/@|555|www\.|https?:|example\.com|Birch Lane|\bP41\b|\bQ12\b/)]);
+    }
+    expect(t.title).toContain("a phone number");
+    expect(t.step).toContain("another item");
+    expect(t.step).toContain("an email address");
+    expect(t.waits_for).toBe("A reply at an address");
+    expect(t.outcome).toContain("a link");
+    expect(t.outcome).toContain("another item");
+    expect(t.area).toBe("garden");
+    expect(areaOf("see projects/P41")).toBe("other");
   });
 });
 
@@ -174,11 +260,86 @@ describe("signature", () => {
     const dir = mkdtempSync(join(tmpdir(), "surface-"));
     expect(await main(["--keygen", dir])).toBe(0);
     const out = join(dir, "snap.json");
-    expect(await main(["--record", RECORD, "--out", out, "--key", join(dir, "surface.key")])).toBe(0);
+    const run = ["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG];
+    expect(await main([...run, "--out", out, "--key", join(dir, "surface.key")])).toBe(0);
     expect(await main(["--verify", out, "--pub", join(dir, "surface.pub")])).toBe(0);
     expect(await main(["--verify", out, "--pub", join(dir, "surface.pub.b64")])).toBe(0);
     const body = readFileSync(out, "utf8");
     writeFileSync(out, body.replace("Back up", "Back uP"));
     expect(await main(["--verify", out, "--pub", join(dir, "surface.pub")])).toBe(1);
+  });
+});
+
+describe("the command line fails closed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "surface-cli-"));
+  const key = join(dir, "surface.key");
+  const quiet = <T>(f: () => Promise<T>) => {
+    const err = console.error, log = console.log;
+    console.error = console.log = () => {};
+    return f().finally(() => ((console.error = err), (console.log = log)));
+  };
+  test("no terms file, a missing one or an empty one writes nothing", async () => {
+    await quiet(() => main(["--keygen", dir]));
+    const empty = join(dir, "empty.txt");
+    writeFileSync(empty, "# notes only\n\n");
+    for (const [i, terms] of [[], ["--private-terms", join(dir, "nope.txt")], ["--private-terms", empty]].entries()) {
+      const out = join(dir, `out${i}.json`);
+      expect(await quiet(() => main(["--record", RECORD, ...terms, "--out", out, "--key", key]))).not.toBe(0);
+      expect(existsSync(out)).toBe(false);
+    }
+  });
+  test("--strict refuses malformed rows and writes nothing", async () => {
+    const out = join(dir, "strict.json");
+    const code = await quiet(() =>
+      main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--strict", "--out", out, "--key", key]),
+    );
+    expect(code).not.toBe(0);
+    expect(existsSync(out)).toBe(false);
+  });
+  test("a malformed row warns with its path and row number", async () => {
+    const lines: string[] = [];
+    const err = console.error, log = console.log;
+    console.error = (m: string) => void lines.push(m);
+    console.log = () => {};
+    try {
+      await main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--out", join(dir, "w.json"), "--key", key]);
+    } finally {
+      console.error = err;
+      console.log = log;
+    }
+    expect(lines.filter((l) => /^warning: .*PENDING\.md:\d+: row skipped/.test(l)).length).toBe(2);
+    expect(lines.join("\n")).not.toContain("no valid time.");
+  });
+  test("a dry run writes nothing and needs no key", async () => {
+    const out: string[] = [];
+    const err = console.error, log = console.log;
+    console.log = (m: string) => void out.push(m);
+    console.error = () => {};
+    try {
+      expect(await main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--dry-run"])).toBe(0);
+    } finally {
+      console.error = err;
+      console.log = log;
+    }
+    const s = JSON.parse(out.join("\n"));
+    expect(s.sig).toBeUndefined();
+    expect(s.excluded_rows).toBe(6);
+  });
+});
+
+describe("one canonical form", () => {
+  test("signed bytes are the standard UTF-8 of the canonical JSON", () => {
+    const s = { version: 1, made_at: "x", threads: [{ title: "café 😀 𝄞 中 …" }], excluded_rows: 0, skipped_rows: 0 };
+    const text = canonical(s);
+    expect(Array.from(signedBytes(s as any))).toEqual(Array.from(Buffer.from(text, "utf8")));
+  });
+  test("the counts are signed", async () => {
+    const keys = makeKeyPair();
+    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const raw = rawPublicKey(keys.publicPem);
+    expect(await verifySnapshot(signed, raw)).toBe(true);
+    expect(await verifySnapshot({ ...signed, excluded_rows: 0 }, raw)).toBe(false);
+    const { skipped_rows, ...noCount } = signed;
+    expect(await verifySnapshot(noCount, raw)).toBe(false);
   });
 });

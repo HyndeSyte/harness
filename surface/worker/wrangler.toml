@@ -1,13 +1,15 @@
 # The surface's Worker (surface/README.md, Deploy). Not deployed yet: no account exists.
-# Cain fills in the KV namespace id and the public key when he sets it up. Both routes are
-# behind Cloudflare Access; the policy is in the README.
+# Cain fills in the KV namespace id and the variables below when he sets it up; the secrets go
+# in with `wrangler secret put`, never in this file. It runs as a route on the app's own Pages
+# hostname, behind Cloudflare Access; the policy is in the README.
 name = "surface-snapshot"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 workers_dev = false
 
-# The route sits on the app's own hostname, so the app reads /snapshot from where it is served.
-# routes = [{ pattern = "surface.example.com/snapshot", zone_name = "example.com" }]
+# The route sits on the app's own Pages hostname, so the app reads /snapshot from its own origin
+# (connect-src 'self', no CORS).
+# routes = [{ pattern = "<app hostname>/snapshot", zone_name = "<zone>" }]
 
 [[kv_namespaces]]
 binding = "SNAPSHOTS"
@@ -16,3 +18,12 @@ id = "REPLACE_WITH_KV_NAMESPACE_ID"
 [vars]
 # The exporter's Ed25519 public key, raw 32 bytes in base64 (bun run surface/export --keygen prints it).
 SNAPSHOT_PUBLIC_KEY = "REPLACE_WITH_PUBLIC_KEY_BASE64"
+# The Zero Trust team domain, like https://<team>.cloudflareaccess.com.
+ACCESS_TEAM_DOMAIN = "REPLACE_WITH_TEAM_DOMAIN"
+# The Access application's audience tag (AUD); comma-separated if more than one.
+ACCESS_AUD = "REPLACE_WITH_ACCESS_AUD"
+
+# Secrets, set with `wrangler secret put <NAME>` (never written here):
+#   OWNER_EMAIL          the one identity allowed to read
+#   PUBLISHER_CLIENT_ID  the exporter's service token Client ID
+#   PUBLISHER_TOKEN      the value the exporter sends in X-Surface-Publisher

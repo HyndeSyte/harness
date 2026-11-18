@@ -16,7 +16,7 @@ const threads = [
   thread("P3", { state: "at his PC", who: "at his PC", last_moved: "2026-11-15T12:00:00Z" }),
   thread("P4", { state: "moving", who: "a laptop session", last_moved: "2026-10-20T12:00:00Z" }),
 ];
-const loaded: Loaded = { ok: true, snapshot: { made_at: "2026-11-18T10:00:00Z", threads } };
+const loaded: Loaded = { ok: true, snapshot: { made_at: "2026-11-18T10:00:00Z", threads, hidden: 0 } };
 
 describe("In motion", () => {
   test("one row per state, in order, with its lines", () => {
@@ -54,5 +54,37 @@ describe("In motion", () => {
   test("an unverifiable snapshot is one line and nothing else", () => {
     const { container } = render(<Surface loaded={{ ok: false, reason: "unverified" }} now={now} talkUrl="x" />);
     expect(container.textContent).toBe("This snapshot could not be verified, so nothing is shown.");
+  });
+
+  test("an expired Access session is one line, Sign in again, that reloads the page", () => {
+    const reload = jest.fn();
+    const { container } = render(<Surface loaded={{ ok: false, reason: "signin" }} now={now} talkUrl="x" onReload={reload} />);
+    expect(container.textContent).toBe("Sign in again");
+    fireEvent.click(screen.getByText("Sign in again"));
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  test("an unknown who or state is a plain other label", () => {
+    const odd = thread("P9", { who: "other", state: "other" });
+    render(<Surface loaded={{ ok: true, snapshot: { made_at: "2026-11-18T10:00:00Z", threads: [odd], hidden: 0 } }} now={now} talkUrl="x" />);
+    expect(within(screen.getByTestId("row-P9")).getByTestId("state").textContent).toBe("other");
+    expect(screen.getByTestId("row-P9").textContent).toContain("Other · Step P9.");
+  });
+
+  test("items not shown are one line, only when there are some", () => {
+    render(<Surface loaded={{ ok: true, snapshot: { made_at: "2026-11-18T10:00:00Z", threads, hidden: 3 } }} now={now} talkUrl="x" />);
+    expect(screen.getByTestId("not-shown").textContent).toBe("3 items not shown");
+  });
+
+  test("no items-not-shown line when nothing is hidden", () => {
+    render(<Surface loaded={loaded} now={now} talkUrl="x" />);
+    expect(screen.queryByTestId("not-shown")).toBeNull();
+  });
+
+  test("a snapshot dated in the future is labelled, never a negative age", () => {
+    render(<Surface loaded={{ ok: true, snapshot: { made_at: "2026-11-18T13:00:00Z", threads, hidden: 0 } }} now={now} talkUrl="x" />);
+    const line = screen.getByTestId("state-line").textContent!;
+    expect(line).toBe("As of 1:00 PM, dated ahead of this device's clock");
+    expect(line).not.toMatch(/-\d/);
   });
 });

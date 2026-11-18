@@ -1,23 +1,53 @@
 import { readFileSync } from "fs";
 import { join } from "path";
-import { utf8 } from "../src/canonical";
+import { canonical, signedBytes } from "../../shared/canonical";
 import { check, loadSnapshot, sanitize, sortThreads, verify, type Thread } from "../src/snapshot";
 
 // Signed by the exporter itself (fixtures/make.ts), so this checks the two implementations agree.
 const raw = JSON.parse(readFileSync(join(__dirname, "fixtures/snapshot.json"), "utf8"));
+const vector = JSON.parse(readFileSync(join(__dirname, "fixtures/vector.json"), "utf8"));
 const pub = readFileSync(join(__dirname, "fixtures/snapshot.pub"), "utf8").trim();
 const clone = () => JSON.parse(JSON.stringify(raw));
-const fetchOf = (body: unknown, ok = true) => async () => ({ ok, json: async () => body });
+const fetchOf = (body: unknown, ok = true, over: Record<string, unknown> = {}) => async () => ({
+  ok,
+  status: ok ? 200 : 500,
+  type: "basic",
+  redirected: false,
+  json: async () => body,
+  ...over,
+});
 
 describe("the loader", () => {
   test("an exporter-signed snapshot verifies", () => {
     expect(verify(raw, pub)).toBe(true);
   });
 
-  test("loads and passes", async () => {
-    const loaded = await loadSnapshot("/snapshot.json", pub, fetchOf(raw));
+  test("loads and passes, with the signed counts as items not shown", async () => {
+    const loaded = await loadSnapshot("/snapshot", pub, fetchOf(raw));
     expect(loaded.ok).toBe(true);
-    if (loaded.ok) expect(loaded.snapshot.threads.length).toBe(raw.threads.length);
+    if (loaded.ok) {
+      expect(loaded.snapshot.threads.length).toBe(raw.threads.length);
+      expect(loaded.snapshot.hidden).toBe(raw.excluded_rows + raw.skipped_rows);
+    }
+  });
+
+  test("the signed counts can't be changed or left out", () => {
+    expect(verify({ ...clone(), excluded_rows: 0 }, pub)).toBe(false);
+    const s = clone();
+    delete s.skipped_rows;
+    expect(verify(s, pub)).toBe(false);
+  });
+
+  test("it reads the Worker's route without following redirects", async () => {
+    let seen: { url?: string; init?: RequestInit } = {};
+    const spy = async (url: string, init?: RequestInit) => {
+      seen = { url, init };
+      return fetchOf(raw)();
+    };
+    await loadSnapshot("/snapshot", pub, spy);
+    expect(seen.url).toBe("/snapshot");
+    expect(seen.init?.redirect).toBe("manual");
+    expect(seen.init?.credentials).toBe("same-origin");
   });
 
   test("one changed character fails", async () => {
@@ -46,10 +76,20 @@ describe("the loader", () => {
     expect(verify(s, pub)).toBe(false);
   });
 
-  test("a failed fetch or bad JSON is unreadable", async () => {
+  test("a server error or bad JSON is unreadable", async () => {
     expect(await loadSnapshot("/s", pub, fetchOf(raw, false))).toEqual({ ok: false, reason: "unreadable" });
-    const broken = async () => ({ ok: true, json: async () => { throw new Error("bad"); } });
+    const broken = fetchOf(raw, true, { json: async () => { throw new Error("bad"); } });
     expect(await loadSnapshot("/s", pub, broken)).toEqual({ ok: false, reason: "unreadable" });
+  });
+
+  test("a redirect or a blocked request (an expired Access session) asks to sign in again", async () => {
+    const signin = { ok: false, reason: "signin" };
+    expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { type: "opaqueredirect", status: 0 }))).toEqual(signin);
+    expect(await loadSnapshot("/s", pub, fetchOf(raw, true, { redirected: true }))).toEqual(signin);
+    expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { status: 302 }))).toEqual(signin);
+    expect(await loadSnapshot("/s", pub, fetchOf(raw, false, { status: 403 }))).toEqual(signin);
+    const blocked = async () => { throw new TypeError("Failed to fetch"); };
+    expect(await loadSnapshot("/s", pub, blocked)).toEqual(signin);
   });
 });
 
@@ -61,11 +101,20 @@ describe("unknown fields", () => {
   test("are dropped from each thread and from the snapshot", () => {
     const s = sanitize({ made_at: "2026-11-18T10:00:00Z", threads: [{ ...base, note: "drop me", nested: { a: 1 } }] });
     expect(Object.keys(s.threads[0]).sort()).toEqual(Object.keys(base).sort());
-    expect(Object.keys(s).sort()).toEqual(["made_at", "threads"]);
+    expect(Object.keys(s).sort()).toEqual(["hidden", "made_at", "threads"]);
+    expect(s.hidden).toBe(0);
   });
-  test("a thread with an unknown who or state is left out", () => {
+  test("an unknown who or state shows as other, never dropped", () => {
     const s = sanitize({ made_at: "x", threads: [{ ...base, who: "someone" }, { ...base, state: "urgent" }, base] });
+    expect(s.threads.length).toBe(3);
+    expect(s.threads[0].who).toBe("other");
+    expect(s.threads[1].state).toBe("other");
+    expect(s.hidden).toBe(0);
+  });
+  test("a thread that can't be drawn is dropped and counted with the signed counts", () => {
+    const s = sanitize({ made_at: "x", threads: [{ ...base, title: 3 }, null, base], excluded_rows: 2, skipped_rows: 1 });
     expect(s.threads.length).toBe(1);
+    expect(s.hidden).toBe(5);
   });
 });
 
@@ -90,9 +139,23 @@ describe("the sort", () => {
   });
 });
 
-describe("utf8", () => {
-  test("matches Node's encoder, ellipsis and emoji included", () => {
-    const text = "As of 9:14 … café \u{1F600} 中";
-    expect(Array.from(utf8(text))).toEqual(Array.from(Buffer.from(text, "utf8")));
+describe("one canonical form", () => {
+  test("the signed bytes are the standard UTF-8, ellipsis, emoji and non-BMP text included", () => {
+    const s = { version: 1, made_at: "x", threads: [{ t: "As of 9:14 … café \u{1F600} 𝄞 中" }], excluded_rows: 0, skipped_rows: 0 };
+    expect(Array.from(signedBytes(s))).toEqual(Array.from(Buffer.from(canonical(s), "utf8")));
+  });
+
+  test("a cross-runtime vector the exporter signed verifies here", () => {
+    expect(verify(vector, pub)).toBe(true);
+    const title: string = vector.threads[0].title;
+    expect(Array.from(title).length).toBe(140);
+    expect(title.endsWith("😀…")).toBe(true);
+    expect(vector.threads[0].step).toContain("𝄞");
+  });
+
+  test("one changed code point in the vector fails", () => {
+    const v = JSON.parse(JSON.stringify(vector));
+    v.threads[0].step = v.threads[0].step.replace("𝄞", "𝄢");
+    expect(verify(v, pub)).toBe(false);
   });
 });

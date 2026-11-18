@@ -12,6 +12,8 @@ const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? "" : "s"}`;
 // "moved <this>". Up to 14 days in figures; older, its age in words.
 export function relative(iso: string, now: Date): string {
   const ms = now.getTime() - Date.parse(iso);
+  // Dated ahead of this device's clock: labelled, never a negative age.
+  if (ms < -MINUTE) return "ahead of this device's clock";
   if (ms < MINUTE) return "just now";
   if (ms < HOUR) return plural(Math.floor(ms / MINUTE), "minute") + " ago";
   if (ms < DAY) return plural(Math.floor(ms / HOUR), "hour") + " ago";
@@ -43,6 +45,9 @@ function clock(d: Date, now: Date): string {
 export function stateLine(madeAt: string, now: Date): string {
   const made = new Date(madeAt);
   const age = now.getTime() - made.getTime();
+  // A snapshot dated in the future is labelled, never given a negative age. A minute of
+  // difference between clocks is ignored.
+  if (age < -MINUTE) return `As of ${clock(made, now)}, dated ahead of this device's clock`;
   if (age > STALE_AFTER) return `as of ${clock(made, now)}, ${plural(Math.floor(age / HOUR), "hour")} old`;
   return `As of ${clock(made, now)}`;
 }

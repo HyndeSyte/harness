@@ -1,21 +1,98 @@
 // The exporter: reads the record's open list and writes a surface-safe, signed snapshot.
 // Nothing here is written by an agent at display time: it only copies typed cells and
-// drops what must never leave the house.
+// drops what must never leave the house. It fails closed: no private terms, no snapshot.
 
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { signedBytes, toBase64, type Signed, type Snapshot, type State, type Thread, type Who } from "../shared/snapshot";
+import { cutCodePoints, signedBytes, toBase64 } from "../shared/canonical";
+import type { Signed, Snapshot, State, Thread, Who } from "../shared/snapshot";
 
 export const TITLE_MAX = 140;
 export const STEP_MAX = 200;
 
-// Rows that never leave the house. Whole words or prefixes, any case: "bank" also catches
-// "banking", and the stems catch "financial", "therapist", "medical", "diagnosed".
-const EXCLUDED = /\b(?:money|financ|debt|bank|budget|health|therap|pt|doctor|medic|diagnos)\w*/i;
+// --- the privacy policy -------------------------------------------------------------------
 
-export function isExcluded(...texts: (string | null | undefined)[]): boolean {
-  return texts.some((t) => !!t && EXCLUDED.test(t));
+// Generic stems that leave a row out whole. Each matches at the start of a word, any case:
+// "bank" also catches "banking", "therap" catches "therapist". The owner's config adds more
+// (exclude_stems); it can't take these away.
+export const DEFAULT_STEMS = [
+  "money", "financ", "debt", "bank", "budget", "pay", "invoice", "tax", "rent", "loan", "salar",
+  "insur", "refund", "health", "therap", "pt", "doctor", "dentist", "prescri", "clinic",
+  "pharmac", "medic", "diagnos",
+];
+
+// Who the owner is called in the record. The code knows only the role word; the owner's own
+// name comes from config (owner_names).
+export const DEFAULT_OWNER_NAMES = ["owner", "the owner"];
+
+export interface Policy {
+  terms: RegExp[];
+  stems: RegExp;
+  owners: string[];
+}
+
+export interface ExporterConfig {
+  owner_names?: string[];
+  exclude_stems?: string[];
+}
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Whole word, Unicode-aware: no letter, digit or underscore on either side.
+const wholeWord = (body: string) => new RegExp(`(?<![\\p{L}\\p{N}_])(?:${body})(?![\\p{L}\\p{N}_])`, "iu");
+
+// The owner's private terms file: one term a line, `re:` for a regular expression, `#` for a
+// note line. Every term matches case-insensitive and as a whole word. A file with no terms
+// is refused: the exporter fails closed rather than export with no list.
+export function parseTerms(text: string, where = "the private terms file"): RegExp[] {
+  const terms: RegExp[] = [];
+  text.replace(/\r\n/g, "\n").split("\n").forEach((line, i) => {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) return;
+    if (t.startsWith("re:")) {
+      const body = t.slice(3).trim();
+      if (!body) throw new Error(`${where}:${i + 1}: an empty re: term`);
+      try {
+        terms.push(wholeWord(body));
+      } catch {
+        throw new Error(`${where}:${i + 1}: not a valid regular expression`);
+      }
+    } else terms.push(wholeWord(escapeRe(t)));
+  });
+  if (!terms.length) throw new Error(`${where} has no terms, so nothing is exported`);
+  return terms;
+}
+
+const list = (v: unknown, name: string): string[] => {
+  if (v === undefined) return [];
+  if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) throw new Error(`config: ${name} must be a list of words`);
+  return (v as string[]).map((x) => x.trim()).filter(Boolean);
+};
+const envList = (v: string | undefined) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+
+// The config: a JSON file (--config) and/or SURFACE_OWNER_NAMES and SURFACE_EXCLUDE_STEMS
+// (comma-separated). Both add to the generic defaults.
+export function makePolicy(termsText: string, config: ExporterConfig = {}, env: Record<string, string | undefined> = {}): Policy {
+  const stems = [...DEFAULT_STEMS, ...list(config.exclude_stems, "exclude_stems"), ...envList(env.SURFACE_EXCLUDE_STEMS)];
+  const owners = [...DEFAULT_OWNER_NAMES, ...list(config.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)];
+  return {
+    terms: parseTerms(termsText),
+    stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map(escapeRe).join("|")})`, "iu"),
+    owners: owners.map((o) => o.toLowerCase()),
+  };
+}
+
+// The private marker: a `#private` tag anywhere in the row, or a Private column whose cell is
+// yes, y, true, x or private. It is final: such a row never exports.
+const PRIVATE_TAG = /(?<![\p{L}\p{N}_])#private(?![\p{L}\p{N}_])/iu;
+export function markedPrivate(cells: Record<string, string>, raw: string): boolean {
+  if (PRIVATE_TAG.test(raw)) return true;
+  const col = (cells["private"] ?? "").trim().toLowerCase();
+  return ["yes", "y", "true", "x", "private"].includes(col);
+}
+
+export function isExcluded(policy: Policy, ...texts: (string | null | undefined)[]): boolean {
+  return texts.some((t) => !!t && (policy.stems.test(t) || policy.terms.some((re) => re.test(t))));
 }
 
 // --- strippers ----------------------------------------------------------------------------
@@ -54,9 +131,7 @@ export function strip(text: string): string {
 export function firstSentence(text: string, max: number): string {
   const t = text.trim();
   const m = t.match(/^.*?[.!?](?=\s|$)/);
-  let s = (m ? m[0] : t).trim();
-  if (s.length > max) s = s.slice(0, max - 1).trimEnd() + "…";
-  return s;
+  return cutCodePoints((m ? m[0] : t).trim(), max);
 }
 
 function empty(cell: string | undefined): boolean {
@@ -87,25 +162,35 @@ function splitRow(line: string): string[] {
 
 const isSeparator = (cells: string[]) => cells.every((c) => /^:?-{2,}:?$/.test(c));
 
-// Every table in the text as a list of rows keyed by header name (lowercased).
-export function tables(text: string): Record<string, string>[][] {
-  const out: Record<string, string>[][] = [];
+export interface TableRow {
+  cells: Record<string, string>; // keyed by header name, lowercased
+  line: number; // 1-based line in the file
+  raw: string;
+}
+
+export interface Table {
+  header: string[];
+  rows: TableRow[];
+}
+
+// Every table in the text.
+export function tables(text: string): Table[] {
+  const out: Table[] = [];
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   let i = 0;
   while (i < lines.length) {
     if (lines[i].trim().startsWith("|") && i + 1 < lines.length && isSeparator(splitRow(lines[i + 1]))) {
       const header = splitRow(lines[i]).map((h) => h.toLowerCase());
-      const rows: Record<string, string>[] = [];
+      const rows: TableRow[] = [];
       i += 2;
       while (i < lines.length && lines[i].trim().startsWith("|")) {
         const cells = splitRow(lines[i]);
         const row: Record<string, string> = {};
         header.forEach((h, k) => (row[h] = cells[k] ?? ""));
-        rows.push(row);
+        rows.push({ cells: row, line: i + 1, raw: lines[i] });
         i++;
       }
-      out.push(rows.length ? rows : []);
-      (out[out.length - 1] as any).header = header;
+      out.push({ header, rows });
     } else i++;
   }
   return out;
@@ -121,23 +206,39 @@ export interface OpenRow {
   waits: string | null;
   done_when: string;
   since: string;
+  line: number;
+  cells: Record<string, string>;
+  raw: string;
 }
 
+const ID_RE = /^[A-Za-z]{1,3}\d+$/;
+
 // The open table: the first one carrying every open column (the Done table has a Done column instead).
-export function openRows(pending: string): OpenRow[] {
-  const t = tables(pending).find((rows) => OPEN_COLUMNS.every((c) => ((rows as any).header as string[]).includes(c)));
+export function openTable(pending: string): Table {
+  const t = tables(pending).find((tb) => OPEN_COLUMNS.every((c) => tb.header.includes(c)));
   if (!t) throw new Error("PENDING.md has no open table with columns " + OPEN_COLUMNS.join(", "));
-  return t
-    .filter((r) => /^[A-Za-z]{1,3}\d+$/.test(r["id"].trim()))
-    .map((r) => ({
-      id: r["id"].trim(),
-      item: r["item"],
-      who: r["who"].trim(),
-      next: r["next step"],
-      waits: empty(r["waits for"]) ? null : r["waits for"],
-      done_when: r["done when"],
-      since: r["since"].trim(),
-    }));
+  return t;
+}
+
+export function toOpenRow(r: TableRow): OpenRow {
+  const c = r.cells;
+  return {
+    id: c["id"].trim(),
+    item: c["item"],
+    who: c["who"].trim(),
+    next: c["next step"],
+    waits: empty(c["waits for"]) ? null : c["waits for"],
+    done_when: c["done when"],
+    since: c["since"].trim(),
+    line: r.line,
+    cells: c,
+    raw: r.raw,
+  };
+}
+
+// The open rows with a well-formed id (the others are reported by buildSnapshot).
+export function openRows(pending: string): OpenRow[] {
+  return openTable(pending).rows.filter((r) => ID_RE.test(r.cells["id"].trim())).map(toOpenRow);
 }
 
 // --- holds and notes ----------------------------------------------------------------------
@@ -163,7 +264,7 @@ function noteTimes(record: string, id: string): string[] {
   if (!existsSync(p)) return [];
   const times: string[] = [];
   for (const t of tables(readFileSync(p, "utf8")))
-    for (const r of t) if (r["when"]) times.push(r["when"].trim());
+    for (const r of t.rows) if (r.cells["when"]) times.push(r.cells["when"].trim());
   return times;
 }
 
@@ -175,59 +276,98 @@ function toTime(s: string | undefined): number | null {
 
 // --- one row to one thread ----------------------------------------------------------------
 
-const namesDane = (s: string | null) => !!s && /\bDane\b|\bDane's\b/i.test(s);
+const isOwner = (cell: string, owners: string[]) => owners.includes(cell.trim().toLowerCase());
+const namesOwner = (s: string | null, owners: string[]) =>
+  !!s && owners.some((o) => wholeWord(escapeRe(o) + "(?:'s)?").test(s));
 
-export function whoOf(row: OpenRow, hold: Hold | undefined): Who {
+export function whoOf(row: OpenRow, hold: Hold | undefined, owners: string[] = DEFAULT_OWNER_NAMES): Who {
   const cell = row.who.toLowerCase();
   if (hold?.job) return "a build job";
-  if (cell === "dane") return "you";
+  if (isOwner(cell, owners)) return "you";
   if (cell === "at his pc") return "at his PC";
   if (cell.startsWith("laptop") || hold?.holder?.startsWith("laptop:")) return "a laptop session";
   if (cell === "build") return "a build job";
   return "cain";
 }
 
-export function stateOf(row: OpenRow, hold: Hold | undefined): State {
+export function stateOf(row: OpenRow, hold: Hold | undefined, owners: string[] = DEFAULT_OWNER_NAMES): State {
   if (hold?.job) return "running";
-  if (row.who.toLowerCase() === "dane" || namesDane(row.waits)) return "waiting on you";
+  if (isOwner(row.who, owners) || namesOwner(row.waits, owners)) return "waiting on you";
   if (row.who.toLowerCase() === "at his pc") return "at his PC";
   return "moving";
 }
 
 export function areaOf(item: string): string {
   const m = item.match(/\bprojects\/([A-Za-z0-9][A-Za-z0-9_-]*)/);
-  return m ? m[1].toLowerCase() : "other";
+  if (!m) return "other";
+  // A folder name that is itself an identifier (a code, a number) is not shown.
+  if (strip(m[1]) !== m[1] || /^[a-z]{1,3}\d+$/i.test(m[1]) || /\d{3,}/.test(m[1])) return "other";
+  return m[1].toLowerCase();
 }
 
-export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[]): Thread | null {
-  if (isExcluded(row.id, row.item, row.next, row.waits, row.done_when)) return null;
-  const times = [toTime(row.since), ...notes.map(toTime), toTime(hold?.taken), toTime(hold?.renewed)].filter(
+// Every cell of a row, for the privacy checks: all columns, the id included.
+const allCells = (row: OpenRow) => [row.raw, ...Object.values(row.cells)];
+
+export type Outcome =
+  | { kind: "thread"; thread: Thread }
+  | { kind: "excluded" }
+  | { kind: "skipped"; reason: string };
+
+export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], policy: Policy): Outcome {
+  if (markedPrivate(row.cells, row.raw)) return { kind: "excluded" };
+  if (isExcluded(policy, ...allCells(row))) return { kind: "excluded" };
+  if (!ID_RE.test(row.id)) return { kind: "skipped", reason: "no valid id" };
+  const since = toTime(row.since);
+  if (since === null) return { kind: "skipped", reason: "no valid Since time" };
+  const times = [since, ...notes.map(toTime), toTime(hold?.taken), toTime(hold?.renewed)].filter(
     (t): t is number => t !== null,
   );
-  if (!times.length) return null;
   const waits = row.waits === null ? null : strip(row.waits) || null;
   return {
-    id: row.id,
-    title: firstSentence(strip(row.item), 140),
-    area: areaOf(row.item),
-    who: whoOf(row, hold),
-    step: firstSentence(strip(row.next), 200),
-    waits_for: waits,
-    outcome: strip(row.done_when),
-    last_moved: new Date(Math.max(...times)).toISOString(),
-    state: stateOf(row, hold),
+    kind: "thread",
+    thread: {
+      id: row.id,
+      title: firstSentence(strip(row.item), TITLE_MAX),
+      area: areaOf(row.item),
+      who: whoOf(row, hold, policy.owners),
+      step: firstSentence(strip(row.next), STEP_MAX),
+      waits_for: waits,
+      outcome: strip(row.done_when),
+      last_moved: new Date(Math.max(...times)).toISOString(),
+      state: stateOf(row, hold, policy.owners),
+    },
   };
 }
 
-export function buildSnapshot(record: string, now = new Date()): Signed {
-  const pending = readFileSync(join(record, "state", "PENDING.md"), "utf8");
+export interface Built {
+  snapshot: Signed;
+  // One line per malformed row: path and row number, never the row's text.
+  warnings: string[];
+}
+
+export function buildSnapshot(record: string, policy: Policy, now = new Date()): Built {
+  const path = join(record, "state", "PENDING.md");
+  const pending = readFileSync(path, "utf8");
   const holds = readHolds(record);
   const threads: Thread[] = [];
-  for (const row of openRows(pending)) {
-    const t = threadOf(row, holds[row.id], noteTimes(record, row.id));
-    if (t) threads.push(t);
+  const warnings: string[] = [];
+  let excluded = 0;
+  let skipped = 0;
+  for (const r of openTable(pending).rows) {
+    const row = toOpenRow(r);
+    const okId = ID_RE.test(row.id);
+    const out = threadOf(row, okId ? holds[row.id] : undefined, okId ? noteTimes(record, row.id) : [], policy);
+    if (out.kind === "thread") threads.push(out.thread);
+    else if (out.kind === "excluded") excluded++;
+    else {
+      skipped++;
+      warnings.push(`${path}:${row.line}: row skipped, ${out.reason}`);
+    }
   }
-  return { version: 1, made_at: now.toISOString(), threads };
+  return {
+    snapshot: { version: 1, made_at: now.toISOString(), threads, excluded_rows: excluded, skipped_rows: skipped },
+    warnings,
+  };
 }
 
 // --- keys and signatures ------------------------------------------------------------------

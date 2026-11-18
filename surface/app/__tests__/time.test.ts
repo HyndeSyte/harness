@@ -38,6 +38,11 @@ describe("the state line", () => {
   test("stale after six hours", () => {
     expect(stateLine("2026-11-18T05:00:00Z", now)).toBe("as of 5:00 AM, 7 hours old");
   });
+  test("in the future is labelled, never a negative age", () => {
+    expect(stateLine("2026-11-18T14:00:00Z", now)).toBe("As of 2:00 PM, dated ahead of this device's clock");
+    expect(stateLine("2026-11-18T12:00:30Z", now)).toBe("As of 12:00 PM");
+    expect(relative("2026-11-18T13:00:00Z", now)).toBe("ahead of this device's clock");
+  });
   test("another day names the day", () => {
     expect(stateLine("2026-11-17T23:00:00Z", now)).toBe("as of Tue, Nov 17, 11:00 PM, 13 hours old");
   });

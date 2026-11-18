@@ -9,6 +9,7 @@ const WHO_LABEL: Record<Who, string> = {
   "a build job": "A build job",
   "a laptop session": "A laptop session",
   "at his PC": "At his PC",
+  other: "Other",
 };
 
 // "Waits for The registrar's notice" reads as "Waits for the registrar's notice".

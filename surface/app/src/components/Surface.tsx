@@ -6,21 +6,38 @@ import { Row } from "./Row";
 
 // The skeleton every screen shares: the state line, Needs you, Next, the screen's own list,
 // and the talk bar. Needs you and Next are empty for now and draw nothing.
+// Reloads the whole page, so Cloudflare Access can sign the owner in again.
+function reloadPage() {
+  const loc = (globalThis as { location?: { reload(): void } }).location;
+  if (loc && typeof loc.reload === "function") loc.reload();
+}
+
 export function Surface({
   loaded,
   now,
   talkUrl,
   needsYou = [],
   next = [],
+  onReload = reloadPage,
 }: {
   loaded: Loaded | null;
   now: Date;
   talkUrl: string;
   needsYou?: Thread[];
   next?: Thread[];
+  onReload?: () => void;
 }) {
   const theme = useTheme();
   if (!loaded) return <View style={[styles.fill, { backgroundColor: theme.bg }]} />;
+  if (!loaded.ok && loaded.reason === "signin") {
+    return (
+      <View style={[styles.fill, styles.center, { backgroundColor: theme.bg }]}>
+        <Pressable accessibilityRole="button" onPress={onReload} testID="sign-in" style={[styles.signIn, { borderColor: theme.rule }]}>
+          <Text style={[styles.notice, { color: theme.text }]}>Sign in again</Text>
+        </Pressable>
+      </View>
+    );
+  }
   if (!loaded.ok) {
     return (
       <View style={[styles.fill, styles.center, { backgroundColor: theme.bg }]}>
@@ -56,10 +73,15 @@ export function Surface({
           ) : null}
           <Section title="In motion" color={theme.text} testID="in-motion">
             {snapshot.threads.length ? (
-              snapshot.threads.map((t) => <Row key={t.id} thread={t} now={now} theme={theme} />)
+              snapshot.threads.map((t, i) => <Row key={`${t.id}-${i}`} thread={t} now={now} theme={theme} />)
             ) : (
               <Text style={[styles.quiet, { color: theme.muted }]}>Nothing open.</Text>
             )}
+            {snapshot.hidden > 0 ? (
+              <Text style={[styles.quiet, { color: theme.muted }]} testID="not-shown">
+                {snapshot.hidden === 1 ? "1 item not shown" : `${snapshot.hidden} items not shown`}
+              </Text>
+            ) : null}
           </Section>
         </View>
       </ScrollView>
@@ -94,6 +116,7 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { alignItems: "center", justifyContent: "center", padding: 24 },
   notice: { fontSize: 15 },
+  signIn: { borderWidth: 1, borderRadius: 10, paddingVertical: 10, paddingHorizontal: 18 },
   scroll: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 24 },
   // Phone first; on a wide screen the same list sits in a readable column.
   column: { width: "100%", maxWidth: 640, alignSelf: "center" },

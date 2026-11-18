@@ -39,6 +39,13 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun install --frozen-lockfile --ignore-scripts
+      # The lockfile's expo, react, react-dom and react-native are one documented SDK 58 set
+      # (expo's own bundledNativeModules.json), checked offline.
+      - name: SDK 58 set
+        run: bun scripts/check-sdk.mjs
       - run: bun run typecheck
       - run: bun run test
       - run: bunx expo export --platform web
+      # No inline script (the content policy allows none) and the headers file Pages needs.
+      - name: Web export checks
+        run: bun scripts/check-dist.mjs
