@@ -1440,7 +1440,7 @@ describe("twenty-ninth review: every takeover moves the generation on, the quara
     r.reviews.list = [REVIEW];
     await expect(ship(r)).rejects.toThrow("state is unknown");
     // A quarantine cut off between its rename and its log entry: the card stays refused, with the restore.
-    const as = `${f}.quarantined-abcd1234`;
+    const as = `${f}.quarantined-pr5-abcd1234`;                                       // 0.12.2: the name carries the pull request
     renameSync29(f, as);
     const st = gateState(dir, 5) as any;
     expect(st.unknown).toContain(`mv -n ${as} ${f}`);

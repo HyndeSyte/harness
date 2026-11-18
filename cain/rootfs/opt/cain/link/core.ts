@@ -104,6 +104,8 @@ const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
 const HOUR = 3_600_000;
 const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts and checks, asked at once) before it says it couldn't read them
+// 0.12.2: the card's wait for the gate's head read ran out (an abort at its time limit), named as the gate's state unknown.
+export const GATE_HEAD_TIMED_OUT = "the read of the pull request's head from GitHub was stopped at its time limit (a timeout)";
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -128,8 +130,12 @@ export const PC_NOTICES: Record<string, string> = {
   reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
   hold_clear_unrecorded: "Your PC isn't taking jobs: its worker couldn't write its record of clearing a version hold (version-hold-cleared.json in the worker folder), so the hold stays. At the PC: free disk space or fix the worker folder's permissions so that file can be written, then start a run (pc-jobs.md, Troubleshooting).",
   worker_start_refused: "Your PC isn't taking jobs: its worker refused to start because a setting meant only for its tests is set where it runs (the PC_WORKER_TEST_BUILD variable, or a preload, require, import or loader flag in NODE_OPTIONS or BUN_OPTIONS, or a bunfig.toml preload). At the PC: remove it as the worker's own refusal says, open a new terminal, then start a run (pc-jobs.md, Troubleshooting).",
-  worker_not_starting: "Jobs are waiting for your PC, and its worker hasn't been heard from for hours. If it was started and nothing happened, a setting on the PC may be stopping it before it can start or say why, such as a preload in BUN_OPTIONS or NODE_OPTIONS set in Windows' environment settings. At the PC: follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  worker_not_starting: "Jobs are waiting for your PC, or one ran out of time waiting, and its worker hasn't been heard from while they waited. If it was started and nothing happened, a setting on the PC may be stopping it before it can start or say why, such as a preload in BUN_OPTIONS or NODE_OPTIONS set in Windows' environment settings. At the PC: follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  // 0.12.2, third pass: the same condition, seen in the keeper's copy while the queue couldn't be reached for hours.
+  worker_not_starting_unconfirmed: "Jobs have been waiting for your PC and its worker hasn't been heard from, but this isn't confirmed: your PC job keeper hasn't been able to read the PC job queue reliably for hours, so its copy of the PC's last check-in may just be old. If the worker was started and nothing happened, follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
   queue_unreachable: "Your PC job keeper hasn't been able to reach the PC job queue on GitHub for about half an hour, so new PC jobs wait and results don't come back. It keeps trying by itself. If it lasts, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  // 0.12.2: the same, raised again within a day of it clearing.
+  queue_unreachable_again: "Your PC job keeper can't reach the PC job queue on GitHub again, within a day of it coming back, so new PC jobs wait and results don't come back. It keeps trying by itself. If it keeps happening, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
   notice_undelivered: "Your PC job keeper had an earlier notice for you that could not be delivered, and after its update it can no longer say which one. If something about PC jobs seems stuck, see pc-jobs.md, Troubleshooting; Cain can read the keeper's log.",
 };
 export const PC_NOTICE_REPEAT = "Said again, in case it didn't reach you before:";
@@ -576,6 +582,9 @@ export interface Deps {
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
   gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
+  // 0.12.2: the pull request's head as the gate reads it (shipgate.ts gateHeadRead, through its curl wrapper), within ms:
+  // the head, or the gate's state unknown, named. Absent (the tests' rig): the facts' head is used, as before.
+  gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }>;
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
@@ -1505,13 +1514,24 @@ export class Link {
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
-    const { facts, checkRuns } = this.d;
-    const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
+    const { facts, checkRuns, gateHead } = this.d;
+    // 0.12.2: while an acceptance stands, the gate's head is read through the gate's own curl wrapper (gateHead), beside
+    // the facts; its wait running out is named as a timeout, and any read that doesn't give the head is the gate's state
+    // unknown, by name.
+    const gateRead = watched.length && gateHead
+      ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
+      : Promise.resolve(null);
+    const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    if (watched.length && gateHead) {
+      if (gh === null) throw new Refusal(`the Ship gate's state is unknown for this pull request: ${GATE_HEAD_TIMED_OUT}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (typeof gh !== "string") throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gh.unknown}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (gh !== head) throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    }
     // Twenty-fifth round: a watch's acceptance is consumed only against the pull request's head as GitHub has it now.
     // When one stands, a head that can't be read refuses the card (the acceptance can't be checked), never passes it.
-    if (watched.length && f?.head !== head)
+    if (watched.length && !gateHead && f?.head !== head)
       throw new Refusal("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it: show the card again in a minute");
     // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
     // the head (a squash or a rebase would leave it out). So the card asks main too, the way the
