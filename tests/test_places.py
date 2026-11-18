@@ -159,7 +159,7 @@ def test_a_presence_judged_at_home_takes_no_address(drives):
 
 
 def test_a_presence_judged_at_school_takes_the_street_address_in_its_location(drives):
-    """He still drives to school (0.24.1): the event's own street address, never a name looked up."""
+    """He still drives to school (0.24.1): the event's own street address, never the map by a name."""
     start = when(drives, days=3, hour=10)
     at(drives, "Class play", start, CLINIC, judged_place="school")
     go(drives)

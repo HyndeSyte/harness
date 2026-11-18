@@ -6,6 +6,10 @@
 - **An event you go to at school gets its drives** when its location has a street address (the school's name on one line and the address on the next included). Before, an event at school never got drives, and nothing said so.
 - **A drive block you deleted stays deleted,** and one that's already there isn't written again. If you put a drive on Gmail yourself, Harness doesn't add a second one beside it.
 - **A missing drive is never quiet.** An event you go to that's left without its drive blocks is named in the morning digest by its day and time, and in Harness's log by its title and day.
+- **No second drive block beside a school run.** When your school drop-off or pickup block starts or ends within 15 minutes of an event, that run is the drive: no "Busy (drive there)" or "Busy (drive back)" is added beside it. A drive Cain put on your calendar at your word counts as the drive too.
+- **No false "couldn't look up the drive" line** for a drive left off on purpose: one a school run or a drive already on your calendar covers, one you skipped, or one already behind you.
+- **Only a real drive of yours counts.** A test drive, a food drive, Google Drive or a driving lesson on your calendar doesn't stop a drive block, and neither does another drive that only brushes past it.
+- **An event at school with only the school's name** gets its address from your place book (never a map search, and no "where is" question for a room). One held online (Zoom, Google Meet, virtual) gets no drive.
 
 ## 0.24.0
 
