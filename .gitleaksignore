@@ -2,19 +2,4 @@
 # One gitleaks finding fingerprint a line (commit:file:rule:line, as the scan prints it), each
 # under a "#" line saying why it is not a secret: a test fixture, a public key, and the like.
 # A real secret is never listed here: it is revoked and replaced instead.
-# The first full-history run after this lands on main is triaged into it.
-# Cain 0.13.1 (the own-user build): made-up values its tests plant to check the scrub and the gate.
-# c1.test.ts: a test private key block the secret search must find (no real key).
-d47fd115f4cd6bd2e552ab7a7f5c68379dd804ab:cain/tests/c1.test.ts:private-key:164
-# image/in.sh: a fake GitHub token ("ghp_TESTONLY...") planted on a fake /data.
-e81adf07fcdb82eedf1d1c3254f9bce9d8bb9c2c:cain/tests/image/in.sh:github-pat:21
-# image/in.sh: a fake Gemini key ("AIzaTESTONLY...") planted on a fake /data.
-e81adf07fcdb82eedf1d1c3254f9bce9d8bb9c2c:cain/tests/image/in.sh:gcp-api-key:22
-# test_c1_transition.py: the sha256 of a released source file, not a token.
-d5b0b6dfb422f2b4c37f4a0a17779fdc1127d956:tests/test_c1_transition.py:discord-api-token:25
-# owner-gate.test.ts: the WebSocket RFC 6455 sample nonce ("the sample nonce" in base64).
-ac6bbfe3bc989089cf59c031360bec57a91eb97d:cain/tests/owner-gate.test.ts:generic-api-key:204
-# test_watch.py: an HMAC test vector of "not-a-real-token.cross-language-vector".
-cb2e92b6d9d8fb850c87efba4149d83364b16fe1:tests/test_watch.py:generic-api-key:501
-# review.test.ts: a stand-in key for the review seats' tests ("test-key-...").
-91458797b0d51400404db57e0f8a57045639b099:cain/tests/review.test.ts:generic-api-key:391
+# Empty for now. The first full-history run after this lands on main is triaged into it.
