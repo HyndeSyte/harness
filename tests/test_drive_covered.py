@@ -44,10 +44,15 @@ def drive_blocks(rig):
     return [b for b in blocks(rig) if b[0].startswith(("Busy (drive", "Maybe busy (drive"))]
 
 
+def outcomes(rig):
+    """Each leg's outcome at the last read, by (event key, leg): the tests' events don't repeat."""
+    return {(k, w): o for (k, _, w), o in rig.gm._leg_outcomes.items()}
+
+
 def assert_quiet(rig, cards_before=0):
     """No leg reported failed, no digest line about a missing drive, and no card for one."""
-    outcomes = rig.gm._leg_outcomes
-    assert LEG_FAILED not in outcomes.values(), outcomes
+    got = outcomes(rig)
+    assert LEG_FAILED not in got.values(), got
     note = rig.gm.digest_line() or ""
     assert "couldn't look up" not in note and "drive block is missing" not in note, note
     assert len(drive_cards_sent(rig)) == cards_before
@@ -101,6 +106,11 @@ def tomorrow(drives, monkeypatch):
     assert ("Busy (school pickup)", start + 60 * M, start + 105 * M, "") in blocks(drives)
     assert not drive_blocks(drives)
     monkeypatch.setattr(drive, "street_address", real)
+    # 0.24.0 never asked about this event: what this build's reads under the old parse said (no address,
+    # and no school address set here) is cleared, as it never happened.
+    with drives.ledger.tx() as db:
+        db.execute("DELETE FROM drive_cards")
+    drives.bot.sent.clear()
     drives.start = start
     return drives
 
@@ -113,8 +123,8 @@ def test_tomorrow_sets_the_address_and_writes_no_drive_beside_the_pickup_or_his_
     assert ("Busy (family)", start, start + 60 * M, SCHOOL) in blocks(tomorrow)    # the address, once
     assert not drive_blocks(tomorrow)                                              # no drive there or back
     assert len(tomorrow.google.writes()) == before + 1                             # the address and nothing else
-    key = next(k for (k, w), o in tomorrow.gm._leg_outcomes.items() if w == "back" and o == COVERED)
-    assert tomorrow.gm._leg_outcomes[(key, "there")] == COVERED                    # his drive on Gmail
+    key = next(k for (k, w), o in outcomes(tomorrow).items() if w == "back" and o == COVERED)
+    assert outcomes(tomorrow)[(key, "there")] == COVERED                    # his drive on Gmail
     assert_quiet(tomorrow)
     assert not [r for r in caplog.records if "no drive blocks for" in r.getMessage()]
     said = [r.getMessage() for r in caplog.records if "no drive " in r.getMessage()]
@@ -158,7 +168,7 @@ def test_a_drop_off_ending_as_an_event_starts_is_its_drive_there(drives):
     go(drives)
     assert [b[0] for b in drive_blocks(drives)] == ["Busy (drive back)"]
     assert ("Busy (drive back)", start + 60 * M, start + 90 * M, "") in blocks(drives)
-    there = [o for (k, w), o in drives.gm._leg_outcomes.items() if w == "there"]
+    there = [o for (k, w), o in outcomes(drives).items() if w == "there"]
     assert there == [COVERED]
     assert_quiet(drives)
 
@@ -186,7 +196,8 @@ def test_the_school_run_rule(which, run_start, run_end, leg, cover):
     at = lambda m: day + timedelta(minutes=m)
     event = family_gmail.Want("e", "Busy (family)", at(14 * 60), at(15 * 60))
     run = family_gmail.Want("r", "Busy (school pickup)", at(run_start), at(run_end))
-    assert family_gmail._run_covers(which, event, at(leg[0]), at(leg[1]), [run]) is cover
+    assert family_gmail._run_covers(which, event, at(leg[0]), at(leg[1]), [run], True) is cover
+    assert family_gmail._run_covers(which, event, at(leg[0]), at(leg[1]), [run], False) is False   # not at school
 
 
 # -- every leg's outcome: only one with none is a failure ------------------------------------------
@@ -207,8 +218,8 @@ def test_a_skipped_event_never_enters_the_days_and_its_legs_are_skipped(drives):
     go(drives)
     go(drives)
     assert drive_blocks(drives) == []
-    assert drives.gm._leg_outcomes[(key, "there")] == SKIPPED
-    assert drives.gm._leg_outcomes[(key, "back")] == SKIPPED
+    assert outcomes(drives)[(key, "there")] == SKIPPED
+    assert outcomes(drives)[(key, "back")] == SKIPPED
     assert_quiet(drives)
 
 
@@ -223,7 +234,7 @@ def test_a_skipped_last_event_of_the_day_leaves_the_one_before_its_drive_home(dr
     go(drives)
     assert drive_blocks(drives) == [("Busy (drive there)", a - 30 * M, a, ""),
                                     ("Busy (drive back)", a + 60 * M, a + 90 * M, "")]
-    assert drives.gm._leg_outcomes[(key, "back")] == SKIPPED
+    assert outcomes(drives)[(key, "back")] == SKIPPED
     assert_quiet(drives)
 
 
@@ -244,8 +255,7 @@ def test_a_chained_pair_ending_the_day_is_not_a_failure(drives):
     go(drives)
     go(drives)
     assert [x[0] for x in drive_blocks(drives)] == ["Busy (drive there)", "Busy (drive there)", "Busy (drive back)"]
-    outcomes = drives.gm._leg_outcomes
-    assert sorted(outcomes.values()) == sorted([COMPUTED, COVERED, COMPUTED, COMPUTED])
+    assert sorted(outcomes(drives).values()) == sorted([COMPUTED, COVERED, COMPUTED, COMPUTED])
     assert_quiet(drives)
 
 
@@ -348,17 +358,20 @@ def test_at_school_with_a_room_name_not_in_the_book_asks_nothing(drives):
     assert blocks(drives) == [("Busy (family)", start, start + 60 * M, "")]
     assert not [u for u in drives.maps.urls if urlsplit(u).hostname == drive.GEOCODE_HOST]
     assert not drives.ledger.db.execute("SELECT 1 FROM place_asks").fetchall()
+    # No school address in the settings either: named, never quiet (0.24.1, third round).
+    assert "couldn't find a drive to the event at" in (drives.gm.digest_line() or "")
 
 
 @pytest.mark.parametrize("title,extra", [
     ("Online parent conference", ()),
     ("Parent conference (virtual)", ()),
+    # With no place in its location, the description says (0.24.1, third round: beside a place it doesn't).
     ("Parent conference", ("DESCRIPTION:Join on Zoom: the link is in the newsletter",)),
     ("Parent conference", ("DESCRIPTION:We'll meet on Google Meet",)),
 ])
 def test_at_school_online_gets_no_drive(drives, title, extra):
     start = when(drives, days=2, hour=14)
-    at_school(drives, title, start, extra=extra)
+    at_school(drives, title, start, location=LOCATION if not extra else "", extra=extra)
     go(drives)
     go(drives)
     assert drive_blocks(drives) == []

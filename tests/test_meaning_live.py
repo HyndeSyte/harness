@@ -2399,7 +2399,9 @@ def test_lookups_go_soonest_first_and_a_near_one_still_waiting_is_named(drives, 
     mine(drives, "Quick one", near, "77 Elm St, Town, VA")
     go(drives)
     local = near.astimezone(NY)
-    assert f"couldn't look up the drive for the event at {local:%b} {local.day}, 6:00" in drives.gm.digest_line()
+    # The 5:00 visit's drive back waits on the same lookup (home or straight on), so it's named with it.
+    assert (f"couldn't look up the drive for the events at {local:%b} {local.day}, 5:00; "
+            f"{local:%b} {local.day}, 6:00") in drives.gm.digest_line()
     far = starts[-1].astimezone(NY)
     assert f"{far:%b} {far.day}, 10:00" not in drives.gm.digest_line()
 

@@ -35,8 +35,10 @@ turns them into his calendar and lets him correct it, all model-free:
     or not the judgment named the place, unless it was judged to be at home. A place none of
     them knows gets one card asking him where it is. Judged to be at school (a school play, a
     class visit), a street address in the event's own location places it, else his place book
-    by the location's name: no map or question for a classroom's name. One held online (its
-    title or description says online, virtual, Zoom or Meet) gets no drive.
+    by the location's name, else the school's own address the school runs drive to: no map
+    or question for a classroom's name. One held online (its title says online, virtual, Zoom
+    or Google Meet, or its location is a link or says so, or, with no location, its
+    description does) gets no drive, wherever it is.
 """
 from __future__ import annotations
 
@@ -50,7 +52,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import caldav, choices, drive, drive_cards, family_rules, meaning, places, render
+from . import choices, drive_cards, family_rules, ical, meaning, places, render
 from .family_gmail import DROP_TITLE, PICK_TITLE, Want, _is_real, _key
 from .ledger import Ledger, iso
 
@@ -178,21 +180,36 @@ def _occ_id(occ) -> str:
     return f"{occ.uid}|{occ.instance}"
 
 
-# An event at school held online: its title or description says so. "Meet" alone is a school's own word
-# ("Meet the teacher"), so only Google Meet, its link, or "on Meet" / "via Meet" count.
-_ONLINE_WORDS = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet|(?:on|via|over)\s+meet|meet\s+link)\b"
-                           r"|zoom\.us/|meet\.google\.com", re.I)
+# An event held online. Its title says so (online, virtual, Zoom, Google Meet), or its location is a link
+# or says so; with no location at all, its description may say so. A Meet link or "virtual option" in the
+# description of an event with a place (a room, a street) doesn't make it online: schools' conferences and
+# assemblies carry an auto-attached Meet link. "Meet" alone is a school's own word ("Meet the teacher").
+_ONLINE_TITLE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet)\b", re.I)
+_ONLINE_PLACE = re.compile(r"\b(?:online|virtual(?:ly)?|zoom|google\s+meet)\b|zoom\.us/|meet\.google\.com", re.I)
+_LINK = re.compile(r"\s*(?:https?://|www\.)\S+\s*", re.I)
+
+
+def _descriptions(item) -> list[str]:
+    """The event's DESCRIPTION, as the calendar parser reads it: unfolded and unescaped."""
+    out = []
+    for line in ical.unfold(item.data or ""):
+        prop = ical.parse_line(line)
+        if prop is not None and prop.name == "DESCRIPTION":
+            out.append(ical.unescape(prop.value))
+    return out
 
 
 def _online_event(item) -> bool:
-    """An event (caldav.Item) whose title or description says it's online, virtual, on Zoom or Meet."""
-    if _ONLINE_WORDS.search(item.occ.summary or ""):
+    """An event (caldav.Item) held online (_ONLINE_TITLE, _ONLINE_PLACE)."""
+    if _ONLINE_TITLE.search(item.occ.summary or ""):
         return True
+    location = (item.occ.location or "").strip()
+    if location:
+        return bool(_LINK.fullmatch(location) or _ONLINE_PLACE.search(location))
     try:
-        notes = [x for x in caldav.details(item.data or "") if x.upper().startswith("DESCRIPTION")]
+        return any(_ONLINE_PLACE.search(x) for x in _descriptions(item))
     except Exception:
         return False
-    return any(_ONLINE_WORDS.search(x.replace("\\n", " ").replace("\\,", ",")) for x in notes)
 
 
 # Where a presence block is held, as judged: at home, the event's location isn't where he goes.
@@ -283,6 +300,7 @@ class MeaningLive:
         # Events he goes to whose place nothing could find, at the last read: key -> (start, said,
         # why), why being drive_cards.PLACE (the place book asks) or drive_cards.FAILED.
         self.unplaced: dict[str, tuple[datetime, str, str]] = {}
+        self.online: dict[str, datetime] = {}   # events held online at the last read: key -> start
 
     def bind(self, owner: int) -> None:
         self.chat_id = owner
@@ -320,9 +338,10 @@ class MeaningLive:
                     else datetime.combine(o.occ.start, time(), zone) for o in ev.occurrences),
                    default=datetime.max.replace(tzinfo=zone))
 
-    def wants(self, items, now: datetime, *, find=None) -> dict[str, Want]:
+    def wants(self, items, now: datetime, *, find=None, school: str = "") -> dict[str, Want]:
         """From the judgments alone, with no model: the same judgment and the same Family give
-        the same wants. The usual skips first (his copies, holds, his own name)."""
+        the same wants. The usual skips first (his copies, holds, his own name). school: the
+        school's street address the school runs drive to, for an event at school with no other."""
         evs = meaning.events_of(items, self.tz, self.name_fn())
         examples = {e.id: e for e in meaning.active_examples(self.ledger)}
         answers = self._answers()
@@ -332,6 +351,7 @@ class MeaningLive:
         seen: set = set()
         self.places.begin()
         self.unplaced = {}
+        self.online = {}
         self.unjudged = []
         none: dict[str, tuple[datetime, str, str]] = {}
         # Soonest first, so the map's allowance for this read goes to the nearest places.
@@ -374,14 +394,19 @@ class MeaningLive:
                     place = "school" if run in ("drop", "pick") else _place(j, b.type)
                     where = ""
                     legs = not any(x.type == "transport" for x in blocks)
-                    if b.type == "presence" and place == "school" and _online_event(item):
-                        legs = False               # at school online (a Zoom conference): no drive
+                    if b.type == "presence" and place != "home" and legs and _online_event(item):
+                        legs = False               # held online (a Zoom conference): no drive
+                        self.online[key] = b.start
                     elif b.type == "presence" and place == "school":
                         # At school: he still drives there. The event's own street address, when it
                         # has one ("EarthSong Community School" then the street on the next line),
-                        # else his place book by the location's name; never the map, and no "where
-                        # is" card for a room's name.
+                        # else his place book by the location's name, else the school's own address
+                        # the school runs drive to; never the map, and no "where is" card for a room's
+                        # name. With no school address either, no drive, and the digest says so.
                         where, _ = self.places.resolve(occ.location)
+                        where = where or school
+                        if not where and legs:
+                            self.unplaced[key] = (b.start, meaning.shown(occ.summary), drive_cards.NO_ADDRESS)
                     elif b.type == "presence" and place not in NOT_THERE:
                         # The event's own location, whether or not the judgment named it: a
                         # street address in it, else his place book, else the map by its name
