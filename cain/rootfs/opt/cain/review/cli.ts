@@ -11,9 +11,9 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readStop, stoppedWhy } from "../stop.ts";
-import { FINAL, LABEL, SEATS, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
+import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
-import { existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
+import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 
 const cfg = configFromEnv();
 const usefulFile = process.env.REVIEW_USEFUL ?? join(dirname(cfg.spendFile), "review-useful.jsonl");
@@ -50,8 +50,19 @@ switch (cmd) {
     // again before every call.
     const g = privacyCheck(b, terms());
     if (!g.ok) fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
+    // A seat whose monthly cap is reached runs nothing until the month turns (the runner
+    // checks before every call). A review whose seats are all there is refused here, at once,
+    // and nothing is left (Cain 0.13.0, read here from the spend file his group may read).
+    let ledger: Ledger = {};
+    try { ledger = JSON.parse(readFileSync(cfg.spendFile, "utf8")); } catch { /* none yet */ }
+    const month = new Date().toLocaleDateString("en-CA", { timeZone: cfg.tz }).slice(0, 7);
+    const seats = new Set(newReview(b, new Date()).seats.map((s) => s.seat));
+    const capped = [...seats].filter((s) => atCap(ledger, month, cfg.caps, s));
+    if (capped.length && capped.length === seats.size)
+      fail(`blocked: the monthly cap is reached for ${capped.map((s) => LABEL[s]).join(", ")}. Nothing was queued; raise the cap in the App's options if wanted, or wait for the month to turn.`, 3);
     leave(b);
     out(b.id);
+    if (capped.length) console.error(`Queued, but ${capped.map((s) => LABEL[s]).join(", ")} won't run: its monthly cap is reached.`);
     // While stopped it's queued all the same, and nothing goes out until he turns it back on.
     const st = readStop();
     if (st.stopped) console.error(`Queued, not sent: ${stoppedWhy(st, "no review is sent")} It goes out by itself once he does.`);

@@ -331,6 +331,34 @@ CREATE TABLE IF NOT EXISTS place_asks(
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS drive_cards(
+  key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  said TEXT NOT NULL,
+  start TEXT NOT NULL,
+  receipt TEXT NOT NULL,
+  what TEXT NOT NULL,
+  rid TEXT NOT NULL,
+  ask TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  aid TEXT NOT NULL,
+  fails INTEGER NOT NULL,
+  uid TEXT NOT NULL DEFAULT '',
+  until TEXT NOT NULL DEFAULT '',
+  place TEXT NOT NULL DEFAULT '',
+  wait_since TEXT NOT NULL DEFAULT '',
+  inst TEXT NOT NULL DEFAULT '',
+  missed INTEGER NOT NULL DEFAULT 0,
+  missed_read TEXT NOT NULL DEFAULT '',
+  shown TEXT NOT NULL DEFAULT '',
+  hold TEXT NOT NULL DEFAULT '',
+  bid TEXT NOT NULL DEFAULT '',
+  conflict TEXT NOT NULL DEFAULT '',
+  listed TEXT NOT NULL DEFAULT '',
+  approved_at TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS family_gmail(
   key TEXT PRIMARY KEY,
   event_id TEXT NOT NULL,

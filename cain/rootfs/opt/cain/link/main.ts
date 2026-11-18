@@ -27,6 +27,8 @@
 //     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read);
 //                                       with no DM id yet, it asks Discord for it first, for 0.8 s at most
 //     POST /check {text, reply_to?, edit?}  what the gate does with a reply or edit, sending nothing
+//     POST /reply {text, reply_to?}    a reply of Cain's with a link (keeper.sh reply): the gate's rules, then posted
+//                                       with its preview off and recorded as his own reply (0.13.0, second round)
 //     POST /sent {tool, ids, question, call, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
@@ -60,12 +62,14 @@ import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, TRUST_DIR, writeStop } from "../stop";
+import { KEEPER_SENT, noteAt } from "../gate/held";
+import { readHosts } from "../gate/hosts";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { Link, Protocol, PULL, type Pull, type State } from "./core";
+import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
-import { gateState, WATCH_DIR } from "./shipgate";
+import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
@@ -132,7 +136,9 @@ async function rest(method: string, path: string, body?: unknown, auth = true, t
     redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
-  if (r.status >= 400) throw new Error(`discord ${r.status}: ${String(data?.message ?? "").slice(0, 100)}`);
+  // With the names of the fields Discord refused (never their values): a 400 that names flags is the
+  // only one the link sends again, without its added preview flag (core.ts quiet, third round).
+  if (r.status >= 400) throw new Error(discordError(r.status, data));
   return data;
 }
 
@@ -225,9 +231,16 @@ const link = new Link({
   // service's lines (/data/trust/reviewed.json), for a review of that head.
   checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
   gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
+  // 0.12.2: while a watch's acceptance stands, the card reads the gate's head through the gate's own curl wrapper
+  // (shipgate.ts gateHeadRead: curl's version read anew each time, killed at its limit, a timeout named), never fetch.
+  // It is authenticated when SHIP_GATE_GITHUB_TOKEN is set, the recommended default (without it these reads share
+  // GitHub's 60 an hour from this address with every watch).
+  gateHead: (pr, ms) => { const p = pullOf(pr); return p ? gateHeadRead(p.repo, p.pr, { ms: Math.max(1_000, ms - 500) }) : Promise.resolve({ unknown: "that isn't a pull request's address" }); },
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
+  linkHosts: () => readHosts(),
+  keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),

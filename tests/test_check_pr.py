@@ -299,7 +299,8 @@ def test_the_windows_job_may_go_but_nothing_else_may_report_under_its_name():
     tests = ".github/workflows/tests.yml"
     w = _workflows()
     start = w[tests].index("  # The PC job worker runs")
-    w[tests] = w[tests][:start].rstrip() + "\n"
+    end = w[tests].index("  # The security watch's checks")
+    w[tests] = w[tests][:start] + w[tests][end:]
     assert "pcjobs-windows" not in w[tests]
     assert check_pr.check_workflows(w) == []                      # removed: the card no longer waits on it
     # Another job of tests.yml, or another workflow, can't post a run under its name.
@@ -578,3 +579,19 @@ def test_the_guard_check_on_git(repo, tmp_path, capsys):
     assert check_pr.main(["--base", "main", "--head", "pr", "--body-file", str(body)]) == 1
     out = capsys.readouterr().out
     assert "every hook timeout" in out and "guard-surface section is stale" in out
+
+
+def test_the_secret_scan_is_required_to_stay_and_always_report():
+    """secrets (Cain 0.13.0, second round): a required job like pytest and bun."""
+    tests = ".github/workflows/tests.yml"
+    assert "secrets" in check_pr.REQUIRED_JOBS[tests]
+    assert check_pr.check_workflows(_workflows()) == []
+    w = _workflows()
+    w[tests] = w[tests].replace("  secrets:\n    runs-on", "  scan:\n    runs-on")
+    assert f"{tests} has no secrets job; it's a required check, keep its name." in check_pr.check_workflows(w)
+    w = _workflows()
+    w[tests] = w[tests].replace("  secrets:\n    runs-on: ubuntu-latest\n", "  secrets:\n    runs-on: ubuntu-latest\n    continue-on-error: true\n")
+    assert any("job secrets has `continue-on-error`" in p for p in check_pr.check_workflows(w))
+    w = _workflows()
+    w[tests] = w[tests].replace("      - name: Scan\n", "      - name: Scan\n        if: github.event_name == 'pull_request'\n")
+    assert any("job secrets step" in p and "`if`" in p for p in check_pr.check_workflows(w))

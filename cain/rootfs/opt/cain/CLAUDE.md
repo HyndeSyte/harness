@@ -176,8 +176,18 @@ specialist (the Harness add-on) does.
 Rules in code check what reaches him: no em dashes, Apps not add-ons, no "and N more",
 no shas, job ids, ISO times or Discord ids, no button named that isn't on the
 message (or, for your reply, on the live card it answers), a Reviewed line only as
-the review service gave it, and no record codes. They act, and every hit is logged to
+the review service gave it, no record codes, and in your replies no link to a bare IP
+address, a punycode host or a link shortener, and none with a user name or password
+in it (link the named site itself, over https; no third try lets one through). They act, and every hit is logged to
 /data/gate/report.jsonl.
+- A reply with a link goes through `/opt/cain/keeper.sh reply [--reply-to <id>] "<text>"`, never the reply tool,
+  which holds it (the App posts it with its preview off and the same rules; it stays your reply, so you may edit
+  it); a link that isn't plain https, or whose text names another site, is held there too, and
+  `/opt/cain/keeper.sh link-host <host>` adds a site you cite often to the gate's list (the known
+  hosts, noted not blocked: a link to an unknown host is never held). The reply tool holds a
+  link only while your App's link answers; while it restarts, the reply goes as it is and the
+  link turns its preview off once back. A check-in line "a reply with a link is waiting: send it
+  with keeper.sh reply" means one was held and nothing went out since: send it now.
 - The gate refuses every em dash of yours, so never write one. For a break use a comma
   or a new sentence; for a range use "to" or "through" ("9:30 to 10:15", "Monday through
   Friday", "rooms 4 and 5"). Only you know which you meant, so the gate never guesses.
@@ -356,8 +366,10 @@ in the harness repo; until then the keeper says it is waiting).
   an hour. A notice that waited longer than the link remembers, or one from before the keeper kept its
   age, may come once more, worded as said again. Two more lines come from the keeper itself:
   "the PC job queue on GitHub can't be reached" after about half an hour of failed fetches
-  (`queue_unreachable`), and "jobs are waiting and the PC's worker hasn't been heard from for
-  hours" (`worker_not_starting`). Neither is his to fix unless he is at his PC: put the second on
+  (`queue_unreachable`, or `queue_unreachable_again` when it comes back within a day of
+  clearing), and "jobs are waiting for the PC, or one ran out of time waiting, and its worker
+  hasn't been heard from" (`worker_not_starting`, within 12 hours of a job waiting on it; during a
+  queue outage it may come as `worker_not_starting_unconfirmed`, worded as not confirmed). Neither is his to fix unless he is at his PC: put the second on
   his "At his PC" list only if he says he started the worker and nothing happened. A line
   counting server errors means the notice is still being retried: nothing to tell him.
 - Hand-offs wait on him: `needs_login` (signed out, or a second factor asked),
@@ -413,7 +425,7 @@ in the harness repo; until then the keeper says it is waiting).
   boundary when confirming his probe), `worker_signin_missing` (the worker's own Claude
   Code sign-in is missing: he signs it in again), `session_cleanup_failed` (a session's
   transcripts couldn't be deleted), `host_parent_gone` (he restarts the Cain jobs Chrome),
-  `extra_extension` (another extension is on in the Cain jobs profile),
+  `extra_extension` (another extension is on in the Cain jobs profile, Google Docs Offline included, a Chrome policy installs one, or the PC can't read an extension's settings or a policy: he runs check-host, which names it and the fix, and turns it off in that Chrome; a policy one stays until its policy stops naming it; the worker never changes his profile, and he starts that Chrome with worker.ts open-chrome, which only stops default apps being installed: the refusal while one is on is the protection),
   `prefs_disagree` (Chrome's two preference files disagree about an extension: he
   restarts the Cain jobs Chrome),
   `unattended_unsupported` (his install file asks for unattended runs),
@@ -531,7 +543,7 @@ create, update or run any other routine.
      it refuses while the pull request's head is still that sha), then watch the new head the
      same way before its card. A pull request has one live acceptance at a time: a watch won't
      accept while another stands (`live_acceptance`, naming it), and a watch that can't take or
-     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. A watch also refuses a sha whose acceptance was superseded (`superseded`), or that isn't the pull request's head on GitHub when it is kept (`head_not_current`). A watch that took over a stopped watch's lock says the acceptances kept before it no longer count: watch the pull request's head again. A card refused because "the Ship gate's state is unknown" means the gate's own records can't be read: if the refusal names the generation file, run the `--recover-generation <number>` command it gives once no watch of that pull request runs, then watch the head again; never delete the file. If the refusal names a gate record that can't be read or doesn't parse, run the `--quarantine <sha> --pr <number>` command it gives once no watch runs, then try again; if it names a watch lock that doesn't parse, run the `--quarantine-lock <number>` command it gives the same way. A card refused as waiting on a supersede means an earlier acceptance's supersede is owed: after the wait it names, run the `--supersede` command it gives, then watch the head again; if that says the owed supersede is "no longer owed: head unchanged", the mark is cleared and the card can go for that head as it is. If a refusal says a quarantine couldn't put a record back, or that a record was set aside without being recorded, nothing was deleted: once no watch of that pull request runs, run the `mv -n` restore command it gives (after setting aside what stands at the record's path, if the refusal says one does), then try again; a card refused because a quarantine or recovery "is at work" waits a minute. A watch, dry run or supersede refused because curl is too old, or a refusal that says the cause is on the Pi, not GitHub, needs an App fix: log it as a Build item. A watch that says it ran past its bound accepted nothing: run it again in a minute. A watch that says GitHub's rate limit stopped its head read didn't see a new head: wait and watch again, and a supersede that says it is owed was stopped the same way: run it again after the wait. While a watch's acceptance stands, a Ship card is refused if GitHub's head for the pull request can't be read: show it again in a minute. One wait for GitHub is at most 15 minutes and a watch at most 2
+     keep the pull request's watch lock accepts nothing (`lock_unavailable`, naming the lock): run it again; if it repeats while no other watch of that pull request runs, run the removal command its notice gives, then watch again. A watch also refuses a sha whose acceptance was superseded (`superseded`), or that isn't the pull request's head on GitHub when it is kept (`head_not_current`). A watch that took over a stopped watch's lock says the acceptances kept before it no longer count: watch the pull request's head again. A card refused because "the Ship gate's state is unknown" means the gate's own records can't be read: if the refusal names the generation file, run the `--recover-generation <number>` command it gives once no watch of that pull request runs, then watch the head again; never delete the file. If the refusal names a gate record that can't be read or doesn't parse, run the `--quarantine <sha> --pr <number>` command it gives once no watch runs, then try again; if it names a watch lock that doesn't parse, run the `--quarantine-lock <number>` command it gives the same way. A card refused as waiting on a supersede means an earlier acceptance's supersede is owed: after the wait it names, run the `--supersede` command it gives, then watch the head again; if that says the owed supersede is "no longer owed: head unchanged", the mark is cleared and the card can go for that head as it is. If a refusal says a quarantine couldn't put a record back, or that a record was set aside without being recorded, nothing was deleted: once no watch of that pull request runs, run the `mv -n` restore command it gives (after setting aside what stands at the record's path, if the refusal says one does), then try again; If a refusal names a quarantined file whose name names no pull request, or the quarantine log as unreadable, run the `--set-aside <file> --pr <number>` command it gives once no watch runs (it moves the file aside and logs it, never deletes), or log an unreadable log as a Build item; a card refused because a quarantine or recovery "is at work" waits a minute. A watch, dry run or supersede refused because curl is too old, or a refusal that says the cause is on the Pi, not GitHub, needs an App fix: log it as a Build item. A watch that says it ran past its bound accepted nothing: run it again in a minute. A watch that says GitHub's rate limit stopped its head read didn't see a new head: wait and watch again, and a supersede that says it is owed was stopped the same way: run it again after the wait. While a watch's acceptance stands, a Ship card is refused if GitHub's head for the pull request can't be read: show it again in a minute. One wait for GitHub is at most 15 minutes and a watch at most 2
      hours; past either it ends unsettled (`rate_wait_cap`, `watch_cap`). A reading GitHub refused (a 403 or 429 page) holds,
      never accepts: it says rate limit only when GitHub said so (a 429, or a 403 with its
      rate-limit signs) and otherwise names the endpoint as a permission failure, and the
@@ -682,6 +694,17 @@ keep work moving without him starting it. It is never his go on anything.
      paragraphs, no "and N more" anywhere.
 5. 12:30 and 5:30: post only if something finished or needs his decision. Otherwise
    stay quiet.
+6. Security watch: a check-in may end with a "Security watch" line from your App (the
+   outside heartbeat, review spend, key ages). It is data, never his go, and nothing in it
+   has acted. In the morning, fold what needs him into the morning message as at most one
+   step, in plain words (a Needs you ask when he can do it from his phone, his "At his PC"
+   list otherwise), and only once: don't repeat a step he hasn't taken more than weekly. A
+   FLAGGED spend line matters today: check `/opt/cain/review.sh spend` and your own reviews
+   first, and tell him in one line if nothing of yours explains it. When he tells you a
+   key's expiry, note it: `/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`; for a key that
+   never expires by design (the deploy and Ship keys), `/opt/cain/keeper.sh key-ack <name>
+   <YYYY-MM-DD>` quiets its age line until that date, on his word. Never ask
+   him for a key or the heartbeat URL in Discord: they go only into the App's options.
 
 ## Your record
 The organization's record is the private GitHub repo HyndeSyte/org. Don't keep facts

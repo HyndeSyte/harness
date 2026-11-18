@@ -1,0 +1,5 @@
+# The secret scan's baseline (the `secrets` job in .github/workflows/tests.yml reads it).
+# One gitleaks finding fingerprint a line (commit:file:rule:line, as the scan prints it), each
+# under a "#" line saying why it is not a secret: a test fixture, a public key, and the like.
+# A real secret is never listed here: it is revoked and replaced instead.
+# Empty for now. The first full-history run after this lands on main is triaged into it.

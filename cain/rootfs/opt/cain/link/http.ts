@@ -4,6 +4,7 @@
 // caller may use only its own routes (auth.ts routeAllowed). The routes are described at the top of main.ts.
 import { since } from "../stop";
 import { boundedText, type Caller, routeAllowed } from "./auth";
+import { noteKey } from "../security/main";
 import { type Link, Refusal, SAID_MAX } from "./core";
 
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
@@ -42,6 +43,9 @@ export function linkRoutes(d: RouteDeps) {
         case "/reuse": return json(await link.reuseProof(b.m, b.values));
         case "/pc-notice": return json(await link.pcNotice(b.code, b.job, b.id, b.repeat));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
+        case "/reply": return json(await link.reply({ text: b.text, replyTo: b.reply_to }));
+        // keeper.sh key-expiry and key-ack as his own user (0.13.1): the key record is root's.
+        case "/key-note": return json(noteKey(String(b.cmd ?? ""), String(b.name ?? ""), String(b.date ?? "")));
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));

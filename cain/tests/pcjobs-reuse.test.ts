@@ -10,7 +10,7 @@ import { createHmac } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { parseHeartbeat, jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
+import { parseHeartbeat, HEARTBEAT_INTERVAL_MS, SKEW_MS, jobText, parseJob, REUSE_SHAPE, resultText, type Job, type OwnerReuse, type Result } from "../rootfs/opt/cain/pcjobs/core.ts";
 import { ageWords, holdClearNotice, HOLD_CLEAR_KEY, SILENT_ROUNDS, cleared, linkNotify, noticeRound, noticeTrouble, resetNoticeProcess, SERVER_FAILS_SHOWN, queuedOf, resendOwed, tell, whatOf, check, fsyncDir, PENDING_STATUS, PUSH_TRIES, pushAnswer, readJobs, reconcileReuse, recordReuse, reuseAnswer, reuseLedger, round, SPENT_WHY, usedReuse, type Config, type ReuseCheck } from "../rootfs/opt/cain/pcjobs/main.ts";
 import { DM, rig } from "./link-rig";
 import * as keeper28 from "../rootfs/opt/cain/pcjobs/main.ts";
@@ -1112,7 +1112,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
     const calls = [...main.matchAll(/\b(tell|waited)\(cfg, ([^;]*?)\);/g)].map((m) => m[2]).filter((a) => !a.startsWith("code, key"));
     expect(calls.length).toBeGreaterThanOrEqual(8);
     for (const a of calls) {
-      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"worker_not_starting"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
+      const tapNotice = !/^"reuse_store_unreadable"|^empty \?|^"hold_clear_unrecorded"|^"worker_start_refused"|^"queue_unreachable"|^"queue_unreachable_again"|^"worker_not_starting"|^"worker_not_starting_unconfirmed"/.test(a);   // the store, the queue's branch and the PC's hold clear and start refusal aren't about a job
       if (tapNotice) expect(a).toMatch(/, whatOf\(cfg, (l|t)\)$/);
     }
     const w = world();
@@ -1683,7 +1683,7 @@ describe("twenty-ninth review: a mark of unknown age re-minted once, the worker 
     renameSync(`${w.remote}.gone`, w.remote);
     quiet(() => round(cfg));
     const t = JSON.parse(readFileSync(`${w.used}.told.json`, "utf8"));
-    expect(t.fetchFails).toBeUndefined();
+    expect(t.fetchFails).toBe(k.FETCH_FAIL_ROUNDS + 3);                           // 0.12.2: the streak is kept while the notice stands
     expect(t.told[k.QUEUE_UNREACHABLE_KEY].clear).toBe(1);
     const words = PC_NOTICES.queue_unreachable;
     expect(words).not.toMatch(ownerWords);
@@ -1722,5 +1722,442 @@ describe("twenty-ninth review: a mark of unknown age re-minted once, the worker 
     const r = rig();
     const a = await r.link.pcNotice("worker_not_starting");
     expect(r.posted[a.message].content).toBe(words);
+  });
+});
+
+describe("0.12.2 review: a short job's worker-not-starting notice, held through a queue outage; the queue notice's hysteresis and its again wording; the re-mint kept before its send", () => {
+  const k = keeper28 as any;
+  const run = <T>(f: () => T): { out: T; logs: string[] } => {
+    const was = console.log;
+    const logs: string[] = [];
+    console.log = (...a: unknown[]) => { logs.push(a.join(" ")); };
+    try { return { out: f(), logs }; } finally { console.log = was; }
+  };
+  const at = (base: Date, min: number) => new Date(base.getTime() + min * 60_000);
+  const beatAt = (d: Date) => parseHeartbeat(JSON.stringify({ v: 1, worker_clock: d.toISOString().replace(/\.\d{3}Z$/, "Z"), code: "idle", job: null, stale_lock: false, skew_ms: null, reason: null }));
+
+  test("a 15 minute job and no heartbeat: worker-not-starting is raised once it has waited its life, and on its unclaimed expiry", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const created = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const short = (state: string, attempt: string | null = null) => ({ state, attempt, created: created.toISOString(), expires: at(created, 15).toISOString() }) as any;
+    // Waiting less than its life: nothing.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, null, [short("pending")], at(created, 10)); });
+    expect(sent).toEqual([]);
+    // Waited its whole life with no heartbeat (the round before the keeper closes it): told.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, null, [short("pending")], at(created, 15)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+    // Seen clear for good once the worker is heard from after it.
+    for (let i = 0; i < 3; i++) run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, 30)), [short("failed")], at(created, 31)); });
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    // Closed as expired without ever being claimed, the worker last heard from longer ago than its check-in interval: told again.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -7 * 60)), [short("failed")], at(created, 20)); });
+    expect(sent).toEqual(["worker_not_starting", "worker_not_starting"]);
+    // A job that was claimed and failed, a heartbeat heard within the job's life, or an expiry long past: not this notice.
+    resetNoticeProcess();
+    const w2 = world();
+    w2.first();
+    const sent2: string[] = [];
+    const cfg2 = w2.cfg("pi-1", { notify: ((c: string) => { sent2.push(c); return true; }) as any });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, null, [short("failed", "a".repeat(16))], at(created, 20)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, beatAt(at(created, 5)), [short("pending")], at(created, 15)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, null, [short("failed")], at(created, 15 + 7 * 60)); });
+    expect(sent2).toEqual([]);
+  });
+
+  test("third pass: a job shorter than the check-in interval raises nothing at once while a fresh heartbeat exists", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const created = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const short = (state: string) => ({ state, attempt: null, created: created.toISOString(), expires: at(created, 15).toISOString() }) as any;
+    // Heard from an hour before the job: fresh, though older than the job's life. Waited out, then closed unclaimed: nothing.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -60)), [short("pending")], at(created, 15)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -60)), [short("failed")], at(created, 20)); });
+    expect(sent).toEqual([]);
+    // Heard from more than the interval before: told.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(created, -(6 * 60 + 3))), [short("failed")], at(created, 20)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+  });
+
+  test("third pass: through a flapping queue the hold is capped, then told once as unconfirmed; never before the cap", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const start = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    // A job that has waited past its bound, the worker last heard from before it was queued.
+    const job = { id: "j1", state: "pending", attempt: null, created: at(start, -7 * 60).toISOString(), expires: at(start, 48 * 60).toISOString() } as any;
+    const h = beatAt(at(start, -8 * 60));
+    // The fetch already failing; then the outage raises queue-unreachable, and the queue flaps, one good fetch between
+    // failures, which keeps that notice standing and so the worker check held. Rounds are a minute apart.
+    run(() => { noticeRound(); k.queueFetch(cfg, false); });
+    let i = 0;
+    const round = (ok: boolean) => { run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [job], at(start, i)); k.queueFetch(cfg, ok); }); i++; };
+    for (; i < k.FETCH_FAIL_ROUNDS + 1;) round(false);
+    expect(sent).toEqual(["queue_unreachable"]);
+    const heldAt = Date.parse(JSON.parse(readFileSync(f, "utf8")).quietPending.since);
+    expect(heldAt).toBe(start.getTime());                                          // the first round held
+    while (at(start, i).getTime() - heldAt < k.QUIET_PENDING_MAX_MS) round(i % 2 === 0);
+    expect(sent).toEqual(["queue_unreachable"]);
+    expect(JSON.parse(readFileSync(f, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    round(false);
+    expect(sent).toEqual(["queue_unreachable", "worker_not_starting_unconfirmed"]);
+    for (let n = 0; n < 20; n++) round(n % 2 === 0);
+    expect(sent).toEqual(["queue_unreachable", "worker_not_starting_unconfirmed"]);
+    // The queue back for good: the told mark stands.
+    for (let n = 0; n < k.QUEUE_CLEAR_FETCHES + 1; n++) round(true);
+    const t = JSON.parse(readFileSync(f, "utf8"));
+    expect(t.told[k.WORKER_QUIET_KEY]).toMatchObject({ code: "worker_not_starting_unconfirmed", posted: true });
+    expect(sent).toEqual(["queue_unreachable", "worker_not_starting_unconfirmed"]);
+    expect(PC_NOTICES.worker_not_starting_unconfirmed).toMatch(/isn't confirmed/);
+  }, 60_000);
+
+  test("fourth pass: freshness is three heartbeat intervals; a worker dying right after a heartbeat is told, at once or by the deadline", () => {
+    expect(k.HEARTBEAT_FRESH_MS).toBe(3 * HEARTBEAT_INTERVAL_MS);
+    expect(k.HEARTBEAT_FRESH_MS).toBeLessThan(k.WORKER_QUIET_MS);
+    expect(k.QUIET_PENDING_MAX_MS).toBe(12 * 3_600_000);
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const h = beatAt(T);                                                            // the worker's last heartbeat; it dies right after
+    // A 4 hour job queued 5 minutes later: waited out, the heartbeat older than three intervals: told at once.
+    const four = { id: "four", state: "pending", attempt: null, created: at(T, 5).toISOString(), expires: at(T, 5 + 4 * 60).toISOString() } as any;
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [four], at(T, 5 + 4 * 60)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+    // A 1 hour job: the heartbeat looks fresh when it is judged, so it is held, not dropped; told at the deadline.
+    resetNoticeProcess();
+    const w2 = world();
+    w2.first();
+    const sent2: string[] = [];
+    const cfg2 = w2.cfg("pi-1", { notify: ((c: string) => { sent2.push(c); return true; }) as any });
+    const hour = (state: string) => ({ id: "hour", state, attempt: null, created: at(T, 5).toISOString(), expires: at(T, 65).toISOString() }) as any;
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, h, [hour("pending")], at(T, 65)); });
+    expect(sent2).toEqual([]);
+    expect(JSON.parse(readFileSync(`${w2.used}.told.json`, "utf8")).quietPending).toEqual({ since: at(T, 65).toISOString(), jobs: ["hour"],
+      held: { hour: { at: at(T, 65).toISOString(), created: at(T, 5).toISOString() } } });
+    // Closed unclaimed, then gone from the listing, rounds every 10 minutes: nothing until 12 hours from when it was held.
+    let m = 75;
+    for (; m < 65 + 12 * 60; m += 10) run(() => { noticeRound(); k.workerQuietNotice(cfg2, h, m < 8 * 60 ? [hour("failed")] : [], at(T, m)); });
+    expect(sent2).toEqual([]);
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, h, [], at(T, 65 + 12 * 60)); });
+    expect(sent2).toEqual(["worker_not_starting"]);
+    expect(JSON.parse(readFileSync(`${w2.used}.told.json`, "utf8")).quietPending).toBeUndefined();
+  });
+
+  test("fourth pass: a held condition clears only on the job's acknowledgment; a job that never acknowledges is told by the deadline", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const h = beatAt(T);
+    const short = (id: string, extra: object = {}) => ({ id, state: "pending", attempt: null, created: at(T, 5).toISOString(), expires: at(T, 20).toISOString(), ...extra }) as any;
+    // Claimed (an attempt) before the deadline: the hold ends, nothing told.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("a")], at(T, 20)); });
+    expect(JSON.parse(readFileSync(f, "utf8")).quietPending.jobs).toEqual(["a"]);
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("a", { state: "claimed", attempt: "b".repeat(16) })], at(T, 60)); });
+    expect(JSON.parse(readFileSync(f, "utf8")).quietPending).toBeUndefined();
+    // Closed with a result (failed after a claim): the same.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("c")], at(T, 20)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("c", { state: "failed", attempt: "d".repeat(16) })], at(T, 90)); });
+    expect(JSON.parse(readFileSync(f, "utf8")).quietPending).toBeUndefined();
+    // A heartbeat at or after the job was queued: the worker started since. Nothing held.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("e")], at(T, 20)); });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, beatAt(at(T, 30)), [short("e", { state: "failed" })], at(T, 31)); });
+    expect(JSON.parse(readFileSync(f, "utf8")).quietPending).toBeUndefined();
+    expect(sent).toEqual([]);
+    // Never acknowledged: told at 12 hours, never before.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("g")], at(T, 20)); });
+    for (let m = 30; m < 20 + 12 * 60; m += 30) run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("g", { state: "failed" })], at(T, m)); });
+    expect(sent).toEqual([]);
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short("g", { state: "failed" })], at(T, 20 + 12 * 60)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+  });
+
+  test("eighth pass: once a job is held, the PC's stamps never decide; only a heartbeat that arrives after the hold, by the keeper's clock, clears it", () => {
+    expect(SKEW_MS).toBe(2 * 60_000);
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const created = at(T, 5);
+    const JOB = "j-20261116-abc123";
+    const short = (state = "pending") => ({ id: JOB, state, attempt: null, created: created.toISOString(), expires: at(T, 20).toISOString() }) as any;
+    const beat = (offsetMs: number, job: string | null = null) => parseHeartbeat(JSON.stringify({ v: 1,
+      worker_clock: new Date(created.getTime() + offsetMs).toISOString().replace(/\.\d{3}Z$/, "Z"), code: job ? "busy" : "idle", job,
+      stale_lock: false, skew_ms: null, reason: null }));
+    const held = (b: any) => {
+      resetNoticeProcess();
+      const w = world();
+      w.first();
+      const sent: string[] = [];
+      const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+      const h0 = beatAt(T);
+      // Held at the job's deadline (the worker's last heartbeat, before the job, still looked fresh).
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [short()], at(T, 20)); });
+      expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending.jobs).toEqual([JOB]);
+      // The same heartbeat seen again, rounds later: no arrival, still held.
+      for (let m = 21; m < 30; m += 3) run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [short("failed")], at(T, m)); });
+      expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending.jobs).toEqual([JOB]);
+      // Then a new heartbeat arrives, whatever the PC stamped on it.
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, b, [short("failed")], at(T, 31)); });
+      expect(sent).toEqual([]);
+      return JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending ?? null;
+    };
+    // A new heartbeat that arrived after the hold clears it, whatever the PC stamped on it. One naming the job, or stamped
+    // more than SKEW_MS after the queue time, shows the worker has run since: nothing is held.
+    for (const off of [SKEW_MS + 1_000, 60 * 60_000]) expect(held(beat(off))).toBeNull();
+    for (const off of [-SKEW_MS, -60_000, 30_000, SKEW_MS, SKEW_MS + 1_000, 60 * 60_000]) expect(held(beat(off, JOB))).toBeNull();
+    // One stamped by the PC before that is a new arrival too, so the hold made at the deadline goes; but by the PC's own word the
+    // worker hasn't run since the job was queued, so it is held again from this round, never told at once.
+    for (const off of [-SKEW_MS, -60_000, 30_000, SKEW_MS])
+      expect(held(beat(off))).toEqual({ since: at(T, 31).toISOString(), jobs: [JOB], held: { [JOB]: { at: at(T, 31).toISOString(), created: created.toISOString() } } });
+  });
+
+  test("eighth pass: a pre-hold heartbeat stamped by a PC clock 10 minutes fast never clears the hold", () => {
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const JOB = "j-20261116-abc123";
+    const created = at(T, 5);
+    const job = { id: JOB, state: "failed", attempt: null, created: created.toISOString(), expires: at(T, 20).toISOString() } as any;
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    // The PC's clock runs 10 minutes fast: its heartbeat, written at T+19 by the keeper's clock, says T+29. The keeper saw it
+    // arrive at T+19, then held the job at T+20 (the notice file as it stands then, kept across a restart).
+    const fast = parseHeartbeat(JSON.stringify({ v: 1, worker_clock: at(T, 29).toISOString().replace(/\.\d{3}Z$/, "Z"), code: "busy", job: JOB, stale_lock: false, skew_ms: null, reason: null }));
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, fast, [], at(T, 19)); });
+    const kept = JSON.parse(readFileSync(f, "utf8"));
+    // Its arrival as the keeper stamped it, one minute before the hold.
+    expect(kept.beat.seen).toBe(at(T, 19).toISOString());
+    kept.quietPending = { since: at(T, 20).toISOString(), jobs: [JOB], held: { [JOB]: { at: at(T, 20).toISOString(), created: created.toISOString() } } };
+    writeFileSync(f, JSON.stringify(kept));
+    // Rounds go on seeing that same heartbeat, its PC stamp more than SKEW_MS past the hold: it never clears.
+    for (let m = 21; m < 60; m += 5) run(() => { noticeRound(); k.workerQuietNotice(cfg, fast, [job], at(T, m)); });
+    expect(JSON.parse(readFileSync(f, "utf8")).quietPending?.jobs).toEqual([JOB]);
+    expect(sent).toEqual([]);
+    // A heartbeat seen for the first time with no record of an earlier one (an upgrade) has no arrival time and clears nothing.
+    resetNoticeProcess();
+    const w2 = world();
+    w2.first();
+    const cfg2 = w2.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f2 = `${w2.used}.told.json`;
+    mkdirSync(dirname(f2), { recursive: true });
+    writeFileSync(f2, JSON.stringify({ v: 3, told: {}, waits: {}, quietPending: { since: at(T, 20).toISOString(), jobs: [JOB], held: { [JOB]: { at: at(T, 20).toISOString(), created: created.toISOString() } } } }));
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, fast, [job], at(T, 40)); });
+    expect(JSON.parse(readFileSync(f2, "utf8")).quietPending?.jobs).toEqual([JOB]);
+    // A new heartbeat arriving after that does.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, beatAt(at(T, 41)), [job], at(T, 41)); });
+    expect(JSON.parse(readFileSync(f2, "utf8")).quietPending).toBeUndefined();
+    expect(sent).toEqual([]);
+  });
+
+  test("eighth pass: a requeued job under the same id, claimed, never clears the old hold; only a claim of the same id and queue time does", () => {
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const JOB = "j-20261116-abc123";
+    const job = (created: Date, extra: object = {}) => ({ id: JOB, state: "pending", attempt: null, created: created.toISOString(), expires: at(created, 15).toISOString(), ...extra }) as any;
+    const rig = () => {
+      resetNoticeProcess();
+      const w = world();
+      w.first();
+      const sent: string[] = [];
+      const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+      const pend = () => JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).quietPending ?? null;
+      return { w, cfg, sent, pend };
+    };
+    const first = job(at(T, 5));
+    const h0 = beatAt(T);
+    {
+      const { cfg, sent, pend } = rig();
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [first], at(T, 20)); });
+      expect(pend()).toMatchObject({ jobs: [JOB], held: { [JOB]: { at: at(T, 20).toISOString(), created: first.created } } });
+      // Requeued under the same id (a new queue time) and claimed: another job, still held.
+      const again = job(at(T, 30));
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [{ ...again, state: "claimed", attempt: "b".repeat(16) }], at(T, 41)); });
+      expect(pend()?.jobs).toEqual([JOB]);
+      expect(sent).toEqual([]);
+      // The held job itself claimed: that clears it.
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [{ ...first, state: "claimed", attempt: "c".repeat(16) }], at(T, 52)); });
+      expect(pend()).toBeNull();
+    }
+    // A hold kept without its queue time (an older notice file): a claim under that id can't be matched, so it never clears it.
+    {
+      const { w, cfg, sent, pend } = rig();
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [], at(T, 19)); });
+      const f = `${w.used}.told.json`;
+      const kept = JSON.parse(readFileSync(f, "utf8"));
+      writeFileSync(f, JSON.stringify({ ...kept, quietPending: { since: at(T, 20).toISOString(), jobs: [JOB] } }));
+      const again = job(at(T, 30));
+      run(() => { noticeRound(); k.workerQuietNotice(cfg, h0, [{ ...again, state: "claimed", attempt: "b".repeat(16) }], at(T, 41)); });
+      expect(pend()?.jobs).toEqual([JOB]);
+      expect(sent).toEqual([]);
+    }
+  });
+  test("fourth pass: a queue outage longer than the cap is told as unconfirmed at 12 hours, and that notice stays owed until delivered", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    let answer = false;
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return c === "worker_not_starting_unconfirmed" ? answer : true; }) as any });
+    const f = `${w.used}.told.json`;
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    // The worker's last heartbeat, then a 1 hour job queued 5 minutes later that it never claims; the queue's fetch fails
+    // from then on, for 14 hours. The job closes unclaimed and leaves the window in which an expiry is judged.
+    const h = beatAt(T);
+    const job = (state: string) => ({ id: "j", state, attempt: null, created: at(T, 5).toISOString(), expires: at(T, 65).toISOString() }) as any;
+    run(() => { noticeRound(); k.queueFetch(cfg, false); });
+    let m = 65;
+    const round = (ok: boolean, js: any[]) => { run(() => { noticeRound(); k.resendOwed(cfg, false); k.workerQuietNotice(cfg, h, js, at(T, m)); k.queueFetch(cfg, ok); }); m += 10; };
+    round(false, [job("pending")]);
+    while (m < 65 + 12 * 60) round(false, m < 8 * 60 ? [job("failed")] : []);
+    expect(sent.filter((c) => c.startsWith("worker"))).toEqual([]);
+    round(false, []);
+    expect(sent.filter((c) => c.startsWith("worker"))).toEqual(["worker_not_starting_unconfirmed"]);
+    // The link doesn't answer: sent again each round with its saved id, after the queue comes back too.
+    const id = JSON.parse(readFileSync(f, "utf8")).told[k.WORKER_QUIET_KEY].id;
+    for (let n = 0; n < 4; n++) round(n > 1, []);
+    expect(sent.filter((c) => c === "worker_not_starting_unconfirmed").length).toBeGreaterThanOrEqual(4);
+    expect(JSON.parse(readFileSync(f, "utf8")).told[k.WORKER_QUIET_KEY]).toMatchObject({ id, posted: false, code: "worker_not_starting_unconfirmed" });
+    answer = true;
+    round(true, []);
+    expect(JSON.parse(readFileSync(f, "utf8")).told[k.WORKER_QUIET_KEY]).toMatchObject({ id, posted: true });
+  });
+
+  test("fourth pass: a restart in the middle keeps the held condition and its deadline", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const T = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const h = beatAt(T);
+    const short = { id: "s", state: "failed", attempt: null, created: at(T, 5).toISOString(), expires: at(T, 20).toISOString() } as any;
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [{ ...short, state: "pending" }], at(T, 20)); });
+    const held = JSON.parse(readFileSync(f, "utf8")).quietPending;
+    expect(held).toEqual({ since: at(T, 20).toISOString(), jobs: ["s"], held: { s: { at: at(T, 20).toISOString(), created: at(T, 5).toISOString() } } });
+    // The keeper restarts six hours in: a new process, the same notice file.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [short], at(T, 6 * 60)); });
+    resetNoticeProcess();
+    const cfg2 = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, h, [], at(T, 6 * 60 + 1)); });
+    expect(JSON.parse(readFileSync(f, "utf8")).quietPending).toEqual(held);
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, h, [], at(T, 20 + 12 * 60 - 1)); });
+    expect(sent).toEqual([]);
+    // Told at 12 hours from when it was first held, not from the restart.
+    run(() => { noticeRound(); k.workerQuietNotice(cfg2, h, [], at(T, 20 + 12 * 60)); });
+    expect(sent).toEqual(["worker_not_starting"]);
+    // A notice file whose held condition is garbled but keeps its time still runs to its deadline.
+    resetNoticeProcess();
+    const w3 = world();
+    w3.first();
+    const sent3: string[] = [];
+    const cfg3 = w3.cfg("pi-1", { notify: ((c: string) => { sent3.push(c); return true; }) as any });
+    mkdirSync(dirname(`${w3.used}.told.json`), { recursive: true });
+    writeFileSync(`${w3.used}.told.json`, JSON.stringify({ v: 3, told: {}, waits: {}, quietPending: { since: T.toISOString(), jobs: "x" } }));
+    run(() => { noticeRound(); k.workerQuietNotice(cfg3, h, [], at(T, 60)); });
+    expect(sent3).toEqual([]);
+    run(() => { noticeRound(); k.workerQuietNotice(cfg3, h, [], at(T, 12 * 60)); });
+    expect(sent3).toEqual(["worker_not_starting"]);
+  });
+
+  test("a 6 hour queue outage with a pending job and an aging heartbeat raises only queue-unreachable, never worker-not-starting", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const start = new Date(Date.parse("2026-11-16T12:00:00Z"));
+    const job = { state: "pending", attempt: null, created: at(start, -1).toISOString(), expires: at(start, 24 * 60).toISOString() } as any;
+    const h = beatAt(at(start, -1));                                                // the copy's heartbeat, last fetched as the outage began
+    // Each round as the keeper runs it: the heartbeat's notices first, then the fetch, which fails.
+    for (let i = 0; i <= 7 * 60; i++) run(() => { noticeRound(); k.workerQuietNotice(cfg, h, [job], at(start, i)); k.queueFetch(cfg, false); });
+    expect(sent).toEqual(["queue_unreachable"]);
+    expect(JSON.parse(readFileSync(`${w.used}.told.json`, "utf8")).told[k.WORKER_QUIET_KEY]).toBeUndefined();
+    // The keeper's round reads the heartbeat's notices before its fetch, so the streak it reads is the earlier rounds'.
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts"), "utf8");
+    expect(main.indexOf("heartbeatNotices(cfg, readHeartbeat(cfg.dir))")).toBeLessThan(main.indexOf("fetched = sync(cfg, seen)"));
+  }, 60_000);
+
+  test("queue-unreachable, once raised, clears only after good fetches in a row; one good fetch between failures neither drops it nor raises a fresh one; back within a day it is worded as again", async () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const sent: string[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string) => { sent.push(c); return true; }) as any });
+    const f = `${w.used}.told.json`;
+    const fetch = (ok: boolean) => run(() => { noticeRound(); k.queueFetch(cfg, ok); });
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS; i++) fetch(false);
+    expect(sent).toEqual(["queue_unreachable"]);
+    // Flapping: a good fetch, then a failure, many times over.
+    for (let i = 0; i < 8; i++) { fetch(true); fetch(false); }
+    expect(sent).toEqual(["queue_unreachable"]);
+    let t = JSON.parse(readFileSync(f, "utf8"));
+    expect(t.told[k.QUEUE_UNREACHABLE_KEY]).toMatchObject({ posted: true, clear: 0 });
+    expect(t.fetchFails).toBeGreaterThanOrEqual(k.FETCH_FAIL_ROUNDS);
+    // Good fetches in a row: kept until the last of them, then gone, its clearing stamped.
+    for (let i = 0; i < k.QUEUE_CLEAR_FETCHES - 1; i++) fetch(true);
+    expect(JSON.parse(readFileSync(f, "utf8")).told[k.QUEUE_UNREACHABLE_KEY]).toBeDefined();
+    fetch(true);
+    t = JSON.parse(readFileSync(f, "utf8"));
+    expect(t.told[k.QUEUE_UNREACHABLE_KEY]).toBeUndefined();
+    expect(t.fetchFails).toBeUndefined();
+    expect(Number.isFinite(Date.parse(t.queueBack))).toBe(true);
+    // Unreachable again within the day: worded as again.
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS; i++) fetch(false);
+    expect(sent).toEqual(["queue_unreachable", "queue_unreachable_again"]);
+    for (let i = 0; i < k.QUEUE_CLEAR_FETCHES; i++) fetch(true);
+    // Past the day: the plain line.
+    t = JSON.parse(readFileSync(f, "utf8"));
+    t.queueBack = new Date(Date.now() - k.QUEUE_AGAIN_MS - 60_000).toISOString();
+    writeFileSync(f, JSON.stringify(t));
+    for (let i = 0; i < k.FETCH_FAIL_ROUNDS; i++) fetch(false);
+    expect(sent).toEqual(["queue_unreachable", "queue_unreachable_again", "queue_unreachable"]);
+    // The link's words for it.
+    const words = PC_NOTICES.queue_unreachable_again;
+    expect(words).toContain("again");
+    expect(words).not.toMatch(/\u2014|add-on|\bcheck|resend|send it again|tap again|try again|\d{4}-\d{2}-\d{2}T|j-\d{8}/i);
+    const r = rig();
+    const a = await r.link.pcNotice("queue_unreachable_again");
+    expect(r.posted[a.message].content).toBe(words);
+  }, 60_000);
+
+  test("a re-minted id is kept in the notice file before its send; if that can't be written, nothing is sent and the error is logged", () => {
+    resetNoticeProcess();
+    const w = world();
+    w.first();
+    const f = `${w.used}.told.json`;
+    const sent: { id: string; repeat?: boolean; onDisk: any }[] = [];
+    const cfg = w.cfg("pi-1", { notify: ((c: string, n: any) => { sent.push({ id: n.id, ...(n.repeat ? { repeat: true } : {}), onDisk: JSON.parse(readFileSync(f, "utf8")).told["unsettled:r"] }); return false; }) as any });
+    const old = "e".repeat(24);
+    mkdirSync(dirname(f), { recursive: true });
+    writeFileSync(f, JSON.stringify({ v: 3, told: { "unsettled:r": { id: old, posted: false, clear: 0, code: "reuse_unsettled", since: new Date(Date.now() - k.NOTICE_DEDUP_MS - 86_400_000).toISOString() } }, waits: {} }));
+    mkdirSync(`${f}.tmp`, { recursive: true });                                      // the notice file can't be written
+    const { logs } = run(() => resendOwed(cfg));
+    expect(sent).toEqual([]);
+    expect(logs.some((l) => l.includes("ERROR: notice reuse_unsettled needs a new id") && l.includes("isn't sent this round"))).toBe(true);
+    expect(JSON.parse(readFileSync(f, "utf8")).told["unsettled:r"].id).toBe(old);
+    // Writable again: the stamp is on disk when the send happens.
+    rmSync(`${f}.tmp`, { recursive: true });
+    run(() => resendOwed(cfg));
+    expect(sent.length).toBe(1);
+    expect(sent[0].id).not.toBe(old);
+    expect(sent[0].repeat).toBe(true);
+    expect(sent[0].onDisk).toMatchObject({ id: sent[0].id, repeat: true });
+    expect(Number.isFinite(Date.parse(sent[0].onDisk.minted))).toBe(true);
   });
 });

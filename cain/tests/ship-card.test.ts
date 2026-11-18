@@ -346,7 +346,11 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
     {
       const q = rig();
       q.files.pending = pendingWith(["P64"], []);
-      expect(q.link.checkSend({ text: "See https://example.com/P64 for details." })).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "codes" }] });
+      // A link in a plugin reply is held too since 0.13.0's second round (it goes through keeper.sh reply), so the
+      // code is one of its hits: through the keeper the same words are still held for the code alone.
+      const d = q.link.checkSend({ text: "See https://example.com/P64 for details." });
+      expect(d).toMatchObject({ would: "refuse", hard: true });
+      expect(d.hits.filter((h) => h.rule !== "keeper")).toMatchObject([{ rule: "codes" }]);
     }
     const r = rig();
     r.files.pending = pendingWith(["P64", "P08"], ["P63"]);
@@ -1440,7 +1444,7 @@ describe("twenty-ninth review: every takeover moves the generation on, the quara
     r.reviews.list = [REVIEW];
     await expect(ship(r)).rejects.toThrow("state is unknown");
     // A quarantine cut off between its rename and its log entry: the card stays refused, with the restore.
-    const as = `${f}.quarantined-abcd1234`;
+    const as = `${f}.quarantined-pr5-abcd1234`;                                       // 0.12.2: the name carries the pull request
     renameSync29(f, as);
     const st = gateState(dir, 5) as any;
     expect(st.unknown).toContain(`mv -n ${as} ${f}`);

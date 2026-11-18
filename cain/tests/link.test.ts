@@ -98,7 +98,7 @@ describe("taps", () => {
     expect(await r.tap(q, q.components[0].components[0].custom_id)).toBe("to Cain");
     expect(r.answers()).toEqual([7]);
     expect(r.updates()[0]).toEqual({ content: "Book the plumber for Tuesday?\n\nYou answered: Yes", components: [],
-      allowed_mentions: { parse: [] } });
+      allowed_mentions: { parse: [] }, flags: 4 });   // previews off (0.13.0)
     expect(r.relayed).toEqual([`Dane tapped "Yes" on your question: "Book the plumber for Tuesday?" (Discord message ${q.id}; its card shows his answer. If it needs words from you, reply with reply_to ${q.id})`]);
     expect(await r.tap(q, q.components[0].components[1].custom_id)).toBe("dead: answered");
     expect(r.relayed.length).toBe(1);

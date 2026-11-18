@@ -96,6 +96,7 @@ class FakeGoogle:
     def __init__(self):
         self.events = {}          # id -> event
         self.calls = []           # (method, path)
+        self.queries = []         # (method, query): what each call asked, sendUpdates included
         self.token_calls = 0
         self.fail = {}            # method -> status or "drop"
         self.token_status = 200
@@ -129,6 +130,7 @@ class FakeGoogle:
             return self._token(method, body)
         assert headers["Authorization"] == "Bearer tok-abcdefgh", "needs the token"
         self.calls.append((method, parts.path))
+        self.queries.append((method, {k: v[0] for k, v in parse_qs(parts.query).items()}))
         failure = self.fail.get(method)
         if failure == "drop":
             raise TransportError("timeout")
@@ -247,6 +249,10 @@ class FakeGoogle:
 
 @pytest.fixture
 def g(on):
+    return make_g(on)
+
+
+def make_g(on):
     on.feeds = Feeds()
     on.google = FakeGoogle()
     on.key = KEY

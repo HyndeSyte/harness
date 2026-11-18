@@ -44,6 +44,48 @@ Settings, People, **Users** and open your user: the id is the 32 letters and dig
 shown there. Put it in `owner_user_id` in this App's Configuration, save, and restart
 the App.
 
+## Security watch
+
+Cain's App keeps an eye on what it can see of the system's health, and Cain brings you
+anything that needs you in his morning update, one thing at a time. Nothing here acts on
+its own.
+
+- **Outside heartbeat** (`heartbeat_url`, empty by default). Make a free account at
+  Healthchecks.io (or a service like it), add a check with a 5 minute period, and paste its
+  ping URL into `heartbeat_url` in this App's Configuration, then restart the App. The App
+  pings it every 5 minutes and says so at once when it stops on an error; the service emails
+  or pushes to you itself when the pings stop, so a dead Pi reaches you without going through
+  the App. Each ping carries only how long the App has been up. The URL is not logged, not in
+  any child's environment (only the heartbeat's own process has it, and the stop ping reads it
+  through curl's standard input, never a command line); it is stored only in the App's options,
+  which is where Supervisor keeps every option, and that is fine. Cain's own Claude session can
+  read that options file too, so a compromised session could read the URL: the risk that a leaked
+  URL masks an outage or fakes a failure includes that case. Keep it like a key, and make a new
+  one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
+  one late ping doesn't page you.
+- **Review spend.** The morning check-in has yesterday's spend per review seat and the month
+  so far against each cap, and flags a day that jumps (over 3 times the week before and at
+  least $1, once the seat was used on at least 3 of those 7 days; or over a fifth of the month's
+  cap): the cheapest sign of a stolen key or a loop. It also says when the month so far, at its
+  rate, would pass a seat's cap. A seat at its monthly cap runs no reviews until the month turns.
+- **Key ages.** The App notes the day it first observed each key or token it holds (by a hash
+  of it, never the key itself) in `/data/keys.json`. The morning check-in names a key within 14
+  days of an expiry noted for it (`/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`), and,
+  on Mondays, one with no expiry noted that has been the same for over 90 days. A key that never
+  expires by design (the link's deploy and Ship keys) can be acknowledged until a date
+  (`/opt/cain/keeper.sh key-ack <name> <YYYY-MM-DD>`), and its line stays quiet until then.
+- **Links.** Messages from Cain's bot no longer unfold link previews: a reply of Cain's with a
+  link goes out through the App with the preview off from the start. A link that isn't plain
+  https on its usual port, points to a bare IP address, a punycode host or a link shortener,
+  has a user name or password in it, or whose text names another site than where it leads, is
+  held for him to rewrite. The short list of sites Cain usually cites is the known hosts, noted
+  not blocked: a link to an unknown host is never held, it goes out as usual and is only noted
+  in the App's gate report ("unknown host"), apart from the report's "preview flag refused"
+  lines (Discord refused the no-preview setting on a card update, which then went without it).
+  While the App's link is restarting, a reply of Cain's with a link goes out through Discord's
+  own plugin rather than wait, noted in the report as "link down: preview not suppressed at
+  post", and its preview is turned off once the link is back.
+
 ## Cards and questions
 
 - Cain asks one question at a time. The next one comes when you answer.

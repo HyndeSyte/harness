@@ -422,7 +422,7 @@ describe("taps on dead cards", () => {
     expect(r.answers().at(-1)).toBe(7);                               // updated in place, never a silent ack
     expect(r.updates().at(-1).components).toEqual([]);
     expect(r.updates().at(-1).content.endsWith(line)).toBe(true);
-    expect(r.ephemerals().at(-1)).toEqual({ content: EXPIRED_TAP, flags: 64, allowed_mentions: { parse: [] } });
+    expect(r.ephemerals().at(-1)).toEqual({ content: EXPIRED_TAP, flags: 64 | 4, allowed_mentions: { parse: [] } });   // previews off too (0.13.0)
     expect(r.relayed.length).toBe(before);                            // nothing reached Cain
     expect(r.harness).toEqual([]);                                    // or the specialist
   };

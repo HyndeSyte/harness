@@ -61,6 +61,17 @@ def drives(tmp_path, maps):
     ("", ""),
     ("Suite 4", ""),
     ("1 Long Rd, " + "x" * 300, "1 Long Rd"),
+    # A venue's name on the first line, its street address on the second (a Family event, Nov 19).
+    ("Blue Ridge Music Hall\n1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    # The same, on one line with the name before a comma.
+    ("Blue Ridge Music Hall, 1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Blue Ridge Music Hall\r\n1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Blue Ridge Music Hall\\n1234 Main St, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Clinic\n1234 Main St Suite 200, Charlottesville, VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Clinic\n1234 Main St Charlottesville VA 22901", "1234 Main St, Charlottesville, VA 22901"),
+    ("Clinic\n12 Elm St NW, Town, VA", "12 Elm St NW, Town, VA"),
+    ("Office\n500 Rte. 29 N, Town, VA 22901", "500 Rte. 29 N, Town, VA 22901"),
+    ("The Barn\n40 Old Mill Crossing, Crozet, VA 22932", "40 Old Mill Crossing, Crozet, VA 22932"),
 ])
 def test_only_the_street_address_is_kept(place, want):
     assert street_address(place) == want
@@ -71,11 +82,53 @@ def test_only_the_street_address_is_kept(place, want):
     ("540 555 1212", ""),
     ("2 Clinic Rd (Dr Patel oncology)", "2 Clinic Rd"),
     ("2 Clinic Rd, Attn Dr Patel", "2 Clinic Rd"),
-    ("Dr Patel, 2 Clinic Rd, Suite 4, Town, VA", "2 Clinic Rd"),
+    # A suite is skipped, never sent, and the town after it still counts.
+    ("Dr Patel, 2 Clinic Rd, Suite 4, Town, VA", "2 Clinic Rd, Town, VA"),
     ("3 people from Sarah's team", ""),
 ])
 def test_a_name_or_note_never_goes_along(place, want):
     assert street_address(place) == want
+
+
+@pytest.mark.parametrize("place,want", [
+    # A town whose name starts like a unit word keeps its town (0.24.0, second round).
+    ("2 Main St, Sterling, VA 20164", "2 Main St, Sterling, VA 20164"),
+    ("2 Main St, Florence, SC", "2 Main St, Florence, SC"),
+    ("2 Main St, Apton, VA", "2 Main St, Apton, VA"),
+    ("Clinic\n2 Main St\nSterling, VA", "2 Main St, Sterling, VA"),
+    # A real unit is still skipped, and the town after it kept.
+    ("2 Main St, Suite 4, Sterling, VA", "2 Main St, Sterling, VA"),
+    ("2 Main St Ste. 200, Florence, SC", "2 Main St, Florence, SC"),
+    ("2 Main St, Unit B, Apton, VA", "2 Main St, Apton, VA"),
+    ("2 Main St #12, Sterling, VA", "2 Main St, Sterling, VA"),
+])
+def test_a_unit_word_ends_at_a_word_and_needs_a_number_or_letter(place, want):
+    assert street_address(place) == want
+
+
+@pytest.mark.parametrize("text,call", [
+    ("540-555-1212", True),
+    ("(540) 555-1212", True),
+    ("+1 540 555 1212 ext 4", True),
+    ("Phone call with Dr Patel", True),
+    ("Call with Sam", True),
+    ("Dentist", False),
+    ("2 Clinic Rd, Town, VA", False),
+    ("Dr Patel, 2 Clinic Rd, Suite 4, Town, VA", False),
+])
+def test_a_phone_call_is_told_apart(text, call):
+    assert drive.is_call(text) is call
+
+
+def test_the_lookup_allowance_running_out_is_later_not_failed(drives, maps):
+    drives._requests = drive.MAX_REQUESTS_PER_READ                # this read's allowance, spent
+    assert drives.between(SCHOOL, "2 Clinic Rd, Town, VA") == drive.LATER
+    assert drives.capped() and maps.urls == []
+    drives.begin()                                                # the next read asks
+    assert drives.between(SCHOOL, "2 Clinic Rd, Town, VA") == 11
+    maps.fail = "timeout"                                         # a service that's down is a failure
+    assert drives.between(SCHOOL, "9 Elm St, Town, VA") == FAILED
+    assert not drives.capped()
 
 
 def test_it_finds_the_drive_in_minutes(drives):

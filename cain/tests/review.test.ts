@@ -611,7 +611,7 @@ describe("the published lines, /data/trust/reviewed.json (Cain 0.11.0)", () => {
     quiet.submit(brief());
     await quiet.runner.tick();
     expect(quiet.runner.cfg.reviewedFile).toBeUndefined();
-    expect(readdirSync(join(quiet.cfg.queueDir, "..")).sort()).toEqual(["health.json", "q", "record-queue", "relay.queue", "spend.json", "terms.txt"]);
+    expect(readdirSync(join(quiet.cfg.queueDir, "..")).sort()).toEqual(["health.json", "q", "record-queue", "relay.queue", "review-spend-days.json", "spend.json", "terms.txt"]);
   });
 
   test("the file is read whole or not at all: a missing, broken or odd file is null, odd entries left out", () => {

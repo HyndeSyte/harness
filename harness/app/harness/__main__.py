@@ -29,7 +29,9 @@ from . import commands, handover, inputs, watch
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
-from .family_gmail import FamilyGmail, home_from_options, rules_from_options, school_address_from_options, school_from_options
+from .family_gmail import (FamilyGmail, cleanup_from_options, his_calendar_from_options, home_from_options,
+                           own_days_from_options, own_dry_run_from_options, rules_from_options,
+                           school_address_from_options, school_from_options)
 from .ledger import Ledger
 from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
@@ -94,7 +96,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                                      or meaning.option_on(data_dir)
                                                      or meaning_live.live_on(data_dir)),
                              ahead_from=lambda address, start, until: (
-                                 google.window(address, start, until) if google.configured() else None))
+                                 google.window(address, start, until) if google.configured() else None),
+                             headers_fn=lambda: meaning_live.live_on(data_dir) and own_dry_run_from_options(data_dir))
     listener = family.serve(inbox, port=family_port) if base.family_entity else None
     # What iCloud and Google answer, from any thread, for the watch on inputs (inputs.py).
     seen = inputs.Seen()
@@ -129,7 +132,12 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                                    lambda: school_address_from_options(data_dir),
                                                    home_fn=lambda: home_from_options(data_dir)),
                                tz=base.timezone, live=live,
-                               live_fn=lambda: meaning_live.live_on(data_dir))
+                               live_fn=lambda: meaning_live.live_on(data_dir),
+                               own_days_fn=lambda: own_days_from_options(data_dir),
+                               own_dry_fn=lambda: own_dry_run_from_options(data_dir),
+                               cleanup_fn=lambda: cleanup_from_options(data_dir),
+                               his_fn=lambda: his_calendar_from_options(data_dir),
+                               samples_dir=data_dir)
     controller = Controller(ledger=ledger, vault=vault, api=chat, engines=engines,
                             executor=executor, base_config=base, status_box=status,
                             requests=requests, calendar=calendar,

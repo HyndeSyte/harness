@@ -56,7 +56,16 @@ branch is up to date with `main` and these checks passed on it:
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
-    `tests.yml` defines it.
+    `tests.yml` defines it, and (Cain 0.13.0) for `secrets`, the secret scan, which must
+    always be there. The pr check only keeps it there and reporting; refusing a merge while it
+    is red needs `secrets` added to the "Checks and history" ruleset's required checks, which
+    takes admin rights (Dane, once). `audit` stays optional for one week, until Nov 25, 2026,
+    since it rests on network lookups: it becomes required (in the pr check's list and the
+    ruleset) once a week of its runs shows no network failures. The `secrets` scan honours a
+    baseline, `.gitleaksignore` at the repository's root (one finding's fingerprint a line, each
+    under a `#` line with its reason), empty to start: the first full-history run after this lands
+    on `main` may surface old findings, and they are triaged into it (a real secret is revoked and
+    replaced, never listed).
 
 `pcjobs-windows` is not a required check in the rulesets (making it one needs the
 repository's rulesets, which take admin rights no session has). The link enforces it
@@ -179,6 +188,16 @@ being replaced clears its mark under the lock ("no longer owed: head unchanged")
 check and child kill are in the one request wrapper, so every gate read has them; the dry run, the
 watch and the supersede refuse to start below curl 7.32, and a read that fails on the Pi's side is
 named as that. After the fenced write the deadline is checked again at once.
+
+The follow-ups (0.12.2). The watch checks its deadline before it publishes an acceptance, as well as
+after. The Ship card reads the pull request's head through the gate's own curl wrapper, and a read
+stopped at its time limit refuses it as "the Ship gate's state is unknown". An unreadable quarantine
+log refuses the card naming the log, with no restore command. A quarantined record carries its pull
+request in its name; one whose name names none (from 0.12.0) blocks every card until
+`/opt/cain/keeper.sh ship-gate --set-aside <file> --pr <number>` moves it into
+`/data/work/ship-gate-set-aside/` and logs it (never a delete). An owed supersede re-reads the head
+under the lock before clearing its mark. The lock quarantine takes the lock in recovery mode and moves
+the generation on. `SHIP_GATE_GITHUB_TOKEN` is the recommended default for every gate read.
 
 Owner's ship checklist, for the gate: rerun the watch after any takeover (the watch's output
 says when one happened, and since the twenty-ninth round a quarantine's or recovery's takeover

@@ -26,8 +26,8 @@
    carries the line "Hook policy version: <N>" for that version and the guard-surface
    section's hash line of each of the three files as they are at the head
    (cain/tools/guard-surface.sh prints them).
-6. The required checks keep reporting: the pytest and bun jobs in tests.yml and
-   the pr job in pr.yml keep their names, with no path or branch filters and no
+6. The required checks keep reporting: the pytest, bun and secrets jobs in tests.yml
+   and the pr job in pr.yml keep their names, with no path or branch filters and no
    `if` or `continue-on-error`, and no other workflow reuses those names. The
    pcjobs-windows job in tests.yml isn't required by GitHub, but the link reads it
    before a Ship card whenever tests.yml names it: while it is there, the same rules
@@ -69,7 +69,9 @@ GUARD_FILES = (GUARD_HOOK, GUARD_SETTINGS, "cain/rootfs/opt/cain/pcjobs/public_s
 HEADINGS = ("What changed", "How it was tested", "Not verified", "Anything Dane must do")
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 # The required checks (RELEASING.md): workflow file -> job ids that must stay as they are.
-REQUIRED_JOBS = {".github/workflows/tests.yml": ("pytest", "bun"),
+# secrets (Cain 0.13.0): the secret scan. GitHub's rulesets don't require it yet, so this keeps
+# it there and always reporting; its result is GitHub's to require (RELEASING.md).
+REQUIRED_JOBS = {".github/workflows/tests.yml": ("pytest", "bun", "secrets"),
                  ".github/workflows/pr.yml": ("pr",)}
 # Jobs no ruleset requires, but that the link reads before a Ship card whenever the
 # head's workflow names them (RELEASING.md): while one is there, the rules above hold for it.

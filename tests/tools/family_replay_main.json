@@ -1,0 +1,57 @@
+{
+ "recorded_from": {
+  "release": "Harness 0.24.0",
+  "tag": "harness-0.24.0",
+  "commit": "27e53e8cef5c463a94149d4178389e6bb57ea798",
+  "archived_from": "27e53e8cef5c463a94149d4178389e6bb57ea798"
+ },
+ "writes": [
+  [
+   [
+    "POST",
+    "Busy (harness test, safe to delete)",
+    "2026-12-05T01:00:00-06:00",
+    "2026-12-05T01:15:00-06:00"
+   ],
+   [
+    "DELETE",
+    "Busy (harness test, safe to delete)",
+    "2026-12-05T01:00:00-06:00",
+    "2026-12-05T01:15:00-06:00"
+   ]
+  ],
+  [
+   [
+    "POST",
+    "Busy (drive there)",
+    "2026-10-24T10:00:00-05:00",
+    "2026-10-24T10:30:00-05:00"
+   ],
+   [
+    "POST",
+    "Busy (family)",
+    "2026-10-24T10:30:00-05:00",
+    "2026-10-24T11:30:00-05:00"
+   ]
+  ],
+  [
+   [
+    "POST",
+    "Busy (drive back)",
+    "2026-10-24T11:30:00-05:00",
+    "2026-10-24T12:00:00-05:00"
+   ]
+  ],
+  [],
+  [],
+  [],
+  [],
+  [],
+  [],
+  [],
+  []
+ ],
+ "lookups": 3,
+ "own_lookups": 6,
+ "own_writes": []
+}

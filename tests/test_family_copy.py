@@ -42,6 +42,28 @@ def day_occ(summary, first, last, uid=None, organizer=GMAIL):
                            uid or summary, "", (), "", organizer)
 
 
+class Read:
+    """One read of a feed as calendar_feed.FeedResult gives it: a full download, each generation
+    its own read. The feed's own parse is `ahead` unless a test sets it apart (an API read)."""
+    status, size, complete, etag, last_modified, fetched_at = 200, 0, True, "", "", None
+    _UNSET = object()
+
+    def __init__(self, feeds, window):
+        self._feeds, self.window, self.ahead, self._feed_ahead = feeds, window, window, Read._UNSET
+
+    @property
+    def feed_ahead(self):
+        return self.ahead if self._feed_ahead is Read._UNSET else self._feed_ahead
+
+    @feed_ahead.setter
+    def feed_ahead(self, value):
+        self._feed_ahead = value
+
+    @property
+    def read_id(self):
+        return f"read-{self._feeds.generation}"
+
+
 class Feeds:
     """What the reader hands over, without any fetching."""
     ahead_days = 60
@@ -50,7 +72,7 @@ class Feeds:
     def __init__(self):
         self.generation = 0
         self.window = ical.Window(GMAIL)
-        res = SimpleNamespace(window=self.window, ahead=self.window)
+        res = Read(self, self.window)
         self.snapshot = SimpleNamespace(feeds={"a": res})
         self.soon: list[timedelta] = []    # early reads asked for
 

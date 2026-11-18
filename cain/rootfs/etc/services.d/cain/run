@@ -19,6 +19,14 @@ export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 # unexported copy, so the option reads below still work. From C1 on Cain's processes run as
 # his own user and can't read it from /proc or from s6's saved environment either.
 unset SUPERVISOR_TOKEN HASSIO_TOKEN
+# The outside heartbeat's URL (heartbeat_url) is read from the App's options only by the security
+# watch's own subshell below, and no other child gets it: not Claude Code's session (tmux and
+# session.sh start from this environment), not the link, the keepers or the check-ins. Unset here
+# too, so nothing that reached this environment can carry it on.
+# No xtrace from here on (third round): this script never traces, and a trace would print the
+# options it reads.
+{ set +x; } 2>/dev/null
+unset HEARTBEAT_URL
 umask 027
 cd /
 export TMPDIR=/run/cain/root-tmp CAIN_ROOT_TMP=/run/cain/root-tmp
@@ -395,12 +403,42 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   mkdir -p -m 700 /data/codex
   while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
 ) &
+# The security watch (security/main.ts), root's: the outside heartbeat (a ping every 5 minutes to
+# heartbeat_url, when set) and the key record (/data/keys.json: when each key was first seen,
+# by a hash of its value, never the value). The URL goes only into this one process's environment
+# (no other child has it) and is never logged; the App's keys reach it only as hashes, made here
+# with printf '%s' (no trailing new line), the same as the watch's own sha256 (security/main.ts sha).
+# The bot token is hashed from where this mode keeps it (TOKEN_FILE, root's since C1).
+(
+  # No xtrace in this subshell (third round): a trace would print the URL and the keys it hashes.
+  { set +x; } 2>/dev/null
+  opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
+  for k in github_token pc_jobs_token gemini_api_key perplexity_api_key anthropic_api_key; do
+    v="$(opt "$k")"
+    if [ -n "$v" ]; then export "KEY_SHA_$k=$(printf '%s' "$v" | sha256sum | cut -d' ' -f1)"; else export "KEY_SHA_$k="; fi
+  done
+  unset v
+  CAIN_DISCORD_ENV="$TOKEN_FILE"
+  HEARTBEAT_URL="$(opt heartbeat_url)"
+  export HEARTBEAT_URL CAIN_DISCORD_ENV
+  while true; do bun "$OPT/security/main.ts" run 2>&1; sleep 10; done
+) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM. checkin.sh decides when, and
 # only types into an idle session (through as-cain, the new way). Started once, with his session.
 checking_in=""
 checkins() {
   if [ -n "$checking_in" ]; then return 0; fi
-  checking_in=1; ( while true; do "$OPT/checkin.sh" || true; sleep 5; done ) &
+  # The review caps go in too (not keys), for the security watch's spend lines.
+  checking_in=1
+  (
+    opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
+    REVIEW_CAP_GEMINI_USD="$(opt gemini_monthly_usd)"
+    REVIEW_CAP_PERPLEXITY_USD="$(opt perplexity_monthly_usd)"
+    REVIEW_CAP_ANTHROPIC_USD="$(opt anthropic_monthly_usd)"
+    REVIEW_CAP_CODEX_RUNS="$(opt codex_monthly_runs)"
+    export REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS
+    while true; do "$OPT/checkin.sh" || true; sleep 5; done
+  ) &
 }
 if [ "$mode" != none ] && [ -z "$held" ]; then checkins; fi
 # The sign-in page and the yes/no status page, for the panel: root's, served by nginx only.

@@ -59,7 +59,7 @@ export const KEEP_MS = 8 * 24 * 3_600_000;
 
 export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"]);
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
-  "/look", "/cards", "/check", "/replay", "/connector"]);
+  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector"]);
 // Root's services, on the unix socket only: what Cain sent (his edit allowlist) and the cards.
 export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice"]);
 

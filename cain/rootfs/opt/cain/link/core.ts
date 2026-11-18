@@ -104,6 +104,8 @@ const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
 const HOUR = 3_600_000;
 const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts and checks, asked at once) before it says it couldn't read them
+// 0.12.2: the card's wait for the gate's head read ran out (an abort at its time limit), named as the gate's state unknown.
+export const GATE_HEAD_TIMED_OUT = "the read of the pull request's head from GitHub was stopped at its time limit (a timeout)";
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -128,8 +130,12 @@ export const PC_NOTICES: Record<string, string> = {
   reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
   hold_clear_unrecorded: "Your PC isn't taking jobs: its worker couldn't write its record of clearing a version hold (version-hold-cleared.json in the worker folder), so the hold stays. At the PC: free disk space or fix the worker folder's permissions so that file can be written, then start a run (pc-jobs.md, Troubleshooting).",
   worker_start_refused: "Your PC isn't taking jobs: its worker refused to start because a setting meant only for its tests is set where it runs (the PC_WORKER_TEST_BUILD variable, or a preload, require, import or loader flag in NODE_OPTIONS or BUN_OPTIONS, or a bunfig.toml preload). At the PC: remove it as the worker's own refusal says, open a new terminal, then start a run (pc-jobs.md, Troubleshooting).",
-  worker_not_starting: "Jobs are waiting for your PC, and its worker hasn't been heard from for hours. If it was started and nothing happened, a setting on the PC may be stopping it before it can start or say why, such as a preload in BUN_OPTIONS or NODE_OPTIONS set in Windows' environment settings. At the PC: follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  worker_not_starting: "Jobs are waiting for your PC, or one ran out of time waiting, and its worker hasn't been heard from while they waited. If it was started and nothing happened, a setting on the PC may be stopping it before it can start or say why, such as a preload in BUN_OPTIONS or NODE_OPTIONS set in Windows' environment settings. At the PC: follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  // 0.12.2, third pass: the same condition, seen in the keeper's copy while the queue couldn't be reached for hours.
+  worker_not_starting_unconfirmed: "Jobs have been waiting for your PC and its worker hasn't been heard from, but this isn't confirmed: your PC job keeper hasn't been able to read the PC job queue reliably for hours, so its copy of the PC's last check-in may just be old. If the worker was started and nothing happened, follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
   queue_unreachable: "Your PC job keeper hasn't been able to reach the PC job queue on GitHub for about half an hour, so new PC jobs wait and results don't come back. It keeps trying by itself. If it lasts, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  // 0.12.2: the same, raised again within a day of it clearing.
+  queue_unreachable_again: "Your PC job keeper can't reach the PC job queue on GitHub again, within a day of it coming back, so new PC jobs wait and results don't come back. It keeps trying by itself. If it keeps happening, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
   notice_undelivered: "Your PC job keeper had an earlier notice for you that could not be delivered, and after its update it can no longer say which one. If something about PC jobs seems stuck, see pc-jobs.md, Troubleshooting; Cain can read the keeper's log.",
 };
 export const PC_NOTICE_REPEAT = "Said again, in case it didn't reach you before:";
@@ -192,6 +198,86 @@ const SHA = /^[0-9a-f]{40}$/;
 export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
 export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
+// Link previews off on everything the link puts in his DM (security watch, Cain 0.13.0): a
+// post, an ephemeral answer and a tap's new message carry Discord's SUPPRESS_EMBEDS flag from
+// the start, so a link in a message never unfurls into a preview fetched from its site.
+// Second round: the flag only ever goes onto bits already there, never clearing one.
+//   - a first post (a message, a webhook's, a tap's new message): ORed onto its own flags;
+//   - an edit that carries flags: ORed onto them and onto the message's flags as last seen;
+//   - an edit that sets words and carries none: only when the message's flags are known (the
+//     link reads them first when it doesn't know them) and lack the bit, as those flags ORed
+//     with it; one that has the bit already is sent as it was (Discord keeps a message's flags);
+//   - a tap's update of its message (type 7): ORed onto flags it carries, never added alone
+//     (answer() puts the tapped message's own flags in first when it sets words);
+//   - anything else as it was.
+// added: whether a flags value went that the caller didn't write, so a refusal of it (a 400 whose
+// body names flags) is tried once more without the added bit, with a "preview flag refused" line in
+// the gate report: a flag problem shows a preview, never a dead card.
+// Third round: every flags value that goes out is masked to the bits Discord takes on a post, an
+// edit or a tap's answer (EDITABLE_FLAGS; EPHEMERAL too on an interaction's own answer or webhook).
+// Bits Discord sets itself and only reports (HAS_THREAD, CROSSPOSTED, LOADING, HAS_SNAPSHOT and the
+// rest) never go back. known: the message's flags as last read; null: the read before an edit
+// failed or timed out, so the edit goes as the caller wrote it (masked), without the added bit.
+export const SUPPRESS_NOTIFICATIONS = 1 << 12;
+export const IS_COMPONENTS_V2 = 1 << 15;
+export const EDITABLE_FLAGS = SUPPRESS_EMBEDS | SUPPRESS_NOTIFICATIONS | IS_COMPONENTS_V2;
+export function maskFlags(flags: unknown, interaction = false): number {
+  return (Number(flags) || 0) & (EDITABLE_FLAGS | (interaction ? EPHEMERAL : 0));
+}
+export interface Quieted { body: unknown; added: boolean }
+export const MESSAGE_PATH = /^\/channels\/\d+\/messages\/(\d+)$/;
+const isInteraction = (path: string) => /^\/interactions\//.test(path) || /^\/webhooks\//.test(path);
+// The caller's own body with its flags masked and nothing added: what a retry sends after a refusal
+// that names flags, and what an edit sends when the message's flags couldn't be read.
+export function masked(path: string, body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const b = body as Record<string, any>, i = isInteraction(path);
+  const m = (o: Record<string, any>) => ("flags" in o ? { ...o, flags: maskFlags(o.flags, i) } : o);
+  return /^\/interactions\//.test(path) && b.data && typeof b.data === "object" ? { ...b, data: m(b.data) } : m(b);
+}
+export function quiet(method: string, path: string, body: unknown, known?: number | null): Quieted {
+  const same = { body, added: false };
+  if (!body || typeof body !== "object" || Array.isArray(body)) return same;
+  const b = body as Record<string, any>;
+  const interaction = isInteraction(path);
+  const or = (o: Record<string, any>, more = 0) => {
+    const base = maskFlags(o.flags, interaction);
+    const flags = maskFlags(base | more | SUPPRESS_EMBEDS, interaction);
+    return { body: { ...o, flags }, added: !("flags" in o) || flags !== base };
+  };
+  if (method === "POST" && (/^\/channels\/\d+\/messages$/.test(path) || /^\/webhooks\/[^/]+\/[^/]+$/.test(path))) return or(b);
+  if (method === "PATCH" && MESSAGE_PATH.test(path)) {
+    if (known === null) return { body: masked(path, b), added: false };
+    if ("flags" in b) return or(b, known ?? 0);
+    if (!("content" in b) || known === undefined || (known & SUPPRESS_EMBEDS)) return same;
+    return or(b, known);
+  }
+  if (method === "POST" && /^\/interactions\//.test(path) && b.data && typeof b.data === "object") {
+    if (b.type === 4 || "flags" in b.data) { const q = or(b.data); return { body: { ...b, data: q.body }, added: q.added }; }
+  }
+  return { body: masked(path, b), added: false };
+}
+// A refusal that names the flags field (Discord's 400 lists the fields it refused; the link's rest
+// puts their names after the message): only that is tried again without the added bit.
+export const namesFlags = (e: unknown) => /discord 400\b/.test(String(e)) && /\bflags\b/i.test(String(e));
+// Discord's error as the link throws it: the status, its message, and the names of the fields it
+// refused (errors: {flags: {_errors: [...]}, data: {flags: ...}}), never values.
+export function discordError(status: number, data: any): string {
+  const names: string[] = [];
+  const walk = (o: any, at: string, depth: number) => {
+    if (!o || typeof o !== "object" || depth > 4 || names.length >= 6) return;
+    for (const k of Object.keys(o)) {
+      if (k === "_errors") continue;
+      const here = at ? `${at}.${k}` : k;
+      if (/^[A-Za-z0-9_]{1,40}$/.test(k)) { if (o[k] && typeof o[k] === "object" && "_errors" in o[k]) names.push(here); walk(o[k], here, depth + 1); }
+    }
+  };
+  walk(data?.errors, "", 0);
+  return `discord ${status}: ${String(data?.message ?? "").slice(0, 100)}${names.length ? ` (fields: ${names.join(", ")})` : ""}`;
+}
+export const PRE_EDIT_READ_MS = 1_500;   // the read of a message's flags before an edit, at most
+// A path for a log line: an interaction's or webhook's token cut short.
+const shortPath = (path: string) => path.replace(/\/[^/]{40,}/g, "/…");
 
 export interface Card {
   text: string; rows: any[]; kind: string; created: number; shown: string | null; expires?: number | null;
@@ -579,11 +665,16 @@ export interface Deps {
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
   gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
+  // 0.12.2: the pull request's head as the gate reads it (shipgate.ts gateHeadRead, through its curl wrapper), within ms:
+  // the head, or the gate's state unknown, named. Absent (the tests' rig): the facts' head is used, as before.
+  gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }>;
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
+  linkHosts?: () => ReadonlySet<string>;
+  keeperSent?: (at: number) => void;                               // a keeper.sh reply went out (gate/held.ts: the check-in's waiting line)                           // the hosts Cain normally cites (gate/hosts.ts); absent: no notices
   // The replay: Cain's own replies and edits as his transcripts have them (since a time),
   // where its report goes, and the pause between pages of his DM (tests: 0).
   transcripts?: (since: number) => Sent | Promise<Sent>;
@@ -763,9 +854,61 @@ export class Link {
   constructor(private d: Deps) {
     // Every call to Discord, noting a rate limit: the moving Stop waits a minute after one.
     this.rest = async (...a) => {
-      try { return await d.rest(...a); }
-      catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
+      const [method, path, body, ...more] = a;
+      try {
+        const known = await this.flagsFor(method, path, body);
+        const q = quiet(method, path, body, known);
+        if (known === null) {
+          // The read failed: the edit goes as the caller wrote it, and the report notes it.
+          this.reportFlag("flags unread", path, "the message's flags couldn't be read before the edit: sent without the preview flag");
+        }
+        try { return this.sawFlags(path, await d.rest(method, path, q.body, ...more)); }
+        catch (e) {
+          if (!q.added || !/discord 400/.test(String(e))) throw e;
+          // Only a 400 that names flags is the flag's: anything else is logged, and nothing is sent twice.
+          if (!namesFlags(e)) { this.log(`Discord refused ${method} ${shortPath(path)}: ${String(e).slice(0, 160)}`); throw e; }
+          this.log(`Discord refused the preview flag on ${method} ${shortPath(path)}: sent again without it`);
+          this.reportFlag("preview flag refused", path);
+          return this.sawFlags(path, await d.rest(method, path, masked(path, body), ...more));
+        }
+      } catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
     };
+  }
+
+  // Each message's flags as Discord last answered them (0.13.0, second round), so an edit never
+  // sends a flags value that drops a bit the message has. Kept for the newest 500 messages.
+  private flags = new Map<string, number>();
+  private sawFlags(path: string, msg: any): any {
+    const id = msg && typeof msg === "object" && /^\/channels\/\d+\/messages/.test(path) ? String(msg.id ?? "") : "";
+    if (id && typeof msg.flags === "number") {
+      this.flags.delete(id);
+      this.flags.set(id, msg.flags);
+      if (this.flags.size > 500) this.flags.delete(this.flags.keys().next().value!);
+    }
+    return msg;
+  }
+  private reportFlag(did: string, path: string, note?: string) {
+    try { this.d.report?.({ point: "preview flag", writer: "link", hits: [], did, ...(note ? { note } : {}), ...(MESSAGE_PATH.exec(path) ? { message: MESSAGE_PATH.exec(path)![1] } : {}) }); }
+    catch (r) { this.log(`couldn't log the gate's report: ${String(r).slice(0, 80)}`); }
+  }
+  // The flags an edit has to keep: as last seen, or read from Discord now for an edit that sets words
+  // or flags of a message the link hasn't seen. undefined: nothing to keep; null: the read failed or ran
+  // past PRE_EDIT_READ_MS (third round), so the edit goes as the caller wrote it, without the added bit.
+  private async flagsFor(method: string, path: string, body: unknown): Promise<number | null | undefined> {
+    const m = method === "PATCH" ? MESSAGE_PATH.exec(path) : null;
+    if (!m || !body || typeof body !== "object" || !("content" in body || "flags" in body)) return undefined;
+    if (this.flags.has(m[1])) return this.flags.get(m[1]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const cur = this.sawFlags(path, await Promise.race([
+        this.d.rest("GET", path, undefined, true, PRE_EDIT_READ_MS),
+        new Promise((_, no) => { timer = setTimeout(() => no(new Error("TimeoutError: the read of its flags ran out of time")), PRE_EDIT_READ_MS + 100); }),
+      ]));
+      return typeof cur?.flags === "number" ? cur.flags : undefined;
+    } catch (e) {
+      this.log(`couldn't read a message's flags before an edit: ${String(e).slice(0, 80)}`);
+      return null;
+    } finally { if (timer) clearTimeout(timer); }
   }
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
@@ -865,8 +1008,37 @@ export class Link {
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
     const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(),
       { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
-        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}) });
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}), plugin: true, hosts: this.d.linkHosts?.() ?? null });
     return { status: "ok", ...d };
+  }
+
+  // keeper.sh reply (Cain 0.13.0, second round): a reply of Cain's with a link in it, posted by the link
+  // with the preview off from the first moment (SUPPRESS_EMBEDS on the post itself), since the plugin's
+  // own reply sets no flags. The same gate as his plugin replies (decideSend, less the rule that sends
+  // links here, and with no third try): "add-on" fixed as it goes, anything else refused with what to
+  // change. The message is recorded as his own reply, not the link's, so he can still edit it, and it
+  // counts for the moving Stop like any reply of his.
+  async reply(a: { text?: unknown; replyTo?: unknown }): Promise<{ status: "posted"; message: string; said: string }> {
+    const text = String(a.text ?? "");
+    if (!text.trim()) throw new Refusal("needs the text to send");
+    const replyTo = a.replyTo === undefined || a.replyTo === null || a.replyTo === "" ? undefined : String(a.replyTo).trim();
+    if (replyTo !== undefined && !SNOWFLAKE.test(replyTo)) throw new Refusal("a message id is a Discord id");
+    const { dm } = await this.identity();
+    const d = decideSend({ tool: "reply", text, replyTo, chat: dm }, this.cardsNow(),
+      { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}), hosts: this.d.linkHosts?.() ?? null });
+    const did = d.would === "refuse" ? "refused" : d.would === "fix" ? "fixed" : "posted";
+    if (d.hits.length && this.d.report) {
+      try { this.d.report({ point: "keeper reply", writer: "cain", hits: d.hits as Hit[], did }); }
+      catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
+    }
+    if (d.would === "refuse") throw new Refusal(d.said);
+    const words = d.would === "fix" ? d.fixed : text;
+    const msg = await this.post(words, [], replyTo ? { replyTo } : {});
+    try { this.d.keeperSent?.(this.d.now()); } catch (e) { this.log(`couldn't note a keeper reply: ${String(e).slice(0, 80)}`); }
+    await this.sent({ tool: "reply", ids: [String(msg.id)], question: asksSomething(words), call: `keeper-${String(msg.id)}`,
+      ...(replyTo ? { reply_to: replyTo } : {}) }, { background: true });
+    return { status: "posted", message: String(msg.id), said: d.would === "fix" ? `Posted, with its wording fixed: ${fixedWhat(d.hits as Hit[])}.` : "Posted." };
   }
 
   // -- Stop everything ----------------------------------------------------------
@@ -1543,13 +1715,24 @@ export class Link {
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
-    const { facts, checkRuns } = this.d;
-    const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
+    const { facts, checkRuns, gateHead } = this.d;
+    // 0.12.2: while an acceptance stands, the gate's head is read through the gate's own curl wrapper (gateHead), beside
+    // the facts; its wait running out is named as a timeout, and any read that doesn't give the head is the gate's state
+    // unknown, by name.
+    const gateRead = watched.length && gateHead
+      ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
+      : Promise.resolve(null);
+    const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    if (watched.length && gateHead) {
+      if (gh === null) throw new Refusal(`the Ship gate's state is unknown for this pull request: ${GATE_HEAD_TIMED_OUT}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (typeof gh !== "string") throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gh.unknown}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (gh !== head) throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    }
     // Twenty-fifth round: a watch's acceptance is consumed only against the pull request's head as GitHub has it now.
     // When one stands, a head that can't be read refuses the card (the acceptance can't be checked), never passes it.
-    if (watched.length && f?.head !== head)
+    if (watched.length && !gateHead && f?.head !== head)
       throw new Refusal("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it: show the card again in a minute");
     // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
     // the head (a squash or a rebase would leave it out). So the card asks main too, the way the
@@ -1759,7 +1942,12 @@ export class Link {
 
   private async answer(it: any, kind: number, data?: unknown): Promise<boolean> {
     try {
-      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, data ? { type: kind, data } : { type: kind }, false);
+      // A tap's update that sets words keeps the tapped message's own flags (only the ones an answer may
+      // carry: masked, third round); the rest wrapper adds the preview flag, so a refusal of it that
+      // names flags is tried once more without it.
+      const keep = kind === 7 && data && typeof data === "object" && "content" in (data as object) && !("flags" in (data as object))
+        && typeof it?.message?.flags === "number" ? { ...(data as object), flags: maskFlags(it.message.flags) } : data;
+      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, keep ? { type: kind, data: keep } : { type: kind }, false);
       return true;
     } catch (e) {
       this.log(`couldn't answer a tap in time: ${String(e).slice(0, 80)}`);
@@ -2066,6 +2254,11 @@ export class Link {
       catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
       this.d.relay(`Your edit changed Discord message ${theirs}, ${m.kind === "notice" || m.kind === "morning" ? "a message" : "a card"} your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     }
+    // His replies go out through the Discord plugin, which sets no flags. One with a link is held by
+    // the reply hook (keeper.sh reply posts it with the preview off from the start); one that slipped
+    // through (the hook down, say) gets the preview turned off here, right after, best effort:
+    // a race with Discord's own fetch, so only a fallback.
+    if (tool === "reply" && n?.links === true) void this.quietReplies(ids.filter((id) => !this.linkPosted(s, id)));
     const net = netOf(n?.net);
     if (net && this.firstTime(call, tool, ids, net)) this.d.relay(netLine(tool, last, net));
     // The broker's record of what went out failed (C1 re-check R5): Cain hears, at most every 6
@@ -2078,6 +2271,25 @@ export class Link {
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;
     return { status: "ok", said: "Noted." };
+  }
+
+  async quietReplies(ids: string[]): Promise<number> {
+    let done = 0;
+    for (const id of ids) {
+      try {
+        const { dm } = await this.identity();
+        // Its flags first: the flag goes onto them, never in place of them.
+        const cur = await this.rest("GET", `/channels/${dm}/messages/${id}`);
+        const had = Number(cur?.flags) || 0;
+        if (had & SUPPRESS_EMBEDS) { done++; continue; }
+        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: maskFlags(had | SUPPRESS_EMBEDS) });
+        done++;
+      } catch (e) {
+        if (/discord 429/.test(String(e))) break;
+        this.log(`couldn't turn a reply's link preview off: ${String(e).slice(0, 80)}`);
+      }
+    }
+    return done;
   }
 
   // Cain's replies from his transcripts (at start, and every few hours): his edit allowlist.

@@ -120,6 +120,7 @@ class PlaceBook:
         self.ledger = ledger
         self.tz = tz
         self._waiting: dict[str, tuple[str, str, datetime]] = {}   # key -> (location, title, start)
+        self.later = False                 # the last resolve's map lookup waits for the next read
 
     # -- the book --------------------------------------------------------------------------------
     def import_rows(self, rows: list[dict]) -> tuple[int, int]:
@@ -145,8 +146,11 @@ class PlaceBook:
         address in its location, else the book, else `find` (drive.Drives.find_place: the
         map, by name near home), else nothing. Ask only when the map said it isn't there,
         not when it couldn't be reached (the next read tries again)."""
-        if not (location or "").strip() or drive.is_online(location):
+        self.later = False
+        if not (location or "").strip():
             return "", False
+        # A street or his book first: an online word beside them ("Virtual Reality Lab, 12 Oak St")
+        # doesn't take the place away. Only the map is never asked with one.
         street = drive.street_address(location)
         if street:
             return street, False
@@ -156,14 +160,32 @@ class PlaceBook:
         row = self.ledger.db.execute("SELECT address, skip FROM places WHERE key=?", (key,)).fetchone()
         if row is not None:
             return ("" if row["skip"] else row["address"]), False
+        if drive.is_online(location):
+            return "", False
         if find is None:
             return "", True
         found = find(location)
+        if found == drive.LATER:
+            self.later = True              # not asked at this read: no failure, no question
+            return "", False
         if found == drive.FAILED:
             return "", False
         if found == drive.NO_ADDRESS or not found:
             return "", True
         return found, False
+
+    def findable(self, location: str, online_words: bool = False) -> bool:
+        """A location worth a drive that nothing placed: not empty, not a call or a link, and not
+        a place he said to skip (a skip row in the book, or Skip on its "Where is" card).
+        online_words: one with an online word in it counts too (one the caller found isn't online)."""
+        key = place_key(location)
+        if not (location or "").strip() or (drive.is_online(location) and not online_words) or not key:
+            return False
+        row = self.ledger.db.execute("SELECT skip FROM places WHERE key=?", (key,)).fetchone()
+        if row is not None and row["skip"]:
+            return False
+        return self.ledger.db.execute("SELECT 1 FROM place_asks WHERE key=? AND state='skipped'",
+                                      (key,)).fetchone() is None
 
     # -- asking him once -------------------------------------------------------------------------
     def begin(self) -> None:

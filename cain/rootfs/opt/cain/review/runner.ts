@@ -24,6 +24,7 @@ export type RunnerConfig = {
   // None: no inbox (the tests that queue directly).
   inboxDir?: string;
   inboxUid?: number;                 // whose files the inbox takes (default his user, ../owned.ts)
+  spendDaysFile?: string;            // spend per day and seat, for the security watch (none: beside spendFile)
   caps: { gemini: number; perplexity: number; claude: number; openaiRuns: number };
   reviewLimit: number;
   timeoutS: Record<SeatName, number>;
@@ -51,6 +52,20 @@ export type RunnerDeps = {
 
 export type SpendRow = { usd: number; runs: number; findings: number; searches: number };
 export type Ledger = Record<string, Partial<Record<SeatName, SpendRow>>>;
+// Spend per day (YYYY-MM-DD in the runner's time zone) and seat, kept 62 days: the security
+// watch's daily lines and its jump rule read it (../security/core.ts).
+export type DayRow = { usd: number; runs: number };
+export type DayLedger = Record<string, Partial<Record<SeatName, DayRow>>>;
+export const DAYS_KEPT = 62;
+// Whether a seat's monthly cap is reached already (runs for Codex, dollars for the others):
+// review.sh refuses a review whose seats are all there, and the security watch says so.
+export function atCap(ledger: Ledger, month: string, caps: RunnerConfig["caps"], seat: SeatName): boolean {
+  const row = ledger[month]?.[seat];
+  if (seat === "openai") return (row?.runs ?? 0) >= caps.openaiRuns;
+  return (row?.usd ?? 0) >= caps[seat];
+}
+export const daysFileOf = (cfg: Pick<RunnerConfig, "spendFile" | "spendDaysFile">) =>
+  cfg.spendDaysFile ?? join(dirname(cfg.spendFile), "review-spend-days.json");
 export type Health = Partial<Record<SeatName, { ok: boolean; at: string; kind?: ErrorKind; detail?: string; fix?: string }>>;
 
 const GROUNDING_FREE = 5_000, GROUNDING_USD = 0.014;   // Gemini 3+: 5,000 grounded searches a month free, then $14 / 1,000
@@ -111,6 +126,15 @@ export class Runner {
     }
     row.usd = Number((row.usd + usd + extra).toFixed(6)); row.runs++; row.findings += findings; row.searches += searches;
     writeAtomic(this.cfg.spendFile, JSON.stringify(l, null, 1));
+    try {
+      const file = daysFileOf(this.cfg), d = this.day();
+      const days = readJson<DayLedger>(file, {});
+      const r = (days[d] ??= {})[seat] ??= { usd: 0, runs: 0 };
+      r.usd = Number((r.usd + usd + extra).toFixed(6)); r.runs++;
+      const oldest = new Date(Date.parse(`${d}T12:00:00Z`) - DAYS_KEPT * 86_400_000).toISOString().slice(0, 10);
+      for (const k of Object.keys(days)) if (k < oldest) delete days[k];
+      writeAtomic(file, JSON.stringify(days, null, 1));
+    } catch (e) { this.log(`couldn't keep the day's spend: ${(e as Error).message.slice(0, 80)}`); }
     return usd + extra;
   }
 
