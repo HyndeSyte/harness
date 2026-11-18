@@ -6,7 +6,8 @@
 //   bun main.ts fail                one ping to <heartbeat_url>/fail (the App stopping on an error)
 //   bun main.ts lines morning|other the check-in's "Security watch" line, or nothing
 //   bun main.ts key-expiry <name> <YYYY-MM-DD|none>   (keeper.sh key-expiry)
-//   bun main.ts keys                each key's name, first seen, expiry: never a key, never a hash
+//   bun main.ts key-ack <name> <YYYY-MM-DD>           (keeper.sh key-ack: a key that never expires by design)
+//   bun main.ts keys                each key's name, first observed, expiry: never a key, never a hash
 // The heartbeat URL comes in HEARTBEAT_URL, is read once and taken out of the environment,
 // and is never printed: not in a log line, an error, a file or the check-in.
 // The keys come in as hashes only (KEY_SHA_<name>, made by the run script from the App's
@@ -18,7 +19,7 @@ import { configFromEnv } from "../review/config.ts";
 import { daysFileOf, type DayLedger, type Ledger } from "../review/runner.ts";
 import {
   afterPing, type BeatState, dayOf, errorName, failUrl, heartbeatLines, heartbeatUrl, keyLines, KEYS, observeKeys, parseKeys,
-  PING_EVERY_MS, PING_TIMEOUT_MS, section, setExpiry, spendLines, statusLine,
+  PING_EVERY_MS, PING_TIMEOUT_MS, section, setAck, setExpiry, spendLines, statusLine,
 } from "./core.ts";
 
 export interface Paths { beat: string; keys: string; discordEnv: string; deployKey: string; shipKey: string }
@@ -159,16 +160,22 @@ if (import.meta.main) {
       console.log(JSON.stringify({ status: r.file ? "ok" : "error", said: r.said }));
       process.exit(r.file ? 0 : 2);
     }
+    case "key-ack": {
+      const r = setAck(parseKeys(read(p.keys)), String(a1 ?? ""), String(a2 ?? ""), dayOf(new Date(), tz));
+      if (r.file) writeWhole(p.keys, JSON.stringify(r.file, null, 1));
+      console.log(JSON.stringify({ status: r.file ? "ok" : "error", said: r.said }));
+      process.exit(r.file ? 0 : 2);
+    }
     case "keys": {
       const f = parseKeys(read(p.keys));
       for (const name of Object.keys(KEYS)) {
         const r = f.keys[name];
-        console.log(`${name}: ${!r ? "not seen" : `${r.present ? "" : "gone, "}first seen ${r.first_seen}${r.expires ? `, expires ${r.expires}` : ", no expiry set"}`}`);
+        console.log(`${name}: ${!r ? "not observed" : `${r.present ? "" : "gone, "}first observed ${r.first_seen}${r.expires ? `, expires ${r.expires}` : ", no expiry set"}${r.ack ? `, acknowledged until ${r.ack}` : ""}`}`);
       }
       break;
     }
     default:
-      console.error("usage: main.ts run | fail | lines morning|other | key-expiry <name> <YYYY-MM-DD|none> | keys");
+      console.error("usage: main.ts run | fail | lines morning|other | key-expiry <name> <YYYY-MM-DD|none> | key-ack <name> <YYYY-MM-DD> | keys");
       process.exit(2);
   }
 }

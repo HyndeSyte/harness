@@ -87,14 +87,14 @@ describe("the outside heartbeat", () => {
     expect(logs.join(" ")).not.toContain("hc-ping");
   });
 
-  test("the CLI: fail with no URL sends nothing and prints nothing; the finish script calls it", () => {
+  test("the CLI: fail with no URL sends nothing and prints nothing; the finish script pings by curl", () => {
     const dir = tmp();
     const p = Bun.spawnSync(["bun", join(CAIN, "security", "main.ts"), "fail"], {
       env: { ...process.env, HEARTBEAT_URL: "", SECURITY_HEARTBEAT_STATE: join(dir, "b.json") }, stdout: "pipe", stderr: "pipe" });
     expect(p.exitCode).toBe(0);
     expect(p.stdout.toString() + p.stderr.toString()).toBe("");
     const finish = readFileSync(join(ROOT, "cain/rootfs/etc/services.d/cain/finish"), "utf8");
-    expect(finish).toContain("security/main.ts fail");
+    expect(finish).toContain("-K -");
     const run = readFileSync(join(ROOT, "cain/rootfs/etc/services.d/cain/run"), "utf8");
     expect(run).toContain("security/main.ts run");
     expect(run).not.toMatch(/echo[^\n]*HEARTBEAT_URL/);
@@ -132,14 +132,15 @@ describe("the spend lines and the jump rule", () => {
   });
 
   test("a day over 3 times the trailing 7-day average is flagged; under it, or under the floor, isn't", () => {
-    const base = week("claude", 0.5);                                  // 7 days of $0.50 before yesterday
-    expect(jumpOf({ ...base, "2026-11-17": { claude: { usd: 1.6, runs: 1 } } }, "2026-11-17", "claude", CAPS)).toContain("over 3 times the 7-day average of $0.50");
-    expect(jumpOf({ ...base, "2026-11-17": { claude: { usd: 1.4, runs: 1 } } }, "2026-11-17", "claude", CAPS)).toBeNull();
-    // Nothing the week before: a few cents isn't a jump, a quarter or more is.
+    const base = week("claude", 0.3);                                  // 7 days of $0.30 before yesterday
+    expect(jumpOf({ ...base, "2026-11-17": { claude: { usd: 1.6, runs: 1 } } }, "2026-11-17", "claude", CAPS)).toContain("over 3 times the 7-day average of $0.30");
+    expect(jumpOf({ ...week("claude", 0.2), "2026-11-17": { claude: { usd: 0.9, runs: 1 } } }, "2026-11-17", "claude", CAPS)).toBeNull();   // under the $1 floor
+    expect(jumpOf({ ...week("claude", 0.5), "2026-11-17": { claude: { usd: 1.4, runs: 1 } } }, "2026-11-17", "claude", CAPS)).toBeNull();
+    // Nothing the week before: no week to compare with, so no 3x jump (second round), whatever the amount under a fifth of the cap.
     expect(jumpOf({ "2026-11-17": { gemini: { usd: 0.1, runs: 1 } } }, "2026-11-17", "gemini", CAPS)).toBeNull();
-    expect(jumpOf({ "2026-11-17": { gemini: { usd: 0.3, runs: 1 } } }, "2026-11-17", "gemini", CAPS)).toBe("with nothing spent the 7 days before");
-    // Codex in runs.
-    expect(jumpOf({ "2026-11-17": { openai: { usd: 0, runs: 12 } } }, "2026-11-17", "openai", CAPS)).toBe("with nothing spent the 7 days before");
+    expect(jumpOf({ "2026-11-17": { gemini: { usd: 1.5, runs: 1 } } }, "2026-11-17", "gemini", CAPS)).toBeNull();
+    // Codex in runs: 7 days of 1 run, then 12.
+    expect(jumpOf({ ...week("openai", 0), "2026-11-17": { openai: { usd: 0, runs: 12 } } }, "2026-11-17", "openai", CAPS)).toContain("over 3 times the 7-day average of 1 run");
     expect(jumpOf({ ...week("openai", 0), "2026-11-17": { openai: { usd: 0, runs: 4 } } }, "2026-11-17", "openai", CAPS)).toBeNull();   // under the 5-run floor
   });
 
@@ -207,20 +208,22 @@ describe("the key record", () => {
     expect(JSON.stringify(r.file)).not.toContain("fixture-token");
   });
 
-  test("a line within 14 days of an expiry, and for a key over 90 days old with none set", () => {
+  test("a line within 14 days of an expiry, and (Mondays) for a key over 90 days old with none set", () => {
+    const MONDAY = "2026-11-16";
     let f = observeKeys(emptyKeys(), { github_token: sha("a"), pc_jobs_token: sha("b"), gemini_api_key: sha("c"), anthropic_api_key: sha("d") }, "2026-08-01").file;
     f = setExpiry(f, "github_token", "2026-12-02").file!;          // 14 days out: said
     f = setExpiry(f, "pc_jobs_token", "2026-12-03").file!;         // 15 days out: not yet
     f = setExpiry(f, "anthropic_api_key", "2026-11-10").file!;     // past
-    const out = keyLines(f, TODAY);
-    expect(out).toHaveLength(3);
+    const out = keyLines(f, TODAY);                                // a Wednesday: no age lines
+    expect(out).toHaveLength(2);
     expect(out[0]).toStartWith("The record keeper's GitHub token expires on Dec 2, in 14 days.");
-    expect(out[1]).toStartWith("The Gemini API key has been the same for 109 days");
-    expect(out[2]).toStartWith("The Anthropic API key expired on Nov 10");
+    expect(out[1]).toStartWith("The Anthropic API key expired on Nov 10");
+    const mon = keyLines(f, MONDAY);
+    expect(mon.find((l) => l.includes("Gemini"))).toStartWith("The Gemini API key has been the same for 107 days (first observed Aug 1)");
     // 90 days exactly isn't over 90.
-    const g = observeKeys(emptyKeys(), { gemini_api_key: sha("c") }, "2026-08-20").file;
-    expect(keyLines(g, TODAY)).toEqual([]);
-    expect(keyLines(g, "2026-11-19")).toHaveLength(1);
+    const g = observeKeys(emptyKeys(), { gemini_api_key: sha("c") }, "2026-08-18").file;
+    expect(keyLines(g, MONDAY)).toEqual([]);
+    expect(keyLines(g, "2026-11-23")).toHaveLength(1);
   });
 
   test("key-expiry refuses an unknown name or a bad date; keeper.sh runs it without the link", () => {
@@ -264,12 +267,14 @@ describe("the check-in's Security watch line", () => {
     const dir = tmp();
     const env = { REVIEW_SPEND: join(dir, "spend.json"), REVIEW_SPEND_DAYS: join(dir, "days.json"), SECURITY_KEYS: join(dir, "keys.json"),
       SECURITY_HEARTBEAT_STATE: join(dir, "beat.json"), CHECKIN_TZ: "America/New_York" };
-    const now = new Date("2026-11-18T12:10:00Z");
+    const monday = new Date("2026-11-16T12:10:00Z");
     writeFileSync(env.SECURITY_KEYS, JSON.stringify(observeKeys(emptyKeys(), { gemini_api_key: sha("x") }, "2026-07-01").file));
-    const morning = lines("morning", env, now);
+    const morning = lines("morning", env, monday);
     expect(morning).toStartWith("Security watch (nothing here acts; bring him at most one step, in plain words): No outside heartbeat yet");
     expect(morning).toContain("Review spend:");
-    expect(morning).toContain("The Gemini API key has been the same for 140 days");
+    expect(morning).toContain("The Gemini API key has been the same for 138 days");
+    const now = new Date("2026-11-18T12:10:00Z");
+    expect(lines("morning", env, now)).not.toContain("Gemini API key");          // the age line only on Mondays
     expect(morning).not.toContain("\n");
     expect(lines("other", env, now)).toBe("");
     writeFileSync(env.SECURITY_HEARTBEAT_STATE, JSON.stringify({ state: "ok", fails: 3, last_ok: now.getTime() - 20 * MIN, last_error: "timed out" }));
@@ -304,18 +309,28 @@ describe("the check-in's Security watch line", () => {
 
 // -- link previews off ------------------------------------------------------------------------------
 describe("link previews off on everything the link posts", () => {
-  test("quiet: posts, webhooks, edits and a tap's update carry the flag; reads and other calls don't change", () => {
-    expect(quiet("POST", `/channels/${DM}/messages`, { content: "x" })).toEqual({ content: "x", flags: 4 });
-    expect(quiet("POST", "/webhooks/1/tok", { content: "x", flags: 64 })).toEqual({ content: "x", flags: 68 });
-    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x", components: [] })).toEqual({ content: "x", components: [], flags: 4 });
-    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { components: [] })).toEqual({ components: [] });   // buttons alone: the post's flag stands
-    expect(quiet("POST", "/interactions/1/tok/callback", { type: 7, data: { content: "x" } })).toEqual({ type: 7, data: { content: "x", flags: 4 } });
-    expect(quiet("POST", "/interactions/1/tok/callback", { type: 6 })).toEqual({ type: 6 });
-    expect(quiet("POST", "/users/@me/channels", { recipient_id: "1" })).toEqual({ recipient_id: "1" });
-    expect(quiet("GET", `/channels/${DM}/messages/123`, undefined)).toBeUndefined();
+  test("quiet: first posts carry the flag; edits only OR it onto the flags the message has; reads and other calls don't change", () => {
+    expect(quiet("POST", `/channels/${DM}/messages`, { content: "x" })).toEqual({ body: { content: "x", flags: 4 }, added: true });
+    expect(quiet("POST", "/webhooks/1/tok", { content: "x", flags: 64 })).toEqual({ body: { content: "x", flags: 68 }, added: true });
+    expect(quiet("POST", "/webhooks/1/tok", { content: "x", flags: 68 })).toEqual({ body: { content: "x", flags: 68 }, added: false });
+    // An edit that sets words: only with the message's flags known, and only when they lack the bit.
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" })).toEqual({ body: { content: "x" }, added: false });
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 4)).toEqual({ body: { content: "x" }, added: false });
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 0)).toEqual({ body: { content: "x", flags: 4 }, added: true });
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { content: "x" }, 2)).toEqual({ body: { content: "x", flags: 6 }, added: true });
+    // An edit that carries flags: ORed onto them and onto what the message has.
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { flags: 4 }, 32)).toEqual({ body: { flags: 36 }, added: true });
+    expect(quiet("PATCH", `/channels/${DM}/messages/123`, { components: [] }, 0)).toEqual({ body: { components: [] }, added: false });   // buttons alone
+    // A tap's update never gets a flags field it didn't carry; a tap's new message does.
+    expect(quiet("POST", "/interactions/1/tok/callback", { type: 7, data: { content: "x" } })).toEqual({ body: { type: 7, data: { content: "x" } }, added: false });
+    expect(quiet("POST", "/interactions/1/tok/callback", { type: 7, data: { content: "x", flags: 64 } })).toEqual({ body: { type: 7, data: { content: "x", flags: 68 } }, added: true });
+    expect(quiet("POST", "/interactions/1/tok/callback", { type: 4, data: { content: "x" } })).toEqual({ body: { type: 4, data: { content: "x", flags: 4 } }, added: true });
+    expect(quiet("POST", "/interactions/1/tok/callback", { type: 6 }).body).toEqual({ type: 6 });
+    expect(quiet("POST", "/users/@me/channels", { recipient_id: "1" }).body).toEqual({ recipient_id: "1" });
+    expect(quiet("GET", `/channels/${DM}/messages/123`, undefined).body).toBeUndefined();
   });
 
-  test("every posting path in a run of the link: cards, asks, Ship cards, the morning message, answers, taps, edits and Cain's replies", async () => {
+  test("every posting path in a run of the link leaves the flag on: cards, asks, Ship cards, the morning message, answers, taps, edits", async () => {
     const r = rig();
     const card = await r.link.addCard({ text: "Added Swim to your calendar. https://example.com/x", rows: [{ type: 1, components: [{ type: 2, style: 2, label: "Undo", custom_id: "k:c:u1" }] }], kind: "card" });
     await r.link.show(card, { item: "none" });
@@ -327,23 +342,32 @@ describe("link previews off on everything the link posts", () => {
     r.later(2 * DAY);
     await r.link.sweep();
     await r.tap(structuredClone(r.msg(morning)), STOP);
-    const reply = r.snowflake();
-    const plain = r.snowflake();
+    await Bun.sleep(20);
+    // Every message the bot has in his DM carries the flag, after every edit.
+    expect(r.cards().length).toBeGreaterThan(3);
+    for (const m of r.cards() as any[]) expect((Number(m.flags) & 4) === 4).toBe(true);
+    for (const e of r.ephemerals()) expect((Number(e.flags) & 4) === 4).toBe(true);
+    // A tap's update that sets words keeps the message's own flags with the bit.
+    for (const u of r.updates()) if ("content" in u) expect(u.flags).toBe(4);
+    // Edits of words never carried a flags field the message already had: no forced flags.
+    const edits = r.calls.filter((c) => c.method === "PATCH" && c.path.startsWith(`/channels/${DM}/messages/`) && "content" in c.body);
+    expect(edits.length).toBeGreaterThan(0);
+    for (const c of edits) expect(c.body.flags).toBeUndefined();
+    expect(r.reports.filter((x) => x.did === "preview flag refused")).toEqual([]);
+  });
+
+  test("a reply of Cain's that slipped past the hook with a link gets its preview turned off after, keeping its flags", async () => {
+    const r = rig();
+    const reply = r.his("See https://www.example.com/x").id;     // stands in for a reply the plugin posted
+    (r.posted[reply] as any).author = { id: "bot" };
+    (r.posted[reply] as any).flags = 32;
+    const plain = r.his("Moved swim to 4:30.").id;
     await r.link.sent({ tool: "reply", ids: [plain], question: false });   // no link in it: nothing to turn off
     await r.link.sent({ tool: "reply", ids: [reply], question: false, links: true });
     await Bun.sleep(20);
-    const posting = r.calls.filter((c) => (c.method === "POST" && (c.path === `/channels/${DM}/messages` || c.path.startsWith("/webhooks/")))
-      || (c.method === "PATCH" && c.path.startsWith(`/channels/${DM}/messages/`) && "content" in c.body)
-      || (c.method === "POST" && c.path.startsWith("/interactions/") && c.body?.data));
-    const kinds = new Set(posting.map((c) => `${c.method} ${c.path.startsWith("/webhooks/") ? "webhook" : c.path.startsWith("/interactions/") ? "update" : c.method === "PATCH" ? "edit" : "post"}`));
-    expect([...kinds].sort()).toEqual(["PATCH edit", "POST post", "POST update", "POST webhook"]);
-    for (const c of posting) {
-      const flags = c.path.startsWith("/interactions/") ? c.body.data.flags : c.body.flags;
-      expect((Number(flags) & 4) === 4).toBe(true);
-    }
-    // Cain's own reply, posted by the plugin, has its preview turned off by the link right after.
-    expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${reply}` && c.body.flags === 4)).toBe(true);
-    expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${plain}` && c.body.flags === 4 && !c.body.components)).toBe(false);
+    expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${reply}` && c.body.flags === 36)).toBe(true);
+    expect(r.calls.some((c) => c.method === "PATCH" && c.path === `/channels/${DM}/messages/${plain}` && "flags" in c.body)).toBe(false);
+    expect((r.posted[reply] as any).flags).toBe(36);
   });
 
   test("the reply hook tells the link which replies carry a link", () => {

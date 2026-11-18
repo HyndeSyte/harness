@@ -6,7 +6,9 @@
 # - pip, .github/ci: what CI installs to run the tests (pytest, PyYAML). The calendar
 #   specialist (harness/) has no Python dependencies of its own: it uses the standard
 #   library only, so there is no harness/ manifest to watch.
-# - github-actions: the actions the workflows use.
+# - pip, .github/ci: also the audit job's own tools (audit-requirements.txt, pinned with hashes).
+# - github-actions: the actions the workflows use, each pinned to a commit.
+# - docker, cain and harness: each App's Dockerfile base image.
 # Cain (cain/) has no npm or Bun manifest (no package.json): its TypeScript uses only Bun
 # and Node built-ins, with Bun itself pinned in its Dockerfile and in tests.yml. Add an npm
 # entry for /cain here the day a package.json appears.
@@ -26,3 +28,11 @@ updates:
     groups:
       minor-and-patch:
         update-types: [minor, patch]
+  - package-ecosystem: docker
+    directory: /cain
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /harness
+    schedule:
+      interval: weekly

@@ -55,19 +55,29 @@ its own.
   ping URL into `heartbeat_url` in this App's Configuration, then restart the App. The App
   pings it every 5 minutes and says so at once when it stops on an error; the service emails
   or pushes to you itself when the pings stop, so a dead Pi reaches you without going through
-  the App. Each ping carries only how long the App has been up. Treat the URL like a key: the
-  App never shows or logs it.
+  the App. Each ping carries only how long the App has been up. The URL is not logged, not in
+  any child's environment (only the heartbeat's own process has it, and the stop ping reads it
+  through curl's standard input, never a command line); it is stored only in the App's options,
+  which is where Supervisor keeps every option, and that is fine. A leaked URL can mask an outage
+  or fake a failure: keep it like a key. Give the check a grace period of 10 to 15 minutes, so
+  one late ping doesn't page you.
 - **Review spend.** The morning check-in has yesterday's spend per review seat and the month
-  so far against each cap, and flags a day that jumps (over 3 times the week before, or over
-  a fifth of the month's cap): the cheapest sign of a stolen key or a loop. A seat at its
-  monthly cap runs no reviews until the month turns.
-- **Key ages.** The App notes the day each key or token it holds first appeared (by a hash of
-  it, never the key itself) in `/data/keys.json`. The morning check-in names a key within 14
-  days of an expiry noted for it (`/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`), and
-  one with no expiry noted that has been the same for over 90 days.
-- **Links.** Messages from Cain's bot no longer unfold link previews, and a reply of Cain's
-  with a link to a bare IP address, a punycode host, a link shortener, or with a user name or
-  password in it, is held for him to rewrite.
+  so far against each cap, and flags a day that jumps (over 3 times the week before and at
+  least $1, once the seat was used on at least 3 of those 7 days; or over a fifth of the month's
+  cap): the cheapest sign of a stolen key or a loop. It also says when the month so far, at its
+  rate, would pass a seat's cap. A seat at its monthly cap runs no reviews until the month turns.
+- **Key ages.** The App notes the day it first observed each key or token it holds (by a hash
+  of it, never the key itself) in `/data/keys.json`. The morning check-in names a key within 14
+  days of an expiry noted for it (`/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`), and,
+  on Mondays, one with no expiry noted that has been the same for over 90 days. A key that never
+  expires by design (the link's deploy and Ship keys) can be acknowledged until a date
+  (`/opt/cain/keeper.sh key-ack <name> <YYYY-MM-DD>`), and its line stays quiet until then.
+- **Links.** Messages from Cain's bot no longer unfold link previews: a reply of Cain's with a
+  link goes out through the App with the preview off from the start. A link that isn't plain
+  https on its usual port, points to a bare IP address, a punycode host or a link shortener,
+  has a user name or password in it, or whose text names another site than where it leads, is
+  held for him to rewrite. A link to a site off the short list Cain usually cites goes out as
+  usual and is only noted in the App's gate report.
 
 ## Cards and questions
 

@@ -50,6 +50,7 @@ export function linkFetch(d: HttpDeps) {
         case "/reuse": return json(await link.reuseProof(b.m, b.values));
         case "/pc-notice": return json(await link.pcNotice(b.code, b.job, b.id, b.repeat));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
+        case "/reply": return json(await link.reply({ text: b.text, replyTo: b.reply_to }));
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));

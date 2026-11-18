@@ -29,6 +29,14 @@
 //                carrying a user name or password before its host (user:pass@). Masked link
 //                targets count: they're what a tap opens. Held for good (no third try): a plain
 //                https link to the named site always says the same. Every hit is logged.
+//                Second round: each link is parsed as a browser would (WHATWG URL) after the
+//                tidying Discord does (<> and closing marks off, backslashes as slashes, a
+//                percent-encoded host decoded), and held too when it isn't https, names a port
+//                other than 443, has no scheme ("//host"), uses a scheme with no "//"
+//                (javascript:, data:, file: and the like), or is a masked link whose visible
+//                text is an address on another host. An https link to a host off LINK_HOSTS
+//                (and the hosts added with keeper.sh link-host) is never held: it only gets a
+//                notice-only line in the gate report, so the list grows from real use.
 // The first three read the words as he'd see them, so nothing slips past by its spelling:
 // compatibility forms folded (NFKC, full-width letters and digits too), invisible characters
 // and combining marks dropped, Cyrillic and Greek letters that look like Latin ones read as
@@ -39,7 +47,7 @@ import { around, linkSpans } from "./rules";
 
 export type CainRule = "reviewed" | "ship words" | "codes" | "links";
 export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes", "links"];
-export interface CainHit { rule: CainRule; result: "refuse" | "unsure"; at: number; end: number; around: string }
+export interface CainHit { rule: CainRule; result: "refuse" | "unsure" | "note"; at: number; end: number; around: string }
 
 // -- reading the words as he'd see them -----------------------------------------------------
 // Invisible characters (zero-width, bidi controls, soft hyphens, joiners: Unicode's default
@@ -216,44 +224,109 @@ export const SHORTENERS: readonly string[] = [
   "dlvr.it", "soo.gd", "clck.ru", "qr.ae", "tr.im", "x.co", "lc.chat", "tiny.one", "surl.li", "shorte.st", "adf.ly",
   "bc.vc", "ouo.io", "cli.re", "chilp.it", "u.to", "y2u.be", "aka.ms",
 ];
-export type LinkWhy = "ip" | "punycode" | "shortener" | "userinfo";
-// Why a link is held, or null for one that passes. link: as found in the text.
+// Schemes with no "//" that a link can still carry (Cain 0.13.0, second round): held wherever they appear as a link.
+const ODD_SCHEMES = "javascript|vbscript|data|file|blob|about|mailto|tel|sms|intent|view-source|filesystem|jar";
+export type LinkWhy = "ip" | "punycode" | "shortener" | "userinfo" | "scheme" | "port" | "relative" | "masked";
+// The hosts Cain normally cites (a link to one of these or under one is quiet; any other https host still
+// goes, with a notice-only line in the gate report so the list can grow from real use). The owner's chief
+// of staff extends it with keeper.sh link-host <host>; this is what the list holds before that.
+export const LINK_HOSTS: readonly string[] = [
+  "claude.ai", "claude.com", "anthropic.com", "github.com", "githubusercontent.com", "home-assistant.io", "intel.com",
+  "healthchecks.io", "discord.com", "google.com", "microsoft.com", "apple.com", "wikipedia.org", "python.org", "bun.sh",
+];
+// The text of a link as Discord reads it: <> and the sentence's own closing marks off, backslashes read as slashes.
+export function normalLink(link: string): string {
+  return String(link ?? "").trim().replace(/^<|>$/g, "").replace(/[>)\].,;:!?'"]+$/g, "").replace(/\\/g, "/");
+}
+// The link parsed as a browser would (WHATWG URL), a link written without a scheme read as https. null: it
+// doesn't parse.
+export function parseLink(link: string): URL | null {
+  const s = normalLink(link);
+  if (/^\/\//.test(s)) return null;
+  try { return new URL(/^[A-Za-z][A-Za-z0-9+.\-]*:/.test(s) ? s : `https://${s}`); } catch { return null; }
+}
+const hostOf = (u: URL) => u.hostname.toLowerCase().replace(/\.+$/, "");
+const under = (host: string, list: Iterable<string>) => { for (const d of list) if (host === d || host.endsWith(`.${d}`)) return true; return false; };
+// Why a link is held, or null for one that passes. link: as found in the text (a link with no scheme is
+// read as https: Discord doesn't make it a link, but he could still copy it).
 export function linkProblem(link: string): LinkWhy | null {
-  const s = String(link ?? "").replace(/^<|[>)\].,;:!?'"]+$/g, "");
-  const m = /^(?:([A-Za-z][A-Za-z0-9+.\-]*):\/\/)?([^/?#\\]*)/.exec(s);
-  if (!m) return null;
-  const auth = m[2];
-  if (auth.includes("@")) return "userinfo";
-  let host = auth.replace(/:\d*$/, "").replace(/\.$/, "");
-  if (/^\[[0-9A-Fa-f:.]+\]$/.test(host)) return "ip";
-  host = host.toLowerCase();
-  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(host) || /^\d+$/.test(host) || /^0x[0-9a-f]+$/.test(host)) return "ip";
-  if (/^(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+)){1,3}$/.test(host)) return "ip";
+  const s = normalLink(link);
+  if (/^\/\//.test(s)) return "relative";
+  const scheme = /^([A-Za-z][A-Za-z0-9+.\-]*):/.exec(s)?.[1]?.toLowerCase();
+  if (scheme && !(scheme === "https" || scheme === "http") && !(/^\d+$/.test(s.slice(scheme.length + 1, scheme.length + 2)) && !/:\/\//.test(s))) return "scheme";
+  // The raw authority, before the parser tidies it: a user name or password before the host.
+  const auth = /^(?:[A-Za-z][A-Za-z0-9+.\-]*:)?\/*([^/?#]*)/.exec(s)?.[1] ?? "";
+  if (auth.includes("@") || /%40/i.test(auth)) return "userinfo";
+  const u = parseLink(s);
+  if (!u) return "scheme";
+  if (u.username || u.password) return "userinfo";
+  const host = hostOf(u);
+  if (!host || /^\[/.test(host) || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return "ip";
   if (host.split(".").some((l) => l.startsWith("xn--")) || /[^\x00-\x7f]/.test(host)) return "punycode";
-  if (SHORTENERS.some((d) => host === d || host.endsWith(`.${d}`))) return "shortener";
+  if (under(host, SHORTENERS)) return "shortener";
+  if (u.protocol !== "https:") return scheme ? "scheme" : null;
+  if (u.port && u.port !== "443") return "port";
   return null;
 }
 const LINK_WORDS: Record<LinkWhy, string> = {
   ip: "a bare IP address", punycode: "a punycode or non-ASCII host", shortener: "a link shortener", userinfo: "a user name or password in it",
+  scheme: "not an https link", port: "a port other than 443", relative: "a link with no scheme", masked: "link text naming another site",
 };
-// Every link in his words (bare, and the targets of masked links), each held link once.
-export function linksHits(text: string): CainHit[] {
-  const t = String(text ?? "").normalize("NFKC").replace(INVISIBLE, "");
-  const out: CainHit[] = [];
-  const seen: [number, number][] = [];
-  const add = (at: number, end: number, link: string) => {
-    if (seen.some(([a, b]) => a < end && at < b)) return;
-    seen.push([at, end]);
-    const why = linkProblem(link);
-    if (why) out.push({ rule: "links", result: "refuse", at, end, around: `${LINK_WORDS[why]}: ${link.slice(0, 60)}` });
+// Every link in his words: bare and schemed links, the targets of masked links, scheme-relative ones and links
+// in schemes with no "//". Each found once.
+export interface LinkFound { at: number; end: number; link: string; shown?: string }
+export function linksIn(text: string): LinkFound[] {
+  // Backslashes read as slashes, as a browser reads them in a link ("https:\\host" is "https://host").
+  const t = String(text ?? "").normalize("NFKC").replace(INVISIBLE, "").replace(/\\/g, "/");
+  const out: LinkFound[] = [];
+  const add = (at: number, end: number, link: string, shown?: string) => {
+    if (out.some((f) => f.at < end && at < f.end)) return;
+    out.push({ at, end, link, ...(shown !== undefined ? { shown } : {}) });
   };
-  for (const m of t.matchAll(/\]\(<?([^)\s>]+)>?\)/g)) { const at = m.index! + 2; add(at, at + m[1].length, m[1]); }
+  for (const m of t.matchAll(/\[([^\]\n]{0,300})\]\(\s*(<[^>\n]*>|[^)\s]+)[^)\n]*\)/g)) {
+    const at = m.index! + m[1].length + 3;
+    add(at, at + m[2].length, m[2], m[1]);
+  }
+  // Scheme-relative and odd-scheme links before the plain ones, so "//host/x" isn't taken as "host/x".
+  for (const m of t.matchAll(/(?<=^|[\s(<"'])\/\/[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+[^\s)>]*/g)) add(m.index!, m.index! + m[0].length, m[0]);
+  for (const m of t.matchAll(new RegExp(`(?<![A-Za-z0-9+.\\-])(?:${ODD_SCHEMES}):[^\\s)>\\]]+`, "gi"))) add(m.index!, m.index! + m[0].length, m[0]);
   for (const [a, b] of linkSpans(t)) add(a, b, t.slice(a, b));
   return out.sort((x, y) => x.at - y.at);
 }
+// Whether a masked link's visible text is itself an address on another host than where the tap goes.
+export function maskedElsewhere(shown: string, target: string): boolean {
+  const v = normalLink(shown);
+  if (/\s/.test(v) || !/^(?:[A-Za-z][A-Za-z0-9+.\-]*:\/\/)?(?:[A-Za-z0-9\-]+\.)+[A-Za-z]{2,}(?:[:/?#]|$)/.test(v)) return false;
+  const a = parseLink(v), b = parseLink(target);
+  if (!a || !b) return !!a;
+  const strip = (h: string) => h.replace(/^www\./, "");
+  return strip(hostOf(a)) !== strip(hostOf(b));
+}
+// The hits for his words: each held link ("refuse"), and each https link to a host off the list, a notice only
+// ("note": logged, never held). hosts: the list (LINK_HOSTS and what was added); not given: notices off.
+export function linksHits(text: string, hosts?: ReadonlySet<string> | readonly string[] | null): CainHit[] {
+  const out: CainHit[] = [];
+  for (const f of linksIn(text)) {
+    const why = linkProblem(f.link) ?? (f.shown !== undefined && maskedElsewhere(f.shown, f.link) ? "masked" : null);
+    if (why) { out.push({ rule: "links", result: "refuse", at: f.at, end: f.end, around: `${LINK_WORDS[why]}: ${f.link.slice(0, 60)}` }); continue; }
+    const u = parseLink(f.link);
+    if (hosts && u && !under(hostOf(u), hosts)) out.push({ rule: "links", result: "note", at: f.at, end: f.end, around: `a host off the list: ${hostOf(u).slice(0, 60)}` });
+  }
+  return out;
+}
+// The list as kept: LINK_HOSTS and one host a line from the file (# for notes), lower case.
+export function readHostList(text: string | null): Set<string> {
+  const set = new Set(LINK_HOSTS);
+  for (const line of String(text ?? "").split("\n")) {
+    const h = line.replace(/#.*/, "").trim().toLowerCase().replace(/\.+$/, "");
+    if (/^(?:[a-z0-9-]{1,63}\.)+[a-z]{2,63}$/.test(h)) set.add(h);
+  }
+  return set;
+}
 
 // -- what each asks of him, for the line that says why his words were held back -----------------
-export const LINKS_WHY = "a link he can't judge by its look (a bare IP address, a punycode host, a link shortener, or a user name or password in it) is held: link to the named site itself, over https";
+export const LINKS_WHY = "a link he can't judge by its look (a bare IP address, a punycode host, a link shortener, a user name or password in it, anything but plain https on its usual port, or link text naming another site) is held: link to the named site itself, over https";
+export const LINKS_KEEPER_WHY = "send links through the keeper: /opt/cain/keeper.sh reply [--reply-to <id>] \"<text>\" posts it with its preview off";
 export const CODES_WHY = "name it by what it does for him, not by its record code: he can't tell what those are";
 export const SHIP_WORDS_WHY = "on a Ship card your line says only what he'll notice: no checks, tests, builds, CI, GitHub, jobs or status, no results (passed, green, success, failed), and no reviews, verdicts or AI names, since the link adds those lines itself";
 export const REVIEWED_UNSURE = "reviews can't be checked right now: leave the Reviewed line out, or send it in a minute";

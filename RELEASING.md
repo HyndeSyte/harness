@@ -56,7 +56,10 @@ branch is up to date with `main` and these checks passed on it:
   - the `pytest`, `bun` and `pr` jobs keep their names, with no paths or branches
     filters and no `if` or `continue-on-error`, and no other workflow reuses the names;
     the same holds for `pcjobs-windows` (the PC worker's tests on Windows) while
-    `tests.yml` defines it.
+    `tests.yml` defines it, and (Cain 0.13.0) for `secrets`, the secret scan, which must
+    always be there. The pr check only keeps it there and reporting; refusing a merge while it
+    is red needs `secrets` added to the "Checks and history" ruleset's required checks, which
+    takes admin rights (Dane, once). `audit` stays optional.
 
 `pcjobs-windows` is not a required check in the rulesets (making it one needs the
 repository's rulesets, which take admin rights no session has). The link enforces it

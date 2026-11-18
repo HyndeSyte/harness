@@ -3,10 +3,14 @@ name: tests
 # `pytest` and `bun` are required checks on main (RELEASING.md). Keep the job
 # names fixed, and add no paths or branches filters and no job-level `if`: a
 # required check must run and report on every pull request. check_pr.py fails a
-# pull request that changes that.
+# pull request that changes that. Every action is pinned to a commit (Dependabot proposes
+# updates). The weekly run and a manual run scan main's whole history for secrets (job secrets).
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,8 +19,8 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
       # pytest, and PyYAML for tests/test_check_pr.py (the pr check parses YAML); the Apps
@@ -28,8 +32,8 @@ jobs:
   bun:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
@@ -39,30 +43,52 @@ jobs:
   pcjobs-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests/pcjobs.test.ts
 
-  # The security watch's checks on the repository (Cain 0.13.0). Not required checks: the
-  # rulesets require pytest, bun and pr only (RELEASING.md), and these two stay optional.
-  # A known vulnerability with a fix, rated high or critical, in what CI installs fails
-  # `audit`. Cain has no npm or Bun manifest; its step audits one if a package.json appears.
+  # The security watch's checks on the repository (Cain 0.13.0). `secrets` is a check the pr
+  # check requires to be here, intact (check_pr.py REQUIRED_JOBS); `audit` stays optional for
+  # now, since it rests on network lookups. A known vulnerability with a fix, rated high or
+  # critical, in what CI installs fails `audit`. Cain has no npm or Bun manifest; its step audits
+  # one if a package.json appears. Unrated findings are kept as the run's artifact and summary.
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
-      - run: pip install "pip-audit==2.10.1"
+      # pip-audit and every package it pulls in, pinned with their hashes.
+      - run: pip install --require-hashes -r .github/ci/audit-requirements.txt
       - name: Python (what CI installs; the calendar specialist installs nothing)
         run: |
           pip-audit -r .github/ci/requirements.txt --format json --output pip-audit.json || true
           test -s pip-audit.json
-          python -I .github/scripts/audit_gate.py pip-audit.json
-      - uses: oven-sh/setup-bun@v2
+          status=0
+          python -I .github/scripts/audit_gate.py pip-audit.json --unrated audit-unrated.txt || status=$?
+          if [ -s audit-unrated.txt ]; then
+            echo "::warning::unrated audit findings (a fix exists, no severity found); see the run's summary and its audit-findings artifact"
+            { echo "### Unrated audit findings"; echo; sed 's/^/- /' audit-unrated.txt; } >> "$GITHUB_STEP_SUMMARY"
+            cat audit-unrated.txt
+          fi
+          exit "$status"
+      - name: Keep the findings
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: audit-findings
+          path: |
+            pip-audit.json
+            audit-unrated.txt
+          if-no-files-found: ignore
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.4"
       - name: Cain (Bun)
@@ -71,15 +97,19 @@ jobs:
           if [ -f package.json ]; then bun install --frozen-lockfile && bun audit --audit-level=high
           else echo "cain/ has no package.json: nothing to audit."; fi
 
-  # A secret scan over the pull request's own commits (gitleaks, pinned and checked by hash):
-  # any finding fails. Only on pull requests; a push to a branch is scanned in its pull request.
+  # A secret scan (gitleaks, pinned and checked by hash): any finding fails. A pull request's own
+  # commits (base..head, whole history fetched); a push to another branch, its commits not in main;
+  # a push to main, the weekly run and a manual run, main's whole history. No step is skipped, so
+  # it always reports (the pr check refuses one with an `if`).
   secrets:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     env:
       GITLEAKS_VERSION: "8.28.0"
       GITLEAKS_SHA256: "a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -88,13 +118,22 @@ jobs:
           curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/gitleaks" && tar -xzf gitleaks.tgz -C "$RUNNER_TEMP/gitleaks" gitleaks && rm gitleaks.tgz
-      - name: Scan the pull request's commits
-        if: github.event_name == 'pull_request'
+      - name: Scan
         env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 --log-opts="$BASE..$HEAD" .
-      - name: Not a pull request
-        if: github.event_name != 'pull_request'
-        run: echo "Not a pull request event; the scan runs on the pull request."
+          case "$EVENT" in
+            pull_request) range="$BASE..$HEAD"; what="the pull request's commits ($range)" ;;
+            push) if [ "$REF" = refs/heads/main ]; then range=""; what="main's whole history"
+                  else range="origin/main..HEAD"; what="this branch's commits not in main"; fi ;;
+            *) range=""; what="the whole history of $REF" ;;
+          esac
+          echo "Scanning $what."
+          if [ -n "$range" ]; then
+            "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 --log-opts="$range" .
+          else
+            "$RUNNER_TEMP/gitleaks/gitleaks" git --no-banner --redact --exit-code 1 .
+          fi

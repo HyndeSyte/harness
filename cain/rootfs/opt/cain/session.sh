@@ -3,6 +3,8 @@
 # If it exits (or he types /exit after signing in), it starts again in 5 s.
 # Errors from this script (not the session's screen) go to /data/session.log.
 export HOME=/data
+# The outside heartbeat's URL is the security watch's alone (services.d/cain/run): never Claude's.
+unset HEARTBEAT_URL
 exec 2>>/data/session.log
 echo "$(date -Is) session.sh starting" >&2
 cd /data/work || { echo "no /data/work" >&2; exit 1; }

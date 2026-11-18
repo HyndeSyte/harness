@@ -7,7 +7,11 @@ severity GitHub gave it. One with no fix, or below high, is printed and passes. 
 severity can't be found (OSV doesn't answer, or no advisory rates it) is printed as unrated
 and passes too: the job fails only on what it knows is high or critical with a fix.
 
-  python audit_gate.py <pip-audit.json>
+  python audit_gate.py <pip-audit.json> [--unrated <file>]
+
+With --unrated, the unrated findings (a fix exists, but no severity could be found) are also
+written to that file, one a line (the job keeps it as an artifact and prints it in the run's
+summary, so they surface beyond the log); an empty file when there are none.
 """
 import json
 import sys
@@ -31,6 +35,11 @@ def _fetch(vuln_id):
     req = urllib.request.Request(f"https://api.osv.dev/v1/vulns/{vuln_id}", headers={"User-Agent": "audit-gate"})
     with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 - a fixed https host
         return json.load(r)
+
+
+def unrated(lines):
+    """The lines of findings whose severity couldn't be found."""
+    return [line for line in lines if ", unrated, " in line]
 
 
 def judge(report, fetch=None):
@@ -65,6 +74,12 @@ def main(argv):
     lines, fail = judge(report)
     for line in lines:
         print(line)
+    if "--unrated" in argv:
+        out = argv[argv.index("--unrated") + 1]
+        found = unrated(lines)
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("".join(f"{line}\n" for line in found))
+        print(f"{len(found)} unrated finding(s) written to {out}.")
     return 1 if fail else 0
 
 

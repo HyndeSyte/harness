@@ -2,10 +2,11 @@
 
 ## 0.13.0
 
-- A dead Pi can now warn you from outside the house: make a free Healthchecks.io account, add a check, and paste its ping URL into heartbeat_url in Cain's App options. The App pings it every 5 minutes, and the service emails or pushes to you itself if the pings stop. Until you do, the morning check-in reminds Cain to bring you that one step.
-- The morning check-in now names a jump in review spending (a day far above the week before, or over a fifth of a month's cap), the cheapest sign of a stolen key or a runaway loop, and says when a seat has reached its monthly cap. A review is refused at once when every seat it needs is at its cap.
-- The morning check-in also names a key or token the App holds that is within 14 days of an expiry Cain noted, or has been the same for over 90 days. The App only keeps a fingerprint of each key, never the key.
-- Links in messages from Cain's bot no longer unfold into previews, and Cain can't send you a link to a bare IP address, a disguised (punycode) address, a link shortener, or one with a password in it.
+- A dead Pi can now warn you from outside the house: make a free Healthchecks.io account, add a check with a 5 minute period and a grace period of 10 to 15 minutes, and paste its ping URL into heartbeat_url in Cain's App options. The App pings it every 5 minutes, and the service emails or pushes to you itself if the pings stop. Until you do, the morning check-in reminds Cain to bring you that one step. Keep that URL like a key: only the heartbeat itself ever sees it.
+- The morning check-in now names a jump in review spending (a day far above a busy week before, at least $1, or over a fifth of a month's cap), the cheapest sign of a stolen key or a runaway loop. It also says when a seat is on pace to pass its monthly cap, and when it has reached it. A review is refused at once when every seat it needs is at its cap.
+- On Mondays the morning check-in names a key or token that has been the same for over 90 days, and any morning one within 14 days of an expiry Cain noted. A key that never expires by design can be marked as known until a date, so it stays quiet. The App only keeps a fingerprint of each key, never the key.
+- Links in messages from Cain's bot no longer unfold into previews: Cain's own replies with a link now go out through the App with the preview off from the start. Cain can't send you a link that isn't plain https, points to a bare IP address, a disguised (punycode) address or a link shortener, has a password in it, or whose words name a different site than where it leads.
+- Card updates keep working even if Discord ever refuses the no-preview setting: the card is updated without it.
 - Nothing in the security watch acts on its own: it only tells Cain, and he brings you one thing at a time.
 
 ## 0.12.2

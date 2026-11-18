@@ -14,9 +14,15 @@
 //           edit of a message that isn't one of Cain's own replies, or whose owner can't be
 //           told right now, or a review claim the review service didn't give, or any review
 //           claim while its lines can't be read, or a record code like P64 (0.11.0), or a
-//           link he can't judge by its look: a bare IP, punycode, a shortener, user:pass@ (0.13.0)
+//           link he can't judge by its look: a bare IP, punycode, a shortener, user:pass@ (0.13.0),
+//           and (0.13.0, second round) not https, a port other than 443, no scheme, a scheme
+//           with no "//", or masked link text naming another host; and any reply through the
+//           plugin that carries a link at all (plugin: true, the reply hook and keeper.sh check):
+//           the plugin sets no flags, so its preview would unfold before the link could turn it
+//           off. Links go through keeper.sh reply, which posts with the preview off.
+//   note    (not a result of its own) an https link to a host off the list: logged, never held
 import type { Reviewed } from "../reviewed";
-import { cainReasons, codesHits, linksHits, reviewedHits } from "./cain";
+import { cainReasons, codesHits, linksHits, linksIn, LINKS_KEEPER_WHY, reviewedHits } from "./cain";
 import { snowflakeTime } from "./plugin";
 import { AT, check, type Hit, reasonParts, type Result } from "./rules";
 
@@ -32,7 +38,7 @@ export interface CardView {
 export interface CardsView { written_at: number; owner: string | null; dm: string | null; cards: CardView[]; sent?: string[] }
 
 export interface SendCall { tool: "reply" | "edit"; text: string; replyTo?: string; target?: string; chat?: string }
-export interface GateHit { rule: string; result: Result; around: string; label?: string }
+export interface GateHit { rule: string; result: Result | "note"; around: string; label?: string }
 export interface Decision {
   would: "pass" | "fix" | "refuse";
   fixed: string; hits: GateHit[]; said: string;
@@ -62,7 +68,8 @@ export const EDIT_WINDOW_MS = 10 * 60_000;
 // for the codes rule; null or not given: nothing is a code.
 export function decideSend(call: SendCall, cards: CardsView | null,
                            o: { tz?: string; dm?: string | null; now?: number; replied?: ReadonlySet<string>;
-                                reviewed?: readonly Reviewed[] | null; items?: ReadonlySet<string> | null } = {}): Decision {
+                                reviewed?: readonly Reviewed[] | null; items?: ReadonlySet<string> | null;
+                                hosts?: ReadonlySet<string> | null; plugin?: boolean } = {}): Decision {
   const tz = o.tz ?? "America/New_York";
   const now = o.now ?? Date.now();
   const dm = cards ? cards.dm ?? null : o.dm ?? null;
@@ -103,14 +110,20 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   if (codes.length) hard = true;
   // A link he can't judge by its look (gate/cain.ts): held for good, since a plain https link to
   // the named site always says the same, so no third try is needed.
-  const links = linksHits(call.text);
-  for (const h of links) hits.push({ rule: h.rule, result: h.result, around: h.around });
+  const found = linksHits(call.text, o.hosts);
+  const links = found.filter((h) => h.result !== "note");
+  for (const h of found) hits.push({ rule: h.rule, result: h.result, around: h.around });
   if (links.length) hard = true;
+  // A reply through the plugin with any link in it (0.13.0, second round): the plugin posts with no
+  // flags, so Discord fetches the preview as the message lands. Held for good: keeper.sh reply says
+  // the same words with the preview off, so no third try is needed.
+  const viaKeeper = !!o.plugin && call.tool === "reply" && linksIn(call.text).length > 0;
+  if (viaKeeper) { hits.push({ rule: "keeper", result: "refuse", around: "" }); hard = true; }
   const held = hits.some((h) => h.result === "refuse" || h.result === "unsure");
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];
   // The wording refusals, each reason said once with its excerpts (an em dash's for all of them).
-  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat", "reviewed", "codes", "links"].includes(h.rule));
+  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat", "reviewed", "codes", "links", "keeper"].includes(h.rule));
   let wordedSaid = false, reviewedSaid = false, codesSaid = false, linksSaid = false;
   for (const h of hits) {
     if (h.rule === "button" && h.label) {
@@ -135,7 +148,10 @@ export function decideSend(call: SendCall, cards: CardsView | null,
     } else if (h.rule === "codes") {
       if (!codesSaid) for (const part of cainReasons(codes, null, 3)) lines.push(`${part.charAt(0).toUpperCase()}${part.slice(1)}.`);
       codesSaid = true;
+    } else if (h.rule === "keeper") {
+      lines.push(`${LINKS_KEEPER_WHY.charAt(0).toUpperCase()}${LINKS_KEEPER_WHY.slice(1)}.`);
     } else if (h.rule === "links") {
+      if (h.result === "note") continue;
       if (!linksSaid) for (const part of cainReasons(links, null, 3)) lines.push(`${part.charAt(0).toUpperCase()}${part.slice(1)}.`);
       linksSaid = true;
     } else if (h.result === "refuse" && !wordedSaid) {

@@ -155,6 +155,10 @@ the review service gave it, no record codes, and in your replies no link to a ba
 address, a punycode host or a link shortener, and none with a user name or password
 in it (link the named site itself, over https; no third try lets one through). They act, and every hit is logged to
 /data/work/gate-report.jsonl.
+- A reply with a link goes through `/opt/cain/keeper.sh reply [--reply-to <id>] "<text>"`, never the reply tool,
+  which holds it (the App posts it with its preview off and the same rules; it stays your reply, so you may edit
+  it); a link that isn't plain https, or whose text names another site, is held there too, and
+  `/opt/cain/keeper.sh link-host <host>` adds a site you cite often to the gate's list.
 - The gate refuses every em dash of yours, so never write one. For a break use a comma
   or a new sentence; for a range use "to" or "through" ("9:30 to 10:15", "Monday through
   Friday", "rooms 4 and 5"). Only you know which you meant, so the gate never guesses.
@@ -668,7 +672,9 @@ keep work moving without him starting it. It is never his go on anything.
    list otherwise), and only once: don't repeat a step he hasn't taken more than weekly. A
    FLAGGED spend line matters today: check `/opt/cain/review.sh spend` and your own reviews
    first, and tell him in one line if nothing of yours explains it. When he tells you a
-   key's expiry, note it: `/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`. Never ask
+   key's expiry, note it: `/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`; for a key that
+   never expires by design (the deploy and Ship keys), `/opt/cain/keeper.sh key-ack <name>
+   <YYYY-MM-DD>` quiets its age line until that date, on his word. Never ask
    him for a key or the heartbeat URL in Discord: they go only into the App's options.
 
 ## Your record

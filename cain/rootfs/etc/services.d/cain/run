@@ -13,6 +13,11 @@ export HOME=/data TERM=xterm-256color LANG=C.UTF-8 LC_ALL=C.UTF-8
 # another process's /proc/<pid>/environ, or s6's copy of the environment). Keeping
 # it out for good needs the session to run as its own user, which comes later.
 unset SUPERVISOR_TOKEN HASSIO_TOKEN
+# The outside heartbeat's URL (heartbeat_url) is read from the App's options only by the security
+# watch's own subshell below, and no other child gets it: not Claude Code's session (tmux and
+# session.sh start from this environment), not the link, the keepers or the check-ins. Unset here
+# too, so nothing that reached this environment can carry it on.
+unset HEARTBEAT_URL
 mkdir -p /data/work
 # Cain's standing rules ship with the add-on, so an update always brings them.
 cp /opt/cain/CLAUDE.md /data/work/CLAUDE.md
@@ -107,8 +112,9 @@ bashio::log.info "Cain is running"
 ) &
 # The security watch (security/main.ts): the outside heartbeat (a ping every 5 minutes to
 # heartbeat_url, when set) and the key record (/data/keys.json: when each key was first seen,
-# by a hash of its value, never the value). The URL goes only into its environment and is
-# never logged; the App's keys reach it only as hashes, made here.
+# by a hash of its value, never the value). The URL goes only into this one process's environment
+# (no other child has it) and is never logged; the App's keys reach it only as hashes, made here
+# with printf '%s' (no trailing new line), the same as the watch's own sha256 (security/main.ts sha).
 (
   opt() { v="$(bashio::config "$1" 2>/dev/null || true)"; [ "$v" = "null" ] && v=""; printf '%s' "$v"; }
   for k in github_token pc_jobs_token gemini_api_key perplexity_api_key anthropic_api_key; do

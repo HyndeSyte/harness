@@ -77,6 +77,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const refusing = new Set<string>();            // the same, refused by Discord (a 403)
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
   const limitN: Record<string, number> = {};     // the next n calls to a path prefix are rate limited
+  const refuseFlag = { on: false };              // Discord answers 400 to any edit that carries flags
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
   const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
   // Discord is slow: posts to his DM, reads of it, or whose bot this is, wait until release()
@@ -108,7 +109,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       const seen = body.enforce_nonce && body.nonce ? nonces[body.nonce] : undefined;
       if (seen && t.now - seen.at < 5 * MIN && posted[seen.id]) return copy(posted[seen.id]);
       const msg = { id: snowflake(), content: body.content, components: body.components ?? [], author: { id: BOT },
-        ...(body.message_reference ? { message_reference: body.message_reference } : {}) };
+        ...(body.message_reference ? { message_reference: body.message_reference } : {}),
+        ...(typeof body.flags === "number" ? { flags: body.flags } : {}) };
       posted[msg.id] = msg;
       lastId = msg.id;
       if (body.nonce) nonces[body.nonce] = { id: msg.id, at: t.now };
@@ -128,8 +130,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     if (one && method === "PATCH") {
       const m = posted[one[1]];
       if (!m) throw new Error("discord 404: Unknown Message");
+      if (refuseFlag.on && body.flags !== undefined) throw new Error("discord 400: Invalid Form Body");
       if (body.content !== undefined) m.content = body.content;
       if (body.components !== undefined) m.components = body.components;
+      if (body.flags !== undefined) m.flags = body.flags;
       if (body.content !== undefined || discord.marksButtonEdits) m.edited_timestamp = new Date(t.now).toISOString();
       return copy(m);
     }
@@ -192,7 +196,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return link; },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews,
+    reports, replays, sent, discord, limitN, spy, reviews, refuseFlag,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

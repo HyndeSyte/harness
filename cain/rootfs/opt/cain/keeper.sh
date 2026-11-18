@@ -54,6 +54,15 @@
 #                                        names it 14 days ahead in the morning check-in); names:
 #                                        github_token, pc_jobs_token, discord_bot_token, gemini_api_key,
 #                                        perplexity_api_key, anthropic_api_key, deploy_key, ship_key
+#   keeper.sh key-ack <name> <YYYY-MM-DD>
+#                                        a key that never expires by design (the deploy and Ship keys): its
+#                                        "same for over 90 days" line stays quiet until that date
+#   keeper.sh reply [--reply-to <id>] "text"
+#                                        a reply of Cain's that carries a link: the link posts it with its
+#                                        preview off from the start (the plugin's reply would unfold it), after
+#                                        the same gate rules, and records it as his own reply (he may edit it)
+#   keeper.sh link-host <host>           adds a host Cain cites to the gate's list (a link to a host off it
+#                                        is only noted in the gate report, never held)
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
@@ -68,10 +77,12 @@ if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
 # Needs no key and no link either: it reads GitHub's public API only, and changes nothing.
 if [ "$cmd" = ship-gate ]; then exec bun "${CAIN_LINK_DIR:-/opt/cain/link}/shipgate.ts" "$@"; fi
 # Needs no key and no link: the key record is the security watch's own file (never a key in it).
-if [ "$cmd" = key-expiry ]; then exec bun "${CAIN_SECURITY:-/opt/cain/security/main.ts}" key-expiry "$@"; fi
+if [ "$cmd" = key-expiry ] || [ "$cmd" = key-ack ]; then exec bun "${CAIN_SECURITY:-/opt/cain/security/main.ts}" "$cmd" "$@"; fi
+# Needs no key and no link: the gate's list of cited hosts is a file of Cain's own.
+if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts.ts" add "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
@@ -80,7 +91,7 @@ if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
 fi
 item="" question="" reply_to="" pr="" head="" edit="" review=""
 case "$cmd" in
-  show|ask|ship|answered|check|connector)
+  show|ask|ship|answered|check|reply|connector)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -153,6 +164,7 @@ case "$cmd" in
   card)     body=$(jq -nc --arg m "${1:-}" '{m: $m}') ;;
   check)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" --arg e "$edit" \
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
+  reply)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" '{text: $t} + (if $r == "" then {} else {reply_to: $r} end)') ;;
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true

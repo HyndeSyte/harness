@@ -199,18 +199,40 @@ export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+
 
 export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
 // Link previews off on everything the link puts in his DM (security watch, Cain 0.13.0): a
-// post, an ephemeral answer, a tap's message update, and every edit of its words carry Discord's
-// SUPPRESS_EMBEDS flag, so a link in a message never unfurls into a preview fetched from
-// its site. Ephemeral answers keep their own flag beside it.
-export function quiet(method: string, path: string, body: unknown): unknown {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+// post, an ephemeral answer and a tap's new message carry Discord's SUPPRESS_EMBEDS flag from
+// the start, so a link in a message never unfurls into a preview fetched from its site.
+// Second round: the flag only ever goes onto bits already there, never clearing one.
+//   - a first post (a message, a webhook's, a tap's new message): ORed onto its own flags;
+//   - an edit that carries flags: ORed onto them and onto the message's flags as last seen;
+//   - an edit that sets words and carries none: only when the message's flags are known (the
+//     link reads them first when it doesn't know them) and lack the bit, as those flags ORed
+//     with it; one that has the bit already is sent as it was (Discord keeps a message's flags);
+//   - a tap's update of its message (type 7): ORed onto flags it carries, never added alone
+//     (answer() puts the tapped message's own flags in first when it sets words);
+//   - anything else as it was.
+// added: whether a flags value went that the caller didn't write, so a refusal of it (a 400) is
+// tried once more as the caller wrote it, with a "preview flag refused" line in the gate report:
+// a flag problem shows a preview, never a dead card.
+export interface Quieted { body: unknown; added: boolean }
+export const MESSAGE_PATH = /^\/channels\/\d+\/messages\/(\d+)$/;
+export function quiet(method: string, path: string, body: unknown, known?: number): Quieted {
+  const same = { body, added: false };
+  if (!body || typeof body !== "object" || Array.isArray(body)) return same;
   const b = body as Record<string, any>;
-  const withFlag = (o: Record<string, any>) => ({ ...o, flags: (Number(o.flags) || 0) | SUPPRESS_EMBEDS });
-  if (method === "POST" && (/^\/channels\/\d+\/messages$/.test(path) || /^\/webhooks\//.test(path))) return withFlag(b);
-  // An edit that sets words (or only the flag): one that moves buttons alone keeps the post's own.
-  if (method === "PATCH" && /^\/channels\/\d+\/messages\/\d+$/.test(path) && ("content" in b || "flags" in b)) return withFlag(b);
-  if (method === "POST" && /^\/interactions\//.test(path) && b.data && typeof b.data === "object") return { ...b, data: withFlag(b.data) };
-  return body;
+  const or = (o: Record<string, any>, more = 0) => {
+    const flags = (Number(o.flags) || 0) | more | SUPPRESS_EMBEDS;
+    return { body: { ...o, flags }, added: !("flags" in o) || flags !== Number(o.flags) };
+  };
+  if (method === "POST" && (/^\/channels\/\d+\/messages$/.test(path) || /^\/webhooks\/[^/]+\/[^/]+$/.test(path))) return or(b);
+  if (method === "PATCH" && MESSAGE_PATH.test(path)) {
+    if ("flags" in b) return or(b, known ?? 0);
+    if (!("content" in b) || known === undefined || (known & SUPPRESS_EMBEDS)) return same;
+    return or(b, known);
+  }
+  if (method === "POST" && /^\/interactions\//.test(path) && b.data && typeof b.data === "object") {
+    if (b.type === 4 || "flags" in b.data) { const q = or(b.data); return { body: { ...b, data: q.body }, added: q.added }; }
+  }
+  return same;
 }
 
 export interface Card {
@@ -604,6 +626,7 @@ export interface Deps {
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
+  linkHosts?: () => ReadonlySet<string>;                           // the hosts Cain normally cites (gate/hosts.ts); absent: no notices
   // The replay: Cain's own replies and edits as his transcripts have them (since a time),
   // where its report goes, and the pause between pages of his DM (tests: 0).
   transcripts?: (since: number) => Sent | Promise<Sent>;
@@ -784,9 +807,46 @@ export class Link {
     // Every call to Discord, noting a rate limit: the moving Stop waits a minute after one.
     this.rest = async (...a) => {
       const [method, path, body, ...more] = a;
-      try { return await d.rest(method, path, quiet(method, path, body), ...more); }
-      catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
+      try {
+        const q = quiet(method, path, body, await this.flagsFor(method, path, body));
+        try { return this.sawFlags(path, await d.rest(method, path, q.body, ...more)); }
+        catch (e) {
+          // The flag refused (a 400): once more as the caller wrote it, and the gate report says so.
+          if (!q.added || !/discord 400/.test(String(e))) throw e;
+          this.log(`Discord refused the preview flag on ${method} ${path.replace(/\/[^/]{40,}/g, "/…")}: sent again without it`);
+          try { d.report?.({ point: "preview flag", writer: "link", hits: [], did: "preview flag refused", ...(MESSAGE_PATH.exec(path) ? { message: MESSAGE_PATH.exec(path)![1] } : {}) }); }
+          catch (r) { this.log(`couldn't log the gate's report: ${String(r).slice(0, 80)}`); }
+          return this.sawFlags(path, await d.rest(method, path, body, ...more));
+        }
+      } catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
     };
+  }
+
+  // Each message's flags as Discord last answered them (0.13.0, second round), so an edit never
+  // sends a flags value that drops a bit the message has. Kept for the newest 500 messages.
+  private flags = new Map<string, number>();
+  private sawFlags(path: string, msg: any): any {
+    const id = msg && typeof msg === "object" && /^\/channels\/\d+\/messages/.test(path) ? String(msg.id ?? "") : "";
+    if (id && typeof msg.flags === "number") {
+      this.flags.delete(id);
+      this.flags.set(id, msg.flags);
+      if (this.flags.size > 500) this.flags.delete(this.flags.keys().next().value!);
+    }
+    return msg;
+  }
+  // The flags an edit has to keep: as last seen, or read from Discord now for an edit that sets words
+  // or flags of a message the link hasn't seen. undefined: not known (the words go without the flag).
+  private async flagsFor(method: string, path: string, body: unknown): Promise<number | undefined> {
+    const m = method === "PATCH" ? MESSAGE_PATH.exec(path) : null;
+    if (!m || !body || typeof body !== "object" || !("content" in body || "flags" in body)) return undefined;
+    if (this.flags.has(m[1])) return this.flags.get(m[1]);
+    try {
+      const cur = this.sawFlags(path, await this.d.rest("GET", path));
+      return typeof cur?.flags === "number" ? cur.flags : undefined;
+    } catch (e) {
+      this.log(`couldn't read a message's flags before an edit: ${String(e).slice(0, 80)}`);
+      return undefined;
+    }
   }
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
@@ -886,8 +946,36 @@ export class Link {
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
     const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(),
       { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
-        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}) });
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}), plugin: true, hosts: this.d.linkHosts?.() ?? null });
     return { status: "ok", ...d };
+  }
+
+  // keeper.sh reply (Cain 0.13.0, second round): a reply of Cain's with a link in it, posted by the link
+  // with the preview off from the first moment (SUPPRESS_EMBEDS on the post itself), since the plugin's
+  // own reply sets no flags. The same gate as his plugin replies (decideSend, less the rule that sends
+  // links here, and with no third try): "add-on" fixed as it goes, anything else refused with what to
+  // change. The message is recorded as his own reply, not the link's, so he can still edit it, and it
+  // counts for the moving Stop like any reply of his.
+  async reply(a: { text?: unknown; replyTo?: unknown }): Promise<{ status: "posted"; message: string; said: string }> {
+    const text = String(a.text ?? "");
+    if (!text.trim()) throw new Refusal("needs the text to send");
+    const replyTo = a.replyTo === undefined || a.replyTo === null || a.replyTo === "" ? undefined : String(a.replyTo).trim();
+    if (replyTo !== undefined && !SNOWFLAKE.test(replyTo)) throw new Refusal("a message id is a Discord id");
+    const { dm } = await this.identity();
+    const d = decideSend({ tool: "reply", text, replyTo, chat: dm }, this.cardsNow(),
+      { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}), hosts: this.d.linkHosts?.() ?? null });
+    const did = d.would === "refuse" ? "refused" : d.would === "fix" ? "fixed" : "posted";
+    if (d.hits.length && this.d.report) {
+      try { this.d.report({ point: "keeper reply", writer: "cain", hits: d.hits as Hit[], did }); }
+      catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
+    }
+    if (d.would === "refuse") throw new Refusal(d.said);
+    const words = d.would === "fix" ? d.fixed : text;
+    const msg = await this.post(words, [], replyTo ? { replyTo } : {});
+    await this.sent({ tool: "reply", ids: [String(msg.id)], question: asksSomething(words), call: `keeper-${String(msg.id)}`,
+      ...(replyTo ? { reply_to: replyTo } : {}) }, { background: true });
+    return { status: "posted", message: String(msg.id), said: d.would === "fix" ? `Posted, with its wording fixed: ${fixedWhat(d.hits as Hit[])}.` : "Posted." };
   }
 
   // -- Stop everything ----------------------------------------------------------
@@ -1756,7 +1844,10 @@ export class Link {
 
   private async answer(it: any, kind: number, data?: unknown): Promise<boolean> {
     try {
-      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, data ? { type: kind, data } : { type: kind }, false);
+      // A tap's update that sets words keeps the tapped message's own flags, with the preview flag.
+      const keep = kind === 7 && data && typeof data === "object" && "content" in (data as object) && !("flags" in (data as object))
+        && typeof it?.message?.flags === "number" ? { ...(data as object), flags: it.message.flags | SUPPRESS_EMBEDS } : data;
+      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, keep ? { type: kind, data: keep } : { type: kind }, false);
       return true;
     } catch (e) {
       this.log(`couldn't answer a tap in time: ${String(e).slice(0, 80)}`);
@@ -2060,8 +2151,10 @@ export class Link {
       catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
       this.d.relay(`Your edit changed Discord message ${theirs}, ${m.kind === "notice" || m.kind === "morning" ? "a message" : "a card"} your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     }
-    // His replies go out through the Discord plugin, which sets no flags: the link turns the
-    // preview off on one with a link in it (the reply hook says which), right after, best effort.
+    // His replies go out through the Discord plugin, which sets no flags. One with a link is held by
+    // the reply hook (keeper.sh reply posts it with the preview off from the start); one that slipped
+    // through (the hook down, say) gets the preview turned off here, right after, best effort:
+    // a race with Discord's own fetch, so only a fallback.
     if (tool === "reply" && n?.links === true) void this.quietReplies(ids.filter((id) => !this.linkPosted(s, id)));
     const net = netOf(n?.net);
     if (net && this.firstTime(call, tool, ids, net)) this.d.relay(netLine(tool, last, net));
@@ -2075,7 +2168,11 @@ export class Link {
     for (const id of ids) {
       try {
         const { dm } = await this.identity();
-        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: SUPPRESS_EMBEDS });
+        // Its flags first: the flag goes onto them, never in place of them.
+        const cur = await this.rest("GET", `/channels/${dm}/messages/${id}`);
+        const had = Number(cur?.flags) || 0;
+        if (had & SUPPRESS_EMBEDS) { done++; continue; }
+        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: had | SUPPRESS_EMBEDS });
         done++;
       } catch (e) {
         if (/discord 429/.test(String(e))) break;

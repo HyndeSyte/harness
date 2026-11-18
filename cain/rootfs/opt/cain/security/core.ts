@@ -7,11 +7,15 @@
 //              minutes, and <url>/fail once when the App stops on an error, so a dead Pi warns
 //              him from outside. The URL is a secret: never logged, never shown, never kept.
 //   spend      yesterday's spend per review seat and the month so far against each cap, and a
-//              flag when a day jumps (over 3 times the trailing 7-day average, or over a fifth
-//              of the month's cap in one day): the cheapest sign of a stolen key or a loop.
-//   keys       when each key the App holds was first seen (by a hash of its value, never the
-//              value), and any expiry set for it: a line within 14 days of an expiry, and for
-//              a key with no expiry set that is older than 90 days.
+//              flag when a day jumps (over 3 times the trailing 7-day average, at least $1 and
+//              with at least 3 active days in those 7; or over a fifth of the month's cap in one
+//              day): the cheapest sign of a stolen key or a loop. A pace line when the month so
+//              far, carried on at its rate, would pass a seat's cap; a line once a cap is reached.
+//   keys       when each key the App holds was first observed (by a hash of its value, never
+//              the value), and any expiry set for it: a line within 14 days of an expiry, and,
+//              on Mondays only, one for a key with no expiry set that is older than 90 days,
+//              unless it is acknowledged until a later date (keeper.sh key-ack, for the keys that
+//              never expire by design).
 import type { DayLedger, Ledger, RunnerConfig } from "../review/runner.ts";
 import { LABEL, SEATS, type SeatName } from "../review/core.ts";
 
@@ -22,7 +26,9 @@ export const FAILS_TO_TELL = 3;              // pings failed in a row before a n
 export const EXPIRY_WARN_DAYS = 14;
 export const OLD_KEY_DAYS = 90;
 export const JUMP_TIMES = 3;                 // a day over 3 times the trailing 7-day average
-export const JUMP_FLOOR_USD = 0.25;          // ...and at least this much, so a few cents on a quiet week don't count
+export const JUMP_FLOOR_USD = 1;             // ...and at least this much, so a few cents on a quiet week don't count
+export const JUMP_ACTIVE_DAYS = 3;           // ...and only once the 7 days before had spend on at least 3 of them
+export const PACE_MIN_DAYS = 3;              // the pace line once this many days of the month are in
 export const JUMP_FLOOR_RUNS = 5;            // the same for Codex, in runs
 export const CAP_SHARE = 1 / 5;              // a day over a fifth of the month's cap
 
@@ -95,18 +101,29 @@ const say = (s: SeatName, n: number) => (s === "openai" ? `${n} run${n === 1 ? "
 const optionOf = (s: SeatName) => (s === "openai" ? "codex_monthly_runs" : s === "claude" ? "anthropic_monthly_usd" : `${s}_monthly_usd`);
 
 // Whether one day's spend on a seat is a jump: over 3 times the 7 days before it (zero days
-// counted), with a small floor, or over a fifth of the month's cap on its own.
+// counted), at least the floor, once those 7 days had spend on at least 3 of them (a seat
+// used now and then has no week to compare with); or over a fifth of the month's cap on its own.
 export function jumpOf(days: DayLedger, day: string, s: SeatName, caps: Caps): string | null {
   const that = amount(s, days[day]?.[s]);
   if (that <= 0) return null;
-  let sum = 0;
-  for (let i = 1; i <= 7; i++) sum += amount(s, days[addDays(day, -i)]?.[s]);
+  let sum = 0, active = 0;
+  for (let i = 1; i <= 7; i++) { const a = amount(s, days[addDays(day, -i)]?.[s]); sum += a; if (a > 0) active++; }
   const avg = sum / 7;
   const cap = seatCap(caps, s);
   const floor = s === "openai" ? JUMP_FLOOR_RUNS : JUMP_FLOOR_USD;
   if (cap > 0 && that > cap * CAP_SHARE) return `over a fifth of the month's cap (${say(s, cap)}) in one day`;
-  if (that >= floor && that > JUMP_TIMES * avg) return avg > 0 ? `over ${JUMP_TIMES} times the 7-day average of ${say(s, Number(avg.toFixed(2)))}` : "with nothing spent the 7 days before";
+  if (active >= JUMP_ACTIVE_DAYS && that >= floor && that > JUMP_TIMES * avg) return `over ${JUMP_TIMES} times the 7-day average of ${say(s, Number(avg.toFixed(2)))}`;
   return null;
+}
+// The month so far carried on at its rate to the month's end, when that passes the seat's cap (and the
+// cap isn't reached yet): null otherwise. today: the check-in's day; the days in are the ones before it.
+export function paceOf(spent: number, today: string, cap: number): number | null {
+  const daysIn = Number(today.slice(8, 10)) - 1;
+  if (cap <= 0 || spent <= 0 || spent >= cap || daysIn < PACE_MIN_DAYS) return null;
+  const [y, m] = today.split("-").map(Number);
+  const inMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const projected = (spent / daysIn) * inMonth;
+  return projected > cap ? projected : null;
 }
 const JUMP_STEP = "A jump is the cheapest sign of a stolen key or a review stuck in a loop: check review.sh status for reviews he didn't start; if none explains it, his one step is a new key for that seat in the App's options.";
 
@@ -134,6 +151,12 @@ export function spendLines(o: { ledger: Ledger; days: DayLedger; caps: Caps; tod
     }
     for (const s of SEATS) {
       const cap = seatCap(caps, s);
+      const p = paceOf(amount(s, ledger[month]?.[s]), today, cap);
+      if (p !== null)
+        out.push(`${LABEL[s]} is on pace for about ${say(s, s === "openai" ? Math.round(p) : Number(p.toFixed(2)))} this month, over its cap of ${say(s, cap)}: at this rate its reviews stop before the month ends. Nothing to do unless that matters; then raise ${optionOf(s)} in Cain's App options, or check review.sh spend for what is using it.`);
+    }
+    for (const s of SEATS) {
+      const cap = seatCap(caps, s);
       if (cap > 0 && amount(s, ledger[month]?.[s]) >= cap)
         out.push(`${LABEL[s]} has reached this month's cap of ${say(s, cap)}: reviews on it are refused until the month turns. Nothing to do unless he wants more; then raise ${optionOf(s)} in Cain's App options.`);
     }
@@ -158,7 +181,9 @@ export const KEYS: Record<string, string> = {
   deploy_key: "the link's deploy key (it lands Ship taps in main)",
   ship_key: "the link's Ship key (it signs Ship tokens)",
 };
-export interface KeyRec { hash: string; first_seen: string; expires?: string; present: boolean }
+// first_seen: the day the App first observed this value (not when it was made); ack: a key that never
+// expires by design, its age line quiet through that day (keeper.sh key-ack).
+export interface KeyRec { hash: string; first_seen: string; expires?: string; ack?: string; present: boolean }
 export interface KeyFile { version: 1; keys: Record<string, KeyRec> }
 export const emptyKeys = (): KeyFile => ({ version: 1, keys: {} });
 export function parseKeys(raw: string | null): KeyFile {
@@ -200,6 +225,17 @@ export function setExpiry(f: KeyFile, name: string, day: string): { file?: KeyFi
   if (!validDay(day)) return { said: "The expiry must be a date as YYYY-MM-DD, or none." };
   return { file: { version: 1, keys: { ...f.keys, [name]: { ...rec, expires: day } } }, said: `Expiry for ${KEYS[name]} set to ${shortDate(day)}.` };
 }
+// keeper.sh key-ack <name> <YYYY-MM-DD>: the age line stays quiet through that day (a day to come).
+export function setAck(f: KeyFile, name: string, day: string, today: string): { file?: KeyFile; said: string } {
+  if (!(name in KEYS)) return { said: `No key called "${name.slice(0, 40)}". Names: ${Object.keys(KEYS).join(", ")}.` };
+  const rec = f.keys[name];
+  if (!rec) return { said: `${KEYS[name]} hasn't been observed yet, so there's nothing to acknowledge.` };
+  if (!validDay(day)) return { said: "The date must be YYYY-MM-DD." };
+  if (day <= today) return { said: "The date must be a day to come." };
+  return { file: { version: 1, keys: { ...f.keys, [name]: { ...rec, ack: day } } }, said: `${cap(KEYS[name])}: its age line is quiet until ${shortDate(day)}.` };
+}
+// Mondays only for the age line (an expiry line comes any morning).
+const isMonday = (day: string) => new Date(`${day}T12:00:00Z`).getUTCDay() === 1;
 export function keyLines(f: KeyFile, today: string): string[] {
   const out: string[] = [];
   for (const name of Object.keys(KEYS)) {
@@ -209,9 +245,9 @@ export function keyLines(f: KeyFile, today: string): string[] {
       const left = daysBetween(today, r.expires);
       if (left < 0) out.push(`${cap(KEYS[name])} expired on ${shortDate(r.expires)}: what uses it has stopped working or soon will. His one step: make a new one and put it where it lives (${where(name)}).`);
       else if (left <= EXPIRY_WARN_DAYS) out.push(`${cap(KEYS[name])} expires ${left === 0 ? "today" : `on ${shortDate(r.expires)}, in ${left} day${left === 1 ? "" : "s"}`}. His one step: make a new one and put it where it lives (${where(name)}).`);
-    } else {
+    } else if (isMonday(today) && !(r.ack && today <= r.ack)) {
       const age = daysBetween(r.first_seen, today);
-      if (age > OLD_KEY_DAYS) out.push(`${cap(KEYS[name])} has been the same for ${age} days (first seen ${shortDate(r.first_seen)}) and has no expiry noted. Nothing urgent: replacing it now and then limits what a leak can do. If it has an expiry, note it with keeper.sh key-expiry ${name} YYYY-MM-DD.`);
+      if (age > OLD_KEY_DAYS) out.push(`${cap(KEYS[name])} has been the same for ${age} days (first observed ${shortDate(r.first_seen)}) and has no expiry noted. Nothing urgent: replacing it now and then limits what a leak can do. If it has an expiry, note it with keeper.sh key-expiry ${name} YYYY-MM-DD; if it never expires by design, keeper.sh key-ack ${name} YYYY-MM-DD quiets this line until then.`);
     }
   }
   return out;

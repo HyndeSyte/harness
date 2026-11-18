@@ -18,7 +18,9 @@
 //     that isn't his DM, an edit of a message that isn't one of his own replies, or (0.11.0)
 //     a Reviewed line the review service didn't give, word for word, with its newest lines
 //     offered (read from /data/trust/reviewed.json, ../reviewed.ts, only for a text that has
-//     a "Reviewed:" sentence; while that can't be read, the third try lets it go).
+//     a "Reviewed:" sentence; while that can't be read, the third try lets it go), or
+//     (0.13.0, second round) any link at all: "send links through the keeper", since the plugin
+//     posts with no flags and its preview would unfold first (keeper.sh reply posts it quietly).
 // The cards come first, always (decision F): the link's local route gets 1.5 s, then
 // /data/trust/cards.json while it's under 3 minutes old. So every rule runs on every send,
 // however slow the link is, and the link's DM id wins over the cached one, rewriting it.
@@ -45,7 +47,8 @@ import { createHash, createHmac } from "node:crypto";
 import { appendFileSync, closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { claimsReview, mayHaveCode, recordItems } from "../gate/cain";
+import { claimsReview, linksIn, mayHaveCode, recordItems } from "../gate/cain";
+import { readHosts } from "../gate/hosts";
 import { appendGate } from "../gate/log";
 import { answerText, REPLY_TOOL, SENDS, sentIds } from "../gate/plugin";
 import { DASH_WHY, fixedWhat, type Hit } from "../gate/rules";
@@ -245,7 +248,10 @@ export async function run(raw: string, o: { ask?: () => Promise<CardsView | null
   const d = decideSend(call, got.cards, { dm: got.cards ? null : readDm(), tz, now,
     ...(call.tool === "edit" ? { replied: repliedIn(input?.transcript_path) } : {}),
     ...(claimsReview(call.text) ? { reviewed: readReviewed() } : {}),
-    ...(mayHaveCode(call.text) ? { items: readItems() } : {}) });
+    ...(mayHaveCode(call.text) ? { items: readItems() } : {}),
+    // Links: the plugin's replies hold any (keeper.sh reply sends them with the preview off), and an
+    // https link off the cited hosts is noted in the report (0.13.0, second round).
+    plugin: true, ...(linksIn(call.text).length ? { hosts: readHosts() } : {}) });
   const tries = readTries();
   let out = act(call, d, tries, now);
   if (!writeTries(tries, now) && out.counted) out = { output: null, did: "passed, tries not counted" };

@@ -25,6 +25,8 @@
 //     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read);
 //                                       with no DM id yet, it asks Discord for it first, for 0.8 s at most
 //     POST /check {text, reply_to?, edit?}  what the gate does with a reply or edit, sending nothing
+//     POST /reply {text, reply_to?}    a reply of Cain's with a link (keeper.sh reply): the gate's rules, then posted
+//                                       with its preview off and recorded as his own reply (0.13.0, second round)
 //     POST /sent {tool, ids, question, call, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
@@ -56,6 +58,7 @@ import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
 import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { readHosts } from "../gate/hosts";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
@@ -220,6 +223,7 @@ const link = new Link({
   reviewed: () => readReviewed(),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
+  linkHosts: () => readHosts(),
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
@@ -279,7 +283,7 @@ setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
 // The routes themselves are in http.ts (linkFetch), so a test serves exactly this handler (0.12.0, twenty-third round).
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"]);
+const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/reply", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"]);
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
   port: PORT, hostname: "0.0.0.0", idleTimeout: 30,

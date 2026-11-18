@@ -2,10 +2,18 @@
 declare APP_EXIT_CODE=${1}
 if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
   bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
-  # The outside heartbeat hears it at once (<heartbeat_url>/fail), when one is set. The URL
-  # goes only into that one command's environment and is never logged.
-  HEARTBEAT_URL="$(bashio::config 'heartbeat_url' 2>/dev/null || true)" \
-    timeout 20 bun /opt/cain/security/main.ts fail 2>&1 || true
+  # The outside heartbeat hears it at once (<heartbeat_url>/fail), when one is set. The URL is
+  # never logged and never on a command line (a process listing shows those): curl reads it from
+  # its config on stdin (-K -), https only, no redirects, 10 seconds at most. printf is bash's own.
+  hb="$(bashio::config 'heartbeat_url' 2>/dev/null || true)"
+  if [[ "${hb}" =~ ^https://[A-Za-z0-9.-]+(:443)?(/[A-Za-z0-9._~%/-]*)?(\?[A-Za-z0-9._~%=\&-]*)?$ ]]; then
+    hb_base="${hb%%\?*}"; hb_query="${hb:${#hb_base}}"
+    printf 'url = "%s/fail%s"\n' "${hb_base%/}" "${hb_query}" \
+      | curl -fsS -m 10 --max-redirs 0 --proto '=https' -o /dev/null --data-binary 'stopped on an error' -K - 2>/dev/null \
+      && bashio::log.info "Told the outside heartbeat the App stopped on an error" \
+      || bashio::log.warning "Couldn't tell the outside heartbeat the App stopped"
+  fi
+  unset hb hb_base hb_query
   echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
   exec /run/s6/basedir/bin/halt
 fi

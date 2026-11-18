@@ -346,7 +346,11 @@ describe("record codes: none on his cards or in Cain's words (0.11.0)", () => {
     {
       const q = rig();
       q.files.pending = pendingWith(["P64"], []);
-      expect(q.link.checkSend({ text: "See https://example.com/P64 for details." })).toMatchObject({ would: "refuse", hard: true, hits: [{ rule: "codes" }] });
+      // A link in a plugin reply is held too since 0.13.0's second round (it goes through keeper.sh reply), so the
+      // code is one of its hits: through the keeper the same words are still held for the code alone.
+      const d = q.link.checkSend({ text: "See https://example.com/P64 for details." });
+      expect(d).toMatchObject({ would: "refuse", hard: true });
+      expect(d.hits.filter((h) => h.rule !== "keeper")).toMatchObject([{ rule: "codes" }]);
     }
     const r = rig();
     r.files.pending = pendingWith(["P64", "P08"], ["P63"]);
