@@ -288,25 +288,8 @@ describe("the check-in's Security watch line", () => {
     expect(section([])).toBe("");
   });
 
-  test("checkin.sh puts the line at the end of the morning prompt", () => {
-    const dir = tmp();
-    const stub = join(dir, "watch.ts");
-    writeFileSync(stub, 'console.log(`Security watch (nothing here acts; bring him at most one step, in plain words): ${process.argv[3]} line.`);');
-    const bin = join(dir, "bin");
-    mkdirSync(bin);
-    const typed = join(dir, "typed.txt");
-    // A tmux that shows Cain idle at his prompt and records what's typed.
-    writeFileSync(join(bin, "tmux"), `#!/bin/bash\nif [ "$2" = capture-pane ]; then echo "? for shortcuts"; exit 0; fi\nif [ "$2" = send-keys ] && [ "$5" = -l ]; then printf '%s\\n' "$6" >> "${typed}"; fi\nexit 0\n`);
-    writeFileSync(join(bin, "sleep"), "#!/bin/bash\nexit 0\n");
-    Bun.spawnSync(["chmod", "+x", join(bin, "tmux"), join(bin, "sleep")]);
-    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, CHECKIN_DIR: join(dir, "c"), RELAY_QUEUE: join(dir, "relay"), JOBS_DIR: join(dir, "jobs"),
-      HOLDS_FILE: join(dir, "none"), NOTES_SEEN: join(dir, "seen"), RECORD_SH: "/bin/true", MEANINGS_FILE: join(dir, "m"), PLACES_FILE: join(dir, "p"),
-      CHECKIN_NOW: "0715", CHECKIN_DAY: "2026-11-18", SECURITY_MAIN: stub };
-    const p = Bun.spawnSync(["bash", join(CAIN, "checkin.sh")], { env, stdout: "pipe", stderr: "pipe" });
-    expect(p.exitCode).toBe(0);
-    const t = readFileSync(typed, "utf8").trim();
-    expect(t).toContain("post Dane his one morning update. Security watch (nothing here acts; bring him at most one step, in plain words): morning line.");
-  });
+  // checkin.sh's own test of this line is in tests/test_addon.py (Cain 0.13.1): as his own user the
+  // check-in types through marks it confirms (typing.sh), and that file's harness drives it.
 });
 
 // -- link previews off ------------------------------------------------------------------------------

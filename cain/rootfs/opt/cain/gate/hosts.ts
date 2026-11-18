@@ -13,7 +13,10 @@ export const HOSTS_FILE = process.env.CAIN_LINK_HOSTS ?? "/data/work/link-hosts.
 // A file of Cain's, read by root too (the link, and the gate in the broker) since he runs as his own
 // user (0.13.1): read as his own files are (../owned.ts), never through a symlink, a FIFO or another's file.
 export function readHosts(path = HOSTS_FILE): Set<string> {
-  const got = readOwned(path, CAIN_UID, 256 * 1024);
+  // His file (root reading it), or the reader's own (Cain's keeper.sh, or root the old way).
+  let got = readOwned(path, CAIN_UID, 256 * 1024);
+  const me = process.getuid?.();
+  if (!got.ok && got.why === "not his" && me !== undefined && me !== CAIN_UID) got = readOwned(path, me, 256 * 1024);
   return readHostList(got.ok ? got.text : null);
 }
 

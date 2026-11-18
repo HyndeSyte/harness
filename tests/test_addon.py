@@ -1618,6 +1618,20 @@ def _in(tmp_path):
     return [re.sub(r'^\{"type":"user","message":\{"role":"user","content":"\[[0-9a-f]{8}\] (.*)"\}\}$', r"\1", l) for l in lines]
 
 
+def test_checkin_ends_the_morning_prompt_with_the_security_watch_line(tmp_path):
+    """Main's Cain 0.13.0 line (security/main.ts lines), on the branch's check-in (Cain 0.13.1): the
+    morning prompt ends with it, the others carry only what the watch says for them."""
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    # The watch as checkin.sh runs it (bun <SECURITY_MAIN> lines <kind>): a stand-in that says its kind.
+    (stub / "bun").write_text('#!/bin/bash\n[ "$2" = lines ] && echo "Security watch (nothing here acts): $3 line."\nexit 0\n',
+                              encoding="utf-8", newline="\n")
+    (stub / "bun").chmod(0o755)
+    out = _checkin(tmp_path, "0712", IDLE, SECURITY_MAIN="watch.ts")
+    said = [_said(tmp_path, l) for l in out.splitlines() if " -l " in l]
+    assert any(t.rstrip().endswith("post Dane his one morning update. Security watch (nothing here acts): morning line.") for t in said), said
+
+
 def test_checkin_fires_once_in_its_hour_and_only_when_cain_is_idle(tmp_path):
     out = _checkin(tmp_path, "0712", IDLE)
     assert "morning" in out and "Not a message from Dane" in out and "Enter" in out
