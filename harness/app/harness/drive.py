@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import re
 import time
 from urllib.parse import quote, urlencode
@@ -194,6 +195,76 @@ def street_address(place: str) -> str:
                 address += "".join(f", {x}" for x in (town, state) if x) + (f" {code}" if code else "")
             return address
     return ""
+
+
+# One street said two ways ("St" and "Street", "N" and "North"): the same street (address_parts).
+_SAME_WORD = {"st": "street", "ave": "avenue", "av": "avenue", "rd": "road", "dr": "drive", "ln": "lane",
+              "blvd": "boulevard", "hwy": "highway", "ct": "court", "pl": "place", "pkwy": "parkway",
+              "cir": "circle", "ter": "terrace", "trl": "trail", "sq": "square", "xing": "crossing",
+              "expy": "expressway", "fwy": "freeway", "tpke": "turnpike", "trce": "trace", "cres": "crescent",
+              "aly": "alley", "rt": "route", "rte": "route", "n": "north", "s": "south", "e": "east",
+              "w": "west", "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest"}
+SAME_POINT_METERS = 150            # two map points this near are one place (same_place)
+
+
+def address_parts(place: str) -> tuple[str, str, str, str] | None:
+    """A place's street address in parts, through street_address: (house number, street, town,
+    postcode), each lower case with the street's words in one spelling; a unit is never part of it.
+    None when there's no street address in it."""
+    address = street_address(place)
+    if not address:
+        return None
+    street, *rest = [p.strip() for p in address.split(",")]
+    m = re.match(r"(\d+[A-Za-z]?)\s+(.*)", street)
+    if not m:
+        return None
+    words = [w.strip(".").casefold() for w in m.group(2).split()]
+    name = " ".join(_SAME_WORD.get(w, w) for w in words if w)
+    town = code = ""
+    if rest:
+        last = re.fullmatch(r"([A-Za-z]{2})(?:\s+(\d{5}))?", rest[-1])
+        if last:
+            code = last.group(2) or ""
+            rest = rest[:-1]
+        town = " ".join(rest[0].casefold().split()) if rest else ""
+    return m.group(1).casefold(), name, town, code
+
+
+def _meters(a: str, b: str) -> float:
+    """Between two "lon,lat" points, near enough for a few hundred meters."""
+    (lon1, lat1), (lon2, lat2) = ((float(x) for x in p.split(",")) for p in (a, b))
+    x = math.radians(lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
+    return 6371000 * math.hypot(x, math.radians(lat2 - lat1))
+
+
+def same_place(a: str, b: str, points: tuple[str, str] = ("", "")) -> bool:
+    """Two places are one: by their map points within SAME_POINT_METERS when both have one ("lon,lat"),
+    else by their street addresses' parts (address_parts: the house number and the street the same, and
+    the town or the postcode, where both sides say one), else, last, by their text with case, commas and
+    spacing left out. "227 N Lewis St" and "227 North Lewis Street, Lexington, VA 24450" are one."""
+    if not (a or "").strip() or not (b or "").strip():
+        return False
+    pa, pb = (points[0] or coordinates(a)), (points[1] or coordinates(b))
+    if pa and pb:
+        try:
+            return _meters(pa, pb) <= SAME_POINT_METERS
+        except ValueError:
+            pass
+    one, two = address_parts(a), address_parts(b)
+    if one is not None and two is not None:
+        if one[:2] != two[:2]:
+            return False
+        if one[2] and two[2] and one[2] != two[2] and not (one[3] and one[3] == two[3]):
+            return False
+        if one[3] and two[3] and one[3] != two[3]:
+            return False
+        return True
+    if (one is None) != (two is None):
+        return False
+
+    def norm(text: str) -> str:
+        return " ".join(text.casefold().replace(",", " ").split())
+    return norm(a) == norm(b)
 
 
 class Drives:
@@ -392,6 +463,17 @@ class Drives:
             return NO_ADDRESS
         minutes = float(kept)
         return minutes if minutes <= MAX_MINUTES else NO_ADDRESS
+
+    def kept_point(self, place: str) -> str:
+        """A place's map point ("lon,lat") from its own text or a lookup already kept, never asked for
+        now: empty when there's none (same_place)."""
+        spot = self._spot(place) if place else None
+        if spot is None:
+            return ""
+        if spot[1]:
+            return spot[1]
+        kept = self._kept("drive_place:" + _hash(spot[2].casefold()))
+        return kept if kept and kept != "none" else ""
 
     def _locate(self, address: str, near: str = "") -> str:
         """"lon,lat", which is how the route service wants it."""

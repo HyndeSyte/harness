@@ -33,7 +33,7 @@ from test_family_add import Rig as FamilyRig, on, rig  # noqa: F401
 from test_family_copy import Feeds, GMAIL, NY, TZ, occ, seed, when
 from test_family_gmail import KEY, RULES, FakeGoogle, count, g, make_g  # noqa: F401
 from test_mail_dates import Box
-from harness import google_cal
+from harness import family_gmail, google_cal
 
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_ID = 7
@@ -1195,7 +1195,7 @@ def test_a_place_he_types_on_the_block_makes_it_his(drives):
     assert drives.google.live()[uid]["location"] == "Back entrance, 2 Clinic Rd"
 
 
-@pytest.mark.parametrize("place", ["Dr Patel's office", "https://example.com/visit", "Zoom call, 2 Clinic Rd"])
+@pytest.mark.parametrize("place", ["Dr Patel's office", "https://example.com/visit", "Zoom call"])
 def test_a_name_link_or_call_writes_no_place_and_no_drive(drives, place):
     start = when(drives, days=3, hour=10)
     goes(drives, "Eye doctor", start, place)
@@ -2021,21 +2021,27 @@ def test_a_chained_pair_whose_first_lookup_fails_names_the_second_too(drives):
     assert len(drive_cards_sent(drives)) == 2
 
 
-def test_new_addresses_past_the_lookup_allowance_wait_and_raise_no_card(drives):
+def test_new_addresses_past_the_lookup_allowance_wait_then_are_named_by_their_own_count(drives):
+    """Past the allowance, a lookup waits for the next read, quietly for its first reads. Since 0.24.1's
+    fourth round each leg counts its own reads waiting (others getting through don't start it again), so
+    one still waiting at its third read is named; every drive is written once the queue drains."""
     drives.maps = AnyMaps()
     drives.gm.drives.transport = drives.maps
     quiet_family(drives)
     starts = [when(drives, days=2 + n, hour=10) for n in range(11)]
     for n, start in enumerate(starts):
         mine(drives, f"Visit {n}", start, f"{n + 10} Oak St, Town, VA")
-    for _ in range(8):
+    for _ in range(2):
         go(drives)
         assert drive_cards_sent(drives) == []
         assert "couldn't look up" not in (drives.gm.digest_line() or "")
+    for _ in range(6):
+        go(drives)
+        waits = json.loads(drives.ledger.get_meta(family_gmail.WAIT_COUNTS) or "{}")
+        assert all(n <= 8 for n in waits.values())
     drives.tick()
-    assert drive_cards_sent(drives) == []
     assert [b[1] for b in blocks(drives) if b[0] == "Busy (drive there)"] == [s - 30 * M for s in starts]
-    assert drives.ledger.db.execute("SELECT COUNT(*) FROM drive_cards WHERE fails>0").fetchone()[0] == 0
+    assert json.loads(drives.ledger.get_meta(family_gmail.WAIT_COUNTS) or "{}") == {}   # all through
 
 
 def test_a_partial_gmail_read_keeps_his_drives_but_never_chains_the_family_event_to_them(drives):

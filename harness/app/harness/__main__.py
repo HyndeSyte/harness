@@ -29,9 +29,9 @@ from . import commands, handover, inputs, watch
 from .engines import AnthropicEngine, OpenAIEngine
 from .family_add import FamilyAdd
 from .family_copy import AHEAD_DAYS, FamilyCopy, name_from_options
-from .family_gmail import (FamilyGmail, cleanup_from_options, home_from_options, own_days_from_options,
-                           own_dry_run_from_options, rules_from_options, school_address_from_options,
-                           school_from_options)
+from .family_gmail import (FamilyGmail, cleanup_from_options, his_calendar_from_options, home_from_options,
+                           own_days_from_options, own_dry_run_from_options, rules_from_options,
+                           school_address_from_options, school_from_options)
 from .ledger import Ledger
 from .mail_dates import MailDates, option_on as mail_option_on
 from .mirror_shadow import read_days
@@ -136,6 +136,7 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                                own_days_fn=lambda: own_days_from_options(data_dir),
                                own_dry_fn=lambda: own_dry_run_from_options(data_dir),
                                cleanup_fn=lambda: cleanup_from_options(data_dir),
+                               his_fn=lambda: his_calendar_from_options(data_dir),
                                samples_dir=data_dir)
     controller = Controller(ledger=ledger, vault=vault, api=chat, engines=engines,
                             executor=executor, base_config=base, status_box=status,

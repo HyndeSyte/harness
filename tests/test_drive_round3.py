@@ -5,7 +5,7 @@ calendars that look like his are named, his own drives must truly be the leg, an
 falls back to the school's own address. All names are invented.
 """
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -38,6 +38,15 @@ def failing(rig, monkeypatch, pairs):
     real = rig.gm.drives.between
     monkeypatch.setattr(rig.gm.drives, "between",
                         lambda a, b: drive.FAILED if (a, b) in pairs else real(a, b))
+
+
+def mirror(rig, feed="a"):
+    """His Gmail feed as Google gives it: the blocks the add-on wrote on it, each "<id>@google.com"."""
+    window = rig.feeds.snapshot.feeds[feed].window
+    for eid, e in rig.google.live().items():
+        start, end = (datetime.fromisoformat(e[k]["dateTime"]) for k in ("start", "end"))
+        window.occurrences.append(occ(e["summary"], start, hours=(end - start).total_seconds() / 3600,
+                                      uid=f"{eid}@google.com"))
 
 
 def at(t):
@@ -140,7 +149,7 @@ def test_an_in_person_school_event_with_a_meet_link_keeps_its_drives(drives, loc
 
 
 @pytest.mark.parametrize("title,location,extra", [
-    ("Zoom: parent conference", LOCATION, ()),                                  # a stray address
+    ("Zoom: parent conference", "", ()),                                        # the title, no place
     ("Parent conference", MEET, ()),                                            # the location is a link
     ("Parent conference", "", (f"DESCRIPTION:Join with Google Meet: {MEET}",)),
     ("Parent conference", "", ("DESCRIPTION:Join: https://meet.goo", " gle.com/abc-defg-hij")),   # folded
@@ -155,13 +164,16 @@ def test_an_online_school_event_gets_no_drive_and_says_nothing(drives, caplog, t
     assert drive_blocks(drives) == []
     assert sorted(outcomes(drives).values()) == [ONLINE, ONLINE]
     assert len([r for r in caplog.records if "held online" in r.getMessage()]) == 1
-    assert "drive" not in notes(drives)
+    # Named in the digest, one line for the event (0.24.1, fourth round), and nothing else about a drive.
+    assert notes(drives).count("no drive: online") == 1
+    assert f"Blocks on Gmail from Family: no drive: online, {at(start)}." in notes(drives)
+    assert "couldn't" not in notes(drives)
     assert_quiet(drives)
 
 
 def test_an_online_event_anywhere_gets_no_drive(drives):
     start = when(drives, days=2, hour=10)
-    goes(drives, "Virtual check-in with the coach", start, CLINIC)
+    goes(drives, "Virtual check-in with the coach", start, "Online")    # its place says so (fourth round)
     go(drives)
     go(drives)
     assert drive_blocks(drives) == []
@@ -282,6 +294,7 @@ def test_the_calendar_written_to_is_his_when_a_second_one_appears(drives):
     go(drives)
     before = blocks(drives)
     assert len(before) == 3
+    mirror(drives)            # his feed shows the blocks Harness wrote (fourth round: the choice rests on them)
     second = Feeds()
     second.window.calendar = "other@gmail.com"
     drives.feeds.snapshot.feeds["b"] = second.snapshot.feeds["a"]

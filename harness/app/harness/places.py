@@ -147,8 +147,10 @@ class PlaceBook:
         map, by name near home), else nothing. Ask only when the map said it isn't there,
         not when it couldn't be reached (the next read tries again)."""
         self.later = False
-        if not (location or "").strip() or drive.is_online(location):
+        if not (location or "").strip():
             return "", False
+        # A street or his book first: an online word beside them ("Virtual Reality Lab, 12 Oak St")
+        # doesn't take the place away. Only the map is never asked with one.
         street = drive.street_address(location)
         if street:
             return street, False
@@ -158,6 +160,8 @@ class PlaceBook:
         row = self.ledger.db.execute("SELECT address, skip FROM places WHERE key=?", (key,)).fetchone()
         if row is not None:
             return ("" if row["skip"] else row["address"]), False
+        if drive.is_online(location):
+            return "", False
         if find is None:
             return "", True
         found = find(location)
@@ -170,11 +174,12 @@ class PlaceBook:
             return "", True
         return found, False
 
-    def findable(self, location: str) -> bool:
+    def findable(self, location: str, online_words: bool = False) -> bool:
         """A location worth a drive that nothing placed: not empty, not a call or a link, and not
-        a place he said to skip (a skip row in the book, or Skip on its "Where is" card)."""
+        a place he said to skip (a skip row in the book, or Skip on its "Where is" card).
+        online_words: one with an online word in it counts too (one the caller found isn't online)."""
         key = place_key(location)
-        if not (location or "").strip() or drive.is_online(location) or not key:
+        if not (location or "").strip() or (drive.is_online(location) and not online_words) or not key:
             return False
         row = self.ledger.db.execute("SELECT skip FROM places WHERE key=?", (key,)).fetchone()
         if row is not None and row["skip"]:

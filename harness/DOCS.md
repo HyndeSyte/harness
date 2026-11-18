@@ -496,6 +496,13 @@ how many blocks are on Gmail.
   written there, and the digest names it. An exact duplicate of a kept block (same title, times and
   place) comes off, its mark read again just before. A block without Harness's mark is never
   touched. Nothing else is written, and no test event is needed again.
+- **`his_calendar` (empty by default):** the address of your own Gmail calendar among those on the
+  Harness page. Empty, your calendar is the one holding Harness's own blocks (found in each feed by
+  their ids), else the one recorded from them before, else the one Gmail calendar read. Set, it wins
+  over all of those. When your calendar (the one set here, or the recorded one) isn't read, nothing
+  that needs your calendar is done and no other calendar is used: the digest says so at every read,
+  with one message when another calendar is read. Two calendars that look like yours with nothing to
+  choose by are named in the digest, and so are both when one is in use beside another.
 - **`remove_all_blocks` (off by default):** on, the drive blocks around your own appointments, from
   yesterday on, come off at the next read, each known by its mark and read again by its id just before: it must
   still carry the own-drive mark, with the title and times it was listed with. A

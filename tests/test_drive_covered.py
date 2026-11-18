@@ -370,8 +370,9 @@ def test_at_school_with_a_room_name_not_in_the_book_asks_nothing(drives):
     ("Parent conference", ("DESCRIPTION:We'll meet on Google Meet",)),
 ])
 def test_at_school_online_gets_no_drive(drives, title, extra):
+    # With no place: a title word beside a street keeps the drives (0.24.1, fourth round).
     start = when(drives, days=2, hour=14)
-    at_school(drives, title, start, location=LOCATION if not extra else "", extra=extra)
+    at_school(drives, title, start, location="", extra=extra)
     go(drives)
     go(drives)
     assert drive_blocks(drives) == []

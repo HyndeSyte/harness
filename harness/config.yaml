@@ -45,6 +45,8 @@ timeout: 30
 # remove_all_blocks: on, the drive blocks Harness made around his own appointments come off Gmail
 # (Family events' blocks stay; ones he edited stay) and nothing new is written while it stays on. For a
 # clean start; off again, blocks are written as before.
+# his_calendar: the address of his own Gmail calendar among those on the Harness page. Empty (the default)
+# takes the one holding Harness's own blocks, else the one Gmail calendar read.
 options:
   family_copy_name: ""
   family_to_gmail: ""
@@ -58,6 +60,7 @@ options:
   own_drive_days: 3
   own_drive_dry_run: true
   remove_all_blocks: false
+  his_calendar: ""
 schema:
   family_copy_name: str?
   family_to_gmail: str?
@@ -71,3 +74,4 @@ schema:
   own_drive_days: int(1,60)?
   own_drive_dry_run: bool?
   remove_all_blocks: bool?
+  his_calendar: str?
