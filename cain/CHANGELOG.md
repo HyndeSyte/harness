@@ -2,11 +2,9 @@
 
 ## 0.13.3
 
-- The move to Cain's own user no longer fails because his connectors (Gmail, his calendars, GitHub, Canva and the rest) wouldn't load under his new rules. Those rules allowed only one address, and Claude Code checks each connector at its own address, so all of them were refused. Every connector now loads, while only the App's own Discord link may run on the Pi and every write tool stays switched off.
-- Before an update that changes Cain's rules ships, a check now runs on a signed-in computer and compares his connectors with and without those rules, so this can't slip through again. If the move ever finds a connector missing, the App's log now names every one.
-- No alarm asks you to restart the App any more. When something the App can fix by restarting (he's paused, his session keeps ending, a question keeps coming back on his screen, or messages don't go in) lasts half an hour or an hour, the App restarts itself, once, and you hear only if that didn't fix it, with what it saw.
-- A move to his own user that undid itself safely and left him running as before sends you no alarm: Cain mentions it in his morning update.
-- Only a hard stop still names the way back (restoring two backups), and only after saying a fixed update also brings him back.
+- The move to Cain's own user no longer fails because his connectors (Gmail, his calendars, GitHub, Canva and the rest) wouldn't load under his new rules. Those rules allowed only one address, and Claude Code checks each connector at its own address, so all of them were refused. Every connector now loads, while only the App's own Discord link may run on the Pi, no other plugin or marketplace can be added, and every write tool stays switched off.
+- Before an update that changes Cain's rules ships, Cain checks on the Pi that every connector still loads under them, first proving the check can tell, so this can't slip through again. If the move ever finds a connector missing, the App's log now names every one.
+- The "Cain is stopped for a moment" alarms no longer ask you to restart the App if he isn't back in half an hour: the App is already restarting itself. Nothing for you to do.
 
 ## 0.13.2
 
