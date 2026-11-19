@@ -1,13 +1,20 @@
-// CI: no type escape hatch anywhere in surface/ outside the sanitiser module (export/lib.ts, the one
-// place a GatedText is made). Fails on `as GatedText`, `as unknown as`, or the type `any`, in code
-// (comments, strings, template text and regular expression literals don't count). The run-time gate
-// (checkSigned) is what holds; this keeps the compile-time brand honest too.
+// CI: no type escape hatch anywhere in surface/, the sanitiser module (export/lib.ts) included. Fails on
+// `as GatedText`, `as unknown as`, or the type `any`, in code (comments, strings, template text and
+// regular expression literals don't count). The one exception is the brand-minting line in lib.ts's
+// mark() function, allowed by its exact content and the exact line before it (ALLOWED below). The
+// run-time gate (checkSigned) is what holds; this keeps the compile-time brand honest too.
 // Run: bun surface/check-casts.ts
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 // The sanitiser module, relative to surface/.
 export const SANITISER_MODULE = ["export", "lib.ts"].join(sep);
+// The allowed lines: in the sanitiser module, the one line that mints the brand, matched by its exact
+// content and the exact line before it (the mark() function's head). Any other "as GatedText", "as
+// unknown as" or any there fails, and so does a second copy of the allowed line elsewhere.
+export const ALLOWED: Record<string, { before: string; line: string; what: string }[]> = {
+  [SANITISER_MODULE]: [{ before: "function mark(s: string): GatedText {", line: "  return s as GatedText;", what: "as GatedText" }],
+};
 const SKIP_DIRS = new Set(["node_modules", "dist", ".expo", "web-build", ".dev"]);
 const SOURCE = /\.(?:ts|tsx|mts|cts|js|mjs|cjs|jsx)$/;
 
@@ -138,18 +145,24 @@ const RULES: [RegExp, string][] = [
   [/(?<![\w$.])any(?![\w$])/, "the type any"],
 ];
 
-// Each forbidden form in one file's code: "path:line: what".
-export function fileProblems(path: string, src: string): string[] {
+// Each forbidden form in one file's code: "path:line: what". A line on the file's allowlist (ALLOWED,
+// by its path) passes only for its own form, and only where its exact content follows its exact line.
+export function fileProblems(path: string, src: string, allowed = ALLOWED[path] ?? []): string[] {
   const out: string[] = [];
+  const raw = src.split("\n");
   codeOnly(src)
     .split("\n")
     .forEach((line, k) => {
-      for (const [re, what] of RULES) if (re.test(line)) out.push(`${path}:${k + 1}: ${what}`);
+      for (const [re, what] of RULES) {
+        if (!re.test(line)) continue;
+        const ok = allowed.some((a) => a.what === what && raw[k] === a.line && raw[k - 1] === a.before);
+        if (!ok) out.push(`${path}:${k + 1}: ${what}`);
+      }
     });
   return out;
 }
 
-// Every source file under surface/, but the sanitiser module and the folders that aren't source.
+// Every source file under surface/, the sanitiser module included, but the folders that aren't source.
 export function castProblems(root: string): string[] {
   const out: string[] = [];
   const walk = (dir: string) => {
@@ -157,7 +170,7 @@ export function castProblems(root: string): string[] {
       const p = join(dir, name);
       if (statSync(p).isDirectory()) {
         if (!SKIP_DIRS.has(name)) walk(p);
-      } else if (SOURCE.test(name) && relative(root, p) !== SANITISER_MODULE) {
+      } else if (SOURCE.test(name)) {
         out.push(...fileProblems(relative(root, p), readFileSync(p, "utf8")));
       }
     }
@@ -170,8 +183,8 @@ if (import.meta.main) {
   const problems = castProblems(import.meta.dir);
   if (problems.length) {
     for (const p of problems) console.error(`cast check: ${p}`);
-    console.error(`cast check: ${problems.length} forbidden cast(s) or any outside ${SANITISER_MODULE}`);
+    console.error(`cast check: ${problems.length} forbidden cast(s) or any (only mark()'s one line in ${SANITISER_MODULE} is allowed)`);
     process.exit(1);
   }
-  console.log(`cast check: no "as GatedText", "as unknown as" or any outside ${SANITISER_MODULE}`);
+  console.log(`cast check: no "as GatedText", "as unknown as" or any, but mark()'s one line in ${SANITISER_MODULE}`);
 }

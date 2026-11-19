@@ -12,6 +12,7 @@ import { Miniflare } from "miniflare";
 import { buildSnapshot, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../../export/lib";
 import { canonical, toBase64 } from "../../shared/canonical";
 import { snapshotId } from "../../shared/snapshot";
+import { REVISION_REQUIRED, SIGNATURE_REFUSED } from "../src/worker";
 
 // Made-up values only.
 const TEAM = "https://example-team.cloudflareaccess.com";
@@ -22,13 +23,14 @@ const PUBLISHER = "publisher-value-example";
 const HOST = "https://surface.example.com/snapshot";
 
 const FIX = join(import.meta.dir, "..", "..", "export", "fixtures");
-const policy = makePolicy(readFileSync(join(FIX, "private-terms.txt"), "utf8"), { owner_names: ["Robin"], names: [] });
+const policy = makePolicy(readFileSync(join(FIX, "private-terms.txt"), "utf8"), JSON.parse(readFileSync(join(FIX, "exporter.json"), "utf8")));
 const keys = makeKeyPair();
 const thief = makeKeyPair();
 type Pair = ReturnType<typeof makeKeyPair>;
-// A snapshot of the fixture record signed by a key, made `ms` from now (workerd reads the real clock).
+// A snapshot of the synthetic record (it passes --strict, so the signer takes it) signed by a key,
+// made `ms` from now (workerd reads the real clock).
 const snap = (ms: number, k: Pair = keys, revision: { seq: number; commit: string } | null = null) =>
-  signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(Date.now() + ms), revision).snapshot, privateKey(k.privatePem), policy);
+  signSnapshot(buildSnapshot(join(FIX, "synthetic"), policy, new Date(Date.now() + ms), revision).snapshot, privateKey(k.privatePem), policy);
 
 let rsa: CryptoKeyPair;
 let jwk: JsonWebKey & { kid: string };
@@ -157,7 +159,8 @@ describe("the Worker under workerd, with a real Durable Object", () => {
     expect((await bodyOf(res)).replaced_retired).toBe(true);
     const t = await put(snap(4 * 60_000 + 30_000, thief, { seq: 999_999_999 + 1, commit: "c".repeat(40) }));
     expect(t.status).toBe(403);
-    expect((await bodyOf(t)).error).toBe("signed by a retired key");
+    // One message for a retired key and a bad signature (eighth round).
+    expect((await bodyOf(t)).error).toBe(SIGNATURE_REFUSED);
   });
 
   test("the same bytes again (a lost response reconciled) is 200 already; an older replay is 409 naming the held identity", async () => {
@@ -194,4 +197,74 @@ describe("the Worker under workerd, with a real Durable Object", () => {
     expect(asPublisher.status).toBe(403);
     expect((await mf.dispatchFetch(HOST)).status).toBe(403);
   });
+
+  // Eighth round: races with revisions, each pair sent in both arrival orders, one after the other
+  // (a set order) and then both at once (the runtime picks the order).
+  const commit = (c: string) => c.repeat(40);
+  const statusOf = async (s: unknown) => {
+    const res = await put(s);
+    return { status: res.status, body: await bodyOf(res) };
+  };
+  test("equal seq, different commits: the first stored is held, the other is 409 conflict", async () => {
+    const a = snap(-120_000, keys, { seq: 7, commit: commit("a") });
+    const b = snap(-60_000, keys, { seq: 7, commit: commit("b") });
+    for (const [first, second] of [[a, b], [b, a]]) {
+      await fresh(`eq-seq-${first === a}`, keys.publicEntry);
+      expect((await statusOf(first)).status).toBe(200);
+      const r = await statusOf(second);
+      expect(r.status).toBe(409);
+      expect(r.body.error).toMatch(/another commit at the stored snapshot's record revision/);
+      expect(await (await get()).json()).toEqual(first);
+    }
+    for (const flip of [false, true]) {
+      await fresh(`eq-seq-race-${flip}`, keys.publicEntry);
+      const results = await Promise.all((flip ? [b, a] : [a, b]).map(async (s) => ({ s, ...(await statusOf(s)) })));
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+      expect(await (await get()).json()).toEqual(results.find((r) => r.status === 200)!.s);
+    }
+  }, 60_000);
+  test("a higher seq with an older made_at wins, in either order", async () => {
+    const high = snap(-120_000, keys, { seq: 8, commit: commit("c") });
+    const low = snap(-60_000, keys, { seq: 6, commit: commit("d") });
+    for (const [first, second] of [[high, low], [low, high]]) {
+      await fresh(`hi-seq-${first === high}`, keys.publicEntry);
+      await statusOf(first);
+      const r = await statusOf(second);
+      expect(r.status).toBe(second === high ? 200 : 409);
+      expect(await (await get()).json()).toEqual(high);
+    }
+    for (const flip of [false, true]) {
+      await fresh(`hi-seq-race-${flip}`, keys.publicEntry);
+      await Promise.all((flip ? [low, high] : [high, low]).map(statusOf));
+      expect(await (await get()).json()).toEqual(high);
+    }
+  }, 60_000);
+  test("mixed revisions: held with one, a candidate without is 409 (a revision is required); held without, made_at decides", async () => {
+    const withRev = snap(-120_000, keys, { seq: 5, commit: commit("e") });
+    const without = snap(-60_000);
+    // Held with a revision, then the newer candidate without one: refused.
+    await fresh("mixed-rev-first", keys.publicEntry);
+    expect((await statusOf(withRev)).status).toBe(200);
+    const r1 = await statusOf(without);
+    expect(r1.status).toBe(409);
+    expect(r1.body.error).toBe(REVISION_REQUIRED);
+    expect(await (await get()).json()).toEqual(withRev);
+    // Held without, then the older candidate with one: made_at decides, 409 older.
+    await fresh("mixed-null-first", keys.publicEntry);
+    expect((await statusOf(without)).status).toBe(200);
+    const r2 = await statusOf(withRev);
+    expect(r2.status).toBe(409);
+    expect(r2.body.error).toMatch(/older than the stored snapshot/);
+    // Held without, a newer candidate with one: stored; from then a revision is required.
+    const newerRev = snap(-30_000, keys, { seq: 5, commit: commit("e") });
+    expect((await statusOf(newerRev)).status).toBe(200);
+    expect((await statusOf(snap(-10_000))).body.error).toBe(REVISION_REQUIRED);
+    // Both at once, in both orders: exactly one is stored and held.
+    for (const flip of [false, true]) {
+      await fresh(`mixed-race-${flip}`, keys.publicEntry);
+      const results = await Promise.all((flip ? [without, withRev] : [withRev, without]).map(async (s) => ({ s, ...(await statusOf(s)) })));
+      expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+      expect(await (await get()).json()).toEqual(results.find((r) => r.status === 200)!.s);
+    }
+  }, 60_000);
 });

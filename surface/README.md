@@ -23,11 +23,12 @@ bun run surface/export --keygen <dir>   # writes surface.key, surface.pub, surfa
 
 # read what would be exported, signed and written nowhere; the private word list goes only to the
 # --report file (mode 0600, outside any git work tree), never to the screen; with --key it prints the
-# approval flags (--made-at and --approve) for exactly these bytes
+# approval flags (--made-at and --approve) for exactly these bytes, and with --report it writes those
+# exact signed bytes beside the report (<report>.signed.json, mode 0600)
 bun run surface/export --record <record checkout> --private-terms <terms file> \
   --config <exporter config> --dry-run --key <dir>/surface.key [--report [<private file>]]
 
-# each export
+# each export (the signer refuses an unknown lower-case or uncased word whatever the flags)
 bun run surface/export --record <record checkout> --private-terms <terms file> \
   --config <exporter config> --out snapshot.json --key <dir>/surface.key [--strict]
 
@@ -60,27 +61,39 @@ characters of the Worker's own JSON message (no other body, never a header). `--
 temporary file, then a rename), so a failed run, in any mode, writes no file and leaves an existing
 one as it was.
 
-**The owner approves the bytes he read (seventh round).** `--put` needs `--made-at <time>` and
-`--approve <digest>`, both printed by a dry run run with `--key`: the time is the dry run's `made_at`,
-and the digest is the SHA-256 of the exact signed bytes it printed (the snapshot's identity, below).
-The upload rebuilds the snapshot at that time and signs it only if its signed bytes have that digest;
-otherwise (the record, the config, the key or the time changed since) it stops with exit 2 and
-nothing sent: run the dry run again and read it. Since the Worker refuses a `made_at` more than 24
+**The owner approves the bytes he read (seventh round; eighth round: the bytes themselves).** `--put`
+needs `--made-at <time>` and `--approve <digest>`, both printed by a dry run run with `--key`: the time
+is the dry run's `made_at`, and the digest is the SHA-256 of the exact signed bytes (the snapshot's
+identity, below). With `--report` the dry run also writes those exact bytes, the canonical signed JSON
+as text, to `<report>.signed.json` beside the report (mode 0600, written atomically, refused inside a
+git work tree like the report): `sha256sum` of that file is the digest, so what the owner approves is
+what he can read. A dry run prints no approval when the bytes can't be uploaded (the gate or
+`--strict` refuses them). The upload builds the snapshot once, at that time, computes its identity,
+compares it with `--approve`, signs that same in-memory object and uploads its one serialization,
+sending the identical body on every reconciling try; when the identity differs (the record, the
+config, the key or the time changed since) it stops with exit 2 and nothing sent: run the dry run again
+and read it. Since the Worker refuses a `made_at` more than 24
 hours old, an approval is good for a day. Every `--put` needs one, so wiring the record keeper to
 upload by itself after each change (Deploy, step 7) needs the owner's decision on how that approval
 is given.
 
+**An upload needs a revision (eighth round).** `--put` refuses with exit 2, nothing sent, when the
+record's revision can't be signed (The signature, below), naming why: not a git checkout, not the top
+of its own work tree, a shallow clone, no upstream branch, not at the upstream's tip, or which path the
+exporter reads has changes not committed (`state/PENDING.md`, the holds file, the notes folder, or
+anything else under `state/`). The Worker refuses a snapshot without a revision once it holds one, so
+nothing would order it.
+
 **The uploader's three outcomes.** Every upload ends in one of these, named on its last line:
 
-- **Preflight rejection, exit 2: nothing sent.** The URL or environment checks above, a missing or
-  wrong approval (`--made-at` and `--approve`), a signed body over the Worker's 512 KiB limit, or a
-  body that doesn't verify under the exporter's own key.
+- **Preflight rejection, exit 2: nothing sent.** The URL or environment checks above, no record
+  revision, a missing or wrong approval (`--made-at` and `--approve`), a signed body over the Worker's
+  512 KiB limit, or a body that doesn't verify under the exporter's own key.
   (A `--strict` failure stops earlier still, exit 1, also with nothing sent.)
 - **Server rejection, exit 1: nothing stored.** A definite answer refusing it: any 4xx (403 from
   Access or the Worker, 409 when the Worker holds a snapshot that keeps its place, 413, 400) or an
-  Access redirect. It is not retried. A 409 met while reconciling (the first try's response lost, and
-  a newer snapshot stored since) is this outcome too: the Worker names the identity it holds, and it
-  isn't this one.
+  Access redirect. It is not retried. (Eighth round: a refusal met while reconciling is not this
+  outcome; see below.)
 - **Unknown remote outcome, exit 3.** No answer, a 5xx, an answer cut off, or a 2xx naming another
   snapshot: the request may have been stored with its response lost. The uploader reconciles by the
   snapshot's signed identity (the SHA-256 of its signed bytes, 64 hex digits): it sends
@@ -88,11 +101,16 @@ is given.
   every PUT with the identity it holds; the same identity already held is a 200 (`already`), so a
   lost response settles as **stored, exit 0**, printing `(snapshot <id>)`. If no try gets an answer,
   it says the snapshot may or may not be stored and exits 3; running the same export again later
-  reconciles the same way (a newer snapshot simply replaces it).
+  reconciles the same way (a newer snapshot simply replaces it). Eighth round: when an earlier try
+  ended unknown and a later try is refused (a 409 because a newer snapshot landed since, or any other
+  refusal), the first try's outcome is unresolved (it may have been stored, then replaced): the last
+  line says so and it exits 3, not 1. A 409 that names this snapshot's own identity as the one held is
+  stored, exit 0.
 
 A 2xx counts as stored only when it names this snapshot's identity: success is reported only when the
 server says this identity is the one current. A different identity, whatever its `made_at` (equal or
-newer included), is never success: a 2xx naming it is exit 3, a 409 naming it exit 1.
+newer included), is never success: a 2xx naming it is exit 3, a 409 naming it exit 1 (exit 3 after an
+earlier unknown try).
 
 `--dry-run` runs every check a real run does (the exit-2 checks: no real owner name, no `names`
 list, config JSON that doesn't parse, a missing or empty terms file, a term that doesn't compile)
@@ -101,14 +119,22 @@ stdout (gated text only; with `--key`, the very object signed, key id included),
 for those bytes on stderr (with `--key`; without it, a line saying there is no digest), and on stderr counts only: threads, rows left out and skipped, the
 threads per area (`surface 2, garden 1, other 5`: the config's `areas` list is the primary control
 on what an area may be), and how many capitalised words were replaced and how many lower-case or
-uncased words aren't in the word list. **The words themselves never go to stderr or stdout.** With `--report <file>` they go to that file alone, written with mode 0600 from the moment it exists (a
+uncased words aren't in the word list, and (eighth round) the run-time gate's verdict, checked without
+signing: "the gate would refuse to sign: <path>", with no approval printed. **The words themselves
+never go to stderr or stdout.** With `--report <file>` they go to that file alone, written with mode 0600 from the moment it exists (a
 new temporary file, `<file>.tmp-<pid>-<random>`, created exclusively, then renamed over the path),
-under a first line saying it is private and never to be relayed: the approval flags, the threads per
-area, each capitalised word the gate replaced, each unknown word (each fails `--strict`), and each
-lower-case word known only as a name-word (not a failure), with its path, row and field. `--report`
+under a first line saying it is private and never to be relayed: the approval flags (and the path of
+the signed-bytes file), the threads per area, then every strict failure (eighth round): each row
+warning, each capitalised word the gate replaced and each unknown word, with its path, row, field and
+word, and on the next line a suggested line to add (`allow_words: "<word>"` for the config, or, for a
+capitalised bundled name word, a `name-words.txt [common]` line, only if it is an ordinary word too;
+a person's name goes in the config's `names`); then each lower-case word known only as a name-word (not
+a failure). `--report`
 with no file writes `~/surface-dry-run.private.txt`. A report path inside any git work tree (a `.git`
 folder or file in its folder or any above it, or git saying so) is refused with exit 2 before anything
-is read; the absolute path of the report is printed on stderr; the temporary file is removed on any
+is read; the folder is taken as it really is (eighth round: its first existing ancestor resolved with
+realpath, so a folder outside any repository that is a link into one is refused), and the temporary
+file and the rename use that resolved folder, so the check and the write see the same directory; the absolute path of the report is printed on stderr; the temporary file is removed on any
 failure, an exception, an exit or a signal; and `surface/.gitignore` lists the default name and the
 temporary-file pattern as a second line. `--report` goes only with `--dry-run` (else exit 2). With `--put` or `--out` a dry run is refused (exit 2). With `--strict` a leftover fails it
 like a real run, and no snapshot is printed.
@@ -156,9 +182,9 @@ is.
   "define" doesn't hold "fine"). Then:
   - **prefix** stems match any word that starts with them ("bank" catches "banking", "therap"
     "therapist"): money, financ, debt, bank, budget, paid, owed, invoice, rent, loan, mortgage, credit,
-    salar, insur, refund, health, therap, doctor, appointment, hospital, surgery, mental, psychiatr,
+    salar, insur, refund, health, therap, doctor, appointment, surgery, psychiatr,
     dentist, dental, orthodont, periodont, endodont, denture, tooth, teeth, prescri, clinic, pharmac,
-    medic, diagnos, bill, price, quote, deposit, venmo, symptom, vaccin, pregnan, allerg, counsel,
+    medic, diagnos, price, quote, deposit, venmo, symptom, vaccin, pregnan, allerg, counsel,
     refill, biopsy, chemo, cancer, rehab, physio, results, urgent care, injur, zelle, cheque, tuition,
     blood, dosag, cardiol, ptsd;
   - **word** stems match only the whole word or the word with one of its listed endings, with no
@@ -166,11 +192,15 @@ is.
     able, out, day, slip), irs, pt, gp (s), mri (s), er, rx, meds, tax (es, ed, ing, able, ation), card
     (s), fee (s), cost (s, ing, ly), cash (ed, es, ing, back), owe (s, d), owing, scan (s, ned, ning,
     ner), pill (s), dose (s, d), sick (ness, er, est, ly), lab (s, work), fine (s, d), check (s, ed,
-    ing, book, books, up, ups), wire (s, d), ticket (s, ed, ing). So "label", "labor", "checklist",
-    "wireless", "payload", "cardboard", "taxi", "costume", "feel" and "pillow" stay in.
+    ing, book, books, up, ups), wire (s, d), ticket (s, ed, ing), and (eighth round, moved from prefix
+    because they matched ordinary words) hospital (s, ised, ized, isation, ization), bill (s, ed, ing,
+    ings, able) and mental (ly). So "label", "labor", "checklist", "wireless", "payload", "cardboard",
+    "taxi", "costume", "feel", "pillow", "hospitality", "billion", "billow" and "mentality" stay in.
   A stem of two words matches any spaces between them. A test checks every stem against its own word
   (and each ending), against the stem inside a longer word, and each short stem against its false
-  positives. Config adds more (`exclude_stems`, each a prefix stem); it can't remove these.
+  positives, and (eighth round) every prefix stem against the common-word lists: none may start an
+  ordinary word there but its own plain inflections. Config adds more (`exclude_stems`, each a prefix
+  stem); it can't remove these.
 - **Long numbers.** A row is left out whole when any cell has a run of four or more digits that
   isn't part of a date (`YYYY-MM-DD`, `M/D/YYYY`, or a year alone, 1900 to 2099): a card's last
   four, an account or a reference number, most phone numbers. A record code (one to three
@@ -179,11 +209,13 @@ is.
 - **Money in any form.** A row is left out whole when any cell has a currency symbol, an ISO
   currency code next to a number ("USD 40", "40EUR"; the common codes in lower case too, "40 usd"), or a number with a currency word
   ("50 dollars", "five quid", "2k euros").
-- **Account shapes.** A row is left out whole when any cell has an IBAN (two capitals, two check
-  digits, then groups of letters and digits, spaced or not, six digits or more in all), a card number
-  (13 to 19 digits, with single spaces or hyphens between them in groups of any size), a UK sort code
-  (12-34-56), or a word naming an account number (acct, a/c, IBAN, BSB, ABA, routing number, sort
-  code, account no or number).
+- **Account shapes.** A row is left out whole when any cell has an IBAN (two letters, two check
+  digits, then groups of letters and digits, spaced or not, six digits or more in all; any case, so a
+  typed lower-case one counts), a card number (13 to 19 digits, with single spaces or hyphens between
+  them in groups of any size), a UK sort code (12-34-56) when an account word is in the same cell or it
+  isn't shaped like a date (DD-MM-YY, MM-DD-YY or YY-MM-DD: "12-05-26" alone is a date and stays), or a
+  word naming an account number (acct, a/c, IBAN, BSB, ABA, routing number, sort code, account no or
+  number), a number glued to it included ("acct42"). Every one of these patterns is case-insensitive.
 - **The private marker is final.** A row carrying the tag `#private` in any cell, or a
   `Private` column whose cell is `yes`, `y`, `true`, `x` or `private`, never exports, whatever
   else it says.
@@ -237,10 +269,15 @@ is.
   list (the allow words, the months and weekdays, `name-words.txt`'s `[common]` words, and the words
   the exporter puts in itself: you, your, someone, a link, an email address and so on), looked up
   with its possessive or contraction off and as an inflection of a known word ("brings", "carried",
-  "fixing", "stopped"), is counted and listed in the dry run's `--report` file. A letter run touching
-  a digit ("v2", "x86") is a code, not a word. Seventh round: under `--strict` (and so `--put`) an
-  unknown word in **any** free-text field (title, step, waits_for, outcome) fails the run, named by
-  field and row only. A name written in lower case, or in a script with no case, is caught by the
+  "fixing", "stopped"), is counted and listed in the dry run's `--report` file. Eighth round: a letter
+  run touching a digit is looked up by its letters ("zorblat2" by "zorblat"); only a whole record-code
+  form (one to three letters then one to five digits, nothing else: "v2", "x86", "p40") is exempt, and a
+  number's own letters right after it ("3rd", "20th", "10am") are known. Seventh round: under
+  `--strict` (and so `--put`) an unknown word in **any** free-text field (title, step, waits_for,
+  outcome) fails the run, named by field and row only. Eighth round: the signer itself refuses one,
+  whatever the flags, so a plain `--out` run with an unknown word left is exit 1 with nothing written
+  ("the gate refused to sign: <path>"); the owner adds the word to `allow_words` (the report suggests
+  the line) or fixes the record. A name written in lower case, or in a script with no case, is caught by the
   names list, the terms file and this check. The owner lists his record's ordinary words in
   `allow_words` from the report. Sentences never end after Mr, Mrs, Ms, Dr or St, so "waiting on Mr.
   Vale" keeps "Mr." and gates the name. The gate runs on the case-preserved normal form (NFKC, so a
@@ -255,16 +292,27 @@ is.
   gate, the cap), which returns a `GatedText`; the id, the times, who, state, area, app, purpose, key
   id and revision each have their own gate (a checked shape or a fixed list). The `GatedText` brand is
   a compile-time aid only. What holds at run time is `checkSigned`, which `signSnapshot` runs on every
-  call: it walks the whole signed object against a closed schema (exactly the signed fields, exactly a
-  thread's fields, exactly a revision's; an unknown field, a missing one, a dynamic or symbol key, a
-  getter, a hidden property, a class instance or an extra array property is refused), and checks every
-  string by its kind: a free text passes only if `sanitise` returned it or sanitising it again returns
-  it unchanged; an area only if it is `other` or on the config's `areas` list (and passes the same
-  re-run); who and state only from their fixed lists; the id, times, key id and revision only in their
-  shapes. A refusal names the path only, never the value. Area names come from the config's list: the
-  exported name is the list's entry, and the config refuses an area that isn't a plain folder name.
-  CI's cast check (`surface/check-casts.ts`) fails on `as GatedText`, `as unknown as` or the type
-  `any` anywhere in `surface/` outside `export/lib.ts` (comments and strings don't count).
+  call. Eighth round: the signer never signs the caller's object. It first checks the input's shape
+  (closed, before the key id is added; the threads array's index descriptors, enumerable data
+  properties with no accessor, before any value is read), then builds a fresh, frozen plain object from
+  the validated primitive values, each read once, adds the key id, and `checkSigned` walks that copy,
+  which is what is signed. `checkSigned` checks it against a closed schema (exactly the signed fields,
+  exactly a thread's fields, exactly a revision's; an unknown field, a missing one, a dynamic or symbol
+  key, a getter, a hidden property, a class instance or an extra array property is refused), and checks
+  every string by its kind: each free text by running `sanitise` again under this policy with its own
+  field's cap (140 for the title, 200 for the step, none for the outcome and waits_for), which must
+  return it unchanged, and by the unknown-word check (no remembered set of texts: whatever made the
+  string, it passes only on its own merits, so a string sanitised under another policy, or for another
+  field, is refused); an area only if it is `other` or on the config's `areas` list (and passes the
+  same re-run); who and state only from their fixed lists; the id, times, key id and revision only in
+  their shapes. `sanitise` is idempotent (a test runs it on its own output for every field and three
+  policies over the fixture and strict corpora). A refusal names the path only, never the value. Area
+  names come from the config's list: the exported name is the list's entry, and the config refuses an
+  area that isn't a plain folder name. CI's cast check (`surface/check-casts.ts`) fails on `as
+  GatedText`, `as unknown as` or the type `any` anywhere in `surface/`, `export/lib.ts` included
+  (eighth round), but for one allowed line: `return s as GatedText;` in `mark()`, matched by its exact
+  content under the exact line `function mark(s: string): GatedText {` (comments and strings don't
+  count).
 - **Counts.** `excluded_rows` (left out on purpose) and `skipped_rows` (no valid id or Since
   time) are signed with the snapshot; the app shows one line "N items not shown". Each skipped
   or oversized row is a warning on stderr with its path and row number (never its text);
@@ -313,9 +361,20 @@ as `sig`. Everything but `sig` is signed:
   can't be moved under another listed key's id.
 - `revision` is the record's commit when the exporter knows it for certain: `{seq, commit}`, `commit`
   the full hash and `seq` the commit's count of ancestors, itself included (`git rev-list --count`),
-  which only grows along a branch. The exporter sets it only when the record checkout is the top of
-  its own git work tree and nothing under `state/` differs from that commit; otherwise it is null and
-  a note says why. The Worker orders snapshots by it (below).
+  which only grows along a branch. The exporter sets it only when it is a stable property of a commit
+  (eighth round): the record checkout is the top of its own git work tree, not a shallow clone
+  (`git rev-parse --is-shallow-repository`), HEAD is the tip of the branch's configured upstream
+  (`git rev-parse @{upstream}` equals HEAD; no upstream means no revision), and no path the exporter
+  reads differs from that commit, untracked or ignored files included: `state/PENDING.md`, the holds
+  file `state/holds.json`, the notes folder `state/notes`, and the rest of `state/`. Otherwise it is
+  null, a note says why, and `--put` refuses. The Worker orders snapshots by it (below).
+  **After a history rewrite that lowers the count** (a force-push that drops commits, a squash), the
+  next revision's `seq` is below the one the Worker holds and every upload is 409 "an older record
+  revision". The way out is to retire the exporter's key and rotate: make a new key pair, list the new
+  key and mark the old `:retired` in both key lists (the Worker's `SNAPSHOT_PUBLIC_KEYS` and the app's
+  `EXPO_PUBLIC_SURFACE_PUBLIC_KEY`), redeploy the Worker and Pages, and upload with the new key: the
+  Worker replaces a snapshot signed by a key no longer active with the next valid upload, whatever its
+  sequence.
 
 The app and the Worker refuse a snapshot with any field outside these and `sig`, or an unknown
 version, app or purpose, before they read the signature (the app says "This snapshot is in a format
@@ -328,8 +387,9 @@ key lists: comma-separated entries `<key id>:<raw public key, base64>` (the line
 `surface.pub.entry`), with `:retired` after a key that may no longer sign. Each runtime checks every
 entry's id against its key; a list with a malformed entry, a wrong id or an id listed twice is no list
 (the Worker refuses every upload with 500, the app every snapshot). A snapshot verifies under the
-entry its signed `key_id` names; a retired key's snapshot is refused by both (the Worker says "signed
-by a retired key"). `--verify` and `--key-match` take a key list, or one key raw or PEM. The canonical
+entry its signed `key_id` names; a retired key's snapshot is refused by both (eighth round: the Worker
+answers it with the same 403 message as a bad signature, "signature does not verify under an active
+key ...", so its answer doesn't say which keys still count). `--verify` and `--key-match` take a key list, or one key raw or PEM. The canonical
 form is one module, `shared/canonical.ts`, imported by the exporter, the Worker and the app (the app's
 `metro.config.js` watches `shared/`).
 
@@ -412,7 +472,28 @@ lacks the Durable Object binding and its migration, or configures a KV namespace
 (`worker/check-wrangler.ts`). The two deploy jobs, `surface-pages-deploy` and
 `surface-worker-deploy` (below), each need `surface-bun`, `surface-app` and `surface-workerd` to pass
 on that commit; both are configured but never run until switched on.
-`app/__tests__/fixtures/snapshot.json` is the fixture record as the exporter signed it, and
+**Eighth round's tests.** `sanitise` run on its own output for every field and three policies over the
+fixture and strict corpora (and edge cases: a cut, markdown, an ellipsis); the signer refusing an
+accessor-backed field, an accessor on an array index (before any read), a string reused across fields,
+a string sanitised under another policy and unknown text in each free-text field, and signing a copy a
+later change to the caller's object can't touch; the digit rule; the dry run's gate verdict and its
+signed-bytes file (its SHA-256 is the approval); the uploaded body's identity equal to `--approve`,
+the identical body on every try, and a refusal after an unknown try being exit 3 (a 409 naming this
+snapshot, exit 0); the revision's shallow, upstream and dirty-path rules and `--put` refusing without
+one; a folder that is a link into a work tree refused; the cast check on `export/lib.ts` with its one
+allowed line; a lower-case IBAN, a spaced card number, "acct42", and two-digit dates and versions that
+stay; every prefix stem against the common-word lists; the report's suggested lines; the Worker's
+mixed revisions both ways, one 403 for a retired key and a bad signature, and a JWK of another type or
+algorithm. The workerd suite adds races with revisions, each in both arrival orders, one after the
+other and both at once: equal `seq` with different commits (one 200, the other 409 conflict), a
+higher `seq` with an older `made_at` (it wins), and the mixed cases (held with a revision and a
+candidate without, and the reverse). Since the signer refuses unknown words whatever the flags, the
+signing tests use the synthetic record or the fixture record without its unknown-word rows
+(`export/fixtures/temp-record.ts`, `signableRecord`), and `--put` tests a record made a git checkout
+with an upstream (`gitRecord`).
+
+`app/__tests__/fixtures/snapshot.json` is the fixture record as the exporter signed it (since the
+eighth round without its unknown-word rows), and
 `vector.json` a cross-runtime vector (an emoji at the cut, non-BMP text, a revision), so the app's
 tests check the exporter's signatures; `bun run surface/app/__tests__/fixtures/make.ts` remakes them
 (and `snapshot.pub`, the key list) after the exporter changes.
@@ -442,11 +523,15 @@ uploads can't both pass the check. It stores the signed snapshot with its identi
    any valid upload, whatever its `made_at` or revision: so a stolen key's snapshot, however far
    ahead it is dated or numbered, is cleared by retiring that key (the answer says
    `replaced_retired`).
-3. **Both carry a revision:** the revision decides. A lower `seq` is 409 ("an older record
+3. **The held snapshot carries a revision and the upload doesn't** (eighth round): 409, "a revision
+   is required once the store holds one". It never falls back to `made_at`.
+4. **Both carry a revision:** the revision decides. A lower `seq` is 409 ("an older record
    revision"), the same `seq` with another commit is 409 ("another commit at the stored snapshot's
    record revision"), a higher `seq` is written whatever `made_at` says; the same commit falls
    through to `made_at`.
-4. **Otherwise `made_at`:** an older one is 409, anything else (an equal one too) is written.
+5. **Otherwise (the held snapshot has no revision) `made_at`:** an older one is 409, anything else
+   (an equal one too) is written, an upload with a revision included; from then on a revision is
+   required.
 
 Every 409 names the identity held. A test runs a newer and an older PUT together with every storage
 step yielding, in both orders, and the workerd suite runs twenty at once against the real Durable
@@ -601,15 +686,16 @@ All from Worker variables and secrets; none is in the code.
 
 What it checks:
 
-- **GET** needs a valid `Cf-Access-Jwt-Assertion`: signed by one of the team's keys (RS256),
+- **GET** needs a valid `Cf-Access-Jwt-Assertion`: signed by one of the team's keys (RS256; eighth
+  round: the key is imported only when its JWK says `kty` RSA and `alg` RS256, else 403),
   for that audience, from that issuer, not expired and not before its start (each with 60 seconds
   of leeway for clock skew), and the owner's email. Anything else, a header or payload that isn't
   a JSON object included, is 403.
 - **PUT** needs the same assertion check with the exporter's client id (`common_name` or `sub`), the right
   `X-Surface-Publisher` value, a body of at most 512 KiB counted in bytes (else 413), exactly the
   signed fields and `sig` with version 2, the app and the purpose, a signature that verifies under the
-  listed entry its signed `key_id` names (else 403), that entry not retired (else 403, "signed by a
-  retired key"), a `made_at` no more than 5 minutes ahead of the Worker's clock and no more than 24
+  listed entry its signed `key_id` names, that entry not retired (else 403, one message for both since
+  the eighth round, so the answer doesn't say which keys still count), a `made_at` no more than 5 minutes ahead of the Worker's clock and no more than 24
   hours behind it (else 400, saying which), and the store's order (above; else 409), that last check
   and the write being one atomic step in the Durable Object. It stores the signed snapshot and the
   time it received it, and every answer names the snapshot identity it holds (`id`): 200 `{stored,
@@ -638,3 +724,40 @@ bunx wrangler@4.156.2 deploy
 
 The next PUT stores a fresh snapshot; until then GET answers 404 and the app says no snapshot
 could be read.
+
+### Runbook (eighth round)
+
+No new routes: each of these uses the key lists, the deploys and the exporter as they are.
+
+**Key compromise** (the exporter's private key, or the machine that holds it, may be in other hands):
+
+1. Make a new key pair on a clean machine: `bun run surface/export --keygen <new dir>`.
+2. Retire the old key in **both** key lists: in the Worker's `SNAPSHOT_PUBLIC_KEYS`
+   (`worker/wrangler.toml`) and the app's `EXPO_PUBLIC_SURFACE_PUBLIC_KEY` (the repository variable
+   `SURFACE_PUBLIC_KEYS`), change the old entry to `<old id>:<old key>:retired` and add the new
+   entry. Check with `--key-match --key <new dir>/surface.key --pub <list>` (exit 0).
+3. Redeploy the Worker and Pages (Deploy, above: a push to `main` with the deploy jobs on), so both
+   refuse the old key: the Worker answers its uploads 403, the app refuses its snapshots.
+4. Publish a replacement snapshot with the new key: a dry run with `--key <new dir>/surface.key`, read
+   it, then `--put` with its approval. The Worker replaces whatever the old key wrote, however far
+   ahead it is dated or numbered (`replaced_retired`).
+5. If the upload credentials may be out too, rotate them as well: a new Access service token
+   (`SURFACE_ACCESS_CLIENT_ID`, `SURFACE_ACCESS_CLIENT_SECRET`, and the Worker's `PUBLISHER_CLIENT_ID`)
+   and a new `PUBLISHER_TOKEN` (`SURFACE_PUBLISHER_TOKEN` on the exporter's side).
+
+**Replay of a captured snapshot into an emptied store.** A signed snapshot is not secret (the owner's
+GET returns it), and it still verifies after the store is emptied (a new `STORE_NAME`), so whoever
+holds one could try to put it back. Two things bound that. A PUT needs both upload credentials: the
+Access service token, checked by Access before the Worker sees anything, and the publisher header,
+checked by the Worker, plus the exporter's client id in Access's assertion; a captured snapshot alone
+carries neither. And the Worker refuses a `made_at` more than 24 hours old, so even with the
+credentials a replay works only within a day of the export. After emptying a store, upload a fresh
+snapshot at once: the store then holds a newer revision, and any older one is 409.
+
+**An unreadable stored snapshot** (GET or PUT answers 503 "the stored snapshot is unreadable"): reset
+the store by starting an empty one, as in Recovering a wedged store above: set `STORE_NAME` to a new
+name in `wrangler.toml` and deploy (`cd surface/worker && bunx wrangler@4.156.2 deploy`, or the deploy
+job from `main`). Wrangler has no command that clears one Durable Object's storage in place; the new
+name is the reset (the old object is never read again). Deleting every object of the class is a
+migration (`deleted_classes`) and is not needed here. The next valid upload fills the new store; until
+then GET answers 404.

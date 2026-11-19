@@ -15,29 +15,32 @@
 
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { createPublicKey, randomBytes } from "node:crypto";
-import { isIsoTime } from "../shared/canonical";
+import { isIsoTime, signedBytes } from "../shared/canonical";
 import { keyList, verifyVerdict, type KeyEntry } from "../shared/snapshot";
 import {
   buildSnapshot,
   configProblem,
+  fold,
+  gateForSigning,
   keyId,
   keyIdOfPrivate,
-  leftoverLine,
   leftoverPlace,
   makeKeyPair,
   makePolicy,
+  NAME_WORDS,
   privateKey,
   rawPublicKey,
   recordRevision,
-  signSnapshot,
+  signGated,
   snapshotIdOf,
   strictProblems,
   withKeyId,
   type Built,
   type ExporterConfig,
+  type LeftoverAt,
 } from "./lib";
 
 function arg(args: string[], name: string): string | undefined {
@@ -125,7 +128,7 @@ const oneLine = (s: string) => s.replace(/[\p{C}]+/gu, " ").replace(/\s+/g, " ")
 // another identity; the snapshot may or may not be stored.
 export type UploadOutcome =
   | { kind: "preflight"; reason: string }
-  | { kind: "rejected"; status: number; message: string }
+  | { kind: "rejected"; status: number; message: string; held?: string }
   | { kind: "stored"; status: number; message: string; id: string }
   | { kind: "unknown"; why: string };
 
@@ -185,33 +188,48 @@ async function putOnce(url: string, body: string, id: string, io: IO): Promise<U
     if (gotId === id) return { kind: "stored", status: res.status, message, id };
     return { kind: "unknown", why: `${res.status}, but the answer names another snapshot` };
   }
-  return { kind: "rejected", status: res.status, message };
+  return { kind: "rejected", status: res.status, message, ...(gotId ? { held: gotId } : {}) };
 }
 
 // Uploads, and on an unknown outcome (a lost response) reconciles by the signed identity: the same
-// signed bytes are sent again, and the Worker answers with the identity it holds (the same snapshot
-// already stored is a 200 naming it). Prints one line per try and a last line naming the outcome.
+// body, byte for byte, is sent again, and the Worker answers with the identity it holds (the same
+// snapshot already stored is a 200 naming it). A refusal after an earlier try ended unknown doesn't
+// settle that earlier try (it may have been stored, then replaced): the outcome stays unknown, unless
+// the refusal is a 409 naming this snapshot's own identity as held, which is stored. Prints one line
+// per try and a last line naming the outcome.
 export async function upload(url: string, body: string, id: string, io: IO): Promise<UploadOutcome> {
   const u = new URL(url);
   const where = `PUT ${u.origin}${u.pathname}`;
   const sleep = io.sleep ?? defaultIO.sleep!;
   let out: UploadOutcome = { kind: "unknown", why: "not sent" };
+  let unresolved = false;
   for (let i = 0; i < RECONCILE_TRIES; i++) {
     if (i > 0) {
       console.error(`${where}: the outcome is unknown; reconciling by sending the same signed snapshot again (${i + 1} of ${RECONCILE_TRIES})`);
       await sleep(1000 * 2 ** (i - 1));
     }
     out = await putOnce(url, body, id, io);
+    if (out.kind === "rejected" && out.status === 409 && out.held === id) {
+      console.log(`${where}: 409, naming this snapshot as the one held (snapshot ${id})`);
+      return { kind: "stored", status: 409, message: out.message, id };
+    }
     if (out.kind === "stored") {
       console.log(`${where}: ${out.status}${out.message ? " " + out.message : ""} (snapshot ${id})`);
       return out;
     }
     if (out.kind === "rejected") {
       console.error(`${where}: ${out.status}${out.message ? " " + out.message : ""}`);
+      if (unresolved) {
+        console.error(
+          `upload: unknown remote outcome: the first attempt's outcome is unresolved (it may have been stored before this refusal); snapshot ${id} may or may not have been stored.`,
+        );
+        return { kind: "unknown", why: `the first attempt's outcome is unresolved; a later try was refused (${out.status})` };
+      }
       console.error(`upload: server rejection; nothing stored.`);
       return out;
     }
-    console.error(`${where}: ${out.why}`);
+    unresolved = true;
+    console.error(`${where}: ${out.kind === "unknown" ? out.why : "no outcome"}`);
   }
   console.error(
     `upload: unknown remote outcome: snapshot ${id} may or may not be stored. Run the same export again later; it reconciles by this identity.`,
@@ -333,7 +351,13 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
   }
   // The record's revision, when git can say it for certain (it then orders uploads in the Worker).
   const rev = recordRevision(record);
-  if (!rev.revision) console.error(`note: no record revision in the snapshot (${rev.why}); the Worker orders it by made_at.`);
+  if (!rev.revision && putUrl) {
+    // The Worker refuses a snapshot without a revision once it holds one, and orders by revision: an
+    // upload goes only with one.
+    console.error(`--put: no record revision can be signed (${rev.why}); upload: preflight rejection, nothing sent.`);
+    return EXIT_PREFLIGHT;
+  }
+  if (!rev.revision) console.error(`note: no record revision in the snapshot (${rev.why}); --put would refuse it.`);
   // The whole pipeline runs before anything is printed, written or sent.
   let built;
   try {
@@ -360,37 +384,64 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
     return 1;
   }
   for (const w of built.warnings) console.error("warning: " + w);
-  // The approval digest: the identity of the exact bytes that would be signed (needs the key id).
-  const digest = signingKey ? snapshotIdOf(withKeyId(s, keyIdOfPrivate(signingKey))) : null;
+  // The run-time gate, without signing: the plain copy with the key id (a placeholder without --key),
+  // checked as signing checks it. Its refusal names the path only.
+  const kid = signingKey ? keyIdOfPrivate(signingKey) : "0".repeat(16);
+  let gated: ReturnType<typeof gateForSigning> | null = null;
+  let gateRefusal: string | null = null;
+  try {
+    gated = gateForSigning(s, kid, policy);
+  } catch (e) {
+    gateRefusal = e instanceof Error ? e.message : String(e);
+  }
   if (dryRun) {
     // For the owner to read before the first upload: exactly what would be signed.
-    console.log(JSON.stringify(signingKey ? withKeyId(s, keyIdOfPrivate(signingKey)) : s, null, 2));
+    console.log(JSON.stringify(signingKey ? withKeyId(s, kid) : s, null, 2));
     console.error(`Dry run: ${s.threads.length} threads, ${s.excluded_rows} rows left out, ${s.skipped_rows} skipped. Nothing written.`);
     // Per area, the config's areas list being the primary control on what an area may be.
     console.error(`Dry run, threads per area: ${areaLine(built)}.`);
     console.error(
       `Dry run: ${built.leftovers.length} capitalised word(s) replaced, ${built.unknowns.length} lower-case or uncased word(s) not in the word list.`,
     );
-    const approval = digest ? approvalLine(s.made_at, digest) : null;
-    // The words themselves never go to stderr or stdout: only to a private file, on request.
+    if (gateRefusal) console.error(`Dry run: the gate would refuse to sign: ${gateRefusal}.`);
+    // The approval digest: the SHA-256 of exactly the canonical signed bytes, only when they can be
+    // uploaded (a key, the gate passes, and nothing fails --strict, which --put implies).
+    const uploadable = !!signingKey && !!gated && !problems.warnings.length && !problems.leftovers.length && !problems.unknown.length;
+    const signedText = uploadable && gated ? new TextDecoder().decode(signedBytes(gated)) : null;
+    const approval = uploadable && gated ? approvalLine(s.made_at, snapshotIdOf(gated)) : null;
+    // The words themselves never go to stderr or stdout: only to a private file, on request; beside
+    // it, the exact signed bytes the approval digest is of.
     if (report) {
+      const bytesFile = signedBytesFile(report);
       try {
-        writePrivate(report, reportText(built, approval));
+        writePrivate(report, reportText(built, approval, signedText ? bytesFile : null));
+        if (signedText) writePrivate(bytesFile, signedText);
       } catch {
         console.error(`${report}: the private report could not be written; nothing written.`);
         return 2;
       }
       console.error(`Dry run: the private word list is in ${report} (mode 0600). Never relay it; delete it when done.`);
+      if (signedText)
+        console.error(`Dry run: the exact signed bytes the approval digest is the SHA-256 of are in ${bytesFile} (mode 0600).`);
     } else if (built.leftovers.length || built.unknowns.length) {
       console.error("Dry run: pass --report [<file>] to write the words to a private file (mode 0600).");
     }
     if (approval) console.error(`Dry run: to upload exactly these bytes once you have read them, add: ${approval}`);
-    else console.error("Dry run: no approval digest without --key (the signed bytes hold the key id).");
+    else if (!signingKey) console.error("Dry run: no approval digest without --key (the signed bytes hold the key id).");
+    else console.error("Dry run: no approval digest: these bytes can't be uploaded (the gate or --strict refuses them).");
     return 0;
   }
   if (built.leftovers.length)
     console.error(`${built.leftovers.length} capitalised word(s) replaced by "someone"; a dry run with --report lists them privately.`);
-  if (putUrl && digest !== approve) {
+  if (!gated) {
+    // The run-time gate names the path only.
+    console.error(`the gate refused to sign: ${gateRefusal}; nothing written.`);
+    return 1;
+  }
+  // Built once: the identity of exactly this object is compared with the approval, and this same
+  // object is signed and uploaded as one serialization, sent byte for byte on every try.
+  const identity = snapshotIdOf(gated);
+  if (putUrl && identity !== approve) {
     console.error(
       "--put: these signed bytes are not the ones approved (the record, the config, the key or the time changed since the dry run); run the dry run again and read it. Upload: preflight rejection, nothing sent.",
     );
@@ -398,9 +449,8 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
   }
   let snapshot;
   try {
-    snapshot = signSnapshot(s, signingKey!, policy);
+    snapshot = signGated(gated, signingKey!, policy);
   } catch (e) {
-    // The run-time gate names the path only.
     console.error(`the gate refused to sign: ${e instanceof Error ? e.message : String(e)}; nothing written.`);
     return 1;
   }
@@ -413,7 +463,7 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
       console.error(`--put: ${pre}; upload: preflight rejection, nothing sent.`);
       return EXIT_PREFLIGHT;
     }
-    const result = await upload(putUrl, body, snapshotIdOf(snapshot), io);
+    const result = await upload(putUrl, body, identity, io);
     if (result.kind === "rejected") return EXIT_REJECTED;
     if (result.kind !== "stored") return EXIT_UNKNOWN;
   }
@@ -443,24 +493,43 @@ async function keysFrom(text: string): Promise<KeyEntry[] | null> {
   return keyList(t.replace(/\s+/g, ","));
 }
 
-// Whether a path is inside a git work tree: a .git (folder or file) in its folder or any above it, or
-// git itself saying so. The folder is taken as it really is (links resolved).
-export function insideGitWorkTree(path: string): boolean {
-  let dir = dirname(resolve(path));
-  while (!existsSync(dir) && dirname(dir) !== dir) dir = dirname(dir);
+// The path as it really is: its first existing ancestor resolved with realpath (links followed), and
+// the parts below it that don't exist yet joined on. The work-tree check and the write both use it, so
+// they see the same directory.
+export function resolvedTarget(path: string): string {
+  const abs = resolve(path);
+  const rest = [basename(abs)];
+  let dir = dirname(abs);
+  while (!existsSync(dir) && dirname(dir) !== dir) {
+    rest.unshift(basename(dir));
+    dir = dirname(dir);
+  }
   try {
     dir = realpathSync(dir);
   } catch {}
+  return join(dir, ...rest);
+}
+
+// Whether a path is inside a git work tree: a .git (folder or file) in its folder or any above it, or
+// git itself saying so. The folder is taken as it really is (resolvedTarget: links resolved).
+export function insideGitWorkTree(path: string): boolean {
+  const target = resolvedTarget(path);
+  let dir = dirname(target);
   for (let d = dir; ; d = dirname(d)) {
     if (existsSync(join(d, ".git"))) return true;
     if (dirname(d) === d) break;
   }
+  while (!existsSync(dir) && dirname(dir) !== dir) dir = dirname(dir);
   try {
     return execFileSync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() === "true";
   } catch {
     return false;
   }
 }
+
+// The file beside the dry run's private report that holds the exact canonical signed bytes (as text)
+// whose SHA-256 is the approval digest.
+export const signedBytesFile = (report: string) => `${report}.signed.json`;
 
 // "surface 2, garden 1, other 5": the exported threads per area.
 export function areaLine(b: Built): string {
@@ -470,16 +539,37 @@ export function areaLine(b: Built): string {
   return parts.length ? parts.join(", ") : "none";
 }
 
-// The dry run's private report: the warning line, the approval flags, then each word with its place.
-export function reportText(b: Built, approval: string | null = null): string {
+// A suggested line for a word that fails --strict: for a capitalised word that is a bundled name word,
+// a line for name-words.txt's [common] section (only if it is an ordinary word too; else it belongs in
+// the config's names); for any other word, a line for the config's allow_words. Never applied by itself.
+export function suggestion(l: LeftoverAt, capitalised: boolean): string {
+  const w = l.word.replace(/['\u2019]s$/i, "").replace(/['\u2019]$/, "");
+  if (capitalised && NAME_WORDS.has(fold(w)))
+    return `name-words.txt [common]: ${fold(w)}   (only if it is an ordinary word; a person's name goes in the config's names)`;
+  return `allow_words: ${JSON.stringify(w)}`;
+}
+
+// The dry run's private report: the warning line, the approval flags, then every strict failure with
+// its place, field and word and a suggested line, then the name-like words.
+export function reportText(b: Built, approval: string | null = null, bytesFile: string | null = null): string {
   const lines = [PRIVATE_REPORT, ""];
-  lines.push(approval ? `to upload exactly the bytes this dry run printed: ${approval}` : "no approval digest (the dry run had no --key)", "");
-  lines.push(`threads per area: ${areaLine(b)}`, "", "capitalised words the gate replaced:");
-  for (const l of b.leftovers) lines.push(leftoverLine(l));
-  lines.push("", "lower-case or uncased words not in the word list (each fails --strict):");
-  for (const l of b.unknowns) lines.push(leftoverLine(l));
+  lines.push(
+    approval
+      ? `to upload exactly the bytes this dry run printed: ${approval}`
+      : "no approval digest (no --key, or the gate or --strict refuses these bytes)",
+  );
+  if (bytesFile) lines.push(`the exact signed bytes (the approval digest is their SHA-256): ${bytesFile}`);
+  lines.push("", `threads per area: ${areaLine(b)}`, "");
+  const total = b.warnings.length + b.leftovers.length + b.unknowns.length;
+  lines.push(`strict failures: ${total} (each fails --strict and --put; an unknown word also stops the signer)`, "");
+  lines.push("row warnings (fix the row in the record):");
+  for (const w of b.warnings) lines.push(w);
+  lines.push("", "capitalised words the gate replaced (each with a suggested line on the next):");
+  for (const l of b.leftovers) lines.push(`${l.where}: ${l.field}: ${l.word}`, `  suggest: ${suggestion(l, true)}`);
+  lines.push("", "lower-case or uncased words not in the word list (each with a suggested line on the next):");
+  for (const l of b.unknowns) lines.push(`${l.where}: ${l.field}: ${l.word}`, `  suggest: ${suggestion(l, false)}`);
   lines.push("", "lower-case words that are also names (name-words.txt [common]; not a failure):");
-  for (const l of b.nameLike) lines.push(leftoverLine(l));
+  for (const l of b.nameLike) lines.push(`${l.where}: ${l.field}: ${l.word}`);
   return lines.join("\n") + "\n";
 }
 
@@ -526,13 +616,16 @@ function renameOver(tmp: string, path: string) {
   }
 }
 
-// Written with mode 0600 from the moment it exists: a new temporary file beside it, then renamed over
-// the path. On any failure the temporary file is removed.
+// Written with mode 0600 from the moment it exists: the destination's directory resolved as it really
+// is (resolvedTarget), refused inside any git work tree, then a new temporary file in that resolved
+// directory, renamed over the path there. On any failure the temporary file is removed.
 export function writePrivate(path: string, text: string) {
+  const target = resolvedTarget(path);
+  if (insideGitWorkTree(target)) throw new Error(`${target}: inside a git work tree; a private file goes outside any repository`);
   let tmp: string | undefined;
   try {
-    tmp = writeTemp(path, text, 0o600);
-    renameOver(tmp, path);
+    tmp = writeTemp(target, text, 0o600);
+    renameOver(tmp, target);
   } catch (e) {
     if (tmp) {
       rmSync(tmp, { force: true });

@@ -45,9 +45,12 @@ export interface Stored {
 // - a held snapshot signed by a key that is no longer active (retired, or no longer listed) is
 //   replaced by any valid candidate, whatever its made_at or revision: a stolen key's far-future
 //   snapshot is cleared by retiring that key;
+// - once the held snapshot carries a revision, a candidate without one is "conflict" (a revision is
+//   required): it never falls back to made_at;
 // - when both carry a revision, the revision decides: a lower seq is "older", the same seq with
 //   another commit is "conflict", a higher seq is written; the same commit falls through to made_at;
-// - otherwise an older made_at is "older", and anything else is written (an equal made_at too).
+// - otherwise (the held snapshot has none) an older made_at is "older", and anything else is written
+//   (an equal made_at too).
 export type WriteResult =
   | { result: "stored"; id: string; made_at: string; received_at: string; replaced_retired: boolean }
   | { result: "same"; id: string; made_at: string; received_at: string }
@@ -86,6 +89,7 @@ export async function compareAndWrite(state: DOState, candidate: Stored, activeK
 function order(held: Stored, candidate: Stored): { result: "older" | "conflict"; why: string } | null {
   const h = held.revision;
   const c = candidate.revision;
+  if (h && !c) return { result: "conflict", why: REVISION_REQUIRED };
   if (h && c) {
     if (c.seq < h.seq) return { result: "older", why: "an older record revision than the stored snapshot" };
     if (c.seq > h.seq) return null;
@@ -96,6 +100,7 @@ function order(held: Stored, candidate: Stored): { result: "older" | "conflict";
 }
 
 const STORE_KEY = "latest";
+export const REVISION_REQUIRED = "a revision is required once the store holds one";
 export function isStored(v: unknown): v is Stored {
   if (!v || typeof v !== "object") return false;
   const s = v as Partial<Stored>;
@@ -179,6 +184,8 @@ export const UNKNOWN_KID_TTL_MS = 60_000;
 const UNKNOWN_KIDS_MAX = 256;
 const SKEW_S = 60;
 export const PUBLISHER_HEADER = "x-surface-publisher";
+export const SIGNATURE_REFUSED =
+  "signature does not verify under an active key (or an unknown version, app, purpose or key id, or a field outside the signed ones)";
 
 const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), {
@@ -263,6 +270,8 @@ export async function accessClaims(request: Request, env: Env, deps: Deps): Prom
   const team = teamOf(env);
   const jwk = await signingKey(team, header.kid, deps);
   if (!jwk) return "an Access assertion signed by an unknown key";
+  // Only an RSA key for RS256 is imported: a key of another type or algorithm under this kid is refused.
+  if (jwk.kty !== "RSA" || jwk.alg !== "RS256") return "an Access assertion signed by an unknown key";
   let ok = false;
   try {
     const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
@@ -359,8 +368,8 @@ async function put(request: Request, env: Env, deps: Deps): Promise<Response> {
   const active = keys.filter((k) => !k.retired).map((k) => k.id);
   if (!active.length) return json(500, { error: "the Worker has no active public key configured" });
   const verdict = await verifyVerdict(body, keys);
-  if (verdict === "retired") return json(403, { error: "signed by a retired key" });
-  if (verdict !== "ok") return json(403, { error: "signature does not verify (or an unknown version, app, purpose or key id, or a field outside the signed ones)" });
+  // One message for a retired key and a bad signature: the answer doesn't say which keys still count.
+  if (verdict !== "ok") return json(403, { error: SIGNATURE_REFUSED });
   const madeAt = Date.parse(body.made_at);
   const now = deps.now();
   if (madeAt > now + MAX_AHEAD_MS)

@@ -3,13 +3,13 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main as exporter, REDIRECTED } from "../export/index";
-import { tempRecord } from "../export/fixtures/temp-record";
+import { gitRecord, gitRecordFrom, tempRecord } from "../export/fixtures/temp-record";
 import { wranglerProblems } from "./check-wrangler";
 import { buildSnapshot, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../export/lib";
 import { canonical, signedBytes, toBase64 } from "../shared/canonical";
 import { snapshotId } from "../shared/snapshot";
 import { sign } from "node:crypto";
-import { createWorker, MAX_AGE_MS, MAX_BYTES, SnapshotStore, teamOf, type Env, type Stored } from "./src/worker";
+import { createWorker, MAX_AGE_MS, MAX_BYTES, REVISION_REQUIRED, SIGNATURE_REFUSED, SnapshotStore, teamOf, type Env, type Stored } from "./src/worker";
 
 const noWait = async () => {};
 // The "--made-at <time> --approve <digest>" a dry run with --key prints.
@@ -60,9 +60,11 @@ function memoryStore(over: Partial<Storage> = {}, delay = async () => {}) {
 
 const keys = makeKeyPair();
 const FIX = join(import.meta.dir, "..", "export", "fixtures");
-const policy = makePolicy(readFileSync(join(FIX, "private-terms.txt"), "utf8"), { owner_names: ["Robin"] });
+const policy = makePolicy(readFileSync(join(FIX, "private-terms.txt"), "utf8"), JSON.parse(readFileSync(join(FIX, "exporter.json"), "utf8")));
+// The synthetic record: since the eighth round the signer refuses an unknown word whatever the flags,
+// so the snapshots here are of a record that passes --strict.
 const snap = (when: string, k = keys, revision: { seq: number; commit: string } | null = null) =>
-  signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(when), revision).snapshot, privateKey(k.privatePem), policy);
+  signSnapshot(buildSnapshot(join(FIX, "synthetic"), policy, new Date(when), revision).snapshot, privateKey(k.privatePem), policy);
 // A response's JSON body, untyped fields read as unknown.
 const bodyOf = async (res: Response): Promise<Record<string, unknown>> => (await res.json()) as Record<string, unknown>;
 function env(over: Partial<Storage> = {}, delay?: () => Promise<void>): Env & { store: ReturnType<typeof memoryStore> } {
@@ -147,7 +149,7 @@ describe("the store", () => {
   });
 
   test("tampered counts are refused", async () => {
-    const s = { ...snap("2026-11-18T12:00:00Z"), excluded_rows: 0 };
+    const s = { ...snap("2026-11-18T12:00:00Z"), excluded_rows: 5 };
     expect((await worker.fetch(await put(s), env())).status).toBe(403);
   });
 
@@ -443,10 +445,11 @@ describe("the exporter's --put, against this Worker in-process", () => {
   const dir = mkdtempSync(join(tmpdir(), "surface-put-"));
   const keyFile = join(dir, "surface.key");
   // --put implies --strict, so it uploads a clean record: no malformed row, no capitalised word left.
-  const record = tempRecord([
+  // A git checkout at its upstream's tip, so a revision is signed (--put refuses without one).
+  const record = gitRecord(tempRecord([
     "| P1 | Tidy the garage shelves. | Cain | Sort the bins. | | Shelves sorted. | 2026-11-01 |",
     "| P2 | Pick the reminder time. | Robin | Choose a time. | Robin's pick | The reminder fires. | 2026-11-02 |",
-  ]);
+  ]));
   const run = ["--record", record, "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json")];
   const URL_ = "https://surface.example.com/snapshot";
   // The exporter dates its snapshot now, so this Worker reads the real clock.
@@ -521,7 +524,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
 
   test("the fixture record, with its malformed rows and leftovers, is refused under --put before any request", async () => {
     const h = harness(workerEnv());
-    const fixtureRun = ["--record", join(FIX, "record"), ...run.slice(2)];
+    const fixtureRun = ["--record", gitRecordFrom(join(FIX, "record")), ...run.slice(2)];
     const { code } = await capture(async () => exporter([...fixtureRun, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: putEnv }));
     expect(code).toBe(1);
     expect(h.calls.length).toBe(0);
@@ -683,10 +686,11 @@ describe("sixth round: the Durable Object compares and writes atomically", () =>
       const reqs = order ? [put(older), put(newer)] : [put(newer), put(older)];
       const res = await Promise.all((await Promise.all(reqs)).map((r) => worker.fetch(r, e)));
       expect(e.store.held()!.made_at).toBe(newer.made_at);
-      const statuses = res.map((r) => r.status);
-      // The older lands first and is replaced, or comes second and is refused: never held.
-      if (order === 0) expect(statuses).toEqual([200, 409]);
-      else expect(statuses).toEqual([200, 200]);
+      const [newerRes, olderRes] = order ? [res[1], res[0]] : [res[0], res[1]];
+      // The older lands first and is replaced, or comes second and is refused: never held. Which one
+      // reaches the store first depends on the signature checks' timing, so either is allowed.
+      expect(newerRes.status).toBe(200);
+      expect([200, 409]).toContain(olderRes.status);
     }
   });
   test("the same snapshot again is 200 naming the same identity, and nothing is rewritten", async () => {
@@ -743,7 +747,8 @@ describe("sixth round: key match and rotation", () => {
       const after = { ...e, SNAPSHOT_PUBLIC_KEYS: list };
       const res = await worker.fetch(await put(snapWith(keys, "2026-11-18T12:00:00Z")), after);
       expect(res.status).toBe(403);
-      if (list.includes("retired")) expect((await bodyOf(res)).error).toBe("signed by a retired key");
+      // One message for a retired key and a bad signature (eighth round).
+      expect((await bodyOf(res)).error).toBe(SIGNATURE_REFUSED);
     }
     expect((await worker.fetch(await put(snapWith(next, "2026-11-18T12:00:00Z")), { ...e, SNAPSHOT_PUBLIC_KEYS: next.publicEntry })).status).toBe(200);
   });
@@ -883,7 +888,7 @@ describe("sixth round: the synthetic deployment, a lost response reconciled", ()
   const URL_ = "https://surface.example.com/snapshot";
   const dir = mkdtempSync(join(tmpdir(), "surface-lost-"));
   const run = [
-    "--record", join(FIX, "synthetic"), "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json"),
+    "--record", gitRecordFrom(join(FIX, "synthetic")), "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json"),
     "--key", join(dir, "surface.key"), "--put", URL_,
   ];
   const live = createWorker({ now: () => Date.now(), fetch: deps.fetch });
@@ -964,9 +969,10 @@ describe("sixth round: the synthetic deployment, a lost response reconciled", ()
     const r = await quiet(async () => exporter(await approved(), { fetch: f, env: putEnv, sleep: noWait }));
     expect(r.code).toBe(3);
   });
-  test("seventh round: a lost response, then a newer write: the reconciling try is refused and reports so", async () => {
+  test("seventh round: a lost response, then a newer write: the reconciling try is refused, and the first try stays unresolved (eighth round: exit 3)", async () => {
     // The first run's first try is stored with its response lost; then a newer snapshot lands; the
-    // retry of the first run's same bytes gets 409 naming the newer identity: exit 1, not stored.
+    // retry of the first run's same bytes gets 409 naming the newer identity. The first try may have
+    // been stored (it was, then replaced): the outcome is unknown, exit 3, never "nothing stored".
     const e = workerEnv();
     const first = await approved();
     const later = await approved(["--made-at", new Date(Date.now() + 2000).toISOString()]);
@@ -985,9 +991,36 @@ describe("sixth round: the synthetic deployment, a lost response reconciled", ()
     };
     const r = await quiet(() => exporter(first, { fetch: f, env: putEnv, sleep: noWait }));
     expect(landed).toBe(true);
-    expect(r.code).toBe(1);
+    expect(r.code).toBe(3);
     expect(r.out).toContain("409 older than the stored snapshot");
-    expect(r.out).toContain("upload: server rejection");
+    expect(r.out).toContain("the first attempt's outcome is unresolved");
+    expect(r.out).not.toContain("upload: server rejection");
+  });
+  test("eighth round: a lost response, then a 409 naming this snapshot's own identity as held: stored, exit 0", async () => {
+    const flags = await approved();
+    const id = flags[flags.length - 1];
+    let n = 0;
+    const f = async () => {
+      if (n++ === 0) throw new Error("the connection reset after the request was sent");
+      return new Response(JSON.stringify({ error: "older than the stored snapshot", id }), { status: 409 });
+    };
+    const r = await quiet(() => exporter(flags, { fetch: f, env: putEnv, sleep: noWait }));
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`(snapshot ${id})`);
+  });
+  test("eighth round: the uploaded body's identity is the approved digest, and every try sends the identical body", async () => {
+    const flags = await approved();
+    const approve = flags[flags.length - 1];
+    const bodies: string[] = [];
+    const f = async (_url: string, init: RequestInit) => {
+      bodies.push(String(init.body));
+      throw new Error("the connection reset after the request was sent");
+    };
+    const r = await quiet(() => exporter(flags, { fetch: f, env: putEnv, sleep: noWait }));
+    expect(r.code).toBe(3);
+    expect(bodies.length).toBe(3);
+    expect(new Set(bodies).size).toBe(1);
+    expect(await snapshotId(JSON.parse(bodies[0]))).toBe(approve);
   });
   test("seventh round: --put needs the dry run's approval: missing, malformed or for other bytes is exit 2 with nothing sent", async () => {
     const e = workerEnv();
@@ -1010,5 +1043,63 @@ describe("sixth round: the synthetic deployment, a lost response reconciled", ()
     const ok = await quiet(() => exporter([...run, ...flags], { fetch: v.fetch, env: putEnv, sleep: noWait }));
     expect(ok.code).toBe(0);
     expect(e.store.held()!.id).toBe(flags[3]);
+  });
+});
+
+describe("eighth round: mixed revisions never fall back to made_at once the store holds one", () => {
+  const commit = (c: string) => c.repeat(40);
+  test("held with a revision, candidate without: 409, a revision is required, however new its made_at", async () => {
+    const e = env();
+    expect((await worker.fetch(await put(snap("2026-11-18T11:00:00Z", keys, { seq: 5, commit: commit("a") })), e)).status).toBe(200);
+    const res = await worker.fetch(await put(snap("2026-11-18T11:59:00Z")), e);
+    expect(res.status).toBe(409);
+    expect((await bodyOf(res)).error).toBe(REVISION_REQUIRED);
+    expect(e.store.held()!.revision).toEqual({ seq: 5, commit: commit("a") });
+  });
+  test("held without a revision, candidate with: made_at decides (newer stored, older 409), and from then a revision is required", async () => {
+    const e = env();
+    expect((await worker.fetch(await put(snap("2026-11-18T11:00:00Z")), e)).status).toBe(200);
+    const older = await worker.fetch(await put(snap("2026-11-18T10:00:00Z", keys, { seq: 5, commit: commit("b") })), e);
+    expect(older.status).toBe(409);
+    expect((await bodyOf(older)).error).toMatch(/older than the stored snapshot/);
+    expect((await worker.fetch(await put(snap("2026-11-18T11:30:00Z", keys, { seq: 5, commit: commit("b") })), e)).status).toBe(200);
+    const after = await worker.fetch(await put(snap("2026-11-18T11:45:00Z")), e);
+    expect(after.status).toBe(409);
+    expect((await bodyOf(after)).error).toBe(REVISION_REQUIRED);
+  });
+  test("a held snapshot from a key no longer active is still replaced by a valid one without a revision", async () => {
+    const thief = makeKeyPair();
+    const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: `${thief.publicEntry},${keys.publicEntry}` };
+    expect((await worker.fetch(await put(snap("2026-11-18T11:00:00Z", thief, { seq: 9, commit: commit("c") })), e)).status).toBe(200);
+    const retired = { ...e, SNAPSHOT_PUBLIC_KEYS: `${thief.publicEntry}:retired,${keys.publicEntry}` };
+    const res = await worker.fetch(await put(snap("2026-11-18T11:30:00Z")), retired);
+    expect(res.status).toBe(200);
+    expect((await bodyOf(res)).replaced_retired).toBe(true);
+  });
+});
+
+describe("eighth round: one 403 for a retired key and a bad signature; the Access key's type is checked", () => {
+  test("a retired key's snapshot and a tampered one get the same message", async () => {
+    const old = makeKeyPair();
+    const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: `${old.publicEntry}:retired,${keys.publicEntry}` };
+    const retired = await worker.fetch(await put(snap("2026-11-18T12:00:00Z", old)), e);
+    const s = snap("2026-11-18T12:00:00Z");
+    s.threads[0].title += "!";
+    const tampered = await worker.fetch(await put(s), e);
+    expect([retired.status, tampered.status]).toEqual([403, 403]);
+    expect((await bodyOf(retired)).error).toBe(SIGNATURE_REFUSED);
+    expect((await bodyOf(tampered)).error).toBe(SIGNATURE_REFUSED);
+  });
+  test("a JWK whose kty isn't RSA or whose alg isn't RS256 is never imported: 403", async () => {
+    for (const [i, over] of [{ kty: "EC" }, { alg: "RS512" }, { alg: undefined }].entries()) {
+      const team = `https://jwk-team-${i}.cloudflareaccess.com`;
+      const w = createWorker({ now: () => NOW, fetch: async () => new Response(JSON.stringify({ keys: [{ ...jwk, ...over }] })) });
+      const token = await jwt({ ...base, iss: team, email: OWNER });
+      const res = await w.fetch(new Request("https://surface.example.com/snapshot", { headers: { "cf-access-jwt-assertion": token } }), { ...env(), ACCESS_TEAM_DOMAIN: team });
+      expect([over, res.status]).toEqual([over, 403]);
+    }
+    // The real key reads.
+    const ok = await worker.fetch(await get(), env());
+    expect(ok.status).toBe(404);
   });
 });

@@ -13,6 +13,7 @@ import {
   isPlainObject,
   isRevision,
   PURPOSE_SNAPSHOT,
+  type Revision,
   REVISION_FIELDS,
   SIGNED_FIELDS,
   signedBytes,
@@ -41,9 +42,9 @@ const prefix = (...stems: string[]): StemRule[] => stems.map((stem) => ({ stem, 
 const word = (stem: string, ...endings: string[]): StemRule => ({ stem, mode: "word", endings });
 export const STEM_RULES: readonly StemRule[] = [
   ...prefix("money", "financ", "debt", "bank", "budget", "paid", "owed", "invoice", "rent", "loan", "mortgage", "credit"),
-  ...prefix("salar", "insur", "refund", "health", "therap", "doctor", "appointment", "hospital", "surgery", "mental"),
+  ...prefix("salar", "insur", "refund", "health", "therap", "doctor", "appointment", "surgery"),
   ...prefix("psychiatr", "dentist", "dental", "orthodont", "periodont", "endodont", "denture", "tooth", "teeth"),
-  ...prefix("prescri", "clinic", "pharmac", "medic", "diagnos", "bill", "price", "quote", "deposit", "venmo"),
+  ...prefix("prescri", "clinic", "pharmac", "medic", "diagnos", "price", "quote", "deposit", "venmo"),
   ...prefix("symptom", "vaccin", "pregnan", "allerg", "counsel", "refill", "biopsy", "chemo", "cancer", "rehab"),
   ...prefix("physio", "results", "urgent care", "injur", "zelle", "cheque", "tuition", "blood", "dosag", "cardiol", "ptsd"),
   word("pay", "s", "ing", "ment", "ments", "ee", "er", "roll", "check", "checks", "pal", "able", "out", "day", "slip"),
@@ -53,6 +54,11 @@ export const STEM_RULES: readonly StemRule[] = [
   word("pill", "s"), word("dose", "s", "d"), word("sick", "ness", "er", "est", "ly"),
   word("lab", "s", "work"), word("fine", "s", "d"), word("check", "s", "ed", "ing", "book", "books", "up", "ups"),
   word("wire", "s", "d"), word("ticket", "s", "ed", "ing"),
+  // Eighth round: prefix stems that matched ordinary words ("hospitality", "billion", "billow",
+  // "billiards", "mentality") are words with their endings listed. "doctor" stays a prefix on purpose:
+  // "doctoral" and "doctorate" are close enough to leave a row out.
+  word("hospital", "s", "ised", "ized", "isation", "ization"), word("bill", "s", "ed", "ing", "ings", "able"),
+  word("mental", "ly"),
 ];
 // The stems alone, in the order above.
 export const DEFAULT_STEMS: readonly string[] = STEM_RULES.map((r) => r.stem);
@@ -63,9 +69,16 @@ export const DEFAULT_STEMS: readonly string[] = STEM_RULES.map((r) => r.stem);
 // with the invisible formatting characters taken out (zero-width spaces and joiners, bidi
 // controls, soft hyphens: Unicode's format class). The strippers and the name replacement run on
 // this same text, and it is what is exported.
+// One exception (eighth round): the ellipsis "…" is kept as it is, not made "...", so the ellipsis a
+// cut ends in survives sanitising again, and sanitise is idempotent (a cut text sanitised again is
+// itself, never cut a second time at a different place).
 const INVISIBLE = /\p{Cf}/gu;
 export function normalise(text: string): string {
-  return text.normalize("NFKC").replace(INVISIBLE, "");
+  return text
+    .split("\u2026")
+    .map((part) => part.normalize("NFKC"))
+    .join("\u2026")
+    .replace(INVISIBLE, "");
 }
 
 // For matching only: the normal form, case-folded, with accents taken off, so "Jünîper" is
@@ -119,18 +132,30 @@ export function namesMoney(text: string): boolean {
   return CURRENCY_SYMBOL.test(n) || ISO_AMOUNT.test(n) || ISO_AMOUNT_LOWER.test(f) || AMOUNT.test(f);
 }
 
-// Account shapes leave the row out: an IBAN (two capitals, two check digits, then groups of letters
-// and digits, spaced or not, with at least six digits in all), a card number (13 to 19 digits, single
-// spaces or hyphens allowed between them), a UK sort code (12-34-56), and the words that name an
-// account number (acct, a/c, IBAN, BSB, ABA, routing number, sort code, account no or number).
-const IBAN = /(?<![\p{L}\p{N}])[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?(?![\p{L}\p{N}])/gu;
+// Account shapes leave the row out: an IBAN (two letters, two check digits, then groups of letters
+// and digits, spaced or not, with at least six digits in all; any case, so a typed lower-case one
+// counts), a card number (13 to 19 digits, single spaces or hyphens allowed between them), a UK sort
+// code (12-34-56) when an account word is in the same cell or it is not shaped like a date, and the
+// words that name an account number (acct, a/c, IBAN, BSB, ABA, routing number, sort code, account no
+// or number), a number glued to them ("acct42") included. Every pattern is case-insensitive.
+const IBAN = /(?<![\p{L}\p{N}])[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?(?![\p{L}\p{N}])/giu;
 const CARD = /(?<![\p{N}])\d(?:[ -]?\d){12,18}(?![\p{N}])/u;
-const SORT_CODE = /(?<![\p{N}-])\d{2}-\d{2}-\d{2}(?![\p{N}-])/u;
-const ACCOUNT_WORD = /(?<![\p{L}\p{N}_])(?:acct|a\/c|iban|bsb|aba|routing\s+(?:no|num|number)|sort\s+code|account\s+(?:no|num|number|#))(?![\p{L}\p{N}_])/iu;
+const SORT_CODE = /(?<![\p{N}-])(\d{2})-(\d{2})-(\d{2})(?![\p{N}-])/giu;
+const ACCOUNT_WORD = /(?<![\p{L}\p{N}_])(?:acct|a\/c|iban|bsb|aba|routing\s+(?:no|num|number)|sort\s+code|account\s+(?:no|num|number|#))(?![\p{L}_])/iu;
+// A two-two-two digit group shaped like a date: day then month (DD-MM-YY), month then day (MM-DD-YY),
+// or a year pair then month then day (YY-MM-DD).
+export function dateShaped(a: number, b: number, c: number): boolean {
+  const day = (x: number) => x >= 1 && x <= 31;
+  const month = (x: number) => x >= 1 && x <= 12;
+  return (day(a) && month(b)) || (month(a) && day(b)) || (month(b) && day(c));
+}
 export function namesAccount(text: string): boolean {
   const n = normalise(text);
   for (const m of n.matchAll(IBAN)) if ((m[0].match(/\d/g) ?? []).length >= 6) return true;
-  return CARD.test(n) || SORT_CODE.test(n) || ACCOUNT_WORD.test(fold(text));
+  const cue = ACCOUNT_WORD.test(fold(text));
+  if (cue || CARD.test(n)) return true;
+  for (const m of n.matchAll(SORT_CODE)) if (!dateShaped(Number(m[1]), Number(m[2]), Number(m[3]))) return true;
+  return false;
 }
 
 // Who the owner is called in the record. The code knows only the role word; the owner's own
@@ -149,6 +174,9 @@ export const CALENDAR_WORDS = [
 ];
 // The words the exported text itself puts in: the name and identifier replacements.
 const OUTPUT_WORDS = ["you", "your", "someone", "someone's", "link", "email", "address", "phone", "number", "item"];
+// The letters a number carries in a date or a time ("3rd", "20th", "10am"): known right after a
+// digit, since the unknown-word check now looks those letters up (eighth round).
+const NUMBER_SUFFIXES = ["st", "nd", "rd", "th", "am", "pm"];
 export function parseWordList(text: string): string[] {
   return text
     .replace(/\r\n/g, "\n")
@@ -347,8 +375,8 @@ export function configProblem(config: unknown, env: Record<string, string | unde
   const c = config as ExporterConfig;
   try {
     for (const k of ["owner_names", "names", "exclude_stems", "areas", "allow_words"] as const) list(c[k], k);
-  } catch (e: any) {
-    return String(e?.message ?? e);
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
   }
   if (!("names" in c)) return 'config: "names" is missing (an empty list is allowed)';
   // The areas are the fixed list area names come from: plain folder words only.
@@ -414,11 +442,26 @@ export interface GateToken {
   possessive: boolean;
   // A run of initials, or one capital letter on its own.
   initials: boolean;
-  // A letter run that touches a digit ("v2", "x86"): a code, not a word.
+  // A letter run that touches a digit ("v2", "x86", "2nd").
   touchesDigit: boolean;
+  // The whole run of letters and digits around it is a record-code form (CODE_TOKEN's shape: one to
+  // three letters, then one to five digits, nothing else: "v2", "x86", "p40"). Only such a token is
+  // exempt from the unknown-word check; any other token touching a digit is looked up by its letters.
+  codeForm: boolean;
   // The forms looked up, folded: the token, then without its possessive or contraction.
   forms: string[];
 }
+
+// The whole run of letters, marks, digits and underscores that holds text[at, end).
+const RUN_CHAR = /[\p{L}\p{M}\p{N}_]/u;
+function wordRun(text: string, at: number, end: number): string {
+  let a = at;
+  let e = end;
+  while (a > 0 && RUN_CHAR.test(text[a - 1])) a--;
+  while (e < text.length && RUN_CHAR.test(text[e])) e++;
+  return text.slice(a, e);
+}
+const CODE_WHOLE = /^\p{L}{1,3}\p{Nd}{1,5}$/u;
 
 export function gateTokens(text: string): GateToken[] {
   const out: GateToken[] = [];
@@ -453,6 +496,7 @@ export function gateTokens(text: string): GateToken[] {
       possessive,
       initials: /^(?:\p{L}\.){2,}$/u.test(tok) || /^\p{Lu}$/u.test(tok),
       touchesDigit: /\p{N}/u.test(text[at - 1] ?? "") || /\p{N}/u.test(text[end] ?? ""),
+      codeForm: CODE_WHOLE.test(wordRun(text, at, end)),
       forms,
     });
   }
@@ -544,8 +588,10 @@ export function inflections(w: string): string[] {
 }
 
 // What the unknown-word check found in a text: words not in the vocabulary (lower-case or uncased,
-// looked up with their possessive or contraction taken off; under --strict any of them fails the run,
-// in every field), and words known only as name-words.txt's [common] words (reported, not a failure).
+// looked up with their possessive or contraction taken off; any of them, in any free-text field, makes
+// the signer refuse, whatever the flags), and words known only as name-words.txt's [common] words
+// (reported, not a failure). A token touching a digit is looked up by its letters ("2nd" by "nd"),
+// unless the whole run is a record-code form ("v2", "x86").
 export function unknownTokens(text: string, vocabulary: Set<string>): string[] {
   return wordCheck(text, vocabulary).unknown;
 }
@@ -553,7 +599,8 @@ export function wordCheck(text: string, vocabulary: Set<string>): { unknown: str
   const unknown: string[] = [];
   const nameLike: string[] = [];
   for (const t of gateTokens(text)) {
-    if (t.capital || t.touchesDigit) continue;
+    if (t.capital || t.codeForm) continue;
+    if (/\p{Nd}/u.test(text[t.at - 1] ?? "") && NUMBER_SUFFIXES.includes(t.forms[0])) continue;
     if (!knownIn(t, vocabulary) && !inflections(t.forms[t.forms.length - 1]).some((f) => vocabulary.has(f))) unknown.push(t.text);
     else if (t.forms.some((f) => NAME_WORDS_COMMON.has(f))) nameLike.push(t.text);
   }
@@ -836,8 +883,6 @@ export type GatedText = string & { readonly [GATED]: true };
 function mark(s: string): GatedText {
   return s as GatedText;
 }
-// Every text sanitise returned, kept so checkSigned can tell a sanitised text at once.
-const sanitisedTexts = new Set<string>();
 
 // A record code for the id field, checked against its shape.
 export function gateId(id: string): GatedText {
@@ -880,21 +925,33 @@ export function sanitise(
   const named = replaceNames(strip(normalise(raw)), policy);
   const g = properNounGate(max ? firstSentence(named, max) : named, policy.allowWords);
   const text = max ? cutCodePoints(g.text, max) : g.text;
-  sanitisedTexts.add(text);
   const words = wordCheck(text, policy.vocabulary);
   return { text: mark(text), capitalised: g.words, unknown: words.unknown, nameLike: words.nameLike };
 }
 
-// A free text passes when sanitise itself made it, or when sanitising it again returns it unchanged.
-function isSanitised(v: unknown, policy: Policy, max?: number): boolean {
-  if (typeof v !== "string") return false;
-  if (sanitisedTexts.has(v)) return true;
+// A free text's problem at signing, or null: sanitise is run again on it, under this policy and with
+// this field's own cap, and must return it unchanged; and it must hold no lower-case or uncased word
+// outside the vocabulary. There is no shortcut: no remembered set of texts, whatever made the string.
+function freeTextProblem(v: unknown, policy: Policy, max?: number): string | null {
+  if (typeof v !== "string") return "a string that did not pass the sanitise pipeline";
+  let again: ReturnType<typeof sanitise>;
   try {
-    return sanitise(v, policy, max).text === v;
+    again = sanitise(v, policy, max);
   } catch {
-    return false;
+    return "a string that did not pass the sanitise pipeline";
   }
+  if (again.text !== v) return "a string that did not pass the sanitise pipeline";
+  if (again.unknown.length) return "an unknown lower-case or uncased word (not in the word list)";
+  return null;
 }
+
+// The free-text fields and their caps.
+export const FREE_TEXT_FIELDS: readonly (readonly [TextField, number | undefined])[] = [
+  ["title", TITLE_MAX],
+  ["step", STEP_MAX],
+  ["outcome", undefined],
+  ["waits_for", undefined],
+];
 
 // An object with exactly these own keys: plain (no class, no prototype tricks), no symbol keys, no
 // hidden (non-enumerable) properties, no getters. Throws, naming the path, otherwise.
@@ -911,11 +968,104 @@ function closed(v: unknown, keys: readonly string[], path: string): Record<strin
   return v;
 }
 
+// One own property's value, read once from its descriptor: an enumerable data property only.
+function dataValue(o: object, k: string, path: string): unknown {
+  const d = Object.getOwnPropertyDescriptor(o, k);
+  if (!d || !d.enumerable || d.get || d.set || !("value" in d)) throw new Error(`${path}: not a plain field`);
+  return d.value;
+}
+// A primitive the signed bytes may hold: a string, a number, or null.
+function primitive(v: unknown, path: string): string | number | null {
+  if (v === null || typeof v === "string" || typeof v === "number") return v;
+  throw new Error(`${path}: not a plain value`);
+}
+
+// A list of threads: a real array (no subclass, no extra or symbol keys), every index an enumerable
+// data property (no accessor). Returns its items, each read once.
+function threadItems(v: unknown, path: string): unknown[] {
+  if (!Array.isArray(v) || Object.getPrototypeOf(v) !== Array.prototype) throw new Error(`${path}: not a list`);
+  if (Object.getOwnPropertySymbols(v).length) throw new Error(`${path}: a field outside the schema`);
+  const len = Object.getOwnPropertyDescriptor(v, "length")?.value;
+  if (typeof len !== "number" || !Number.isSafeInteger(len)) throw new Error(`${path}: not a list`);
+  const names = Object.getOwnPropertyNames(v);
+  if (names.length !== len + 1) throw new Error(`${path}: a field outside the schema`);
+  const out: unknown[] = [];
+  for (let i = 0; i < len; i++) out.push(dataValue(v, String(i), `${path}[${i}]`));
+  return out;
+}
+
+// The copy signing uses: a fresh plain object built only from the input's primitive values, each read
+// once from an enumerable data property after the input's shape is checked (closed() on the object
+// and each thread and the revision, the array's index descriptors), with the key id added. Nothing of
+// the caller's object is kept, so what is checked is what is signed. Frozen.
+export function plainSignedCopy(s: unknown, keyIdHex: string): Signed {
+  const src = closed(s, PIPELINE_FIELDS, "snapshot");
+  const field = (k: string) => primitive(dataValue(src, k, `snapshot.${k}`), `snapshot.${k}`);
+  const str = (v: unknown, path: string): string => {
+    if (typeof v !== "string") throw new Error(`${path}: not a string`);
+    return v;
+  };
+  const count = (v: unknown, path: string): number => {
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) throw new Error(`${path}: not a count`);
+    return v;
+  };
+  const isWho = (v: unknown): v is Who => (WHO as readonly unknown[]).includes(v);
+  const isState = (v: unknown): v is State => (STATES as readonly unknown[]).includes(v);
+  if (field("version") !== SNAPSHOT_VERSION) throw new Error("snapshot.version: not the version this exporter signs");
+  if (field("app") !== APP_ID) throw new Error("snapshot.app: not the app");
+  if (field("purpose") !== PURPOSE_SNAPSHOT) throw new Error("snapshot.purpose: not the purpose");
+  const items = threadItems(dataValue(src, "threads", "snapshot.threads"), "snapshot.threads");
+  const threads: Thread[] = items.map((raw, i) => {
+    const path = `snapshot.threads[${i}]`;
+    const t = closed(raw, THREAD_FIELDS, path);
+    const v: Record<string, string | number | null> = {};
+    for (const k of THREAD_FIELDS) v[k] = primitive(dataValue(t, k, `${path}.${k}`), `${path}.${k}`);
+    if (!isWho(v.who)) throw new Error(`${path}.who: not a fixed word`);
+    if (!isState(v.state)) throw new Error(`${path}.state: not a fixed word`);
+    return Object.freeze({
+      id: str(v.id, `${path}.id`),
+      title: str(v.title, `${path}.title`),
+      area: str(v.area, `${path}.area`),
+      who: v.who,
+      step: str(v.step, `${path}.step`),
+      waits_for: v.waits_for === null ? null : str(v.waits_for, `${path}.waits_for`),
+      outcome: str(v.outcome, `${path}.outcome`),
+      last_moved: str(v.last_moved, `${path}.last_moved`),
+      state: v.state,
+    });
+  });
+  const rawRevision = dataValue(src, "revision", "snapshot.revision");
+  let revision: Revision | null = null;
+  if (rawRevision !== null) {
+    const r = closed(rawRevision, REVISION_FIELDS, "snapshot.revision");
+    const seq = primitive(dataValue(r, "seq", "snapshot.revision.seq"), "snapshot.revision.seq");
+    const commit = primitive(dataValue(r, "commit", "snapshot.revision.commit"), "snapshot.revision.commit");
+    const rev = { seq, commit };
+    if (!isRevision(rev)) throw new Error("snapshot.revision: not a revision");
+    revision = Object.freeze({ seq: rev.seq, commit: rev.commit });
+  }
+  Object.freeze(threads);
+  return Object.freeze({
+    version: SNAPSHOT_VERSION,
+    app: APP_ID,
+    purpose: PURPOSE_SNAPSHOT,
+    key_id: keyIdHex,
+    made_at: str(field("made_at"), "snapshot.made_at"),
+    revision,
+    threads,
+    excluded_rows: count(field("excluded_rows"), "snapshot.excluded_rows"),
+    skipped_rows: count(field("skipped_rows"), "snapshot.skipped_rows"),
+  });
+}
+// The pipeline's fields: every signed field but the key id, which signing adds.
+const PIPELINE_FIELDS: readonly string[] = SIGNED_FIELDS.filter((k) => k !== "key_id");
+
 // The run-time gate, on every signing: the whole signed object against the closed schema (exactly
 // the signed fields, exactly the thread fields, exactly {seq, commit}), every string checked by its
-// kind: the free texts by sanitise (isSanitised), the area against the config's list (and sanitise),
-// the id, times, key id and revision by their shapes, who, state, app and purpose by their fixed
-// lists. Throws, naming the path only, never the value.
+// kind: each free text by sanitise run again with its own field's cap, which must return it unchanged,
+// and by the unknown-word check (freeTextProblem); the area against the config's list (and sanitise);
+// the id, times, key id and revision by their shapes; who, state, app and purpose by their fixed lists.
+// Throws, naming the path only, never the value.
 export function checkSigned(value: unknown, policy: Policy): void {
   const s = closed(value, SIGNED_FIELDS, "snapshot");
   if (s.version !== SNAPSHOT_VERSION) throw new Error("snapshot.version: not the version this exporter signs");
@@ -929,20 +1079,19 @@ export function checkSigned(value: unknown, policy: Policy): void {
   }
   for (const k of ["excluded_rows", "skipped_rows"] as const)
     if (typeof s[k] !== "number" || !Number.isSafeInteger(s[k]) || (s[k] as number) < 0) throw new Error(`snapshot.${k}: not a count`);
-  const threads = s.threads;
-  if (!Array.isArray(threads) || Object.getPrototypeOf(threads) !== Array.prototype) throw new Error("snapshot.threads: not a list");
-  if (Object.getOwnPropertySymbols(threads).length || Object.getOwnPropertyNames(threads).length !== threads.length + 1)
-    throw new Error("snapshot.threads: a field outside the schema");
+  const threads = threadItems(s.threads, "snapshot.threads");
   threads.forEach((raw, i) => {
     const path = `snapshot.threads[${i}]`;
     const t = closed(raw, THREAD_FIELDS, path);
     if (typeof t.id !== "string" || !ID_RE.test(t.id)) throw new Error(`${path}.id: not a record code`);
-    if (!isSanitised(t.title, policy, TITLE_MAX)) throw new Error(`${path}.title: a string that did not pass the sanitise pipeline`);
-    if (!isSanitised(t.step, policy, STEP_MAX)) throw new Error(`${path}.step: a string that did not pass the sanitise pipeline`);
-    if (!isSanitised(t.outcome, policy)) throw new Error(`${path}.outcome: a string that did not pass the sanitise pipeline`);
-    if (t.waits_for !== null && (!isSanitised(t.waits_for, policy) || t.waits_for === ""))
-      throw new Error(`${path}.waits_for: a string that did not pass the sanitise pipeline`);
-    if (typeof t.area !== "string" || (t.area !== "other" && !policy.areas.includes(t.area)) || !isSanitised(t.area, policy))
+    for (const [field, max] of FREE_TEXT_FIELDS) {
+      const v = t[field];
+      if (field === "waits_for" && v === null) continue;
+      if (field === "waits_for" && v === "") throw new Error(`${path}.waits_for: a string that did not pass the sanitise pipeline`);
+      const problem = freeTextProblem(v, policy, max);
+      if (problem) throw new Error(`${path}.${field}: ${problem}`);
+    }
+    if (typeof t.area !== "string" || (t.area !== "other" && !policy.areas.includes(t.area)) || sanitise(t.area, policy).text !== t.area)
       throw new Error(`${path}.area: not on the areas list`);
     if (!(WHO as readonly unknown[]).includes(t.who)) throw new Error(`${path}.who: not a fixed word`);
     if (!(STATES as readonly unknown[]).includes(t.state)) throw new Error(`${path}.state: not a fixed word`);
@@ -1169,16 +1318,31 @@ export function keyIdOfPrivate(key: KeyObject): string {
   return keyId(rawPublicKey(createPublicKey(key).export({ format: "pem", type: "spki" }).toString()));
 }
 
-// Signs only what passes the run-time gate: checkSigned walks the whole signed object against the
-// closed schema on every call, so nothing unsanitised, unknown or extra can be signed.
+// The object signing would sign, checked without signing: the plain copy (plainSignedCopy) with the key
+// id, through the run-time gate (checkSigned). The dry run calls it to report the gate's verdict and
+// to compute the approval digest; --put calls it, compares the digest, and signs this same object.
+export function gateForSigning(s: unknown, keyIdHex: string, policy: Policy): Signed {
+  const copy = plainSignedCopy(s, keyIdHex);
+  checkSigned(copy, policy);
+  return copy;
+}
+
+// Signs an object gateForSigning returned: the gate runs again on it (it is frozen, so it is the same
+// object checked), and its key id must be this key's. The signature covers exactly its signed bytes.
+export function signGated(gated: Signed, key: KeyObject, policy: Policy): Snapshot {
+  if (!Object.isFrozen(gated)) throw new Error("snapshot: not an object the gate returned");
+  if (gated.key_id !== keyIdOfPrivate(key)) throw new Error("snapshot.key_id: not this key's id");
+  checkSigned(gated, policy);
+  const sig = sign(null, signedBytes(gated), key);
+  // The caller gets its own plain (unfrozen) copy of exactly what was signed.
+  return structuredClone({ ...gated, sig: toBase64(new Uint8Array(sig)) });
+}
+
+// Signs only what passes the run-time gate, and only a plain copy built from validated values, never
+// the caller's object: the input's shape is checked before the key id is added, the array's index
+// descriptors before any value is read, and the copy is what checkSigned walks and what is signed.
 export function signSnapshot(s: ExportSigned, key: KeyObject, policy: Policy): Snapshot {
-  const signed = withKeyId(s, keyIdOfPrivate(key));
-  // The pipeline's object itself must be closed too: a field the copy above would leave behind is
-  // refused, not dropped.
-  closed(s, SIGNED_FIELDS.filter((k) => k !== "key_id"), "snapshot");
-  checkSigned(signed, policy);
-  const sig = sign(null, signedBytes(signed), key);
-  return { ...signed, sig: toBase64(new Uint8Array(sig)) };
+  return signGated(gateForSigning(s, keyIdOfPrivate(key), policy), key, policy);
 }
 
 // A new key pair: the private key (PEM), the public key (PEM), the raw public key in base64, and its
@@ -1197,23 +1361,49 @@ export function makeKeyPair(): { privatePem: string; publicPem: string; publicRa
 
 // --- the record's revision ----------------------------------------------------------------------
 
-// The record checkout's revision, when git can say it for certain: the checkout is the top of its own
-// git work tree (not a folder inside another repository, like the fixtures), and nothing under state/
-// differs from its last commit. Then {seq: the commit's count of ancestors, itself included, which
-// only grows along a branch; commit: its hash}. Else null, with the reason.
+// The paths the exporter reads, each checked for changes not committed (untracked and ignored files
+// included: an ignored holds file is still read), with the name a refusal gives it.
+export const READ_PATHS: readonly (readonly [string, string])[] = [
+  ["state/PENDING.md", "state/PENDING.md"],
+  ["state/holds.json", "the holds file (state/holds.json)"],
+  ["state/notes", "the notes folder (state/notes)"],
+  ["state", "state/"],
+];
+
+// The record checkout's revision, when git can say it for certain that it is a stable property of a
+// commit everyone sees: the checkout is the top of its own git work tree (not a folder inside another
+// repository, like the fixtures), it is not a shallow clone (its count would be short), HEAD is the tip
+// of the branch's configured upstream (no upstream: no revision; a local commit or a checkout behind
+// the upstream could be rewritten or counted again), and no path the exporter reads differs from that
+// commit (READ_PATHS). Then {seq: the commit's count of ancestors, itself included, which only grows
+// along a branch; commit: its hash}. Else null, with the reason (--put then refuses).
 export function recordRevision(record: string): { revision: { seq: number; commit: string } | null; why?: string } {
   const git = (...args: string[]) =>
     execFileSync("git", ["-C", record, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }).trim();
+  let top: string;
   try {
-    const top = git("rev-parse", "--show-toplevel");
+    top = git("rev-parse", "--show-toplevel");
+  } catch {
+    return { revision: null, why: "the record is not a git checkout (or git is missing)" };
+  }
+  try {
     if (realpathSync(top) !== realpathSync(record)) return { revision: null, why: "the record is not the top of its own git work tree" };
-    if (git("status", "--porcelain", "--untracked-files=all", "--", "state") !== "")
-      return { revision: null, why: "the record's state/ has changes not committed" };
+    if (git("rev-parse", "--is-shallow-repository") !== "false") return { revision: null, why: "the record is a shallow clone" };
     const commit = git("rev-parse", "HEAD");
+    let upstream: string;
+    try {
+      upstream = git("rev-parse", "--verify", "--quiet", "@{upstream}");
+    } catch {
+      return { revision: null, why: "the record's branch has no upstream branch configured" };
+    }
+    if (upstream !== commit) return { revision: null, why: "the record is not at its upstream branch's tip" };
+    for (const [path, name] of READ_PATHS)
+      if (git("status", "--porcelain", "--untracked-files=all", "--ignored", "--", path) !== "")
+        return { revision: null, why: `${name} has changes not committed` };
     const seq = Number(git("rev-list", "--count", "HEAD"));
     const r = { seq, commit };
     return isRevision(r) ? { revision: r } : { revision: null, why: "git gave no usable revision" };
   } catch {
-    return { revision: null, why: "the record is not a git checkout (or git is missing)" };
+    return { revision: null, why: "git could not read the record's revision" };
   }
 }

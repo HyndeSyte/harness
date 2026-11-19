@@ -2,7 +2,7 @@
   "version": 2,
   "app": "harness-surface",
   "purpose": "in-motion-snapshot",
-  "key_id": "11c79bb8da29ee30",
+  "key_id": "5e5a9c129bf9fb57",
   "made_at": "2026-11-18T10:00:00.000Z",
   "revision": null,
   "threads": [
@@ -249,39 +249,6 @@
       "state": "moving"
     },
     {
-      "id": "P110",
-      "title": "Sort the tools.",
-      "area": "other",
-      "who": "the assistant",
-      "step": "Sort them.",
-      "waits_for": "the zorblat crew",
-      "outcome": "Done.",
-      "last_moved": "2026-11-03T00:00:00.000Z",
-      "state": "moving"
-    },
-    {
-      "id": "P111",
-      "title": "Sort the zorblat bins.",
-      "area": "other",
-      "who": "the assistant",
-      "step": "Sort them.",
-      "waits_for": null,
-      "outcome": "Done.",
-      "last_moved": "2026-11-03T00:00:00.000Z",
-      "state": "moving"
-    },
-    {
-      "id": "P112",
-      "title": "Tidy the shed.",
-      "area": "other",
-      "who": "the assistant",
-      "step": "Ask quillon about the spot.",
-      "waits_for": null,
-      "outcome": "Done.",
-      "last_moved": "2026-11-03T00:00:00.000Z",
-      "state": "moving"
-    },
-    {
       "id": "P113",
       "title": "Fix the garden's gate.",
       "area": "other",
@@ -359,17 +326,6 @@
       "state": "moving"
     },
     {
-      "id": "P120",
-      "title": "Return the drill to 李.",
-      "area": "other",
-      "who": "the assistant",
-      "step": "Sort it.",
-      "waits_for": null,
-      "outcome": "Done.",
-      "last_moved": "2026-11-03T00:00:00.000Z",
-      "state": "moving"
-    },
-    {
       "id": "P121",
       "title": "Leave the ladder for the someone.",
       "area": "other",
@@ -383,5 +339,5 @@
   ],
   "excluded_rows": 47,
   "skipped_rows": 2,
-  "sig": "s/XTmeBnaJ+dACoUOJYJVbWjI4ToueYUtxqCAt5go78JHEwfgnvxTmu9ujuDN5ZMmY9ylh5DmsF5os9A+2q5Bg=="
+  "sig": "4Dj0HWO5+KfiZDKmJu61/ZXwT+6+0mweZFSLPeUHguGdPrL3yUQR0aHhXxqWkmrvteMy9GLuhBJwBJWFkOeSAQ=="
 }

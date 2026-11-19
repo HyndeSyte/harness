@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,10 +45,13 @@ import {
   checkSigned,
   withKeyId,
   keyIdOfPrivate,
+  dateShaped,
+  STEP_MAX,
+  TITLE_MAX,
 } from "./lib";
 import { main, PRIVATE_REPORT, PUT_MAX_BYTES, uploadPreflight } from "./index";
 import { SCHEMA, snapshotId } from "../shared/snapshot";
-import { tempRecord } from "./fixtures/temp-record";
+import { gitIn, gitRecord, signableRecord, tempRecord } from "./fixtures/temp-record";
 import { keyId, STEM_RULES, namesAccount, namesMoney, gateTokens, inflections, NAME_WORDS_COMMON, recordRevision, parseWordList, parseNameWords } from "./lib";
 import { DEFAULT_REPORT, insideGitWorkTree, writePrivate } from "./index";
 import { keyList } from "../shared/snapshot";
@@ -66,6 +70,10 @@ const policy = makePolicy(readFileSync(TERMS, "utf8"), JSON.parse(readFileSync(C
 const built = buildSnapshot(RECORD, policy, NOW);
 const snap = built.snapshot;
 const byId = Object.fromEntries(snap.threads.map((t) => [t.id, t]));
+// The fixture record without the rows holding an unknown word, which the signer refuses whatever the
+// flags (eighth round): what a plain signed export of the fixture uses.
+const SIGNABLE = signableRecord();
+const signableSnap = buildSnapshot(SIGNABLE, policy, NOW).snapshot;
 
 describe("the open list", () => {
   test("reads the open table and not the Done table", () => {
@@ -325,7 +333,7 @@ describe("strippers", () => {
 
 describe("signature", () => {
   const keys = makeKeyPair();
-  const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
+  const signed = signSnapshot(signableSnap, privateKey(keys.privatePem), policy);
   const raw = rawPublicKey(keys.publicPem);
 
   test("key id is the first 16 hex of the public key's sha256", async () => {
@@ -357,7 +365,7 @@ describe("signature", () => {
     const dir = mkdtempSync(join(tmpdir(), "surface-"));
     expect(await main(["--keygen", dir])).toBe(0);
     const out = join(dir, "snap.json");
-    const run = ["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG];
+    const run = ["--record", SIGNABLE, "--private-terms", TERMS, "--config", CONFIG];
     expect(await main([...run, "--out", out, "--key", join(dir, "surface.key")])).toBe(0);
     expect(await main(["--verify", out, "--pub", join(dir, "surface.pub")])).toBe(0);
     expect(await main(["--verify", out, "--pub", join(dir, "surface.pub.b64")])).toBe(0);
@@ -399,7 +407,7 @@ describe("the command line fails closed", () => {
     console.error = (m: string) => void lines.push(m);
     console.log = () => {};
     try {
-      await main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--out", join(dir, "w.json"), "--key", key]);
+      await main(["--record", SIGNABLE, "--private-terms", TERMS, "--config", CONFIG, "--out", join(dir, "w.json"), "--key", key]);
     } finally {
       console.error = err;
       console.log = log;
@@ -432,7 +440,7 @@ describe("one canonical form", () => {
   });
   test("the counts are signed", async () => {
     const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
+    const signed = signSnapshot(signableSnap, privateKey(keys.privatePem), policy);
     const raw = rawPublicKey(keys.publicPem);
     expect(await verifySnapshot(signed, entry(raw))).toBe(true);
     expect(await verifySnapshot({ ...signed, excluded_rows: 0 }, entry(raw))).toBe(false);
@@ -535,7 +543,7 @@ describe("the proper-noun gate", () => {
 
   const dir = mkdtempSync(join(tmpdir(), "surface-gate-"));
   const key = join(dir, "surface.key");
-  const rec = tempRecord(["| P1 | Return the drill to Kestrel next door, then lunch. | Cain | Ring at noon. | | Drill back. | 2026-11-01 |"]);
+  const rec = tempRecord(["| P1 | Return the drill to Kestrel next door, then lunch. | Cain | Ring at lunch. | | Drill back. | 2026-11-01 |"]);
   const run = ["--record", rec, "--private-terms", TERMS, "--config", CONFIG];
   test("under --strict a leftover fails the run: exit 1, nothing written, the field and row only, never the word", async () => {
     await capture(() => main(["--keygen", dir]));
@@ -1039,12 +1047,12 @@ describe("sixth round: more stems", () => {
 describe("seventh round: the gate at run time", () => {
   const keys = makeKeyPair();
   const key = privateKey(keys.privatePem);
-  const signedOf = () => withKeyId(snap, keyIdOfPrivate(key));
+  const signedOf = () => withKeyId(signableSnap, keyIdOfPrivate(key));
   // A deep copy of the pipeline's object, to tamper with (JSON.parse's result is untyped).
-  const copy = (): ReturnType<typeof JSON.parse> => JSON.parse(JSON.stringify(snap));
+  const copy = (): ReturnType<typeof JSON.parse> => JSON.parse(JSON.stringify(signableSnap));
   test("the fixture's signed object passes the walk, and signing runs it on every call", () => {
     expect(() => checkSigned(signedOf(), policy)).not.toThrow();
-    expect(snap.threads.length).toBeGreaterThan(10);
+    expect(signableSnap.threads.length).toBeGreaterThan(10);
   });
   test("a string that skipped the pipeline is refused by signSnapshot itself, naming the path only", () => {
     const tampered = copy();
@@ -1133,7 +1141,7 @@ describe("sixth round: the signed version follows the schema", () => {
   });
   test("an unknown version, app or purpose doesn't verify, signed or not", async () => {
     const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
+    const signed = signSnapshot(signableSnap, privateKey(keys.privatePem), policy);
     const raw = rawPublicKey(keys.publicPem);
     expect(await verifySnapshot(signed, entry(raw))).toBe(true);
     for (const over of [{ version: 1 }, { version: 3 }, { app: "other-app" }, { purpose: "command" }])
@@ -1142,7 +1150,7 @@ describe("sixth round: the signed version follows the schema", () => {
   test("the key id is inside the signed bytes: moved under another listed key's id, it doesn't verify", async () => {
     const a = makeKeyPair();
     const b = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(a.privatePem), policy);
+    const signed = signSnapshot(signableSnap, privateKey(a.privatePem), policy);
     const both = [...entry(rawPublicKey(a.publicPem)), ...entry(rawPublicKey(b.publicPem))];
     expect(await verifySnapshot(signed, both)).toBe(true);
     expect(await verifySnapshot({ ...signed, key_id: both[1].id }, both)).toBe(false);
@@ -1182,7 +1190,7 @@ describe("sixth round: key match", () => {
 describe("sixth round: the uploader's preflight", () => {
   test("refuses a body over the Worker's limit, or one that doesn't verify under its own key", async () => {
     const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
+    const signed = signSnapshot(signableSnap, privateKey(keys.privatePem), policy);
     const raw = rawPublicKey(keys.publicPem);
     const body = JSON.stringify(signed);
     expect(await uploadPreflight(body, entry(raw)[0])).toBeNull();
@@ -1192,32 +1200,61 @@ describe("sixth round: the uploader's preflight", () => {
   });
 });
 
-describe("seventh round: the record's revision", () => {
-  const git = (cwd: string, ...args: string[]) =>
-    execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" }).trim();
-  const repo = () => {
-    const rec = tempRecord(["| P1 | Sort the tools. | Cain | Sort them. | | Done. | 2026-11-01 |"]);
-    git(rec, "init", "-q");
+describe("seventh round: the record's revision (eighth round: a stable property of a commit)", () => {
+  const git = gitIn;
+  // A record checkout whose branch tracks an upstream at its tip.
+  const repo = () => gitRecord(tempRecord(["| P1 | Sort the tools. | Cain | Sort them. | | Done. | 2026-11-01 |"]));
+  const commitAll = (rec: string, msg: string) => {
     git(rec, "add", "-A");
-    git(rec, "commit", "-q", "-m", "one");
-    return rec;
+    git(rec, "commit", "-q", "-m", msg);
   };
-  test("a clean checkout at the top of its own work tree gives {seq, commit}; the next commit a higher seq", () => {
+  test("a clean checkout at its upstream's tip gives {seq, commit}; the next pushed commit a higher seq", () => {
     const rec = repo();
     const one = recordRevision(rec).revision!;
     expect(one.seq).toBe(1);
     expect(one.commit).toMatch(/^[0-9a-f]{40}$/);
     writeFileSync(join(rec, "state", "holds.json"), "{}");
-    git(rec, "add", "-A");
-    git(rec, "commit", "-q", "-m", "two");
+    commitAll(rec, "two");
+    // Committed but not pushed: not the upstream's tip.
+    expect(recordRevision(rec)).toEqual({ revision: null, why: "the record is not at its upstream branch's tip" });
+    git(rec, "push", "-q");
     const two = recordRevision(rec).revision!;
     expect(two.seq).toBe(2);
     expect(two.commit).not.toBe(one.commit);
   });
-  test("uncommitted changes under state/, a folder inside another repository, or no git: null, with the reason", () => {
-    const rec = repo();
-    writeFileSync(join(rec, "state", "holds.json"), "{}");
-    expect(recordRevision(rec)).toEqual({ revision: null, why: "the record's state/ has changes not committed" });
+  test("each path the exporter reads, dirty, untracked or ignored, means no revision, naming the path", () => {
+    const cases: [string, (rec: string) => void, string][] = [
+      ["PENDING.md edited", (rec) => writeFileSync(join(rec, "state", "PENDING.md"), "changed\n"), "state/PENDING.md has changes not committed"],
+      ["a new holds file", (rec) => writeFileSync(join(rec, "state", "holds.json"), "{}"), "the holds file (state/holds.json) has changes not committed"],
+      ["a new note", (rec) => (mkdirSync(join(rec, "state", "notes"), { recursive: true }), writeFileSync(join(rec, "state", "notes", "P1.md"), "x")), "the notes folder (state/notes) has changes not committed"],
+      ["an ignored holds file", (rec) => {
+        writeFileSync(join(rec, ".gitignore"), "state/holds.json\n");
+        commitAll(rec, "ignore");
+        git(rec, "push", "-q");
+        writeFileSync(join(rec, "state", "holds.json"), "{}");
+      }, "the holds file (state/holds.json) has changes not committed"],
+      ["another file under state/", (rec) => writeFileSync(join(rec, "state", "other.md"), "x"), "state/ has changes not committed"],
+    ];
+    for (const [what, change, why] of cases) {
+      const rec = repo();
+      change(rec);
+      expect([what, recordRevision(rec)]).toEqual([what, { revision: null, why }]);
+    }
+  });
+  test("no upstream, a shallow clone, a folder inside another repository, or no git: null, with the reason", () => {
+    const local = tempRecord(["| P1 | Sort the tools. | Cain | Sort them. | | Done. | 2026-11-01 |"]);
+    git(local, "init", "-q");
+    commitAll(local, "one");
+    expect(recordRevision(local)).toEqual({ revision: null, why: "the record's branch has no upstream branch configured" });
+    // A shallow clone of a record with two commits, its upstream at its tip.
+    const src = repo();
+    writeFileSync(join(src, "state", "holds.json"), "{}");
+    commitAll(src, "two");
+    git(src, "push", "-q");
+    const bare = git(src, "config", "remote.origin.url");
+    const shallow = join(mkdtempSync(join(tmpdir(), "surface-shallow-")), "rec");
+    execFileSync("git", ["clone", "-q", "--depth", "1", `file://${bare}`, shallow], { stdio: "ignore" });
+    expect(recordRevision(shallow)).toEqual({ revision: null, why: "the record is a shallow clone" });
     expect(recordRevision(RECORD).revision).toBeNull();
     expect(recordRevision(tempRecord(["| P1 | x | Cain | x | | x | 2026-11-01 |"])).revision).toBeNull();
   });
@@ -1232,6 +1269,34 @@ describe("seventh round: the record's revision", () => {
     const keys = await keyList(readFileSync(join(dir, "surface.pub.entry"), "utf8"));
     expect(await verifySnapshot(s, keys)).toBe(true);
     expect(await verifySnapshot({ ...s, revision: { ...s.revision, seq: s.revision.seq + 1 } }, keys)).toBe(false);
+  });
+  test("--put refuses with no revision: exit 2, nothing sent, the reason named", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-rev-put-"));
+    await capture(() => main(["--keygen", dir]));
+    const env = {
+      SURFACE_PUT_HOST: "surface.example.com",
+      SURFACE_ACCESS_CLIENT_ID: "id-example",
+      SURFACE_ACCESS_CLIENT_SECRET: "secret-example",
+      SURFACE_PUBLISHER_TOKEN: "publisher-example",
+    };
+    const dirty = repo();
+    writeFileSync(join(dirty, "state", "holds.json"), "{}");
+    for (const [rec, why] of [
+      [tempRecord(["| P1 | Sort the tools. | Cain | Sort them. | | Done. | 2026-11-01 |"]), /not a git checkout|not the top of its own git work tree/],
+      [dirty, /the holds file \(state\/holds\.json\) has changes not committed/],
+    ] as const) {
+      let calls = 0;
+      const r = await capture(() =>
+        main(["--record", rec, "--private-terms", TERMS, "--config", CONFIG, "--key", join(dir, "surface.key"), "--put", "https://surface.example.com/snapshot", "--made-at", NOW.toISOString(), "--approve", "0".repeat(64)], {
+          fetch: async () => (calls++, new Response("{}")),
+          env,
+        }),
+      );
+      expect(r.code).toBe(2);
+      expect(calls).toBe(0);
+      expect(r.err).toMatch(/--put: no record revision can be signed/);
+      expect(r.err).toMatch(why);
+    }
   });
 });
 
@@ -1406,5 +1471,287 @@ describe("seventh round: the common words against the bundled name lists", () =>
     expect(NAME_WORDS.has("doug") && !NAME_WORDS_COMMON.has("doug")).toBe(true);
     expect(() => parseNameWords("stray\n[names]\nx")).toThrow(/before the first/);
     expect(parseNameWords("[names]\na b\n[common]\nc").common).toEqual(new Set(["c"]));
+  });
+});
+
+// --- eighth round ---------------------------------------------------------------------------------
+
+describe("eighth round: sanitise is idempotent, and the signer re-runs it with each field's cap", () => {
+  // Every free-text cell of the fixture record (the fixture corpus, every row of which is the strict
+  // corpus) and the synthetic record, under three policies.
+  const cellsOf = (rec: string) =>
+    openRows(readFileSync(join(rec, "state", "PENDING.md"), "utf8")).flatMap((r) => [r.item, r.next, r.waits ?? "", r.done_when]);
+  const corpus = [...cellsOf(RECORD), ...cellsOf(join(FIX, "synthetic"))].filter(Boolean);
+  const strictRows: Record<string, string> = JSON.parse(readFileSync(join(FIX, "strict-corpus.json"), "utf8"));
+  const policies: [string, ReturnType<typeof makePolicy>][] = [
+    ["the fixture config", policy],
+    ["the owner only", makePolicy(readFileSync(TERMS, "utf8"), { owner_names: ["Robin"], names: [] })],
+    ["more allowed words and names", makePolicy(readFileSync(TERMS, "utf8"), { owner_names: ["Robin"], names: ["Kestrel", "Ottoline"], allow_words: ["Penrose", "zorblat"] })],
+  ];
+  test("sanitising its own output returns it unchanged, for every field and policy, over the fixture and strict corpora", () => {
+    expect(corpus.length).toBeGreaterThan(200);
+    expect(Object.keys(strictRows).length).toBeGreaterThan(50);
+    const fields: [string, number | undefined][] = [["title", TITLE_MAX], ["step", STEP_MAX], ["outcome", undefined], ["waits_for", undefined]];
+    const bad: string[] = [];
+    for (const [pname, p] of policies)
+      for (const [field, max] of fields)
+        for (const cell of corpus) {
+          const once = sanitise(cell, p, max).text;
+          const twice = sanitise(once, p, max).text;
+          if (twice !== once) bad.push(`${pname}: ${field}: ${JSON.stringify(once)} -> ${JSON.stringify(twice)}`);
+        }
+    expect(bad).toEqual([]);
+  });
+  test("edge cases: a cut text, markdown, a name next to a sentence end, an abbreviation", () => {
+    const edges = [
+      "word ".repeat(80) + "end.",
+      "Fix **the** _gate_ for Morgan Vale. Then more.",
+      "Waiting on Mr. Vale. Then Dr. Penrose.",
+      "a_b_c_d and `x` and *y*",
+      "Ask Ｍｏｒｇａｎ at https://example.com about P41.",
+      // A cut whose last kept character is a space, and an ellipsis inside the text.
+      "abcd abcd abcd abc defg hijk lmno",
+      "wait… then go. Then more.",
+      "a… b",
+    ];
+    for (const [, p] of policies)
+      for (const max of [TITLE_MAX, STEP_MAX, 20, 19, 21, undefined])
+        for (const e of edges) {
+          const once = sanitise(e, p, max).text;
+          expect([e, max, sanitise(once, p, max).text]).toEqual([e, max, once]);
+        }
+  });
+});
+
+describe("eighth round: the signer signs a plain copy of validated values", () => {
+  const keys = makeKeyPair();
+  const key = privateKey(keys.privatePem);
+  const copy = (): ReturnType<typeof JSON.parse> => JSON.parse(JSON.stringify(signableSnap));
+  const outcome = (s: unknown, p = policy) => {
+    try {
+      signSnapshot(s as typeof signableSnap, key, p);
+      return "signed";
+    } catch (e) {
+      return String(e instanceof Error ? e.message : e);
+    }
+  };
+  test("an accessor-backed field (a getter that returns a different string on each read) is refused", () => {
+    const t = copy();
+    let n = 0;
+    Object.defineProperty(t.threads[0], "title", { get: () => (n++ === 0 ? "Sort the tools." : "Raw text from Kestrel"), enumerable: true });
+    expect(outcome(t)).toMatch(/snapshot\.threads\[0\]\.title: not a plain field/);
+    // On the snapshot itself, and an array index backed by an accessor: refused before any value is read.
+    const u = copy();
+    let reads = 0;
+    const first = u.threads[0];
+    Object.defineProperty(u.threads, "0", { get: () => (reads++, first), enumerable: true, configurable: true });
+    expect(outcome(u)).toMatch(/snapshot\.threads\[0\]: not a plain field/);
+    expect(reads).toBe(0);
+    const v = copy();
+    Object.defineProperty(v, "made_at", { get: () => signableSnap.made_at, enumerable: true });
+    expect(outcome(v)).toMatch(/snapshot\.made_at: not a plain field/);
+  });
+  test("a string reused across fields (an outcome-length string passed as a title) is refused", () => {
+    const long = sanitise("Sort the tools and the bins and the shelves in the garage, " + "then sort the tools again, ".repeat(8) + "and done.", policy).text;
+    expect(long.length).toBeGreaterThan(TITLE_MAX);
+    const t = copy();
+    t.threads[0].outcome = long;
+    expect(outcome(t)).toBe("signed");
+    t.threads[0].title = long;
+    expect(outcome(t)).toMatch(/snapshot\.threads\[0\]\.title: a string that did not pass the sanitise pipeline/);
+  });
+  test("a string sanitised under another policy is refused", () => {
+    const config = JSON.parse(readFileSync(CONFIG, "utf8"));
+    const other = makePolicy(readFileSync(TERMS, "utf8"), { ...config, allow_words: [...config.allow_words, "Kestrel"] });
+    const text = sanitise("Return the drill to Kestrel.", other).text;
+    expect(text).toBe("Return the drill to Kestrel.");
+    const t = copy();
+    t.threads[0].outcome = text;
+    expect(outcome(t, other)).toBe("signed");
+    expect(outcome(t)).toMatch(/snapshot\.threads\[0\]\.outcome: a string that did not pass the sanitise pipeline/);
+  });
+  test("unknown lower-case or uncased text is refused in every free-text field, whatever the flags", () => {
+    for (const [field, text] of [["title", "Sort the zorblat."], ["step", "Sort the zorblat."], ["outcome", "The zorblat is sorted."], ["waits_for", "the zorblat"], ["title", "Sort the 中文."]] as const) {
+      const t = copy();
+      t.threads[0][field] = text;
+      expect([field, sanitise(text, policy, field === "title" ? TITLE_MAX : field === "step" ? STEP_MAX : undefined).text]).toEqual([field, text]);
+      expect([field, outcome(t)]).toEqual([field, `snapshot.threads[0].${field}: an unknown lower-case or uncased word (not in the word list)`]);
+    }
+    // And the command line, without --strict: exit 1, nothing written, the place only.
+  });
+  test("the plain run without --strict refuses a record with an unknown word: exit 1, nothing written, no word printed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-unknown-sign-"));
+    await capture(() => main(["--keygen", dir]));
+    const rec = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat. | | Done. | 2026-11-01 |"]);
+    const out = join(dir, "o.json");
+    const r = await capture(() => main(["--record", rec, "--private-terms", TERMS, "--config", CONFIG, "--out", out, "--key", join(dir, "surface.key")]));
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/the gate refused to sign: snapshot\.threads\[0\]\.step: an unknown lower-case or uncased word/);
+    expect(r.err).not.toContain("zorblat");
+    expect(existsSync(out)).toBe(false);
+  });
+  test("the caller's object is never what is signed: changing it afterwards changes nothing signed", async () => {
+    const t = copy();
+    const signed = signSnapshot(t, key, policy);
+    t.threads[0].title = "changed";
+    expect(signed.threads[0].title).not.toBe("changed");
+    expect(await verifySnapshot(signed, entry(rawPublicKey(keys.publicPem)))).toBe(true);
+    // A proxy that answers differently each time it is read is read once, then checked as copied.
+    let n = 0;
+    const thread = copy().threads[0];
+    const proxied = new Proxy(thread, {
+      getOwnPropertyDescriptor(target, k) {
+        const d = Reflect.getOwnPropertyDescriptor(target, k);
+        if (k === "title" && d) return { ...d, value: n++ === 0 ? thread.title : "Raw text from Kestrel" };
+        return d;
+      },
+    });
+    const p = copy();
+    p.threads[0] = proxied;
+    // Its shape check saw the clean title; the copy took the other one, and the gate, walking the
+    // copy, refuses it: what is checked is what would be signed.
+    expect(outcome(p)).toMatch(/snapshot\.threads\[0\]\.title: a string that did not pass the sanitise pipeline/);
+  });
+});
+
+describe("eighth round: the unknown-word check and digits", () => {
+  test("a token touching a digit is looked up by its letters; only a whole record-code form is exempt", () => {
+    expect(unknownTokens("see v2 and x86 and p40 and ab12345", policy.vocabulary)).toEqual([]);
+    expect(unknownTokens("the zorblat2 and 9quillon and abc123def", policy.vocabulary)).toEqual(["zorblat", "quillon", "abc", "def"]);
+    // Four letters then digits is not a code form.
+    expect(unknownTokens("abcd12", policy.vocabulary)).toEqual(["abcd"]);
+    // A number's own letters right after it: dates and times.
+    expect(unknownTokens("on the 3rd and the 20th at 10am or 5pm", policy.vocabulary)).toEqual([]);
+    expect(unknownTokens("the th", policy.vocabulary)).toEqual(["th"]);
+  });
+  test("the dry run reports unknown words and does not sign; the gate's verdict is named, with no approval", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-dry-gate-"));
+    await capture(() => main(["--keygen", dir]));
+    const rec = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat2. | | Done. | 2026-11-01 |"]);
+    const r = await capture(() => main(["--record", rec, "--private-terms", TERMS, "--config", CONFIG, "--dry-run", "--key", join(dir, "surface.key")]));
+    expect(r.code).toBe(0);
+    expect(r.err).toMatch(/1 lower-case or uncased word\(s\) not in the word list/);
+    expect(r.err).toMatch(/the gate would refuse to sign: snapshot\.threads\[0\]\.step: an unknown/);
+    expect(r.err).toMatch(/no approval digest: these bytes can't be uploaded/);
+    expect(r.err).not.toContain("zorblat");
+    expect(JSON.parse(r.out).sig).toBeUndefined();
+  });
+});
+
+describe("eighth round: the approval digest is of bytes the owner can read", () => {
+  test("a dry run with --key and --report writes the exact signed bytes beside the report (0600); the digest is their SHA-256", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-bytes-"));
+    await capture(() => main(["--keygen", dir]));
+    const report = join(mkdtempSync(join(tmpdir(), "surface-bytes-report-")), "report.txt");
+    const run = ["--record", join(FIX, "synthetic"), "--private-terms", TERMS, "--config", CONFIG, "--dry-run", "--key", join(dir, "surface.key"), "--report", report];
+    const r = await capture(() => main(run));
+    expect(r.code).toBe(0);
+    const approve = /--approve ([0-9a-f]{64})/.exec(r.err)![1];
+    const bytesFile = `${report}.signed.json`;
+    expect(statSync(bytesFile).mode & 0o777).toBe(0o600);
+    const bytes = readFileSync(bytesFile);
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(approve);
+    // They are the canonical signed JSON, as text: the signed fields with the key id.
+    const parsed = JSON.parse(bytes.toString("utf8"));
+    expect(parsed.key_id).toBe(keyId(rawPublicKey(readFileSync(join(dir, "surface.pub"), "utf8"))));
+    expect(parsed.sig).toBeUndefined();
+    expect(canonical(parsed)).toBe(bytes.toString("utf8"));
+    expect(readFileSync(report, "utf8")).toContain(bytesFile);
+  });
+});
+
+describe("eighth round: a private file's directory is resolved before the work-tree check", () => {
+  test("a directory outside any repository that is a symlink into a work tree is refused, for the report and for writePrivate", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "surface-wt-"));
+    gitIn(repo, "init", "-q");
+    mkdirSync(join(repo, "inner"));
+    const outside = mkdtempSync(join(tmpdir(), "surface-link-"));
+    const link = join(outside, "linked");
+    symlinkSync(join(repo, "inner"), link);
+    expect(insideGitWorkTree(join(link, "report.txt"))).toBe(true);
+    expect(insideGitWorkTree(join(link, "not-yet", "report.txt"))).toBe(true);
+    expect(() => writePrivate(join(link, "report.txt"), "private\n")).toThrow(/inside a git work tree/);
+    expect(readdirSync(join(repo, "inner"))).toEqual([]);
+    const r = await capture(() => main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--dry-run", "--report", join(link, "report.txt")]));
+    expect(r.code).toBe(2);
+    expect(readdirSync(join(repo, "inner"))).toEqual([]);
+    // A real directory outside any repository is fine, and the file lands there.
+    const plain = join(mkdtempSync(join(tmpdir(), "surface-plain-")), "report.txt");
+    writePrivate(plain, "private\n");
+    expect(statSync(plain).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("eighth round: the cast check reads the sanitiser module too", () => {
+  test("lib.ts passes with only mark()'s line allowed; any other cast there fails", () => {
+    const lib = readFileSync(join(import.meta.dir, "lib.ts"), "utf8");
+    const path = ["export", "lib.ts"].join("/");
+    expect(fileProblems(path, lib)).toEqual([]);
+    const lines = lib.split("\n");
+    const at = lines.indexOf("  return s as GatedText;");
+    expect(lines[at - 1]).toBe("function mark(s: string): GatedText {");
+    // Another brand cast, an as unknown as, an any: each fails, at its line.
+    for (const [extra, what] of [["const x = y as GatedText;", "as GatedText"], ["const x = y as unknown as string;", "as unknown as"], ["let z: any = 1;", "the type any"]]) {
+      const src = lib + "\n" + extra + "\n";
+      expect(fileProblems(path, src)).toEqual([`${path}:${lines.length + 1}: ${what}`]);
+    }
+    // The allowed line anywhere but under mark()'s head fails too.
+    expect(fileProblems(path, lib + "\nfunction other(s: string): GatedText {\n  return s as GatedText;\n}\n")).toEqual([`${path}:${lines.length + 2}: as GatedText`]);
+    // And another file gets no allowance at all.
+    expect(fileProblems("export/other.ts", "function mark(s: string): GatedText {\n  return s as GatedText;\n}\n")).toEqual(["export/other.ts:2: as GatedText"]);
+  });
+});
+
+describe("eighth round: money and account gates", () => {
+  test("a lower-case IBAN, a spaced card number, acct glued to a number, a sort code with a cue or not date-shaped", () => {
+    for (const t of [
+      "gb82 west 1234 5698 7654 32",
+      "pay into gb82west12345698765432",
+      "card 4111 1111 1111 1111",
+      "4111-1111-1111-1111",
+      "acct42",
+      "ACCT 99",
+      "sort code 12-05-26",
+      "acct 01-02-03",
+      "40-50-60",
+      "99-32-11",
+    ])
+      expect([t, namesAccount(t)]).toEqual([t, true]);
+  });
+  test("two-digit dates and versions don't exclude", () => {
+    for (const t of ["on 12-05-26", "due 01-12-26", "from 26-11-19", "11-30-26 in the US form", "version 1.2.3", "v10.12.03", "release 2-1-0"])
+      expect([t, namesAccount(t)]).toEqual([t, false]);
+    expect(dateShaped(12, 5, 26)).toBe(true);
+    expect(dateShaped(26, 11, 19)).toBe(true);
+    expect(dateShaped(40, 50, 60)).toBe(false);
+  });
+  test("prefix stems match no ordinary word on the common-word lists; the ones that did are words with endings", () => {
+    const words = [...new Set([...COMMON_WORDS_FILE, ...NAME_WORDS_COMMON].map(fold))];
+    for (const r of STEM_RULES)
+      if (r.mode === "prefix") {
+        const s = fold(r.stem);
+        // The stem's own plain inflections are what it is for ("banks").
+        const own = new Set(["", "s", "es", "ed", "ing", "er", "ers"].map((e) => s + e));
+        expect([r.stem, words.filter((w) => w.startsWith(s) && !own.has(w))]).toEqual([r.stem, []]);
+      }
+    for (const ordinary of ["hospitality", "billion", "billow", "billiards", "mentality"]) expect([ordinary, isExcluded(policy, ordinary)]).toEqual([ordinary, false]);
+    for (const health of ["hospital", "hospitals", "bill", "bills", "billing", "mental", "mentally"]) expect([health, isExcluded(policy, health)]).toEqual([health, true]);
+  });
+  test("the dry-run report lists every strict failure with its field, the word and a suggested line", async () => {
+    const rec = tempRecord([
+      "| P1 | Return the drill to Kestrel. | Cain | Sort the zorblat. | | Done. | 2026-11-01 |",
+      "| P2 | Ask Will about it. | Cain | Ask. | | Done. | 2026-11-01 |",
+      "| bad | No id. | Cain | Go. | | Done. | 2026-11-01 |",
+    ]);
+    const report = join(mkdtempSync(join(tmpdir(), "surface-suggest-")), "report.txt");
+    expect((await capture(() => main(["--record", rec, "--private-terms", TERMS, "--config", CONFIG, "--dry-run", "--report", report]))).code).toBe(0);
+    const text = readFileSync(report, "utf8");
+    const lines = text.split("\n");
+    const after = (re: RegExp) => lines[lines.findIndex((l) => re.test(l)) + 1];
+    expect(text).toMatch(/strict failures: 4/);
+    expect(after(/PENDING\.md:5: title: Kestrel$/)).toBe('  suggest: allow_words: "Kestrel"');
+    expect(after(/PENDING\.md:5: step: zorblat$/)).toBe('  suggest: allow_words: "zorblat"');
+    expect(after(/PENDING\.md:6: title: Will$/)).toMatch(/^  suggest: name-words\.txt \[common\]: will /);
+    expect(text).toMatch(/PENDING\.md:7: row skipped, no valid id/);
   });
 });

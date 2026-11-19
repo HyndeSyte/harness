@@ -28,14 +28,16 @@ jobs:
       # No workers.dev host and no preview URLs for the Worker.
       - name: Worker config check
         run: bun surface/worker/check-wrangler.ts
-      # No "as GatedText", "as unknown as" or the type any anywhere in surface/ outside the sanitiser
-      # module (surface/export/lib.ts); comments and strings don't count.
+      # No "as GatedText", "as unknown as" or the type any anywhere in surface/, the sanitiser module
+      # (surface/export/lib.ts) included, but for mark()'s one brand-minting line, allowed by its exact
+      # content; comments and strings don't count.
       - name: Cast check
         run: bun surface/check-casts.ts
 
   # The Worker bundled as it deploys, run by Miniflare in workerd (the runtime Cloudflare uses) with
   # the real SQLite-backed Durable Object bound as STORE: the store's ordering, retired keys, the clock
-  # bounds, version 1, Access, and a concurrent upload race.
+  # bounds, version 1, Access, a concurrent upload race, and races with revisions (equal seq with
+  # different commits, a higher seq with an older made_at, and mixed revisions, in both orders).
   surface-workerd:
     runs-on: ubuntu-latest
     defaults:

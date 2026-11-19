@@ -6,6 +6,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APP_ID, PURPOSE_SNAPSHOT, SNAPSHOT_VERSION } from "../../../shared/canonical";
+import { signableRecord } from "../../../export/fixtures/temp-record";
 import { areaOf, buildSnapshot, gateFixed, gateId, gateRevision, gateTime, makeKeyPair, makePolicy, privateKey, sanitise, signSnapshot } from "../../../export/lib";
 
 const here = import.meta.dir;
@@ -13,10 +14,17 @@ const fix = join(here, "../../../export/fixtures");
 const keys = makeKeyPair();
 const key = privateKey(keys.privatePem);
 const policy = makePolicy(readFileSync(join(fix, "private-terms.txt"), "utf8"), JSON.parse(readFileSync(join(fix, "exporter.json"), "utf8")));
-const snapshot = signSnapshot(buildSnapshot(join(fix, "record"), policy, new Date("2026-11-18T10:00:00Z")).snapshot, key, policy);
+// The fixture record without its rows holding an unknown word, which the signer refuses whatever the
+// flags (eighth round).
+const snapshot = signSnapshot(buildSnapshot(signableRecord(), policy, new Date("2026-11-18T10:00:00Z")).snapshot, key, policy);
 // Every string goes through the exporter's own gates (signSnapshot signs nothing else). The text is
-// lower case, so the proper-noun gate leaves it as written.
-const vectorPolicy = makePolicy("not-a-real-term", { owner_names: ["Nobody"], names: [] });
+// lower case, so the proper-noun gate leaves it as written; its words are allowed, since the signer
+// refuses an unknown word.
+const vectorPolicy = makePolicy("not-a-real-term", {
+  owner_names: ["Nobody"],
+  names: [],
+  allow_words: ["a".repeat(138), "café", "中文", "quoted", "back", "é", "vs"],
+});
 const text = (t: string, max?: number) => sanitise(t, vectorPolicy, max).text;
 const vector = signSnapshot(
   {
@@ -31,7 +39,7 @@ const vector = signSnapshot(
         title: text("a".repeat(138) + "😀😀😀", 140),
         area: areaOf("nothing", vectorPolicy),
         who: gateFixed("the assistant"),
-        step: text("café, 中文, 𝄞 and \u{1F469}‍\u{1F4BB} … \"quoted\" \\ back"),
+        step: text("café, 中文, 𝄞 and \u{1F469}‍\u{1F4BB} … \"quoted\" \\ back", 200),
         waits_for: null,
         outcome: text("é vs é"),
         last_moved: gateTime(Date.parse("2026-11-18T09:00:00.000Z")),
