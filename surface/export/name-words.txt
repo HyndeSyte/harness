@@ -1,0 +1,31 @@
+# Words that are also common given names or surnames (surface/README.md, the proper-noun gate). None
+# of them may be on the bundled common-words list: a capitalised one is gated like any name. A test
+# checks the two lists share no word. One a line, lower case; `#` for a note line. Months and
+# weekdays are here too where they are names; every month and weekday is exempt only next to a
+# number or a date, whatever this list says.
+
+# given names
+abby amber angel april art august autumn barb bea belle bill billy bob bobby brook buck bud
+candy carol chance chase cherry chip chris christian clay cliff crystal daisy dale dawn dean
+destiny dick dolly don dot doug drew earl easter eve faith fern flora frank gene ginger gail
+glen grace grant guy hank harry hazel heather holly honey hope hunter iris ivy jack jade jay
+jean jenny jerry jewel jim jimmy jo joe joy judge june kay kit lance lane laurel lee les lily
+mabel mac mae marge mark marsh mart max may mel melody mercy merry mike mo molly nat ned nick
+olive opal pat patience patsy pearl peg penny pepper pierce pip poppy prince queenie ray red
+reed rich rob robin rocky rod roger rose rosemary ruby rusty sage sandy scott shelly sky sonny
+sterling stu sue summer sunny tad ted terry tiny tom tony trinity troy val victor violet wade
+walt ward warren wes will willow winter wren
+
+# surnames
+bacon baker banks barber bell berry best bird bishop black blue bond bones booth bowman brewer
+bridge brook brooks brown bush butcher butler cash carpenter carter castle chamberlain chandler
+church clark coach cook cooper crane cross dancer day devine dix dyer field fields fish
+fisher fletcher ford forest foster fox french friend frost fuller gardener gates gentle gold
+golden good goodman gray green grey gross hall hammer hart hawk hay hill holder hood horn
+house howard hunt keen king knight lamb law little long love lucky major march marsh mason
+may miller monday moon moore morning moss nash newman north oak page park parker parsons
+pearl person pike piper pope porter post potter power price quick rain reeve rice rich
+rider rivers rock root rose rush sage salt savage sharp shepherd short silver singer small
+smith snow spring stamp steel stone strong summers sun sunday swan swift taylor temple thursday
+tuesday turner wall walker ward waters weaver webb west wheeler white wild winter wise wolf
+wood woods young

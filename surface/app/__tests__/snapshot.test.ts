@@ -108,6 +108,21 @@ describe("the loader", () => {
   });
 });
 
+describe("sixth round: versions and keys", () => {
+  test("an unknown version, app or purpose is refused as unsupported, before its signature is read", () => {
+    for (const over of [{ version: 1 }, { version: 3 }, { app: "other" }, { purpose: "command" }]) {
+      expect(check({ ...clone(), ...over }, pub)).toEqual({ ok: false, reason: "unsupported" });
+      expect(verify({ ...clone(), ...over }, pub)).toBe(false);
+    }
+  });
+  test("the key is picked from a comma-separated list by the snapshot's key_id", () => {
+    const other = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    expect(verify(raw, `${other},${pub}`)).toBe(true);
+    expect(verify(raw, `${pub} , ${other}`)).toBe(true);
+    expect(verify(raw, `${other},not-base64!,`)).toBe(false);
+  });
+});
+
 describe("unknown fields", () => {
   const base = {
     id: "P1", title: "t", area: "other", who: "the assistant", step: "s", waits_for: null,
@@ -156,7 +171,7 @@ describe("the sort", () => {
 
 describe("one canonical form", () => {
   test("the signed bytes are the standard UTF-8, ellipsis, emoji and non-BMP text included", () => {
-    const s = { version: 1, made_at: "x", threads: [{ t: "As of 9:14 … café \u{1F600} 𝄞 中" }], excluded_rows: 0, skipped_rows: 0 };
+    const s = { version: 2, app: "harness-surface", purpose: "in-motion-snapshot", made_at: "x", threads: [{ t: "As of 9:14 … café \u{1F600} 𝄞 中" }], excluded_rows: 0, skipped_rows: 0 };
     expect(Array.from(signedBytes(s))).toEqual(Array.from(Buffer.from(canonical(s), "utf8")));
   });
 

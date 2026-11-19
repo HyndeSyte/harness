@@ -5,8 +5,8 @@
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { cutCodePoints, signedBytes, toBase64 } from "../shared/canonical";
-import type { Signed, Snapshot, State, Thread, Who } from "../shared/snapshot";
+import { APP_ID, cutCodePoints, PURPOSE_SNAPSHOT, signedBytes, SNAPSHOT_VERSION, toBase64 } from "../shared/canonical";
+import { STATES, WHO, type Signed, type Snapshot, type State, type Thread, type Who } from "../shared/snapshot";
 
 export const TITLE_MAX = 140;
 export const STEP_MAX = 200;
@@ -24,6 +24,9 @@ export const DEFAULT_STEMS = [
   "prescri", "clinic", "pharmac", "medic", "diagnos",
   "bill", "fee", "cost", "price", "quote", "deposit", "venmo", "cash", "owe",
   "symptom", "scan", "mri", "blood", "vaccin", "pregnan", "allerg", "pill", "dose", "sick", "counsel",
+  // sixth round
+  "meds", "rx", "refill", "biopsy", "chemo", "cancer", "rehab", "physio", "lab", "results", "er",
+  "urgent care", "injur", "zelle", "wire", "cheque", "check", "tuition", "fine", "ticket",
 ];
 
 // --- one normal form ----------------------------------------------------------------------
@@ -88,6 +91,14 @@ export const DEFAULT_OWNER_NAMES = ["owner", "the owner"];
 // English words (common-words.txt: function words, pronouns, common verbs, weekdays and months, no
 // names) and these. The owner's config adds product and place words (allow_words).
 export const DEFAULT_ALLOW_WORDS = ["I", "OK"];
+// Months and weekdays: a capitalised one stays only next to a number or a date ("May 5", "on 3 June",
+// "Friday 2026-11-20"), since several are names too (May, June, April, August).
+export const CALENDAR_WORDS = [
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+];
+// The words the exported text itself puts in: the name and identifier replacements.
+const OUTPUT_WORDS = ["you", "your", "someone", "someone's", "link", "email", "address", "phone", "number", "item"];
 export function parseWordList(text: string): string[] {
   return text
     .replace(/\r\n/g, "\n")
@@ -95,7 +106,15 @@ export function parseWordList(text: string): string[] {
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"));
 }
-export const COMMON_WORDS: readonly string[] = parseWordList(readFileSync(join(import.meta.dir, "common-words.txt"), "utf8"));
+// Words that are also common given names or surnames (name-words.txt): never on the common list,
+// whatever common-words.txt says, so a capitalised one is gated like any name.
+export const NAME_WORDS: ReadonlySet<string> = new Set(
+  parseWordList(readFileSync(join(import.meta.dir, "name-words.txt"), "utf8")).flatMap((l) => l.split(/\s+/)).filter(Boolean),
+);
+export const COMMON_WORDS_FILE: readonly string[] = parseWordList(readFileSync(join(import.meta.dir, "common-words.txt"), "utf8"));
+export const COMMON_WORDS: readonly string[] = COMMON_WORDS_FILE.filter(
+  (w) => !NAME_WORDS.has(w.toLowerCase()) && !CALENDAR_WORDS.includes(w.toLowerCase()),
+);
 
 export interface Policy {
   terms: RegExp[];
@@ -110,6 +129,11 @@ export interface Policy {
   areas: string[];
   // Capitalised words that may stay (COMMON_WORDS, DEFAULT_ALLOW_WORDS and config `allow_words`), folded.
   allowWords: Set<string>;
+  // Every word a lower-case or uncased token may be without being listed as unknown: the allow
+  // words, the months and weekdays, and the words the exporter itself puts in. Folded.
+  vocabulary: Set<string>;
+  // How far the chunks of a long text overlap: more than the longest plain term.
+  overlap: number;
 }
 
 export interface ExporterConfig {
@@ -163,7 +187,14 @@ export function riskyPattern(body: string): string | null {
 // load. A file with no terms, or a term that doesn't compile or could backtrack without bound,
 // is refused (by line number, never the term): the exporter fails closed.
 export function parseTerms(text: string, where = "the private terms file"): RegExp[] {
+  return parseTermList(text, where).terms;
+}
+
+// The terms and the length of the longest plain term (the chunks' overlap must exceed it). A plain
+// term longer than half a chunk is refused: the overlap couldn't hold it.
+export function parseTermList(text: string, where = "the private terms file"): { terms: RegExp[]; longestPlain: number } {
   const terms: RegExp[] = [];
+  let longestPlain = 0;
   text.replace(/\r\n/g, "\n").split("\n").forEach((line, i) => {
     const t = line.trim();
     if (!t || t.startsWith("#")) return;
@@ -183,12 +214,15 @@ export function parseTerms(text: string, where = "the private terms file"): RegE
       terms.push(re);
     } else {
       // The term as written, and folded when that differs (an accented term matches plain text).
+      const len = Math.max(t.length, fold(t).length);
+      if (len > MATCH_SPAN / 2) throw new Error(`${where}:${i + 1}: a term longer than ${MATCH_SPAN / 2} characters`);
+      longestPlain = Math.max(longestPlain, len);
       terms.push(wholeWord(escapeRe(t)));
       if (fold(t) !== t.toLowerCase()) terms.push(wholeWord(escapeRe(fold(t))));
     }
   });
   if (!terms.length) throw new Error(`${where} has no terms, so nothing is exported`);
-  return terms;
+  return { terms, longestPlain };
 }
 
 const list = (v: unknown, name: string): string[] => {
@@ -209,14 +243,19 @@ export function makePolicy(termsText: string, config: ExporterConfig = {}, env: 
   const names = [...list(config.names, "names"), ...envList(env.SURFACE_NAMES)];
   const areas = list(config.areas, "areas").map(fold);
   const allow = [...COMMON_WORDS, ...DEFAULT_ALLOW_WORDS, ...list(config.allow_words, "allow_words")].map(fold);
+  const { terms, longestPlain } = parseTermList(termsText);
+  // A stem of more than one word ("urgent care") matches any run of spaces between its words.
+  const stemRe = (x: string) => fold(x).split(/\s+/).map(escapeRe).join("\\s+");
   return {
-    terms: parseTerms(termsText),
-    stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map((x) => escapeRe(fold(x))).join("|")})`, "iu"),
+    terms,
+    stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map(stemRe).join("|")})`, "iu"),
     owners: [...DEFAULT_OWNER_NAMES, ...ownerNames].map(fold),
     ownerNames,
     names,
     areas,
     allowWords: new Set(allow),
+    vocabulary: new Set([...allow, ...CALENDAR_WORDS, ...OUTPUT_WORDS]),
+    overlap: Math.max(MATCH_OVERLAP, longestPlain + 1),
   };
 }
 
@@ -281,17 +320,43 @@ export function replaceNames(text: string, policy: Pick<Policy, "ownerNames" | "
 export function properNounGate(text: string, allow: Set<string>): { text: string; words: string[] } {
   const words: string[] = [];
   const allowed = (w: string) => allow.has(fold(w).replace(/\u2019/g, "'"));
-  const out = text.replace(TOKEN, (tok) => {
+  const out = text.replace(TOKEN, (tok: string, at: number) => {
     if (!/^\p{Lu}/u.test(tok)) return tok;
     const poss = /['\u2019][sS]$/.test(tok);
     const bare = poss ? tok.slice(0, -2) : tok;
     if (allowed(tok) || allowed(bare)) return tok;
+    // A month or weekday stays only next to a number or a date.
+    if (!poss && CALENDAR_WORDS.includes(fold(tok)) && nextToNumber(text, at, tok.length)) return tok;
     const parts = bare.split("-");
     if (parts.length > 1 && parts.every(allowed)) return tok;
     words.push(tok);
     return poss ? "someone's" : "someone";
   });
   return { text: out, words };
+}
+
+// A number or a date right before ("3 May", "the 3rd of May", "2026-11-20, Friday") or right after
+// ("May 5", "June 2026", "Friday, the 20th") a word at text[at, at + len).
+export function nextToNumber(text: string, at: number, len: number): boolean {
+  const before = text.slice(Math.max(0, at - 40), at);
+  const after = text.slice(at + len, at + len + 40);
+  return /\p{Nd}(?:st|nd|rd|th)?(?:\s+of)?[\s,]*$/iu.test(before) || /^[\s,]*(?:the\s+)?\p{Nd}/iu.test(after);
+}
+
+// Lower-case and uncased words not in the vocabulary (the allow words, the months and weekdays, and
+// the words the exporter puts in): listed in the dry run's private report for the owner to read, and
+// under --strict a failure when they are in waits_for. A word with a digit in it is not listed.
+export function unknownTokens(text: string, vocabulary: Set<string>): string[] {
+  const out: string[] = [];
+  const known = (w: string) => vocabulary.has(fold(w).replace(/\u2019/g, "'"));
+  for (const m of text.matchAll(TOKEN)) {
+    const tok = m[0];
+    if (/^\p{Lu}/u.test(tok) || /\p{N}/u.test(tok)) continue;
+    const bare = /['\u2019][sS]$/.test(tok) ? tok.slice(0, -2) : tok;
+    if (known(tok) || known(bare) || bare.split(/[-'\u2019]/).every(known)) continue;
+    out.push(tok);
+  }
+  return out;
 }
 
 // The private marker: a `#private` tag anywhere in the row, or a Private column whose cell is
@@ -305,22 +370,33 @@ export function markedPrivate(cells: Record<string, string>, raw: string): boole
 
 // A row is left out when any text, in its normal form and folded, has a stem, a private term or
 // money in it.
+// A text longer than MATCH_SPAN (in its normal form or folded) fails closed: it is left out, never
+// matched in chunks a pattern could straddle.
 export function isExcluded(policy: Policy, ...texts: (string | null | undefined)[]): boolean {
   return texts.some((t) => {
     if (!t) return false;
+    if (oversize(t)) return true;
     const n = normalise(t);
     const f = fold(t);
-    return policy.stems.test(f) || policy.terms.some((re) => matchesBounded(re, n) || matchesBounded(re, f)) || namesMoney(t) || namesLongNumber(t);
+    return (
+      policy.stems.test(f) ||
+      policy.terms.some((re) => matchesBounded(re, n, policy.overlap) || matchesBounded(re, f, policy.overlap)) ||
+      namesMoney(t) ||
+      namesLongNumber(t)
+    );
   });
 }
 
-// A private term runs over at most MATCH_SPAN characters at a time: a longer cell is checked in
-// overlapping chunks, so one pattern never runs over the whole of a huge cell.
+// A private term runs over at most MATCH_SPAN characters at a time. A cell longer than that is left
+// out whole (oversize); matchesBounded's chunks, overlapping by more than the longest plain term, are
+// a second line only.
 export const MATCH_SPAN = 4000;
-const MATCH_OVERLAP = 400;
-export function matchesBounded(re: RegExp, text: string): boolean {
+export const MATCH_OVERLAP = 400;
+export const oversize = (t: string) => normalise(t).length > MATCH_SPAN || fold(t).length > MATCH_SPAN;
+export function matchesBounded(re: RegExp, text: string, overlap = MATCH_OVERLAP): boolean {
   if (text.length <= MATCH_SPAN) return re.test(text);
-  for (let i = 0; i < text.length; i += MATCH_SPAN - MATCH_OVERLAP) {
+  if (overlap >= MATCH_SPAN) throw new Error("matchesBounded: the overlap must be under the chunk size");
+  for (let i = 0; i < text.length; i += MATCH_SPAN - overlap) {
     if (re.test(text.slice(i, i + MATCH_SPAN))) return true;
     if (i + MATCH_SPAN >= text.length) break;
   }
@@ -545,34 +621,109 @@ export function stateOf(row: OpenRow, hold: Hold | undefined, owners: string[] =
 
 // The area: the project folder the Item names, only when it passes the same checks as the cells
 // (the private marker, the stems and terms, money) and is on the config's `areas` list; any other
-// folder, or none, is "other".
-export function areaOf(item: string, policy?: Policy): string {
+// folder, or none, is "other". The areas list is the primary control on what an area may be.
+export function areaOf(item: string, policy?: Policy): GatedText {
   const m = normalise(item).match(/\bprojects\/([A-Za-z0-9][A-Za-z0-9_-]*)/);
-  if (!m || !policy) return "other";
+  if (!m || !policy) return mark("other");
   const folder = m[1];
   // A folder name that is itself an identifier (a code, a number) is not shown.
-  if (strip(folder) !== folder || /^[a-z]{1,3}\d+$/i.test(folder) || /\d{3,}/.test(folder)) return "other";
-  if (PRIVATE_TAG.test(folder) || isExcluded(policy, folder, folder.replace(/[-_]+/g, " "))) return "other";
+  if (strip(folder) !== folder || /^[a-z]{1,3}\d+$/i.test(folder) || /\d{3,}/.test(folder)) return mark("other");
+  if (PRIVATE_TAG.test(folder) || isExcluded(policy, folder, folder.replace(/[-_]+/g, " "))) return mark("other");
   const f = fold(folder);
-  return policy.areas.includes(f) ? f : "other";
+  return mark(policy.areas.includes(f) ? f : "other");
+}
+
+// --- one sanitise pipeline, and the gated type ------------------------------------------------
+
+// Every string the exporter signs is a GatedText: made only by the functions below, each the one
+// way its kind of value leaves (free text through sanitise, the rest from fixed lists or checked
+// shapes). signSnapshot walks the whole signed object and refuses any string that isn't one, so a
+// field added later can't skip the pipeline.
+declare const GATED: unique symbol;
+export type GatedText = string & { readonly [GATED]: true };
+const gatedValues = new Set<string>();
+function mark(s: string): GatedText {
+  gatedValues.add(s);
+  return s as GatedText;
+}
+export const isGated = (s: string) => gatedValues.has(s);
+
+// A record code for the id field, checked against its shape.
+export function gateId(id: string): GatedText {
+  if (!ID_RE.test(id)) throw new Error("gateId: not a record code");
+  return mark(id);
+}
+// A time, as the ISO form of a Date.
+export function gateTime(ms: number): GatedText {
+  return mark(new Date(ms).toISOString());
+}
+// One of the fixed words: a who, a state, the app or the purpose.
+const FIXED: readonly string[] = [...WHO, ...STATES, APP_ID, PURPOSE_SNAPSHOT];
+export function gateFixed<T extends string>(word: T): T & GatedText {
+  if (!FIXED.includes(word)) throw new Error("gateFixed: not a fixed word");
+  return mark(word) as T & GatedText;
+}
+
+export type TextField = "title" | "step" | "waits_for" | "outcome";
+
+// The one pipeline for free text: the normal form, identifiers stripped, every configured name
+// replaced, cut to the first sentence when capped, the proper-noun gate, and the cap again (a
+// replaced word is longer than most). Returns the text and what the gate replaced and the
+// lower-case or uncased words it doesn't know.
+export function sanitise(raw: string, policy: Policy, max?: number): { text: GatedText; capitalised: string[]; unknown: string[] } {
+  const named = replaceNames(strip(normalise(raw)), policy);
+  const g = properNounGate(max ? firstSentence(named, max) : named, policy.allowWords);
+  const text = max ? cutCodePoints(g.text, max) : g.text;
+  return { text: mark(text), capitalised: g.words, unknown: unknownTokens(text, policy.vocabulary) };
+}
+
+// Throws, naming the path only, when any string in the value isn't a GatedText.
+export function assertGated(value: unknown, path = "snapshot"): void {
+  if (typeof value === "string") {
+    if (!isGated(value)) throw new Error(`${path}: a string that did not pass the sanitise pipeline`);
+  } else if (Array.isArray(value)) value.forEach((v, i) => assertGated(v, `${path}[${i}]`));
+  else if (value && typeof value === "object")
+    for (const [k, v] of Object.entries(value)) assertGated(v, `${path}.${k}`);
+}
+
+export interface ExportThread extends Thread {
+  id: GatedText;
+  title: GatedText;
+  area: GatedText;
+  who: Who & GatedText;
+  step: GatedText;
+  waits_for: GatedText | null;
+  outcome: GatedText;
+  last_moved: GatedText;
+  state: State & GatedText;
+}
+
+export interface ExportSigned extends Signed {
+  app: typeof APP_ID & GatedText;
+  purpose: typeof PURPOSE_SNAPSHOT & GatedText;
+  made_at: GatedText;
+  threads: ExportThread[];
 }
 
 // Every cell of a row, for the privacy checks: all columns, the id included.
 const allCells = (row: OpenRow) => [row.raw, ...Object.values(row.cells)];
 
-// A capitalised word the proper-noun gate replaced: its field and the word, never more.
+// A word found in an exported text: its field and the word, never more. A capitalised word the
+// proper-noun gate replaced, or a lower-case or uncased word not in the vocabulary.
 export interface Leftover {
-  field: "title" | "step" | "waits_for" | "outcome";
+  field: TextField;
   word: string;
 }
 
 export type Outcome =
-  | { kind: "thread"; thread: Thread; leftovers: Leftover[] }
-  | { kind: "excluded" }
+  | { kind: "thread"; thread: ExportThread; leftovers: Leftover[]; unknowns: Leftover[] }
+  | { kind: "excluded"; warning?: string }
   | { kind: "skipped"; reason: string };
 
 export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], policy: Policy): Outcome {
   if (markedPrivate(row.cells, row.raw)) return { kind: "excluded" };
+  // A cell too long to match whole is left out, and named as a warning (so --strict fails on it).
+  if (allCells(row).some(oversize)) return { kind: "excluded", warning: `a cell longer than ${MATCH_SPAN} characters` };
   if (isExcluded(policy, ...allCells(row))) return { kind: "excluded" };
   if (!ID_RE.test(row.id)) return { kind: "skipped", reason: "no valid id" };
   const since = toTime(row.since);
@@ -580,78 +731,108 @@ export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], 
   const times = [since, ...notes.map(toTime), toTime(hold?.taken), toTime(hold?.renewed)].filter(
     (t): t is number => t !== null,
   );
-  // Classified first (who and state read the names), then, on the one normal form, the
-  // identifiers stripped, every name replaced, and any capitalised word left gated.
+  // Classified first (who and state read the names), then every text through the one pipeline.
   const leftovers: Leftover[] = [];
-  // Title and step are cut to their first sentence before the gate, so only what is exported counts.
-  const clean = (field: Leftover["field"], t: string, max?: number) => {
-    const named = replaceNames(strip(normalise(t)), policy);
-    const g = properNounGate(max ? firstSentence(named, max) : named, policy.allowWords);
-    for (const word of g.words) leftovers.push({ field, word });
-    // A replaced word is longer than most, so the cap holds again after the gate.
-    return max ? cutCodePoints(g.text, max) : g.text;
+  const unknowns: Leftover[] = [];
+  const clean = (field: TextField, t: string, max?: number) => {
+    const r = sanitise(t, policy, max);
+    for (const word of r.capitalised) leftovers.push({ field, word });
+    for (const word of r.unknown) unknowns.push({ field, word });
+    return r.text;
   };
   const waits = row.waits === null ? null : clean("waits_for", row.waits) || null;
   return {
     kind: "thread",
     thread: {
-      id: row.id,
+      id: gateId(row.id),
       title: clean("title", row.item, TITLE_MAX),
       area: areaOf(row.item, policy),
-      who: whoOf(row, hold, policy.owners),
+      who: gateFixed(whoOf(row, hold, policy.owners)),
       step: clean("step", row.next, STEP_MAX),
       waits_for: waits,
       outcome: clean("outcome", row.done_when),
-      last_moved: new Date(Math.max(...times)).toISOString(),
-      state: stateOf(row, hold, policy.owners),
+      last_moved: gateTime(Math.max(...times)),
+      state: gateFixed(stateOf(row, hold, policy.owners)),
     },
     leftovers,
+    unknowns,
   };
 }
 
-// A capitalised word the gate replaced, where it was: the path and row number, the field and the word.
+// A word found, where it was: the path and row number, the field and the word.
 export interface LeftoverAt extends Leftover {
   where: string;
 }
 
 export interface Built {
-  snapshot: Signed;
-  // One line per malformed row: path and row number, never the row's text.
+  snapshot: ExportSigned;
+  // One line per malformed or oversized row: path and row number, never the row's text.
   warnings: string[];
   // Each capitalised word the gate replaced. Only the private dry-run report prints the word;
   // a --strict failure prints the place and the field (leftoverPlace).
   leftovers: LeftoverAt[];
+  // Each lower-case or uncased word not in the vocabulary, the same way.
+  unknowns: LeftoverAt[];
+  // How many exported threads each area has ("other" included). Area names are on the config's list.
+  areas: Record<string, number>;
 }
 
 export const leftoverPlace = (l: LeftoverAt) => `${l.where}: ${l.field}`;
 export const leftoverLine = (l: LeftoverAt) => `${l.where}: ${l.field}: ${l.word}`;
 
+// What fails a --strict run (and so every --put): a warning (a malformed or oversized row), a
+// capitalised word the gate replaced, or an unknown word in waits_for. Places only, never words.
+export function strictProblems(b: Built): { warnings: string[]; leftovers: LeftoverAt[]; waitsUnknown: LeftoverAt[] } {
+  return { warnings: b.warnings, leftovers: b.leftovers, waitsUnknown: b.unknowns.filter((u) => u.field === "waits_for") };
+}
+export const strictFails = (b: Built) => {
+  const p = strictProblems(b);
+  return p.warnings.length + p.leftovers.length + p.waitsUnknown.length > 0;
+};
+
 export function buildSnapshot(record: string, policy: Policy, now = new Date()): Built {
   const path = join(record, "state", "PENDING.md");
   const pending = readFileSync(path, "utf8");
   const holds = readHolds(record);
-  const threads: Thread[] = [];
+  const threads: ExportThread[] = [];
   const warnings: string[] = [];
   const leftovers: LeftoverAt[] = [];
+  const unknowns: LeftoverAt[] = [];
+  const areas: Record<string, number> = {};
   let excluded = 0;
   let skipped = 0;
   for (const r of openTable(pending).rows) {
     const row = toOpenRow(r);
     const okId = ID_RE.test(row.id);
     const out = threadOf(row, okId ? holds[row.id] : undefined, okId ? noteTimes(record, row.id) : [], policy);
+    const where = `${path}:${row.line}`;
     if (out.kind === "thread") {
       threads.push(out.thread);
-      for (const l of out.leftovers) leftovers.push({ ...l, where: `${path}:${row.line}` });
-    } else if (out.kind === "excluded") excluded++;
-    else {
+      areas[out.thread.area] = (areas[out.thread.area] ?? 0) + 1;
+      for (const l of out.leftovers) leftovers.push({ ...l, where });
+      for (const u of out.unknowns) unknowns.push({ ...u, where });
+    } else if (out.kind === "excluded") {
+      excluded++;
+      if (out.warning) warnings.push(`${where}: row left out, ${out.warning}`);
+    } else {
       skipped++;
-      warnings.push(`${path}:${row.line}: row skipped, ${out.reason}`);
+      warnings.push(`${where}: row skipped, ${out.reason}`);
     }
   }
   return {
-    snapshot: { version: 1, made_at: now.toISOString(), threads, excluded_rows: excluded, skipped_rows: skipped },
+    snapshot: {
+      version: SNAPSHOT_VERSION,
+      app: gateFixed(APP_ID),
+      purpose: gateFixed(PURPOSE_SNAPSHOT),
+      made_at: gateTime(now.getTime()),
+      threads,
+      excluded_rows: excluded,
+      skipped_rows: skipped,
+    },
     warnings,
     leftovers,
+    unknowns,
+    areas,
   };
 }
 
@@ -674,13 +855,22 @@ export function keyId(raw: Uint8Array): string {
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
 }
 
+// The snapshot's identity (the same as shared/snapshot.ts snapshotId): the first 32 hex digits of
+// the SHA-256 of its signed bytes.
+export function snapshotIdOf(s: Signed): string {
+  return createHash("sha256").update(signedBytes(s)).digest("hex").slice(0, 32);
+}
+
 export function privateKey(pem: string): KeyObject {
   const k = createPrivateKey(pem);
   if (k.asymmetricKeyType !== "ed25519") throw new Error("not an Ed25519 private key");
   return k;
 }
 
-export function signSnapshot(s: Signed, key: KeyObject): Snapshot {
+// Signs only what passed the pipeline: any string in the signed object that isn't a GatedText is
+// refused, so nothing unsanitised can be signed.
+export function signSnapshot(s: ExportSigned, key: KeyObject): Snapshot {
+  assertGated(s);
   const pub = rawPublicKey(createPublicKey(key).export({ format: "pem", type: "spki" }).toString());
   const sig = sign(null, signedBytes(s), key);
   return { ...s, sig: toBase64(new Uint8Array(sig)), key_id: keyId(pub) };

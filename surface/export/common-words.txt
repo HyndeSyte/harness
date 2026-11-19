@@ -1,8 +1,10 @@
 # Common English words a capitalised token may be without counting as a name (surface/README.md,
 # the proper-noun gate). One a line, lower case; `#` for a note line. Function words, pronouns,
-# common imperative and ordinary verbs, weekdays and months. No names: words that are also common
-# first names (will, mark, bill, grace, hope, rose, chase, drew, frank, pat, rob, sue, art) are left
-# out on purpose. The owner's config adds more (allow_words).
+# common imperative and ordinary verbs. No names: words that are also common first names or
+# surnames (name-words.txt: may, june, will, mark, grace, rose, cook, post and the like) are left
+# out, and a test keeps the two lists apart. Months and weekdays are not here: the gate lets one
+# stand only next to a number or a date (lib.ts, CALENDAR_WORDS). The owner's config adds more
+# (allow_words).
 
 # articles, conjunctions, prepositions and other function words
 a
@@ -213,7 +215,6 @@ should
 would
 must
 might
-may
 # contractions
 don't
 doesn't
@@ -276,7 +277,6 @@ collect
 come
 confirm
 copy
-cook
 cover
 cut
 decide
@@ -330,7 +330,6 @@ pick
 plan
 plant
 plug
-post
 prepare
 print
 prune
@@ -390,25 +389,6 @@ water
 work
 wrap
 write
-# weekdays and months
-monday
-tuesday
-wednesday
-thursday
-friday
-saturday
-sunday
-january
-february
-march
-april
-june
-july
-august
-september
-october
-november
-december
 # titles before a name (the name after them is still gated)
 mr
 mrs

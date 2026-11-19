@@ -5,13 +5,31 @@
 // bun run surface/export --record ... --key <private key PEM> --put <url> [--out <file>] [--strict]
 //   (the Access and publisher values come from SURFACE_ACCESS_CLIENT_ID, SURFACE_ACCESS_CLIENT_SECRET
 //   and SURFACE_PUBLISHER_TOKEN, never from flags or files; the URL's host must be SURFACE_PUT_HOST)
+// bun run surface/export --record ... --dry-run [--report <file>]   (the private word list goes to <file>, mode 0600)
 // bun run surface/export --verify <file> --pub <public key: PEM or raw base64>
+// bun run surface/export --key-match --key <private key PEM> --pub <file or comma-separated raw base64 keys>
 // bun run surface/export --keygen <dir>   (writes surface.key, surface.pub, surface.pub.b64)
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
-import { verifySnapshot } from "../shared/snapshot";
-import { buildSnapshot, configProblem, leftoverLine, leftoverPlace, makeKeyPair, makePolicy, privateKey, rawPublicKey, signSnapshot, type ExporterConfig } from "./lib";
+import { createPublicKey } from "node:crypto";
+import { parseKeyList, verifySnapshot } from "../shared/snapshot";
+import {
+  buildSnapshot,
+  configProblem,
+  keyId,
+  leftoverLine,
+  leftoverPlace,
+  makeKeyPair,
+  makePolicy,
+  privateKey,
+  rawPublicKey,
+  signSnapshot,
+  snapshotIdOf,
+  strictProblems,
+  type Built,
+  type ExporterConfig,
+} from "./lib";
 
 function arg(args: string[], name: string): string | undefined {
   const i = args.indexOf(name);
@@ -28,8 +46,18 @@ export const PUT_HOST_ENV = "SURFACE_PUT_HOST";
 export const REDIRECTED = "Access redirected: the service token or its Service Auth policy is wrong";
 // How much of the Worker's message is printed.
 export const MESSAGE_MAX = 200;
-// The first line of the dry run's leftover-word report, which holds words from the record.
-export const PRIVATE_REPORT = "PRIVATE, not for posting: capitalised words from the record that the gate replaced (path:row: field: word). Read them here; never paste them anywhere.";
+// The first line of the dry run's private report file, which holds words from the record.
+export const PRIVATE_REPORT =
+  "PRIVATE, not for posting or relaying: words from the record (path:row: field: word). Read them on this machine; never paste, send or relay them anywhere, and delete this file when done.";
+// The most the Worker takes (worker/src/index.ts MAX_BYTES): a bigger body is refused before sending.
+export const PUT_MAX_BYTES = 512 * 1024;
+// How many times a lost response is reconciled by sending the same signed bytes again.
+export const RECONCILE_TRIES = 3;
+// The uploader's exit codes: its own preflight refused (nothing sent), the server refused, or the
+// outcome is unknown (the response was lost and reconciling didn't settle it).
+export const EXIT_PREFLIGHT = 2;
+export const EXIT_REJECTED = 1;
+export const EXIT_UNKNOWN = 3;
 
 const USAGE = `usage:
   bun run surface/export --record <record checkout> --private-terms <file> --out <file> --key <private key PEM>
@@ -39,15 +67,19 @@ const USAGE = `usage:
       (with SURFACE_PUT_HOST, SURFACE_ACCESS_CLIENT_ID, SURFACE_ACCESS_CLIENT_SECRET and
       SURFACE_PUBLISHER_TOKEN set; --put implies --strict)
   bun run surface/export --record <record checkout> --private-terms <file> --dry-run [--config <file>] [--strict]
+      [--report <file>]   (the private word list, written with mode 0600; without it, counts only)
   bun run surface/export --verify <file> --pub <public key file>
+  bun run surface/export --key-match --key <private key PEM> --pub <file or comma-separated raw base64 keys>
   bun run surface/export --keygen <dir>`;
 
 export interface IO {
   fetch: (url: string, init: RequestInit) => Promise<Response>;
   env: Record<string, string | undefined>;
+  // Waits between reconciling tries (tests pass one that doesn't wait).
+  sleep?: (ms: number) => Promise<void>;
 }
 
-const defaultIO: IO = { fetch: (url, init) => fetch(url, init), env: process.env };
+const defaultIO: IO = { fetch: (url, init) => fetch(url, init), env: process.env, sleep: (ms) => new Promise((r) => setTimeout(r, ms)) };
 
 // The --put URL's own checks, before any request: https, no credentials in it, its host is
 // exactly SURFACE_PUT_HOST, and its path is exactly /snapshot with no query or fragment. Returns a one-line reason, or null.
@@ -72,12 +104,33 @@ export function putUrlProblem(raw: string, env: Record<string, string | undefine
 // Printable, one line, bounded: nothing from the response but the Worker's own JSON message.
 const oneLine = (s: string) => s.replace(/[\p{C}]+/gu, " ").replace(/\s+/g, " ").trim().slice(0, MESSAGE_MAX);
 
-// Sends a signed snapshot: the Access service token's two headers (checked by Access) and the
-// publisher header (checked by the Worker). Never follows a redirect, never prints a header, and
-// prints the status and at most 200 characters of the Worker's JSON message.
-async function upload(url: string, body: string, io: IO): Promise<number> {
-  const u = new URL(url);
-  const where = `PUT ${u.origin}${u.pathname}`;
+// What came of one upload. preflight: refused here, nothing sent. rejected: the server answered
+// and refused it (a 4xx, or a redirect from Access). stored: the server answered 2xx with this
+// snapshot's identity. unknown: no answer, a 5xx, an answer that can't be read, or a 2xx naming
+// another identity; the snapshot may or may not be stored.
+export type UploadOutcome =
+  | { kind: "preflight"; reason: string }
+  | { kind: "rejected"; status: number; message: string }
+  | { kind: "stored"; status: number; message: string; id: string }
+  | { kind: "unknown"; why: string };
+
+// The uploader's own checks on the body, before anything is sent: its size, and that it verifies
+// under its own key with its own identity. Returns a reason, or null.
+export async function uploadPreflight(body: string, pub: Uint8Array): Promise<string | null> {
+  if (new TextEncoder().encode(body).byteLength > PUT_MAX_BYTES) return `the snapshot is over ${PUT_MAX_BYTES} bytes`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return "the snapshot is not JSON";
+  }
+  if (!(await verifySnapshot(parsed, pub))) return "the snapshot does not verify under its own key";
+  return null;
+}
+
+// Sends a signed snapshot once: the Access service token's two headers (checked by Access) and the
+// publisher header (checked by the Worker). Never follows a redirect, never prints a header.
+async function putOnce(url: string, body: string, id: string, io: IO): Promise<UploadOutcome> {
   let res: Response;
   try {
     res = await io.fetch(url, {
@@ -92,24 +145,63 @@ async function upload(url: string, body: string, io: IO): Promise<number> {
       },
     });
   } catch (e: any) {
-    console.error(`${where}: no answer (${oneLine(String(e?.message ?? e))})`);
-    return 1;
+    return { kind: "unknown", why: `no answer (${oneLine(String(e?.message ?? e))})` };
   }
-  if (res.type === "opaqueredirect" || res.redirected || res.status === 0 || (res.status >= 300 && res.status < 400)) {
-    console.error(`${where}: ${res.status} ${REDIRECTED}; nothing stored.`);
-    return 1;
+  if (res.type === "opaqueredirect" || res.redirected || res.status === 0 || (res.status >= 300 && res.status < 400))
+    return { kind: "rejected", status: res.status, message: REDIRECTED };
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    return { kind: "unknown", why: `${res.status}, and the answer was cut off` };
   }
-  const text = await res.text().catch(() => "");
   let message = "";
+  let gotId: string | undefined;
   try {
     const j = JSON.parse(text);
-    if (j && typeof j === "object")
+    if (j && typeof j === "object") {
       message = typeof j.error === "string" ? j.error : typeof j.stored === "string" ? `stored ${j.stored}` : "";
+      if (typeof j.id === "string") gotId = j.id;
+    }
   } catch {}
   message = oneLine(message);
-  const ok = res.status >= 200 && res.status < 300;
-  (ok ? console.log : console.error)(`${where}: ${res.status}${message ? " " + message : ""}`);
-  return ok ? 0 : 1;
+  if (res.status >= 500) return { kind: "unknown", why: `${res.status}${message ? " " + message : ""}` };
+  if (res.status >= 200 && res.status < 300) {
+    if (gotId === id) return { kind: "stored", status: res.status, message, id };
+    return { kind: "unknown", why: `${res.status}, but the answer names another snapshot` };
+  }
+  return { kind: "rejected", status: res.status, message };
+}
+
+// Uploads, and on an unknown outcome (a lost response) reconciles by the signed identity: the same
+// signed bytes are sent again, and the Worker answers with the identity it holds (the same snapshot
+// already stored is a 200 naming it). Prints one line per try and a last line naming the outcome.
+export async function upload(url: string, body: string, id: string, io: IO): Promise<UploadOutcome> {
+  const u = new URL(url);
+  const where = `PUT ${u.origin}${u.pathname}`;
+  const sleep = io.sleep ?? defaultIO.sleep!;
+  let out: UploadOutcome = { kind: "unknown", why: "not sent" };
+  for (let i = 0; i < RECONCILE_TRIES; i++) {
+    if (i > 0) {
+      console.error(`${where}: the outcome is unknown; reconciling by sending the same signed snapshot again (${i + 1} of ${RECONCILE_TRIES})`);
+      await sleep(1000 * 2 ** (i - 1));
+    }
+    out = await putOnce(url, body, id, io);
+    if (out.kind === "stored") {
+      console.log(`${where}: ${out.status}${out.message ? " " + out.message : ""} (snapshot ${id})`);
+      return out;
+    }
+    if (out.kind === "rejected") {
+      console.error(`${where}: ${out.status}${out.message ? " " + out.message : ""}`);
+      console.error(`upload: server rejection; nothing stored.`);
+      return out;
+    }
+    console.error(`${where}: ${out.why}`);
+  }
+  console.error(
+    `upload: unknown remote outcome: snapshot ${id} may or may not be stored. Run the same export again later; it reconciles by this identity.`,
+  );
+  return out;
 }
 
 export async function main(args: string[], io: IO = defaultIO): Promise<number> {
@@ -134,6 +226,7 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
     console.log(ok ? "verified" : "NOT verified");
     return ok ? 0 : 1;
   }
+  if (args.includes("--key-match")) return keyMatch(args);
   const record = arg(args, "--record");
   const out = arg(args, "--out");
   const key = arg(args, "--key");
@@ -141,6 +234,9 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
   const configFile = arg(args, "--config");
   const putUrl = arg(args, "--put");
   const dryRun = args.includes("--dry-run");
+  const report = arg(args, "--report");
+  if (args.includes("--report") && (!report || report.startsWith("--"))) return (console.error(USAGE), 2);
+  if (report && !dryRun) return (console.error("--report goes only with --dry-run; nothing written.\n" + USAGE), 2);
   // --put implies --strict: nothing leaves with a malformed row or a capitalised word left.
   const strict = args.includes("--strict") || args.includes("--put");
   // A dry run writes and sends nothing, so --put and --out don't go with it.
@@ -151,11 +247,11 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
   if (putUrl) {
     // Every value the upload needs is checked before anything is read or sent.
     const bad = putUrlProblem(putUrl, io.env);
-    if (bad) return (console.error(`${bad}; nothing sent.`), 2);
+    if (bad) return (console.error(`${bad}; upload: preflight rejection, nothing sent.`), EXIT_PREFLIGHT);
     const missing = PUT_ENV.filter((k) => !(io.env[k] ?? "").trim());
     if (missing.length) {
-      console.error(`--put needs ${missing.join(", ")} in the environment; nothing sent.`);
-      return 2;
+      console.error(`--put needs ${missing.join(", ")} in the environment; upload: preflight rejection, nothing sent.`);
+      return EXIT_PREFLIGHT;
     }
   }
   // Every check below runs the same in a dry run. Fail closed: no private terms file, or one with
@@ -200,13 +296,16 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
     return 1;
   }
   const s = built.snapshot;
-  if (strict && (built.warnings.length || built.leftovers.length)) {
-    for (const w of built.warnings) console.error("warning: " + w);
+  const problems = strictProblems(built);
+  if (strict && (problems.warnings.length || problems.leftovers.length || problems.waitsUnknown.length)) {
+    for (const w of problems.warnings) console.error("warning: " + w);
     // The field and the row number only, never the word.
-    for (const l of built.leftovers) console.error("capitalised word not on the allow list: " + leftoverPlace(l));
+    for (const l of problems.leftovers) console.error("capitalised word not on the allow list: " + leftoverPlace(l));
+    for (const l of problems.waitsUnknown) console.error("unknown word in waits_for: " + leftoverPlace(l));
     console.error(
-      `--strict: ${built.warnings.length} malformed row(s), ${built.leftovers.length} capitalised word(s) not on the allow list; nothing written.` +
-        (built.leftovers.length ? " A dry run lists the words privately." : ""),
+      `--strict: ${problems.warnings.length} row warning(s), ${problems.leftovers.length} capitalised word(s) not on the allow list, ` +
+        `${problems.waitsUnknown.length} unknown word(s) in waits_for; nothing written.` +
+        (problems.leftovers.length || problems.waitsUnknown.length ? " A dry run with --report lists the words privately." : ""),
     );
     return 1;
   }
@@ -215,27 +314,103 @@ export async function main(args: string[], io: IO = defaultIO): Promise<number> 
     // For the owner to read before the first upload: exactly what would be signed.
     console.log(JSON.stringify(s, null, 2));
     console.error(`Dry run: ${s.threads.length} threads, ${s.excluded_rows} rows left out, ${s.skipped_rows} skipped. Nothing written.`);
-    if (built.leftovers.length) {
-      // Words from the record: stderr only, under a line that says so.
-      console.error(PRIVATE_REPORT);
-      for (const l of built.leftovers) console.error(leftoverLine(l));
+    // Per area, the config's areas list being the primary control on what an area may be.
+    console.error(`Dry run, threads per area: ${areaLine(built)}.`);
+    console.error(
+      `Dry run: ${built.leftovers.length} capitalised word(s) replaced, ${built.unknowns.length} lower-case or uncased word(s) not in the word list.`,
+    );
+    // The words themselves never go to stderr or stdout: only to a private file, on request.
+    if (report) {
+      try {
+        writePrivate(report, reportText(built));
+      } catch {
+        console.error(`${report}: the private report could not be written; nothing written.`);
+        return 2;
+      }
+      console.error(`Dry run: the private word list is in ${report} (mode 0600). Never relay it.`);
+    } else if (built.leftovers.length || built.unknowns.length) {
+      console.error("Dry run: pass --report <file> to write the words to a private file (mode 0600).");
     }
     return 0;
   }
   if (built.leftovers.length)
-    console.error(`${built.leftovers.length} capitalised word(s) replaced by "someone"; a dry run lists them privately.`);
+    console.error(`${built.leftovers.length} capitalised word(s) replaced by "someone"; a dry run with --report lists them privately.`);
   const snapshot = signSnapshot(s, signingKey!);
   const body = JSON.stringify(snapshot, null, 2) + "\n";
   // With --put the file is written only once the upload is stored, so a failed run leaves it as it was.
   if (putUrl) {
-    const code = await upload(putUrl, body, io);
-    if (code !== 0) return code;
+    const own = rawPublicKey(createPublicKey(signingKey!).export({ format: "pem", type: "spki" }).toString());
+    const pre = await uploadPreflight(body, own);
+    if (pre) {
+      console.error(`--put: ${pre}; upload: preflight rejection, nothing sent.`);
+      return EXIT_PREFLIGHT;
+    }
+    const result = await upload(putUrl, body, snapshotIdOf(s), io);
+    if (result.kind === "rejected") return EXIT_REJECTED;
+    if (result.kind !== "stored") return EXIT_UNKNOWN;
   }
   if (out) {
     writeWhole(out, body);
     console.log(`Wrote ${snapshot.threads.length} threads to ${out} (${s.excluded_rows} left out, ${s.skipped_rows} skipped).`);
   }
   return 0;
+}
+
+// "surface 2, garden 1, other 5": the exported threads per area.
+export function areaLine(b: Built): string {
+  const parts = Object.entries(b.areas)
+    .sort(([a], [b2]) => (a === "other" ? 1 : b2 === "other" ? -1 : a.localeCompare(b2)))
+    .map(([a, n]) => `${a} ${n}`);
+  return parts.length ? parts.join(", ") : "none";
+}
+
+// The dry run's private report: the warning line, then each word with its place.
+export function reportText(b: Built): string {
+  const lines = [PRIVATE_REPORT, "", `threads per area: ${areaLine(b)}`, "", "capitalised words the gate replaced:"];
+  for (const l of b.leftovers) lines.push(leftoverLine(l));
+  lines.push("", "lower-case or uncased words not in the word list:");
+  for (const l of b.unknowns) lines.push(leftoverLine(l));
+  return lines.join("\n") + "\n";
+}
+
+// Written with mode 0600 from the moment it exists: a new temporary file beside it (created
+// exclusively, so nothing is written through a link), then renamed over the path.
+export function writePrivate(path: string, text: string) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  try {
+    const fd = openSync(tmp, "wx", 0o600);
+    try {
+      writeSync(fd, text);
+    } finally {
+      closeSync(fd);
+    }
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+// Prints the private key's key id and whether it is among the given public keys (the Worker's
+// SNAPSHOT_PUBLIC_KEYS and the app's EXPO_PUBLIC_SURFACE_PUBLIC_KEY): exit 0 if it is, 1 if not.
+function keyMatch(args: string[]): number {
+  const key = arg(args, "--key");
+  const pub = arg(args, "--pub");
+  if (!key || !pub) return (console.error(USAGE), 2);
+  let mine: string;
+  try {
+    const k = privateKey(readFileSync(key, "utf8"));
+    mine = keyId(rawPublicKey(createPublicKey(k).export({ format: "pem", type: "spki" }).toString()));
+  } catch {
+    return (console.error(`${key}: not a readable Ed25519 private key`), 2);
+  }
+  const text = existsSync(pub) ? readFileSync(pub, "utf8") : pub;
+  const listed = text.includes("BEGIN") ? [rawPublicKey(text)] : parseKeyList(text.replace(/\s+/g, ","));
+  const ids = listed.map(keyId);
+  console.log(`exporter key ${mine}; listed: ${ids.join(", ") || "none"}`);
+  if (ids.includes(mine)) return (console.log("key match: the exporter's key is listed"), 0);
+  console.error("key match: the exporter's key is NOT listed");
+  return 1;
 }
 
 // Written whole or not at all: a temporary file beside it, then a rename.

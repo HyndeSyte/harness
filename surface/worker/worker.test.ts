@@ -6,8 +6,9 @@ import { main as exporter, REDIRECTED } from "../export/index";
 import { tempRecord } from "../export/fixtures/temp-record";
 import { wranglerProblems } from "./check-wrangler";
 import { buildSnapshot, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../export/lib";
-import { createWorker, MAX_BYTES, teamOf, type Env } from "./src/index";
+import { createWorker, MAX_BYTES, SnapshotStore, teamOf, type Env, type Stored } from "./src/index";
 
+const noWait = async () => {};
 // Made-up values only.
 const TEAM = "https://example-team.cloudflareaccess.com";
 const AUD = "aud-tag-example-0001";
@@ -16,9 +17,36 @@ const CLIENT_ID = "client-id-example.access";
 const PUBLISHER = "publisher-value-example";
 const NOW = Date.parse("2026-11-18T12:00:00Z");
 
-function memoryKV() {
-  const m = new Map<string, string>();
-  return { get: async (k: string) => m.get(k) ?? null, put: async (k: string, v: string) => void m.set(k, v), m };
+// The Durable Object, in memory: one SnapshotStore per name, its storage a Map, and
+// blockConcurrencyWhile a real lock (events wait their turn), as the runtime gives it.
+type Storage = { get: (k: string) => Promise<unknown>; put: (k: string, v: unknown) => Promise<void> };
+function memoryStore(over: Partial<Storage> = {}, delay = async () => {}) {
+  const maps = new Map<string, Map<string, unknown>>();
+  const objects = new Map<string, SnapshotStore>();
+  const mapOf = (name: string) => (maps.has(name) ? maps.get(name)! : (maps.set(name, new Map()), maps.get(name)!));
+  const objectOf = (name: string) => {
+    if (!objects.has(name)) {
+      const m = mapOf(name);
+      let chain: Promise<unknown> = Promise.resolve();
+      const storage: Storage = {
+        get: async (k) => (await delay(), m.get(k)),
+        put: async (k, v) => (await delay(), void m.set(k, structuredClone(v))),
+        ...over,
+      };
+      const state = {
+        storage,
+        blockConcurrencyWhile<T>(f: () => Promise<T>): Promise<T> {
+          const run = chain.then(f, f);
+          chain = run.catch(() => {});
+          return run;
+        },
+      };
+      objects.set(name, new SnapshotStore(state));
+    }
+    return objects.get(name)!;
+  };
+  const ns = { idFromName: (n: string) => n, get: (id: unknown) => ({ fetch: (r: Request) => objectOf(String(id)).fetch(r) }) };
+  return { ns, raw: (name = "latest") => mapOf(name), held: (name = "latest") => mapOf(name).get("latest") as Stored | undefined };
 }
 
 const keys = makeKeyPair();
@@ -26,9 +54,12 @@ const FIX = join(import.meta.dir, "..", "export", "fixtures");
 const policy = makePolicy(readFileSync(join(FIX, "private-terms.txt"), "utf8"), { owner_names: ["Robin"] });
 const snap = (when: string) =>
   signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(when)).snapshot, privateKey(keys.privatePem));
-const env = (): Env & { SNAPSHOTS: ReturnType<typeof memoryKV> } => ({
-  SNAPSHOTS: memoryKV(),
-  SNAPSHOT_PUBLIC_KEY: keys.publicRaw,
+function env(over: Partial<Storage> = {}, delay?: () => Promise<void>): Env & { store: ReturnType<typeof memoryStore> } {
+  const store = memoryStore(over, delay);
+  return { ...envBase(), STORE: store.ns, store };
+}
+const envBase = () => ({
+  SNAPSHOT_PUBLIC_KEYS: keys.publicRaw,
   ACCESS_TEAM_DOMAIN: TEAM,
   ACCESS_AUD: AUD,
   OWNER_EMAIL: OWNER,
@@ -101,7 +132,7 @@ describe("the store", () => {
     const s = snap("2026-11-18T12:00:00Z");
     s.threads[0].title = s.threads[0].title + "!";
     expect((await worker.fetch(await put(s), e)).status).toBe(403);
-    expect(e.SNAPSHOTS.m.size).toBe(0);
+    expect(e.store.held()).toBeUndefined();
   });
 
   test("tampered counts are refused", async () => {
@@ -126,7 +157,7 @@ describe("the store", () => {
     const res = await worker.fetch(await put(snap("2026-11-18T12:06:00Z")), e);
     expect(res.status).toBe(400);
     expect(((await res.json()) as any).error).toMatch(/5 minutes ahead/);
-    expect(e.SNAPSHOTS.m.size).toBe(0);
+    expect(e.store.held()).toBeUndefined();
     expect((await worker.fetch(await put(snap("2026-11-18T12:04:00Z")), e)).status).toBe(200);
   });
 
@@ -134,7 +165,7 @@ describe("the store", () => {
     const e = env();
     const s = { ...snap("2026-11-18T12:00:00Z"), extra: "not signed" };
     expect((await worker.fetch(await put(s), e)).status).toBe(200);
-    expect(JSON.parse(e.SNAPSHOTS.m.get("latest")!).extra).toBeUndefined();
+    expect((e.store.held()!.snapshot as any).extra).toBeUndefined();
   });
 
   test("the size limit counts bytes, not characters", async () => {
@@ -148,7 +179,7 @@ describe("the store", () => {
   });
 
   test("no public key configured refuses", async () => {
-    const e = { ...env(), SNAPSHOT_PUBLIC_KEY: "REPLACE_WITH_PUBLIC_KEY_BASE64" };
+    const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: "REPLACE_WITH_PUBLIC_KEY_BASE64" };
     expect((await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e)).status).toBe(500);
   });
 
@@ -161,7 +192,7 @@ describe("the store", () => {
 });
 
 describe("store faults are 503, never cached", () => {
-  const broken = (over: Partial<ReturnType<typeof memoryKV>>) => ({ ...env(), SNAPSHOTS: { ...memoryKV(), ...over } });
+  const broken = (over: Partial<Storage>) => env(over);
   const fail = async () => {
     throw new Error("kv down");
   };
@@ -180,11 +211,11 @@ describe("store faults are 503, never cached", () => {
   });
   test("a garbled stored value names the recovery", async () => {
     const e = env();
-    e.SNAPSHOTS.m.set("latest", "{garbled");
+    e.store.raw().set("latest", "{garbled");
     for (const r of [await get(), await put(snap("2026-11-18T12:00:00Z"))]) {
       const res = await worker.fetch(r, e);
       expect(res.status).toBe(503);
-      expect(((await res.json()) as any).error).toMatch(/delete the KV entry "latest"/);
+      expect(((await res.json()) as any).error).toMatch(/set the Worker variable STORE_NAME to a new name/);
     }
   });
 });
@@ -312,11 +343,22 @@ describe("wrangler.toml", () => {
   test("has workers_dev and preview_urls false", () => {
     expect(wranglerProblems(readFileSync(join(import.meta.dir, "wrangler.toml"), "utf8"))).toEqual([]);
   });
+  const DO = '[[durable_objects.bindings]]\nname = "STORE"\nclass_name = "SnapshotStore"\n[[migrations]]\ntag = "v1"\nnew_sqlite_classes = ["SnapshotStore"]\n';
   test("the check fails if either is missing or true", () => {
-    expect(wranglerProblems('name = "x"\nworkers_dev = false\n')).toEqual(["preview_urls is missing (it must be false)"]);
-    expect(wranglerProblems('workers_dev = true\npreview_urls = false\n')).toEqual(["workers_dev is true (it must be false)"]);
-    expect(wranglerProblems('workers_dev = false\npreview_urls = false\n[env.dev]\nworkers_dev = true\n')).toEqual([
+    expect(wranglerProblems('name = "x"\nworkers_dev = false\n' + DO)).toEqual(["preview_urls is missing (it must be false)"]);
+    expect(wranglerProblems('workers_dev = true\npreview_urls = false\n' + DO)).toEqual(["workers_dev is true (it must be false)"]);
+    expect(wranglerProblems('workers_dev = false\npreview_urls = false\n' + DO + '[env.dev]\nworkers_dev = true\n')).toEqual([
       "env.dev.workers_dev is true (it must be false)",
+    ]);
+  });
+  test("the check fails without the Durable Object, or with a KV namespace", () => {
+    const flags = "workers_dev = false\npreview_urls = false\n";
+    expect(wranglerProblems(flags)).toEqual([
+      "the Durable Object binding STORE to SnapshotStore is missing",
+      "no migration creates the SnapshotStore class",
+    ]);
+    expect(wranglerProblems(flags + '[[kv_namespaces]]\nbinding = "SNAPSHOTS"\nid = "x"\n' + DO)).toEqual([
+      "a KV namespace is configured; the store is the Durable Object",
     ]);
   });
 });
@@ -337,7 +379,7 @@ describe("Access on PUT", () => {
       const e = env();
       const r = await put(s(), { "cf-access-jwt-assertion": await serviceJwt(odd) });
       expect((await worker.fetch(r, e)).status).toBe(403);
-      expect(e.SNAPSHOTS.m.size).toBe(0);
+      expect(e.store.held()).toBeUndefined();
     }
     // The publisher header is still required with the id in sub.
     const r = await put(s(), { "cf-access-jwt-assertion": await serviceJwt({ common_name: undefined, sub: CLIENT_ID }), "x-surface-publisher": "wrong" });
@@ -356,7 +398,7 @@ describe("Access on PUT", () => {
     });
     expect((await worker.fetch(r, e)).status).toBe(403);
     expect((await worker.fetch(await put(s(), { "x-surface-publisher": "wrong" }), e)).status).toBe(403);
-    expect(e.SNAPSHOTS.m.size).toBe(0);
+    expect(e.store.held()).toBeUndefined();
   });
   test("no assertion at all can't upload", async () => {
     const r = new Request("https://surface.example.com/snapshot", {
@@ -384,7 +426,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
   // --put implies --strict, so it uploads a clean record: no malformed row, no capitalised word left.
   const record = tempRecord([
     "| P1 | Tidy the garage shelves. | Cain | Sort the bins. | | Shelves sorted. | 2026-11-01 |",
-    "| P2 | Pick the reminder time. | Robin | Choose a time on Friday. | Robin's pick | The reminder fires. | 2026-11-02 |",
+    "| P2 | Pick the reminder time. | Robin | Choose a time. | Robin's pick | The reminder fires. | 2026-11-02 |",
   ]);
   const run = ["--record", record, "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json")];
   const URL_ = "https://surface.example.com/snapshot";
@@ -420,7 +462,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
   beforeAll(async () => {
     await capture(() => exporter(["--keygen", dir]));
   });
-  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEY: readFileSync(join(dir, "surface.pub.b64"), "utf8").trim() });
+  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEYS: readFileSync(join(dir, "surface.pub.b64"), "utf8").trim() });
 
   test("a signed snapshot is stored: 200, exit 0, the status and the Worker's message printed", async () => {
     const e = workerEnv();
@@ -430,7 +472,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
     expect(out).toMatch(/PUT https:\/\/surface\.example\.com\/snapshot: 200 stored /);
     expect(h.calls.length).toBe(1);
     expect(h.calls[0].headers.get("x-surface-publisher")).toBe(PUBLISHER);
-    const stored = JSON.parse(e.SNAPSHOTS.m.get("latest")!);
+    const stored = e.store.held()!.snapshot as any;
     expect(stored.threads.length).toBeGreaterThan(0);
     expect(out).not.toContain(SECRET);
     expect(out).not.toContain(PUBLISHER);
@@ -443,7 +485,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
     const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
     expect(code).toBe(1);
     expect(out).toContain("403 the publisher header is missing or wrong");
-    expect(e.SNAPSHOTS.m.size).toBe(0);
+    expect(e.store.held()).toBeUndefined();
   });
 
   test("Access refusing the token is exit 1", async () => {
@@ -468,13 +510,14 @@ describe("the exporter's --put, against this Worker in-process", () => {
     const out = join(dir, "kept.json");
     writeFileSync(out, "the earlier file\n");
     for (const f of [
+      async () => new Response(JSON.stringify({ error: "no" }), { status: 400 }),
       async () => new Response(JSON.stringify({ error: "no" }), { status: 500 }),
       async () => {
         throw new Error("connection refused");
       },
     ]) {
-      const r = await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_], { fetch: f, env: putEnv }));
-      expect(r.code).toBe(1);
+      const r = await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_], { fetch: f, env: putEnv, sleep: noWait }));
+      expect(r.code).not.toBe(0);
       expect(readFileSync(out, "utf8")).toBe("the earlier file\n");
     }
     // A stored upload writes it.
@@ -485,7 +528,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
 
   test("an older snapshot is 409, exit 1", async () => {
     const e = workerEnv();
-    e.SNAPSHOTS.m.set("latest", JSON.stringify({ made_at: "2999-01-01T00:00:00.000Z" }));
+    e.store.raw().set("latest", { id: "f".repeat(32), made_at: "2999-01-01T00:00:00.000Z", snapshot: {} });
     const h = harness(e);
     const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
     expect(code).toBe(1);
@@ -503,17 +546,22 @@ describe("the exporter's --put, against this Worker in-process", () => {
     }
   });
 
-  test("no answer is exit 1", async () => {
+  test("no answer at all is an unknown remote outcome: exit 3, after reconciling", async () => {
+    let tries = 0;
     const { code, out } = await capture(() =>
       exporter([...run, "--key", keyFile, "--put", URL_], {
         fetch: async () => {
+          tries++;
           throw new Error("connection refused");
         },
         env: putEnv,
+        sleep: noWait,
       }),
     );
-    expect(code).toBe(1);
+    expect(code).toBe(3);
+    expect(tries).toBe(3);
     expect(out).toContain("no answer");
+    expect(out).toContain("upload: unknown remote outcome");
   });
 
   test("the URL must be https, on SURFACE_PUT_HOST, exactly /snapshot, with no credentials, query or fragment: else exit 2 before any request", async () => {
@@ -579,14 +627,15 @@ describe("the exporter's --put, against this Worker in-process", () => {
   test("the printed message is the Worker's JSON message only, at most 200 characters", async () => {
     const long = "x".repeat(500);
     const f = async () => new Response(JSON.stringify({ error: long, extra: "not printed" }), { status: 400 });
+    // (a 4xx: a server rejection, no reconciling)
     const r1 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: f, env: putEnv }));
     expect(r1.code).toBe(1);
     expect(r1.out).toContain("x".repeat(200));
     expect(r1.out).not.toContain("x".repeat(201));
     expect(r1.out).not.toContain("not printed");
     const html = async () => new Response("<html>secret-ish page</html>", { status: 502 });
-    const r2 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: html, env: putEnv }));
-    expect(r2.code).toBe(1);
+    const r2 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: html, env: putEnv, sleep: noWait }));
+    expect(r2.code).toBe(3);
     expect(r2.out).not.toContain("secret-ish");
   });
 
@@ -595,5 +644,184 @@ describe("the exporter's --put, against this Worker in-process", () => {
     expect((await capture(() => exporter([...run, "--key", keyFile, "--put"], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
     expect((await capture(() => exporter([...run, "--dry-run", "--put", URL_], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
     expect(h.calls.length).toBe(0);
+  });
+});
+
+describe("sixth round: the Durable Object compares and writes atomically", () => {
+  test("concurrent PUTs, newer and older, interleaved at every storage step: the newer is held, the older gets 409", async () => {
+    // Each storage call yields several times, so without the lock the older's read could pass
+    // before the newer's write lands.
+    const yieldMany = async () => {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    };
+    for (const order of [0, 1]) {
+      const e = env({}, yieldMany);
+      const newer = snap("2026-11-18T12:00:00Z");
+      const older = snap("2026-11-18T11:00:00Z");
+      const reqs = order ? [put(older), put(newer)] : [put(newer), put(older)];
+      const res = await Promise.all((await Promise.all(reqs)).map((r) => worker.fetch(r, e)));
+      expect(e.store.held()!.made_at).toBe(newer.made_at);
+      const statuses = res.map((r) => r.status);
+      // The older lands first and is replaced, or comes second and is refused: never held.
+      if (order === 0) expect(statuses).toEqual([200, 409]);
+      else expect(statuses).toEqual([200, 200]);
+    }
+  });
+  test("the same snapshot again is 200 naming the same identity, and nothing is rewritten", async () => {
+    const e = env();
+    const s = snap("2026-11-18T12:00:00Z");
+    const first = (await (await worker.fetch(await put(s), e)).json()) as any;
+    const real = e.store.raw();
+    const before = real.get("latest");
+    const second = (await (await worker.fetch(await put(s), e)).json()) as any;
+    expect(second.id).toBe(first.id);
+    expect(second.already).toBe(true);
+    expect(real.get("latest")).toBe(before);
+    expect(first.id).toMatch(/^[0-9a-f]{32}$/);
+  });
+  test("a 409 names the identity held", async () => {
+    const e = env();
+    const a = (await (await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e)).json()) as any;
+    const res = await worker.fetch(await put(snap("2026-11-18T11:00:00Z")), e);
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as any).id).toBe(a.id);
+  });
+  test("STORE_NAME starts an empty store: the recovery for a wedged one", async () => {
+    const e = env();
+    e.store.raw().set("latest", "{garbled");
+    expect((await worker.fetch(await get(), e)).status).toBe(503);
+    const fresh = { ...e, STORE_NAME: "latest-2" };
+    expect((await worker.fetch(await get(), fresh)).status).toBe(404);
+    expect((await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), fresh)).status).toBe(200);
+    expect((await worker.fetch(await get(), fresh)).status).toBe(200);
+  });
+});
+
+describe("sixth round: key match and rotation", () => {
+  const next = makeKeyPair();
+  const snapWith = (k: typeof next, when: string) =>
+    signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(when)).snapshot, privateKey(k.privatePem));
+  test("a snapshot verifies under the listed key its key_id names, in any order", async () => {
+    for (const list of [`${keys.publicRaw},${next.publicRaw}`, `${next.publicRaw}, ${keys.publicRaw}`]) {
+      const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: list };
+      expect((await worker.fetch(await put(snapWith(keys, "2026-11-18T11:00:00Z")), e)).status).toBe(200);
+      expect((await worker.fetch(await put(snapWith(next, "2026-11-18T12:00:00Z")), e)).status).toBe(200);
+    }
+  });
+  test("the rotation: add the new key, switch the exporter, remove the old; the old key is then refused", async () => {
+    const e = env();
+    // 1. Only the old key.
+    expect((await worker.fetch(await put(snapWith(keys, "2026-11-18T10:00:00Z")), e)).status).toBe(200);
+    expect((await worker.fetch(await put(snapWith(next, "2026-11-18T10:30:00Z")), e)).status).toBe(403);
+    // 2. Both listed: the exporter switches to the new key.
+    const both = { ...e, SNAPSHOT_PUBLIC_KEYS: `${keys.publicRaw},${next.publicRaw}` };
+    expect((await worker.fetch(await put(snapWith(next, "2026-11-18T11:00:00Z")), both)).status).toBe(200);
+    // 3. The old one removed: an upload signed by it is refused.
+    const after = { ...e, SNAPSHOT_PUBLIC_KEYS: next.publicRaw };
+    expect((await worker.fetch(await put(snapWith(keys, "2026-11-18T12:00:00Z")), after)).status).toBe(403);
+    expect((await worker.fetch(await put(snapWith(next, "2026-11-18T12:00:00Z")), after)).status).toBe(200);
+  });
+  test("a list with nothing usable is no key", async () => {
+    const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: "nonsense, ,REPLACE_WITH_PUBLIC_KEY_BASE64" };
+    expect((await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e)).status).toBe(500);
+  });
+  test("an unknown version, app or purpose is refused even with a good key", async () => {
+    for (const over of [{ version: 1 }, { app: "x" }, { purpose: "command" }]) {
+      const res = await worker.fetch(await put({ ...snap("2026-11-18T12:00:00Z"), ...over }), env());
+      expect([over, res.status]).toEqual([over, 403]);
+    }
+  });
+});
+
+describe("sixth round: the synthetic deployment, a lost response reconciled", () => {
+  // The synthetic record (export/fixtures/synthetic), uploaded through Access to this Worker in-process,
+  // with the response lost on the way back after the Worker stored it.
+  const ID = "service-token-id-example";
+  const SECRET = "service-token-secret-example";
+  const putEnv = {
+    SURFACE_PUT_HOST: "surface.example.com",
+    SURFACE_ACCESS_CLIENT_ID: ID,
+    SURFACE_ACCESS_CLIENT_SECRET: SECRET,
+    SURFACE_PUBLISHER_TOKEN: PUBLISHER,
+  };
+  const URL_ = "https://surface.example.com/snapshot";
+  const dir = mkdtempSync(join(tmpdir(), "surface-lost-"));
+  const run = [
+    "--record", join(FIX, "synthetic"), "--private-terms", join(FIX, "private-terms.txt"), "--config", join(FIX, "exporter.json"),
+    "--key", join(dir, "surface.key"), "--put", URL_,
+  ];
+  const live = createWorker({ now: () => Date.now(), fetch: deps.fetch });
+  const quiet = async (f: () => Promise<number>) => {
+    const lines: string[] = [];
+    const err = console.error, log = console.log;
+    console.error = console.log = (m: string) => void lines.push(String(m));
+    try {
+      return { code: await f(), out: lines.join("\n") };
+    } finally {
+      console.error = err;
+      console.log = log;
+    }
+  };
+  // Access in front of the Worker; `lose` says which tries lose their response after the Worker answered.
+  function via(e: Env, lose: (n: number) => boolean) {
+    let n = 0;
+    const statuses: number[] = [];
+    const f = async (url: string, init: RequestInit) => {
+      const i = n++;
+      const h = new Headers(init.headers);
+      if (h.get("cf-access-client-id") !== ID || h.get("cf-access-client-secret") !== SECRET) return new Response("Forbidden", { status: 403 });
+      h.delete("cf-access-client-id");
+      h.delete("cf-access-client-secret");
+      h.set("cf-access-jwt-assertion", await serviceJwt({ exp: Date.now() / 1000 + 3600 }));
+      const res = await live.fetch(new Request(url, { method: init.method, body: init.body, headers: h }), e);
+      statuses.push(res.status);
+      if (lose(i)) throw new Error("the connection reset after the request was sent");
+      return res;
+    };
+    return { fetch: f, statuses, tries: () => n };
+  }
+  beforeAll(async () => {
+    await quiet(() => exporter(["--keygen", dir]));
+  });
+  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEYS: readFileSync(join(dir, "surface.pub.b64"), "utf8").trim() });
+
+  test("the first response is lost; the second try finds the same identity held: stored, exit 0", async () => {
+    const e = workerEnv();
+    const v = via(e, (i) => i === 0);
+    const r = await quiet(() => exporter(run, { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    expect(r.code).toBe(0);
+    expect(v.tries()).toBe(2);
+    expect(v.statuses).toEqual([200, 200]);
+    expect(r.out).toContain("reconciling");
+    const held = e.store.held()!;
+    expect(r.out).toContain(`(snapshot ${held.id})`);
+    expect((held.snapshot as any).threads.map((t: any) => t.id)).toEqual(["S1", "S2"]);
+  });
+  test("every response lost: an unknown remote outcome, exit 3, though the Worker holds it", async () => {
+    const e = workerEnv();
+    const v = via(e, () => true);
+    const out = join(dir, "never.json");
+    const r = await quiet(() => exporter([...run, "--out", out], { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    expect(r.code).toBe(3);
+    expect(r.out).toContain("upload: unknown remote outcome");
+    expect(existsSync(out)).toBe(false);
+    expect(e.store.held()).toBeDefined();
+  });
+  test("a server rejection is exit 1 with no reconciling; a preflight rejection is exit 2 with nothing sent", async () => {
+    const e = workerEnv();
+    const v = via(e, () => false);
+    const r = await quiet(() => exporter(run, { fetch: v.fetch, env: { ...putEnv, SURFACE_PUBLISHER_TOKEN: "wrong" }, sleep: noWait }));
+    expect(r.code).toBe(1);
+    expect(v.tries()).toBe(1);
+    expect(r.out).toContain("upload: server rejection");
+    const p = await quiet(() => exporter(run, { fetch: v.fetch, env: { ...putEnv, SURFACE_PUT_HOST: "other.example.com" }, sleep: noWait }));
+    expect(p.code).toBe(2);
+    expect(p.out).toContain("upload: preflight rejection, nothing sent");
+    expect(v.tries()).toBe(1);
+  });
+  test("a 2xx that names another snapshot is not taken as stored", async () => {
+    const f = async () => new Response(JSON.stringify({ stored: "x", id: "0".repeat(32) }), { status: 200 });
+    const r = await quiet(() => exporter(run, { fetch: f, env: putEnv, sleep: noWait }));
+    expect(r.code).toBe(3);
   });
 });

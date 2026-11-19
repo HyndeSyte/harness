@@ -3,21 +3,113 @@
 // Deploy), and checks Access's own assertion itself: GET only for the owner's identity, PUT only
 // for the exporter's service token carrying the publisher header, and a valid signature. It holds
 // no GitHub token and no record access, and has no way into the home network: it only checks a
-// signature and keeps one JSON document in KV.
+// signature and keeps one JSON document in a Durable Object, which compares and writes atomically.
 
 import { fromBase64 } from "../../shared/canonical";
-import { verifySnapshot } from "../../shared/snapshot";
+import { parseKeyList, snapshotId, verifySnapshot } from "../../shared/snapshot";
 
-export interface KV {
-  get(key: string): Promise<string | null>;
-  put(key: string, value: string): Promise<void>;
+// --- the store: one Durable Object --------------------------------------------------------------
+
+// The storage a Durable Object gets (the part used here), and its state.
+export interface DOStorage {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown): Promise<void>;
+}
+export interface DOState {
+  storage: DOStorage;
+  // Runs the callback with no other event delivered to this object until it settles.
+  blockConcurrencyWhile<T>(f: () => Promise<T>): Promise<T>;
+}
+// The namespace binding the Worker gets (fetch-style stubs, no runtime imports).
+export interface DONamespace {
+  idFromName(name: string): unknown;
+  get(id: unknown): { fetch(request: Request): Promise<Response> };
+}
+
+// What the store holds: the signed fields, the signature and key id, and the snapshot's identity.
+export interface Stored {
+  id: string;
+  made_at: string;
+  snapshot: Record<string, unknown>;
+}
+
+// The compare and write: under the object's lock, read what is held, and write the candidate only
+// if it isn't older. The same identity again is "same" (nothing written; the uploader reconciling a
+// lost response learns its snapshot is the one held); an older made_at is "older"; else "stored".
+export type WriteResult =
+  | { result: "stored" | "same"; id: string; made_at: string }
+  | { result: "older"; id: string; made_at: string }
+  | { result: "unreadable" }
+  | { result: "failed" };
+
+export async function compareAndWrite(state: DOState, candidate: Stored): Promise<WriteResult> {
+  return state.blockConcurrencyWhile(async () => {
+    let held: unknown;
+    try {
+      held = await state.storage.get(STORE_KEY);
+    } catch {
+      return { result: "failed" } as const;
+    }
+    if (held !== undefined && !isStored(held)) return { result: "unreadable" } as const;
+    if (held) {
+      if (held.id === candidate.id) return { result: "same", id: held.id, made_at: held.made_at } as const;
+      if (Date.parse(held.made_at) > Date.parse(candidate.made_at)) return { result: "older", id: held.id, made_at: held.made_at } as const;
+    }
+    try {
+      await state.storage.put(STORE_KEY, candidate);
+    } catch {
+      return { result: "failed" } as const;
+    }
+    return { result: "stored", id: candidate.id, made_at: candidate.made_at } as const;
+  });
+}
+
+const STORE_KEY = "latest";
+const isStored = (v: unknown): v is Stored =>
+  !!v && typeof v === "object" && typeof (v as Stored).id === "string" && typeof (v as Stored).made_at === "string" &&
+  !Number.isNaN(Date.parse((v as Stored).made_at)) && !!(v as Stored).snapshot && typeof (v as Stored).snapshot === "object";
+
+// The Durable Object class (wrangler.toml binds it as STORE). Reached only through the Worker, which
+// has already checked Access, the publisher and the signature: GET reads what is held, PUT compares
+// and writes.
+export class SnapshotStore {
+  constructor(private state: DOState) {}
+  async fetch(request: Request): Promise<Response> {
+    if (request.method === "GET") {
+      let held: unknown;
+      try {
+        held = await this.state.storage.get(STORE_KEY);
+      } catch {
+        return Response.json({ result: "failed" });
+      }
+      if (held === undefined) return Response.json({ result: "empty" });
+      return Response.json(isStored(held) ? { result: "held", stored: held } : { result: "unreadable" });
+    }
+    if (request.method === "PUT") {
+      let candidate: unknown;
+      try {
+        candidate = await request.json();
+      } catch {
+        return Response.json({ result: "failed" });
+      }
+      if (!isStored(candidate)) return Response.json({ result: "failed" });
+      return Response.json(await compareAndWrite(this.state, candidate));
+    }
+    return new Response(null, { status: 405 });
+  }
 }
 
 // Every value comes from the Worker's variables and secrets (wrangler.toml, `wrangler secret put`).
 export interface Env {
-  SNAPSHOTS: KV;
-  // The exporter's Ed25519 public key, raw 32 bytes in base64. A variable.
-  SNAPSHOT_PUBLIC_KEY: string;
+  // The Durable Object namespace holding the one store.
+  STORE: DONamespace;
+  // The store object's name (default "latest"). A new name starts an empty store: the recovery
+  // when the held snapshot is unreadable or dated in the future. A variable.
+  STORE_NAME?: string;
+  // The exporter's Ed25519 public keys, raw 32 bytes each in base64, comma-separated: a snapshot
+  // verifies under the one its key_id names, so a new key is added beside the old before the
+  // exporter switches, and the old removed after. A variable.
+  SNAPSHOT_PUBLIC_KEYS: string;
   // The Zero Trust team domain, like https://<team>.cloudflareaccess.com (the https:// may be left
   // off; it is normalised to that form). A variable.
   ACCESS_TEAM_DOMAIN: string;
@@ -36,7 +128,6 @@ export interface Deps {
   now: () => number;
 }
 
-const KEY = "latest";
 export const MAX_BYTES = 512 * 1024;
 export const MAX_AHEAD_MS = 5 * 60_000;
 const CERTS_TTL_MS = 10 * 60_000;
@@ -172,23 +263,26 @@ export const ACCESS_SETTINGS = ["ACCESS_TEAM_DOMAIN", "ACCESS_AUD", "OWNER_EMAIL
 const missingSettings = (env: Env) =>
   ACCESS_SETTINGS.filter((k) => typeof env[k] !== "string" || !env[k].trim().replace(/\/+$/, ""));
 
-// --- the store --------------------------------------------------------------------------------
+// --- the store, from the Worker's side -------------------------------------------------------
 
-async function readStored(env: Env): Promise<{ made_at: string } | null> {
-  let text: string | null;
+const storeOf = (env: Env) => env.STORE.get(env.STORE.idFromName((env.STORE_NAME || "").trim() || STORE_KEY));
+const RECOVER = 'set the Worker variable STORE_NAME to a new name to start an empty store (surface/README.md, Recovering a wedged store)';
+
+async function askStore(env: Env, request: Request): Promise<any> {
   try {
-    text = await env.SNAPSHOTS.get(KEY);
+    const res = await storeOf(env).fetch(request);
+    return await res.json();
   } catch {
-    throw new Unavailable("the store could not be read");
+    throw new Unavailable("the store could not be reached");
   }
-  if (text === null) return null;
-  try {
-    const v = JSON.parse(text);
-    if (!v || typeof v !== "object" || typeof v.made_at !== "string") throw new Error();
-    return v;
-  } catch {
-    throw new Unavailable(`the stored snapshot is unreadable; delete the KV entry "${KEY}" to recover`);
-  }
+}
+
+async function readStored(env: Env): Promise<Stored | null> {
+  const r = await askStore(env, new Request("https://store/latest", { method: "GET" }));
+  if (r?.result === "empty") return null;
+  if (r?.result === "held" && isStored(r.stored)) return r.stored;
+  if (r?.result === "unreadable") throw new Unavailable(`the stored snapshot is unreadable; ${RECOVER}`);
+  throw new Unavailable("the store could not be read");
 }
 
 // --- the routes -------------------------------------------------------------------------------
@@ -215,23 +309,18 @@ async function put(request: Request, env: Env, deps: Deps): Promise<Response> {
   } catch {
     return json(400, { error: "not JSON" });
   }
-  let pub: Uint8Array;
-  try {
-    pub = fromBase64(env.SNAPSHOT_PUBLIC_KEY || "");
-  } catch {
-    pub = new Uint8Array();
-  }
-  if (pub.length !== 32) return json(500, { error: "the Worker has no public key configured" });
-  if (!(await verifySnapshot(body, pub))) return json(403, { error: "signature does not verify" });
+  const keys = parseKeyList(env.SNAPSHOT_PUBLIC_KEYS || "");
+  if (!keys.length) return json(500, { error: "the Worker has no public key configured" });
+  if (!(await verifySnapshot(body, keys))) return json(403, { error: "signature does not verify (or an unknown version, app, purpose or key id)" });
   const madeAt = Date.parse(body.made_at);
   if (Number.isNaN(madeAt)) return json(400, { error: "made_at is not a time" });
   if (madeAt > deps.now() + MAX_AHEAD_MS)
     return json(400, { error: "made_at is more than 5 minutes ahead of the Worker's clock; check the exporter's clock" });
-  const prev = await readStored(env);
-  if (prev && Date.parse(prev.made_at) > madeAt) return json(409, { error: "older than the stored snapshot" });
   // Store only the signed fields, as received, so nothing unsigned rides along.
-  const stored = {
+  const snapshot = {
     version: body.version,
+    app: body.app,
+    purpose: body.purpose,
     made_at: body.made_at,
     threads: body.threads,
     excluded_rows: body.excluded_rows,
@@ -239,12 +328,17 @@ async function put(request: Request, env: Env, deps: Deps): Promise<Response> {
     sig: body.sig,
     key_id: body.key_id,
   };
-  try {
-    await env.SNAPSHOTS.put(KEY, JSON.stringify(stored));
-  } catch {
-    throw new Unavailable("the store could not be written");
-  }
-  return json(200, { stored: body.made_at });
+  const id = await snapshotId(snapshot);
+  const r: WriteResult = await askStore(
+    env,
+    new Request("https://store/latest", { method: "PUT", body: JSON.stringify({ id, made_at: body.made_at, snapshot }) }),
+  );
+  // Every answer names the identity the store holds, so a lost response can be reconciled.
+  if (r?.result === "stored") return json(200, { stored: body.made_at, id });
+  if (r?.result === "same") return json(200, { stored: body.made_at, id, already: true });
+  if (r?.result === "older") return json(409, { error: "older than the stored snapshot", id: r.id });
+  if (r?.result === "unreadable") throw new Unavailable(`the stored snapshot is unreadable; ${RECOVER}`);
+  throw new Unavailable("the store could not be written");
 }
 
 async function get(request: Request, env: Env, deps: Deps): Promise<Response> {
@@ -254,7 +348,7 @@ async function get(request: Request, env: Env, deps: Deps): Promise<Response> {
     return json(403, { error: "not the owner" });
   const current = await readStored(env);
   if (!current) return json(404, { error: "no snapshot yet" });
-  return json(200, current);
+  return json(200, current.snapshot);
 }
 
 export function createWorker(deps: Deps) {

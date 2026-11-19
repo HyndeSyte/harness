@@ -68,6 +68,14 @@ Open items, one row each. Who has it, the next step, what it waits for, when it 
 | P100 | Ottoline wants the ladder back. | Cain | Fetch it from the shed. | | Ladder returned. | 2026-11-03 |
 | P101 | Read the club newsletter draft. | Cain | Read it once it comes. | Thessaly to send the draft | Draft read. | 2026-11-03 |
 | P102 | Fix the gate, waiting on Mr. Penrose. Then paint it. | Cain | Ask for the latch. | | Gate shut. | 2026-11-03 |
+| P103 | May sends the school forms back. | Cain | Wait for them. | | Forms back. | 2026-11-03 |
+| P104 | Ask May about the school forms. | Cain | Wait for them. | | Forms back. | 2026-11-03 |
+| P105 | June has the ladder. | Cain | Ask for it back. | | Ladder back. | 2026-11-03 |
+| P106 | Fetch the ladder from June. | Cain | Ask for it back. | | Ladder back. | 2026-11-03 |
+| P107 | Will brings the drill over. | Cain | Wait for it. | | Drill here. | 2026-11-03 |
+| P108 | Lend the drill to Will. | Cain | Hand it over. | | Drill lent. | 2026-11-03 |
+| P109 | Plan a lunch out on May 5. | Cain | Book a table for 3 June. | | Done. | 2026-11-03 |
+| P110 | Sort the tools. | Cain | Sort them. | the zorblat crew | Done. | 2026-11-03 |
 
 ## Done
 

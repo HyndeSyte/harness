@@ -1,5 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
+  "app": "harness-surface",
+  "purpose": "in-motion-snapshot",
   "made_at": "2026-11-18T10:00:00.000Z",
   "threads": [
     {
@@ -7,15 +9,15 @@
       "title": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀…",
       "area": "other",
       "who": "the assistant",
-      "step": "Café, 中文, 𝄞 and 👩‍💻 … \"quoted\" \\ back",
+      "step": "café, 中文, 𝄞 and 👩💻 ... \"quoted\" \\ back",
       "waits_for": null,
-      "outcome": "é vs é",
+      "outcome": "é vs é",
       "last_moved": "2026-11-18T09:00:00.000Z",
       "state": "moving"
     }
   ],
   "excluded_rows": 1,
   "skipped_rows": 2,
-  "sig": "RErhXDHGVaVRh7G0NCSGjdLaaY6o81uvN+Sd2Zu24tKOMH/Wa1YfwhTvSSkNS1YZM64Vcu+4hyfx1O0LOhOzBQ==",
-  "key_id": "c4295a2dd501cdfe"
+  "sig": "CfhhrFQ4BTSWxkz6/lpBZWbLKw0AScqv4ww3v4c20A+Aamux76tVFJogdAcHmiDx4VzMRvZrWMYQ0ajCeNq0Dg==",
+  "key_id": "37e1598320a33918"
 }

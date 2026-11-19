@@ -61,6 +61,8 @@ export function Surface({
         <Text style={[styles.notice, { color: theme.muted }]} testID="notice">
           {loaded.reason === "unverified"
             ? "This snapshot could not be verified, so nothing is shown."
+            : loaded.reason === "unsupported"
+              ? "This snapshot is in a format this app doesn't know, so nothing is shown."
             : loaded.reason === "notallowed"
               ? "This account is not allowed to read the snapshot."
               : "No snapshot could be read."}

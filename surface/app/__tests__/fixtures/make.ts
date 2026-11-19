@@ -5,7 +5,8 @@
 // Run from the repo root: bun run surface/app/__tests__/fixtures/make.ts
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { buildSnapshot, firstSentence, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../../../export/lib";
+import { APP_ID, PURPOSE_SNAPSHOT, SNAPSHOT_VERSION } from "../../../shared/canonical";
+import { areaOf, buildSnapshot, gateFixed, gateId, gateTime, makeKeyPair, makePolicy, privateKey, sanitise, signSnapshot } from "../../../export/lib";
 
 const here = import.meta.dir;
 const fix = join(here, "../../../export/fixtures");
@@ -13,21 +14,27 @@ const keys = makeKeyPair();
 const key = privateKey(keys.privatePem);
 const policy = makePolicy(readFileSync(join(fix, "private-terms.txt"), "utf8"), JSON.parse(readFileSync(join(fix, "exporter.json"), "utf8")));
 const snapshot = signSnapshot(buildSnapshot(join(fix, "record"), policy, new Date("2026-11-18T10:00:00Z")).snapshot, key);
+// Every string goes through the exporter's own gates (signSnapshot signs nothing else). The text is
+// lower case, so the proper-noun gate leaves it as written.
+const vectorPolicy = makePolicy("not-a-real-term", { owner_names: ["Nobody"], names: [] });
+const text = (t: string, max?: number) => sanitise(t, vectorPolicy, max).text;
 const vector = signSnapshot(
   {
-    version: 1,
-    made_at: "2026-11-18T10:00:00.000Z",
+    version: SNAPSHOT_VERSION,
+    app: gateFixed(APP_ID),
+    purpose: gateFixed(PURPOSE_SNAPSHOT),
+    made_at: gateTime(Date.parse("2026-11-18T10:00:00.000Z")),
     threads: [
       {
-        id: "P1",
-        title: firstSentence("a".repeat(138) + "😀😀😀", 140),
-        area: "other",
-        who: "the assistant",
-        step: "Café, 中文, 𝄞 and \u{1F469}‍\u{1F4BB} … \"quoted\" \\ back",
+        id: gateId("P1"),
+        title: text("a".repeat(138) + "😀😀😀", 140),
+        area: areaOf("nothing", vectorPolicy),
+        who: gateFixed("the assistant"),
+        step: text("café, 中文, 𝄞 and \u{1F469}‍\u{1F4BB} … \"quoted\" \\ back"),
         waits_for: null,
-        outcome: "é vs é",
-        last_moved: "2026-11-18T09:00:00.000Z",
-        state: "moving",
+        outcome: text("é vs é"),
+        last_moved: gateTime(Date.parse("2026-11-18T09:00:00.000Z")),
+        state: gateFixed("moving"),
       },
     ],
     excluded_rows: 1,

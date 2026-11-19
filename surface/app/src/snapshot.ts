@@ -1,7 +1,7 @@
 // Reads the snapshot, checks its signature, and keeps only the fields the screen knows.
 import * as ed from "@noble/ed25519";
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
-import { fromBase64, hex, signedBytes } from "../../shared/canonical";
+import { APP_ID, fromBase64, hex, PURPOSE_SNAPSHOT, signedBytes, SNAPSHOT_VERSION } from "../../shared/canonical";
 
 ed.hashes.sha512 = sha512;
 
@@ -32,22 +32,37 @@ export interface Snapshot {
 
 // signin: the read was redirected or refused as unauthenticated (an expired Access session).
 // notallowed: the Worker itself refused it (a 403 with its JSON message). offline: no HTTP answer
-// at all (no network, DNS, a timeout).
-export type Reason = "unreadable" | "unverified" | "signin" | "notallowed" | "offline";
+// at all (no network, DNS, a timeout). unsupported: a version, app or purpose this app doesn't know,
+// refused before its signature is even read (its signed fields may not be these).
+export type Reason = "unreadable" | "unverified" | "unsupported" | "signin" | "notallowed" | "offline";
 export type Loaded = { ok: true; snapshot: Snapshot } | { ok: false; reason: Reason };
 
 const isCount = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 
-export function verify(raw: unknown, publicKeyB64: string): boolean {
+// The one version, app and purpose this app knows.
+export function supported(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  const s = raw as Record<string, unknown>;
+  return s.version === SNAPSHOT_VERSION && s.app === APP_ID && s.purpose === PURPOSE_SNAPSHOT;
+}
+
+// The public keys, comma-separated raw base64 (EXPO_PUBLIC_SURFACE_PUBLIC_KEY): the snapshot verifies
+// under the one its key_id names, so a rotation lists the new key beside the old for a while.
+export function verify(raw: unknown, publicKeysB64: string): boolean {
   try {
-    if (!raw || typeof raw !== "object") return false;
+    if (!supported(raw)) return false;
     const s = raw as Record<string, unknown>;
-    if (s.version !== 1 || typeof s.sig !== "string" || typeof s.key_id !== "string") return false;
+    if (typeof s.sig !== "string" || typeof s.key_id !== "string") return false;
     if (typeof s.made_at !== "string" || !Array.isArray(s.threads)) return false;
     if (!isCount(s.excluded_rows) || !isCount(s.skipped_rows)) return false;
-    const pub = fromBase64(publicKeyB64);
-    if (pub.length !== 32) return false;
-    if (s.key_id !== hex(sha256(pub)).slice(0, 16)) return false;
+    let pub: Uint8Array | undefined;
+    for (const part of (publicKeysB64 || "").split(",")) {
+      try {
+        const k = fromBase64(part.trim());
+        if (k.length === 32 && hex(sha256(k)).slice(0, 16) === s.key_id) pub = k;
+      } catch {}
+    }
+    if (!pub) return false;
     return ed.verify(fromBase64(s.sig), signedBytes(s as any), pub);
   } catch {
     return false;
@@ -95,6 +110,7 @@ export function sortThreads(threads: Thread[]): Thread[] {
 }
 
 export function check(raw: unknown, publicKeyB64: string): Loaded {
+  if (!supported(raw)) return { ok: false, reason: "unsupported" };
   if (!verify(raw, publicKeyB64)) return { ok: false, reason: "unverified" };
   const s = raw as { made_at: string; threads: unknown[] };
   if (!isTime(s.made_at)) return { ok: false, reason: "unverified" };

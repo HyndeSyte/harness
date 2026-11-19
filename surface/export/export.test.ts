@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifySnapshot, canonical, fromBase64, WHO } from "../shared/snapshot";
@@ -30,8 +30,23 @@ import {
   rawPublicKey,
   signSnapshot,
   strip,
+  assertGated,
+  CALENDAR_WORDS,
+  COMMON_WORDS,
+  COMMON_WORDS_FILE,
+  DEFAULT_STEMS,
+  gateFixed,
+  isGated,
+  MATCH_OVERLAP,
+  NAME_WORDS,
+  nextToNumber,
+  sanitise,
+  snapshotIdOf,
+  strictProblems,
+  unknownTokens,
 } from "./lib";
-import { main, PRIVATE_REPORT } from "./index";
+import { main, PRIVATE_REPORT, PUT_MAX_BYTES, uploadPreflight } from "./index";
+import { SCHEMA, snapshotId } from "../shared/snapshot";
 import { tempRecord } from "./fixtures/temp-record";
 
 const FIX = join(import.meta.dir, "fixtures");
@@ -53,13 +68,15 @@ describe("the open list", () => {
   });
 
   test("snapshot shape", () => {
-    expect(snap.version).toBe(1);
+    expect(snap.version).toBe(2);
+    expect(snap.app).toBe("harness-surface");
+    expect(snap.purpose).toBe("in-motion-snapshot");
     expect(snap.made_at).toBe(NOW.toISOString());
     for (const t of snap.threads)
       expect(Object.keys(t).sort()).toEqual(
         ["area", "id", "last_moved", "outcome", "state", "step", "title", "waits_for", "who"].sort(),
       );
-    expect(Object.keys(snap).sort()).toEqual(["excluded_rows", "made_at", "skipped_rows", "threads", "version"]);
+    expect(Object.keys(snap).sort()).toEqual(["app", "excluded_rows", "made_at", "purpose", "skipped_rows", "threads", "version"]);
   });
 });
 
@@ -488,8 +505,8 @@ describe("each part of a name", () => {
 
 describe("the proper-noun gate", () => {
   test("a capitalised word mid-sentence becomes someone; sentence starts and the allow list stay", () => {
-    const g = properNounGate("Meet Kestrel on Friday at the Worker. Then Paris's train, OK.", policy.allowWords);
-    expect(g.text).toBe("Meet someone on Friday at the Worker. Then someone's train, OK.");
+    const g = properNounGate("Meet Kestrel on Friday 21 November at the Worker. Then Paris's train, OK.", policy.allowWords);
+    expect(g.text).toBe("Meet someone on Friday 21 November at the Worker. Then someone's train, OK.");
     expect(g.words).toEqual(["Kestrel", "Paris's"]);
   });
   test("no capitalised word is left in the fixture snapshot but on the allow list", () => {
@@ -529,16 +546,34 @@ describe("the proper-noun gate", () => {
     const s = JSON.parse(readFileSync(out, "utf8"));
     expect(s.threads[0].title).toBe("Return the drill to someone next door, then lunch.");
   });
-  test("a dry run prints the leftover words on stderr only, under the private line", async () => {
+  test("a dry run never prints the words: counts only on stderr, the words in a --report file with mode 0600", async () => {
     const r = await capture(() => main([...run, "--dry-run"]));
     expect(r.code).toBe(0);
-    const err = r.err.split("\n");
-    const at = err.indexOf(PRIVATE_REPORT);
-    expect(at).toBeGreaterThanOrEqual(0);
-    expect(err.slice(at + 1).some((l) => /PENDING\.md:5: title: Kestrel$/.test(l))).toBe(true);
-    expect(err.slice(0, at).join("\n")).not.toContain("Kestrel");
+    expect(r.err).not.toContain("Kestrel");
+    expect(r.err).not.toContain(PRIVATE_REPORT);
+    expect(r.err).toMatch(/1 capitalised word\(s\) replaced/);
+    expect(r.err).toMatch(/--report <file>/);
     expect(r.out).not.toContain("Kestrel");
     expect(JSON.parse(r.out).threads[0].title).toBe("Return the drill to someone next door, then lunch.");
+    const file = join(mkdtempSync(join(tmpdir(), "surface-report-")), "report.txt");
+    const w = await capture(() => main([...run, "--dry-run", "--report", file]));
+    expect(w.code).toBe(0);
+    expect(w.err).not.toContain("Kestrel");
+    expect(w.out).not.toContain("Kestrel");
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    const lines = readFileSync(file, "utf8").split("\n");
+    expect(lines[0]).toBe(PRIVATE_REPORT);
+    expect(lines.some((l) => /PENDING\.md:5: title: Kestrel$/.test(l))).toBe(true);
+    // Run again: the file is replaced, still 0600.
+    chmodSync(file, 0o644);
+    expect((await capture(() => main([...run, "--dry-run", "--report", file]))).code).toBe(0);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+  test("--report goes only with --dry-run", async () => {
+    const file = join(mkdtempSync(join(tmpdir(), "surface-report-")), "report.txt");
+    const r = await capture(() => main([...run, "--report", file, "--out", join(dir, "x.json"), "--key", key]));
+    expect(r.code).toBe(2);
+    expect(existsSync(file)).toBe(false);
   });
   test("a dry run under --strict fails on a leftover with no word and no snapshot", async () => {
     const r = await capture(() => main([...run, "--dry-run", "--strict"]));
@@ -650,15 +685,15 @@ describe("the synthetic record", () => {
 
 describe("fifth round: the gate takes sentence starts too", () => {
   test("a capitalised word at a sentence start is a candidate unless it is a common word or allowed", () => {
-    const g = properNounGate("Ottoline wants it. Then Penrose rings. Read it on Monday.", policy.allowWords);
-    expect(g.text).toBe("someone wants it. Then someone rings. Read it on Monday.");
+    const g = properNounGate("Ottoline wants it. Then Penrose rings. Read it on Monday 23 November.", policy.allowWords);
+    expect(g.text).toBe("someone wants it. Then someone rings. Read it on Monday 23 November.");
     expect(g.words).toEqual(["Ottoline", "Penrose"]);
     expect(properNounGate("Follow-up for Re-Kestrel.", policy.allowWords).words).toEqual(["Re-Kestrel"]);
     expect(properNounGate("Don't wait; Let's go. It’s done.", policy.allowWords).words).toEqual([]);
   });
-  test("the bundled list is common words only and the defaults no longer carry the weekdays", () => {
-    expect(policy.allowWords.has("monday")).toBe(true);
-    expect(policy.allowWords.has("december")).toBe(true);
+  test("the bundled list is common words only; months and weekdays are not on it", () => {
+    expect(policy.allowWords.has("monday")).toBe(false);
+    expect(policy.allowWords.has("december")).toBe(false);
     for (const name of ["will", "mark", "bill", "grace", "hope", "rose", "kestrel"]) expect(policy.allowWords.has(name)).toBe(false);
   });
   test("a sentence never ends after Mr, Mrs, Ms, Dr or St", () => {
@@ -829,5 +864,212 @@ describe("fifth round: stems and long numbers", () => {
   test("a row with only dates in it is kept", () => {
     expect(byId.P99.title).toBe("Move the skip to 11/20/2026, then 2026-11-21.");
     expect(byId.P99.step).toBe("Ring on 2026-11-19 in 2026.");
+  });
+});
+
+describe("sixth round: names that double as common words", () => {
+  test("the bundled list shares no word with the name list, and months and weekdays are off it", () => {
+    const inFile = COMMON_WORDS_FILE.map((w) => w.toLowerCase());
+    expect(inFile.filter((w) => NAME_WORDS.has(w))).toEqual([]);
+    expect(inFile.filter((w) => CALENDAR_WORDS.includes(w))).toEqual([]);
+    for (const w of ["may", "june", "april", "august", "will", "mark", "grace", "rose", "hope", "pat", "sue", "jack", "rich", "bob", "cook"]) {
+      expect([w, NAME_WORDS.has(w)]).toEqual([w, true]);
+      expect([w, COMMON_WORDS.includes(w), policy.allowWords.has(w)]).toEqual([w, false, false]);
+    }
+  });
+  test("May, June and Will are gated at a sentence start and mid-sentence", () => {
+    for (const t of ["May sends the forms.", "Ask May now.", "June has it.", "Give it to June.", "Will brings it.", "Lend it to Will."])
+      expect([t, properNounGate(t, policy.allowWords).words.length]).toEqual([t, 1]);
+  });
+  test("a month or weekday stays only next to a number or a date", () => {
+    const keep = ["Lunch on May 5.", "on 3 June", "the 3rd of May", "Friday 2026-11-20", "Friday, 20 November", "June 2026", "2026-11-20, Friday"];
+    for (const t of keep) expect([t, properNounGate(t, new Set(["lunch"])).words]).toEqual([t, []]);
+    const gate = ["Ask May.", "on Friday", "June said so", "May's car"];
+    for (const t of gate) expect([t, properNounGate(t, policy.allowWords).words.length]).toEqual([t, 1]);
+    expect(nextToNumber("x May 5", 2, 3)).toBe(true);
+    expect(nextToNumber("x May y", 2, 3)).toBe(false);
+  });
+  test("the fixture rows P103 to P108 are someone; P109 keeps its dates", () => {
+    expect(byId.P103.title).toBe("someone sends the school forms back.");
+    expect(byId.P104.title).toBe("Ask someone about the school forms.");
+    expect(byId.P107.title).toBe("someone brings the drill over.");
+    expect(byId.P108.title).toBe("Lend the drill to someone.");
+    expect(byId.P109.title).toBe("Plan a lunch out on May 5.");
+    expect(byId.P109.step).toBe("Book a table for 3 June.");
+  });
+});
+
+describe("sixth round: unknown words", () => {
+  test("lower-case and uncased words not in the word list are listed; capitals, numbers and known words are not", () => {
+    expect(unknownTokens("the zorblat crew at 7:30 with someone's 中文 Ladder", policy.vocabulary)).toEqual(["zorblat", "crew", "中文"]);
+    expect(unknownTokens("you and your pick, a link, an email address", policy.vocabulary)).toEqual([]);
+  });
+  test("the dry run's report lists them; --strict fails on them in waits_for only", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-unknown-"));
+    await capture(() => main(["--keygen", dir]));
+    const rec = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat. | the zorblat crew | Done. | 2026-11-01 |"]);
+    const run = ["--record", rec, "--private-terms", TERMS, "--config", CONFIG];
+    const r = await capture(() => main([...run, "--strict", "--out", join(dir, "o.json"), "--key", join(dir, "surface.key")]));
+    expect(r.code).toBe(1);
+    expect(r.err).toMatch(/unknown word in waits_for: .*PENDING\.md:5: waits_for$/m);
+    expect(r.err).not.toContain("zorblat");
+    const b = buildSnapshot(rec, policy, NOW);
+    expect(strictProblems(b).waitsUnknown.length).toBe(2);
+    expect(b.unknowns.filter((u) => u.field === "step").map((u) => u.word)).toEqual(["zorblat"]);
+    const file = join(dir, "report.txt");
+    expect((await capture(() => main([...run, "--dry-run", "--report", file]))).code).toBe(0);
+    expect(readFileSync(file, "utf8")).toMatch(/PENDING\.md:5: waits_for: crew/);
+    // The same word in step alone doesn't fail --strict.
+    const ok = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat. | | Done. | 2026-11-01 |"]);
+    expect(strictProblems(buildSnapshot(ok, policy, NOW)).waitsUnknown.length).toBe(0);
+  });
+});
+
+describe("sixth round: chunked matching fails closed", () => {
+  test("a cell longer than the chunk size leaves the row out, and fails --strict", async () => {
+    const long = "word ".repeat(MATCH_SPAN / 4);
+    const rec = tempRecord([`| P1 | ${long} | Cain | Go. | | Done. | 2026-11-01 |`]);
+    const b = buildSnapshot(rec, policy, NOW);
+    expect(b.snapshot.threads.length).toBe(0);
+    expect(b.snapshot.excluded_rows).toBe(1);
+    expect(b.warnings).toEqual([expect.stringMatching(/PENDING\.md:5: row left out, a cell longer than 4000 characters/)]);
+    expect(isExcluded(makePolicy("Juniper"), "a ".repeat(6000))).toBe(true);
+    const dir = mkdtempSync(join(tmpdir(), "surface-long-"));
+    await capture(() => main(["--keygen", dir]));
+    const r = await capture(() => main(["--record", rec, "--private-terms", TERMS, "--config", CONFIG, "--strict", "--out", join(dir, "o.json"), "--key", join(dir, "surface.key")]));
+    expect(r.code).toBe(1);
+    expect(existsSync(join(dir, "o.json"))).toBe(false);
+  });
+  test("the overlap is larger than the longest plain term", () => {
+    const term = "x".repeat(900);
+    const p = makePolicy(`Juniper\n${term}`);
+    expect(p.overlap).toBeGreaterThan(900);
+    expect(makePolicy("Juniper").overlap).toBe(MATCH_OVERLAP);
+    expect(() => makePolicy("y".repeat(MATCH_SPAN / 2 + 1))).toThrow(/:1: a term longer than/);
+  });
+  test("a term straddling a chunk boundary is found", () => {
+    const term = "straddling-term-" + "q".repeat(500);
+    const p = makePolicy(term);
+    const re = p.terms[0];
+    const step = MATCH_SPAN - p.overlap;
+    // The term starts just before the first chunk's end, so the first chunk holds only its head.
+    const text = "a ".repeat(1800) + term + " " + "b ".repeat(4000);
+    // It starts after the second chunk's start under this overlap, before it under an overlap of 100.
+    expect(text.indexOf(term)).toBeGreaterThan(step);
+    expect(text.indexOf(term)).toBeLessThan(MATCH_SPAN - 100);
+    expect(text.indexOf(term)).toBeLessThan(MATCH_SPAN);
+    expect(text.indexOf(term) + term.length).toBeGreaterThan(MATCH_SPAN);
+    expect(matchesBounded(re, text, p.overlap)).toBe(true);
+    // With the old overlap, shorter than the term, it would be missed.
+    expect(matchesBounded(re, text, 100)).toBe(false);
+  });
+});
+
+describe("sixth round: more stems", () => {
+  const cases: [string, string][] = [
+    ["meds", "the meds"], ["rx", "an Rx"], ["refill", "refill it"], ["biopsy", "the biopsy"], ["chemo", "chemo day"],
+    ["cancer", "cancer ward"], ["rehab", "rehab visit"], ["physio", "physiotherapy"], ["lab", "the lab"], ["results", "the results"],
+    ["er", "the ER"], ["urgent care", "urgent  care run"], ["injur", "the injury"], ["zelle", "Zelle it"], ["wire", "wire it"],
+    ["cheque", "the cheque"], ["check", "check in"], ["tuition", "tuition"], ["fine", "a fine"], ["ticket", "the ticket"],
+  ];
+  test("each leaves its text out", () => {
+    for (const [stem, text] of cases) {
+      expect(DEFAULT_STEMS).toContain(stem);
+      expect([stem, isExcluded(policy, text)]).toEqual([stem, true]);
+    }
+    expect(isExcluded(policy, "urgent matters")).toBe(false);
+  });
+  test("the dry run gives the threads per area", async () => {
+    const r = await capture(() => main(["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--dry-run"]));
+    expect(r.code).toBe(0);
+    expect(r.err).toMatch(/threads per area: garden 1, harness 1, surface 1, other \d+\./);
+    expect(built.areas.surface).toBe(1);
+  });
+});
+
+describe("sixth round: one pipeline, gated strings only", () => {
+  // Every string anywhere in the signed object must have come out of the pipeline.
+  const walk = (v: unknown, path: string, bad: string[]) => {
+    if (typeof v === "string") {
+      if (!isGated(v)) bad.push(path);
+    } else if (Array.isArray(v)) v.forEach((x, i) => walk(x, `${path}[${i}]`, bad));
+    else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, `${path}.${k}`, bad);
+  };
+  test("every string in the fixture's signed object is gated", () => {
+    const keys = makeKeyPair();
+    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const { sig, key_id, ...signedPart } = signed;
+    const bad: string[] = [];
+    walk(signedPart, "snapshot", bad);
+    expect(bad).toEqual([]);
+    expect(snap.threads.length).toBeGreaterThan(10);
+  });
+  test("a string that skipped the pipeline is refused, and nothing is signed", () => {
+    const keys = makeKeyPair();
+    const tampered = { ...snap, threads: [{ ...snap.threads[0], title: "Raw text from Kestrel " + Math.random() }] } as any;
+    expect(() => assertGated(tampered)).toThrow(/snapshot\.threads\[0\]\.title: a string that did not pass/);
+    expect(() => signSnapshot(tampered, privateKey(keys.privatePem))).toThrow();
+    expect(() => gateFixed("anything else" as any)).toThrow();
+  });
+  test("sanitise is the whole pipeline: normal form, strippers, names, cut, gate", () => {
+    const r = sanitise("Ask Ｍｏｒｇａｎ at https://example.com about P41. Then more.", policy, 140);
+    expect(r.text).toBe("Ask someone at a link about another item.");
+    expect(isGated(r.text)).toBe(true);
+  });
+});
+
+describe("sixth round: the signed version follows the schema", () => {
+  // Each version's schema fingerprint. A change to the signed fields or a thread's fields changes
+  // the fingerprint, so it fails here until SNAPSHOT_VERSION is bumped and a line added.
+  const KNOWN: Record<number, string> = {
+    1: "c21887ca052ccae6", // no app or purpose
+    2: "d82fa6ae1be69ddf", // app and purpose added (sixth round)
+  };
+  test("this version's schema is the one pinned for it", async () => {
+    const fp = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical({ signed: SCHEMA.signed, thread: SCHEMA.thread }))));
+    const hex = Array.from(fp, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+    expect([SCHEMA.version, hex]).toEqual([SCHEMA.version, KNOWN[SCHEMA.version]]);
+    expect(new Set(Object.values(KNOWN)).size).toBe(Object.keys(KNOWN).length);
+  });
+  test("an unknown version, app or purpose doesn't verify, signed or not", async () => {
+    const keys = makeKeyPair();
+    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const raw = rawPublicKey(keys.publicPem);
+    expect(await verifySnapshot(signed, raw)).toBe(true);
+    for (const over of [{ version: 1 }, { version: 3 }, { app: "other-app" }, { purpose: "command" }])
+      expect([over, await verifySnapshot({ ...signed, ...over }, raw)]).toEqual([over, false]);
+  });
+  test("the identity is the same in the exporter and shared code", async () => {
+    expect(snapshotIdOf(snap)).toBe(await snapshotId(snap as any));
+    expect(snapshotIdOf(snap)).toMatch(/^[0-9a-f]{32}$/);
+  });
+});
+
+describe("sixth round: key match", () => {
+  test("--key-match says whether the exporter's key is listed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-keymatch-"));
+    await capture(() => main(["--keygen", dir]));
+    const mine = readFileSync(join(dir, "surface.pub.b64"), "utf8").trim();
+    const other = makeKeyPair().publicRaw;
+    const key = join(dir, "surface.key");
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", `${other},${mine}`]))).code).toBe(0);
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", join(dir, "surface.pub.b64")]))).code).toBe(0);
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", join(dir, "surface.pub")]))).code).toBe(0);
+    const no = await capture(() => main(["--key-match", "--key", key, "--pub", other]));
+    expect(no.code).toBe(1);
+    expect(no.err).toContain("NOT listed");
+  });
+});
+
+describe("sixth round: the uploader's preflight", () => {
+  test("refuses a body over the Worker's limit, or one that doesn't verify under its own key", async () => {
+    const keys = makeKeyPair();
+    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const raw = rawPublicKey(keys.publicPem);
+    const body = JSON.stringify(signed);
+    expect(await uploadPreflight(body, raw)).toBeNull();
+    expect(await uploadPreflight(body + " ".repeat(PUT_MAX_BYTES), raw)).toMatch(/over/);
+    expect(await uploadPreflight(JSON.stringify({ ...signed, excluded_rows: 0 }), raw)).toMatch(/does not verify/);
+    expect(await uploadPreflight(body, rawPublicKey(makeKeyPair().publicPem))).toMatch(/does not verify/);
   });
 });

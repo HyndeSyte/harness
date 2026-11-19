@@ -21,6 +21,8 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.4"
+      # The exporter's tests include the strict-mode regression corpus (surface/export/corpus.test.ts):
+      # every fixture row, alone, must come out under --strict as fixtures/strict-corpus.json says.
       - run: bun test surface/export surface/worker surface/app/scripts
       # No workers.dev host and no preview URLs for the Worker.
       - name: Worker config check
@@ -31,6 +33,10 @@ jobs:
     env:
       # The build needs nothing from Expo's servers.
       EXPO_OFFLINE: "1"
+      # The app's public settings, from repository variables (blank until the deploy; the app then
+      # says no key is set). Public values only: no secret goes into a web build.
+      EXPO_PUBLIC_SURFACE_PUBLIC_KEY: ${{ vars.SURFACE_PUBLIC_KEYS }}
+      EXPO_PUBLIC_SURFACE_TALK_URL: ${{ vars.SURFACE_TALK_URL }}
     defaults:
       run:
         working-directory: surface/app
@@ -52,3 +58,46 @@ jobs:
       # No inline script in any .html file, and the headers file with its content policy, parsed.
       - name: Web export checks
         run: bun scripts/check-dist.mjs
+      # The checked build, kept: the Pages deploy below serves exactly these bytes, never a rebuild.
+      - name: Keep the checked build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: surface-web-dist
+          path: surface/app/dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  # Pages deploys the artifact CI built and checked above (surface/README.md, Deploy). Configured but
+  # off: it runs only on a push to main once the repository variable SURFACE_PAGES_DEPLOY is "true",
+  # with the Cloudflare secrets set. Until the owner has a Cloudflare account it never runs.
+  surface-pages-deploy:
+    needs: [surface-bun, surface-app]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SURFACE_PAGES_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: surface-pages-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: surface-web-dist
+          path: surface/app/dist
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      # The same checks again, on the downloaded bytes about to be served.
+      - name: Web export checks, on the artifact
+        working-directory: surface/app
+        run: bun scripts/check-dist.mjs
+      - name: Deploy to Pages
+        working-directory: surface/app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bunx wrangler@4.156.2 pages deploy dist --project-name surface --branch main

@@ -15,8 +15,28 @@ export function canonical(value: unknown): string {
   return "{" + keys.map((k) => JSON.stringify(k) + ":" + canonical(obj[k])).join(",") + "}";
 }
 
+// The signed format's version. Bumped on every change to the signed fields or a thread's fields
+// (SCHEMA below; a test pins each version to its schema's fingerprint), and the app and the Worker
+// refuse any version they don't know.
+export const SNAPSHOT_VERSION = 2;
+// Fixed identifiers inside the signed bytes: which app the bytes are for and what they are for. A
+// later command envelope gets its own purpose (and its own key), so a snapshot's signature can never
+// be replayed as a command, nor a command's as a snapshot.
+export const APP_ID = "harness-surface";
+export const PURPOSE_SNAPSHOT = "in-motion-snapshot";
+
 // The fields the signature covers, in this order of meaning (the canonical form sorts them).
-export const SIGNED_FIELDS = ["version", "made_at", "threads", "excluded_rows", "skipped_rows"] as const;
+export const SIGNED_FIELDS = ["version", "app", "purpose", "made_at", "threads", "excluded_rows", "skipped_rows"] as const;
+// A thread's fields, every one of them signed.
+export const THREAD_FIELDS = ["id", "title", "area", "who", "step", "waits_for", "outcome", "last_moved", "state"] as const;
+// What a version stands for: its signed fields and its thread fields.
+export const SCHEMA = { version: SNAPSHOT_VERSION, signed: SIGNED_FIELDS, thread: THREAD_FIELDS } as const;
+
+// The version and the two identifiers, checked before a signature is: an unknown version is
+// refused whatever it carries, since its signed fields may not be these.
+export function knownEnvelope(s: Record<string, unknown>): boolean {
+  return s.version === SNAPSHOT_VERSION && s.app === APP_ID && s.purpose === PURPOSE_SNAPSHOT;
+}
 
 export type SignedFields = { [K in (typeof SIGNED_FIELDS)[number]]: unknown };
 
