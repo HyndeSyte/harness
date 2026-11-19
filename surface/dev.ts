@@ -16,7 +16,7 @@ const record = opt("--record", join(fixtures, "record"))!;
 // A real record needs the owner's own private terms file: the exporter refuses to run without one.
 const terms = opt("--private-terms", opt("--record") ? undefined : join(fixtures, "private-terms.txt"));
 const config = opt("--config", opt("--record") ? undefined : join(fixtures, "exporter.json"));
-if (!existsSync(join(dev, "surface.key"))) await main(["--keygen", dev]);
+if (!existsSync(join(dev, "surface.key")) || !existsSync(join(dev, "surface.pub.entry"))) await main(["--keygen", dev]);
 mkdirSync(join(here, "app/public"), { recursive: true });
 const out = join(here, "app/public/snapshot.json");
 const code = await main([
@@ -27,7 +27,8 @@ const code = await main([
   "--key", join(dev, "surface.key"),
 ]);
 if (code) process.exit(code);
-const pub = readFileSync(join(dev, "surface.pub.b64"), "utf8").trim();
+// The key-list entry (key id and raw key), the form the app reads.
+const pub = readFileSync(join(dev, "surface.pub.entry"), "utf8").trim();
 // The deployed app reads the Worker's /snapshot; dev reads the file in public/.
 writeFileSync(
   join(here, "app/.env.local"),

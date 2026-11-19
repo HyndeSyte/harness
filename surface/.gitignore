@@ -2,3 +2,12 @@
 .dev/
 *.key
 *.pem
+# The exporter's dry-run report (private: words from the record) under its default name, and the
+# temporary files the exporter writes before a rename (<path>.tmp-<pid>-<random>). The exporter also
+# refuses a report path inside any git work tree; these are a second line.
+surface-dry-run.private.txt
+# The exact signed bytes a dry run with --key and --report writes beside its report (eighth round).
+*.signed.json
+*.tmp-*
+# The workerd suite's dependencies (bun install in worker/workerd).
+worker/workerd/node_modules/

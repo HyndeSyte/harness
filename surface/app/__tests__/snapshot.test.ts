@@ -1,6 +1,8 @@
 import { readFileSync } from "fs";
 import { join } from "path";
-import { canonical, signedBytes } from "../../shared/canonical";
+import * as ed from "@noble/ed25519";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { canonical, hex, signedBytes, signedBytesOf, toBase64 } from "../../shared/canonical";
 import { check, loadSnapshot, sanitize, sortThreads, verify, type Thread } from "../src/snapshot";
 
 // Signed by the exporter itself (fixtures/make.ts), so this checks the two implementations agree.
@@ -108,6 +110,56 @@ describe("the loader", () => {
   });
 });
 
+describe("sixth round: versions and keys", () => {
+  test("an unknown version, app or purpose is refused as unsupported, before its signature is read", () => {
+    for (const over of [{ version: 1 }, { version: 3 }, { app: "other" }, { purpose: "command" }]) {
+      expect(check({ ...clone(), ...over }, pub)).toEqual({ ok: false, reason: "unsupported" });
+      expect(verify({ ...clone(), ...over }, pub)).toBe(false);
+    }
+  });
+  // Another key's list entry, made here.
+  const otherKey = ed.utils.randomSecretKey();
+  const otherPub = ed.getPublicKey(otherKey);
+  const other = `${hex(sha256(otherPub)).slice(0, 16)}:${toBase64(otherPub)}`;
+  test("the key is picked from a key list by the snapshot's signed key_id", () => {
+    expect(pub).toMatch(/^[0-9a-f]{16}:[A-Za-z0-9+/]+=*$/);
+    expect(verify(raw, `${other},${pub}`)).toBe(true);
+    expect(verify(raw, `${pub} , ${other}`)).toBe(true);
+    expect(verify(raw, `${other},not-base64!,`)).toBe(false);
+  });
+  test("seventh round: a retired key's snapshot is refused, and so is every snapshot under a list with a mistake", () => {
+    expect(verify(raw, `${pub}:retired,${other}`)).toBe(false);
+    expect(check(raw, `${pub}:retired`)).toEqual({ ok: false, reason: "unverified" });
+    // A bare key (no id), an id that isn't its key's own (here or on another entry), a duplicate.
+    expect(verify(raw, pub.split(":")[1])).toBe(false);
+    expect(verify(raw, `0000000000000000:${pub.split(":")[1]}`)).toBe(false);
+    expect(verify(raw, `${pub},0000000000000000:${other.split(":")[1]}`)).toBe(false);
+    expect(verify(raw, `${pub},${pub}`)).toBe(false);
+  });
+  test("seventh round: the key id is signed: moved under another listed key's id, it doesn't verify", () => {
+    expect(verify({ ...clone(), key_id: other.split(":")[0] }, `${pub},${other}`)).toBe(false);
+  });
+  test("seventh round: version 1 is refused: a version 1 blob, validly signed in its own form, replayed", () => {
+    const v1Signed = { version: 1, made_at: raw.made_at, threads: raw.threads, excluded_rows: raw.excluded_rows, skipped_rows: raw.skipped_rows };
+    const sig = toBase64(ed.sign(new TextEncoder().encode(canonical(v1Signed)), otherKey));
+    const v1 = { ...v1Signed, sig, key_id: other.split(":")[0] };
+    // Its signature is good in version 1's own form.
+    expect(ed.verify(ed.sign(new TextEncoder().encode(canonical(v1Signed)), otherKey), new TextEncoder().encode(canonical(v1Signed)), otherPub)).toBe(true);
+    expect(check(v1, other)).toEqual({ ok: false, reason: "unsupported" });
+    expect(verify(v1, other)).toBe(false);
+  });
+  test("seventh round: a version 2 snapshot with any field outside the signed ones is refused", () => {
+    expect(verify({ ...clone(), note: "x" }, pub)).toBe(false);
+    const s = clone();
+    delete s.revision;
+    expect(verify(s, pub)).toBe(false);
+    // A snapshot this app signs here itself, in the version 2 form, verifies: the two agree.
+    const mine = { ...clone(), key_id: other.split(":")[0] };
+    mine.sig = toBase64(ed.sign(signedBytesOf(mine), otherKey));
+    expect(verify(mine, other)).toBe(true);
+  });
+});
+
 describe("unknown fields", () => {
   const base = {
     id: "P1", title: "t", area: "other", who: "the assistant", step: "s", waits_for: null,
@@ -156,7 +208,7 @@ describe("the sort", () => {
 
 describe("one canonical form", () => {
   test("the signed bytes are the standard UTF-8, ellipsis, emoji and non-BMP text included", () => {
-    const s = { version: 1, made_at: "x", threads: [{ t: "As of 9:14 … café \u{1F600} 𝄞 中" }], excluded_rows: 0, skipped_rows: 0 };
+    const s = { version: 2, app: "harness-surface", purpose: "in-motion-snapshot", key_id: "k", made_at: "x", revision: null, threads: [{ t: "As of 9:14 … café \u{1F600} 𝄞 中" }], excluded_rows: 0, skipped_rows: 0 };
     expect(Array.from(signedBytes(s))).toEqual(Array.from(Buffer.from(canonical(s), "utf8")));
   });
 

@@ -56,6 +56,11 @@ describe("In motion", () => {
     expect(container.textContent).toBe("This snapshot could not be verified, so nothing is shown.");
   });
 
+  test("a snapshot in an unknown format is one line and nothing else", () => {
+    const { container } = render(<Surface loaded={{ ok: false, reason: "unsupported" }} now={now} talkUrl="x" />);
+    expect(container.textContent).toBe("This snapshot is in a format this app doesn't know, so nothing is shown.");
+  });
+
   test("an expired Access session is one line, Sign in again, that reloads the page", () => {
     const reload = jest.fn();
     const { container } = render(<Surface loaded={{ ok: false, reason: "signin" }} now={now} talkUrl="x" onReload={reload} />);
