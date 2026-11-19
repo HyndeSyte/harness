@@ -20,16 +20,23 @@ allows every https server (`{ "serverUrl": "https://*" }`) beside the Discord br
 
 `cain/tools/connector-check.sh [settings.json]` (default: Cain's, from the clone it sits in):
 
-1. Checks the allowlist's shape (`cain/tools/mcp-allowlist.ts`): a proxy URL or a per-host list
-   fails here, before any listing.
+1. Checks the allowlist's shape and the locks it relies on (`cain/tools/mcp-allowlist.ts`): a
+   proxy URL or a per-host list fails here, before any listing.
 2. Runs `claude mcp list`, with no managed settings, and counts the `claude.ai ...` lines.
    None at all means no account is signed in (or it has no connectors): the check fails,
    loudly, with `CONNECTOR CHECK FAILED ... no signed-in account here`. It never passes for want
    of something to compare.
-3. Runs `claude --settings <settings.json> mcp list` and requires the same claude.ai
+3. Proves `--settings` is enforced here, the control: it writes a known-bad copy of the
+   settings (in its temp folder: `allowedMcpServers` holding only the bridge's `serverCommand`),
+   runs `claude --settings <known-bad> mcp list`, and requires no claude.ai connector from it.
+   If any lists, it fails with `the managed MCP rules aren't enforced through --settings here,
+   so this check can't tell`. (Enforcement was confirmed on the live server on Nov 19: 0.13.2's
+   proxy-only file listed 0 of 18 connectors, 0.13.3's 18 of 18.)
+4. Runs `claude --settings <settings.json> mcp list` and requires the same claude.ai
    connectors, by name and count. One missing fails it, and every name missing is printed.
-4. On a pass it prints `Connector check passed at <head sha>: all N claude.ai connectors load
-   under Cain's rules`.
+5. On a pass it prints the line that binds the head and the settings checked:
+   `Connector check passed at <head sha>, settings sha256 <digest>: all N claude.ai connectors
+   load under Cain's rules`, then the connector names seen, sorted, one per line.
 
 Each listing waits up to 180 seconds (`CONNECTOR_CHECK_TIMEOUT_S`), since it asks every server.
 
@@ -38,17 +45,14 @@ Each listing waits up to 180 seconds (`CONNECTOR_CHECK_TIMEOUT_S`), since it ask
 CI can't run it: it has no signed-in Claude account, so the `bun` job only runs its tests with
 a stand-in `claude` (`cain/tests/connector-check.test.ts`) and checks the allowlist's shape.
 
-It runs on a machine where Claude Code is signed in to the account Cain uses, with its
-connectors connected:
+Cain runs it himself, on the live server (the Pi), signed in as the account, for every pull
+request that changes his managed settings: from the settings file at the pull request's head,
+before he shows the Ship card. He puts its passing line in the pull request description. A new
+head needs a new run. Nothing in it is Dane's to do.
 
-- **The maintainer's signed-in machine** (a laptop session at Dane's PC, on his OK), for every
-  pull request that changes Cain's managed settings, before its Ship card. Run it from a clone
-  checked out at the pull request's head, and put its last line (`Connector check passed at
-  <head sha> ...`) in the pull request description under "How it was tested". A new head that
-  changes the settings again needs a new run.
-- **The Ship job**, when its own Claude Code is signed in: RELEASING.md, Ship, step 3. When it
-  isn't, the check fails loudly there as above, and the job goes on only if the pull request
-  description carries a passing line for the head it installs.
+The Ship step (RELEASING.md, Ship, step 3) requires that line for the exact head it installs,
+and that the SHA-256 of `cain/rootfs/opt/cain/settings.json` at that head equals the digest in
+the line; otherwise it installs nothing and says so.
 
 ## The switch's own check
 

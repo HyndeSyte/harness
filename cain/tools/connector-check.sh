@@ -10,7 +10,14 @@
 #   claude --settings <settings> mcp list  the same under Cain's rules
 # and passes only when both list the same claude.ai connectors, at least one. With no account
 # signed in (no claude.ai connector listed without the rules) it fails, loudly: it never passes
-# for want of something to compare.
+# for want of something to compare. Before comparing it proves --settings is enforced here: a
+# known-bad copy of the settings (allowedMcpServers holding only the bridge's serverCommand)
+# must list no claude.ai connector, or the check fails, since it couldn't tell.
+#
+# Its passing line binds the head and the settings checked (Cain puts it in the pull request
+# description; the Ship step requires it for the exact head, with the same digest):
+#   Connector check passed at <head sha>, settings sha256 <digest>: all N claude.ai connectors load under Cain's rules
+# followed by the connector names seen, sorted, one per line.
 #
 #   cain/tools/connector-check.sh [settings.json]   (default: Cain's, from this clone)
 # Exits 0 when every connector loads under the rules, 1 when one doesn't or the check couldn't
@@ -43,6 +50,20 @@ if [ "$want" -eq 0 ]; then
   fail "\`claude mcp list\` named no claude.ai connector (exit $rc$(head -c 300 "$tmp/plain.err" | tr '\n' ' ' | sed 's/^./: &/')). This check needs Claude Code signed in to the account Cain uses, with its connectors; no signed-in account here, so nothing was compared and it doesn't pass. Sign in (claude, then /login) and run it again."
 fi
 
+# The control: --settings must be enforced, or a pass below would prove nothing. The candidate
+# settings with allowedMcpServers cut to the bridge's serverCommand alone must load no connector.
+bun -e 'const [src, dst] = process.argv.slice(1); const s = JSON.parse(await Bun.file(src).text());
+s.allowedMcpServers = (Array.isArray(s.allowedMcpServers) ? s.allowedMcpServers : []).filter((e) => e && e.serverCommand !== undefined);
+await Bun.write(dst, JSON.stringify(s, null, 2));' "$settings" "$tmp/known-bad.json" \
+  || fail "couldn't build the known-bad settings for the control run"
+timeout "$WAIT" "$CLAUDE" --settings "$tmp/known-bad.json" mcp list > "$tmp/control" 2> "$tmp/control.err"; rc=$?
+names < "$tmp/control" > "$tmp/control.names"
+leaked="$(wc -l < "$tmp/control.names" | tr -d ' ')"
+if [ "$leaked" -ne 0 ]; then
+  echo "Under a known-bad allowlist (only the bridge's serverCommand): $leaked of $want claude.ai connectors listed (exit $rc)." >&2
+  fail "the managed MCP rules aren't enforced through --settings here, so this check can't tell"
+fi
+
 timeout "$WAIT" "$CLAUDE" --settings "$settings" mcp list > "$tmp/ruled" 2> "$tmp/ruled.err"; rc=$?
 names < "$tmp/ruled" > "$tmp/ruled.names"
 got="$(wc -l < "$tmp/ruled.names" | tr -d ' ')"
@@ -53,4 +74,6 @@ if [ "$got" -ne "$want" ] || [ -n "$missing" ]; then
   fail "his claude.ai connectors wouldn't all load under $settings"
 fi
 head="$(git -C "$here" rev-parse HEAD 2>/dev/null || echo "no git head")"
-echo "Connector check passed at $head: all $want claude.ai connectors load under Cain's rules ($settings)."
+digest="$(sha256sum "$settings" | cut -d' ' -f1)"
+echo "Connector check passed at $head, settings sha256 $digest: all $want claude.ai connectors load under Cain's rules"
+cat "$tmp/ruled.names"

@@ -240,10 +240,11 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
    - Python: `python -m pytest -q -p no:cacheprovider` from the repo root.
    - Cain: `bun test cain/tests` (install Bun if missing).
    - A change to Cain's managed settings (`cain/rootfs/opt/cain/settings.json`) also needs
-     the connector check, `cain/tools/connector-check.sh`, on a machine where Claude Code is
-     signed in to Cain's account (CI has none; `cain/docs/connector-check.md`). It fails
-     loudly with no account signed in. A session that can't run it says so under "Not
-     verified"; its passing line goes in the description before the Ship card.
+     the connector check, `cain/tools/connector-check.sh`, which CI can't run (no signed-in
+     account; `cain/docs/connector-check.md`). Cain runs it himself on the live server (the
+     Pi), signed in as the account, from the settings file at the pull request's head, before
+     he shows the Ship card, and puts its passing line in the description. A build session
+     doesn't run it: it says so under "Not verified". Nothing in it is Dane's to do.
 5. Commit as `HyndeSyte <HyndeSyte@users.noreply.github.com>` (GitHub rejects pushes
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
 6. Push the branch and open a pull request into `main`. The description follows the
@@ -311,12 +312,12 @@ for 2 hours, without which Cain can't start the job.
    `Home Assistant connector: needs signing in again` (or `no answer`). main keeps
    the commit; only the install waits (If Home Assistant's connector lapses, below).
 3. When the pull request changes Cain's managed settings (`cain/rootfs/opt/cain/settings.json`),
-   run `cain/tools/connector-check.sh` from a clone at that commit before installing Cain. It
-   fails because a connector is missing: install nothing, and end with
-   `Connector check: failed` and the names it printed. It fails because no account is signed
-   in here: go on only if the pull request description carries `Connector check passed at
-   <that full sha>` from a signed-in machine, and otherwise install nothing and end with
-   `Connector check: not run (no signed-in account), and no passing line for this head`.
+   its description must carry Cain's passing line from the connector check for the exact head
+   being installed, `Connector check passed at <that full sha>, settings sha256 <digest>: ...`,
+   and the SHA-256 of `cain/rootfs/opt/cain/settings.json` at that head
+   (`git show <sha>:cain/rootfs/opt/cain/settings.json | sha256sum`) must equal that digest.
+   Otherwise install nothing and end with
+   `Connector check: no passing line for this head and its settings`.
 4. In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. When it changed both, Cain first, then
    Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness

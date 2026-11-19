@@ -15,34 +15,79 @@ const SETTINGS = join(ROOT, "cain/rootfs/opt/cain/settings.json");
 const CONNECTORS = ["claude.ai Canva", "claude.ai Claude Docs", "claude.ai GitHub", "claude.ai Gmail", "claude.ai Google Calendar"];
 const line = (n: string, url = "https://example.test/mcp") => `${n}: ${url} - ✓ Connected`;
 
-// A stand-in claude: `mcp list` prints PLAIN's lines, and with --settings RULED's.
-function fake(plain: string[], ruled: string[], rcPlain = 0) {
+// A stand-in claude: `mcp list` prints PLAIN's lines, and with --settings RULED's, honouring the
+// settings as Claude Code does: a file whose allowedMcpServers allows no server URL loads no
+// claude.ai connector. ENFORCING false makes a stand-in that ignores the managed rules.
+function fake(plain: string[], ruled: string[], rcPlain = 0, enforcing = true) {
   const dir = mkdtempSync(join(tmpdir(), "conncheck-"));
   writeFileSync(join(dir, "plain"), plain.join("\n") + (plain.length ? "\n" : ""));
   writeFileSync(join(dir, "ruled"), ruled.join("\n") + (ruled.length ? "\n" : ""));
   const bin = join(dir, "claude");
   writeFileSync(bin, `#!/bin/bash
 echo "$*" >> "${dir}/calls"
-if [ "$1" = --settings ]; then echo "Checking MCP server health..."; echo; cat "${dir}/ruled"; exit 0; fi
+if [ "$1" = --settings ]; then
+  echo "Checking MCP server health..."; echo
+  if ${enforcing ? "true" : "false"} && ! grep -q '"serverUrl"' "$2"; then grep -v '^claude\\.ai ' "${dir}/ruled"; exit 0; fi
+  cat "${dir}/ruled"; exit 0
+fi
 echo "Checking MCP server health..."; echo; cat "${dir}/plain"; exit ${rcPlain}
 `);
   chmodSync(bin, 0o755);
   return { dir, bin };
 }
+const calls = (dir: string) => readFileSync(join(dir, "calls"), "utf8").trim().split("\n");
+const sha256 = (file: string) => new Bun.CryptoHasher("sha256").update(readFileSync(file)).digest("hex");
 function run(bin: string, settings = SETTINGS) {
   const p = Bun.spawnSync(["bash", SCRIPT, settings], { env: { ...process.env, CLAUDE_BIN: bin } });
   return { rc: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
 }
 
 describe("the pre-ship connector check", () => {
-  test("passes when every claude.ai connector also loads under Cain's rules, and runs both listings", () => {
+  test("passes when every claude.ai connector also loads under Cain's rules: a control run first, then the line binding head and settings", () => {
     const all = [...CONNECTORS.map((n) => line(n)), "plugin:discord:discord: bun run start - ✓ Connected"];
     const f = fake(all, all);
     const r = run(f.bin);
     expect(r.err).toBe("");
     expect(r.rc).toBe(0);
-    expect(r.out).toContain(`all ${CONNECTORS.length} claude.ai connectors load`);
-    expect(readFileSync(join(f.dir, "calls"), "utf8").trim().split("\n")).toEqual(["mcp list", `--settings ${SETTINGS} mcp list`]);
+    const c = calls(f.dir);
+    expect(c.length).toBe(3);
+    expect(c[0]).toBe("mcp list");
+    expect(c[1]).toMatch(/^--settings \S+\/known-bad\.json mcp list$/);
+    expect(c[2]).toBe(`--settings ${SETTINGS} mcp list`);
+    const head = Bun.spawnSync(["git", "-C", ROOT, "rev-parse", "HEAD"]).stdout.toString().trim();
+    const out = r.out.trim().split("\n");
+    expect(out[0]).toBe(`Connector check passed at ${head}, settings sha256 ${sha256(SETTINGS)}: all ${CONNECTORS.length} claude.ai connectors load under Cain's rules`);
+    expect(out.slice(1)).toEqual([...CONNECTORS].sort());
+  });
+
+  test("the known-bad control is the candidate settings with allowedMcpServers cut to the bridge's serverCommand", () => {
+    const all = CONNECTORS.map((n) => line(n));
+    const dir = mkdtempSync(join(tmpdir(), "conncheck-k-"));
+    const bin = join(dir, "claude");
+    // Keeps a copy of each --settings file it is handed.
+    writeFileSync(bin, `#!/bin/bash
+if [ "$1" = --settings ]; then n=$(ls "${dir}"/seen-* 2>/dev/null | wc -l); cp "$2" "${dir}/seen-$n"; grep -q '"serverUrl"' "$2" || exit 0; fi
+printf '%s\\n' ${all.map((l) => `'${l}'`).join(" ")}
+`);
+    chmodSync(bin, 0o755);
+    const r = run(bin);
+    expect(r.rc).toBe(0);
+    const bad = JSON.parse(readFileSync(join(dir, "seen-0"), "utf8"));
+    const base = JSON.parse(readFileSync(SETTINGS, "utf8"));
+    expect(bad.allowedMcpServers).toEqual(base.allowedMcpServers.filter((e: any) => e.serverCommand !== undefined));
+    expect(bad.allowedMcpServers.length).toBe(1);
+    expect({ ...bad, allowedMcpServers: undefined }).toEqual({ ...base, allowedMcpServers: undefined });
+  });
+
+  test("fails when --settings isn't enforced: the known-bad control still lists connectors", () => {
+    const all = CONNECTORS.map((n) => line(n));
+    const f = fake(all, all, 0, false);
+    const r = run(f.bin);
+    expect(r.rc).toBe(1);
+    expect(r.err).toContain("the managed MCP rules aren't enforced through --settings here, so this check can't tell");
+    expect(r.err).toContain(`${CONNECTORS.length} of ${CONNECTORS.length} claude.ai connectors listed`);
+    expect(r.out).not.toContain("passed");
+    expect(calls(f.dir).length).toBe(2);   // the real comparison never ran
   });
 
   test("fails, naming each one missing, when the rules refuse some (Nov 19: all 18)", () => {
@@ -65,7 +110,7 @@ describe("the pre-ship connector check", () => {
       expect(r.err).toContain("no signed-in account here");
       expect(r.out).not.toContain("passed");
       // The ruled listing never runs: there's nothing to compare it with.
-      expect(readFileSync(join(f.dir, "calls"), "utf8").trim()).toBe("mcp list");
+      expect(calls(f.dir)).toEqual(["mcp list"]);
     }
     const r = run("/nonexistent/claude");
     expect(r.rc).toBe(1);
@@ -92,8 +137,14 @@ describe("the pre-ship connector check", () => {
     expect(doc).toContain("cain/tools/connector-check.sh");
     expect(doc).toContain("CI can't run it");
     expect(doc).toContain("signed in");
+    expect(doc).toContain("on the live server (the Pi)");
+    expect(doc).not.toContain("maintainer's signed-in machine");
+    expect(doc).not.toContain("laptop session");
     const rel = readFileSync(join(ROOT, "RELEASING.md"), "utf8").replace(/\s+/g, " ");
     expect(rel).toContain("cain/tools/connector-check.sh");
+    expect(rel).toContain("settings sha256 <digest>");
+    expect(rel).toContain("must equal that digest");
+    expect(rel).not.toContain("from a signed-in machine");
   });
 });
 
