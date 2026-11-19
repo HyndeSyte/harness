@@ -197,4 +197,36 @@ describe("his MCP allowlist lets every claude.ai connector load (0.13.3)", () =>
     expect(mcpAllowlistProblems({ ...settings, disableSideloadFlags: false }).length).toBeGreaterThan(0);
     expect(mcpAllowlistProblems({ ...settings, allowManagedMcpServersOnly: false }).length).toBeGreaterThan(0);
   });
+
+  test("the locks the wide allowlist relies on", () => {
+    expect(settings.strictKnownMarketplaces).toEqual([{ source: "github", repo: "anthropics/claude-plugins-official" }]);
+    expect(settings.enabledPlugins).toEqual({ "discord@claude-plugins-official": true });
+    expect(settings.syncClaudeAiPlugins).toBe(false);
+    expect(settings.allowManagedHooksOnly).toBe(true);
+    expect(settings.allowManagedPermissionRulesOnly).toBe(true);
+    expect(settings.disableSideloadFlags).toBe(true);
+    expect(settings.strictPluginOnlyCustomization).toContain("mcp");
+    expect(settings.strictPluginOnlyCustomization).toContain("hooks");
+    // The shape checker refuses each one loosened.
+    const bad: Record<string, unknown>[] = [
+      { strictKnownMarketplaces: [] },
+      { strictKnownMarketplaces: [{ source: "github", repo: "anthropics/claude-plugins-official" }, { source: "github", repo: "someone/else" }] },
+      { strictKnownMarketplaces: [{ source: "github", repo: "someone/else" }] },
+      { strictKnownMarketplaces: undefined },
+      { enabledPlugins: { "discord@claude-plugins-official": true, "other@claude-plugins-official": true } },
+      { enabledPlugins: { "discord@claude-plugins-official": false } },
+      { enabledPlugins: undefined },
+      { syncClaudeAiPlugins: true },
+      { syncClaudeAiPlugins: undefined },
+      { allowManagedHooksOnly: false },
+      { allowManagedPermissionRulesOnly: false },
+      { allowManagedPermissionRulesOnly: undefined },
+      { disableSideloadFlags: undefined },
+      { strictPluginOnlyCustomization: ["mcp"] },
+      { strictPluginOnlyCustomization: undefined },
+    ];
+    for (const b of bad) expect(mcpAllowlistProblems({ ...settings, ...b }).length).toBeGreaterThan(0);
+    // Containing mcp and hooks is enough; more locked surfaces are fine.
+    expect(mcpAllowlistProblems({ ...settings, strictPluginOnlyCustomization: ["mcp", "hooks", "skills"] })).toEqual([]);
+  });
 });

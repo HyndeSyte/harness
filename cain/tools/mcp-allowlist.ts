@@ -9,11 +9,17 @@
 // itself three times on Nov 19. A list of hosts would break each time a connector is added, so
 // every https server is allowed. Local (stdio) servers stay locked to the Discord bridge, and
 // servers he'd add himself stay blocked by strictPluginOnlyCustomization ["mcp", "hooks"] and
-// disableSideloadFlags; the deny list still denies every write tool by name.
+// disableSideloadFlags; the deny list still denies every write tool by name. The wide list
+// relies on those locks, so they are checked here too: one known marketplace (Anthropic's
+// official one), only the Discord plugin enabled, no claude.ai plugin sync, and managed hooks
+// and permission rules only.
 
 export const BRIDGE = { serverCommand: ["/usr/local/bin/bun", "/opt/cain/discord/bridge.ts"] };
 export const CONNECTORS = { serverUrl: "https://*" };
 export const ALLOWLIST = [BRIDGE, CONNECTORS];
+
+export const MARKETPLACES = [{ source: "github", repo: "anthropics/claude-plugins-official" }];
+export const PLUGINS = { "discord@claude-plugins-official": true };
 
 const PROXY = "mcp-proxy.anthropic.com";
 
@@ -23,9 +29,16 @@ const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
 export function mcpAllowlistProblems(settings: any): string[] {
   const out: string[] = [];
   if (settings?.allowManagedMcpServersOnly !== true) out.push("allowManagedMcpServersOnly isn't true");
-  if (settings?.strictPluginOnlyCustomization === undefined || !same(settings.strictPluginOnlyCustomization, ["mcp", "hooks"]))
-    out.push('strictPluginOnlyCustomization isn\'t ["mcp", "hooks"]');
+  const spoc = settings?.strictPluginOnlyCustomization;
+  if (!Array.isArray(spoc) || !spoc.includes("mcp") || !spoc.includes("hooks"))
+    out.push('strictPluginOnlyCustomization doesn\'t hold "mcp" and "hooks"');
   if (settings?.disableSideloadFlags !== true) out.push("disableSideloadFlags isn't true");
+  if (settings?.allowManagedHooksOnly !== true) out.push("allowManagedHooksOnly isn't true");
+  if (settings?.allowManagedPermissionRulesOnly !== true) out.push("allowManagedPermissionRulesOnly isn't true");
+  if (settings?.syncClaudeAiPlugins !== false) out.push("syncClaudeAiPlugins isn't false");
+  if (!same(settings?.strictKnownMarketplaces, MARKETPLACES))
+    out.push('strictKnownMarketplaces isn\'t exactly [{ "source": "github", "repo": "anthropics/claude-plugins-official" }]');
+  if (!same(settings?.enabledPlugins, PLUGINS)) out.push('enabledPlugins isn\'t exactly { "discord@claude-plugins-official": true }');
   const list = settings?.allowedMcpServers;
   if (!Array.isArray(list)) { out.push("allowedMcpServers isn't a list"); return out; }
   for (const e of list) {

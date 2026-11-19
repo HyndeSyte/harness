@@ -14,7 +14,10 @@ connector against that connector's own server URL (`gmailmcp.googleapis.com`,
 connectors were refused under the new rules, and the switch to his own user undid itself
 three times on Nov 19. CI has no signed-in account, which is how it got through. 0.13.3
 allows every https server (`{ "serverUrl": "https://*" }`) beside the Discord bridge's
-`serverCommand`; `cain/tools/mcp-allowlist.ts` checks that shape in CI.
+`serverCommand`; `cain/tools/mcp-allowlist.ts` checks that shape in CI, with the locks the wide list relies on:
+one known marketplace (`anthropics/claude-plugins-official`), only the Discord plugin enabled,
+`syncClaudeAiPlugins` false, `allowManagedHooksOnly`, `allowManagedPermissionRulesOnly` and
+`disableSideloadFlags` true, and `strictPluginOnlyCustomization` holding `mcp` and `hooks`.
 
 ## What it does
 
@@ -53,6 +56,12 @@ head needs a new run. Nothing in it is Dane's to do.
 The Ship step (RELEASING.md, Ship, step 3) requires that line for the exact head it installs,
 and that the SHA-256 of `cain/rootfs/opt/cain/settings.json` at that head equals the digest in
 the line; otherwise it installs nothing and says so.
+
+## Follow-up, not done here
+
+A per-host allowlist generated from the verified connector list, with the check failing `new
+connector host X: add it`, so that a new connector is a reviewed change rather than allowed by
+`https://*`.
 
 ## The switch's own check
 
