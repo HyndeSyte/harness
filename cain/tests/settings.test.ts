@@ -154,3 +154,47 @@ describe("the old way's files are 0.11.0's", () => {
     }
   });
 });
+
+// Cain 0.13.3: Claude Code checks each claude.ai connector against its own server URL
+// (gmailmcp.googleapis.com, api.githubcopilot.com, mcp.canva.com, ...), never Anthropic's MCP
+// proxy. 0.13.2 allowed only the proxy, so all 18 of his connectors were refused under his new
+// rules and the switch to his own user undid itself three times (Nov 19).
+describe("his MCP allowlist lets every claude.ai connector load (0.13.3)", () => {
+  const { ALLOWLIST, mcpAllowlistProblems } = require("../tools/mcp-allowlist.ts");
+  const withList = (list: unknown) => ({ ...settings, allowedMcpServers: list });
+  const BRIDGE = { serverCommand: ["/usr/local/bin/bun", "/opt/cain/discord/bridge.ts"] };
+
+  test("exactly two entries: the bridge's serverCommand as it was, and every https server", () => {
+    expect(settings.allowManagedMcpServersOnly).toBe(true);
+    expect(settings.allowedMcpServers).toEqual([BRIDGE, { serverUrl: "https://*" }]);
+    expect(settings.allowedMcpServers).toEqual(ALLOWLIST);
+    expect(mcpAllowlistProblems(settings)).toEqual([]);
+  });
+
+  test("the old way's settings carry no MCP allowlist to keep in step", () => {
+    const legacy = JSON.parse(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json"), "utf8"));
+    expect(legacy.allowedMcpServers).toBeUndefined();
+  });
+
+  test("a settings file naming the MCP proxy fails", () => {
+    const p = mcpAllowlistProblems(withList([BRIDGE, { serverUrl: "https://mcp-proxy.anthropic.com/v1/mcp/*" }]));
+    expect(p.some((l: string) => l.includes("MCP proxy"))).toBe(true);
+  });
+
+  test("a settings file naming a per-host list fails", () => {
+    const hosts = ["https://gmailmcp.googleapis.com/*", "https://api.githubcopilot.com/*", "https://mcp.canva.com/*"];
+    const p = mcpAllowlistProblems(withList([BRIDGE, ...hosts.map((serverUrl) => ({ serverUrl }))]));
+    expect(p.some((l: string) => l.includes("per-host"))).toBe(true);
+    // A per-host list beside https://* still fails: exactly the two entries.
+    expect(mcpAllowlistProblems(withList([BRIDGE, { serverUrl: "https://*" }, { serverUrl: hosts[0] }])).length).toBeGreaterThan(0);
+  });
+
+  test("stdio stays locked to the bridge, and the lock on servers of his own stays", () => {
+    expect(mcpAllowlistProblems(withList([{ serverCommand: ["bun", "/opt/cain/discord/bridge.ts"] }, { serverUrl: "https://*" }])).length).toBeGreaterThan(0);
+    expect(mcpAllowlistProblems(withList([BRIDGE, { serverUrl: "https://*" }, { serverCommand: ["/bin/sh"] }])).length).toBeGreaterThan(0);
+    expect(mcpAllowlistProblems(withList([{ serverUrl: "https://*" }])).length).toBeGreaterThan(0);
+    expect(mcpAllowlistProblems({ ...settings, strictPluginOnlyCustomization: ["hooks"] }).length).toBeGreaterThan(0);
+    expect(mcpAllowlistProblems({ ...settings, disableSideloadFlags: false }).length).toBeGreaterThan(0);
+    expect(mcpAllowlistProblems({ ...settings, allowManagedMcpServersOnly: false }).length).toBeGreaterThan(0);
+  });
+});
