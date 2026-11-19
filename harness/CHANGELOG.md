@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.3
+
+- **Telling Cain about a change to your calendar works again.** Since 0.24.1, every calendar request crashed before Claude was asked, and the message wrongly blamed Claude's reply. "I cancelled PT today" on Nov 19 was one of them. Finding which Gmail calendar is yours now happens before the request is handed off, and a failed lookup no longer stops the request.
+- A crash on our side is called a bug in the calendar specialist, never a bad reply from Claude.
+- A retry that runs within seconds is no longer announced. You hear only how it turned out, so a "running it once more" note can't arrive after the answer. A retry after a ten-minute timeout is still announced.
+
 ## 0.24.2
 
 - The calendar App now signs everything it sends to Cain's App, with a key of its own, and takes an answer only when Cain's App signed it. Nothing changes for you.

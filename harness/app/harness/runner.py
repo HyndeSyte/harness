@@ -173,6 +173,10 @@ class Runner:
         # What became of his last calendar requests, from the record (Nov 11: an answer said no
         # proposal had been sent when one had been approved). Read here: the worker has no ledger.
         recent = cc.recent(job["id"]) if cc else []
+        # Which calendar is his, found here too: finding it reads the record, and SQLite refuses
+        # a read from the worker's thread (Nov 19: "I cancelled PT today" crashed twice before
+        # Claude was called, from 0.24.1, when finding his calendar began to read the record).
+        address = cc.context_address() if cc else None
 
         t0 = self.monotonic()
         job_id = job["id"]
@@ -181,8 +185,15 @@ class Runner:
             # In the worker: what his calendar says about the events he names is a Google read.
             # It counts against the job's own deadline, so retries never outlive the job
             # (Nov 8: a message with Cain's context ran past 10 minutes and was cut off).
+            # The read is a help, never a stop: one that fails leaves the model without it.
+            calendar: list[str] = []
+            if cc:
+                try:
+                    calendar = cc.context_for(text, now, address)
+                except Exception as e:
+                    log.warning("job %s: reading his calendar for context failed: %s", job_id, type(e).__name__)
             with_calendar = prompts.user_content(text, earlier=earlier, recent=recent,
-                                                 calendar=cc.context_for(text, now), sent=sent) if cc else user
+                                                 calendar=calendar, sent=sent) if cc else user
             spent = self.monotonic() - t0
             if spent > 20:
                 log.info("job %s: reading his calendar for context took %d s", job_id, spent)
@@ -236,9 +247,9 @@ class Runner:
             del self._futures[job_id]
             try:
                 outcome = fut.result()
-            except Exception as e:          # a bug in a worker, not a provider answer
+            except Exception as e:          # a bug in a worker, not a provider answer: said as ours
                 log.error("worker crashed on %s: %s", job_id, type(e).__name__)
-                outcome = CallOutcome(error=EngineError("fatal", "bad_output", type(e).__name__))
+                outcome = CallOutcome(error=EngineError("fatal", "internal_error", type(e).__name__))
             try:
                 self._finish(job_id, outcome)
             except Exception as e:          # a bug after the answer: end the job now, never hang
@@ -446,8 +457,12 @@ class Runner:
                 self.ledger.set_meta(f"job_retried:{job['id']}", self.ledger.now().isoformat(), db)
                 self.ledger.transition(job["id"], "received", db=db)
                 self.ledger.event("job_retry", {"job": job["id"], "reason": reason}, db=db)
-                self._reply(db, job, f"That didn't finish ({reason_text(reason, engine)}), "
-                                     "so I'm running it once more.", kind="notice")
+                # Said only after a ten-minute wait, when the retry may take as long again. Any
+                # other retry runs within seconds and its outcome is what he hears: a notice of it
+                # reached him after that outcome (Nov 19), and Cain then had to explain it.
+                if reason == "deadline":
+                    self._reply(db, job, f"That didn't finish ({reason_text(reason, engine)}), "
+                                         "so I'm running it once more.", kind="notice")
             else:
                 again = " It failed twice, so it's logged for a fix." \
                     if self.ledger.get_meta(f"job_retried:{job['id']}") else ""

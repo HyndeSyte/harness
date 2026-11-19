@@ -27,7 +27,7 @@ from harness.handover import Handover, Inbox
 from harness.ledger import iso
 from harness.vault import Vault
 from fake_caldav import APP_PASSWORD, APPLE_ID, FAMILY_PATH, FAMILY_URL, FakeICloud, no_network  # noqa: F401
-from fakes import FakeBot, FakeEngine, SyncExecutor, result
+from fakes import FakeBot, FakeEngine, SyncExecutor, ThreadExecutor, result
 from test_calendar_change import FakeGmail
 from test_discord_keeper import OWNER, TOKEN, FakeDiscord, FakeLink
 
@@ -292,6 +292,43 @@ def test_the_third_try_from_that_morning_now_lands_whole(m):
     assert m.gmail_times(PT_ID) == ("11:30", "12:30") and m.copy_times() == ("11:30", "12:30")
     assert m.block_state("drop") == "cancelled"
     assert m.seen()[-1].count("Moved PT") == 1                      # one event, said once
+
+
+def test_i_cancelled_pt_today_works_with_the_worker_on_its_own_thread(m):
+    """Nov 19: "I cancelled PT today" crashed twice before Claude was called, and was said as
+    "Claude's reply didn't fit the allowed shapes". From 0.24.1 finding his calendar reads the
+    record, and the worker asked for it from its own thread, which SQLite refuses. Here the worker
+    runs on a thread of its own, as in the App, and his calendar is found from the record."""
+    with m.ledger.tx() as db:
+        m.ledger.set_meta("test_his_calendar", GMAIL, db)
+    m.cc.address = lambda: m.ledger.get_meta("test_his_calendar")
+    m.c.runner.executor = ThreadExecutor()
+    out = m.tells("I cancelled PT today", ask(change("gmail", "remove", PT_TITLE)))
+    assert out["status"] == "executed", out
+    assert "PT - Example Clinic" in m.claude.calls[-1]["user"]     # his calendar reached the model
+    assert m.gmail.events[PT_ID]["status"] == "cancelled"
+    assert not any("allowed shapes" in t or "once more" in t for t in m.seen() + [out.get("said", "")])
+
+
+def test_a_calendar_lookup_that_fails_never_stops_the_message(m):
+    """Finding his calendar is a help: when it fails, the model runs without it."""
+    def broken():
+        raise RuntimeError("no record")
+    m.cc.address = broken
+    m.c.runner.executor = ThreadExecutor()
+    out = m.tells("what's on today?", result(text="Nothing after 3."))
+    assert "Nothing after 3." in out.get("said", "") and m.claude.calls
+
+
+def test_a_crash_in_the_worker_is_said_as_ours_not_claudes(m, monkeypatch):
+    def crash(*a, **k):
+        raise TypeError("a bug")
+    monkeypatch.setattr(m.cc, "context_for", crash)
+    m.c.runner.executor = ThreadExecutor()
+    monkeypatch.setattr("harness.runner.call_with_retries", crash)
+    out = m.tells("I cancelled PT today")
+    said = out.get("said", "") + " ".join(m.seen())
+    assert "allowed shapes" not in said and "bug in the calendar specialist" in said, said
 
 
 # -- b. his words, either way round, on both calendars ---------------------------------------------
