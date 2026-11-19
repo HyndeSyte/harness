@@ -6,14 +6,14 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { APP_ID, PURPOSE_SNAPSHOT, SNAPSHOT_VERSION } from "../../../shared/canonical";
-import { areaOf, buildSnapshot, gateFixed, gateId, gateTime, makeKeyPair, makePolicy, privateKey, sanitise, signSnapshot } from "../../../export/lib";
+import { areaOf, buildSnapshot, gateFixed, gateId, gateRevision, gateTime, makeKeyPair, makePolicy, privateKey, sanitise, signSnapshot } from "../../../export/lib";
 
 const here = import.meta.dir;
 const fix = join(here, "../../../export/fixtures");
 const keys = makeKeyPair();
 const key = privateKey(keys.privatePem);
 const policy = makePolicy(readFileSync(join(fix, "private-terms.txt"), "utf8"), JSON.parse(readFileSync(join(fix, "exporter.json"), "utf8")));
-const snapshot = signSnapshot(buildSnapshot(join(fix, "record"), policy, new Date("2026-11-18T10:00:00Z")).snapshot, key);
+const snapshot = signSnapshot(buildSnapshot(join(fix, "record"), policy, new Date("2026-11-18T10:00:00Z")).snapshot, key, policy);
 // Every string goes through the exporter's own gates (signSnapshot signs nothing else). The text is
 // lower case, so the proper-noun gate leaves it as written.
 const vectorPolicy = makePolicy("not-a-real-term", { owner_names: ["Nobody"], names: [] });
@@ -24,6 +24,7 @@ const vector = signSnapshot(
     app: gateFixed(APP_ID),
     purpose: gateFixed(PURPOSE_SNAPSHOT),
     made_at: gateTime(Date.parse("2026-11-18T10:00:00.000Z")),
+    revision: gateRevision(42, "0123456789abcdef0123456789abcdef01234567"),
     threads: [
       {
         id: gateId("P1"),
@@ -41,8 +42,10 @@ const vector = signSnapshot(
     skipped_rows: 2,
   },
   key,
+  vectorPolicy,
 );
 writeFileSync(join(here, "snapshot.json"), JSON.stringify(snapshot, null, 2) + "\n");
 writeFileSync(join(here, "vector.json"), JSON.stringify(vector, null, 2) + "\n");
-writeFileSync(join(here, "snapshot.pub"), keys.publicRaw + "\n");
+// The app's key list: this key's entry (`<key id>:<raw base64>`).
+writeFileSync(join(here, "snapshot.pub"), keys.publicEntry + "\n");
 console.log("wrote snapshot.json, vector.json and snapshot.pub");

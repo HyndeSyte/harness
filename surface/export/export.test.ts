@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifySnapshot, canonical, fromBase64, WHO } from "../shared/snapshot";
@@ -15,7 +16,6 @@ import {
   firstSentence,
   leftoverLine,
   leftoverPlace,
-  matchesBounded,
   MATCH_SPAN,
   namesLongNumber,
   riskyPattern,
@@ -30,24 +30,32 @@ import {
   rawPublicKey,
   signSnapshot,
   strip,
-  assertGated,
   CALENDAR_WORDS,
   COMMON_WORDS,
   COMMON_WORDS_FILE,
   DEFAULT_STEMS,
   gateFixed,
-  isGated,
-  MATCH_OVERLAP,
   NAME_WORDS,
   nextToNumber,
   sanitise,
   snapshotIdOf,
   strictProblems,
   unknownTokens,
+  checkSigned,
+  withKeyId,
+  keyIdOfPrivate,
 } from "./lib";
 import { main, PRIVATE_REPORT, PUT_MAX_BYTES, uploadPreflight } from "./index";
 import { SCHEMA, snapshotId } from "../shared/snapshot";
 import { tempRecord } from "./fixtures/temp-record";
+import { keyId, STEM_RULES, namesAccount, namesMoney, gateTokens, inflections, NAME_WORDS_COMMON, recordRevision, parseWordList, parseNameWords } from "./lib";
+import { DEFAULT_REPORT, insideGitWorkTree, writePrivate } from "./index";
+import { keyList } from "../shared/snapshot";
+import { fileProblems } from "../check-casts";
+import type { KeyEntry } from "../shared/snapshot";
+
+// A one-key list for a raw public key (the key-list entry the Worker and the app hold).
+const entry = (raw: Uint8Array, retired = false): KeyEntry[] => [{ id: keyId(raw), raw, retired }];
 
 const FIX = join(import.meta.dir, "fixtures");
 const RECORD = join(FIX, "record");
@@ -76,7 +84,8 @@ describe("the open list", () => {
       expect(Object.keys(t).sort()).toEqual(
         ["area", "id", "last_moved", "outcome", "state", "step", "title", "waits_for", "who"].sort(),
       );
-    expect(Object.keys(snap).sort()).toEqual(["app", "excluded_rows", "made_at", "purpose", "skipped_rows", "threads", "version"]);
+    expect(Object.keys(snap).sort()).toEqual(["app", "excluded_rows", "made_at", "purpose", "revision", "skipped_rows", "threads", "version"]);
+    expect(snap.revision).toBeNull();
   });
 });
 
@@ -147,15 +156,15 @@ describe("fields", () => {
     expect(cut).toBe("a".repeat(138) + family + "…");
   });
   test("without Intl.Segmenter the cut falls back to code points", () => {
-    const seg = (Intl as any).Segmenter;
+    const seg = Reflect.get(Intl, "Segmenter");
     try {
-      delete (Intl as any).Segmenter;
+      Reflect.deleteProperty(Intl, "Segmenter");
       expect(cutCodePoints("ab😀😀😀", 4)).toBe("ab😀…");
       expect(cutCodePoints("𝄞".repeat(5), 3)).toBe("𝄞𝄞…");
     } finally {
-      (Intl as any).Segmenter = seg;
+      Reflect.set(Intl, "Segmenter", seg);
     }
-    expect(typeof (Intl as any).Segmenter).toBe("function");
+    expect(typeof Reflect.get(Intl, "Segmenter")).toBe("function");
   });
   test("title and step are first sentences, capped", () => {
     expect(byId.P40.title).toBe("Surface piece one for projects/surface.");
@@ -205,7 +214,7 @@ describe("names never leave", () => {
     expect(makePolicy("x").names).toEqual([]);
     const p = makePolicy("x", {}, { SURFACE_NAMES: "Kim, Lee", SURFACE_OWNER_NAMES: "Jo" });
     expect(replaceNames("Kim and Lee's dog for Jo", p)).toBe("someone and someone's dog for you");
-    expect(() => makePolicy("x", { names: "Kim" as any })).toThrow();
+    expect(() => makePolicy("x", JSON.parse('{"names": "Kim"}'))).toThrow();
   });
 });
 
@@ -235,7 +244,7 @@ describe("exclusions", () => {
     expect(isExcluded(makePolicy("x"), "the bank")).toBe(true);
   });
   test("a word in the id excludes the row", () => {
-    expect(isExcluded(p, "PT3")).toBe(true);
+    expect(isExcluded(p, "PT")).toBe(true);
   });
   test("a private term the stems miss leaves the row out whole", () => {
     expect(isExcluded(makePolicy("nothing-here"), "Plan the visit for Juniper at the lake house.")).toBe(false);
@@ -316,7 +325,7 @@ describe("strippers", () => {
 
 describe("signature", () => {
   const keys = makeKeyPair();
-  const signed = signSnapshot(snap, privateKey(keys.privatePem));
+  const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
   const raw = rawPublicKey(keys.publicPem);
 
   test("key id is the first 16 hex of the public key's sha256", async () => {
@@ -327,21 +336,21 @@ describe("signature", () => {
   });
 
   test("a signed snapshot verifies", async () => {
-    expect(await verifySnapshot(signed, raw)).toBe(true);
+    expect(await verifySnapshot(signed, entry(raw))).toBe(true);
   });
 
   test("one tampered byte fails", async () => {
     const text = canonical(signed);
     const i = text.indexOf("Pick the school");
     const tampered = JSON.parse(text.slice(0, i) + "p" + text.slice(i + 1));
-    expect(await verifySnapshot(tampered, raw)).toBe(false);
+    expect(await verifySnapshot(tampered, entry(raw))).toBe(false);
     const sigBytes = fromBase64(signed.sig);
     sigBytes[0] ^= 1;
-    expect(await verifySnapshot({ ...signed, sig: btoa(String.fromCharCode(...sigBytes)) }, raw)).toBe(false);
+    expect(await verifySnapshot({ ...signed, sig: btoa(String.fromCharCode(...sigBytes)) }, entry(raw))).toBe(false);
   });
 
   test("another key fails", async () => {
-    expect(await verifySnapshot(signed, rawPublicKey(makeKeyPair().publicPem))).toBe(false);
+    expect(await verifySnapshot(signed, entry(rawPublicKey(makeKeyPair().publicPem)))).toBe(false);
   });
 
   test("the command line writes and verifies", async () => {
@@ -417,18 +426,18 @@ describe("the command line fails closed", () => {
 
 describe("one canonical form", () => {
   test("signed bytes are the standard UTF-8 of the canonical JSON", () => {
-    const s = { version: 1, made_at: "x", threads: [{ title: "café 😀 𝄞 中 …" }], excluded_rows: 0, skipped_rows: 0 };
+    const s = { version: 2, app: "a", purpose: "p", key_id: "k", made_at: "x", revision: null, threads: [{ title: "café 😀 𝄞 中 …" }], excluded_rows: 0, skipped_rows: 0 };
     const text = canonical(s);
-    expect(Array.from(signedBytes(s as any))).toEqual(Array.from(Buffer.from(text, "utf8")));
+    expect(Array.from(signedBytes(s))).toEqual(Array.from(Buffer.from(text, "utf8")));
   });
   test("the counts are signed", async () => {
     const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
     const raw = rawPublicKey(keys.publicPem);
-    expect(await verifySnapshot(signed, raw)).toBe(true);
-    expect(await verifySnapshot({ ...signed, excluded_rows: 0 }, raw)).toBe(false);
+    expect(await verifySnapshot(signed, entry(raw))).toBe(true);
+    expect(await verifySnapshot({ ...signed, excluded_rows: 0 }, entry(raw))).toBe(false);
     const { skipped_rows, ...noCount } = signed;
-    expect(await verifySnapshot(noCount, raw)).toBe(false);
+    expect(await verifySnapshot(noCount, entry(raw))).toBe(false);
   });
 });
 
@@ -552,7 +561,7 @@ describe("the proper-noun gate", () => {
     expect(r.err).not.toContain("Kestrel");
     expect(r.err).not.toContain(PRIVATE_REPORT);
     expect(r.err).toMatch(/1 capitalised word\(s\) replaced/);
-    expect(r.err).toMatch(/--report <file>/);
+    expect(r.err).toMatch(/--report \[<file>\]/);
     expect(r.out).not.toContain("Kestrel");
     expect(JSON.parse(r.out).threads[0].title).toBe("Return the drill to someone next door, then lunch.");
     const file = join(mkdtempSync(join(tmpdir(), "surface-report-")), "report.txt");
@@ -826,14 +835,14 @@ describe("fifth round: the terms file", () => {
     expect(() => parseTerms("re:(a+)+$")).toThrow(/:1: .*without bound/);
     expect(() => parseTerms("re:a)|(b")).toThrow(/:1: not a valid regular expression/);
   });
-  test("a match runs over at most MATCH_SPAN characters at a time; the whole cell is still checked", () => {
-    const seen: number[] = [];
-    const spy = { test: (t: string) => (seen.push(t.length), /needle/.test(t)) } as unknown as RegExp;
-    const long = "x ".repeat(10000) + "needle";
-    expect(matchesBounded(spy, long)).toBe(true);
-    expect(Math.max(...seen)).toBeLessThanOrEqual(MATCH_SPAN);
-    expect(matchesBounded(/needle/, "x".repeat(MATCH_SPAN - 3) + " needle " + "y".repeat(9000))).toBe(true);
+  test("a cell over MATCH_SPAN characters is left out whole; a cell under it is matched whole", () => {
     expect(isExcluded(makePolicy("Juniper"), "a ".repeat(6000) + "Juniper")).toBe(true);
+    expect(isExcluded(makePolicy("Juniper"), "a ".repeat(6000))).toBe(true);
+    // A term at the very end of a cell just under the cap is found: there are no chunks to fall between.
+    const cell = "a ".repeat((MATCH_SPAN - 10) / 2) + "Juniper";
+    expect(cell.length).toBeLessThanOrEqual(MATCH_SPAN);
+    expect(isExcluded(makePolicy("Juniper"), cell)).toBe(true);
+    expect(isExcluded(makePolicy("Juniper"), "a ".repeat((MATCH_SPAN - 10) / 2))).toBe(false);
   });
 });
 
@@ -901,31 +910,85 @@ describe("sixth round: names that double as common words", () => {
 
 describe("sixth round: unknown words", () => {
   test("lower-case and uncased words not in the word list are listed; capitals, numbers and known words are not", () => {
-    expect(unknownTokens("the zorblat crew at 7:30 with someone's 中文 Ladder", policy.vocabulary)).toEqual(["zorblat", "crew", "中文"]);
+    expect(unknownTokens("the zorblat quillon at 7:30 with someone's 中文 Ladder", policy.vocabulary)).toEqual(["zorblat", "quillon", "中文"]);
     expect(unknownTokens("you and your pick, a link, an email address", policy.vocabulary)).toEqual([]);
   });
-  test("the dry run's report lists them; --strict fails on them in waits_for only", async () => {
+  test("seventh round: the dry run's report lists them; --strict fails on them in every field", async () => {
     const dir = mkdtempSync(join(tmpdir(), "surface-unknown-"));
     await capture(() => main(["--keygen", dir]));
     const rec = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat. | the zorblat crew | Done. | 2026-11-01 |"]);
     const run = ["--record", rec, "--private-terms", TERMS, "--config", CONFIG];
     const r = await capture(() => main([...run, "--strict", "--out", join(dir, "o.json"), "--key", join(dir, "surface.key")]));
     expect(r.code).toBe(1);
-    expect(r.err).toMatch(/unknown word in waits_for: .*PENDING\.md:5: waits_for$/m);
+    expect(r.err).toMatch(/unknown word: .*PENDING\.md:5: waits_for$/m);
+    expect(r.err).toMatch(/unknown word: .*PENDING\.md:5: step$/m);
     expect(r.err).not.toContain("zorblat");
     const b = buildSnapshot(rec, policy, NOW);
-    expect(strictProblems(b).waitsUnknown.length).toBe(2);
-    expect(b.unknowns.filter((u) => u.field === "step").map((u) => u.word)).toEqual(["zorblat"]);
-    const file = join(dir, "report.txt");
-    expect((await capture(() => main([...run, "--dry-run", "--report", file]))).code).toBe(0);
-    expect(readFileSync(file, "utf8")).toMatch(/PENDING\.md:5: waits_for: crew/);
-    // The same word in step alone doesn't fail --strict.
-    const ok = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat. | | Done. | 2026-11-01 |"]);
-    expect(strictProblems(buildSnapshot(ok, policy, NOW)).waitsUnknown.length).toBe(0);
+    expect(strictProblems(b).unknown.map((u) => u.field).sort()).toEqual(["step", "waits_for"]);
+    const report = join(mkdtempSync(join(tmpdir(), "surface-unknown-report-")), "report.txt");
+    expect((await capture(() => main([...run, "--dry-run", "--report", report]))).code).toBe(0);
+    expect(readFileSync(report, "utf8")).toMatch(/PENDING\.md:5: waits_for: zorblat/);
+    // The same word in the step alone now fails --strict too.
+    const step = tempRecord(["| P1 | Sort the tools. | Cain | Sort the zorblat. | | Done. | 2026-11-01 |"]);
+    expect(strictProblems(buildSnapshot(step, policy, NOW)).unknown.map((u) => u.field)).toEqual(["step"]);
+    for (const [cell, field] of [["| P1 | Sort the zorblat. | Cain | Sort it. | | Done. | 2026-11-01 |", "title"], ["| P1 | Sort it. | Cain | Sort it. | | The zorblat is done. | 2026-11-01 |", "outcome"]] as const)
+      expect([field, strictProblems(buildSnapshot(tempRecord([cell]), policy, NOW)).unknown.map((u) => u.field)]).toEqual([field, [field]]);
   });
 });
 
-describe("sixth round: chunked matching fails closed", () => {
+describe("seventh round: the name gate's tokens", () => {
+  test("tokens are runs of Unicode letters; digits and underscores split them", () => {
+    expect(gateTokens("abc_def x86 café-crème O'Neill naïve").map((t) => t.text)).toEqual(["abc", "def", "x", "café-crème", "O'Neill", "naïve"]);
+    expect(gateTokens("x86")[0].touchesDigit).toBe(true);
+  });
+  test("possessives and apostrophe forms are taken off before a lookup", () => {
+    const forms = (t: string) => gateTokens(t)[0].forms;
+    expect(forms("Robin's")).toEqual(["robin's", "robin"]);
+    expect(forms("James’s")).toEqual(["james's", "james"]);
+    expect(forms("don't")).toEqual(["don't", "do"]);
+    expect(forms("can't")).toEqual(["can't", "can"]);
+    expect(forms("we'll")).toEqual(["we'll", "we"]);
+    expect(forms("they're")).toEqual(["they're", "they"]);
+    expect(gateTokens("James' car")[0]).toMatchObject({ text: "James'", possessive: true });
+    expect(properNounGate("ask James' crew", policy.allowWords).text).toBe("ask someone's crew");
+    expect(properNounGate("Thessaly's crew", policy.allowWords).text).toBe("someone's crew");
+    expect(unknownTokens("the garden's gate, it's done", policy.vocabulary)).toEqual([]);
+  });
+  test("initials are one name; a lone capital other than I and A is an initial", () => {
+    expect(properNounGate("ask J.R.R. today", policy.allowWords)).toEqual({ text: "ask someone today", words: ["J.R.R."] });
+    expect(properNounGate("ask J. today", policy.allowWords).words).toEqual(["J"]);
+    expect(properNounGate("I think A plan works", policy.allowWords).words).toEqual([]);
+    expect(properNounGate("at 9 a.m. or 5 P.M.", policy.allowWords).words).toEqual([]);
+  });
+  test("an all-caps word is capitalised: gated unless allowed", () => {
+    expect(properNounGate("for KESTREL now", policy.allowWords).words).toEqual(["KESTREL"]);
+    expect(properNounGate("OK, DONE, THE GATE", policy.allowWords).words).toEqual([]);
+    expect(properNounGate("KESTREL'S drill", policy.allowWords).text).toBe("someone's drill");
+  });
+  test("a lower-case word may be an inflection of a known one", () => {
+    expect(inflections("brings")).toContain("bring");
+    expect(inflections("carried")).toContain("carry");
+    expect(inflections("fixing")).toContain("fix");
+    expect(inflections("stopped")).toContain("stop");
+    expect(unknownTokens("it sorts and sorted the tools", policy.vocabulary)).toEqual([]);
+  });
+  test("a month or weekday next to a number is a date only when no other name signal is present", () => {
+    const allow = policy.allowWords;
+    for (const t of ["on May 5", "on 3 June", "Friday, 20 November", "the 3rd of May", "May 5 and 6"])
+      expect([t, properNounGate(t, allow).words]).toEqual([t, []]);
+    for (const t of ["ask May 5 times", "with June 3 days early", "Mrs. May 12 sent it", "Dr June 2", "Kestrel May 5", "May Kestrel 5", "May's 5 forms"])
+      expect([t, properNounGate(t, allow).words.includes(t.match(/May|June/)![0]) || properNounGate(t, allow).words.some((w) => /^(May|June)/.test(w))]).toEqual([t, true]);
+  });
+  test("a lower-case [common] name-word is known, and reported as name-like; a [names] one is unknown", () => {
+    expect(NAME_WORDS_COMMON.has("will")).toBe(true);
+    expect(NAME_WORDS.has("doug") && !NAME_WORDS_COMMON.has("doug")).toBe(true);
+    expect(unknownTokens("the job will run", policy.vocabulary)).toEqual([]);
+    expect(unknownTokens("ask doug", policy.vocabulary)).toEqual(["doug"]);
+    expect(sanitise("the job will run", policy).nameLike).toEqual(["will"]);
+  });
+});
+
+describe("long cells fail closed", () => {
   test("a cell longer than the chunk size leaves the row out, and fails --strict", async () => {
     const long = "word ".repeat(MATCH_SPAN / 4);
     const rec = tempRecord([`| P1 | ${long} | Cain | Go. | | Done. | 2026-11-01 |`]);
@@ -940,28 +1003,14 @@ describe("sixth round: chunked matching fails closed", () => {
     expect(r.code).toBe(1);
     expect(existsSync(join(dir, "o.json"))).toBe(false);
   });
-  test("the overlap is larger than the longest plain term", () => {
-    const term = "x".repeat(900);
-    const p = makePolicy(`Juniper\n${term}`);
-    expect(p.overlap).toBeGreaterThan(900);
-    expect(makePolicy("Juniper").overlap).toBe(MATCH_OVERLAP);
-    expect(() => makePolicy("y".repeat(MATCH_SPAN / 2 + 1))).toThrow(/:1: a term longer than/);
-  });
-  test("a term straddling a chunk boundary is found", () => {
+  test("seventh round: no chunks: a plain term is capped at PLAIN_TERM_MAX, and a cell is matched whole", () => {
+    expect(() => makePolicy("y".repeat(2001))).toThrow(/:1: a term longer than 2000/);
+    expect(() => makePolicy("y".repeat(2000))).not.toThrow();
     const term = "straddling-term-" + "q".repeat(500);
-    const p = makePolicy(term);
-    const re = p.terms[0];
-    const step = MATCH_SPAN - p.overlap;
-    // The term starts just before the first chunk's end, so the first chunk holds only its head.
-    const text = "a ".repeat(1800) + term + " " + "b ".repeat(4000);
-    // It starts after the second chunk's start under this overlap, before it under an overlap of 100.
-    expect(text.indexOf(term)).toBeGreaterThan(step);
-    expect(text.indexOf(term)).toBeLessThan(MATCH_SPAN - 100);
-    expect(text.indexOf(term)).toBeLessThan(MATCH_SPAN);
-    expect(text.indexOf(term) + term.length).toBeGreaterThan(MATCH_SPAN);
-    expect(matchesBounded(re, text, p.overlap)).toBe(true);
-    // With the old overlap, shorter than the term, it would be missed.
-    expect(matchesBounded(re, text, 100)).toBe(false);
+    // Where the old chunks would have split it: found, since the whole cell is matched.
+    const cell = "a ".repeat(1700) + term + " b";
+    expect(cell.length).toBeLessThanOrEqual(MATCH_SPAN);
+    expect(isExcluded(makePolicy(term), cell)).toBe(true);
   });
 });
 
@@ -987,89 +1036,375 @@ describe("sixth round: more stems", () => {
   });
 });
 
-describe("sixth round: one pipeline, gated strings only", () => {
-  // Every string anywhere in the signed object must have come out of the pipeline.
-  const walk = (v: unknown, path: string, bad: string[]) => {
-    if (typeof v === "string") {
-      if (!isGated(v)) bad.push(path);
-    } else if (Array.isArray(v)) v.forEach((x, i) => walk(x, `${path}[${i}]`, bad));
-    else if (v && typeof v === "object") for (const [k, x] of Object.entries(v)) walk(x, `${path}.${k}`, bad);
-  };
-  test("every string in the fixture's signed object is gated", () => {
-    const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem));
-    const { sig, key_id, ...signedPart } = signed;
-    const bad: string[] = [];
-    walk(signedPart, "snapshot", bad);
-    expect(bad).toEqual([]);
+describe("seventh round: the gate at run time", () => {
+  const keys = makeKeyPair();
+  const key = privateKey(keys.privatePem);
+  const signedOf = () => withKeyId(snap, keyIdOfPrivate(key));
+  // A deep copy of the pipeline's object, to tamper with (JSON.parse's result is untyped).
+  const copy = (): ReturnType<typeof JSON.parse> => JSON.parse(JSON.stringify(snap));
+  test("the fixture's signed object passes the walk, and signing runs it on every call", () => {
+    expect(() => checkSigned(signedOf(), policy)).not.toThrow();
     expect(snap.threads.length).toBeGreaterThan(10);
   });
-  test("a string that skipped the pipeline is refused, and nothing is signed", () => {
-    const keys = makeKeyPair();
-    const tampered = { ...snap, threads: [{ ...snap.threads[0], title: "Raw text from Kestrel " + Math.random() }] } as any;
-    expect(() => assertGated(tampered)).toThrow(/snapshot\.threads\[0\]\.title: a string that did not pass/);
-    expect(() => signSnapshot(tampered, privateKey(keys.privatePem))).toThrow();
-    expect(() => gateFixed("anything else" as any)).toThrow();
+  test("a string that skipped the pipeline is refused by signSnapshot itself, naming the path only", () => {
+    const tampered = copy();
+    tampered.threads[0].title = "Raw text from Kestrel " + Math.random();
+    expect(() => signSnapshot(tampered, key, policy)).toThrow(/snapshot\.threads\[0\]\.title: a string that did not pass/);
+    try {
+      signSnapshot(tampered, key, policy);
+    } catch (e) {
+      expect(String(e)).not.toContain("Kestrel");
+    }
+  });
+  test("a string that sanitising again leaves unchanged passes, though sanitise never returned it", () => {
+    const t = copy();
+    t.threads[0].outcome = "the gate is shut " + Math.floor(Math.random() * 1000) + " times over";
+    expect(() => signSnapshot(t, key, policy)).not.toThrow();
+  });
+  test("unknown fields, dynamic keys, symbol keys, getters and class instances are refused", () => {
+    type Loose = ReturnType<typeof JSON.parse>;
+    const cases: [string, (s: Loose) => void, RegExp][] = [
+      ["a field on the snapshot", (s) => void (s.note = "hello"), /snapshot\.note: a field outside the schema/],
+      ["a field on a thread", (s) => void (s.threads[0].extra = "x"), /threads\[0\]\.extra: a field outside the schema/],
+      ["a dynamic key", (s) => void (s.threads[0]["k" + Date.now()] = "x"), /a field outside the schema/],
+      ["a symbol key", (s) => void (s.threads[0][Symbol("x")] = "x"), /a symbol key/],
+      ["a getter", (s) => void Object.defineProperty(s.threads[0], "title", { get: () => "x", enumerable: true }), /not a plain field/],
+      ["a hidden field", (s) => void Object.defineProperty(s.threads[0], "hidden", { value: "x", enumerable: false }), /not a plain field/],
+      ["a missing field", (s) => void delete s.threads[0].step, /threads\[0\]\.step: missing/],
+      ["a class instance", (s) => void (s.threads[0] = Object.assign(Object.create({ x: 1 }), s.threads[0])), /not a plain object/],
+      ["an extra array property", (s) => void Object.assign(s.threads, { extra: 1 }), /snapshot\.threads: a field outside the schema/],
+      ["an area off the list", (s) => void (s.threads[0].area = "kitchen"), /area: not on the areas list/],
+      ["an unknown who", (s) => void (s.threads[0].who = "Kestrel"), /who: not a fixed word/],
+      ["a bad id", (s) => void (s.threads[0].id = "not an id"), /id: not a record code/],
+      ["a bad time", (s) => void (s.threads[0].last_moved = "yesterday"), /last_moved: not a time/],
+      ["a bad revision", (s) => void (s.revision = { seq: 1, commit: "abc", extra: 1 }), /snapshot\.revision/],
+      ["a bad version", (s) => void (s.version = 1), /snapshot\.version/],
+    ];
+    for (const [name, change, why] of cases) {
+      const t = copy();
+      change(t);
+      const outcome = () => {
+        try {
+          signSnapshot(t, key, policy);
+          return "signed";
+        } catch (e) {
+          return String(e);
+        }
+      };
+      expect([name, outcome()]).toEqual([name, expect.stringMatching(why)]);
+    }
+  });
+  test("an area comes from the config's list, never the record's text", () => {
+    expect(areaOf("Work on projects/Garden today", policy)).toBe("garden");
+    expect(areaOf("Work on projects/kitchen today", policy)).toBe("other");
+    expect(configProblem({ owner_names: ["Robin"], names: [], areas: ["My Garden"] })).toMatch(/an area must be a plain folder name/);
+    expect(configProblem({ owner_names: ["Robin"], names: [], areas: ["other"] })).toMatch(/an area must be/);
+    const word: string = "anything else";
+    expect(() => gateFixed(word)).toThrow();
   });
   test("sanitise is the whole pipeline: normal form, strippers, names, cut, gate", () => {
     const r = sanitise("Ask Ｍｏｒｇａｎ at https://example.com about P41. Then more.", policy, 140);
     expect(r.text).toBe("Ask someone at a link about another item.");
-    expect(isGated(r.text)).toBe(true);
+  });
+});
+
+describe("seventh round: the cast check (CI)", () => {
+  test("no forbidden cast or any outside the sanitiser module", async () => {
+    const { castProblems } = await import("../check-casts");
+    expect(castProblems(join(import.meta.dir, ".."))).toEqual([]);
   });
 });
 
 describe("sixth round: the signed version follows the schema", () => {
-  // Each version's schema fingerprint. A change to the signed fields or a thread's fields changes
-  // the fingerprint, so it fails here until SNAPSHOT_VERSION is bumped and a line added.
+  // Each version's schema fingerprint. A change to the signed fields, a thread's fields or a
+  // revision's fields changes the fingerprint, so it fails here until the version is bumped and a
+  // line added (version 2 was never deployed, so the seventh round settled it in place).
   const KNOWN: Record<number, string> = {
     1: "c21887ca052ccae6", // no app or purpose
-    2: "d82fa6ae1be69ddf", // app and purpose added (sixth round)
+    2: "e63f824979560014", // app and purpose (sixth round), key_id and revision (seventh round)
   };
   test("this version's schema is the one pinned for it", async () => {
-    const fp = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical({ signed: SCHEMA.signed, thread: SCHEMA.thread }))));
+    const fp = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical({ signed: SCHEMA.signed, thread: SCHEMA.thread, revision: SCHEMA.revision }))),
+    );
     const hex = Array.from(fp, (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
     expect([SCHEMA.version, hex]).toEqual([SCHEMA.version, KNOWN[SCHEMA.version]]);
     expect(new Set(Object.values(KNOWN)).size).toBe(Object.keys(KNOWN).length);
   });
   test("an unknown version, app or purpose doesn't verify, signed or not", async () => {
     const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
     const raw = rawPublicKey(keys.publicPem);
-    expect(await verifySnapshot(signed, raw)).toBe(true);
+    expect(await verifySnapshot(signed, entry(raw))).toBe(true);
     for (const over of [{ version: 1 }, { version: 3 }, { app: "other-app" }, { purpose: "command" }])
-      expect([over, await verifySnapshot({ ...signed, ...over }, raw)]).toEqual([over, false]);
+      expect([over, await verifySnapshot({ ...signed, ...over }, entry(raw))]).toEqual([over, false]);
   });
-  test("the identity is the same in the exporter and shared code", async () => {
-    expect(snapshotIdOf(snap)).toBe(await snapshotId(snap as any));
-    expect(snapshotIdOf(snap)).toMatch(/^[0-9a-f]{32}$/);
+  test("the key id is inside the signed bytes: moved under another listed key's id, it doesn't verify", async () => {
+    const a = makeKeyPair();
+    const b = makeKeyPair();
+    const signed = signSnapshot(snap, privateKey(a.privatePem), policy);
+    const both = [...entry(rawPublicKey(a.publicPem)), ...entry(rawPublicKey(b.publicPem))];
+    expect(await verifySnapshot(signed, both)).toBe(true);
+    expect(await verifySnapshot({ ...signed, key_id: both[1].id }, both)).toBe(false);
+  });
+  test("the identity is the SHA-256 of the signed bytes, the same in the exporter and shared code", async () => {
+    const signed = withKeyId(snap, "0123456789abcdef");
+    expect(snapshotIdOf(signed)).toBe(await snapshotId(signed));
+    expect(snapshotIdOf(signed)).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
 describe("sixth round: key match", () => {
-  test("--key-match says whether the exporter's key is listed", async () => {
+  test("--key-match says whether the exporter's key is listed and active (seventh round: ids and retired)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "surface-keymatch-"));
     await capture(() => main(["--keygen", dir]));
-    const mine = readFileSync(join(dir, "surface.pub.b64"), "utf8").trim();
-    const other = makeKeyPair().publicRaw;
+    const mine = readFileSync(join(dir, "surface.pub.entry"), "utf8").trim();
+    const other = makeKeyPair().publicEntry;
     const key = join(dir, "surface.key");
+    expect(mine).toMatch(/^[0-9a-f]{16}:[A-Za-z0-9+/]+=*$/);
     expect((await capture(() => main(["--key-match", "--key", key, "--pub", `${other},${mine}`]))).code).toBe(0);
-    expect((await capture(() => main(["--key-match", "--key", key, "--pub", join(dir, "surface.pub.b64")]))).code).toBe(0);
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", join(dir, "surface.pub.entry")]))).code).toBe(0);
     expect((await capture(() => main(["--key-match", "--key", key, "--pub", join(dir, "surface.pub")]))).code).toBe(0);
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", join(dir, "surface.pub.b64")]))).code).toBe(0);
     const no = await capture(() => main(["--key-match", "--key", key, "--pub", other]));
     expect(no.code).toBe(1);
     expect(no.err).toContain("NOT listed");
+    const retired = await capture(() => main(["--key-match", "--key", key, "--pub", `${other},${mine}:retired`]));
+    expect(retired.code).toBe(1);
+    expect(retired.err).toContain("RETIRED");
+    // An id that isn't its key's own, or a malformed entry: the list doesn't parse.
+    const wrongId = "0000000000000000:" + mine.split(":")[1];
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", wrongId]))).code).toBe(2);
+    expect((await capture(() => main(["--key-match", "--key", key, "--pub", `${mine},garbage`]))).code).toBe(2);
   });
 });
 
 describe("sixth round: the uploader's preflight", () => {
   test("refuses a body over the Worker's limit, or one that doesn't verify under its own key", async () => {
     const keys = makeKeyPair();
-    const signed = signSnapshot(snap, privateKey(keys.privatePem));
+    const signed = signSnapshot(snap, privateKey(keys.privatePem), policy);
     const raw = rawPublicKey(keys.publicPem);
     const body = JSON.stringify(signed);
-    expect(await uploadPreflight(body, raw)).toBeNull();
-    expect(await uploadPreflight(body + " ".repeat(PUT_MAX_BYTES), raw)).toMatch(/over/);
-    expect(await uploadPreflight(JSON.stringify({ ...signed, excluded_rows: 0 }), raw)).toMatch(/does not verify/);
-    expect(await uploadPreflight(body, rawPublicKey(makeKeyPair().publicPem))).toMatch(/does not verify/);
+    expect(await uploadPreflight(body, entry(raw)[0])).toBeNull();
+    expect(await uploadPreflight(body + " ".repeat(PUT_MAX_BYTES), entry(raw)[0])).toMatch(/over/);
+    expect(await uploadPreflight(JSON.stringify({ ...signed, excluded_rows: 0 }), entry(raw)[0])).toMatch(/does not verify/);
+    expect(await uploadPreflight(body, entry(rawPublicKey(makeKeyPair().publicPem))[0])).toMatch(/does not verify/);
+  });
+});
+
+describe("seventh round: the record's revision", () => {
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], { encoding: "utf8" }).trim();
+  const repo = () => {
+    const rec = tempRecord(["| P1 | Sort the tools. | Cain | Sort them. | | Done. | 2026-11-01 |"]);
+    git(rec, "init", "-q");
+    git(rec, "add", "-A");
+    git(rec, "commit", "-q", "-m", "one");
+    return rec;
+  };
+  test("a clean checkout at the top of its own work tree gives {seq, commit}; the next commit a higher seq", () => {
+    const rec = repo();
+    const one = recordRevision(rec).revision!;
+    expect(one.seq).toBe(1);
+    expect(one.commit).toMatch(/^[0-9a-f]{40}$/);
+    writeFileSync(join(rec, "state", "holds.json"), "{}");
+    git(rec, "add", "-A");
+    git(rec, "commit", "-q", "-m", "two");
+    const two = recordRevision(rec).revision!;
+    expect(two.seq).toBe(2);
+    expect(two.commit).not.toBe(one.commit);
+  });
+  test("uncommitted changes under state/, a folder inside another repository, or no git: null, with the reason", () => {
+    const rec = repo();
+    writeFileSync(join(rec, "state", "holds.json"), "{}");
+    expect(recordRevision(rec)).toEqual({ revision: null, why: "the record's state/ has changes not committed" });
+    expect(recordRevision(RECORD).revision).toBeNull();
+    expect(recordRevision(tempRecord(["| P1 | x | Cain | x | | x | 2026-11-01 |"])).revision).toBeNull();
+  });
+  test("the revision is signed: it is in the signed bytes and the exporter's output", async () => {
+    const rec = repo();
+    const dir = mkdtempSync(join(tmpdir(), "surface-rev-"));
+    await capture(() => main(["--keygen", dir]));
+    const out = join(dir, "o.json");
+    expect((await capture(() => main(["--record", rec, "--private-terms", TERMS, "--config", CONFIG, "--out", out, "--key", join(dir, "surface.key")]))).code).toBe(0);
+    const s = JSON.parse(readFileSync(out, "utf8"));
+    expect(s.revision).toEqual(recordRevision(rec).revision);
+    const keys = await keyList(readFileSync(join(dir, "surface.pub.entry"), "utf8"));
+    expect(await verifySnapshot(s, keys)).toBe(true);
+    expect(await verifySnapshot({ ...s, revision: { ...s.revision, seq: s.revision.seq + 1 } }, keys)).toBe(false);
+  });
+});
+
+describe("seventh round: the dry-run report's path", () => {
+  const run = ["--record", RECORD, "--private-terms", TERMS, "--config", CONFIG, "--dry-run"];
+  test("a path inside any git work tree is refused before anything is read", async () => {
+    const inRepo = join(import.meta.dir, "fixtures", "report.private.txt");
+    const r = await capture(() => main([...run, "--report", inRepo]));
+    expect(r.code).toBe(2);
+    expect(r.err).toMatch(/inside a git work tree/);
+    expect(r.out).toBe("");
+    expect(existsSync(inRepo)).toBe(false);
+    // A folder that is a work tree by its .git file alone counts too.
+    const fake = mkdtempSync(join(tmpdir(), "surface-fakegit-"));
+    writeFileSync(join(fake, ".git"), "gitdir: /nowhere\n");
+    expect(insideGitWorkTree(join(fake, "sub", "report.txt"))).toBe(true);
+    expect(insideGitWorkTree(join(mkdtempSync(join(tmpdir(), "surface-nogit-")), "report.txt"))).toBe(false);
+  });
+  test("the absolute path is printed on stderr; --report alone uses the default name in the home folder", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-report-abs-"));
+    const prev = process.cwd();
+    process.chdir(dir);
+    try {
+      const r = await capture(() => main([...run, "--report", "rel.txt"]));
+      expect(r.code).toBe(0);
+      expect(r.err).toContain(`the private word list is in ${join(realpathSync(dir), "rel.txt")}`);
+    } finally {
+      process.chdir(prev);
+    }
+    const home = mkdtempSync(join(tmpdir(), "surface-home-"));
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const r = await capture(() => main([...run, "--report"]));
+      expect(r.code).toBe(0);
+      expect(existsSync(join(home, DEFAULT_REPORT))).toBe(true);
+      expect(statSync(join(home, DEFAULT_REPORT)).mode & 0o777).toBe(0o600);
+    } finally {
+      process.env.HOME = oldHome;
+    }
+  });
+  test("the default name and the temporary-file pattern are in surface/.gitignore", () => {
+    const ignore = readFileSync(join(import.meta.dir, "..", ".gitignore"), "utf8");
+    expect(ignore).toContain(DEFAULT_REPORT);
+    expect(ignore).toContain("*.tmp-*");
+  });
+  test("a failed write leaves no temporary file behind", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "surface-report-fail-"));
+    // The target is a folder: the rename over it fails after the temporary file is written.
+    const target = join(dir, "is-a-folder");
+    mkdirSync(join(target, "x"), { recursive: true });
+    const r = await capture(() => main([...run, "--report", target]));
+    expect(r.code).toBe(2);
+    expect(readdirSync(dir)).toEqual(["is-a-folder"]);
+    expect(() => writePrivate(target, "x")).toThrow();
+    expect(readdirSync(dir)).toEqual(["is-a-folder"]);
+  });
+});
+
+describe("seventh round: every stem's token boundary", () => {
+  // One example each stem must catch, by its rule.
+  const hit = (r: (typeof STEM_RULES)[number]) =>
+    r.mode === "prefix" ? `the ${r.stem}xyz here` : `the ${r.stem}${r.endings[0] ?? ""} here`;
+  test("each stem catches its own word (and, for a word stem, each listed ending)", () => {
+    for (const r of STEM_RULES) {
+      expect([r.stem, isExcluded(policy, hit(r))]).toEqual([r.stem, true]);
+      expect([r.stem, isExcluded(policy, `the ${r.stem} here`)]).toEqual([r.stem, true]);
+      if (r.mode === "word") for (const e of r.endings) expect([r.stem + e, isExcluded(policy, `x ${r.stem}${e} y`)]).toEqual([r.stem + e, true]);
+    }
+  });
+  test("no stem matches inside a word, and a word stem never matches a longer word", () => {
+    for (const r of STEM_RULES) {
+      expect([r.stem, isExcluded(policy, `the q${r.stem} here`)]).toEqual([r.stem, false]);
+      if (r.mode === "word") expect([r.stem, isExcluded(policy, `the ${r.stem}qz here`)]).toEqual([r.stem, false]);
+    }
+  });
+  test("the short stems' false positives stay in", () => {
+    const fine: [string, string[]][] = [
+      ["er", ["after", "error", "errand", "her"]],
+      ["rx", ["rxjs"]],
+      ["lab", ["label", "labor", "collab", "labrador"]],
+      ["fine", ["define", "finely", "refine"]],
+      ["check", ["checklist", "checkpoint", "recheck"]],
+      ["wire", ["wireless", "haywire"]],
+      ["ticket", ["ticketless", "sticket"]],
+      ["pt", ["ptarmigan", "opt"]],
+      ["pay", ["payload"]],
+      ["card", ["cardboard", "discard"]],
+      ["tax", ["taxi", "syntax"]],
+      ["cost", ["costume"]],
+      ["fee", ["feel", "feed", "coffee"]],
+      ["pill", ["pillow"]],
+      ["scan", ["scandal"]],
+      ["sick", ["sickle"]],
+      ["owe", ["owen", "bowel", "flowers"]],
+    ];
+    for (const [stem, words] of fine) {
+      expect(STEM_RULES.find((r) => r.stem === stem)?.mode).toBe("word");
+      for (const w of words) expect([stem, w, isExcluded(policy, `see the ${w} today`)]).toEqual([stem, w, false]);
+    }
+  });
+});
+
+describe("seventh round: account shapes and money", () => {
+  test("an IBAN, spaced or not, even shaped like a record code", () => {
+    for (const t of ["GB82 WEST 1234 5698 7654 32", "DE89370400440532013000", "pay to FR14 2004 1010 0505 0001 3M02 606"])
+      expect([t, namesAccount(t) || namesLongNumber(t)]).toEqual([t, true]);
+    expect(namesAccount("DE89370400440532013000")).toBe(true);
+    expect(namesAccount("GB82 WEST 1234 5698 7654 32")).toBe(true);
+    expect(isExcluded(policy, "the DE89370400440532013000 one")).toBe(true);
+  });
+  test("a card number in groups of any size", () => {
+    for (const t of ["4111 1111 1111 1111", "4111-1111-1111-1111", "411 111 111 111 1111", "4111111111111111"])
+      expect([t, namesAccount(t)]).toEqual([t, true]);
+  });
+  test("account words and a sort code", () => {
+    for (const t of ["acct ending soon", "the a/c details", "IBAN later", "routing number please", "sort code next", "account no. is on it", "12-34-56"])
+      expect([t, namesAccount(t)]).toEqual([t, true]);
+    for (const t of ["account for it", "on 2026-11-20", "the gate at 7:30", "P41 and P42", "projects/garden"])
+      expect([t, namesAccount(t)]).toEqual([t, false]);
+  });
+  test("currency amounts: symbols, codes in either case for the common ones, words", () => {
+    for (const t of ["£5", "40 usd", "eur 12", "USD 40", "40EUR", "50 dollars", "five quid", "2k euros"]) expect([t, namesMoney(t)]).toEqual([t, true]);
+    for (const t of ["try 3 times", "php 8 upgrade", "5 boxes"]) expect([t, namesMoney(t)]).toEqual([t, false]);
+  });
+});
+
+describe("seventh round: the cast check", () => {
+  test("comments, strings, templates and regular expressions don't count; code does", () => {
+    const ok = [
+      "// any as unknown as\nconst a = 1;",
+      "const s = 'any as GatedText';",
+      'const s = "as unknown as";',
+      "const t = `any ${1 + 2} any`;",
+      "const r = /any|as unknown as/g;",
+      "const c = company;",
+      "x.any = 1;",
+      "/* any */ const z = a / b / c;",
+    ];
+    for (const src of ok) expect([src, fileProblems("f.ts", src)]).toEqual([src, []]);
+    const bad: [string, string][] = [
+      ["let x: any = 1;", "the type any"],
+      ["const y = x as any;", "the type any"],
+      ["const y = x as unknown as T;", "as unknown as"],
+      ["const g = s as GatedText;", "as GatedText"],
+      ["const t = `${x as any}`;", "the type any"],
+      ["function f(a: any[]) {}", "the type any"],
+    ];
+    for (const [src, what] of bad) expect([src, fileProblems("f.ts", src)]).toEqual([src, [`f.ts:1: ${what}`]]);
+  });
+});
+
+describe("seventh round: the common words against the bundled name lists", () => {
+  const listOf = (f: string) => new Set(parseWordList(readFileSync(join(import.meta.dir, "names", f), "utf8")));
+  const surnames = listOf("surnames.txt");
+  const given = listOf("given-names.txt");
+  test("the bundled lists are the sizes the README gives, lower case, one a line", () => {
+    expect(surnames.size).toBe(13862);
+    expect(given.size).toBe(6380);
+    for (const w of [...surnames, ...given].slice(0, 2000)) expect(w).toMatch(/^[a-z' -]+$/);
+  });
+  test("no word of common-words.txt is in them: every overlap is in name-words.txt", () => {
+    const inFile = COMMON_WORDS_FILE.map((w) => w.toLowerCase());
+    expect(inFile.filter((w) => surnames.has(w) || given.has(w))).toEqual([]);
+    for (const w of ["to", "do", "he", "you", "call", "check", "fix", "work", "will", "may"]) {
+      expect([w, surnames.has(w) || given.has(w) || NAME_WORDS.has(w)]).toEqual([w, true]);
+      expect([w, NAME_WORDS.has(w), policy.allowWords.has(w) && !JSON.parse(readFileSync(CONFIG, "utf8")).allow_words.map(fold).includes(w)]).toEqual([w, true, false]);
+    }
+  });
+  test("name-words.txt has its two sections, and a word before them is refused", () => {
+    expect(NAME_WORDS_COMMON.has("to")).toBe(true);
+    expect(NAME_WORDS.has("doug") && !NAME_WORDS_COMMON.has("doug")).toBe(true);
+    expect(() => parseNameWords("stray\n[names]\nx")).toThrow(/before the first/);
+    expect(parseNameWords("[names]\na b\n[common]\nc").common).toEqual(new Set(["c"]));
   });
 });

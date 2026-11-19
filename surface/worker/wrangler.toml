@@ -26,9 +26,10 @@ tag = "v1"
 new_sqlite_classes = ["SnapshotStore"]
 
 [vars]
-# The exporter's Ed25519 public keys, raw 32 bytes each in base64 (bun run surface/export --keygen
-# prints one), comma-separated: the new key goes in beside the old before a rotation.
-SNAPSHOT_PUBLIC_KEYS = "REPLACE_WITH_PUBLIC_KEY_BASE64"
+# The exporter's Ed25519 public keys, comma-separated, each `<key id>:<raw key, base64>` (bun run
+# surface/export --keygen prints one; it is surface.pub.entry), with `:retired` after a key that may
+# no longer sign: the new key goes in beside the old before a rotation, and the old is retired after.
+SNAPSHOT_PUBLIC_KEYS = "REPLACE_WITH_KEY_ID:REPLACE_WITH_PUBLIC_KEY_BASE64"
 # The store object's name. A new name starts an empty store (the recovery for a wedged one).
 STORE_NAME = "latest"
 # The Zero Trust team domain, like https://<team>.cloudflareaccess.com.

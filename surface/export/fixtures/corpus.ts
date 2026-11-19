@@ -15,7 +15,7 @@ export function strictOutcome(raw: string): string {
     p.warnings.some((w) => /row skipped/.test(w)) ? "skipped" : "",
     p.warnings.some((w) => /row left out/.test(w)) ? "oversize" : "",
     p.leftovers.length ? "capitalised" : "",
-    p.waitsUnknown.length ? "waits_for" : "",
+    p.unknown.length ? "unknown" : "",
   ].filter(Boolean);
   if (why.length) return "fail:" + why.join("+");
   if (b.snapshot.excluded_rows) return "excluded";

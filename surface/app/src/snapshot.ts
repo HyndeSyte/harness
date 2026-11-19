@@ -1,7 +1,7 @@
 // Reads the snapshot, checks its signature, and keeps only the fields the screen knows.
 import * as ed from "@noble/ed25519";
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
-import { APP_ID, fromBase64, hex, PURPOSE_SNAPSHOT, signedBytes, SNAPSHOT_VERSION } from "../../shared/canonical";
+import { APP_ID, fromBase64, hex, parseKeyEntries, PURPOSE_SNAPSHOT, signedBytesOf, SNAPSHOT_VERSION, wellFormed } from "../../shared/canonical";
 
 ed.hashes.sha512 = sha512;
 
@@ -46,24 +46,19 @@ export function supported(raw: unknown): boolean {
   return s.version === SNAPSHOT_VERSION && s.app === APP_ID && s.purpose === PURPOSE_SNAPSHOT;
 }
 
-// The public keys, comma-separated raw base64 (EXPO_PUBLIC_SURFACE_PUBLIC_KEY): the snapshot verifies
-// under the one its key_id names, so a rotation lists the new key beside the old for a while.
-export function verify(raw: unknown, publicKeysB64: string): boolean {
+// The public keys (EXPO_PUBLIC_SURFACE_PUBLIC_KEY): a key list, comma-separated `<key id>:<raw base64>`
+// entries with `:retired` after a key that may no longer sign. The snapshot verifies under the entry
+// its signed key_id names, whose id must be its key's own; a retired key's snapshot is refused, and
+// so is every snapshot when the list has a mistake in it. A snapshot with any field outside the
+// signed ones, or a version other than 2, is refused before its signature is read.
+export function verify(raw: unknown, publicKeys: string): boolean {
   try {
-    if (!supported(raw)) return false;
-    const s = raw as Record<string, unknown>;
-    if (typeof s.sig !== "string" || typeof s.key_id !== "string") return false;
-    if (typeof s.made_at !== "string" || !Array.isArray(s.threads)) return false;
-    if (!isCount(s.excluded_rows) || !isCount(s.skipped_rows)) return false;
-    let pub: Uint8Array | undefined;
-    for (const part of (publicKeysB64 || "").split(",")) {
-      try {
-        const k = fromBase64(part.trim());
-        if (k.length === 32 && hex(sha256(k)).slice(0, 16) === s.key_id) pub = k;
-      } catch {}
-    }
-    if (!pub) return false;
-    return ed.verify(fromBase64(s.sig), signedBytes(s as any), pub);
+    if (!supported(raw) || !wellFormed(raw)) return false;
+    const entries = parseKeyEntries(publicKeys);
+    if (!entries || !entries.every((e) => hex(sha256(e.raw)).slice(0, 16) === e.id)) return false;
+    const entry = entries.find((e) => e.id === raw.key_id);
+    if (!entry || entry.retired) return false;
+    return ed.verify(fromBase64(raw.sig), signedBytesOf(raw), entry.raw);
   } catch {
     return false;
   }

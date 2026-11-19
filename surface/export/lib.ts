@@ -3,9 +3,23 @@
 // drops what must never leave the house. It fails closed: no private terms, no snapshot.
 
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { APP_ID, cutCodePoints, PURPOSE_SNAPSHOT, signedBytes, SNAPSHOT_VERSION, toBase64 } from "../shared/canonical";
+import {
+  APP_ID,
+  cutCodePoints,
+  isIsoTime,
+  isPlainObject,
+  isRevision,
+  PURPOSE_SNAPSHOT,
+  REVISION_FIELDS,
+  SIGNED_FIELDS,
+  signedBytes,
+  SNAPSHOT_VERSION,
+  THREAD_FIELDS,
+  toBase64,
+} from "../shared/canonical";
 import { STATES, WHO, type Signed, type Snapshot, type State, type Thread, type Who } from "../shared/snapshot";
 
 export const TITLE_MAX = 140;
@@ -13,21 +27,35 @@ export const STEP_MAX = 200;
 
 // --- the privacy policy -------------------------------------------------------------------
 
-// Generic stems that leave a row out whole. Each matches at the start of a word, any case:
-// "bank" also catches "banking", "therap" catches "therapist". The owner's config adds more
-// (exclude_stems); it can't take these away.
-export const DEFAULT_STEMS = [
-  "money", "financ", "debt", "bank", "budget", "pay", "paid", "owed", "invoice", "tax", "rent", "loan",
-  "mortgage", "credit", "card", "salar", "insur", "refund", "irs",
-  "health", "therap", "pt", "doctor", "gp", "appointment", "hospital", "surgery", "mental", "psychiatr",
-  "dentist", "dental", "orthodont", "periodont", "endodont", "denture", "tooth", "teeth",
-  "prescri", "clinic", "pharmac", "medic", "diagnos",
-  "bill", "fee", "cost", "price", "quote", "deposit", "venmo", "cash", "owe",
-  "symptom", "scan", "mri", "blood", "vaccin", "pregnan", "allerg", "pill", "dose", "sick", "counsel",
-  // sixth round
-  "meds", "rx", "refill", "biopsy", "chemo", "cancer", "rehab", "physio", "lab", "results", "er",
-  "urgent care", "injur", "zelle", "wire", "cheque", "check", "tuition", "fine", "ticket",
+// Generic stems that leave a row out whole, each with its token-boundary rule (STEM_RULES below).
+// The owner's config adds more (exclude_stems, each a prefix stem); it can't take these away.
+//
+// The two rules. Before a stem there is never a letter, digit or underscore (so "after" doesn't hold
+// "er" and "define" doesn't hold "fine"). Then:
+// - prefix: any word starting with the stem ("bank" catches "banking", "therap" catches "therapist");
+// - word: the stem is the whole word, or the stem with one of its listed endings, with no letter,
+//   digit or underscore after ("lab" catches "lab" and "labs", never "label" or "labor").
+// A stem of two words ("urgent care") matches any run of spaces between them.
+export type StemRule = { stem: string; mode: "prefix" } | { stem: string; mode: "word"; endings: string[] };
+const prefix = (...stems: string[]): StemRule[] => stems.map((stem) => ({ stem, mode: "prefix" }));
+const word = (stem: string, ...endings: string[]): StemRule => ({ stem, mode: "word", endings });
+export const STEM_RULES: readonly StemRule[] = [
+  ...prefix("money", "financ", "debt", "bank", "budget", "paid", "owed", "invoice", "rent", "loan", "mortgage", "credit"),
+  ...prefix("salar", "insur", "refund", "health", "therap", "doctor", "appointment", "hospital", "surgery", "mental"),
+  ...prefix("psychiatr", "dentist", "dental", "orthodont", "periodont", "endodont", "denture", "tooth", "teeth"),
+  ...prefix("prescri", "clinic", "pharmac", "medic", "diagnos", "bill", "price", "quote", "deposit", "venmo"),
+  ...prefix("symptom", "vaccin", "pregnan", "allerg", "counsel", "refill", "biopsy", "chemo", "cancer", "rehab"),
+  ...prefix("physio", "results", "urgent care", "injur", "zelle", "cheque", "tuition", "blood", "dosag", "cardiol", "ptsd"),
+  word("pay", "s", "ing", "ment", "ments", "ee", "er", "roll", "check", "checks", "pal", "able", "out", "day", "slip"),
+  word("irs"), word("pt"), word("gp", "s"), word("mri", "s"), word("er"), word("rx"), word("meds"),
+  word("tax", "es", "ed", "ing", "able", "ation"), word("card", "s"), word("fee", "s"), word("cost", "s", "ing", "ly"),
+  word("cash", "ed", "es", "ing", "back"), word("owe", "s", "d"), word("owing"), word("scan", "s", "ned", "ning", "ner"),
+  word("pill", "s"), word("dose", "s", "d"), word("sick", "ness", "er", "est", "ly"),
+  word("lab", "s", "work"), word("fine", "s", "d"), word("check", "s", "ed", "ing", "book", "books", "up", "ups"),
+  word("wire", "s", "d"), word("ticket", "s", "ed", "ing"),
 ];
+// The stems alone, in the order above.
+export const DEFAULT_STEMS: readonly string[] = STEM_RULES.map((r) => r.stem);
 
 // --- one normal form ----------------------------------------------------------------------
 
@@ -66,7 +94,7 @@ const AMOUNT = new RegExp(
 // code (one to three letters then digits, like P1040) is not such a run.
 const DATE_ISO = /(?<!\p{Nd})\d{4}-\d{2}-\d{2}(?!\p{Nd})/gu;
 const DATE_SLASH = /(?<!\p{Nd})\d{1,2}\/\d{1,2}\/\d{4}(?!\p{Nd})/gu;
-const CODE_TOKEN = /(?<![\p{L}\p{N}_])\p{L}{1,3}\p{Nd}+(?![\p{L}\p{N}_])/gu;
+const CODE_TOKEN = /(?<![\p{L}\p{N}_])\p{L}{1,3}\p{Nd}{1,5}(?![\p{L}\p{N}_])/gu;
 const DIGIT_RUN = /\p{Nd}{4,}/gu;
 export function namesLongNumber(text: string): boolean {
   const t = normalise(text).replace(DATE_ISO, " ").replace(DATE_SLASH, " ").replace(CODE_TOKEN, " ");
@@ -78,9 +106,31 @@ export function namesLongNumber(text: string): boolean {
   return false;
 }
 
+// The common currency codes in lower case too ("40 usd", "eur 12"); the rest only in capitals, since
+// several are words in lower case ("try 3", "php 8").
+const ISO_LOWER = "usd|eur|gbp|aud|nzd|cad|chf|jpy|inr|btc|eth";
+const ISO_AMOUNT_LOWER = new RegExp(
+  `(?<![\\p{L}\\p{N}_])(?:${ISO_LOWER})\\s?\\d|\\d\\s?(?:${ISO_LOWER})(?![\\p{L}\\p{N}_])`,
+  "u",
+);
 export function namesMoney(text: string): boolean {
   const n = normalise(text);
-  return CURRENCY_SYMBOL.test(n) || ISO_AMOUNT.test(n) || AMOUNT.test(fold(text));
+  const f = fold(text);
+  return CURRENCY_SYMBOL.test(n) || ISO_AMOUNT.test(n) || ISO_AMOUNT_LOWER.test(f) || AMOUNT.test(f);
+}
+
+// Account shapes leave the row out: an IBAN (two capitals, two check digits, then groups of letters
+// and digits, spaced or not, with at least six digits in all), a card number (13 to 19 digits, single
+// spaces or hyphens allowed between them), a UK sort code (12-34-56), and the words that name an
+// account number (acct, a/c, IBAN, BSB, ABA, routing number, sort code, account no or number).
+const IBAN = /(?<![\p{L}\p{N}])[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?(?![\p{L}\p{N}])/gu;
+const CARD = /(?<![\p{N}])\d(?:[ -]?\d){12,18}(?![\p{N}])/u;
+const SORT_CODE = /(?<![\p{N}-])\d{2}-\d{2}-\d{2}(?![\p{N}-])/u;
+const ACCOUNT_WORD = /(?<![\p{L}\p{N}_])(?:acct|a\/c|iban|bsb|aba|routing\s+(?:no|num|number)|sort\s+code|account\s+(?:no|num|number|#))(?![\p{L}\p{N}_])/iu;
+export function namesAccount(text: string): boolean {
+  const n = normalise(text);
+  for (const m of n.matchAll(IBAN)) if ((m[0].match(/\d/g) ?? []).length >= 6) return true;
+  return CARD.test(n) || SORT_CODE.test(n) || ACCOUNT_WORD.test(fold(text));
 }
 
 // Who the owner is called in the record. The code knows only the role word; the owner's own
@@ -106,15 +156,38 @@ export function parseWordList(text: string): string[] {
     .map((l) => l.trim())
     .filter((l) => l && !l.startsWith("#"));
 }
-// Words that are also common given names or surnames (name-words.txt): never on the common list,
-// whatever common-words.txt says, so a capitalised one is gated like any name.
-export const NAME_WORDS: ReadonlySet<string> = new Set(
-  parseWordList(readFileSync(join(import.meta.dir, "name-words.txt"), "utf8")).flatMap((l) => l.split(/\s+/)).filter(Boolean),
+// Words that are also given names or surnames (name-words.txt): never on the common list, whatever
+// common-words.txt says, so a capitalised one is gated like any name. Its [common] section is the
+// ones that are ordinary words too: known in lower case. Its [names] section is unknown in lower case.
+export function parseNameWords(text: string): { all: Set<string>; common: Set<string> } {
+  const all = new Set<string>();
+  const common = new Set<string>();
+  let section = "";
+  for (const line of parseWordList(text)) {
+    const m = /^\[(names|common)\]$/.exec(line);
+    if (m) {
+      section = m[1];
+      continue;
+    }
+    if (!section) throw new Error("name-words.txt: a word before the first [names] or [common] line");
+    for (const w of line.split(/\s+/).filter(Boolean)) {
+      all.add(w);
+      if (section === "common") common.add(w);
+    }
+  }
+  return { all, common };
+}
+const NAME_LISTS = parseNameWords(readFileSync(join(import.meta.dir, "name-words.txt"), "utf8"));
+export const NAME_WORDS: ReadonlySet<string> = NAME_LISTS.all;
+export const NAME_WORDS_COMMON: ReadonlySet<string> = NAME_LISTS.common;
+export const COMMON_WORDS_FILE: readonly string[] = parseWordList(readFileSync(join(import.meta.dir, "common-words.txt"), "utf8")).flatMap(
+  (l) => l.split(/\s+/).filter(Boolean),
 );
-export const COMMON_WORDS_FILE: readonly string[] = parseWordList(readFileSync(join(import.meta.dir, "common-words.txt"), "utf8"));
 export const COMMON_WORDS: readonly string[] = COMMON_WORDS_FILE.filter(
   (w) => !NAME_WORDS.has(w.toLowerCase()) && !CALENDAR_WORDS.includes(w.toLowerCase()),
 );
+// Abbreviations with full stops the gate reads as one word: times of day.
+const DOTTED_WORDS = ["a.m.", "p.m."];
 
 export interface Policy {
   terms: RegExp[];
@@ -130,10 +203,9 @@ export interface Policy {
   // Capitalised words that may stay (COMMON_WORDS, DEFAULT_ALLOW_WORDS and config `allow_words`), folded.
   allowWords: Set<string>;
   // Every word a lower-case or uncased token may be without being listed as unknown: the allow
-  // words, the months and weekdays, and the words the exporter itself puts in. Folded.
+  // words, the months and weekdays, name-words.txt's [common] section, and the words the exporter
+  // itself puts in. Folded.
   vocabulary: Set<string>;
-  // How far the chunks of a long text overlap: more than the longest plain term.
-  overlap: number;
 }
 
 export interface ExporterConfig {
@@ -190,11 +262,11 @@ export function parseTerms(text: string, where = "the private terms file"): RegE
   return parseTermList(text, where).terms;
 }
 
-// The terms and the length of the longest plain term (the chunks' overlap must exceed it). A plain
-// term longer than half a chunk is refused: the overlap couldn't hold it.
-export function parseTermList(text: string, where = "the private terms file"): { terms: RegExp[]; longestPlain: number } {
+// The terms. A plain term longer than PLAIN_TERM_MAX characters is refused (no record cell is that
+// long and still exported: cells are capped at MATCH_SPAN).
+export const PLAIN_TERM_MAX = 2000;
+export function parseTermList(text: string, where = "the private terms file"): { terms: RegExp[] } {
   const terms: RegExp[] = [];
-  let longestPlain = 0;
   text.replace(/\r\n/g, "\n").split("\n").forEach((line, i) => {
     const t = line.trim();
     if (!t || t.startsWith("#")) return;
@@ -215,14 +287,13 @@ export function parseTermList(text: string, where = "the private terms file"): {
     } else {
       // The term as written, and folded when that differs (an accented term matches plain text).
       const len = Math.max(t.length, fold(t).length);
-      if (len > MATCH_SPAN / 2) throw new Error(`${where}:${i + 1}: a term longer than ${MATCH_SPAN / 2} characters`);
-      longestPlain = Math.max(longestPlain, len);
+      if (len > PLAIN_TERM_MAX) throw new Error(`${where}:${i + 1}: a term longer than ${PLAIN_TERM_MAX} characters`);
       terms.push(wholeWord(escapeRe(t)));
       if (fold(t) !== t.toLowerCase()) terms.push(wholeWord(escapeRe(fold(t))));
     }
   });
   if (!terms.length) throw new Error(`${where} has no terms, so nothing is exported`);
-  return { terms, longestPlain };
+  return { terms };
 }
 
 const list = (v: unknown, name: string): string[] => {
@@ -235,28 +306,37 @@ const envList = (v: string | undefined) => (v ?? "").split(",").map((x) => x.tri
 // The config: a JSON file (--config) and/or SURFACE_OWNER_NAMES, SURFACE_NAMES and
 // SURFACE_EXCLUDE_STEMS (comma-separated). Both add to the generic defaults.
 export function makePolicy(termsText: string, config: ExporterConfig = {}, env: Record<string, string | undefined> = {}): Policy {
-  const stems = [...DEFAULT_STEMS, ...list(config.exclude_stems, "exclude_stems"), ...envList(env.SURFACE_EXCLUDE_STEMS)];
+  const extra = [...list(config.exclude_stems, "exclude_stems"), ...envList(env.SURFACE_EXCLUDE_STEMS)];
   // The role words are never name parts ("the" would otherwise become "you" everywhere).
   const ownerNames = [...list(config.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)].filter(
     (n) => !DEFAULT_OWNER_NAMES.includes(fold(n)),
   );
   const names = [...list(config.names, "names"), ...envList(env.SURFACE_NAMES)];
   const areas = list(config.areas, "areas").map(fold);
-  const allow = [...COMMON_WORDS, ...DEFAULT_ALLOW_WORDS, ...list(config.allow_words, "allow_words")].map(fold);
-  const { terms, longestPlain } = parseTermList(termsText);
-  // A stem of more than one word ("urgent care") matches any run of spaces between its words.
-  const stemRe = (x: string) => fold(x).split(/\s+/).map(escapeRe).join("\\s+");
+  const allow = [...COMMON_WORDS, ...DEFAULT_ALLOW_WORDS, ...DOTTED_WORDS, ...list(config.allow_words, "allow_words")].map(fold);
+  const { terms } = parseTermList(termsText);
   return {
     terms,
-    stems: new RegExp(`(?<![\\p{L}\\p{N}_])(?:${stems.map(stemRe).join("|")})`, "iu"),
+    stems: stemPattern([...STEM_RULES, ...extra.map((stem): StemRule => ({ stem, mode: "prefix" }))]),
     owners: [...DEFAULT_OWNER_NAMES, ...ownerNames].map(fold),
     ownerNames,
     names,
     areas,
     allowWords: new Set(allow),
-    vocabulary: new Set([...allow, ...CALENDAR_WORDS, ...OUTPUT_WORDS]),
-    overlap: Math.max(MATCH_OVERLAP, longestPlain + 1),
+    vocabulary: new Set([...allow, ...CALENDAR_WORDS, ...OUTPUT_WORDS, ...NAME_WORDS_COMMON]),
   };
+}
+
+// The stems' one pattern, each by its rule (STEM_RULES above), matched on the folded text. A stem of
+// more than one word matches any run of spaces between its words.
+export function stemPattern(rules: readonly StemRule[]): RegExp {
+  const body = (x: string) => fold(x).split(/\s+/).map(escapeRe).join("\\s+");
+  const alts = rules.map((r) =>
+    r.mode === "prefix"
+      ? body(r.stem)
+      : `${body(r.stem)}(?:${r.endings.map(escapeRe).join("|")})?(?![\\p{L}\\p{N}_])`,
+  );
+  return new RegExp(`(?<![\\p{L}\\p{N}_])(?:${alts.map((a) => `(?:${a})`).join("|")})`, "iu");
 }
 
 // The config's own checks, before anything is read, written or sent. Returns a one-line reason,
@@ -271,6 +351,9 @@ export function configProblem(config: unknown, env: Record<string, string | unde
     return String(e?.message ?? e);
   }
   if (!("names" in c)) return 'config: "names" is missing (an empty list is allowed)';
+  // The areas are the fixed list area names come from: plain folder words only.
+  if (list(c.areas, "areas").some((a) => !/^[a-z0-9][a-z0-9_-]*$/.test(fold(a)) || fold(a) === "other"))
+    return "config: an area must be a plain folder name (letters, digits, - or _), and not \"other\"";
   const owners = [...list(c.owner_names, "owner_names"), ...envList(env.SURFACE_OWNER_NAMES)].filter(
     (n) => !DEFAULT_OWNER_NAMES.includes(fold(n)),
   );
@@ -311,28 +394,129 @@ export function replaceNames(text: string, policy: Pick<Policy, "ownerNames" | "
     .replace(/\u0001(?:\s+\u0001)*(?:\s+\u0002)?|\u0002/g, (m) => (m.endsWith(YOUR) ? "your" : "you"));
 }
 
-// The proper-noun gate: in an exported text, every capitalised word, at the start of a sentence
-// or not, becomes "someone" (its possessive "someone's") unless it is on the allow list (the
-// bundled common words, DEFAULT_ALLOW_WORDS and config allow_words). A hyphenated word stays only
-// when the whole of it, or each part, is on the list. It runs on the case-preserved normal form;
-// a lower-case or uncased name is caught only by the names list and the terms file. Returns the
-// text and the words it replaced.
+// --- the gate's words ------------------------------------------------------------------------
+
+// The gate's tokens: runs of Unicode letters (with their combining marks), joined by an apostrophe or
+// a hyphen ("O'Neill", "Vale-Smith", "don't"), or a run of initials ("J.R.R.", "a.m."). Digits,
+// underscores and every other character split tokens.
+const GATE_TOKEN = /(?:\p{L}\.){2,}|\p{L}[\p{L}\p{M}]*(?:['\u2019-]\p{L}[\p{L}\p{M}]*)*/gu;
+// Apostrophe forms taken off before a lookup: the possessive ('s, and a bare ' after s), and the
+// contractions 'd, 'll, 're, 've, 'm and n't.
+const CONTRACTED: Record<string, string> = { "can't": "can", "won't": "will", "shan't": "shall", "ain't": "am" };
+
+export interface GateToken {
+  text: string;
+  at: number;
+  end: number;
+  // Starts with a capital (an all-caps word included).
+  capital: boolean;
+  // A possessive ('s, or ' after s).
+  possessive: boolean;
+  // A run of initials, or one capital letter on its own.
+  initials: boolean;
+  // A letter run that touches a digit ("v2", "x86"): a code, not a word.
+  touchesDigit: boolean;
+  // The forms looked up, folded: the token, then without its possessive or contraction.
+  forms: string[];
+}
+
+export function gateTokens(text: string): GateToken[] {
+  const out: GateToken[] = [];
+  for (const m of text.matchAll(GATE_TOKEN)) {
+    const tok = m[0];
+    const at = m.index!;
+    const end = at + tok.length;
+    const f = fold(tok).replace(/\u2019/g, "'");
+    const forms = [f];
+    let possessive = false;
+    if (CONTRACTED[f]) forms.push(CONTRACTED[f]);
+    else if (/'s$/.test(f)) {
+      forms.push(f.slice(0, -2));
+      possessive = true;
+    } else if (/s'$/.test(f)) {
+      forms.push(f.slice(0, -1));
+      possessive = true;
+    } else if (/n't$/.test(f)) forms.push(f.slice(0, -3));
+    else if (/'(?:d|ll|re|ve|m)$/.test(f)) forms.push(f.replace(/'(?:d|ll|re|ve|m)$/, ""));
+    // A bare trailing apostrophe after s ("James' car") was not taken by the token pattern: it is
+    // taken here, so the whole possessive is replaced.
+    let stop = end;
+    if (!possessive && /s$/i.test(tok) && /^['\u2019](?![\p{L}])/u.test(text.slice(end))) {
+      possessive = true;
+      stop = end + 1;
+    }
+    out.push({
+      text: text.slice(at, stop),
+      at,
+      end: stop,
+      capital: /^\p{Lu}/u.test(tok),
+      possessive,
+      initials: /^(?:\p{L}\.){2,}$/u.test(tok) || /^\p{Lu}$/u.test(tok),
+      touchesDigit: /\p{N}/u.test(text[at - 1] ?? "") || /\p{N}/u.test(text[end] ?? ""),
+      forms,
+    });
+  }
+  return out;
+}
+
+// A word is known when any of its forms, or every part of its hyphenated form, is in the set.
+function knownIn(t: GateToken, set: Set<string>): boolean {
+  if (t.forms.some((f) => set.has(f))) return true;
+  const last = t.forms[t.forms.length - 1];
+  const parts = last.split("-");
+  return parts.length > 1 && parts.every((p) => set.has(p));
+}
+
+// Titles before a name, and words that put a person after them: a month or weekday after one of
+// these is a name, whatever number follows ("ask May 5 questions", "Mr. June 3").
+export const HONORIFICS = ["mr", "mrs", "ms", "mx", "miss", "dr", "prof", "sir", "dame"];
+export const PERSON_CUES = [
+  "ask", "asks", "asked", "tell", "tells", "told", "call", "calls", "called", "text", "texts", "texted",
+  "email", "emails", "emailed", "message", "messaged", "ping", "pinged", "meet", "meets", "met", "thank",
+  "thanks", "remind", "reminded", "with", "from", "dear", "hi", "hey", "cc",
+];
+
+// The proper-noun gate: in an exported text, every capitalised word (an all-caps one included), at
+// the start of a sentence or not, becomes "someone" (its possessive "someone's") unless it is on the
+// allow list (the bundled common words, DEFAULT_ALLOW_WORDS and config allow_words), looked up with
+// its possessive or contraction taken off. A hyphenated word stays only when the whole of it, or each
+// part, is on the list. A run of initials ("J.R.R.") is one word, and a lone capital other than "I"
+// and "A" is an initial. A month or weekday stays only next to a number or a date, and only when no
+// other name signal is there: a possessive, a title or a person cue before it, or a gated or
+// replaced name next to it. It runs on the case-preserved normal form; a lower-case or uncased name
+// is caught only by the names list, the terms file and the unknown-word check. Returns the text and
+// the words it replaced.
 export function properNounGate(text: string, allow: Set<string>): { text: string; words: string[] } {
-  const words: string[] = [];
-  const allowed = (w: string) => allow.has(fold(w).replace(/\u2019/g, "'"));
-  const out = text.replace(TOKEN, (tok: string, at: number) => {
-    if (!/^\p{Lu}/u.test(tok)) return tok;
-    const poss = /['\u2019][sS]$/.test(tok);
-    const bare = poss ? tok.slice(0, -2) : tok;
-    if (allowed(tok) || allowed(bare)) return tok;
-    // A month or weekday stays only next to a number or a date.
-    if (!poss && CALENDAR_WORDS.includes(fold(tok)) && nextToNumber(text, at, tok.length)) return tok;
-    const parts = bare.split("-");
-    if (parts.length > 1 && parts.every(allowed)) return tok;
-    words.push(tok);
-    return poss ? "someone's" : "someone";
+  const tokens = gateTokens(text);
+  // First every word but the months and weekdays, then those, which read their neighbours.
+  const gated = tokens.map((t) => {
+    if (!t.capital) return false;
+    if (knownIn(t, allow)) return false;
+    if (t.initials) return true;
+    if (!t.possessive && CALENDAR_WORDS.includes(t.forms[t.forms.length - 1])) return null;
+    return true;
   });
-  return { text: out, words };
+  tokens.forEach((t, i) => {
+    if (gated[i] !== null) return;
+    const prev = tokens[i - 1];
+    const next = tokens[i + 1];
+    const near = (o: GateToken | undefined, j: number) =>
+      !!o && (gated[j] === true || o.forms.some((f) => f === "someone" || f === "someone's"));
+    const signal =
+      (!!prev && (HONORIFICS.includes(prev.forms[0]) || PERSON_CUES.includes(prev.forms[0]))) ||
+      near(prev, i - 1) || near(next, i + 1);
+    gated[i] = signal || !nextToNumber(text, t.at, t.text.length);
+  });
+  const words: string[] = [];
+  let out = "";
+  let last = 0;
+  tokens.forEach((t, i) => {
+    if (!gated[i]) return;
+    words.push(t.text);
+    out += text.slice(last, t.at) + (t.possessive ? "someone's" : "someone");
+    last = t.end;
+  });
+  return { text: out + text.slice(last), words };
 }
 
 // A number or a date right before ("3 May", "the 3rd of May", "2026-11-20, Friday") or right after
@@ -343,20 +527,37 @@ export function nextToNumber(text: string, at: number, len: number): boolean {
   return /\p{Nd}(?:st|nd|rd|th)?(?:\s+of)?[\s,]*$/iu.test(before) || /^[\s,]*(?:the\s+)?\p{Nd}/iu.test(after);
 }
 
-// Lower-case and uncased words not in the vocabulary (the allow words, the months and weekdays, and
-// the words the exporter puts in): listed in the dry run's private report for the owner to read, and
-// under --strict a failure when they are in waits_for. A word with a digit in it is not listed.
-export function unknownTokens(text: string, vocabulary: Set<string>): string[] {
+// The plain forms a lower-case word may be an inflection of, for the unknown-word check only (never
+// for the capitalised allow list): "brings" is "bring", "carried" is "carry", "fixing" is "fix",
+// "stopped" is "stop".
+export function inflections(w: string): string[] {
   const out: string[] = [];
-  const known = (w: string) => vocabulary.has(fold(w).replace(/\u2019/g, "'"));
-  for (const m of text.matchAll(TOKEN)) {
-    const tok = m[0];
-    if (/^\p{Lu}/u.test(tok) || /\p{N}/u.test(tok)) continue;
-    const bare = /['\u2019][sS]$/.test(tok) ? tok.slice(0, -2) : tok;
-    if (known(tok) || known(bare) || bare.split(/[-'\u2019]/).every(known)) continue;
-    out.push(tok);
-  }
+  const add = (x: string) => x.length >= 2 && out.push(x);
+  if (/ies$/.test(w)) add(w.slice(0, -3) + "y");
+  if (/ied$/.test(w)) add(w.slice(0, -3) + "y");
+  if (/es$/.test(w)) add(w.slice(0, -2));
+  if (/s$/.test(w) && !/ss$/.test(w)) add(w.slice(0, -1));
+  if (/ed$/.test(w)) add(w.slice(0, -2)), add(w.slice(0, -1));
+  if (/ing$/.test(w)) add(w.slice(0, -3)), add(w.slice(0, -3) + "e");
+  if (/([b-df-hj-np-tv-z])\1(?:ed|ing)$/.test(w)) add(w.replace(/([b-df-hj-np-tv-z])\1(?:ed|ing)$/, "$1"));
   return out;
+}
+
+// What the unknown-word check found in a text: words not in the vocabulary (lower-case or uncased,
+// looked up with their possessive or contraction taken off; under --strict any of them fails the run,
+// in every field), and words known only as name-words.txt's [common] words (reported, not a failure).
+export function unknownTokens(text: string, vocabulary: Set<string>): string[] {
+  return wordCheck(text, vocabulary).unknown;
+}
+export function wordCheck(text: string, vocabulary: Set<string>): { unknown: string[]; nameLike: string[] } {
+  const unknown: string[] = [];
+  const nameLike: string[] = [];
+  for (const t of gateTokens(text)) {
+    if (t.capital || t.touchesDigit) continue;
+    if (!knownIn(t, vocabulary) && !inflections(t.forms[t.forms.length - 1]).some((f) => vocabulary.has(f))) unknown.push(t.text);
+    else if (t.forms.some((f) => NAME_WORDS_COMMON.has(f))) nameLike.push(t.text);
+  }
+  return { unknown, nameLike };
 }
 
 // The private marker: a `#private` tag anywhere in the row, or a Private column whose cell is
@@ -368,10 +569,9 @@ export function markedPrivate(cells: Record<string, string>, raw: string): boole
   return ["yes", "y", "true", "x", "private"].includes(col);
 }
 
-// A row is left out when any text, in its normal form and folded, has a stem, a private term or
-// money in it.
-// A text longer than MATCH_SPAN (in its normal form or folded) fails closed: it is left out, never
-// matched in chunks a pattern could straddle.
+// A row is left out when any text, in its normal form and folded, has a stem, a private term, money,
+// an account shape or a long number in it. A text longer than MATCH_SPAN (in its normal form or
+// folded) fails closed: it is left out. Every check runs over the whole cell, never in chunks.
 export function isExcluded(policy: Policy, ...texts: (string | null | undefined)[]): boolean {
   return texts.some((t) => {
     if (!t) return false;
@@ -380,28 +580,18 @@ export function isExcluded(policy: Policy, ...texts: (string | null | undefined)
     const f = fold(t);
     return (
       policy.stems.test(f) ||
-      policy.terms.some((re) => matchesBounded(re, n, policy.overlap) || matchesBounded(re, f, policy.overlap)) ||
+      policy.terms.some((re) => re.test(n) || re.test(f)) ||
       namesMoney(t) ||
+      namesAccount(t) ||
       namesLongNumber(t)
     );
   });
 }
 
-// A private term runs over at most MATCH_SPAN characters at a time. A cell longer than that is left
-// out whole (oversize); matchesBounded's chunks, overlapping by more than the longest plain term, are
-// a second line only.
+// Every cell is capped: a cell longer than this, in its normal form or folded, is left out whole and
+// named as a warning, so every term and pattern runs over at most this many characters, whole.
 export const MATCH_SPAN = 4000;
-export const MATCH_OVERLAP = 400;
 export const oversize = (t: string) => normalise(t).length > MATCH_SPAN || fold(t).length > MATCH_SPAN;
-export function matchesBounded(re: RegExp, text: string, overlap = MATCH_OVERLAP): boolean {
-  if (text.length <= MATCH_SPAN) return re.test(text);
-  if (overlap >= MATCH_SPAN) throw new Error("matchesBounded: the overlap must be under the chunk size");
-  for (let i = 0; i < text.length; i += MATCH_SPAN - overlap) {
-    if (re.test(text.slice(i, i + MATCH_SPAN))) return true;
-    if (i + MATCH_SPAN >= text.length) break;
-  }
-  return false;
-}
 
 // --- strippers ----------------------------------------------------------------------------
 
@@ -621,32 +811,33 @@ export function stateOf(row: OpenRow, hold: Hold | undefined, owners: string[] =
 
 // The area: the project folder the Item names, only when it passes the same checks as the cells
 // (the private marker, the stems and terms, money) and is on the config's `areas` list; any other
-// folder, or none, is "other". The areas list is the primary control on what an area may be.
+// folder, or none, is "other". The name exported is the list's own entry, never the record's text:
+// area names come from that fixed list.
 export function areaOf(item: string, policy?: Policy): GatedText {
   const m = normalise(item).match(/\bprojects\/([A-Za-z0-9][A-Za-z0-9_-]*)/);
-  if (!m || !policy) return mark("other");
+  if (!m || !policy) return gateArea("other", policy);
   const folder = m[1];
   // A folder name that is itself an identifier (a code, a number) is not shown.
-  if (strip(folder) !== folder || /^[a-z]{1,3}\d+$/i.test(folder) || /\d{3,}/.test(folder)) return mark("other");
-  if (PRIVATE_TAG.test(folder) || isExcluded(policy, folder, folder.replace(/[-_]+/g, " "))) return mark("other");
+  if (strip(folder) !== folder || /^[a-z]{1,3}\d+$/i.test(folder) || /\d{3,}/.test(folder)) return gateArea("other", policy);
+  if (PRIVATE_TAG.test(folder) || isExcluded(policy, folder, folder.replace(/[-_]+/g, " "))) return gateArea("other", policy);
   const f = fold(folder);
-  return mark(policy.areas.includes(f) ? f : "other");
+  const listed = policy.areas.find((a) => a === f);
+  return gateArea(listed ?? "other", policy);
 }
 
 // --- one sanitise pipeline, and the gated type ------------------------------------------------
 
-// Every string the exporter signs is a GatedText: made only by the functions below, each the one
-// way its kind of value leaves (free text through sanitise, the rest from fixed lists or checked
-// shapes). signSnapshot walks the whole signed object and refuses any string that isn't one, so a
-// field added later can't skip the pipeline.
+// Every string the exporter signs is a GatedText, made only here: free text through sanitise, the
+// rest from fixed lists or checked shapes. The brand is a compile-time aid only; what holds at run
+// time is checkSigned below, which signSnapshot runs on every call: it walks the whole object against
+// a closed schema and checks every string again.
 declare const GATED: unique symbol;
 export type GatedText = string & { readonly [GATED]: true };
-const gatedValues = new Set<string>();
 function mark(s: string): GatedText {
-  gatedValues.add(s);
   return s as GatedText;
 }
-export const isGated = (s: string) => gatedValues.has(s);
+// Every text sanitise returned, kept so checkSigned can tell a sanitised text at once.
+const sanitisedTexts = new Set<string>();
 
 // A record code for the id field, checked against its shape.
 export function gateId(id: string): GatedText {
@@ -663,27 +854,100 @@ export function gateFixed<T extends string>(word: T): T & GatedText {
   if (!FIXED.includes(word)) throw new Error("gateFixed: not a fixed word");
   return mark(word) as T & GatedText;
 }
+// An area: "other" or an entry of the config's areas list.
+export function gateArea(area: string, policy?: Pick<Policy, "areas">): GatedText {
+  if (area !== "other" && !policy?.areas.includes(area)) throw new Error("gateArea: not on the areas list");
+  return mark(area);
+}
+// The record's revision: a commit hash, checked against its shape.
+export function gateRevision(seq: number, commit: string): { seq: number; commit: GatedText } {
+  const r = { seq, commit };
+  if (!isRevision(r)) throw new Error("gateRevision: not a revision");
+  return { seq, commit: mark(commit) };
+}
 
 export type TextField = "title" | "step" | "waits_for" | "outcome";
 
 // The one pipeline for free text: the normal form, identifiers stripped, every configured name
 // replaced, cut to the first sentence when capped, the proper-noun gate, and the cap again (a
-// replaced word is longer than most). Returns the text and what the gate replaced and the
-// lower-case or uncased words it doesn't know.
-export function sanitise(raw: string, policy: Policy, max?: number): { text: GatedText; capitalised: string[]; unknown: string[] } {
+// replaced word is longer than most). Returns the text, what the gate replaced, the lower-case or
+// uncased words it doesn't know, and the lower-case words known only as name-words.
+export function sanitise(
+  raw: string,
+  policy: Policy,
+  max?: number,
+): { text: GatedText; capitalised: string[]; unknown: string[]; nameLike: string[] } {
   const named = replaceNames(strip(normalise(raw)), policy);
   const g = properNounGate(max ? firstSentence(named, max) : named, policy.allowWords);
   const text = max ? cutCodePoints(g.text, max) : g.text;
-  return { text: mark(text), capitalised: g.words, unknown: unknownTokens(text, policy.vocabulary) };
+  sanitisedTexts.add(text);
+  const words = wordCheck(text, policy.vocabulary);
+  return { text: mark(text), capitalised: g.words, unknown: words.unknown, nameLike: words.nameLike };
 }
 
-// Throws, naming the path only, when any string in the value isn't a GatedText.
-export function assertGated(value: unknown, path = "snapshot"): void {
-  if (typeof value === "string") {
-    if (!isGated(value)) throw new Error(`${path}: a string that did not pass the sanitise pipeline`);
-  } else if (Array.isArray(value)) value.forEach((v, i) => assertGated(v, `${path}[${i}]`));
-  else if (value && typeof value === "object")
-    for (const [k, v] of Object.entries(value)) assertGated(v, `${path}.${k}`);
+// A free text passes when sanitise itself made it, or when sanitising it again returns it unchanged.
+function isSanitised(v: unknown, policy: Policy, max?: number): boolean {
+  if (typeof v !== "string") return false;
+  if (sanitisedTexts.has(v)) return true;
+  try {
+    return sanitise(v, policy, max).text === v;
+  } catch {
+    return false;
+  }
+}
+
+// An object with exactly these own keys: plain (no class, no prototype tricks), no symbol keys, no
+// hidden (non-enumerable) properties, no getters. Throws, naming the path, otherwise.
+function closed(v: unknown, keys: readonly string[], path: string): Record<string, unknown> {
+  if (!isPlainObject(v)) throw new Error(`${path}: not a plain object`);
+  if (Object.getOwnPropertySymbols(v).length) throw new Error(`${path}: a symbol key`);
+  const own = Object.getOwnPropertyNames(v);
+  for (const k of own) {
+    const d = Object.getOwnPropertyDescriptor(v, k)!;
+    if (!d.enumerable || d.get || d.set) throw new Error(`${path}.${k}: not a plain field`);
+    if (!keys.includes(k)) throw new Error(`${path}.${k}: a field outside the schema`);
+  }
+  for (const k of keys) if (!own.includes(k)) throw new Error(`${path}.${k}: missing`);
+  return v;
+}
+
+// The run-time gate, on every signing: the whole signed object against the closed schema (exactly
+// the signed fields, exactly the thread fields, exactly {seq, commit}), every string checked by its
+// kind: the free texts by sanitise (isSanitised), the area against the config's list (and sanitise),
+// the id, times, key id and revision by their shapes, who, state, app and purpose by their fixed
+// lists. Throws, naming the path only, never the value.
+export function checkSigned(value: unknown, policy: Policy): void {
+  const s = closed(value, SIGNED_FIELDS, "snapshot");
+  if (s.version !== SNAPSHOT_VERSION) throw new Error("snapshot.version: not the version this exporter signs");
+  if (s.app !== APP_ID) throw new Error("snapshot.app: not the app");
+  if (s.purpose !== PURPOSE_SNAPSHOT) throw new Error("snapshot.purpose: not the purpose");
+  if (typeof s.key_id !== "string" || !/^[0-9a-f]{16}$/.test(s.key_id)) throw new Error("snapshot.key_id: not a key id");
+  if (!isIsoTime(s.made_at)) throw new Error("snapshot.made_at: not a time");
+  if (s.revision !== null) {
+    closed(s.revision, REVISION_FIELDS, "snapshot.revision");
+    if (!isRevision(s.revision)) throw new Error("snapshot.revision: not a revision");
+  }
+  for (const k of ["excluded_rows", "skipped_rows"] as const)
+    if (typeof s[k] !== "number" || !Number.isSafeInteger(s[k]) || (s[k] as number) < 0) throw new Error(`snapshot.${k}: not a count`);
+  const threads = s.threads;
+  if (!Array.isArray(threads) || Object.getPrototypeOf(threads) !== Array.prototype) throw new Error("snapshot.threads: not a list");
+  if (Object.getOwnPropertySymbols(threads).length || Object.getOwnPropertyNames(threads).length !== threads.length + 1)
+    throw new Error("snapshot.threads: a field outside the schema");
+  threads.forEach((raw, i) => {
+    const path = `snapshot.threads[${i}]`;
+    const t = closed(raw, THREAD_FIELDS, path);
+    if (typeof t.id !== "string" || !ID_RE.test(t.id)) throw new Error(`${path}.id: not a record code`);
+    if (!isSanitised(t.title, policy, TITLE_MAX)) throw new Error(`${path}.title: a string that did not pass the sanitise pipeline`);
+    if (!isSanitised(t.step, policy, STEP_MAX)) throw new Error(`${path}.step: a string that did not pass the sanitise pipeline`);
+    if (!isSanitised(t.outcome, policy)) throw new Error(`${path}.outcome: a string that did not pass the sanitise pipeline`);
+    if (t.waits_for !== null && (!isSanitised(t.waits_for, policy) || t.waits_for === ""))
+      throw new Error(`${path}.waits_for: a string that did not pass the sanitise pipeline`);
+    if (typeof t.area !== "string" || (t.area !== "other" && !policy.areas.includes(t.area)) || !isSanitised(t.area, policy))
+      throw new Error(`${path}.area: not on the areas list`);
+    if (!(WHO as readonly unknown[]).includes(t.who)) throw new Error(`${path}.who: not a fixed word`);
+    if (!(STATES as readonly unknown[]).includes(t.state)) throw new Error(`${path}.state: not a fixed word`);
+    if (!isIsoTime(t.last_moved)) throw new Error(`${path}.last_moved: not a time`);
+  });
 }
 
 export interface ExportThread extends Thread {
@@ -698,10 +962,12 @@ export interface ExportThread extends Thread {
   state: State & GatedText;
 }
 
-export interface ExportSigned extends Signed {
+// What the pipeline builds: every signed field but the key id, which signing adds (withKeyId).
+export interface ExportSigned extends Omit<Signed, "key_id"> {
   app: typeof APP_ID & GatedText;
   purpose: typeof PURPOSE_SNAPSHOT & GatedText;
   made_at: GatedText;
+  revision: { seq: number; commit: GatedText } | null;
   threads: ExportThread[];
 }
 
@@ -716,7 +982,7 @@ export interface Leftover {
 }
 
 export type Outcome =
-  | { kind: "thread"; thread: ExportThread; leftovers: Leftover[]; unknowns: Leftover[] }
+  | { kind: "thread"; thread: ExportThread; leftovers: Leftover[]; unknowns: Leftover[]; nameLike: Leftover[] }
   | { kind: "excluded"; warning?: string }
   | { kind: "skipped"; reason: string };
 
@@ -734,10 +1000,12 @@ export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], 
   // Classified first (who and state read the names), then every text through the one pipeline.
   const leftovers: Leftover[] = [];
   const unknowns: Leftover[] = [];
+  const nameLike: Leftover[] = [];
   const clean = (field: TextField, t: string, max?: number) => {
     const r = sanitise(t, policy, max);
     for (const word of r.capitalised) leftovers.push({ field, word });
     for (const word of r.unknown) unknowns.push({ field, word });
+    for (const word of r.nameLike) nameLike.push({ field, word });
     return r.text;
   };
   const waits = row.waits === null ? null : clean("waits_for", row.waits) || null;
@@ -756,6 +1024,7 @@ export function threadOf(row: OpenRow, hold: Hold | undefined, notes: string[], 
     },
     leftovers,
     unknowns,
+    nameLike,
   };
 }
 
@@ -773,6 +1042,9 @@ export interface Built {
   leftovers: LeftoverAt[];
   // Each lower-case or uncased word not in the vocabulary, the same way.
   unknowns: LeftoverAt[];
+  // Each lower-case word known only as a name-words.txt [common] word ("will", "rose"): reported
+  // in the private dry-run report, not a failure.
+  nameLike: LeftoverAt[];
   // How many exported threads each area has ("other" included). Area names are on the config's list.
   areas: Record<string, number>;
 }
@@ -781,16 +1053,22 @@ export const leftoverPlace = (l: LeftoverAt) => `${l.where}: ${l.field}`;
 export const leftoverLine = (l: LeftoverAt) => `${l.where}: ${l.field}: ${l.word}`;
 
 // What fails a --strict run (and so every --put): a warning (a malformed or oversized row), a
-// capitalised word the gate replaced, or an unknown word in waits_for. Places only, never words.
-export function strictProblems(b: Built): { warnings: string[]; leftovers: LeftoverAt[]; waitsUnknown: LeftoverAt[] } {
-  return { warnings: b.warnings, leftovers: b.leftovers, waitsUnknown: b.unknowns.filter((u) => u.field === "waits_for") };
+// capitalised word the gate replaced, or an unknown word in any free-text field. Places only, never
+// words.
+export function strictProblems(b: Built): { warnings: string[]; leftovers: LeftoverAt[]; unknown: LeftoverAt[] } {
+  return { warnings: b.warnings, leftovers: b.leftovers, unknown: b.unknowns };
 }
 export const strictFails = (b: Built) => {
   const p = strictProblems(b);
-  return p.warnings.length + p.leftovers.length + p.waitsUnknown.length > 0;
+  return p.warnings.length + p.leftovers.length + p.unknown.length > 0;
 };
 
-export function buildSnapshot(record: string, policy: Policy, now = new Date()): Built {
+export function buildSnapshot(
+  record: string,
+  policy: Policy,
+  now = new Date(),
+  revision: { seq: number; commit: string } | null = null,
+): Built {
   const path = join(record, "state", "PENDING.md");
   const pending = readFileSync(path, "utf8");
   const holds = readHolds(record);
@@ -798,6 +1076,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
   const warnings: string[] = [];
   const leftovers: LeftoverAt[] = [];
   const unknowns: LeftoverAt[] = [];
+  const nameLike: LeftoverAt[] = [];
   const areas: Record<string, number> = {};
   let excluded = 0;
   let skipped = 0;
@@ -811,6 +1090,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
       areas[out.thread.area] = (areas[out.thread.area] ?? 0) + 1;
       for (const l of out.leftovers) leftovers.push({ ...l, where });
       for (const u of out.unknowns) unknowns.push({ ...u, where });
+      for (const u of out.nameLike) nameLike.push({ ...u, where });
     } else if (out.kind === "excluded") {
       excluded++;
       if (out.warning) warnings.push(`${where}: row left out, ${out.warning}`);
@@ -825,6 +1105,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
       app: gateFixed(APP_ID),
       purpose: gateFixed(PURPOSE_SNAPSHOT),
       made_at: gateTime(now.getTime()),
+      revision: revision ? gateRevision(revision.seq, revision.commit) : null,
       threads,
       excluded_rows: excluded,
       skipped_rows: skipped,
@@ -832,6 +1113,7 @@ export function buildSnapshot(record: string, policy: Policy, now = new Date()):
     warnings,
     leftovers,
     unknowns,
+    nameLike,
     areas,
   };
 }
@@ -855,10 +1137,26 @@ export function keyId(raw: Uint8Array): string {
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
 }
 
-// The snapshot's identity (the same as shared/snapshot.ts snapshotId): the first 32 hex digits of
-// the SHA-256 of its signed bytes.
+// The signed object: the pipeline's fields with the key id, in the signed fields' order.
+export function withKeyId(s: ExportSigned, keyIdHex: string): Signed {
+  return {
+    version: s.version,
+    app: s.app,
+    purpose: s.purpose,
+    key_id: keyIdHex,
+    made_at: s.made_at,
+    revision: s.revision,
+    threads: s.threads,
+    excluded_rows: s.excluded_rows,
+    skipped_rows: s.skipped_rows,
+  };
+}
+
+// The snapshot's identity (the same as shared/snapshot.ts snapshotId): the SHA-256 of its signed
+// bytes, in hex. It is also the approval digest: the dry run prints it, and --put signs only bytes
+// with this digest (--approve).
 export function snapshotIdOf(s: Signed): string {
-  return createHash("sha256").update(signedBytes(s)).digest("hex").slice(0, 32);
+  return createHash("sha256").update(signedBytes(s)).digest("hex");
 }
 
 export function privateKey(pem: string): KeyObject {
@@ -867,21 +1165,55 @@ export function privateKey(pem: string): KeyObject {
   return k;
 }
 
-// Signs only what passed the pipeline: any string in the signed object that isn't a GatedText is
-// refused, so nothing unsanitised can be signed.
-export function signSnapshot(s: ExportSigned, key: KeyObject): Snapshot {
-  assertGated(s);
-  const pub = rawPublicKey(createPublicKey(key).export({ format: "pem", type: "spki" }).toString());
-  const sig = sign(null, signedBytes(s), key);
-  return { ...s, sig: toBase64(new Uint8Array(sig)), key_id: keyId(pub) };
+export function keyIdOfPrivate(key: KeyObject): string {
+  return keyId(rawPublicKey(createPublicKey(key).export({ format: "pem", type: "spki" }).toString()));
 }
 
-export function makeKeyPair(): { privatePem: string; publicPem: string; publicRaw: string } {
+// Signs only what passes the run-time gate: checkSigned walks the whole signed object against the
+// closed schema on every call, so nothing unsanitised, unknown or extra can be signed.
+export function signSnapshot(s: ExportSigned, key: KeyObject, policy: Policy): Snapshot {
+  const signed = withKeyId(s, keyIdOfPrivate(key));
+  // The pipeline's object itself must be closed too: a field the copy above would leave behind is
+  // refused, not dropped.
+  closed(s, SIGNED_FIELDS.filter((k) => k !== "key_id"), "snapshot");
+  checkSigned(signed, policy);
+  const sig = sign(null, signedBytes(signed), key);
+  return { ...signed, sig: toBase64(new Uint8Array(sig)) };
+}
+
+// A new key pair: the private key (PEM), the public key (PEM), the raw public key in base64, and its
+// key-list entry (`<key id>:<raw base64>`, what SNAPSHOT_PUBLIC_KEYS and SURFACE_PUBLIC_KEYS list).
+export function makeKeyPair(): { privatePem: string; publicPem: string; publicRaw: string; publicEntry: string } {
   const { privateKey: priv, publicKey: pub } = generateKeyPairSync("ed25519");
   const publicPem = pub.export({ format: "pem", type: "spki" }).toString();
+  const raw = rawPublicKey(publicPem);
   return {
     privatePem: priv.export({ format: "pem", type: "pkcs8" }).toString(),
     publicPem,
-    publicRaw: toBase64(rawPublicKey(publicPem)),
+    publicRaw: toBase64(raw),
+    publicEntry: `${keyId(raw)}:${toBase64(raw)}`,
   };
+}
+
+// --- the record's revision ----------------------------------------------------------------------
+
+// The record checkout's revision, when git can say it for certain: the checkout is the top of its own
+// git work tree (not a folder inside another repository, like the fixtures), and nothing under state/
+// differs from its last commit. Then {seq: the commit's count of ancestors, itself included, which
+// only grows along a branch; commit: its hash}. Else null, with the reason.
+export function recordRevision(record: string): { revision: { seq: number; commit: string } | null; why?: string } {
+  const git = (...args: string[]) =>
+    execFileSync("git", ["-C", record, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }).trim();
+  try {
+    const top = git("rev-parse", "--show-toplevel");
+    if (realpathSync(top) !== realpathSync(record)) return { revision: null, why: "the record is not the top of its own git work tree" };
+    if (git("status", "--porcelain", "--untracked-files=all", "--", "state") !== "")
+      return { revision: null, why: "the record's state/ has changes not committed" };
+    const commit = git("rev-parse", "HEAD");
+    const seq = Number(git("rev-list", "--count", "HEAD"));
+    const r = { seq, commit };
+    return isRevision(r) ? { revision: r } : { revision: null, why: "git gave no usable revision" };
+  } catch {
+    return { revision: null, why: "the record is not a git checkout (or git is missing)" };
+  }
 }

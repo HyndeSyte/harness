@@ -8,13 +8,11 @@
 
 # articles, conjunctions, prepositions and other function words
 a
-an
 the
 and
 or
 but
 nor
-so
 yet
 if
 then
@@ -36,7 +34,6 @@ those
 there
 here
 of
-to
 in
 on
 at
@@ -57,7 +54,6 @@ between
 through
 during
 until
-till
 since
 over
 under
@@ -72,7 +68,6 @@ than
 too
 very
 also
-just
 only
 not
 no
@@ -85,10 +80,7 @@ every
 both
 either
 neither
-few
-more
 most
-less
 least
 much
 many
@@ -101,9 +93,7 @@ last
 first
 second
 third
-new
 old
-still
 already
 soon
 now
@@ -112,7 +102,6 @@ tonight
 tomorrow
 yesterday
 later
-early
 maybe
 perhaps
 please
@@ -132,7 +121,6 @@ two
 three
 four
 five
-six
 seven
 eight
 nine
@@ -142,7 +130,6 @@ across
 along
 near
 per
-via
 because
 though
 although
@@ -169,15 +156,12 @@ me
 my
 mine
 myself
-you
 your
 yours
 yourself
-he
 him
 his
 she
-her
 hers
 it
 its
@@ -202,7 +186,6 @@ were
 be
 been
 being
-do
 does
 did
 have
@@ -255,29 +238,18 @@ agree
 answer
 arrange
 ask
-back
 bake
-begin
-book
 borrow
-box
 bring
 buy
-call
-cancel
-carry
 change
 charge
-check
 choose
 clean
-clear
-close
 collect
 come
 confirm
 copy
-cover
 cut
 decide
 delete
@@ -295,14 +267,10 @@ file
 fill
 find
 finish
-fix
 fold
 follow
 get
 give
-go
-hand
-hang
 help
 hold
 install
@@ -311,10 +279,7 @@ leave
 lend
 let
 lift
-list
 load
-look
-lock
 make
 meet
 mend
@@ -324,11 +289,8 @@ need
 note
 open
 order
-pack
 paint
-pick
 plan
-plant
 plug
 prepare
 print
@@ -336,7 +298,6 @@ prune
 push
 put
 rake
-read
 remind
 remove
 renew
@@ -347,12 +308,8 @@ report
 reset
 return
 review
-ring
 run
 save
-say
-see
-sell
 send
 set
 share
@@ -380,13 +337,9 @@ unlock
 update
 use
 visit
-wait
-walk
 want
-wash
 watch
 water
-work
 wrap
 write
 # titles before a name (the name after them is still gated)

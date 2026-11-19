@@ -2,7 +2,9 @@
   "version": 2,
   "app": "harness-surface",
   "purpose": "in-motion-snapshot",
+  "key_id": "11c79bb8da29ee30",
   "made_at": "2026-11-18T10:00:00.000Z",
+  "revision": null,
   "threads": [
     {
       "id": "P40",
@@ -256,10 +258,130 @@
       "outcome": "Done.",
       "last_moved": "2026-11-03T00:00:00.000Z",
       "state": "moving"
+    },
+    {
+      "id": "P111",
+      "title": "Sort the zorblat bins.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort them.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P112",
+      "title": "Tidy the shed.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Ask quillon about the spot.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P113",
+      "title": "Fix the garden's gate.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Ask someone's crew.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P114",
+      "title": "We'll tidy the shed; it's the ladder's spot.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P115",
+      "title": "Return the drill to someone",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P116",
+      "title": "Leave the ladder for someone.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "OK, done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P117",
+      "title": "Ask someone 5 times about the forms.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P118",
+      "title": "Mrs. someone 12 sent the forms.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P119",
+      "title": "Fetch the ladder on 12 May.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P120",
+      "title": "Return the drill to 李.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "Done.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
+    },
+    {
+      "id": "P121",
+      "title": "Leave the ladder for the someone.",
+      "area": "other",
+      "who": "the assistant",
+      "step": "Sort it.",
+      "waits_for": null,
+      "outcome": "DONE.",
+      "last_moved": "2026-11-03T00:00:00.000Z",
+      "state": "moving"
     }
   ],
   "excluded_rows": 47,
   "skipped_rows": 2,
-  "sig": "dT+EOBeix4HqqTv3PUUPtwQx/CdL5T9+anWXYPbPj9jvykNp4OKXIWYD29ESkGL1gxDI14j7vlQMddcHyyP7Bw==",
-  "key_id": "37e1598320a33918"
+  "sig": "s/XTmeBnaJ+dACoUOJYJVbWjI4ToueYUtxqCAt5go78JHEwfgnvxTmu9ujuDN5ZMmY9ylh5DmsF5os9A+2q5Bg=="
 }

@@ -2,7 +2,9 @@
 // must hold. Fails if dist/_headers is missing, if its Content-Security-Policy, parsed directive
 // by directive, doesn't have script-src 'self' alone (no 'unsafe-inline', no 'unsafe-eval'),
 // connect-src 'self' and frame-ancestors 'none', or if any .html file under dist has a <script>
-// without a src (the policy allows no inline script).
+// without a src (the policy allows no inline script). Seventh round: the artifact is synthetic only,
+// so it fails too if any file under dist holds a snapshot (a snapshot.json, or a file carrying the
+// signed snapshot's purpose): the build ships code and public settings, never record data.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
@@ -41,6 +43,17 @@ export function inlineScripts(html) {
   return (html.match(/<script\b[^>]*>/gi) ?? []).filter((tag) => !/\ssrc\s*=/i.test(tag));
 }
 
+// Files under dist that look like a snapshot: named snapshot.json, or holding the purpose string
+// with a signature field beside it.
+export function snapshotFiles(dir) {
+  const all = (d) => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? all(join(d, e.name)) : [join(d, e.name)]));
+  return all(dir).filter((f) => {
+    if (/(^|\/)snapshot\.json$/i.test(f)) return true;
+    const text = readFileSync(f, "latin1");
+    return text.includes('"purpose":"in-motion-snapshot"') || (text.includes('"in-motion-snapshot"') && /"sig"\s*:/.test(text));
+  });
+}
+
 function htmlFiles(dir) {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
     e.isDirectory() ? htmlFiles(join(dir, e.name)) : /\.html?$/i.test(e.name) ? [join(dir, e.name)] : [],
@@ -58,9 +71,11 @@ if (import.meta.main) {
   for (const file of files)
     for (const tag of inlineScripts(readFileSync(file, "utf8")))
       problems.push(`dist/${relative(dist, file)} has an inline script: ${tag}`);
+  if (existsSync(dist))
+    for (const file of snapshotFiles(dist)) problems.push(`dist/${relative(dist, file)} holds a snapshot; the build artifact is synthetic only`);
   if (problems.length) {
     for (const p of problems) console.error("dist check: " + p);
     process.exit(1);
   }
-  console.log(`dist check: ${files.length} .html file(s) with no inline script; _headers' content policy holds`);
+  console.log(`dist check: ${files.length} .html file(s) with no inline script; _headers' content policy holds; no snapshot in dist`);
 }

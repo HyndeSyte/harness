@@ -6,9 +6,18 @@ import { main as exporter, REDIRECTED } from "../export/index";
 import { tempRecord } from "../export/fixtures/temp-record";
 import { wranglerProblems } from "./check-wrangler";
 import { buildSnapshot, makeKeyPair, makePolicy, privateKey, signSnapshot } from "../export/lib";
-import { createWorker, MAX_BYTES, SnapshotStore, teamOf, type Env, type Stored } from "./src/index";
+import { canonical, signedBytes, toBase64 } from "../shared/canonical";
+import { snapshotId } from "../shared/snapshot";
+import { sign } from "node:crypto";
+import { createWorker, MAX_AGE_MS, MAX_BYTES, SnapshotStore, teamOf, type Env, type Stored } from "./src/worker";
 
 const noWait = async () => {};
+// The "--made-at <time> --approve <digest>" a dry run with --key prints.
+const approvalOf = (out: string): string[] => {
+  const m = out.match(/add: (--made-at \S+ --approve [0-9a-f]{64})/);
+  if (!m) throw new Error("no approval line in the dry run's output");
+  return m[1].split(" ");
+};
 // Made-up values only.
 const TEAM = "https://example-team.cloudflareaccess.com";
 const AUD = "aud-tag-example-0001";
@@ -52,14 +61,16 @@ function memoryStore(over: Partial<Storage> = {}, delay = async () => {}) {
 const keys = makeKeyPair();
 const FIX = join(import.meta.dir, "..", "export", "fixtures");
 const policy = makePolicy(readFileSync(join(FIX, "private-terms.txt"), "utf8"), { owner_names: ["Robin"] });
-const snap = (when: string) =>
-  signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(when)).snapshot, privateKey(keys.privatePem));
+const snap = (when: string, k = keys, revision: { seq: number; commit: string } | null = null) =>
+  signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(when), revision).snapshot, privateKey(k.privatePem), policy);
+// A response's JSON body, untyped fields read as unknown.
+const bodyOf = async (res: Response): Promise<Record<string, unknown>> => (await res.json()) as Record<string, unknown>;
 function env(over: Partial<Storage> = {}, delay?: () => Promise<void>): Env & { store: ReturnType<typeof memoryStore> } {
   const store = memoryStore(over, delay);
   return { ...envBase(), STORE: store.ns, store };
 }
 const envBase = () => ({
-  SNAPSHOT_PUBLIC_KEYS: keys.publicRaw,
+  SNAPSHOT_PUBLIC_KEYS: keys.publicEntry,
   ACCESS_TEAM_DOMAIN: TEAM,
   ACCESS_AUD: AUD,
   OWNER_EMAIL: OWNER,
@@ -142,7 +153,7 @@ describe("the store", () => {
 
   test("a snapshot signed by another key is refused", async () => {
     const other = makeKeyPair();
-    const s = signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(NOW)).snapshot, privateKey(other.privatePem));
+    const s = snap(new Date(NOW).toISOString(), other);
     expect((await worker.fetch(await put(s), env())).status).toBe(403);
   });
 
@@ -156,16 +167,16 @@ describe("the store", () => {
     const e = env();
     const res = await worker.fetch(await put(snap("2026-11-18T12:06:00Z")), e);
     expect(res.status).toBe(400);
-    expect(((await res.json()) as any).error).toMatch(/5 minutes ahead/);
+    expect((await bodyOf(res)).error).toMatch(/5 minutes ahead/);
     expect(e.store.held()).toBeUndefined();
     expect((await worker.fetch(await put(snap("2026-11-18T12:04:00Z")), e)).status).toBe(200);
   });
 
-  test("unsigned extra fields are not stored", async () => {
+  test("a field outside the signed ones is refused, and nothing is stored", async () => {
     const e = env();
     const s = { ...snap("2026-11-18T12:00:00Z"), extra: "not signed" };
-    expect((await worker.fetch(await put(s), e)).status).toBe(200);
-    expect((e.store.held()!.snapshot as any).extra).toBeUndefined();
+    expect((await worker.fetch(await put(s), e)).status).toBe(403);
+    expect(e.store.held()).toBeUndefined();
   });
 
   test("the size limit counts bytes, not characters", async () => {
@@ -215,7 +226,7 @@ describe("store faults are 503, never cached", () => {
     for (const r of [await get(), await put(snap("2026-11-18T12:00:00Z"))]) {
       const res = await worker.fetch(r, e);
       expect(res.status).toBe(503);
-      expect(((await res.json()) as any).error).toMatch(/set the Worker variable STORE_NAME to a new name/);
+      expect((await bodyOf(res)).error).toMatch(/set the Worker variable STORE_NAME to a new name/);
     }
   });
 });
@@ -266,11 +277,11 @@ describe("Access on GET", () => {
         const res = await worker.fetch(r, { ...env(), [name]: " " });
         expect(res.status).toBe(503);
         expect(res.headers.get("cache-control")).toBe("no-store");
-        expect(((await res.json()) as any).error).toContain(name);
+        expect((await bodyOf(res)).error).toContain(name);
       }
     }
     const res = await worker.fetch(await get(), { ...env(), OWNER_EMAIL: "", ACCESS_AUD: "" });
-    expect(((await res.json()) as any).error).toMatch(/ACCESS_AUD, OWNER_EMAIL are blank/);
+    expect((await bodyOf(res)).error).toMatch(/ACCESS_AUD, OWNER_EMAIL are blank/);
   });
   test("a payload that is null, or not an object, is 403, not 503", async () => {
     const forged = async (payload: string) => {
@@ -336,6 +347,14 @@ describe("an unknown key id", () => {
     expect(fetches).toBe(2);
     expect(await read("kid-1")).toBe(404); // the known key still reads, from the cache
     expect(fetches).toBe(2);
+  });
+});
+
+describe("the entry module", () => {
+  test("exports only the fetch handler and the Durable Object class, as workerd requires", async () => {
+    const entry = await import("./src/index");
+    expect(Object.keys(entry).sort()).toEqual(["SnapshotStore", "default"]);
+    expect(typeof entry.default.fetch).toBe("function");
   });
 });
 
@@ -462,18 +481,20 @@ describe("the exporter's --put, against this Worker in-process", () => {
   beforeAll(async () => {
     await capture(() => exporter(["--keygen", dir]));
   });
-  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEYS: readFileSync(join(dir, "surface.pub.b64"), "utf8").trim() });
+  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEYS: readFileSync(join(dir, "surface.pub.entry"), "utf8").trim() });
+  // The approval flags a dry run with the key prints for exactly these bytes (seventh round).
+  const approval = async (r = run, extra: string[] = []) => approvalOf((await capture(() => exporter([...r, "--dry-run", "--key", keyFile, ...extra]))).out);
 
   test("a signed snapshot is stored: 200, exit 0, the status and the Worker's message printed", async () => {
     const e = workerEnv();
     const h = harness(e);
-    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
+    const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: putEnv }));
     expect(code).toBe(0);
     expect(out).toMatch(/PUT https:\/\/surface\.example\.com\/snapshot: 200 stored /);
     expect(h.calls.length).toBe(1);
     expect(h.calls[0].headers.get("x-surface-publisher")).toBe(PUBLISHER);
-    const stored = e.store.held()!.snapshot as any;
-    expect(stored.threads.length).toBeGreaterThan(0);
+    const stored = e.store.held()!.snapshot;
+    expect((stored.threads as unknown[]).length).toBeGreaterThan(0);
     expect(out).not.toContain(SECRET);
     expect(out).not.toContain(PUBLISHER);
   });
@@ -482,7 +503,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
     const e = workerEnv();
     const h = harness(e);
     const env2 = { ...putEnv, SURFACE_PUBLISHER_TOKEN: "wrong" };
-    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
+    const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: env2 }));
     expect(code).toBe(1);
     expect(out).toContain("403 the publisher header is missing or wrong");
     expect(e.store.held()).toBeUndefined();
@@ -491,7 +512,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
   test("Access refusing the token is exit 1", async () => {
     const h = harness(workerEnv());
     const env2 = { ...putEnv, SURFACE_ACCESS_CLIENT_SECRET: "wrong" };
-    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
+    const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: env2 }));
     expect(code).toBe(1);
     expect(out).toContain(": 403");
     // Only the Worker's JSON message is ever printed, never another body.
@@ -501,7 +522,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
   test("the fixture record, with its malformed rows and leftovers, is refused under --put before any request", async () => {
     const h = harness(workerEnv());
     const fixtureRun = ["--record", join(FIX, "record"), ...run.slice(2)];
-    const { code } = await capture(() => exporter([...fixtureRun, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
+    const { code } = await capture(async () => exporter([...fixtureRun, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: putEnv }));
     expect(code).toBe(1);
     expect(h.calls.length).toBe(0);
   });
@@ -516,21 +537,22 @@ describe("the exporter's --put, against this Worker in-process", () => {
         throw new Error("connection refused");
       },
     ]) {
-      const r = await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_], { fetch: f, env: putEnv, sleep: noWait }));
+      const r = await capture(async () => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_, ...(await approval())], { fetch: f, env: putEnv, sleep: noWait }));
       expect(r.code).not.toBe(0);
       expect(readFileSync(out, "utf8")).toBe("the earlier file\n");
     }
     // A stored upload writes it.
     const h = harness(workerEnv());
-    expect((await capture(() => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_], { fetch: h.fetch, env: putEnv }))).code).toBe(0);
+    expect((await capture(async () => exporter([...run, "--key", keyFile, "--out", out, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: putEnv }))).code).toBe(0);
     expect(JSON.parse(readFileSync(out, "utf8")).sig).toBeString();
   });
 
   test("an older snapshot is 409, exit 1", async () => {
     const e = workerEnv();
-    e.store.raw().set("latest", { id: "f".repeat(32), made_at: "2999-01-01T00:00:00.000Z", snapshot: {} });
+    const kid = readFileSync(join(dir, "surface.pub.entry"), "utf8").split(":")[0];
+    e.store.raw().set("latest", { id: "f".repeat(64), made_at: "2999-01-01T00:00:00.000Z", received_at: "2026-11-18T12:00:00.000Z", key_id: kid, revision: null, snapshot: {} });
     const h = harness(e);
-    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: putEnv }));
+    const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: putEnv }));
     expect(code).toBe(1);
     expect(out).toContain("409 older than the stored snapshot");
   });
@@ -539,7 +561,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
     for (const name of Object.keys(putEnv)) {
       const h = harness(workerEnv());
       const env2: Record<string, string | undefined> = { ...putEnv, [name]: undefined };
-      const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: h.fetch, env: env2 }));
+      const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: h.fetch, env: env2 }));
       expect(code).toBe(2);
       expect(out).toContain(name);
       expect(h.calls.length).toBe(0);
@@ -548,8 +570,8 @@ describe("the exporter's --put, against this Worker in-process", () => {
 
   test("no answer at all is an unknown remote outcome: exit 3, after reconciling", async () => {
     let tries = 0;
-    const { code, out } = await capture(() =>
-      exporter([...run, "--key", keyFile, "--put", URL_], {
+    const { code, out } = await capture(async () =>
+      exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], {
         fetch: async () => {
           tries++;
           throw new Error("connection refused");
@@ -607,7 +629,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
 
   test("a 307 to another host is refused: the other host gets no request and no header", async () => {
     const r = redirecting("https://elsewhere.example.net/collect");
-    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: r.fetch, env: putEnv }));
+    const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: r.fetch, env: putEnv }));
     expect(code).toBe(1);
     expect(out).toContain(REDIRECTED);
     expect(r.calls.length).toBe(1);
@@ -617,7 +639,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
 
   test("a redirect from the first host to itself (an Access login) is refused likewise", async () => {
     const r = redirecting("https://surface.example.com/cdn-cgi/access/login?x=1");
-    const { code, out } = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: r.fetch, env: putEnv }));
+    const { code, out } = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: r.fetch, env: putEnv }));
     expect(code).toBe(1);
     expect(out).toContain("Access redirected: the service token or its Service Auth policy is wrong");
     expect(r.calls.length).toBe(1);
@@ -628,13 +650,13 @@ describe("the exporter's --put, against this Worker in-process", () => {
     const long = "x".repeat(500);
     const f = async () => new Response(JSON.stringify({ error: long, extra: "not printed" }), { status: 400 });
     // (a 4xx: a server rejection, no reconciling)
-    const r1 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: f, env: putEnv }));
+    const r1 = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: f, env: putEnv }));
     expect(r1.code).toBe(1);
     expect(r1.out).toContain("x".repeat(200));
     expect(r1.out).not.toContain("x".repeat(201));
     expect(r1.out).not.toContain("not printed");
     const html = async () => new Response("<html>secret-ish page</html>", { status: 502 });
-    const r2 = await capture(() => exporter([...run, "--key", keyFile, "--put", URL_], { fetch: html, env: putEnv, sleep: noWait }));
+    const r2 = await capture(async () => exporter([...run, "--key", keyFile, "--put", URL_, ...(await approval())], { fetch: html, env: putEnv, sleep: noWait }));
     expect(r2.code).toBe(3);
     expect(r2.out).not.toContain("secret-ish");
   });
@@ -642,7 +664,7 @@ describe("the exporter's --put, against this Worker in-process", () => {
   test("--put with no url, or with --dry-run, is exit 2", async () => {
     const h = harness(workerEnv());
     expect((await capture(() => exporter([...run, "--key", keyFile, "--put"], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
-    expect((await capture(() => exporter([...run, "--dry-run", "--put", URL_], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
+    expect((await capture(async () => exporter([...run, "--dry-run", "--put", URL_, ...(await approval())], { fetch: h.fetch, env: putEnv }))).code).toBe(2);
     expect(h.calls.length).toBe(0);
   });
 });
@@ -670,21 +692,22 @@ describe("sixth round: the Durable Object compares and writes atomically", () =>
   test("the same snapshot again is 200 naming the same identity, and nothing is rewritten", async () => {
     const e = env();
     const s = snap("2026-11-18T12:00:00Z");
-    const first = (await (await worker.fetch(await put(s), e)).json()) as any;
+    const first = await bodyOf(await worker.fetch(await put(s), e));
     const real = e.store.raw();
     const before = real.get("latest");
-    const second = (await (await worker.fetch(await put(s), e)).json()) as any;
+    const second = await bodyOf(await worker.fetch(await put(s), e));
     expect(second.id).toBe(first.id);
     expect(second.already).toBe(true);
     expect(real.get("latest")).toBe(before);
-    expect(first.id).toMatch(/^[0-9a-f]{32}$/);
+    expect(first.id).toMatch(/^[0-9a-f]{64}$/);
+    expect(first.id).toBe(await snapshotId(s));
   });
   test("a 409 names the identity held", async () => {
     const e = env();
-    const a = (await (await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e)).json()) as any;
+    const a = await bodyOf(await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e));
     const res = await worker.fetch(await put(snap("2026-11-18T11:00:00Z")), e);
     expect(res.status).toBe(409);
-    expect(((await res.json()) as any).id).toBe(a.id);
+    expect((await bodyOf(res)).id).toBe(a.id);
   });
   test("STORE_NAME starts an empty store: the recovery for a wedged one", async () => {
     const e = env();
@@ -699,37 +722,150 @@ describe("sixth round: the Durable Object compares and writes atomically", () =>
 
 describe("sixth round: key match and rotation", () => {
   const next = makeKeyPair();
-  const snapWith = (k: typeof next, when: string) =>
-    signSnapshot(buildSnapshot(join(FIX, "record"), policy, new Date(when)).snapshot, privateKey(k.privatePem));
+  const snapWith = (k: typeof next, when: string) => snap(when, k);
   test("a snapshot verifies under the listed key its key_id names, in any order", async () => {
-    for (const list of [`${keys.publicRaw},${next.publicRaw}`, `${next.publicRaw}, ${keys.publicRaw}`]) {
+    for (const list of [`${keys.publicEntry},${next.publicEntry}`, `${next.publicEntry}, ${keys.publicEntry}`]) {
       const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: list };
       expect((await worker.fetch(await put(snapWith(keys, "2026-11-18T11:00:00Z")), e)).status).toBe(200);
       expect((await worker.fetch(await put(snapWith(next, "2026-11-18T12:00:00Z")), e)).status).toBe(200);
     }
   });
-  test("the rotation: add the new key, switch the exporter, remove the old; the old key is then refused", async () => {
+  test("the rotation: add the new key, switch the exporter, retire the old; the old key is then refused", async () => {
     const e = env();
     // 1. Only the old key.
     expect((await worker.fetch(await put(snapWith(keys, "2026-11-18T10:00:00Z")), e)).status).toBe(200);
     expect((await worker.fetch(await put(snapWith(next, "2026-11-18T10:30:00Z")), e)).status).toBe(403);
     // 2. Both listed: the exporter switches to the new key.
-    const both = { ...e, SNAPSHOT_PUBLIC_KEYS: `${keys.publicRaw},${next.publicRaw}` };
+    const both = { ...e, SNAPSHOT_PUBLIC_KEYS: `${keys.publicEntry},${next.publicEntry}` };
     expect((await worker.fetch(await put(snapWith(next, "2026-11-18T11:00:00Z")), both)).status).toBe(200);
-    // 3. The old one removed: an upload signed by it is refused.
-    const after = { ...e, SNAPSHOT_PUBLIC_KEYS: next.publicRaw };
-    expect((await worker.fetch(await put(snapWith(keys, "2026-11-18T12:00:00Z")), after)).status).toBe(403);
-    expect((await worker.fetch(await put(snapWith(next, "2026-11-18T12:00:00Z")), after)).status).toBe(200);
+    // 3. The old one retired (or removed): an upload signed by it is refused.
+    for (const list of [`${keys.publicEntry}:retired,${next.publicEntry}`, next.publicEntry]) {
+      const after = { ...e, SNAPSHOT_PUBLIC_KEYS: list };
+      const res = await worker.fetch(await put(snapWith(keys, "2026-11-18T12:00:00Z")), after);
+      expect(res.status).toBe(403);
+      if (list.includes("retired")) expect((await bodyOf(res)).error).toBe("signed by a retired key");
+    }
+    expect((await worker.fetch(await put(snapWith(next, "2026-11-18T12:00:00Z")), { ...e, SNAPSHOT_PUBLIC_KEYS: next.publicEntry })).status).toBe(200);
   });
-  test("a list with nothing usable is no key", async () => {
-    const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: "nonsense, ,REPLACE_WITH_PUBLIC_KEY_BASE64" };
-    expect((await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e)).status).toBe(500);
+  test("a list with a mistake in it is no list: a bare key, an id that isn't its key's, a duplicate, garbage", async () => {
+    const [id, raw] = keys.publicEntry.split(":");
+    for (const list of ["nonsense, ,REPLACE_WITH_PUBLIC_KEY_BASE64", keys.publicRaw, `${"0".repeat(16)}:${raw}`, `${keys.publicEntry},${keys.publicEntry}`, `${keys.publicEntry},x`, `${id}:${raw}:old`, ""]) {
+      const res = await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), { ...env(), SNAPSHOT_PUBLIC_KEYS: list });
+      expect([list, res.status]).toEqual([list, 500]);
+    }
+    // Every key retired: no active key.
+    const res = await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), { ...env(), SNAPSHOT_PUBLIC_KEYS: `${keys.publicEntry}:retired` });
+    expect(res.status).toBe(500);
   });
   test("an unknown version, app or purpose is refused even with a good key", async () => {
     for (const over of [{ version: 1 }, { app: "x" }, { purpose: "command" }]) {
       const res = await worker.fetch(await put({ ...snap("2026-11-18T12:00:00Z"), ...over }), env());
       expect([over, res.status]).toEqual([over, 403]);
     }
+  });
+});
+
+describe("seventh round: the store's ordering", () => {
+  const thief = makeKeyPair();
+  const kidOf = (k: typeof thief) => k.publicEntry.split(":")[0];
+  const commit = (c: string) => c.repeat(40);
+  // A value the store holds, as the Worker writes it.
+  const heldAs = (over: Partial<Stored>): Stored => ({
+    id: "e".repeat(64),
+    made_at: "2026-11-18T11:00:00.000Z",
+    received_at: "2026-11-18T11:00:01.000Z",
+    key_id: kidOf(keys),
+    revision: null,
+    snapshot: { held: true },
+    ...over,
+  });
+  test("a retired key wrote a far-future snapshot; a valid key then succeeds", async () => {
+    const e = { ...env(), SNAPSHOT_PUBLIC_KEYS: `${thief.publicEntry},${keys.publicEntry}` };
+    // While the stolen key is still active, its snapshot dated far ahead (from before the bound, or a
+    // skewed Worker clock) and with a far-ahead revision holds the store: a valid key's newer one is 409.
+    e.store.raw().set("latest", heldAs({ key_id: kidOf(thief), made_at: "2999-01-01T00:00:00.000Z", revision: { seq: 999_999_999, commit: commit("a") } }));
+    expect((await worker.fetch(await put(snap("2026-11-18T12:00:00Z")), e)).status).toBe(409);
+    // Its key retired: any valid snapshot replaces it, whatever its made_at or revision.
+    const retired = { ...e, SNAPSHOT_PUBLIC_KEYS: `${thief.publicEntry}:retired,${keys.publicEntry}` };
+    const res = await worker.fetch(await put(snap("2026-11-18T11:30:00Z")), retired);
+    expect(res.status).toBe(200);
+    expect((await bodyOf(res)).replaced_retired).toBe(true);
+    expect(e.store.held()!.made_at).toBe("2026-11-18T11:30:00.000Z");
+    // And the stolen key's own uploads are refused.
+    expect((await worker.fetch(await put(snap("2026-11-18T12:01:00Z", thief)), retired)).status).toBe(403);
+  });
+  test("a held snapshot signed by a key no longer listed at all is replaced the same way", async () => {
+    const e = env();
+    e.store.raw().set("latest", heldAs({ key_id: kidOf(thief), made_at: "2999-01-01T00:00:00.000Z" }));
+    expect((await worker.fetch(await put(snap("2026-11-18T11:00:00Z")), e)).status).toBe(200);
+  });
+  test("a skewed-future made_at is refused, and so is one older than the maximum age", async () => {
+    const e = env();
+    for (const when of ["2026-11-18T12:05:01Z", "2027-01-01T00:00:00Z"]) {
+      const res = await worker.fetch(await put(snap(when)), e);
+      expect([when, res.status]).toEqual([when, 400]);
+    }
+    const old = new Date(NOW - MAX_AGE_MS - 60_000).toISOString();
+    const res = await worker.fetch(await put(snap(old)), e);
+    expect(res.status).toBe(400);
+    expect((await bodyOf(res)).error).toMatch(/more than 24 hours old/);
+    expect(e.store.held()).toBeUndefined();
+    expect((await worker.fetch(await put(snap(new Date(NOW - MAX_AGE_MS + 60_000).toISOString())), e)).status).toBe(200);
+  });
+  test("the server's receipt time is stored beside the snapshot", async () => {
+    const e = env();
+    const res = await worker.fetch(await put(snap("2026-11-18T11:59:00Z")), e);
+    expect((await bodyOf(res)).received_at).toBe(new Date(NOW).toISOString());
+    expect(e.store.held()!.received_at).toBe(new Date(NOW).toISOString());
+    expect(e.store.held()!.key_id).toBe(kidOf(keys));
+    // GET returns the signed snapshot only, not the receipt.
+    expect(Object.keys(await bodyOf(await worker.fetch(await get(), e)))).not.toContain("received_at");
+  });
+  test("the record revision is the precondition: newest revision wins, whatever made_at says", async () => {
+    const e = env();
+    expect((await worker.fetch(await put(snap("2026-11-18T11:00:00Z", keys, { seq: 5, commit: commit("b") })), e)).status).toBe(200);
+    // A lower revision, though newer by made_at: 409.
+    const lower = await worker.fetch(await put(snap("2026-11-18T11:30:00Z", keys, { seq: 4, commit: commit("c") })), e);
+    expect(lower.status).toBe(409);
+    expect((await bodyOf(lower)).error).toMatch(/older record revision/);
+    // Another commit at the same revision: 409.
+    const other = await worker.fetch(await put(snap("2026-11-18T11:30:00Z", keys, { seq: 5, commit: commit("d") })), e);
+    expect(other.status).toBe(409);
+    expect((await bodyOf(other)).error).toMatch(/another commit/);
+    // A higher revision, though older by made_at: stored.
+    expect((await worker.fetch(await put(snap("2026-11-18T10:00:00Z", keys, { seq: 6, commit: commit("e") })), e)).status).toBe(200);
+    // The same commit again: made_at decides.
+    expect((await worker.fetch(await put(snap("2026-11-18T09:00:00Z", keys, { seq: 6, commit: commit("e") })), e)).status).toBe(409);
+    expect((await worker.fetch(await put(snap("2026-11-18T11:45:00Z", keys, { seq: 6, commit: commit("e") })), e)).status).toBe(200);
+    // Without a revision on either side, made_at decides.
+    expect((await worker.fetch(await put(snap("2026-11-18T11:40:00Z")), e)).status).toBe(409);
+  });
+  test("version 1 is refused: a version 1 blob, validly signed in its own form, replayed", async () => {
+    // Version 1's signed bytes: {version, made_at, threads, excluded_rows, skipped_rows}, no app,
+    // purpose or key id inside them.
+    const v2 = snap("2026-11-18T12:00:00Z");
+    const v1Signed = { version: 1, made_at: v2.made_at, threads: v2.threads, excluded_rows: v2.excluded_rows, skipped_rows: v2.skipped_rows };
+    const sig = toBase64(new Uint8Array(sign(null, new TextEncoder().encode(canonical(v1Signed)), privateKey(keys.privatePem))));
+    const v1 = { ...v1Signed, sig, key_id: v2.key_id };
+    const e = env();
+    const res = await worker.fetch(await put(v1), e);
+    expect(res.status).toBe(403);
+    expect(e.store.held()).toBeUndefined();
+    // The same blob dressed as version 2 doesn't verify either: the signed bytes differ.
+    const dressed = { ...v1, version: 2, app: v2.app, purpose: v2.purpose, revision: null };
+    expect((await worker.fetch(await put(dressed), e)).status).toBe(403);
+    expect(signedBytes(v2).length).toBeGreaterThan(0);
+  });
+  test("an older version 2 blob replayed is 409 naming the identity held", async () => {
+    const e = env();
+    const older = snap("2026-11-18T11:00:00Z");
+    const newer = snap("2026-11-18T11:30:00Z");
+    expect((await worker.fetch(await put(older), e)).status).toBe(200);
+    expect((await worker.fetch(await put(newer), e)).status).toBe(200);
+    const res = await worker.fetch(await put(older), e);
+    expect(res.status).toBe(409);
+    expect((await bodyOf(res)).id).toBe(await snapshotId(newer));
+    expect(e.store.held()!.id).toBe(await snapshotId(newer));
   });
 });
 
@@ -783,25 +919,29 @@ describe("sixth round: the synthetic deployment, a lost response reconciled", ()
   beforeAll(async () => {
     await quiet(() => exporter(["--keygen", dir]));
   });
-  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEYS: readFileSync(join(dir, "surface.pub.b64"), "utf8").trim() });
+  const workerEnv = () => ({ ...env(), SNAPSHOT_PUBLIC_KEYS: readFileSync(join(dir, "surface.pub.entry"), "utf8").trim() });
+  // The dry run's approval flags for the synthetic record, then the --put run with them.
+  const dryRun = run.slice(0, run.indexOf("--key"));
+  const approved = async (extra: string[] = []) =>
+    [...run, ...approvalOf((await quiet(() => exporter([...dryRun, "--dry-run", "--key", join(dir, "surface.key"), ...extra]))).out)];
 
   test("the first response is lost; the second try finds the same identity held: stored, exit 0", async () => {
     const e = workerEnv();
     const v = via(e, (i) => i === 0);
-    const r = await quiet(() => exporter(run, { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    const r = await quiet(async () => exporter(await approved(), { fetch: v.fetch, env: putEnv, sleep: noWait }));
     expect(r.code).toBe(0);
     expect(v.tries()).toBe(2);
     expect(v.statuses).toEqual([200, 200]);
     expect(r.out).toContain("reconciling");
     const held = e.store.held()!;
     expect(r.out).toContain(`(snapshot ${held.id})`);
-    expect((held.snapshot as any).threads.map((t: any) => t.id)).toEqual(["S1", "S2"]);
+    expect((held.snapshot.threads as { id: string }[]).map((t) => t.id)).toEqual(["S1", "S2"]);
   });
   test("every response lost: an unknown remote outcome, exit 3, though the Worker holds it", async () => {
     const e = workerEnv();
     const v = via(e, () => true);
     const out = join(dir, "never.json");
-    const r = await quiet(() => exporter([...run, "--out", out], { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    const r = await quiet(async () => exporter([...(await approved()), "--out", out], { fetch: v.fetch, env: putEnv, sleep: noWait }));
     expect(r.code).toBe(3);
     expect(r.out).toContain("upload: unknown remote outcome");
     expect(existsSync(out)).toBe(false);
@@ -810,18 +950,65 @@ describe("sixth round: the synthetic deployment, a lost response reconciled", ()
   test("a server rejection is exit 1 with no reconciling; a preflight rejection is exit 2 with nothing sent", async () => {
     const e = workerEnv();
     const v = via(e, () => false);
-    const r = await quiet(() => exporter(run, { fetch: v.fetch, env: { ...putEnv, SURFACE_PUBLISHER_TOKEN: "wrong" }, sleep: noWait }));
+    const r = await quiet(async () => exporter(await approved(), { fetch: v.fetch, env: { ...putEnv, SURFACE_PUBLISHER_TOKEN: "wrong" }, sleep: noWait }));
     expect(r.code).toBe(1);
     expect(v.tries()).toBe(1);
     expect(r.out).toContain("upload: server rejection");
-    const p = await quiet(() => exporter(run, { fetch: v.fetch, env: { ...putEnv, SURFACE_PUT_HOST: "other.example.com" }, sleep: noWait }));
+    const p = await quiet(async () => exporter(await approved(), { fetch: v.fetch, env: { ...putEnv, SURFACE_PUT_HOST: "other.example.com" }, sleep: noWait }));
     expect(p.code).toBe(2);
     expect(p.out).toContain("upload: preflight rejection, nothing sent");
     expect(v.tries()).toBe(1);
   });
   test("a 2xx that names another snapshot is not taken as stored", async () => {
     const f = async () => new Response(JSON.stringify({ stored: "x", id: "0".repeat(32) }), { status: 200 });
-    const r = await quiet(() => exporter(run, { fetch: f, env: putEnv, sleep: noWait }));
+    const r = await quiet(async () => exporter(await approved(), { fetch: f, env: putEnv, sleep: noWait }));
     expect(r.code).toBe(3);
+  });
+  test("seventh round: a lost response, then a newer write: the reconciling try is refused and reports so", async () => {
+    // The first run's first try is stored with its response lost; then a newer snapshot lands; the
+    // retry of the first run's same bytes gets 409 naming the newer identity: exit 1, not stored.
+    const e = workerEnv();
+    const first = await approved();
+    const later = await approved(["--made-at", new Date(Date.now() + 2000).toISOString()]);
+    let landed = false;
+    let n = 0;
+    const v = via(e, () => false);
+    const f = async (url: string, init: RequestInit) => {
+      const res = await v.fetch(url, init);
+      if (n++ === 0) {
+        // Lost on the way back; meanwhile the later run stores its newer snapshot.
+        const l = await quiet(() => exporter(later, { fetch: via(e, () => false).fetch, env: putEnv, sleep: noWait }));
+        landed = l.code === 0;
+        throw new Error("the connection reset after the request was sent");
+      }
+      return res;
+    };
+    const r = await quiet(() => exporter(first, { fetch: f, env: putEnv, sleep: noWait }));
+    expect(landed).toBe(true);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("409 older than the stored snapshot");
+    expect(r.out).toContain("upload: server rejection");
+  });
+  test("seventh round: --put needs the dry run's approval: missing, malformed or for other bytes is exit 2 with nothing sent", async () => {
+    const e = workerEnv();
+    const v = via(e, () => false);
+    const bare = run;
+    const a = await quiet(() => exporter(bare, { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    expect(a.code).toBe(2);
+    expect(a.out).toMatch(/--put needs --made-at <time> and --approve <digest>/);
+    const flags = approvalOf((await quiet(() => exporter([...dryRun, "--dry-run", "--key", join(dir, "surface.key")]))).out);
+    const wrong = [...run, flags[0], flags[1], "--approve", "0".repeat(64)];
+    const b = await quiet(() => exporter(wrong, { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    expect(b.code).toBe(2);
+    expect(b.out).toMatch(/not the ones approved/);
+    // The approved digest with another time: other bytes.
+    const otherTime = [...run, "--made-at", new Date(Date.parse(flags[1]) + 1000).toISOString(), flags[2], flags[3]];
+    const c = await quiet(() => exporter(otherTime, { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    expect(c.code).toBe(2);
+    expect(v.tries()).toBe(0);
+    // The digest is the snapshot's identity: the one the Worker then holds.
+    const ok = await quiet(() => exporter([...run, ...flags], { fetch: v.fetch, env: putEnv, sleep: noWait }));
+    expect(ok.code).toBe(0);
+    expect(e.store.held()!.id).toBe(flags[3]);
   });
 });

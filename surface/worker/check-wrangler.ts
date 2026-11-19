@@ -18,7 +18,7 @@ export function wranglerProblems(text: string): string[] {
     if (!(key in config)) problems.push(`${key} is missing (it must be false)`);
     else if (config[key] !== false) problems.push(`${key} is ${JSON.stringify(config[key])} (it must be false)`);
   }
-  const bindings = ((config.durable_objects as any)?.bindings ?? []) as { name?: string; class_name?: string }[];
+  const bindings = ((config.durable_objects as { bindings?: unknown } | undefined)?.bindings ?? []) as { name?: string; class_name?: string }[];
   if (!bindings.some((b) => b.name === "STORE" && b.class_name === "SnapshotStore"))
     problems.push("the Durable Object binding STORE to SnapshotStore is missing");
   const migrations = (config.migrations ?? []) as { new_sqlite_classes?: string[]; new_classes?: string[] }[];

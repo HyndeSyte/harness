@@ -1,8 +1,9 @@
 name: surface
 
-# The surface's tests (surface/README.md): the exporter and the Worker under Bun, and the app's
-# tests, typecheck and web build. Not required checks; the required ones stay in tests.yml and
-# pr.yml. Every action is pinned to a commit, the same ones tests.yml uses.
+# The surface's tests (surface/README.md): the exporter and the Worker under Bun, the Worker again
+# under workerd with a real Durable Object, the cast check, and the app's tests, typecheck and web
+# build. Not required checks; the required ones stay in tests.yml and pr.yml. Every action is pinned
+# to a commit, the same ones tests.yml uses. Both deploy jobs need every one of these jobs.
 on:
   push:
   pull_request:
@@ -27,6 +28,29 @@ jobs:
       # No workers.dev host and no preview URLs for the Worker.
       - name: Worker config check
         run: bun surface/worker/check-wrangler.ts
+      # No "as GatedText", "as unknown as" or the type any anywhere in surface/ outside the sanitiser
+      # module (surface/export/lib.ts); comments and strings don't count.
+      - name: Cast check
+        run: bun surface/check-casts.ts
+
+  # The Worker bundled as it deploys, run by Miniflare in workerd (the runtime Cloudflare uses) with
+  # the real SQLite-backed Durable Object bound as STORE: the store's ordering, retired keys, the clock
+  # bounds, version 1, Access, and a concurrent upload race.
+  surface-workerd:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: surface/worker/workerd
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: The Worker under workerd
+        run: bun test ./suite.workerd.ts
 
   surface-app:
     runs-on: ubuntu-latest
@@ -70,9 +94,10 @@ jobs:
 
   # Pages deploys the artifact CI built and checked above (surface/README.md, Deploy). Configured but
   # off: it runs only on a push to main once the repository variable SURFACE_PAGES_DEPLOY is "true",
-  # with the Cloudflare secrets set. Until the owner has a Cloudflare account it never runs.
+  # with the Cloudflare secrets set. Until the owner has a Cloudflare account it never runs. It needs
+  # the workerd suite as well as the Bun and app jobs.
   surface-pages-deploy:
-    needs: [surface-bun, surface-app]
+    needs: [surface-bun, surface-app, surface-workerd]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SURFACE_PAGES_DEPLOY == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -101,3 +126,36 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: bunx wrangler@4.156.2 pages deploy dist --project-name surface --branch main
+
+  # The Worker's deploy (surface/README.md, Deploy), gated the same way: configured but off. It runs
+  # only on a push to main once the repository variable SURFACE_WORKER_DEPLOY is "true", with its own
+  # token (Workers Scripts and routes only), and only after the Bun suite, the workerd suite and the
+  # app job passed on that commit. It refuses a wrangler.toml with a placeholder left in it.
+  surface-worker-deploy:
+    needs: [surface-bun, surface-app, surface-workerd]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.SURFACE_WORKER_DEPLOY == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: surface-worker-deploy
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: surface/worker
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Worker config check
+        run: bun check-wrangler.ts
+      - name: No placeholder left
+        run: "! grep -n 'REPLACE_WITH' wrangler.toml"
+      - name: Deploy the Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_WORKERS_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bunx wrangler@4.156.2 deploy
