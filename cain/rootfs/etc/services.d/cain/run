@@ -610,6 +610,10 @@ session_ended() {
 # After two minutes of running, and his check passed (the new way), a stop's or a pause's alarm
 # comes down (as his own user, any alarm).
 asked=0; listed_at=$(date +%s); told_at=$(date +%s)
+# Restarts for a channel that went down, counted apart from quick ends: a session that runs two
+# minutes resets those, but not these. Only a channel connected for 10 minutes straight resets
+# these, and at the third Dane hears Cain isn't answering, however late in a session it drops.
+chan_restarts=0
 while true; do
 if [ -n "$held" ]; then hold; fi
 if [ "$mode" = none ]; then stopped; fi
@@ -666,9 +670,12 @@ while session_up; do
     st=""; at=""
     read -r st at < /run/cain/discord.state || true
     at="$(printf '%s' "$at" | tr -cd '0-9')"
+    if [ "$st" = connected ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -ge "${C1_CHANNEL_STEADY_S:-600}" ]; then chan_restarts=0; fi
     if [ "$st" = down ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -gt "${C1_CHANNEL_DOWN_S:-90}" ] \
        && [ $(( $(date +%s) - up_since )) -gt "${C1_CHANNEL_DOWN_S:-90}" ]; then
       bashio::log.warning "Cain's Discord channel has been down 90 seconds: restarting his session"
+      chan_restarts=$((chan_restarts + 1))
+      if [ "$chan_restarts" -ge 3 ]; then "$OPT/notice.sh" tell session || true; fi
       end_his_session || fail_closed
       break
     fi
@@ -686,11 +693,12 @@ while session_up; do
   timeout -k 5 60 "$OPT/watch.sh" || true
   # His check passed, but its mark couldn't be kept: tried again.
   if [ -n "$checked" ] && [ ! -s "$SESSION_CHECKED" ]; then checked_now; fi
-  # The new way counts a session as running only while its Discord channel is up: on Nov 19 the
+  # The new way counts a session as running only while its Discord channel is up, with no channel
+  # restart still counted (chan_restarts, so an alarm doesn't come down and go up again): on Nov 19 the
   # channel was down at every two-minute mark, this reset the count of quick ends each time, and
   # Dane never heard Cain wasn't answering.
   if [ -z "$cleared" ] && [ -n "$checked" ] && [ $(( $(date +%s) - up_since )) -ge "${C1_RUNNING_S:-120}" ] \
-     && { [ "$mode" != own ] || [ "$(cut -d ' ' -f 1 /run/cain/discord.state 2>/dev/null || true)" = connected ]; }; then
+     && { [ "$mode" != own ] || { [ "$chan_restarts" -eq 0 ] && [ "$(cut -d ' ' -f 1 /run/cain/discord.state 2>/dev/null || true)" = connected ]; }; }; then
     cleared=1; quick=0
     if [ "$mode" = own ]; then "$OPT/notice.sh" clear switched || true; else "$OPT/notice.sh" clear running || true; fi
   fi

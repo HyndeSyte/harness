@@ -905,6 +905,39 @@ def test_the_whole_start_tells_dane_when_his_channel_keeps_going_down(tmp_path):
     assert "notice.sh clear switched" in lines and sum("new-session" in l for l in lines) == 1, lines[:40]
 
 
+def test_the_whole_start_tells_dane_when_his_channel_drops_after_he_counts_as_running(tmp_path):
+    """The outside review's case: the channel is connected when the session is counted as running,
+    then drops. Channel restarts are counted apart from quick ends, so that reset doesn't hide them:
+    at the third Dane hears it, and the alarm isn't taken down again by the next session's two
+    minutes while restarts are still counted."""
+    import shutil
+    if not shutil.which("bash") or not shutil.which("jq") or os.name == "nt":
+        pytest.skip("needs bash, jq and a POSIX process model")
+    state = (tmp_path / "run" / "cain" / "discord.state").as_posix()
+    seen = (tmp_path / "watched").as_posix()
+    up, proc = (tmp_path / "session").as_posix(), (tmp_path / "proc" / "4242").as_posix()
+    # Each start connects the channel (and forgets how often the loop has looked); the loop's
+    # second look in a session finds it dropped, long ago.
+    as_cain = (f'case "$*" in *new-session*) touch {up}; mkdir -p {proc}; rm -f {seen}; '
+               f'printf "State:\\tS (sleeping)\\nUid:\\t1000\\t1000\\t1000\\t1000\\n" > {proc}/status; '
+               f'echo "connected $(date +%s)" > {state};; '
+               f'*has-session*) [ -f {up} ] || exit 1;; *kill-session*) exit 1;; esac; exit 0')
+    watch = (f'echo x >> {seen}\n'
+             f'[ "$(wc -l < {seen})" = 2 ] && echo "down $(( $(date +%s) - 600 ))" > {state}\nexit 0')
+    calls, stop, bindir, runc = _whole_start(tmp_path, **{"as-cain": as_cain, "c1/check.sh": "exit 0", "watch.sh": watch})
+    runc.mkdir(parents=True, exist_ok=True)
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
+    assert alive, err
+    assert "notice.sh tell session" in lines, lines[:60]
+    starts = [i for i, l in enumerate(lines) if "new-session" in l]
+    told = lines.index("notice.sh tell session")
+    assert len([i for i in starts if i < told]) == 3, lines[:60]
+    clears = [i for i, l in enumerate(lines) if l == "notice.sh clear switched"]
+    assert clears and clears[0] < starts[1], lines[:60]                 # the first session did count as running
+    assert not any(starts[1] < i for i in clears), lines[:60]           # none after a channel restart
+
+
 def test_his_connectors_are_never_listed_while_he_runs_as_his_own_user(tmp_path):
     """Nov 19: `claude mcp list` starts every connector to check it, his Discord link too, and the
     broker gives the channel to the newest connection, so the listing 30 seconds after each start
