@@ -239,7 +239,8 @@ def test_restart_fails_orphaned_running_jobs(ledger, config):
     assert r2.reconcile_after_restart() == 1
     assert ledger.job(job)["state"] == "received"      # failed, and put back for one more try
     assert receipt(ledger, job)["reason"] == "interrupted"
-    assert "restarted" in queued(ledger)[-1]["text"] and "running it once more" in queued(ledger)[-1]["text"]
+    # Nov 19: a retry that runs at once is not announced; its outcome is what he hears.
+    assert not any("running it once more" in q["text"] for q in queued(ledger))
 
 
 def test_a_reply_carries_the_exchange_it_answers(ledger, config):
@@ -287,10 +288,10 @@ def test_a_bug_after_the_answer_ends_the_job_at_once_and_retries_it_once(ledger,
         raise KeyError("rule")
     monkeypatch.setattr(r, "_on_answer", boom)
     run(r)
-    # not left running: failed, then put back for one retry, with a notice (no "send it again")
+    # not left running: failed, then put back for one retry, unannounced (no "send it again")
     assert ledger.job(job)["state"] == "received"
     texts = [o["text"] for o in queued(ledger)]
-    assert any("running it once more" in t for t in texts)
+    assert not any("running it once more" in t for t in texts)
     assert not any("Send it again" in t for t in texts)
     run(r)                                              # the retry hits the same bug
     assert ledger.job(job)["state"] == "failed"
@@ -338,7 +339,7 @@ def test_without_cain_a_failure_is_retried_once_by_itself_never_handed_back(ledg
     monkeypatch.setattr(r, "_on_answer", boom)
     run(r)
     assert ledger.job(job)["state"] == "received"
-    assert any("running it once more" in o["text"] for o in queued(ledger))
+    assert not any("running it once more" in o["text"] for o in queued(ledger))   # unannounced (Nov 19)
     run(r)                                              # the retry hits the same bug
     assert ledger.job(job)["state"] == "failed"
     texts = [o["text"] for o in queued(ledger)]
@@ -366,10 +367,11 @@ def test_reading_his_calendar_counts_against_the_jobs_deadline(ledger, config, m
     eng_r, _ = make(ledger, config, [result(text="ok")])
     eng_r.monotonic = lambda: clock[0]
 
-    def slow_context(text, now):
+    def slow_context(text, now, address):
         clock[0] += 100.0
         return ""
-    eng_r.calendar_change = SimpleNamespace(on=lambda: True, context_for=slow_context, recent=lambda job: [])
+    eng_r.calendar_change = SimpleNamespace(on=lambda: True, context_for=slow_context, recent=lambda job: [],
+                                            context_address=lambda: "owner@gmail.com")
     seen = {}
     real = runner_mod.call_with_retries
 
