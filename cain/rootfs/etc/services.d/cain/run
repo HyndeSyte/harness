@@ -218,7 +218,28 @@ export TMUX_CMD
 # The App's alarms to Dane (notice.sh): their daily repeats and retries, the probe and its readback,
 # whatever the mode: a minute in, then every 10 minutes. Started here, once CAIN_AS says how his
 # files are read (the readback is his).
-( sleep 60; while true; do "$OPT/notice.sh" tick 2>&1 || true; sleep 600; done ) &
+# The same watcher restarts the App itself (Cain 0.13.3), where an alarm used to ask Dane to: an
+# alarm of the stop, session, screen or deliver groups that the App deals with itself, still on
+# with no clear after its window (30 minutes for a switch or restart, an hour for the others), has
+# the Supervisor restart the App, once (notice.sh restart-due marks it first, so it's asked once).
+# Only that alarm raised again after the restart and still on a window later reaches Dane, saying
+# the App restarted itself. A restart the Supervisor didn't take is unmarked, and due again at the
+# next tick.
+self_restart() {   # self_restart <groups, one a line>
+  local groups
+  groups="$(printf '%s' "$1" | tr '\n' ' ')"
+  bashio::log.warning "An alarm the App deals with itself is still on after its window (${groups% }): asking the Supervisor to restart this App, once"
+  if ! bashio::addon.restart; then
+    bashio::log.warning "The Supervisor didn't take the restart; asking again in 10 minutes"
+    # shellcheck disable=SC2086
+    "$OPT/notice.sh" restart-undo $groups 2>&1 || true
+  fi
+}
+( sleep 60; while true; do
+    "$OPT/notice.sh" tick 2>&1 || true
+    due="$("$OPT/notice.sh" restart-due)" && [ -n "$due" ] && self_restart "$due"
+    sleep 600
+  done ) &
 
 if [ "$mode" = old ]; then
   # 0.11.0's start, unchanged: the rules copied in (c1/lock.sh old did, and checked them), the

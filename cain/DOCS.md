@@ -261,7 +261,7 @@ waiting half an hour that no sign-in alarm told you of gets "Cain is waiting at 
 the way to sign in.
 If a try of the move fails, he keeps running the old way (after a restart of the App, when the
 try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
-session (`/opt/cain/notice.sh`), what happened and the way back:
+session (`/opt/cain/notice.sh`), what happened (below: what the App does itself first):
 
 - in Discord, from his bot, once;
 - as a push to your phone, through Home Assistant, again each day until it's fixed, and
@@ -326,9 +326,17 @@ in the helper is the only proof the channel works end to end, and the App has Ca
 each time (above): after an update, set `notice_hook` and restart the App if it hasn't restarted
 since; the probe and its readback follow by themselves.
 
-**The way back** (the alarms say which applies): restart the Cain App (Settings, Apps,
-Cain, Restart); or restore two backups from just before the update, Cain's first and then the
-calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
+**What the App does itself, and the way back** (since 0.13.3): no alarm asks you to restart the
+App. When he's stopped for a restart, paused, his session keeps ending, a question keeps coming
+back on his screen, or what the App types doesn't go in, the App tells no one at first: if it's
+still so after 30 minutes (a restart or a switch) or an hour (the others), the App restarts
+itself through the Supervisor, once, and you hear only if it comes back after that, in an alarm
+that says the App restarted itself and what it saw. A move to his own user that undid itself
+safely and runs him the old way sends you no alarm: Cain hears it and puts it in his morning
+update. Only a hard stop (a failed safety check, a move stopped part way, a damaged start state,
+a safety setup that didn't check out, or the App stopping itself) names a way back, after "A
+fixed update also brings him back": restore two backups from just before the update, Cain's
+first and then the calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 

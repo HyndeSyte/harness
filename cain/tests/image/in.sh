@@ -268,13 +268,24 @@ alarm)
   grep -q "held (not a breach)" /fp/check.out || fail "the check didn't say he's held: $(tail -n 1 /fp/check.out)"
   [ "$(cut -d' ' -f1 $D/c1/check-held)" = 9.9.9 ] && grep -q "the link didn't answer" $D/c1/check-held \
     || fail "the hold isn't on record for this version: $(cat $D/c1/check-held 2>/dev/null)"
-  grep -q "^/api/webhook/$hook {\"state\":\"on\",\"group\":\"stop\",\"alarm\":\"held\",\"title\":\"Cain is paused\"" /fp/hook.log \
-    || fail "Home Assistant didn't get the pause: $(head -c 300 /fp/hook.log)"
-  grep -q "This isn't a breach" /fp/hook.log && grep -q "Settings, System, Backups" /fp/hook.log || fail "the pause didn't say what it is and the way back"
+  # A pause is the App's to deal with (Cain 0.13.3): kept, told to no one, until its own restart
+  # didn't clear it. Its window is taken as past here (NOTICE_WINDOW_S=0).
+  grep -qx "kind held" $D/c1/notice.d/stop || fail "the pause isn't kept: $(cat $D/c1/notice.d/stop 2>&1)"
+  ! grep -q '"alarm":"held"' /fp/hook.log || fail "the pause went to Home Assistant before the App restarted itself"
+  [ "$(NOTICE_WINDOW_S=0 "$OPT/notice.sh" restart-due 2>/dev/null)" = stop ] || fail "the pause wasn't due the App's restart past its window"
+  [ -z "$(NOTICE_WINDOW_S=0 "$OPT/notice.sh" restart-due 2>/dev/null)" ] || fail "the pause was due a second restart"
+  sleep 1.1
+  "$OPT/notice.sh" tell held >/dev/null                      # raised again after the restart
+  NOTICE_WINDOW_S=0 "$OPT/notice.sh" tick >/dev/null 2>&1
+  grep -q "^/api/webhook/$hook {\"state\":\"on\",\"group\":\"stop\",\"alarm\":\"held\",\"title\":\"Cain is still paused\"" /fp/hook.log \
+    || fail "Home Assistant didn't get the pause after the App's restart: $(head -c 300 /fp/hook.log)"
+  grep -q "This isn't a breach" /fp/hook.log && grep -q "restarted itself at" /fp/hook.log || fail "the pause didn't say what it is and that the App restarted itself"
+  ! grep -q "Settings, Apps" /fp/hook.log || fail "the pause handed Dane a step"
   grep -qx "discord 0" $D/c1/notice.d/stop || fail "his bot posted, with its token away"
   "$OPT/notice.sh" tell switch-failed "the smoke test failed" >/dev/null
   "$OPT/notice.sh" tell breach >/dev/null
   grep -q "\"group\":\"stop\",\"alarm\":\"breach\",\"title\":\"Cain is stopped\"" /fp/hook.log || fail "Home Assistant didn't get the breach's alarm"
+  grep -q "A fixed update also brings him back. To get him back now, restore two backups" /fp/hook.log || fail "the breach's alarm didn't name the way back after the fixed update"
   "$OPT/notice.sh" clear running >/dev/null
   grep -q "\"state\":\"clear\",\"group\":\"stop\",\"alarm\":\"breach\",\"title\":\"Cain is back\"" /fp/hook.log || fail "the alarm didn't come down"
   [ ! -e $D/c1/notice.d/stop ] && [ -f $D/c1/notice.d/switch ] || fail "clearing the stop took the wrong alarms down"

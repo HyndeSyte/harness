@@ -1064,9 +1064,10 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     assert "(the last: a, b, the App more)" in call("text", "switch-waits", "a — b, the add-on\nmore")
 
     # Raised while Discord is down and no hook is set: kept, nothing lost, and nothing is made
-    # from owner_user_id (Cain could read that through his Home Assistant connector).
-    call("tell", "held")
-    assert field("stop", "kind") == "held" and field("stop", "discord") == "0" and field("stop", "sent") == "0" and read("ha") == []
+    # from owner_user_id (Cain could read that through his Home Assistant connector). A hard stop
+    # (Cain 0.13.3: the ones the App deals with itself reach no one at first, cain/tests/notice.test.ts).
+    call("tell", "setup")
+    assert field("stop", "kind") == "setup" and field("stop", "discord") == "0" and field("stop", "sent") == "0" and read("ha") == []
     (stub / "ha-up").touch()
     call("tick", NOTICE_DAY_S="0")
     assert read("ha") == []
@@ -1076,7 +1077,7 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     alarms = [l for l in read("ha") if '"state":"on"' in l]
     assert alarms and alarms[-1].startswith(f'url = "http://ha.test:8123/api/webhook/{hook}"')
     sent = json.loads(alarms[-1].split('" ', 1)[1])
-    assert (sent["group"], sent["alarm"], sent["title"]) == ("stop", "held", "Cain is paused") and "isn't a breach" in sent["message"]
+    assert (sent["group"], sent["alarm"], sent["title"]) == ("stop", "setup", "Cain is stopped") and "didn't check out" in sent["message"]
     assert not any(hook in a for a in read("curl-args"))
     assert field("stop", "fp") == hashlib.sha256(hook.encode()).hexdigest()[:16] and field("stop", "discord") == "0"
     assert any('"state":"test","group":"probe"' in l for l in read("ha")) and (data / "c1/notice-probed").exists()
@@ -1086,23 +1087,24 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     (data / "link/discord.env").write_text("DISCORD_BOT_TOKEN=x\n")
     call("tick")
     assert len(read("discord")) == 1 and read("discord")[0].startswith(f"{data.as_posix()}/link/discord.env | ")
-    assert read("discord")[0].endswith("isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. "
-                                       "If he isn't back within an hour, restore two backups from just before his last update, Cain's and the calendar App's, "
+    assert read("discord")[0].endswith("didn't check out at start, so he isn't started. A fixed update also brings him back. "
+                                       "To get him back now, restore two backups from just before his last update, Cain's and the calendar App's, "
                                        "one after the other: Settings, System, Backups. The Cain App's log has the details.")
     n = len(read("ha"))
-    call("tick"); call("tell", "held")
+    call("tick"); call("tell", "setup")
     assert len(read("discord")) == 1 and len(read("ha")) == n            # raised already: nothing new
     call("tick", NOTICE_DAY_S="0")
     assert len(read("discord")) == 1 and posted()["state"] == "on"        # Home Assistant daily, Discord once
     # Another group's alarm stands beside it; the same group's replaces it.
     call("tell", "switch-failed", "the smoke test failed")
-    call("tell", "session")
+    call("tell", "session")                                               # kept for the App: posts nothing
     call("tell", "breach")
     assert (field("stop", "kind"), field("session", "kind"), field("switch", "kind")) == ("breach", "session", "switch-failed")
-    assert field("switch", "cause") == "the smoke test failed" and "(the smoke test failed)" in read("discord")[-3]
+    assert field("switch", "cause") == "the smoke test failed" and "(the smoke test failed)" in read("discord")[-2]
+    assert field("session", "discord") == "0" and field("session", "shown") == "0"
     assert read("discord")[-1].endswith("| Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. "
-                                        "To get him back now, restore two backups from just before his last update, Cain's and the calendar App's, "
-                                        "one after the other: Settings, System, Backups. A fixed update also brings him back. The Cain App's log has the details.")
+                                        "A fixed update also brings him back. To get him back now, restore two backups from just before his last update, "
+                                        "Cain's and the calendar App's, one after the other: Settings, System, Backups. The Cain App's log has the details.")
     # A lesser alarm doesn't replace a greater one in its group: the App stopping itself after a breach.
     call("tell", "exited")
     assert field("stop", "kind") == "breach"
@@ -1110,10 +1112,10 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     call("clear", "running")
     assert not (groups / "stop").exists() and not (groups / "session").exists() and field("switch", "kind") == "switch-failed"
     cleared = [json.loads(l.split('" ', 1)[1]) for l in read("ha") if '"state":"clear"' in l]
-    assert {(c["group"], c["title"]) for c in cleared} == {("stop", "Cain is back"), ("session", "Cain is back")}
+    assert {(c["group"], c["title"]) for c in cleared} == {("stop", "Cain is back")}     # the session's was never shown
     assert read("discord")[-1].endswith("| Cain is running again.")
     # The same group's alarm replaced while Home Assistant is away: what it showed still comes down.
-    call("tell", "held")
+    call("tell", "setup")
     os.remove(stub / "ha-up")
     call("tell", "breach")
     assert field("stop", "kind") == "breach" and field("stop", "shown") == "1" and field("stop", "fp") == ""
@@ -1134,26 +1136,24 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     call("tick")
     assert not (groups / "switch").exists() and posted()["title"] == "Cain moved to his own user"
     # A question that keeps coming back on his screen (unstick.sh): its own group, which neither his
-    # running again nor his move clears, only his prompt back (clear screen).
+    # running again nor his move clears, only his prompt back (clear screen). The App deals with it
+    # itself first (0.13.3): kept, posted nowhere, and its clearing quiet.
+    n_ha, n_dc = len(read("ha")), len(read("discord"))
     call("tell", "waiting")
-    assert field("screen", "kind") == "waiting" and (posted()["group"], posted()["alarm"]) == ("screen", "waiting")
-    assert read("discord")[-1].endswith("| Cain isn't answering: a question is waiting on his screen, where no one answers it, "
-                                        "and the App couldn't clear it by itself. If he isn't back within an hour, restart the Cain "
-                                        "App: Settings, Apps, Cain, Restart. The Cain App's log has the details.")
+    assert field("screen", "kind") == "waiting" and len(read("ha")) == n_ha and len(read("discord")) == n_dc
     call("clear", "running")
     call("clear", "switched")
     assert field("screen", "kind") == "waiting"
     call("clear", "screen")
-    assert not (groups / "screen").exists() and (posted()["state"], posted()["group"], posted()["title"]) == ("clear", "screen", "Cain is back")
-    assert read("discord")[-1].endswith("| Cain is answering again: nothing waits on his screen.")
+    assert not (groups / "screen").exists() and len(read("ha")) == n_ha and len(read("discord")) == n_dc
     call("clear", "other", want=2)
     # A clearing with no hook to take it down stays, said, until one can.
-    call("tell", "session")
+    call("tell", "damaged")
     options.write_text(json.dumps({"notice_hook": "../x"}))
-    assert "still up" in call("clear", "running", want=1) and field("session", "clear") == "1"
+    assert "still up" in call("clear", "running", want=1) and field("stop", "clear") == "1"
     options.write_text(json.dumps({"notice_hook": hook}))
     call("tick")
-    assert not (groups / "session").exists() and posted()["state"] == "clear"
+    assert not (groups / "stop").exists() and posted()["state"] == "clear"
     # A hook that isn't one is never used.
     for bad in ("../../api/services", "short", hook + "/x"):
         options.write_text(json.dumps({"notice_hook": bad}))
@@ -2445,7 +2445,7 @@ def test_the_switch_waits_until_the_alarm_channel_is_shown_to_work():
     assert gate < loop.index("bashio::addon.restart || bashio::log.warning")
     assert '"$OPT/notice.sh" hooked' in loop and "File it as a note on P33 for the laptop session" in loop
     assert "find /data/c1/hook-told -mmin -1440" in loop
-    assert '( sleep 60; while true; do "$OPT/notice.sh" tick 2>&1 || true; sleep 600; done ) &' in run
+    assert '"$OPT/notice.sh" tick 2>&1 || true' in run and 'due="$("$OPT/notice.sh" restart-due)" && [ -n "$due" ] && self_restart "$due"' in run
     assert 'timeout -k 5 60 "$OPT/watch.sh" || true' in loop
     assert loop.index('"$OPT/unstick.sh"') < loop.index('"$OPT/watch.sh"')
     assert 'export CAIN_AS="$OPT/as-cain"' in run and 'export CAIN_AS=""' in run
