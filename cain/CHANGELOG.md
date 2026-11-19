@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.2
+
+- The move to Cain's own user no longer fails its start-up test of his Discord channel every time. The test's call to Claude Code read the test's message as a second channel name, so Claude Code stopped before it began and the move waited six hours to try again. It now starts properly, and the move can finish on its next try.
+- If Claude Code ever stops before starting during that test, the App's log now says so in plain words, with Claude Code's own error, instead of only that the Discord plugin didn't load.
+
 ## 0.13.1
 
 - Cain now runs as his own user on the Pi instead of as its administrator. The App's keys (GitHub, the review services', the Discord bot's and the Supervisor's) are out of his reach, and the checks on his messages and your Stop live where he can't change them.
