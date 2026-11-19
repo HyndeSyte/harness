@@ -72,18 +72,26 @@ dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
 link="${CAIN_LINK:-http://127.0.0.1:8097}"
 hooks="${CAIN_HOOKS:-/opt/cain/hooks}"
 cmd="${1:-handover}"; shift || true
-# Needs no key and no link: it runs the hook itself.
-if [ "$cmd" = selftest ]; then exec bun "$hooks/discord-send.ts" --self-test; fi
+# Needs no key and no link: it runs the gate itself, the broker's as his own user (the new
+# way), the reply hook as root (the old way).
+if [ "$cmd" = selftest ]; then
+  if [ "$(head -c 10 "${CAIN_MODE_FILE:-/run/cain/mode}" 2>/dev/null)" = "own" ]; then exec bun /opt/cain/discord/selftest.ts; fi
+  exec bun "$hooks/discord-send.ts" --self-test
+fi
 # Needs no key and no link either: it reads GitHub's public API only, and changes nothing.
 if [ "$cmd" = ship-gate ]; then exec bun "${CAIN_LINK_DIR:-/opt/cain/link}/shipgate.ts" "$@"; fi
 # Needs no key and no link: the key record is the security watch's own file (never a key in it).
-if [ "$cmd" = key-expiry ] || [ "$cmd" = key-ack ]; then exec bun "${CAIN_SECURITY:-/opt/cain/security/main.ts}" "$cmd" "$@"; fi
+# As his own user (0.13.1) the record is root's, so the link writes the note (its /key-note).
+if { [ "$cmd" = key-expiry ] || [ "$cmd" = key-ack ]; } && [ "$(head -c 10 "${CAIN_MODE_FILE:-/run/cain/mode}" 2>/dev/null)" != "own" ]; then
+  exec bun "${CAIN_SECURITY:-/opt/cain/security/main.ts}" "$cmd" "$@"
+fi
 # Needs no key and no link: the gate's list of cited hosts is a file of Cain's own.
 if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts.ts" add "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="http://0fcc2575-harness:8098/$cmd"; ctx=harness-handover-v1 ;;
   show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
+  key-expiry|key-ack) url="$link/key-note"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
@@ -109,15 +117,27 @@ case "$cmd" in
 esac
 # The card's item, question and thread, as the link takes them.
 meta='def opt($k; $v): if $v == "" then {} else {($k): $v} end; ({item: $it} + opt("question"; $q) + opt("reply_to"; $r))'
-owner=$(jq -r '.allowFrom[0] // empty' "$dir/access.json" 2>/dev/null)
-# The key is HMAC-SHA256(bot token, context); the token stays in its file.
-key=$(ENV_FILE="$dir/.env" CTX="$ctx" bun -e '
+# As his own user (the new way, /run/cain/mode "own"), he has no token: his keys are the two
+# root writes for him at each start, his own for the link and the handover key the calendar
+# specialist checks, and his DM's owner comes from the link's cards file. The old way (as
+# root) derives them from the token, as 0.11.0 did.
+keys="${CAIN_KEYS:-/run/cain/keys}"
+if [ "$(head -c 10 "${CAIN_MODE_FILE:-/run/cain/mode}" 2>/dev/null)" = "own" ]; then
+  owner=$(jq -r '.owner // empty' "${CAIN_CARDS:-/data/trust/cards.json}" 2>/dev/null)
+  if [ "$ctx" = harness-handover-v1 ]; then kf="$keys/handover.key"; else kf="$keys/cain.key"; fi
+  key=$(head -c 200 "$kf" 2>/dev/null) && [ -n "$key" ] \
+    || { echo '{"status":"error","said":"This start has no key for the link or the specialist yet; try again in a minute."}'; exit 1; }
+else
+  owner=$(jq -r '.allowFrom[0] // empty' "$dir/access.json" 2>/dev/null)
+  # The key is HMAC-SHA256(bot token, context); the token stays in its file.
+  key=$(ENV_FILE="$dir/.env" CTX="$ctx" bun -e '
 const fs = require("fs"), crypto = require("crypto");
 let m = null;
 try { m = fs.readFileSync(process.env.ENV_FILE, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m); } catch (e) {}
 if (!m) process.exit(1);
 process.stdout.write(crypto.createHmac("sha256", m[1].trim()).update(process.env.CTX).digest("hex"));
 ') || { echo '{"status":"error","said":"No bot token here, so the specialist cannot be reached."}'; exit 1; }
+fi
 umask 077
 hdr=$(mktemp)
 trap 'rm -f "$hdr"' EXIT
@@ -166,6 +186,7 @@ case "$cmd" in
               '{text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $e == "" then {} else {edit: $e} end)') ;;
   reply)    body=$(jq -nc --arg t "${1:-}" --arg r "$reply_to" '{text: $t} + (if $r == "" then {} else {reply_to: $r} end)') ;;
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
+  key-expiry|key-ack) body=$(jq -nc --arg c "$cmd" --arg n "${1:-}" --arg d "${2:-}" '{cmd: $c, name: $n, date: $d}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;

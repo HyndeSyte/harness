@@ -1,16 +1,19 @@
 // review.sh: Cain's way to ask for an outside review and read what came back.
-//   submit <brief.json>    queue a brief; prints its id (or "blocked: privacy ...", exit 3)
+// It runs as Cain's user (C1): it leaves a brief in the inbox and reads the queue, which only
+// the runner writes, so a review's state and its Reviewed line can only be the runner's.
+//   submit <brief.json>    leave a brief for the runner; prints its id (or "blocked: privacy ...",
+//                          exit 3, and nothing is left). The runner takes it within a tick.
 //   status <id>            the review's state and each seat's state, one line each
 //   result <id>            result.json (what goes to the record), once finished
 //   useful <id> <seat> <n> how many of that seat's findings Cain adopted (cost per useful finding)
 //   spend                  this month per seat: dollars, cap, runs, findings, useful, $ per useful
 //   health                 the last nightly seat check
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readStop, stoppedWhy } from "../stop.ts";
-import { FINAL, LABEL, SEATS, markBlocked, newReview, parseBrief, privacyCheck, resultJson, shownId, type SeatName } from "./core.ts";
+import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
-import { atCap, existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
+import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 
 const cfg = configFromEnv();
 const usefulFile = process.env.REVIEW_USEFUL ?? join(dirname(cfg.spendFile), "review-useful.jsonl");
@@ -21,6 +24,19 @@ const terms = () => { try { return readFileSync(cfg.termsFile, "utf8"); } catch 
 
 function money(n: number) { return `$${n.toFixed(2)}`; }
 
+// A brief waiting in the inbox for the runner.
+const inboxFile = (id: string) => (cfg.inboxDir && safeId(id) ? join(cfg.inboxDir, `${id}.json`) : "");
+const waiting = (id: string) => { const f = inboxFile(id); return !!f && existsSync(f); };
+// The brief's own fields, nothing else, written whole: a temp name the runner skips, then renamed.
+function leave(b: Brief): void {
+  const f = inboxFile(b.id);
+  if (!f) fail("no inbox for review briefs");
+  mkdirSync(cfg.inboxDir!, { recursive: true });
+  const tmp = join(cfg.inboxDir!, `.${b.id}.${process.pid}.tmp`);
+  writeFileSync(tmp, JSON.stringify(b), { mode: 0o640 });
+  renameSync(tmp, f);
+}
+
 switch (cmd) {
   case "submit": {
     if (!a1) fail("usage: review.sh submit <brief.json>");
@@ -29,25 +45,22 @@ switch (cmd) {
     const p = parseBrief(raw);
     if (!p.brief) fail(`not a brief: ${p.error}`);
     const b = p.brief!;
-    if (existsReview(cfg.queueDir, b.id)) fail(`a review with id ${b.id} already exists; use a new id`);
-    const r = newReview(b, new Date());
-    // The gate runs here first, so Cain hears at once; the runner runs it again before every call.
+    if (existsReview(cfg.queueDir, b.id) || waiting(b.id)) fail(`a review with id ${b.id} already exists; use a new id`);
+    // The gate runs here first, so Cain hears at once and nothing is left; the runner runs it
+    // again before every call.
     const g = privacyCheck(b, terms());
-    if (!g.ok) {
-      markBlocked(r, g.why, r.created_at);
-      r.relayed = true;
-      saveReview(cfg.queueDir, r);
-      fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
-    }
+    if (!g.ok) fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
     // A seat whose monthly cap is reached runs nothing until the month turns (the runner
-    // checks before every call). A review whose seats are all there is refused here, at once.
+    // checks before every call). A review whose seats are all there is refused here, at once,
+    // and nothing is left (Cain 0.13.0, read here from the spend file his group may read).
     let ledger: Ledger = {};
     try { ledger = JSON.parse(readFileSync(cfg.spendFile, "utf8")); } catch { /* none yet */ }
     const month = new Date().toLocaleDateString("en-CA", { timeZone: cfg.tz }).slice(0, 7);
-    const capped = [...new Set(r.seats.map((s) => s.seat))].filter((s) => atCap(ledger, month, cfg.caps, s));
-    if (capped.length && capped.length === new Set(r.seats.map((s) => s.seat)).size)
+    const seats = new Set(newReview(b, new Date()).seats.map((s) => s.seat));
+    const capped = [...seats].filter((s) => atCap(ledger, month, cfg.caps, s));
+    if (capped.length && capped.length === seats.size)
       fail(`blocked: the monthly cap is reached for ${capped.map((s) => LABEL[s]).join(", ")}. Nothing was queued; raise the cap in the App's options if wanted, or wait for the month to turn.`, 3);
-    saveReview(cfg.queueDir, r);
+    leave(b);
     out(b.id);
     if (capped.length) console.error(`Queued, but ${capped.map((s) => LABEL[s]).join(", ")} won't run: its monthly cap is reached.`);
     // While stopped it's queued all the same, and nothing goes out until he turns it back on.
@@ -57,6 +70,7 @@ switch (cmd) {
   }
   case "status": {
     const r = a1 ? loadReview(cfg.queueDir, a1) : null;
+    if (!r && a1 && waiting(a1)) { out(`${a1}: waiting for the runner to take it (within a minute)`); break; }
     if (!r) fail(`no review ${a1 ?? ""}`.trim(), 1);
     out(`${shownId(r!)}: ${r!.status}${r!.blocked_why ? ` (${r!.blocked_why.join("; ")})` : ""}${r!.record_dir ? `, record ${r!.record_dir}` : ""}, $${r!.cost_usd.toFixed(3)}`);
     for (const s of r!.seats) {

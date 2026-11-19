@@ -6,8 +6,10 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-export const LINK_HELD = process.env.CAIN_LINK_HELD ?? "/data/work/link-held.json";
-export const KEEPER_SENT = process.env.CAIN_KEEPER_SENT ?? "/data/work/keeper-reply.json";
+// Root's folder (/data/link), not Cain's /data/work: since Cain runs as his own user (0.13.1) the
+// gate (the broker) and the link write these as root, and root never writes into a folder of his.
+export const LINK_HELD = process.env.CAIN_LINK_HELD ?? "/data/link/link-held.json";
+export const KEEPER_SENT = process.env.CAIN_KEEPER_SENT ?? "/data/link/keeper-reply.json";
 export const HELD_WAIT_MS = 10 * 60_000;      // a hold older than this, with no keeper reply since, is named
 export const HELD_FORGET_MS = 24 * 3_600_000; // and named for a day at most
 export const HELD_LINE = "a reply with a link is waiting: send it with keeper.sh reply";

@@ -75,12 +75,12 @@ describe("Cain's rules", () => {
 
   test("the message gate: it acts, buttons named only from the card that has them, look first, the replay filed", () => {
     const gate = section(rules, "## The message gate").replace(/\s+/g, " ");
-    for (const must of ["They act", "/data/work/gate-report.jsonl", "\"The message gate held this:\"", "don't mention the gate to him",
+    for (const must of ["They act", "/data/gate/report.jsonl", "\"The message gate held this:\"", "don't mention the gate to him",
       "third try goes as it is", "Send only to his DM, and edit only your own replies", "is refused every time, and no third try lets it through",
       "An edit straight after your reply is fine", "an edit is held too: send it as a new reply instead, or edit in a minute",
       "If the edit is held, send a one-line correction as a new reply instead", "The gate refuses every em dash of yours, so never write one", "for a range use \"to\" or \"through\"", "A specialist's card is never refused",
       "Name a button to him only in a reply to the card that has it", "/opt/cain/keeper.sh card <message id>", "/opt/cain/keeper.sh check",
-      "/opt/cain/keeper.sh selftest", "/data/work/gate-replay.json", "projects/org-v2/gate-replay-<YYYY-MM-DD>.md", "through the record keeper",
+      "/opt/cain/keeper.sh selftest", "/data/gate/replay.json", "projects/org-v2/gate-replay-<YYYY-MM-DD>.md", "through the record keeper",
       "check the gate end to end", "Nothing to tell him"])
       expect(gate).toContain(must);
     expect(gate).not.toContain("only report");

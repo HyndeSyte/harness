@@ -213,6 +213,125 @@ A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
 
+## Cain's own user (since 0.12.0)
+
+Cain's Claude Code session runs as its own user, `cain`, not as root. The App's keys, the
+Discord bot's token and the Supervisor's token stay root's; the Discord plugin's server runs
+as a third user, `discord`, behind a broker that checks every send (the message gate). His
+rules are Claude Code's managed settings, under `/etc/claude-code`, installed from the image
+and checked at every start. The whole design, and its review, is in the record:
+`projects/org-v2/c1-plan.md`.
+
+The move happens once, at the first start after the calendar App signs its requests (the
+calendar App 0.24.0) and the App's alarms to your phone are shown to work (below): the App
+restarts itself, checks the new setup on the Pi, and only then switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then Cain runs as
+0.11.0 did. After the move there is no way back to root but restoring the backup taken before
+the update. `/data/trust/c1check.json` holds the check that runs as `cain` at every start.
+
+### If Cain stops
+
+Nothing of Cain's runs unchecked, and no stop is silent. The App stops him when a check of
+his own user finds a breach, when the move stops part way, when his start state is damaged,
+or when its safety setup doesn't check out at start; it pauses him (not a breach) when that
+check can't finish, and tries it again every 10 minutes until it does. If his session keeps
+ending soon after it starts, the App keeps starting it again, and says so at the third time.
+If a question waits on his screen, where no one answers it (one of Claude Code's own, or his
+own asked there by mistake), he can't take a message until it's answered: the App presses Esc
+after 5 minutes (15 for what looks like a sign-in or his folder's trust question, yours to answer
+on the panel if you're at it), and if that doesn't close it, starts his session fresh 5 minutes
+later (at most once an hour, and he's told to read your messages he may have missed). You hear
+only when that can't clear it (a question back within the hour of a fresh start, three closed
+with Esc within an hour, or a step the App can't keep track of), and it comes down once his
+prompt has been back 5 minutes. A draft left in his input box (not the App's own), unchanged
+for 15 minutes, is saved in his folder and cleared, and a screen the App doesn't know is saved
+and his session started fresh; he's told each time.
+The App types your taps and his check-ins into his session only after that session has passed
+its check of his own user (at every start, and every start is the App's: when Claude Code ends,
+his session ends and the App starts it again), only at his prompt, empty and steady, and it
+presses Enter only once what it typed sits whole in his input box. Each line it types carries its
+own random mark, and leaves its queue only once that mark shows in his session's transcript or
+on his screen above his input box: a question that takes the Enter leaves the line to go in later,
+once, and a line that can't be known in or not is never typed again as new (he gets it as a file,
+told to check first). A text too long or unusual to type goes as a file in his folder, the line
+typed naming it. A tap that can't go in waits, never lost, and check-ins that miss their hour
+are named in the next one, however many. If nothing goes in for half an hour while something
+waits (his screen not busy), or for two hours in all, or a draft or a screen the App doesn't know
+stays half an hour, you hear "Cain isn't getting messages", once, and when it's back; a sign-in
+waiting half an hour that no sign-in alarm told you of gets "Cain is waiting at a sign-in", with
+the way to sign in.
+If a try of the move fails, he keeps running the old way (after a restart of the App, when the
+try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
+session (`/opt/cain/notice.sh`), what happened and the way back:
+
+- in Discord, from his bot, once;
+- as a push to your phone, through Home Assistant, again each day until it's fixed, and
+  replaced (with "Cain is back") once he has run two minutes and passed his check (for a
+  question on his screen, once his prompt has been back 5 minutes). It goes to your phone
+  only: no Home Assistant notification, which everyone in the house would see.
+
+Alarms are kept apart by what they're about (whether he's running, whether his session keeps
+ending, whether his move went through, whether a question keeps coming back on his screen,
+whether what the App types goes in, whether its alarms reach your phone), so one never takes
+down another.
+
+The Home Assistant side is one automation with a webhook trigger. The App has no Home
+Assistant API access, on purpose: the Supervisor's route to a notification would give every
+process of the App the run of all of Home Assistant, and this webhook can only pass an alarm on
+to your phone.
+Its id is a long random one (32 to 128 letters, digits, `-` or `_`) in this App's
+`notice_hook` option, which only the App's root and Home Assistant's admins can read, never
+Cain's own user: an id he could work out would let him send or take down an alarm. Until it's
+set, the alarms go to Discord only, and those still standing reach Home Assistant once it is
+(the App reads it at its next start). The App also posts a probe (`state: test`) daily, and
+at once when the hook is set or changed, which notifies no one: the automation notes its time
+in a helper. The App can't read Home Assistant, so it asks Cain to read that helper through his
+read-only connector and write what it says into his folder, and checks it against the probe:
+moved, the channel counts as working (the move to his own user waits for that); read and not
+moved, you hear it from his bot ("Cain's alarms reach you here only"), and Cain files it for a
+fix. No one needs to check it by hand.
+
+```yaml
+alias: Cain App alarms
+mode: queued
+max: 20
+triggers:
+  - trigger: webhook
+    webhook_id: <the notice_hook id>
+    allowed_methods: [POST]
+    local_only: true
+actions:
+  - choose:
+      - conditions: "{{ trigger.json.state == 'test' }}"
+        sequence:
+          - action: input_datetime.set_datetime
+            target: {entity_id: input_datetime.cain_alarms_checked}
+            data: {timestamp: "{{ now().timestamp() }}"}
+      - conditions: "{{ trigger.json.state in ['on', 'clear'] }}"
+        sequence:
+          - action: notify.mobile_app_<your phone>
+            data:
+              title: "{{ trigger.json.title }}"
+              message: "{{ trigger.json.message }}"
+              data:
+                tag: "cain_app_{{ trigger.json.group }}"
+                push:
+                  interruption-level: "{{ 'time-sensitive' if trigger.json.state == 'on' else 'active' }}"
+```
+
+The tag is what lets "Cain is back", or a newer alarm about the same thing, replace the one on
+your phone. `input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
+Assistant can't be reached is sent once it can; one that clears while it can't stays to be
+taken down. Home Assistant answers every webhook post alike, found or not, so the probe's time
+in the helper is the only proof the channel works end to end, and the App has Cain read it back
+each time (above): after an update, set `notice_hook` and restart the App if it hasn't restarted
+since; the probe and its readback follow by themselves.
+
+**The way back** (the alarms say which applies): restart the Cain App (Settings, Apps,
+Cain, Restart); or restore two backups from just before the update, Cain's first and then the
+calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
+while the other is on its old version, it waits. After a restore, the calendar App may send
+again a card it sent after its backup was taken; the newest card is the one to answer.
+
 ## Your record: one hand on each item (since 0.6.0)
 
 The record keeper (`/opt/cain/record/main.ts`) is the record's only writer. Every

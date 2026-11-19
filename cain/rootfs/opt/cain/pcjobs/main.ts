@@ -21,7 +21,7 @@
 //   bun main.ts list            the PC worker's last heartbeat, then one line per job, newest first
 //   bun main.ts result <id>     a job's result, checked, as fixed lines (each fact a quoted string, labelled untrusted)
 //   bun main.ts worker          the PC worker's last heartbeat
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants as fsConstants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { reuseOk, REUSE_SHAPE, unapprovedValues, normalUrl, reportValues, resultLines, ID, isReadOnly, jobFromAsk, jobText, listLine, newId, parseHeartbeat, parseJob, parseResult, resultText, stateAfter,
@@ -52,7 +52,40 @@ export type Config = {
 // an answer that says "tap". Fail closed: no key, the link down or slow, a refusal, or an
 // answer that isn't a plain tap for this message and these values, refuses the job.
 export type ReuseCheck = (r: OwnerReuse) => { ok: true; via: string } | { ok: false; why: string };
-export const LINK = "http://127.0.0.1:8097";
+// Where the keeper reaches the link (C1, Cain as his own user): the link's unix socket that only root
+// can open ("unix:<path>"), so being root is the keeper's key and it needs no bot token. An http
+// address (the tests' link) is keyed with the relay key, as keeper.sh keyed it before C1.
+export const LINK = `unix:${process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock"}`;
+// A request file in the queue folder, read only when it is a plain file (C1: Cain's own user writes
+// that folder and the keeper reads it as root, so a link or anything else there is never followed).
+// Opened once, without following a link and without waiting on a pipe, then checked and read through
+// that same descriptor, so nothing swapped in between the check and the read counts; at most 8001
+// bytes are read (one more than a request may hold). null for anything but a plain file.
+const NOT_PLAIN = new Set(["ELOOP", "EMLINK", "EISDIR", "ENXIO", "EPERM", "EACCES"]);
+export function requestText(file: string): string | null {
+  let fd: number;
+  try { fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0)); }
+  catch (e) { if (NOT_PLAIN.has((e as NodeJS.ErrnoException).code ?? "")) return null; throw e; }
+  try {
+    if (!fstatSync(fd).isFile()) return null;
+    const buf = Buffer.alloc(8_001);
+    let n = 0;
+    while (n < buf.length) { const r = readSync(fd, buf, n, buf.length - n, null); if (r <= 0) break; n += r; }
+    return buf.subarray(0, n).toString("utf8");
+  } finally { closeSync(fd); }
+}
+// The curl lines that reach one route of the link: its socket, or the address and the key (none
+// without a bot token).
+export function linkTarget(cfg: Pick<Config, "link" | "discordEnv">, path: string): string[] | null {
+  const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const link = cfg.link ?? LINK;
+  if (link.startsWith("unix:")) return [`unix-socket = ${q(link.slice(5))}`, `url = ${q(`http://link${path}`)}`];
+  let tok = "";
+  try { tok = readFileSync(cfg.discordEnv ?? DISCORD_ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { /* none */ }
+  if (!tok) return null;
+  const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
+  return [`url = ${q(`${link}${path}`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`];
+}
 export const DISCORD_ENV = "/data/.claude/channels/discord/.env";
 // The link's answer, read strictly: status ok, this very message, these very values.
 export function reuseAnswer(r: OwnerReuse, text: string): { ok: true; via: string } | { ok: false; why: string } {
@@ -64,17 +97,15 @@ export function reuseAnswer(r: OwnerReuse, text: string): { ok: true; via: strin
     return { ok: false, why: "the link couldn't check it" };
   return { ok: true, via: a.via };
 }
-// The real check: one POST to the link's /reuse, keyed as keeper.sh keys it, through curl
-// (the keeper's round is synchronous). The key and body go in on curl's standard input
-// (its config), never on a command line another process could read.
+// The real check: one POST to the link's /reuse, on its root socket (linkTarget), through curl
+// (the keeper's round is synchronous). The body (and a key, for an http link) go in on curl's
+// standard input (its config), never on a command line another process could read.
 export function linkReuse(cfg: Pick<Config, "link" | "discordEnv">): ReuseCheck {
   return (r) => {
-    let tok = "";
-    try { tok = readFileSync(cfg.discordEnv ?? DISCORD_ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { /* none */ }
-    if (!tok) return { ok: false, why: "no bot token here, so the link can't be asked" };
-    const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
+    const target = linkTarget(cfg, "/reuse");
+    if (!target) return { ok: false, why: "no bot token here, so the link can't be asked" };
     const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    const conf = [`url = ${q(`${cfg.link ?? LINK}/reuse`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`, `header = "Content-Type: application/json"`,
+    const conf = [...target, `header = "Content-Type: application/json"`,
       `data-binary = ${q(JSON.stringify({ m: r.message_id, values: r.values }))}`, `max-time = 40`, `noproxy = "*"`, `silent`].join("\n") + "\n";
     const p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore",
       env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
@@ -410,9 +441,28 @@ function saveTold(cfg: Pick<Config, "used">, t: Told, quiet = false): boolean {
   try {
     mkdirSync(dirname(toldFile(cfg)), { recursive: true });
     writeFileSync(`${toldFile(cfg)}.tmp`, text);
+    hisToRead(`${toldFile(cfg)}.tmp`);
     renameSync(`${toldFile(cfg)}.tmp`, toldFile(cfg));
     return true;
   } catch (e) { if (!quiet) log(`couldn't keep which notices went out: ${(e as Error).message}`); return false; }
+}
+// The notice marks are for Cain's eyes too (pcjobs.sh list and worker run as his own user since C1):
+// each new copy goes into his group, read-only to him, as the lockdown left the one before (the App's
+// umask 027 would leave it root's group). Without a cain group (the tests, an App from before C1) or
+// when not root, nothing changes; a failure only delays his reading to the next start's lockdown.
+let cainGid: number | null | undefined;
+function hisToRead(file: string): void {
+  if (process.getuid?.() !== 0) return;
+  if (cainGid === undefined) {
+    try {
+      const line = readFileSync("/etc/group", "utf8").split("\n").find((l) => l.startsWith("cain:"));
+      const g = line ? Number(line.split(":")[2]) : NaN;
+      cainGid = Number.isInteger(g) && g > 0 ? g : null;
+    } catch { cainGid = null; }
+  }
+  if (cainGid === null) return;
+  try { chownSync(file, 0, cainGid); chmodSync(file, 0o640); }
+  catch (e) { log(`couldn't give the notice marks to Cain's group: ${(e as Error).message}`); }
 }
 // One send of a mark, with its saved id: "posted" once the link confirms it posted (or had already posted it),
 // "refused" on a permanent refusal (logged loudly, never sent again), "retry" otherwise.
@@ -592,7 +642,7 @@ export function noticeTrouble(cfg: Pick<Config, "used">): string[] {
   // Twenty-eighth round: a mark from before the twenty-seventh round has no since: its age is said to be unknown.
   const unknownAge = owed.some((m) => !Number.isFinite(Date.parse(m.since ?? "")));
   const waiting = `${owed.length} notice${owed.length === 1 ? "" : "s"} for Dane wait${owed.length === 1 ? "s" : ""}${owed.length ? ` (${[...new Set(owed.map((m) => m.code))].join(", ")})` : ""}${oldest !== undefined ? `, the oldest for ${ageWords(Date.now() - oldest)}` : ""}${unknownAge ? `${oldest !== undefined ? ";" : ","} age unknown for ${owed.filter((m) => !Number.isFinite(Date.parse(m.since ?? ""))).length} from before the age was kept` : ""}`;
-  if (t.config) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${waiting}. Check the link and the keeper share the relay key, then restart the App: they go then.`);
+  if (t.config) out.push(`Keeper: ATTENTION: the link refused the keeper's notices as not allowed (its key or setup); ${waiting}. Check the link and the keeper are from the same Cain release (the keeper reaches the link on its root socket), then restart the App: they go then.`);
   // Twenty-seventh round, the local escalation: the link hasn't answered at all for SILENT_ROUNDS rounds in a row.
   // Twenty-eighth round: a round counts when the link didn't answer a notice or the queue's fetch got no answer.
   if ((t.silent ?? 0) >= SILENT_ROUNDS) out.push(`Keeper: ATTENTION: the keeper has had no answer for ${t.silent} rounds in a row (the link didn't answer its notices, or the queue couldn't be fetched from GitHub); ${waiting}. Check the link is running and the Pi reaches GitHub; they go once the link answers.`);
@@ -794,15 +844,13 @@ export function whatOf(cfg: Config, l: Pick<ReuseLine, "job" | "rid" | "site" | 
   if (ID.test(l.job)) { const r = jobWhat(read(join(cfg.dir, "jobs", `${l.job}.json`))); if (r && "site" in r) return r; }
   return queuedOf(cfg, l.job);
 }
-// The real send: one POST to the link's /pc-notice, keyed as linkReuse keys it.
+// The real send: one POST to the link's /pc-notice, reached as linkReuse reaches it.
 export function linkNotify(cfg: Pick<Config, "link" | "discordEnv">): Notify {
   return (code, n) => {
-    let tok = "";
-    try { tok = readFileSync(cfg.discordEnv ?? DISCORD_ENV, "utf8").match(/^DISCORD_BOT_TOKEN=(.*)$/m)?.[1]?.trim() ?? ""; } catch { /* none */ }
-    if (!tok) return false;
-    const key = createHmac("sha256", tok).update("harness-relay-v1").digest("hex");
+    const target = linkTarget(cfg, "/pc-notice");
+    if (!target) return false;
     const q = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    const conf = [`url = ${q(`${cfg.link ?? LINK}/pc-notice`)}`, `header = ${q(`X-Harness-Key: ${key}`)}`, `header = "Content-Type: application/json"`,
+    const conf = [...target, `header = "Content-Type: application/json"`,
       `data-binary = ${q(JSON.stringify({ code, ...(n?.id ? { id: n.id } : {}), ...(n?.job ? { job: "site" in n.job ? { site: n.job.site, action: n.job.action } : { queued: n.job.queued } } : {}), ...(n?.repeat ? { repeat: true } : {}) }))}`,
       `max-time = 40`, `noproxy = "*"`, `silent`, `write-out = "\\n%{http_code}"`].join("\n") + "\n";
     const p = Bun.spawnSync(["curl", "-q", "-K", "-"], { stdin: Buffer.from(conf), stdout: "pipe", stderr: "ignore",
@@ -1304,7 +1352,7 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     names = names.filter((n) => {
       const rid = n.replace(/\.json$/, "");
       if (waitRid.has(rid)) return false;
-      if (!ledger) { try { const r = JSON.parse(readFileSync(join(cfg.queue, n), "utf8")); if (r?.job?.owner_reuse) return false; } catch { /* checked below */ } }
+      if (!ledger) { try { const r = JSON.parse(requestText(join(cfg.queue, n)) ?? ""); if (r?.job?.owner_reuse) return false; } catch { /* checked below */ } }
       return existsSync(join(cfg.queue, n));
     });
     if (!names.length) return { ok: true, queued: 0, refused: 0 };
@@ -1314,13 +1362,15 @@ export function round(cfg: Config): { ok: boolean; queued: number; refused: numb
     for (const n of names) {
       const file = join(cfg.queue, n);
       const rid = n.replace(/\.json$/, "");
-      if (!RID.test(rid)) { rmSync(file, { force: true }); continue; }
-      let raw = "";
-      try { raw = readFileSync(file, "utf8"); } catch { continue; }
-      const c = raw.length > 8_000 ? { why: "a job request is at most 8000 bytes" } : check(cfg, raw, jobs, now);
+      // recursive: a folder planted under a request's name goes too (a link is removed, never followed).
+      if (!RID.test(rid)) { rmSync(file, { force: true, recursive: true }); continue; }
+      let raw: string | null = "";
+      try { raw = requestText(file); } catch { continue; }
+      const c = raw === null ? { why: "a job request is a plain file" }
+        : raw.length > 8_000 ? { why: "a job request is at most 8000 bytes" } : check(cfg, raw, jobs, now);
       if ("why" in c) {
         writeOutcome(cfg, { request: rid, state: "refused", reason: c.why });
-        rmSync(file, { force: true });
+        rmSync(file, { force: true, recursive: true });
         refused++;
         log(`refused ${rid}: ${c.why}`);
         continue;

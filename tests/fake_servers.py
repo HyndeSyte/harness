@@ -1,12 +1,14 @@
 """Local stand-ins for Cain's link, Anthropic and OpenAI, spoken to over real HTTP.
 
 They implement only what the controller uses, with the semantics that
-matter: the link checks the key made from the bot token and returns
-increasing card ids; the model endpoints return structured output in
+matter: the link checks each request is signed with the key made from the bot
+token, signs its answers (link/auth.ts, Cain 0.12.0), and returns increasing
+card ids; the model endpoints return structured output in
 each provider's own response shape, with usage.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import re
 import threading
@@ -42,9 +44,10 @@ class LinkState:
     """Cain's link (cain/rootfs/opt/cain/link/main.ts): holds the cards Cain shows."""
 
     def __init__(self, token):
-        from harness.cain_relay import key_for
-        self.key = key_for(token)
+        from harness.cain_relay import sign_key_for
+        self.key = sign_key_for(token)   # K_sign, not the old relay key (C1 plan 3.9)
         self.lock = threading.Lock()
+        self.ids = []                    # each signed request's id, in order
         self.next_card = 1
         self.cards = {}                  # id -> {"text", "rows", "kind"}
         self.answers = []                # (callback, text)
@@ -57,13 +60,31 @@ class LinkState:
 
 
 class LinkHandler(_Base):
-    def _ok(self):
+    # The request must be signed (link/auth.ts); every answer is signed back over its id.
+    def _ok(self, text=""):
+        from harness.cain_relay import _mac
         st: LinkState = self.server.state
-        if self.headers.get("x-harness-key") != st.key:
+        m = re.match(r"^id=([0-9a-f]{32}),t=([0-9]+),s=([0-9a-f]{64})$", self.headers.get("x-harness-sig") or "")
+        want = m and _mac(st.key, ["request", self.command.upper(), self.path, m.group(1), m.group(2), text])
+        if not m or not hmac.compare_digest(m.group(3), want):
             st.bad_keys += 1
+            self._rid = ""
             self._json(403, {"status": "refused"})
             return False
+        self._rid = m.group(1)
+        st.ids.append(self._rid)
         return True
+
+    def _json(self, status, obj):
+        from harness.cain_relay import sign_response
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        if getattr(self, "_rid", ""):
+            self.send_header("x-harness-sig", sign_response(self.server.state.key, self._rid, status, data.decode()))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         if not self._ok():
@@ -77,10 +98,12 @@ class LinkHandler(_Base):
         return self._json(404, {"status": "not found"})
 
     def do_POST(self):
-        if not self._ok():
+        n = int(self.headers.get("Content-Length", "0") or 0)
+        text = self.rfile.read(n).decode()
+        if not self._ok(text):
             return
         st: LinkState = self.server.state
-        body = self._body()
+        body = json.loads(text or "{}")
         with st.lock:
             if self.path == "/card":
                 cid = st.next_card

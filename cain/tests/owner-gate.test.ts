@@ -172,8 +172,10 @@ function render(dir: string, port: number, upstream: number): string {
   swap(/allow 172\.30\.32\.2;/, "allow 127.0.0.1;");
   swap(/include \/etc\/nginx\/owner\.conf;/, `include ${dir}/owner.conf;`);
   swap(/root \/opt\/cain;/, `root ${dir}/www;`);
-  swap(/alias \/tmp\/([\w.-]+);/, `alias ${dir}/$1;`);
-  swap(/proxy_pass http:\/\/127\.0\.0\.1:\d+;/, `proxy_pass http://127.0.0.1:${upstream};`);
+  // Root's pages (C1: /run/cain/www) and the upstreams (C1: unix sockets only nginx's workers and
+  // root can open) are moved into the temp dir and onto the stand-in's port.
+  swap(/alias \/run\/cain\/www\/([\w.-]+);/, `alias ${dir}/$1;`);
+  swap(/proxy_pass http:\/\/unix:\/run\/cain\/upstream\/[\w.-]+\.sock;/, `proxy_pass http://127.0.0.1:${upstream};`);
   return conf;
 }
 

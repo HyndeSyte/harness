@@ -5,9 +5,13 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { STOP } from "../rootfs/opt/cain/link/core";
 import { readTranscripts } from "../rootfs/opt/cain/link/publish";
 import { BOT, DAY, DM, HOUR, MIN, OWNER, PR, rig, SHA1 } from "./link-rig";
+
+// Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
+process.env.CAIN_TRANSCRIPT_UID = String(typeof process.getuid === "function" ? process.getuid() : 0);
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 const STOP_ONLY = [{ type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
@@ -338,11 +342,24 @@ describe("the replay", () => {
     expect(rep.rules_version).toBe(3);
   });
 
-  test("keyed and on this machine only", () => {
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
-    const local = /const LOCAL_ONLY = new Set\(\[([^\]]*)\]\)/.exec(main)![1];
-    for (const route of ["/replay", "/look", "/cards", "/check", "/connector", "/sent"]) expect(local).toContain(`"${route}"`);
-    expect(main.indexOf('if (!keyOk) return json({ status: "refused" }, 403);')).toBeLessThan(main.indexOf('case "/replay"'));
+  test("Cain's, from this machine only; /sent root's alone (C1)", () => {
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const http = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes
+    for (const route of ["/replay", "/look", "/cards", "/check", "/connector"]) {
+      expect(routeAllowed("cain", route)).toBe(true);
+      expect(routeAllowed("specialist", route)).toBe(false);
+    }
+    expect(routeAllowed("cain", "/sent")).toBe(false);
+    expect(routeAllowed("root", "/sent")).toBe(true);
+    // Who the caller is comes from the state contract (c1/contract.ts, tested in c1.test.ts): Cain's
+    // key counts only from this machine, and only routes the caller may use are routed.
+    expect(main).toContain("const d = linkDecides(MODE, asked);");
+    expect(main).toContain("cainKey: !relayKey && sameKey(bare, cainKey()), local");
+    // Both servers route through http.ts (linkRoutes), where the caller's check comes before any route.
+    expect(main).toContain("const route = linkRoutes(routeDeps);");
+    expect(main).toContain("fetch: rootFetch(routeDeps, MAX_BODY)");
+    expect(http.indexOf("if (!routeAllowed(caller, url.pathname)) return json({ status: \"refused\" }, 403);")).toBeLessThan(http.indexOf('case "/replay"'));
+    expect(http.indexOf("if (!routeAllowed(caller, url.pathname))")).toBeGreaterThan(0);
     expect(main).toContain('if (token() && link.replayDue()) link.replay(30, "rules")');   // once by itself after the rules change
   });
 });

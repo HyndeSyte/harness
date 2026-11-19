@@ -1,9 +1,9 @@
 {
  "recorded_from": {
-  "release": "Harness 0.24.0",
-  "tag": "harness-0.24.0",
-  "commit": "27e53e8cef5c463a94149d4178389e6bb57ea798",
-  "archived_from": "27e53e8cef5c463a94149d4178389e6bb57ea798"
+  "release": "Harness 0.24.1",
+  "tag": "harness-0.24.1",
+  "commit": "5b58cf2a20f68ecae99d5144ebbf2ebb645f45a5",
+  "archived_from": "5b58cf2a20f68ecae99d5144ebbf2ebb645f45a5"
  },
  "writes": [
   [

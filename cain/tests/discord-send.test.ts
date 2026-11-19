@@ -17,7 +17,9 @@ import type { Reviewed } from "../rootfs/opt/cain/reviewed";
 
 const HOOK = join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-send.ts");
 const SENT_HOOK = join(import.meta.dir, "../rootfs/opt/cain/hooks/discord-sent.ts");
-const SETTINGS = join(import.meta.dir, "../rootfs/opt/cain/settings.json");
+// The reply hook is the old way's (legacy/settings.json, 0.11.0's rules, C1); the new way's gate
+// runs in the broker (discord/broker.ts).
+const SETTINGS = join(import.meta.dir, "../rootfs/opt/cain/legacy/settings.json");
 const REPLY = "mcp__plugin_discord_discord__reply", EDIT = "mcp__plugin_discord_discord__edit_message";
 const NOW = Date.UTC(2026, 10, 12, 15, 0);
 const DM = "5151000000000000001", OTHER = "5151000000000000002";

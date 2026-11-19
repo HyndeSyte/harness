@@ -109,18 +109,18 @@ def he_sees_no_broken_rule(request, monkeypatch):
 
     real_bot = fakes.FakeBot.send_message
 
-    def bot_send(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None):
+    def bot_send(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None, op=None):
         shown = discord_chat.to_markdown(text) if html else escape(text)
         toggle = TOGGLE if buttons or kind in discord_chat.TOGGLE_KINDS else ()
         found.extend(rule_problems("message", shown, [*labels_of(buttons), *toggle]))
-        return real_bot(self, chat_id, text, buttons, html=html, kind=kind, expires=expires)
+        return real_bot(self, chat_id, text, buttons, html=html, kind=kind, expires=expires, op=op)
 
     real_card = discord_chat.LinkChat.send_message
 
-    def card_send(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None):
+    def card_send(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None, op=None):
         shown = discord_chat.to_markdown(text) if html else escape(text)
         found.extend(rule_problems("card", shown, labels_of(self._rows(buttons, kind))))
-        return real_card(self, chat_id, text, buttons, html=html, kind=kind, expires=expires)
+        return real_card(self, chat_id, text, buttons, html=html, kind=kind, expires=expires, op=op)
 
     real_note = discord_chat.LinkChat.answer_callback
 

@@ -26,8 +26,8 @@ import family_replay  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 # The installed release. The repository has no release tags (the CI checkout has none either), so the
 # commit is hard-coded with the tag name it will have: the last commit on main that changed harness/.
-INSTALLED_TAG = "harness-0.24.0"
-INSTALLED_COMMIT = "27e53e8cef5c463a94149d4178389e6bb57ea798"
+INSTALLED_TAG = "harness-0.24.1"
+INSTALLED_COMMIT = "5b58cf2a20f68ecae99d5144ebbf2ebb645f45a5"
 
 
 def _git(*args):

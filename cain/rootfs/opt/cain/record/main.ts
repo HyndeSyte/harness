@@ -37,9 +37,14 @@ class GitError extends Error {}
 function git(cfg: Config, args: string[], cwd = cfg.dir): string {
   const env: Record<string, string> = { ...process.env as any, GIT_TERMINAL_PROMPT: "0" };
   if (cfg.token) {
-    // Rewritten every time, so nothing planted there is ever used.
-    const ask = "/tmp/record-askpass.sh";
-    writeFileSync(ask, '#!/bin/sh\ncase "$1" in Username*) echo x-access-token;; *) echo "$RECORD_TOKEN";; esac\n', { mode: 0o700 });
+    // Rewritten every time, so nothing planted there is ever used, and kept in root's own
+    // folder (C1): in a shared /tmp, Cain's user could make that name first. Removed and
+    // made new (wx), so a file of anyone else's is never written through.
+    const dir = process.env.CAIN_ROOT_TMP ?? "/run/cain/root-tmp";
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const ask = join(dir, "record-askpass.sh");
+    rmSync(ask, { force: true });
+    writeFileSync(ask, '#!/bin/sh\ncase "$1" in Username*) echo x-access-token;; *) echo "$RECORD_TOKEN";; esac\n', { mode: 0o700, flag: "wx" });
     env.GIT_ASKPASS = ask; env.RECORD_TOKEN = cfg.token;
   }
   // Byte-exact files (the shas writers send are of the bytes as committed), links

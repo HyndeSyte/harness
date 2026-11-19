@@ -82,8 +82,14 @@ describe("the Discord reads hook", () => {
   });
 });
 
-describe("settings.json wires the hook on exactly the two reads", () => {
-  const settings = JSON.parse(readFileSync(join(ROOT, "opt/cain/settings.json"), "utf8"));
+describe("the old way's settings wire the hook on exactly the two reads", () => {
+  // C1: the old way (as root, 0.11.0's rules, legacy/settings.json) checks reads with this hook;
+  // the new way's managed settings have no such hook, since the broker checks every read.
+  const settings = JSON.parse(readFileSync(join(ROOT, "opt/cain/legacy/settings.json"), "utf8"));
+  test("the new way's managed settings leave reads to the broker", () => {
+    const managed = JSON.parse(readFileSync(join(ROOT, "opt/cain/settings.json"), "utf8"));
+    expect(JSON.stringify(managed.hooks ?? {})).not.toContain("discord-read.ts");
+  });
   test("one PreToolUse entry per read, by exact name", () => {
     const entries = settings.hooks.PreToolUse.filter((e: any) => String(e.hooks?.[0]?.command).includes("discord-read.ts"));
     expect(entries.map((e: any) => e.matcher).sort()).toEqual([...READS].sort());
@@ -144,10 +150,10 @@ describe("the Discord plugin pin", () => {
 
   test("the start script installs the pinned commit", () => {
     const run = readFileSync(join(ROOT, "etc/services.d/cain/run"), "utf8");
-    expect(run).toContain('jq -r .commit /opt/cain/discord/pin.json');
+    expect(run).toContain('jq -r .commit "$OPT/discord/pin.json"');
     expect(run).toContain('checkout -q --detach "$pin_commit"');
     expect(run.indexOf("checkout -q --detach")).toBeLessThan(run.indexOf("claude plugin install discord@claude-plugins-official"));
-    expect(run).toContain("bun /opt/cain/discord/upkeep.ts");
+    expect(run).toContain('bun "$OPT/discord/upkeep.ts"');
   });
 
   const installed = (dir: string, version = "0.0.4") => JSON.stringify({ version: 2, plugins: { [PIN.plugin]: [

@@ -44,11 +44,54 @@ RUN apt-get update \
 
 ENV DISABLE_AUTOUPDATER=1
 
+# C1: Cain's session runs as its own user, and the Discord plugin's server as another, so
+# neither reaches a key root keeps. Fixed ids: /data keeps numeric owners across versions.
+RUN groupadd -g 1000 cain && useradd -u 1000 -g cain -d /data/cain -M -s /bin/bash cain \
+    && groupadd -g 1001 discord && useradd -u 1001 -g discord -d /data/discord -M -s /usr/sbin/nologin discord
+
 COPY rootfs /
-RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh
+RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh /opt/cain/c1/*.sh /opt/cain/as-cain
+
+# The Discord plugin, pinned in the image (/opt/cain/discord/pin.json), fetched only here:
+#   - the seed Claude Code loads it from (CLAUDE_CODE_PLUGIN_SEED_DIR, read only, never
+#     updated), whose .mcp.json runs the bridge to the broker instead of the server;
+#   - the server itself with its packages, which the broker runs as discord.
+# The build fails unless every pinned file matches its hash.
+RUN set -eu; seed=/opt/cain/plugin-seed; pin=/opt/cain/discord/pin.json; \
+    commit="$(jq -r .commit "$pin")"; \
+    CLAUDE_CODE_PLUGIN_CACHE_DIR="$seed" claude plugin marketplace add anthropics/claude-plugins-official; \
+    git -C "$seed/marketplaces/claude-plugins-official" fetch -q --depth 1 origin "$commit"; \
+    git -C "$seed/marketplaces/claude-plugins-official" -c advice.detachedHead=false checkout -q --detach "$commit"; \
+    CLAUDE_CODE_PLUGIN_CACHE_DIR="$seed" claude plugin install discord@claude-plugins-official --scope user; \
+    plugin="$(dirname "$(find "$seed/cache" -path '*/discord/*/.claude-plugin/plugin.json' | head -n 1)")/.."; \
+    plugin="$(readlink -f "$plugin")"; \
+    for f in $(jq -r '.files | keys[]' "$pin"); do \
+      echo "$(jq -r --arg f "$f" '.files[$f]' "$pin")  $plugin/$f" | sha256sum -c - ; \
+    done; \
+    install -d -m 0755 /opt/cain/discord/plugin; \
+    cp -a "$plugin/." /opt/cain/discord/plugin/; \
+    (cd /opt/cain/discord/plugin && bun install --frozen-lockfile --production --no-summary); \
+    install -m 0644 /opt/cain/discord/seed-mcp.json "$plugin/.mcp.json"; \
+    rm -rf /root/.claude /root/.claude.json /root/.cache /root/.bun; \
+    mkt="$seed/marketplaces/claude-plugins-official/.claude-plugin/marketplace.json"; \
+    jq '.plugins |= map(select(.name == "discord"))' "$mkt" > "$mkt.tmp" && mv "$mkt.tmp" "$mkt"; \
+    test "$(jq -r '[.plugins[].name] | join(",")' "$mkt")" = discord; \
+    chown -R root:root "$seed" /opt/cain/discord/plugin; chmod -R a+rX,go-w "$seed" /opt/cain/discord/plugin
+# The seed's copy of the official marketplace lists the Discord plugin alone (C1 code review C1-3):
+# the seed's entry overrides his own at every start and isn't refreshed, so no other plugin of it
+# can be installed into his session; the managed MCP allowlist (settings.json) takes the rest.
+
+# Cain's rules (/opt/cain/settings.json and CLAUDE.md) go to /etc/claude-code, where Claude
+# Code reads managed policy, at every start that runs him as his own user, checked by hash
+# (c1/lock.sh): a container Home Assistant recreates keeps only /data, and the old way of
+# starting, before the first cutover, must run without them.
+
+# No setuid or setgid program can raise him (his session also runs with no_new_privs).
+RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+    && test -z "$(find / -xdev -type f -perm /6000 -print -quit)"
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.13.0" \
+    io.hass.version="0.13.1" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

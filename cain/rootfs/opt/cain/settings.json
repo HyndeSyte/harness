@@ -66,8 +66,6 @@
       "mcp__claude_ai_Microsoft_365__sharepoint_delete_item",
       "mcp__claude_ai_Microsoft_365__teams_create_chat",
       "Read(//data/options.json)",
-      "Read(//data/.claude/channels/discord/.env)",
-      "Edit(//data/.claude/channels/discord/.env)",
       "Read(//data/link/**)",
       "Edit(//data/link/**)",
       "Edit(//data/trust/**)",
@@ -77,54 +75,37 @@
       "Edit(//data/review-spend.json)",
       "Edit(//data/record-holds.json)",
       "Edit(//data/record-holds.json.next)",
+      "Edit(//etc/claude-code/**)",
       "Edit(//data/pc-jobs/**)",
-      "Edit(//data/pc-jobs-outcomes/**)"
-    ]
+      "Edit(//data/pc-jobs-outcomes/**)",
+      "Edit(//data/pc-jobs-reuse-used.jsonl*)"
+    ],
+    "disableBypassPermissionsMode": "disable"
   },
+  "allowManagedHooksOnly": true,
+  "allowManagedPermissionRulesOnly": true,
+  "disableSideloadFlags": true,
+  "strictPluginOnlyCustomization": ["mcp", "hooks"],
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [
+    { "serverCommand": ["/usr/local/bin/bun", "/opt/cain/discord/bridge.ts"] },
+    { "serverUrl": "https://mcp-proxy.anthropic.com/v1/mcp/*" }
+  ],
+  "strictKnownMarketplaces": [
+    { "source": "github", "repo": "anthropics/claude-plugins-official" }
+  ],
+  "enabledPlugins": {
+    "discord@claude-plugins-official": true
+  },
+  "syncClaudeAiPlugins": false,
+  "skillOverrides": { "auto-mode-setup": "off" },
+  "promptSuggestionEnabled": false,
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "RemoteTrigger",
         "hooks": [
           { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15, "onFailure": "block" }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__download_attachment",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__fetch_messages",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__reply",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__edit_message",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "mcp__plugin_discord_discord__reply",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-sent.ts || true", "timeout": 15, "async": true }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__edit_message",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-sent.ts || true", "timeout": 15, "async": true }
         ]
       }
     ]

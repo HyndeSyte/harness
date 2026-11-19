@@ -16,7 +16,23 @@ import { DM, rig } from "./link-rig";
 import * as keeper28 from "../rootfs/opt/cain/pcjobs/main.ts";
 import * as linkcore28 from "../rootfs/opt/cain/link/core";
 import { askValues, PC_NOTICES, pcQueuedWords } from "../rootfs/opt/cain/link/core";
-import { linkFetch } from "../rootfs/opt/cain/link/http";
+import { linkRoutes, rootFetch } from "../rootfs/opt/cain/link/http";
+
+// The link's root socket (link/http.ts rootFetch, what link/main.ts serves on it), on a socket of the
+// test's own: the keeper runs as root and reaches the link there (C1). A caller other than root (the
+// "as" argument) gets the routes as link/main.ts would give that caller.
+const SOCKETS = process.platform !== "win32" && !!Bun.which("curl");
+function linkSocket(r: { link: any }, opts: { as?: "root" | "cain"; onBody?: (b: unknown) => void } = {}) {
+  const sock = join(mkdtempSync(join(tmpdir(), "pcjobs-sock-")), "link.sock");
+  const deps = { link: r.link, toHarness: async () => true };
+  const asRoot = rootFetch(deps), routes = linkRoutes(deps);
+  const server = Bun.serve({ unix: sock, async fetch(req) {
+    if (opts.onBody && req.method === "POST") opts.onBody(await req.clone().json());
+    if ((opts.as ?? "root") === "root") return asRoot(req);
+    return routes(req, new URL(req.url), opts.as!, req.method === "POST" ? await req.text() : "");
+  } });
+  return { sock, link: `unix:${sock}`, server };
+}
 
 const VALUE = "****plnt";
 const ASKED = `Check the account the PC reported, "${VALUE}", in a new job?`;
@@ -916,21 +932,17 @@ describe("twenty-first review: bounded waits with a notice, three clear rounds, 
 });
 
 describe("twenty-second review: the job named by what it does, a lost acknowledgement kept until confirmed, and an unreadable store counted on a failed fetch", () => {
-  test.skipIf(!Bun.which("curl"))("end to end: the keeper's tell, the link's route, the gate's rules: the line names the job by its site and action, posts, and is not refused", async () => {
-    const TOKEN = "not-a-real-token.for-the-notice-test";
+  test.skipIf(!SOCKETS)("end to end: the keeper's tell, the link's route, the gate's rules: the line names the job by its site and action, posts, and is not refused", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pcjobs-notice22-"));
-    writeFileSync(join(dir, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`);
-    const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
     const r = rig();
     const bodies: any[] = [];
-    // The link's own HTTP handler (link/http.ts linkFetch, what link/main.ts serves), on a port of its own.
-    const handler = linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true, localOnly: new Set(["/pc-notice"]) });
-    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(req, srv) { bodies.push(await req.clone().json()); return handler(req, srv); } });
+    // The link's root socket, as link/main.ts serves it; the keeper needs no bot token there (C1).
+    const { link, server } = linkSocket(r, { onBody: (b) => bodies.push(b) });
     const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
     const used = join(dir, "state", "used.jsonl");
     try {
       const src = `const { tell } = await import(${JSON.stringify(main)});
-        tell({ used: ${JSON.stringify(used)}, link: "http://127.0.0.1:${server.port}", discordEnv: ${JSON.stringify(join(dir, ".env"))} }, "reuse_fetch_failed", "fetch:${MSG}",
+        tell({ used: ${JSON.stringify(used)}, link: ${JSON.stringify(link)}, discordEnv: ${JSON.stringify(join(dir, "no-token.env"))} }, "reuse_fetch_failed", "fetch:${MSG}",
           { site: "example.com", action: "read_account_settings" });`;
       await Bun.spawn(["bun", "-e", src], { stdout: "pipe", stderr: "pipe" }).exited;
       expect(bodies.length).toBe(1);
@@ -994,18 +1006,13 @@ describe("twenty-second review: the job named by what it does, a lost acknowledg
 describe("twenty-third review: notice marks never leave the owner untold, permanent refusals capped, every job named, through the link's real handler", () => {
   const TOKEN = "not-a-real-token.for-the-notice-test-23";
   const key = createHmac("sha256", TOKEN).update("harness-relay-v1").digest("hex");
-  const serve = (r: ReturnType<typeof rig>) => {
-    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true, localOnly: new Set(["/pc-notice"]) }) });
-    return server;
-  };
   const envFile = () => { const d = mkdtempSync(join(tmpdir(), "pcjobs-env23-")); writeFileSync(join(d, ".env"), `DISCORD_BOT_TOKEN=${TOKEN}\n`); return join(d, ".env"); };
 
-  test.skipIf(!Bun.which("curl"))("end to end through the link's real HTTP handler: posted, already posted, and refused, as the keeper reads them", async () => {
+  test.skipIf(!SOCKETS)("end to end through the link's real handler on its root socket: posted, already posted, and refused, as the keeper reads them", async () => {
     const r = rig();
-    const server = serve(r);
+    const { sock, link, server } = linkSocket(r);
     try {
-      const url = `http://127.0.0.1:${server.port}/pc-notice`;
-      const post = (b: unknown, k = key) => fetch(url, { method: "POST", body: JSON.stringify(b), headers: { "content-type": "application/json", "x-harness-key": k } });
+      const post = (b: unknown, path = "/pc-notice") => fetch(`http://link${path}`, { unix: sock, method: "POST", body: JSON.stringify(b), headers: { "content-type": "application/json" } } as any);
       const id = "a".repeat(24);
       const first = await post({ code: "reuse_fetch_failed", id, job: { site: "example.com", action: "read_account_settings" } });
       expect(first.status).toBe(200);
@@ -1017,11 +1024,11 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
       const bad = await post({ code: "reuse_fetch_failed", id: "b".repeat(24), job: "j-20261115-abcdef" });
       expect(bad.status).toBe(400);
       expect((await bad.json()).status).toBe("refused");
-      expect((await post({ code: "reuse_fetch_failed" }, "0".repeat(64))).status).toBe(403);
+      expect((await post({ text: "a question" }, "/ask")).status).toBe(403);            // root's socket opens only root's routes
       // The keeper's own send, over curl, in its own process (its curl call is synchronous), reads each answer as it must.
       const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
       const src = `const { linkNotify } = await import(${JSON.stringify(main)});
-        const n = linkNotify({ link: "http://127.0.0.1:${server.port}", discordEnv: ${JSON.stringify(envFile())} });
+        const n = linkNotify({ link: ${JSON.stringify(link)} });
         const job = { site: "example.com", action: "read_account_settings" };
         console.log(JSON.stringify([n("reuse_fetch_failed", { id: "c".repeat(24), job }), n("reuse_fetch_failed", { id: "c".repeat(24), job }),
           n("reuse_fetch_failed", { id: "d".repeat(24), job: { site: "Example Com", action: "x" } }), n("reuse_fetch_failed", { id: "e".repeat(24), job: { queued: "2026-11-15T14:05:00Z" } })]));`;
@@ -1032,6 +1039,7 @@ describe("twenty-third review: notice marks never leave the owner untold, perman
       expect(lines).toContain(`${PC_NOTICES.reuse_fetch_failed} (It is a PC browser job seen by the keeper at Nov 15, 9:05 AM, code reuse_fetch_failed.)`);
       expect(r.reports).toEqual([]);                                                // the gate's rules: nothing to fix or hold
       expect(linkNotify({ link: "http://127.0.0.1:1", discordEnv: envFile() })("reuse_fetch_failed", { id: "f".repeat(24) })).toBe(false);   // no answer: passing
+      expect(linkNotify({ link: `unix:${sock}.gone` })("reuse_fetch_failed", { id: "f".repeat(24) })).toBe(false);   // no socket: passing
     } finally { server.stop(true); }
   }, 30_000);
 
@@ -1149,7 +1157,8 @@ describe("twenty-fourth review: notice refusals by kind, and a job named even wh
     let answer = 403;
     const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(JSON.stringify({ status: "nope" }), { status: answer, headers: { "content-type": "application/json" } }) });
     const r = rig();
-    const real = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: linkFetch({ link: r.link, keyOk: (h) => h === key, health: () => ({}), toHarness: async () => true, localOnly: new Set(["/pc-notice"]) }) });
+    // The link's real routes, served to a caller that may not send notices (Cain's): 403, a configuration refusal.
+    const real = SOCKETS ? linkSocket(r, { as: "cain" }) : null;
     try {
       const main = join(import.meta.dir, "../rootfs/opt/cain/pcjobs/main.ts");
       const one = async (port: number, env: string) => {
@@ -1163,11 +1172,15 @@ describe("twenty-fourth review: notice refusals by kind, and a job named even wh
       answer = 401; expect(await one(server.port, envFile())).toBe("config");
       answer = 502; expect(await one(server.port, envFile())).toBe("server");
       answer = 500; expect(await one(server.port, envFile())).toBe("server");
-      // The link's real handler with a wrong key answers 403: a configuration refusal.
-      const wrong = mkdtempSync(join(tmpdir(), "pcjobs-env24w-"));
-      writeFileSync(join(wrong, ".env"), "DISCORD_BOT_TOKEN=another-token\n");
-      expect(await one(real.port, join(wrong, ".env"))).toBe("config");
-    } finally { server.stop(true); real.stop(true); }
+      // The link's real routes refusing the caller answer 403: a configuration refusal.
+      if (real) {
+        const src = `const { linkNotify } = await import(${JSON.stringify(main)});
+          console.log(JSON.stringify(linkNotify({ link: ${JSON.stringify(real.link)} })("reuse_fetch_failed", { id: "c".repeat(24) })));`;
+        const child = Bun.spawn(["bun", "-e", src], { stdout: "pipe", stderr: "pipe" });
+        await child.exited;
+        expect(JSON.parse((await new Response(child.stdout).text()).trim())).toBe("config");
+      }
+    } finally { server.stop(true); real?.server.stop(true); }
   }, 30_000);
 
   test("a configuration refusal stops the sends for this process and shows prominently on the status; a new process sends again", () => {

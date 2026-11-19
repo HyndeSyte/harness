@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.2
+
+- The calendar App now signs everything it sends to Cain's App, with a key of its own, and takes an answer only when Cain's App signed it. Nothing changes for you.
+- A card that waits through an outage goes out once, even when its first try got through but the answer didn't.
+- A message that can't reach Cain's App for 7 days is dropped rather than risk it going out twice, and the morning digest counts it.
+- Install it together with Cain 0.13.1, Cain first. Until it's in, its cards wait at Cain's App; none is lost.
+
 ## 0.24.1
 
 - **A block made before Harness could read its address now gets it, with its drives.** On the next read, an event you go to whose block has no address or no drive blocks gets both, the same as a new one: the street address on the block and "Busy (drive there)" and "Busy (drive back)" around it, sized from the real drive. Thursday's school event is the first one this fixes.

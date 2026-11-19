@@ -3,12 +3,16 @@
 // message back from Discord; the cards are published for the reply hook without text;
 // and each send point logs what the gate's rules would have done, changing nothing.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
+import { KEEP_MS, RequestLog, SignedOps, writeSynced } from "../rootfs/opt/cain/link/auth";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
+
+// Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
+process.env.CAIN_TRANSCRIPT_UID = String(typeof process.getuid === "function" ? process.getuid() : 0);
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 // A receipt for something the specialist did, as the Harness builds it.
@@ -192,6 +196,112 @@ describe("the cards, published for the reply hook", () => {
     store.save({ ...s, owner: "4444" });
     await writer.settled();
     expect(JSON.parse(readFileSync(cardsPath, "utf8")).owner).toBe("4444");
+  });
+
+  test("the link's state on disk: two copies, the newer read; one damaged loses nothing; both damaged kept aside, never quietly a fresh store (C1 re-check N2)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    const store = stateFile(p);
+    const s = { ...rig().state(), owner: "4242" };
+    store.save(s);
+    expect(JSON.parse(readFileSync(`${p}.2`, "utf8")).owner).toBe("4242");
+    store.save({ ...s, owner: "4343" });
+    writeFileSync(p, "{not json");                                       // the first copy damaged
+    expect(stateFile(p).load().owner).toBe("4343");
+    const behind = JSON.stringify({ ...s, owner: "old", saveGen: 1 });
+    writeFileSync(p, behind);                                            // the first copy a save behind
+    expect(stateFile(p).load().owner).toBe("4343");
+    writeFileSync(`${p}.2`, "{oops");
+    const fresh = stateFile(p);
+    expect([fresh.load().owner, fresh.lost()]).toEqual(["old", 0]);
+    writeFileSync(p, "{oops");                                           // both damaged
+    let t = 1_800_000_000_000;
+    const lost = stateFile(p, () => {}, undefined, () => t);
+    const got = lost.load();
+    expect([got.owner, Object.keys(got.cards).length, lost.lost(), lost.lostNow()]).toEqual([undefined, 0, t, true]);
+    expect(readdirSync(dir).filter((f) => f.includes(".damaged-")).length).toBe(2);
+    lost.save(got);
+    t += KEEP_MS - 1;
+    const after = stateFile(p, () => {}, undefined, () => t);
+    expect([after.lost(), after.lostNow()]).toEqual([1_800_000_000_000, false]);         // a restart remembers, told once
+    t += 2;
+    expect(stateFile(p, () => {}, undefined, () => t).lost()).toBe(0);                    // until it can't matter
+  });
+
+  test("a loss is recorded before the damaged copies move, and a crash between the two still counts as a loss (C1 re-check B1)", () => {
+    const damaged = () => {
+      const dir = mkdtempSync(join(tmpdir(), "state-"));
+      const p = join(dir, "state.json");
+      writeFileSync(p, "{oops"); writeFileSync(`${p}.2`, "{oops");
+      return { dir, p };
+    };
+    // The marker can't be written: nothing moves, nothing passes for a fresh store, and a later
+    // start that can write it records the loss.
+    let { dir, p } = damaged();
+    const refusing = stateFile(p, () => {}, (path, body) => { if (path.endsWith(".lost")) throw new Error("EIO"); writeFileSync(path, body); });
+    expect(() => refusing.load()).toThrow("EIO");
+    expect([readdirSync(dir).sort(), refusing.lost()]).toEqual([["state.json", "state.json.2"], 0]);
+    const later = stateFile(p);
+    later.load();
+    expect([later.lost() > 0, later.lostNow(), existsSync(`${p}.lost`)]).toEqual([true, true, true]);
+    // Killed after the marker, before the copies moved: the next start finds both, records the
+    // loss again at its own time (later: safe), moves them, and says it found them.
+    ({ dir, p } = damaged());
+    const t0 = Date.now() - 60_000;
+    writeFileSync(`${p}.lost`, String(t0));
+    const resumed = stateFile(p);
+    resumed.load();
+    const t1 = resumed.lost();
+    expect([t1 > t0, resumed.lostNow(), readdirSync(dir).filter((f) => f.includes(`.damaged-${t1}`)).length]).toEqual([true, true, 2]);
+    // A marker that doesn't hold a time, or can't be read, counts as a loss now.
+    ({ dir, p } = damaged());
+    writeFileSync(`${p}.lost`, "garbage");
+    expect(stateFile(p).lost() > 0).toBe(true);
+    ({ dir, p } = damaged());
+    mkdirSync(`${p}.lost`);
+    expect(stateFile(p).lost() > 0).toBe(true);
+  });
+
+  test("a second loss before the first's window ends covers the cards made in between: their answers are the explicit unknown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    let t = 1_800_000_000_000;
+    const damage = () => { writeFileSync(p, "{oops"); writeFileSync(`${p}.2`, "{oops"); };
+    const clock = () => t;
+    stateFile(p, () => {}, undefined, clock).save(rig().state());
+    damage();
+    let store = stateFile(p, () => {}, undefined, clock);
+    store.load();                                                        // the first loss
+    expect(store.lost()).toBe(1_800_000_000_000);
+    const ops = (st: { lost(): number }) => new SignedOps(new RequestLog(join(dir, "requests.json"), t), clock, undefined,
+      (path, s) => path === "/card" && s.status === 200 && st.lost() > 0 && s.at <= st.lost());
+    t += 12 * HOUR;
+    store.save(store.load());                                            // the link goes on
+    const CARD = "e".repeat(32);
+    let runs = 0;
+    const act = async () => { runs++; return { status: 200, body: '{"id":99}' }; };
+    expect((await ops(store).run(CARD, "/card", act)).status).toBe(200);  // a card made after the first loss
+    t += 12 * HOUR;
+    damage();
+    store = stateFile(p, () => {}, undefined, clock);
+    store.load();                                                        // the second, within the first's 8 days
+    expect(store.lost()).toBe(t);
+    const a = await ops(store).run(CARD, "/card", act);
+    expect([a.status, JSON.parse(a.body).status, runs]).toEqual([409, "unknown", 1]);
+  });
+
+  test("a save that couldn't be made durable throws, and the next read takes the newer copy, not a stale first one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    let failFirst = false;
+    const write = (path: string, body: string) => { if (failFirst && path === p) throw new Error("EIO"); writeFileSync(path, body); };
+    const store = stateFile(p, () => {}, write);
+    const s = rig().state();
+    store.save({ ...s, owner: "1" });
+    failFirst = true;
+    expect(() => store.save({ ...s, owner: "2" })).toThrow("EIO");       // the second copy has it, the first doesn't
+    expect(store.load().owner).toBe("2");
+    expect(() => stateFile(p, () => {}, (_p, _b) => writeSynced(_p, _b, () => { throw new Error("EIO: folder"); })).save(s)).toThrow("folder");
   });
 
   test("the link asks for a write after each save and each sweep, and answers /cards itself", () => {
@@ -478,6 +588,23 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     const said = r.relayed.length;
     await r.link.sent(note);                                               // the hook's retry of the same note
     expect(r.relayed.length).toBe(said);
+  });
+});
+
+describe("the broker's record of what went out (C1 re-check R5)", () => {
+  test("a problem with it reaches Cain, at most every 6 hours", async () => {
+    const r = rig();
+    const told = () => r.relayed.filter((x) => x.startsWith("The Discord broker says")).length;
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false });
+    expect(told()).toBe(0);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the broker couldn't keep its record of a message that went out (ENOSPC)" });
+    expect(told()).toBe(1);
+    expect(r.relayed.at(-1)).toContain("ENOSPC");
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the same again" });
+    expect(told()).toBe(1);
+    r.later(7 * HOUR);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the same again" });
+    expect(told()).toBe(2);
   });
 });
 

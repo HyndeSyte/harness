@@ -21,8 +21,13 @@ else
   bashio::log.error "Could not write /etc/nginx/owner.conf, so Cain's panel stays closed"
 fi
 # Hygiene: s6's copy of the container's environment, the token included, root only.
-# That keeps it from nginx's workers, which don't run as root; not from the session.
 chmod 0700 /run/s6/container_environment 2>/dev/null || true
+# The upstreams nginx proxies to are unix sockets only nginx's workers (nobody:nogroup) and
+# root can open, never a port Cain's own user could take while one is down (C1 plan 3.9).
+# cain/run makes /run/cain/upstream (root:nogroup 0750); wait for it.
+for _ in $(seq 1 120); do [ -d /run/cain/upstream ] && break; sleep 1; done
 nginx || bashio::log.error "nginx did not start"
-exec ttyd --interface 127.0.0.1 --port 7681 --base-path /tty --writable \
-  bash -c 'until tmux -u has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux -u attach -t cain'
+umask 0007
+rm -f /run/cain/upstream/ttyd.sock
+exec ttyd --interface /run/cain/upstream/ttyd.sock --socket-owner root:nogroup --base-path /tty --writable \
+  /opt/cain/terminal-attach.sh

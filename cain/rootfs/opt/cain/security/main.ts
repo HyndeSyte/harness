@@ -129,6 +129,18 @@ export function lines(kind: "morning" | "other", env: Record<string, string | un
   return section(out);
 }
 
+// keeper.sh key-expiry and key-ack: a note on the key record. Run as root, by this command the old way
+// and by the link's /key-note the new way (0.13.1: the record is root's, and Cain runs as his own user).
+export function noteKey(cmd: string, name: string, date: string, env: Record<string, string | undefined> = process.env): { status: "ok" | "error"; said: string } {
+  const p = paths(env);
+  const tz = configFromEnv(env).tz;
+  if (cmd !== "key-expiry" && cmd !== "key-ack") return { status: "error", said: "unknown key note" };
+  const r = cmd === "key-expiry" ? setExpiry(parseKeys(read(p.keys)), name, date)
+    : setAck(parseKeys(read(p.keys)), name, date, dayOf(new Date(), tz));
+  if (r.file) writeWhole(p.keys, JSON.stringify(r.file, null, 1));
+  return { status: r.file ? "ok" : "error", said: r.said };
+}
+
 if (import.meta.main) {
   const env = process.env;
   const log = (m: string) => console.log(`[security] ${m}`);
@@ -160,17 +172,11 @@ if (import.meta.main) {
       if (t) console.log(t);
       break;
     }
-    case "key-expiry": {
-      const r = setExpiry(parseKeys(read(p.keys)), String(a1 ?? ""), String(a2 ?? ""));
-      if (r.file) writeWhole(p.keys, JSON.stringify(r.file, null, 1));
-      console.log(JSON.stringify({ status: r.file ? "ok" : "error", said: r.said }));
-      process.exit(r.file ? 0 : 2);
-    }
+    case "key-expiry":
     case "key-ack": {
-      const r = setAck(parseKeys(read(p.keys)), String(a1 ?? ""), String(a2 ?? ""), dayOf(new Date(), tz));
-      if (r.file) writeWhole(p.keys, JSON.stringify(r.file, null, 1));
-      console.log(JSON.stringify({ status: r.file ? "ok" : "error", said: r.said }));
-      process.exit(r.file ? 0 : 2);
+      const r = noteKey(cmd, String(a1 ?? ""), String(a2 ?? ""), env);
+      console.log(JSON.stringify(r));
+      process.exit(r.status === "ok" ? 0 : 2);
     }
     case "keys": {
       const f = parseKeys(read(p.keys));

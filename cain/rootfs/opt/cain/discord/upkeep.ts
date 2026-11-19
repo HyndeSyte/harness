@@ -5,9 +5,14 @@
 //   - At start and daily: the plugin's inbox (where download_attachment writes, under
 //     names the plugin makes: <ms>-<attachment id>.<ext>) loses files older than 7 days,
 //     then the oldest files until it holds at most 200 MB.
-import { lstatSync, readdirSync, unlinkSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { accessHere, checkAccess, pinCheckHere } from "../hooks/discord-read.ts";
+import { pinProblem } from "./pin.ts";
+
+// The new way (C1, /run/cain/mode "own") runs the plugin from the image's seed and its server
+// copy; the old way from what 0.11.0 installed into /data/.claude.
+const ownWay = () => { try { return readFileSync(process.env.CAIN_MODE_FILE ?? "/run/cain/mode", "utf8").trim() === "own"; } catch { return false; } };
 
 export const MAX_AGE_MS = 7 * 24 * 3_600_000;
 export const MAX_BYTES = 200 * 1024 * 1024;
@@ -39,7 +44,7 @@ const log = (m: string) => console.log(`[discord] ${m}`);
 if (import.meta.main) {
   const access = checkAccess(accessHere());
   if (access) log(`ERROR: ${access}. Cain's Discord reads are refused until access.json is dmPolicy allowlist, one allowed user, no groups (/discord:access).`);
-  const pin = pinCheckHere();
+  const pin = ownWay() ? pinProblem() : pinCheckHere();
   if (pin) log(`ERROR: ${pin}. Cain's Discord reads are refused until the pinned plugin is installed or a new pin is reviewed.`);
   const sweep = () => {
     const r = sweepInbox(INBOX, Date.now());

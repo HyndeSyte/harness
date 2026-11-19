@@ -2,8 +2,10 @@
 // REST calls, the sweep that posts cards Cain hasn't shown in time and takes buttons
 // off cards that stopped mattering, and a small local HTTP API.
 //
-// HTTP on port 8097, keyed with HMAC-SHA256(bot token, "harness-relay-v1"):
-//   from the calendar specialist (the Harness add-on, over the add-ons' network):
+// HTTP on port 8097. Who may call, by Cain's state (c1/contract.ts, auth.ts):
+//   from the calendar specialist (the Harness App, over the Apps' network), signed both ways
+//   with K_sign = HMAC-SHA256(bot token, "harness-link-sign-v2"); its old bare header (the
+//   relay key, HMAC-SHA256(bot token, "harness-relay-v1")) gets 503 and nothing done:
 //     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now;
 //                                       one with buttons goes out by itself if he hasn't shown it in about 2 minutes)
 //     POST /buttons {card, rows}        change a card's buttons (after a tap)
@@ -53,26 +55,30 @@
 // (../stop.ts). The deploy key (deploykey.ts) is the one key main is locked to: with it
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
-import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { sign as edSign } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
+import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
-import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { ensureStop, readStop, TRUST_DIR, writeStop } from "../stop";
 import { KEEPER_SENT, noteAt } from "../gate/held";
 import { readHosts } from "../gate/hosts";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { discordError, Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
+import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
-import { linkFetch } from "./http";
+import { linkRoutes, rootFetch } from "./http";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
-const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
-const ACCESS = "/data/.claude/channels/discord/access.json";
+// The bot token and the plugin's allowlist, root's since C1 (the run script points these at
+// their old places only for the old way of starting, before the first cutover).
+const ENV = process.env.LINK_ENV ?? "/data/link/discord.env";
+const ACCESS = process.env.LINK_ACCESS ?? "/data/discord/access.json";
 const DIR = process.env.LINK_DIR ?? "/data/link";
 const STATE = `${DIR}/state.json`;
 const WATCH = `${DIR}/watch.json`;
@@ -101,10 +107,6 @@ function token(): string {
 function key(context: string): string {
   return hmacKey(token(), context);
 }
-function same(a: string, b: string): boolean {
-  const x = Buffer.from(a), y = Buffer.from(b);
-  return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
-}
 function paired(): string {
   try { return String(JSON.parse(readFileSync(ACCESS, "utf8")).allowFrom?.[0] ?? ""); } catch { return ""; }
 }
@@ -115,6 +117,16 @@ const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) =
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
 function save(s: State): void { stateStore.save(s); }
+// Read once at the start, so a store found damaged is known before anything is asked of the link.
+// One whose loss couldn't be recorded: the link doesn't start (the run script tries again in 5
+// seconds), rather than run on a store that could later pass for a fresh one (C1 re-check B1).
+try { load(); }
+catch (e) {
+  console.log(`[cain] link: ERROR: its record of cards and messages is damaged and the loss couldn't be recorded (${String(e).slice(0, 80)}); not starting until it can`);
+  process.exit(1);
+}
+if (stateStore.lostNow()) console.log("[cain] link: ERROR: its record of cards and messages was damaged on disk (both copies), kept aside, and started over");
+else if (stateStore.lost()) console.log("[cain] link: its record of cards and messages was found damaged within the last 8 days: a card's request isn't run again meanwhile");
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -200,7 +212,8 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
-  relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
+  // Durable (C1 re-check N2): a card's line to Cain is on disk before the card's request is done.
+  relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
@@ -286,15 +299,132 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-// The routes themselves are in http.ts (linkFetch), so a test serves exactly this handler (0.12.0, twenty-third round).
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/reply", "/replay", "/connector", "/sent", "/reuse", "/pc-notice"]);
+// Three callers, each opening only its own routes (auth.ts, C1): the calendar specialist
+// signs each request with its key, never sending it; Cain shows his own key, made at each
+// start, from this machine only; root's services (the broker) use a unix socket only root
+// can open. A caller that proves nothing gets only /health's "ok".
+const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
+const KEYS = process.env.CAIN_KEYS ?? "/run/cain/keys";
+const LINK_SOCK = process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
+function cainKey(): string { try { return readFileSync(`${KEYS}/cain.key`, "utf8").trim(); } catch { return ""; } }
+const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+
+// The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
+// exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
+const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ };
+const route = linkRoutes(routeDeps);
+
+// The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept
+// and signed back, with K_sign = HMAC(bot token, "harness-link-sign-v2"). The old relay key,
+// HMAC(bot token, "harness-relay-v1"), authorizes nothing of the specialist's in any state, and
+// no signature made with it verifies, so one captured from an old Harness signs nothing (C1
+// plan 3.9).
+const requests = new RequestLog(`${DIR}/requests.json`);
+if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the specialist's operations is damaged (both copies); no new one is taken until it can't matter (8 days)`);
+else if (requests.recoveredFrom) console.log(`[cain] link: its record of the specialist's operations was read from ${requests.recoveredFrom} (the other was damaged or a step behind); nothing lost`);
+// A card's request runs again only while the cards it made are on record: a store found damaged
+// lost which request made which card, so then it's an explicit unknown too.
+// And a card's answer from before the loss names a card that's gone: the explicit unknown.
+const ops = new SignedOps(requests, Date.now, (p) => RERUN_SAFE.has(p) && !stateStore.lost(),
+  (p, s) => p === "/card" && s.status === 200 && stateStore.lost() > 0 && s.at <= stateStore.lost());
+// A body larger than any route takes is refused before it's read, signed or not (C1-7).
+const MAX_BODY = 16_384;
+// Recorded, durably, at the specialist's first signed request: until then the run script keeps
+// every process of Cain's user stopped (3.12), so an old Harness's bare key never meets one.
+// Only a write that succeeded counts: one that didn't is tried again at the next (C1-6).
+const SIGNS = `${DIR}/specialist-signs`;
+let specialistSigns = existsSync(SIGNS);
+// Who may call, by state (c1/contract.ts): old in the old way, own in the new one, stopped
+// while Cain isn't started. The run script sets it.
+const MODE: LinkMode = (["old", "own", "stopped"] as const).includes(process.env.LINK_MODE as LinkMode) ? process.env.LINK_MODE as LinkMode : "own";
+const health = (known: boolean) => json(healthBody(known, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
+// The specialist's state, for the status page and the alarm: when it last signed, and since
+// when it has sent the old key (Harness 0.23.0's header) instead. Root's file.
+const SPECIALIST_FILE = process.env.CAIN_SPECIALIST_STATE ?? "/run/cain/specialist.json";
+const specialist = { signed_at: 0, old_key_since: 0, old_key_last: 0 };
+let oldKeyRelayed = 0;
+function saveSpecialist(): void {
+  const view = { ...specialist, signs_recorded: specialistSigns, signs_error: specialistMarker.error || null,
+    history_damaged_since: requests.damagedSince || null };
+  try { writeFileSync(`${SPECIALIST_FILE}.tmp`, JSON.stringify(view), { mode: 0o600 }); renameSync(`${SPECIALIST_FILE}.tmp`, SPECIALIST_FILE); }
+  catch { /* the status page shows nothing new */ }
+}
+const specialistMarker = { error: "" };
+function signedNow(): void {
+  const first = !specialist.signed_at;
+  specialist.signed_at = Date.now(); specialist.old_key_since = 0;
+  if (!specialistSigns) {
+    try { writeSynced(SIGNS, String(Date.now())); specialistSigns = true; specialistMarker.error = ""; }
+    catch (e) { specialistMarker.error = String(e).slice(0, 80); console.log(`[cain] link: couldn't record that the specialist signs (tried again at its next request): ${specialistMarker.error}`); }
+  }
+  if (first || specialistMarker.error) saveSpecialist();
+}
+// An old key from the specialist: 503 and nothing done. In the old way that's the calendar App
+// not updated yet (the run script tells Cain after 30 minutes); after the switch it means the
+// calendar App went back to 0.23.0, so Cain hears at once, at most hourly.
+function oldKeySeen(): void {
+  const now = Date.now();
+  if (!specialist.old_key_since) specialist.old_key_since = now;
+  specialist.old_key_last = now;
+  saveSpecialist();
+  if (MODE !== "old" && now - oldKeyRelayed > 3_600_000) {
+    oldKeyRelayed = now;
+    link.relayLine("The calendar App is sending its old key again, so it went back to an older version (a restore, most likely). Its cards wait at the link, none lost. Show him a new Ship card for the pull request that last updated the calendar App, so his tap installs it again, and file a note on P33 for the laptop session.");
+  }
+}
+
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
-  port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
-  fetch: linkFetch({ link, keyOk: (h) => same(h, key("harness-relay-v1")),
-    health: () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() }), toHarness, tz: process.env.CHECKIN_TZ, localOnly: LOCAL_ONLY }),
+  port: PORT, hostname: "0.0.0.0", idleTimeout: 30, maxRequestBodySize: MAX_BODY,
+  async fetch(req, server) {
+    const url = new URL(req.url);
+    const raw = req.method === "POST" ? await boundedText(req, MAX_BODY) : "";
+    if (raw === null) return json({ status: "too large" }, 413);
+    const target = url.pathname + url.search;
+    const signKey = key(SIG_CONTEXT);
+    const id = checkRequest(req.headers.get(SIG_HEADER), signKey, req.method, target, raw);
+    if (id) {
+      signedNow();
+      const signed = (status: number, body: string) => new Response(body, { status,
+        headers: { "content-type": "application/json", [SIG_HEADER]: signResponse(signKey, id, status, body) } });
+      if (req.method !== "POST") {
+        const res = url.pathname === "/health" ? health(true) : await route(req, url, "specialist", raw);
+        return signed(res.status, await res.text());
+      }
+      // Each operation once (SignedOps): done, its stored answer; still running, the first's
+      // answer; received but never done, reconciled, never simply repeated.
+      const a = await ops.run(id, url.pathname, async () => { const res = await route(req, url, "specialist", raw, id); return { status: res.status, body: await res.text() }; });
+      if (a.status === 503 && requests.damagedSince) saveSpecialist();
+      return signed(a.status, a.body);
+    }
+    const ip = server.requestIP(req)?.address ?? "";
+    const bare = req.headers.get("x-harness-key") ?? "";
+    const local = loopback(ip);
+    const relayKey = sameKey(bare, key("harness-relay-v1"));
+    const asked = { signed: false, relayKey, cainKey: !relayKey && sameKey(bare, cainKey()), local, path: url.pathname };
+    // The old key from anywhere but this machine is the specialist's: never taken (503, nothing
+    // done, so an old Harness keeps its card and retries), counted for the alarm.
+    if (relayKey && !local) oldKeySeen();
+    if (req.method === "GET" && url.pathname === "/health")
+      return health((relayKey && local && MODE === "old") || (asked.cainKey && local && MODE === "own"));
+    const d = linkDecides(MODE, asked);
+    if ("refuse" in d) return d.refuse === 503
+      ? json({ status: "upgrading", said: "the link takes only signed requests now" }, 503)
+      : json({ status: "refused" }, 403);
+    return route(req, url, d.caller as Caller, raw);
+  },
 });
-console.log(`[cain] link listening on ${PORT}`);
+// Root's own: the broker reads the cards and says what Cain sent, and the PC job keeper checks
+// his taps and tells him what it can't do (/reuse, /pc-notice). The folder is root's.
+try { rmSync(LINK_SOCK, { force: true }); } catch { /* none */ }
+Bun.serve({ unix: LINK_SOCK, idleTimeout: 30, maxRequestBodySize: MAX_BODY, fetch: rootFetch(routeDeps, MAX_BODY) });
+try { chmodSync(LINK_SOCK, 0o600); } catch (e) { console.log(`[cain] link: couldn't close its root socket to others: ${String(e).slice(0, 80)}`); }
+
+console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
+if (stateStore.lostNow())
+  link.relayLine("The link's record of cards and messages was damaged on disk (both copies) and started over, the damaged copies kept aside: buttons on cards from before now won't work, and the calendar specialist's cards from just before may need sending again (they go out as an explicit unknown, never twice). Tell Dane in one line that the Pi's storage needs a look, and keep it in PENDING until it's fixed.");
+if (requests.damagedNow)
+  link.relayLine("The link's record of what the calendar specialist asked of it is damaged on disk (both copies), so for 8 days it takes nothing new from the specialist: what the specialist sends meanwhile waits, and is dropped after 7 days, so nothing can go out twice. Tell Dane in one line that his calendar cards are paused by a storage problem on the Pi, and keep it in PENDING until it's fixed.");
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)

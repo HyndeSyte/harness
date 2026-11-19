@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "discord": {
+      "command": "/usr/local/bin/bun",
+      "args": ["/opt/cain/discord/bridge.ts"]
+    }
+  }
+}

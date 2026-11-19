@@ -286,6 +286,8 @@ export interface Card {
   posting?: Posting;                 // a post whose answer never came: it may be on Discord already
   told?: boolean;                    // Cain was told it couldn't go out by itself
   lapseTold?: boolean;               // Cain was told it expired before it reached him
+  req?: string;                      // the specialist's signed request that made it (C1): one request, one card
+  announce?: string;                 // Cain's line about it, kept until it went (C1 re-check F1)
 }
 // A card's post that began and never heard back: when (at), its buttons then (rows, as a
 // digest), who made it (the link by itself, or Cain's show) and the item it went under.
@@ -332,6 +334,7 @@ export interface Ask {               // Cain's question waiting behind the open 
 }
 export interface State {
   owner?: string; dm?: string; bot?: string; next: number;
+  saveGen?: number;                  // which save this is (publish.ts stateFile: the newer copy wins)
   cards: Record<string, Card>; messages: Record<string, Shown>;
   held?: Ask[];
   migrated?: boolean;                // the one-time look over cards posted before 0.7.0 is done
@@ -1203,7 +1206,19 @@ export class Link {
   }
 
   // -- cards from specialists -------------------------------------------------
-  async addCard(c: { text: string; rows?: any[]; kind?: string; expires?: unknown }): Promise<number> {
+  async addCard(c: { text: string; rows?: any[]; kind?: string; expires?: unknown; req?: string }): Promise<number> {
+    // A request already made a card (the link stopped before it could answer, or failed): that
+    // card, never a second one. A notice that goes out at once and isn't out yet goes now: its
+    // post is once only, by its posting mark and a look in his DM first (C1 re-check R2, R3).
+    if (c.req) {
+      const had = Object.entries(this.d.load().cards).find(([, v]) => v.req === c.req);
+      if (had) {
+        const [hid, card] = had;
+        if (DIRECT_KINDS.has(card.kind) && !card.shown && !card.outcome) await this.deliverDirect(Number(hid), card.kind);
+        this.announce(Number(hid));
+        return Number(hid);
+      }
+    }
     const kind = String(c.kind ?? "reply");
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
@@ -1224,23 +1239,46 @@ export class Link {
     const expires = toMs(c.expires);
     if (expires === null && c.expires != null && c.expires !== "")
       this.log(`card ${id}: its expiry isn't a time (${String(c.expires).slice(0, 40)}), so it has none`);
-    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due };
-    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
-    this.d.save(s);
+    // Cain's line about it, kept with the card in the same save and cleared once it went, so a
+    // request that comes again after the link stopped or failed in between tells him then.
     const flagged = w.refused.length ? flaggedLine(w.refused) : "";
+    let announce = "";
     if (DIRECT_KINDS.has(kind)) {
-      const shown = await this.show(id, { item: "none" });
-      if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
-      // A Turn back on notice with a Stop of its own: a moving Stop placed meanwhile comes off.
-      if (shown && kind === "resumed") void this.inStopQueue(() => this.placeStop());
-      if (flagged) this.d.relay(`The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`);
+      if (flagged) announce = `The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`;
     } else {
       const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
         : "Show it now if it matters today, or fold it into the morning message.";
       const flag = flagged ? ` The message gate flags its words: ${flagged}. It goes out as it is; if it matters, set it right in one line of your own after it.` : "";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
+      announce = `The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`;
     }
+    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due, ...(c.req ? { req: c.req } : {}), ...(announce ? { announce } : {}) };
+    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
+    this.d.save(s);
+    if (DIRECT_KINDS.has(kind)) await this.deliverDirect(id, kind);
+    this.announce(id);
     return id;
+  }
+
+  // Tells Cain the line kept on a card, then clears it (C1 re-check F1). A card with buttons
+  // already out by itself needs no "show it" line: he heard it went out. Should the link stop
+  // between telling him and clearing it, he's told twice: harmless, since a card is posted once
+  // however often it's shown ("already out").
+  private announce(id: number): void {
+    const card = this.d.load().cards[String(id)];
+    if (!card?.announce) return;
+    if (!card.shown || DIRECT_KINDS.has(card.kind)) this.d.relay(card.announce);
+    const s = this.d.load();
+    const c = s.cards[String(id)];
+    if (c) { delete c.announce; this.d.save(s); }
+  }
+
+  // A notice that goes out at once (Stop, Turn back on, an alert), under no item.
+  private async deliverDirect(id: number, kind: string): Promise<string> {
+    const shown = await this.show(id, { item: "none" });
+    if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
+    // A Turn back on notice with a Stop of its own: a moving Stop placed meanwhile comes off.
+    if (shown && kind === "resumed") void this.inStopQueue(() => this.placeStop());
+    return shown;
   }
 
   async show(id: number, m: { item?: unknown; question?: unknown; replyTo?: unknown }): Promise<string> {
@@ -2182,6 +2220,9 @@ export class Link {
     this.netSeen.set(key, now);
     return true;
   }
+  // When Cain last heard that the broker's record of what went out failed (discord/spool.ts).
+  private spoolToldAt = 0;
+
   async sent(n: any, o: { background?: boolean } = {}): Promise<{ status: "ok"; said: string }> {
     const ids: string[] = (Array.isArray(n?.ids) ? n.ids : []).map(String).filter((x: string) => SNOWFLAKE.test(x)).slice(0, 10);
     if (!ids.length) throw new Refusal("needs the ids of what went out");
@@ -2220,6 +2261,13 @@ export class Link {
     if (tool === "reply" && n?.links === true) void this.quietReplies(ids.filter((id) => !this.linkPosted(s, id)));
     const net = netOf(n?.net);
     if (net && this.firstTime(call, tool, ids, net)) this.d.relay(netLine(tool, last, net));
+    // The broker's record of what went out failed (C1 re-check R5): Cain hears, at most every 6
+    // hours, so a disk that refuses writes doesn't go unnoticed.
+    const spoolProblem = typeof n?.spool_problem === "string" ? n.spool_problem.replace(/\s+/g, " ").trim().slice(0, 300) : "";
+    if (spoolProblem && now - this.spoolToldAt > 6 * 3_600_000) {
+      this.spoolToldAt = now;
+      this.d.relay(`The Discord broker says ${spoolProblem}. Nothing to tell him the first time. If it happens again, the Pi's storage needs a look: tell Dane in one line, and keep it in PENDING until it's fixed.`);
+    }
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;
     return { status: "ok", said: "Noted." };

@@ -268,15 +268,63 @@ describe("the gate report tells an unknown host from a refused preview flag", ()
 });
 
 // -- 5. the secret scan's baseline -------------------------------------------------------------------------
+// The baseline's shape: every line is a "#" comment, blank, or one gitleaks fingerprint
+// (commit:path:rule:line) for a file in this repository, right under a "#" line giving its reason.
+// An entry outside the tests, fixtures or docs needs its reason to say "not a test file:" and why.
+// Returns the problems found, empty when the file is well formed.
+function baselineProblems(text: string, root: string): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  const lines = text.split("\n");
+  lines.forEach((raw, i) => {
+    const line = raw.trimEnd();
+    if (line === "" || line.startsWith("#")) return;
+    const at = `line ${i + 1}`;
+    const m = /^([0-9a-f]{40}):(.+):([a-z0-9]+(?:-[a-z0-9]+)*):([1-9][0-9]*)$/.exec(line);
+    if (!m) { problems.push(`${at}: not a fingerprint (commit:path:rule:line): ${line}`); return; }
+    const path = m[2];
+    if (path.startsWith("/") || path.split("/").some((p) => p === ".." || p === "." || p === "")) {
+      problems.push(`${at}: not a path in this repository: ${path}`);
+    } else if (!existsSync(join(root, path))) problems.push(`${at}: no such file in this repository: ${path}`);
+    if (seen.has(line)) problems.push(`${at}: duplicate: ${line}`);
+    seen.add(line);
+    const before = i > 0 ? lines[i - 1].trim() : "";
+    const reason = before.startsWith("#") ? before.slice(1).trim() : "";
+    if (!reason) { problems.push(`${at}: no reason comment on the line above: ${line}`); return; }
+    const inTests = path.split("/").slice(0, -1).some((p) => p === "tests" || p === "fixtures" || p === "__tests__" || p === "docs");
+    if (!inTests && !/not a test file:\s*\S/.test(reason)) {
+      problems.push(`${at}: ${path} is outside the tests, fixtures and docs and its reason doesn't say why ("not a test file: ...")`);
+    }
+  });
+  return problems;
+}
+
 describe("the secret scan honours a baseline", () => {
-  test("an empty .gitleaksignore with its reasons, read by both scans, and RELEASING.md's dates", () => {
+  test(".gitleaksignore has the baseline's shape, read by both scans, and RELEASING.md's dates", () => {
     const ignore = join(ROOT, ".gitleaksignore");
     expect(existsSync(ignore)).toBe(true);
-    expect(readFileSync(ignore, "utf8").split("\n").filter((l) => l.trim() && !l.startsWith("#"))).toEqual([]);
+    expect(baselineProblems(readFileSync(ignore, "utf8"), ROOT)).toEqual([]);
     const yml = readFileSync(join(ROOT, ".github", "workflows", "tests.yml"), "utf8");
     expect(yml.split("--gitleaks-ignore-path .gitleaksignore").length).toBe(3);
     const rel = readFileSync(join(ROOT, "RELEASING.md"), "utf8");
     expect(rel).toContain("Nov 25, 2026");
     expect(rel).toContain("once a week of its runs shows no network failures");
+  });
+
+  test("the shape check is strict: no reason, a bad line, a duplicate, a stray path each fail", () => {
+    const sha = "0123456789abcdef0123456789abcdef01234567";
+    const fp = `${sha}:cain/tests/c1.test.ts:generic-api-key:12`;
+    expect(baselineProblems(`# a header\n\n# a made-up test key\n${fp}\n`, ROOT)).toEqual([]);
+    expect(baselineProblems(`# a header\n\n${fp}\n`, ROOT)).toEqual([`line 3: no reason comment on the line above: ${fp}`]);
+    expect(baselineProblems(`#\n${fp}\n`, ROOT)[0]).toContain("no reason comment");
+    expect(baselineProblems(`# why\n${fp}\n# why\n${fp}\n`, ROOT)).toEqual([`line 4: duplicate: ${fp}`]);
+    expect(baselineProblems(`# why\n${sha}:cain/tests/c1.test.ts::12\n`, ROOT)[0]).toContain("not a fingerprint");
+    expect(baselineProblems(`# why\n   \n${sha}:cain/tests/c1.test.ts:generic-api-key:0\n`, ROOT)[0]).toContain("not a fingerprint");
+    expect(baselineProblems(`# why\nabc:cain/tests/c1.test.ts:rule:1\n`, ROOT)[0]).toContain("not a fingerprint");
+    expect(baselineProblems(`# why\n${sha}:cain/tests/nope.ts:rule:1\n`, ROOT)[0]).toContain("no such file");
+    expect(baselineProblems(`# why\n${sha}:../etc/passwd:rule:1\n`, ROOT)[0]).toContain("not a path in this repository");
+    expect(baselineProblems(`# why\n${sha}:/etc/passwd:rule:1\n`, ROOT)[0]).toContain("not a path in this repository");
+    expect(baselineProblems(`# a value\n${sha}:cain/config.yaml:rule:1\n`, ROOT)[0]).toContain("outside the tests");
+    expect(baselineProblems(`# not a test file: a public key\n${sha}:cain/config.yaml:rule:1\n`, ROOT)).toEqual([]);
   });
 });

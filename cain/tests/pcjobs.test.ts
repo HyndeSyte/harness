@@ -15,7 +15,7 @@ import {
   addressCtxFor, PLANS, resultLines, reportValues, carriesReport, riskyEntry, unapprovedValues,
   type Allow, type Job, type Result,
 } from "../rootfs/opt/cain/pcjobs/core.ts";
-import { heartbeatLine, heartbeatNotice, readHeartbeat, readJobs, readResult, round, type Config } from "../rootfs/opt/cain/pcjobs/main.ts";
+import { heartbeatLine, heartbeatNotice, readHeartbeat, readJobs, readResult, requestText, round, type Config } from "../rootfs/opt/cain/pcjobs/main.ts";
 import {
   allowedTools, canaryOk, confirmProfile, fingerprint, inventory, launchSession, navGuard, next, outsideConfig, parseInstall, parseStream, probe,
   hookMain, navDecide, guardCheck, endCheck, tabsFrom, envProblem, baseEnv, sessionEnv, chromeBusy, claudeSessions, readNavLog, allowedEnd,
@@ -911,6 +911,29 @@ describe("Cain's keeper", () => {
     expect(q.outcome(stranger)).toMatchObject({ state: "refused", reason: "only Cain's jobs are accepted" });
     expect(readdirSync(q.cfg.queue)).toEqual([]);
     expect(readJobs(q.cfg.dir).map((j) => j.id)).toEqual([o.id]);
+  });
+
+  // C1: Cain's own user writes the queue folder and the keeper reads it as root, so anything but a
+  // plain file there (a link to a root-only file, a folder) is refused unread and removed, its target untouched.
+  test.skipIf(WIN)("a link or a folder in the queue folder is refused unread, and what a link points at is left alone", () => {
+    const q = queueRig({ attributes: false });
+    const secret = join(dirname(q.cfg.queue), "root-only.env");
+    writeFileSync(secret, `{"from": "cain", "job": ${JSON.stringify(READ)}}`);   // even one that would parse as a good job
+    symlinkSync(secret, join(q.cfg.queue, "pc-0901.json"));
+    mkdirSync(join(q.cfg.queue, "pc-0902.json"));
+    // A pipe never blocks the keeper (opened without waiting), and a big file is read no further than 8001 bytes.
+    const fifo = Bun.which("mkfifo") ? Bun.spawnSync(["mkfifo", join(q.cfg.queue, "pc-0903.json")]).exitCode === 0 : false;
+    writeFileSync(join(q.cfg.queue, "pc-0904.json"), "x".repeat(1_000_000));
+    const good = q.ask(READ);
+    expect(round(q.cfg)).toEqual({ ok: true, queued: 1, refused: fifo ? 4 : 3 });
+    for (const rid of ["pc-0901", "pc-0902", ...(fifo ? ["pc-0903"] : [])])
+      expect(q.outcome(rid)).toEqual(expect.objectContaining({ state: "refused", reason: "a job request is a plain file" }));
+    expect(q.outcome("pc-0904")).toEqual(expect.objectContaining({ state: "refused", reason: "a job request is at most 8000 bytes" }));
+    expect(requestText(join(q.cfg.queue, "..", "root-only.env"))).toContain('"from": "cain"');   // a plain file reads as it is
+    expect(q.outcome(good)).toMatchObject({ state: "queued" });
+    expect(readdirSync(q.cfg.queue)).toEqual([]);
+    expect(readFileSync(secret, "utf8")).toContain('"from": "cain"');          // the link's target is still there, untouched
+    expect(readJobs(q.cfg.dir)).toHaveLength(1);                                // only the plain file's job went in
   });
 
   test("refuses every irreversible job, even with a good token, until the confirm path ships", () => {

@@ -3,16 +3,21 @@
 // A link to a host off the list is never held, only noted in the gate report.
 //   bun hosts.ts add <host>     keeper.sh link-host <host>: adds one, says what the list holds
 //   bun hosts.ts list           the list as the gate reads it
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { CAIN_UID, readOwned } from "../owned";
 import { LINK_HOSTS, readHostList } from "./cain";
 
 export const HOSTS_FILE = process.env.CAIN_LINK_HOSTS ?? "/data/work/link-hosts.txt";
 
+// A file of Cain's, read by root too (the link, and the gate in the broker) since he runs as his own
+// user (0.13.1): read as his own files are (../owned.ts), never through a symlink, a FIFO or another's file.
 export function readHosts(path = HOSTS_FILE): Set<string> {
-  let text: string | null = null;
-  try { text = readFileSync(path, "utf8"); } catch { /* none added yet */ }
-  return readHostList(text);
+  // His file (root reading it), or the reader's own (Cain's keeper.sh, or root the old way).
+  let got = readOwned(path, CAIN_UID, 256 * 1024);
+  const me = process.getuid?.();
+  if (!got.ok && got.why === "not his" && me !== undefined && me !== CAIN_UID) got = readOwned(path, me, 256 * 1024);
+  return readHostList(got.ok ? got.text : null);
 }
 
 // One host added: lower case, a name with a dot, no scheme, path or port.
