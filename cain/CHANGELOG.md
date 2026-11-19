@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.4
+
+- Cain answers again. Since the switch to his own user on Nov 19, his session restarted every two and a half minutes all day, so your messages reached nothing. Half a minute after each start, the App listed his connectors to its log; listing them starts each one, his Discord link too, and that took his Discord channel away from his running session. The App then saw the channel down and restarted him, and the next listing took it again. The App no longer lists his connectors while he runs as his own user. Nothing they did is lost: the switch had already checked them all.
+- You now hear when Cain keeps restarting. Two minutes after each start the App counted his session as running and reset its count of restarts, even with his Discord channel down, so the third-restart alarm to your phone never came. A session now counts as running only while his Discord channel is connected, and restarts for a channel that went down are counted on their own, reset only after ten steady minutes: at the third you hear Cain isn't answering, however late in a session the channel drops.
+- How it was checked: a test starts the whole App with his channel down and shows the restarts lead to the alarm (it fails on 0.13.3), that a channel dropping after he counts as running still leads to the alarm, and that a connected channel takes the alarm down with no restart. A second test shows no listing runs while he's on his own user.
+
 ## 0.13.3
 
 - The move to Cain's own user no longer fails because his connectors (Gmail, his calendars, GitHub, Canva and the rest) wouldn't load under his new rules. Those rules allowed only one address, and Claude Code checks each connector at its own address, so all of them were refused. Every connector now loads, while only the App's own Discord link may run on the Pi, no other plugin or marketplace can be added, and every write tool stays switched off.

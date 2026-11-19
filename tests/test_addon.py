@@ -876,6 +876,101 @@ def test_the_whole_start_never_leaves_him_unchecked_when_tmux_hangs(tmp_path):
     assert not any(l.startswith("check.sh") for l in lines)              # never counted as running, never passed
 
 
+def test_the_whole_start_tells_dane_when_his_channel_keeps_going_down(tmp_path):
+    """Nov 19: his session started, passed its check and ran two minutes, but its Discord channel
+    was down by then every time, so the watchdog restarted him every two and a half minutes all
+    day. Two minutes of running reset the count of quick ends each time, and Dane never heard.
+    A session counts as running only while its channel is connected: one that keeps losing it is
+    restarted later each time, and at the third Dane hears Cain isn't answering."""
+    import shutil
+    import time
+    if not shutil.which("bash") or not shutil.which("jq") or os.name == "nt":
+        pytest.skip("needs bash, jq and a POSIX process model")
+    calls, stop, bindir, runc = _whole_start(tmp_path, **{"as-cain": _session_up(tmp_path), "c1/check.sh": "exit 0"})
+    runc.mkdir(parents=True, exist_ok=True)
+    (runc / "discord.state").write_text(f"down {int(time.time()) - 600}\n")
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
+    assert alive, err
+    starts = [l for l in lines if "new-session" in l]
+    assert len(starts) >= 3 and "notice.sh tell session" in lines, lines[:40]
+    assert "notice.sh clear switched" not in lines, lines[:40]           # never counted as running
+    # A connected channel does count: the alarm comes down and nothing is restarted.
+    calls.unlink()
+    stop.unlink()
+    (runc / "discord.state").write_text(f"connected {int(time.time())}\n")
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh clear switched" in l,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
+    assert alive, err
+    assert "notice.sh clear switched" in lines and sum("new-session" in l for l in lines) == 1, lines[:40]
+
+
+def test_the_whole_start_tells_dane_when_his_channel_drops_after_he_counts_as_running(tmp_path):
+    """The outside review's case: the channel is connected when the session is counted as running,
+    then drops. Channel restarts are counted apart from quick ends, so that reset doesn't hide them:
+    at the third Dane hears it, and the alarm isn't taken down again by the next session's two
+    minutes while restarts are still counted."""
+    import shutil
+    if not shutil.which("bash") or not shutil.which("jq") or os.name == "nt":
+        pytest.skip("needs bash, jq and a POSIX process model")
+    state = (tmp_path / "run" / "cain" / "discord.state").as_posix()
+    seen = (tmp_path / "watched").as_posix()
+    up, proc = (tmp_path / "session").as_posix(), (tmp_path / "proc" / "4242").as_posix()
+    # Each start connects the channel (and forgets how often the loop has looked); the loop's
+    # second look in a session finds it dropped, long ago.
+    as_cain = (f'case "$*" in *new-session*) touch {up}; mkdir -p {proc}; rm -f {seen}; '
+               f'printf "State:\\tS (sleeping)\\nUid:\\t1000\\t1000\\t1000\\t1000\\n" > {proc}/status; '
+               f'echo "connected $(date +%s)" > {state};; '
+               f'*has-session*) [ -f {up} ] || exit 1;; *kill-session*) exit 1;; esac; exit 0')
+    watch = (f'echo x >> {seen}\n'
+             f'[ "$(wc -l < {seen})" = 2 ] && echo "down $(( $(date +%s) - 600 ))" > {state}\nexit 0')
+    calls, stop, bindir, runc = _whole_start(tmp_path, **{"as-cain": as_cain, "c1/check.sh": "exit 0", "watch.sh": watch})
+    runc.mkdir(parents=True, exist_ok=True)
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
+    assert alive, err
+    assert "notice.sh tell session" in lines, lines[:60]
+    starts = [i for i, l in enumerate(lines) if "new-session" in l]
+    told = lines.index("notice.sh tell session")
+    assert len([i for i in starts if i < told]) == 3, lines[:60]
+    clears = [i for i, l in enumerate(lines) if l == "notice.sh clear switched"]
+    assert clears and clears[0] < starts[1], lines[:60]                 # the first session did count as running
+    assert not any(starts[1] < i for i in clears), lines[:60]           # none after a channel restart
+
+
+def test_his_connectors_are_never_listed_while_he_runs_as_his_own_user(tmp_path):
+    """Nov 19: `claude mcp list` starts every connector to check it, his Discord link too, and the
+    broker gives the channel to the newest connection, so the listing 30 seconds after each start
+    took the channel from his running session. The new way never runs it; the old way still does
+    (the switch needs the names)."""
+    import shutil
+    import subprocess
+    if not shutil.which("bash"):
+        pytest.skip("no bash")
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
+    start = run.index("list_connectors() {")
+    fn = run[start:run.index("\n}\n", start) + 3]
+    assert "mcp list" not in fn[:fn.index('if [ "$mode" != old ]')]
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    ran = tmp_path / "ran"
+    (bindir / "claude").write_text(f'#!/bin/bash\necho "$*" >> {ran.as_posix()}\n')
+    (bindir / "claude").chmod(0o755)
+    (tmp_path / "opt").mkdir()
+    (tmp_path / "opt/as-cain").write_text(f'#!/bin/bash\necho "as-cain $*" >> {ran.as_posix()}\n')
+    (tmp_path / "opt/as-cain").chmod(0o755)
+    data = tmp_path / "data"
+    (data / "c1").mkdir(parents=True)
+    for mode in ("own", "none"):
+        (tmp_path / "list.sh").write_text(f"set -o errexit -o nounset -o pipefail\nmode={mode}\nOPT={(tmp_path / 'opt').as_posix()}\n"
+                                          + fn.replace("/data/", f"{data.as_posix()}/") + "\nlist_connectors\n")
+        env = {**os.environ, "PATH": f"{bindir.as_posix()}:{os.environ.get('PATH', '')}"}
+        out = subprocess.run(["bash", (tmp_path / "list.sh").as_posix()], capture_output=True, text=True, env=env)
+        assert out.returncode == 0 and "not listed" in out.stdout, (mode, out.stdout, out.stderr[-300:])
+        assert not ran.exists(), mode
+    assert not (data / "c1/connectors-before").exists()
+
+
 def test_an_end_of_the_start_is_told_but_not_a_stop_by_signal(tmp_path):
     """The start's exit trap: should it ever end on a fault (errexit) or an exit, Dane hears his App
     stopped itself (the finish script halts the container next); when a signal ends it, as when the
