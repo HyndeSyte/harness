@@ -1,0 +1,3 @@
+# Made-up private terms for the tests. One a line, matched whole-word, any case.
+Juniper
+re:surprise\w*

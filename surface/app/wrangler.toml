@@ -1,0 +1,7 @@
+# Cloudflare Pages, for the app's web build (surface/README.md, Deploy). Not deployed yet.
+# Build (root surface/app): bun install --frozen-lockfile --ignore-scripts && bun scripts/check-sdk.mjs &&
+#   bunx expo export --platform web && bun scripts/check-dist.mjs
+# The whole hostname sits behind Cloudflare Access; /snapshot on it is the Worker's route.
+name = "surface"
+pages_build_output_dir = "dist"
+compatibility_date = "2026-11-01"

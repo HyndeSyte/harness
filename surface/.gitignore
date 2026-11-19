@@ -1,0 +1,4 @@
+# Dev keys (bun run surface/dev.ts makes them). A private key is never committed.
+.dev/
+*.key
+*.pem

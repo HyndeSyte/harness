@@ -1,0 +1,33 @@
+{
+  "owner_names": [
+    "Robin"
+  ],
+  "names": [
+    "Morgan Vale"
+  ],
+  "exclude_stems": [
+    "lawyer"
+  ],
+  "areas": [
+    "surface",
+    "harness",
+    "garden"
+  ],
+  "allow_words": [
+    "CI",
+    "Worker",
+    "Surface",
+    "Build",
+    "Calendar",
+    "Laptop",
+    "Digest",
+    "Shelves",
+    "Domain",
+    "Drill",
+    "Fence",
+    "Notes",
+    "Skip",
+    "Ladder",
+    "Gate"
+  ]
+}

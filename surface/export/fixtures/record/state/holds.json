@@ -1,0 +1,24 @@
+{
+  "P40": {
+    "holder": "cain",
+    "for": "Build the surface's first piece.",
+    "branches": ["claude/surface-in-motion"],
+    "job": "build-surface-in-motion",
+    "taken": "2026-11-18T08:05:00Z",
+    "renewed": "2026-11-18T09:40:00Z"
+  },
+  "P43": {
+    "holder": "laptop:desk",
+    "for": "Printer driver at the desk laptop.",
+    "branches": [],
+    "taken": "2026-11-12T19:00:00Z",
+    "renewed": "2026-11-12T20:15:00Z"
+  },
+  "P45": {
+    "holder": "cain",
+    "for": "Drafting the note.",
+    "branches": [],
+    "taken": "2026-11-11T10:00:00Z",
+    "renewed": "2026-11-11T10:00:00Z"
+  }
+}
