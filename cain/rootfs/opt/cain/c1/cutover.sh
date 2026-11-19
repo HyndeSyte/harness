@@ -216,7 +216,11 @@ if [ "$state" = fresh ]; then
   if [ -n "$(tail -n +2 "$C/connectors-before")" ]; then
     listed="$("$OPT/as-cain" env CLAUDE_CODE_PLUGIN_SEED_DIR="$OPT/plugin-seed" DISABLE_AUTOUPDATER=1 timeout 180 claude mcp list 2>/dev/null || true)"
     missing="$(printf '%s\n' "$listed" | sed -n 's/^\(claude\.ai [^:]*\):.*/\1/p' | sort -u | comm -13 - <(tail -n +2 "$C/connectors-before"))"
-    [ -z "$missing" ] || abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
+    # The App's log gets every name missing, whole; the line kept for Dane's alarm stays short.
+    if [ -n "$missing" ]; then
+      log "his connectors missing under his new rules ($(printf '%s\n' "$missing" | wc -l) of $(tail -n +2 "$C/connectors-before" | wc -l)): $(printf '%s' "$missing" | tr '\n' ',' | sed 's/,/, /g')"
+      abort "his connectors wouldn't all load under his new rules (missing: $(printf '%s' "$missing" | tr '\n' ',' | cut -c1-200))"
+    fi
   fi
   kp validate-1
   # Whatever the validation started is ended, not trusted to have ended: every process of uid

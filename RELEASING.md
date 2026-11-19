@@ -239,6 +239,11 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
 4. Run the tests:
    - Python: `python -m pytest -q -p no:cacheprovider` from the repo root.
    - Cain: `bun test cain/tests` (install Bun if missing).
+   - A change to Cain's managed settings (`cain/rootfs/opt/cain/settings.json`) also needs
+     the connector check, `cain/tools/connector-check.sh`, on a machine where Claude Code is
+     signed in to Cain's account (CI has none; `cain/docs/connector-check.md`). It fails
+     loudly with no account signed in. A session that can't run it says so under "Not
+     verified"; its passing line goes in the description before the Ship card.
 5. Commit as `HyndeSyte <HyndeSyte@users.noreply.github.com>` (GitHub rejects pushes
    that expose a private email). Message: `<App> <version>: <what, in a line>`.
 6. Push the branch and open a pull request into `main`. The description follows the
@@ -305,13 +310,20 @@ for 2 hours, without which Cain can't start the job.
    doesn't answer, stop: install nothing, change nothing, and end with one line,
    `Home Assistant connector: needs signing in again` (or `no answer`). main keeps
    the commit; only the install waits (If Home Assistant's connector lapses, below).
-3. In Home Assistant: check for App updates, then update only the App(s) the pull
+3. When the pull request changes Cain's managed settings (`cain/rootfs/opt/cain/settings.json`),
+   run `cain/tools/connector-check.sh` from a clone at that commit before installing Cain. It
+   fails because a connector is missing: install nothing, and end with
+   `Connector check: failed` and the names it printed. It fails because no account is signed
+   in here: go on only if the pull request description carries `Connector check passed at
+   <that full sha>` from a signed-in machine, and otherwise install nothing and end with
+   `Connector check: not run (no signed-in account), and no passing line for this head`.
+4. In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. When it changed both, Cain first, then
    Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness
    with 503, so its cards wait, none lost, until Harness signs). An App already at its
    new version is skipped. Nothing else in Home Assistant: no options, no other Apps,
    no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
-4. Confirm the new version is running from the update result and the App's log.
+5. Confirm the new version is running from the update result and the App's log.
 
 The job is a cloud session, not a process on the Pi: Home Assistant's Supervisor does
 each update, so replacing Cain's container doesn't stop the job before Harness. If the
