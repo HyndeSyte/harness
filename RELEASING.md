@@ -399,6 +399,19 @@ ruleset still applies to it: the commit's checks must have passed, and no force 
 deletion. Then install the App with a backup taken first, so a bad release can be
 rolled back from Home Assistant.
 
+What the first use taught (Nov 19, Cain 0.13.4, when Cain restarted every few minutes and
+couldn't show a Ship card):
+
+- Cain itself can't ship either when its session can't stay up, not only when the link is
+  broken: break glass covers that too.
+- The laptop's push guard (`cain/tools/record-prepush.ts`) refuses every session push to
+  `main`, since `main` is never held, so this push needs `--no-verify`. Ask Dane once for
+  both: "OK to install <App and version> without a Ship card, by the backup route, skipping
+  the push guard for that one push?" Never skip it on the first OK alone.
+- The key can be added and deleted with `gh api repos/HyndeSyte/harness/keys` (title it as
+  break glass, `read_only=false`), no web page needed. Delete it in the same command that
+  pushes, whatever the push does, and list the keys after: only the link's is left.
+
 ## Rules for every session
 
 - No secrets in code, commits, logs, pull requests or reports. Don't print tokens.
