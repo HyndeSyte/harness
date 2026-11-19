@@ -6,7 +6,7 @@
 // Each finished review's Reviewed line is published to /data/trust/reviewed.json
 // (../reviewed.ts) before Cain hears it's done, and the file is rebuilt from the queue
 // at start, so it survives a restart.
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, chownSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
@@ -79,8 +79,11 @@ function writeAtomic(path: string, text: string) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = join(dirname(path), `.${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
   // Readable by the folder's group (C1: his user's group), so review.sh can show status and
-  // results to him; only root writes here.
+  // results to him; only root writes here. A file already there keeps its group and mode: in
+  // /data (no setgid) a new one would come out root:root, and lock.sh's root:cain on the spend
+  // and health files was lost at the first rewrite (Cain 0.13.5).
   writeFileSync(tmp, text, { mode: 0o640 });
+  try { const s = statSync(path); chownSync(tmp, s.uid, s.gid); chmodSync(tmp, s.mode & 0o777); } catch { /* a new file */ }
   renameSync(tmp, path);
 }
 function readJson<T>(path: string, fallback: T): T {

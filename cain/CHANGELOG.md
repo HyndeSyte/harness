@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.5
+
+- Cain can start his Build and Ship jobs again. Since his move to his own user, every one was refused: the record keeper's list of who holds what, which his job check reads, was rewritten readable only by the App's administrator, so the check couldn't read it. The keepers now keep each file's owner and permissions when they rewrite it, so the list, and the review spend and health files his check-ins read, stay readable to him.
+- Cain's own read of the record works without his stopgap: the App's image trusts the record's folder for git, which otherwise refuses a folder another user owns.
+- How it was checked: a test rewrites the holds list and a review file under a strict setting and shows each keeps its permissions and group; the record and review tests pass.
+
 ## 0.13.4
 
 - Cain answers again. Since the switch to his own user on Nov 19, his session restarted every two and a half minutes all day, so your messages reached nothing. Half a minute after each start, the App listed his connectors to its log; listing them starts each one, his Discord link too, and that took his Discord channel away from his running session. The App then saw the channel down and restarted him, and the next listing took it again. The App no longer lists his connectors while he runs as his own user. Nothing they did is lost: the switch had already checked them all.

@@ -51,6 +51,9 @@ RUN groupadd -g 1000 cain && useradd -u 1000 -g cain -d /data/cain -M -s /bin/ba
 
 COPY rootfs /
 RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh /opt/cain/c1/*.sh /opt/cain/as-cain
+# The record keeper's copy (/data/record) is root's; record.sh reads it as cain, and git refuses
+# a repository another user owns (Nov 19, Cain 0.13.5).
+RUN git config --system --add safe.directory /data/record
 
 # The Discord plugin, pinned in the image (/opt/cain/discord/pin.json), fetched only here:
 #   - the seed Claude Code loads it from (CLAUDE_CODE_PLUGIN_SEED_DIR, read only, never
@@ -92,6 +95,6 @@ RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.13.4" \
+    io.hass.version="0.13.5" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"
