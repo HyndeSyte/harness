@@ -26,16 +26,7 @@
 # where no one answers it: unstick.sh), "deliver" (what the App types into his session doesn't go
 # in, or his screen waits at a sign-in: watch.sh) and "phone" (its alarms to his phone failed their
 # test). Within a group a newer alarm replaces the last.
-# Each says what happened, in plain words: it reaches him as it is, and hands him no step. A hard
-# stop (breach, switch-stopped, damaged, exited, setup), where no automatic path exists, also names
-# the backups, after "A fixed update also brings him back". The others the App deals with itself
-# (Cain 0.13.3): "restart", "switch-blocked", "held", "session", "waiting" and "stalled" are kept
-# for the App and reach no one at first. Still on with no clear after their window (30 minutes for
-# a switch or restart, an hour for the others), the run script's watcher has the Supervisor restart
-# the App, once (notice.sh restart-due), and only when the alarm is raised again after that
-# restart and still stands a window later does it reach Dane, saying the App restarted itself and
-# what it saw. A switch that undid itself safely and runs him the old way ("switch-restart") posts
-# no alarm at all: one line goes to Cain through the relay queue, for his morning update. When one
+# Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
 # is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
 # here runs without the lock: a writer that can't have it within 30 seconds exits 75, and the
@@ -50,12 +41,7 @@
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
 #   notice.sh hooked                 0 when notice_hook is set, well formed (no lock)
-#   notice.sh restart-due            the groups whose alarm is due the App's one restart, marked as
-#                                    restarted, one a line (exit 1 when none): the run script's
-#                                    watcher then asks the Supervisor for it
-#   notice.sh restart-undo <group>.. the Supervisor didn't take that restart: unmarked, so it's due again
-#   notice.sh text <alarm> [cause] [restarted at, epoch]   an alarm's title and text, one line each
-#                                    (tests, docs); with a time, the text after the App's restart
+#   notice.sh text <alarm> [cause]   an alarm's title and text, one line each (tests, docs)
 # Exits 0 when done, 1 when something stays to be kept or sent (said on stderr), 2 on a wrong
 # use, 75 when it couldn't have the lock.
 set -uo pipefail
@@ -71,17 +57,11 @@ OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
 GROUPS_ALL="stop session switch screen deliver phone"
-WINDOW_S="${NOTICE_WINDOW_S:-3600}"               # an alarm the App deals with itself: an hour
-SWITCH_WINDOW_S="${NOTICE_SWITCH_WINDOW_S:-1800}" # 30 minutes for a switch or restart
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
+RESTART="restart the Cain App: Settings, Apps, Cain, Restart"
 DETAILS="The Cain App's log has the details."
-HARD="A fixed update also brings him back. To get him back now, $BACKUPS."
-# The alarms the App deals with itself, by restarting itself once, and their windows.
-self_heals() { case "$1" in restart|switch-blocked|held|session|waiting|stalled) return 0 ;; *) return 1 ;; esac; }
-window_of() { case "$1" in restart|switch-blocked) echo "$SWITCH_WINDOW_S" ;; *) echo "$WINDOW_S" ;; esac; }
-at() { date -d "@$1" '+%-I:%M %p' 2>/dev/null || echo "a while ago"; }
 group_of() {
   case "$1" in
     breach|switch-stopped|switch-blocked|damaged|setup|restart|switch-restart|exited|held) echo stop ;;
@@ -93,51 +73,37 @@ group_of() {
     *) return 1 ;;
   esac
 }
-alarm() {   # alarm <kind> [cause] [restarted at]: sets T (its title) and M (its text); 1 for no such alarm.
-  # With a restart time, the text Dane gets once the App's own restart didn't clear it.
-  local c="${2:+ (${2})}" r="${3:-}"
-  [ "${r:-0}" != 0 ] || r=""
+alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for no such alarm
+  local c="${2:+ (${2})}"
   case "$1" in
     breach) T="Cain is stopped"
-      M="Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. $HARD $DETAILS" ;;
+      M="Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. To get him back now, $BACKUPS. A fixed update also brings him back. $DETAILS" ;;
     switch-stopped) T="Cain is stopped"
-      M="Cain is stopped: his move to a safer setup stopped part way. $HARD $DETAILS" ;;
+      M="Cain is stopped: his move to a safer setup stopped part way. To get him back, $BACKUPS. $DETAILS" ;;
     damaged) T="Cain is stopped"
-      M="Cain is stopped: his saved start state is damaged, so he isn't started. $HARD $DETAILS" ;;
+      M="Cain is stopped: his saved start state is damaged, so he isn't started. To get him back, $BACKUPS. $DETAILS" ;;
     setup) T="Cain is stopped"
-      M="Cain is stopped: his App's safety setup didn't check out at start, so he isn't started. $HARD $DETAILS" ;;
+      M="Cain is stopped: his App's safety setup didn't check out at start, so he isn't started. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+    restart) T="Cain is stopped for a moment"
+      M="Cain is stopped for a moment: his App is restarting itself to start him clean. Nothing for you to do." ;;
+    switch-restart) T="Cain is stopped for a moment"
+      M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone, and his App is restarting itself to run him the old way for now. Nothing for you to do." ;;
     exited) T="Cain is stopped"
-      M="Cain is stopped: his App ran into something it couldn't get past and stopped itself. $HARD $DETAILS" ;;
-    restart) if [ -n "$r" ]; then T="Cain is still stopped"
-        M="Cain is still stopped: his App needed a fresh start to run him clean${c}, so it restarted itself at $(at "$r"), and he still isn't back after that. The App keeps trying by itself. $DETAILS"
-      else T="Cain is stopped for a moment"
-        M="Cain is stopped for a moment: his App is restarting itself to start him clean${c}. Nothing for you to do."; fi ;;
-    switch-restart) T="Cain's move waits for a fresh start"
-      M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone safely, and his App is restarting itself to run him the old way for now. Nothing for you to do." ;;
-    held) if [ -n "$r" ]; then T="Cain is still paused"
-        M="Cain is still paused: the safety check of his own user couldn't finish, so his session is held. This isn't a breach. The App restarted itself at $(at "$r") to clear it, and the check still couldn't finish after that. It tries again every 10 minutes, and he comes back by himself once it finishes. $DETAILS"
-      else T="Cain is paused"
-        M="Cain is paused: the safety check of his own user couldn't finish, so his session is held. This isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. Nothing for you to do."; fi ;;
-    session) if [ -n "$r" ]; then T="Cain still isn't answering"
-        M="Cain still isn't answering: his session keeps stopping soon after it starts. The App restarted itself at $(at "$r") to clear it, and it kept happening after that. It keeps starting his session again by itself. $DETAILS"
-      else T="Cain isn't answering"
-        M="Cain isn't answering: his session keeps stopping soon after it starts. The App keeps starting it again by itself. Nothing for you to do."; fi ;;
+      M="Cain is stopped: his App ran into something it couldn't get past and stopped itself. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+    held) T="Cain is paused"
+      M="Cain is paused: the safety check of his own user couldn't finish, so his session is held. This isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. If he isn't back within an hour, $BACKUPS. $DETAILS" ;;
+    session) T="Cain isn't answering"
+      M="Cain isn't answering: his session keeps stopping soon after it starts. The App keeps starting it again by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     switch-failed) T="Cain is back on the old way for now"
       M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone and his App went back to the old way. Nothing for you to do: the App tries again by itself, at most three times in six hours. If he doesn't answer you, you'll hear that too." ;;
     switch-waits) T="Cain is back on the old way for now"
       M="Cain's move to his own user didn't pass its checks three times${2:+ (the last: ${2})}, so his App went back to the old way and waits six hours before it tries again. Nothing for you to do. If he doesn't answer you, you'll hear that too." ;;
-    switch-blocked) if [ -n "$r" ]; then T="Cain is still stopped"
-        M="Cain is still stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. The App restarted itself at $(at "$r") to try again, and he still isn't back after that. $DETAILS"
-      else T="Cain is stopped"
-        M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing, and the App restarts itself to try again. Nothing for you to do."; fi ;;
-    waiting) if [ -n "$r" ]; then T="Cain still isn't answering"
-        M="Cain still isn't answering: a question keeps waiting on his screen, where no one answers it. The App restarted itself at $(at "$r") to clear it, and it came back after that. $DETAILS"
-      else T="Cain isn't answering"
-        M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and the App couldn't clear it yet. It restarts itself to clear it. Nothing for you to do."; fi ;;
-    stalled) if [ -n "$r" ]; then T="Cain still isn't getting messages"
-        M="Cain still isn't getting messages: what the App types into his session (your taps, his check-ins) doesn't go in${c}. The App restarted itself at $(at "$r") to clear it, and it still doesn't go in after that. It keeps trying by itself. $DETAILS"
-      else T="Cain isn't getting messages"
-        M="Cain isn't getting messages: what the App types into his session (your taps, his check-ins) hasn't gone in for a while${c}. The App keeps trying, and clears what it can by itself. Nothing for you to do."; fi ;;
+    switch-blocked) T="Cain is stopped"
+      M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+    waiting) T="Cain isn't answering"
+      M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and the App couldn't clear it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    stalled) T="Cain isn't getting messages"
+      M="Cain isn't getting messages: what the App types into his session (your taps, his check-ins) hasn't gone in for a while${c}. The App keeps trying, and clears what it can by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     signin) T="Cain is waiting at a sign-in"
       M="Cain is waiting at a sign-in on his screen${c}, so nothing reaches him. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
     phone) T="Cain's alarms reach you here only"
@@ -160,28 +126,21 @@ plain() { printf '%s' "$1" | tr '\r\n' '  ' | sed 's/ *\xe2\x80\x94 */, /g; s/ad
 # group (any alarm of it, a replaced one included: it stays to be taken down), and whether it has
 # cleared (its notification still to come down).
 load() {   # load <group>
-  kind=""; cause=""; sent=0; fp=""; discord=0; clear=0; shown=0; since=0; seen=0; restarted=0; esc=0; G="$1"
+  kind=""; cause=""; sent=0; fp=""; discord=0; clear=0; shown=0; G="$1"
   [ -f "$DIR/$G" ] || return 1
   local k v
   while IFS=' ' read -r k v; do
     case "$k" in kind) kind="$v" ;; cause) cause="$v" ;; sent) sent="$v" ;; fp) fp="$v" ;; discord) discord="$v" ;;
-      clear) clear="$v" ;; shown) shown="$v" ;; since) since="$v" ;; seen) seen="$v" ;; restarted) restarted="$v" ;;
-      esc) esc="$v" ;; esac
+      clear) clear="$v" ;; shown) shown="$v" ;; esac
   done < "$DIR/$G"
   case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
-  # Kept from before 0.13.3 (no since): raised when its file was last written.
-  case "$since" in ''|0|*[!0-9]*) since="$(stat -c %Y "$DIR/$G" 2>/dev/null || date +%s)" ;; esac
-  case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
-  case "$restarted" in ''|*[!0-9]*) restarted=0 ;; esac
-  [ "$esc" = 1 ] || esc=0
   [[ "$fp" =~ ^[0-9a-f]{16}$ ]] || fp=""
   [ "$shown" = 1 ] || shown=0
-  [ "$(group_of "$kind" 2>/dev/null)" = "$G" ] && alarm "$kind" "$cause" "$(escalated_at)"
+  [ "$(group_of "$kind" 2>/dev/null)" = "$G" ] && alarm "$kind" "$cause"
 }
 save() {
   if mkdir -p "$DIR" 2>/dev/null \
-     && printf 'kind %s\ncause %s\nsent %s\nfp %s\ndiscord %s\nclear %s\nshown %s\nsince %s\nseen %s\nrestarted %s\nesc %s\n' \
-          "$kind" "$cause" "$sent" "$fp" "$discord" "$clear" "$shown" "$since" "$seen" "$restarted" "$esc" > "$DIR/.$G.tmp" 2>/dev/null \
+     && printf 'kind %s\ncause %s\nsent %s\nfp %s\ndiscord %s\nclear %s\nshown %s\n' "$kind" "$cause" "$sent" "$fp" "$discord" "$clear" "$shown" > "$DIR/.$G.tmp" 2>/dev/null \
      && mv -fT "$DIR/.$G.tmp" "$DIR/$G" 2>/dev/null; then return 0; fi
   rm -f "$DIR/.$G.tmp" 2>/dev/null
   echo "[cain] alarm '$kind': its state couldn't be kept ($DIR/$G), so its caller raises it again" >&2
@@ -214,12 +173,8 @@ discord_send() {
   TOKEN_FILE="$tok" ACCESS_FILE="$acc" "$OPT/alert.sh" "$1" >/dev/null 2>&1
 }
 
-# The restart time an escalated alarm's text names; none while the App still deals with it.
-escalated_at() { if [ "$esc" = 1 ]; then echo "$restarted"; fi; }
 deliver() {   # a group's raised alarm: Discord once, Home Assistant daily or when its hook changed
-  alarm "$kind" "$cause" "$(escalated_at)" || return 1
-  # One the App deals with itself reaches no one until its own restart didn't clear it.
-  if self_heals "$kind" && [ "$esc" != 1 ]; then save; return; fi
+  alarm "$kind" "$cause" || return 1
   local now h said="" missed=""
   if [ "$discord" != 1 ]; then
     if discord_send "$M"; then discord=1; said="his bot"; else missed="his bot"; fi
@@ -252,84 +207,26 @@ rank() {
     held|switch-restart|session|switch-waits|waiting|stalled|signin|phone) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
-  local g c r=0 e=0 now
+  local g c
   g="$(group_of "$1")" || { echo "notice: no alarm called '$1'" >&2; return 2; }
   c="$(plain "${2:-}")"
-  now="$(date +%s)"
-  # A switch undone safely, the App restarting to run him the old way: no alarm for Dane. Cain
-  # hears it once, for his morning update (the relay queue, as the App's other lines reach him).
-  if [ "$1" = switch-restart ]; then
-    [ -f "$DIR/switch-restart-told" ] && [ "$(head -n 1 "$DIR/switch-restart-told" 2>/dev/null)" = "$c" ] && return 0
-    relay "The Cain App's move to your own user didn't pass its checks${c:+ ($c)}, so it was undone safely and the App restarted itself to run you the old way for now. The App told Dane nothing: put it in your morning update to him, in one line, with nothing for him to do. File it as a note on P33 for the laptop session." \
-      || { echo "[cain] alarm 'switch-restart': its line for Cain couldn't be queued ($QUEUE), so its caller raises it again" >&2; return 1; }
-    printf '%s\n' "$c" > "$DIR/switch-restart-told"
-    echo "[cain] alarm 'switch-restart' passed to Cain for his morning update; nothing goes to Dane"
-    return 0
-  fi
   if load "$g" && [ "$clear" != 1 ]; then
-    seen="$now"
     if [ "$kind" = "$1" ] && [ "$cause" = "$c" ]; then deliver; return; fi
     if [ "$(rank "$1")" -lt "$(rank "$kind")" ]; then
       echo "[cain] alarm '$1' kept back: '$kind' stands" >&2
       deliver; return
     fi
-    # The App's one restart for this stretch, and whether Dane already heard it didn't help,
-    # carry over to the alarm that replaces it: never a second restart for the same trouble.
-    if self_heals "$1" && self_heals "$kind"; then r="$restarted"; e="$esc"; fi
   fi
   # A new alarm for the group: delivered afresh, but what Home Assistant shows for the group is
   # kept (shown), so a notification of the alarm it replaces still comes down when it clears.
-  G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0; since="$now"; seen="$now"; restarted="$r"; esc="$e"
-  if self_heals "$kind" && [ "$esc" != 1 ]; then
-    echo "[cain] alarm '$kind' kept for the App: it restarts itself if this lasts $(( $(window_of "$kind") / 60 )) minutes, and Dane hears only if that doesn't clear it"
-  fi
+  G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0
   deliver
-}
-# The groups whose alarm is due the App's one restart: on, not cleared, past its window and not
-# restarted for yet. Marked restarted before the watcher asks the Supervisor, so it's asked once.
-restart_due() {
-  local g now any=1
-  now="$(date +%s)"
-  for g in stop session screen deliver; do
-    load "$g" || continue
-    [ "$clear" != 1 ] && self_heals "$kind" && [ "$restarted" = 0 ] || continue
-    [ $((now - since)) -ge "$(window_of "$kind")" ] || continue
-    restarted="$now"; save || continue
-    echo "[cain] alarm '$kind' still on after $(( $(window_of "$kind") / 60 )) minutes: the App restarts itself, once" >&2
-    echo "$g"; any=0
-  done
-  return "$any"
-}
-restart_undo() {
-  local g
-  for g in "$@"; do
-    case " stop session screen deliver " in *" $g "*) ;; *) continue ;; esac
-    load "$g" || continue
-    restarted=0; save
-  done
-}
-# After the App's restart: an alarm raised again since, and still on a window later, reaches Dane
-# (its text says the App restarted itself and what it saw). One not raised again since the
-# restart, two windows on, was cleared by it and is forgotten.
-after_restart() {
-  local now w
-  self_heals "$kind" && [ "$restarted" != 0 ] && [ "$esc" != 1 ] || return 0
-  now="$(date +%s)"; w="$(window_of "$kind")"
-  if [ "$seen" -gt "$restarted" ] && [ $((now - restarted)) -ge "$w" ]; then
-    esc=1; discord=0; sent=0
-    echo "[cain] alarm '$kind' came back after the App restarted itself: Dane hears it now"
-  elif [ "$seen" -le "$restarted" ] && [ $((now - restarted)) -ge $((2 * w)) ]; then
-    rm -f -- "${DIR:?}/${G:?}"; echo "[cain] alarm '$kind' wasn't raised again after the App restarted itself: forgotten"
-    return 1
-  fi
-  return 0
 }
 clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   local groups g rc=0
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
     delivered) groups="deliver" ;; phone) groups="phone" ;;
     *) echo "notice: clear running, switched, screen, delivered or phone" >&2; return 2 ;; esac
-  case "$1" in running|switched) rm -f -- "${DIR:?}/switch-restart-told" ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -408,21 +305,18 @@ tick() {
   check_readback || rc=1
   for g in $GROUPS_ALL; do
     load "$g" || continue
-    if [ "$clear" = 1 ]; then finish_clear || rc=1; continue; fi
-    after_restart || continue
-    deliver || rc=1
+    if [ "$clear" = 1 ]; then finish_clear || rc=1; else deliver || rc=1; fi
   done
   return "$rc"
 }
 
-case "${1:-}" in tell|clear|tick|probe|restart-due|restart-undo) ;;
-  text) alarm "${2:-}" "$(plain "${3:-}")" "${4:-}" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
+case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}")" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
   # A proof within two days, made with the hook set now (none set, or another, proves nothing).
   proven) t="$(head -n 1 "$PROVEN" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone | tick | probe | restart-due | restart-undo <group>... | proven | hooked | text <alarm> [cause] [restarted at]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \
@@ -433,6 +327,4 @@ case "$1" in
   clear) clear_groups "${2:-}" ;;
   tick) tick ;;
   probe) probe ;;
-  restart-due) restart_due ;;
-  restart-undo) shift; restart_undo "$@" ;;
 esac
