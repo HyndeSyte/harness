@@ -2,28 +2,35 @@
 // What it measures is liveness: it can say alive while messages are lost. This release only alarms.
 //   bun main.ts loop                 a pass every 5 minutes, for good (the run script starts it)
 //   bun main.ts pass                 one pass, now
-//   bun main.ts boot                 the App's container booted: counted in /data once per container,
-//                                    and the boot-loop alarm raised or taken down
-//   bun main.ts session-asked        the run script is about to stop his session: a root-owned mark
-//                                    naming that very run, so its end is "asked"
-//   bun main.ts session-gone         the run script saw his session gone: when, for how long it ran
-//   bun main.ts session-start [code] his session starts: the run before it classed (boot, asked,
-//                                    crash-*, clean, unknown, self-*) from root's own marks and the exit
-//                                    code session.sh kept, kept in /data, and the alarms raised or down
-//   bun main.ts install <version>    the version this start runs: an install when it changed
+//   bun main.ts install <version>    the version this start runs: an install when it changed (run
+//                                    before boot, so a start the update itself caused isn't counted)
+//   bun main.ts boot                 the App's container started: kept in /data once per container
+//                                    (boot, asked or update), and the container-start alarm raised or down
+//   bun main.ts session-asked <id>   the run script is about to stop his session: a root-owned mark
+//                                    naming that very run (the id the run script holds), so its end is
+//                                    "asked"
+//   bun main.ts stop-asked [id]      the Supervisor is stopping the App (the run script's TERM, or s6's
+//                                    finish after it): the run marked asked as above, and a mark in /data
+//                                    so the next container start isn't counted
+//   bun main.ts session-gone <id>    the run script saw his session gone: when, for how long it ran
+//   bun main.ts session-start <code> <id>
+//                                    his session starts: the run before it (id: the one the run script
+//                                    holds in memory, empty after s6 restarted it) classed from root's
+//                                    own marks and the exit code session.sh kept, kept in /data, and the
+//                                    alarms raised or down. Prints "run <new id> <kind>".
 // The probe's own heartbeat URL (probe_heartbeat_url) comes in PROBE_PING_URL, is read once
 // and taken out of the environment, and is never logged, written anywhere or put on a command
 // line (fetch sends it; no child process gets it). It is pinged only after a pass that passed:
 // the outside service alarms Dane when the pings stop.
-import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, openSync, writeSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { heartbeatUrl } from "../security/core";
 import { readStop } from "../stop";
 import {
-  afterStart, alarmFor, askDue, endKind, END_KINDS, failedWords, type Facts, hourlyState, type Hourly, type Install, inWindow, lastSlot,
-  parseBoots, pass, type RestoreRecord, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts, type Screen, screenOf, shouldPing,
-  startsIn, STARTS_MAX, STARTS_WINDOW_S, tooManyBoots, tooManyStarts,
+  afterStart, alarmFor, askDue, bootKind, endKind, END_KINDS, failedWords, type Facts, hourlyState, type Hourly, type Install, inWindow, lastSlot,
+  parseBoots, pass, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts, type Screen, screenOf, shouldPing,
+  SELF_WINDOW_S, startsIn, tooManyBoots, tooManySelf, tooManyStarts, updateCause,
 } from "./core";
 
 const env = process.env;
@@ -34,7 +41,11 @@ export const paths = (e: Record<string, string | undefined> = env) => {
     dir: D, run: R,
     starts: join(D, "starts"), install: join(D, "install.json"), passes: join(D, "passes.jsonl"), hourly: join(D, "hourly.json"),
     alive: join(D, "alive"), alarmed: join(D, "alarmed"), boots: join(D, "boots"),
-    ask: join(R, "ask"), answered: join(R, "answered"),
+    // The Supervisor asked the App to stop (stop-asked): the next container start isn't counted.
+    stopAsked: join(D, "stop-asked"),
+    // The hourly check's ask and answer, and when a message of the owner's last came in for his session
+    // (the broker's note, a time only).
+    ask: join(R, "ask"), answered: join(R, "answered"), heard: join(R, "heard"),
     // This container's marks (tmpfs: a new container starts with none): his session's run as root
     // started it, the run script's own stop request for that run, and that this container booted.
     session: join(R, "session.json"), asked: join(R, "asked"), booted: join(R, "booted"),
@@ -52,24 +63,18 @@ type Paths = ReturnType<typeof paths>;
 const text = (p: string) => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 const json = <T>(p: string): T | null => { try { return JSON.parse(readFileSync(p, "utf8")) as T; } catch { return null; } };
 const num = (p: string) => { const n = Number((text(p) ?? "").trim().split(/\s+/)[0]); return Number.isFinite(n) && n > 0 ? n : null; };
-// Whole or not at all, root's alone.
+// Whole or not at all, root's alone: written under a fresh temp name created exclusively (never
+// following a link or reusing a file), synced, then renamed over the mark. Every mark and record the
+// probe keeps goes through here, in folders root alone may write (/run/cain/probe, /data/probe).
 export function writeWhole(p: string, body: string, mode = 0o600): void {
   mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-  writeFileSync(`${p}.tmp`, body, { mode });
-  chmodSync(`${p}.tmp`, mode);
-  renameSync(`${p}.tmp`, p);
+  const tmp = `${p}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(tmp, "wx", mode);
+  try { writeSync(fd, body); fsyncSync(fd); } catch (e) { closeSync(fd); rmSync(tmp, { force: true }); throw e; }
+  closeSync(fd);
+  try { renameSync(tmp, p); } catch (e) { rmSync(tmp, { force: true }); throw e; }
 }
 const log = (m: string) => console.log(`[cain] probe: ${m}`);
-// The durable record of restores: root's alone, whole or not at all, synced before the rename.
-// Used only by the dormant rollback/helper.ts (not started in this release).
-export function writeRecord(path: string, r: RestoreRecord): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const fd = openSync(`${path}.tmp`, "w", 0o600);
-  try { writeSync(fd, JSON.stringify(r)); fsyncSync(fd); } finally { closeSync(fd); }
-  chmodSync(`${path}.tmp`, 0o600);
-  renameSync(`${path}.tmp`, path);
-  try { const dfd = openSync(dirname(path), "r"); try { fsyncSync(dfd); } finally { closeSync(dfd); } } catch { /* best effort */ }
-}
 
 // -- the facts ----------------------------------------------------------------------------------------
 // A process of the Discord plugin's server: its command runs server.ts from the plugin's folder
@@ -132,11 +137,11 @@ export async function runPass(d: PassDeps): Promise<Pass> {
   // isn't asked there, and an ask from before doesn't count.
   const hh: Hourly = own ? h : {};
   const result = pass(facts, hh, { screen, stopped });
-  if (own && !stopped && askDue(h, now, screen === "ready")) {
+  // Not while a turn is at work (his screen not ready) or within 5 minutes of a message of the
+  // owner's: asked at the next pass that may instead.
+  if (own && !stopped && askDue(h, now, screen === "ready", num(p.heard))) {
     try {
-      mkdirSync(p.run, { recursive: true, mode: 0o700 });
-      writeFileSync(`${p.ask}.tmp`, `${now} ${PROBE_LINE.length}\n`, { mode: 0o600 });
-      renameSync(`${p.ask}.tmp`, p.ask);
+      writeWhole(p.ask, `${now} ${PROBE_LINE.length}\n`);
       rmSync(p.answered, { force: true });
       h.asked = now; delete h.answered;
     } catch (e) { log(`couldn't ask the hourly liveness check: ${String(e).slice(0, 80)}`); }
@@ -166,99 +171,134 @@ export async function runPass(d: PassDeps): Promise<Pass> {
 
 // -- his session's runs, as root saw them ----------------------------------------------------------
 interface Run { id: string; at: number; ended?: number }
+const RUN_ID = /^[0-9a-f]{16}$/;
 const readRun = (p: Paths): Run | null => {
   const r = json<Run>(p.session);
-  return r && typeof r.id === "string" && Number.isFinite(r.at) ? r : null;
+  return r && typeof r.id === "string" && RUN_ID.test(r.id) && Number.isFinite(r.at) ? r : null;
 };
-// The run script is about to stop his session: the mark names that very run. Root's alone; his own
-// user can't write it, so no exit of his can pass for one the App asked for.
-export function markAsked(p: Paths): boolean {
+// The run script is about to stop his session: the mark names that very run, the one the run script
+// holds in memory (mem), which must also be the run on file. Root's alone; his own user can't write
+// it, so no exit of his can pass for one the App asked for.
+export function markAsked(p: Paths, mem: string): boolean {
   const r = readRun(p);
-  if (!r || r.ended) return false;
+  if (!r || r.ended || r.id !== mem) return false;
   writeWhole(p.asked, `${r.id}\n`);
   return true;
 }
-// The run script saw his session gone: the first time it saw so is when the run ended.
-export function markGone(p: Paths, now: number): void {
-  const r = readRun(p);
-  if (r && !r.ended) writeWhole(p.session, JSON.stringify({ ...r, ended: now }));
+// The Supervisor is stopping the App (SIGTERM to s6, so the run script's own termination): the run
+// marked asked before his session ends, when the run script still holds its id, and a mark in /data
+// so the container start after it isn't counted.
+export function stopAsked(p: Paths, now: number, mem: string): boolean {
+  writeWhole(p.stopAsked, `${now}\n`);
+  return mem !== "" && markAsked(p, mem);
 }
-// How the run before this start ended, from root's own marks: no run in this container (boot), the
-// run script's stop request for that run (asked), and how long it ran (to when root saw it end, or
-// now when it didn't); the exit code is session.sh's, his to write, so it alone never makes a start
-// "asked" and never counts a late end toward a loop.
-export function classify(p: Paths, now: number, code: number | null): string {
+// The run script saw his session gone: the first time it saw so is when the run ended. A run script
+// that holds an id marks only that run.
+export function markGone(p: Paths, now: number, mem = ""): void {
+  const r = readRun(p);
+  if (r && !r.ended && (mem === "" || mem === r.id)) writeWhole(p.session, JSON.stringify({ ...r, ended: now }));
+}
+// How the run before this start ended, from root's own marks: no run in this container (boot); the
+// run script's stop request for that run (asked: the mark, the run on file and the id the run script
+// holds in memory all the same run); how long it ran to when root saw it end; or, when root never saw
+// it end (s6 restarted the run script meanwhile), the gap from its start to this one. The exit code is
+// session.sh's, his to write, so it alone never makes a start "asked" and never counts a late end as
+// an early exit.
+export function classify(p: Paths, now: number, code: number | null, mem: string): string {
   const r = readRun(p);
   if (!r) return "boot";
-  const asked = (text(p.asked) ?? "").trim() === r.id;
+  const asked = mem !== "" && mem === r.id && (text(p.asked) ?? "").trim() === r.id;
+  const seen = r.ended !== undefined;
   const ran = (r.ended ?? now) - r.at;
-  return endKind({ first: false, asked, code, ran: ran >= 0 ? ran : null });
+  return endKind({ first: false, asked, code, ran: ran >= 0 ? ran : null, seen });
 }
 // One start of his session: the run before it classed and kept, this run's mark written, and the
 // alarms raised or taken down. Alarm only.
-export function sessionStart(p: Paths, now: number, code: number | null, notice: PassDeps["notice"]): string {
-  const kind = classify(p, now, code);
+export function sessionStart(p: Paths, now: number, code: number | null, notice: PassDeps["notice"], mem = ""): { kind: string; id: string } {
+  const kind = classify(p, now, code, mem);
   recordStart(p, now, kind, notice);
-  writeWhole(p.session, JSON.stringify({ id: randomBytes(8).toString("hex"), at: now }));
+  const id = randomBytes(8).toString("hex");
+  writeWhole(p.session, JSON.stringify({ id, at: now }));
   rmSync(p.asked, { force: true });
-  return kind;
+  return { kind, id };
+}
+// A line added to a file of root's, the whole file rewritten (never appended in place).
+function addLine(path: string, line: string, now: number): string {
+  const body = pruneStarts(`${text(path) ?? ""}${line}\n`, now);
+  writeWhole(path, body);
+  return body;
 }
 export function recordStart(p: Paths, now: number, end: string, notice: PassDeps["notice"]): number {
   const kind = END_KINDS.test(end) ? end : "unknown";
-  mkdirSync(p.dir, { recursive: true, mode: 0o700 });
-  appendFileSync(p.starts, `${now} ${kind}\n`, { mode: 0o600 });
-  writeWhole(p.starts, pruneStarts(text(p.starts) ?? "", now));
-  // A late non-zero exit no one asked for: his own user can cause one, so it alarms once a stretch
-  // ("Cain's session ended on its own") and never counts toward a loop.
-  const self = `${p.alarmed}-self`;
-  if (/^self-/.test(kind) && !existsSync(self) && notice("tell", "self-ended", `exit ${kind.slice(5)}`) <= 1) writeWhole(self, `${now}\n`);
+  addLine(p.starts, `${now} ${kind}`, now);
   return checkStarts(p, now, notice);
 }
-// The crash loop (more than 3 crash starts in 30 minutes): "Cain keeps crashing", and within a day
-// of an install "A rollback of Cain would have run" too, once for each new loop (one that starts
-// after the last one ended); both come down once the count is back under. A stretch of "ended on its
-// own" ends after 30 minutes with no such end. None of this is silenced by the owner's Stop: a
-// stopped session never starts, so it never counts.
+const flagOf = (p: Paths, k: string) => `${p.alarmed}-${k}`;
+// The line that names the update: within a day of a version change, once for each new loop (it comes
+// down once neither loop stands, so the next loop says it again).
+function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-boots", notice: PassDeps["notice"]): void {
+  const i = json<Install>(p.install);
+  if (!inWindow(i, now)) return;
+  if (notice("tell", kind, updateCause(i!, now)) <= 1) writeWhole(flagOf(p, "update"), `${now}\n`);
+}
+function updateDown(p: Paths, notice: PassDeps["notice"]): void {
+  if (!existsSync(flagOf(p, "update")) || existsSync(flagOf(p, "starts")) || existsSync(flagOf(p, "boots"))) return;
+  if (notice("clear", "update") <= 1) rmSync(flagOf(p, "update"), { force: true });
+}
+// Repeated early exits (more than 3 in 30 minutes): "Cain's session keeps exiting early", and within
+// a day of an install the line that names it; down once the count is back under. Repeated late error
+// exits (more than 4 in 60 minutes): "Cain's session keeps ending on its own", down once back under.
+// None of this is silenced by the owner's Stop: a stopped session never starts, so it never counts.
 export function checkStarts(p: Paths, now: number, notice: PassDeps["notice"]): number {
   const all = text(p.starts) ?? "";
   const starts = parseStarts(all);
   const n = startsIn(starts, now);
-  const flag = `${p.alarmed}-starts`;
+  const flag = flagOf(p, "starts");
   if (tooManyStarts(starts, now)) {
-    if (!existsSync(flag) && notice("tell", "restarts", `${n} crash starts in 30 minutes`) <= 1) {
+    if (!existsSync(flag) && notice("tell", "restarts", `${n} in 30 minutes`) <= 1) {
       writeWhole(flag, `${now}\n`);
-      const i = json<Install>(p.install);
-      if (inWindow(i, now)) notice("tell", "rollback-disarmed", `Cain ${i!.version}, installed within the last day`);
+      sayUpdate(p, now, "update-exits", notice);
     }
-  } else if (existsSync(flag) && n <= STARTS_MAX) {
+  } else if (existsSync(flag)) {
     if (notice("clear", "restarts") <= 1) rmSync(flag, { force: true });
   }
-  const self = `${p.alarmed}-self`;
-  if (existsSync(self) && startsIn(parseSelf(all), now) === 0 && (num(self) ?? 0) <= now - STARTS_WINDOW_S) {
-    if (notice("clear", "self") <= 1) rmSync(self, { force: true });
+  const self = parseSelf(all);
+  const sflag = flagOf(p, "self");
+  if (tooManySelf(self, now)) {
+    if (!existsSync(sflag) && notice("tell", "self-loop", `${startsIn(self, now, 0, SELF_WINDOW_S)} in 60 minutes`) <= 1) writeWhole(sflag, `${now}\n`);
+  } else if (existsSync(sflag)) {
+    if (notice("clear", "self") <= 1) rmSync(sflag, { force: true });
   }
+  updateDown(p, notice);
   return n;
 }
-// The App's container booted: counted once per container (a mark in /run, which a new container
-// starts without), and more than 3 boots in 30 minutes alarms "Cain's App keeps restarting".
-export function recordBoot(p: Paths, now: number, notice: PassDeps["notice"]): boolean {
-  if (existsSync(p.booted)) return false;
+// The App's container started: kept once per container (a mark in /run, which a new container starts
+// without) as "boot", "asked" (the Supervisor asked the App to stop before it: the mark in /data,
+// taken here) or "update" (one of the first two within 10 minutes of a version change). More than 3
+// counted starts in 30 minutes: "Cain's App container keeps starting", and within a day of an install
+// the line that names it.
+export function recordBoot(p: Paths, now: number, notice: PassDeps["notice"]): string | null {
+  if (existsSync(p.booted)) return null;
   writeWhole(p.booted, `${now}\n`);
-  mkdirSync(p.dir, { recursive: true, mode: 0o700 });
-  appendFileSync(p.boots, `${now}\n`, { mode: 0o600 });
-  writeWhole(p.boots, pruneStarts(text(p.boots) ?? "", now));
+  const kind = bootKind({ now, stopAsked: existsSync(p.stopAsked), install: json<Install>(p.install), bootsText: text(p.boots) ?? "" });
+  addLine(p.boots, `${now} ${kind}`, now);
+  rmSync(p.stopAsked, { force: true });
   checkBoots(p, now, notice);
-  return true;
+  return kind;
 }
 export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): number {
   const boots = parseBoots(text(p.boots) ?? "");
   const n = startsIn(boots, now);
-  const flag = `${p.alarmed}-boots`;
+  const flag = flagOf(p, "boots");
   if (tooManyBoots(boots, now)) {
-    if (!existsSync(flag) && notice("tell", "boots", `${n} starts of the App in 30 minutes`) <= 1) writeWhole(flag, `${now}\n`);
+    if (!existsSync(flag) && notice("tell", "boots", `${n} in 30 minutes`) <= 1) {
+      writeWhole(flag, `${now}\n`);
+      sayUpdate(p, now, "update-boots", notice);
+    }
   } else if (existsSync(flag)) {
     if (notice("clear", "boots") <= 1) rmSync(flag, { force: true });
   }
+  updateDown(p, notice);
   return n;
 }
 
@@ -297,6 +337,7 @@ if (import.meta.main) {
   const deps = (): PassDeps => ({ p, now: now(), tz, mode: mode(), plugin: () => pluginUp(p.proc), tmux: tmuxUp, screen: () => screenNow(p),
     ping: () => pingOnce(url), notice: noticeCall(p) });
   const [cmd, arg] = process.argv.slice(2);
+  const idArg = (a: string | undefined) => /^[0-9a-f]{16}$/.test(a ?? "") ? a! : "";
   if (cmd === "loop") {
     const b = heartbeatUrl(url);
     log(`liveness every 5 minutes; its outside heartbeat ${b.kind === "ok" ? "on" : b.kind === "invalid" ? "set but not usable" : "off (probe_heartbeat_url is empty)"}`);
@@ -310,19 +351,23 @@ if (import.meta.main) {
     const r = await runPass(deps());
     console.log(r.ok ? "passed" : `${r.status}: ${failedWords(r)}`);
   } else if (cmd === "boot") {
-    console.log(recordBoot(p, now(), noticeCall(p)) ? "boot counted" : "this container's boot was counted already");
+    const k = recordBoot(p, now(), noticeCall(p));
+    console.log(k ? `this container's start kept as ${k}` : "this container's start was kept already");
   } else if (cmd === "session-asked") {
-    console.log(markAsked(p) ? "marked: this run's end was asked for" : "no run of his to mark");
+    console.log(markAsked(p, idArg(arg)) ? "marked: this run's end was asked for" : "no run of his to mark");
+  } else if (cmd === "stop-asked") {
+    console.log(stopAsked(p, now(), idArg(arg)) ? "the stop was asked for: kept, and his run marked" : "the stop was asked for: kept");
   } else if (cmd === "session-gone") {
-    markGone(p, now());
+    markGone(p, now(), idArg(arg));
   } else if (cmd === "session-start") {
     const raw = (arg ?? "").replace(/[^0-9]/g, "").slice(0, 8);
-    console.log(`the run before: ${sessionStart(p, now(), raw === "" ? null : Number(raw), noticeCall(p))}`);
+    const r = sessionStart(p, now(), raw === "" ? null : Number(raw), noticeCall(p), idArg(process.argv[4]));
+    console.log(`run ${r.id} ${r.kind}`);
   } else if (cmd === "install") {
     const i = recordInstall(p, arg ?? "", now());
     console.log(i ? `${i.version} since ${i.at || "before the probe"}` : "no version");
   } else {
-    console.error("usage: main.ts loop | pass | boot | session-asked | session-gone | session-start [code] | install <version>");
+    console.error("usage: main.ts loop | pass | install <version> | boot | session-asked <id> | stop-asked [id] | session-gone <id> | session-start <code> <id>");
     process.exit(2);
   }
 }

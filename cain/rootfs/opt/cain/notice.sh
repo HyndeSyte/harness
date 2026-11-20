@@ -26,11 +26,12 @@
 # where no one answers it: unstick.sh), "deliver" (what the App types into his session doesn't go
 # in, or his screen waits at a sign-in: watch.sh) and "phone" (its alarms to his phone failed their
 # test), and since 0.14.0 "probe" (the App's liveness checks of him failed, or his screen waits at a
-# sign-in or on the model's API: probe/main.ts), "restarts" (his session crashed and started more
-# than 3 times in 30 minutes, counted from /data), "rollback" (that crash loop came within a day of
-# an install, so a rollback would have run; none is in this release), "self" (his session ended on
-# its own, late, with an error) and "boots" (the App's container started more than 3 times in 30
-# minutes). Within a group a newer alarm replaces the last.
+# sign-in or on the model's API: probe/main.ts), "restarts" (repeated early exits of his session:
+# more than 3 in 30 minutes, each within 5 minutes of its start, counted from /data), "self" (repeated
+# late error exits of his session: more than 4 in 60 minutes), "boots" (repeated starts of his App's
+# container: more than 3 counted in 30 minutes) and "update" (either loop within a day of a version
+# change: what changed and the way back by hand; nothing rolls back by itself). Within a group a newer
+# alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
 # is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
@@ -43,10 +44,10 @@
 #   notice.sh clear delivered        what the App types goes in again (watch.sh): the deliver group
 #   notice.sh clear phone            the probe was read back moved: the phone group clears
 #   notice.sh clear probe            the App's probe of him passed again: the probe group
-#   notice.sh clear restarts         his session's crash starts are back under the limit: the restarts
-#                                    and rollback groups
-#   notice.sh clear self             no late error end of his session for 30 minutes: the self group
-#   notice.sh clear boots            the App's boots are back under the limit: the boots group
+#   notice.sh clear restarts         his session's early exits are back under the limit: the restarts group
+#   notice.sh clear self             his session's late error exits are back under the limit: the self group
+#   notice.sh clear boots            the App's container starts are back under the limit: the boots group
+#   notice.sh clear update           neither loop stands any more: the update group
 #   notice.sh tick                   the repeats, retries, the probe and its readback (every 10 minutes)
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
@@ -66,7 +67,7 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts rollback self boots"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots update"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
@@ -82,9 +83,9 @@ group_of() {
     phone) echo phone ;;
     probe|needs-signin|api-down) echo probe ;;
     restarts) echo restarts ;;
-    rollback-disarmed) echo rollback ;;
-    self-ended) echo self ;;
+    self-loop) echo self ;;
     boots) echo boots ;;
+    update-exits|update-boots) echo update ;;
     *) return 1 ;;
   esac
 }
@@ -128,15 +129,17 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     needs-signin) T="Cain needs sign-in"
       M="Cain needs sign-in: his screen waits at a Claude sign-in, so he can't answer. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
     api-down) T="The model's API isn't answering"
-      M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself, and nothing was rolled back. If it lasts hours, check Anthropic's status page." ;;
-    restarts) T="Cain keeps crashing"
-      M="Cain keeps crashing: his session crashed and started again and again${c}. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
-    rollback-disarmed) T="A rollback of Cain would have run"
-      M="A rollback of Cain would have run${c}: his session keeps crashing within a day of his last update. The automatic restore is not in this release, so nothing was done. To get him back, restore the backup of Cain from just before his last update: Settings, System, Backups. $DETAILS" ;;
-    self-ended) T="Cain's session ended on its own"
-      M="Cain's session ended on its own with an error${c}, after it had run a while. The App started it again by itself. Ends like this don't count as crashes. If it keeps happening, $RESTART. $DETAILS" ;;
+      M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself. If it lasts hours, check Anthropic's status page." ;;
+    restarts) T="Cain's session keeps exiting early"
+      M="Cain's session keeps exiting early: it ended on its own within 5 minutes of starting more than 3 times in half an hour${c}. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    self-loop) T="Cain's session keeps ending on its own"
+      M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
     boots) T="Cain's App keeps restarting"
-      M="Cain's App keeps restarting${c}: the whole App, not only his session, started again and again. If it doesn't settle within an hour, $RESTART. If it still restarts after that, $BACKUPS. $DETAILS" ;;
+      M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. If it doesn't settle within an hour, $RESTART. If it still restarts after that, $BACKUPS. $DETAILS" ;;
+    update-exits) T="Cain keeps exiting early since his update"
+      M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. To go back by hand, restore the backup taken before the update from Home Assistant's backup page: Settings, System, Backups. $DETAILS" ;;
+    update-boots) T="Cain's App keeps restarting since his update"
+      M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. To go back by hand, restore the backup taken before the update from Home Assistant's backup page: Settings, System, Backups. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -146,10 +149,10 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     deliver) CT="Cain is getting messages again"; CM="Cain is getting messages again: what the App types goes in." ;;
     phone) CT="Cain's alarms reach your phone again"; CM="Cain's alarms to your phone through Home Assistant passed their test again." ;;
     probe) CT="Cain's checks pass again"; CM="Cain's liveness checks pass again." ;;
-    restarts) CT="Cain stopped crashing"; CM="Cain stopped crashing: his session has stayed up." ;;
-    rollback) CT="Cain stopped crashing"; CM="Cain stopped crashing: his session has stayed up, so no rollback is called for." ;;
-    self) CT="Cain's session stays up"; CM="Cain's session hasn't ended on its own for 30 minutes." ;;
-    boots) CT="Cain's App stopped restarting"; CM="Cain's App stopped restarting: it has stayed up." ;;
+    restarts) CT="Cain's session stays up"; CM="Cain's session has stopped exiting early." ;;
+    self) CT="Cain's session stays up"; CM="Cain's session has stopped ending on its own." ;;
+    boots) CT="Cain's App stopped restarting"; CM="Cain's App container has stopped starting again and again." ;;
+    update) CT="Cain has settled since his update"; CM="Cain has settled since his update: his session and his App stay up." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -238,7 +241,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|rollback-disarmed|self-ended|boots) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|update-exits|update-boots) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -259,9 +262,9 @@ tell() {   # tell <kind> [cause]
 clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   local groups g rc=0
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
-    delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts rollback" ;;
-    self) groups="self" ;; boots) groups="boots" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self or boots" >&2; return 2 ;; esac
+    delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
+    self) groups="self" ;; boots) groups="boots" ;; update) groups="update" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots or update" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -351,7 +354,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|update | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \

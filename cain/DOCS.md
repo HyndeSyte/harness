@@ -340,8 +340,8 @@ again a card it sent after its backup was taken; the newest card is the one to a
 
 The outside heartbeat above says the App is alive. That is not the same as Cain answering: on
 Nov 19 his session restarted every two and a half minutes for about six hours while the heartbeat
-kept saying alive. 0.14.0 adds alarms for that. It only alarms: it restores nothing, has no
-Supervisor access and no switch.
+kept saying alive. 0.14.0 adds alarms for that. It only alarms: nothing in it restores or rolls
+back anything, it has no Supervisor access, and no switch.
 
 - **Liveness checks, every 5 minutes**, with no model call, from a part of the App outside Cain's
   session: his Discord plugin is running, his session is there, the App's own Discord connection is
@@ -349,63 +349,81 @@ Supervisor access and no switch.
   the last check-in over an hour old. Two failed passes in a row alarm, once for the stretch, with
   its all-clear when a pass goes through. A sign-in on his screen alarms "Cain needs sign-in", and
   the model's API errors on his screen "The model's API isn't answering", instead of a failure.
-- **The hourly liveness check of his session**: once an hour, when his screen is free, the App
-  hands his session one fixed line on his Discord channel and he must answer it with a fixed
-  reply. It shows his session takes a turn. It never reaches Discord or you, and costs a few short
-  turns of your Claude usage a day. A long turn doesn't count against it: while his screen is at
-  work, the 20 minutes he has to answer stretch, up to an hour more.
+- **The hourly liveness check of his session**: once an hour the App hands his session one fixed
+  line on his Discord channel and he must answer it with a fixed reply. It shows his session takes a
+  turn. It never reaches Discord or you, and costs a few short turns of your Claude usage a day. It
+  waits while a turn is at work and for 5 minutes after a message of yours reaches him, and is asked
+  at the next 5-minute pass instead, so it never cuts in on you. A long turn doesn't count against
+  it: while his screen is at work, the 20 minutes he has to answer stretch, up to an hour more.
 - **Plainly: these are liveness checks.** They show his parts run, not that he answers you. They
   can say alive while your messages are lost. A real round trip (a message of yours seen reaching
-  his session) is a later item; this release has none, and the App reads nothing of your messages.
+  his session) is a later item; this release has none, and the App reads nothing of your messages
+  (only the time one came in, for the wait above).
 - **The probe's second heartbeat check**: set `probe_heartbeat_url` to the ping URL of a second
   check at your heartbeat service (Healthchecks.io: a check with a 5 minute period and a 15 minute
   grace). The App pings it only after a pass where every liveness check passed, so when his parts
   stop, or the Pi or the App is down, the pings stop and the service alarms your phone itself. The
   URL is read only by the probe's own process, never logged, never on a command line, and never
   reaches Cain's session.
-- **The crash-start count, kept in `/data`**: every start of his session is written there with how
-  the run before it ended, from what root alone saw: the first start in a container ("boot"), a stop
-  the App's start script recorded for that very run before it ended ("asked", never guessed from an
-  exit code or a signal), and how long the run lasted to when the start script saw it gone. A run
-  that ended unasked within 5 minutes of its start is a crash start, whatever exit code it left. A
-  later non-zero exit is "self": Cain's own user can end his own session, so it alarms once a
-  stretch, "Cain's session ended on its own", and never counts toward a loop.
-- **The crash-loop alarm**: more than 3 crash starts in 30 minutes is "Cain keeps crashing", on your
-  phone through Home Assistant and in Discord; it comes down once the count is back under. When the
-  loop starts within a day of an install, "A rollback of Cain would have run" goes out too, once for
-  each new loop (one that starts after the last one ended); it says the restore is not in this
-  release, and how to restore by hand.
-- **The boot-loop alarm**: every start of the App's container is counted in `/data` too, once per
-  container. More than 3 in 30 minutes is "Cain's App keeps restarting".
-- **During your saved Stop** the liveness checks stay silent. The crash-loop and boot-loop alarms
-  still fire: a stopped session never starts, so they only ever count real restarts.
+- **During your saved Stop no ping goes out** to that second check, even when every check passes,
+  so to the outside service your Stop looks like a failure: about 20 minutes after you tap Stop (the
+  5 minute period and the 15 minute grace), it marks the check down and sends you its own alarm, from
+  the service, not from Cain. It comes back up by itself at the first passing check after you tap
+  Turn back on. If you'd rather not hear it, pause that check at the service while you're stopped.
+  The App's own liveness alarms stay silent during your Stop.
+- **Repeated early exits of his session**, counted in `/data`: every start of his session is
+  written there with how the run before it ended, from what root alone saw: the first start in a
+  container ("boot"); a stop the App's start script asked for that very run ("asked": root's mark,
+  written before the session ends, naming the run the start script holds in memory, never guessed
+  from an exit code or a signal); or how long the run lasted to when the start script saw it gone.
+  A run that ended unasked within 5 minutes of its start is an early exit, whatever exit code it
+  left. When the start script never saw a run end (it was itself restarted meanwhile), only the gap
+  between the two starts decides: an early exit if the next start came within 5 minutes, otherwise
+  "unknown", which counts nothing. More than 3 early exits in 30 minutes is "Cain's session keeps
+  exiting early", on your phone through Home Assistant and in Discord; it comes down once the count
+  is back under.
+- **Repeated late error exits of his session**: an unasked end after the 5-minute mark with an
+  error code is counted apart (Cain's own user can end his own session, so these never count as
+  early exits). More than 4 in 60 minutes is "Cain's session keeps ending on its own".
+- **Repeated starts of his App's container**, counted in `/data` too, once per container. More than
+  3 counted in 30 minutes is "Cain's App keeps restarting". Not counted: a start after a stop the
+  Supervisor asked for (your Stop, Restart or update from Home Assistant; the App records that stop
+  as it goes), and the first two starts within 10 minutes of a version change, since an update
+  restarts the container. The count and the record of the installed version live in `/data`, so a
+  restart of the container keeps them.
+- **The line that names the update**: when either loop (early exits, or container starts) begins
+  within a day of a version change, a second alarm goes with it, for example: "Cain's session has
+  exited early several times since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls
+  back by itself. To go back by hand, restore the backup taken before the update from Home
+  Assistant's backup page." It comes down once neither loop stands, and goes out again with each new
+  loop.
+- **Asked stops never count**: an owner's Stop, Restart or update from Home Assistant reaches the
+  App's start script as a stop signal before anything else stops, and root records it as asked
+  before his session ends. Claude Code's own updater is off in this App (it is pinned in the image),
+  so it never ends his session to update itself.
+- **During your saved Stop** the liveness checks stay silent. The loop alarms still fire: a stopped
+  session never starts, so they only ever count real restarts.
 
-Each check is kept in `/data/probe` with its time, root's alone.
+Each check is kept in `/data/probe` with its time, root's alone; the marks of this container's runs
+are in `/run/cain/probe`, root's alone too. Nothing under either can be written by Cain's own user.
 
-## What the restore release will need
+### Checking it on the Pi
 
-An automatic restore of the version before a bad update is a separate, later release. Its code
-(`rollback/helper.ts`) ships in 0.14.0 dormant: nothing starts it, and run by hand it refuses. Before
-that release ships:
+`cain/tools/probe-drill.sh` (in the repository, run by your assistant from a shell with Docker, such
+as Home Assistant's SSH App with protection mode off) has the drills, in order:
 
-- Home Assistant's **Backup before update** on for the Cain App, and **auto-update off** for this
-  App, so every update has the backup to go back to and none happens unwatched.
-- The drills, on the Pi, in this order. `cain/tools/probe-drill.sh` (in the repository, run by your
-  assistant from a shell with Docker, such as Home Assistant's SSH App with protection mode off)
-  has the steps that apply to 0.14.0 (1, 1b, 2, 3 and 4); the rest wait for the restore release.
-  1. uid 1000 (Cain's own user) can't read the Supervisor's token or the helper's inputs.
-  1b. uid 1000 kills its own session 6 times, and nothing but the "Cain's session ended on its own"
-     alarm happens.
-  2. The Nov 19 replay fires the crash-loop alarm.
-  3. Kill the plugin, close the session, cut the network for 15 minutes: each alarm raises and clears.
-  4. An API outage and a reboot: no false alarm.
-  5. A fresh manual backup, then the helper's partial restore of this App's own backup, watched from
-     outside the container: the Supervisor's log for the data folder being removed, whether the
-     record in the App's config folder survives, whether `/jobs` is readable under the backup role,
-     and whether the version after matches the backup.
-  6. The full rollback from an older signed version and a deliberately broken one, with you watching.
-  7. The bad version refused on reinstall.
-  8. A power cut during a restore.
+1. uid 1000 (Cain's own user) can't read the Supervisor's token, the probe's records and marks or
+   the gateway state, can't write anything under `/run/cain/probe` or `/data/probe`, and can't list
+   `/run/cain`.
+1b. uid 1000 kills its own session 6 times after the 5-minute mark: no early exit is counted, and
+   "Cain's session keeps ending on its own" is raised once.
+2. The Nov 19 replay raises "Cain's session keeps exiting early".
+3. Kill the plugin, close the session, cut the network for 15 minutes: each alarm raises and clears.
+4. An API outage and a reboot: no false alarm.
+5. Restart the App from Home Assistant 4 times within 30 minutes: nothing counts.
+
+For a hand restore to be there when the update line asks for it, keep a backup taken before each
+update of Cain: the Ship job takes one, and Home Assistant's **Backup before update** does too.
 
 ## Your record: one hand on each item (since 0.6.0)
 

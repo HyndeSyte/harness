@@ -29,7 +29,7 @@ cd /data/work || { echo "no /data/work" >&2; exit 1; }
 claude --permission-mode auto --channels plugin:discord@claude-plugins-official
 rc=$?
 echo "$(date -Is) claude exited ($rc): the App starts his session again, and checks it first" >&2
-# Its exit code, for the run script's count of crash starts (Cain 0.14.0, probe/core.ts endKind):
+# Its exit code, for the run script's count of early exits (Cain 0.14.0, probe/core.ts endKind):
 # his own folder the new way, root's the old way. The code only says how a run ended, never whether
 # the App asked for the end (a root-owned mark says that) and never whether it counts (how long the
 # run lasted, as root saw it, says that): his own user can write this file and end his own session.

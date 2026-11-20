@@ -61,6 +61,29 @@ uid_procs() {
   done
 }
 
+# The probe's folders (Cain 0.14.0): /run/cain/probe and /data/probe root's alone, as lock.sh made
+# them, with the marks the probe writes in them; nothing under them writable, or even reachable, by
+# uid 1000, and he can't create a mark there.
+probe_marks_root_only() {
+  local p bad
+  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" boot >/dev/null 2>&1 || fail "the probe couldn't keep the container's start"
+  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" session-start "" "" >/dev/null 2>&1 || fail "the probe couldn't keep a session start"
+  [ -s /run/cain/probe/session.json ] && [ -s $D/probe/boots ] || fail "the probe's marks weren't written"
+  for p in /run/cain/probe $D/probe; do
+    [ "$(stat -c '%U:%G %a' "$p")" = "root:root 700" ] || fail "$p isn't root's alone: $(stat -c '%U:%G %a' "$p")"
+  done
+  bad="$(find /run/cain/probe $D/probe \( ! -user root -o ! -group root -o -perm /077 \) -print 2>/dev/null)"
+  [ -z "$bad" ] || fail "under the probe's folders, not root's alone: $bad"
+  bad="$(setpriv --reuid=1000 --regid=1000 --init-groups bash -c '
+    for p in /run/cain /run/cain/probe /run/cain/probe/session.json /run/cain/probe/booted /run/cain/probe/asked '"$D"'/probe '"$D"'/probe/boots '"$D"'/probe/starts '"$D"'/probe/stop-asked; do
+      [ -w "$p" ] && echo "writable: $p"
+    done
+    : > /run/cain/probe/asked 2>/dev/null && echo "created: /run/cain/probe/asked"
+    ls /run/cain/probe >/dev/null 2>&1 && echo "listed: /run/cain/probe"
+    true')"
+  [ -z "$bad" ] || fail "uid 1000 reaches the probe's marks: $bad"
+}
+
 # The old tree's contents and owners (not modes: the switch tightens those first).
 old_print() { (cd $D && find .claude .claude.json work -printf '%p|%y|%U|%G|%s|%l\n' 2>/dev/null | sort; find .claude .claude.json work -type f -exec sha256sum {} + 2>/dev/null | sort -k2); }
 
@@ -145,6 +168,7 @@ final)
   prepare
   [ "$("$OPT/c1/state.sh")" = cut ] || fail "not cut over: $("$OPT/c1/state.sh")"
   secret_free
+  probe_marks_root_only
   for q in cain/.claude/projects/-data-work/leaked.jsonl cain/.claude/projects/-data-work/encoded.jsonl work/leak-work.txt work/proj/.git discord/inbox/leak.txt; do
     [ -e "$D/c1/quarantine/$q" ] || [ -n "$(ls -d "$D/c1/quarantine/$q".* 2>/dev/null)" ] || fail "not quarantined: $q"
   done

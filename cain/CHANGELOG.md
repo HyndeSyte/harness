@@ -2,12 +2,12 @@
 
 ## 0.14.0
 
-- The App now checks every 5 minutes that Cain's parts are running (his Discord plugin, his session, his Discord connection), and once an hour that his session answers a short check that never reaches you. These are liveness checks: they can say he's alive while a message of yours is lost.
-- When his session keeps crashing (more than 3 crashes in 30 minutes), you hear "Cain keeps crashing" on your phone and in Discord. A restart the App asked for, the first start after a reboot, and an end long after a start don't count.
-- When the whole App keeps restarting (more than 3 times in 30 minutes), you hear "Cain's App keeps restarting".
-- If his session ends on its own with an error after running a while, you hear it once: "Cain's session ended on its own".
-- A crash loop within a day of an update also says "A rollback of Cain would have run", with how to restore by hand. This release has no automatic restore.
-- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every liveness check passes. Fewer false alarms: nothing from the liveness checks while your Stop holds, and a sign-in or API outage on his screen is named as that.
+- The App now checks every 5 minutes that Cain's parts are running (his Discord plugin, his session, his Discord connection), and once an hour that his session answers a short check that never reaches you. These are liveness checks: they can say he's alive while a message of yours is lost. The hourly one waits while he's at work on something and for 5 minutes after you write to him.
+- When his session keeps exiting early (more than 3 times in 30 minutes, each within 5 minutes of starting), you hear "Cain's session keeps exiting early" on your phone and in Discord. When it keeps ending on its own with an error after running a while (more than 4 times in an hour), you hear "Cain's session keeps ending on its own".
+- When the whole App keeps restarting (more than 3 times in 30 minutes), you hear "Cain's App keeps restarting". Your own Stop, Restart or update from Home Assistant never counts, and neither does the restart an update makes.
+- Within a day of an update, either loop also tells you which update it was and how long ago, and how to go back by hand: restore the backup taken before the update from Home Assistant's backup page. Nothing rolls back by itself.
+- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every liveness check passes. While your Stop holds it isn't pinged, so that service will tell you the check is down about 20 minutes after you tap Stop; it comes back by itself after Turn back on.
+- Fewer false alarms: nothing from the liveness checks while your Stop holds, and a sign-in or API outage on his screen is named as that.
 
 ## 0.13.5
 

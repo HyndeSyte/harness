@@ -51,6 +51,20 @@ checked_now() {
 # halts the container: Dane hears it from root first (notice.sh; C1 second review). Not when a
 # signal ends it, as when the Supervisor stops or updates the App.
 trap 'rc=$?; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
+# The run of his session this script started, as it holds it in memory (probe/main.ts session-start
+# hands it back). A stop counts as asked only when root's mark, the run on file and this all name the
+# same run; after s6 restarts this script it is empty, and the run before is classed by its timing.
+run_id=""
+# The Supervisor stopping the App (an owner's Stop, Restart or update from Home Assistant) reaches
+# this script as SIGTERM from s6 before anything else of the container is stopped: root records the
+# stop as asked, naming the run it holds, before his session ends, and keeps a mark in /data so the
+# container start after it isn't counted (Cain 0.14.0). Then it dies of the same signal, so s6's
+# finish script sees a stop, not an exit of its own (which would halt the container and alarm).
+# The waits in the loops below are interruptible (sleep in the background, then wait), so the
+# trap runs at once; the finish script records the stop as well, should it not.
+stop_asked() { timeout 5 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" >/dev/null 2>&1 || true; }
+trap 'stop_asked; trap - TERM; kill -TERM $$' TERM
+nap() { sleep "$1" & wait $! 2>/dev/null || true; }
 
 relay() { printf '%s\n' "$(jq -cn --arg t "$1" '{text: $t}')" >> /data/relay.queue; }
 # Each failed try of the switch reaches Dane from root (notice.sh; C1 second review: the first
@@ -185,13 +199,14 @@ if [ "$mode" = none ]; then "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_c
 { printf '%s\n' "$mode" > /run/cain/mode.tmp && chmod 0644 /run/cain/mode.tmp && mv /run/cain/mode.tmp /run/cain/mode; } \
   || bashio::log.error "Couldn't write /run/cain/mode"
 bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session held until the check of his own user finishes}"
-# This container's boot, counted in /data once per container (probe/main.ts boot, Cain 0.14.0): more
-# than 3 in 30 minutes alarms that the App keeps restarting. Then the version this start runs: a
-# version that changed since the last start is an install, and a crash loop within a day of it also
-# says a rollback would have run (none is in this release: rollback/helper.ts ships dormant and
-# nothing starts it).
-timeout 30 bun "$OPT/probe/main.ts" boot 2>&1 || true
+# The version this start runs (probe/main.ts install, Cain 0.14.0): a version that changed since the
+# last start is an install, and a loop within a day of it says so, with the way back by hand. Then
+# this container's start, kept in /data once per container: more than 3 counted in 30 minutes alarms
+# that the App keeps restarting. A start after a stop the Supervisor asked for, and the first two
+# within 10 minutes of a version change (the update's own restart), aren't counted. Nothing here
+# restores or rolls back anything.
 [ "$version" = unknown ] || timeout 30 bun "$OPT/probe/main.ts" install "$version" 2>&1 || true
+timeout 30 bun "$OPT/probe/main.ts" boot 2>&1 || true
 
 # What each way of running reads where. The old way keeps 0.11.0's places; the new one the
 # places of C1's section 3.2.
@@ -281,8 +296,9 @@ his_procs() {
 end_his_session() {
   unchecked
   # The stop request, recorded root's own before the stop, naming the run it stops (probe/main.ts
-  # session-asked): only that makes the run's end "asked". Never inferred from an exit code.
-  timeout 30 bun "${OPT:-/opt/cain}/probe/main.ts" session-asked >/dev/null 2>&1 || true
+  # session-asked, with the run this script holds): only that makes the run's end "asked". Never
+  # inferred from an exit code.
+  timeout 30 bun "${OPT:-/opt/cain}/probe/main.ts" session-asked "${run_id:-}" >/dev/null 2>&1 || true
   timeout 10 $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
   if [ "$TMUX_CMD" != tmux ]; then
     local i
@@ -328,14 +344,16 @@ session_up() {
 }
 # His session. A start that doesn't take returns 1, never ends this script: the foreground loop
 # below starts it again, later each time, and tells Dane if it keeps failing (session_ended).
-# How his runs end, for the count of crash starts (probe/core.ts endKind; Cain 0.14.0), from what
+# How his runs end, for the count of early exits (probe/core.ts endKind; Cain 0.14.0), from what
 # root alone saw: "boot" for the first start in this container, "asked" only when this script
-# recorded its own stop request for that run before it ended (end_his_session), and otherwise how
-# long it ran to when this script saw it gone (session_gone): within 5 minutes a crash start, which
-# counts toward the alarm whatever code it kept ("unknown" when none); later, exit 0 is "clean" and
-# a non-zero exit "self" (his own user can cause one), which alarms once a stretch and never counts.
+# recorded its own stop request for that run before it ended (end_his_session, stop_asked), and
+# otherwise how long it ran to when this script saw it gone (session_gone): within 5 minutes an early
+# exit, which counts toward its alarm whatever code it kept ("unknown" when none); later, exit 0 is
+# "clean" and a non-zero exit "self" (his own user can cause one), counted apart in an hour's window.
+# A run this script never saw end (s6 restarted it meanwhile) is an early exit only when this start
+# comes within 5 minutes of the run's start, and "unknown" otherwise.
 # session.sh keeps the exit code: his own folder the new way (read as him), root's the old way.
-session_gone() { timeout 30 bun "$OPT/probe/main.ts" session-gone >/dev/null 2>&1 || true; }
+session_gone() { timeout 30 bun "$OPT/probe/main.ts" session-gone "${run_id:-}" >/dev/null 2>&1 || true; }
 last_code() {
   if [ "$mode" = own ]; then timeout 10 "$OPT/as-cain" head -c 8 /run/cain/tmux/claude.rc 2>/dev/null | tr -cd '0-9' || true
   else head -c 8 /run/cain/claude.rc 2>/dev/null | tr -cd '0-9' || true; fi
@@ -344,9 +362,15 @@ start_his_session() {
   unchecked
   bashio::log.info "Starting Cain"
   # Every start of his session is kept in /data (probe/main.ts session-start), outside his session
-  # and across restarts and reboots, with how the run before it ended: nothing can reset the count,
-  # and only crash starts count (more than 3 in 30 minutes alarms).
-  timeout 30 bun "$OPT/probe/main.ts" session-start "$(last_code)" 2>&1 || true
+  # and across restarts and reboots, with how the run before it ended: nothing can reset the count.
+  # The new run's id comes back on the last line ("run <id> <kind>") and is held here in memory.
+  local started
+  started="$(timeout 30 bun "$OPT/probe/main.ts" session-start "$(last_code)" "${run_id:-}" 2>&1 | tee /dev/stderr | tail -n 1)" || true
+  case "$started" in
+    "run "*) run_id="$(printf '%s' "$started" | cut -d ' ' -f 2 | tr -cd '0-9a-f' | head -c 16)"
+             bashio::log.info "The run before ended: $(printf '%s' "$started" | cut -d ' ' -f 3 | tr -cd 'a-z0-9-' | head -c 20)" ;;
+    *) run_id="" ;;
+  esac
   rm -f /run/cain/claude.rc 2>/dev/null || true
   [ "$mode" != own ] || timeout 10 "$OPT/as-cain" rm -f /run/cain/tmux/claude.rc 2>/dev/null || true
   if ! start_session; then bashio::log.error "tmux could not start"; return 1; fi
@@ -463,7 +487,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # are liveness checks: they can say alive while messages are lost. A pass that passed pings the
 # probe's own outside heartbeat (probe_heartbeat_url, read here by this one subshell, in no other
 # child's environment, never logged). A failed stretch alarms through notice.sh, both routes; it
-# also keeps the crash-loop and boot-loop alarms current. Alarms only.
+# also keeps the alarms for repeated early exits and repeated container starts current. Alarms only.
 (
   { set +x; } 2>/dev/null
   v="$(bashio::config 'probe_heartbeat_url' 2>/dev/null || true)"; [ "$v" = "null" ] && v=""
@@ -641,7 +665,7 @@ session_ended() {
   for ((i = 1; i < quick && wait < 600; i++)); do wait=$((wait * 2)); done
   [ "$wait" -le 600 ] || wait=600
   bashio::log.warning "Starting his session again in $wait seconds"
-  sleep "$wait"
+  nap "$wait"
 }
 # Stay in the foreground while he runs, his session started again whenever it ends. The check of
 # his own user runs here (run_check), and its answer acts at once: a breach stops him and a check
@@ -747,7 +771,7 @@ while session_up; do
     cleared=1; quick=0
     if [ "$mode" = own ]; then "$OPT/notice.sh" clear switched || true; else "$OPT/notice.sh" clear running || true; fi
   fi
-  sleep 10
+  nap 10
 done
 if [ "$mode" = none ] || [ -n "$held" ]; then continue; fi
 session_gone

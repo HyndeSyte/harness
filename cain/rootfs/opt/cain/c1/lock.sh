@@ -22,7 +22,7 @@ case "${1:-}" in
 run)
   # Cain 0.14.0: his group may pass through /run/cain to what he reads there by name, but not list it
   # (0710): what root keeps there (the link's gateway state, the probe's marks) stays
-  # unreadable and unwritable to him (cain/tests/probe-rollback.test.ts checks these modes).
+  # unreadable and unwritable to him (cain/tests/probe.test.ts checks these modes).
   install -d -m 0710 -o root -g cain /run/cain || die "no /run/cain"
   install -d -m 0700 -o root -g root /run/cain/root-tmp
   install -d -m 0750 -o root -g cain /run/cain/keys

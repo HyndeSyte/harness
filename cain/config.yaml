@@ -47,7 +47,8 @@ timeout: 30
 # URL can mask an outage or fake a failure. Empty: no heartbeat, and the morning check-in says so.
 # probe_heartbeat_url (0.14.0): the probe's own outside heartbeat, a second check at the same service
 # as heartbeat_url (its own ping URL). Pinged only after a liveness pass that passed (every 5 minutes),
-# so the service alarms the owner when Cain's parts stop running, not only when the App stops. Read only by
+# and never while the owner's Stop holds, so the service alarms the owner when Cain's parts stop running,
+# not only when the App stops (and during his Stop too: DOCS.md says so). Read only by
 # the probe's own subshell (the run script), never by Cain's session, never logged. Empty: no ping.
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its

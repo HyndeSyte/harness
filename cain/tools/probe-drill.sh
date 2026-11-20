@@ -1,22 +1,22 @@
 #!/bin/bash
 # The Pi drills for Cain 0.14.0's alarms, in order, for the owner's assistant to run on the real Pi
 # from a shell that can reach Docker (Home Assistant's SSH App with protection mode off). Not shipped
-# in the image. This release has no restore: only the steps that apply to it are here (1, 1b, 2, 3
-# and 4 of the drill order in DOCS.md). Steps 5 to 8 (the partial restore of this App's own backup,
-# the full rollback, the bad version refused on reinstall, a power cut during a restore) wait for the
-# restore release, which brings them with its own code.
+# in the image. This release only alarms: nothing here restores or rolls back anything.
 #
-#   probe-drill.sh 1    the boundary, as uid 1000 (Cain's own user): reading the Supervisor's token
-#                       (there should be none: hassio_api is off), the probe's records and marks and
-#                       the link's gateway state file must each fail, and /run/cain must not list.
+#   probe-drill.sh 1    the boundary, as uid 1000 (Cain's own user): reading the Supervisor's token,
+#                       the probe's records and marks and the link's gateway state file must each
+#                       fail, nothing under /run/cain/probe may be written, and /run/cain must not list.
 #   probe-drill.sh 1b   uid 1000 kills its own session 6 times, each after it has run over 5 minutes:
-#                       nothing but the "Cain's session ended on its own" alarm may happen (no crash
-#                       count, no "Cain keeps crashing", no "A rollback of Cain would have run").
+#                       no early exit is counted, no "Cain's session keeps exiting early", and "Cain's
+#                       session keeps ending on its own" is raised once (more than 4 in an hour).
 #   probe-drill.sh 2    the Nov 19 replay: his session killed within a minute of each start, more than
-#                       3 times in 30 minutes: "Cain keeps crashing" must fire.
+#                       3 times in 30 minutes: "Cain's session keeps exiting early" must fire.
 #   probe-drill.sh 3    kill the plugin, close his session, cut the network for 15 minutes: each alarm
 #                       must be raised and then cleared.
 #   probe-drill.sh 4    an API outage and a reboot: no false alarm (prints the steps, then checks).
+#   probe-drill.sh 5    asked stops: Restart the App from Home Assistant 4 times within 30 minutes (and
+#                       an update, if one is waiting): every start kept as "asked" or "update", no
+#                       container-start alarm, no early exit counted (prints the steps, then checks).
 #
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
 # token or a heartbeat URL.
@@ -45,10 +45,13 @@ case "${1:-}" in
     for f in /run/s6/container_environment/SUPERVISOR_TOKEN /data/probe/starts /data/probe/boots /run/cain/probe/session.json /run/cain/link-gateway.state; do
       if as_cain sh -c "head -c 1 '$f' >/dev/null 2>&1"; then say "  READ $f: it must not be readable"; ok=0; else say "  refused: $f"; fi
     done
-    if as_cain sh -c 'printf x > /run/cain/probe/asked' 2>/dev/null; then say "  WROTE the run script's stop mark: it must not be writable"; ok=0; else say "  refused: writing the stop mark"; fi
+    for f in /run/cain/probe /run/cain/probe/asked /run/cain/probe/session.json /data/probe /data/probe/stop-asked; do
+      if as_cain sh -c "[ -w '$f' ] || : > '$f'" 2>/dev/null; then say "  WROTE $f: nothing under the probe's folders may be writable"; ok=0; else say "  refused: writing $f"; fi
+    done
     if as_cain sh -c 'ls /run/cain >/dev/null 2>&1'; then say "  LISTED /run/cain: it must not be listable"; ok=0; else say "  refused: listing /run/cain"; fi
-    if in_c sh -c 'pgrep -f rollback/helper.ts >/dev/null'; then say "  the rollback helper runs: it must not in this release"; ok=0; else say "  no rollback helper runs"; fi
-    [ "$ok" = 1 ] && echo "PASS: uid 1000 can't read the token, the probe's records or the gateway state, can't write the stop mark, and no helper runs" || fail "the boundary didn't hold (above)"
+    bad="$(in_c sh -c 'find /run/cain/probe /data/probe \( ! -user root -o -perm /077 \) -print' 2>/dev/null)"
+    if [ -n "$bad" ]; then say "  not root's alone: $bad"; ok=0; else say "  every path under the probe's folders is root's alone"; fi
+    [ "$ok" = 1 ] && echo "PASS: uid 1000 can't read the token, the probe's records or the gateway state, and can't write under the probe's folders" || fail "the boundary didn't hold (above)"
     ;;
   1b)
     say "step 1b: uid 1000 kills its own session 6 times, each after over 5 minutes"
@@ -61,12 +64,11 @@ case "${1:-}" in
       sleep 30
     done
     starts_since "$since"
-    n="$(in_c awk -v s="$since" '$1 >= s && $2 ~ /^crash-/' /data/probe/starts | wc -l)"
-    [ "$n" = 0 ] || fail "$n of those ends counted as crash starts"
-    alarm_up restarts && fail "\"Cain keeps crashing\" was raised"
-    alarm_up rollback && fail "\"A rollback of Cain would have run\" was raised"
-    alarm_up self || fail "\"Cain's session ended on its own\" wasn't raised"
-    echo "PASS: six self-kills after the 5 minute mark counted nothing; only \"ended on its own\" was raised. Confirm on the phone it came once."
+    n="$(in_c awk -v s="$since" '$1 >= s && $2 ~ /^early-/' /data/probe/starts | wc -l)"
+    [ "$n" = 0 ] || fail "$n of those ends counted as early exits"
+    alarm_up restarts && fail "\"Cain's session keeps exiting early\" was raised"
+    alarm_up self || fail "\"Cain's session keeps ending on its own\" wasn't raised"
+    echo "PASS: six self-kills after the 5 minute mark counted no early exit, and \"keeps ending on its own\" was raised. Confirm on the phone it came once."
     ;;
   2)
     say "step 2: the Nov 19 replay, his session killed within a minute of each start"
@@ -77,10 +79,11 @@ case "${1:-}" in
       say "  kill $i"
       kill_his_session
     done
-    wait_for 900 alarm_up restarts || fail "\"Cain keeps crashing\" wasn't raised"
+    wait_for 900 alarm_up restarts || fail "\"Cain's session keeps exiting early\" wasn't raised"
     starts_since "$since"
-    say "  raised; it comes down once 30 minutes pass without a crash start"
-    echo "PASS: the crash loop alarmed. Confirm the push reached the phone, and that it clears within the hour."
+    say "  within a day of an update the line naming it comes too: $(alarm_up update && echo raised || echo not raised)"
+    say "  raised; it comes down once the 30 minutes hold no more than 3 early exits"
+    echo "PASS: the early exits alarmed. Confirm the push reached the phone, and that it clears within the hour."
     ;;
   3)
     say "step 3: the plugin killed, his session closed, the network cut"
@@ -117,19 +120,42 @@ case "${1:-}" in
      the router for api.anthropic.com). Expected: "The model's API isn't answering" once, cleared
      after, and nothing else.
   b. Reboot the Pi (ha host reboot). Expected: the first start after the boot is "boot", one boot is
-     counted, and no crash-loop or boot-loop alarm.
+     counted, and no early-exit or container-start alarm.
 Then run: probe-drill.sh 4 check <the time step 4 began, in epoch seconds>
 EOF
     say "  this step began at $since"
     if [ "${2:-}" = check ]; then
       s="${3:?the time step 4 began}"
       starts_since "$s"
-      n="$(in_c awk -v s="$s" '$1 >= s && $2 ~ /^crash-/' /data/probe/starts | wc -l)"
-      [ "$n" -le 3 ] || fail "$n crash starts since step 4 began"
-      alarm_up restarts && fail "\"Cain keeps crashing\" is up"
+      n="$(in_c awk -v s="$s" '$1 >= s && $2 ~ /^early-/' /data/probe/starts | wc -l)"
+      [ "$n" -le 3 ] || fail "$n early exits since step 4 began"
+      alarm_up restarts && fail "\"Cain's session keeps exiting early\" is up"
       alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
-      echo "PASS: no crash-loop or boot-loop alarm after the API outage and the reboot"
+      echo "PASS: no early-exit or container-start alarm after the API outage and the reboot"
     fi
     ;;
-  *) echo "usage: probe-drill.sh 1|1b|2|3|4 [check ...]   (steps 5 to 8 wait for the restore release)"; exit 2 ;;
+  5)
+    since=$(date +%s)
+    say "step 5: stops asked from Home Assistant never count"
+    cat <<'EOF'
+  In Home Assistant, Settings, Apps, Cain: tap Restart, wait until the log says Cain's start, and do
+  it 4 times within 30 minutes (an update of the App, if one is waiting, counts as one of them).
+  Expected: each start kept as "asked" (or "update") in /data/probe/boots, his session's first start
+  in each container "boot", no "Cain's App keeps restarting" and no early exit counted.
+Then run: probe-drill.sh 5 check <the time step 5 began, in epoch seconds>
+EOF
+    say "  this step began at $since"
+    if [ "${2:-}" = check ]; then
+      s="${3:?the time step 5 began}"
+      in_c awk -v s="$s" '$1 >= s' /data/probe/boots
+      n="$(in_c awk -v s="$s" '$1 >= s && $2 == "boot"' /data/probe/boots | wc -l)"
+      [ "$n" = 0 ] || fail "$n container starts counted since step 5 began (each Restart should be kept as asked)"
+      n="$(in_c awk -v s="$s" '$1 >= s && $2 ~ /^early-/' /data/probe/starts | wc -l)"
+      [ "$n" = 0 ] || fail "$n early exits counted since step 5 began"
+      alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
+      alarm_up restarts && fail "\"Cain's session keeps exiting early\" is up"
+      echo "PASS: the asked stops counted nothing"
+    fi
+    ;;
+  *) echo "usage: probe-drill.sh 1|1b|2|3|4|5 [check ...]"; exit 2 ;;
 esac

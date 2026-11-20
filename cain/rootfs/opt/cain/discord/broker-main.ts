@@ -154,11 +154,8 @@ function connection(sock: Socket): void {
     session: name,
     setTimer: (ms, f) => setTimeout(f, ms),
     clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
-    probeAnswered: () => {
-      mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });
-      writeFileSync(`${PROBE_RUN}/answered.tmp`, `${Math.floor(Date.now() / 1000)}\n`, { mode: 0o600 });
-      renameSync(`${PROBE_RUN}/answered.tmp`, `${PROBE_RUN}/answered`);
-    },
+    probeAnswered: () => probeMark("answered"),
+    heard: () => probeMark("heard"),
   });
   conn.session = session;
   current = conn;
@@ -177,6 +174,15 @@ function connection(sock: Socket): void {
     for await (const chunk of proc.stderr) read(dec.decode(chunk, { stream: true }));
   })();
   void proc.exited.then((code) => { log(`the plugin's server stopped (${code})`); session.serverGone(); });
+}
+
+// A mark of the probe's (the hourly check's answer, or when a message of the owner's came in for his
+// session): the time only, root's alone, whole or not at all (a fresh temp name, then a rename).
+function probeMark(name: "answered" | "heard"): void {
+  mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });
+  const tmp = `${PROBE_RUN}/${name}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, `${Math.floor(Date.now() / 1000)}\n`, { mode: 0o600, flag: "wx" });
+  renameSync(tmp, `${PROBE_RUN}/${name}`);
 }
 
 // The probe's ask: handed to his session once a connection has started (every 5 seconds a look).

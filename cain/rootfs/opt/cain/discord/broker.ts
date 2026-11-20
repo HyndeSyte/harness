@@ -71,6 +71,7 @@ export interface BrokerDeps {
   setTimer?: (ms: number, f: () => void) => unknown;
   clearTimer?: (t: unknown) => void;
   probeAnswered?: () => void;                          // his session gave the hourly liveness check's fixed answer
+  heard?: () => void;                                  // a message of the owner's came in for his session (its time only)
 }
 
 interface Pending { method: string; tool?: string; args?: Record<string, unknown>; outbox?: string; note?: string; timer?: unknown; initialize?: boolean }
@@ -272,7 +273,12 @@ export class BrokerSession {
       return void this.d.toClient(JSON.stringify(m));
     }
     if (typeof m.method === "string" && m.id === undefined) {
-      if (SERVER_NOTES.has(m.method)) this.d.toClient(JSON.stringify(m));
+      if (SERVER_NOTES.has(m.method)) {
+        // A message of the owner's came in for his session: the hourly liveness check keeps 5 minutes clear
+        // of it (probe/core.ts askDue). Only the time is noted, nothing of the message.
+        if (m.method === "notifications/claude/channel") { try { this.d.heard?.(); } catch { /* the probe then asks as usual */ } }
+        this.d.toClient(JSON.stringify(m));
+      }
       else this.d.log(`dropped a server notification: ${m.method.slice(0, 60)}`);
       return;
     }
