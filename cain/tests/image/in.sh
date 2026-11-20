@@ -406,7 +406,7 @@ alarm)
     || fail "the hold isn't on record for this version: $(cat $D/c1/check-held 2>/dev/null)"
   grep -q "^/api/webhook/$hook {\"state\":\"on\",\"group\":\"stop\",\"alarm\":\"held\",\"title\":\"Cain is paused\"" /fp/hook.log \
     || fail "Home Assistant didn't get the pause: $(head -c 300 /fp/hook.log)"
-  grep -q "This isn't a breach" /fp/hook.log && grep -q "Settings, System, Backups" /fp/hook.log || fail "the pause didn't say what it is and the way back"
+  grep -q "This isn't a breach" /fp/hook.log && grep -q "under If Cain stops" /fp/hook.log || fail "the pause didn't say what it is and the way back"
   grep -qx "discord 0" $D/c1/notice.d/stop || fail "his bot posted, with its token away"
   "$OPT/notice.sh" tell switch-failed "the smoke test failed" >/dev/null
   "$OPT/notice.sh" tell breach >/dev/null

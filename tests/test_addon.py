@@ -683,7 +683,8 @@ def test_no_stop_is_silent(tmp_path):
     kinds = set(re.findall(r"\bstop_kind=([a-z-]+)", run))
     assert kinds == {"setup", "breach", "switch-stopped", "switch-blocked", "switch-restart", "restart", "damaged"}
     told = set(re.findall(r'notice\.sh" tell ([a-z-]+)', run)) | set(re.findall(r"\bkind=(switch-[a-z]+)", run))
-    assert told == {"exited", "switch-failed", "switch-waits", "held", "session", "breach"}
+    # Cain 0.15.0: the channel watchdog names the plugin's server apart from his channel going down.
+    assert told == {"exited", "switch-failed", "switch-waits", "held", "session", "breach", "channel", "server-gone"}
     for kind in kinds | told:
         out = subprocess.run(["bash", (CAIN / "rootfs/opt/cain/notice.sh").as_posix(), "text", kind], capture_output=True, text=True)
         assert out.returncode == 0 and out.stdout.count("\n") == 2, kind
@@ -694,7 +695,12 @@ def test_no_stop_is_silent(tmp_path):
     assert fn.count('"$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_cause" || true') == 3 and fn.count("no_session") == 3
     assert 'if [ "$mode" = none ]; then stopped; fi' in run
     exits = [l for l in code if re.search(r"\bexit \d", l)]
-    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }']
+    # And (Cain 0.15.0) the App restarting itself: exit 3, only from self_restart, after the probe said
+    # "restart" (the switch on, marks kept) and his session was ended; told, so the EXIT trap stays quiet.
+    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "      exit 3 ;;"]
+    self_fn = _run_fns(run, "self_restart() {", "# When his channel went down")
+    assert self_fn.index("    restart)") < self_fn.index(": > /run/cain/self-restart") < self_fn.index("end_his_session || true") < self_fn.index("exit 3")
+    assert "[ ! -e /run/cain/self-restart ]" in run.split("trap 'rc=$?;")[1].split("\n")[0]
     assert "check-told" not in run and "stopped-told" not in run and '"$OPT/alert.sh" "Cain is stopped' not in run
     # The check runs in the foreground only, one try at a time: never in the background.
     assert run.count('"$OPT/c1/check.sh"') == 2 and "C1_UNTRIED" in run
@@ -719,8 +725,11 @@ def _whole_start(tmp_path, **stubs):
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text().replace("\r\n", "\n")
     data, runc, opt, bindir = tmp_path / "data", tmp_path / "run" / "cain", tmp_path / "opt", tmp_path / "bin"
     procs = tmp_path / "proc"
-    for d in (data / "c1", data / "link", opt / "c1", opt / "discord", bindir, procs):
+    for d in (data / "c1", data / "link", opt / "c1", opt / "discord", bindir, procs, data / "cain" / ".claude"):
         d.mkdir(parents=True, exist_ok=True)
+    # He is signed in to Claude (Cain 0.15.0: a session waiting on the owner's sign-in is never
+    # restarted for its channel; tests/test_cain_stays_on.py takes this away for that case).
+    (data / "cain" / ".claude" / ".credentials.json").write_text('{"signed": "in"}\n')
     calls, stop = tmp_path / "calls", tmp_path / "stop"
     note = f'echo "$(basename "$0") $*" >> {calls.as_posix()}'
     scripts = {"c1/lock.sh": "exit 0", "c1/state.sh": "echo cut", "notice.sh": "exit 0", "as-cain": "exit 1",
@@ -797,10 +806,10 @@ def test_the_whole_start_keeps_starting_a_session_that_wont_start_and_says_so(tm
     if not shutil.which("bash") or not shutil.which("jq") or os.name == "nt":
         pytest.skip("needs bash, jq and a POSIX process model")
     calls, stop, bindir, _ = _whole_start(tmp_path)
-    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l)
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: any(x.startswith("notice.sh tell session ") for x in l))
     assert alive, err
     tries = [l for l in lines if l.startswith("as-cain env CAIN_MODE=own tmux -u -S") and "new-session" in l]
-    assert len(tries) >= 3 and "notice.sh tell session" in lines and "notice.sh tell exited" not in lines, lines[:30]
+    assert len(tries) >= 3 and any(x.startswith("notice.sh tell session ") for x in lines) and "notice.sh tell exited" not in lines, lines[:30]
 
 
 def _session_up(tmp_path):
@@ -876,11 +885,11 @@ def test_the_whole_start_never_leaves_him_unchecked_when_tmux_hangs(tmp_path):
             f'printf "State:\\tS (sleeping)\\nUid:\\t1000\\t1000\\t1000\\t1000\\n" > {proc}/status;; '
             '*has-session*) exit 124;; *kill-session*) exit 1;; esac; exit 0')
     calls, stop, bindir, _ = _whole_start(tmp_path, **{"as-cain": hung, "c1/check.sh": "exit 0"})
-    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l, C1_CHECK_FIRST_S="0")
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: any(x.startswith("notice.sh tell session ") for x in l), C1_CHECK_FIRST_S="0")
     assert alive, err
     starts = [i for i, l in enumerate(lines) if "new-session" in l]
     kills = [i for i, l in enumerate(lines) if l.startswith("setpriv --reuid=1000")]
-    assert len(starts) >= 3 and len(kills) >= len(starts) - 1 and "notice.sh tell session" in lines, lines[:40]
+    assert len(starts) >= 3 and len(kills) >= len(starts) - 1 and any(x.startswith("notice.sh tell session ") for x in lines), lines[:40]
     assert not any(l.startswith("check.sh") for l in lines)              # never counted as running, never passed
 
 
@@ -897,11 +906,11 @@ def test_the_whole_start_tells_dane_when_his_channel_keeps_going_down(tmp_path):
     calls, stop, bindir, runc = _whole_start(tmp_path, **{"as-cain": _session_up(tmp_path), "c1/check.sh": "exit 0"})
     runc.mkdir(parents=True, exist_ok=True)
     (runc / "discord.state").write_text(f"down {int(time.time()) - 600}\n")
-    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l,
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: any(x.startswith("notice.sh tell channel ") for x in l),
                                    C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
     assert alive, err
     starts = [l for l in lines if "new-session" in l]
-    assert len(starts) >= 3 and "notice.sh tell session" in lines, lines[:40]
+    assert len(starts) >= 3 and any(x.startswith("notice.sh tell channel ") for x in lines), lines[:40]
     assert "notice.sh clear switched" not in lines, lines[:40]           # never counted as running
     # A connected channel does count: the alarm comes down and nothing is restarted.
     calls.unlink()
@@ -934,12 +943,12 @@ def test_the_whole_start_tells_dane_when_his_channel_drops_after_he_counts_as_ru
              f'[ "$(wc -l < {seen})" = 2 ] && echo "down $(( $(date +%s) - 600 ))" > {state}\nexit 0')
     calls, stop, bindir, runc = _whole_start(tmp_path, **{"as-cain": as_cain, "c1/check.sh": "exit 0", "watch.sh": watch})
     runc.mkdir(parents=True, exist_ok=True)
-    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh tell session" in l,
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: any(x.startswith("notice.sh tell channel ") for x in l),
                                    C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
     assert alive, err
-    assert "notice.sh tell session" in lines, lines[:60]
+    assert any(x.startswith("notice.sh tell channel ") for x in lines), lines[:60]
     starts = [i for i, l in enumerate(lines) if "new-session" in l]
-    told = lines.index("notice.sh tell session")
+    told = next(i for i, x in enumerate(lines) if x.startswith("notice.sh tell channel "))
     assert len([i for i in starts if i < told]) == 3, lines[:60]
     clears = [i for i, l in enumerate(lines) if l == "notice.sh clear switched"]
     assert clears and clears[0] < starts[1], lines[:60]                 # the first session did count as running
@@ -1155,7 +1164,11 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
         for words in (title, text):
             assert "—" not in words and "add-on" not in words.lower(), kind
             assert not re.search(r"\b([PQ]\d+|[CDF]\d|wave \d)\b", words), kind
-        assert "Settings, " in text or "Nothing for you to do" in text or "Open Cain in Home Assistant, tap Sign in" in text, kind
+        # Cain 0.15.0: what the App does itself, or the way back named in its documentation; his own
+        # sign-in names where its link is. Never a step of his (cain/tests/stays-on.test.ts).
+        assert ("Nothing for you to do" in text or "by itself" in text or "If Cain stops" in text
+                or "Only you can sign him in" in text), kind
+        assert "Settings, " not in text and "restart the Cain App" not in text, kind
     # The App restarts itself in both of these (Cain 0.13.3): each ends at "Nothing for you to do."
     for kind in ("restart", "switch-restart"):
         text = call("text", kind, "x").splitlines()[1]
@@ -1194,8 +1207,8 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     call("tick")
     assert len(read("discord")) == 1 and read("discord")[0].startswith(f"{data.as_posix()}/link/discord.env | ")
     assert read("discord")[0].endswith("isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. "
-                                       "If he isn't back within an hour, restore two backups from just before his last update, Cain's and the calendar App's, "
-                                       "one after the other: Settings, System, Backups. The Cain App's log has the details.")
+                                       "The App keeps his link and the calendar App's cards running meanwhile, and the way back is in the App's "
+                                       "documentation, under If Cain stops. The Cain App's log has the details.")
     n = len(read("ha"))
     call("tick"); call("tell", "held")
     assert len(read("discord")) == 1 and len(read("ha")) == n            # raised already: nothing new
@@ -1208,8 +1221,8 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     assert (field("stop", "kind"), field("session", "kind"), field("switch", "kind")) == ("breach", "session", "switch-failed")
     assert field("switch", "cause") == "the smoke test failed" and "(the smoke test failed)" in read("discord")[-3]
     assert read("discord")[-1].endswith("| Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. "
-                                        "To get him back now, restore two backups from just before his last update, Cain's and the calendar App's, "
-                                        "one after the other: Settings, System, Backups. A fixed update also brings him back. The Cain App's log has the details.")
+                                        "A fixed update brings him back by itself. The App keeps his link and the calendar App's cards running meanwhile, "
+                                        "and the way back is in the App's documentation, under If Cain stops. The Cain App's log has the details.")
     # A lesser alarm doesn't replace a greater one in its group: the App stopping itself after a breach.
     call("tell", "exited")
     assert field("stop", "kind") == "breach"
@@ -1245,8 +1258,7 @@ def test_the_apps_alarms_reach_the_owner_from_root_by_his_bot_and_home_assistant
     call("tell", "waiting")
     assert field("screen", "kind") == "waiting" and (posted()["group"], posted()["alarm"]) == ("screen", "waiting")
     assert read("discord")[-1].endswith("| Cain isn't answering: a question is waiting on his screen, where no one answers it, "
-                                        "and the App couldn't clear it by itself. If he isn't back within an hour, restart the Cain "
-                                        "App: Settings, Apps, Cain, Restart. The Cain App's log has the details.")
+                                        "and Esc didn't clear it. The App starts his session fresh by itself. The Cain App's log has the details.")
     call("clear", "running")
     call("clear", "switched")
     assert field("screen", "kind") == "waiting"
@@ -3226,7 +3238,8 @@ def test_cain_chatgpt_signin_is_on_the_ingress_page():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     block = nginx.split("location /codex {")[1].split("}")[0]
     assert "proxy_pass http://unix:/run/cain-web/upstream/codex.sock;" in block       # C1: no port he could take
-    assert nginx.count("listen ") == 1 and "allow 172.30.32.2;" in nginx      # still Ingress only
+    # Still Ingress only; the second listen (Cain 0.15.0) serves the Supervisor's /health alone.
+    assert nginx.count("listen ") == 2 and "allow 172.30.32.2;" in nginx and block.count("listen") == 0
     page = (CAIN / "rootfs/opt/cain/index.html").read_text()
     assert 'href="codex"' in page and 'href="/codex' not in page
     main = (CAIN / "rootfs/opt/cain/review/main.ts").read_text(encoding="utf-8")

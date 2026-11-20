@@ -30,10 +30,12 @@ def _start(tmp_path, as_cain=None, signed_in=True, screen=None):
     whole.write_text(first + '\nbashio::api.supervisor() { echo "${STUB_WATCHDOG:-true}"; }\n' + rest)
     for d in (runc / "root-tmp", runc.parent / "cain-web" / "www"):
         d.mkdir(parents=True, exist_ok=True)
+    cred = tmp_path / "data" / "cain" / ".claude" / ".credentials.json"
     if signed_in:
-        cred = tmp_path / "data" / "cain" / ".claude" / ".credentials.json"
         cred.parent.mkdir(parents=True, exist_ok=True)
         cred.write_text('{"x": 1}\n')
+    else:
+        cred.unlink(missing_ok=True)
     if screen:
         (runc.parent / "cain-web" / "www" / "status.json").write_text('{"screen": "%s"}\n' % screen)
     return calls, stop, bindir, runc
