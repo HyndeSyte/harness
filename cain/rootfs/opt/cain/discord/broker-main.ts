@@ -12,6 +12,7 @@ import { checkAccess, ownerDm } from "../hooks/discord-read";
 import { SentSpool } from "./spool";
 import { BrokerSession, fileOutbox, MAX_LINE } from "./broker";
 import { gateSend, sentNote } from "./gate-call";
+import { checkFolder, folderWhy } from "../probe/folder";
 
 const env = process.env;
 const SOCK = env.CAIN_DISCORD_SOCK ?? "/run/cain/discord.sock";
@@ -178,8 +179,12 @@ function connection(sock: Socket): void {
 
 // A mark of the probe's (the hourly check's answer, or when a message of the owner's came in for his
 // session): the time only, root's alone, whole or not at all (a fresh temp name, then a rename).
+// The folder is looked at first and after it is made (probe/folder.ts: root's, 0700, not a symlink);
+// otherwise nothing is written, and the probe's own pass alarms that it was tampered with.
 function probeMark(name: "answered" | "heard"): void {
+  checkFolder(PROBE_RUN);
   mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });
+  checkFolder(PROBE_RUN);
   const tmp = `${PROBE_RUN}/${name}.${process.pid}.${Date.now()}.tmp`;
   writeFileSync(tmp, `${Math.floor(Date.now() / 1000)}\n`, { mode: 0o600, flag: "wx" });
   renameSync(tmp, `${PROBE_RUN}/${name}`);
@@ -188,7 +193,7 @@ function probeMark(name: "answered" | "heard"): void {
 // The probe's ask: handed to his session once a connection has started (every 5 seconds a look).
 function probeAsk(): void {
   const ask = `${PROBE_RUN}/ask`;
-  if (!current || !existsSync(ask)) return;
+  if (!current || folderWhy(PROBE_RUN) !== null || !existsSync(ask)) return;
   if (current.session.probe(`0000${Date.now()}`)) rmSync(ask, { force: true });
 }
 

@@ -2,12 +2,13 @@
 
 ## 0.14.0
 
-- The App now checks every 5 minutes that Cain's parts are running (his Discord plugin, his session, his Discord connection), and once an hour that his session answers a short check that never reaches you. These are liveness checks: they can say he's alive while a message of yours is lost. The hourly one waits while he's at work on something and for 5 minutes after you write to him.
-- When his session keeps exiting early (more than 3 times in 30 minutes, each within 5 minutes of starting), you hear "Cain's session keeps exiting early" on your phone and in Discord. When it keeps ending on its own with an error after running a while (more than 4 times in an hour), you hear "Cain's session keeps ending on its own".
+- The App now checks every 5 minutes that Cain's parts are running (his Discord plugin, his session, his Discord connection), and once an hour that his session answers a short check that never reaches you. These are liveness checks: they can say he's alive while a message of yours is lost. The hourly one waits while he's at work on something and for 5 minutes after you write to him, but never more than 2 hours. A turn of his that runs 2 hours without a break tells you "Cain's turn has been running for N minutes".
+- When his session keeps exiting early (more than 3 times in 30 minutes, each within 5 minutes of starting), you hear "Cain's session keeps exiting early" on your phone and in Discord. When it keeps ending on its own with an error after running a while (more than 4 times in an hour), you hear "Cain's session keeps ending on its own", which names the model's API or the network as possible causes. When it keeps starting again but the App never saw how it ended (more than 6 times in an hour), you hear "Cain's session keeps restarting", which says it is a pattern, not a confirmed crash.
 - When the whole App keeps restarting (more than 3 times in 30 minutes), you hear "Cain's App keeps restarting". Your own Stop, Restart or update from Home Assistant never counts, and neither does the restart an update makes.
-- Within a day of an update, either loop also tells you which update it was and how long ago, and how to go back by hand: restore the backup taken before the update from Home Assistant's backup page. Nothing rolls back by itself.
-- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every liveness check passes. While your Stop holds it isn't pinged, so that service will tell you the check is down about 20 minutes after you tap Stop; it comes back by itself after Turn back on.
-- Fewer false alarms: nothing from the liveness checks while your Stop holds, and a sign-in or API outage on his screen is named as that.
+- Each of these alarms gives the count, the window, the last exit code and the last line of his session's log. Only within a day of an update does one also say which update it was and that, if Home Assistant made a backup before the update, you can restore it from its Backups page. Nothing rolls back by itself.
+- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every liveness check passes. Your Stop doesn't pause it or the App's checks, since Cain keeps answering through a Stop.
+- If the folder where the App keeps these checks is ever changed by anything but the App, it stops using it and tells you "Cain's probe folder was tampered with".
+- Claude Code itself stays at the version this App ships with; its fixes arrive with App updates.
 
 ## 0.13.5
 

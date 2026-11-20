@@ -37,6 +37,17 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
+      # Claude Code's own updater is off in Cain's image (DISABLE_AUTOUPDATER), so its fixes arrive
+      # only with App releases. A note when a newer Claude Code than the image's pin exists: a warning
+      # on the run, never a failure (the lookup needs the network; no answer says so and passes).
+      - name: Claude Code's pinned version (a note, never a failure)
+        run: |
+          pin="$(sed -n 's/^ARG CLAUDE_VERSION=//p' cain/Dockerfile)"
+          latest="$(curl -fsS -m 15 https://registry.npmjs.org/@anthropic-ai/claude-code/latest 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)"
+          if [ -z "$latest" ]; then echo "couldn't read Claude Code's newest version; pinned ${pin}"
+          elif [ "$(printf '%s\n%s\n' "$pin" "$latest" | sort -V | tail -n 1)" != "$pin" ]; then
+            echo "::warning title=Claude Code update::Claude Code ${latest} is out; Cain's image pins ${pin} (cain/Dockerfile CLAUDE_VERSION)"
+          else echo "Claude Code ${pin} is the newest"; fi
       # A name or an import that doesn't resolve fails here: Bun runs TypeScript unchecked, so
       # one would crash only at run time. Type nits aren't gated (cain/tsconfig.check.json).
       - name: Names and imports in Cain's code resolve

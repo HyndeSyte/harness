@@ -80,8 +80,21 @@ probe_marks_root_only() {
     done
     : > /run/cain/probe/asked 2>/dev/null && echo "created: /run/cain/probe/asked"
     ls /run/cain/probe >/dev/null 2>&1 && echo "listed: /run/cain/probe"
+    # Fifth round: the folders above them are closed too, so neither can be renamed or replaced.
+    for p in '"$D"' /run/cain; do [ -w "$p" ] && echo "writable: $p"; done
+    mv '"$D"'/probe '"$D"'/probe.moved 2>/dev/null && echo "renamed: '"$D"'/probe"
+    mv /run/cain/probe /run/cain/probe.moved 2>/dev/null && echo "renamed: /run/cain/probe"
+    mkdir '"$D"'/probe.new 2>/dev/null && echo "made: '"$D"'/probe.new"
+    ln -s /tmp '"$D"'/probe.link 2>/dev/null && echo "linked: '"$D"'/probe.link"
     true')"
   [ -z "$bad" ] || fail "uid 1000 reaches the probe's marks: $bad"
+  # A folder that isn't root's 0700 or is a symlink is refused, not used: exit 3 and nothing written.
+  mv /run/cain/probe /run/cain/probe.real && install -d -m 0700 /tmp/probe-elsewhere && ln -s /tmp/probe-elsewhere /run/cain/probe \
+    || fail "couldn't set up the symlinked folder"
+  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" session-start "" "" >/dev/null 2>&1; p=$?
+  rm -f /run/cain/probe && mv /run/cain/probe.real /run/cain/probe
+  [ "$p" = 3 ] || fail "a symlinked probe folder wasn't refused (exit $p)"
+  [ -z "$(ls -A /tmp/probe-elsewhere)" ] || fail "the probe wrote through a symlinked folder"
 }
 
 # The old tree's contents and owners (not modes: the switch tightens those first).

@@ -238,6 +238,8 @@ def test_cain_versions_agree_and_everything_is_pinned():
     base = re.search(r"ARG BUILD_FROM=(\S+)", docker).group(1)
     assert re.fullmatch(r"ghcr\.io/home-assistant/base-debian:trixie-\d{4}\.\d{2}\.\d+", base)
     assert (CAIN / "build.yaml").read_text().count(base) == 2
+    # Claude Code's own updater stays off (the image pins its version), so its fixes arrive with App
+    # releases; the bun job's "Claude Code's pinned version" step warns when a newer one is out.
     assert re.search(r"ARG CLAUDE_VERSION=\d+\.\d+\.\d+$", docker, re.M)
     assert re.search(r"ARG BUN_VERSION=\d+\.\d+\.\d+$", docker, re.M)
     assert "sha256sum -c" in docker and "ENV DISABLE_AUTOUPDATER=1" in docker

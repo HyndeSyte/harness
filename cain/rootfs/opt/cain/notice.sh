@@ -28,9 +28,12 @@
 # test), and since 0.14.0 "probe" (the App's liveness checks of him failed, or his screen waits at a
 # sign-in or on the model's API: probe/main.ts), "restarts" (repeated early exits of his session:
 # more than 3 in 30 minutes, each within 5 minutes of its start, counted from /data), "self" (repeated
-# late error exits of his session: more than 4 in 60 minutes), "boots" (repeated starts of his App's
-# container: more than 3 counted in 30 minutes) and "update" (either loop within a day of a version
-# change: what changed and the way back by hand; nothing rolls back by itself). Within a group a newer
+# late error exits of his session: more than 4 in 60 minutes), "unseen" (restarts of his session whose
+# end root never saw: more than 6 in 60 minutes, a cadence, not a confirmed exit), "boots" (repeated
+# starts of his App's container: more than 3 counted in 30 minutes), "update" (the early-exit or
+# container loop within a day of a version change: what changed and the way back by hand; nothing
+# rolls back by itself; outside that day no alarm names an update), "turn" (a turn of his at work for
+# 2 hours without a break) and "tamper" (the probe's folders aren't root's alone). Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
@@ -48,6 +51,9 @@
 #   notice.sh clear self             his session's late error exits are back under the limit: the self group
 #   notice.sh clear boots            the App's container starts are back under the limit: the boots group
 #   notice.sh clear update           neither loop stands any more: the update group
+#   notice.sh clear unseen           his session's unseen restarts are back under the limit: the unseen group
+#   notice.sh clear turn             his long turn ended: the turn group
+#   notice.sh clear tampered         the probe's folders are right again: the tamper group
 #   notice.sh tick                   the repeats, retries, the probe and its readback (every 10 minutes)
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
@@ -67,7 +73,7 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots update"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots update unseen turn tamper"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
@@ -86,6 +92,9 @@ group_of() {
     self-loop) echo self ;;
     boots) echo boots ;;
     update-exits|update-boots) echo update ;;
+    unseen-loop) echo unseen ;;
+    turn-long) echo turn ;;
+    tampered) echo tamper ;;
     *) return 1 ;;
   esac
 }
@@ -131,15 +140,22 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     api-down) T="The model's API isn't answering"
       M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself. If it lasts hours, check Anthropic's status page." ;;
     restarts) T="Cain's session keeps exiting early"
-      M="Cain's session keeps exiting early: it ended on its own within 5 minutes of starting more than 3 times in half an hour${c}. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps exiting early: it ended on its own within 5 minutes of starting more than 3 times in half an hour${c}. Each exit was seen. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     self-loop) T="Cain's session keeps ending on its own"
-      M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. Possible causes: the model's API or the network not answering him. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
+    unseen-loop) T="Cain's session keeps restarting"
+      M="Cain's session keeps restarting: it started again more than 6 times in an hour${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
     boots) T="Cain's App keeps restarting"
-      M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. If it doesn't settle within an hour, $RESTART. If it still restarts after that, $BACKUPS. $DETAILS" ;;
+      M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. If it doesn't settle within an hour, $RESTART. $DETAILS" ;;
     update-exits) T="Cain keeps exiting early since his update"
-      M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. To go back by hand, restore the backup taken before the update from Home Assistant's backup page: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. If Home Assistant made a backup before the update, you can restore it from its Backups page: Settings, System, Backups. $DETAILS" ;;
     update-boots) T="Cain's App keeps restarting since his update"
-      M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. To go back by hand, restore the backup taken before the update from Home Assistant's backup page: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. If Home Assistant made a backup before the update, you can restore it from its Backups page: Settings, System, Backups. $DETAILS" ;;
+    turn-long) local mins; mins="$(printf '%s' "${2:-}" | tr -cd '0-9' | cut -c1-5)"
+      T="Cain's turn has been running for ${mins:-over 120} minutes"
+      M="Cain's turn has been running for ${mins:-over 120} minutes without a break. He may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. If he doesn't answer you, $RESTART. $DETAILS" ;;
+    tampered) T="Cain's probe folder was tampered with"
+      M="Cain's probe folder was tampered with${c}: a folder where the App keeps its liveness records isn't the App's alone, so the App stopped reading and writing there, and its liveness alarms are off until it is right. First $RESTART: that sets the folders up again. If this comes back, the Cain App's log has the details." ;;
     *) return 1 ;;
   esac
 }
@@ -153,6 +169,9 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     self) CT="Cain's session stays up"; CM="Cain's session has stopped ending on its own." ;;
     boots) CT="Cain's App stopped restarting"; CM="Cain's App container has stopped starting again and again." ;;
     update) CT="Cain has settled since his update"; CM="Cain has settled since his update: his session and his App stay up." ;;
+    unseen) CT="Cain's session stays up"; CM="Cain's session has stopped restarting again and again." ;;
+    turn) CT="Cain's long turn ended"; CM="Cain's long turn ended: his screen is free again." ;;
+    tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -241,7 +260,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|update-exits|update-boots) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|update-exits|update-boots|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -263,8 +282,9 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   local groups g rc=0
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
-    self) groups="self" ;; boots) groups="boots" ;; update) groups="update" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots or update" >&2; return 2 ;; esac
+    self) groups="self" ;; boots) groups="boots" ;; update) groups="update" ;; unseen) groups="unseen" ;;
+    turn) groups="turn" ;; tampered) groups="tamper" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, update, unseen, turn or tampered" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -354,7 +374,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|update | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|update|unseen|turn|tampered | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \

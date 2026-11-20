@@ -15,10 +15,16 @@
 //     minutes alarm;
 //   - repeated late error exits of his session: more than 4 non-zero exits after the 5-minute mark
 //     in 60 minutes alarm (his own user can cause one, so they are counted apart);
+//   - repeated restarts whose end root never saw (s6 restarted the run script meanwhile, and the next
+//     start came more than 5 minutes after the run's start): more than 6 in 60 minutes alarm that his
+//     session keeps restarting. That is a cadence, not a confirmed exit, and its alarm says so;
 //   - repeated starts of his App's container: more than 3 counted starts in 30 minutes alarm. A start
 //     after a stop that was asked for (the Supervisor's stop or update) and the first two starts
 //     within 10 minutes of a version change aren't counted.
-// Within a day of a version change, either loop also says so, with the way back by hand.
+// Within a day of a version change, the early-exit or container loop also says so, with the way back
+// by hand; outside that day an alarm gives the count, the window and what root saw only.
+// The owner's Stop (stop.json) stops jobs, cards and merges, not his session, so none of this reads it.
+// Only the App's own stopped mode (the mode file says none) silences the liveness alarms and pings.
 
 export const PASS_EVERY_S = 300;
 export const ASK_EVERY_S = 3600;
@@ -29,9 +35,14 @@ export const STARTS_MAX = 3;                     // more than this many early ex
 export const SHORT_RUN_S = 5 * 60;               // a run that ended unasked within this of its start exited early
 export const SELF_WINDOW_S = 60 * 60;
 export const SELF_MAX = 4;                       // more than this many late error exits in the hour
+export const UNSEEN_WINDOW_S = 60 * 60;
+export const UNSEEN_MAX = 6;                     // more than this many restarts with the end unseen in the hour
+export const DEFER_MAX_S = 2 * 3600;             // the hourly line waits for a turn at most this long
+export const TURN_LONG_S = 2 * 3600;             // a turn at work this long alarms, once a stretch
 export const BOOTS_MAX = 3;                      // more than this many counted container starts in the window
 export const UPDATE_BOOT_S = 10 * 60;            // starts this soon after a version change may be the update's own
 export const UPDATE_BOOTS = 2;                   // and the first this many of them aren't counted
+export const STOP_MARK_S = 5 * 60;               // a stop mark older than this, at the next container start, doesn't count
 export const OWNER_QUIET_S = 5 * 60;             // no hourly ask within this of a message of the owner's
 export const INSTALL_WINDOW_S = 24 * 3600;
 export const GATEWAY_ACK_S = 180;                // Discord acknowledges the link's heartbeat every ~41 s
@@ -116,7 +127,10 @@ export function lastSlot(now: number, tz: string, grace = INPUT_GRACE_S): number
 }
 
 // -- the hourly liveness check --------------------------------------------------------------------
-export interface Hourly { asked?: number; answered?: number; timedOut?: number }
+// deferred: when the hourly line first came due and was held back (a turn at work, or the owner's
+// 5 minutes), cleared once it is asked. busy: when his screen was first seen at work in the current
+// stretch, cleared when it isn't. turnTold: the stretch (its busy) whose long turn was alarmed.
+export interface Hourly { asked?: number; answered?: number; timedOut?: number; deferred?: number; busy?: number; turnTold?: number }
 export type HourlyState = "none" | "waiting" | "answered" | "timeout";
 // working: his screen is at work on a turn now. A long turn isn't a missed answer: the window
 // stretches while the screen is at work, up to WORK_MAX_S more.
@@ -131,36 +145,51 @@ export function hourlyState(h: Hourly, now: number, working = false): HourlyStat
 // Ask now? Only when his screen is free (no turn at work), never within OWNER_QUIET_S of a message
 // of the owner's reaching his session (ownerAt, the broker's note of when), never while the last ask
 // waits for its answer, and at most hourly (a failed ask too: it's asked again an hour after the
-// last). An ask skipped for a turn or the owner is simply asked at the next pass that may.
-export function askDue(h: Hourly, now: number, screenFree: boolean, ownerAt: number | null = null): boolean {
-  if (!screenFree) return false;
-  if (ownerAt !== null && now - ownerAt < OWNER_QUIET_S) return false;
+// last). An ask skipped for a turn or the owner is simply asked at the next pass that may, but the
+// wait is capped: once it came due DEFER_MAX_S ago (h.deferred) it goes in anyway, so a turn that
+// never ends can't keep the check out for good.
+export function clockDue(h: Hourly, now: number): boolean {
   if (hourlyState(h, now) === "waiting") return false;
   return !h.asked || now - h.asked >= ASK_EVERY_S;
+}
+export function askDue(h: Hourly, now: number, screenFree: boolean, ownerAt: number | null = null): boolean {
+  if (!clockDue(h, now)) return false;
+  if (h.deferred !== undefined && now - h.deferred >= DEFER_MAX_S) return true;
+  if (!screenFree) return false;
+  if (ownerAt !== null && now - ownerAt < OWNER_QUIET_S) return false;
+  return true;
+}
+// How long his screen has been at work without a break, in minutes, once it is TURN_LONG_S or more
+// and that stretch wasn't alarmed yet; else null. The liveness layers never wait on this.
+export function longTurn(h: Hourly, now: number): number | null {
+  if (h.busy === undefined || now - h.busy < TURN_LONG_S || h.turnTold === h.busy) return null;
+  return Math.floor((now - h.busy) / 60);
 }
 
 // -- one pass ---------------------------------------------------------------------------------------
 // status: "ok" passed; "failed" a liveness check failed; "signin" or "api" his screen says why he
-// can't answer (alarmed as that, never as a failure); "stopped" the owner's Stop holds (no alarm).
+// can't answer (alarmed as that, never as a failure); "stopped" the App's own stopped mode (the mode
+// file says none: the App stopped his session on purpose and told the owner itself), no alarm and no
+// ping. The owner's Stop is none of these: his session keeps running and answering through it.
 export type Status = "ok" | "failed" | "signin" | "api" | "stopped";
 export interface Pass { at: number; ok: boolean; failed: string[]; hourly: HourlyState; status?: Status }
-export function pass(f: Facts, h: Hourly, o: { screen?: Screen; stopped?: boolean } = {}): Pass {
+export function pass(f: Facts, h: Hourly, o: { screen?: Screen; appStopped?: boolean } = {}): Pass {
   const failed: string[] = layers(f);
   const hourly = hourlyState(h, f.now, o.screen === "working");
   if (hourly === "timeout") failed.push("answer");
   const ok = failed.length === 0;
   let status: Status = ok ? "ok" : "failed";
-  if (o.stopped) status = "stopped";
+  if (o.appStopped) status = "stopped";
   else if (o.screen === "signin") status = "signin";
   else if (o.screen === "api") status = "api";
   return { at: f.now, ok, failed, hourly, status };
 }
-// The outside heartbeat hears from the probe only when every check passed, and never while the
-// owner's Stop holds: a missed ping is the alarm from outside, so during his Stop the outside check
-// goes late (DOCS.md says so).
+// The outside heartbeat hears from the probe only when every check passed. A missed ping is the alarm
+// from outside. The owner's Stop doesn't touch it (his session runs on); only the App's own stopped
+// mode, which already told him, does: then no pass passes and nothing is pinged.
 export function shouldPing(p: Pass): boolean { return p.ok === true && p.failed.length === 0 && p.status !== "stopped"; }
 // The alarm the App raises for a pass, or null: two failed passes in a row (or a missed hourly
-// answer, at once); a sign-in or API screen as that, at once; never while the owner's Stop holds.
+// answer, at once); a sign-in or API screen as that, at once; never in the App's own stopped mode.
 export type AlarmKind = "probe" | "needs-signin" | "api-down";
 export function alarmFor(recent: Pass[]): AlarmKind | null {
   const last = recent.at(-1);
@@ -190,12 +219,13 @@ export function failedWords(p: Pass): string {
 //   early-<how>    unasked, within SHORT_RUN_S of its start: <how> is the exit code kept, "clean"
 //                  for 0, or "unknown" when none was kept. Only these count toward the early-exit
 //                  alarm;
-//   clean, unknown unasked, later than that, exit 0 or no code kept; and "unknown" too for a run whose
-//                  end the run script never saw (s6 restarted it meanwhile) when the next start came
-//                  more than SHORT_RUN_S after the run's start;
+//   clean, unknown unasked, later than that, exit 0 or no code kept, the end seen;
+//   unseen         a run whose end the run script never saw (s6 restarted it meanwhile) when the next
+//                  start came more than SHORT_RUN_S after the run's start: how it ended is unknown,
+//                  so it counts only in its own hour-long window, as a restart cadence;
 //   self-<code>    unasked, later than that, a non-zero exit, seen. His own user can end his session
 //                  with any code, so these count apart, in their own hour-long window.
-export const END_KINDS = /^(boot|asked|clean|unknown|early-(clean|unknown|\d{1,3})|self-\d{1,3})$/;
+export const END_KINDS = /^(boot|asked|clean|unknown|unseen|early-(clean|unknown|\d{1,3})|self-\d{1,3})$/;
 // ran: seconds from the run's start to when root saw it end. seen false: root never saw it end, and
 // ran is then the gap from the run's start to this start, which alone decides.
 export function endKind(o: { first: boolean; asked: boolean; code: number | null; ran: number | null; seen?: boolean }): string {
@@ -205,7 +235,7 @@ export function endKind(o: { first: boolean; asked: boolean; code: number | null
   const how = code === null ? "unknown" : code === 0 ? "clean" : String(code);
   if (o.ran === null || o.ran < 0) return "unknown";
   const short = o.ran <= SHORT_RUN_S;
-  if (o.seen === false) return short ? `early-${how}` : "unknown";
+  if (o.seen === false) return short ? `early-${how}` : "unseen";
   if (short) return `early-${how}`;
   if (code === null) return "unknown";
   if (code === 0) return "clean";
@@ -217,6 +247,8 @@ const startLines = (text: string, kind: RegExp) => text.split("\n").map((l) => l
 export function parseStarts(text: string): number[] { return startLines(text, /^early-/); }
 // The starts after a late error exit (self).
 export function parseSelf(text: string): number[] { return startLines(text, /^self-\d+$/); }
+// The starts after a run whose end root never saw (unseen).
+export function parseUnseen(text: string): number[] { return startLines(text, /^unseen$/); }
 export function startsIn(starts: number[], now: number, since = 0, window = STARTS_WINDOW_S): number {
   return starts.filter((t) => t > now - window && t <= now && t >= since).length;
 }
@@ -224,6 +256,31 @@ export function tooManyStarts(starts: number[], now: number, since = 0): boolean
   return startsIn(starts, now, since) > STARTS_MAX;
 }
 export function tooManySelf(self: number[], now: number): boolean { return startsIn(self, now, 0, SELF_WINDOW_S) > SELF_MAX; }
+export function tooManyUnseen(unseen: number[], now: number): boolean { return startsIn(unseen, now, 0, UNSEEN_WINDOW_S) > UNSEEN_MAX; }
+// The last exit code root kept with a start (early-<code>, self-<code>, clean as 0), or null.
+export function lastCode(text: string): string | null {
+  const kinds = text.split("\n").map((l) => l.trim().split(/\s+/)[1] ?? "").filter((k) => END_KINDS.test(k));
+  for (const k of kinds.reverse()) {
+    const m = /^(?:early|self)-(\d{1,3})$/.exec(k);
+    if (m) return m[1];
+    if (k === "clean" || k === "early-clean") return "0";
+    if (k !== "boot" && k !== "asked") return null;
+  }
+  return null;
+}
+// A line of his session's log, as it may go into an alarm: his user writes that log, so only plain
+// characters, links taken out, and short.
+export function logLine(raw: string): string | null {
+  const last = raw.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1);
+  if (!last) return null;
+  const s = last.replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, "(a link)").replace(/[^A-Za-z0-9 .,:;()'_=+-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 60).trim();
+  return s || null;
+}
+// The cause an exit alarm carries: the count and window, the last exit code, and the last line of his
+// session's log when one was captured. Short enough for notice.sh (it keeps 160 characters).
+export function exitCause(count: string, code: string | null, line: string | null): string {
+  return [count, code === null ? "" : `last exit code ${code}`, line ? `last log line: ${line}` : ""].filter(Boolean).join(", ");
+}
 // The boots file: one "<epoch seconds> <kind>" line per start of the App's container, in /data:
 // "boot" counts; "asked" (after a stop the Supervisor asked for) and "update" (one of the first two
 // within UPDATE_BOOT_S of a version change) don't.

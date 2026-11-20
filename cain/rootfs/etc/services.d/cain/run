@@ -62,7 +62,8 @@ run_id=""
 # finish script sees a stop, not an exit of its own (which would halt the container and alarm).
 # The waits in the loops below are interruptible (sleep in the background, then wait), so the
 # trap runs at once; the finish script records the stop as well, should it not.
-stop_asked() { timeout 5 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" >/dev/null 2>&1 || true; }
+# Up to 10 seconds for it, inside s6's grace for this service (the Dockerfile's S6_SERVICES_GRACETIME).
+stop_asked() { timeout 10 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" >/dev/null 2>&1 || true; }
 trap 'stop_asked; trap - TERM; kill -TERM $$' TERM
 nap() { sleep "$1" & wait $! 2>/dev/null || true; }
 

@@ -354,7 +354,10 @@ back anything, it has no Supervisor access, and no switch.
   turn. It never reaches Discord or you, and costs a few short turns of your Claude usage a day. It
   waits while a turn is at work and for 5 minutes after a message of yours reaches him, and is asked
   at the next 5-minute pass instead, so it never cuts in on you. A long turn doesn't count against
-  it: while his screen is at work, the 20 minutes he has to answer stretch, up to an hour more.
+  it: while his screen is at work, the 20 minutes he has to answer stretch, up to an hour more. The
+  wait has a cap: once the line has been held back for 2 hours, it goes in anyway. A turn at work for
+  2 hours without a break also raises "Cain's turn has been running for N minutes", once for that
+  stretch, and it comes down when the turn ends. The 5-minute checks above never wait on a turn.
 - **Plainly: these are liveness checks.** They show his parts run, not that he answers you. They
   can say alive while your messages are lost. A real round trip (a message of yours seen reaching
   his session) is a later item; this release has none, and the App reads nothing of your messages
@@ -365,12 +368,12 @@ back anything, it has no Supervisor access, and no switch.
   stop, or the Pi or the App is down, the pings stop and the service alarms your phone itself. The
   URL is read only by the probe's own process, never logged, never on a command line, and never
   reaches Cain's session.
-- **During your saved Stop no ping goes out** to that second check, even when every check passes,
-  so to the outside service your Stop looks like a failure: about 20 minutes after you tap Stop (the
-  5 minute period and the 15 minute grace), it marks the check down and sends you its own alarm, from
-  the service, not from Cain. It comes back up by itself at the first passing check after you tap
-  Turn back on. If you'd rather not hear it, pause that check at the service while you're stopped.
-  The App's own liveness alarms stay silent during your Stop.
+- **Your Stop doesn't touch any of this.** Stop stops jobs, cards and merges, not Cain's session:
+  he keeps running and answering through a Stop, so the 5-minute checks, the hourly line and both
+  heartbeat pings go on as usual, and a failure during your Stop alarms like any other. Only the
+  App's own stopped mode silences the liveness alarms and the probe's pings: when the App itself
+  stops his session on purpose (a failed safety check of his own user, for example), it has already
+  told you why with its own "Cain is stopped" notice. That is rare, and always caused by the App.
 - **Repeated early exits of his session**, counted in `/data`: every start of his session is
   written there with how the run before it ended, from what root alone saw: the first start in a
   container ("boot"); a stop the App's start script asked for that very run ("asked": root's mark,
@@ -379,33 +382,47 @@ back anything, it has no Supervisor access, and no switch.
   A run that ended unasked within 5 minutes of its start is an early exit, whatever exit code it
   left. When the start script never saw a run end (it was itself restarted meanwhile), only the gap
   between the two starts decides: an early exit if the next start came within 5 minutes, otherwise
-  "unknown", which counts nothing. More than 3 early exits in 30 minutes is "Cain's session keeps
-  exiting early", on your phone through Home Assistant and in Discord; it comes down once the count
-  is back under.
+  an unseen end. More than 3 early exits in 30 minutes is "Cain's session keeps exiting early", on
+  your phone through Home Assistant and in Discord; it comes down once the count is back under.
+- **Unseen ends** have their own 60-minute window: more than 6 is "Cain's session keeps
+  restarting". Its text says the restarts were seen but not the exits, so it is a cadence, not a
+  confirmed crash; it never counts as an early exit and never names an update.
 - **Repeated late error exits of his session**: an unasked end after the 5-minute mark with an
   error code is counted apart (Cain's own user can end his own session, so these never count as
-  early exits). More than 4 in 60 minutes is "Cain's session keeps ending on its own".
+  early exits). More than 4 in 60 minutes is "Cain's session keeps ending on its own". Its text names
+  the model's API or the network as possible causes.
+- **What each of these alarms says**: the count and its window, the last exit code root kept, and,
+  when there is one, the last line of his session's log (plain characters only, links taken out, at
+  most 60 characters). Outside a day of an update, that is all: nothing about updates or backups.
 - **Repeated starts of his App's container**, counted in `/data` too, once per container. More than
   3 counted in 30 minutes is "Cain's App keeps restarting". Not counted: a start after a stop the
-  Supervisor asked for (your Stop, Restart or update from Home Assistant; the App records that stop
-  as it goes), and the first two starts within 10 minutes of a version change, since an update
-  restarts the container. The count and the record of the installed version live in `/data`, so a
+  Supervisor asked for (a Stop, Restart or update of the App from Home Assistant; the App records
+  that stop as it goes, in its start script's stop handler and again in its finish script, with the
+  container's name and the time: the next start takes the mark, and counts it only when it is from
+  this App's container and under 5 minutes old), and the first two starts within 10 minutes of a
+  version change, since an update restarts the container. The App gives its stop handlers more time
+  than s6-overlay's default (15 seconds for the services, 10 for a finish script, inside the
+  Supervisor's 30), so the mark lands on slow SD storage too. The count and the record of the installed version live in `/data`, so a
   restart of the container keeps them.
 - **The line that names the update**: when either loop (early exits, or container starts) begins
   within a day of a version change, a second alarm goes with it, for example: "Cain's session has
   exited early several times since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls
-  back by itself. To go back by hand, restore the backup taken before the update from Home
-  Assistant's backup page." It comes down once neither loop stands, and goes out again with each new
-  loop.
+  back by itself. If Home Assistant made a backup before the update, you can restore it from its
+  Backups page." Only then: past that day, no alarm mentions an update. It comes down once neither
+  loop stands, and goes out again with each new loop.
 - **Asked stops never count**: an owner's Stop, Restart or update from Home Assistant reaches the
   App's start script as a stop signal before anything else stops, and root records it as asked
-  before his session ends. Claude Code's own updater is off in this App (it is pinned in the image),
-  so it never ends his session to update itself.
-- **During your saved Stop** the liveness checks stay silent. The loop alarms still fire: a stopped
-  session never starts, so they only ever count real restarts.
+  before his session ends. Claude Code's own updater is off in this App (its version is pinned in
+  the image), so it never ends his session to update itself.
+  Claude Code fixes arrive with App releases, and the repository's CI notes when a newer Claude Code
+  than the pinned one is out.
 
 Each check is kept in `/data/probe` with its time, root's alone; the marks of this container's runs
-are in `/run/cain/probe`, root's alone too. Nothing under either can be written by Cain's own user.
+are in `/run/cain/probe`, root's alone too. Nothing under either can be written by Cain's own user,
+nor can either folder be renamed or replaced: `/data` and `/run/cain` aren't his to write. Before
+every read or write there, the App checks the folder is root's, mode 0700 and not a symlink; if it
+isn't, it refuses to use it and alarms once, "Cain's probe folder was tampered with". A restart of
+the App sets the folders up again.
 
 ### Checking it on the Pi
 

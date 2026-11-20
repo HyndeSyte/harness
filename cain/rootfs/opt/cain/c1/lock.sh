@@ -33,6 +33,11 @@ run)
   # ask and answer, his session's start and the run script's own stop requests) root's alone.
   install -d -m 0700 -o root -g root /run/cain/probe
   install -d -m 0700 -o root -g root "$D/probe" || die "no $D/probe"
+  # Fifth round: the folders that hold the probe's can't be written by him either, so it can't be
+  # renamed or replaced from above (/data is root's 0711 after the switch; the old way keeps it
+  # root's, not writable by group or others, too).
+  [ "$(stat -c %u "$D")" = 0 ] || chown root "$D" || die "$D isn't root's"
+  chmod go-w "$D" /run/cain || die "$D or /run/cain writable by others"
   chmod 0700 /run/s6/container_environment 2>/dev/null
   chmod 0400 /run/s6/container_environment/* 2>/dev/null
   [ ! -d /run/s6/container_environment ] || [ "$(stat -c %a /run/s6/container_environment)" = 700 ] \
