@@ -739,17 +739,18 @@ describe("notice.sh", () => {
     expect(t("boots")).toContain("Cain's App container keeps starting");
     expect(t("boots")).toContain("not counting stops and updates asked from Home Assistant");
   });
-  test("the update line is factual: what happened since which update, and the way back by hand", () => {
+  test("the update line is factual: what happened since which update, and no step of his (Cain 0.15.0)", () => {
     const m = t("update-exits", "Cain 0.14.0, installed 3 hours ago").split("\n")[1];
     expect(m).toContain("Cain's session has exited early several times since the update to Cain 0.14.0, installed 3 hours ago.");
-    expect(m).toContain("Nothing rolls back by itself.");
-    expect(m).toContain("If a backup was made before the update, restoring it from Backups undoes the update and any changes since");
+    expect(m).toContain("nothing rolls back by itself.");
+    expect(m).toContain("The App keeps starting it by itself");
+    expect(m).not.toMatch(/backup|restor/i);
     const u = t("update-unseen", "Cain 0.14.0, installed 3 hours ago").split("\n")[1];
     expect(u).toContain("since the update to Cain 0.14.0, installed 3 hours ago, its exits unseen");
-    expect(u).toContain("If a backup was made before the update, restoring it from Backups undoes the update and any changes since");
+    expect(u).not.toMatch(/backup|restor/i);
     const b = t("update-boots", "Cain 0.14.0, installed 5 minutes ago").split("\n")[1];
     expect(b).toContain("Cain's App container has started several times since the update to Cain 0.14.0, installed 5 minutes ago.");
-    expect(b).toContain("Nothing rolls back by itself.");
+    expect(b).toContain("nothing rolls back by itself.");
   });
   test("the alarms of earlier rounds are gone", () => {
     for (const k of ["messages", "rollback", "rollback-disarmed", "rollback-failed", "rollback-again", "rollback-unsigned", "rollback-nobackup", "rollback-record", "rollback-unavailable", "self-ended"])
@@ -943,14 +944,16 @@ describe("the asked mark (sixth round): bound to the run script's start, kept on
 describe("alarm texts (fifth round)", () => {
   const NOTICE = join(ROOT, "rootfs/opt/cain/notice.sh");
   const msg = (k: string, c = "") => Bun.spawnSync(["bash", NOTICE, "text", k, c]).stdout.toString().split("\n");
-  test("the update sentence and the way back by hand only in the update line; the others give what was measured", () => {
+  test("the update sentence only in the update line; the others give what was measured", () => {
     for (const k of ["restarts", "self-loop", "unseen-loop", "boots"]) {
       const [title, m] = msg(k, "4 in 30 minutes, last exit code 1");
       expect(`${title} ${m}`).not.toMatch(/the update|his update|backup|restore|roll/i);
       expect(m).toContain("(4 in 30 minutes, last exit code 1)");
     }
-    for (const k of ["update-exits", "update-unseen", "update-boots"])
-      expect(msg(k, "Cain 0.14.0, installed 3 hours ago")[1]).toContain("If a backup was made before the update, restoring it from Backups undoes the update and any changes since");
+    for (const k of ["update-exits", "update-unseen", "update-boots"]) {
+      expect(msg(k, "Cain 0.14.0, installed 3 hours ago")[1]).toContain("since the update to Cain 0.14.0, installed 3 hours ago");
+      expect(msg(k, "Cain 0.14.0, installed 3 hours ago")[1]).toContain("nothing rolls back by itself");
+    }
     // The update line goes out only within a day of an install (the probe's own rule).
     const main = src("rootfs/opt/cain/probe/main.ts");
     const say = main.slice(main.indexOf("function sayUpdate"), main.indexOf("function updateDown"));
@@ -1233,8 +1236,10 @@ describe("alarm texts (sixth round)", () => {
   test("the quoted log line is prefixed \"session log says:\"; the restore line; the long turn may be normal", () => {
     expect(exitCause("4 in 30 minutes", null, "x")).toBe("4 in 30 minutes, session log says: x");
     expect(src("rootfs/opt/cain/probe/core.ts")).not.toContain("last log line:");
-    for (const k of ["update-exits", "update-unseen", "update-boots"])
-      expect(msg(k, "Cain 0.14.0, installed 3 hours ago")[1]).toContain("If a backup was made before the update, restoring it from Backups undoes the update and any changes since");
+    for (const k of ["update-exits", "update-unseen", "update-boots"]) {
+      expect(msg(k, "Cain 0.14.0, installed 3 hours ago")[1]).toContain("since the update to Cain 0.14.0, installed 3 hours ago");
+      expect(msg(k, "Cain 0.14.0, installed 3 hours ago")[1]).toContain("nothing rolls back by itself");
+    }
     expect(src("rootfs/opt/cain/notice.sh")).not.toContain("you can restore it from its Backups page");
     expect(msg("turn-long", "130")[1]).toContain("This may be normal for a long job");
     const u = msg("unseen-loop", "4 in 30 minutes")[1];
@@ -1284,12 +1289,12 @@ describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window
     const [t, m] = msg("asked-loop", "7 in 60 minutes");
     expect(t).toBe("Cain's App keeps being restarted");
     expect(m).toContain("more than 6 times in an hour or more than 12 times in a day (7 in 60 minutes)");
-    expect(m).toContain("The previous runs ended with a stop that was requested");
+    expect(m).toContain("The stops were requested");
     expect(m).toContain("Nothing rolls back by itself");
     expect(m).not.toContain("—");
     const [ut, um] = msg("update-asked", "Cain 0.14.0, installed 3 hours ago");
     expect(ut).toBe("Cain's App keeps being restarted since his update");
-    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. The previous runs ended with a stop that was requested");
+    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. The stops were requested");
     expect(um).toContain("Nothing rolls back by itself.");
     expect(src("rootfs/opt/cain/notice.sh")).toContain("update-exits|update-unseen|update-boots|update-asked|update-starts) echo update ;;");
   });
@@ -1392,7 +1397,7 @@ describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window
     const [t, m] = msg("tampered", "/run is owned by user 1000, mode 0777 (above /run/cain/probe)");
     expect(t).toBe("Cain's probe folder isn't the App's alone");
     expect(m).toContain("(/run is owned by user 1000, mode 0777 (above /run/cain/probe))");
-    expect(m).toContain("restarting the App sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand");
+    expect(m).toContain("The App sets its own folders up again at its next start and fixes what it can above them; Cain files the path for a fix if it stays.");
     expect(m).toContain("this alarm comes again each day meanwhile");
     for (const f of ["rootfs/opt/cain/notice.sh", "rootfs/opt/cain/probe/folder.ts", "rootfs/opt/cain/probe/main.ts", "DOCS.md", "CHANGELOG.md"])
       expect(src(f)).not.toContain("tampered with");
@@ -1528,7 +1533,7 @@ describe("one window over every start, asked restarts over a day, alarm texts th
     expect(m).toContain("Nothing rolls back by itself");
     const [ut, um] = msg("update-starts", "Cain 0.14.0, installed 3 hours ago");
     expect(ut).toBe("Cain's App keeps starting since his update");
-    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls back by itself.");
+    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. It comes back each time, and nothing rolls back by itself.");
     const nsh = src("rootfs/opt/cain/notice.sh");
     expect(nsh).toContain("start-loop) echo all ;;");
     expect(nsh).toContain('all) groups="all" ;;');
@@ -1539,14 +1544,15 @@ describe("one window over every start, asked restarts over a day, alarm texts th
     for (const k of ["asked-loop", "update-asked", "start-loop"]) {
       const m = msg(k, "7 in 60 minutes")[1];
       expect(m).not.toMatch(/turn (it|them|that|this)? ?off|switch (it )?off|disable|look for an automation/i);
-      expect(m).toMatch(/[Cc]heck the Supervisor log for who asked and why/);
-      expect(m).toContain("If the watchdog asked, the App looked unhealthy to it, and that is what to fix, not the watchdog.");
-      expect(m).toContain("Nothing rolls back by itself.");
+      // Cain 0.15.0: a fact, never a step of his: the Supervisor's log names who asked.
+      expect(m).toMatch(/Supervisor's log/);
+      expect(m).not.toMatch(/[Cc]heck the Supervisor log/);
+      expect(m).toMatch(/[Nn]othing rolls back by itself\./);
       expect(m).not.toContain("—");
     }
     for (const k of ["asked-loop", "update-asked"]) {
       const m = msg(k, "7 in 60 minutes")[1];
-      expect(m).toContain("The previous runs ended with a stop that was requested: a Restart or update from Home Assistant, a backup, an automation, or the Supervisor's watchdog restarting an App that looked unhealthy.");
+      expect(m).toContain("The stops were requested: a Restart or update from Home Assistant, a backup, an automation, the Supervisor's watchdog, or the App restarting itself.");
     }
     expect(src("rootfs/opt/cain/notice.sh")).not.toMatch(/turn it off/i);
   });
@@ -1584,7 +1590,7 @@ describe("one window over every start, asked restarts over a day, alarm texts th
   test("DOCS.md and CHANGELOG.md name the combined window and the three asked and unseen windows", () => {
     for (const f of ["DOCS.md", "CHANGELOG.md"]) {
       // The 0.14.0 section of the CHANGELOG, whitespace folded.
-      const d = (f === "CHANGELOG.md" ? src(f).split(/^## /m)[1] : src(f)).replace(/\s+/g, " ");
+      const d = (f === "CHANGELOG.md" ? src(f).split(/^## /m).find((x) => x.startsWith("0.14.0"))! : src(f)).replace(/\s+/g, " ");
       expect(d).toContain("Cain's App keeps starting");
       expect(d).toContain("more than 8 in 60 minutes, or more than 12 in 24 hours");
       expect(d).toContain("more than 6 in 60 minutes, or more than 12 in 24 hours");

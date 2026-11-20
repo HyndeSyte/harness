@@ -167,13 +167,13 @@ describe("the cards, published for the reply hook", () => {
     expect(v.sent).not.toContain(old);
   });
 
-  test("written whole through a rename, readable by all", async () => {
+  test("written whole through a rename, root:cain 0640 (Cain 0.15.0: his session reads it; pinned.ts)", async () => {
     const r = rig();
     const dir = mkdtempSync(join(tmpdir(), "cards-"));
     const path = join(dir, "trust", "cards.json");
     await publishCards(r.state(), 5, path);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ written_at: 5, owner: null, dm: null, cards: [], sent: [] });
-    if (process.platform !== "win32") expect((statSync(path).mode & 0o777).toString(8)).toBe("644");
+    if (process.platform !== "win32") expect((statSync(path).mode & 0o777).toString(8)).toBe("640");
   });
 
   test("a save never writes them; one write shortly after carries the latest state", async () => {
