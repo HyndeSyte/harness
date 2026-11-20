@@ -181,6 +181,8 @@ function render(dir: string, port: number, upstream: number, health = { port: 0,
   swap(/172\.30\.32\.0\/23 1;/, `${health.from} 1;`);
   swap(/allow 172\.30\.32\.0\/23;/, "allow 127.0.0.0/8;");
   swap(/access_log \/run\/cain-web\/health-miss\.log /, `access_log ${dir}/health-miss.log `);
+  // Fourth round: the note of each /health 200 (time and address, for probe-drill.sh 7's gate) too.
+  swap(/access_log \/run\/cain-web\/health-ok\.log /, `access_log ${dir}/health-ok.log `);
   swap(/if \(-f \/run\/cain-web\/www\/health-down\)/, `if (-f ${dir}/health-down)`);
   swap(/^user nobody nogroup;$/m, "");
   // Root's pages (C1: /run/cain-web/www) and the upstreams (C1: unix sockets only nginx's workers and
@@ -379,5 +381,19 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
     let noted = "";
     for (let i = 0; i < 40 && !noted.includes("127.0.0.9"); i++) { await Bun.sleep(50); noted = readFileSync(miss, "utf8"); }
     expect(noted.split("\n").filter(Boolean)).toEqual(["127.0.0.9"]);   // only /health's 404s, with the address
+    // Fourth round: each /health 200 is noted with its time (epoch seconds) and address; 404s and other
+    // paths are not.
+    const ok = join(h.dir, "health-ok.log");
+    writeFileSync(ok, "");
+    const t0 = Math.floor(Date.now() / 1000);
+    expect(await from("127.0.0.2", "/health")).toBe(200);
+    expect(await from("127.0.0.9", "/health")).toBe(404);
+    expect(await from("127.0.0.2", "/healthz")).toBe(404);
+    let oks: string[] = [];
+    for (let i = 0; i < 40 && oks.length < 1; i++) { await Bun.sleep(50); oks = readFileSync(ok, "utf8").split("\n").filter(Boolean); }
+    expect(oks.length).toBe(1);
+    const [at, addr] = oks[0].split(" ");
+    expect(addr).toBe("127.0.0.2");
+    expect(Math.abs(Number(at) - t0)).toBeLessThan(5);
   });
 });
