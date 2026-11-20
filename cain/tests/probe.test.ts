@@ -626,10 +626,13 @@ describe("starts of the App's container, kept in /data", () => {
 });
 
 describe("installs and the 24-hour window", () => {
-  test("a first record opens no window; a changed version does", () => {
+  test("a first record opens a window too (Cain 0.15.0: 0.14.0's install found none and opened none); a changed version does", () => {
     const first = afterStart(null, "0.14.0", T);
-    expect(first.fresh).toBe(false);
-    expect(inWindow(first.install, T)).toBe(false);
+    expect(first.fresh).toBe(true);
+    expect(first.install).toEqual({ id: `0.14.0@${T}`, version: "0.14.0", previous: null, at: T });
+    expect(inWindow(first.install, T + 3600)).toBe(true);
+    // A record 0.14.0 kept at 0 stays as it is: no window, and the next version opens one.
+    expect(afterStart({ id: "0.14.0@0", version: "0.14.0", previous: null, at: 0 }, "0.14.0", T).fresh).toBe(false);
     const next = afterStart(first.install, "0.14.1", T + 100);
     expect(next.install).toEqual({ id: `0.14.1@${T + 100}`, version: "0.14.1", previous: "0.14.0", at: T + 100 });
     expect(afterStart(next.install, "unknown", T + 200).install).toBe(next.install);

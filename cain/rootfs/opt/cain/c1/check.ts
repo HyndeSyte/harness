@@ -70,7 +70,7 @@ const connects = (path: string) => new Promise<boolean>((done) => {
   s.on("error", () => done(false));
   setTimeout(() => { s.destroy(); done(false); }, 3000);
 });
-for (const sock of ["/run/cain/upstream/ttyd.sock", "/run/cain/upstream/codex.sock"])
+for (const sock of ["/run/cain-web/upstream/ttyd.sock", "/run/cain-web/upstream/codex.sock"])
   must(`can't reach ${sock}`, !(await connects(sock)));
 
 // 6. The link: his key opens none of the specialist's routes, nor root's; nothing opens without

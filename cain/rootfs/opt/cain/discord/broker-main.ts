@@ -10,7 +10,7 @@ import { pinProblem } from "./pin";
 import { appendGate } from "../gate/log";
 import { checkAccess, ownerDm } from "../hooks/discord-read";
 import { SentSpool } from "./spool";
-import { BrokerSession, fileOutbox, MAX_LINE } from "./broker";
+import { BrokerSession, fileOutbox, MAX_LINE, SERVER_STEADY_S, serverWait } from "./broker";
 import { gateSend, sentNote } from "./gate-call";
 import { checkFolder, folderWhy } from "../probe/folder";
 
@@ -83,14 +83,16 @@ let current: { sock: Socket; session: BrokerSession } | null = null;
 let n = 0;
 
 // Whether Cain's channel is connected, for the run script's watchdog (it restarts his session
-// when this has said "down" for 90 seconds): "connected <s>" or "down <s>", whole.
+// when this has said "down" for 90 seconds): "connected <s>", "down <s>" or (Cain 0.15.0) "server-down
+// <s>", the plugin's server not running under a live connection since <s> (the broker is starting it
+// again), whole.
 const STATE_FILE = env.CAIN_DISCORD_STATE_FILE ?? "/run/cain/discord.state";
 // A broker that restarts under a connected channel leaves it dead (the bridge never reconnects):
 // say "down" from now, so the watchdog restarts his session. Before any connection: no state.
 try { if (readFileSync(STATE_FILE, "utf8").startsWith("connected")) channelState("down"); } catch { /* none yet */ }
-function channelState(what: "connected" | "down"): void {
+function channelState(what: "connected" | "down" | "server-down", at = Math.floor(Date.now() / 1000)): void {
   if (env.CAIN_BROKER_SMOKE === "1") return;
-  try { writeFileSync(`${STATE_FILE}.tmp`, `${what} ${Math.floor(Date.now() / 1000)}
+  try { writeFileSync(`${STATE_FILE}.tmp`, `${what} ${at}
 `, { mode: 0o644 }); renameSync(`${STATE_FILE}.tmp`, STATE_FILE); }
   catch { /* the watchdog then sees nothing new, and waits */ }
 }
@@ -110,12 +112,17 @@ function lineReader(onLine: (l: string) => void, onTooLong: () => void) {
   };
 }
 
-function connection(sock: Socket): void {
-  if (current) { log("a new connection replaced the one before"); current.session.end(); }
-  sock.setEncoding("utf8");
-  const name = `conn-${++n}-${Date.now()}`;
-  if (pinned) { sock.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32000, message: `The Discord channel is down: ${pinned}.` } }) + "\n"); return; }
-  const proc = Bun.spawn(SERVER_CMD ?? ["setpriv", "--reuid=discord", "--regid=discord", "--init-groups", "--no-new-privs",
+// The plugin's server, supervised (Cain 0.15.0). On Nov 20 it exited under a live connection
+// ("the plugin's server stopped (0)") and nothing started it again: the channel stayed down 19
+// minutes. Now, while his connection lasts, a server that stops for any reason is started again
+// within seconds (1, 2, 4, 8, then every 15 seconds; back to 1 after a minute up), each restart
+// logged with its exit code, and given his session's own handshake again (BrokerSession.reinit),
+// so his session keeps its channel. Meanwhile the state says "server-down": the run script's
+// watchdog names it apart from his session's exits.
+const backoffScale = Number(env.CAIN_SERVER_BACKOFF_SCALE ?? 1);   // tests only: shorter waits
+
+function spawnServer() {
+  return Bun.spawn(SERVER_CMD ?? ["setpriv", "--reuid=discord", "--regid=discord", "--init-groups", "--no-new-privs",
     "--inh-caps=-all", "--bounding-set=-all", "/usr/local/bin/bun", join(PLUGIN, "server.ts")], {
     cwd: PLUGIN,
     // The token's only way in: this process's environment, never its command line. The smoke
@@ -126,11 +133,27 @@ function connection(sock: Socket): void {
           DISCORD_ACCESS_MODE: "static", DISCORD_BOT_TOKEN: token() },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
+}
+type Server = ReturnType<typeof spawnServer>;
+
+function connection(sock: Socket): void {
+  if (current) { log("a new connection replaced the one before"); current.session.end(); }
+  sock.setEncoding("utf8");
+  const name = `conn-${++n}-${Date.now()}`;
+  if (pinned) { sock.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32000, message: `The Discord channel is down: ${pinned}.` } }) + "\n"); return; }
+  let proc: Server | null = spawnServer();
+  let restarts = 0, streakAt = 0, timer: ReturnType<typeof setTimeout> | null = null, steady: ReturnType<typeof setTimeout> | null = null;
   const conn = { sock, session: null as unknown as BrokerSession };
   const session = new BrokerSession({
     toClient: (l) => { if (!sock.destroyed) sock.write(l + "\n"); },
-    toServer: (l) => { try { proc.stdin.write(l + "\n"); proc.stdin.flush(); } catch { /* it's gone: serverGone follows */ } },
-    close: () => { try { sock.destroy(); } catch { /* closed */ } try { proc.kill(); } catch { /* gone */ } if (current === conn) { current = null; channelState("down"); } },
+    toServer: (l) => { if (!proc) return; try { proc.stdin.write(l + "\n"); proc.stdin.flush(); } catch { /* it's gone: its exit follows */ } },
+    close: () => {
+      try { sock.destroy(); } catch { /* closed */ }
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (steady) { clearTimeout(steady); steady = null; }
+      try { proc?.kill(); } catch { /* gone */ }
+      if (current === conn) { current = null; channelState("down"); }
+    },
     gate: (tool, args, s) => gateSend(tool, args, s, {
       cards: async () => { const r = await linkCall("/cards"); return r.ok ? await r.json() : null; },
       cardsFile: () => text(CARDS),
@@ -164,17 +187,50 @@ function connection(sock: Socket): void {
   sock.on("data", lineReader((l) => { void session.fromClient(l); }, () => { void session.fromClient("x".repeat(MAX_LINE + 1)); }));
   sock.on("close", () => session.end());
   sock.on("error", () => { /* close follows */ });
-  void (async () => {
-    const dec = new TextDecoder();
-    const read = lineReader((l) => session.fromServer(l), () => log("the server sent a line too long; dropped"));
-    for await (const chunk of proc.stdout) read(dec.decode(chunk, { stream: true }));
-  })();
-  void (async () => {
-    const dec = new TextDecoder();
-    const read = lineReader((l) => { if (l.trim()) log(`plugin: ${l.slice(0, 300)}`); }, () => {});
-    for await (const chunk of proc.stderr) read(dec.decode(chunk, { stream: true }));
-  })();
-  void proc.exited.then((code) => { log(`the plugin's server stopped (${code})`); session.serverGone(); });
+  const watch = (p: Server) => {
+    void (async () => {
+      const dec = new TextDecoder();
+      const read = lineReader((l) => { if (proc === p) session.fromServer(l); }, () => log("the server sent a line too long; dropped"));
+      for await (const chunk of p.stdout) read(dec.decode(chunk, { stream: true }));
+    })();
+    void (async () => {
+      const dec = new TextDecoder();
+      const read = lineReader((l) => { if (l.trim()) log(`plugin: ${l.slice(0, 300)}`); }, () => {});
+      for await (const chunk of p.stderr) read(dec.decode(chunk, { stream: true }));
+    })();
+    void p.exited.then((code) => {
+      if (proc !== p) return;
+      proc = null;
+      if (!session.open() || current !== conn) { log(`the plugin's server stopped (${code}) with its connection`); return; }
+      if (steady) { clearTimeout(steady); steady = null; }
+      if (restarts === 0) streakAt = Math.floor(Date.now() / 1000);
+      restarts++;
+      const wait = serverWait(restarts);
+      log(`the plugin's server stopped (${code}): starting it again in ${wait} s (restart ${restarts})`);
+      session.serverLost();
+      channelState("server-down", streakAt);
+      timer = setTimeout(() => {
+        timer = null;
+        if (!session.open() || current !== conn) return;
+        try { proc = spawnServer(); }
+        catch (e) { log(`couldn't start the plugin's server again: ${String(e).slice(0, 80)}`); proc = null; session.serverGone(); return; }
+        const p2 = proc;
+        watch(p2);
+        session.reinit(restarts);
+        log(`the plugin's server started again (restart ${restarts}, it had stopped with ${code})`);
+        // The channel counts as up again once the new server has run a minute: a server that keeps
+        // stopping stays "server-down" from its first stop, for the watchdog.
+        steady = setTimeout(() => {
+          steady = null;
+          if (proc !== p2 || !session.open() || current !== conn) return;
+          restarts = 0;
+          log("the plugin's server has run a minute again: the channel is up");
+          channelState("connected");
+        }, SERVER_STEADY_S * 1000 * backoffScale);
+      }, wait * 1000 * backoffScale);
+    });
+  };
+  watch(proc);
 }
 
 // A mark of the probe's (the hourly check's answer, or when a message of the owner's came in for his

@@ -248,12 +248,17 @@ def test_cain_versions_agree_and_everything_is_pinned():
 def test_cain_terminal_is_reachable_only_through_ingress():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "allow 172.30.32.2;" in nginx and "deny all;" in nginx
-    assert nginx.count("listen ") == 1 and "listen 8099 " in nginx
+    # Cain 0.15.0: a second server, for the Supervisor's watchdog only: /health, from Home Assistant's
+    # internal network, and nothing else (every other path 404).
+    assert nginx.count("listen ") == 2 and "listen 8099 " in nginx and "listen 8098;" in nginx
+    health = nginx.split("listen 8098;")[1].split("  server {")[0]
+    assert "allow 172.30.32.0/23;" in health and "deny all;" in health and "location = /health {" in health
+    assert "location / { return 404; }" in health and "proxy_pass" not in health and "alias" not in health
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
     # C1: ttyd listens on a unix socket only nginx's workers and root can open, never a port
     # Cain's own user could take while it's down; it attaches as the session's own user.
-    assert "--interface /run/cain/upstream/ttyd.sock --socket-owner root:nogroup" in term
-    assert "proxy_pass http://unix:/run/cain/upstream/ttyd.sock;" in nginx
+    assert "--interface /run/cain-web/upstream/ttyd.sock --socket-owner root:nogroup" in term
+    assert "proxy_pass http://unix:/run/cain-web/upstream/ttyd.sock;" in nginx
     attach = (CAIN / "rootfs/opt/cain/terminal-attach.sh").read_text()
     assert "/opt/cain/as-cain bash -c" in attach and "attach-session -E -t cain" in attach
 
@@ -1396,9 +1401,9 @@ def test_cain_signin_link_is_rejoined(tmp_path):
 
 
 def test_cain_signin_page_is_served_from_roots_folder_for_nginx():
-    # C1: root's pages live in /run/cain/www (root:nogroup), never at a fixed name in /tmp.
+    # C1: root's pages live in /run/cain-web/www (root:nogroup), never at a fixed name in /tmp.
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
-    assert "location = /signin" in nginx and "alias /run/cain/www/signin.html;" in nginx
+    assert "location = /signin" in nginx and "alias /run/cain-web/www/signin.html;" in nginx
     assert "/tmp/" not in nginx
 
 
@@ -1432,13 +1437,13 @@ def test_cain_status_gives_facts_not_the_screen():
     # /status lets setup be checked from outside; the screen may hold a token, so
     # only yes/no facts and a fixed state word leave the add-on.
     run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
-    status = run.split("printf '{\"signed_in\"")[1].split("> /run/cain/www/status.tmp")[0]
+    status = run.split("printf '{\"signed_in\"")[1].split("> /run/cain-web/www/status.tmp")[0]
     assert "$screen" not in status and "$last" not in status
     assert status.count("$(flag ") == 4 and '"$state"' in status
     states = {line.split("state=")[1].split(";")[0].strip() for line in run.splitlines() if "state=" in line and "then state=" in line}
     assert states == {"login_needed", "waiting_for_code", "trust_prompt", "first_run_menu", "ready", "dialog"}
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
-    assert "location = /status {" in nginx and "alias /run/cain/www/status.json;" in nginx
+    assert "location = /status {" in nginx and "alias /run/cain-web/www/status.json;" in nginx
 
 
 def test_cain_tells_the_owner_once_when_its_signin_expires():
@@ -3220,12 +3225,12 @@ def test_cain_review_keys_never_reach_logs_or_cain():
 def test_cain_chatgpt_signin_is_on_the_ingress_page():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     block = nginx.split("location /codex {")[1].split("}")[0]
-    assert "proxy_pass http://unix:/run/cain/upstream/codex.sock;" in block       # C1: no port he could take
+    assert "proxy_pass http://unix:/run/cain-web/upstream/codex.sock;" in block       # C1: no port he could take
     assert nginx.count("listen ") == 1 and "allow 172.30.32.2;" in nginx      # still Ingress only
     page = (CAIN / "rootfs/opt/cain/index.html").read_text()
     assert 'href="codex"' in page and 'href="/codex' not in page
     main = (CAIN / "rootfs/opt/cain/review/main.ts").read_text(encoding="utf-8")
-    assert '"/run/cain/upstream/codex.sock"' in main
+    assert '"/run/cain-web/upstream/codex.sock"' in main
     signin = (CAIN / "rootfs/opt/cain/review/signin.ts").read_text(encoding="utf-8")
     assert '"login", "--device-auth"' in signin and 'cli_auth_credentials_store = "file"' in signin
 

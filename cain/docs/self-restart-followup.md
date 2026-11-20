@@ -1,4 +1,4 @@
-# Follow-up: the App restarting itself (not built)
+# Follow-up: the App restarting itself (built in 0.15.0)
 
 Cain 0.13.3 was going to have the App restart itself, once, when an alarm it could fix by a
 restart stood past its window, and tell Dane only if that didn't help. A review took it out: a
@@ -18,3 +18,18 @@ What a separate job needs before the App restarts itself:
 - A running count and the first failure's date in the "switch undone" line.
 - Drill the Supervisor restart call from the watcher's subshell, as the unprivileged user, on the
   real server, before relying on it.
+
+## What 0.15.0 built, and what is still open
+
+Built (cain/rootfs/etc/services.d/cain/run `self_restart`, probe/main.ts `selfRestart`): the App exits on
+an error and the Supervisor's watchdog switch starts it again, read through `/addons/self/info` (no API
+role); marks in `/data/probe` (`self-restarts`, `self.json`, `self-asked`); one restart per incident
+(30 minutes); 3 Supervisor answers in a row that can't be read alarm with the reason; with the switch off
+the App never exits and alarms once, naming the switch; each self-restart in the morning check-in, and an
+alarm after 3 in 24 hours or 2 of the same kind; the next start counted as an asked restart whose
+requester is the App. The outside dead-man check is the heartbeat (heartbeat_url, every 5 minutes, since
+Nov 18) and the Supervisor's watchdog itself.
+
+Still open: the running count and first failure's date in the "switch undone" line, and the drill of
+the exit-and-watchdog route on the real server (probe-drill.sh 5 kill with the switch on, and a forced
+self-restart) before relying on it.

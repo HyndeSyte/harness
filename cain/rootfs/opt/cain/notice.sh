@@ -34,10 +34,14 @@
 # (repeated asked restarts of the App: more than 6 in 60 minutes or more than 12 in 24 hours, each stop
 # requested), "all" (every start together, whatever its kind: more than 8 in 60 minutes or more than 12 in
 # 24 hours, with the counts by kind), "update" (the early-exit, unseen, container, asked-restart or
-# combined-start loop within a day of a version change: what changed and
-# the way back by hand; nothing rolls back by itself; outside that day no alarm names an update), "turn"
+# combined-start loop within a day of a version change: what changed;
+# nothing rolls back by itself; outside that day no alarm names an update), "turn"
 # (a turn of his at work for 2 hours without a break) and "tamper" (the probe's folders aren't the App's
-# alone; it goes to his bot again once a day while it stands). Within a group a newer
+# alone; it goes to his bot again once a day while it stands), and since 0.15.0 "watchdog" (the App
+# can't restart itself: the Supervisor's Watchdog switch is off; once, naming the switch) and
+# "selfrestart" (the App couldn't restart itself, or keeps restarting itself). "channel" and
+# "server-gone" join "session", and "self-restart" (the App restarting itself now) joins "stop".
+# Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
@@ -79,18 +83,22 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
-BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
-RESTART="restart the Cain App: Settings, Apps, Cain, Restart"
+# What every alarm says (Cain 0.15.0): the real cause and the step the App takes itself, never a step
+# of his (no restart, no settings, no switch), with one exception: the Supervisor's Watchdog switch
+# (self-off), the one thing only he can turn on. His one-time Claude sign-in is his too: those alarms
+# say where the sign-in link is (cain/tests/stays-on.test.ts checks every text here).
 DETAILS="The Cain App's log has the details."
-# Who asked for a stop, and what to fix (eighth round): never to switch the asker off.
-ASKED_WHO="The previous runs ended with a stop that was requested: a Restart or update from Home Assistant, a backup, an automation, or the Supervisor's watchdog restarting an App that looked unhealthy. Check the Supervisor log for who asked and why: Settings, System, Logs, Supervisor. If the watchdog asked, the App looked unhealthy to it, and that is what to fix, not the watchdog."
+SELFRESTART="If his Discord channel stays down, the App restarts itself."
+WAYBACK="The App keeps his link and the calendar App's cards running meanwhile, and the way back is in the App's documentation, under If Cain stops."
+# Who asked for a stop (eighth round), as a fact: never to switch the asker off.
+ASKED_WHO="The stops were requested: a Restart or update from Home Assistant, a backup, an automation, the Supervisor's watchdog, or the App restarting itself. The Supervisor's log says who asked."
 group_of() {
   case "$1" in
-    breach|switch-stopped|switch-blocked|damaged|setup|restart|switch-restart|exited|held) echo stop ;;
-    session) echo session ;;
+    breach|switch-stopped|switch-blocked|damaged|setup|restart|switch-restart|exited|held|self-restart) echo stop ;;
+    session|channel|server-gone) echo session ;;
     switch-failed|switch-waits) echo switch ;;
     waiting) echo screen ;;
     stalled|signin) echo deliver ;;
@@ -105,6 +113,8 @@ group_of() {
     unseen-loop) echo unseen ;;
     turn-long) echo turn ;;
     tampered) echo tamper ;;
+    self-off) echo watchdog ;;
+    self-refused|self-loops) echo selfrestart ;;
     *) return 1 ;;
   esac
 }
@@ -112,70 +122,82 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
   local c="${2:+ (${2})}"
   case "$1" in
     breach) T="Cain is stopped"
-      M="Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. To get him back now, $BACKUPS. A fixed update also brings him back. $DETAILS" ;;
+      M="Cain is stopped: a safety check of his own user failed after his update, so he won't run on this version. A fixed update brings him back by itself. $WAYBACK $DETAILS" ;;
     switch-stopped) T="Cain is stopped"
-      M="Cain is stopped: his move to a safer setup stopped part way. To get him back, $BACKUPS. $DETAILS" ;;
+      M="Cain is stopped: his move to a safer setup stopped part way. $WAYBACK $DETAILS" ;;
     damaged) T="Cain is stopped"
-      M="Cain is stopped: his saved start state is damaged, so he isn't started. To get him back, $BACKUPS. $DETAILS" ;;
+      M="Cain is stopped: his saved start state is damaged, so he isn't started. $WAYBACK $DETAILS" ;;
     setup) T="Cain is stopped"
-      M="Cain is stopped: his App's safety setup didn't check out at start, so he isn't started. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+      M="Cain is stopped: his App's safety setup didn't check out at start, so he isn't started. The App checks again at each start. $WAYBACK $DETAILS" ;;
     restart) T="Cain is stopped for a moment"
       M="Cain is stopped for a moment: his App is restarting itself to start him clean. Nothing for you to do." ;;
     switch-restart) T="Cain is stopped for a moment"
       M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone, and his App is restarting itself to run him the old way for now. Nothing for you to do." ;;
     exited) T="Cain is stopped"
-      M="Cain is stopped: his App ran into something it couldn't get past and stopped itself. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+      M="Cain is stopped: his App ran into something it couldn't get past and stopped itself. With the App's Watchdog switch on, the Supervisor starts it again by itself. $WAYBACK $DETAILS" ;;
     held) T="Cain is paused"
-      M="Cain is paused: the safety check of his own user couldn't finish, so his session is held. This isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. If he isn't back within an hour, $BACKUPS. $DETAILS" ;;
+      M="Cain is paused: the safety check of his own user couldn't finish, so his session is held. This isn't a breach. The App tries the check again every 10 minutes, and he comes back by himself once it finishes. $WAYBACK $DETAILS" ;;
     session) T="Cain isn't answering"
-      M="Cain isn't answering: his session keeps stopping soon after it starts. The App keeps starting it again by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain isn't answering: his session keeps exiting soon after it starts${c}. The App keeps starting it again by itself. $SELFRESTART $DETAILS" ;;
+    channel) T="Cain isn't answering"
+      M="Cain isn't answering: his Discord channel keeps going down${c}. The App has restarted his session for it 3 times and keeps doing so. $SELFRESTART $DETAILS" ;;
+    server-gone) T="Cain isn't answering"
+      M="Cain isn't answering: the Discord plugin's server keeps stopping${c}. The App starts it again within seconds each time, and has restarted his session for it 3 times. $SELFRESTART $DETAILS" ;;
+    self-restart) T="Cain's App is restarting itself"
+      M="Cain's App is restarting itself: ${2:-his Discord channel stayed down}. The Supervisor's watchdog starts it again within a minute, and you hear when he's back. Nothing for you to do." ;;
+    self-off) T="Cain needs one switch turned on"
+      M="Cain's App can't restart itself: his Discord channel stayed down${c}, and the Supervisor's Watchdog switch for the Cain App is off, so a restart would leave him down. That switch is the one thing only you can turn on: Home Assistant, Settings, Apps, Cain, Watchdog. Meanwhile the App keeps restarting his session by itself. With it on, the App also comes back by itself after a crash or a kill." ;;
+    self-refused) T="Cain's App couldn't restart itself"
+      M="Cain's App couldn't restart itself${c}, so it stays up and keeps restarting his session by itself. It asks the Supervisor again every minute. $DETAILS" ;;
+    self-loops) T="Cain's App keeps restarting itself"
+      M="Cain's App keeps restarting itself${c}, each time because his Discord channel stayed down. It comes back each time; the cause is in the App's log, and Cain files it for a fix. $DETAILS" ;;
     switch-failed) T="Cain is back on the old way for now"
       M="Cain's move to his own user, the safer setup in his update, didn't pass its checks${c}, so it was undone and his App went back to the old way. Nothing for you to do: the App tries again by itself, at most three times in six hours. If he doesn't answer you, you'll hear that too." ;;
     switch-waits) T="Cain is back on the old way for now"
       M="Cain's move to his own user didn't pass its checks three times${2:+ (the last: ${2})}, so his App went back to the old way and waits six hours before it tries again. Nothing for you to do. If he doesn't answer you, you'll hear that too." ;;
     switch-blocked) T="Cain is stopped"
-      M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. First $RESTART. If he's still stopped after that, $BACKUPS. $DETAILS" ;;
+      M="Cain is stopped: his move to his own user couldn't begin${c}, and his App couldn't put that on record, so it stopped him rather than carry on unrecorded. The move changed nothing. The App tries again at its next start. $WAYBACK $DETAILS" ;;
     waiting) T="Cain isn't answering"
-      M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and the App couldn't clear it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain isn't answering: a question is waiting on his screen, where no one answers it, and Esc didn't clear it. The App starts his session fresh by itself. $DETAILS" ;;
     stalled) T="Cain isn't getting messages"
-      M="Cain isn't getting messages: what the App types into his session (your taps, his check-ins) hasn't gone in for a while${c}. The App keeps trying, and clears what it can by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain isn't getting messages: what the App types into his session (your taps, his check-ins) hasn't gone in for a while${c}. The App keeps trying, and clears what it can by itself. $SELFRESTART $DETAILS" ;;
     signin) T="Cain is waiting at a sign-in"
-      M="Cain is waiting at a sign-in on his screen${c}, so nothing reaches him. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
+      M="Cain is waiting at his Claude sign-in on his screen${c}, so nothing reaches him. Only you can sign him in: the sign-in link is on the Cain page in Home Assistant, and the code it gives you goes in the box there." ;;
     phone) T="Cain's alarms reach you here only"
       M="Cain's alarms to your phone through Home Assistant didn't pass their test${c}, so for now they reach you only here, from his bot. Nothing for you to do: Cain has it filed for a fix." ;;
     probe) T="Cain's liveness checks failed"
-      M="Cain may not be answering: the App's liveness checks of him failed${c}. These checks show his parts are running, not that he answers you, so a failure is worth a look. The App keeps bringing him back by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain may not be answering: the App's liveness checks of him failed${c}. These checks show his parts are running, not that he answers you. The App keeps bringing him back by itself. $SELFRESTART $DETAILS" ;;
     needs-signin) T="Cain needs sign-in"
-      M="Cain needs sign-in: his screen waits at a Claude sign-in, so he can't answer. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
+      M="Cain needs his Claude sign-in: his screen waits at it, so he can't answer. Only you can sign him in: the sign-in link is on the Cain page in Home Assistant, and the code it gives you goes in the box there." ;;
     api-down) T="The model's API isn't answering"
-      M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself. If it lasts hours, check Anthropic's status page." ;;
+      M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself, and the App keeps checking." ;;
     restarts) T="Cain's session keeps exiting early"
-      M="Cain's session keeps exiting early: it ended on its own within 5 minutes of starting more than 3 times in half an hour${c}. Each exit was seen. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps exiting early: it ended on its own within 5 minutes of starting more than 3 times in half an hour${c}. Each exit was seen. The App keeps starting it by itself. $SELFRESTART $DETAILS" ;;
     self-loop) T="Cain's session keeps ending on its own"
-      M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. Possible causes: the model's API or the network not answering him. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. Possible causes: the model's API or the network not answering him. The App keeps starting it by itself. $SELFRESTART $DETAILS" ;;
     unseen-loop) T="Cain's session keeps restarting"
-      M="Cain's session keeps restarting: it started again after a run of which no clean stop was recorded (a crash, a kill, a power cut, or a stop that took too long to finish (the stop drill timings show it)) more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps restarting: it started again after a run of which no clean stop was recorded (a crash, a kill, a power cut, or a stop that took too long to finish (the stop drill timings show it)) more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. $SELFRESTART $DETAILS" ;;
     boots) T="Cain's App keeps restarting"
-      M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. If it doesn't settle within an hour, $RESTART. $DETAILS" ;;
+      M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. It comes back each time; the cause is in the App's log. $DETAILS" ;;
     asked-loop) T="Cain's App keeps being restarted"
       M="Cain's App keeps being restarted: it was asked to stop or restart more than 6 times in an hour or more than 12 times in a day${c}, so Cain can't stay up. $ASKED_WHO Nothing rolls back by itself. $DETAILS" ;;
     start-loop) T="Cain's App keeps starting"
-      M="Cain's App keeps starting: counting every start together, whatever its kind (requested restarts, restarts with no clean stop recorded, restarts of his session after an early or an error exit, and plain starts), it started more than 8 times in an hour or more than 12 times in a day${c}. Each kind is also counted on its own; this count catches a mix of them. If some were requested, check the Supervisor log for who asked and why: Settings, System, Logs, Supervisor. If the watchdog asked, the App looked unhealthy to it, and that is what to fix, not the watchdog. Nothing rolls back by itself. $DETAILS" ;;
+      M="Cain's App keeps starting: counting every start together, whatever its kind (requested restarts, restarts with no clean stop recorded, restarts of his session after an early or an error exit, and plain starts), it started more than 8 times in an hour or more than 12 times in a day${c}. Each kind is also counted on its own; this count catches a mix of them. Requested ones are named in the Supervisor's log. Nothing rolls back by itself. $DETAILS" ;;
     update-exits) T="Cain keeps exiting early since his update"
-      M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's session has exited early several times since the update to ${2:-his last version}. The App keeps starting it by itself, and nothing rolls back by itself. $DETAILS" ;;
     update-unseen) T="Cain's session keeps restarting since his update"
-      M="Cain's session has restarted several times since the update to ${2:-his last version}, its exits unseen: an early crash before its exit handlers run looks like this. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's session has restarted several times since the update to ${2:-his last version}, its exits unseen: an early crash before its exit handlers run looks like this. The App keeps starting it by itself, and nothing rolls back by itself. $DETAILS" ;;
     update-asked) T="Cain's App keeps being restarted since his update"
-      M="Cain's App has been asked to restart several times since the update to ${2:-his last version}. $ASKED_WHO Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's App has been asked to restart several times since the update to ${2:-his last version}. $ASKED_WHO Nothing rolls back by itself. $DETAILS" ;;
     update-starts) T="Cain's App keeps starting since his update"
-      M="Cain's App has started many times, counting every kind of start, since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's App has started many times, counting every kind of start, since the update to ${2:-his last version}. It comes back each time, and nothing rolls back by itself. $DETAILS" ;;
     update-boots) T="Cain's App keeps restarting since his update"
-      M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's App container has started several times since the update to ${2:-his last version}. It comes back each time, and nothing rolls back by itself. $DETAILS" ;;
     turn-long) local mins; mins="$(printf '%s' "${2:-}" | tr -cd '0-9' | cut -c1-5)"
       T="Cain's turn has been running for ${mins:-over 120} minutes"
-      M="Cain's turn has been running for ${mins:-over 120} minutes without a break. This may be normal for a long job, or he may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. If he doesn't answer you, $RESTART. $DETAILS" ;;
+      M="Cain's turn has been running for ${mins:-over 120} minutes without a break. This may be normal for a long job, or he may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. $SELFRESTART $DETAILS" ;;
     tampered) T="Cain's probe folder isn't the App's alone"
-      M="Cain's probe folder isn't the App's alone${c}: a folder where the App keeps its liveness records, or one above it, has an owner or mode it must not have, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). The way out: restarting the App sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand." ;;
+      M="Cain's probe folder isn't the App's alone${c}: a folder where the App keeps its liveness records, or one above it, has an owner or mode it must not have, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). The App sets its own folders up again at its next start and fixes what it can above them; Cain files the path for a fix if it stays." ;;
     *) return 1 ;;
   esac
 }
@@ -193,6 +215,8 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     update) CT="Cain has settled since his update"; CM="Cain has settled since his update: his session and his App stay up." ;;
     unseen) CT="Cain's session stays up"; CM="Cain's session has stopped restarting again and again." ;;
     turn) CT="Cain's long turn ended"; CM="Cain's long turn ended: his screen is free again." ;;
+    watchdog) CT="Cain's App can restart itself again"; CM="The Supervisor's Watchdog switch for the Cain App is on: the App can restart itself, and comes back by itself after a crash or a kill." ;;
+    selfrestart) CT="Cain's App stays up"; CM="Cain's App is up, and his Discord channel is connected." ;;
     tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
@@ -260,7 +284,8 @@ deliver() {   # a group's raised alarm: Discord once, Home Assistant daily or wh
   fi
   now="$(date +%s)"
   if h="$(hook)"; then
-    if [ "$fp" != "$(hash16 "$h")" ] || [ $((now - sent)) -ge "$DAY" ]; then
+    # The switch-off alarm goes once (Cain 0.15.0), again only when the hook changes.
+    if [ "$fp" != "$(hash16 "$h")" ] || { [ $((now - sent)) -ge "$DAY" ] && { [ "$kind" != self-off ] || [ "$sent" = 0 ]; }; }; then
       if ha_send on "$T" "$M"; then sent="$now"; fp="$(hash16 "$h")"; shown=1; said="${said:+$said and }Home Assistant"
       else missed="${missed:+$missed and }Home Assistant"; fi
     fi
@@ -283,7 +308,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|channel|server-gone|self-restart|self-off|self-refused|self-loops|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -311,8 +336,8 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
     self) groups="self" ;; boots) groups="boots" ;; asked) groups="asked" ;; all) groups="all" ;; update) groups="update" ;; unseen) groups="unseen" ;;
-    turn) groups="turn" ;; tampered) groups="tamper" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn or tampered" >&2; return 2 ;; esac
+    turn) groups="turn" ;; tampered) groups="tamper" ;; watchdog) groups="watchdog" ;; selfrestart) groups="selfrestart" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog or selfrestart" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -402,7 +427,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \

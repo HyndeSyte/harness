@@ -50,7 +50,8 @@ checked_now() {
 # Should this start ever end (a step it can't get past, or a fault in it), the finish script
 # halts the container: Dane hears it from root first (notice.sh; C1 second review). Not when a
 # signal ends it, as when the Supervisor stops or updates the App.
-trap 'rc=$?; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
+# A self-restart (Cain 0.15.0, self_restart below) ends it on purpose, already told, and isn't that.
+trap 'rc=$?; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && [ ! -e /run/cain/self-restart ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
 # The run of his session this script started, as it holds it in memory (probe/main.ts session-start
 # hands it back). A stop counts as asked only when root's mark, the run on file and this all name the
 # same run; after s6 restarts this script it is empty, and the run before is classed by its timing.
@@ -210,7 +211,7 @@ if [ "$mode" = none ]; then "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_c
   || bashio::log.error "Couldn't write /run/cain/mode"
 bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session held until the check of his own user finishes}"
 # The version this start runs (probe/main.ts install, Cain 0.14.0): a version that changed since the
-# last start is an install, and a loop within a day of it says so, with the way back by hand. Then
+# last start is an install, and a loop within a day of it says so (Cain 0.15.0: a first record counts as an install too). Then
 # this container's start, kept in /data once per container: more than 3 counted in 30 minutes alarms
 # that the App keeps restarting. Every start of this script (an s6-only restart too) clears any stop mark
 # and keeps start_id as the last start record. A start after a stop the Supervisor asked for, and the first two
@@ -527,7 +528,7 @@ checkins() {
 }
 if [ "$mode" != none ] && [ -z "$held" ]; then checkins; fi
 # The sign-in page and the yes/no status page, for the panel: root's, served by nginx only.
-printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain/www/signin.html \
+printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain-web/www/signin.html \
   || bashio::log.error "Couldn't write the sign-in page"
 (
   while true; do
@@ -535,7 +536,7 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     url=$(printf '%s\n' "$screen" | "$OPT/signin-url.sh" || true)
     if ! printf '%s\n' "$screen" | tail -n 30 | grep -Eqi 'paste.*code|oauth/authorize'; then
       url=''
-      printf '%s' '<!doctype html><p>No sign-in waiting.</p>' > /run/cain/www/signin.tmp && mv /run/cain/www/signin.tmp /run/cain/www/signin.html
+      printf '%s' '<!doctype html><p>No sign-in waiting.</p>' > /run/cain-web/www/signin.tmp && mv /run/cain-web/www/signin.tmp /run/cain-web/www/signin.html
     fi
     flag() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
     paired() { tr -d ' \n' < "$ACCESS_FILE" | grep -q '"allowFrom":\["'; }
@@ -556,10 +557,10 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
       "$(flag grep -q '^DISCORD_BOT_TOKEN=.' "$TOKEN_FILE")" \
       "$(flag paired)" \
       "$(flag grep -Eq '"dmPolicy": *"allowlist"' "$ACCESS_FILE")" \
-      "$state" "$mode" > /run/cain/www/status.tmp && chmod 0640 /run/cain/www/status.tmp && chgrp nogroup /run/cain/www/status.tmp \
-      && mv /run/cain/www/status.tmp /run/cain/www/status.json || true
+      "$state" "$mode" > /run/cain-web/www/status.tmp && chmod 0640 /run/cain-web/www/status.tmp && chgrp nogroup /run/cain-web/www/status.tmp \
+      && mv /run/cain-web/www/status.tmp /run/cain-web/www/status.json || true
     if [ "$state" = login_needed ] && [ ! -f /data/alerted-login ]; then
-      if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain can't answer: its Claude sign-in has expired. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code in the box."; then
+      if TOKEN_FILE="$TOKEN_FILE" ACCESS_FILE="$ACCESS_FILE" "$OPT/alert.sh" "Cain can't answer: his Claude sign-in has expired. Only you can sign him in: the sign-in link is on the Cain page in Home Assistant, and the code it gives you goes in the box there."; then
         touch /data/alerted-login
         bashio::log.warning "Sign-in expired; told the owner in Discord"
       else
@@ -570,9 +571,9 @@ printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>
     fi
     if [ -n "$url" ]; then
       safe=$(printf '%s' "$url" | sed 's/&/\&amp;/g; s/"/%22/g; s/</%3C/g')
-      printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /run/cain/www/signin.tmp && mv /run/cain/www/signin.tmp /run/cain/www/signin.html || true
+      printf '<!doctype html><meta name=viewport content="width=device-width"><p><a href="%s" target="_blank" rel="noopener" style="font-size:1.4em">Sign in to Claude</a></p><p>Then paste the code it gives you into the Cain page.</p>' "$safe" > /run/cain-web/www/signin.tmp && mv /run/cain-web/www/signin.tmp /run/cain-web/www/signin.html || true
     fi
-    chgrp nogroup /run/cain/www/signin.html 2>/dev/null; chmod 0640 /run/cain/www/signin.html 2>/dev/null
+    chgrp nogroup /run/cain-web/www/signin.html 2>/dev/null; chmod 0640 /run/cain-web/www/signin.html 2>/dev/null
     sleep 2
   done
 ) &
@@ -673,7 +674,7 @@ run_check() {   # run_check <the last try: 0 or 1>
 quick=0
 session_ended() {
   quick=$((quick + 1))
-  if [ "$quick" -ge 3 ]; then "$OPT/notice.sh" tell session || true; fi
+  if [ "$quick" -ge 3 ]; then "$OPT/notice.sh" tell session "it ended $quick times in a row" || true; fi
   local wait=10 i
   for ((i = 1; i < quick && wait < 600; i++)); do wait=$((wait * 2)); done
   [ "$wait" -le 600 ] || wait=600
@@ -691,6 +692,66 @@ session_ended() {
 #     that the calendar App's update didn't happen, with the fix.
 # After two minutes of running, and his check passed (the new way), a stop's or a pause's alarm
 # comes down (as his own user, any alarm).
+# The App restarting itself, the last resort (Cain 0.15.0, cain/docs/self-restart-followup.md). On
+# Nov 20 his channel stayed down 19 minutes after the plugin's server stopped, and the alarm told
+# Dane to restart the App himself. Now, when his Discord channel stays down across 3 restarts of his
+# session, or for 10 minutes, whichever comes first (never while his screen waits on the owner's
+# one-time sign-in), the App ends his session and exits on an error, and the Supervisor's watchdog
+# (the one switch on the App's page, which only Dane can turn on) starts it again: no wider access
+# than the App has (it reads the switch through /addons/self/info, which every App may read). The
+# probe keeps the marks in /data (probe/main.ts self-restart): one restart per incident (30
+# minutes), the count in the 0.14.0 windows as an asked restart whose requester is the App, a
+# report in the morning check-in, an alarm after 3 in 24 hours or 2 for the same cause, and 3
+# Supervisor answers in a row that can't be read alarm with the reason. With the switch off the App
+# never exits (it would stay down): it alarms once, naming the switch, and keeps restarting his
+# session. /health (nginx, the watchdog's URL in config.yaml) answers 503 while a self-restart is
+# due, 200 otherwise.
+HEALTH_DOWN=/run/cain-web/www/health-down
+health_up() { rm -f "$HEALTH_DOWN" 2>/dev/null || true; }
+health_down() { { : > "$HEALTH_DOWN" && chgrp nogroup "$HEALTH_DOWN" && chmod 0640 "$HEALTH_DOWN"; } 2>/dev/null || true; }
+health_up
+# The watchdog switch, as the Supervisor says: on, off, or unknown (no answer within 20 seconds).
+watchdog_switch() {
+  local f="${TMPDIR:-/run/cain/root-tmp}/watchdog.$$" v pid i
+  rm -f "$f"
+  ( bashio::api.supervisor GET /addons/self/info false .watchdog > "$f" 2>/dev/null ) &
+  pid=$!
+  for i in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; nap 0.5; done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  v="$(head -c 10 "$f" 2>/dev/null | tr -cd 'a-z' || true)"; rm -f "$f"
+  case "$v" in true) echo on ;; false) echo off ;; *) echo unknown ;; esac
+}
+# His screen waits on the owner's one-time sign-in (no Claude credentials yet, or the panel's status
+# says a sign-in screen): his session is never restarted for its channel then.
+waiting_signin() {
+  [ -s "$CRED" ] || return 0
+  case "$(jq -r '.screen // empty' /run/cain-web/www/status.json 2>/dev/null || true)" in
+    login_needed|waiting_for_code|first_run_menu|trust_prompt) return 0 ;;
+  esac
+  return 1
+}
+self_tried=0
+self_restart() {   # self_restart <kind> <cause>: never returns when the App restarts itself
+  [ $(( $(date +%s) - self_tried )) -ge "${C1_SELF_RETRY_S:-60}" ] || return 0
+  self_tried=$(date +%s)
+  health_down
+  local sw dec
+  sw="$(watchdog_switch)"
+  dec="$(timeout 60 bun "$OPT/probe/main.ts" self-restart "$1" "$sw" "${start_id:-}" "$2" 2>&1 | tail -n 1 | tr -cd 'a-z-')" || true
+  case "$dec" in
+    restart)
+      bashio::log.warning "The App restarts itself: $2. The Supervisor's watchdog starts it again."
+      { : > /run/cain/self-restart; } 2>/dev/null || true
+      end_his_session || true
+      exit 3 ;;
+    wait) bashio::log.info "A self-restart is due ($2), but the App restarted itself for this already within 30 minutes: his session is restarted instead" ;;
+    off) bashio::log.warning "A self-restart is due ($2), but the Supervisor's watchdog switch is off, so the App stays up (it would stay down) and restarts his session instead" ;;
+    *) bashio::log.warning "A self-restart is due ($2), but the Supervisor didn't say whether its watchdog is on (${dec:-no answer}): tried again in a minute" ;;
+  esac
+}
+# When his channel went down (the broker's state), or, with none yet in this container, when his
+# first session started: for the 10 minutes.
+first_up=""
 asked=0; listed_at=$(date +%s); told_at=$(date +%s)
 # Restarts for a channel that went down, counted apart from quick ends: a session that runs two
 # minutes resets those, but not these. Only a channel connected for 10 minutes straight resets
@@ -748,18 +809,48 @@ while session_up; do
   # A failed try of the switch whose alarm couldn't be kept at the start: tried again every 10
   # minutes until it is (tell_failed_switch).
   if [ "$mode" = old ] && [ $(( $(date +%s) - told_at )) -ge 600 ]; then told_at=$(date +%s); tell_failed_switch || true; fi
-  if [ "$mode" = own ] && [ -f /run/cain/discord.state ]; then
-    st=""; at=""
-    read -r st at < /run/cain/discord.state || true
+  # The channel watchdog (the new way): the broker's state says connected, down (his connection
+  # ended), or server-down (the plugin's server isn't running under his connection; the broker starts
+  # it again within seconds). Each is its own state here, named in the log and in any alarm. A first
+  # session that never connects (no state yet in this container) is restarted after 3 minutes, once
+  # signed in; a session whose screen waits on the owner's one-time sign-in never is (Cain 0.15.0).
+  if [ "$mode" = own ]; then
+    st=""; at=""; why=""; now=$(date +%s)
+    [ ! -f /run/cain/discord.state ] || read -r st at < /run/cain/discord.state || true
     at="$(printf '%s' "$at" | tr -cd '0-9')"
-    if [ "$st" = connected ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -ge "${C1_CHANNEL_STEADY_S:-600}" ]; then chan_restarts=0; fi
-    if [ "$st" = down ] && [ -n "$at" ] && [ $(( $(date +%s) - at )) -gt "${C1_CHANNEL_DOWN_S:-90}" ] \
-       && [ $(( $(date +%s) - up_since )) -gt "${C1_CHANNEL_DOWN_S:-90}" ]; then
-      bashio::log.warning "Cain's Discord channel has been down 90 seconds: restarting his session"
-      chan_restarts=$((chan_restarts + 1))
-      if [ "$chan_restarts" -ge 3 ]; then "$OPT/notice.sh" tell session || true; fi
-      end_his_session || fail_closed
-      break
+    [ -n "$first_up" ] || first_up="$up_since"
+    if [ "$st" = connected ] && [ -n "$at" ]; then
+      health_up
+      if [ $(( now - at )) -ge "${C1_CHANNEL_STEADY_S:-600}" ]; then chan_restarts=0; fi
+    elif waiting_signin; then
+      :
+    else
+      down_since="${at:-$first_up}"
+      if [ "$st" = server-down ] && [ -n "$at" ] && [ $(( now - at )) -gt "${C1_SERVER_DOWN_S:-60}" ] \
+         && [ $(( now - up_since )) -gt "${C1_SERVER_DOWN_S:-60}" ]; then
+        why="the Discord plugin's server has been stopped $(( now - at )) seconds and the broker couldn't keep it running"
+      elif [ "$st" = down ] && [ -n "$at" ] && [ $(( now - at )) -gt "${C1_CHANNEL_DOWN_S:-90}" ] \
+         && [ $(( now - up_since )) -gt "${C1_CHANNEL_DOWN_S:-90}" ]; then
+        why="his session's Discord channel has been down $(( now - at )) seconds"
+      elif [ -z "$st" ] && [ $(( now - up_since )) -gt "${C1_FIRST_CONNECT_S:-180}" ]; then
+        why="his session, signed in, hasn't connected to Discord in $(( now - up_since )) seconds since it started"
+      fi
+      # Past 3 restarts of his session for its channel, or 10 minutes down: the App restarts itself.
+      if [ $(( now - down_since )) -ge "${C1_SELF_RESTART_S:-600}" ]; then
+        self_restart channel-down "his Discord channel has been down $(( (now - down_since) / 60 )) minutes"
+      elif [ -n "$why" ] && [ "$chan_restarts" -ge 3 ]; then
+        self_restart channel-restarts "his Discord channel stayed down across $chan_restarts restarts of his session (now: $why)"
+      fi
+      if [ -n "$why" ]; then
+        bashio::log.warning "Restarting his session: $why"
+        chan_restarts=$((chan_restarts + 1))
+        if [ "$chan_restarts" -ge 3 ]; then
+          if [ "$st" = server-down ]; then "$OPT/notice.sh" tell server-gone "$why" || true
+          else "$OPT/notice.sh" tell channel "$why" || true; fi
+        fi
+        end_his_session || fail_closed
+        break
+      fi
     fi
   fi
   # A question waiting on his screen, where no one answers it (unstick.sh): Esc after 5 minutes;
@@ -782,7 +873,8 @@ while session_up; do
   if [ -z "$cleared" ] && [ -n "$checked" ] && [ $(( $(date +%s) - up_since )) -ge "${C1_RUNNING_S:-120}" ] \
      && { [ "$mode" != own ] || { [ "$chan_restarts" -eq 0 ] && [ "$(cut -d ' ' -f 1 /run/cain/discord.state 2>/dev/null || true)" = connected ]; }; }; then
     cleared=1; quick=0
-    if [ "$mode" = own ]; then "$OPT/notice.sh" clear switched || true; else "$OPT/notice.sh" clear running || true; fi
+    if [ "$mode" = own ]; then "$OPT/notice.sh" clear switched || true; "$OPT/notice.sh" clear selfrestart || true
+    else "$OPT/notice.sh" clear running || true; fi
   fi
   nap 10
 done

@@ -433,6 +433,13 @@ kind=other; [ "$slot" = 0710 ] && kind=morning
 watch=$(timeout 30 bun "${SECURITY_MAIN:-/opt/cain/security/main.ts}" lines "$kind" 2>/dev/null \
           | head -n 1 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ')
 [ -n "$watch" ] && watch=" $watch"
+# Every time the App restarted itself in the 24 hours before (Cain 0.15.0, probe/main.ts self-report),
+# with its time and cause: in the morning only.
+if [ "$slot" = 0710 ]; then
+  selfline=$(timeout 30 bun "${PROBE_MAIN:-/opt/cain/probe/main.ts}" self-report 2>/dev/null \
+               | tail -n 1 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ' | cut -c1-600)
+  [ -n "$selfline" ] && watch="$watch $selfline"
+fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update.$watch"
 else

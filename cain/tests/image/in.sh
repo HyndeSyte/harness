@@ -349,6 +349,29 @@ final)
   loaded="$(jq -c 'select(.type == "system" and .subtype == "init") | [.plugins[]? | {name, path}]' /fp/after.jsonl | head -n 1)"
   extra="$(jq -r --arg s "$OPT/plugin-seed/" 'select(.type == "system" and .subtype == "init") | .plugins[]? | select(((.path // "") | startswith($s) or . == "builtin") | not) | "\(.name) \(.path)"' /fp/after.jsonl)"
   [ -z "$extra" ] || fail "his session loaded a plugin from outside the image's seed: $extra"
+  # Cain 0.15.0: the trust file his instructions tell him to read (his DM's chat id, after a restart)
+  # stays readable to his user after every write, made fresh or rewritten, under the run script's umask.
+  # And the panel (E): nginx's workers (nobody:nogroup, nginx.conf's user line) reach the sign-in page and
+  # the terminal's socket in /run/cain-web; his user doesn't.
+  grep -qx 'user nobody nogroup;' /etc/nginx/nginx.conf || fail "nginx.conf doesn't name its workers' user"
+  printf 'x' > /run/cain-web/www/signin.html && chgrp nogroup /run/cain-web/www/signin.html && chmod 0640 /run/cain-web/www/signin.html
+  setpriv --reuid=nobody --regid=nogroup --clear-groups cat /run/cain-web/www/signin.html >/dev/null \
+    || fail "nginx's workers can't read the sign-in page: $(stat -c '%U:%G:%a' /run/cain-web /run/cain-web/www 2>&1 | tr '\n' ' ')"
+  bun -e 'require("net").createServer(() => {}).listen("/run/cain-web/upstream/t.sock", () => { require("fs").chownSync("/run/cain-web/upstream/t.sock", 0, 65534); require("fs").chmodSync("/run/cain-web/upstream/t.sock", 0o770); console.log("up"); })' > /fp/sock.out &
+  sk=$!; for _ in $(seq 1 50); do grep -q up /fp/sock.out 2>/dev/null && break; sleep 0.1; done
+  setpriv --reuid=nobody --regid=nogroup --clear-groups bun -e 'const s = require("net").connect("/run/cain-web/upstream/t.sock"); s.on("connect", () => process.exit(0)); s.on("error", (e) => { console.error(e.code); process.exit(1); });' \
+    || { kill "$sk"; fail "nginx's workers can't connect to a socket in /run/cain-web/upstream"; }
+  if setpriv --reuid=1000 --regid=1000 --init-groups cat /run/cain-web/www/signin.html >/dev/null 2>&1; then kill "$sk"; fail "his user can read the panel's pages"; fi
+  kill "$sk" 2>/dev/null; wait "$sk" 2>/dev/null; rm -f /run/cain-web/upstream/t.sock /run/cain-web/www/signin.html
+  rm -f $D/trust/cards.json
+  for i in 1 2; do
+    ( umask 027; cd "$OPT" && bun -e 'const { publishCards } = await import("/opt/cain/link/publish.ts"); const { emptyState } = await import("/opt/cain/link/core.ts"); await publishCards(emptyState(), Date.now(), "/data/trust/cards.json");' ) \
+      || fail "the link couldn't write cards.json"
+    [ "$(stat -c %U:%G:%a $D/trust/cards.json)" = root:cain:640 ] || fail "cards.json is $(stat -c %U:%G:%a $D/trust/cards.json), not root:cain:640 (write $i)"
+    setpriv --reuid=1000 --regid=1000 --init-groups jq -e 'type == "object"' $D/trust/cards.json >/dev/null \
+      || fail "his user can't read cards.json (write $i)"
+  done
+  "$OPT/c1/lock.sh" verify || fail "the start's check doesn't hold with cards.json his to read"
   note "final checks held ($other couldn't be installed; loaded: $loaded)"
   ;;
 alarm)

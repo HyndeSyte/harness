@@ -31,8 +31,8 @@
 //     one combined window: more than 8 in 60 minutes, or more than 12 in 24 hours, alarm that the App keeps
 //     starting, with the counts by kind. A loop that mixes kinds (5 asked and 3 unseen in an hour) or
 //     paces one kind under its own limits can't stay under this one. The per-kind windows stay as they are.
-// Within a day of a version change, the early-exit, unseen, container, asked-restart or combined-start loop also says so, with the way back
-// by hand; outside that day an alarm gives the count, the window and what root saw only.
+// Within a day of a version change, the early-exit, unseen, container, asked-restart or combined-start loop also says so (a first record
+// counts as an install, Cain 0.15.0); outside that day an alarm gives the count, the window and what root saw only.
 // The owner's Stop (stop.json) stops jobs, cards and merges, not his session, so none of this reads it.
 // Only the App's own stopped mode (the mode file says none) silences the liveness alarms and pings.
 
@@ -397,11 +397,15 @@ export function pruneStarts(text: string, now: number): string {
 // -- installs ---------------------------------------------------------------------------------------
 export interface Install { id: string; version: string; previous: string | null; at: number }
 const VERSION = /^\d+\.\d+\.\d+$/;
-// The install record after a start that runs this version. A first record (none before) is no
-// install: at 0, so no window opens. A version that can't be read changes nothing.
+// The install record after a start that runs this version. A version that can't be read changes nothing.
+// Cain 0.15.0: a first record (none before) is an install too, at this start, so its day is watched. On
+// Nov 20 0.14.0, the first version to keep this record, was installed that morning, found no record
+// before it, and kept "at 0" (no window): the replay drill's loop never said "since his update". A first
+// record is either the App's first install or the update to the first version that keeps one; both are
+// an install whose day matters. A record kept as "at 0" by 0.14.0 is taken as it is (that day is past).
 export function afterStart(prev: Install | null, version: string, now: number): { install: Install | null; fresh: boolean } {
   if (!VERSION.test(version)) return { install: prev, fresh: false };
-  if (!prev) return { install: { id: `${version}@0`, version, previous: null, at: 0 }, fresh: false };
+  if (!prev) return { install: { id: `${version}@${now}`, version, previous: null, at: now }, fresh: true };
   if (prev.version === version) return { install: prev, fresh: false };
   return { install: { id: `${version}@${now}`, version, previous: prev.version, at: now }, fresh: true };
 }
@@ -418,3 +422,64 @@ export function ago(s: number): string {
 }
 // The cause the install-correlated alarm carries: the version and how long ago it went in.
 export function updateCause(i: Install, now: number): string { return `Cain ${i.version}, installed ${ago(now - i.at)} ago`; }
+
+// -- the App restarting itself (Cain 0.15.0) ----------------------------------------------------------
+// When his Discord channel stays down across 3 restarts of his session, or for 10 minutes, the run
+// script asks here whether the App restarts itself (cain/docs/self-restart-followup.md): one restart per
+// incident (any further one due within 30 minutes of the last coalesces into it), never while the
+// Supervisor's watchdog switch is off (the App would stay down: it alarms once, naming the switch),
+// and 3 answers in a row from the Supervisor that can't be read alarm with the reason. Every restart is
+// kept in /data with its cause and time, for the morning check-in; 3 in 24 hours, or 2 for the same
+// cause, alarm.
+export const SELF_INCIDENT_S = 30 * 60;
+export const SELF_REFUSALS_MAX = 3;
+export const SELF_DAY_S = 24 * 3600;
+export const SELF_DAY_MAX = 3;
+export const SELF_SAME_MAX = 2;
+export const SELF_MARK_S = 15 * 60;              // the mark the next container start reads, at most this old
+export const SELF_KINDS = /^(channel-down|channel-restarts)$/;
+export type Switch = "on" | "off" | "unknown";
+export interface SelfRow { at: number; kind: string; cause: string }
+export interface SelfState { refusals: number; offTold: boolean }
+export type SelfAlarm = { kind: "self-off" | "self-refused" | "self-loops"; cause: string } | { clear: "watchdog" };
+export function parseSelfRows(text: string): SelfRow[] {
+  const out: SelfRow[] = [];
+  for (const l of text.split("\n")) {
+    try { const r = JSON.parse(l); if (Number.isSafeInteger(r?.at) && typeof r?.kind === "string" && typeof r?.cause === "string") out.push({ at: r.at, kind: r.kind, cause: r.cause }); }
+    catch { /* not a row */ }
+  }
+  return out;
+}
+const KIND_WORDS: Record<string, string> = {
+  "channel-down": "his Discord channel down 10 minutes",
+  "channel-restarts": "his Discord channel down across 3 restarts of his session",
+};
+export function selfWords(kind: string): string { return KIND_WORDS[kind] ?? kind; }
+export function selfDecide(rows: SelfRow[], st: SelfState, sw: Switch, kind: string, cause: string, now: number):
+  { decision: "restart" | "wait" | "off" | "unknown"; state: SelfState; row: SelfRow | null; alarms: SelfAlarm[] } {
+  const alarms: SelfAlarm[] = [];
+  if (rows.some((r) => r.at <= now && now - r.at < SELF_INCIDENT_S)) return { decision: "wait", state: st, row: null, alarms };
+  if (sw === "unknown") {
+    const refusals = st.refusals + 1;
+    if (refusals === SELF_REFUSALS_MAX) alarms.push({ kind: "self-refused", cause: `the Supervisor didn't say whether its watchdog is on, ${refusals} times in a row` });
+    return { decision: "unknown", state: { ...st, refusals }, row: null, alarms };
+  }
+  if (sw === "off") {
+    if (!st.offTold) alarms.push({ kind: "self-off", cause });
+    return { decision: "off", state: { refusals: 0, offTold: true }, row: null, alarms };
+  }
+  if (st.offTold) alarms.push({ clear: "watchdog" });
+  const row = { at: now, kind, cause };
+  const day = [...rows, row].filter((r) => r.at <= now && now - r.at < SELF_DAY_S);
+  const same = day.filter((r) => r.kind === kind).length;
+  if (day.length >= SELF_DAY_MAX) alarms.push({ kind: "self-loops", cause: `${day.length} in 24 hours, the last for ${selfWords(kind)}` });
+  else if (same >= SELF_SAME_MAX) alarms.push({ kind: "self-loops", cause: `${same} in 24 hours for ${selfWords(kind)}` });
+  return { decision: "restart", state: { refusals: 0, offTold: false }, row, alarms };
+}
+// The morning check-in's line: each self-restart in the 24 hours before, with its time and cause.
+export function selfReport(rows: SelfRow[], now: number, tz: string): string {
+  const day = rows.filter((r) => r.at <= now && now - r.at < SELF_DAY_S);
+  if (!day.length) return "";
+  const t = (s: number) => new Date(s * 1000).toLocaleTimeString("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" });
+  return `Your App restarted itself ${day.length === 1 ? "once" : `${day.length} times`} in the last 24 hours: ${day.map((r) => `at ${t(r.at)}, for ${selfWords(r.kind)}`).join("; ")}. It did that itself and it's back; tell him in one line in the morning message, and nothing for him to do.`;
+}

@@ -36,6 +36,13 @@ export const MAX_BAD = 20;
 export const MAX_FILES = 10;
 export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 export const MAX_TEXT = 20_000;
+// The plugin's server, started again when it stops under a live connection (broker-main.ts, Cain
+// 0.15.0): waits of 1, 2, 4, 8, then 15 seconds, back to the start once a server has run a minute.
+export const SERVER_BACKOFF_S = [1, 2, 4, 8, 15];
+export const SERVER_STEADY_S = 60;
+export function serverWait(restarts: number): number {
+  return SERVER_BACKOFF_S[Math.min(Math.max(restarts, 1), SERVER_BACKOFF_S.length) - 1];
+}
 
 type Msg = Record<string, any>;
 const SNOWFLAKE = /^\d{15,22}$/;
@@ -123,6 +130,8 @@ export class BrokerSession {
   private initId: string | null = null;
   private closed = false;
   private ready = false;                               // Claude Code's initialize was answered
+  private initParams: unknown = undefined;             // its initialize's params, for a restarted server
+  private reinitId: string | null = null;              // the broker's own initialize to a restarted server
   constructor(private d: BrokerDeps) {}
 
   // The hourly liveness check's line, handed to his session as a message of his channel. false when there
@@ -146,6 +155,31 @@ export class BrokerSession {
     this.closed = true;
     for (const [id, p] of this.pending) { this.d.clearTimer?.(p.timer); if (p.outbox) this.d.outbox.drop(p.outbox); this.pending.delete(id); }
     this.d.close();
+  }
+
+  open(): boolean { return !this.closed; }
+
+  // The server stopped and the broker starts it again under this same connection (Cain 0.15.0):
+  // every call in flight gets the same error as when the channel ends, but the connection stays,
+  // so his session keeps its Discord channel. Nothing is replayed.
+  serverLost(): void {
+    for (const [key, p] of this.pending) {
+      this.d.clearTimer?.(p.timer);
+      if (p.outbox) this.d.outbox.drop(p.outbox);
+      this.d.toClient(err(JSON.parse(key), p.tool && ACTS.has(p.tool) && p.args ? UNKNOWN : "The Discord channel stopped before this finished; try it again."));
+    }
+    this.pending.clear();
+    this.reinitId = null;
+  }
+
+  // The new server's handshake: Claude Code's own initialize, as it sent it, under an id of the
+  // broker's whose answer goes nowhere, then its initialized notification. false when Claude Code
+  // never sent one (it does at once; nothing to repeat then).
+  reinit(n: number): boolean {
+    if (this.closed || this.initParams === undefined) return false;
+    this.reinitId = `cain-broker-reinit-${n}`;
+    this.d.toServer(JSON.stringify({ jsonrpc: "2.0", id: this.reinitId, method: "initialize", params: this.initParams }));
+    return true;
   }
 
   // The server stopped: every call in flight gets an error, and the connection ends.
@@ -178,7 +212,7 @@ export class BrokerSession {
     if (this.pending.size >= MAX_PENDING) return void this.d.toClient(err(m.id, "too many calls in flight; send it again in a moment"));
     if (m.method !== "tools/call") {
       const p: Pending = { method: m.method, initialize: m.method === "initialize" };
-      if (p.initialize) this.initId = key;
+      if (p.initialize) { this.initId = key; this.initParams = m.params ?? {}; }
       this.track(key, m.id, p);
       return void this.d.toServer(JSON.stringify({ jsonrpc: "2.0", id: m.id, method: m.method, ...(m.params !== undefined ? { params: m.params } : {}) }));
     }
@@ -255,6 +289,14 @@ export class BrokerSession {
     if (!m || typeof m !== "object") return;
     const isAnswer = m.id !== undefined && m.id !== null && typeof m.method !== "string";
     if (isAnswer) {
+      // A restarted server's answer to the broker's own initialize: never Claude Code's to see. Its
+      // initialized notification follows, and the channel is whole again.
+      if (this.reinitId !== null && m.id === this.reinitId) {
+        this.reinitId = null;
+        if (m.error) return this.d.log("the restarted server refused the handshake");
+        this.d.toServer(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+        return this.d.log("the restarted server took the handshake");
+      }
       const key = JSON.stringify(m.id);
       const p = this.untrack(key);
       if (!p) return;                                        // timed out, or never ours

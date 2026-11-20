@@ -26,7 +26,11 @@ run)
   install -d -m 0710 -o root -g cain /run/cain || die "no /run/cain"
   install -d -m 0700 -o root -g root /run/cain/root-tmp
   install -d -m 0750 -o root -g cain /run/cain/keys
-  install -d -m 0750 -o root -g nogroup /run/cain/www /run/cain/upstream
+  # The panel's pages and sockets, for nginx's workers (nobody:nogroup) and root only (Cain 0.15.0):
+  # outside /run/cain, which his group alone may pass through (0710 since 0.14.0), so nginx got
+  # "Permission denied" on the terminal's socket and the sign-in page there. His user can't pass here.
+  install -d -m 0750 -o root -g nogroup /run/cain-web
+  install -d -m 0750 -o root -g nogroup /run/cain-web/www /run/cain-web/upstream
   install -d -m 0750 -o root -g discord /run/cain/outbox
   install -d -m 0700 -o cain -g cain /run/cain/tmux
   # The probe (Cain 0.14.0): its records in /data and its marks in /run (the hourly liveness check's
@@ -89,6 +93,8 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   own "$D/.claude" root:root 0700
   own "$D/.claude.json" root:root 0600
   own "$D/trust" root:root 0755
+  # What his instructions tell him to read there (his DM's chat id): root:cain 0640 (pinned.ts keeps it so).
+  own "$D/trust/cards.json" root:cain 0640
   own "$D/discord" root:discord 0751   # he may pass through to the inbox, nothing else
   own "$D/discord/access.json" root:discord 0640
   own "$D/discord/inbox" discord:cain 2750

@@ -45,7 +45,7 @@ if (import.meta.main) {
   // this restarts, and a page of his would be served in the panel as this one.
   const login = new CodexLogin({ home: codexHome });
   try {
-    const sock = env.REVIEW_SOCK ?? "/run/cain/upstream/codex.sock";
+    const sock = env.REVIEW_SOCK ?? "/run/cain-web/upstream/codex.sock";
     if (env.REVIEW_PORT) Bun.serve({ hostname: "127.0.0.1", port: Number(env.REVIEW_PORT), fetch: (req) => handle(req, login) });
     else {
       try { rmSync(sock, { force: true }); } catch { /* none */ }

@@ -21,6 +21,10 @@
 //                                    run marked asked as above, the trap's nonce left in /run, and a
 //                                    pending mark in /data naming this start (seventh round: only the
 //                                    finish script promotes it, so a stop that never finished counts)
+//   bun main.ts self-restart <kind> <on|off|unknown> <start id> <cause>
+//                                    (Cain 0.15.0) his channel is down past its bound: whether the App
+//                                    restarts itself (restart, wait, off or unknown), its marks kept
+//   bun main.ts self-report          the morning check-in's line on the App's own restarts (24 hours)
 //   bun main.ts folders              each folder from the probe's two up to /, with its owner, mode and
 //                                    verdict (the first Pi drill; reads only)
 // t0: the shell's $EPOCHREALTIME when the trap or the finish script began, so the time each took is
@@ -47,7 +51,7 @@ import {
   afterStart, alarmFor, askDue, bootKind, clockDue, endKind, END_KINDS, exitCause, failedWords, type Facts, hourlyState, type Hourly, type Install,
   inWindow, lastCode, lastSlot, logLine, longTurn, parseBoots, pass, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts,
   parseAsked, parseUnseen, type Screen, tooManyAsked, askedCount, allStarts, allCount, tooManyAll, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
-  unseenCount, updateCause,
+  unseenCount, updateCause, parseSelfRows, selfDecide, selfReport, selfWords, type SelfState, type Switch, SELF_KINDS, SELF_MARK_S,
 } from "./core";
 
 const env = process.env;
@@ -66,6 +70,10 @@ export const paths = (e: Record<string, string | undefined> = env) => {
     stopAsked: join(D, "stop-asked"), start: join(D, "start.json"),
     // How long each stop's TERM trap and finish script took (seventh round), for the stop drills.
     stopTimes: join(D, "stop-times"),
+    // The App's own restarts (Cain 0.15.0): each with its cause and time (self-restarts, JSON lines), the
+    // refusal count and whether the switch-off alarm went (self.json), and the mark the next container
+    // start reads (self-asked, naming the last start record's id).
+    selfRows: join(D, "self-restarts"), self: join(D, "self.json"), selfAsked: join(D, "self-asked"),
     // The hourly check's ask and answer, and when a message of the owner's last came in for his session
     // (the broker's note, a time only).
     ask: join(R, "ask"), answered: join(R, "answered"), heard: join(R, "heard"),
@@ -467,8 +475,11 @@ export function recordBoot(p: Paths, now: number, notice: PassDeps["notice"], st
   let kind: string | null = null;
   if (!exists(p.booted)) {
     writeWhole(p.booted, `${now}\n`);
-    kind = bootKind({ now, stopAsked: takeStopMark(p, now, last), install: json<Install>(p.install), bootsText: text(p.boots) ?? "" });
-    addLine(p.boots, `${now} ${kind}`, now);
+    const self = takeSelfMark(p, now, last);
+    kind = self ? "asked" : bootKind({ now, stopAsked: takeStopMark(p, now, last), install: json<Install>(p.install), bootsText: text(p.boots) ?? "" });
+    if (self) rm(p.stopAsked);
+    // A restart the App asked for itself counts as an asked one, its requester and cause named.
+    addLine(p.boots, self ? `${now} asked self:${self}` : `${now} ${kind}`, now);
     checkBoots(p, now, notice);
   } else if (exists(p.stopAsked)) log("a stop mark left by a restart of the run script alone: cleared");
   rm(p.stopAsked); rm(p.term);
@@ -494,7 +505,11 @@ export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): n
   const asked = parseAsked(text(p.boots) ?? "");
   const aflag = flagOf(p, "asked");
   if (tooManyAsked(asked, now)) {
-    if (!exists(aflag) && notice("tell", "asked-loop", askedCount(asked, now)) <= 1) {
+    // The App's own restarts among them are named with their cause (Cain 0.15.0).
+    const own = (text(p.boots) ?? "").split("\n").map((l) => l.trim().split(/\s+/))
+      .filter((f) => f[1] === "asked" && (f[2] ?? "").startsWith("self:") && now - Number(f[0]) < 24 * 3600).map((f) => f[2].slice(5));
+    const ownWords = own.length ? `, ${own.length} of them the App's own restarts (for ${[...new Set(own)].map((k) => selfWords(k)).join(", ")})` : "";
+    if (!exists(aflag) && notice("tell", "asked-loop", `${askedCount(asked, now)}${ownWords}`) <= 1) {
       writeWhole(aflag, `${now}\n`);
       sayUpdate(p, now, "update-asked", notice);
     }
@@ -506,11 +521,46 @@ export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): n
   return n;
 }
 
+// The mark of a restart the App asked for itself (selfRestart below): taken once, at the next container
+// start, and counted only when it names the last start record and is under 15 minutes old. Its kind, or null.
+export function takeSelfMark(p: Paths, now: number, last: string | null): string | null {
+  if (!exists(p.selfAsked)) return null;
+  const m = json<{ at?: unknown; id?: unknown; kind?: unknown }>(p.selfAsked);
+  rm(p.selfAsked);
+  if (!m || typeof m.at !== "number" || typeof m.kind !== "string" || !SELF_KINDS.test(m.kind) || typeof m.id !== "string") return null;
+  if (last === null || m.id !== last) { log("a self-restart mark from another start of the run script: not counted as asked"); return null; }
+  if (now - m.at < -60 || now - m.at > SELF_MARK_S) { log("a self-restart mark older than 15 minutes: not counted as asked"); return null; }
+  return m.kind;
+}
+// The run script found his channel down past its bound: whether the App restarts itself now (it prints
+// the decision on its last line: restart, wait, off or unknown). On restart the row and the mark are kept
+// before the run script exits; every alarm due goes out first, through notice.sh.
+export function selfRestart(p: Paths, now: number, kind: string, sw: Switch, start: string, cause: string, notice: PassDeps["notice"]): string {
+  if (!SELF_KINDS.test(kind)) return "unknown";
+  const st = json<SelfState>(p.self);
+  const state: SelfState = { refusals: Number.isSafeInteger(st?.refusals) ? st!.refusals : 0, offTold: st?.offTold === true };
+  const rows = parseSelfRows(text(p.selfRows) ?? "");
+  const words = cause.replace(/[\r\n]+/g, " ").slice(0, 200);
+  const d = selfDecide(rows, state, sw, kind, words, now);
+  for (const a of d.alarms) {
+    if ("clear" in a) notice("clear", a.clear);
+    else notice("tell", a.kind, a.cause);
+  }
+  if (d.decision !== "wait") writeWhole(p.self, JSON.stringify(d.state));
+  if (d.row) {
+    const keep = [...rows.filter((r) => now - r.at < 7 * 86400), d.row].slice(-200);
+    writeWhole(p.selfRows, keep.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    if (START_ID.test(start)) writeWhole(p.selfAsked, JSON.stringify({ id: start, at: now, kind }));
+    notice("tell", "self-restart", words);
+    log(`the App restarts itself: ${words}`);
+  }
+  return d.decision;
+}
 export function recordInstall(p: Paths, version: string, now: number): Install | null {
   const prev = json<Install>(p.install);
   const { install, fresh } = afterStart(prev, version, now);
   if (install && install !== prev) writeWhole(p.install, JSON.stringify(install));
-  if (fresh && install) log(`installed: Cain ${install.version} (was ${install.previous}); the next 24 hours are watched`);
+  if (fresh && install) log(`installed: Cain ${install.version} (${install.previous ? `was ${install.previous}` : "no install on record before"}); the next 24 hours are watched`);
   return install;
 }
 
@@ -576,11 +626,16 @@ if (import.meta.main) {
       const raw = (arg ?? "").replace(/[^0-9]/g, "").slice(0, 8);
       const r = sessionStart(p, now(), raw === "" ? null : Number(raw), noticeCall(p), idArg(process.argv[4]));
       console.log(`run ${r.id} ${r.kind}`);
+    } else if (cmd === "self-restart") {
+      const sw = (process.argv[4] === "on" || process.argv[4] === "off" ? process.argv[4] : "unknown") as Switch;
+      console.log(selfRestart(p, now(), arg ?? "", sw, idArg(process.argv[5]), process.argv[6] ?? "", noticeCall(p)));
+    } else if (cmd === "self-report") {
+      console.log(selfReport(parseSelfRows(text(p.selfRows) ?? ""), now(), tz));
     } else if (cmd === "install") {
       const i = recordInstall(p, arg ?? "", now());
       console.log(i ? `${i.version} since ${i.at || "before the probe"}` : "no version");
     } else {
-      console.error("usage: main.ts loop | pass | install <version> | boot <start id> | session-asked <id> | stop-asked <id> <start id> [t0] | stop-finish <code> <signal> [t0] | session-gone <id> | session-start <code> <id> | folders");
+      console.error("usage: main.ts loop | pass | install <version> | boot <start id> | session-asked <id> | stop-asked <id> <start id> [t0] | stop-finish <code> <signal> [t0] | session-gone <id> | session-start <code> <id> | self-restart <kind> <on|off|unknown> <start id> <cause> | self-report | folders");
       process.exit(2);
     }
   } catch (e) {

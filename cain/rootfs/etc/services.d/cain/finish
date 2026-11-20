@@ -15,6 +15,14 @@ if [ -e /run/cain/probe/term ]; then
   timeout 4 bun /opt/cain/probe/main.ts stop-finish "${APP_EXIT_CODE}" "${2:-}" "$t0" >/dev/null 2>&1 || true
 fi
 unset t0
+if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]] && [ -e /run/cain/self-restart ]; then
+  # The App restarting itself (Cain 0.15.0, the run script's self_restart): already told and kept in
+  # /data by the probe. The container stops on an error so the Supervisor's watchdog starts it again;
+  # the outside heartbeat isn't told it failed (it alarms by itself should the App not come back).
+  bashio::log.warning "Cain's App stops to restart itself (exit code ${APP_EXIT_CODE}); the Supervisor's watchdog starts it again"
+  echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
+  exec /run/s6/basedir/bin/halt
+fi
 if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
   bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
   # The outside heartbeat hears it at once (<heartbeat_url>/fail), when one is set. The URL is

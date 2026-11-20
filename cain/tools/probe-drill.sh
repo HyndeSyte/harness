@@ -1,5 +1,5 @@
 #!/bin/bash
-# The Pi drills for Cain 0.14.0's alarms, in order, for the owner's assistant to run on the real Pi
+# The Pi drills for Cain's alarms (0.14.0, and 0.15.0's step 6), in order, for the owner's assistant to run on the real Pi
 # from a shell that can reach Docker (Home Assistant's SSH App with protection mode off). Not shipped
 # in the image. This release only alarms: nothing here restores or rolls back anything. Run them on
 # the Pi after the install, before the alarms are relied on.
@@ -34,16 +34,47 @@
 #                       script took for every stop since the step began (/data/probe/stop-times: the
 #                       trap must stay under 6 seconds and the finish script under 4).
 #
+#   probe-drill.sh 6    (Cain 0.15.0) the plugin's server stopped under a live connection: started again
+#                       within seconds by the broker, logged with its exit code, and his session never
+#                       restarted for it.
+#
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
 # token or a heartbeat URL.
+#
+# The container (Cain 0.15.0): found by its name, app_<hash>_cain as Home Assistant names Apps now,
+# falling back to addon_<hash>_cain; CAIN_CONTAINER=<name> picks one by hand. Every step first checks
+# that each tool it uses is there, on this machine and in the container, and fails loudly naming the
+# one that isn't (the image has no procps: no pkill, no ps; kills go through /proc).
+#
+# Rerunning one step alone: each step stands on its own, so run only its number. For step 1b (six
+# self-kills, about 40 minutes):
+#   CAIN_CONTAINER="$(docker ps --format '{{.Names}}' | grep -E '^app_[A-Za-z0-9]+_cain$')" bash probe-drill.sh 1b
+# or just `bash probe-drill.sh 1b` when one Cain container runs. Wait 60 minutes after an earlier 1b
+# (or a 2) first, so its exits are out of the hour's window, or the "keeps ending" alarm is already up.
 set -uo pipefail
-C="${CAIN_CONTAINER:-addon_0fcc2575_cain}"
 say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+fail() { echo "FAIL: $*"; exit 1; }
+# Tools this machine needs for a step, and tools the container needs: each checked before the step starts.
+need() { local t; for t in "$@"; do command -v "$t" >/dev/null 2>&1 || { echo "FAIL: step ${STEP:-?} needs '$t' on this machine, and it isn't there"; exit 2; }; done; }
+need_in() { local t; for t in "$@"; do docker exec "$C" sh -c "command -v '$t'" >/dev/null 2>&1 || { echo "FAIL: step ${STEP:-?} needs '$t' in the container $C, and it isn't there"; exit 2; }; done; }
+STEP="${1:-}"
+need docker date sleep grep awk
+# The container by its name: app_<hash>_cain (Home Assistant's name for Apps now), then addon_<hash>_cain.
+find_container() {
+  local all c pat
+  all="$(docker ps --format '{{.Names}}' 2>/dev/null; docker ps -a --format '{{.Names}}' 2>/dev/null)"
+  for pat in '^app_[A-Za-z0-9]+_cain$' '^addon_[A-Za-z0-9]+_cain$'; do
+    c="$(printf '%s\n' "$all" | grep -E "$pat" | head -n 1)"
+    [ -z "$c" ] || { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+C="${CAIN_CONTAINER:-$(find_container || true)}"
+[ -n "$C" ] || { echo "FAIL: no Cain container found (no app_*_cain or addon_*_cain in docker ps -a); set CAIN_CONTAINER=<name>"; exit 2; }
 in_c() { docker exec "$C" "$@"; }
 as_cain() { docker exec -u 1000 "$C" "$@"; }
-fail() { echo "FAIL: $*"; exit 1; }
-command -v docker >/dev/null || { echo "FAIL: no docker here (use Home Assistant's SSH App with protection mode off)"; exit 2; }
 in_c true 2>/dev/null || { echo "FAIL: no running container $C"; exit 2; }
+say "the Cain container: $C"
 
 alarm_up() { in_c test -s "/data/c1/notice.d/$1" 2>/dev/null && ! in_c grep -q '^clear 1' "/data/c1/notice.d/$1" 2>/dev/null; }
 wait_for() {   # wait_for <seconds> <command...>: 0 once the command passes
@@ -65,6 +96,7 @@ stop_times() {
 
 case "${1:-}" in
   0)
+    need_in bun
     say "step 0: the probe's folders and every folder above them, with each one's owner, mode and verdict"
     out="$(in_c bun /opt/cain/probe/main.ts folders 2>&1)" || fail "couldn't run the probe's folder check: $out"
     printf '%s\n' "$out"
@@ -72,6 +104,7 @@ case "${1:-}" in
     echo "PASS: both probe folders and every folder above them are the App's alone"
     ;;
   1)
+    need_in sh head ls find
     say "step 1: the boundary, as uid 1000"
     ok=1
     for f in /run/s6/container_environment/SUPERVISOR_TOKEN /data/probe/starts /data/probe/boots /run/cain/probe/session.json /run/cain/link-gateway.state; do
@@ -86,13 +119,18 @@ case "${1:-}" in
     [ "$ok" = 1 ] && echo "PASS: uid 1000 can't read the token, the probe's records or the gateway state, and can't write under the probe's folders" || fail "the boundary didn't hold (above)"
     ;;
   1b)
+    need_in sh tr tmux awk
     say "step 1b: uid 1000 kills its own session 6 times, each after over 5 minutes"
     since=$(date +%s)
     for i in 1 2 3 4 5 6; do
       wait_session_up 600 || fail "his session didn't come back before kill $i"
       say "  kill $i: waiting 5 minutes 30 seconds, then his own user ends his session with an error"
       sleep 330
-      as_cain sh -c 'pkill -9 -u 1000 -f "^claude " || pkill -9 -u 1000 claude' 2>/dev/null || true
+      # Through /proc, as step 3 kills (the image has no pkill): every process of his whose command is
+      # Claude Code's, ended by his own user with SIGKILL (an error exit).
+      killed="$(as_cain sh -c 'n=0; for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; case "$c" in "claude "*|*/claude\ *) kill -9 "${p#/proc/}" 2>/dev/null && n=$((n + 1)) ;; esac; done; echo "$n"' 2>/dev/null)"
+      [ "${killed:-0}" -gt 0 ] 2>/dev/null || fail "kill $i ended no process of Claude Code's (found none through /proc)"
+      say "  kill $i: ended ${killed} process(es)"
       sleep 30
     done
     starts_since "$since"
@@ -103,6 +141,7 @@ case "${1:-}" in
     echo "PASS: six self-kills after the 5 minute mark counted no early exit, and \"keeps ending on its own\" was raised. Confirm on the phone it came once."
     ;;
   2)
+    need_in tmux awk test
     say "step 2: the Nov 19 replay, his session killed within a minute of each start"
     since=$(date +%s)
     for i in 1 2 3 4 5; do
@@ -118,6 +157,7 @@ case "${1:-}" in
     echo "PASS: the early exits alarmed. Confirm the push reached the phone, and that it clears within the hour."
     ;;
   3)
+    need_in sh grep tmux tail test
     say "step 3: the plugin killed, his session closed, the network cut"
     say "  3a: killing Cain's Discord plugin every 15 seconds until the probe's alarm"
     t0=$(date +%s)
@@ -145,6 +185,7 @@ case "${1:-}" in
     echo "PASS: each alarm was raised and cleared. Confirm the pushes reached the phone and the outside check went late."
     ;;
   4)
+    need_in awk test
     since=$(date +%s)
     say "step 4: an API outage and a reboot cause no false alarm"
     cat <<'EOF'
@@ -167,6 +208,8 @@ EOF
     fi
     ;;
   5)
+    need_in awk test cat
+    [ "${2:-}" != s6 ] || need_in sh
     since=$(date +%s)
     boots_since() { in_c awk -v s="$1" '$1 >= s' /data/probe/boots; }
     case "${2:-}" in
@@ -198,7 +241,7 @@ EOF
       kill)
         say "step 5 kill: an abrupt termination is never asked"
         docker kill "$C" >/dev/null || fail "couldn't kill the container"
-        say "  killed; start the App again from Home Assistant (Settings, Apps, Cain, Start) if the watchdog doesn't"
+        say "  killed; with the App's Watchdog switch on, the Supervisor starts it again by itself"
         wait_for 900 sh -c "docker exec $C awk -v s=$since '\$1 >= s' /data/probe/boots 2>/dev/null | grep -q ." \
           || fail "no new container start kept within 15 minutes"
         boots_since "$since"
@@ -229,5 +272,23 @@ EOF
       *) echo "usage: probe-drill.sh 5 ha [check <start>] | 5 kill | 5 s6"; exit 2 ;;
     esac
     ;;
-  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4 [check ...] | 5 ha|kill|s6"; exit 2 ;;
+  6)
+    need_in sh tr cat grep tail
+    say "step 6: the plugin's server stopped once under his connection; the broker starts it again"
+    since=$(date +%s)
+    before="$(in_c awk -v s="$since" '$1 >= s' /data/probe/starts 2>/dev/null | wc -l)"
+    in_c sh -c 'for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; case "$c" in *discord/plugin/server.ts*) kill "${p#/proc/}" 2>/dev/null ;; esac; done; true'
+    sleep 20
+    st="$(in_c cat /run/cain/discord.state 2>/dev/null | cut -d' ' -f1)"
+    say "  the channel's state 20 seconds on: ${st:-none} (server-down until the new server has run a minute)"
+    in_c sh -c 'for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; case "$c" in *discord/plugin/server.ts*) exit 0 ;; esac; done; exit 1' \
+      || fail "no plugin server runs 20 seconds after it was stopped"
+    sleep 70
+    st="$(in_c cat /run/cain/discord.state 2>/dev/null | cut -d' ' -f1)"
+    [ "$st" = connected ] || fail "the channel's state is ${st:-none}, not connected, 90 seconds after the server was stopped"
+    after="$(in_c awk -v s="$since" '$1 >= s' /data/probe/starts 2>/dev/null | wc -l)"
+    [ "$after" = "$before" ] || fail "his session was restarted for it ($after starts since the step began)"
+    echo "PASS: the server came back within seconds and his session kept its channel. Confirm the App's log shows \"the plugin's server stopped (<code>): starting it again\"."
+    ;;
+  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4|6 [check ...] | 5 ha|kill|s6"; exit 2 ;;
 esac

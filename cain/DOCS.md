@@ -14,6 +14,8 @@ plugin (research preview) and your Claude plan; no API key.
 4. Type `/discord:configure` and your bot token. Then `/discord:access pair <code>`
    after you DM the bot, and `/discord:access policy allowlist`.
 5. Type `/exit`. The session starts again in 5 seconds with Discord connected.
+6. On the App's page in Home Assistant (Settings, Apps, Cain), turn on **Watchdog**. It is the
+   one switch the App can't turn on itself (below, **The Watchdog switch**).
 
 ## What Cain reads in Discord without asking
 
@@ -336,6 +338,45 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
+## What 0.15.0 does: Cain stays on Discord
+
+On Nov 20 two drills found gaps: when the Discord plugin's server stopped, nothing started it again,
+and Cain was off Discord for 19 minutes until the App was restarted by hand; and after the App's
+container was killed, it stayed down 10 minutes with no alarm, since every alarm runs inside the App.
+
+- **The plugin's server is supervised.** When it stops for any reason, the App starts it again
+  within seconds (waits of 1, 2, 4, 8, then 15 seconds), logs each restart with its exit code
+  ("the plugin's server stopped (0): starting it again in 1 s"), and hands it Cain's session's own
+  handshake again, so his session keeps its channel. While it's down the App names it as its own
+  state, "the Discord plugin's server", apart from his session exiting.
+- **The App restarts itself, as a last resort.** When his Discord channel stays down across 3
+  restarts of his session, or for 10 minutes, whichever comes first, the App ends his session and
+  stops on an error, and the Supervisor's watchdog starts it again. One restart per incident (30
+  minutes), each kept in `/data/probe` with its cause and time, named in the next morning check-in,
+  counted in 0.14.0's restart counts as a restart the App asked for itself, and an alarm after 3 in
+  24 hours or 2 for the same cause. Never while his screen waits on your one-time sign-in.
+- **A first session that never connects** (signed in, but no Discord connection 3 minutes after it
+  started) is restarted; one waiting on your sign-in never is.
+- **No alarm hands you a manual step.** Each names the real cause (the plugin's server gone, his
+  session exiting, his channel down past its restarts, the App restarting itself) and what the App
+  does about it. The one exception is the Watchdog switch below; your Claude sign-in is yours too.
+- The panel's terminal opens again: since 0.14.0 nginx couldn't reach its socket or the sign-in page.
+- A loop within a day of an install now says so for the first version that keeps the install record
+  too (0.14.0's own install didn't).
+
+### The Watchdog switch
+
+The **Watchdog** switch on the Cain App's page in Home Assistant (Settings, Apps, Cain) is the one
+thing only you can turn on, once. With it on, Home Assistant's Supervisor starts the App again by
+itself whenever its container stops on an error: a crash, a kill, running out of memory, or the App
+restarting itself because Cain's Discord channel stayed down. It also asks the App's health page
+(`/health`, the `watchdog` URL in its configuration, answered on Home Assistant's internal network
+only) and restarts the App when that answers an error, which it does only while a self-restart is
+due. With it off, a killed App stays down until someone starts it, and the App never restarts itself
+(it would stay down): it tells you once, naming this switch, and keeps restarting Cain's session
+instead. The App reads the switch through the Supervisor's own-info call, which every App may read;
+it has no wider access than before.
+
 ## What 0.14.0 does: liveness alarms
 
 The outside heartbeat above says the App is alive. That is not the same as Cain answering: on
@@ -494,6 +535,12 @@ on the Pi after the install, before the alarms are relied on:
    and the mark it leaves is cleared. Each of the three prints how long the stop handler and the
    finish script took for every stop since it began, as the App measured them: the handler must stay
    under 6 seconds and the finish script under 4.
+6. (0.15.0) Stop the plugin's server once: it runs again within seconds, the channel says connected
+   again within 90 seconds, and his session isn't restarted for it.
+
+The drill finds the container by its name (`app_<hash>_cain`, then `addon_<hash>_cain`; set
+`CAIN_CONTAINER` to pick one), checks every tool a step uses before it starts, and kills through
+`/proc` (the image has no `pkill`). Any step reruns alone: `bash probe-drill.sh 1b`.
 
 For a hand restore to be there when the update line asks for it, keep a backup taken before each
 update of Cain: the Ship job takes one, and Home Assistant's **Backup before update** does too.

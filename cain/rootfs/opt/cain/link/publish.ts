@@ -1,6 +1,6 @@
 // What the link writes for readers outside it (piece D):
 // - /data/trust/cards.json: the cards as the reply hook reads them when the link doesn't
-//   answer (core.ts cardsView: no text). Only root writes /data/trust; everyone reads it.
+//   answer (core.ts cardsView: no text). Only root writes /data/trust; root:cain 0640, so he reads it.
 //   Never written inside a save: a save only asks for a write (CardsWriter.soon), and one
 //   write about half a second later, whole through a temp file and a rename, carries the
 //   state as it is then. The sweep asks too, so it's fresh at least once a minute.
@@ -10,12 +10,12 @@
 // token posts them all), and which of them his reply tool made (seedReplies). They are
 // streamed in chunks and the event loop gets a turn often, so a tap is never kept waiting.
 import { closeSync, createReadStream, fstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { answerText, sentIds } from "../gate/plugin";
 import { CAIN_UID, openOwnedFd } from "../owned";
 import { KEEP_MS, writeSynced } from "./auth";
 import { cardsView, emptyState, type ReplayReport, type Sent, type State } from "./core";
+import { writePinned } from "../pinned";
 
 // Whose transcripts these are (tests set their own user), read at each call.
 const transcriptUid = () => Number(process.env.CAIN_TRANSCRIPT_UID ?? CAIN_UID);
@@ -96,10 +96,9 @@ export function stateFile(path: string, onSave: () => void = () => {},
   };
 }
 
+// root:cain 0640 on every write (../pinned.ts, Cain 0.15.0): his session reads its DM's chat id here.
 export async function publishCards(s: State, now: number, path = CARDS_FILE): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o755 });
-  await writeFile(`${path}.tmp`, JSON.stringify(cardsView(s, now)), { mode: 0o644 });
-  await rename(`${path}.tmp`, path);
+  await writePinned(path, JSON.stringify(cardsView(s, now)));
 }
 
 // One pending write at a time, of the state as it is when the write happens.

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.0
+
+- Cain stays on Discord when the Discord plugin's server stops. The App now starts it again within seconds, every time, and logs why it stopped. On Nov 20 it stopped once and nothing started it again, so Cain was off Discord for 19 minutes.
+- If his Discord channel stays down anyway, across 3 restarts of his session or for 10 minutes, the App restarts itself, once per incident, and comes back by itself. You see each one in the next morning message, with when and why, and hear at once if it happens 3 times in a day or twice for the same reason.
+- One switch to turn on, once: Watchdog, on the Cain App's page in Home Assistant (Settings, Apps, Cain). With it on, Home Assistant starts the App again after a crash, a kill or its own restart. Until it's on, the App tells you once and keeps restarting Cain's session instead, since restarting itself would leave it down.
+- Alarms no longer ask you to restart the App, open settings or switch anything. Each says what went wrong (the plugin's server, his session, his channel, the App itself) and what the App is doing about it. The Watchdog switch is the one exception, and your Claude sign-in stays yours.
+- A first session that signs in but never connects to Discord is restarted within minutes; one waiting for your sign-in is left alone.
+- The Cain panel's sign-in terminal opens again (it showed an error since 0.14.0).
+- Cain can read his DM's chat id after a restart again, so he can tell you what you should hear first.
+- An alarm about a restart loop says it began within a day of an update again, including for 0.14.0's own install.
+
 ## 0.14.0
 
 - The App now checks every 5 minutes that Cain's parts are running (his Discord plugin, his session, his Discord connection), and once an hour that his session answers a short check that never reaches you. These are liveness checks: they can say he's alive while a message of yours is lost. The hourly one waits while he's at work on something and for 5 minutes after you write to him, but never more than 2 hours. A turn of his that runs 2 hours without a break tells you "Cain's turn has been running for N minutes".

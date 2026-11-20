@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.14.0"
+version: "0.15.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -17,6 +17,12 @@ startup: application
 boot: auto
 ingress: true
 ingress_port: 8099
+# The Supervisor's watchdog (Cain 0.15.0): with the Watchdog switch on the App's page turned on, the
+# Supervisor starts the App again when its container stops on an error (a kill, a crash, or the App
+# restarting itself when Cain's Discord channel stays down) and when this answers an error. nginx
+# answers it on the internal network only (rootfs/etc/nginx/nginx.conf), 503 only while a
+# self-restart is due. Read through /addons/self/info, which needs no API role.
+watchdog: http://[HOST]:[PORT:8098]/health
 panel_icon: mdi:account-tie
 panel_title: Cain
 panel_admin: true
