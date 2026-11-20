@@ -47,6 +47,9 @@
 #                       container on the hassio network), checks it is inside 172.30.32.0/23, asks
 #                       /health from the Supervisor's own container (200 wanted), and watches the App's
 #                       log for 3 minutes: any "answered 404 to:" line fails it, naming the address.
+#                       Fourth round: it also reads the Watchdog switch through the Supervisor's info
+#                       call (must be on), and needs at least one /health 200 to the Supervisor's
+#                       address in nginx's note of 200s (health-ok.log) during those 3 minutes.
 #                       Nothing after it runs unless it passes. "probe-drill.sh 7 gate" runs it alone.
 #
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
@@ -330,11 +333,17 @@ EOF
     echo "PASS: the server came back within seconds and his session kept its channel. Confirm the App's log shows \"the plugin's server stopped (<code>): starting it again\"."
     ;;
   7)
-    need_in sh test rm
+    need_in sh test rm curl jq awk
     need timeout
     # The gate (third round): the Supervisor's health probe gets 200, from an address nginx admits, and
     # the App's log shows no /health 404. Without it the watchdog could restart the App in a loop.
     say "step 7 gate: the Supervisor's health probe, with the App's Watchdog switch on"
+    # Fourth round: the switch itself, read through the Supervisor's info call from inside the App
+    # (/addons/self/info). The token stays in the container: printf is the shell's own, curl reads the
+    # header from its config on stdin, and only the true/false of data.watchdog leaves the container.
+    wd="$(docker exec "$C" sh -c 'printf "header = \"Authorization: Bearer %s\"\n" "${SUPERVISOR_TOKEN:-}" | curl -q -fsS -m 10 -K - http://supervisor/addons/self/info 2>/dev/null | jq -r "if .result == \"ok\" and (.data.watchdog | type) == \"boolean\" then .data.watchdog else \"unknown\" end" 2>/dev/null' 2>/dev/null | tr -cd 'a-z')"
+    [ "$wd" = true ] || fail "the Supervisor's info call says the App's Watchdog switch is ${wd:-unreadable}, not on. Turn it on (Home Assistant, the Cain App's page), then run this again"
+    say "  the Supervisor's info call says the Watchdog switch is on"
     SUP="${SUPERVISOR_CONTAINER:-hassio_supervisor}"
     net_ip() { docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "hassio"}}{{$v.IPAddress}}{{end}}{{end}}' "$1" 2>/dev/null | tr -cd '0-9.'; }
     sup_ip="$(net_ip "$SUP")"; app_ip="$(net_ip "$C")"
@@ -347,12 +356,17 @@ try: print(urllib.request.urlopen(sys.argv[1], timeout=5).status)
 except urllib.error.HTTPError as e: print(e.code)
 except Exception: print("none")' "http://$app_ip:8098/health" 2>/dev/null | tr -cd '0-9a-z')"
     [ "$hc" = 200 ] || fail "/health answered the Supervisor's own container with ${hc:-nothing}, not 200. Don't rely on the exit route; report it"
-    say "  /health answers 200 from the Supervisor's container; watching the App's log for 3 minutes for a /health 404"
-    gate_since="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    say "  /health answers 200 from the Supervisor's container; watching for 3 minutes: the Supervisor's own probe must get 200 (health-ok.log) and the App's log must show no /health 404"
+    gate_since="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; gate_epoch="$(date +%s)"
     sleep 190
     miss="$(docker logs --since "$gate_since" "$C" 2>&1 | grep -m 1 "answered 404 to:")"
     [ -z "$miss" ] || fail "the App's log shows a /health 404: ${miss}. Don't rely on the exit route; report it"
-    echo "PASS (gate): the Supervisor's probe comes from $sup_ip and gets 200, and the App's log shows no /health 404 in 3 minutes."
+    # Fourth round: reachability alone isn't the probe. At least one /health 200 to the Supervisor's own
+    # address in the watch window, from nginx's note of each 200 (time, address). The test request above
+    # came before the window, so it doesn't count.
+    oks="$(in_c awk -v s="$gate_epoch" -v ip="$sup_ip" '$1 + 0 >= s && $2 == ip' /run/cain-web/health-ok.log 2>/dev/null | wc -l | tr -cd '0-9')"
+    [ "${oks:-0}" -ge 1 ] || fail "nginx noted no /health 200 to the Supervisor ($sup_ip) in 3 minutes: its watchdog probe isn't reaching /health as expected. Don't rely on the exit route; report it"
+    echo "PASS (gate): the Watchdog switch is on (the Supervisor's info call), the Supervisor's own probe from $sup_ip got 200 ${oks} times in 3 minutes, and the App's log shows no /health 404."
     [ "${2:-}" != gate ] || exit 0
     say "step 7: the exit route: the App stops with exit code 3, and the Supervisor's watchdog starts it again within a minute"
     say "  needs the App's Watchdog switch on (Home Assistant, the Cain App's page). The outside heartbeat hears a failure: expected."

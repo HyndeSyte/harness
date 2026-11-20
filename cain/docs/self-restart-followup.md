@@ -52,3 +52,15 @@ network (172.30.32.0/23) and logs each 404's address at most once a minute; prob
 with a gate that checks the Supervisor's probe address and its 200 on the Pi before the exit route is
 relied on. The Supervisor call is bounded as a process group (no orphan curls), and the fallback waits
 2 minutes, past the Supervisor's 30 second stop timeout, instead of 1.
+
+Fourth round (the third outside review): a restart call with no answer in its 30 seconds now waits the
+same 2 minutes before the exit route, since the Supervisor may still carry it out; only a definite
+refusal exits at once. So the fallback and the Supervisor's own restart can overlap only when the
+Supervisor takes longer than about 150 seconds to stop the App, not never. A group that ignores the
+TERM at the bound gets KILL 5 seconds later. terminal/run makes /run/cain-web itself just before nginx
+(root:nogroup 0750, as lock.sh does), so nginx and /health no longer wait on the run script. The mark
+holds the time it was written: a crash inside the window (any exit but 0, 3 or a caught TERM) removes
+it, so it alarms and reports as a crash, and a TERM stop more than the wait plus 30 seconds after it is
+logged as "stopped during the self-restart window", not a self-restart. probe-drill.sh 7's gate also
+reads the Watchdog switch through the Supervisor's info call (must be on) and needs a /health 200 to
+the Supervisor's address in nginx's note of 200s during its 3 minutes.

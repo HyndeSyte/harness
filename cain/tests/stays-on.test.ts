@@ -359,6 +359,22 @@ exit 0
     expect(readFileSync(join(OPT, "session.sh"), "utf8")).toContain("\nclaude --permission-mode auto --channels plugin:discord@claude-plugins-official\n");
     expect(readFileSync(join(OPT, "discord", "broker-main.ts"), "utf8")).toContain('"/usr/local/bin/bun", join(PLUGIN, "server.ts")');
   });
+  // Fourth round: step 7's gate proves the probe itself, not only that /health can be reached.
+  test("step 7's gate reads the Watchdog switch through the Supervisor's info call and needs a /health 200 to the Supervisor in its window", () => {
+    const seven = drillSrc.slice(drillSrc.search(/^  7\)/m), drillSrc.search(/^  \*\)/m));
+    expect(seven).toContain("http://supervisor/addons/self/info");
+    expect(seven).toContain('[ "$wd" = true ] || fail');
+    expect(seven).toContain("-K -");                                              // the token never on a command line
+    expect(seven).not.toMatch(/echo[^\n]*SUPERVISOR_TOKEN|Bearer \$/);
+    expect(seven).toContain("/run/cain-web/health-ok.log");
+    expect(seven).toContain('[ "${oks:-0}" -ge 1 ] || fail');
+    expect(seven.indexOf('[ "$wd" = true ]')).toBeLessThan(seven.indexOf("PASS (gate)"));
+    expect(seven.indexOf("sleep 190")).toBeLessThan(seven.indexOf('[ "${oks:-0}" -ge 1 ]'));
+    expect(seven).toMatch(/PASS \(gate\): the Watchdog switch is on \(the Supervisor's info call\), the Supervisor's own probe from \$sup_ip got 200/);
+    const nginx = readFileSync(join(import.meta.dir, "..", "rootfs", "etc", "nginx", "nginx.conf"), "utf8");
+    expect(nginx).toContain("access_log /run/cain-web/health-ok.log cain_health_ok if=$cain_health_ok;");
+    expect(nginx).toContain("log_format cain_health_ok '$msec $remote_addr';");
+  });
   test.skipIf(process.platform !== "linux")("kill_exact kills the one exact match, refuses an ambiguous one, and leaves look-alikes", async () => {
     const body = drillSrc.match(/^KILL_EXACT='([^']*)'$/m)![1];
     const spawn = (mark: string) => Bun.spawn(["/bin/bash", "-c", "sleep 30; :", mark], { stdout: "ignore", stderr: "ignore" });
@@ -550,6 +566,94 @@ describe("the finish script on a self-restart (the outside review's third findin
     expect(r.body).toBe("stopped on an error");
     expect(r.out).not.toContain("restart itself");
   });
+  // Fourth round, the third outside review's third finding: the mark is live from just before the restart
+  // request until the real stop. The run script from its top through its TERM trap, as shipped, with a
+  // fresh mark written as self_mark writes it (the epoch), then one way of ending.
+  function inWindow(end: string) {
+    const RUN = join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "run");
+    const lines = readFileSync(RUN, "utf8").split("\n");
+    const termTrap = lines.findIndex((l) => l.startsWith("trap ") && l.endsWith(" TERM"));
+    const d = mkdtempSync(join(tmpdir(), "cain-window-"));
+    dirs.push(d);
+    for (const s of ["run/cain", "run/cain-web/www", "opt"]) mkdirSync(join(d, s), { recursive: true });
+    writeFileSync(join(d, "opt/notice.sh"), `#!/bin/bash\necho "$*" >> "${d}/notices"\n`, { mode: 0o755 });
+    const top = lines.slice(1, termTrap + 1).join("\n").replaceAll("/run/cain", join(d, "run/cain"))
+      .replace("OPT=/opt/cain", `OPT=${join(d, "opt")}`).replace(/^stop_asked\(\) \{.*$/m, "stop_asked() { :; }");
+    const p = Bun.spawnSync(["bash", "-c", `set -o errexit\n${top}\ndate +%s > ${join(d, "run/cain/self-restart")}\n${end}\n`], { stdout: "pipe", stderr: "pipe" });
+    const notices = existsSync(join(d, "notices")) ? readFileSync(join(d, "notices"), "utf8").trim() : "";
+    return { code: p.exitCode, signal: p.signalCode, marked: existsSync(join(d, "run/cain/self-restart")), notices, dir: d };
+  }
+  test.skipIf(process.platform === "win32")("a crash inside the self-restart window takes the mark away: it alarms, and finish reports a crash", () => {
+    const c = inWindow("false");
+    expect([c.code, c.marked, c.notices]).toEqual([1, false, "tell exited"]);
+    const r = finish("1", "", false, c.dir);
+    expect([r.body, r.halted, r.exitcode]).toEqual(["stopped on an error", true, "1"]);
+    expect(r.out).not.toContain("restart itself");
+  });
+  test.skipIf(process.platform === "win32")("the deliberate fallback (exit 3) and a caught TERM keep the mark, and neither alarms from the trap", () => {
+    const three = inWindow("exit 3");
+    expect([three.code, three.marked, three.notices]).toEqual([3, true, ""]);
+    const term = inWindow("kill -TERM $$; sleep 5");
+    expect([term.signal, term.marked, term.notices]).toEqual(["SIGTERM", true, ""]);
+  });
+  test.skipIf(process.platform === "win32")("a TERM stop later than the wait plus 30 seconds after the mark is a stop during the window, not a self-restart", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const late = mkdtempSync(join(tmpdir(), "cain-late-"));
+    dirs.push(late);
+    mkdirSync(join(late, "run/cain"), { recursive: true });
+    writeFileSync(join(late, "run/cain/self-restart"), `${now - 151}\n`);
+    const r = finish("256", "15", false, late);
+    expect(r.body).toBe(null);                                                      // no self-restart ping
+    expect(r.out).toContain("stopped during the self-restart window");
+    expect(r.halted).toBe(false);
+    expect(existsSync(join(late, "run/cain/self-restart"))).toBe(false);            // still used once
+    // Inside the window it is the self-restart, as before; so is a mark with no time (an earlier version).
+    writeFileSync(join(late, "run/cain/self-restart"), `${now - 140}\n`);
+    expect(finish("256", "15", false, late).body).toContain("self-restart, exit code 256");
+    writeFileSync(join(late, "run/cain/self-restart"), "");
+    expect(finish("256", "15", false, late).body).toContain("self-restart, exit code 256");
+    // The exit route (3) is the run script's own fallback, after its wait: a self-restart whatever the age.
+    writeFileSync(join(late, "run/cain/self-restart"), `${now - 600}\n`);
+    expect(finish("3", "", false, late).body).toContain("self-restart, exit code 3");
+  });
+});
+
+// -- fourth round: nginx no longer waits on the run script for its folder -------------------------------
+describe("terminal/run makes /run/cain-web itself, just before nginx", () => {
+  const TERM_RUN = join(import.meta.dir, "..", "rootfs", "etc", "services.d", "terminal", "run");
+  const src = readFileSync(TERM_RUN, "utf8");
+  test("no wait for the folder; it is made with lock.sh's owner and modes, before nginx starts", () => {
+    expect(src).not.toMatch(/seq 1 120|\[ -d \/run\/cain-web/);
+    const lock = readFileSync(join(OPT, "c1", "lock.sh"), "utf8");
+    for (const l of ["install -d -m 0750 -o root -g nogroup /run/cain-web", "install -d -m 0750 -o root -g nogroup /run/cain-web/www /run/cain-web/upstream"]) {
+      expect(src).toContain(`\n${l}\n`);
+      expect(lock).toContain(l);                                                   // lock.sh's own, unchanged
+    }
+    expect(src.indexOf("install -d -m 0750 -o root -g nogroup /run/cain-web\n")).toBeLessThan(src.indexOf('nginx_out="$(nginx 2>&1)"'));
+  });
+  test.skipIf(process.platform === "win32")("run with no folder there, nginx finds it made, with www and upstream at 0750", () => {
+    const d = mkdtempSync(join(tmpdir(), "cain-term-"));
+    dirs.push(d);
+    mkdirSync(join(d, "bin"), { recursive: true });
+    const web = join(d, "run/cain-web");
+    // nginx and ttyd stand-ins: nginx notes what it finds; ttyd ends the script.
+    writeFileSync(join(d, "bin/nginx"), `#!/bin/bash\nstat -c '%n %a' ${web} ${web}/www ${web}/upstream > ${d}/seen 2>&1\nexit 0\n`, { mode: 0o755 });
+    writeFileSync(join(d, "bin/ttyd"), `#!/bin/bash\necho ttyd >> ${d}/seen\n`, { mode: 0o755 });
+    writeFileSync(join(d, "bin/sleep"), `#!/bin/bash\necho "sleep $*" >> ${d}/slept\n`, { mode: 0o755 });
+    const body = src.split("\n").slice(1).join("\n")
+      .replaceAll("-o root -g nogroup ", "")                                       // no chown as a test user
+      .replaceAll("/run/cain-web", web).replaceAll("/opt/cain/", `${d}/opt/`).replaceAll("/etc/nginx/owner.conf", `${d}/owner.conf`)
+      .replaceAll("/run/s6/container_environment", `${d}/env`);
+    mkdirSync(join(d, "opt"), { recursive: true });
+    writeFileSync(join(d, "opt/owner-gate.sh"), "#!/bin/bash\necho gate\n", { mode: 0o755 });
+    writeFileSync(join(d, "opt/notice.sh"), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+    const sh = `bashio::app.config() { :; }\nbashio::config() { echo x; }\nbashio::log.info() { :; }\nbashio::log.error() { echo "error: $*"; }\n${body}`;
+    const p = Bun.spawnSync(["bash", "-c", sh], { env: { ...process.env, PATH: `${join(d, "bin")}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
+    expect(p.exitCode).toBe(0);
+    const seen = readFileSync(join(d, "seen"), "utf8").trim().split("\n");
+    expect(seen).toEqual([`${web} 750`, `${web}/www 750`, `${web}/upstream 750`, "ttyd"]);
+    expect(existsSync(join(d, "slept"))).toBe(false);                               // no wait at all
+  });
 });
 
 // -- third round: the Supervisor calls are bounded as a process group, and /health 404s reach the log ----
@@ -563,16 +667,19 @@ describe("run_bounded and the health check's 404 line", () => {
     // A stand-in for bashio's curl to a Supervisor that never answers: a child process of the call.
     const sh = `set -o errexit -o nounset -o pipefail\nnap() { sleep "$1" & wait $! 2>/dev/null || true; }\n${fn("run_bounded")}\n`
       + `hung() { bash -c 'sleep 300; : ${tag}'; }\nrc=0; run_bounded 1 ${d}/out hung || rc=$?; echo "rc=$rc"\n`
-      + `quick() { echo answer; }\nrun_bounded 5 ${d}/out quick && echo "quick=$(cat ${d}/out)"\n`;
+      // Fourth round: one that ignores the TERM (as a stuck curl might) is KILLed 5 seconds after it.
+      + `deaf() { bash -c "trap '' TERM; sleep 300; : ${tag}-deaf"; }\nt0=$SECONDS; rc=0; run_bounded 1 ${d}/out deaf || rc=$?; echo "deaf=$rc after=$(( SECONDS - t0 ))"\n`
+      + `quick() { echo answer; }\nt0=$SECONDS; run_bounded 5 ${d}/out quick && echo "quick=$(cat ${d}/out) after=$(( SECONDS - t0 ))"\n`;
     const p = Bun.spawnSync(["bash", "-c", sh], { stdout: "pipe", stderr: "pipe" });
     const out = p.stdout.toString();
     expect(out).toContain("rc=124");
-    expect(out).toContain("quick=answer");
+    expect(out).toMatch(/deaf=124 after=[67]\b/);
+    expect(out).toMatch(/quick=answer after=[01]\b/);                              // no KILL wait without a timeout
     Bun.sleepSync(300);
     const left = Bun.spawnSync(["pgrep", "-f", tag], { stdout: "pipe" }).stdout.toString().trim();
     if (left) Bun.spawnSync(["pkill", "-f", tag]);
     expect(left).toBe("");
-  });
+  }, 30_000);
   test.skipIf(process.platform === "win32")("each address nginx refused is in one warning with its count, and the note is emptied", () => {
     const d = mkdtempSync(join(tmpdir(), "cain-miss-"));
     dirs.push(d);
@@ -584,6 +691,6 @@ describe("run_bounded and the health check's 404 line", () => {
     expect(out[0]).toContain("answered 404 to: 10.0.0.7 (1), 172.30.33.5 (2)");
     expect(readFileSync(miss, "utf8")).toBe("");
     expect(Bun.spawnSync(["bash", "-c", sh("")], { stdout: "pipe" }).stdout.toString()).toBe("");   // nothing new: no line
-    expect(RUN).toContain("( while true; do sleep 60; health_misses || true; done ) &");           // at most once a minute
+    expect(RUN).toContain("( while true; do sleep 60; health_misses || true; health_ok_trim || true; done ) &");           // at most once a minute
   });
 });

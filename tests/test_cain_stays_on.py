@@ -36,7 +36,9 @@ def _start(tmp_path, as_cain=None, signed_in=True, screen=None):
     stubs = ('bashio::api.supervisor() { echo "supervisor $*" >> ' + calls.as_posix() + '; '
              'if [ -n "${STUB_SUP_BODY:-}" ]; then printf "%s" "$STUB_SUP_BODY"; '
              'else printf \'{"result":"ok","data":{"watchdog":%s}}\' "${STUB_WATCHDOG:-true}"; fi; return "${STUB_SUP_RC:-0}"; }\n'
-             'bashio::addon.restart() { echo "addon-restart" >> ' + calls.as_posix() + '; return "${STUB_RESTART_RC:-0}"; }\n')
+             'bashio::addon.restart() { echo "addon-restart" >> ' + calls.as_posix() + '; '
+             '[ -z "${STUB_RESTART_HANG:-}" ] || { echo "restart-asked $(date +%s)" >> ' + calls.as_posix() + '; sleep 300; }; '
+             'return "${STUB_RESTART_RC:-0}"; }\n')
     marker = "export C1_PROC_ROOT="
     i = text.index("\n", text.index(marker)) + 1
     whole.write_text(text[:i] + stubs + text[i:])
@@ -96,6 +98,56 @@ def test_a_refused_restart_call_takes_the_exit_route_at_once(tmp_path):
     assert not alive, lines[:40]
     assert "addon-restart" in lines and (runc / "self-restart").exists()
     assert (runc.parent / "cain-web" / "www" / "health-down").exists()
+
+
+def test_a_restart_call_that_hangs_past_its_bound_waits_before_the_exit_route(tmp_path):
+    """Fourth round, the third outside review's first finding: a restart call with no answer within its
+    bound (124) may still be carried out by the Supervisor, so the App waits the same 2 minutes
+    (C1_SELF_STOP_WAIT_S, 4 seconds here) before it takes the exit route, instead of exiting at once.
+    The mark holds the time it was written, before the call."""
+    _needs_posix()
+    calls, stop, bindir, runc = _start(tmp_path)
+    runc.mkdir(parents=True, exist_ok=True)
+    (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
+    # The harness's sleep returns at once; this one also notes the waits this test looks for (the KILL's
+    # 5 seconds after the TERM, and the self-stop wait, 7 here) and the exit route's 503 mark as it stands.
+    health = runc.parent / "cain-web" / "www" / "health-down"
+    sleep = bindir / "sleep"
+    sleep.write_text(sleep.read_text().replace("exec /bin/sleep 0.05",
+                     f'case "$1" in 5|7) echo "sleep $1 health-down=$([ -e {health.as_posix()} ] && echo yes || echo no)" >> {calls.as_posix()};; esac\n'
+                     "exec /bin/sleep 0.05"))
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=40,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1",
+                                   STUB_RESTART_HANG="1", C1_SELF_CALL_S="1", C1_SELF_STOP_WAIT_S="7")
+    assert not alive, lines[:40]
+    asked = [l for l in lines if l.startswith("restart-asked ")]
+    assert len(asked) == 1, lines[:40]
+    asked_at = int(asked[0].split()[1])
+    # After the call ran past its bound: the KILL 5 seconds after the TERM, then the full wait, and only
+    # then the exit route (its 503 mark not yet there during either wait, and there at the end).
+    i = lines.index(asked[0])
+    assert "sleep 5 health-down=no" in lines[i:], lines[i:]
+    assert "sleep 7 health-down=no" in lines[i:], lines[i:]
+    assert lines.index("sleep 5 health-down=no", i) < lines.index("sleep 7 health-down=no", i)
+    assert health.exists() and (runc / "self-restart").exists(), lines[:40]
+    mark_at = int((runc / "self-restart").read_text().strip())
+    assert asked_at - 5 <= mark_at <= asked_at
+    assert "notice.sh tell exited" not in lines
+
+
+def test_a_refused_restart_call_still_exits_at_once(tmp_path):
+    """A definite refusal (any code but 124) takes the exit route with no wait, even with a long one set."""
+    _needs_posix()
+    calls, stop, bindir, runc = _start(tmp_path)
+    runc.mkdir(parents=True, exist_ok=True)
+    (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
+    t0 = time.time()
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=30,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1", STUB_RESTART_RC="2",
+                                   C1_SELF_STOP_WAIT_S="3600")
+    assert not alive and time.time() - t0 < 30, lines[:40]
+    assert "addon-restart" in lines and (runc / "self-restart").exists()
+    assert "sleep 3600" not in lines
 
 
 @pytest.mark.parametrize("decision,switch", [("wait", "true"), ("off", "false"), ("unknown", "true")])

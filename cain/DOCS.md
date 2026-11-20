@@ -359,8 +359,11 @@ container was killed, it stayed down 10 minutes with no alarm, since every alarm
 - **The App restarts itself, as a last resort.** When his Discord channel stays down across 3
   restarts of his session, or for 10 minutes, whichever comes first, the App ends his session and
   asks the Supervisor to restart it (the Supervisor's own restart call, which every App may make);
-  should the Supervisor refuse, or not stop it within 2 minutes, the App stops on an error (exit code
-  3) and the Supervisor's watchdog starts it again. The App's log says "Asking the Supervisor for the
+  should the Supervisor refuse, the App stops on an error (exit code 3) at once, and should the
+  Supervisor take the call, or not answer it within 30 seconds, but not stop the App within 2 minutes
+  after, it stops on an error then; the Supervisor's watchdog starts it again. The two can overlap only
+  if the Supervisor takes longer than about 150 seconds to stop the App. A Stop of yours, or a crash,
+  inside that window is not called a self-restart. The App's log says "Asking the Supervisor for the
   App's restart" just before the call. A line saying the Supervisor took it rarely shows, because on
   a real success the Supervisor stops the App before it answers. The real sign of a self-restart is
   the outside heartbeat's failure ping, "restarting itself (self-restart, exit code 256)", followed
@@ -409,7 +412,9 @@ Supervisor's restart call is the route the App uses, with the exit route only be
 **Drill 7 starts with a release gate: the Supervisor's health probe.** With the Watchdog switch on,
 it reads the address the Supervisor probes from, checks it is inside 172.30.32.0/23, asks `/health`
 from the Supervisor's own container and wants 200, then watches the App's log for 3 minutes for any
-`/health` 404 line. If any of that fails, the exit route is not relied on and the result goes back to
+`/health` 404 line. It also reads the Watchdog switch through the Supervisor's info call and wants
+it on, and wants at least one `/health` 200 to the Supervisor's own address in those 3 minutes (nginx
+notes each 200 with its time and address). If any of that fails, the exit route is not relied on and the result goes back to
 the laptop session. `bash probe-drill.sh 7 gate` runs the gate alone.
 
 ## What 0.14.0 does: liveness alarms

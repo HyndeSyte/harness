@@ -58,7 +58,12 @@ checked_now() {
 # self-restart. The mark is written again only just before a self-restart request, and the finish
 # script deletes it once it has read it, so it is used exactly once.
 rm -f /run/cain/self-restart /run/cain-web/www/health-down 2>/dev/null || true
-trap 'rc=$?; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && [ ! -e /run/cain/self-restart ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
+# Fourth round: the mark is live from just before the restart request until the real stop (up to about
+# 150 seconds). An exit in that window that is neither 0, nor 3 (the deliberate fallback), nor a caught
+# TERM (term_caught, set by the TERM trap below) is a crash: the mark goes, so it alarms here and the
+# finish script reports it as a crash.
+term_caught=""
+trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ -z "$term_caught" ]; then rm -f /run/cain/self-restart 2>/dev/null || true; fi; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && [ ! -e /run/cain/self-restart ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
 # The run of his session this script started, as it holds it in memory (probe/main.ts session-start
 # hands it back). A stop counts as asked only when root's mark, the run on file and this all name the
 # same run; after s6 restarts this script it is empty, and the run before is classed by its timing.
@@ -81,7 +86,7 @@ run_id=""
 # took is kept for the stop drills ($EPOCHREALTIME at the trap's start).
 start_id="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -cd '0-9a-f' | head -c 16)"
 stop_asked() { timeout 6 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" "${start_id:-}" "${EPOCHREALTIME:-}" >/dev/null 2>&1 || true; }
-trap 'stop_asked; trap - TERM; kill -TERM $$' TERM
+trap 'term_caught=1; stop_asked; trap - TERM; kill -TERM $$' TERM
 nap() { sleep "$1" & wait $! 2>/dev/null || true; }
 
 relay() { printf '%s\n' "$(jq -cn --arg t "$1" '{text: $t}')" >> /data/relay.queue; }
@@ -275,7 +280,17 @@ health_misses() {
   : > "$HEALTH_MISS" 2>/dev/null || true
   [ -z "$seen" ] || bashio::log.warning "The health check URL (/health) answered 404 to: $seen. The Supervisor's watchdog probe must come from 172.30.32.0/23 to get 200"
 }
-( while true; do sleep 60; health_misses || true; done ) &
+# Fourth round: nginx also notes each /health 200 with its time and address (health-ok.log), so
+# probe-drill.sh 7's gate can see the Supervisor's own probe get 200. Kept small: past 32 KB, only its
+# last 200 lines stay (about half an hour of probes at the Supervisor's pace or more).
+HEALTH_OK=/run/cain-web/health-ok.log
+health_ok_trim() {
+  local keep
+  [ "$(stat -c %s "$HEALTH_OK" 2>/dev/null || echo 0)" -gt 32768 ] || return 0
+  keep="$(tail -n 200 "$HEALTH_OK" 2>/dev/null)" || keep=""
+  { : > "$HEALTH_OK" && printf '%s\n' "$keep" >> "$HEALTH_OK"; } 2>/dev/null || true
+}
+( while true; do sleep 60; health_misses || true; health_ok_trim || true; done ) &
 
 if [ "$mode" = old ]; then
   # 0.11.0's start, unchanged: the rules copied in (c1/lock.sh old did, and checked them), the
@@ -749,6 +764,8 @@ run_bounded() {
   [ -n "$had_m" ] || set +m
   for ((i = 0; i < limit * 2; i++)); do kill -0 "$pid" 2>/dev/null || break; nap 0.5; done
   kill -TERM -- "-$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true
+  # Fourth round: on a timeout, anything of the group that outlives the TERM gets KILL 5 seconds later.
+  if [ "$i" -ge $(( limit * 2 )) ]; then nap 5; kill -KILL -- "-$pid" 2>/dev/null || true; fi
   wait "$pid" 2>/dev/null || true
   [ ! -s "$f.rc" ] || rc="$(head -c 4 "$f.rc" | tr -cd '0-9')"
   rm -f "$f.rc"
@@ -780,8 +797,9 @@ waiting_signin() {
 # The exit route (the fallback, and what probe-drill.sh 7 proves on the Pi): the mark the finish
 # script and the EXIT trap read, the health page's 503, then exit 3. The finish script records 3 as
 # the container's exit code and halts it, and the Supervisor's watchdog starts the App again.
+self_mark() { { date +%s > /run/cain/self-restart; } 2>/dev/null || true; }
 self_exit() {
-  { : > /run/cain/self-restart; } 2>/dev/null || true
+  [ -s /run/cain/self-restart ] || self_mark
   health_down
   exit 3
 }
@@ -795,7 +813,7 @@ self_restart() {   # self_restart <kind> <cause>: never returns when the App res
   case "$dec" in
     restart)
       bashio::log.warning "The App restarts itself: $2"
-      { : > /run/cain/self-restart; } 2>/dev/null || true
+      self_mark
       end_his_session || true
       # The primary route (second round): the Supervisor's own restart call, POST /addons/self/restart,
       # which every App may make with no API role (the Supervisor lets /addons/self/* through for any
@@ -807,16 +825,22 @@ self_restart() {   # self_restart <kind> <cause>: never returns when the App res
       # The real sign of a self-restart is the finish script's failure ping (exit code 256) and a fresh
       # start after it.
       bashio::log.warning "Asking the Supervisor for the App's restart"
-      if run_bounded 30 "${TMPDIR:-/run/cain/root-tmp}/restart.$$" bashio::addon.restart; then
-        bashio::log.info "The Supervisor took the restart before stopping the App; waiting for it to stop the App"
-        # Third round: 2 minutes, four times the Supervisor's own stop timeout (config.yaml timeout: 30,
-        # after which it kills the container), so the fallback never overlaps a slow stop and the start
-        # the Supervisor makes after it.
-        nap "${C1_SELF_STOP_WAIT_S:-120}"
-        bashio::log.warning "The Supervisor didn't stop the App within 2 minutes of taking its restart: the App stops on an error instead"
-      else
-        bashio::log.warning "The Supervisor didn't take the restart call: the App stops on an error instead, for its watchdog to start it again"
-      fi
+      local rrc=0
+      run_bounded "${C1_SELF_CALL_S:-30}" "${TMPDIR:-/run/cain/root-tmp}/restart.$$" bashio::addon.restart || rrc=$?
+      # Third round: 2 minutes, four times the Supervisor's own stop timeout (config.yaml timeout: 30,
+      # after which it kills the container), before the fallback. Fourth round: a call with no answer in
+      # its 30 seconds (124) waits the same 2 minutes, since the Supervisor may still carry it out; only a
+      # definite refusal (any other code) stops at once. So the fallback overlaps the Supervisor's own
+      # restart only when the Supervisor takes longer than about 150 seconds (30 plus 120) to stop it.
+      case "$rrc" in
+        0) bashio::log.info "The Supervisor took the restart before stopping the App; waiting for it to stop the App"
+           nap "${C1_SELF_STOP_WAIT_S:-120}"
+           bashio::log.warning "The Supervisor didn't stop the App within 2 minutes of taking its restart: the App stops on an error instead" ;;
+        124) bashio::log.warning "The Supervisor didn't answer the restart call within 30 seconds; waiting 2 minutes in case it still restarts the App"
+           nap "${C1_SELF_STOP_WAIT_S:-120}"
+           bashio::log.warning "The Supervisor didn't stop the App within 2 minutes of the unanswered restart call: the App stops on an error instead" ;;
+        *) bashio::log.warning "The Supervisor refused the restart call ($rrc): the App stops on an error instead, for its watchdog to start it again" ;;
+      esac
       self_exit ;;
     wait) health_up; bashio::log.info "A self-restart is due ($2), but the App restarted itself for this already within 30 minutes: his session is restarted instead" ;;
     off) health_up; bashio::log.warning "A self-restart is due ($2), but the Supervisor's watchdog switch is off, so the App stays up (it would stay down) and restarts his session instead" ;;

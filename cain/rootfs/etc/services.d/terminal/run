@@ -24,8 +24,11 @@ fi
 chmod 0700 /run/s6/container_environment 2>/dev/null || true
 # The upstreams nginx proxies to are unix sockets only nginx's workers (nobody:nogroup) and
 # root can open, never a port Cain's own user could take while one is down (C1 plan 3.9).
-# cain/run makes /run/cain-web/upstream (root:nogroup 0750); wait for it.
-for _ in $(seq 1 120); do [ -d /run/cain-web/upstream ] && break; sleep 1; done
+# Fourth round: made here, just before nginx starts (nginx opens /run/cain-web/health-miss.log at its
+# start), with the owner and modes lock.sh gives them (root:nogroup 0750), so nginx and the health check
+# never wait on the run script. lock.sh makes them again, which changes nothing.
+install -d -m 0750 -o root -g nogroup /run/cain-web
+install -d -m 0750 -o root -g nogroup /run/cain-web/www /run/cain-web/upstream
 # nginx serves the panel and the Supervisor's health check (/health, config.yaml's watchdog URL).
 # Should it not start (Cain 0.15.0, second round), that is logged with nginx's own words as the cause,
 # after 3 tries 5 seconds apart, and raised as an alarm of its own (notice.sh tell nginx): with the
