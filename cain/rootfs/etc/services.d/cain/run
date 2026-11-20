@@ -51,6 +51,13 @@ checked_now() {
 # halts the container: Dane hears it from root first (notice.sh; C1 second review). Not when a
 # signal ends it, as when the Supervisor stops or updates the App.
 # A self-restart (Cain 0.15.0, self_restart below) ends it on purpose, already told, and isn't that.
+# Third round: the self-restart mark and the health page's 503 mark are cleared here, at the very top,
+# before the EXIT and TERM traps are armed. /run can survive a stop and start (s6 restarting this
+# service inside a live container keeps it), and a mark left from an earlier self-restart would keep
+# this trap quiet on a later real crash and have the finish script call the owner's own Stop a
+# self-restart. The mark is written again only just before a self-restart request, and the finish
+# script deletes it once it has read it, so it is used exactly once.
+rm -f /run/cain/self-restart /run/cain-web/www/health-down 2>/dev/null || true
 trap 'rc=$?; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && [ ! -e /run/cain/self-restart ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
 # The run of his session this script started, as it holds it in memory (probe/main.ts session-start
 # hands it back). A stop counts as asked only when root's mark, the run on file and this all name the
@@ -254,6 +261,21 @@ export TMUX_CMD
 # whatever the mode: a minute in, then every 10 minutes. Started here, once CAIN_AS says how his
 # files are read (the readback is his).
 ( sleep 60; while true; do "$OPT/notice.sh" tick 2>&1 || true; sleep 600; done ) &
+# The Supervisor's health check answered 404 (Cain 0.15.0, third round): nginx notes the address of
+# each /health request it refused (nginx.conf, health-miss.log), and this says so in the App's log at
+# most once a minute, with each address and how often, then empties the file. With the Watchdog switch
+# on, a probe from an address nginx doesn't admit gets 404 every time and the Supervisor restarts the
+# App in a loop; this line is how that shows (probe-drill.sh 7 and DOCS.md check it on the Pi).
+HEALTH_MISS=/run/cain-web/health-miss.log
+health_misses() {
+  local seen
+  [ -s "$HEALTH_MISS" ] || return 0
+  seen="$(head -c 4096 "$HEALTH_MISS" 2>/dev/null | tr -cd '0-9a-fA-F.:\n' | grep -v '^$' | sort | uniq -c \
+          | awk '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $2, $1}' | cut -c1-300)" || seen=""
+  : > "$HEALTH_MISS" 2>/dev/null || true
+  [ -z "$seen" ] || bashio::log.warning "The health check URL (/health) answered 404 to: $seen. The Supervisor's watchdog probe must come from 172.30.32.0/23 to get 200"
+}
+( while true; do sleep 60; health_misses || true; done ) &
 
 if [ "$mode" = old ]; then
   # 0.11.0's start, unchanged: the rules copied in (c1/lock.sh old did, and checked them), the
@@ -714,14 +736,20 @@ health_up() { rm -f "$HEALTH_DOWN" 2>/dev/null || true; }
 health_down() { { : > "$HEALTH_DOWN" && chgrp nogroup "$HEALTH_DOWN" && chmod 0640 "$HEALTH_DOWN"; } 2>/dev/null || true; }
 health_up
 # A call to the Supervisor in a background subshell, bounded: run_bounded <seconds> <out file> <command...>.
-# 0 only when the command itself finished with 0 in time.
+# 0 only when the command itself finished with 0 in time. Third round: the subshell runs in its own
+# process group (set -m around the fork), and a timeout kills the whole group, so the curl bashio runs
+# inside it (bashio sets no curl timeout) goes too and a hung Supervisor leaves no orphan curls.
 run_bounded() {
-  local limit="$1" f="$2" pid i rc=124; shift 2
+  local limit="$1" f="$2" pid i rc=124 had_m=""; shift 2
   rm -f "$f" "$f.rc"
+  case $- in *m*) had_m=1 ;; esac
+  set -m
   ( "$@" > "$f" 2>/dev/null; echo "$?" > "$f.rc" ) &
   pid=$!
+  [ -n "$had_m" ] || set +m
   for ((i = 0; i < limit * 2; i++)); do kill -0 "$pid" 2>/dev/null || break; nap 0.5; done
-  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  kill -TERM -- "-$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
   [ ! -s "$f.rc" ] || rc="$(head -c 4 "$f.rc" | tr -cd '0-9')"
   rm -f "$f.rc"
   return "${rc:-124}"
@@ -773,11 +801,19 @@ self_restart() {   # self_restart <kind> <cause>: never returns when the App res
       # which every App may make with no API role (the Supervisor lets /addons/self/* through for any
       # App's token; the same call the switch to his own user makes, below). The Supervisor
       # stops this container (SIGTERM) and starts it again. Should it refuse, or not stop the App within
-      # a minute, the exit route above.
+      # 2 minutes, the exit route above.
+      # Third round: on a real success the Supervisor stops the container before it answers, so the
+      # line before the call is the one the log shows; "took" only appears when its answer comes first.
+      # The real sign of a self-restart is the finish script's failure ping (exit code 256) and a fresh
+      # start after it.
+      bashio::log.warning "Asking the Supervisor for the App's restart"
       if run_bounded 30 "${TMPDIR:-/run/cain/root-tmp}/restart.$$" bashio::addon.restart; then
-        bashio::log.info "The Supervisor took the restart; waiting for it to stop the App"
-        nap "${C1_SELF_STOP_WAIT_S:-60}"
-        bashio::log.warning "The Supervisor didn't stop the App within a minute of taking its restart: the App stops on an error instead"
+        bashio::log.info "The Supervisor took the restart before stopping the App; waiting for it to stop the App"
+        # Third round: 2 minutes, four times the Supervisor's own stop timeout (config.yaml timeout: 30,
+        # after which it kills the container), so the fallback never overlaps a slow stop and the start
+        # the Supervisor makes after it.
+        nap "${C1_SELF_STOP_WAIT_S:-120}"
+        bashio::log.warning "The Supervisor didn't stop the App within 2 minutes of taking its restart: the App stops on an error instead"
       else
         bashio::log.warning "The Supervisor didn't take the restart call: the App stops on an error instead, for its watchdog to start it again"
       fi

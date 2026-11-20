@@ -35,7 +35,15 @@ heartbeat_fail() {
   hb=""; hb_base=""; hb_query=""
   if [ -n "${hb_xtrace}" ]; then set -x; fi
 }
+# Third round: the mark is read once and deleted at once, so it is consumed exactly once: a later stop
+# or crash in the same container (/run kept, as when s6 restarts the service) is never taken for a
+# self-restart. The run script also clears it at its very top.
+self_restart_mark=""
 if [ -e /run/cain/self-restart ]; then
+  self_restart_mark=1
+  rm -f /run/cain/self-restart 2>/dev/null || true
+fi
+if [ -n "${self_restart_mark}" ]; then
   # The App restarting itself (Cain 0.15.0, the run script's self_restart): already told and kept in
   # /data by the probe. Second round: the outside heartbeat hears it as a failure every time, by its
   # own body, so a restart that never comes back (the Supervisor never starting the App again) is

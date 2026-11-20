@@ -42,6 +42,12 @@
 #                       minute. Needs the App's Watchdog switch on. The outside heartbeat hears it as a
 #                       failure (expected), and the next start is kept as a plain boot. The App relies on
 #                       this route only once this step has passed (DOCS.md).
+#                       Third round, a release gate run first: the Supervisor's health probe. With the
+#                       Watchdog switch on, it finds the address the Supervisor probes from (its
+#                       container on the hassio network), checks it is inside 172.30.32.0/23, asks
+#                       /health from the Supervisor's own container (200 wanted), and watches the App's
+#                       log for 3 minutes: any "answered 404 to:" line fails it, naming the address.
+#                       Nothing after it runs unless it passes. "probe-drill.sh 7 gate" runs it alone.
 #
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
 # token or a heartbeat URL.
@@ -326,6 +332,28 @@ EOF
   7)
     need_in sh test rm
     need timeout
+    # The gate (third round): the Supervisor's health probe gets 200, from an address nginx admits, and
+    # the App's log shows no /health 404. Without it the watchdog could restart the App in a loop.
+    say "step 7 gate: the Supervisor's health probe, with the App's Watchdog switch on"
+    SUP="${SUPERVISOR_CONTAINER:-hassio_supervisor}"
+    net_ip() { docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "hassio"}}{{$v.IPAddress}}{{end}}{{end}}' "$1" 2>/dev/null | tr -cd '0-9.'; }
+    sup_ip="$(net_ip "$SUP")"; app_ip="$(net_ip "$C")"
+    [ -n "$sup_ip" ] || fail "couldn't read the Supervisor's address on the hassio network (container $SUP; set SUPERVISOR_CONTAINER=<name>)"
+    [ -n "$app_ip" ] || fail "couldn't read the App's address on the hassio network"
+    say "  the Supervisor probes from $sup_ip; the App is at $app_ip"
+    case "$sup_ip" in 172.30.3[23].*) ;; *) fail "the Supervisor's address $sup_ip is outside 172.30.32.0/23: /health would answer it 404. Don't rely on the exit route; report it" ;; esac
+    hc="$(docker exec "$SUP" python3 -c 'import sys, urllib.request, urllib.error
+try: print(urllib.request.urlopen(sys.argv[1], timeout=5).status)
+except urllib.error.HTTPError as e: print(e.code)
+except Exception: print("none")' "http://$app_ip:8098/health" 2>/dev/null | tr -cd '0-9a-z')"
+    [ "$hc" = 200 ] || fail "/health answered the Supervisor's own container with ${hc:-nothing}, not 200. Don't rely on the exit route; report it"
+    say "  /health answers 200 from the Supervisor's container; watching the App's log for 3 minutes for a /health 404"
+    gate_since="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    sleep 190
+    miss="$(docker logs --since "$gate_since" "$C" 2>&1 | grep -m 1 "answered 404 to:")"
+    [ -z "$miss" ] || fail "the App's log shows a /health 404: ${miss}. Don't rely on the exit route; report it"
+    echo "PASS (gate): the Supervisor's probe comes from $sup_ip and gets 200, and the App's log shows no /health 404 in 3 minutes."
+    [ "${2:-}" != gate ] || exit 0
     say "step 7: the exit route: the App stops with exit code 3, and the Supervisor's watchdog starts it again within a minute"
     say "  needs the App's Watchdog switch on (Home Assistant, the Cain App's page). The outside heartbeat hears a failure: expected."
     id0="$(docker inspect -f '{{.Id}}' "$C")" || fail "couldn't read the container's id"
@@ -349,5 +377,5 @@ EOF
     say "  running again as $back, $(( $(date +%s) - stopped )) s after it stopped"
     echo "PASS: the exit route works: exit code 3, and the Supervisor started the App again within a minute. The self-restart may rely on it now."
     ;;
-  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4|6|7 [check ...] | 5 ha|kill|s6"; exit 2 ;;
+  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4|6|7 [gate] [check ...] | 5 ha|kill|s6"; exit 2 ;;
 esac

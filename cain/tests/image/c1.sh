@@ -136,16 +136,23 @@ echo "the old session's container never switches"
 # The Supervisor's health check (Cain 0.15.0, second round): the shipped terminal service starts the
 # shipped nginx in the image, and /health, asked from the Supervisor's own address (172.30.32.2, on a
 # network laid out as Home Assistant's), answers 200, then 503 once the run script's mark is there, and
-# 200 again without it; from any other address, and on any other path, 404 (in.sh health-serve).
-hnet="cain-health-$$"; hc="cain-health-$$"
+# 200 again without it; on any other path, 404 (in.sh health-serve). Third round: any other address on
+# the hassio network (172.30.32.0/23) gets the same answer, an address outside it gets 404 (a second
+# network, 172.30.40.0/24, joined to the same container), and each 404 shows in the App's log with its
+# address within about a minute.
+hnet="cain-health-$$"; hout="cain-health-out-$$"; hc="cain-health-$$"
 hd=""
-cleanup_health() { docker rm -f "$hc" >/dev/null 2>&1 || true; docker network rm "$hnet" >/dev/null 2>&1 || true; [ -z "$hd" ] || sudo rm -rf "$hd"; }
+cleanup_health() { docker rm -f "$hc" >/dev/null 2>&1 || true; docker network rm "$hnet" "$hout" >/dev/null 2>&1 || true; [ -z "$hd" ] || sudo rm -rf "$hd"; }
 trap cleanup_health EXIT
 docker network create --subnet 172.30.32.0/23 "$hnet" >/dev/null
+docker network create --subnet 172.30.40.0/24 "$hout" >/dev/null
 hd="$(mktemp -d)"; chmod 0755 "$hd"
 docker run -d --name "$hc" --network "$hnet" --ip 172.30.33.10 --entrypoint /bin/bash -v "$hd:/data" -v "$T:/t:ro" "$IMG" /t/in.sh health-serve >/dev/null
+docker network connect --ip 172.30.40.10 "$hout" "$hc"
 ask() {   # ask <from address> <path>: the status code nginx answers
-  docker run --rm --network "$hnet" --ip "$1" --entrypoint curl "$IMG" -s -o /dev/null -m 5 -w '%{http_code}' "http://172.30.33.10:8098$2" || true
+  local net="$hnet" to=172.30.33.10
+  case "$1" in 172.30.40.*) net="$hout"; to=172.30.40.10 ;; esac
+  docker run --rm --network "$net" --ip "$1" --entrypoint curl "$IMG" -s -o /dev/null -m 5 -w '%{http_code}' "http://$to:8098$2" || true
 }
 up=""
 for _ in $(seq 1 60); do
@@ -157,14 +164,18 @@ done
 docker logs "$hc" 2>&1 | grep -q "nginx did not start" && die "the terminal service says nginx did not start"
 docker exec "$hc" sh -c ': > /run/cain-web/www/health-down && chgrp nogroup /run/cain-web/www/health-down && chmod 0640 /run/cain-web/www/health-down'
 [ "$(ask 172.30.32.2 /health)" = 503 ] || die "/health didn't answer 503 with the self-restart mark there"
-[ "$(ask 172.30.32.3 /health)" = 404 ] || die "/health answered another App's address with something other than 404"
+[ "$(ask 172.30.33.20 /health)" = 503 ] || die "/health didn't answer another address on the hassio network as it answers the Supervisor"
 docker exec "$hc" rm -f /run/cain-web/www/health-down
 [ "$(ask 172.30.32.2 /health)" = 200 ] || die "/health didn't go back to 200 once the mark was gone"
+[ "$(ask 172.30.32.3 /health)" = 200 ] || die "/health didn't answer 200 to another address in 172.30.32.0/23"
+[ "$(ask 172.30.40.5 /health)" = 404 ] || die "/health answered an address outside 172.30.32.0/23 with something other than 404"
 for path in / /status /signin /tty/ /healthz; do
   [ "$(ask 172.30.32.2 "$path")" = 404 ] || die "the health port answered $path with something other than 404"
 done
+docker exec "$hc" grep -qx 172.30.40.5 /run/cain-web/health-miss.log \
+  || die "nginx didn't note the address of the refused /health in health-miss.log"
 cleanup_health; trap - EXIT
 ran=$((ran + 1))
-echo "the Supervisor's health check: 200, 503 with the mark, 404 for anyone else and any other path"
+echo "the Supervisor's health check: 200 to the hassio network, 503 with the mark, 404 outside it and on any other path, each 404 noted"
 
 echo "C1 image test: $ran cases passed"

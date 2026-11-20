@@ -249,14 +249,19 @@ def test_cain_terminal_is_reachable_only_through_ingress():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "allow 172.30.32.2;" in nginx and "deny all;" in nginx
     # Cain 0.15.0: a second server, for the Supervisor's watchdog only: /health, from the Supervisor
-    # alone (second round: not the whole internal network), and nothing else (every other path 404).
-    # Its address is checked inside the location, since a return runs before allow and deny.
+    # alone, and nothing else (every other path 404). Third round: the hassio network as a whole
+    # (172.30.32.0/23), since the probe's address was never seen on the device; the panel stays the
+    # Ingress proxy's alone. Its address is checked inside the location, since a return runs before
+    # allow and deny, and each refused /health is noted with its address for the run script's log.
     assert nginx.count("listen ") == 2 and "listen 8099 " in nginx and "listen 8098;" in nginx
+    panel = nginx.split("listen 8099 ")[1].split("  # The Supervisor's watchdog")[0]
+    assert "172.30.32.0/23" not in panel
     health = nginx.split("listen 8098;")[1].split("  server {")[0]
-    assert "172.30.32.0/23" not in nginx
-    assert "geo $cain_health_from { default 0; 172.30.32.2 1; }" in nginx
-    assert "allow 172.30.32.2;" in health and "deny all;" in health and "location = /health {" in health
+    assert "geo $cain_health_from { default 0; 172.30.32.0/23 1; }" in nginx
+    assert "map $status $cain_health_miss { 404 1; default 0; }" in nginx and "log_format cain_health_miss '$remote_addr';" in nginx
+    assert "allow 172.30.32.0/23;" in health and "deny all;" in health and "location = /health {" in health
     loc = health.split("location = /health {")[1].split("location / {")[0]
+    assert "access_log /run/cain-web/health-miss.log cain_health_miss if=$cain_health_miss;" in loc
     assert loc.index("if ($cain_health_from != 1) { return 404;") < loc.index("health-down")
     assert "location / { return 404; }" in health and "proxy_pass" not in health and "alias" not in health
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
@@ -711,6 +716,15 @@ def test_no_stop_is_silent(tmp_path):
     assert self_fn.index("    restart)") < self_fn.index(": > /run/cain/self-restart") < self_fn.index("end_his_session || true") \
         < self_fn.index("bashio::addon.restart") < self_fn.index("self_exit ;;")
     assert self_fn.count("health_down") == 0 and self_fn.count("health_up") == 3
+    # Third round: the line the log really shows on a success comes before the call; "took" only when the
+    # answer comes first; the exit-route fallback waits 2 minutes, past the Supervisor's 30 second stop.
+    assert self_fn.index('"Asking the Supervisor for the App\'s restart"') < self_fn.index("bashio::addon.restart")
+    assert 'nap "${C1_SELF_STOP_WAIT_S:-120}"' in self_fn and "timeout: 30" in (CAIN / "config.yaml").read_text()
+    # And the self-restart mark (with the health page's) is cleared at the very top, before both traps.
+    top = run.index("rm -f /run/cain/self-restart /run/cain-web/www/health-down")
+    assert top < run.index("trap 'rc=$?;") < run.index("trap 'stop_asked;")
+    fin = (CAIN / "rootfs/etc/services.d/cain/finish").read_text()
+    assert fin.index("[ -e /run/cain/self-restart ]") < fin.index("rm -f /run/cain/self-restart") < fin.index("heartbeat_fail \"restarting itself")
     assert run.count("self_exit\n") == 1 and "drill-exit-route" in run
     assert "[ ! -e /run/cain/self-restart ]" in run.split("trap 'rc=$?;")[1].split("\n")[0]
     assert "check-told" not in run and "stopped-told" not in run and '"$OPT/alert.sh" "Cain is stopped' not in run

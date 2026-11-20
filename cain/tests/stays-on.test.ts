@@ -481,10 +481,11 @@ describe("pinned files and the panel's sockets", () => {
 // -- second round: a self-restart that never comes back is raised from outside -------------------------
 describe("the finish script on a self-restart (the outside review's third finding)", () => {
   const FINISH = join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "finish");
-  function finish(code: string, signal: string, marked: boolean) {
-    const d = mkdtempSync(join(tmpdir(), "cain-finish-"));
-    dirs.push(d);
+  function finish(code: string, signal: string, marked: boolean, at?: string) {
+    const d = at ?? mkdtempSync(join(tmpdir(), "cain-finish-"));
+    if (!at) dirs.push(d);
     for (const s of ["run/cain", "results", "bin"]) mkdirSync(join(d, s), { recursive: true });
+    for (const f of ["curl.args", "halted", "results/exitcode"]) rmSync(join(d, f), { force: true });
     if (marked) writeFileSync(join(d, "run/cain/self-restart"), "");
     writeFileSync(join(d, "bin/curl"), `#!/bin/bash\ncat > /dev/null\nfor a in "$@"; do printf '%s\\n' "$a"; done > "${d}/curl.args"\nexit 0\n`, { mode: 0o755 });
     writeFileSync(join(d, "bin/halt"), `#!/bin/bash\necho halted > "${d}/halted"\n`, { mode: 0o755 });
@@ -495,7 +496,7 @@ describe("the finish script on a self-restart (the outside review's third findin
     const p = Bun.spawnSync(["bash", "-c", sh], { env: { ...process.env, PATH: `${join(d, "bin")}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
     const args = existsSync(join(d, "curl.args")) ? readFileSync(join(d, "curl.args"), "utf8").split("\n") : [];
     const body = args.length ? args[args.indexOf("--data-binary") + 1] : null;
-    return { body, halted: existsSync(join(d, "halted")), exitcode: existsSync(join(d, "results/exitcode")) ? readFileSync(join(d, "results/exitcode"), "utf8").trim() : null, out: p.stdout.toString() };
+    return { body, halted: existsSync(join(d, "halted")), exitcode: existsSync(join(d, "results/exitcode")) ? readFileSync(join(d, "results/exitcode"), "utf8").trim() : null, out: p.stdout.toString(), dir: d };
   }
   test.skipIf(process.platform === "win32")("the exit route (3): the heartbeat hears a self-restart failure, and the container halts with 3", () => {
     const r = finish("3", "", true);
@@ -510,5 +511,79 @@ describe("the finish script on a self-restart (the outside review's third findin
   test.skipIf(process.platform === "win32")("without the mark, an error still says stopped on an error, and a plain stop says nothing", () => {
     expect(finish("1", "", false).body).toBe("stopped on an error");
     expect(finish("256", "15", false).body).toBe(null);
+  });
+  // Third round, the second outside review's first finding: the mark is consumed exactly once.
+  test.skipIf(process.platform === "win32")("a mark consumed by one finish is gone for the next: the owner's Stop after it is a plain stop, a crash is a crash", () => {
+    const first = finish("256", "15", true);
+    expect(first.body).toContain("self-restart, exit code 256");
+    expect(existsSync(join(first.dir, "run/cain/self-restart"))).toBe(false);
+    expect(finish("256", "15", false, first.dir).body).toBe(null);                 // the owner's own Stop: nothing
+    const crash = finish("1", "", false, first.dir);
+    expect([crash.body, crash.halted, crash.exitcode]).toEqual(["stopped on an error", true, "1"]);
+  });
+  // A mark left in /run from an earlier self-restart (s6 restarting the service in a live container
+  // keeps /run): the run script's very top clears it before its traps are armed, so a real crash after
+  // it alarms from the EXIT trap, and the finish script reports it as a crash, not a self-restart.
+  test.skipIf(process.platform === "win32")("a stale mark at start: the run script clears it, the exit trap alarms on a crash, and finish doesn't call it a self-restart", () => {
+    const RUN = join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "run");
+    const lines = readFileSync(RUN, "utf8").split("\n");
+    const exitTrap = lines.findIndex((l) => l.startsWith("trap ") && l.endsWith(" EXIT"));
+    const termTrap = lines.findIndex((l) => l.startsWith("trap ") && l.endsWith(" TERM"));
+    const clear = lines.findIndex((l) => l.startsWith("rm -f /run/cain/self-restart"));
+    expect(clear).toBeGreaterThan(0);
+    expect(clear).toBeLessThan(exitTrap);
+    expect(exitTrap).toBeLessThan(termTrap);
+    const d = mkdtempSync(join(tmpdir(), "cain-stale-"));
+    dirs.push(d);
+    for (const s of ["run/cain", "run/cain-web/www", "opt"]) mkdirSync(join(d, s), { recursive: true });
+    writeFileSync(join(d, "run/cain/self-restart"), "");                            // left from before
+    writeFileSync(join(d, "opt/notice.sh"), `#!/bin/bash\necho "$*" >> "${d}/notices"\n`, { mode: 0o755 });
+    // The run script from its top through the EXIT trap, as shipped, then a crash (a step that fails
+    // under errexit, as bashio runs it).
+    const top = lines.slice(1, exitTrap + 1).join("\n").replaceAll("/run/cain", join(d, "run/cain"))
+      .replace("OPT=/opt/cain", `OPT=${join(d, "opt")}`);
+    const p = Bun.spawnSync(["bash", "-c", `set -o errexit\n${top}\nfalse\n`], { stdout: "pipe", stderr: "pipe" });
+    expect(p.exitCode).toBe(1);
+    expect(existsSync(join(d, "run/cain/self-restart"))).toBe(false);
+    expect(readFileSync(join(d, "notices"), "utf8").trim()).toBe("tell exited");
+    const r = finish("1", "", false, d);
+    expect(r.body).toBe("stopped on an error");
+    expect(r.out).not.toContain("restart itself");
+  });
+});
+
+// -- third round: the Supervisor calls are bounded as a process group, and /health 404s reach the log ----
+describe("run_bounded and the health check's 404 line", () => {
+  const RUN = readFileSync(join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "run"), "utf8");
+  const fn = (name: string) => { const a = RUN.indexOf(`${name}() {`); return RUN.slice(a, RUN.indexOf("\n}\n", a) + 3); };
+  test.skipIf(process.platform !== "linux")("a hung call is killed with everything it started: no orphan curl", () => {
+    const tag = `cain-hung-${process.pid}-${Date.now()}`;
+    const d = mkdtempSync(join(tmpdir(), "cain-bounded-"));
+    dirs.push(d);
+    // A stand-in for bashio's curl to a Supervisor that never answers: a child process of the call.
+    const sh = `set -o errexit -o nounset -o pipefail\nnap() { sleep "$1" & wait $! 2>/dev/null || true; }\n${fn("run_bounded")}\n`
+      + `hung() { bash -c 'sleep 300; : ${tag}'; }\nrc=0; run_bounded 1 ${d}/out hung || rc=$?; echo "rc=$rc"\n`
+      + `quick() { echo answer; }\nrun_bounded 5 ${d}/out quick && echo "quick=$(cat ${d}/out)"\n`;
+    const p = Bun.spawnSync(["bash", "-c", sh], { stdout: "pipe", stderr: "pipe" });
+    const out = p.stdout.toString();
+    expect(out).toContain("rc=124");
+    expect(out).toContain("quick=answer");
+    Bun.sleepSync(300);
+    const left = Bun.spawnSync(["pgrep", "-f", tag], { stdout: "pipe" }).stdout.toString().trim();
+    if (left) Bun.spawnSync(["pkill", "-f", tag]);
+    expect(left).toBe("");
+  });
+  test.skipIf(process.platform === "win32")("each address nginx refused is in one warning with its count, and the note is emptied", () => {
+    const d = mkdtempSync(join(tmpdir(), "cain-miss-"));
+    dirs.push(d);
+    const miss = join(d, "health-miss.log");
+    const sh = (pre: string) => `set -o errexit -o nounset -o pipefail\nbashio::log.warning() { echo "warn: $*"; }\nHEALTH_MISS=${miss}\n${fn("health_misses")}\n${pre}\nhealth_misses\n`;
+    writeFileSync(miss, "172.30.33.5\n172.30.33.5\n10.0.0.7\n");
+    const out = Bun.spawnSync(["bash", "-c", sh("")], { stdout: "pipe" }).stdout.toString().trim().split("\n");
+    expect(out.length).toBe(1);
+    expect(out[0]).toContain("answered 404 to: 10.0.0.7 (1), 172.30.33.5 (2)");
+    expect(readFileSync(miss, "utf8")).toBe("");
+    expect(Bun.spawnSync(["bash", "-c", sh("")], { stdout: "pipe" }).stdout.toString()).toBe("");   // nothing new: no line
+    expect(RUN).toContain("( while true; do sleep 60; health_misses || true; done ) &");           // at most once a minute
   });
 });

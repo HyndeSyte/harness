@@ -42,4 +42,13 @@ just before the App stops.
 Still open: the running count and first failure's date in the "switch undone" line; the exit route
 proven on the real server, probe-drill.sh 7 (the App stops with 3 and the Supervisor starts it again
 within a minute), before relying on it; and the restart call watched once on the Pi in a real
-self-restart (the log says "The Supervisor took the restart" and the next start is kept as asked).
+self-restart (the log says "Asking the Supervisor for the App's restart", the outside heartbeat gets
+the failure ping with exit code 256, and the next start is kept as asked).
+
+Third round (the second outside review): the self-restart mark is cleared at the very top of the run
+script, before its traps, and the finish script deletes it once read, so a mark left in /run can never
+silence a later crash or turn the owner's Stop into a self-restart. /health answers the whole hassio
+network (172.30.32.0/23) and logs each 404's address at most once a minute; probe-drill.sh 7 now opens
+with a gate that checks the Supervisor's probe address and its 200 on the Pi before the exit route is
+relied on. The Supervisor call is bounded as a process group (no orphan curls), and the fallback waits
+2 minutes, past the Supervisor's 30 second stop timeout, instead of 1.

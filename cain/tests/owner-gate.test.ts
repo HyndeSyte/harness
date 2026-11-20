@@ -159,7 +159,7 @@ describe.skipIf(!BASH)("terminal/run's gate step", () => {
 const BUILT = NGINX ? Bun.spawnSync([NGINX, "-V"], { stdout: "pipe", stderr: "pipe" }).stderr.toString() : "";
 const TEMP_PATHS = ["client_body", "proxy", "fastcgi", "uwsgi", "scgi"].filter((t) => !BUILT.includes(`--without-http_${t}_module`));
 
-function render(dir: string, port: number, upstream: number, health = { port: 0, from: "127.0.0.1" }): string {
+function render(dir: string, port: number, upstream: number, health = { port: 0, from: "127.0.0.0/30" }): string {
   let conf = shipped("etc/nginx/nginx.conf");
   // A swap that finds nothing fails, so this never quietly tests some other config.
   const swap = (from: RegExp, to: string) => {
@@ -175,9 +175,12 @@ function render(dir: string, port: number, upstream: number, health = { port: 0,
   swap(/root \/opt\/cain;/, `root ${dir}/www;`);
   // The Supervisor's health server (Cain 0.15.0, port 8098), kept and tested below (second round: it
   // was stripped here untested): on its own free port, the Supervisor's address the given one, and its
-  // mark in the temp dir.
+  // mark in the temp dir. Third round: the hassio network (172.30.32.0/23) stands in as the given
+  // range, and the note of each refused /health (health-miss.log) is kept in the temp dir.
   swap(/listen 8098;/, `listen 127.0.0.1:${health.port};`);
-  swap(/172\.30\.32\.2 1;/, `${health.from} 1;`);
+  swap(/172\.30\.32\.0\/23 1;/, `${health.from} 1;`);
+  swap(/allow 172\.30\.32\.0\/23;/, "allow 127.0.0.0/8;");
+  swap(/access_log \/run\/cain-web\/health-miss\.log /, `access_log ${dir}/health-miss.log `);
   swap(/if \(-f \/run\/cain-web\/www\/health-down\)/, `if (-f ${dir}/health-down)`);
   swap(/^user nobody nogroup;$/m, "");
   // Root's pages (C1: /run/cain-web/www) and the upstreams (C1: unix sockets only nginx's workers and
@@ -231,7 +234,7 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
   let foreign = 0;   // the health server's Supervisor at another address
 
   const healthOf = new Map<number, { port: number; dir: string }>();
-  async function start(owner: string, from = "127.0.0.1"): Promise<number> {
+  async function start(owner: string, from = "127.0.0.0/30"): Promise<number> {
     const dir = mkdtempSync(join(tmpdir(), "cain-nginx-"));
     chmodSync(dir, 0o755);                               // readable by nginx's workers, should they run as another user
     const port = await freePort();
@@ -280,7 +283,7 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
       });
       owned = await start(OWNER);
       unowned = await start("");
-      foreign = await start(OWNER, "127.0.0.2");         // the Supervisor somewhere else: 127.0.0.1 isn't it
+      foreign = await start(OWNER, "127.0.0.2/32");      // the network somewhere else: 127.0.0.1 isn't in it
     } catch (e) {
       await stopAll();
       throw e;
@@ -345,10 +348,36 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
     rmSync(join(h.dir, "health-down"));
     expect(await at(h.port, "/health")).toEqual([200, "ok"]);
     for (const path of ["/", "/status", "/signin", "/tty/", "/health/x", "/healthz"]) expect([path, (await at(h.port, path))[0]]).toEqual([path, 404]);
-    // Not the Supervisor (its address is 127.0.0.2 in this config): 404 even for /health, mark or none.
+    // Not on the network (127.0.0.2/32 in this config): 404 even for /health, mark or none.
     const f = healthOf.get(foreign)!;
     expect((await at(f.port, "/health"))[0]).toBe(404);
     writeFileSync(join(f.dir, "health-down"), "");
     expect((await at(f.port, "/health"))[0]).toBe(404);
+  });
+
+  // Third round: the whole hassio network gets the answer (127.0.0.0/30 stands in for 172.30.32.0/23):
+  // the Supervisor's usual address and another address in the range get 200, one outside it 404, and
+  // each refused /health is noted with its address for the run script's once-a-minute log line.
+  test.skipIf(process.platform !== "linux")("the health check answers every address on the network, 404 outside it, and notes each 404's address", async () => {
+    const h = healthOf.get(owned)!;
+    const from = (local: string, path: string) => new Promise<number>((resolve, reject) => {
+      const sock = connect({ port: h.port, host: "127.0.0.1", localAddress: local });
+      let got = "";
+      sock.setEncoding("utf8");
+      sock.setTimeout(5000, () => { sock.destroy(); reject(new Error(`no answer from nginx: ${JSON.stringify(got)}`)); });
+      sock.on("connect", () => sock.write([`GET ${path} HTTP/1.1`, "Host: 127.0.0.1", "Connection: close", "", ""].join("\r\n")));
+      sock.on("data", (d) => { got += d; if (got.includes("\r\n")) { sock.destroy(); resolve(Number(got.split(" ")[1])); } });
+      sock.on("error", reject);
+    });
+    const miss = join(h.dir, "health-miss.log");
+    writeFileSync(miss, "");
+    expect(await from("127.0.0.1", "/health")).toBe(200);
+    expect(await from("127.0.0.2", "/health")).toBe(200);
+    expect(await from("127.0.0.9", "/health")).toBe(404);
+    expect(await from("127.0.0.2", "/healthz")).toBe(404);
+    expect(await from("127.0.0.2", "/")).toBe(404);
+    let noted = "";
+    for (let i = 0; i < 40 && !noted.includes("127.0.0.9"); i++) { await Bun.sleep(50); noted = readFileSync(miss, "utf8"); }
+    expect(noted.split("\n").filter(Boolean)).toEqual(["127.0.0.9"]);   // only /health's 404s, with the address
   });
 });

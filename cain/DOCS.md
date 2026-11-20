@@ -359,8 +359,12 @@ container was killed, it stayed down 10 minutes with no alarm, since every alarm
 - **The App restarts itself, as a last resort.** When his Discord channel stays down across 3
   restarts of his session, or for 10 minutes, whichever comes first, the App ends his session and
   asks the Supervisor to restart it (the Supervisor's own restart call, which every App may make);
-  should the Supervisor refuse, or not stop it within a minute, the App stops on an error (exit code
-  3) and the Supervisor's watchdog starts it again. One restart per incident (30 minutes), each kept
+  should the Supervisor refuse, or not stop it within 2 minutes, the App stops on an error (exit code
+  3) and the Supervisor's watchdog starts it again. The App's log says "Asking the Supervisor for the
+  App's restart" just before the call. A line saying the Supervisor took it rarely shows, because on
+  a real success the Supervisor stops the App before it answers. The real sign of a self-restart is
+  the outside heartbeat's failure ping, "restarting itself (self-restart, exit code 256)", followed
+  by a fresh start of the App. One restart per incident (30 minutes), each kept
   in `/data/probe` with its cause and time, named in the next morning check-in, counted in 0.14.0's
   restart counts as a restart the App asked for itself, and an alarm after 3 in 24 hours or 2 for the
   same cause. Every self-restart also pings the outside heartbeat's failure address, so one that never
@@ -381,9 +385,13 @@ The **Watchdog** switch on the Cain App's page in Home Assistant (Settings, Apps
 thing only you can turn on, once. With it on, Home Assistant's Supervisor starts the App again by
 itself whenever its container stops on an error: a crash, a kill, running out of memory, or the App
 restarting itself by its exit route because Cain's Discord channel stayed down. It also asks the App's
-health page (`/health`, the `watchdog` URL in its configuration, answered to the Supervisor alone and
-404 to anyone else) and restarts the App when that answers an error, which it does only in the moment
-a self-restart is under way. With it off, a killed App stays down until someone starts it, and the App
+health page (`/health`, the `watchdog` URL in its configuration, answered to Home Assistant's own
+internal network, 172.30.32.0/23, where the Supervisor is, and 404 to any other address and on any
+other path; the answer is only whether the App is up) and restarts the App when that answers an
+error, which it does only in the moment a self-restart is under way. Each `/health` 404 shows in the
+App's log, at most once a minute, with the address it came from ("The health check URL (/health)
+answered 404 to: ..."), so a probe from an unexpected address can't restart the App in a loop
+unseen. With it off, a killed App stays down until someone starts it, and the App
 never restarts itself (its exit route would leave it down): it tells you once, naming this switch, and
 keeps restarting Cain's session instead. The App reads the switch through the Supervisor's own-info
 call and asks for its restart through the Supervisor's own restart call, both of which every App may
@@ -397,6 +405,12 @@ Cain himself keeps running. It comes down at the next start that works.
 **The exit route is relied on only once Pi drill 7 has passed** (below): it proves that the App
 stopping with exit code 3 is started again by the Supervisor within a minute. Until then the
 Supervisor's restart call is the route the App uses, with the exit route only behind it.
+
+**Drill 7 starts with a release gate: the Supervisor's health probe.** With the Watchdog switch on,
+it reads the address the Supervisor probes from, checks it is inside 172.30.32.0/23, asks `/health`
+from the Supervisor's own container and wants 200, then watches the App's log for 3 minutes for any
+`/health` 404 line. If any of that fails, the exit route is not relied on and the result goes back to
+the laptop session. `bash probe-drill.sh 7 gate` runs the gate alone.
 
 ## What 0.14.0 does: liveness alarms
 
@@ -558,9 +572,11 @@ on the Pi after the install, before the alarms are relied on:
    under 6 seconds and the finish script under 4.
 6. (0.15.0) Stop the plugin's server once: it runs again within seconds, the channel says connected
    again within 90 seconds, and his session isn't restarted for it.
-7. (0.15.0, with the Watchdog switch on) The exit route: the App stops with exit code 3 and the
-   Supervisor starts it again within a minute. The outside heartbeat hears a failure meanwhile, as
-   expected. Until this passes, don't rely on the exit route.
+7. (0.15.0, with the Watchdog switch on) First the gate: the Supervisor's health probe comes from an
+   address in 172.30.32.0/23, gets 200, and the App's log shows no `/health` 404 for 3 minutes. Then
+   the exit route: the App stops with exit code 3 and the Supervisor starts it again within a minute.
+   The outside heartbeat hears a failure meanwhile, as expected. Until both pass, don't rely on the
+   exit route.
 
 The drill finds the container by its name (`app_<hash>_cain`, then `addon_<hash>_cain`; set
 `CAIN_CONTAINER` to pick one), checks every tool a step uses before it starts, and kills through
