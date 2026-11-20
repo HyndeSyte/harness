@@ -518,11 +518,11 @@ describe("stops that are asked", () => {
   });
   test("the run script's TERM trap marks the stop before it dies of the signal; the finish script marks it too and doesn't halt", () => {
     const run = src("rootfs/etc/services.d/cain/run");
-    expect(run).toContain(`trap 'stop_asked; trap - TERM; kill -TERM $$' TERM`);
+    expect(run).toContain(`trap 'term_caught=1; stop_asked; trap - TERM; kill -TERM $$' TERM`);
     expect(run).toContain('stop_asked() { timeout 6 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" "${start_id:-}"');
     expect(run.indexOf('start_id="$(od')).toBeLessThan(run.indexOf("stop_asked() {"));
     // The trap is set before anything starts his session, and the loops' waits are interruptible.
-    expect(run.indexOf("trap 'stop_asked")).toBeLessThan(run.indexOf("start_his_session() {"));
+    expect(run.indexOf("trap 'term_caught=1; stop_asked")).toBeLessThan(run.indexOf("start_his_session() {"));
     expect(run).toContain("nap() { sleep \"$1\" & wait $! 2>/dev/null || true; }");
     const loop = run.slice(run.lastIndexOf("while session_up; do"));
     expect(loop).toContain("nap 10");
