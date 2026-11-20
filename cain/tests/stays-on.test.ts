@@ -67,7 +67,9 @@ describe("the plugin's server is supervised", () => {
     void (async () => { const dec = new TextDecoder(); for await (const c of broker.stdout) out += dec.decode(c); })();
     const until = async (f: () => boolean, ms: number) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) return false; await Bun.sleep(50); } return true; };
     try {
-      expect(await until(() => out.includes("listening on"), 10_000)).toBe(true);
+      // Bound either way: as root it hands the socket to cain; a runner that isn't root can't chown it
+      // to root, says so, and the socket stays its own (this test connects as that same user).
+      expect(await until(() => out.includes("listening on") || out.includes("couldn't open the socket to cain"), 10_000)).toBe(true);
       const sock = connect(join(d, "discord.sock"));
       let got = "";
       sock.setEncoding("utf8");
