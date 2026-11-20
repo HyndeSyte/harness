@@ -8,17 +8,23 @@
 //                                    container is kept in /data (boot, asked or update) and the
 //                                    container-start alarm raised or down; every start clears any stop
 //                                    mark and keeps its id as the last start record
-//   bun main.ts stop-finish <code> <signal>
-//                                    s6's finish script: the stop mark kept only for a real stop (256
-//                                    with signal 15, or 15) the TERM trap left its nonce for; any other
-//                                    end (SIGKILL, SIGSEGV, SIGABRT...) clears both
+//   bun main.ts stop-finish <code> <signal> [<t0>]
+//                                    s6's finish script: the TERM trap's pending stop mark promoted to
+//                                    asked only for a real stop (256 with signal 15) whose nonce is the
+//                                    last start record's id; any other end (SIGKILL, SIGSEGV, SIGABRT, an
+//                                    exit of its own, exit 15 included) clears both
 //   bun main.ts session-asked <id>   the run script is about to stop his session: a root-owned mark
 //                                    naming that very run (the id the run script holds), so its end is
 //                                    "asked"
-//   bun main.ts stop-asked <id> <start id>
+//   bun main.ts stop-asked <id> <start id> [<t0>]
 //                                    the Supervisor is stopping the App (the run script's TERM trap): the
-//                                    run marked asked as above, the trap's nonce left in /run, and a mark
-//                                    in /data naming this start, so the next container start isn't counted
+//                                    run marked asked as above, the trap's nonce left in /run, and a
+//                                    pending mark in /data naming this start (seventh round: only the
+//                                    finish script promotes it, so a stop that never finished counts)
+//   bun main.ts folders              each folder from the probe's two up to /, with its owner, mode and
+//                                    verdict (the first Pi drill; reads only)
+// t0: the shell's $EPOCHREALTIME when the trap or the finish script began, so the time each took is
+// kept in /data/probe/stop-times for the stop drills to print.
 //   bun main.ts session-gone <id>    the run script saw his session gone: when, for how long it ran
 //   bun main.ts session-start <code> <id>
 //                                    his session starts: the run before it (id: the one the run script
@@ -36,11 +42,11 @@ import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openS
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { heartbeatUrl } from "../security/core";
-import { checkFolder, FolderTampered, folderWhy } from "./folder";
+import { chainVerdicts, checkFolder, FolderTampered, folderWhy } from "./folder";
 import {
   afterStart, alarmFor, askDue, bootKind, clockDue, endKind, END_KINDS, exitCause, failedWords, type Facts, hourlyState, type Hourly, type Install,
   inWindow, lastCode, lastSlot, logLine, longTurn, parseBoots, pass, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts,
-  parseUnseen, type Screen, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
+  parseAsked, parseUnseen, type Screen, tooManyAsked, ASKED_WINDOW_S, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
   unseenCount, updateCause,
 } from "./core";
 
@@ -58,6 +64,8 @@ export const paths = (e: Record<string, string | undefined> = env) => {
     // The Supervisor asked the App to stop (stop-asked): the next container start isn't counted, when the
     // mark names the last start of the run script (start.json, its id and time).
     stopAsked: join(D, "stop-asked"), start: join(D, "start.json"),
+    // How long each stop's TERM trap and finish script took (seventh round), for the stop drills.
+    stopTimes: join(D, "stop-times"),
     // The hourly check's ask and answer, and when a message of the owner's last came in for his session
     // (the broker's note, a time only).
     ask: join(R, "ask"), answered: join(R, "answered"), heard: join(R, "heard"),
@@ -117,8 +125,8 @@ export const TAMPER_REPEAT_S = 86400;
 let toldTamper: number | null = null;
 export function onTamper(e: unknown, notice: PassDeps["notice"], now = Math.floor(Date.now() / 1000)): boolean {
   if (!(e instanceof FolderTampered)) return false;
-  log(`refused: the probe's folder ${e.dir} ${e.why}`);
-  if ((toldTamper === null || now - toldTamper >= TAMPER_REPEAT_S) && notice("tell", "tampered", `${e.dir} ${e.why}`) <= 1) toldTamper = now;
+  log(`refused: the probe's folder ${e.dir}: ${e.why}`);
+  if ((toldTamper === null || now - toldTamper >= TAMPER_REPEAT_S) && notice("tell", "tampered", e.why) <= 1) toldTamper = now;
   return true;
 }
 // Both folders right again after an alarm: it comes down.
@@ -269,42 +277,63 @@ export function markAsked(p: Paths, mem: string): boolean {
 }
 // The Supervisor is stopping the App (SIGTERM to s6, reaching the run script's TERM trap): the run
 // marked asked before his session ends, when the run script still holds its id; the trap's nonce left
-// in /run (its start id: the finish script keeps the mark only when it finds it); and a mark in /data
-// naming the run script's start (its own id, start), with the time, so the container start after it
-// isn't counted. The next start counts it only when its id is the last start record's, within 5
-// minutes (sixth round: bound to that start of the run script, which a recreated container can't
-// change).
-interface StopMark { at: number; id: string }
-export function stopAsked(p: Paths, now: number, mem: string, start: string): boolean {
+// in /run (its start id); and a pending mark in /data naming the run script's start, with the time.
+// Seventh round, two phases: the trap writes only that pending mark. The finish script promotes it to
+// asked, and only on 256 with signal 15 and a nonce equal to the last start record's id. The next
+// container start counts only a promoted mark: a pending one means the stop never finished (the
+// container killed, the power lost, the finish script never ran), so that start counts as a plain
+// boot and the mark is cleared.
+interface StopMark { at: number; id: string; state: "pending" | "asked" }
+// Milliseconds since t0 (the shell's $EPOCHREALTIME, "<seconds>.<micro>"), or null when unreadable.
+export function since(t0: string | undefined, nowMs = Date.now()): number | null {
+  if (!/^\d{9,11}([.,]\d{1,9})?$/.test(t0 ?? "")) return null;
+  const ms = Math.round(nowMs - Number(t0!.replace(",", ".")) * 1000);
+  return ms >= 0 && ms < 600_000 ? ms : null;
+}
+function stopTime(p: Paths, now: number, what: string, ms: number | null): void {
+  try { addLine(p.stopTimes, `${now} ${what} ${ms === null ? "unmeasured" : `${ms}ms`}`, now); }
+  catch (e) { if (e instanceof FolderTampered) throw e; }
+}
+export function stopAsked(p: Paths, now: number, mem: string, start: string, t0?: string): boolean {
   if (START_ID.test(start)) {
     writeWhole(p.term, `${start}\n`);
-    writeWhole(p.stopAsked, `${JSON.stringify({ at: now, id: start } satisfies StopMark)}\n`);
+    writeWhole(p.stopAsked, `${JSON.stringify({ at: now, id: start, state: "pending" } satisfies StopMark)}\n`);
   } else log("a stop with no start id: not kept as asked");
-  return mem !== "" && markAsked(p, mem);
+  const marked = mem !== "" && markAsked(p, mem);
+  stopTime(p, now, "trap", since(t0));
+  return marked;
 }
-// s6's finish script, with the exit code and signal s6 passes: a real stop is 256 with signal 15 (or
-// 15). Only then, and only when the TERM trap left its nonce for the last start, is the mark kept (made
-// again, should the trap's write not have landed). Any other end (a SIGKILL from the OOM killer, a
-// SIGSEGV, a SIGABRT, an exit of its own) is never asked: the mark and the nonce are cleared.
-export function stopFinish(p: Paths, now: number, code: number, sig: number): boolean {
-  const real = (code === 256 && sig === 15) || code === 15;
+// s6's finish script, with the exit code and signal s6 passes. Only 256 with signal 15 is a real stop
+// (seventh round: a plain exit 15 no longer counts). Only then, with the trap's nonce the last start
+// record's id and the trap's pending mark naming it, is the mark promoted to asked. Any other end (a
+// SIGKILL from the OOM killer, a SIGSEGV, a SIGABRT, an exit of its own) is never asked: the mark and
+// the nonce are cleared.
+export function stopFinish(p: Paths, now: number, code: number, sig: number, t0?: string): boolean {
+  const real = code === 256 && sig === 15;
   const nonce = (text(p.term) ?? "").trim();
   const last = json<{ id?: unknown }>(p.start);
-  if (real && START_ID.test(nonce) && last && last.id === nonce) {
-    writeWhole(p.stopAsked, `${JSON.stringify({ at: now, id: nonce } satisfies StopMark)}\n`);
-    return true;
+  const mark = json<{ id?: unknown; state?: unknown }>(p.stopAsked);
+  let kept = false;
+  if (real && START_ID.test(nonce) && last && last.id === nonce && mark && mark.id === nonce && mark.state === "pending") {
+    writeWhole(p.stopAsked, `${JSON.stringify({ at: now, id: nonce, state: "asked" } satisfies StopMark)}\n`);
+    kept = true;
+  } else {
+    if (!real) log(`the run script ended by ${code === 256 ? `signal ${sig}` : `exit ${code}`}: not a stop that was asked`);
+    else log("a stop with no pending mark and nonce from this start's TERM trap: not kept as asked");
+    rm(p.stopAsked); rm(p.term);
   }
-  if (!real) log(`the run script ended by ${code === 256 ? `signal ${sig}` : `exit ${code}`}: not a stop that was asked`);
-  else log("a stop with no nonce from this start's TERM trap: not kept as asked");
-  rm(p.stopAsked); rm(p.term);
-  return false;
+  stopTime(p, now, kept ? "finish promoted" : "finish not-asked", since(t0));
+  return kept;
 }
 // The stop mark, taken: whether it counts for a container start now, after the start whose record is
-// last (its id). A mark from another start, an old-format, stale or garbled one never counts.
+// last (its id). Only a promoted mark counts: a pending one (the stop never finished), a mark from
+// another start, an old-format, stale or garbled one never does.
 export function takeStopMark(p: Paths, now: number, last: string | null): boolean {
-  const m = json<{ at?: unknown; id?: unknown }>(p.stopAsked);
+  const m = json<{ at?: unknown; id?: unknown; state?: unknown }>(p.stopAsked);
   rm(p.stopAsked);
   if (!m || typeof m.at !== "number" || !Number.isFinite(m.at) || typeof m.id !== "string" || !START_ID.test(m.id)) return false;
+  if (m.state === "pending") { log("a pending stop mark: the stop never finished (a kill or a power cut), so this start counts"); return false; }
+  if (m.state !== "asked") return false;
   if (last === null || m.id !== last) { log("a stop mark from another start of the run script: not counted as asked"); return false; }
   const age = now - m.at;
   if (age < -60 || age > STOP_MARK_S) { log("a stop mark older than 5 minutes: not counted as asked"); return false; }
@@ -354,19 +383,20 @@ export function recordStart(p: Paths, now: number, end: string, notice: PassDeps
 const flagOf = (p: Paths, k: string) => `${p.alarmed}-${k}`;
 // The line that names the update: within a day of a version change, once for each new loop (it comes
 // down once neither loop stands, so the next loop says it again).
-function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-unseen" | "update-boots", notice: PassDeps["notice"]): void {
+function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-unseen" | "update-boots" | "update-asked", notice: PassDeps["notice"]): void {
   const i = json<Install>(p.install);
   if (!inWindow(i, now)) return;
   if (notice("tell", kind, updateCause(i!, now)) <= 1) writeWhole(flagOf(p, "update"), `${now}\n`);
 }
 function updateDown(p: Paths, notice: PassDeps["notice"]): void {
-  if (!exists(flagOf(p, "update")) || exists(flagOf(p, "starts")) || exists(flagOf(p, "boots")) || exists(flagOf(p, "unseen"))) return;
+  if (!exists(flagOf(p, "update")) || exists(flagOf(p, "starts")) || exists(flagOf(p, "boots")) || exists(flagOf(p, "unseen"))
+    || exists(flagOf(p, "asked"))) return;
   if (notice("clear", "update") <= 1) rm(flagOf(p, "update"));
 }
 // Repeated early exits (more than 3 in 30 minutes): "Cain's session keeps exiting early", and within
 // a day of an install the line that names it; down once the count is back under. Repeated late error
 // exits (more than 4 in 60 minutes): "Cain's session keeps ending on its own", down once back under.
-// Restarts whose end root never saw (more than 3 in 30 minutes, or more than 6 in 60): "Cain's session
+// Restarts whose end root never saw (more than 3 in 30 minutes, 6 in 60, or 8 in 24 hours): "Cain's session
 // keeps restarting", a cadence, not a confirmed exit, kept apart from both; within a day of an install
 // it names the update too (an early crash before exit handlers run looks unseen).
 // Each carries the count and window, the last exit code root kept and the last line of his session's
@@ -441,6 +471,18 @@ export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): n
   } else if (exists(flag)) {
     if (notice("clear", "boots") <= 1) rm(flag);
   }
+  // Asked starts in their own window (seventh round): more than 6 in 60 minutes is "Cain's App keeps being
+  // restarted", requested but repeated; within a day of an install the update line too.
+  const asked = parseAsked(text(p.boots) ?? "");
+  const aflag = flagOf(p, "asked");
+  if (tooManyAsked(asked, now)) {
+    if (!exists(aflag) && notice("tell", "asked-loop", `${startsIn(asked, now, 0, ASKED_WINDOW_S)} in 60 minutes`) <= 1) {
+      writeWhole(aflag, `${now}\n`);
+      sayUpdate(p, now, "update-asked", notice);
+    }
+  } else if (exists(aflag)) {
+    if (notice("clear", "asked") <= 1) rm(aflag);
+  }
   updateDown(p, notice);
   return n;
 }
@@ -503,10 +545,12 @@ if (import.meta.main) {
     } else if (cmd === "session-asked") {
       console.log(markAsked(p, idArg(arg)) ? "marked: this run's end was asked for" : "no run of his to mark");
     } else if (cmd === "stop-asked") {
-      console.log(stopAsked(p, now(), idArg(arg), idArg(process.argv[4])) ? "the stop was asked for: kept, and his run marked" : "the stop was asked for: kept");
+      console.log(stopAsked(p, now(), idArg(arg), idArg(process.argv[4]), process.argv[5]) ? "the stop was asked for: pending, and his run marked" : "the stop was asked for: pending");
     } else if (cmd === "stop-finish") {
       const n = (a: string | undefined) => { const v = (a ?? "").replace(/[^0-9]/g, "").slice(0, 4); return v === "" ? -1 : Number(v); };
-      console.log(stopFinish(p, now(), n(arg), n(process.argv[4])) ? "a real stop: its mark kept" : "not a stop that was asked: no mark");
+      console.log(stopFinish(p, now(), n(arg), n(process.argv[4]), process.argv[5]) ? "a real stop: its mark promoted to asked" : "not a stop that was asked: no mark");
+    } else if (cmd === "folders") {
+      for (const d of [p.run, p.dir]) { console.log(`${d}:`); for (const l of chainVerdicts(d)) console.log(`  ${l}`); }
     } else if (cmd === "session-gone") {
       markGone(p, now(), idArg(arg));
     } else if (cmd === "session-start") {
@@ -517,7 +561,7 @@ if (import.meta.main) {
       const i = recordInstall(p, arg ?? "", now());
       console.log(i ? `${i.version} since ${i.at || "before the probe"}` : "no version");
     } else {
-      console.error("usage: main.ts loop | pass | install <version> | boot <start id> | session-asked <id> | stop-asked <id> <start id> | stop-finish <code> <signal> | session-gone <id> | session-start <code> <id>");
+      console.error("usage: main.ts loop | pass | install <version> | boot <start id> | session-asked <id> | stop-asked <id> <start id> [t0] | stop-finish <code> <signal> [t0] | session-gone <id> | session-start <code> <id> | folders");
       process.exit(2);
     }
   } catch (e) {

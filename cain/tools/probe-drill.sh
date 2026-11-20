@@ -1,8 +1,12 @@
 #!/bin/bash
 # The Pi drills for Cain 0.14.0's alarms, in order, for the owner's assistant to run on the real Pi
 # from a shell that can reach Docker (Home Assistant's SSH App with protection mode off). Not shipped
-# in the image. This release only alarms: nothing here restores or rolls back anything.
+# in the image. This release only alarms: nothing here restores or rolls back anything. Run them on
+# the Pi after the install, before the alarms are relied on.
 #
+#   probe-drill.sh 0    the probe's folders (seventh round): each folder from /run/cain/probe and from
+#                       /data/probe up to /, with its owner, its mode and the probe's verdict; any
+#                       REFUSED line fails (the probe would refuse that folder and alarm).
 #   probe-drill.sh 1    the boundary, as uid 1000 (Cain's own user): reading the Supervisor's token,
 #                       the probe's records and marks and the link's gateway state file must each
 #                       fail, nothing under /run/cain/probe may be written, and /run/cain must not list.
@@ -26,6 +30,9 @@
 #                       5 s6     an s6-only restart of the run script (s6-svc -r): the same container,
 #                                no new start counted, and the stop mark it leaves is cleared by the
 #                                run script's next start.
+#                       Each of the three prints the measured time the TERM trap and the finish
+#                       script took for every stop since the step began (/data/probe/stop-times: the
+#                       trap must stay under 6 seconds and the finish script under 4).
 #
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
 # token or a heartbeat URL.
@@ -46,8 +53,24 @@ wait_for() {   # wait_for <seconds> <command...>: 0 once the command passes
 starts_since() { in_c awk -v s="$1" '$1 >= s' /data/probe/starts; }
 kill_his_session() { as_cain tmux -S /run/cain/tmux/cain.sock kill-session -t cain 2>/dev/null || true; }
 wait_session_up() { wait_for "${1:-300}" as_cain tmux -S /run/cain/tmux/cain.sock has-session -t cain; }
+# The time each stop's TERM trap and finish script took since a moment (seventh round), as measured by
+# the App itself from the shell's clock at their start; "none" when no stop ran its trap meanwhile.
+stop_times() {
+  local t
+  t="$(in_c awk -v s="$1" '$1 >= s' /data/probe/stop-times 2>/dev/null)"
+  if [ -n "$t" ]; then say "  stop timings since the step began (the trap must stay under 6000ms, the finish script under 4000ms):"
+    printf '%s\n' "$t" | while read -r at what ms; do say "    $(date -d "@$at" '+%H:%M:%S' 2>/dev/null || echo "$at") $what $ms"; done
+  else say "  stop timings since the step began: none (no stop ran the TERM trap)"; fi
+}
 
 case "${1:-}" in
+  0)
+    say "step 0: the probe's folders and every folder above them, with each one's owner, mode and verdict"
+    out="$(in_c bun /opt/cain/probe/main.ts folders 2>&1)" || fail "couldn't run the probe's folder check: $out"
+    printf '%s\n' "$out"
+    if printf '%s\n' "$out" | grep -q REFUSED; then fail "a folder above is refused (above): the probe would stop and alarm"; fi
+    echo "PASS: both probe folders and every folder above them are the App's alone"
+    ;;
   1)
     say "step 1: the boundary, as uid 1000"
     ok=1
@@ -168,6 +191,7 @@ EOF
           alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
           alarm_up restarts && fail "\"Cain's session keeps exiting early\" is up"
           alarm_up unseen && fail "\"Cain's session keeps restarting\" is up"
+          stop_times "$s"
           echo "PASS: the asked stops counted nothing. Confirm each stop took under 30 seconds."
         fi
         ;;
@@ -182,6 +206,7 @@ EOF
         [ "$k" = boot ] || fail "the start after docker kill was kept as \"$k\", not \"boot\""
         in_c test -e /data/probe/stop-asked && fail "a stop mark stayed after the start"
         alarm_up boots && say "  note: \"Cain's App keeps restarting\" is up (other starts in the last 30 minutes)"
+        stop_times "$since"
         echo "PASS: the start after an abrupt termination was counted, and no stop mark stayed"
         ;;
       s6)
@@ -198,10 +223,11 @@ EOF
         in_c awk -v s="$since" '$1 >= s' /data/probe/starts
         alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
         alarm_up unseen && fail "\"Cain's session keeps restarting\" is up"
+        stop_times "$since"
         echo "PASS: the s6-only restart counted no container start, and its stop mark was cleared"
         ;;
       *) echo "usage: probe-drill.sh 5 ha [check <start>] | 5 kill | 5 s6"; exit 2 ;;
     esac
     ;;
-  *) echo "usage: probe-drill.sh 1|1b|2|3|4 [check ...] | 5 ha|kill|s6"; exit 2 ;;
+  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4 [check ...] | 5 ha|kill|s6"; exit 2 ;;
 esac

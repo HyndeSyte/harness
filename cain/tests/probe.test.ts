@@ -7,14 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   afterStart, ago, alarmFor, askDue, bootKind, endKind, exitCause, type Facts, hourlyState, inWindow, type Install,
-  lastCode, lastSlot, layers, localTime, logLine, parseBoots, parseSelf, parseStarts, parseUnseen, pass, PROBE_CHAT, PROBE_LINE,
-  PROBE_REPLY, screenOf, shouldPing, startsIn, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen, unseenCount,
+  lastCode, lastSlot, layers, localTime, logLine, parseAsked, parseBoots, parseSelf, parseStarts, parseUnseen, pass, PROBE_CHAT, PROBE_LINE,
+  PROBE_REPLY, screenOf, shouldPing, startsIn, tooManyAsked, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen, unseenCount,
 } from "../rootfs/opt/cain/probe/core";
 import {
-  classify, markAsked, markGone, paths, recordBoot, recordInstall, recordStart, runPass, sessionLogLine, sessionStart, stopAsked, stopFinish, takeStopMark,
+  classify, markAsked, markGone, paths, since, recordBoot, recordInstall, recordStart, runPass, sessionLogLine, sessionStart, stopAsked, stopFinish, takeStopMark,
   writeWhole, type PassDeps,
 } from "../rootfs/opt/cain/probe/main";
-import { aboveWhy, folderWhy } from "../rootfs/opt/cain/probe/folder";
+import { aboveWhy, chainVerdicts, folderWhy } from "../rootfs/opt/cain/probe/folder";
 import { chmodSync, linkSync, realpathSync, renameSync, rmSync, symlinkSync } from "node:fs";
 import { BrokerSession } from "../rootfs/opt/cain/discord/broker";
 import { INTENTS } from "../rootfs/opt/cain/link/core";
@@ -435,7 +435,10 @@ describe("early exits of his session, kept in /data", () => {
     expect(notices).toEqual([["tell", "unseen-loop", "4 in 30 minutes"], ["tell", "update-unseen", "Cain 0.14.0, installed 32 minutes ago"]]);
     expect(parseStarts(readFileSync(p.starts, "utf8"))).toEqual([]);
     expect(parseSelf(readFileSync(p.starts, "utf8"))).toEqual([]);
+    // Twelve unseen ends in a day stay over the 24-hour window (more than 8): still up an hour on.
     recordStart(p, T + 12 * 330 + 3600, "clean", n);
+    expect(notices.some((x) => x[0] === "clear")).toBe(false);
+    recordStart(p, T + 12 * 330 + 86400, "clean", n);
     expect(notices.slice(-2)).toEqual([["clear", "unseen"], ["clear", "update"]]);
   });
   test("four late error exits in an hour don't alarm", () => {
@@ -752,7 +755,9 @@ describe("notice.sh", () => {
     const n = src("rootfs/opt/cain/notice.sh");
     expect(n).toContain('restarts) groups="restarts" ;;');
     expect(n).toContain('update) groups="update" ;;');
-    expect(n).toContain("update-exits|update-unseen|update-boots) echo update ;;");
+    expect(n).toContain("update-exits|update-unseen|update-boots|update-asked) echo update ;;");
+    expect(n).toContain('asked) groups="asked" ;;');
+    expect(n).toContain("asked-loop) echo asked ;;");
   });
 });
 
@@ -816,8 +821,10 @@ describe("the asked mark (sixth round): bound to the run script's start, kept on
     const { p, n, at } = startsWorld();
     recordBoot(at("c0"), T - 100, n, S1);                                 // the run script's start: the last start record
     stopAsked(at("c0"), T, "", S1);
-    expect(JSON.parse(readFileSync(p.stopAsked, "utf8"))).toEqual({ at: T, id: S1 });
+    expect(JSON.parse(readFileSync(p.stopAsked, "utf8"))).toEqual({ at: T, id: S1, state: "pending" });
     expect(readFileSync(at("c0").term, "utf8")).toBe(`${S1}\n`);          // the trap's nonce, in /run
+    expect(stopFinish(at("c0"), T + 1, 256, 15)).toBe(true);
+    expect(JSON.parse(readFileSync(p.stopAsked, "utf8"))).toEqual({ at: T + 1, id: S1, state: "asked" });
     expect(recordBoot(at("c1"), T + 20, n, S2)).toBe("asked");
     expect(existsSync(p.stopAsked)).toBe(false);                          // taken
     expect(JSON.parse(readFileSync(p.start, "utf8"))).toEqual({ id: S2, at: T + 20 });
@@ -827,9 +834,11 @@ describe("the asked mark (sixth round): bound to the run script's start, kept on
     const { p, n, at } = startsWorld();
     recordBoot(at("c0"), T - 100, n, S1);
     stopAsked(at("c0"), T, "", S1);
+    stopFinish(at("c0"), T, 256, 15);
     expect(recordBoot(at("c1"), T + 301, n, S2)).toBe("boot");
     expect(existsSync(p.stopAsked)).toBe(false);
     stopAsked(at("c1"), T, "", S2);
+    stopFinish(at("c1"), T, 256, 15);
     expect(takeStopMark(p, T + 300, S2)).toBe(true);                      // the edge: 5 minutes counts
   });
   test("a mark from another start of the run script never counts; no hostname is involved", () => {
@@ -870,7 +879,8 @@ describe("the asked mark (sixth round): bound to the run script's start, kept on
       return { kept, mark: existsSync(p.stopAsked), next: recordBoot(at("c1"), T + 90, n, S2) };
     };
     expect(real(256, 15, true)).toEqual({ kept: true, mark: true, next: "asked" });
-    expect(real(15, 0, true)).toEqual({ kept: true, mark: true, next: "asked" });
+    // Seventh round: a plain exit 15 is no stop, even with the trap's nonce and pending mark.
+    expect(real(15, 0, true)).toEqual({ kept: false, mark: false, next: "boot" });
     // No nonce from the trap (a TERM it never handled): never asked.
     expect(real(256, 15, false)).toEqual({ kept: false, mark: false, next: "boot" });
     // SIGKILL (the OOM killer), SIGSEGV, SIGABRT, an exit of its own: never asked, even after the trap ran.
@@ -1010,12 +1020,12 @@ describe("the probe's folders are looked at before every read or write (fifth ro
     expect(onTamper(err, d.notice)).toBe(true);
     expect(onTamper(err, d.notice)).toBe(true);
     expect(notices.filter((x) => x[1] === "tampered").length).toBe(1);
-    expect(notices.find((x) => x[1] === "tampered")![2]).toBe(`${p.run} is a symlink`);
+    expect(notices.find((x) => x[1] === "tampered")![2]).toMatch(new RegExp(`^${p.run} is owned by (root|user \\d+), mode \\d{4}, and is a symlink$`));
   });
   test("a folder opened to others: refused; a session start refused too", () => {
     const { p } = tamperWorld();
     chmodSync(p.dir, 0o755);
-    expect(folderWhy(p.dir)).toBe("has mode 0755, not 0700");
+    expect(folderWhy(p.dir)).toMatch(new RegExp(`^${p.dir} is owned by (root|user \\d+), mode 0755, not (root|user \\d+)'s with mode 0700$`));
     expect(() => sessionStart(p, T, null, () => 0, "")).toThrow(/0755/);
     expect(() => stopAsked(p, T, "", S1)).toThrow(/0755/);
   });
@@ -1038,7 +1048,7 @@ describe("the probe's folders are looked at before every read or write (fifth ro
   });
   test("notice.sh has the alarm", () => {
     const r = Bun.spawnSync(["bash", join(ROOT, "rootfs/opt/cain/notice.sh"), "text", "tampered", "/data/probe is a symlink"]).stdout.toString();
-    expect(r.split("\n")[0]).toBe("Cain's probe folder was tampered with");
+    expect(r.split("\n")[0]).toBe("Cain's probe folder isn't the App's alone");
   });
   test("the folders above can't be written by him: lock.sh, and the image test's parent-rename case", () => {
     expect(src("rootfs/opt/cain/c1/lock.sh")).toContain('chmod go-w "$D" /run/cain');
@@ -1096,9 +1106,10 @@ describe("the tamper response doesn't silence liveness for good (sixth round)", 
     const { dir, p } = tw();
     expect(aboveWhy(p.dir)).toBeNull();
     chmodSync(dir, 0o777);
-    expect(folderWhy(p.dir)).toBe(`has ${realpathSync(dir)} above it, which others can write`);
-    expect(folderWhy(p.run)).toMatch(/above it, which others can write$/);
-    expect(() => recordInstall(p, "0.14.0", T)).toThrow(/others can write/);
+    const u = process.getuid!() === 0 ? "root" : `user ${process.getuid!()}`;
+    expect(folderWhy(p.dir)).toBe(`${realpathSync(dir)} is owned by ${u}, mode 0777 (above ${p.dir})`);
+    expect(folderWhy(p.run)).toMatch(/is owned by .*, mode 0777 \(above .*\)$/);
+    expect(() => recordInstall(p, "0.14.0", T)).toThrow(/mode 0777/);
     chmodSync(dir, 0o1777);                                               // sticky, but not root's here unless the test runs as root
     expect(folderWhy(p.dir) === null).toBe(statSync(dir).uid === 0);
     chmodSync(dir, 0o700);
@@ -1121,7 +1132,7 @@ describe("the tamper response doesn't silence liveness for good (sixth round)", 
     const dir = tmp();
     chmodSync(dir, 0o777);
     const q = paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run") });
-    expect(() => recordInstall(q, "0.14.0", T)).toThrow(/others can write/);
+    expect(() => recordInstall(q, "0.14.0", T)).toThrow(/mode 0777/);
     expect(existsSync(join(dir, "probe"))).toBe(false);
   });
   test("while the probe refuses, the heartbeat ping stops, so the outside service fires", async () => {
@@ -1220,7 +1231,194 @@ describe("alarm texts (sixth round)", () => {
     expect(src("rootfs/opt/cain/notice.sh")).not.toContain("you can restore it from its Backups page");
     expect(msg("turn-long", "130")[1]).toContain("This may be normal for a long job");
     const u = msg("unseen-loop", "4 in 30 minutes")[1];
-    expect(u).toContain("more than 3 times in half an hour, or more than 6 times in an hour (4 in 30 minutes)");
+    expect(u).toContain("more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day (4 in 30 minutes)");
     expect(msg("tampered", "x")[1]).toContain("this alarm comes again each day meanwhile");
+  });
+});
+
+describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window (seventh round)", () => {
+  const NOTICE = join(ROOT, "rootfs/opt/cain/notice.sh");
+  const msg = (k: string, c = "") => Bun.spawnSync(["bash", NOTICE, "text", k, c]).stdout.toString().split("\n");
+  // One container: the run script starts, his session starts, then the Supervisor stops it (the trap,
+  // then the finish script with 256/15).
+  function askedStop(at: (r?: string) => ReturnType<typeof paths>, n: (...a: string[]) => number, c: string, t: number, sid: string) {
+    const p = at(c);
+    const kind = recordBoot(p, t, n, sid);
+    const r = sessionStart(p, t + 5, null, n, "");
+    stopAsked(p, t + 140, r.id, sid);
+    expect(stopFinish(p, t + 141, 256, 15)).toBe(true);
+    return kind;
+  }
+  test("the Nov 19 pace, every stop asked: \"Cain's App keeps being restarted\" at the seventh asked start, with the update line", () => {
+    const { notices, n, at } = startsWorld();
+    recordInstall(at("c0"), "0.13.5", T - 86400 * 3);
+    recordInstall(at("c0"), "0.14.0", T - 3 * 3600);
+    const kinds: string[] = [];
+    for (let i = 0; i <= 7; i++) {
+      kinds.push(askedStop(at, n, `c${i}`, T + i * 150, `${i}`.padStart(16, "c"))!);
+      if (i === 6) expect(notices.filter((x) => x[0] === "tell")).toEqual([]);   // six asked starts: under the limit
+    }
+    expect(kinds).toEqual(["boot", "asked", "asked", "asked", "asked", "asked", "asked", "asked"]);
+    // The seventh asked start alarms, once, with the update line; no container-start alarm (one boot).
+    expect(notices.filter((x) => x[0] === "tell")).toEqual([["tell", "asked-loop", "7 in 60 minutes"], ["tell", "update-asked", "Cain 0.14.0, installed 3 hours ago"]]);
+    expect(parseAsked(readFileSync(at().boots, "utf8")).length).toBe(7);
+    // Down once the hour holds no more than 6, and the update line with it.
+    recordBoot(at("c9"), T + 7 * 150 + 3600, n, "9".padStart(16, "c"));
+    expect(notices.slice(-2)).toEqual([["clear", "asked"], ["clear", "update"]]);
+  });
+  test("outside a day of an install the asked-restart alarm carries no update line; the window's edges", () => {
+    const { notices, n, at } = startsWorld();
+    for (let i = 0; i <= 7; i++) askedStop(at, n, `c${i}`, T + i * 300, `${i}`.padStart(16, "d"));
+    expect(tells(notices)).toEqual(["asked-loop"]);
+    expect(tooManyAsked([T - 3599, T - 3000, T - 2000, T - 1000, T - 500, T - 10, T], T)).toBe(true);
+    expect(tooManyAsked([T - 3600, T - 3000, T - 2000, T - 1000, T - 500, T - 10, T], T)).toBe(false);
+  });
+  test("the asked-restart alarm's text: requested but repeated, nothing rolls back by itself; the update kind is in the update group", () => {
+    const [t, m] = msg("asked-loop", "7 in 60 minutes");
+    expect(t).toBe("Cain's App keeps being restarted");
+    expect(m).toContain("more than 6 times in an hour (7 in 60 minutes)");
+    expect(m).toContain("Each restart was requested");
+    expect(m).toContain("they keep repeating");
+    expect(m).toContain("Nothing rolls back by itself");
+    expect(m).not.toContain("—");
+    const [ut, um] = msg("update-asked", "Cain 0.14.0, installed 3 hours ago");
+    expect(ut).toBe("Cain's App keeps being restarted since his update");
+    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. The restarts were requested, but they keep repeating. Nothing rolls back by itself.");
+    expect(src("rootfs/opt/cain/notice.sh")).toContain("update-exits|update-unseen|update-boots|update-asked) echo update ;;");
+  });
+  test("a pending mark alone is never asked: the next container start is a plain boot, and the mark is cleared", () => {
+    const { p, notices, n, at } = startsWorld();
+    recordBoot(at("c0"), T, n, S1);
+    stopAsked(at("c0"), T + 60, "", S1);                                  // the trap ran; the finish script never did
+    expect(JSON.parse(readFileSync(p.stopAsked, "utf8")).state).toBe("pending");
+    expect(takeStopMark(p, T + 70, S1)).toBe(false);
+    expect(existsSync(p.stopAsked)).toBe(false);
+    stopAsked(at("c0"), T + 80, "", S1);
+    expect(recordBoot(at("c1"), T + 90, n, S2)).toBe("boot");             // the container killed, power lost
+    expect(existsSync(p.stopAsked)).toBe(false);
+    expect(notices).toEqual([]);
+  });
+  test("promotion only on 256 with signal 15 and the nonce the last start record's id; exit 15 with a nonce is never asked", () => {
+    const run = (o: { code: number; sig: number; nonce?: string; pending?: boolean }) => {
+      const { p, n, at } = startsWorld();
+      const c0 = at("c0");
+      recordBoot(c0, T, n, S1);
+      if (o.pending !== false) stopAsked(c0, T + 60, "", S1);
+      if (o.nonce !== undefined) writeWhole(c0.term, `${o.nonce}\n`);
+      const kept = stopFinish(c0, T + 61, o.code, o.sig);
+      const state = existsSync(p.stopAsked) ? JSON.parse(readFileSync(p.stopAsked, "utf8")).state : null;
+      return { kept, state, next: recordBoot(at("c1"), T + 90, n, S2) };
+    };
+    expect(run({ code: 256, sig: 15 })).toEqual({ kept: true, state: "asked", next: "asked" });
+    expect(run({ code: 15, sig: 0 })).toEqual({ kept: false, state: null, next: "boot" });
+    expect(run({ code: 15, sig: 15 })).toEqual({ kept: false, state: null, next: "boot" });
+    expect(run({ code: 256, sig: 15, nonce: S2 })).toEqual({ kept: false, state: null, next: "boot" });   // another start's nonce
+    expect(run({ code: 256, sig: 15, nonce: S1, pending: false })).toEqual({ kept: false, state: null, next: "boot" });   // no pending mark
+    for (const [code, sig] of [[256, 9], [256, 11], [256, 6], [1, 0], [0, 0]]) expect(run({ code, sig }).next).toBe("boot");
+    // A pending mark the trap wrote for another start is no mark to promote either.
+    const { p, n, at } = startsWorld();
+    recordBoot(at("c0"), T, n, S1);
+    writeWhole(at("c0").term, `${S1}\n`);
+    writeWhole(p.stopAsked, JSON.stringify({ at: T, id: S2, state: "pending" }));
+    expect(stopFinish(at("c0"), T + 1, 256, 15)).toBe(false);
+    // The finish script no longer names exit 15 as a stop.
+    expect(src("rootfs/etc/services.d/cain/finish")).not.toMatch(/or exit 15|, or 15\)/);
+    expect(src("rootfs/opt/cain/probe/main.ts")).toContain("const real = code === 256 && sig === 15;");
+  });
+  test("the start id is absent from the session child's environment: a shell variable of the run script, never exported", () => {
+    const run = src("rootfs/etc/services.d/cain/run");
+    expect(run).not.toMatch(/export[^\n]*\bstart_id\b|declare -[a-z]*x[a-z]* start_id|set -a|set -o allexport/);
+    const line = run.split("\n").find((l) => l.startsWith("start_id="))!;
+    expect(line).toBeTruthy();
+    // Run the very line, then start a child as the run script starts his session: it sees no start id.
+    const dir = tmp();
+    writeFileSync(join(dir, "t.sh"), `#!/bin/bash\n${line}\nprintf 'parent %s\\n' "$start_id"\nenv | grep -c '^start_id=' || true\nbash -c 'printf "child %s\\n" "\${start_id:-none}"'\n`);
+    const out = Bun.spawnSync(["bash", join(dir, "t.sh")]).stdout.toString().split("\n");
+    expect(out[0]).toMatch(/^parent [0-9a-f]{16}$/);
+    expect(out[1]).toBe("0");
+    expect(out[2]).toBe("child none");
+  });
+  test("the trap and the finish script hand in their start time; how long each took is kept for the stop drills", () => {
+    expect(src("rootfs/etc/services.d/cain/run")).toContain('stop-asked "${run_id:-}" "${start_id:-}" "${EPOCHREALTIME:-}"');
+    const fin = src("rootfs/etc/services.d/cain/finish");
+    expect(fin).toContain('t0="${EPOCHREALTIME:-}"');
+    expect(fin.indexOf('t0="${EPOCHREALTIME:-}"')).toBeLessThan(fin.indexOf("timeout 4 bun"));
+    expect(fin).toContain('stop-finish "${APP_EXIT_CODE}" "${2:-}" "$t0"');
+    expect(since("1700000000.250000", 1700000001000)).toBe(750);
+    expect(since("1700000000,25", 1700000000500)).toBe(250);
+    for (const bad of [undefined, "", "x", "1700000000.5; rm", "-1"]) expect(since(bad, 1700000001000)).toBeNull();
+    const { p, n, at } = startsWorld();
+    recordBoot(at("c0"), T, n, S1);
+    stopAsked(at("c0"), T + 60, "", S1, `${(Date.now() - 1200) / 1000}`);
+    stopFinish(at("c0"), T + 61, 256, 15, "garbled");
+    const lines = readFileSync(p.stopTimes, "utf8").trim().split("\n");
+    expect(lines[0]).toMatch(new RegExp(`^${T + 60} trap \\d+ms$`));
+    expect(Number(/ (\d+)ms$/.exec(lines[0])![1])).toBeGreaterThanOrEqual(1200);
+    expect(lines[1]).toBe(`${T + 61} finish promoted unmeasured`);
+  });
+  test("a restart every 11 minutes, every end unseen: under 30 and 60 minutes, alarmed in 24 hours at the ninth", () => {
+    const { p, notices, n } = startsWorld();
+    sessionStart(p, T, null, n, "");
+    const told: number[] = [];
+    for (let i = 1; i <= 12; i++) {
+      sessionStart(p, T + i * 660, null, n, "");                          // s6 restarted the run script each time
+      if (notices.length && !told.length) told.push(i);
+    }
+    expect(told).toEqual([9]);
+    expect(notices).toEqual([["tell", "unseen-loop", "9 in 24 hours"]]);
+    const unseen = parseUnseen(readFileSync(p.starts, "utf8"));
+    expect(unseenCount(unseen, T + 9 * 660)).toBe("9 in 24 hours");
+    expect(tooManyUnseen([T - 86399, ...Array.from({ length: 8 }, (_, k) => T - k * 3600)], T)).toBe(true);
+    expect(tooManyUnseen([T - 86400, ...Array.from({ length: 8 }, (_, k) => T - k * 3600)], T)).toBe(false);
+  });
+  test("no text claims a loop is caught at any pace or whatever the gap: the three windows are named", () => {
+    for (const f of ["rootfs/opt/cain/probe/core.ts", "rootfs/opt/cain/probe/main.ts", "rootfs/etc/services.d/cain/run", "rootfs/etc/services.d/cain/finish", "rootfs/opt/cain/notice.sh", "DOCS.md", "CHANGELOG.md"])
+      expect(src(f)).not.toMatch(/any pace|whatever the gap|at any cadence|any cadence/i);
+    const u = msg("unseen-loop", "9 in 24 hours")[1];
+    expect(u).toContain("no clean stop was recorded (a crash, a kill or a power cut)");
+    expect(u).toContain("more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day (9 in 24 hours)");
+    const docs = src("DOCS.md");
+    expect(docs).toContain("more than 3 in 30 minutes, more than 6 in 60 minutes, or more than 8 in 24 hours");
+    expect(src("CHANGELOG.md")).toContain("more than 8 in 24 hours");
+  });
+  test("the folder alarm: its title claims no intent, its cause names the path with its owner and mode, and the way out", () => {
+    const [t, m] = msg("tampered", "/run is owned by user 1000, mode 0777 (above /run/cain/probe)");
+    expect(t).toBe("Cain's probe folder isn't the App's alone");
+    expect(m).toContain("(/run is owned by user 1000, mode 0777 (above /run/cain/probe))");
+    expect(m).toContain("restarting the App sets the folders up again");
+    expect(m).toContain("If this alarm comes back, the Cain App's log names the path");
+    expect(m).toContain("this alarm comes again each day meanwhile");
+    for (const f of ["rootfs/opt/cain/notice.sh", "rootfs/opt/cain/probe/folder.ts", "rootfs/opt/cain/probe/main.ts", "DOCS.md", "CHANGELOG.md"])
+      expect(src(f)).not.toContain("tampered with");
+    const docs = src("DOCS.md");
+    expect(docs).toContain("Cain's probe folder isn't the App's alone");
+    expect(docs).toContain("the App's log names the path");
+  });
+  test("each folder's verdict, from the probe's two up to /, for the first drill", () => {
+    const dir = tmp();
+    const p = paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run") });
+    mkdirSync(p.dir, { mode: 0o700 });
+    chmodSync(dir, 0o777);
+    const v = chainVerdicts(p.dir);
+    const u = process.getuid!() === 0 ? "root" : `user ${process.getuid!()}`;
+    expect(v[0]).toBe(`${p.dir} is owned by ${u}, mode 0700: ok`);
+    expect(v[1]).toBe(`${realpathSync(dir)} is owned by ${u}, mode 0777: REFUSED, others can write it`);
+    expect(v.at(-1)).toMatch(/^\/ is owned by /);
+    expect(chainVerdicts(p.run)[0]).toBe(`${p.run}: missing, made ${u}'s with mode 0700 at its next use`);
+    chmodSync(dir, 0o700);
+    const b = Bun.spawnSync(["bun", MAIN, "folders"], { env: { ...process.env, PROBE_DIR: p.dir, PROBE_RUN: p.run, PROBE_NOTICE: "/bin/true" } });
+    expect(b.exitCode).toBe(0);
+    const out = b.stdout.toString();
+    expect(out).toContain(`${p.run}:\n`);
+    expect(out).toContain(`${p.dir}:\n  ${p.dir} is owned by ${u}, mode 0700: ok`);
+  });
+  test("the drills: a first one for the folders, and the three stop drills print the trap's and the finish script's time", () => {
+    const drill = src("tools/probe-drill.sh");
+    expect(drill).toMatch(/^  0\)/m);
+    expect(drill).toContain("bun /opt/cain/probe/main.ts folders");
+    expect(drill).toContain("/data/probe/stop-times");
+    expect(drill.split('stop_times "$').length - 1).toBe(3);
+    const docs = src("DOCS.md");
+    expect(docs).toContain("on the Pi after the install, before the alarms are relied on");
   });
 });

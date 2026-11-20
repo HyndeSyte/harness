@@ -180,7 +180,7 @@ function connection(sock: Socket): void {
 // A mark of the probe's (the hourly check's answer, or when a message of the owner's came in for his
 // session): the time only, root's alone, whole or not at all (a fresh temp name, then a rename).
 // The folder is looked at first and after it is made (probe/folder.ts: root's, 0700, not a symlink);
-// otherwise nothing is written, and the probe's own pass alarms that it was tampered with.
+// otherwise nothing is written, and the probe's own pass alarms that the folder isn't the App's alone.
 function probeMark(name: "answered" | "heard"): void {
   checkFolder(PROBE_RUN);
   mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });

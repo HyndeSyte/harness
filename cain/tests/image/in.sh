@@ -69,13 +69,25 @@ probe_marks_root_only() {
   PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" boot 0123456789abcdef >/dev/null 2>&1 || fail "the probe couldn't keep the container's start"
   PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" session-start "" "" >/dev/null 2>&1 || fail "the probe couldn't keep a session start"
   [ -s /run/cain/probe/session.json ] && [ -s $D/probe/boots ] || fail "the probe's marks weren't written"
+  # Seventh round: the stop's two phases in the real image. The trap's mark is pending; the finish
+  # script promotes it on 256/15 with the nonce, and each keeps how long it took. Then the run script's
+  # start again (the same container) clears the mark, so nothing here leaks into a later start.
+  bun "$OPT/probe/main.ts" stop-asked "" 0123456789abcdef "${EPOCHREALTIME:-}" >/dev/null 2>&1 || fail "the TERM trap's step failed"
+  grep -q '"state":"pending"' $D/probe/stop-asked || fail "the TERM trap's mark isn't pending"
+  bun "$OPT/probe/main.ts" stop-finish 256 15 "${EPOCHREALTIME:-}" >/dev/null 2>&1 || fail "the finish script's step failed"
+  grep -q '"state":"asked"' $D/probe/stop-asked || fail "the finish script didn't promote the mark on 256/15"
+  grep -Eq ' trap [0-9]+ms$' $D/probe/stop-times && grep -Eq ' finish promoted [0-9]+ms$' $D/probe/stop-times \
+    || fail "the stop's timings weren't kept: $(cat $D/probe/stop-times 2>&1)"
+  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" boot 0123456789abcdef >/dev/null 2>&1 || fail "the probe couldn't keep the run script's start"
+  [ ! -e $D/probe/stop-asked ] && [ ! -e /run/cain/probe/term ] || fail "the run script's start didn't clear the stop mark"
+  bun "$OPT/probe/main.ts" folders | grep -q REFUSED && fail "a probe folder or one above it is refused: $(bun "$OPT/probe/main.ts" folders)"
   for p in /run/cain/probe $D/probe; do
     [ "$(stat -c '%U:%G %a' "$p")" = "root:root 700" ] || fail "$p isn't root's alone: $(stat -c '%U:%G %a' "$p")"
   done
   bad="$(find /run/cain/probe $D/probe \( ! -user root -o ! -group root -o -perm /077 \) -print 2>/dev/null)"
   [ -z "$bad" ] || fail "under the probe's folders, not root's alone: $bad"
   bad="$(setpriv --reuid=1000 --regid=1000 --init-groups bash -c '
-    for p in /run/cain /run/cain/probe /run/cain/probe/session.json /run/cain/probe/booted /run/cain/probe/asked '"$D"'/probe '"$D"'/probe/boots '"$D"'/probe/starts '"$D"'/probe/stop-asked '"$D"'/probe/start.json /run/cain/probe/term; do
+    for p in /run/cain /run/cain/probe /run/cain/probe/session.json /run/cain/probe/booted /run/cain/probe/asked '"$D"'/probe '"$D"'/probe/boots '"$D"'/probe/starts '"$D"'/probe/stop-asked '"$D"'/probe/start.json '"$D"'/probe/stop-times /run/cain/probe/term; do
       [ -w "$p" ] && echo "writable: $p"
     done
     : > /run/cain/probe/asked 2>/dev/null && echo "created: /run/cain/probe/asked"

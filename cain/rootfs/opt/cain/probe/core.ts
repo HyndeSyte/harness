@@ -15,14 +15,17 @@
 //     minutes alarm;
 //   - repeated late error exits of his session: more than 4 non-zero exits after the 5-minute mark
 //     in 60 minutes alarm (his own user can cause one, so they are counted apart);
-//   - repeated restarts whose end root never saw (no exit recorded for the run and no valid asked mark,
-//     whatever the gap between the starts; sixth round): more than 3 in 30 minutes, or more than 6 in
-//     60 minutes, alarm that his session keeps restarting. That is a cadence, not a confirmed exit, and
-//     its alarm says so;
+//   - repeated restarts whose end root never saw (no exit recorded for the run and no valid asked mark;
+//     sixth round): more than 3 in 30 minutes, more than 6 in 60 minutes, or (seventh round) more than
+//     8 in 24 hours alarm that his session keeps restarting. Those three windows are the bound: a slower
+//     pace than all three stays under them. That is a cadence, not a confirmed exit, and its alarm says so;
 //   - repeated starts of his App's container: more than 3 counted starts in 30 minutes alarm. A start
 //     after a stop that was asked for (the Supervisor's stop or update) and the first two starts
-//     within 10 minutes of a version change aren't counted.
-// Within a day of a version change, the early-exit, unseen or container loop also says so, with the way back
+//     within 10 minutes of a version change aren't counted there;
+//   - repeated asked restarts of his App's container (seventh round): every stop the Supervisor asks for
+//     arrives as the same SIGTERM, whoever asked (the owner, an automation, a watchdog), so asked starts
+//     are counted in their own window: more than 6 in 60 minutes alarm that the App keeps being restarted.
+// Within a day of a version change, the early-exit, unseen, container or asked-restart loop also says so, with the way back
 // by hand; outside that day an alarm gives the count, the window and what root saw only.
 // The owner's Stop (stop.json) stops jobs, cards and merges, not his session, so none of this reads it.
 // Only the App's own stopped mode (the mode file says none) silences the liveness alarms and pings.
@@ -39,6 +42,10 @@ export const SELF_MAX = 4;                       // more than this many late err
 export const UNSEEN_WINDOW_S = 60 * 60;
 export const UNSEEN_MAX = 6;                     // more than this many restarts with the end unseen in the hour
 export const UNSEEN_TIGHT_MAX = 3;               // or more than this many in STARTS_WINDOW_S (a tight loop)
+export const UNSEEN_DAY_S = 24 * 3600;
+export const UNSEEN_DAY_MAX = 8;                 // or more than this many in a day (a slow loop, seventh round)
+export const ASKED_WINDOW_S = 60 * 60;
+export const ASKED_MAX = 6;                      // more than this many asked container starts in the hour
 export const DEFER_MAX_S = 2 * 3600;             // the hourly line waits for a turn at most this long
 export const TURN_LONG_S = 2 * 3600;             // a turn at work this long alarms, once a stretch
 export const BOOTS_MAX = 3;                      // more than this many counted container starts in the window
@@ -224,15 +231,14 @@ export function failedWords(p: Pass): string {
 //                  alarm;
 //   clean, unknown unasked, later than that, exit 0 or no code kept, the end seen;
 //   unseen         a run with no recorded exit and no valid asked mark (s6 restarted the run script
-//                  meanwhile, or it died before its exit handlers ran), whatever the gap: how it ended
-//                  is unknown, so it counts in its own windows, as a restart cadence (sixth round: a
-//                  tight one, more than 3 in 30 minutes, alarms as early exits do; a slow one, more
-//                  than 6 in 60 minutes, too);
+//                  meanwhile, or it died before its exit handlers ran), however long it ran: how it
+//                  ended is unknown, so it counts in its own three windows, as a restart cadence (more
+//                  than 3 in 30 minutes, more than 6 in 60, or more than 8 in 24 hours);
 //   self-<code>    unasked, later than that, a non-zero exit, seen. His own user can end his session
 //                  with any code, so these count apart, in their own hour-long window.
 export const END_KINDS = /^(boot|asked|clean|unknown|unseen|early-(clean|unknown|\d{1,3})|self-\d{1,3})$/;
 // ran: seconds from the run's start to when root saw it end. seen false: root never saw it end: unseen,
-// whatever the gap (sixth round; it was an early exit under 5 minutes before, which claimed an exit
+// however long it ran (sixth round; it was an early exit under 5 minutes before, which claimed an exit
 // root never saw).
 export function endKind(o: { first: boolean; asked: boolean; code: number | null; ran: number | null; seen?: boolean }): string {
   if (o.first) return "boot";
@@ -262,14 +268,18 @@ export function tooManyStarts(starts: number[], now: number, since = 0): boolean
   return startsIn(starts, now, since) > STARTS_MAX;
 }
 export function tooManySelf(self: number[], now: number): boolean { return startsIn(self, now, 0, SELF_WINDOW_S) > SELF_MAX; }
-// Unseen ends: a tight loop (more than 3 in 30 minutes) or a slow one (more than 6 in 60 minutes).
+// Unseen ends, in three windows: more than 3 in 30 minutes, more than 6 in 60 minutes, or (seventh
+// round) more than 8 in 24 hours, so a restart every 11 minutes all day can't stay under them.
 export function tooManyUnseen(unseen: number[], now: number): boolean {
-  return startsIn(unseen, now) > UNSEEN_TIGHT_MAX || startsIn(unseen, now, 0, UNSEEN_WINDOW_S) > UNSEEN_MAX;
+  return startsIn(unseen, now) > UNSEEN_TIGHT_MAX || startsIn(unseen, now, 0, UNSEEN_WINDOW_S) > UNSEEN_MAX
+    || startsIn(unseen, now, 0, UNSEEN_DAY_S) > UNSEEN_DAY_MAX;
 }
-// The count an unseen alarm gives: the tight window's when it alone tripped, else the hour's.
+// The count an unseen alarm gives, with its window: the tightest window that tripped.
 export function unseenCount(unseen: number[], now: number): string {
-  const n30 = startsIn(unseen, now), n60 = startsIn(unseen, now, 0, UNSEEN_WINDOW_S);
-  return n30 > UNSEEN_TIGHT_MAX ? `${n30} in 30 minutes` : `${n60} in 60 minutes`;
+  const n30 = startsIn(unseen, now), n60 = startsIn(unseen, now, 0, UNSEEN_WINDOW_S), nDay = startsIn(unseen, now, 0, UNSEEN_DAY_S);
+  if (n30 > UNSEEN_TIGHT_MAX) return `${n30} in 30 minutes`;
+  if (n60 > UNSEEN_MAX) return `${n60} in 60 minutes`;
+  return `${nDay} in 24 hours`;
 }
 // The last exit code root kept with a start (early-<code>, self-<code>, clean as 0), or null.
 export function lastCode(text: string): string | null {
@@ -310,6 +320,10 @@ export function bootKind(o: { now: number; stopAsked: boolean; install: Install 
 }
 export function parseBoots(text: string): number[] { return startLines(text, /^boot$/); }
 export function tooManyBoots(boots: number[], now: number): boolean { return startsIn(boots, now) > BOOTS_MAX; }
+// The asked starts (seventh round): a stop asked of the Supervisor is the same SIGTERM whoever asked, so a
+// loop of them (an automation, repeated restarts from the App's page, a watchdog) counts in its own window.
+export function parseAsked(text: string): number[] { return startLines(text, /^asked$/); }
+export function tooManyAsked(asked: number[], now: number): boolean { return startsIn(asked, now, 0, ASKED_WINDOW_S) > ASKED_MAX; }
 // A file kept short: the last day, at most 500 lines.
 export function pruneStarts(text: string, now: number): string {
   const keep = text.split("\n").filter((l) => { const n = Number(l.trim().split(/\s+/)[0]); return Number.isSafeInteger(n) && n > now - 86400; });

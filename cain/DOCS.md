@@ -381,13 +381,15 @@ back anything, it has no Supervisor access, and no switch.
   from an exit code or a signal); or how long the run lasted to when the start script saw it gone.
   A run that ended unasked within 5 minutes of its start is an early exit, whatever exit code it
   left. A run with no recorded exit and no valid asked mark (the start script was itself restarted
-  meanwhile, or the run died before its exit handlers ran) is an unseen end, whatever the gap
-  between the two starts. More than 3 early exits in 30 minutes is "Cain's session keeps exiting early", on
+  meanwhile, or the run died before its exit handlers ran) is an unseen end, however long it ran.
+  More than 3 early exits in 30 minutes is "Cain's session keeps exiting early", on
   your phone through Home Assistant and in Discord; it comes down once the count is back under.
-- **Unseen ends** have their own windows: more than 3 in 30 minutes (a tight loop, as early exits),
-  or more than 6 in 60 minutes (a slow one), is "Cain's session keeps restarting". Its text says the
-  restarts were seen but not the exits, so it is a cadence, not a confirmed crash; it never counts as
-  an early exit. Within a day of an update it carries the update line too, since an early crash
+- **Unseen ends** have their own three windows: more than 3 in 30 minutes, more than 6 in 60 minutes, or more than 8 in 24 hours
+  is "Cain's session keeps restarting", with the count and the window that tripped. The 24-hour
+  window catches a slow loop the others miss (a restart every 11 minutes all day); a pace slower than
+  all three stays under them. Its text says no clean stop was recorded (a crash, a kill or a power
+  cut), and that the restarts were seen but not the exits, so it is a cadence, not a confirmed crash;
+  it never counts as an early exit. Within a day of an update it carries the update line too, since an early crash
   before the exit handlers run looks unseen.
 - **Repeated late error exits of his session**: an unasked end after the 5-minute mark with an
   error code is counted apart (Cain's own user can end his own session, so these never count as
@@ -402,18 +404,29 @@ back anything, it has no Supervisor access, and no switch.
   Supervisor asked for, and the first two starts within 10 minutes of a version change, since an
   update restarts the container. How a stop counts as asked: each start of the App's start script
   makes its own id, which root keeps as the last start record in `/data`. A stop signal (a Stop,
-  Restart or update of the App from Home Assistant) reaches the start script's stop handler, which
-  leaves a nonce for that start and a mark naming its id and the time. The finish script keeps the
-  mark only for a real stop: the start script ended by SIGTERM (or exit 15), with the handler's nonce
-  there. A death by SIGKILL (the out-of-memory killer, or `docker kill`), SIGSEGV or SIGABRT is never
-  asked, and clears the mark. The next container start counts the mark only when its id is the last
-  start record's and it is under 5 minutes old; every start of the start script, a restart by s6
+  Restart or update of the App from Home Assistant, or the same asked by an automation or a watchdog)
+  reaches the start script's stop handler, which leaves a nonce for that start and a pending mark
+  naming its id and the time. The stop is marked in two phases: the finish script promotes the
+  pending mark to asked only for a real stop, the start script ended by SIGTERM (s6 passes 256 and
+  signal 15), with the handler's nonce equal to the last start record's id. A plain exit 15, a death
+  by SIGKILL (the out-of-memory killer, or `docker kill`), SIGSEGV or SIGABRT is never asked, and
+  clears the mark. The next container start counts only a promoted mark, when its id is the last
+  start record's and it is under 5 minutes old. A pending mark left over means the stop never
+  finished (the container was killed, the power was lost, the finish script never ran): that start
+  counts as a plain boot, and the mark is cleared; every start of the start script, a restart by s6
   alone included, clears any mark, so a stale one can never hide a later crash. The stop's budget sits
   inside the Supervisor's 30 seconds with margin: 8 seconds for the services to stop (the stop
   handler takes at most 6), 5 for a finish script (its mark at most 4), then 3 before everything left
   is killed. The count and the record of the installed version live in `/data`, so a
   restart of the container keeps them.
-- **The line that names the update**: when a loop (early exits, unseen ends, or container starts) begins
+- **Repeated asked restarts of his App**: every stop the Supervisor asks for arrives as the same
+  signal, whoever asked, so a loop of them (a Home Assistant automation, repeated restarts from the
+  App's page, a watchdog) would otherwise never count. Asked starts are kept in their own window in
+  `/data`: more than 6 in 60 minutes is "Cain's App keeps being restarted". Its text says the
+  restarts were requested but keep repeating, and that nothing rolls back by itself; look for an
+  automation or a watchdog restarting the App. Within a day of an update it carries the update line
+  too.
+- **The line that names the update**: when a loop (early exits, unseen ends, container starts or asked restarts) begins
   within a day of a version change, a second alarm goes with it, for example: "Cain's session has
   exited early several times since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls
   back by itself. If a backup was made before the update, restoring it from Backups undoes the update
@@ -421,9 +434,10 @@ back anything, it has no Supervisor access, and no switch.
   loop stands, and goes out again with each new loop.
 - **A long turn**: "Cain's turn has been running for N minutes" adds "This may be normal for a long
   job."; it comes down when the turn ends.
-- **Asked stops never count**: an owner's Stop, Restart or update from Home Assistant reaches the
-  App's start script as a stop signal before anything else stops, and root records it as asked
-  before his session ends. Claude Code's own updater is off in this App (its version is pinned in
+- **Asked stops never count as crashes**: an owner's Stop, Restart or update from Home Assistant
+  reaches the App's start script as a stop signal before anything else stops, and root records it as
+  asked before his session ends. They count only in the asked-restart window above (more than 6 in an
+  hour), never as early exits or container starts. Claude Code's own updater is off in this App (its version is pinned in
   the image), so it never ends his session to update itself.
   Claude Code fixes arrive with App releases, and the repository's CI notes when a newer Claude Code
   than the pinned one is out.
@@ -435,14 +449,19 @@ his to write (the App's start fixes what it can). Before every read or write the
 the folder is root's, mode 0700 and not a symlink, and the folders above it; a missing folder is made
 that way rather than refused. The probe's files are opened without following a link and read only
 when they are plain files. If a folder isn't right, the App refuses to use it, stops the probe's
-heartbeat ping (so the outside service alarms too) and raises "Cain's probe folder was tampered
-with", again each day while it lasts. A restart of the App sets the folders up again.
+heartbeat ping (so the outside service alarms too) and raises
+"Cain's probe folder isn't the App's alone", again each day while it lasts. Its cause names the failing path with its owner and mode in
+plain words, for example "/run is owned by user 1000, mode 0777". The way out: restarting the App
+sets the folders up again; if the alarm comes back, the App's log names the path.
 
 ### Checking it on the Pi
 
 `cain/tools/probe-drill.sh` (in the repository, run by your assistant from a shell with Docker, such
-as Home Assistant's SSH App with protection mode off) has the drills, in order:
+as Home Assistant's SSH App with protection mode off) has the drills. Run them, in order,
+on the Pi after the install, before the alarms are relied on:
 
+0. The probe's folders: each folder from `/run/cain/probe` and from `/data/probe` up to `/`, with
+   its owner, its mode and the probe's verdict. Any refused folder fails the drill.
 1. uid 1000 (Cain's own user) can't read the Supervisor's token, the probe's records and marks or
    the gateway state, can't write anything under `/run/cain/probe` or `/data/probe`, and can't list
    `/run/cain`.
@@ -455,7 +474,9 @@ as Home Assistant's SSH App with protection mode off) has the drills, in order:
    App from Home Assistant 4 times within 30 minutes, each stop under 30 seconds: nothing counts;
    `5 kill`, an abrupt termination (`docker kill`): the next start counts as a boot, never asked, and
    no stop mark stays; `5 s6`, a restart of the start script by s6 alone: no container start counts,
-   and the mark it leaves is cleared.
+   and the mark it leaves is cleared. Each of the three prints how long the stop handler and the
+   finish script took for every stop since it began, as the App measured them: the handler must stay
+   under 6 seconds and the finish script under 4.
 
 For a hand restore to be there when the update line asks for it, keep a backup taken before each
 update of Cain: the Ship job takes one, and Home Assistant's **Backup before update** does too.

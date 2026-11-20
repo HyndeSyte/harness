@@ -64,12 +64,15 @@ run_id=""
 # trap runs at once; the finish script records the stop as well, should it not.
 # Sixth round: the mark names this start of the run script (start_id, made here, fresh each start,
 # kept by root as the last start record in /data by the boot step below), and the trap leaves its nonce
-# in /run for the finish script. The next container start counts the mark only when its id is the last
-# start record's; every start of this script clears it, so an s6-only restart's mark can't absorb a
-# later crash. Up to 6 seconds for it, inside s6's 8 second grace for the services (the Dockerfile's
-# S6_SERVICES_GRACETIME).
+# in /run for the finish script. start_id is a shell variable of this script only, never exported, so
+# no child (his session least of all) has it. Seventh round: the trap's mark is only pending; the
+# finish script promotes it to asked on 256 with signal 15 and the nonce, and the next container start
+# counts only a promoted mark (a pending one means the stop never finished: a plain boot). Every start
+# of this script clears it, so an s6-only restart's mark can't absorb a later crash. Up to 6 seconds for
+# it, inside s6's 8 second grace for the services (the Dockerfile's S6_SERVICES_GRACETIME); the time it
+# took is kept for the stop drills ($EPOCHREALTIME at the trap's start).
 start_id="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -cd '0-9a-f' | head -c 16)"
-stop_asked() { timeout 6 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" "${start_id:-}" >/dev/null 2>&1 || true; }
+stop_asked() { timeout 6 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" "${start_id:-}" "${EPOCHREALTIME:-}" >/dev/null 2>&1 || true; }
 trap 'stop_asked; trap - TERM; kill -TERM $$' TERM
 nap() { sleep "$1" & wait $! 2>/dev/null || true; }
 
@@ -211,8 +214,9 @@ bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session
 # this container's start, kept in /data once per container: more than 3 counted in 30 minutes alarms
 # that the App keeps restarting. Every start of this script (an s6-only restart too) clears any stop mark
 # and keeps start_id as the last start record. A start after a stop the Supervisor asked for, and the first two
-# within 10 minutes of a version change (the update's own restart), aren't counted. Nothing here
-# restores or rolls back anything.
+# within 10 minutes of a version change (the update's own restart), aren't counted there; asked starts
+# are counted in their own window instead (more than 6 in 60 minutes: the App keeps being restarted).
+# Nothing here restores or rolls back anything.
 [ "$version" = unknown ] || timeout 30 bun "$OPT/probe/main.ts" install "$version" 2>&1 || true
 timeout 30 bun "$OPT/probe/main.ts" boot "${start_id:-}" 2>&1 || true
 
@@ -359,7 +363,8 @@ session_up() {
 # exit, which counts toward its alarm whatever code it kept ("unknown" when none); later, exit 0 is
 # "clean" and a non-zero exit "self" (his own user can cause one), counted apart in an hour's window.
 # A run this script never saw end (s6 restarted it meanwhile, or it died before its exit handlers ran)
-# is "unseen", whatever the gap: counted in its own windows (more than 3 in 30 minutes, or 6 in 60).
+# is "unseen", however long it ran: counted in its own windows (more than 3 in 30 minutes, 6 in 60, or
+# 8 in 24 hours).
 # session.sh keeps the exit code: his own folder the new way (read as him), root's the old way.
 session_gone() { timeout 30 bun "$OPT/probe/main.ts" session-gone "${run_id:-}" >/dev/null 2>&1 || true; }
 last_code() {
