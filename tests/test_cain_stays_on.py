@@ -118,7 +118,8 @@ def test_a_connected_channel_never_restarts_the_app(tmp_path):
     calls, stop, bindir, runc = _start(tmp_path)
     runc.mkdir(parents=True, exist_ok=True)
     (runc / "discord.state").write_text(f"connected {int(time.time()) - 3600}\n")
-    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh clear switched" in l,
+    # Waits for the second clear: it follows "clear switched" in the same turn of the loop.
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: "notice.sh clear selfrestart" in l,
                                    C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1")
     assert alive, err
     assert not _self_calls(lines) and sum("new-session" in l for l in lines) == 1, lines[:40]
