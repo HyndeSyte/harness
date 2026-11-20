@@ -62,7 +62,8 @@ its own.
   read that options file too, so a compromised session could read the URL: the risk that a leaked
   URL masks an outage or fakes a failure includes that case. Keep it like a key, and make a new
   one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
-  one late ping doesn't page you.
+  one late ping doesn't page you. A second check, pinged only while Cain really answers, is
+  `probe_heartbeat_url` (**Is Cain really answering**, below).
 - **Review spend.** The morning check-in has yesterday's spend per review seat and the month
   so far against each cap, and flags a day that jumps (over 3 times the week before and at
   least $1, once the seat was used on at least 3 of those 7 days; or over a fifth of the month's
@@ -334,6 +335,68 @@ or a pause that lasts, restore two backups from just before the update, Cain's f
 calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
+
+## Is Cain really answering (since 0.14.0)
+
+The outside heartbeat above says the App is alive. That is not the same as Cain answering: on
+Nov 19 his session restarted every two and a half minutes for about six hours while the heartbeat
+kept saying alive. So the App also checks that Cain can really answer, alarms you when he can't,
+and undoes an update that broke him within its first day.
+
+**The probe.** Every 5 minutes, with no model call, a part of the App outside Cain's session
+checks four things: his Discord plugin is running, his session is there, the App's own Discord
+connection is up and Discord acknowledged it in the last 3 minutes, and something the App typed
+reached his session since the last check-in that is over an hour old. Once an hour, when his
+screen is free, the App also hands his session one fixed line on his Discord channel and he must
+answer it with a fixed reply within 20 minutes. That line and his answer never reach Discord or
+you: the App's own part of the channel hands it over and takes the answer. Hourly, not more often,
+so it costs only a few short turns of your Claude usage a day. Each check is kept in `/data/probe`
+with its time.
+
+**The alarm, two routes.**
+- From outside: set `probe_heartbeat_url` to the ping URL of a second check at your heartbeat
+  service (Healthchecks.io: add a check with a 5 minute period and a 15 minute grace). The App pings
+  it only after a check that passed, so when Cain stops answering, or the Pi or the App is down, the
+  pings stop and the service alarms your phone itself. It doesn't depend on Cain or the Pi. The URL
+  is read only by the probe's own process, never logged, and never reaches Cain's session.
+- From the App: two failed checks in a row, or an hourly answer that didn't come, sends one alarm
+  to your phone through Home Assistant and in Discord ("Cain isn't answering"), once for the whole
+  stretch, and "Cain is answering again" when a check passes.
+
+**The restart count.** Every start of Cain's session is written to a file in `/data`, which
+survives App restarts and reboots, and the App counts the starts in the last 30 minutes from that
+file. Nothing in his session or its restart can reset it. More than 3 starts in 30 minutes is an
+alarm, both routes ("Cain keeps restarting"); it comes down once the count is back under.
+
+**The rollback rule.** At each start the App notes its version; a version that changed is an
+install, and the 24 hours after it are watched. If, within those 24 hours, two checks in a row
+fail, an hourly answer doesn't come, or his session starts more than 3 times in 30 minutes, the App
+restores the backup Home Assistant took of Cain just before that update, through the Supervisor,
+and Cain comes back on the version before. Only:
+- to a version you installed with a Ship tap (the App keeps the versions its link signed a Ship
+  for); otherwise it alarms you and does nothing;
+- from that pre-install backup (the App keeps one backup of Cain alone and removes older ones); if
+  there is none, it alarms you and does nothing;
+- once per update: a failure after a rollback alarms you and the App does nothing more by itself.
+
+You hear one line when it happens, on your phone and in Discord, with the version undone and the
+version restored, and Cain puts it in the next morning message's Moving section. If the Supervisor
+refuses the restore 3 times in a row, you hear that, with its reason, and the way back by hand
+(Settings, System, Backups).
+
+The part that decides on a rollback runs as its own user, not Cain's and not the App's
+administrator: it can read the checks but can't change Cain's settings, hooks, plugin or home. All
+it can do is ask for that one restore or an alarm. A small part of the App's administrator does
+the restore, after checking the request again against its own records, and refuses anything else.
+For this the App now has the Supervisor's API with the backup role only (it can list, remove and
+restore backups, nothing else); its token stays with the administrator part.
+
+**Drills, on the Pi** (from a shell with Docker, such as Home Assistant's SSH App with protection
+mode off; `cain/tools/probe-drill.sh` in the repository): `--backups` lists Cain's backups and the
+one a rollback would restore, changing nothing; `--restore` takes a fresh backup of Cain and has the
+App restore exactly that one, the rollback's own call; with no option it stops Cain's Discord plugin
+again and again and waits: the alarm should reach your phone within 10 minutes with no one
+watching. A drill holds any rollback back while it runs.
 
 ## Your record: one hand on each item (since 0.6.0)
 

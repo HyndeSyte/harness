@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.14.0
+
+- The App now checks every 5 minutes that Cain can really answer, not only that the App is up: his Discord plugin, his session, his Discord connection, and that what the App types reaches him. Once an hour he must answer a short check himself, which never reaches you.
+- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service. It is pinged only while Cain passes his checks, so your phone hears from outside when he stops answering, even if the Pi is down.
+- When his checks fail, or his session restarts more than 3 times in 30 minutes, you hear it on your phone and in Discord. The restart count is now kept on disk, so a restart can't hide it.
+- Within a day of an update, if the update stops Cain answering, the App puts back the version before it from the backup Home Assistant took just before the update, once, and only to a version you installed with a Ship tap. You hear one line when it happens, and it shows in the next morning message.
+- The App can now see and restore its own backups (Supervisor access with the backup role only), for that rollback.
+
 ## 0.13.5
 
 - Cain can start his Build and Ship jobs again. Since his move to his own user, every one was refused: the record keeper's list of who holds what, which his job check reads, was rewritten readable only by the App's administrator, so the check couldn't read it. The keepers now keep each file's owner and permissions when they rewrite it, so the list, and the review spend and health files his check-ins read, stay readable to him.

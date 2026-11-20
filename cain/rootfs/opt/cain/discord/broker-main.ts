@@ -24,6 +24,8 @@ const LINK_STATE = env.CAIN_LINK_STATE ?? "/data/link/state.json";
 const CARDS = env.CAIN_CARDS ?? "/data/trust/cards.json";
 const REPLIED = env.CAIN_GATE_REPLIED ?? "/data/gate/replied.json";
 const CAIN_GID = Number(env.CAIN_GID ?? 1000);
+// The hourly check (probe/main.ts): its ask, root's, and where his answer is noted for it.
+const PROBE_RUN = env.PROBE_RUN ?? "/run/cain/probe";
 const DISCORD_GID = Number(env.DISCORD_GID ?? 1001);
 // For the tests only (the run script never sets it): the server's command in place of the
 // pinned plugin as discord.
@@ -152,6 +154,11 @@ function connection(sock: Socket): void {
     session: name,
     setTimer: (ms, f) => setTimeout(f, ms),
     clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
+    probeAnswered: () => {
+      mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });
+      writeFileSync(`${PROBE_RUN}/answered.tmp`, `${Math.floor(Date.now() / 1000)}\n`, { mode: 0o600 });
+      renameSync(`${PROBE_RUN}/answered.tmp`, `${PROBE_RUN}/answered`);
+    },
   });
   conn.session = session;
   current = conn;
@@ -172,7 +179,15 @@ function connection(sock: Socket): void {
   void proc.exited.then((code) => { log(`the plugin's server stopped (${code})`); session.serverGone(); });
 }
 
+// The probe's ask: handed to his session once a connection has started (every 5 seconds a look).
+function probeAsk(): void {
+  const ask = `${PROBE_RUN}/ask`;
+  if (!current || !existsSync(ask)) return;
+  if (current.session.probe(`0000${Date.now()}`)) rmSync(ask, { force: true });
+}
+
 if (import.meta.main) {
+  if (env.CAIN_BROKER_SMOKE !== "1") setInterval(probeAsk, 5_000);
   // Notes a crash left unsent go now, and any the link didn't take every 30 seconds after.
   if (env.CAIN_BROKER_SMOKE !== "1") { void spool.flush(); setInterval(() => void spool.flush(), 30_000); }
   mkdirSync(OUTBOX, { recursive: true, mode: 0o750 });

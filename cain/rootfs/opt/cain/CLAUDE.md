@@ -40,6 +40,10 @@ commands that would read them fail by design, so never work around one or ask hi
   input_datetime.cain_alarms_checked through your Home Assistant connector and write its
   last_changed time, exactly as given and nothing else, into /data/work/alarms-checked. It's how
   the App knows its alarms reach his phone; nothing to tell him.
+- Once an hour your App checks you answer: a message in chat 000000000000000000 from
+  "cain-app-probe" asks for a reply. Answer it at once with the reply tool in that chat, text
+  exactly `probe answered`, and nothing else. It never reaches Discord or him: nothing to tell
+  him, and nothing to record.
 - The message gate runs in your Discord channel itself and answers inside the reply tool's
   result. If a send's outcome is unknown (the channel stopped before it confirmed), read the
   chat with fetch_messages before you send it again.

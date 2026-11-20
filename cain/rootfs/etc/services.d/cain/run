@@ -26,7 +26,7 @@ unset SUPERVISOR_TOKEN HASSIO_TOKEN
 # No xtrace from here on (third round): this script never traces, and a trace would print the
 # options it reads.
 { set +x; } 2>/dev/null
-unset HEARTBEAT_URL
+unset HEARTBEAT_URL PROBE_PING_URL
 umask 027
 cd /
 export TMPDIR=/run/cain/root-tmp CAIN_ROOT_TMP=/run/cain/root-tmp
@@ -185,6 +185,11 @@ if [ "$mode" = none ]; then "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_c
 { printf '%s\n' "$mode" > /run/cain/mode.tmp && chmod 0644 /run/cain/mode.tmp && mv /run/cain/mode.tmp /run/cain/mode; } \
   || bashio::log.error "Couldn't write /run/cain/mode"
 bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session held until the check of his own user finishes}"
+# The version this start runs, for the rollback rule (probe/core.ts): a version that changed since
+# the last start is an install, watched for 24 hours. Then root's helper looks whether this start
+# came from a restore (a rollback leaves no record in /data: the restore put it back as it was).
+[ "$version" = unknown ] || bun "$OPT/probe/main.ts" install "$version" 2>&1 || true
+( bun "$OPT/rollback/helper.ts" boot 2>&1 || true ) &
 
 # What each way of running reads where. The old way keeps 0.11.0's places; the new one the
 # places of C1's section 3.2.
@@ -320,6 +325,9 @@ session_up() {
 start_his_session() {
   unchecked
   bashio::log.info "Starting Cain"
+  # Every start of his session is kept in /data (probe/main.ts start), outside his session and
+  # across restarts and reboots, so nothing can reset the count: more than 3 in 30 minutes alarms.
+  timeout 30 bun "$OPT/probe/main.ts" start session 2>&1 || true
   if ! start_session; then bashio::log.error "tmux could not start"; return 1; fi
   sleep 3
   if ! session_up; then
@@ -426,6 +434,29 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   export HEARTBEAT_URL CAIN_DISCORD_ENV
   while true; do bun /opt/cain/security/main.ts run 2>&1; sleep 10; done
 ) &
+# The probe (probe/main.ts, Cain 0.14.0), root's, outside his session like watch.sh: every 5 minutes
+# with no model call (the plugin's process, his tmux session, the link's Discord gateway, typed
+# input since the last check-in), and once an hour a fixed line his session must answer through
+# his reply tool (the broker hands it to him and takes the answer; nothing reaches Discord). A pass
+# that passed pings the probe's own outside heartbeat (probe_heartbeat_url, read here by this one
+# subshell, in no other child's environment, never logged); a missed ping alarms Dane from outside.
+# A failed stretch alarms through notice.sh, both routes.
+(
+  { set +x; } 2>/dev/null
+  v="$(bashio::config 'probe_heartbeat_url' 2>/dev/null || true)"; [ "$v" = "null" ] && v=""
+  PROBE_PING_URL="$v"; unset v
+  export PROBE_PING_URL
+  while true; do bun "$OPT/probe/main.ts" loop 2>&1; sleep 10; done
+) &
+# The rollback watcher (rollback/watcher.ts), as its own user, watch: not his, not root. It reads
+# what the probe keeps and asks for a rollback or an alarm in its own folder; it can't write his
+# settings, hooks, plugin or home. Root's helper (rollback/helper.ts) checks a rollback request
+# again from root's records and does only the restore of the recorded pre-install backup; it is the
+# only process that calls the Supervisor's backup API.
+if [ -x "$OPT/as-watch" ]; then
+  ( while true; do "$OPT/as-watch" bun "$OPT/rollback/watcher.ts" loop 2>&1 || true; sleep 10; done ) &
+fi
+( while true; do bun "$OPT/rollback/helper.ts" loop 2>&1; sleep 10; done ) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM. checkin.sh decides when, and
 # only types into an idle session (through as-cain, the new way). Started once, with his session.
 checking_in=""

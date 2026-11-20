@@ -479,3 +479,12 @@ function connect(): void {
   ws.onerror = () => {};
 }
 connect();
+// The gateway's health for the probe (probe/main.ts, Cain 0.14.0): "connected <s>" or "down <s>",
+// with when Discord last acknowledged a heartbeat (seconds), every 30 seconds. Root's, read by root.
+const GATEWAY_STATE = process.env.CAIN_LINK_GATEWAY_STATE ?? "/run/cain/link-gateway.state";
+setInterval(() => {
+  try {
+    writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
+    renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
+  } catch { /* the probe then sees an old time, and fails that layer */ }
+}, 30_000);

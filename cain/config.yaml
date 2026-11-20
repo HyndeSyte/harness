@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.13.5"
+version: "0.14.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -21,7 +21,12 @@ panel_icon: mdi:account-tie
 panel_title: Cain
 panel_admin: true
 homeassistant_api: false
-hassio_api: false
+# The Supervisor's API, with the backup role only (0.14.0): the rollback helper (root's alone,
+# rollback/helper.ts) lists this App's backups, removes older ones of this App alone, and restores
+# the pre-install backup within 24 hours of a broken install. The token stays root's (s6's saved
+# environment, c1/lock.sh run); Cain's own user and the watcher never have it.
+hassio_api: true
+hassio_role: backup
 auth_api: false
 backup: cold
 # The link's two keys stay out of backups: whoever holds a backup can't sign a Ship
@@ -45,6 +50,10 @@ timeout: 30
 # App's options (/data/options.json, where Supervisor keeps every option: that is fine). Cain's own
 # session can read that file, so a compromised session can read the URL: keep it like a key. A leaked
 # URL can mask an outage or fake a failure. Empty: no heartbeat, and the morning check-in says so.
+# probe_heartbeat_url (0.14.0): the probe's own outside heartbeat, a second check at the same service
+# as heartbeat_url (its own ping URL). Pinged only after a probe that passed (every 5 minutes), so
+# the service alarms the owner when Cain stops answering, not only when the App stops. Read only by
+# the probe's own subshell (the run script), never by Cain's session, never logged. Empty: no ping.
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
@@ -65,6 +74,7 @@ options:
   pc_jobs_token: ""
   pc_jobs_repo: "HyndeSyte/pc-jobs"
   heartbeat_url: ""
+  probe_heartbeat_url: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -80,3 +90,4 @@ schema:
   pc_jobs_token: password?
   pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?
   heartbeat_url: password?
+  probe_heartbeat_url: password?

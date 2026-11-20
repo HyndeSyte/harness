@@ -16,12 +16,18 @@
 //   from the server: answers, notifications/claude/channel (his messages) and
 //     notifications/message. The initialize answer loses the permission-relay capability,
 //     so Claude Code never sends a prompt here.
+//   the hourly check (Cain 0.14.0, probe/core.ts): the probe asks root's broker, never Discord,
+//     to hand his session one fixed line on a chat id no Discord chat has (PROBE_CHAT), as a
+//     message of his channel; a reply to that chat is answered here and goes nowhere, and only the
+//     fixed answer counts (anything else to it is refused). So the hourly check costs one short
+//     turn of his and never reaches Dane, Discord or the gate.
 // The gate's hard rules fail closed: an error refuses the call, and no retry passes a hard
 // refusal. Limits: 12 MB a line (8 MB of attachments), 32 calls in flight, 60 s a call, 20 bad
 // frames. A call that may have done something (a send, an edit, a reaction, a download) and
 // never got its answer is told its outcome is unknown, never "send it again".
 import { chownSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { PROBE_CHAT, PROBE_LINE, PROBE_REPLY } from "../probe/core";
 
 export const MAX_LINE = 12 * 1024 * 1024;
 export const MAX_PENDING = 32;
@@ -64,6 +70,7 @@ export interface BrokerDeps {
   session: string;                                     // this connection's name, for the gate's tries
   setTimer?: (ms: number, f: () => void) => unknown;
   clearTimer?: (t: unknown) => void;
+  probeAnswered?: () => void;                          // his session gave the hourly check's fixed answer
 }
 
 interface Pending { method: string; tool?: string; args?: Record<string, unknown>; outbox?: string; note?: string; timer?: unknown; initialize?: boolean }
@@ -114,7 +121,18 @@ export class BrokerSession {
   private bad = 0;
   private initId: string | null = null;
   private closed = false;
+  private ready = false;                               // Claude Code's initialize was answered
   constructor(private d: BrokerDeps) {}
+
+  // The hourly check's line, handed to his session as a message of his channel. false when there
+  // is no session to hand it to yet.
+  probe(messageId: string): boolean {
+    if (this.closed || !this.ready) return false;
+    this.d.toClient(JSON.stringify({ jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: PROBE_LINE,
+      meta: { chat_id: PROBE_CHAT, message_id: messageId, user: "cain-app-probe", user_id: PROBE_CHAT, ts: new Date().toISOString() } } }));
+    this.d.log("handed his session the hourly check");
+    return true;
+  }
 
   private refuseFrame(why: string): void {
     this.bad++;
@@ -167,6 +185,15 @@ export class BrokerSession {
     const checked = checkArgs(name, m.params?.arguments);
     if ("why" in checked) { this.d.log(`refused ${name.slice(0, 40) || "a tool call"}: ${checked.why}`); return void this.d.toClient(toolError(m.id, `${name || "This call"} failed: ${checked.why}`)); }
     let args = checked.args;
+    // The hourly check's chat: answered here, never sent on. Only the fixed answer counts.
+    if (String(args.chat_id ?? args.channel ?? "") === PROBE_CHAT) {
+      if (name === "reply" && String(args.text ?? "").trim() === PROBE_REPLY && args.files_data === undefined) {
+        try { this.d.probeAnswered?.(); } catch (e) { this.d.log(`couldn't keep the hourly check's answer: ${String(e).slice(0, 80)}`); }
+        this.d.log("his session answered the hourly check");
+        return void this.d.toClient(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: "sent" }] } }));
+      }
+      return void this.d.toClient(toolError(m.id, `${name} failed: this chat is your App's hourly check; it takes only a reply with the text "${PROBE_REPLY}"`));
+    }
     const p: Pending = { method: "tools/call", tool: name };
     this.track(key, m.id, p);                                // counted while the gate runs
     if (name === "reply" || name === "edit_message") {
@@ -230,6 +257,7 @@ export class BrokerSession {
       const key = JSON.stringify(m.id);
       const p = this.untrack(key);
       if (!p) return;                                        // timed out, or never ours
+      if (p.initialize && m.result && !m.error) this.ready = true;
       if (p.initialize && m.result?.capabilities?.experimental) {
         const exp = { ...m.result.capabilities.experimental };
         delete exp["claude/channel/permission"];

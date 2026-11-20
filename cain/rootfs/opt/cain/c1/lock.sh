@@ -26,6 +26,11 @@ run)
   install -d -m 0750 -o root -g nogroup /run/cain/www /run/cain/upstream
   install -d -m 0750 -o root -g discord /run/cain/outbox
   install -d -m 0700 -o cain -g cain /run/cain/tmux
+  # The probe and the rollback watcher (Cain 0.14.0): the probe's records root's, its group's (watch)
+  # to read; the watcher's own folder its own; the hourly check's ask and answer root's alone.
+  install -d -m 0700 -o root -g root /run/cain/probe
+  install -d -m 0750 -o root -g watch "$D/probe" || die "no $D/probe"
+  install -d -m 0700 -o watch -g watch "$D/watcher" || die "no $D/watcher"
   chmod 0700 /run/s6/container_environment 2>/dev/null
   chmod 0400 /run/s6/container_environment/* 2>/dev/null
   [ ! -d /run/s6/container_environment ] || [ "$(stat -c %a /run/s6/container_environment)" = 700 ] \
@@ -67,6 +72,8 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   own "$D/link" root:root 0700
   own "$D/codex" root:root 0700
   own "$D/c1" root:root 0700
+  own "$D/probe" root:watch 0750
+  own "$D/watcher" watch:watch 0700
   own "$D/.claude" root:root 0700
   own "$D/.claude.json" root:root 0600
   own "$D/trust" root:root 0755

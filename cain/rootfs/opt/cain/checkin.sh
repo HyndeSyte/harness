@@ -433,6 +433,13 @@ kind=other; [ "$slot" = 0710 ] && kind=morning
 watch=$(timeout 30 bun "${SECURITY_MAIN:-/opt/cain/security/main.ts}" lines "$kind" 2>/dev/null \
           | head -n 1 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ')
 [ -n "$watch" ] && watch=" $watch"
+# A rollback the App saw at its start (probe/main.ts lines), once, for the morning's Moving section.
+probe_main="${PROBE_MAIN:-/opt/cain/probe/main.ts}"
+if [ "$kind" = morning ] && [ -f "$probe_main" ]; then
+  rolled=$(timeout 30 bun "$probe_main" lines morning 2>/dev/null \
+             | head -n 1 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ')
+  [ -n "$rolled" ] && watch="$watch $rolled"
+fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update.$watch"
 else
