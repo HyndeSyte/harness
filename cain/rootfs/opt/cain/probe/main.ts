@@ -46,7 +46,7 @@ import { chainVerdicts, checkFolder, FolderTampered, folderWhy } from "./folder"
 import {
   afterStart, alarmFor, askDue, bootKind, clockDue, endKind, END_KINDS, exitCause, failedWords, type Facts, hourlyState, type Hourly, type Install,
   inWindow, lastCode, lastSlot, logLine, longTurn, parseBoots, pass, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts,
-  parseAsked, parseUnseen, type Screen, tooManyAsked, ASKED_WINDOW_S, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
+  parseAsked, parseUnseen, type Screen, tooManyAsked, askedCount, allStarts, allCount, tooManyAll, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
   unseenCount, updateCause,
 } from "./core";
 
@@ -383,14 +383,14 @@ export function recordStart(p: Paths, now: number, end: string, notice: PassDeps
 const flagOf = (p: Paths, k: string) => `${p.alarmed}-${k}`;
 // The line that names the update: within a day of a version change, once for each new loop (it comes
 // down once neither loop stands, so the next loop says it again).
-function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-unseen" | "update-boots" | "update-asked", notice: PassDeps["notice"]): void {
+function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-unseen" | "update-boots" | "update-asked" | "update-starts", notice: PassDeps["notice"]): void {
   const i = json<Install>(p.install);
   if (!inWindow(i, now)) return;
   if (notice("tell", kind, updateCause(i!, now)) <= 1) writeWhole(flagOf(p, "update"), `${now}\n`);
 }
 function updateDown(p: Paths, notice: PassDeps["notice"]): void {
   if (!exists(flagOf(p, "update")) || exists(flagOf(p, "starts")) || exists(flagOf(p, "boots")) || exists(flagOf(p, "unseen"))
-    || exists(flagOf(p, "asked"))) return;
+    || exists(flagOf(p, "asked")) || exists(flagOf(p, "all"))) return;
   if (notice("clear", "update") <= 1) rm(flagOf(p, "update"));
 }
 // Repeated early exits (more than 3 in 30 minutes): "Cain's session keeps exiting early", and within
@@ -434,8 +434,25 @@ export function checkStarts(p: Paths, now: number, notice: PassDeps["notice"]): 
   } else if (exists(uflag)) {
     if (notice("clear", "unseen") <= 1) rm(uflag);
   }
+  checkAll(p, now, notice);
   updateDown(p, notice);
   return n;
+}
+// Every start together, whatever its kind (eighth round): container starts (boot, asked, update) and his
+// session's restarts after an early exit, an unseen end or a late error exit, in one window. More than 8
+// in 60 minutes, or more than 12 in 24 hours: "Cain's App keeps starting", with the counts by kind, and
+// within a day of an install the update line; down once both are back under.
+export function checkAll(p: Paths, now: number, notice: PassDeps["notice"]): void {
+  const all = allStarts(text(p.boots) ?? "", text(p.starts) ?? "");
+  const flag = flagOf(p, "all");
+  if (tooManyAll(all, now)) {
+    if (!exists(flag) && notice("tell", "start-loop", allCount(all, now)) <= 1) {
+      writeWhole(flag, `${now}\n`);
+      sayUpdate(p, now, "update-starts", notice);
+    }
+  } else if (exists(flag)) {
+    if (notice("clear", "all") <= 1) rm(flag);
+  }
 }
 // The run script started (start: its own id for this start). The first start in a container (a mark in
 // /run, which a new container starts without) is kept as "boot", "asked" (the Supervisor asked the App
@@ -471,18 +488,20 @@ export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): n
   } else if (exists(flag)) {
     if (notice("clear", "boots") <= 1) rm(flag);
   }
-  // Asked starts in their own window (seventh round): more than 6 in 60 minutes is "Cain's App keeps being
-  // restarted", requested but repeated; within a day of an install the update line too.
+  // Asked starts in their own windows (seventh round; the day window eighth): more than 6 in 60 minutes or
+  // more than 12 in 24 hours is "Cain's App keeps being restarted", each stop requested; within a day of an
+  // install the update line too.
   const asked = parseAsked(text(p.boots) ?? "");
   const aflag = flagOf(p, "asked");
   if (tooManyAsked(asked, now)) {
-    if (!exists(aflag) && notice("tell", "asked-loop", `${startsIn(asked, now, 0, ASKED_WINDOW_S)} in 60 minutes`) <= 1) {
+    if (!exists(aflag) && notice("tell", "asked-loop", askedCount(asked, now)) <= 1) {
       writeWhole(aflag, `${now}\n`);
       sayUpdate(p, now, "update-asked", notice);
     }
   } else if (exists(aflag)) {
     if (notice("clear", "asked") <= 1) rm(aflag);
   }
+  checkAll(p, now, notice);
   updateDown(p, notice);
   return n;
 }

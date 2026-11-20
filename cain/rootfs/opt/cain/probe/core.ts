@@ -24,8 +24,14 @@
 //     within 10 minutes of a version change aren't counted there;
 //   - repeated asked restarts of his App's container (seventh round): every stop the Supervisor asks for
 //     arrives as the same SIGTERM, whoever asked (the owner, an automation, a watchdog), so asked starts
-//     are counted in their own window: more than 6 in 60 minutes alarm that the App keeps being restarted.
-// Within a day of a version change, the early-exit, unseen, container or asked-restart loop also says so, with the way back
+//     are counted in their own windows: more than 6 in 60 minutes, or (eighth round) more than 12 in 24
+//     hours, alarm that the App keeps being restarted;
+//   - every start together, whatever its kind (eighth round): each container start (boot, asked or update)
+//     and each restart of his session after an early exit, an unseen end or a late error exit, counted in
+//     one combined window: more than 8 in 60 minutes, or more than 12 in 24 hours, alarm that the App keeps
+//     starting, with the counts by kind. A loop that mixes kinds (5 asked and 3 unseen in an hour) or
+//     paces one kind under its own limits can't stay under this one. The per-kind windows stay as they are.
+// Within a day of a version change, the early-exit, unseen, container, asked-restart or combined-start loop also says so, with the way back
 // by hand; outside that day an alarm gives the count, the window and what root saw only.
 // The owner's Stop (stop.json) stops jobs, cards and merges, not his session, so none of this reads it.
 // Only the App's own stopped mode (the mode file says none) silences the liveness alarms and pings.
@@ -46,6 +52,12 @@ export const UNSEEN_DAY_S = 24 * 3600;
 export const UNSEEN_DAY_MAX = 8;                 // or more than this many in a day (a slow loop, seventh round)
 export const ASKED_WINDOW_S = 60 * 60;
 export const ASKED_MAX = 6;                      // more than this many asked container starts in the hour
+export const ASKED_DAY_S = 24 * 3600;
+export const ASKED_DAY_MAX = 12;                 // or more than this many in a day (eighth round)
+export const ALL_WINDOW_S = 60 * 60;
+export const ALL_MAX = 8;                        // more than this many starts of every kind together in the hour
+export const ALL_DAY_S = 24 * 3600;
+export const ALL_DAY_MAX = 12;                   // or more than this many in a day (eighth round)
 export const DEFER_MAX_S = 2 * 3600;             // the hourly line waits for a turn at most this long
 export const TURN_LONG_S = 2 * 3600;             // a turn at work this long alarms, once a stretch
 export const BOOTS_MAX = 3;                      // more than this many counted container starts in the window
@@ -323,7 +335,59 @@ export function tooManyBoots(boots: number[], now: number): boolean { return sta
 // The asked starts (seventh round): a stop asked of the Supervisor is the same SIGTERM whoever asked, so a
 // loop of them (an automation, repeated restarts from the App's page, a watchdog) counts in its own window.
 export function parseAsked(text: string): number[] { return startLines(text, /^asked$/); }
-export function tooManyAsked(asked: number[], now: number): boolean { return startsIn(asked, now, 0, ASKED_WINDOW_S) > ASKED_MAX; }
+// Asked starts in two windows: more than 6 in 60 minutes, or (eighth round) more than 12 in 24 hours, so a
+// requested restart every 11 minutes (at most 6 an hour) all day can't stay under them.
+export function tooManyAsked(asked: number[], now: number): boolean {
+  return startsIn(asked, now, 0, ASKED_WINDOW_S) > ASKED_MAX || startsIn(asked, now, 0, ASKED_DAY_S) > ASKED_DAY_MAX;
+}
+// The count an asked alarm gives, with its window: the tighter window that tripped.
+export function askedCount(asked: number[], now: number): string {
+  const n60 = startsIn(asked, now, 0, ASKED_WINDOW_S);
+  return n60 > ASKED_MAX ? `${n60} in 60 minutes` : `${startsIn(asked, now, 0, ASKED_DAY_S)} in 24 hours`;
+}
+
+// -- every start together (eighth round) -------------------------------------------------------------
+// Each class of start is counted in its own windows, so a loop that mixes them (5 asked and 3 unseen in
+// an hour) or paces one class under its own limits stayed silent. Here every start counts, whatever its
+// kind: each container start from the boots file (boot, asked, update), and each restart of his session
+// from the starts file after an early exit, an unseen end or a late error exit. A container start also
+// writes a "boot" line to the starts file (the first session in it), and a requested or clean end of his
+// session is no restart of the App: neither is counted again here.
+export type StartClass = "asked" | "unseen" | "early" | "self" | "update" | "plain";
+export interface AnyStart { at: number; kind: StartClass }
+const CLASS_WORDS: [StartClass, string][] = [
+  ["asked", "asked"], ["unseen", "with no clean stop recorded"], ["early", "after an early exit"],
+  ["self", "after an error exit"], ["update", "after the update"], ["plain", "plain"],
+];
+export function allStarts(bootsText: string, startsText: string): AnyStart[] {
+  const out: AnyStart[] = [];
+  const rows = (t: string) => t.split("\n").map((l) => l.trim().split(/\s+/)).map((p) => ({ at: Number(p[0]), k: p[1] ?? "" }))
+    .filter((r) => Number.isSafeInteger(r.at) && r.at > 0);
+  for (const r of rows(bootsText)) {
+    if (r.k === "boot") out.push({ at: r.at, kind: "plain" });
+    else if (r.k === "asked") out.push({ at: r.at, kind: "asked" });
+    else if (r.k === "update") out.push({ at: r.at, kind: "update" });
+  }
+  for (const r of rows(startsText)) {
+    if (r.k === "unseen") out.push({ at: r.at, kind: "unseen" });
+    else if (/^early-(clean|unknown|\d{1,3})$/.test(r.k)) out.push({ at: r.at, kind: "early" });
+    else if (/^self-\d{1,3}$/.test(r.k)) out.push({ at: r.at, kind: "self" });
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+export function tooManyAll(all: AnyStart[], now: number): boolean {
+  const at = all.map((s) => s.at);
+  return startsIn(at, now, 0, ALL_WINDOW_S) > ALL_MAX || startsIn(at, now, 0, ALL_DAY_S) > ALL_DAY_MAX;
+}
+// The cause the combined alarm carries: the count in the tighter window that tripped, then the counts by
+// kind in that window ("9 starts in an hour: 5 asked, 3 with no clean stop recorded, 1 plain").
+export function allCount(all: AnyStart[], now: number): string {
+  const in60 = all.filter((s) => s.at > now - ALL_WINDOW_S && s.at <= now);
+  const hour = in60.length > ALL_MAX;
+  const inWin = hour ? in60 : all.filter((s) => s.at > now - ALL_DAY_S && s.at <= now);
+  const parts = CLASS_WORDS.map(([k, w]) => [inWin.filter((s) => s.kind === k).length, w] as const).filter(([n]) => n > 0).map(([n, w]) => `${n} ${w}`);
+  return `${inWin.length} starts in ${hour ? "an hour" : "24 hours"}: ${parts.join(", ")}`;
+}
 // A file kept short: the last day, at most 500 lines.
 export function pruneStarts(text: string, now: number): string {
   const keep = text.split("\n").filter((l) => { const n = Number(l.trim().split(/\s+/)[0]); return Number.isSafeInteger(n) && n > now - 86400; });

@@ -387,8 +387,8 @@ back anything, it has no Supervisor access, and no switch.
 - **Unseen ends** have their own three windows: more than 3 in 30 minutes, more than 6 in 60 minutes, or more than 8 in 24 hours
   is "Cain's session keeps restarting", with the count and the window that tripped. The 24-hour
   window catches a slow loop the others miss (a restart every 11 minutes all day); a pace slower than
-  all three stays under them. Its text says no clean stop was recorded (a crash, a kill or a power
-  cut), and that the restarts were seen but not the exits, so it is a cadence, not a confirmed crash;
+  all three stays under them. Its text says no clean stop was recorded (a crash, a kill, a power
+  cut, or a stop that took too long to finish (the stop drill timings show it)), and that the restarts were seen but not the exits, so it is a cadence, not a confirmed crash;
   it never counts as an early exit. Within a day of an update it carries the update line too, since an early crash
   before the exit handlers run looks unseen.
 - **Repeated late error exits of his session**: an unasked end after the 5-minute mark with an
@@ -422,11 +422,26 @@ back anything, it has no Supervisor access, and no switch.
 - **Repeated asked restarts of his App**: every stop the Supervisor asks for arrives as the same
   signal, whoever asked, so a loop of them (a Home Assistant automation, repeated restarts from the
   App's page, a watchdog) would otherwise never count. Asked starts are kept in their own window in
-  `/data`: more than 6 in 60 minutes is "Cain's App keeps being restarted". Its text says the
-  restarts were requested but keep repeating, and that nothing rolls back by itself; look for an
-  automation or a watchdog restarting the App. Within a day of an update it carries the update line
-  too.
-- **The line that names the update**: when a loop (early exits, unseen ends, container starts or asked restarts) begins
+  `/data`, with two windows: more than 6 in 60 minutes, or more than 12 in 24 hours (so a requested
+  restart every 11 minutes, at most 6 an hour, still alarms within a day), is "Cain's App keeps being
+  restarted". Its text says the previous runs ended with a stop that was requested (a Restart or
+  update from Home Assistant, a backup, an automation, or the Supervisor's watchdog restarting an App
+  that looked unhealthy), to check the Supervisor log for who asked and why, and that if the watchdog
+  asked, the App looked unhealthy to it, and that is what to fix, not the watchdog. Nothing rolls
+  back by itself. Within a day of an update it carries the update line too, with the same words.
+- **Every start together**: each kind of start above is counted in its own windows, so a loop that
+  mixes kinds (5 asked restarts and 3 unseen ends in an hour) or paces one kind under its own limits
+  would stay under each of them. One combined window counts them all, whatever the kind: each
+  container start (plain, asked, or one of an update's own) and each restart of his session after an
+  early exit, an unseen end or a late error exit. More than 8 in 60 minutes, or more than 12 in 24
+  hours, is "Cain's App keeps starting", whose cause gives the counts by kind, for example "9 starts
+  in an hour: 5 asked, 3 with no clean stop recorded, 1 plain". Within a day of an update it carries
+  the update line too. The per-kind windows stay as they are. In short, the windows are: early exits,
+  more than 3 in 30 minutes; unseen ends, more than 3 in 30 minutes, more than 6 in 60 minutes, or
+  more than 8 in 24 hours; late error exits, more than 4 in 60 minutes; counted container starts, more
+  than 3 in 30 minutes; asked restarts, more than 6 in 60 minutes, or more than 12 in 24 hours; every
+  start together, more than 8 in 60 minutes, or more than 12 in 24 hours.
+- **The line that names the update**: when a loop (early exits, unseen ends, container starts, asked restarts or every start together) begins
   within a day of a version change, a second alarm goes with it, for example: "Cain's session has
   exited early several times since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls
   back by itself. If a backup was made before the update, restoring it from Backups undoes the update
@@ -436,8 +451,10 @@ back anything, it has no Supervisor access, and no switch.
   job."; it comes down when the turn ends.
 - **Asked stops never count as crashes**: an owner's Stop, Restart or update from Home Assistant
   reaches the App's start script as a stop signal before anything else stops, and root records it as
-  asked before his session ends. They count only in the asked-restart window above (more than 6 in an
-  hour), never as early exits or container starts. Claude Code's own updater is off in this App (its version is pinned in
+  asked before his session ends. They count only in the asked-restart windows above (more than 6 in an
+  hour, or more than 12 in a day) and in the combined window over every start, never as early exits or
+  counted container starts. His session's own end by a signal, while the start script keeps running,
+  is never asked: only the start script's own end by SIGTERM is, and his user can't signal it. Claude Code's own updater is off in this App (its version is pinned in
   the image), so it never ends his session to update itself.
   Claude Code fixes arrive with App releases, and the repository's CI notes when a newer Claude Code
   than the pinned one is out.
@@ -452,7 +469,7 @@ when they are plain files. If a folder isn't right, the App refuses to use it, s
 heartbeat ping (so the outside service alarms too) and raises
 "Cain's probe folder isn't the App's alone", again each day while it lasts. Its cause names the failing path with its owner and mode in
 plain words, for example "/run is owned by user 1000, mode 0777". The way out: restarting the App
-sets the folders up again; if the alarm comes back, the App's log names the path.
+sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand.
 
 ### Checking it on the Pi
 

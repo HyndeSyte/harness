@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  afterStart, ago, alarmFor, askDue, bootKind, endKind, exitCause, type Facts, hourlyState, inWindow, type Install,
+  afterStart, ago, allCount, allStarts, alarmFor, askDue, askedCount, bootKind, tooManyAll, endKind, exitCause, type Facts, hourlyState, inWindow, type Install,
   lastCode, lastSlot, layers, localTime, logLine, parseAsked, parseBoots, parseSelf, parseStarts, parseUnseen, pass, PROBE_CHAT, PROBE_LINE,
   PROBE_REPLY, screenOf, shouldPing, startsIn, tooManyAsked, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen, unseenCount,
 } from "../rootfs/opt/cain/probe/core";
@@ -383,11 +383,12 @@ describe("early exits of his session, kept in /data", () => {
       }
       if (seenEvery) {
         expect(new Set(kinds)).toEqual(new Set(["early-unknown", "early-clean"]));
-        expect(tells(notices)).toEqual(["restarts", "update-exits"]);     // once for the loop, not each start
+        // once for the loop, not each start; the ninth start in the hour trips the combined window too (eighth round)
+        expect(tells(notices)).toEqual(["restarts", "update-exits", "start-loop", "update-starts"]);
       } else {
         // No exit recorded and no asked mark (the finish script suppressed): unseen, alarmed as a tight loop.
         expect(new Set(kinds)).toEqual(new Set(["unseen"]));
-        expect(tells(notices)).toEqual(["unseen-loop", "update-unseen"]);
+        expect(tells(notices)).toEqual(["unseen-loop", "update-unseen", "start-loop", "update-starts"]);
       }
       const told = notices.filter((x) => x[0] === "tell");
       expect(told[0][2]).toMatch(seenEvery ? /^4 in 30 minutes, last exit code (0|1)$/ : /^4 in 30 minutes$/);
@@ -432,12 +433,15 @@ describe("early exits of his session, kept in /data", () => {
     for (let i = 1; i <= 12; i++) kinds.push(sessionStart(p, T + i * 330, i % 3 ? 1 : null, n, "").kind);   // s6 restarted the run script each time
     expect(new Set(kinds)).toEqual(new Set(["unseen"]));
     // The fourth, once for the stretch (4 in 30 minutes), and within a day of an install the update line too.
-    expect(notices).toEqual([["tell", "unseen-loop", "4 in 30 minutes"], ["tell", "update-unseen", "Cain 0.14.0, installed 32 minutes ago"]]);
+    // Eighth round: the ninth start in the hour trips the combined window as well, with its counts by kind.
+    expect(notices).toEqual([["tell", "unseen-loop", "4 in 30 minutes"], ["tell", "update-unseen", "Cain 0.14.0, installed 32 minutes ago"],
+      ["tell", "start-loop", "9 starts in an hour: 9 with no clean stop recorded"], ["tell", "update-starts", "Cain 0.14.0, installed 59 minutes ago"]]);
     expect(parseStarts(readFileSync(p.starts, "utf8"))).toEqual([]);
     expect(parseSelf(readFileSync(p.starts, "utf8"))).toEqual([]);
     // Twelve unseen ends in a day stay over the 24-hour window (more than 8): still up an hour on.
+    // The combined window (12 in a day is not more than 12) comes down; the unseen one stays.
     recordStart(p, T + 12 * 330 + 3600, "clean", n);
-    expect(notices.some((x) => x[0] === "clear")).toBe(false);
+    expect(notices.filter((x) => x[0] === "clear")).toEqual([["clear", "all"]]);
     recordStart(p, T + 12 * 330 + 86400, "clean", n);
     expect(notices.slice(-2)).toEqual([["clear", "unseen"], ["clear", "update"]]);
   });
@@ -755,7 +759,7 @@ describe("notice.sh", () => {
     const n = src("rootfs/opt/cain/notice.sh");
     expect(n).toContain('restarts) groups="restarts" ;;');
     expect(n).toContain('update) groups="update" ;;');
-    expect(n).toContain("update-exits|update-unseen|update-boots|update-asked) echo update ;;");
+    expect(n).toContain("update-exits|update-unseen|update-boots|update-asked|update-starts) echo update ;;");
     expect(n).toContain('asked) groups="asked" ;;');
     expect(n).toContain("asked-loop) echo asked ;;");
   });
@@ -1273,18 +1277,18 @@ describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window
     expect(tooManyAsked([T - 3599, T - 3000, T - 2000, T - 1000, T - 500, T - 10, T], T)).toBe(true);
     expect(tooManyAsked([T - 3600, T - 3000, T - 2000, T - 1000, T - 500, T - 10, T], T)).toBe(false);
   });
-  test("the asked-restart alarm's text: requested but repeated, nothing rolls back by itself; the update kind is in the update group", () => {
+  test("the asked-restart alarm's text: who asked, the Supervisor log, nothing rolls back by itself; the update kind is in the update group", () => {
     const [t, m] = msg("asked-loop", "7 in 60 minutes");
     expect(t).toBe("Cain's App keeps being restarted");
-    expect(m).toContain("more than 6 times in an hour (7 in 60 minutes)");
-    expect(m).toContain("Each restart was requested");
-    expect(m).toContain("they keep repeating");
+    expect(m).toContain("more than 6 times in an hour or more than 12 times in a day (7 in 60 minutes)");
+    expect(m).toContain("The previous runs ended with a stop that was requested");
     expect(m).toContain("Nothing rolls back by itself");
     expect(m).not.toContain("—");
     const [ut, um] = msg("update-asked", "Cain 0.14.0, installed 3 hours ago");
     expect(ut).toBe("Cain's App keeps being restarted since his update");
-    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. The restarts were requested, but they keep repeating. Nothing rolls back by itself.");
-    expect(src("rootfs/opt/cain/notice.sh")).toContain("update-exits|update-unseen|update-boots|update-asked) echo update ;;");
+    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. The previous runs ended with a stop that was requested");
+    expect(um).toContain("Nothing rolls back by itself.");
+    expect(src("rootfs/opt/cain/notice.sh")).toContain("update-exits|update-unseen|update-boots|update-asked|update-starts) echo update ;;");
   });
   test("a pending mark alone is never asked: the next container start is a plain boot, and the mark is cleared", () => {
     const { p, notices, n, at } = startsWorld();
@@ -1375,7 +1379,7 @@ describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window
     for (const f of ["rootfs/opt/cain/probe/core.ts", "rootfs/opt/cain/probe/main.ts", "rootfs/etc/services.d/cain/run", "rootfs/etc/services.d/cain/finish", "rootfs/opt/cain/notice.sh", "DOCS.md", "CHANGELOG.md"])
       expect(src(f)).not.toMatch(/any pace|whatever the gap|at any cadence|any cadence/i);
     const u = msg("unseen-loop", "9 in 24 hours")[1];
-    expect(u).toContain("no clean stop was recorded (a crash, a kill or a power cut)");
+    expect(u).toContain("no clean stop was recorded (a crash, a kill, a power cut, or a stop that took too long to finish (the stop drill timings show it))");
     expect(u).toContain("more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day (9 in 24 hours)");
     const docs = src("DOCS.md");
     expect(docs).toContain("more than 3 in 30 minutes, more than 6 in 60 minutes, or more than 8 in 24 hours");
@@ -1385,14 +1389,13 @@ describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window
     const [t, m] = msg("tampered", "/run is owned by user 1000, mode 0777 (above /run/cain/probe)");
     expect(t).toBe("Cain's probe folder isn't the App's alone");
     expect(m).toContain("(/run is owned by user 1000, mode 0777 (above /run/cain/probe))");
-    expect(m).toContain("restarting the App sets the folders up again");
-    expect(m).toContain("If this alarm comes back, the Cain App's log names the path");
+    expect(m).toContain("restarting the App sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand");
     expect(m).toContain("this alarm comes again each day meanwhile");
     for (const f of ["rootfs/opt/cain/notice.sh", "rootfs/opt/cain/probe/folder.ts", "rootfs/opt/cain/probe/main.ts", "DOCS.md", "CHANGELOG.md"])
       expect(src(f)).not.toContain("tampered with");
-    const docs = src("DOCS.md");
+    const docs = src("DOCS.md").replace(/\s+/g, " ");
     expect(docs).toContain("Cain's probe folder isn't the App's alone");
-    expect(docs).toContain("the App's log names the path");
+    expect(docs).toContain("restarting the App sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand");
   });
   test("each folder's verdict, from the probe's two up to /, for the first drill", () => {
     const dir = tmp();
@@ -1420,5 +1423,171 @@ describe("asked restarts counted, a two-phase stop mark, a 24-hour unseen window
     expect(drill.split('stop_times "$').length - 1).toBe(3);
     const docs = src("DOCS.md");
     expect(docs).toContain("on the Pi after the install, before the alarms are relied on");
+  });
+});
+
+describe("one window over every start, asked restarts over a day, alarm texts that point at the cause (eighth round)", () => {
+  const NOTICE = join(ROOT, "rootfs/opt/cain/notice.sh");
+  const msg = (k: string, c = "") => Bun.spawnSync(["bash", NOTICE, "text", k, c]).stdout.toString().split("\n");
+  // One container: the run script starts, his session starts, then, stop seconds later, the Supervisor stops
+  // it (the trap, then the finish script with 256/15). The next start follows within seconds of the stop.
+  function askedStop(at: (r?: string) => ReturnType<typeof paths>, n: (...a: string[]) => number, c: string, t: number, sid: string, stop = 140) {
+    const p = at(c);
+    const kind = recordBoot(p, t, n, sid);
+    const r = sessionStart(p, t + 5, null, n, "");
+    stopAsked(p, t + stop, r.id, sid);
+    expect(stopFinish(p, t + stop + 1, 256, 15)).toBe(true);
+    return kind;
+  }
+  test("a requested restart every 11 minutes (at most 6 an hour) alarms within a day: the combined window, then the asked one", () => {
+    const { notices, n, at } = startsWorld();
+    const firstAt: Record<string, number> = {};
+    for (let i = 0; i <= 13; i++) {
+      expect(askedStop(at, n, `c${i}`, T + i * 660, `${i}`.padStart(16, "e"), 650)).toBe(i === 0 ? "boot" : "asked");
+      for (const k of tells(notices)) firstAt[k] ??= i;
+    }
+    // Never more than 6 asked starts in any hour: the hour windows stay quiet.
+    expect(tooManyAsked(parseAsked(readFileSync(at().boots, "utf8")), T + 6 * 660)).toBe(false);
+    // The thirteenth start (one plain, twelve asked) trips the combined day window; the thirteenth asked start the asked one.
+    expect(firstAt).toEqual({ "start-loop": 12, "asked-loop": 13 });
+    expect(notices.filter((x) => x[0] === "tell")).toEqual([
+      ["tell", "start-loop", "13 starts in 24 hours: 12 asked, 1 plain"],
+      ["tell", "asked-loop", "13 in 24 hours"],
+    ]);
+    expect(13 * 660).toBeLessThan(86400);                                  // within a day: under two and a half hours
+  });
+  test("a mixed loop in an hour: 5 asked and 3 unseen after a plain start alarms \"Cain's App keeps starting\", with the counts by kind", () => {
+    const { notices, n, at } = startsWorld();
+    recordInstall(at("c0"), "0.13.5", T - 86400 * 3);
+    recordInstall(at("c0"), "0.14.0", T - 2 * 3600);
+    let t = T;
+    askedStop(at, n, "c0", t, "0".padStart(16, "f"));                     // the plain first start, its stop asked
+    for (let i = 1; i <= 5; i++) { t += 360; askedStop(at, n, `c${i}`, t, `${i}`.padStart(16, "f")); }
+    // Then, in the last container, s6 restarts the run script three times and no clean stop is recorded.
+    const c5 = at("c5");
+    for (let k = 0; k < 3; k++) {
+      t += 360;
+      expect(recordBoot(c5, t, n, `${k}`.padStart(16, "a"))).toBeNull();
+      expect(sessionStart(c5, t + 5, null, n, "").kind).toBe("unseen");
+      if (k === 1) expect(notices.filter((x) => x[0] === "tell")).toEqual([]);   // 8 starts: under the limit
+    }
+    expect(t - T).toBeLessThan(3600);
+    // No one kind is over its own limit (5 asked, 3 unseen in half an hour), but all 9 together are.
+    expect(notices.filter((x) => x[0] === "tell")).toEqual([
+      ["tell", "start-loop", "9 starts in an hour: 5 asked, 3 with no clean stop recorded, 1 plain"],
+      ["tell", "update-starts", "Cain 0.14.0, installed 2 hours ago"],
+    ]);
+    // Down once the hour and the day are back under (9 in a day is not more than 12), and the update line with it.
+    recordBoot(at("c9"), t + 3600, n, "9".padStart(16, "a"));
+    expect(notices.filter((x) => x[0] === "clear")).toEqual([["clear", "all"], ["clear", "update"]]);
+  });
+  test("a quiet day with a few restarts of each kind raises nothing", () => {
+    const { notices, n, at } = startsWorld();
+    // Three restarts from Home Assistant through the day, each asked; then a crash and a plain start.
+    let last = T;
+    askedStop(at, n, "c0", T, "0".padStart(16, "9"), 2 * 3600 - 20);
+    for (const [i, h, next] of [[1, 2, 7], [2, 7, 15], [3, 15, 18]] as const) {
+      expect(askedStop(at, n, `c${i}`, T + h * 3600, `${i}`.padStart(16, "9"), i === 3 ? 60 : (next - h) * 3600 - 20)).toBe("asked");
+      last = T + h * 3600;
+    }
+    expect(last).toBe(T + 15 * 3600);
+    recordBoot(at("c4"), T + 18 * 3600, n, "4".padStart(16, "9"));        // a plain start after a crash
+    const c4 = at("c4");
+    sessionStart(c4, T + 18 * 3600 + 5, null, n, "");
+    sessionStart(c4, T + 20 * 3600, null, n, "");                         // unseen
+    recordStart(c4, T + 21 * 3600, "early-1", n);
+    recordStart(c4, T + 22 * 3600, "self-1", n);
+    expect(notices).toEqual([]);
+  });
+  test("the combined window and the asked day window, at their edges", () => {
+    const hour = (k: number, last: number) => [...Array.from({ length: k - 1 }, (_, j) => `${T - j * 60} asked`), `${T - last} boot`].join("\n");
+    expect(tooManyAll(allStarts(hour(9, 3599), ""), T)).toBe(true);
+    expect(tooManyAll(allStarts(hour(9, 3600), ""), T)).toBe(false);
+    expect(tooManyAll(allStarts(hour(8, 100), ""), T)).toBe(false);
+    const day = (k: number, last: number) => [...Array.from({ length: k - 1 }, (_, j) => `${T - j * 7000} asked`), `${T - last} boot`].join("\n");
+    expect(tooManyAll(allStarts(day(13, 86399), ""), T)).toBe(true);
+    expect(tooManyAll(allStarts(day(13, 86400), ""), T)).toBe(false);
+    const asked = (k: number, last: number) => [...Array.from({ length: k - 1 }, (_, j) => T - j * 7000), T - last];
+    expect(tooManyAsked(asked(13, 86399), T)).toBe(true);
+    expect(tooManyAsked(asked(13, 86400), T)).toBe(false);
+    expect(askedCount(asked(13, 86399), T)).toBe("13 in 24 hours");
+    // Every kind is counted, once: a session's own "boot" line (the first in a container), a requested or
+    // clean end of his session are not starts of the App.
+    const all = allStarts(`${T - 9} boot\n${T - 8} asked\n${T - 7} update\n`, `${T - 9} boot\n${T - 6} unseen\n${T - 5} early-1\n${T - 4} self-137\n${T - 3} asked\n${T - 2} clean\n${T - 1} unknown\n`);
+    expect(all.map((x) => x.kind)).toEqual(["plain", "asked", "update", "unseen", "early", "self"]);
+    expect(allCount([...all, ...all].map((x, i) => ({ ...x, at: x.at - (i < 6 ? 0 : 1) })), T)).toBe(
+      "12 starts in an hour: 2 asked, 2 with no clean stop recorded, 2 after an early exit, 2 after an error exit, 2 after the update, 2 plain");
+  });
+  test("the combined alarm's text and group; its update line; its clear", () => {
+    const [t, m] = msg("start-loop", "9 starts in an hour: 5 asked, 3 with no clean stop recorded, 1 plain");
+    expect(t).toBe("Cain's App keeps starting");
+    expect(m).toContain("more than 8 times in an hour or more than 12 times in a day (9 starts in an hour: 5 asked, 3 with no clean stop recorded, 1 plain)");
+    expect(m).toContain("Nothing rolls back by itself");
+    const [ut, um] = msg("update-starts", "Cain 0.14.0, installed 3 hours ago");
+    expect(ut).toBe("Cain's App keeps starting since his update");
+    expect(um).toContain("since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls back by itself.");
+    const nsh = src("rootfs/opt/cain/notice.sh");
+    expect(nsh).toContain("start-loop) echo all ;;");
+    expect(nsh).toContain('all) groups="all" ;;');
+    expect(nsh).toMatch(/GROUPS_ALL="[^"]* all [^"]*"/);
+    expect(Bun.spawnSync(["bash", NOTICE, "text", "start-loop", "x"]).exitCode).toBe(0);
+  });
+  test("no asked or combined text tells the owner to turn something off; each names the Supervisor log and the watchdog", () => {
+    for (const k of ["asked-loop", "update-asked", "start-loop"]) {
+      const m = msg(k, "7 in 60 minutes")[1];
+      expect(m).not.toMatch(/turn (it|them|that|this)? ?off|switch (it )?off|disable|look for an automation/i);
+      expect(m).toMatch(/[Cc]heck the Supervisor log for who asked and why/);
+      expect(m).toContain("If the watchdog asked, the App looked unhealthy to it, and that is what to fix, not the watchdog.");
+      expect(m).toContain("Nothing rolls back by itself.");
+      expect(m).not.toContain("—");
+    }
+    for (const k of ["asked-loop", "update-asked"]) {
+      const m = msg(k, "7 in 60 minutes")[1];
+      expect(m).toContain("The previous runs ended with a stop that was requested: a Restart or update from Home Assistant, a backup, an automation, or the Supervisor's watchdog restarting an App that looked unhealthy.");
+    }
+    expect(src("rootfs/opt/cain/notice.sh")).not.toMatch(/turn it off/i);
+  });
+  test("a session child ending with signal 15 while the run script keeps running leaves no asked mark", () => {
+    for (const ranS of [60, 600]) {
+      const { p, notices, n, at } = startsWorld();
+      const c0 = at("c0");
+      expect(recordBoot(c0, T, n, S1)).toBe("boot");
+      const r = sessionStart(c0, T + 5, null, n, "");
+      // His session (a child, under tmux) ends by its own SIGTERM: exit 143. The run script keeps running, so
+      // no TERM trap ran and no finish script: it only saw the session gone, and starts it again.
+      markGone(c0, T + 5 + ranS, r.id);
+      const next = sessionStart(c0, T + 6 + ranS, 143, n, r.id);
+      expect(next.kind).toBe(ranS <= 300 ? "early-143" : "self-143");
+      expect(existsSync(p.stopAsked)).toBe(false);
+      expect(existsSync(c0.term)).toBe(false);
+      expect(existsSync(c0.asked)).toBe(false);
+      // A finish script never ran: the next container start is a plain boot, never asked.
+      expect(recordBoot(at("c1"), T + 900, n, S2)).toBe("boot");
+      expect(notices).toEqual([]);
+    }
+  });
+  test("the run script never execs: his session is started as a child (under tmux), never in the run script's place", () => {
+    const run = src("rootfs/etc/services.d/cain/run");
+    const code = run.split("\n").filter((l) => !/^\s*#/.test(l)).map((l) => l.replace(/\s#.*$/, ""));
+    expect(code.filter((l) => /(^|[;&|({]\s*|\s)exec(\s|$)/.test(l))).toEqual([]);
+    const start = run.slice(run.indexOf("start_session() {"), run.indexOf("\n}\n", run.indexOf("start_session() {")));
+    expect(start).toContain("new-session -d -s cain");
+    expect(start).not.toMatch(/\bexec\b/);
+    // The image test checks the same in the real image, as uid 1000.
+    const img = src("tests/image/in.sh");
+    expect(img).toContain("run_script_boundary");
+    expect(img).toContain("kill -0");
+  });
+  test("DOCS.md and CHANGELOG.md name the combined window and the three asked and unseen windows", () => {
+    for (const f of ["DOCS.md", "CHANGELOG.md"]) {
+      // The 0.14.0 section of the CHANGELOG, whitespace folded.
+      const d = (f === "CHANGELOG.md" ? src(f).split(/^## /m)[1] : src(f)).replace(/\s+/g, " ");
+      expect(d).toContain("Cain's App keeps starting");
+      expect(d).toContain("more than 8 in 60 minutes, or more than 12 in 24 hours");
+      expect(d).toContain("more than 6 in 60 minutes, or more than 12 in 24 hours");
+      expect(d).toContain("more than 3 in 30 minutes, more than 6 in 60 minutes, or more than 8 in 24 hours");
+      expect(d).not.toMatch(/turn it off/i);
+    }
+    expect(src("DOCS.md").replace(/\s+/g, " ")).toContain("a stop that took too long to finish (the stop drill timings show it)");
   });
 });

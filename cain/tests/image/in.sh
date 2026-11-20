@@ -117,6 +117,61 @@ probe_marks_root_only() {
   [ "$p" = 0 ] && [ "$q" = "root:root 700" ] || fail "a missing probe folder wasn't made root's 0700 (exit $p, $q)"
 }
 
+# Eighth round: the trust boundary between his session and the run script, in the real image. The run
+# script never execs (it stays its own process, s6's child, while his session runs) and starts his
+# session with its own start_session, under tmux as his own user (as-cain). As uid 1000, signalling the
+# run script fails: kill -0 on its pid is refused, so a SIGTERM of his (or a child's own) can never end
+# the run script, and so never becomes the finish script's 256 with signal 15, an asked stop.
+run_script_boundary() {
+  local w=/tmp/boundary rs i sess sp out
+  rm -rf "$w"; install -d -m 0755 "$w" "$w/opt"; install -d -m 0700 -o cain -g cain "$w/o"
+  # The run script's own start_session, as it ships, in a root bash standing in for the run script.
+  sed -n '/^start_session() {/,/^}/p' /etc/services.d/cain/run > "$w/start_session.sh"
+  grep -q 'new-session -d -s cain' "$w/start_session.sh" || fail "the run script's start_session wasn't found"
+  grep -Ev '^[[:space:]]*#' /etc/services.d/cain/run | grep -Eq '(^|[;&|({[:space:]])exec([[:space:]]|$)' && fail "the run script execs"
+  cp "$OPT/as-cain" "$w/opt/as-cain"
+  # A stand-in session.sh: as his user it tries to signal the run script, and records what each try said.
+  cat > "$w/opt/session.sh" <<'EOS'
+#!/bin/bash
+rs="$(cat /tmp/boundary/rs.pid)"
+{
+  echo "me $$ $PPID $(id -u)"
+  if e="$(kill -0 "$rs" 2>&1)"; then echo "kill0 ok"; else echo "kill0 refused: $e"; fi
+  if e="$(kill -TERM "$rs" 2>&1)"; then echo "term ok"; else echo "term refused: $e"; fi
+} > /tmp/boundary/o/out.tmp
+mv /tmp/boundary/o/out.tmp /tmp/boundary/o/out
+exec sleep 30
+EOS
+  chmod 0755 "$w/opt/as-cain" "$w/opt/session.sh"
+  { echo '#!/bin/bash'; echo "OPT=$w/opt; SOCK_TMUX=/run/cain/tmux/cain.sock; mode=own"; cat "$w/start_session.sh"
+    echo "echo \$\$ > $w/rs.pid; chmod 0644 $w/rs.pid"; echo 'start_session'; echo 'while sleep 1; do :; done'; } > "$w/run.sh"
+  bash "$w/run.sh" & rs=$!
+  for i in $(seq 1 100); do [ -s "$w/o/out" ] && break; sleep 0.1; done
+  [ -s "$w/o/out" ] || fail "the stand-in session didn't start under the run script's start_session"
+  out="$(cat "$w/o/out")"
+  read -r _ sess sp _ <<< "$(grep '^me ' <<< "$out")"
+  # While both run: the run script is still its own process (no exec), and the session is another one, his.
+  kill -0 "$rs" 2>/dev/null || fail "the run script stand-in ended when its session tried to signal it"
+  tr '\0' ' ' < "/proc/$rs/cmdline" | grep -q "$w/run.sh" || fail "the run script's process was replaced: $(tr '\0' ' ' < "/proc/$rs/cmdline")"
+  [ "$sess" != "$rs" ] && [ -d "/proc/$sess" ] || fail "his session isn't a process apart from the run script (session $sess, run script $rs)"
+  [ "$(awk '/^Uid:/{print $2; exit}' "/proc/$sess/status")" = 1000 ] || fail "his session doesn't run as uid 1000"
+  # Its parent is the tmux server the run script started (or the pane's shell under it), never the run script.
+  [ "$sp" != "$rs" ] || fail "his session's parent is the run script's own process"
+  for i in 1 2 3; do tr '\0' ' ' < "/proc/$sp/cmdline" 2>/dev/null | grep -q '^tmux' && break; sp="$(awk '/^PPid:/{print $2; exit}' "/proc/$sp/status" 2>/dev/null)"; done
+  tr '\0' ' ' < "/proc/$sp/cmdline" 2>/dev/null | grep -q '^tmux' || fail "his session isn't under the tmux server the run script started"
+  grep -q '^me [0-9]* [0-9]* 1000$' <<< "$out" || fail "the stand-in session didn't run as uid 1000: $out"
+  grep -Eq '^kill0 refused: .*(not permitted|EPERM)' <<< "$out" || fail "uid 1000 could signal the run script: $out"
+  grep -Eq '^term refused: .*(not permitted|EPERM)' <<< "$out" || fail "uid 1000 could send the run script SIGTERM: $out"
+  # And from a plain process of his user, through as-cain as every root script starts one.
+  e="$("$OPT/as-cain" bash -c "kill -0 $rs 2>&1 && echo signalled")"
+  grep -q signalled <<< "$e" && fail "as-cain's uid 1000 could signal the run script"
+  grep -Eq 'not permitted|EPERM' <<< "$e" || fail "as-cain's kill -0 of the run script failed, but not as refused: $e"
+  kill "$rs" 2>/dev/null; wait "$rs" 2>/dev/null
+  "$OPT/as-cain" tmux -u -S /run/cain/tmux/cain.sock kill-server 2>/dev/null || true
+  rm -rf "$w"
+  note "the run script never execs, and uid 1000 can't signal it"
+}
+
 # The old tree's contents and owners (not modes: the switch tightens those first).
 old_print() { (cd $D && find .claude .claude.json work -printf '%p|%y|%U|%G|%s|%l\n' 2>/dev/null | sort; find .claude .claude.json work -type f -exec sha256sum {} + 2>/dev/null | sort -k2); }
 
@@ -202,6 +257,7 @@ final)
   [ "$("$OPT/c1/state.sh")" = cut ] || fail "not cut over: $("$OPT/c1/state.sh")"
   secret_free
   probe_marks_root_only
+  run_script_boundary
   for q in cain/.claude/projects/-data-work/leaked.jsonl cain/.claude/projects/-data-work/encoded.jsonl work/leak-work.txt work/proj/.git discord/inbox/leak.txt; do
     [ -e "$D/c1/quarantine/$q" ] || [ -n "$(ls -d "$D/c1/quarantine/$q".* 2>/dev/null)" ] || fail "not quarantined: $q"
   done

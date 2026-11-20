@@ -31,8 +31,10 @@
 # late error exits of his session: more than 4 in 60 minutes), "unseen" (restarts of his session whose
 # end root never saw: more than 3 in 30 minutes, 6 in 60, or 8 in 24 hours, a cadence, not a confirmed
 # exit), "boots" (repeated starts of his App's container: more than 3 counted in 30 minutes), "asked"
-# (repeated asked restarts of the App: more than 6 in 60 minutes, requested but repeated), "update" (the
-# early-exit, unseen, container or asked-restart loop within a day of a version change: what changed and
+# (repeated asked restarts of the App: more than 6 in 60 minutes or more than 12 in 24 hours, each stop
+# requested), "all" (every start together, whatever its kind: more than 8 in 60 minutes or more than 12 in
+# 24 hours, with the counts by kind), "update" (the early-exit, unseen, container, asked-restart or
+# combined-start loop within a day of a version change: what changed and
 # the way back by hand; nothing rolls back by itself; outside that day no alarm names an update), "turn"
 # (a turn of his at work for 2 hours without a break) and "tamper" (the probe's folders aren't the App's
 # alone; it goes to his bot again once a day while it stands). Within a group a newer
@@ -53,6 +55,7 @@
 #   notice.sh clear self             his session's late error exits are back under the limit: the self group
 #   notice.sh clear boots            the App's container starts are back under the limit: the boots group
 #   notice.sh clear asked            the App's asked restarts are back under the limit: the asked group
+#   notice.sh clear all              every start together is back under the limit: the all group
 #   notice.sh clear update           neither loop stands any more: the update group
 #   notice.sh clear unseen           his session's unseen restarts are back under the limit: the unseen group
 #   notice.sh clear turn             his long turn ended: the turn group
@@ -76,12 +79,14 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked update unseen turn tamper"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
 RESTART="restart the Cain App: Settings, Apps, Cain, Restart"
 DETAILS="The Cain App's log has the details."
+# Who asked for a stop, and what to fix (eighth round): never to switch the asker off.
+ASKED_WHO="The previous runs ended with a stop that was requested: a Restart or update from Home Assistant, a backup, an automation, or the Supervisor's watchdog restarting an App that looked unhealthy. Check the Supervisor log for who asked and why: Settings, System, Logs, Supervisor. If the watchdog asked, the App looked unhealthy to it, and that is what to fix, not the watchdog."
 group_of() {
   case "$1" in
     breach|switch-stopped|switch-blocked|damaged|setup|restart|switch-restart|exited|held) echo stop ;;
@@ -95,7 +100,8 @@ group_of() {
     self-loop) echo self ;;
     boots) echo boots ;;
     asked-loop) echo asked ;;
-    update-exits|update-unseen|update-boots|update-asked) echo update ;;
+    start-loop) echo all ;;
+    update-exits|update-unseen|update-boots|update-asked|update-starts) echo update ;;
     unseen-loop) echo unseen ;;
     turn-long) echo turn ;;
     tampered) echo tamper ;;
@@ -148,24 +154,28 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     self-loop) T="Cain's session keeps ending on its own"
       M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. Possible causes: the model's API or the network not answering him. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
     unseen-loop) T="Cain's session keeps restarting"
-      M="Cain's session keeps restarting: it started again after a run of which no clean stop was recorded (a crash, a kill or a power cut) more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps restarting: it started again after a run of which no clean stop was recorded (a crash, a kill, a power cut, or a stop that took too long to finish (the stop drill timings show it)) more than 3 times in half an hour, more than 6 times in an hour, or more than 8 times in a day${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
     boots) T="Cain's App keeps restarting"
       M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. If it doesn't settle within an hour, $RESTART. $DETAILS" ;;
     asked-loop) T="Cain's App keeps being restarted"
-      M="Cain's App keeps being restarted: it was asked to stop or restart more than 6 times in an hour${c}. Each restart was requested (from Home Assistant, an automation or a watchdog), but they keep repeating, so Cain can't stay up. Nothing rolls back by itself, and nothing stops the restarts by itself: look for an automation or a watchdog that restarts the Cain App, and turn it off. $DETAILS" ;;
+      M="Cain's App keeps being restarted: it was asked to stop or restart more than 6 times in an hour or more than 12 times in a day${c}, so Cain can't stay up. $ASKED_WHO Nothing rolls back by itself. $DETAILS" ;;
+    start-loop) T="Cain's App keeps starting"
+      M="Cain's App keeps starting: counting every start together, whatever its kind (requested restarts, restarts with no clean stop recorded, restarts of his session after an early or an error exit, and plain starts), it started more than 8 times in an hour or more than 12 times in a day${c}. Each kind is also counted on its own; this count catches a mix of them. If some were requested, check the Supervisor log for who asked and why: Settings, System, Logs, Supervisor. If the watchdog asked, the App looked unhealthy to it, and that is what to fix, not the watchdog. Nothing rolls back by itself. $DETAILS" ;;
     update-exits) T="Cain keeps exiting early since his update"
       M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
     update-unseen) T="Cain's session keeps restarting since his update"
       M="Cain's session has restarted several times since the update to ${2:-his last version}, its exits unseen: an early crash before its exit handlers run looks like this. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
     update-asked) T="Cain's App keeps being restarted since his update"
-      M="Cain's App has been asked to restart several times since the update to ${2:-his last version}. The restarts were requested, but they keep repeating. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's App has been asked to restart several times since the update to ${2:-his last version}. $ASKED_WHO Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+    update-starts) T="Cain's App keeps starting since his update"
+      M="Cain's App has started many times, counting every kind of start, since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
     update-boots) T="Cain's App keeps restarting since his update"
       M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
     turn-long) local mins; mins="$(printf '%s' "${2:-}" | tr -cd '0-9' | cut -c1-5)"
       T="Cain's turn has been running for ${mins:-over 120} minutes"
       M="Cain's turn has been running for ${mins:-over 120} minutes without a break. This may be normal for a long job, or he may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. If he doesn't answer you, $RESTART. $DETAILS" ;;
     tampered) T="Cain's probe folder isn't the App's alone"
-      M="Cain's probe folder isn't the App's alone${c}: a folder where the App keeps its liveness records, or one above it, has an owner or mode it must not have, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). The way out: restarting the App sets the folders up again. If this alarm comes back, the Cain App's log names the path." ;;
+      M="Cain's probe folder isn't the App's alone${c}: a folder where the App keeps its liveness records, or one above it, has an owner or mode it must not have, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). The way out: restarting the App sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand." ;;
     *) return 1 ;;
   esac
 }
@@ -179,6 +189,7 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     self) CT="Cain's session stays up"; CM="Cain's session has stopped ending on its own." ;;
     boots) CT="Cain's App stopped restarting"; CM="Cain's App container has stopped starting again and again." ;;
     asked) CT="Cain's App stopped being restarted"; CM="Cain's App is no longer being restarted again and again." ;;
+    all) CT="Cain's App stopped starting again and again"; CM="Cain's App has stopped starting again and again, counting every kind of start." ;;
     update) CT="Cain has settled since his update"; CM="Cain has settled since his update: his session and his App stay up." ;;
     unseen) CT="Cain's session stays up"; CM="Cain's session has stopped restarting again and again." ;;
     turn) CT="Cain's long turn ended"; CM="Cain's long turn ended: his screen is free again." ;;
@@ -272,7 +283,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|update-exits|update-unseen|update-boots|update-asked|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -299,9 +310,9 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   local groups g rc=0
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
-    self) groups="self" ;; boots) groups="boots" ;; asked) groups="asked" ;; update) groups="update" ;; unseen) groups="unseen" ;;
+    self) groups="self" ;; boots) groups="boots" ;; asked) groups="asked" ;; all) groups="all" ;; update) groups="update" ;; unseen) groups="unseen" ;;
     turn) groups="turn" ;; tampered) groups="tamper" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, update, unseen, turn or tampered" >&2; return 2 ;; esac
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn or tampered" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -391,7 +402,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|update|unseen|turn|tampered | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \
