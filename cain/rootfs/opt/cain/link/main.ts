@@ -56,7 +56,9 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { pruneIds } from "../probe/core";
 import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
@@ -433,6 +435,21 @@ else if (deployKey.made)
   link.relayLine(`The link made a new deploy key${deployKey.remade ? " (the old one couldn't be read)" : ""}. Until its public half (in the add-on's log) is added on GitHub, and any old one deleted there, his Ship taps can't land anything in main (RELEASING.md, If the deploy key is remade). If a laptop session is installing this release, it adds the key itself: nothing to tell him. Otherwise (a restored Pi, say), tell him in one line that shipping is down until a laptop session at his PC adds it, and keep it in PENDING marked "At his PC".`);
 
 // -- the gateway: taps and reactions ---------------------------------------------------
+// The probe's message round trip (probe/core.ts, Cain 0.14.0): the id of each message of his in a
+// DM, with when the link saw it, in a file root's alone. Nothing else of the message is kept: its
+// words are never read here. The broker notes the ids that reached his session; a message seen
+// that never reached him within 10 minutes fails the probe.
+const PROBE_SEEN = process.env.CAIN_PROBE_SEEN ?? "/run/cain/probe/seen";
+function seenMessage(d: any): void {
+  const id = String(d?.id ?? ""), owner = paired();
+  if (!/^\d{15,22}$/.test(id) || d?.guild_id || !owner || String(d?.author?.id ?? "") !== owner) return;
+  const now = Math.floor(Date.now() / 1000);
+  mkdirSync(dirname(PROBE_SEEN), { recursive: true, mode: 0o700 });
+  appendFileSync(PROBE_SEEN, `${id} ${now}\n`, { mode: 0o600 });
+  try {
+    if (statSync(PROBE_SEEN).size > 64_000) { writeFileSync(`${PROBE_SEEN}.tmp`, pruneIds(readFileSync(PROBE_SEEN, "utf8"), now), { mode: 0o600 }); renameSync(`${PROBE_SEEN}.tmp`, PROBE_SEEN); }
+  } catch { /* next time */ }
+}
 let ws: WebSocket | null = null;
 let beat: ReturnType<typeof setInterval> | null = null;
 let failures = 0;
@@ -444,6 +461,7 @@ const proto = new Protocol((o) => ws?.send(JSON.stringify(o)), token, {
   ready: () => { failures = 0; connected = true; console.log("[cain] link: connection ready"); },
   interaction: (d) => { link.onInteraction(d).catch((e) => console.log(`[cain] link: tap failed: ${String(e).slice(0, 80)}`)); },
   reaction: (d) => { link.onReaction(d).catch((e) => console.log(`[cain] link: reaction failed: ${String(e).slice(0, 80)}`)); },
+  message: (d) => { try { seenMessage(d); } catch { /* the probe then can't tell this one; it alarms on none */ } },
 });
 
 function connect(): void {

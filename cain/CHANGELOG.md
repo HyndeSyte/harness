@@ -2,11 +2,13 @@
 
 ## 0.14.0
 
-- The App now checks every 5 minutes that Cain can really answer, not only that the App is up: his Discord plugin, his session, his Discord connection, and that what the App types reaches him. Once an hour he must answer a short check himself, which never reaches you.
-- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service. It is pinged only while Cain passes his checks, so your phone hears from outside when he stops answering, even if the Pi is down.
-- When his checks fail, or his session restarts more than 3 times in 30 minutes, you hear it on your phone and in Discord. The restart count is now kept on disk, so a restart can't hide it.
-- Within a day of an update, if the update stops Cain answering, the App puts back the version before it from the backup Home Assistant took just before the update, once, and only to a version you installed with a Ship tap. You hear one line when it happens, and it shows in the next morning message.
-- The App can now see and restore its own backups (Supervisor access with the backup role only), for that rollback.
+- The App now checks on Cain every 5 minutes: that his Discord plugin, his session and his Discord connection are up, and once an hour that his session answers a short check that never reaches you. These are liveness checks: they show his parts run, not that he answers you.
+- The real check: each message you send him on Discord must reach his session within 10 minutes, or you hear "Messages aren't reaching Cain". The App keeps only the message's id, never its words.
+- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every check passes, so your phone hears from outside when he stops, even if the Pi is down.
+- Fewer false alarms: nothing alarms while your Stop holds, a sign-in screen says "Cain needs sign-in", an API outage says "The model's API isn't answering", and a long turn isn't counted as a missed answer.
+- When his session keeps crashing (more than 3 crashes in 30 minutes), you hear it on your phone and in Discord. Restarts the App or Home Assistant asked for, and the first start after a reboot, don't count.
+- An automatic rollback for an update that keeps crashing within a day, off for now: a new option, `rollback_armed`, stays off until it has been drilled on the Pi. While off, you hear "A rollback of Cain would have run" and nothing is done. It never deletes a backup.
+- Turn on Home Assistant's Backup before update for the Cain App: after each update the App checks that backup is there, and tells you at once if it isn't.
 
 ## 0.13.5
 

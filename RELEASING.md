@@ -319,10 +319,11 @@ for 2 hours, without which Cain can't start the job.
    Otherwise install nothing and end with
    `Connector check: no passing line for this head and its settings`.
 4. In Home Assistant: check for App updates, then update only the App(s) the pull
-   request changed, with a backup taken first (the update's own backup switch on). Since
-   Cain 0.14.0 that backup is what Cain's App restores by itself if the update stops him
-   answering within a day (cain/DOCS.md, "Is Cain really answering"): if the update can't take
-   it, first take a backup of that App alone (unless one of it was taken today), then update. When it changed both, Cain first, then
+   request changed, with a backup taken first (the update's own backup switch, Backup before
+   update, on). Since Cain 0.14.0 Cain's App looks for that backup at once after the update and
+   alarms if it isn't there; it is what the App's rollback would restore, which stays off
+   (`rollback_armed`) until the Pi drills in cain/DOCS.md ("Is Cain really answering") pass. The
+   App never deletes a backup. When it changed both, Cain first, then
    Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness
    with 503, so its cards wait, none lost, until Harness signs). An App already at its
    new version is skipped. Nothing else in Home Assistant: no options, no other Apps,
@@ -399,11 +400,10 @@ it as a deploy key with write access in GitHub's web page, pushes the fix's comm
 `main` as a fast-forward (`git push git@github.com:HyndeSyte/harness.git
 <sha>:refs/heads/main`), and deletes that key right after. The "Checks and history"
 ruleset still applies to it: the commit's checks must have passed, and no force push or
-deletion. Then install the App with a backup taken first (a backup of that App alone,
-unless one was taken today), so a bad release can be rolled back from Home Assistant, and,
-since Cain 0.14.0, by Cain's App itself within a day of the install. A version installed this
-way has no signed Ship, so the App never rolls back *to* it: a later bad release on top of it
-alarms instead.
+deletion. Then install the App with Backup before update on, so a bad release can be
+rolled back from Home Assistant (and, once `rollback_armed` is on after its drills, by Cain's
+App itself within a day of the install). A version installed this way has no signed Ship, so the
+App never rolls back *to* it: a later bad release on top of it alarms instead.
 
 What the first use taught (Nov 19, Cain 0.13.4, when Cain restarted every few minutes and
 couldn't show a Ship card):

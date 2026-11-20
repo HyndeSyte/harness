@@ -20,17 +20,23 @@ D="${C1_DATA:-/data}"
 
 case "${1:-}" in
 run)
-  install -d -m 0750 -o root -g cain /run/cain || die "no /run/cain"
+  # Cain 0.14.0: his group may pass through /run/cain to what he reads there by name, but not list it
+  # (0710): what root keeps there (the link's gateway state, the probe's ask, the ids it notes) stays
+  # unreadable and unwritable to him (cain/tests/probe-rollback.test.ts checks these modes).
+  install -d -m 0710 -o root -g cain /run/cain || die "no /run/cain"
   install -d -m 0700 -o root -g root /run/cain/root-tmp
   install -d -m 0750 -o root -g cain /run/cain/keys
   install -d -m 0750 -o root -g nogroup /run/cain/www /run/cain/upstream
   install -d -m 0750 -o root -g discord /run/cain/outbox
   install -d -m 0700 -o cain -g cain /run/cain/tmux
   # The probe and the rollback watcher (Cain 0.14.0): the probe's records root's, its group's (watch)
-  # to read; the watcher's own folder its own; the hourly check's ask and answer root's alone.
+  # to read; the watcher's own folder its own; the hourly liveness check's ask and answer, and the
+  # round trip's message ids, root's alone. The record of restores outside /data (/config, the
+  # App's own config folder) root's alone.
   install -d -m 0700 -o root -g root /run/cain/probe
   install -d -m 0750 -o root -g watch "$D/probe" || die "no $D/probe"
   install -d -m 0700 -o watch -g watch "$D/watcher" || die "no $D/watcher"
+  [ ! -d "${C1_CONFIG:-/config}" ] || { chown root:root "${C1_CONFIG:-/config}" && chmod 0700 "${C1_CONFIG:-/config}"; } || die "/config couldn't be made root's only"
   chmod 0700 /run/s6/container_environment 2>/dev/null
   chmod 0400 /run/s6/container_environment/* 2>/dev/null
   [ ! -d /run/s6/container_environment ] || [ "$(stat -c %a /run/s6/container_environment)" = 700 ] \

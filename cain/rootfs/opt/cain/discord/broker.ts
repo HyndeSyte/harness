@@ -16,10 +16,10 @@
 //   from the server: answers, notifications/claude/channel (his messages) and
 //     notifications/message. The initialize answer loses the permission-relay capability,
 //     so Claude Code never sends a prompt here.
-//   the hourly check (Cain 0.14.0, probe/core.ts): the probe asks root's broker, never Discord,
+//   the hourly liveness check (Cain 0.14.0, probe/core.ts): the probe asks root's broker, never Discord,
 //     to hand his session one fixed line on a chat id no Discord chat has (PROBE_CHAT), as a
 //     message of his channel; a reply to that chat is answered here and goes nowhere, and only the
-//     fixed answer counts (anything else to it is refused). So the hourly check costs one short
+//     fixed answer counts (anything else to it is refused). So the hourly liveness check costs one short
 //     turn of his and never reaches Dane, Discord or the gate.
 // The gate's hard rules fail closed: an error refuses the call, and no retry passes a hard
 // refusal. Limits: 12 MB a line (8 MB of attachments), 32 calls in flight, 60 s a call, 20 bad
@@ -70,7 +70,8 @@ export interface BrokerDeps {
   session: string;                                     // this connection's name, for the gate's tries
   setTimer?: (ms: number, f: () => void) => unknown;
   clearTimer?: (t: unknown) => void;
-  probeAnswered?: () => void;                          // his session gave the hourly check's fixed answer
+  probeAnswered?: () => void;                          // his session gave the hourly liveness check's fixed answer
+  reached?: (messageId: string) => void;               // a message of his channel was handed to his session (the probe's round trip)
 }
 
 interface Pending { method: string; tool?: string; args?: Record<string, unknown>; outbox?: string; note?: string; timer?: unknown; initialize?: boolean }
@@ -124,13 +125,13 @@ export class BrokerSession {
   private ready = false;                               // Claude Code's initialize was answered
   constructor(private d: BrokerDeps) {}
 
-  // The hourly check's line, handed to his session as a message of his channel. false when there
+  // The hourly liveness check's line, handed to his session as a message of his channel. false when there
   // is no session to hand it to yet.
   probe(messageId: string): boolean {
     if (this.closed || !this.ready) return false;
     this.d.toClient(JSON.stringify({ jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: PROBE_LINE,
       meta: { chat_id: PROBE_CHAT, message_id: messageId, user: "cain-app-probe", user_id: PROBE_CHAT, ts: new Date().toISOString() } } }));
-    this.d.log("handed his session the hourly check");
+    this.d.log("handed his session the hourly liveness check");
     return true;
   }
 
@@ -185,14 +186,14 @@ export class BrokerSession {
     const checked = checkArgs(name, m.params?.arguments);
     if ("why" in checked) { this.d.log(`refused ${name.slice(0, 40) || "a tool call"}: ${checked.why}`); return void this.d.toClient(toolError(m.id, `${name || "This call"} failed: ${checked.why}`)); }
     let args = checked.args;
-    // The hourly check's chat: answered here, never sent on. Only the fixed answer counts.
+    // The hourly liveness check's chat: answered here, never sent on. Only the fixed answer counts.
     if (String(args.chat_id ?? args.channel ?? "") === PROBE_CHAT) {
       if (name === "reply" && String(args.text ?? "").trim() === PROBE_REPLY && args.files_data === undefined) {
-        try { this.d.probeAnswered?.(); } catch (e) { this.d.log(`couldn't keep the hourly check's answer: ${String(e).slice(0, 80)}`); }
-        this.d.log("his session answered the hourly check");
+        try { this.d.probeAnswered?.(); } catch (e) { this.d.log(`couldn't keep the hourly liveness check's answer: ${String(e).slice(0, 80)}`); }
+        this.d.log("his session answered the hourly liveness check");
         return void this.d.toClient(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: "sent" }] } }));
       }
-      return void this.d.toClient(toolError(m.id, `${name} failed: this chat is your App's hourly check; it takes only a reply with the text "${PROBE_REPLY}"`));
+      return void this.d.toClient(toolError(m.id, `${name} failed: this chat is your App's hourly liveness check; it takes only a reply with the text "${PROBE_REPLY}"`));
     }
     const p: Pending = { method: "tools/call", tool: name };
     this.track(key, m.id, p);                                // counted while the gate runs
@@ -272,7 +273,13 @@ export class BrokerSession {
       return void this.d.toClient(JSON.stringify(m));
     }
     if (typeof m.method === "string" && m.id === undefined) {
-      if (SERVER_NOTES.has(m.method)) this.d.toClient(JSON.stringify(m));
+      if (SERVER_NOTES.has(m.method)) {
+        this.d.toClient(JSON.stringify(m));
+        // The message round trip (probe/core.ts): the id of each of his messages handed to his
+        // session, noted after it went, so the probe can tell one the link saw never arrived.
+        const id = m.method === "notifications/claude/channel" ? String(m.params?.meta?.message_id ?? "") : "";
+        if (/^\d{15,22}$/.test(id)) { try { this.d.reached?.(id); } catch (e) { this.d.log(`couldn't note a message for the probe: ${String(e).slice(0, 80)}`); } }
+      }
       else this.d.log(`dropped a server notification: ${m.method.slice(0, 60)}`);
       return;
     }

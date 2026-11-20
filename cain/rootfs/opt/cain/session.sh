@@ -27,4 +27,9 @@ exec 2>>/data/session.log
 echo "$(date -Is) session.sh starting (${CAIN_MODE:-old})" >&2
 cd /data/work || { echo "no /data/work" >&2; exit 1; }
 claude --permission-mode auto --channels plugin:discord@claude-plugins-official
-echo "$(date -Is) claude exited ($?): the App starts his session again, and checks it first" >&2
+rc=$?
+echo "$(date -Is) claude exited ($rc): the App starts his session again, and checks it first" >&2
+# Its exit code, for the run script's count of crash starts (Cain 0.14.0, probe/core.ts endKind):
+# his own folder the new way, root's the old way. Only a non-zero exit no one asked for counts.
+if [ "${CAIN_MODE:-}" = own ]; then exitf=/run/cain/tmux/claude.rc; else exitf=/run/cain/claude.rc; fi
+printf '%s\n' "$rc" > "$exitf" 2>/dev/null || true

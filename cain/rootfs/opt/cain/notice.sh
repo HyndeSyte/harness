@@ -25,10 +25,12 @@
 # own user failed; he runs the old way), "screen" (a question keeps coming back on his screen,
 # where no one answers it: unstick.sh), "deliver" (what the App types into his session doesn't go
 # in, or his screen waits at a sign-in: watch.sh) and "phone" (its alarms to his phone failed their
-# test), and since 0.14.0 "probe" (the App's own probe of him failed: probe/main.ts), "restarts"
-# (his session started more than 3 times in 30 minutes, counted from /data) and "rollback" (a
-# rollback within a day of an install: done, refused, or not allowed). Within a group a newer alarm
-# replaces the last.
+# test), and since 0.14.0 "probe" (the App's liveness checks of him failed, a message of his didn't
+# reach his session, or his screen waits at a sign-in or on the model's API: probe/main.ts),
+# "restarts" (his session crashed and started more than 3 times in 30 minutes, counted from /data),
+# "rollback" (a rollback within a day of an install: being done, would have run with the switch
+# off, failed, or not allowed) and "backup" (no pre-install backup to roll back to). Within a group
+# a newer alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
 # is kept and tried again. The state is root's, in /data/c1/notice.d. Nothing
@@ -41,7 +43,10 @@
 #   notice.sh clear delivered        what the App types goes in again (watch.sh): the deliver group
 #   notice.sh clear phone            the probe was read back moved: the phone group clears
 #   notice.sh clear probe            the App's probe of him passed again: the probe and rollback groups
-#   notice.sh clear restarts         his session's starts are back under the limit: the restarts group
+#   notice.sh clear restarts         his session's crash starts are back under the limit: the restarts group
+#   notice.sh clear backup           the pre-install backup was found after all: the backup group
+#   notice.sh flush <alarm> [cause]  as tell, then 0 only once Discord and Home Assistant both took
+#                                    it (3 when either didn't): the rollback's alarm before its restore
 #   notice.sh tick                   the repeats, retries, the probe and its readback (every 10 minutes)
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
@@ -61,7 +66,7 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts rollback"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts rollback backup"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 BACKUPS="restore two backups from just before his last update, Cain's and the calendar App's, one after the other: Settings, System, Backups"
@@ -75,9 +80,10 @@ group_of() {
     waiting) echo screen ;;
     stalled|signin) echo deliver ;;
     phone) echo phone ;;
-    probe) echo probe ;;
+    probe|messages|needs-signin|api-down) echo probe ;;
     restarts) echo restarts ;;
-    rollback|rollback-failed|rollback-again|rollback-unsigned|rollback-nobackup) echo rollback ;;
+    rollback|rollback-disarmed|rollback-failed|rollback-again|rollback-unsigned|rollback-nobackup|rollback-record) echo rollback ;;
+    rollback-unavailable) echo backup ;;
     *) return 1 ;;
   esac
 }
@@ -116,20 +122,32 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain is waiting at a sign-in on his screen${c}, so nothing reaches him. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
     phone) T="Cain's alarms reach you here only"
       M="Cain's alarms to your phone through Home Assistant didn't pass their test${c}, so for now they reach you only here, from his bot. Nothing for you to do: Cain has it filed for a fix." ;;
-    probe) T="Cain isn't answering"
-      M="Cain isn't answering: the App's own check of him failed${c}. The App keeps bringing him back by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
-    restarts) T="Cain keeps restarting"
-      M="Cain keeps restarting: his session started again and again${c}. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    probe) T="Cain's liveness checks failed"
+      M="Cain may not be answering: the App's liveness checks of him failed${c}. These checks show his parts are running, not that he answers you, so a failure is worth a look. The App keeps bringing him back by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
+    messages) T="Messages aren't reaching Cain"
+      M="Messages aren't reaching Cain: a message you sent him on Discord${c} didn't reach his session within 10 minutes. Nothing was rolled back. If he doesn't answer within the hour, $RESTART, then send it again. $DETAILS" ;;
+    needs-signin) T="Cain needs sign-in"
+      M="Cain needs sign-in: his screen waits at a Claude sign-in, so he can't answer. Open Cain in Home Assistant, tap Sign in to Claude, and paste the code it gives you into the Cain page." ;;
+    api-down) T="The model's API isn't answering"
+      M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself, and nothing was rolled back. If it lasts hours, check Anthropic's status page." ;;
+    restarts) T="Cain keeps crashing"
+      M="Cain keeps crashing: his session crashed and started again and again${c}. The App keeps starting it by itself. If he isn't back within an hour, $RESTART. $DETAILS" ;;
     rollback) T="Cain is being rolled back"
-      M="Cain is being rolled back${c}: his last update stopped him answering within a day of its install, so the App is restoring the version before it from the backup taken just before that update. Nothing for you to do: he's back in a few minutes." ;;
+      M="Cain is being rolled back${c}: his last update kept crashing within a day of its install, so the App is restoring the version before it from the backup Home Assistant took just before that update. He's back in a few minutes. If your outside heartbeat check for him stays silent after that, the restore itself failed: restore the backup of Cain from just before his last update yourself, Settings, System, Backups." ;;
+    rollback-disarmed) T="A rollback of Cain would have run"
+      M="A rollback would have run${c}: his last update kept crashing within a day of its install. The automatic rollback is off (rollback_armed in the App's options), so nothing was done. To get him back, restore the backup of Cain from just before his last update: Settings, System, Backups. $DETAILS" ;;
     rollback-failed) T="Cain's rollback didn't go through"
-      M="Cain's last update stopped him answering, and the App's rollback to the version before it didn't go through${c}. To get him back, restore the backup of Cain from just before his last update: Settings, System, Backups. $DETAILS" ;;
-    rollback-again) T="Cain isn't answering after a rollback"
-      M="Cain isn't answering${c}. The App rolls back only once for each update, so it does nothing more by itself. First $RESTART. If he's still not answering after that, restore an earlier backup of Cain: Settings, System, Backups. $DETAILS" ;;
-    rollback-unsigned) T="Cain isn't answering after his update"
-      M="Cain's last update stopped him answering${c}. The App rolls back by itself only to a version you installed with a Ship tap, so it did nothing. To get him back, restore the backup of Cain from just before his last update: Settings, System, Backups. $DETAILS" ;;
-    rollback-nobackup) T="Cain isn't answering after his update"
-      M="Cain's last update stopped him answering${c}, and the App found no backup of him from just before it, so it can't roll back by itself. First $RESTART. If he's still not answering, restore his newest backup: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's last update kept crashing, and the App's rollback to the version before it didn't go through${c}. To get him back, restore the backup of Cain from just before his last update: Settings, System, Backups. $DETAILS" ;;
+    rollback-again) T="Cain keeps crashing after a rollback"
+      M="Cain keeps crashing${c}. The App rolls back only once for each update, and never the same version twice, so it does nothing more by itself. First $RESTART. If he's still crashing after that, restore an earlier backup of Cain: Settings, System, Backups. $DETAILS" ;;
+    rollback-unsigned) T="Cain keeps crashing after his update"
+      M="Cain's last update keeps crashing${c}. The App rolls back by itself only to a version you installed with a Ship tap, so it did nothing. To get him back, restore the backup of Cain from just before his last update: Settings, System, Backups. $DETAILS" ;;
+    rollback-nobackup) T="Cain keeps crashing after his update"
+      M="Cain's last update keeps crashing${c}, and the App found no backup of him from just before it, so it can't roll back by itself. First $RESTART. If he's still crashing, restore his newest backup: Settings, System, Backups. $DETAILS" ;;
+    rollback-record) T="Cain's rollback record can't be read"
+      M="The App's record of its restores can't be read${c}, so it won't roll Cain back by itself until that's fixed. Nothing else changed: he runs as before. $DETAILS" ;;
+    rollback-unavailable) T="Cain's rollback is unavailable"
+      M="Cain's rollback is unavailable for his last update${c}, so if it breaks him the App can't put the version before back by itself. Turn on Backup before update for the Cain App in Home Assistant, so the next update has one. Nothing else changed. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -138,9 +156,10 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     screen) CT="Cain is back"; CM="Cain is answering again: nothing waits on his screen." ;;
     deliver) CT="Cain is getting messages again"; CM="Cain is getting messages again: what the App types goes in." ;;
     phone) CT="Cain's alarms reach your phone again"; CM="Cain's alarms to your phone through Home Assistant passed their test again." ;;
-    probe) CT="Cain is answering again"; CM="Cain is answering again: the App's own check of him passed." ;;
-    restarts) CT="Cain stopped restarting"; CM="Cain stopped restarting: his session has stayed up." ;;
-    rollback) CT="Cain is answering again"; CM="Cain is answering again: the App's own check of him passed." ;;
+    probe) CT="Cain's checks pass again"; CM="Cain's liveness checks pass again, and your messages reach him." ;;
+    restarts) CT="Cain stopped crashing"; CM="Cain stopped crashing: his session has stayed up." ;;
+    rollback) CT="Cain's checks pass again"; CM="Cain's liveness checks pass again, and your messages reach him." ;;
+    backup) CT="Cain's rollback is available"; CM="The App found the backup of Cain from just before his last update after all." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -229,8 +248,8 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    rollback-failed|rollback) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|restarts|rollback-again|rollback-unsigned|rollback-nobackup) echo 1 ;; *) echo 0 ;; esac
+    rollback-failed|rollback|rollback-record) echo 2 ;;
+    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|messages|needs-signin|api-down|restarts|rollback-disarmed|rollback-again|rollback-unsigned|rollback-nobackup|rollback-unavailable) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -252,7 +271,8 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   local groups g rc=0
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe rollback" ;; restarts) groups="restarts" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe or restarts" >&2; return 2 ;; esac
+    backup) groups="backup" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts or backup" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -336,13 +356,13 @@ tick() {
   return "$rc"
 }
 
-case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}")" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
+case "${1:-}" in tell|flush|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}")" || exit 2; printf '%s\n%s\n' "$T" "$M"; exit 0 ;;
   # A proof within two days, made with the hook set now (none set, or another, proves nothing).
   proven) t="$(head -n 1 "$PROVEN" 2>/dev/null | cut -d' ' -f1 | tr -cd '0-9')"
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell|flush <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|backup | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \
@@ -350,6 +370,11 @@ mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \
 flock -w "${NOTICE_LOCK_S:-30}" 9 || { echo "[cain] alarms: another writer kept the lock; this one is raised again by its caller or the next tick" >&2; exit 75; }
 case "$1" in
   tell) tell "${2:-}" "${3:-}" ;;
+  # The alarm, then whether both routes have it now: Discord sent, and Home Assistant took it
+  # (within the day, under the hook set now). A rollback's restore waits for this (helper.ts).
+  flush) tell "${2:-}" "${3:-}" || exit $?
+         load "$(group_of "$2")" && [ "$kind" = "$2" ] && [ "$discord" = 1 ] && h="$(hook)" && [ "$fp" = "$(hash16 "$h")" ] \
+           && [ $(( $(date +%s) - sent )) -lt "$DAY" ] || { echo "[cain] alarm '$2' isn't through on both routes yet" >&2; exit 3; } ;;
   clear) clear_groups "${2:-}" ;;
   tick) tick ;;
   probe) probe ;;

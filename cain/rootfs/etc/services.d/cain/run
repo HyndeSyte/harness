@@ -186,8 +186,10 @@ if [ "$mode" = none ]; then "$OPT/notice.sh" tell "${stop_kind:-setup}" "$stop_c
   || bashio::log.error "Couldn't write /run/cain/mode"
 bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session held until the check of his own user finishes}"
 # The version this start runs, for the rollback rule (probe/core.ts): a version that changed since
-# the last start is an install, watched for 24 hours. Then root's helper looks whether this start
-# came from a restore (a rollback leaves no record in /data: the restore put it back as it was).
+# the last start is an install, watched for 24 hours (a start on the version a restore on record
+# went back to is the rollback, never an install). Then root's helper settles the restore on record
+# (its record lives outside /data, in /config: a restore puts /data back as the backup held it),
+# and looks at once for the Supervisor's pre-install backup of a new install.
 [ "$version" = unknown ] || bun "$OPT/probe/main.ts" install "$version" 2>&1 || true
 ( bun "$OPT/rollback/helper.ts" boot 2>&1 || true ) &
 
@@ -278,6 +280,7 @@ his_procs() {
 # there is no such session. 1 when it can't be shown ended.
 end_his_session() {
   unchecked
+  ended_by_us=1                                  # asked for: the start after it is no crash start
   timeout 10 $TMUX_CMD -u kill-session -t cain 2>/dev/null || true
   if [ "$TMUX_CMD" != tmux ]; then
     local i
@@ -322,12 +325,31 @@ session_up() {
 }
 # His session. A start that doesn't take returns 1, never ends this script: the foreground loop
 # below starts it again, later each time, and tells Dane if it keeps failing (session_ended).
+# How his last session run ended, for the count of crash starts (probe/core.ts endKind; Cain
+# 0.14.0): "boot" for the first start in this container (no run before it here), "asked" when this
+# script ended it (end_his_session) or it ended on a signal tmux, s6 or the Supervisor sends,
+# "clean" on exit 0, "unknown" with no exit code kept, and "crash-<code>" for any other exit,
+# which no one asked for. session.sh keeps the code: his own folder the new way (read as him),
+# root's the old way. Only crash starts count toward the alarm and the rollback.
+first_start=1; ended_by_us=0
+last_end() {
+  local code="" f=/run/cain/claude.rc
+  if [ -n "$first_start" ]; then echo boot; return; fi
+  if [ "$ended_by_us" = 1 ]; then echo asked; return; fi
+  if [ "$mode" = own ]; then code="$(timeout 10 "$OPT/as-cain" head -c 8 /run/cain/tmux/claude.rc 2>/dev/null | tr -cd '0-9' || true)"
+  else code="$(head -c 8 "$f" 2>/dev/null | tr -cd '0-9' || true)"; fi
+  case "$code" in '') echo unknown ;; 0) echo clean ;; 129|130|143) echo asked ;; *) echo "crash-$((10#$code % 1000))" ;; esac
+}
 start_his_session() {
   unchecked
   bashio::log.info "Starting Cain"
   # Every start of his session is kept in /data (probe/main.ts start), outside his session and
-  # across restarts and reboots, so nothing can reset the count: more than 3 in 30 minutes alarms.
-  timeout 30 bun "$OPT/probe/main.ts" start session 2>&1 || true
+  # across restarts and reboots, with how the run before it ended: nothing can reset the count, and
+  # only crash starts count (more than 3 in 30 minutes alarms; the rollback rule reads the same).
+  timeout 30 bun "$OPT/probe/main.ts" start "$(last_end)" 2>&1 || true
+  first_start=""; ended_by_us=0
+  rm -f /run/cain/claude.rc 2>/dev/null || true
+  [ "$mode" != own ] || timeout 10 "$OPT/as-cain" rm -f /run/cain/tmux/claude.rc 2>/dev/null || true
   if ! start_session; then bashio::log.error "tmux could not start"; return 1; fi
   sleep 3
   if ! session_up; then
@@ -448,15 +470,27 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   export PROBE_PING_URL
   while true; do bun "$OPT/probe/main.ts" loop 2>&1; sleep 10; done
 ) &
+# The probe's checks are liveness (his parts run), not proof he answers; the message round trip
+# (the link's ids of his messages against the broker's) is the one real check. All of it alarms
+# only: nothing the probe sees rolls a release back.
 # The rollback watcher (rollback/watcher.ts), as its own user, watch: not his, not root. It reads
-# what the probe keeps and asks for a rollback or an alarm in its own folder; it can't write his
-# settings, hooks, plugin or home. Root's helper (rollback/helper.ts) checks a rollback request
-# again from root's records and does only the restore of the recorded pre-install backup; it is the
-# only process that calls the Supervisor's backup API.
+# what the probe keeps and raises one flag in its own folder; it can't write his settings, hooks,
+# plugin or home. Root's helper (rollback/helper.ts) takes nothing from the flag but that it is
+# there, decides again from root's own records, and is the only process that calls the
+# Supervisor's backup API. The automatic restore is off unless rollback_armed is on in the App's
+# options (default off: a rollback that would have run only alarms, both routes). Read here, in the
+# helper's own subshell, and nowhere else.
 if [ -x "$OPT/as-watch" ]; then
   ( while true; do "$OPT/as-watch" bun "$OPT/rollback/watcher.ts" loop 2>&1 || true; sleep 10; done ) &
 fi
-( while true; do bun "$OPT/rollback/helper.ts" loop 2>&1; sleep 10; done ) &
+(
+  v="$(bashio::config 'rollback_armed' 2>/dev/null || true)"; [ "$v" = true ] || v=false
+  ROLLBACK_ARMED="$v"; unset v
+  export ROLLBACK_ARMED
+  if [ "$ROLLBACK_ARMED" = true ]; then bashio::log.warning "The automatic rollback is armed (rollback_armed)"
+  else bashio::log.info "The automatic rollback is off (rollback_armed): a rollback that would have run only alarms"; fi
+  while true; do bun "$OPT/rollback/helper.ts" loop 2>&1; sleep 10; done
+) &
 # Relayed taps, and check-ins at 7:10 AM, 12:30 PM and 5:30 PM. checkin.sh decides when, and
 # only types into an idle session (through as-cain, the new way). Started once, with his session.
 checking_in=""
