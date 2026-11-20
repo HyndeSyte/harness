@@ -38,6 +38,12 @@ run)
   # root's, not writable by group or others, too).
   [ "$(stat -c %u "$D")" = 0 ] || chown root "$D" || die "$D isn't root's"
   chmod go-w "$D" /run/cain || die "$D or /run/cain writable by others"
+  # Sixth round: the whole chain above both folders, up to /, root's and not writable by him (the probe
+  # checks it before every read or write, probe/folder.ts); fixed here where it can be.
+  for a in / /run "$(dirname "$D")"; do
+    [ "$(stat -c %u "$a")" = 0 ] || chown root "$a" 2>/dev/null || true
+    [ -k "$a" ] || chmod go-w "$a" 2>/dev/null || true
+  done
   chmod 0700 /run/s6/container_environment 2>/dev/null
   chmod 0400 /run/s6/container_environment/* 2>/dev/null
   [ ! -d /run/s6/container_environment ] || [ "$(stat -c %a /run/s6/container_environment)" = 700 ] \

@@ -66,7 +66,7 @@ uid_procs() {
 # uid 1000, and he can't create a mark there.
 probe_marks_root_only() {
   local p bad
-  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" boot >/dev/null 2>&1 || fail "the probe couldn't keep the container's start"
+  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" boot 0123456789abcdef >/dev/null 2>&1 || fail "the probe couldn't keep the container's start"
   PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" session-start "" "" >/dev/null 2>&1 || fail "the probe couldn't keep a session start"
   [ -s /run/cain/probe/session.json ] && [ -s $D/probe/boots ] || fail "the probe's marks weren't written"
   for p in /run/cain/probe $D/probe; do
@@ -75,13 +75,15 @@ probe_marks_root_only() {
   bad="$(find /run/cain/probe $D/probe \( ! -user root -o ! -group root -o -perm /077 \) -print 2>/dev/null)"
   [ -z "$bad" ] || fail "under the probe's folders, not root's alone: $bad"
   bad="$(setpriv --reuid=1000 --regid=1000 --init-groups bash -c '
-    for p in /run/cain /run/cain/probe /run/cain/probe/session.json /run/cain/probe/booted /run/cain/probe/asked '"$D"'/probe '"$D"'/probe/boots '"$D"'/probe/starts '"$D"'/probe/stop-asked; do
+    for p in /run/cain /run/cain/probe /run/cain/probe/session.json /run/cain/probe/booted /run/cain/probe/asked '"$D"'/probe '"$D"'/probe/boots '"$D"'/probe/starts '"$D"'/probe/stop-asked '"$D"'/probe/start.json /run/cain/probe/term; do
       [ -w "$p" ] && echo "writable: $p"
     done
     : > /run/cain/probe/asked 2>/dev/null && echo "created: /run/cain/probe/asked"
     ls /run/cain/probe >/dev/null 2>&1 && echo "listed: /run/cain/probe"
     # Fifth round: the folders above them are closed too, so neither can be renamed or replaced.
     for p in '"$D"' /run/cain; do [ -w "$p" ] && echo "writable: $p"; done
+    # Sixth round: and every folder above them, up to /.
+    for p in / /run "$(dirname '"$D"')"; do [ -w "$p" ] && [ ! -k "$p" ] && echo "writable: $p"; done
     mv '"$D"'/probe '"$D"'/probe.moved 2>/dev/null && echo "renamed: '"$D"'/probe"
     mv /run/cain/probe /run/cain/probe.moved 2>/dev/null && echo "renamed: /run/cain/probe"
     mkdir '"$D"'/probe.new 2>/dev/null && echo "made: '"$D"'/probe.new"
@@ -95,6 +97,12 @@ probe_marks_root_only() {
   rm -f /run/cain/probe && mv /run/cain/probe.real /run/cain/probe
   [ "$p" = 3 ] || fail "a symlinked probe folder wasn't refused (exit $p)"
   [ -z "$(ls -A /tmp/probe-elsewhere)" ] || fail "the probe wrote through a symlinked folder"
+  # Sixth round: a missing folder is made root's 0700, not refused.
+  mv /run/cain/probe /run/cain/probe.real || fail "couldn't move the folder aside"
+  PROBE_NOTICE=/bin/true bun "$OPT/probe/main.ts" session-start "" "" >/dev/null 2>&1; p=$?
+  q="$(stat -c '%U:%G %a' /run/cain/probe 2>/dev/null)"
+  rm -rf /run/cain/probe && mv /run/cain/probe.real /run/cain/probe
+  [ "$p" = 0 ] && [ "$q" = "root:root 700" ] || fail "a missing probe folder wasn't made root's 0700 (exit $p, $q)"
 }
 
 # The old tree's contents and owners (not modes: the switch tightens those first).

@@ -4,14 +4,21 @@
 //   bun main.ts pass                 one pass, now
 //   bun main.ts install <version>    the version this start runs: an install when it changed (run
 //                                    before boot, so a start the update itself caused isn't counted)
-//   bun main.ts boot                 the App's container started: kept in /data once per container
-//                                    (boot, asked or update), and the container-start alarm raised or down
+//   bun main.ts boot <start id>      the run script started (its own id for this start): the first in a
+//                                    container is kept in /data (boot, asked or update) and the
+//                                    container-start alarm raised or down; every start clears any stop
+//                                    mark and keeps its id as the last start record
+//   bun main.ts stop-finish <code> <signal>
+//                                    s6's finish script: the stop mark kept only for a real stop (256
+//                                    with signal 15, or 15) the TERM trap left its nonce for; any other
+//                                    end (SIGKILL, SIGSEGV, SIGABRT...) clears both
 //   bun main.ts session-asked <id>   the run script is about to stop his session: a root-owned mark
 //                                    naming that very run (the id the run script holds), so its end is
 //                                    "asked"
-//   bun main.ts stop-asked [id]      the Supervisor is stopping the App (the run script's TERM, or s6's
-//                                    finish after it): the run marked asked as above, and a mark in /data
-//                                    so the next container start isn't counted
+//   bun main.ts stop-asked <id> <start id>
+//                                    the Supervisor is stopping the App (the run script's TERM trap): the
+//                                    run marked asked as above, the trap's nonce left in /run, and a mark
+//                                    in /data naming this start, so the next container start isn't counted
 //   bun main.ts session-gone <id>    the run script saw his session gone: when, for how long it ran
 //   bun main.ts session-start <code> <id>
 //                                    his session starts: the run before it (id: the one the run script
@@ -25,17 +32,16 @@
 // keeps running through a Stop); the App's own stopped mode (the mode file says none) does.
 // Before every read or write under /data/probe or /run/cain/probe the folder is looked at
 // (probe/folder.ts): root's, 0700, not a symlink, or the probe refuses and alarms once.
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { heartbeatUrl } from "../security/core";
 import { checkFolder, FolderTampered, folderWhy } from "./folder";
 import {
   afterStart, alarmFor, askDue, bootKind, clockDue, endKind, END_KINDS, exitCause, failedWords, type Facts, hourlyState, type Hourly, type Install,
   inWindow, lastCode, lastSlot, logLine, longTurn, parseBoots, pass, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts,
-  parseUnseen, type Screen, screenOf, shouldPing, SELF_WINDOW_S, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
-  UNSEEN_WINDOW_S, updateCause,
+  parseUnseen, type Screen, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
+  unseenCount, updateCause,
 } from "./core";
 
 const env = process.env;
@@ -49,14 +55,17 @@ export const paths = (e: Record<string, string | undefined> = env) => {
     dir: D, run: R,
     starts: join(D, "starts"), install: join(D, "install.json"), passes: join(D, "passes.jsonl"), hourly: join(D, "hourly.json"),
     alive: join(D, "alive"), alarmed: join(D, "alarmed"), boots: join(D, "boots"),
-    // The Supervisor asked the App to stop (stop-asked): the next container start isn't counted.
-    stopAsked: join(D, "stop-asked"),
+    // The Supervisor asked the App to stop (stop-asked): the next container start isn't counted, when the
+    // mark names the last start of the run script (start.json, its id and time).
+    stopAsked: join(D, "stop-asked"), start: join(D, "start.json"),
     // The hourly check's ask and answer, and when a message of the owner's last came in for his session
     // (the broker's note, a time only).
     ask: join(R, "ask"), answered: join(R, "answered"), heard: join(R, "heard"),
     // This container's marks (tmpfs: a new container starts with none): his session's run as root
     // started it, the run script's own stop request for that run, and that this container booted.
     session: join(R, "session.json"), asked: join(R, "asked"), booted: join(R, "booted"),
+    // The run script's TERM trap ran for this start (its start id): only then is a stop "real".
+    term: join(R, "term"),
     delivered: e.CHECKIN_DELIVERED ?? "/data/checkin.delivered",
     gateway: e.PROBE_GATEWAY ?? "/run/cain/link-gateway.state",
     mode: e.PROBE_MODE_FILE ?? "/run/cain/mode",
@@ -71,9 +80,18 @@ type Paths = ReturnType<typeof paths>;
 
 // A path under one of the probe's folders: the folder looked at first (FolderTampered otherwise).
 function guard(p: string): void { const d = dirname(p); if (GUARDED.has(d)) checkFolder(d); }
-const text = (p: string) => { guard(p); try { return readFileSync(p, "utf8"); } catch { return null; } };
+// A file under the probe's folders is opened without following a link (O_NOFOLLOW; Bun has no openat,
+// so it is the path under the folder just looked at) and read only when it is a plain file.
+const text = (p: string) => {
+  const d = dirname(p);
+  if (!GUARDED.has(d)) { try { return readFileSync(p, "utf8"); } catch { return null; } }
+  checkFolder(d);
+  let fd: number;
+  try { fd = openSync(p, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); } catch { return null; }
+  try { return fstatSync(fd).isFile() ? readFileSync(fd, "utf8") : null; } catch { return null; } finally { closeSync(fd); }
+};
 const json = <T>(p: string): T | null => { const t = text(p); try { return t === null ? null : JSON.parse(t) as T; } catch { return null; } };
-const exists = (p: string) => { guard(p); return existsSync(p); };
+const exists = (p: string) => { guard(p); try { lstatSync(p); return true; } catch { return false; } };
 const rm = (p: string) => { guard(p); rmSync(p, { force: true }); };
 const num = (p: string) => { const n = Number((text(p) ?? "").trim().split(/\s+/)[0]); return Number.isFinite(n) && n > 0 ? n : null; };
 // Whole or not at all, root's alone: written under a fresh temp name created exclusively (never
@@ -91,29 +109,34 @@ export function writeWhole(p: string, body: string, mode = 0o600): void {
 }
 const log = (m: string) => console.log(`[cain] probe: ${m}`);
 
-// A folder found wrong: refused, and alarmed once (notice.sh keeps the same alarm and cause as one;
-// a process tells it at most once). true when e was that.
-let toldTamper = false;
-export function onTamper(e: unknown, notice: PassDeps["notice"]): boolean {
+// A folder found wrong: refused, and alarmed, again each day while it lasts (sixth round: a tamper
+// mustn't silence liveness for good; notice.sh sends the same alarm to his bot again once a day has
+// passed). Meanwhile no pass passes, so the probe's outside heartbeat isn't pinged and its service
+// alarms too. true when e was that.
+export const TAMPER_REPEAT_S = 86400;
+let toldTamper: number | null = null;
+export function onTamper(e: unknown, notice: PassDeps["notice"], now = Math.floor(Date.now() / 1000)): boolean {
   if (!(e instanceof FolderTampered)) return false;
   log(`refused: the probe's folder ${e.dir} ${e.why}`);
-  if (!toldTamper && notice("tell", "tampered", `${e.dir} ${e.why}`) <= 1) toldTamper = true;
+  if ((toldTamper === null || now - toldTamper >= TAMPER_REPEAT_S) && notice("tell", "tampered", `${e.dir} ${e.why}`) <= 1) toldTamper = now;
   return true;
 }
 // Both folders right again after an alarm: it comes down.
 export function tamperCleared(p: Paths, notice: PassDeps["notice"], force = false): void {
-  if ((toldTamper || force) && folderWhy(p.dir) === null && folderWhy(p.run) === null && notice("clear", "tampered") <= 1) toldTamper = false;
+  if ((toldTamper !== null || force) && folderWhy(p.dir) === null && folderWhy(p.run) === null && notice("clear", "tampered") <= 1) toldTamper = null;
 }
 
 // The last line of his session's log, as it may go into an alarm (core logLine). He writes that log,
 // so it is opened without following a link, and only a plain file with one name, root's or his, is
-// read, its last 4 KB: never something it points at.
+// read, its last 4 KB: never something it points at. The descriptor is checked after the open and
+// before any read (a plain file, one link, root's or Cain's).
 export function sessionLogLine(p: Paths): string | null {
   let fd: number;
   try { fd = openSync(p.sessionLog, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); } catch { return null; }
   try {
     const st = fstatSync(fd);
     const cain = Number(env.CAIN_UID ?? 1000), me = typeof process.getuid === "function" ? process.getuid() : 0;
+    // me: the probe's own user, root on the Pi (a test's own user here).
     if (!st.isFile() || st.nlink !== 1 || ![0, cain, me].includes(st.uid)) return null;
     const n = Math.min(st.size, 4096);
     const buf = Buffer.alloc(n);
@@ -170,6 +193,8 @@ export interface PassDeps {
 // the ping.
 export async function runPass(d: PassDeps): Promise<Pass> {
   const { p, now } = d;
+  // Both folders looked at first: a refused folder ends the pass here, so nothing is pinged.
+  checkFolder(p.dir); checkFolder(p.run);
   const h: Hourly = json<Hourly>(p.hourly) ?? {};
   const ans = num(p.answered);
   if (ans && h.asked && ans >= h.asked && !(h.answered && h.answered >= h.asked)) h.answered = ans;
@@ -242,26 +267,45 @@ export function markAsked(p: Paths, mem: string): boolean {
   writeWhole(p.asked, `${r.id}\n`);
   return true;
 }
-// Which container wrote a stop mark: the hostname. The Supervisor names the App's container after
-// the App and recreates it on each restart or update, so its Docker id changes from one container to
-// the next while the hostname stays; a mark from any other host (a /data copied or restored onto
-// another machine or App) never counts.
-export function containerId(): string { return hostname().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 64) || "unknown"; }
-// The Supervisor is stopping the App (SIGTERM to s6: the run script's own TERM trap, and the finish
-// script on 256/15 as well): the run marked asked before his session ends, when the run script still
-// holds its id, and a mark in /data, with this container's id and the time, so the container start
-// after it isn't counted. The next start takes it, and counts it only from this container and within
-// 5 minutes.
-export function stopAsked(p: Paths, now: number, mem: string, container = containerId()): boolean {
-  writeWhole(p.stopAsked, `${JSON.stringify({ at: now, container })}\n`);
+// The Supervisor is stopping the App (SIGTERM to s6, reaching the run script's TERM trap): the run
+// marked asked before his session ends, when the run script still holds its id; the trap's nonce left
+// in /run (its start id: the finish script keeps the mark only when it finds it); and a mark in /data
+// naming the run script's start (its own id, start), with the time, so the container start after it
+// isn't counted. The next start counts it only when its id is the last start record's, within 5
+// minutes (sixth round: bound to that start of the run script, which a recreated container can't
+// change).
+interface StopMark { at: number; id: string }
+export function stopAsked(p: Paths, now: number, mem: string, start: string): boolean {
+  if (START_ID.test(start)) {
+    writeWhole(p.term, `${start}\n`);
+    writeWhole(p.stopAsked, `${JSON.stringify({ at: now, id: start } satisfies StopMark)}\n`);
+  } else log("a stop with no start id: not kept as asked");
   return mem !== "" && markAsked(p, mem);
 }
-// The stop mark, taken: whether it counts for a start now in this container.
-export function takeStopMark(p: Paths, now: number, container = containerId()): boolean {
-  const m = json<{ at?: unknown; container?: unknown }>(p.stopAsked);
+// s6's finish script, with the exit code and signal s6 passes: a real stop is 256 with signal 15 (or
+// 15). Only then, and only when the TERM trap left its nonce for the last start, is the mark kept (made
+// again, should the trap's write not have landed). Any other end (a SIGKILL from the OOM killer, a
+// SIGSEGV, a SIGABRT, an exit of its own) is never asked: the mark and the nonce are cleared.
+export function stopFinish(p: Paths, now: number, code: number, sig: number): boolean {
+  const real = (code === 256 && sig === 15) || code === 15;
+  const nonce = (text(p.term) ?? "").trim();
+  const last = json<{ id?: unknown }>(p.start);
+  if (real && START_ID.test(nonce) && last && last.id === nonce) {
+    writeWhole(p.stopAsked, `${JSON.stringify({ at: now, id: nonce } satisfies StopMark)}\n`);
+    return true;
+  }
+  if (!real) log(`the run script ended by ${code === 256 ? `signal ${sig}` : `exit ${code}`}: not a stop that was asked`);
+  else log("a stop with no nonce from this start's TERM trap: not kept as asked");
+  rm(p.stopAsked); rm(p.term);
+  return false;
+}
+// The stop mark, taken: whether it counts for a container start now, after the start whose record is
+// last (its id). A mark from another start, an old-format, stale or garbled one never counts.
+export function takeStopMark(p: Paths, now: number, last: string | null): boolean {
+  const m = json<{ at?: unknown; id?: unknown }>(p.stopAsked);
   rm(p.stopAsked);
-  if (!m || typeof m.at !== "number" || !Number.isFinite(m.at) || typeof m.container !== "string") return false;
-  if (m.container !== container) { log("a stop mark from another container: not counted as asked"); return false; }
+  if (!m || typeof m.at !== "number" || !Number.isFinite(m.at) || typeof m.id !== "string" || !START_ID.test(m.id)) return false;
+  if (last === null || m.id !== last) { log("a stop mark from another start of the run script: not counted as asked"); return false; }
   const age = now - m.at;
   if (age < -60 || age > STOP_MARK_S) { log("a stop mark older than 5 minutes: not counted as asked"); return false; }
   return true;
@@ -310,20 +354,21 @@ export function recordStart(p: Paths, now: number, end: string, notice: PassDeps
 const flagOf = (p: Paths, k: string) => `${p.alarmed}-${k}`;
 // The line that names the update: within a day of a version change, once for each new loop (it comes
 // down once neither loop stands, so the next loop says it again).
-function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-boots", notice: PassDeps["notice"]): void {
+function sayUpdate(p: Paths, now: number, kind: "update-exits" | "update-unseen" | "update-boots", notice: PassDeps["notice"]): void {
   const i = json<Install>(p.install);
   if (!inWindow(i, now)) return;
   if (notice("tell", kind, updateCause(i!, now)) <= 1) writeWhole(flagOf(p, "update"), `${now}\n`);
 }
 function updateDown(p: Paths, notice: PassDeps["notice"]): void {
-  if (!exists(flagOf(p, "update")) || exists(flagOf(p, "starts")) || exists(flagOf(p, "boots"))) return;
+  if (!exists(flagOf(p, "update")) || exists(flagOf(p, "starts")) || exists(flagOf(p, "boots")) || exists(flagOf(p, "unseen"))) return;
   if (notice("clear", "update") <= 1) rm(flagOf(p, "update"));
 }
 // Repeated early exits (more than 3 in 30 minutes): "Cain's session keeps exiting early", and within
 // a day of an install the line that names it; down once the count is back under. Repeated late error
 // exits (more than 4 in 60 minutes): "Cain's session keeps ending on its own", down once back under.
-// Restarts whose end root never saw (more than 6 in 60 minutes): "Cain's session keeps restarting",
-// a cadence, not a confirmed exit, kept apart from both and never naming an update.
+// Restarts whose end root never saw (more than 3 in 30 minutes, or more than 6 in 60): "Cain's session
+// keeps restarting", a cadence, not a confirmed exit, kept apart from both; within a day of an install
+// it names the update too (an early crash before exit handlers run looks unseen).
 // Each carries the count and window, the last exit code root kept and the last line of his session's
 // log. None of this reads the owner's Stop: his session runs through it.
 export function checkStarts(p: Paths, now: number, notice: PassDeps["notice"]): number {
@@ -352,24 +397,36 @@ export function checkStarts(p: Paths, now: number, notice: PassDeps["notice"]): 
   const unseen = parseUnseen(all);
   const uflag = flagOf(p, "unseen");
   if (tooManyUnseen(unseen, now)) {
-    if (!exists(uflag) && notice("tell", "unseen-loop", exitCause(`${startsIn(unseen, now, 0, UNSEEN_WINDOW_S)} in 60 minutes`, null, logged())) <= 1) writeWhole(uflag, `${now}\n`);
+    if (!exists(uflag) && notice("tell", "unseen-loop", exitCause(unseenCount(unseen, now), null, logged())) <= 1) {
+      writeWhole(uflag, `${now}\n`);
+      sayUpdate(p, now, "update-unseen", notice);
+    }
   } else if (exists(uflag)) {
     if (notice("clear", "unseen") <= 1) rm(uflag);
   }
   updateDown(p, notice);
   return n;
 }
-// The App's container started: kept once per container (a mark in /run, which a new container starts
-// without) as "boot", "asked" (the Supervisor asked the App to stop before it: the mark in /data,
-// taken here) or "update" (one of the first two within 10 minutes of a version change). More than 3
-// counted starts in 30 minutes: "Cain's App container keeps starting", and within a day of an install
-// the line that names it.
-export function recordBoot(p: Paths, now: number, notice: PassDeps["notice"], container = containerId()): string | null {
-  if (exists(p.booted)) return null;
-  writeWhole(p.booted, `${now}\n`);
-  const kind = bootKind({ now, stopAsked: takeStopMark(p, now, container), install: json<Install>(p.install), bootsText: text(p.boots) ?? "" });
-  addLine(p.boots, `${now} ${kind}`, now);
-  checkBoots(p, now, notice);
+// The run script started (start: its own id for this start). The first start in a container (a mark in
+// /run, which a new container starts without) is kept as "boot", "asked" (the Supervisor asked the App
+// to stop before it: the mark in /data, naming the last start record's id, taken here) or "update" (one
+// of the first two within 10 minutes of a version change). More than 3 counted starts in 30 minutes:
+// "Cain's App container keeps starting", and within a day of an install the line that names it.
+// Every start, an s6-only restart of the run script included, then clears any stop mark and the trap's
+// nonce, and keeps its id as the last start record, so a stale mark can never absorb a later crash.
+export function recordBoot(p: Paths, now: number, notice: PassDeps["notice"], start = ""): string | null {
+  const prev = json<{ id?: unknown }>(p.start);
+  const last = prev && typeof prev.id === "string" && START_ID.test(prev.id) ? prev.id : null;
+  let kind: string | null = null;
+  if (!exists(p.booted)) {
+    writeWhole(p.booted, `${now}\n`);
+    kind = bootKind({ now, stopAsked: takeStopMark(p, now, last), install: json<Install>(p.install), bootsText: text(p.boots) ?? "" });
+    addLine(p.boots, `${now} ${kind}`, now);
+    checkBoots(p, now, notice);
+  } else if (exists(p.stopAsked)) log("a stop mark left by a restart of the run script alone: cleared");
+  rm(p.stopAsked); rm(p.term);
+  if (START_ID.test(start)) writeWhole(p.start, JSON.stringify({ id: start, at: now }));
+  else rm(p.start);
   return kind;
 }
 export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): number {
@@ -441,12 +498,15 @@ if (import.meta.main) {
       const r = await runPass(deps());
       console.log(r.ok ? "passed" : `${r.status}: ${failedWords(r)}`);
     } else if (cmd === "boot") {
-      const k = recordBoot(p, now(), noticeCall(p));
+      const k = recordBoot(p, now(), noticeCall(p), idArg(arg));
       console.log(k ? `this container's start kept as ${k}` : "this container's start was kept already");
     } else if (cmd === "session-asked") {
       console.log(markAsked(p, idArg(arg)) ? "marked: this run's end was asked for" : "no run of his to mark");
     } else if (cmd === "stop-asked") {
-      console.log(stopAsked(p, now(), idArg(arg)) ? "the stop was asked for: kept, and his run marked" : "the stop was asked for: kept");
+      console.log(stopAsked(p, now(), idArg(arg), idArg(process.argv[4])) ? "the stop was asked for: kept, and his run marked" : "the stop was asked for: kept");
+    } else if (cmd === "stop-finish") {
+      const n = (a: string | undefined) => { const v = (a ?? "").replace(/[^0-9]/g, "").slice(0, 4); return v === "" ? -1 : Number(v); };
+      console.log(stopFinish(p, now(), n(arg), n(process.argv[4])) ? "a real stop: its mark kept" : "not a stop that was asked: no mark");
     } else if (cmd === "session-gone") {
       markGone(p, now(), idArg(arg));
     } else if (cmd === "session-start") {
@@ -457,7 +517,7 @@ if (import.meta.main) {
       const i = recordInstall(p, arg ?? "", now());
       console.log(i ? `${i.version} since ${i.at || "before the probe"}` : "no version");
     } else {
-      console.error("usage: main.ts loop | pass | install <version> | boot | session-asked <id> | stop-asked [id] | session-gone <id> | session-start <code> <id>");
+      console.error("usage: main.ts loop | pass | install <version> | boot <start id> | session-asked <id> | stop-asked <id> <start id> | stop-finish <code> <signal> | session-gone <id> | session-start <code> <id>");
       process.exit(2);
     }
   } catch (e) {

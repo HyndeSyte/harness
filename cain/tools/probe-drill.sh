@@ -14,9 +14,18 @@
 #   probe-drill.sh 3    kill the plugin, close his session, cut the network for 15 minutes: each alarm
 #                       must be raised and then cleared.
 #   probe-drill.sh 4    an API outage and a reboot: no false alarm (prints the steps, then checks).
-#   probe-drill.sh 5    asked stops: Restart the App from Home Assistant 4 times within 30 minutes (and
-#                       an update, if one is waiting): every start kept as "asked" or "update", no
-#                       container-start alarm, no early exit counted (prints the steps, then checks).
+#   probe-drill.sh 5    how stops are classed (sixth round), three parts, each checking what /data keeps
+#                       and the alarms:
+#                       5 ha     an intentional shutdown from Home Assistant: Restart the App 4 times
+#                                within 30 minutes (and an update, if one is waiting): every start kept
+#                                as "asked" or "update", no container-start alarm, no early exit counted,
+#                                and each stop inside the Supervisor's 30 seconds (prints the steps,
+#                                then checks: probe-drill.sh 5 ha check <start>);
+#                       5 kill   an abrupt termination (docker kill, SIGKILL to the whole container):
+#                                the next start is kept as "boot", never "asked", and no stop mark stays;
+#                       5 s6     an s6-only restart of the run script (s6-svc -r): the same container,
+#                                no new start counted, and the stop mark it leaves is cleared by the
+#                                run script's next start.
 #
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
 # token or a heartbeat URL.
@@ -136,26 +145,63 @@ EOF
     ;;
   5)
     since=$(date +%s)
-    say "step 5: stops asked from Home Assistant never count"
-    cat <<'EOF'
+    boots_since() { in_c awk -v s="$1" '$1 >= s' /data/probe/boots; }
+    case "${2:-}" in
+      ha)
+        say "step 5 ha: stops asked from Home Assistant never count"
+        cat <<'EOF'
   In Home Assistant, Settings, Apps, Cain: tap Restart, wait until the log says Cain's start, and do
-  it 4 times within 30 minutes (an update of the App, if one is waiting, counts as one of them).
+  it 4 times within 30 minutes (an update of the App, if one is waiting, counts as one of them). Time
+  each stop: from the tap to the log's last line of the old container must be under 30 seconds.
   Expected: each start kept as "asked" (or "update") in /data/probe/boots, his session's first start
   in each container "boot", no "Cain's App keeps restarting" and no early exit counted.
-Then run: probe-drill.sh 5 check <the time step 5 began, in epoch seconds>
+Then run: probe-drill.sh 5 ha check <the time step 5 began, in epoch seconds>
 EOF
-    say "  this step began at $since"
-    if [ "${2:-}" = check ]; then
-      s="${3:?the time step 5 began}"
-      in_c awk -v s="$s" '$1 >= s' /data/probe/boots
-      n="$(in_c awk -v s="$s" '$1 >= s && $2 == "boot"' /data/probe/boots | wc -l)"
-      [ "$n" = 0 ] || fail "$n container starts counted since step 5 began (each Restart should be kept as asked)"
-      n="$(in_c awk -v s="$s" '$1 >= s && $2 ~ /^early-/' /data/probe/starts | wc -l)"
-      [ "$n" = 0 ] || fail "$n early exits counted since step 5 began"
-      alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
-      alarm_up restarts && fail "\"Cain's session keeps exiting early\" is up"
-      echo "PASS: the asked stops counted nothing"
-    fi
+        say "  this step began at $since"
+        if [ "${3:-}" = check ]; then
+          s="${4:?the time step 5 began}"
+          boots_since "$s"
+          n="$(in_c awk -v s="$s" '$1 >= s && $2 == "boot"' /data/probe/boots | wc -l)"
+          [ "$n" = 0 ] || fail "$n container starts counted since step 5 began (each Restart should be kept as asked)"
+          n="$(in_c awk -v s="$s" '$1 >= s && $2 ~ /^(early-|unseen)/' /data/probe/starts | wc -l)"
+          [ "$n" = 0 ] || fail "$n early or unseen exits counted since step 5 began"
+          alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
+          alarm_up restarts && fail "\"Cain's session keeps exiting early\" is up"
+          alarm_up unseen && fail "\"Cain's session keeps restarting\" is up"
+          echo "PASS: the asked stops counted nothing. Confirm each stop took under 30 seconds."
+        fi
+        ;;
+      kill)
+        say "step 5 kill: an abrupt termination is never asked"
+        docker kill "$C" >/dev/null || fail "couldn't kill the container"
+        say "  killed; start the App again from Home Assistant (Settings, Apps, Cain, Start) if the watchdog doesn't"
+        wait_for 900 sh -c "docker exec $C awk -v s=$since '\$1 >= s' /data/probe/boots 2>/dev/null | grep -q ." \
+          || fail "no new container start kept within 15 minutes"
+        boots_since "$since"
+        k="$(in_c awk -v s="$since" '$1 >= s {k=$2} END {print k}' /data/probe/boots)"
+        [ "$k" = boot ] || fail "the start after docker kill was kept as \"$k\", not \"boot\""
+        in_c test -e /data/probe/stop-asked && fail "a stop mark stayed after the start"
+        alarm_up boots && say "  note: \"Cain's App keeps restarting\" is up (other starts in the last 30 minutes)"
+        echo "PASS: the start after an abrupt termination was counted, and no stop mark stayed"
+        ;;
+      s6)
+        say "step 5 s6: an s6-only restart of the run script"
+        before="$(in_c cat /data/probe/boots 2>/dev/null | wc -l)"
+        in_c sh -c 's6-svc -r /run/service/cain 2>/dev/null || /command/s6-svc -r /run/service/cain' \
+          || fail "couldn't restart the run script (s6-svc -r /run/service/cain)"
+        sleep 90
+        in_c true || fail "the container stopped"
+        after="$(in_c cat /data/probe/boots 2>/dev/null | wc -l)"
+        [ "$after" = "$before" ] || fail "an s6-only restart was counted as a container start"
+        in_c test -e /data/probe/stop-asked && fail "the stop mark the restart left wasn't cleared by the run script's next start"
+        in_c test -e /run/cain/probe/term && fail "the TERM trap's nonce wasn't cleared"
+        in_c awk -v s="$since" '$1 >= s' /data/probe/starts
+        alarm_up boots && fail "\"Cain's App keeps restarting\" is up"
+        alarm_up unseen && fail "\"Cain's session keeps restarting\" is up"
+        echo "PASS: the s6-only restart counted no container start, and its stop mark was cleared"
+        ;;
+      *) echo "usage: probe-drill.sh 5 ha [check <start>] | 5 kill | 5 s6"; exit 2 ;;
+    esac
     ;;
-  *) echo "usage: probe-drill.sh 1|1b|2|3|4|5 [check ...]"; exit 2 ;;
+  *) echo "usage: probe-drill.sh 1|1b|2|3|4 [check ...] | 5 ha|kill|s6"; exit 2 ;;
 esac

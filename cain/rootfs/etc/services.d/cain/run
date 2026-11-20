@@ -62,8 +62,14 @@ run_id=""
 # finish script sees a stop, not an exit of its own (which would halt the container and alarm).
 # The waits in the loops below are interruptible (sleep in the background, then wait), so the
 # trap runs at once; the finish script records the stop as well, should it not.
-# Up to 10 seconds for it, inside s6's grace for this service (the Dockerfile's S6_SERVICES_GRACETIME).
-stop_asked() { timeout 10 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" >/dev/null 2>&1 || true; }
+# Sixth round: the mark names this start of the run script (start_id, made here, fresh each start,
+# kept by root as the last start record in /data by the boot step below), and the trap leaves its nonce
+# in /run for the finish script. The next container start counts the mark only when its id is the last
+# start record's; every start of this script clears it, so an s6-only restart's mark can't absorb a
+# later crash. Up to 6 seconds for it, inside s6's 8 second grace for the services (the Dockerfile's
+# S6_SERVICES_GRACETIME).
+start_id="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -cd '0-9a-f' | head -c 16)"
+stop_asked() { timeout 6 bun "$OPT/probe/main.ts" stop-asked "${run_id:-}" "${start_id:-}" >/dev/null 2>&1 || true; }
 trap 'stop_asked; trap - TERM; kill -TERM $$' TERM
 nap() { sleep "$1" & wait $! 2>/dev/null || true; }
 
@@ -203,11 +209,12 @@ bashio::log.info "Cain's start: ${mode/own/as his own user}${held:+, his session
 # The version this start runs (probe/main.ts install, Cain 0.14.0): a version that changed since the
 # last start is an install, and a loop within a day of it says so, with the way back by hand. Then
 # this container's start, kept in /data once per container: more than 3 counted in 30 minutes alarms
-# that the App keeps restarting. A start after a stop the Supervisor asked for, and the first two
+# that the App keeps restarting. Every start of this script (an s6-only restart too) clears any stop mark
+# and keeps start_id as the last start record. A start after a stop the Supervisor asked for, and the first two
 # within 10 minutes of a version change (the update's own restart), aren't counted. Nothing here
 # restores or rolls back anything.
 [ "$version" = unknown ] || timeout 30 bun "$OPT/probe/main.ts" install "$version" 2>&1 || true
-timeout 30 bun "$OPT/probe/main.ts" boot 2>&1 || true
+timeout 30 bun "$OPT/probe/main.ts" boot "${start_id:-}" 2>&1 || true
 
 # What each way of running reads where. The old way keeps 0.11.0's places; the new one the
 # places of C1's section 3.2.
@@ -351,8 +358,8 @@ session_up() {
 # otherwise how long it ran to when this script saw it gone (session_gone): within 5 minutes an early
 # exit, which counts toward its alarm whatever code it kept ("unknown" when none); later, exit 0 is
 # "clean" and a non-zero exit "self" (his own user can cause one), counted apart in an hour's window.
-# A run this script never saw end (s6 restarted it meanwhile) is an early exit only when this start
-# comes within 5 minutes of the run's start, and "unknown" otherwise.
+# A run this script never saw end (s6 restarted it meanwhile, or it died before its exit handlers ran)
+# is "unseen", whatever the gap: counted in its own windows (more than 3 in 30 minutes, or 6 in 60).
 # session.sh keeps the exit code: his own folder the new way (read as him), root's the old way.
 session_gone() { timeout 30 bun "$OPT/probe/main.ts" session-gone "${run_id:-}" >/dev/null 2>&1 || true; }
 last_code() {

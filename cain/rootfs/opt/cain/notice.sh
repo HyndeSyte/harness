@@ -29,11 +29,12 @@
 # sign-in or on the model's API: probe/main.ts), "restarts" (repeated early exits of his session:
 # more than 3 in 30 minutes, each within 5 minutes of its start, counted from /data), "self" (repeated
 # late error exits of his session: more than 4 in 60 minutes), "unseen" (restarts of his session whose
-# end root never saw: more than 6 in 60 minutes, a cadence, not a confirmed exit), "boots" (repeated
-# starts of his App's container: more than 3 counted in 30 minutes), "update" (the early-exit or
-# container loop within a day of a version change: what changed and the way back by hand; nothing
+# end root never saw: more than 3 in 30 minutes or 6 in 60, a cadence, not a confirmed exit), "boots"
+# (repeated starts of his App's container: more than 3 counted in 30 minutes), "update" (the early-exit,
+# unseen or container loop within a day of a version change: what changed and the way back by hand; nothing
 # rolls back by itself; outside that day no alarm names an update), "turn" (a turn of his at work for
-# 2 hours without a break) and "tamper" (the probe's folders aren't root's alone). Within a group a newer
+# 2 hours without a break) and "tamper" (the probe's folders aren't root's alone; it goes to his bot
+# again once a day while it stands). Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
 # clears, "Cain is back" replaces its push and both say so; until a hook takes it, the clearing
@@ -91,7 +92,7 @@ group_of() {
     restarts) echo restarts ;;
     self-loop) echo self ;;
     boots) echo boots ;;
-    update-exits|update-boots) echo update ;;
+    update-exits|update-unseen|update-boots) echo update ;;
     unseen-loop) echo unseen ;;
     turn-long) echo turn ;;
     tampered) echo tamper ;;
@@ -144,18 +145,20 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     self-loop) T="Cain's session keeps ending on its own"
       M="Cain's session keeps ending on its own: it exited with an error after running over 5 minutes more than 4 times in an hour${c}. Possible causes: the model's API or the network not answering him. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
     unseen-loop) T="Cain's session keeps restarting"
-      M="Cain's session keeps restarting: it started again more than 6 times in an hour${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
+      M="Cain's session keeps restarting: it started again more than 3 times in half an hour, or more than 6 times in an hour${c}. The restarts were seen but not the exits, so this is a cadence, not a confirmed crash. The App keeps starting it by itself. If it keeps happening, $RESTART. $DETAILS" ;;
     boots) T="Cain's App keeps restarting"
       M="Cain's App container keeps starting: the whole App, not only his session, started more than 3 times in half an hour${c}, not counting stops and updates asked from Home Assistant. If it doesn't settle within an hour, $RESTART. $DETAILS" ;;
     update-exits) T="Cain keeps exiting early since his update"
-      M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. If Home Assistant made a backup before the update, you can restore it from its Backups page: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's session has exited early several times since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
+    update-unseen) T="Cain's session keeps restarting since his update"
+      M="Cain's session has restarted several times since the update to ${2:-his last version}, its exits unseen: an early crash before its exit handlers run looks like this. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
     update-boots) T="Cain's App keeps restarting since his update"
-      M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. If Home Assistant made a backup before the update, you can restore it from its Backups page: Settings, System, Backups. $DETAILS" ;;
+      M="Cain's App container has started several times since the update to ${2:-his last version}. Nothing rolls back by itself. If a backup was made before the update, restoring it from Backups undoes the update and any changes since: Settings, System, Backups. $DETAILS" ;;
     turn-long) local mins; mins="$(printf '%s' "${2:-}" | tr -cd '0-9' | cut -c1-5)"
       T="Cain's turn has been running for ${mins:-over 120} minutes"
-      M="Cain's turn has been running for ${mins:-over 120} minutes without a break. He may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. If he doesn't answer you, $RESTART. $DETAILS" ;;
+      M="Cain's turn has been running for ${mins:-over 120} minutes without a break. This may be normal for a long job, or he may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. If he doesn't answer you, $RESTART. $DETAILS" ;;
     tampered) T="Cain's probe folder was tampered with"
-      M="Cain's probe folder was tampered with${c}: a folder where the App keeps its liveness records isn't the App's alone, so the App stopped reading and writing there, and its liveness alarms are off until it is right. First $RESTART: that sets the folders up again. If this comes back, the Cain App's log has the details." ;;
+      M="Cain's probe folder was tampered with${c}: a folder where the App keeps its liveness records isn't the App's alone, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). First $RESTART: that sets the folders up again. If this comes back, the Cain App's log has the details." ;;
     *) return 1 ;;
   esac
 }
@@ -182,21 +185,22 @@ plain() { printf '%s' "$1" | tr '\r\n' '  ' | sed 's/ *\xe2\x80\x94 */, /g; s/ad
 # group (any alarm of it, a replaced one included: it stays to be taken down), and whether it has
 # cleared (its notification still to come down).
 load() {   # load <group>
-  kind=""; cause=""; sent=0; fp=""; discord=0; clear=0; shown=0; G="$1"
+  kind=""; cause=""; sent=0; fp=""; discord=0; clear=0; shown=0; told=0; G="$1"
   [ -f "$DIR/$G" ] || return 1
   local k v
   while IFS=' ' read -r k v; do
     case "$k" in kind) kind="$v" ;; cause) cause="$v" ;; sent) sent="$v" ;; fp) fp="$v" ;; discord) discord="$v" ;;
-      clear) clear="$v" ;; shown) shown="$v" ;; esac
+      clear) clear="$v" ;; shown) shown="$v" ;; told) told="$v" ;; esac
   done < "$DIR/$G"
   case "$sent" in ''|*[!0-9]*) sent=0 ;; esac
+  case "$told" in ''|*[!0-9]*) told=0 ;; esac
   [[ "$fp" =~ ^[0-9a-f]{16}$ ]] || fp=""
   [ "$shown" = 1 ] || shown=0
   [ "$(group_of "$kind" 2>/dev/null)" = "$G" ] && alarm "$kind" "$cause"
 }
 save() {
   if mkdir -p "$DIR" 2>/dev/null \
-     && printf 'kind %s\ncause %s\nsent %s\nfp %s\ndiscord %s\nclear %s\nshown %s\n' "$kind" "$cause" "$sent" "$fp" "$discord" "$clear" "$shown" > "$DIR/.$G.tmp" 2>/dev/null \
+     && printf 'kind %s\ncause %s\nsent %s\nfp %s\ndiscord %s\nclear %s\nshown %s\ntold %s\n' "$kind" "$cause" "$sent" "$fp" "$discord" "$clear" "$shown" "$told" > "$DIR/.$G.tmp" 2>/dev/null \
      && mv -fT "$DIR/.$G.tmp" "$DIR/$G" 2>/dev/null; then return 0; fi
   rm -f "$DIR/.$G.tmp" 2>/dev/null
   echo "[cain] alarm '$kind': its state couldn't be kept ($DIR/$G), so its caller raises it again" >&2
@@ -233,7 +237,7 @@ deliver() {   # a group's raised alarm: Discord once, Home Assistant daily or wh
   alarm "$kind" "$cause" || return 1
   local now h said="" missed=""
   if [ "$discord" != 1 ]; then
-    if discord_send "$M"; then discord=1; said="his bot"; else missed="his bot"; fi
+    if discord_send "$M"; then discord=1; told="$(date +%s)"; said="his bot"; else missed="his bot"; fi
   fi
   now="$(date +%s)"
   if h="$(hook)"; then
@@ -260,14 +264,19 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|update-exits|update-boots|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|update-exits|update-unseen|update-boots|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
   g="$(group_of "$1")" || { echo "notice: no alarm called '$1'" >&2; return 2; }
   c="$(plain "${2:-}")"
   if load "$g" && [ "$clear" != 1 ]; then
-    if [ "$kind" = "$1" ] && [ "$cause" = "$c" ]; then deliver; return; fi
+    if [ "$kind" = "$1" ] && [ "$cause" = "$c" ]; then
+      # The tamper alarm, told again (the probe does so daily while it lasts): his bot hears it again
+      # once a day has passed since it last did, as Home Assistant does.
+      if [ "$1" = tampered ] && [ "$discord" = 1 ] && [ $(( $(date +%s) - told )) -ge "$DAY" ]; then discord=0; fi
+      deliver; return
+    fi
     if [ "$(rank "$1")" -lt "$(rank "$kind")" ]; then
       echo "[cain] alarm '$1' kept back: '$kind' stands" >&2
       deliver; return
@@ -275,7 +284,7 @@ tell() {   # tell <kind> [cause]
   fi
   # A new alarm for the group: delivered afresh, but what Home Assistant shows for the group is
   # kept (shown), so a notification of the alarm it replaces still comes down when it clears.
-  G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0
+  G="$g"; kind="$1"; cause="$c"; sent=0; fp=""; discord=0; clear=0; told=0
   deliver
 }
 clear_groups() {   # clear_groups running|switched|screen|delivered|phone

@@ -44,12 +44,11 @@ RUN apt-get update \
 
 ENV DISABLE_AUTOUPDATER=1
 
-# s6-overlay v3's stop grace (milliseconds), so the run script's TERM trap and the finish script
-# have headroom to keep their stop marks on slow SD storage: up to 15 s for the services to stop
-# after TERM, up to 10 s for a finish script, then 5 s before everything left is killed. The
-# defaults are 3 s, 5 s and 3 s. The App's config.yaml gives the Supervisor's stop 30 s in all
-# (timeout: 30), so the services' grace and the kill grace stay under it.
-ENV S6_SERVICES_GRACETIME=15000 S6_KILL_FINISH_MAXTIME=10000 S6_KILL_GRACETIME=5000
+# s6-overlay v3's stop grace (milliseconds), inside the Supervisor's 30 seconds (config.yaml's
+# timeout: 30) with margin: up to 8 s for the services to stop after TERM (the run script's TERM trap
+# takes at most 6), up to 5 s for a finish script (the cain finish script's stop mark takes at most 4),
+# then 3 s before everything left is killed: 16 s in all. The defaults are 3 s, 5 s and 3 s.
+ENV S6_SERVICES_GRACETIME=8000 S6_KILL_FINISH_MAXTIME=5000 S6_KILL_GRACETIME=3000
 
 # C1: Cain's session runs as its own user, and the Discord plugin's server as another, so
 # neither reaches a key root keeps. Fixed ids: /data keeps numeric owners across versions.

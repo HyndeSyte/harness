@@ -1,14 +1,14 @@
 #!/usr/bin/env bashio
 declare APP_EXIT_CODE=${1}
-# The start was ended by SIGTERM (s6 passes 256 and the signal): the Supervisor is stopping the App,
-# an owner's Stop, Restart or update from Home Assistant. Root keeps that stop as asked (probe/main.ts
-# stop-asked, Cain 0.14.0), so the container start after it isn't counted as a restart; the run
-# script's own TERM trap normally did so already, naming his run, and this is the same mark again
-# (fifth round: the mark carries this container's id and the time; the next start takes it, and
-# counts it only from this container and within 5 minutes). Up to 8 seconds, inside s6's finish
-# limit (the Dockerfile's S6_KILL_FINISH_MAXTIME).
-if [[ "${APP_EXIT_CODE}" -eq 256 ]] && [[ "${2:-}" -eq 15 ]]; then
-  timeout 8 bun /opt/cain/probe/main.ts stop-asked >/dev/null 2>&1 || true
+# The stop mark (probe/main.ts stop-finish, Cain 0.14.0). A real stop is the run script ended by
+# SIGTERM (s6 passes 256 and the signal, 15), or exit 15: the Supervisor stopping the App, an owner's
+# Stop, Restart or update from Home Assistant. Root keeps that stop as asked, so the container start after
+# it isn't counted, only when the run script's TERM trap left its nonce for this start (sixth round): a
+# death by SIGKILL (the OOM killer), SIGSEGV or SIGABRT is never asked, and clears any mark. Called only
+# when the nonce is there, so a crash without a TERM costs nothing here. Up to 4 seconds, inside s6's
+# 5 second finish limit (s6-supervise's own, and the Dockerfile's S6_KILL_FINISH_MAXTIME).
+if [ -e /run/cain/probe/term ]; then
+  timeout 4 bun /opt/cain/probe/main.ts stop-finish "${APP_EXIT_CODE}" "${2:-}" >/dev/null 2>&1 || true
 fi
 if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
   bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"

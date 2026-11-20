@@ -15,13 +15,14 @@
 //     minutes alarm;
 //   - repeated late error exits of his session: more than 4 non-zero exits after the 5-minute mark
 //     in 60 minutes alarm (his own user can cause one, so they are counted apart);
-//   - repeated restarts whose end root never saw (s6 restarted the run script meanwhile, and the next
-//     start came more than 5 minutes after the run's start): more than 6 in 60 minutes alarm that his
-//     session keeps restarting. That is a cadence, not a confirmed exit, and its alarm says so;
+//   - repeated restarts whose end root never saw (no exit recorded for the run and no valid asked mark,
+//     whatever the gap between the starts; sixth round): more than 3 in 30 minutes, or more than 6 in
+//     60 minutes, alarm that his session keeps restarting. That is a cadence, not a confirmed exit, and
+//     its alarm says so;
 //   - repeated starts of his App's container: more than 3 counted starts in 30 minutes alarm. A start
 //     after a stop that was asked for (the Supervisor's stop or update) and the first two starts
 //     within 10 minutes of a version change aren't counted.
-// Within a day of a version change, the early-exit or container loop also says so, with the way back
+// Within a day of a version change, the early-exit, unseen or container loop also says so, with the way back
 // by hand; outside that day an alarm gives the count, the window and what root saw only.
 // The owner's Stop (stop.json) stops jobs, cards and merges, not his session, so none of this reads it.
 // Only the App's own stopped mode (the mode file says none) silences the liveness alarms and pings.
@@ -37,12 +38,14 @@ export const SELF_WINDOW_S = 60 * 60;
 export const SELF_MAX = 4;                       // more than this many late error exits in the hour
 export const UNSEEN_WINDOW_S = 60 * 60;
 export const UNSEEN_MAX = 6;                     // more than this many restarts with the end unseen in the hour
+export const UNSEEN_TIGHT_MAX = 3;               // or more than this many in STARTS_WINDOW_S (a tight loop)
 export const DEFER_MAX_S = 2 * 3600;             // the hourly line waits for a turn at most this long
 export const TURN_LONG_S = 2 * 3600;             // a turn at work this long alarms, once a stretch
 export const BOOTS_MAX = 3;                      // more than this many counted container starts in the window
 export const UPDATE_BOOT_S = 10 * 60;            // starts this soon after a version change may be the update's own
 export const UPDATE_BOOTS = 2;                   // and the first this many of them aren't counted
 export const STOP_MARK_S = 5 * 60;               // a stop mark older than this, at the next container start, doesn't count
+export const START_ID = /^[0-9a-f]{16}$/;        // the run script's own id for one start of it (the asked mark is bound to it)
 export const OWNER_QUIET_S = 5 * 60;             // no hourly ask within this of a message of the owner's
 export const INSTALL_WINDOW_S = 24 * 3600;
 export const GATEWAY_ACK_S = 180;                // Discord acknowledges the link's heartbeat every ~41 s
@@ -220,22 +223,25 @@ export function failedWords(p: Pass): string {
 //                  for 0, or "unknown" when none was kept. Only these count toward the early-exit
 //                  alarm;
 //   clean, unknown unasked, later than that, exit 0 or no code kept, the end seen;
-//   unseen         a run whose end the run script never saw (s6 restarted it meanwhile) when the next
-//                  start came more than SHORT_RUN_S after the run's start: how it ended is unknown,
-//                  so it counts only in its own hour-long window, as a restart cadence;
+//   unseen         a run with no recorded exit and no valid asked mark (s6 restarted the run script
+//                  meanwhile, or it died before its exit handlers ran), whatever the gap: how it ended
+//                  is unknown, so it counts in its own windows, as a restart cadence (sixth round: a
+//                  tight one, more than 3 in 30 minutes, alarms as early exits do; a slow one, more
+//                  than 6 in 60 minutes, too);
 //   self-<code>    unasked, later than that, a non-zero exit, seen. His own user can end his session
 //                  with any code, so these count apart, in their own hour-long window.
 export const END_KINDS = /^(boot|asked|clean|unknown|unseen|early-(clean|unknown|\d{1,3})|self-\d{1,3})$/;
-// ran: seconds from the run's start to when root saw it end. seen false: root never saw it end, and
-// ran is then the gap from the run's start to this start, which alone decides.
+// ran: seconds from the run's start to when root saw it end. seen false: root never saw it end: unseen,
+// whatever the gap (sixth round; it was an early exit under 5 minutes before, which claimed an exit
+// root never saw).
 export function endKind(o: { first: boolean; asked: boolean; code: number | null; ran: number | null; seen?: boolean }): string {
   if (o.first) return "boot";
   if (o.asked) return "asked";
+  if (o.seen === false) return "unseen";
   const code = o.code === null ? null : Math.abs(Math.trunc(o.code)) % 1000;
   const how = code === null ? "unknown" : code === 0 ? "clean" : String(code);
   if (o.ran === null || o.ran < 0) return "unknown";
   const short = o.ran <= SHORT_RUN_S;
-  if (o.seen === false) return short ? `early-${how}` : "unseen";
   if (short) return `early-${how}`;
   if (code === null) return "unknown";
   if (code === 0) return "clean";
@@ -256,7 +262,15 @@ export function tooManyStarts(starts: number[], now: number, since = 0): boolean
   return startsIn(starts, now, since) > STARTS_MAX;
 }
 export function tooManySelf(self: number[], now: number): boolean { return startsIn(self, now, 0, SELF_WINDOW_S) > SELF_MAX; }
-export function tooManyUnseen(unseen: number[], now: number): boolean { return startsIn(unseen, now, 0, UNSEEN_WINDOW_S) > UNSEEN_MAX; }
+// Unseen ends: a tight loop (more than 3 in 30 minutes) or a slow one (more than 6 in 60 minutes).
+export function tooManyUnseen(unseen: number[], now: number): boolean {
+  return startsIn(unseen, now) > UNSEEN_TIGHT_MAX || startsIn(unseen, now, 0, UNSEEN_WINDOW_S) > UNSEEN_MAX;
+}
+// The count an unseen alarm gives: the tight window's when it alone tripped, else the hour's.
+export function unseenCount(unseen: number[], now: number): string {
+  const n30 = startsIn(unseen, now), n60 = startsIn(unseen, now, 0, UNSEEN_WINDOW_S);
+  return n30 > UNSEEN_TIGHT_MAX ? `${n30} in 30 minutes` : `${n60} in 60 minutes`;
+}
 // The last exit code root kept with a start (early-<code>, self-<code>, clean as 0), or null.
 export function lastCode(text: string): string | null {
   const kinds = text.split("\n").map((l) => l.trim().split(/\s+/)[1] ?? "").filter((k) => END_KINDS.test(k));
@@ -279,7 +293,7 @@ export function logLine(raw: string): string | null {
 // The cause an exit alarm carries: the count and window, the last exit code, and the last line of his
 // session's log when one was captured. Short enough for notice.sh (it keeps 160 characters).
 export function exitCause(count: string, code: string | null, line: string | null): string {
-  return [count, code === null ? "" : `last exit code ${code}`, line ? `last log line: ${line}` : ""].filter(Boolean).join(", ");
+  return [count, code === null ? "" : `last exit code ${code}`, line ? `session log says: ${line}` : ""].filter(Boolean).join(", ");
 }
 // The boots file: one "<epoch seconds> <kind>" line per start of the App's container, in /data:
 // "boot" counts; "asked" (after a stop the Supervisor asked for) and "update" (one of the first two
