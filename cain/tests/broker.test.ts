@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BrokerSession, checkArgs, fileOutbox, type GateVerdict, MAX_BAD, MAX_PENDING, UNKNOWN } from "../rootfs/opt/cain/discord/broker";
+import { BrokerSession, checkArgs, fileOutbox, type GateVerdict, MAX_BAD, MAX_PENDING, REINIT_MS, RESTARTING, UNKNOWN } from "../rootfs/opt/cain/discord/broker";
 
 const DM = "1569045703332855809";
 const MSG = "1571141530771525664";
@@ -13,6 +13,7 @@ function rig(gate: (tool: "reply" | "edit", args: Record<string, unknown>) => Pr
              readsOk: (chat: string) => string = (chat) => (chat === DM ? "" : "not his DM")) {
   const toClient: any[] = [], toServer: any[] = [], logs: string[] = [], sent: any[] = [], gated: any[] = [];
   const timers: { ms: number; f: () => void; on: boolean }[] = [];
+  const failed: string[] = [];
   let closed = false;
   const box = mkdtempSync(join(tmpdir(), "outbox-"));
   const s = new BrokerSession({
@@ -22,11 +23,12 @@ function rig(gate: (tool: "reply" | "edit", args: Record<string, unknown>) => Pr
     readsOk, outbox: fileOutbox(box), log: (l) => logs.push(l), session: "conn-1",
     setTimer: (ms, f) => { const t = { ms, f, on: true }; timers.push(t); return t; },
     clearTimer: (t: any) => { if (t) t.on = false; },
+    serverFailed: (why) => failed.push(why),
   });
   const call = (id: number | string, name: string, args: Record<string, unknown>) =>
     s.fromClient(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }));
   const answer = (id: number | string, text: string) => s.fromServer(JSON.stringify({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text }] } }));
-  return { s, toClient, toServer, logs, sent, gated, timers, box, call, answer, closed: () => closed };
+  return { s, toClient, toServer, logs, sent, gated, timers, failed, box, call, answer, closed: () => closed };
 }
 
 describe("from Claude Code: only the list passes", () => {
@@ -217,5 +219,73 @@ describe("from the server", () => {
     t.s.serverGone();
     expect(t.toClient.map((m) => m.id).sort()).toEqual([40, 41]);
     expect(t.closed()).toBe(true);
+  });
+});
+
+// Cain 0.15.0, second round (the outside review's fourth finding): while the plugin's server is down,
+// and until a restarted one took the replayed handshake, no client line is dropped silently and no call
+// reaches a server that isn't initialized; a refused or unanswered handshake is a failed server.
+describe("a server gap and its replayed handshake", () => {
+  const init = (t: ReturnType<typeof rig>) => t.s.fromClient(JSON.stringify({ jsonrpc: "2.0", id: 0, method: "initialize", params: { protocolVersion: "2025-06-18", clientInfo: { name: "claude-code" } } }));
+  test("a call made during the gap is answered at once and never sent; after the handshake it goes through", async () => {
+    const t = rig();
+    await init(t);
+    t.s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: 0, result: { capabilities: {} } }));
+    await t.call(1, "reply", { chat_id: DM, text: "in flight" });      // in flight when the server stops
+    t.s.serverLost();
+    expect(t.toClient.find((m) => m.id === 1)?.error?.message).toBe(UNKNOWN);
+    const sentBefore = t.toServer.length;
+    // The gap: a read, a list and a notification. Each call answered at once, nothing sent.
+    await t.call(2, "fetch_messages", { channel: DM });
+    await t.s.fromClient(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }));
+    await t.s.fromClient(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: {} }));
+    expect(t.toClient.find((m) => m.id === 2)?.error?.message).toBe(RESTARTING);
+    expect(t.toClient.find((m) => m.id === 3)?.error?.message).toBe(RESTARTING);
+    expect(t.toServer.length).toBe(sentBefore);
+    // The new server: the replayed initialize goes; a call before its answer is still held.
+    expect(t.s.reinit(1)).toBe(true);
+    expect(t.toServer.at(-1)).toMatchObject({ id: "cain-broker-reinit-1", method: "initialize" });
+    await t.s.fromClient(JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/list" }));
+    expect(t.toClient.find((m) => m.id === 4)?.error?.message).toBe(RESTARTING);
+    expect(t.toServer.some((m) => m.id === 4)).toBe(false);
+    // Its answer: initialized goes first, then calls pass again.
+    t.s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: "cain-broker-reinit-1", result: { capabilities: {} } }));
+    expect(t.toServer.at(-1)).toEqual({ jsonrpc: "2.0", method: "notifications/initialized" });
+    expect(t.s.whole()).toBe(true);
+    await t.s.fromClient(JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/list" }));
+    expect(t.toServer.at(-1)).toMatchObject({ id: 5, method: "tools/list" });
+    expect(t.toClient.some((m) => m.id === "cain-broker-reinit-1")).toBe(false);
+    expect(t.failed).toEqual([]);
+  });
+  test("a send whose gate was still deciding when the server stopped is answered, never sent to the gap", async () => {
+    let release: (v: GateVerdict) => void = () => {};
+    const t = rig(() => new Promise((ok) => { release = ok; }));
+    await init(t);
+    t.s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: 0, result: { capabilities: {} } }));
+    const p = t.call(9, "reply", { chat_id: DM, text: "hi" });
+    t.s.serverLost();
+    release({ kind: "pass", did: "passed" });
+    await p;
+    expect(t.toServer.some((m) => m.id === 9)).toBe(false);
+    expect(t.toClient.filter((m) => m.id === 9).length).toBe(1);
+  });
+  test("a refused handshake, or none within its time, is a failed server, and calls stay held", async () => {
+    const t = rig();
+    await init(t);
+    t.s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: 0, result: { capabilities: {} } }));
+    t.s.serverLost();
+    t.s.reinit(1);
+    t.s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: "cain-broker-reinit-1", error: { code: -32600, message: "no" } }));
+    expect(t.failed).toEqual(["the restarted server refused the handshake"]);
+    expect(t.toServer.some((m) => m.method === "notifications/initialized" && t.toServer.indexOf(m) > 1)).toBe(false);
+    expect(t.s.whole()).toBe(false);
+    await t.s.fromClient(JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/list" }));
+    expect(t.toClient.find((m) => m.id === 6)?.error?.message).toBe(RESTARTING);
+    // The next server never answers: its handshake times out.
+    t.s.serverLost();
+    t.s.reinit(2);
+    const timer = t.timers.find((x) => x.ms === REINIT_MS && x.on)!;
+    timer.f();
+    expect(t.failed).toEqual(["the restarted server refused the handshake", "the restarted server didn't answer the handshake"]);
   });
 });

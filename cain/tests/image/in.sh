@@ -374,6 +374,15 @@ final)
   "$OPT/c1/lock.sh" verify || fail "the start's check doesn't hold with cards.json his to read"
   note "final checks held ($other couldn't be installed; loaded: $loaded)"
   ;;
+health-serve)
+  # Cain 0.15.0, second round: the panel's folders as the run script makes them, then the shipped
+  # terminal service as it runs in the App (bashio), which writes the owner map, starts the shipped
+  # nginx and stays up as ttyd. c1.sh asks /health from outside.
+  # lock.sh run on an empty /data may stop short of its end; the panel's folders come first in it.
+  "$OPT/c1/lock.sh" run >/dev/null 2>&1 || true
+  [ "$(stat -c %U:%G:%a /run/cain-web/www 2>/dev/null)" = root:nogroup:750 ] || fail "lock.sh run didn't make /run/cain-web/www root:nogroup 0750"
+  exec bashio /etc/services.d/terminal/run
+  ;;
 alarm)
   # The App's alarms with Discord down (C1 second review, must-fixes 1 and 2), on the switched
   # /data: the check of his own user can't finish here (no link runs, so its routes don't answer):

@@ -2,7 +2,8 @@
 // run script, like the record keeper. Its keys come from the add-on's options in
 // its own environment only; they are read once, removed from the environment, and
 // never printed. Codex (the OpenAI seat) gets an environment with none of them.
-import { chmodSync, chownSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
+import { pinSocket } from "../pinned.ts";
 import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
@@ -50,8 +51,7 @@ if (import.meta.main) {
     else {
       try { rmSync(sock, { force: true }); } catch { /* none */ }
       Bun.serve({ unix: sock, fetch: (req) => handle(req, login) });
-      chownSync(sock, 0, Number(env.NGINX_GID ?? 65534));
-      chmodSync(sock, 0o660);
+      pinSocket(sock);                                 // root:nogroup 0770, as ttyd's (../pinned.ts)
     }
   } catch (e) { log(`sign-in page didn't start: ${(e as Error).message}`); }
 

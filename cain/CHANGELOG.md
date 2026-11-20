@@ -2,8 +2,10 @@
 
 ## 0.15.0
 
-- Cain stays on Discord when the Discord plugin's server stops. The App now starts it again within seconds, every time, and logs why it stopped. On Nov 20 it stopped once and nothing started it again, so Cain was off Discord for 19 minutes.
-- If his Discord channel stays down anyway, across 3 restarts of his session or for 10 minutes, the App restarts itself, once per incident, and comes back by itself. You see each one in the next morning message, with when and why, and hear at once if it happens 3 times in a day or twice for the same reason.
+- Cain stays on Discord when the Discord plugin's server stops. The App now starts it again within seconds, every time, and logs why it stopped: its exit code, the signal and its last lines. A message Cain sends in those seconds gets "try again in a few seconds" at once instead of vanishing. On Nov 20 it stopped once and nothing started it again, so Cain was off Discord for 19 minutes.
+- If his Discord channel stays down anyway, across 3 restarts of his session or for 10 minutes, the App restarts itself, once per incident, and comes back by itself. It asks Home Assistant to restart it, and only if that doesn't work stops so the Watchdog brings it back. You see each one in the next morning message, with when and why, and hear at once if it happens 3 times in a day or twice for the same reason. Your outside heartbeat check hears each one too, so a restart that never comes back reaches you from outside.
+- A long first sign-in no longer makes the App restart itself afterwards: the waits start again once you have signed in.
+- If the App's page can't start, you hear it ("Cain's App page is down"), and Cain keeps running.
 - One switch to turn on, once: Watchdog, on the Cain App's page in Home Assistant (Settings, Apps, Cain). With it on, Home Assistant starts the App again after a crash, a kill or its own restart. Until it's on, the App tells you once and keeps restarting Cain's session instead, since restarting itself would leave it down.
 - Alarms no longer ask you to restart the App, open settings or switch anything. Each says what went wrong (the plugin's server, his session, his channel, the App itself) and what the App is doing about it. The Watchdog switch is the one exception, and your Claude sign-in stays yours.
 - A first session that signs in but never connects to Discord is restarted within minutes; one waiting for your sign-in is left alone.

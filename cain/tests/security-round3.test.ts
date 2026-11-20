@@ -199,7 +199,10 @@ describe("flags: only the editable bits ever go out", () => {
 describe("the heartbeat's curl and its errors", () => {
   const finishPart = () => {
     const f = readFileSync(FINISH, "utf8");
-    return f.slice(f.indexOf("  case $- in *x*) hb_xtrace=1"), f.indexOf("  unset hb_xtrace") + "  unset hb_xtrace".length);
+    // Cain 0.15.0, second round: the ping is the finish script's heartbeat_fail function, called here
+    // as its error path calls it.
+    const fn = f.slice(f.indexOf("heartbeat_fail() {"), f.indexOf("\n}\n", f.indexOf("heartbeat_fail() {")) + 3);
+    return `${fn}\nheartbeat_fail "stopped on an error"`;
   };
   test.skipIf(!Bun.which("bash"))("curl starts with -q, https only, no redirects, two retries, the URL on stdin; no xtrace even under set -x", () => {
     const dir = tmp(), bin = join(dir, "bin");

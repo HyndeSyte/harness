@@ -248,11 +248,16 @@ def test_cain_versions_agree_and_everything_is_pinned():
 def test_cain_terminal_is_reachable_only_through_ingress():
     nginx = (CAIN / "rootfs/etc/nginx/nginx.conf").read_text()
     assert "allow 172.30.32.2;" in nginx and "deny all;" in nginx
-    # Cain 0.15.0: a second server, for the Supervisor's watchdog only: /health, from Home Assistant's
-    # internal network, and nothing else (every other path 404).
+    # Cain 0.15.0: a second server, for the Supervisor's watchdog only: /health, from the Supervisor
+    # alone (second round: not the whole internal network), and nothing else (every other path 404).
+    # Its address is checked inside the location, since a return runs before allow and deny.
     assert nginx.count("listen ") == 2 and "listen 8099 " in nginx and "listen 8098;" in nginx
     health = nginx.split("listen 8098;")[1].split("  server {")[0]
-    assert "allow 172.30.32.0/23;" in health and "deny all;" in health and "location = /health {" in health
+    assert "172.30.32.0/23" not in nginx
+    assert "geo $cain_health_from { default 0; 172.30.32.2 1; }" in nginx
+    assert "allow 172.30.32.2;" in health and "deny all;" in health and "location = /health {" in health
+    loc = health.split("location = /health {")[1].split("location / {")[0]
+    assert loc.index("if ($cain_health_from != 1) { return 404;") < loc.index("health-down")
     assert "location / { return 404; }" in health and "proxy_pass" not in health and "alias" not in health
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
     # C1: ttyd listens on a unix socket only nginx's workers and root can open, never a port
@@ -697,9 +702,16 @@ def test_no_stop_is_silent(tmp_path):
     exits = [l for l in code if re.search(r"\bexit \d", l)]
     # And (Cain 0.15.0) the App restarting itself: exit 3, only from self_restart, after the probe said
     # "restart" (the switch on, marks kept) and his session was ended; told, so the EXIT trap stays quiet.
-    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "      exit 3 ;;"]
+    # Second round: exit 3 lives in self_exit (the exit route), reached from self_restart's restart
+    # decision after the Supervisor's restart call, and from the Pi drill's root-only mark.
+    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3"]
+    exit_fn = _run_fns(run, "self_exit() {", "self_tried=0")
+    assert exit_fn.index(": > /run/cain/self-restart") < exit_fn.index("health_down") < exit_fn.index("exit 3")
     self_fn = _run_fns(run, "self_restart() {", "# When his channel went down")
-    assert self_fn.index("    restart)") < self_fn.index(": > /run/cain/self-restart") < self_fn.index("end_his_session || true") < self_fn.index("exit 3")
+    assert self_fn.index("    restart)") < self_fn.index(": > /run/cain/self-restart") < self_fn.index("end_his_session || true") \
+        < self_fn.index("bashio::addon.restart") < self_fn.index("self_exit ;;")
+    assert self_fn.count("health_down") == 0 and self_fn.count("health_up") == 3
+    assert run.count("self_exit\n") == 1 and "drill-exit-route" in run
     assert "[ ! -e /run/cain/self-restart ]" in run.split("trap 'rc=$?;")[1].split("\n")[0]
     assert "check-told" not in run and "stopped-told" not in run and '"$OPT/alert.sh" "Cain is stopped' not in run
     # The check runs in the foreground only, one try at a time: never in the background.

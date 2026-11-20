@@ -37,6 +37,11 @@
 #   probe-drill.sh 6    (Cain 0.15.0) the plugin's server stopped under a live connection: started again
 #                       within seconds by the broker, logged with its exit code, and his session never
 #                       restarted for it.
+#   probe-drill.sh 7    (Cain 0.15.0, second round) the exit route a self-restart falls back to: the App
+#                       stops with exit code 3 and the Supervisor's watchdog starts it again within a
+#                       minute. Needs the App's Watchdog switch on. The outside heartbeat hears it as a
+#                       failure (expected), and the next start is kept as a plain boot. The App relies on
+#                       this route only once this step has passed (DOCS.md).
 #
 # Each step prints what it does and ends with PASS or FAIL. Nothing here reads or prints a key, a
 # token or a heartbeat URL.
@@ -45,6 +50,11 @@
 # falling back to addon_<hash>_cain; CAIN_CONTAINER=<name> picks one by hand. Every step first checks
 # that each tool it uses is there, on this machine and in the container, and fails loudly naming the
 # one that isn't (the image has no procps: no pkill, no ps; kills go through /proc).
+#
+# Kills (second round): only inside the target container (docker exec, so its own PID namespace: no
+# process of the Pi or another App is seen), only the process whose executable and whole argument list
+# are exactly the ones named, and never when more than one matches (an ambiguous match is refused and
+# nothing is killed).
 #
 # Rerunning one step alone: each step stands on its own, so run only its number. For step 1b (six
 # self-kills, about 40 minutes):
@@ -74,6 +84,27 @@ C="${CAIN_CONTAINER:-$(find_container || true)}"
 in_c() { docker exec "$C" "$@"; }
 as_cain() { docker exec -u 1000 "$C" "$@"; }
 in_c true 2>/dev/null || { echo "FAIL: no running container $C"; exit 2; }
+# kill_exact's body, run inside the container: <signal> <executable> <argv...>. Prints killed:<pid>,
+# none, or ambiguous:<count>; exits 0, 4 or 3.
+KILL_EXACT='sig="$1"; exe="$(readlink -f "$2" 2>/dev/null || printf %s "$2")"; shift 2
+want="$(printf "%s\n" "$@")"; n=0; hit=""
+for p in /proc/[0-9]*; do
+  [ "$(readlink "$p/exe" 2>/dev/null)" = "$exe" ] || continue
+  [ "$(tr "\000" "\n" < "$p/cmdline" 2>/dev/null)" = "$want" ] || continue
+  n=$((n + 1)); hit="${p#/proc/}"
+done
+if [ "$n" = 0 ]; then echo none; exit 4; fi
+if [ "$n" != 1 ]; then echo "ambiguous:$n"; exit 3; fi
+kill "-$sig" "$hit" && echo "killed:$hit"'
+# kill_exact <as: root|cain> <signal> <executable> <argv...>: the one matching process in the container.
+kill_exact() {
+  local who="$1"; shift
+  if [ "$who" = cain ]; then as_cain sh -c "$KILL_EXACT" kill_exact "$@"; else in_c sh -c "$KILL_EXACT" kill_exact "$@"; fi
+}
+# The exact processes the steps end: the plugin's server as the broker starts it, and Claude Code as
+# session.sh starts it.
+PLUGIN_SERVER=(/usr/local/bin/bun /usr/local/bin/bun /opt/cain/discord/plugin/server.ts)
+CLAUDE_CODE=(/usr/local/bin/claude claude --permission-mode auto --channels plugin:discord@claude-plugins-official)
 say "the Cain container: $C"
 
 alarm_up() { in_c test -s "/data/c1/notice.d/$1" 2>/dev/null && ! in_c grep -q '^clear 1' "/data/c1/notice.d/$1" 2>/dev/null; }
@@ -119,18 +150,18 @@ case "${1:-}" in
     [ "$ok" = 1 ] && echo "PASS: uid 1000 can't read the token, the probe's records or the gateway state, and can't write under the probe's folders" || fail "the boundary didn't hold (above)"
     ;;
   1b)
-    need_in sh tr tmux awk
+    need_in sh tr tmux awk readlink
     say "step 1b: uid 1000 kills its own session 6 times, each after over 5 minutes"
     since=$(date +%s)
     for i in 1 2 3 4 5 6; do
       wait_session_up 600 || fail "his session didn't come back before kill $i"
       say "  kill $i: waiting 5 minutes 30 seconds, then his own user ends his session with an error"
       sleep 330
-      # Through /proc, as step 3 kills (the image has no pkill): every process of his whose command is
-      # Claude Code's, ended by his own user with SIGKILL (an error exit).
-      killed="$(as_cain sh -c 'n=0; for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; case "$c" in "claude "*|*/claude\ *) kill -9 "${p#/proc/}" 2>/dev/null && n=$((n + 1)) ;; esac; done; echo "$n"' 2>/dev/null)"
-      [ "${killed:-0}" -gt 0 ] 2>/dev/null || fail "kill $i ended no process of Claude Code's (found none through /proc)"
-      say "  kill $i: ended ${killed} process(es)"
+      # Through /proc in the container (the image has no pkill): Claude Code, exactly as session.sh
+      # starts it, ended by his own user with SIGKILL (an error exit); refused when not exactly one.
+      killed="$(kill_exact cain 9 "${CLAUDE_CODE[@]}" 2>/dev/null)"
+      case "$killed" in killed:*) ;; *) fail "kill $i: Claude Code's process wasn't exactly one (${killed:-no answer}), so nothing was killed" ;; esac
+      say "  kill $i: ended process ${killed#killed:}"
       sleep 30
     done
     starts_since "$since"
@@ -157,13 +188,14 @@ case "${1:-}" in
     echo "PASS: the early exits alarmed. Confirm the push reached the phone, and that it clears within the hour."
     ;;
   3)
-    need_in sh grep tmux tail test
+    need_in sh grep tmux tail test tr readlink
     say "step 3: the plugin killed, his session closed, the network cut"
     say "  3a: killing Cain's Discord plugin every 15 seconds until the probe's alarm"
     t0=$(date +%s)
     until alarm_up probe; do
       [ $(( $(date +%s) - t0 )) -lt 720 ] || fail "no probe alarm within 12 minutes of killing the plugin"
-      in_c sh -c 'for p in /proc/[0-9]*; do grep -qa "discord/plugin/server.ts" "$p/cmdline" 2>/dev/null && kill "${p#/proc/}" 2>/dev/null; done; true' || true
+      r="$(kill_exact root TERM "${PLUGIN_SERVER[@]}" 2>/dev/null)"
+      case "$r" in ambiguous:*) fail "more than one plugin server matched (${r#ambiguous:}), so nothing was killed" ;; esac
       sleep 15
     done
     say "  raised after $(( $(date +%s) - t0 )) s; waiting for it to clear"
@@ -273,15 +305,16 @@ EOF
     esac
     ;;
   6)
-    need_in sh tr cat grep tail
+    need_in sh tr cat grep tail readlink
     say "step 6: the plugin's server stopped once under his connection; the broker starts it again"
     since=$(date +%s)
     before="$(in_c awk -v s="$since" '$1 >= s' /data/probe/starts 2>/dev/null | wc -l)"
-    in_c sh -c 'for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; case "$c" in *discord/plugin/server.ts*) kill "${p#/proc/}" 2>/dev/null ;; esac; done; true'
+    r="$(kill_exact root TERM "${PLUGIN_SERVER[@]}" 2>/dev/null)"
+    case "$r" in killed:*) say "  stopped the plugin's server (process ${r#killed:})" ;; *) fail "the plugin's server wasn't exactly one process (${r:-no answer}), so nothing was killed" ;; esac
     sleep 20
     st="$(in_c cat /run/cain/discord.state 2>/dev/null | cut -d' ' -f1)"
     say "  the channel's state 20 seconds on: ${st:-none} (server-down until the new server has run a minute)"
-    in_c sh -c 'for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; case "$c" in *discord/plugin/server.ts*) exit 0 ;; esac; done; exit 1' \
+    in_c sh -c 'for p in /proc/[0-9]*; do c="$(tr "\000" " " < "$p/cmdline" 2>/dev/null)"; [ "$c" = "/usr/local/bin/bun /opt/cain/discord/plugin/server.ts " ] && exit 0; done; exit 1' \
       || fail "no plugin server runs 20 seconds after it was stopped"
     sleep 70
     st="$(in_c cat /run/cain/discord.state 2>/dev/null | cut -d' ' -f1)"
@@ -290,5 +323,31 @@ EOF
     [ "$after" = "$before" ] || fail "his session was restarted for it ($after starts since the step began)"
     echo "PASS: the server came back within seconds and his session kept its channel. Confirm the App's log shows \"the plugin's server stopped (<code>): starting it again\"."
     ;;
-  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4|6 [check ...] | 5 ha|kill|s6"; exit 2 ;;
+  7)
+    need_in sh test rm
+    need timeout
+    say "step 7: the exit route: the App stops with exit code 3, and the Supervisor's watchdog starts it again within a minute"
+    say "  needs the App's Watchdog switch on (Home Assistant, the Cain App's page). The outside heartbeat hears a failure: expected."
+    id0="$(docker inspect -f '{{.Id}}' "$C")" || fail "couldn't read the container's id"
+    in_c sh -c ': > /run/cain/root-tmp/drill-exit-route' || fail "couldn't leave the drill's mark in the container"
+    say "  mark left; the run script takes the exit route at its next tick (within about 10 seconds)"
+    code="$(timeout 120 docker wait "$id0" 2>/dev/null | tr -cd '0-9')"
+    stopped=$(date +%s)
+    [ -n "$code" ] || { in_c rm -f /run/cain/root-tmp/drill-exit-route 2>/dev/null; fail "the App didn't stop within 2 minutes of the mark (mark taken back)"; }
+    [ "$code" = 3 ] || fail "the App stopped with exit code $code, not 3"
+    say "  the App stopped with exit code 3; waiting up to a minute for the Supervisor to start it again"
+    back=""
+    while [ $(( $(date +%s) - stopped )) -le 60 ]; do
+      c2="$(find_container || true)"
+      if [ -n "$c2" ] && [ "$(docker inspect -f '{{.State.Running}}' "$c2" 2>/dev/null)" = true ] \
+         && { [ "$(docker inspect -f '{{.Id}}' "$c2")" != "$id0" ] || [ "$(docker inspect -f '{{.State.StartedAt}}' "$c2" | cut -c1-19)" \> "$(date -u -d "@$stopped" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo 0)" ]; }; then
+        back="$c2"; break
+      fi
+      sleep 2
+    done
+    [ -n "$back" ] || fail "the Supervisor didn't start the App again within a minute of its exit code 3 (is the Watchdog switch on?)"
+    say "  running again as $back, $(( $(date +%s) - stopped )) s after it stopped"
+    echo "PASS: the exit route works: exit code 3, and the Supervisor started the App again within a minute. The self-restart may rely on it now."
+    ;;
+  *) echo "usage: probe-drill.sh 0|1|1b|2|3|4|6|7 [check ...] | 5 ha|kill|s6"; exit 2 ;;
 esac

@@ -15,34 +15,44 @@ if [ -e /run/cain/probe/term ]; then
   timeout 4 bun /opt/cain/probe/main.ts stop-finish "${APP_EXIT_CODE}" "${2:-}" "$t0" >/dev/null 2>&1 || true
 fi
 unset t0
-if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]] && [ -e /run/cain/self-restart ]; then
-  # The App restarting itself (Cain 0.15.0, the run script's self_restart): already told and kept in
-  # /data by the probe. The container stops on an error so the Supervisor's watchdog starts it again;
-  # the outside heartbeat isn't told it failed (it alarms by itself should the App not come back).
-  bashio::log.warning "Cain's App stops to restart itself (exit code ${APP_EXIT_CODE}); the Supervisor's watchdog starts it again"
-  echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
-  exec /run/s6/basedir/bin/halt
-fi
-if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
-  bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
-  # The outside heartbeat hears it at once (<heartbeat_url>/fail), when one is set. The URL is
-  # never logged and never on a command line (a process listing shows those): curl reads it from
-  # its config on stdin (-K -), https only, no redirects, 10 seconds at most. printf is bash's own.
-  # Third round: -q first, so no curl config of the environment's is read; two retries; and no
-  # xtrace for this block (a trace would print the URL), put back as it was after.
+# The outside heartbeat's failure ping (<heartbeat_url>/fail), when one is set, with what happened as
+# its body: heartbeat_fail <words>. The URL is never logged and never on a command line (a process
+# listing shows those): curl reads it from its config on stdin (-K -), https only, no redirects, 10
+# seconds at most. printf is bash's own. Third round: -q first, so no curl config of the environment's
+# is read; two retries; and no xtrace for this block (a trace would print the URL), put back as it was.
+heartbeat_fail() {
+  local hb hb_base hb_query hb_xtrace
   case $- in *x*) hb_xtrace=1 ;; *) hb_xtrace= ;; esac
   { set +x; } 2>/dev/null
   hb="$(bashio::config 'heartbeat_url' 2>/dev/null || true)"
   if [[ "${hb}" =~ ^https://[A-Za-z0-9.-]+(:443)?(/[A-Za-z0-9._~%/-]*)?(\?[A-Za-z0-9._~%=\&-]*)?$ ]]; then
     hb_base="${hb%%\?*}"; hb_query="${hb:${#hb_base}}"
     printf 'url = "%s/fail%s"\n' "${hb_base%/}" "${hb_query}" \
-      | curl -q -fsS -m 10 --retry 2 --max-redirs 0 --proto '=https' -o /dev/null --data-binary 'stopped on an error' -K - 2>/dev/null \
-      && bashio::log.info "Told the outside heartbeat the App stopped on an error" \
-      || bashio::log.warning "Couldn't tell the outside heartbeat the App stopped"
+      | curl -q -fsS -m 10 --retry 2 --max-redirs 0 --proto '=https' -o /dev/null --data-binary "$1" -K - 2>/dev/null \
+      && bashio::log.info "Told the outside heartbeat: $1" \
+      || bashio::log.warning "Couldn't tell the outside heartbeat: $1"
   fi
-  unset hb hb_base hb_query
+  hb=""; hb_base=""; hb_query=""
   if [ -n "${hb_xtrace}" ]; then set -x; fi
-  unset hb_xtrace
+}
+if [ -e /run/cain/self-restart ]; then
+  # The App restarting itself (Cain 0.15.0, the run script's self_restart): already told and kept in
+  # /data by the probe. Second round: the outside heartbeat hears it as a failure every time, by its
+  # own body, so a restart that never comes back (the Supervisor never starting the App again) is
+  # raised from outside the App, which is the only place it can be. The next start's pings bring the
+  # check back up. Either route: the Supervisor's restart call (it stops the App: 256 and SIGTERM) or
+  # the exit route (exit 3, recorded as the container's exit code and halted here, for the watchdog).
+  heartbeat_fail "restarting itself (self-restart, exit code ${APP_EXIT_CODE}); it should be back within minutes"
+  if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
+    bashio::log.warning "Cain's App stops to restart itself (exit code ${APP_EXIT_CODE}); the Supervisor's watchdog starts it again"
+    echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
+    exec /run/s6/basedir/bin/halt
+  fi
+fi
+if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
+  bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
+  # The outside heartbeat hears it at once (above).
+  heartbeat_fail "stopped on an error"
   echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
   exec /run/s6/basedir/bin/halt
 fi

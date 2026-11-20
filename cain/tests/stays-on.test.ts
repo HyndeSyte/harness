@@ -19,6 +19,7 @@ afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true 
 const STUB = `
 const fs = require("fs");
 const log = process.argv[2];
+const refuse = process.argv[3] === "refuse";                 // a restarted server refuses the handshake
 const starts = (fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\\n").filter((l) => l === "start").length : 0) + 1;
 fs.appendFileSync(log, "start\\n");
 let buf = "";
@@ -31,7 +32,8 @@ process.stdin.on("data", (c) => {
     if (!line.trim()) continue;
     fs.appendFileSync(log, line + "\\n");
     const m = JSON.parse(line);
-    if (m.id !== undefined && m.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "stub", version: "1" } } }) + "\\n");
+    if (m.id !== undefined && m.method === "initialize" && refuse && starts > 1) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -32600, message: "refused" } }) + "\\n");
+    else if (m.id !== undefined && m.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "stub", version: "1" } } }) + "\\n");
     else if (m.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { tools: [], from: starts } }) + "\\n");
   }
 });
@@ -45,31 +47,40 @@ describe("the plugin's server is supervised", () => {
     expect(Math.max(...SERVER_BACKOFF_S)).toBeLessThanOrEqual(15);
   });
 
-  test.skipIf(process.platform === "win32")("a server that stops is started again within seconds, logged with its exit code, under the same connection", async () => {
+  function launch(extra: string[] = [], scale = "1") {
     const d = mkdtempSync(join(tmpdir(), "cain-broker-"));
     dirs.push(d);
     for (const s of ["state", "plugin", "outbox", "probe"]) mkdirSync(join(d, s));
     writeFileSync(join(d, "stub.js"), STUB);
     writeFileSync(join(d, "pin.json"), JSON.stringify({ version: "0", files: {} }));
     writeFileSync(join(d, "token.env"), "DISCORD_BOT_TOKEN=not-a-real-token\n");
+    const env = { ...process.env, ...brokerEnv(d, extra, scale) };
+    const broker = Bun.spawn([process.execPath, join(OPT, "discord", "broker-main.ts")], { env, stdout: "pipe", stderr: "pipe" });
+    const o = { out: "" };
+    void (async () => { const dec = new TextDecoder(); for await (const c of broker.stdout) o.out += dec.decode(c); })();
+    return { d, broker, o };
+  }
+  function brokerEnv(d: string, extra: string[] = [], scale = "1"): Record<string, string> {
     const gid = String(process.getgid?.() ?? 0);
-    const env = {
-      ...process.env, CAIN_DISCORD_SOCK: join(d, "discord.sock"), CAIN_DISCORD_TOKEN_FILE: join(d, "token.env"),
+    return {
+      CAIN_DISCORD_SOCK: join(d, "discord.sock"), CAIN_DISCORD_TOKEN_FILE: join(d, "token.env"),
       CAIN_DISCORD_STATE: join(d, "state"), CAIN_DISCORD_PLUGIN: join(d, "plugin"), CAIN_DISCORD_OUTBOX: join(d, "outbox"),
       CAIN_LINK_SOCK: join(d, "no-link.sock"), CAIN_CARDS: join(d, "cards.json"), CAIN_GATE_REPLIED: join(d, "replied.json"),
       CAIN_GATE_LOG: join(d, "gate.jsonl"), PROBE_RUN: join(d, "probe"), CAIN_DISCORD_STATE_FILE: join(d, "discord.state"),
       CAIN_SENT_SPOOL: join(d, "spool.jsonl"), CAIN_GID: gid, DISCORD_GID: gid, CAIN_DISCORD_PIN: join(d, "pin.json"),
-      CAIN_DISCORD_SEED: "", CAIN_DISCORD_SERVER_CMD: JSON.stringify([process.execPath, join(d, "stub.js"), join(d, "server.log")]),
-      CAIN_SERVER_BACKOFF_SCALE: "1",
+      CAIN_DISCORD_SEED: "", CAIN_DISCORD_SERVER_CMD: JSON.stringify([process.execPath, join(d, "stub.js"), join(d, "server.log"), ...extra]),
+      CAIN_SERVER_BACKOFF_SCALE: scale,
     };
-    const broker = Bun.spawn([process.execPath, join(OPT, "discord", "broker-main.ts")], { env, stdout: "pipe", stderr: "pipe" });
-    let out = "";
-    void (async () => { const dec = new TextDecoder(); for await (const c of broker.stdout) out += dec.decode(c); })();
-    const until = async (f: () => boolean, ms: number) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) return false; await Bun.sleep(50); } return true; };
+  }
+  const until = async (f: () => boolean, ms: number) => { const t = Date.now(); while (!f()) { if (Date.now() - t > ms) return false; await Bun.sleep(50); } return true; };
+
+  test.skipIf(process.platform === "win32")("a server that stops is started again within seconds, logged with its exit code, under the same connection", async () => {
+    const { d, broker, o } = launch();
+    const out = () => o.out;
     try {
       // Bound either way: as root it hands the socket to cain; a runner that isn't root can't chown it
       // to root, says so, and the socket stays its own (this test connects as that same user).
-      expect(await until(() => out.includes("listening on") || out.includes("couldn't open the socket to cain"), 10_000)).toBe(true);
+      expect(await until(() => out().includes("listening on") || out().includes("couldn't open the socket to cain"), 10_000)).toBe(true);
       const sock = connect(join(d, "discord.sock"));
       let got = "";
       sock.setEncoding("utf8");
@@ -78,10 +89,15 @@ describe("the plugin's server is supervised", () => {
       sock.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code", version: "x" } } }) + "\n");
       expect(await until(() => got.includes('"id":1'), 5_000)).toBe(true);
       // The first server stops (code 7): the broker says so with the code, and the state names it.
-      expect(await until(() => /the plugin's server stopped \(7\): starting it again in 1 s \(restart 1\)/.test(out), 5_000)).toBe(true);
+      expect(await until(() => /the plugin's server stopped \(7\): starting it again in 1 s \(restart 1\)/.test(out()), 5_000)).toBe(true);
       const stoppedAt = Date.now();
+      // A call made in the gap (the server down, the next one not started yet) is answered at once
+      // with the restarting error: never dropped, never sent to a server that isn't initialized.
+      sock.write(JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list" }) + "\n");
+      expect(await until(() => got.includes('"id":10'), 2_000)).toBe(true);
+      expect(got.split("\n").find((l) => l.includes('"id":10'))).toContain("restarting its server");
       expect(readFileSync(join(d, "discord.state"), "utf8")).toMatch(/^server-down \d+\n$/);
-      expect(await until(() => out.includes("the plugin's server started again (restart 1, it had stopped with 7)"), 5_000)).toBe(true);
+      expect(await until(() => out().includes("the plugin's server started again (restart 1, it had stopped with 7)"), 5_000)).toBe(true);
       expect(Date.now() - stoppedAt).toBeLessThan(4_000);                       // within seconds
       // The new server got his session's own handshake, under the broker's id, and its answer went nowhere.
       expect(await until(() => readFileSync(join(d, "server.log"), "utf8").includes("notifications/initialized"), 5_000)).toBe(true);
@@ -92,7 +108,7 @@ describe("the plugin's server is supervised", () => {
       // His connection stayed: a call now reaches the second server.
       sock.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
       expect(await until(() => got.includes('"from":2'), 5_000)).toBe(true);
-      expect(out).not.toContain("a new connection replaced");
+      expect(out()).not.toContain("a new connection replaced");
       sock.destroy();
       expect(await until(() => readFileSync(join(d, "discord.state"), "utf8").startsWith("down"), 5_000)).toBe(true);
     } finally {
@@ -100,6 +116,50 @@ describe("the plugin's server is supervised", () => {
       await broker.exited;
     }
     expect(existsSync(join(d, "server.log"))).toBe(true);
+  }, 30_000);
+
+  test.skipIf(process.platform === "win32")("a restarted server that refuses the handshake leaves the state server-down for the watchdog, never connected", async () => {
+    // Waits scaled by 0.05: the restart after 50 ms, the minute up as 3 seconds.
+    const { d, broker, o } = launch(["refuse"], "0.05");
+    try {
+      expect(await until(() => o.out.includes("listening on") || o.out.includes("couldn't open the socket to cain"), 10_000)).toBe(true);
+      const sock = connect(join(d, "discord.sock"));
+      let got = "";
+      sock.setEncoding("utf8");
+      sock.on("data", (c) => { got += c; });
+      await new Promise((ok) => sock.on("connect", ok));
+      sock.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-code", version: "x" } } }) + "\n");
+      expect(await until(() => got.includes('"id":1'), 5_000)).toBe(true);
+      expect(await until(() => o.out.includes("the restarted server refused the handshake: the channel stays down for the watchdog"), 8_000)).toBe(true);
+      const first = readFileSync(join(d, "discord.state"), "utf8");
+      expect(first).toMatch(/^server-down \d+\n$/);
+      await Bun.sleep(4_000);                                       // past the scaled minute up
+      expect(readFileSync(join(d, "discord.state"), "utf8")).toBe(first);
+      expect(o.out).not.toContain("the channel is up");
+      // A call now is answered with the restarting error, not sent to the uninitialized server.
+      sock.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
+      expect(await until(() => got.includes('"id":2'), 2_000)).toBe(true);
+      expect(got).toContain("restarting its server");
+      expect(readFileSync(join(d, "server.log"), "utf8").split("\n").some((l) => l.includes('"method":"tools/list"'))).toBe(false);
+      sock.destroy();
+    } finally {
+      broker.kill();
+      await broker.exited;
+    }
+  }, 30_000);
+
+  test.skipIf(process.platform === "win32")("a broker that starts again writes the state down from now, whatever it said before", async () => {
+    const { d, broker, o } = launch();
+    try {
+      // A stale server-down left by the broker before (its time an hour ago) is replaced at start.
+      expect(await until(() => o.out.includes("listening on") || o.out.includes("couldn't open the socket to cain"), 10_000)).toBe(true);
+    } finally { broker.kill(); await broker.exited; }
+    const old = Math.floor(Date.now() / 1000) - 3600;
+    writeFileSync(join(d, "discord.state"), `server-down ${old}\n`);
+    const again = Bun.spawn([process.execPath, join(OPT, "discord", "broker-main.ts")], { env: { ...process.env, ...brokerEnv(d) }, stdout: "pipe", stderr: "pipe" });
+    try {
+      expect(await until(() => { const t = readFileSync(join(d, "discord.state"), "utf8"); return t.startsWith("down ") && Number(t.split(" ")[1]) > old + 3000; }, 10_000)).toBe(true);
+    } finally { again.kill(); await again.exited; }
   }, 30_000);
 });
 
@@ -284,12 +344,42 @@ exit 0
     const code = drillSrc.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
     expect(code).not.toMatch(/\bpkill\b|\bpgrep\b|(?<!docker )\bps\s+(-|aux)/m);
     expect(code).not.toContain("addon_0fcc2575_cain");
-    for (const step of ["0", "1", "1b", "2", "3", "4", "5", "6"]) {
+    for (const step of ["0", "1", "1b", "2", "3", "4", "5", "6", "7"]) {
       const body = drillSrc.slice(drillSrc.search(new RegExp(`^  ${step}\\)`, "m")));
       expect(body.split("\n")[1]).toMatch(/^\s+need_in /);
     }
     expect(drillSrc).toContain("bash probe-drill.sh 1b");
-    expect(drillSrc).toMatch(/kill -9 "\$\{p#\/proc\/\}"/);
+    // Second round: every kill goes through kill_exact (inside the container, exact executable and
+    // arguments, never an ambiguous match); no step kills by a pattern any more.
+    expect(code).not.toMatch(/kill -9 "\$\{p#\/proc\/\}"|grep -qa "discord\/plugin\/server\.ts"/);
+    expect(code.match(/kill_exact (root|cain) /g)?.length).toBe(3);
+    expect(drillSrc).toContain("PLUGIN_SERVER=(/usr/local/bin/bun /usr/local/bin/bun /opt/cain/discord/plugin/server.ts)");
+    expect(drillSrc).toContain("CLAUDE_CODE=(/usr/local/bin/claude claude --permission-mode auto --channels plugin:discord@claude-plugins-official)");
+    // The exact command lines match what the App starts.
+    expect(readFileSync(join(OPT, "session.sh"), "utf8")).toContain("\nclaude --permission-mode auto --channels plugin:discord@claude-plugins-official\n");
+    expect(readFileSync(join(OPT, "discord", "broker-main.ts"), "utf8")).toContain('"/usr/local/bin/bun", join(PLUGIN, "server.ts")');
+  });
+  test.skipIf(process.platform !== "linux")("kill_exact kills the one exact match, refuses an ambiguous one, and leaves look-alikes", async () => {
+    const body = drillSrc.match(/^KILL_EXACT='([^']*)'$/m)![1];
+    const spawn = (mark: string) => Bun.spawn(["/bin/bash", "-c", "sleep 30; :", mark], { stdout: "ignore", stderr: "ignore" });
+    const kx = (...a: string[]) => Bun.spawnSync(["sh", "-c", body, "kill_exact", ...a], { stdout: "pipe" });
+    const twins = [spawn("drill-twin"), spawn("drill-twin")];
+    const one = spawn("drill-one");
+    const alike = spawn("drill-one-more");
+    await Bun.sleep(200);
+    try {
+      const amb = kx("TERM", "/bin/bash", "/bin/bash", "-c", "sleep 30; :", "drill-twin");
+      expect([amb.exitCode, amb.stdout.toString().trim()]).toEqual([3, "ambiguous:2"]);
+      expect(twins.every((p) => p.exitCode === null)).toBe(true);
+      const r = kx("TERM", "/bin/bash", "/bin/bash", "-c", "sleep 30; :", "drill-one");
+      expect([r.exitCode, r.stdout.toString().trim()]).toEqual([0, `killed:${one.pid}`]);
+      await one.exited;
+      expect(alike.exitCode).toBe(null);
+      // The same arguments under another executable, or a prefix of them, match nothing.
+      expect(kx("TERM", "/bin/sh", "/bin/bash", "-c", "sleep 30; :", "drill-one-more").exitCode).toBe(4);
+      expect(kx("TERM", "/bin/bash", "/bin/bash", "-c", "sleep 30; :").exitCode).toBe(4);
+      expect(alike.exitCode).toBe(null);
+    } finally { for (const p of [...twins, one, alike]) p.kill(); }
   });
 });
 
@@ -350,5 +440,75 @@ describe("no alarm or notice hands the owner a manual step (C)", () => {
       });
     }
     expect(hits).toEqual([]);
+  });
+});
+
+// -- second round follow-ups: pinned files and the panel's sockets ------------------------------------
+import { pinSocket, SOCKET_MODE } from "../rootfs/opt/cain/pinned.ts";
+import * as pinnedMod from "../rootfs/opt/cain/pinned.ts";
+import { statSync } from "node:fs";
+import { createServer } from "node:net";
+describe("pinned files and the panel's sockets", () => {
+  test("the unused synchronous writer is gone", () => {
+    expect("writePinnedSync" in pinnedMod).toBe(false);
+  });
+  test.skipIf(process.platform === "win32")("the codex socket is pinned 0770, as ttyd's, and a failed chown is logged when root", async () => {
+    const d = mkdtempSync(join(tmpdir(), "cain-sock-"));
+    dirs.push(d);
+    const path = join(d, "codex.sock");
+    const srv = createServer(() => {});
+    await new Promise<void>((ok) => srv.listen(path, ok));
+    const said: string[] = [];
+    const was = console.error;
+    console.error = (...a: unknown[]) => { said.push(a.join(" ")); };
+    try {
+      pinSocket(path, Number(process.getgid?.() ?? 0));
+      expect(statSync(path).mode & 0o777).toBe(SOCKET_MODE);
+      expect(SOCKET_MODE).toBe(0o770);
+      pinSocket(path, Number.NaN);                                 // a chown that can't work
+      expect(statSync(path).mode & 0o777).toBe(0o770);
+      if (process.getuid?.() === 0) expect(said.some((l) => l.includes(`couldn't give ${path} to root:nogroup`))).toBe(true);
+      else expect(said).toEqual([]);
+    } finally { console.error = was; srv.close(); }
+    const review = readFileSync(join(OPT, "review", "main.ts"), "utf8");
+    expect(review).toContain("pinSocket(sock);");
+    expect(review).not.toContain("0o660");
+    expect(readFileSync(join(import.meta.dir, "..", "rootfs", "etc", "services.d", "terminal", "run"), "utf8"))
+      .toContain("--socket-owner root:nogroup");
+  });
+});
+
+// -- second round: a self-restart that never comes back is raised from outside -------------------------
+describe("the finish script on a self-restart (the outside review's third finding)", () => {
+  const FINISH = join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "finish");
+  function finish(code: string, signal: string, marked: boolean) {
+    const d = mkdtempSync(join(tmpdir(), "cain-finish-"));
+    dirs.push(d);
+    for (const s of ["run/cain", "results", "bin"]) mkdirSync(join(d, s), { recursive: true });
+    if (marked) writeFileSync(join(d, "run/cain/self-restart"), "");
+    writeFileSync(join(d, "bin/curl"), `#!/bin/bash\ncat > /dev/null\nfor a in "$@"; do printf '%s\\n' "$a"; done > "${d}/curl.args"\nexit 0\n`, { mode: 0o755 });
+    writeFileSync(join(d, "bin/halt"), `#!/bin/bash\necho halted > "${d}/halted"\n`, { mode: 0o755 });
+    const src = readFileSync(FINISH, "utf8").split("\n").slice(1).join("\n")
+      .replaceAll("/run/cain", join(d, "run/cain")).replaceAll("/run/s6-linux-init-container-results", join(d, "results"))
+      .replaceAll("/run/s6/basedir/bin/halt", join(d, "bin/halt"));
+    const sh = `bashio::config() { printf '%s' "https://hc-ping.example.net/fixture-0005"; }\nbashio::log.info() { echo "info: $*"; }\nbashio::log.warning() { echo "warn: $*"; }\nset -- ${code} ${signal}\n${src}`;
+    const p = Bun.spawnSync(["bash", "-c", sh], { env: { ...process.env, PATH: `${join(d, "bin")}:${process.env.PATH}` }, stdout: "pipe", stderr: "pipe" });
+    const args = existsSync(join(d, "curl.args")) ? readFileSync(join(d, "curl.args"), "utf8").split("\n") : [];
+    const body = args.length ? args[args.indexOf("--data-binary") + 1] : null;
+    return { body, halted: existsSync(join(d, "halted")), exitcode: existsSync(join(d, "results/exitcode")) ? readFileSync(join(d, "results/exitcode"), "utf8").trim() : null, out: p.stdout.toString() };
+  }
+  test.skipIf(process.platform === "win32")("the exit route (3): the heartbeat hears a self-restart failure, and the container halts with 3", () => {
+    const r = finish("3", "", true);
+    expect(r.body).toContain("restarting itself (self-restart, exit code 3)");
+    expect([r.halted, r.exitcode]).toEqual([true, "3"]);
+  });
+  test.skipIf(process.platform === "win32")("the Supervisor's restart call (256, SIGTERM): the heartbeat hears it too, and the stop goes on", () => {
+    const r = finish("256", "15", true);
+    expect(r.body).toContain("restarting itself (self-restart, exit code 256)");
+    expect(r.halted).toBe(false);
+  });
+  test.skipIf(process.platform === "win32")("without the mark, an error still says stopped on an error, and a plain stop says nothing", () => {
+    expect(finish("1", "", false).body).toBe("stopped on an error");
+    expect(finish("256", "15", false).body).toBe(null);
   });
 });

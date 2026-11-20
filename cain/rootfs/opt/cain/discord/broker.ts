@@ -40,6 +40,11 @@ export const MAX_TEXT = 20_000;
 // 0.15.0): waits of 1, 2, 4, 8, then 15 seconds, back to the start once a server has run a minute.
 export const SERVER_BACKOFF_S = [1, 2, 4, 8, 15];
 export const SERVER_STEADY_S = 60;
+// How long a restarted server has to answer the replayed handshake before it counts as failed.
+export const REINIT_MS = 10_000;
+// What a call gets while the plugin's server is down or its replayed handshake isn't done yet: an
+// answer at once, never a silent drop and never a call reaching a server that isn't initialized.
+export const RESTARTING = "The Discord channel is restarting its server; nothing was sent. Try it again in a few seconds.";
 export function serverWait(restarts: number): number {
   return SERVER_BACKOFF_S[Math.min(Math.max(restarts, 1), SERVER_BACKOFF_S.length) - 1];
 }
@@ -79,6 +84,9 @@ export interface BrokerDeps {
   clearTimer?: (t: unknown) => void;
   probeAnswered?: () => void;                          // his session gave the hourly liveness check's fixed answer
   heard?: () => void;                                  // a message of the owner's came in for his session (its time only)
+  // A restarted server refused the broker's replayed handshake, or didn't answer it in REINIT_MS
+  // (Cain 0.15.0, second round): the server isn't whole, so the run script's watchdog must act.
+  serverFailed?: (why: string) => void;
 }
 
 interface Pending { method: string; tool?: string; args?: Record<string, unknown>; outbox?: string; note?: string; timer?: unknown; initialize?: boolean }
@@ -132,6 +140,8 @@ export class BrokerSession {
   private ready = false;                               // Claude Code's initialize was answered
   private initParams: unknown = undefined;             // its initialize's params, for a restarted server
   private reinitId: string | null = null;              // the broker's own initialize to a restarted server
+  private reinitTimer: unknown = undefined;
+  private serverUp = true;                             // false from a server's stop until the new one took the handshake
   constructor(private d: BrokerDeps) {}
 
   // The hourly liveness check's line, handed to his session as a message of his channel. false when there
@@ -153,11 +163,14 @@ export class BrokerSession {
   end(): void {
     if (this.closed) return;
     this.closed = true;
+    this.d.clearTimer?.(this.reinitTimer);
     for (const [id, p] of this.pending) { this.d.clearTimer?.(p.timer); if (p.outbox) this.d.outbox.drop(p.outbox); this.pending.delete(id); }
     this.d.close();
   }
 
   open(): boolean { return !this.closed; }
+  // The server is running and initialized: calls go through (false during a gap and its handshake).
+  whole(): boolean { return !this.closed && this.serverUp; }
 
   // The server stopped and the broker starts it again under this same connection (Cain 0.15.0):
   // every call in flight gets the same error as when the channel ends, but the connection stays,
@@ -170,15 +183,28 @@ export class BrokerSession {
     }
     this.pending.clear();
     this.reinitId = null;
+    this.d.clearTimer?.(this.reinitTimer);
+    this.serverUp = false;                                   // held until the new server took the handshake
   }
 
   // The new server's handshake: Claude Code's own initialize, as it sent it, under an id of the
   // broker's whose answer goes nowhere, then its initialized notification. false when Claude Code
   // never sent one (it does at once; nothing to repeat then).
+  // Client traffic stays held (answered with RESTARTING) until the answer comes and the initialized
+  // notification has gone; a refusal, or no answer in REINIT_MS, is a failed server (serverFailed).
   reinit(n: number): boolean {
-    if (this.closed || this.initParams === undefined) return false;
-    this.reinitId = `cain-broker-reinit-${n}`;
-    this.d.toServer(JSON.stringify({ jsonrpc: "2.0", id: this.reinitId, method: "initialize", params: this.initParams }));
+    if (this.closed) return false;
+    if (this.initParams === undefined) { this.serverUp = true; return false; }
+    const id = `cain-broker-reinit-${n}`;
+    this.reinitId = id;
+    this.d.clearTimer?.(this.reinitTimer);
+    this.reinitTimer = this.d.setTimer?.(REINIT_MS, () => {
+      if (this.closed || this.reinitId !== id) return;
+      this.reinitId = null;
+      this.d.log("the restarted server didn't answer the handshake");
+      this.d.serverFailed?.("the restarted server didn't answer the handshake");
+    });
+    this.d.toServer(JSON.stringify({ jsonrpc: "2.0", id, method: "initialize", params: this.initParams }));
     return true;
   }
 
@@ -202,6 +228,7 @@ export class BrokerSession {
     const hasId = m.id !== undefined && m.id !== null && (typeof m.id === "string" || typeof m.id === "number");
     if (typeof m.method !== "string") return this.refuseFrame(hasId ? "an answer the server never asked for" : "no method");
     if (!hasId) {                                             // a notification
+      if (!this.serverUp) return this.d.log(`dropped a notification while the server restarts: ${m.method.slice(0, 60)}`);
       if (CLIENT_NOTES.has(m.method)) this.d.toServer(JSON.stringify(m));
       else this.d.log(`dropped a notification: ${m.method.slice(0, 60)}`);
       return;
@@ -210,6 +237,8 @@ export class BrokerSession {
     if (this.pending.has(key)) return void this.d.toClient(err(m.id, "a call with this id is already in flight"));
     if (!CALLS.has(m.method)) { this.d.log(`refused a call: ${m.method.slice(0, 60)}`); return void this.d.toClient(err(m.id, `${m.method.slice(0, 60)} isn't allowed here`, -32601)); }
     if (this.pending.size >= MAX_PENDING) return void this.d.toClient(err(m.id, "too many calls in flight; send it again in a moment"));
+    // During a server gap, or before a restarted server took the handshake: answered at once.
+    if (!this.serverUp) return void this.d.toClient(err(m.id, RESTARTING));
     if (m.method !== "tools/call") {
       const p: Pending = { method: m.method, initialize: m.method === "initialize" };
       if (p.initialize) { this.initId = key; this.initParams = m.params ?? {}; }
@@ -262,6 +291,8 @@ export class BrokerSession {
       if (why) { this.untrack(key); this.d.log(`refused ${name}: ${why}`); return void this.d.toClient(toolError(m.id, `${name} failed: ${why}`)); }
       p.args = args;
     }
+    // The server may have stopped while the gate ran: nothing was sent, so it's a plain retry.
+    if (!this.serverUp) { this.untrack(key); return void this.d.toClient(err(m.id, RESTARTING)); }
     this.d.toServer(JSON.stringify({ jsonrpc: "2.0", id: m.id, method: "tools/call", params: { name, arguments: p.args } }));
   }
 
@@ -293,8 +324,13 @@ export class BrokerSession {
       // initialized notification follows, and the channel is whole again.
       if (this.reinitId !== null && m.id === this.reinitId) {
         this.reinitId = null;
-        if (m.error) return this.d.log("the restarted server refused the handshake");
+        this.d.clearTimer?.(this.reinitTimer);
+        if (m.error || !m.result) {
+          this.d.log("the restarted server refused the handshake");
+          return this.d.serverFailed?.("the restarted server refused the handshake");
+        }
         this.d.toServer(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }));
+        this.serverUp = true;                                // only now: its initialized notification went first
         return this.d.log("the restarted server took the handshake");
       }
       const key = JSON.stringify(m.id);

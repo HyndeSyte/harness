@@ -347,14 +347,25 @@ container was killed, it stayed down 10 minutes with no alarm, since every alarm
 - **The plugin's server is supervised.** When it stops for any reason, the App starts it again
   within seconds (waits of 1, 2, 4, 8, then 15 seconds), logs each restart with its exit code
   ("the plugin's server stopped (0): starting it again in 1 s"), and hands it Cain's session's own
-  handshake again, so his session keeps its channel. While it's down the App names it as its own
-  state, "the Discord plugin's server", apart from his session exiting.
+  handshake again, so his session keeps its channel. Each stop is logged with its exit code, the
+  signal that ended it, and the last lines it wrote. While it's down, and until the new server has
+  taken that handshake, a call from his session is answered at once ("the Discord channel is
+  restarting its server; nothing was sent"), never dropped or sent to a server that isn't ready; a
+  new server that refuses the handshake, or doesn't answer it in 10 seconds, leaves the channel down
+  for the watchdog. While it's down the App names it as its own state, "the Discord plugin's
+  server", apart from his session exiting. A restart of the broker itself (the part that holds his
+  connection) is different: it ends his connection, so the state says down from that moment and the
+  App restarts his session after 90 seconds; the plugin's server comes back with his new session.
 - **The App restarts itself, as a last resort.** When his Discord channel stays down across 3
   restarts of his session, or for 10 minutes, whichever comes first, the App ends his session and
-  stops on an error, and the Supervisor's watchdog starts it again. One restart per incident (30
-  minutes), each kept in `/data/probe` with its cause and time, named in the next morning check-in,
-  counted in 0.14.0's restart counts as a restart the App asked for itself, and an alarm after 3 in
-  24 hours or 2 for the same cause. Never while his screen waits on your one-time sign-in.
+  asks the Supervisor to restart it (the Supervisor's own restart call, which every App may make);
+  should the Supervisor refuse, or not stop it within a minute, the App stops on an error (exit code
+  3) and the Supervisor's watchdog starts it again. One restart per incident (30 minutes), each kept
+  in `/data/probe` with its cause and time, named in the next morning check-in, counted in 0.14.0's
+  restart counts as a restart the App asked for itself, and an alarm after 3 in 24 hours or 2 for the
+  same cause. Every self-restart also pings the outside heartbeat's failure address, so one that never
+  comes back is raised from outside. Never while his screen waits on your one-time sign-in: the 10
+  minutes and the wait for a first connection start again when the sign-in ends.
 - **A first session that never connects** (signed in, but no Discord connection 3 minutes after it
   started) is restarted; one waiting on your sign-in never is.
 - **No alarm hands you a manual step.** Each names the real cause (the plugin's server gone, his
@@ -369,13 +380,23 @@ container was killed, it stayed down 10 minutes with no alarm, since every alarm
 The **Watchdog** switch on the Cain App's page in Home Assistant (Settings, Apps, Cain) is the one
 thing only you can turn on, once. With it on, Home Assistant's Supervisor starts the App again by
 itself whenever its container stops on an error: a crash, a kill, running out of memory, or the App
-restarting itself because Cain's Discord channel stayed down. It also asks the App's health page
-(`/health`, the `watchdog` URL in its configuration, answered on Home Assistant's internal network
-only) and restarts the App when that answers an error, which it does only while a self-restart is
-due. With it off, a killed App stays down until someone starts it, and the App never restarts itself
-(it would stay down): it tells you once, naming this switch, and keeps restarting Cain's session
-instead. The App reads the switch through the Supervisor's own-info call, which every App may read;
-it has no wider access than before.
+restarting itself by its exit route because Cain's Discord channel stayed down. It also asks the App's
+health page (`/health`, the `watchdog` URL in its configuration, answered to the Supervisor alone and
+404 to anyone else) and restarts the App when that answers an error, which it does only in the moment
+a self-restart is under way. With it off, a killed App stays down until someone starts it, and the App
+never restarts itself (its exit route would leave it down): it tells you once, naming this switch, and
+keeps restarting Cain's session instead. The App reads the switch through the Supervisor's own-info
+call and asks for its restart through the Supervisor's own restart call, both of which every App may
+make without an API role (`hassio_api` stays off); it has no wider access than before. Only a
+successful answer whose `watchdog` is exactly true or false counts; anything else is "unknown".
+
+If the App's web server (nginx, which serves its page and `/health`) doesn't start after 3 tries, the
+App logs nginx's own words as the cause and raises an alarm of its own, "Cain's App page is down";
+Cain himself keeps running. It comes down at the next start that works.
+
+**The exit route is relied on only once Pi drill 7 has passed** (below): it proves that the App
+stopping with exit code 3 is started again by the Supervisor within a minute. Until then the
+Supervisor's restart call is the route the App uses, with the exit route only behind it.
 
 ## What 0.14.0 does: liveness alarms
 
@@ -537,10 +558,15 @@ on the Pi after the install, before the alarms are relied on:
    under 6 seconds and the finish script under 4.
 6. (0.15.0) Stop the plugin's server once: it runs again within seconds, the channel says connected
    again within 90 seconds, and his session isn't restarted for it.
+7. (0.15.0, with the Watchdog switch on) The exit route: the App stops with exit code 3 and the
+   Supervisor starts it again within a minute. The outside heartbeat hears a failure meanwhile, as
+   expected. Until this passes, don't rely on the exit route.
 
 The drill finds the container by its name (`app_<hash>_cain`, then `addon_<hash>_cain`; set
 `CAIN_CONTAINER` to pick one), checks every tool a step uses before it starts, and kills through
-`/proc` (the image has no `pkill`). Any step reruns alone: `bash probe-drill.sh 1b`.
+`/proc` (the image has no `pkill`), inside that container only, and only the one process whose
+program and arguments are exactly the ones named: two matches are refused and nothing is killed. Any
+step reruns alone: `bash probe-drill.sh 1b`.
 
 For a hand restore to be there when the update line asks for it, keep a backup taken before each
 update of Cain: the Ship job takes one, and Home Assistant's **Backup before update** does too.

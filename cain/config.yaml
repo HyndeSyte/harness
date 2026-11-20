@@ -20,8 +20,9 @@ ingress_port: 8099
 # The Supervisor's watchdog (Cain 0.15.0): with the Watchdog switch on the App's page turned on, the
 # Supervisor starts the App again when its container stops on an error (a kill, a crash, or the App
 # restarting itself when Cain's Discord channel stays down) and when this answers an error. nginx
-# answers it on the internal network only (rootfs/etc/nginx/nginx.conf), 503 only while a
-# self-restart is due. Read through /addons/self/info, which needs no API role.
+# answers it to the Supervisor alone (rootfs/etc/nginx/nginx.conf), 503 only while a self-restart
+# is due (the mark is set just before the App stops). The switch is read through /addons/self/info
+# and the restart asked through /addons/self/restart, which need no API role (hassio_api stays off).
 watchdog: http://[HOST]:[PORT:8098]/health
 panel_icon: mdi:account-tie
 panel_title: Cain

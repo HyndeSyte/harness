@@ -30,6 +30,16 @@ alarm after 3 in 24 hours or 2 of the same kind; the next start counted as an as
 requester is the App. The outside dead-man check is the heartbeat (heartbeat_url, every 5 minutes, since
 Nov 18) and the Supervisor's watchdog itself.
 
-Still open: the running count and first failure's date in the "switch undone" line, and the drill of
-the exit-and-watchdog route on the real server (probe-drill.sh 5 kill with the switch on, and a forced
-self-restart) before relying on it.
+Second round (the outside review): the primary route is now the Supervisor's own restart call (POST
+/addons/self/restart). The Supervisor lets every App's token through to /addons/self/* (but security
+and update) with no API role, so hassio_api stays off and no manager role is needed; the switch to his
+own user already makes the same call (bashio::addon.restart). The exit route (exit 3, the s6 exitcode
+file, the watchdog) is the fallback when the Supervisor refuses the call or doesn't stop the App within a
+minute. Every self-restart pings the outside heartbeat's failure URL from the finish script, so a halt
+that never comes back is raised from outside the App. The /health 503 is set only on a restart decision,
+just before the App stops.
+
+Still open: the running count and first failure's date in the "switch undone" line; the exit route
+proven on the real server, probe-drill.sh 7 (the App stops with 3 and the Supervisor starts it again
+within a minute), before relying on it; and the restart call watched once on the Pi in a real
+self-restart (the log says "The Supervisor took the restart" and the next start is kept as asked).

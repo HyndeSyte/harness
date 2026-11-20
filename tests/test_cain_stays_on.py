@@ -20,14 +20,26 @@ def _needs_posix():
 def _start(tmp_path, as_cain=None, signed_in=True, screen=None):
     calls, stop, bindir, runc = _whole_start(tmp_path, **{"as-cain": as_cain or _session_up(tmp_path), "c1/check.sh": "exit 0"})
     note = f'echo "$(basename "$0") $*" >> {calls.as_posix()}'
-    # bun: the probe's self-restart answers as the switch says (on: restart); everything else as before.
+    health = (runc.parent / "cain-web" / "www" / "health-down").as_posix()
+    # bun: the probe's self-restart answers as the switch says (on: restart), or STUB_DECISION when set,
+    # and notes whether the health page's mark stood when it was asked (second round: decide first).
     (bindir / "bun").write_text("#!/bin/bash\n"
-                                'case "$2" in self-restart) ' + note + '; case "$4" in on) echo restart;; off) echo off;; *) echo unknown;; esac; exit 0;; esac\n'
+                                'case "$2" in self-restart) ' + note + f'; [ -e {health} ] && echo "health-down at decision" >> {calls.as_posix()}; '
+                                '[ -z "${STUB_DECISION:-}" ] || { echo "$STUB_DECISION"; exit 0; }; '
+                                'case "$4" in on) echo restart;; off) echo off;; *) echo unknown;; esac; exit 0;; esac\n'
                                 'case "$2" in container-id) echo boot:1;; esac; exit 0\n')
     whole = tmp_path / "whole.sh"
     text = whole.read_text()
-    first, rest = text.split("\n", 1)
-    whole.write_text(first + '\nbashio::api.supervisor() { echo "${STUB_WATCHDOG:-true}"; }\n' + rest)
+    # The Supervisor, stubbed after the harness's own stubs: its answer to /addons/self/info (STUB_WATCHDOG
+    # true or false as the JSON the Supervisor sends, or STUB_SUP_BODY whole) with STUB_SUP_RC as its
+    # status, and its restart call (STUB_RESTART_RC: 0 took it, else refused).
+    stubs = ('bashio::api.supervisor() { echo "supervisor $*" >> ' + calls.as_posix() + '; '
+             'if [ -n "${STUB_SUP_BODY:-}" ]; then printf "%s" "$STUB_SUP_BODY"; '
+             'else printf \'{"result":"ok","data":{"watchdog":%s}}\' "${STUB_WATCHDOG:-true}"; fi; return "${STUB_SUP_RC:-0}"; }\n'
+             'bashio::addon.restart() { echo "addon-restart" >> ' + calls.as_posix() + '; return "${STUB_RESTART_RC:-0}"; }\n')
+    marker = "export C1_PROC_ROOT="
+    i = text.index("\n", text.index(marker)) + 1
+    whole.write_text(text[:i] + stubs + text[i:])
     for d in (runc / "root-tmp", runc.parent / "cain-web" / "www"):
         d.mkdir(parents=True, exist_ok=True)
     cred = tmp_path / "data" / "cain" / ".claude" / ".credentials.json"
@@ -38,6 +50,9 @@ def _start(tmp_path, as_cain=None, signed_in=True, screen=None):
         cred.unlink(missing_ok=True)
     if screen:
         (runc.parent / "cain-web" / "www" / "status.json").write_text('{"screen": "%s"}\n' % screen)
+    # The panel's status writer chgrps its file to nogroup; a test runner may not be in that group.
+    (bindir / "chgrp").write_text("#!/bin/bash\nexit 0\n")
+    (bindir / "chgrp").chmod(0o755)
     return calls, stop, bindir, runc
 
 
@@ -61,8 +76,46 @@ def test_a_channel_down_10_minutes_restarts_the_app_once_with_the_switch_on(tmp_
     assert "his Discord channel has been down 11 minutes" in asked[0]
     assert (runc / "self-restart").exists()
     assert (runc.parent / "cain-web" / "www" / "health-down").exists()
-    assert any(l.startswith("setpriv --reuid=1000") for l in lines[lines.index(asked[0]):]), lines[:40]   # his session ended
+    assert "health-down at decision" not in lines, lines[:40]           # 503 only once the decision is restart
+    after = lines[lines.index(asked[0]):]
+    assert any(l.startswith("setpriv --reuid=1000") for l in after), lines[:40]   # his session ended
+    # The Supervisor's own restart call first (the primary route); here it never stops the App, so after
+    # its wait the App takes the exit route.
+    assert "addon-restart" in after, lines[:40]
     assert "notice.sh tell exited" not in lines
+
+
+def test_a_refused_restart_call_takes_the_exit_route_at_once(tmp_path):
+    _needs_posix()
+    calls, stop, bindir, runc = _start(tmp_path)
+    runc.mkdir(parents=True, exist_ok=True)
+    (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=15,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1", STUB_RESTART_RC="1",
+                                   C1_SELF_STOP_WAIT_S="3600")
+    assert not alive, lines[:40]
+    assert "addon-restart" in lines and (runc / "self-restart").exists()
+    assert (runc.parent / "cain-web" / "www" / "health-down").exists()
+
+
+@pytest.mark.parametrize("decision,switch", [("wait", "true"), ("off", "false"), ("unknown", "true")])
+def test_the_health_page_stays_200_after_a_wait_off_or_unknown_decision(tmp_path, decision, switch):
+    """Second round, the outside review's first finding: the health page's 503 (nginx answers it while
+    the mark is there) is set only on a restart decision, so after a wait, off or unknown the mark is
+    gone: a mark left by anything before is cleared at the decision, and none is set before it."""
+    _needs_posix()
+    calls, stop, bindir, runc = _start(tmp_path)
+    runc.mkdir(parents=True, exist_ok=True)
+    (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
+    health = runc.parent / "cain-web" / "www" / "health-down"
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: bool(_self_calls(l)) and sum("new-session" in x for x in l) >= 2,
+                                   timeout=30, C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1",
+                                   STUB_WATCHDOG=switch, STUB_DECISION=decision, C1_SELF_RETRY_S="3600")
+    assert alive, err
+    assert _self_calls(lines), lines[:40]
+    assert "health-down at decision" not in lines, lines[:40]
+    assert not health.exists(), lines[:40]
+    assert not (runc / "self-restart").exists() and "addon-restart" not in lines
 
 
 def test_three_session_restarts_with_the_channel_down_restart_the_app(tmp_path):
@@ -107,10 +160,40 @@ def test_a_supervisor_that_doesnt_answer_is_unknown_and_the_app_stays_up(tmp_pat
     (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
     alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: sum("new-session" in x for x in l) >= 3,
                                    timeout=40, C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1",
-                                   STUB_WATCHDOG="null", C1_SELF_RETRY_S="0")
+                                   STUB_SUP_BODY="", STUB_SUP_RC="1", C1_SELF_RETRY_S="0")
     assert alive, err
     asked = _self_calls(lines)
     assert asked and all(a.split()[4] == "unknown" for a in asked), lines[:40]
+
+
+def _switch(tmp_path, body, rc=0, sleep_s=0):
+    """watchdog_switch (and run_bounded) from the run script, alone, against a stubbed Supervisor."""
+    import subprocess
+    from test_addon import CAIN, _run_fns
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    fns = _run_fns(run, "run_bounded() {", "# His screen waits on the owner's one-time sign-in")
+    script = ("nap() { sleep \"$1\"; }\n"
+              f"bashio::api.supervisor() {{ sleep {sleep_s}; printf '%s' \"$BODY\"; return {rc}; }}\n"
+              f"export TMPDIR={tmp_path.as_posix()}\n" + fns + "\nwatchdog_switch\n")
+    r = subprocess.run(["bash", "-c", script], env={**os.environ, "BODY": body}, capture_output=True, text=True, timeout=60)
+    return r.stdout.strip()
+
+
+def test_the_switch_reads_only_a_successful_strict_answer(tmp_path):
+    """Second round, the sixth finding: the switch reads on only from the Supervisor's own JSON with
+    result ok and a boolean data.watchdog; an error body that contains the word true, a failed call,
+    a string "true", text, or no answer is unknown."""
+    _needs_posix()
+    ok = lambda v: '{"result":"ok","data":{"watchdog":%s,"slug":"cain"}}' % v
+    assert _switch(tmp_path, ok("true")) == "on"
+    assert _switch(tmp_path, ok("false")) == "off"
+    assert _switch(tmp_path, '{"result":"error","message":"it is true that the watchdog failed"}') == "unknown"
+    assert _switch(tmp_path, '{"result":"error","message":"true"}', rc=1) == "unknown"
+    assert _switch(tmp_path, ok("true"), rc=1) == "unknown"              # the call itself failed
+    assert _switch(tmp_path, "true") == "unknown"
+    assert _switch(tmp_path, ok('"true"')) == "unknown"
+    assert _switch(tmp_path, '<html>502 true gateway</html>') == "unknown"
+    assert _switch(tmp_path, "") == "unknown"
 
 
 def test_a_connected_channel_never_restarts_the_app(tmp_path):
@@ -156,3 +239,92 @@ def test_a_first_session_waiting_on_the_owners_sign_in_is_never_restarted(tmp_pa
         assert alive, err
         assert sum("new-session" in l for l in lines) == 1, (signed_in, lines[:40])
         assert not _self_calls(lines) and not any(l.startswith("setpriv --reuid=1000") for l in lines), (signed_in, lines[:40])
+
+
+def test_the_sign_in_wait_reads_the_screen_the_panels_real_writer_keeps(tmp_path):
+    """Second round, the second finding: the "screen" key waiting_signin reads is the one the panel's
+    status loop writes, and nothing is pre-written here: his screen shows the code prompt, the real
+    writer keeps "waiting_for_code", and his session is never restarted for its channel."""
+    _needs_posix()
+    from test_addon import CAIN
+    run = (CAIN / "rootfs/etc/services.d/cain/run").read_text()
+    writer = run[run.index("printf '{\"signed_in\""):run.index("/run/cain-web/www/status.json || true")]
+    assert '"screen": "%s"' in writer and "/run/cain-web/www/status.tmp" in writer
+    reader = run[run.index("waiting_signin() {"):run.index("self_exit() {")]
+    assert "jq -r '.screen // empty' /run/cain-web/www/status.json" in reader
+    for state in ("login_needed", "waiting_for_code", "first_run_menu", "trust_prompt"):
+        assert f"state={state}" in run and state in reader
+    # $CRED is set for both ways of running before the loop reads it.
+    assert run.count("  CRED=/data/") == 2 and run.index("  CRED=/data/") < run.index("waiting_signin() {")
+    as_cain = ('case "$*" in *capture-pane*) printf "Paste code here if prompted\\n"; exit 0;; esac\n' + _session_up(tmp_path))
+    calls, stop, bindir, runc = _start(tmp_path, as_cain=as_cain, signed_in=True)
+    status = runc.parent / "cain-web" / "www" / "status.json"
+    assert not status.exists()
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=8,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_FIRST_CONNECT_S="1", C1_SELF_RESTART_S="1")
+    assert alive, err
+    import json
+    assert json.loads(status.read_text())["screen"] == "waiting_for_code"
+    assert sum("new-session" in l for l in lines) == 1, lines[:40]
+    assert not _self_calls(lines) and not any(l.startswith("setpriv --reuid=1000") for l in lines), lines[:40]
+
+
+def test_a_sign_in_longer_than_the_10_minutes_then_a_normal_connect_restarts_nothing(tmp_path):
+    """Second round, the second finding: a first sign-in that takes longer than the App's 10 minutes
+    (scaled: 3 seconds here, the first-connect wait 2) used to restart the App on the first tick after
+    it, before the connect wait applied. Now the 10 minutes and the connect wait start again when the
+    screen stops waiting, and a channel that connects within the wait restarts nothing."""
+    _needs_posix()
+    import threading
+    calls, stop, bindir, runc = _start(tmp_path, signed_in=False)
+    runc.mkdir(parents=True, exist_ok=True)
+    cred = tmp_path / "data" / "cain" / ".claude" / ".credentials.json"
+
+    def owner_signs_in_then_it_connects():
+        time.sleep(5)                                                      # longer than the scaled 10 minutes
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text('{"x": 1}\n')
+        time.sleep(1)                                                      # within the scaled connect wait
+        (runc / "discord.state").write_text(f"connected {int(time.time())}\n")
+
+    t = threading.Thread(target=owner_signs_in_then_it_connects)
+    t.start()
+    try:
+        alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=11,
+                                       C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_FIRST_CONNECT_S="2",
+                                       C1_SELF_RESTART_S="3", C1_CHANNEL_DOWN_S="1")
+    finally:
+        t.join()
+    assert alive, err
+    assert not _self_calls(lines), lines[:40]
+    assert sum("new-session" in l for l in lines) == 1, lines[:40]
+    assert not any(l.startswith("setpriv --reuid=1000") for l in lines), lines[:40]
+    assert not (runc / "self-restart").exists()
+
+
+def test_without_a_connect_after_the_sign_in_the_wait_still_ends(tmp_path):
+    """The same long sign-in, but his channel never connects: his session is restarted once the
+    connect wait from the sign-in's end has passed, and nothing sooner."""
+    _needs_posix()
+    import threading
+    calls, stop, bindir, runc = _start(tmp_path, signed_in=False)
+    cred = tmp_path / "data" / "cain" / ".claude" / ".credentials.json"
+    signed = {}
+
+    def owner_signs_in():
+        time.sleep(4)
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text('{"x": 1}\n')
+        signed["at"] = time.time()
+
+    t = threading.Thread(target=owner_signs_in)
+    t.start()
+    try:
+        alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: sum("new-session" in x for x in l) >= 2,
+                                       timeout=20, C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_FIRST_CONNECT_S="2",
+                                       C1_SELF_RESTART_S="600")
+    finally:
+        t.join()
+    assert alive, err
+    assert sum("new-session" in l for l in lines) >= 2, lines[:40]
+    assert time.time() - signed["at"] >= 2

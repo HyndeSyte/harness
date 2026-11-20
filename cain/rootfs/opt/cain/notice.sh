@@ -40,7 +40,9 @@
 # alone; it goes to his bot again once a day while it stands), and since 0.15.0 "watchdog" (the App
 # can't restart itself: the Supervisor's Watchdog switch is off; once, naming the switch) and
 # "selfrestart" (the App couldn't restart itself, or keeps restarting itself). "channel" and
-# "server-gone" join "session", and "self-restart" (the App restarting itself now) joins "stop".
+# "server-gone" join "session", and "self-restart" (the App restarting itself now) joins "stop". Since
+# 0.15.0's second round, "panel" (kind "nginx": the App's web server, which serves its page and the
+# Supervisor's health check, didn't start; cleared once it does).
 # Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
@@ -83,7 +85,7 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart panel"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 # What every alarm says (Cain 0.15.0): the real cause and the step the App takes itself, never a step
@@ -115,6 +117,7 @@ group_of() {
     tampered) echo tamper ;;
     self-off) echo watchdog ;;
     self-refused|self-loops) echo selfrestart ;;
+    nginx) echo panel ;;
     *) return 1 ;;
   esac
 }
@@ -144,7 +147,9 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     server-gone) T="Cain isn't answering"
       M="Cain isn't answering: the Discord plugin's server keeps stopping${c}. The App starts it again within seconds each time, and has restarted his session for it 3 times. $SELFRESTART $DETAILS" ;;
     self-restart) T="Cain's App is restarting itself"
-      M="Cain's App is restarting itself: ${2:-his Discord channel stayed down}. The Supervisor's watchdog starts it again within a minute, and you hear when he's back. Nothing for you to do." ;;
+      M="Cain's App is restarting itself: ${2:-his Discord channel stayed down}. The Supervisor starts it again within a minute, and you hear when he's back. Nothing for you to do." ;;
+    nginx) T="Cain's App page is down"
+      M="Cain's App page and the Supervisor's health check of the App aren't running: its web server didn't start${c}. Cain himself keeps running and answering you. The App tries again at its next start, and this comes down once it starts. $DETAILS" ;;
     self-off) T="Cain needs one switch turned on"
       M="Cain's App can't restart itself: his Discord channel stayed down${c}, and the Supervisor's Watchdog switch for the Cain App is off, so a restart would leave him down. That switch is the one thing only you can turn on: Home Assistant, Settings, Apps, Cain, Watchdog. Meanwhile the App keeps restarting his session by itself. With it on, the App also comes back by itself after a crash or a kill." ;;
     self-refused) T="Cain's App couldn't restart itself"
@@ -217,6 +222,7 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     turn) CT="Cain's long turn ended"; CM="Cain's long turn ended: his screen is free again." ;;
     watchdog) CT="Cain's App can restart itself again"; CM="The Supervisor's Watchdog switch for the Cain App is on: the App can restart itself, and comes back by itself after a crash or a kill." ;;
     selfrestart) CT="Cain's App stays up"; CM="Cain's App is up, and his Discord channel is connected." ;;
+    panel) CT="Cain's App page is back"; CM="Cain's App page and its health check are running again." ;;
     tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
@@ -308,7 +314,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|channel|server-gone|self-restart|self-off|self-refused|self-loops|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|channel|server-gone|self-restart|self-off|self-refused|self-loops|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered|nginx) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c
@@ -336,8 +342,8 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
   case "$1" in running) groups="stop session" ;; switched) groups="stop session switch" ;; screen) groups="screen" ;;
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
     self) groups="self" ;; boots) groups="boots" ;; asked) groups="asked" ;; all) groups="all" ;; update) groups="update" ;; unseen) groups="unseen" ;;
-    turn) groups="turn" ;; tampered) groups="tamper" ;; watchdog) groups="watchdog" ;; selfrestart) groups="selfrestart" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog or selfrestart" >&2; return 2 ;; esac
+    turn) groups="turn" ;; tampered) groups="tamper" ;; watchdog) groups="watchdog" ;; selfrestart) groups="selfrestart" ;; panel) groups="panel" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog, selfrestart or panel" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then

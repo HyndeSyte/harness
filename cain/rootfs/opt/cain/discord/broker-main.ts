@@ -87,9 +87,12 @@ let n = 0;
 // <s>", the plugin's server not running under a live connection since <s> (the broker is starting it
 // again), whole.
 const STATE_FILE = env.CAIN_DISCORD_STATE_FILE ?? "/run/cain/discord.state";
-// A broker that restarts under a connected channel leaves it dead (the bridge never reconnects):
-// say "down" from now, so the watchdog restarts his session. Before any connection: no state.
-try { if (readFileSync(STATE_FILE, "utf8").startsWith("connected")) channelState("down"); } catch { /* none yet */ }
+// A broker that restarts leaves his channel dead (the bridge never reconnects): whatever the state
+// file said ("connected", or a "server-down" or "down" from the broker before, with its old time), it
+// says "down" from now, so the watchdog restarts his session after its 90 seconds, and a stale time
+// never counts toward the App's 10 minutes (Cain 0.15.0, second round). Before any connection in this
+// container there is no file, and none is written: the first-connect wait applies.
+try { readFileSync(STATE_FILE, "utf8"); channelState("down"); } catch { /* none yet */ }
 function channelState(what: "connected" | "down" | "server-down", at = Math.floor(Date.now() / 1000)): void {
   if (env.CAIN_BROKER_SMOKE === "1") return;
   try { writeFileSync(`${STATE_FILE}.tmp`, `${what} ${at}
@@ -120,6 +123,7 @@ function lineReader(onLine: (l: string) => void, onTooLong: () => void) {
 // so his session keeps its channel. Meanwhile the state says "server-down": the run script's
 // watchdog names it apart from his session's exits.
 const backoffScale = Number(env.CAIN_SERVER_BACKOFF_SCALE ?? 1);   // tests only: shorter waits
+const tails = new WeakMap<object, string[]>();                     // each server's last stderr lines
 
 function spawnServer() {
   return Bun.spawn(SERVER_CMD ?? ["setpriv", "--reuid=discord", "--regid=discord", "--init-groups", "--no-new-privs",
@@ -180,6 +184,15 @@ function connection(sock: Socket): void {
     clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
     probeAnswered: () => probeMark("answered"),
     heard: () => probeMark("heard"),
+    // A restarted server that refused the replayed handshake, or didn't answer it: the channel isn't
+    // whole, so the state says server-down from the first stop of this streak, and the run script's
+    // watchdog restarts his session after its minute (and the App itself, past its bound).
+    serverFailed: (why) => {
+      if (current !== conn) return;
+      if (steady) { clearTimeout(steady); steady = null; }
+      log(`${why}: the channel stays down for the watchdog`);
+      channelState("server-down", streakAt || Math.floor(Date.now() / 1000));
+    },
   });
   conn.session = session;
   current = conn;
@@ -195,18 +208,28 @@ function connection(sock: Socket): void {
     })();
     void (async () => {
       const dec = new TextDecoder();
-      const read = lineReader((l) => { if (l.trim()) log(`plugin: ${l.slice(0, 300)}`); }, () => {});
+      const read = lineReader((l) => {
+        if (!l.trim()) return;
+        log(`plugin: ${l.slice(0, 300)}`);
+        const t = tails.get(p) ?? []; t.push(l.slice(0, 160)); if (t.length > 3) t.shift(); tails.set(p, t);
+      }, () => {});
       for await (const chunk of p.stderr) read(dec.decode(chunk, { stream: true }));
     })();
     void p.exited.then((code) => {
       if (proc !== p) return;
       proc = null;
-      if (!session.open() || current !== conn) { log(`the plugin's server stopped (${code}) with its connection`); return; }
+      // Why it stopped, as far as the broker can tell: its exit code, the signal that ended it, and the
+      // last lines it wrote to stderr (each already in the log as "plugin: ...").
+      const sig = p.signalCode ? `, signal ${p.signalCode}` : "";
+      const tail = (tails.get(p) ?? []).join(" | ");
+      tails.delete(p);
+      if (tail) log(`the plugin's server's last words before it stopped (${code}${sig}): ${tail}`);
+      if (!session.open() || current !== conn) { log(`the plugin's server stopped (${code}${sig}) with its connection`); return; }
       if (steady) { clearTimeout(steady); steady = null; }
       if (restarts === 0) streakAt = Math.floor(Date.now() / 1000);
       restarts++;
       const wait = serverWait(restarts);
-      log(`the plugin's server stopped (${code}): starting it again in ${wait} s (restart ${restarts})`);
+      log(`the plugin's server stopped (${code}${sig}): starting it again in ${wait} s (restart ${restarts})`);
       session.serverLost();
       channelState("server-down", streakAt);
       timer = setTimeout(() => {
@@ -222,7 +245,8 @@ function connection(sock: Socket): void {
         // stopping stays "server-down" from its first stop, for the watchdog.
         steady = setTimeout(() => {
           steady = null;
-          if (proc !== p2 || !session.open() || current !== conn) return;
+          // Only a server that took the replayed handshake counts (a refused one stays server-down).
+          if (proc !== p2 || !session.whole() || current !== conn) return;
           restarts = 0;
           log("the plugin's server has run a minute again: the channel is up");
           channelState("connected");

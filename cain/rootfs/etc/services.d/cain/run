@@ -704,25 +704,44 @@ session_ended() {
 # report in the morning check-in, an alarm after 3 in 24 hours or 2 for the same cause, and 3
 # Supervisor answers in a row that can't be read alarm with the reason. With the switch off the App
 # never exits (it would stay down): it alarms once, naming the switch, and keeps restarting his
-# session. /health (nginx, the watchdog's URL in config.yaml) answers 503 while a self-restart is
-# due, 200 otherwise.
+# session. /health (nginx, the watchdog's URL in config.yaml) answers 503 only while a self-restart
+# is due: the mark is set only on a restart decision, just before the App stops, and cleared at every
+# start of this script and on every other decision (second round: before, it was set before the
+# probe decided and stayed after a wait, off or unknown, so the Supervisor restarted the App on the
+# URL alone, with no mark, no row and no alarm).
 HEALTH_DOWN=/run/cain-web/www/health-down
 health_up() { rm -f "$HEALTH_DOWN" 2>/dev/null || true; }
 health_down() { { : > "$HEALTH_DOWN" && chgrp nogroup "$HEALTH_DOWN" && chmod 0640 "$HEALTH_DOWN"; } 2>/dev/null || true; }
 health_up
-# The watchdog switch, as the Supervisor says: on, off, or unknown (no answer within 20 seconds).
-watchdog_switch() {
-  local f="${TMPDIR:-/run/cain/root-tmp}/watchdog.$$" v pid i
-  rm -f "$f"
-  ( bashio::api.supervisor GET /addons/self/info false .watchdog > "$f" 2>/dev/null ) &
+# A call to the Supervisor in a background subshell, bounded: run_bounded <seconds> <out file> <command...>.
+# 0 only when the command itself finished with 0 in time.
+run_bounded() {
+  local limit="$1" f="$2" pid i rc=124; shift 2
+  rm -f "$f" "$f.rc"
+  ( "$@" > "$f" 2>/dev/null; echo "$?" > "$f.rc" ) &
   pid=$!
-  for i in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; nap 0.5; done
+  for ((i = 0; i < limit * 2; i++)); do kill -0 "$pid" 2>/dev/null || break; nap 0.5; done
   kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-  v="$(head -c 10 "$f" 2>/dev/null | tr -cd 'a-z' || true)"; rm -f "$f"
+  [ ! -s "$f.rc" ] || rc="$(head -c 4 "$f.rc" | tr -cd '0-9')"
+  rm -f "$f.rc"
+  return "${rc:-124}"
+}
+# The watchdog switch, as the Supervisor says: on, off, or unknown. Second round, strictly: only a call
+# that succeeded (within 20 seconds), whose whole answer is the Supervisor's JSON with result "ok" and a
+# boolean data.watchdog, counts; an error, a timeout, an error body (even one with "true" in it) or
+# anything else is unknown.
+watchdog_switch() {
+  local f="${TMPDIR:-/run/cain/root-tmp}/watchdog.$$" v=""
+  if run_bounded 20 "$f" bashio::api.supervisor GET /addons/self/info true; then
+    v="$(jq -r 'if .result == "ok" and (.data.watchdog | type) == "boolean" then .data.watchdog else "unknown" end' "$f" 2>/dev/null || true)"
+  fi
+  rm -f "$f"
   case "$v" in true) echo on ;; false) echo off ;; *) echo unknown ;; esac
 }
 # His screen waits on the owner's one-time sign-in (no Claude credentials yet, or the panel's status
-# says a sign-in screen): his session is never restarted for its channel then.
+# says a sign-in screen): his session is never restarted for its channel then. $CRED is where his
+# Claude credentials are, set above with the way of running (What each way of running reads where);
+# the screen is the "screen" key the panel's status loop above writes to status.json.
 waiting_signin() {
   [ -s "$CRED" ] || return 0
   case "$(jq -r '.screen // empty' /run/cain-web/www/status.json 2>/dev/null || true)" in
@@ -730,28 +749,49 @@ waiting_signin() {
   esac
   return 1
 }
+# The exit route (the fallback, and what probe-drill.sh 7 proves on the Pi): the mark the finish
+# script and the EXIT trap read, the health page's 503, then exit 3. The finish script records 3 as
+# the container's exit code and halts it, and the Supervisor's watchdog starts the App again.
+self_exit() {
+  { : > /run/cain/self-restart; } 2>/dev/null || true
+  health_down
+  exit 3
+}
 self_tried=0
 self_restart() {   # self_restart <kind> <cause>: never returns when the App restarts itself
   [ $(( $(date +%s) - self_tried )) -ge "${C1_SELF_RETRY_S:-60}" ] || return 0
   self_tried=$(date +%s)
-  health_down
   local sw dec
   sw="$(watchdog_switch)"
   dec="$(timeout 60 bun "$OPT/probe/main.ts" self-restart "$1" "$sw" "${start_id:-}" "$2" 2>&1 | tail -n 1 | tr -cd 'a-z-')" || true
   case "$dec" in
     restart)
-      bashio::log.warning "The App restarts itself: $2. The Supervisor's watchdog starts it again."
+      bashio::log.warning "The App restarts itself: $2"
       { : > /run/cain/self-restart; } 2>/dev/null || true
       end_his_session || true
-      exit 3 ;;
-    wait) bashio::log.info "A self-restart is due ($2), but the App restarted itself for this already within 30 minutes: his session is restarted instead" ;;
-    off) bashio::log.warning "A self-restart is due ($2), but the Supervisor's watchdog switch is off, so the App stays up (it would stay down) and restarts his session instead" ;;
-    *) bashio::log.warning "A self-restart is due ($2), but the Supervisor didn't say whether its watchdog is on (${dec:-no answer}): tried again in a minute" ;;
+      # The primary route (second round): the Supervisor's own restart call, POST /addons/self/restart,
+      # which every App may make with no API role (the Supervisor lets /addons/self/* through for any
+      # App's token; the same call the switch to his own user makes, below). The Supervisor
+      # stops this container (SIGTERM) and starts it again. Should it refuse, or not stop the App within
+      # a minute, the exit route above.
+      if run_bounded 30 "${TMPDIR:-/run/cain/root-tmp}/restart.$$" bashio::addon.restart; then
+        bashio::log.info "The Supervisor took the restart; waiting for it to stop the App"
+        nap "${C1_SELF_STOP_WAIT_S:-60}"
+        bashio::log.warning "The Supervisor didn't stop the App within a minute of taking its restart: the App stops on an error instead"
+      else
+        bashio::log.warning "The Supervisor didn't take the restart call: the App stops on an error instead, for its watchdog to start it again"
+      fi
+      self_exit ;;
+    wait) health_up; bashio::log.info "A self-restart is due ($2), but the App restarted itself for this already within 30 minutes: his session is restarted instead" ;;
+    off) health_up; bashio::log.warning "A self-restart is due ($2), but the Supervisor's watchdog switch is off, so the App stays up (it would stay down) and restarts his session instead" ;;
+    *) health_up; bashio::log.warning "A self-restart is due ($2), but the Supervisor didn't say whether its watchdog is on (${dec:-no answer}): tried again in a minute" ;;
   esac
 }
 # When his channel went down (the broker's state), or, with none yet in this container, when his
-# first session started: for the 10 minutes.
-first_up=""
+# first session started: for the 10 minutes. Second round: a wait on the owner's sign-in moves both
+# on. On the tick his screen stops waiting (signin_end), the 10 minutes and the first-connect wait
+# start again from then, so a sign-in that took longer than 10 minutes never restarts the App.
+first_up=""; signin_held=""; signin_end=0
 asked=0; listed_at=$(date +%s); told_at=$(date +%s)
 # Restarts for a channel that went down, counted apart from quick ends: a session that runs two
 # minutes resets those, but not these. Only a channel connected for 10 minutes straight resets
@@ -767,6 +807,14 @@ up_since=$(date +%s); cleared=""; check_tries=0; check_due=$(( up_since + ${C1_C
 [ "$mode" = own ] || checked=1
 if [ -n "$checked" ]; then checked_now; else unchecked; fi
 while session_up; do
+  # The Pi drill of the exit route (cain/tools/probe-drill.sh 7): a file only root can make, in root's
+  # own folder. The App ends his session and takes the exit route as a self-restart would.
+  if [ -e /run/cain/root-tmp/drill-exit-route ]; then
+    rm -f /run/cain/root-tmp/drill-exit-route
+    bashio::log.warning "The exit-route drill (probe-drill.sh 7): the App stops with exit code 3, for the Supervisor's watchdog to start it again"
+    end_his_session || true
+    self_exit
+  fi
   if [ -z "$checked" ] && [ "$(date +%s)" -ge "$check_due" ]; then
     check_tries=$((check_tries + 1))
     if [ "$check_tries" -ge 5 ]; then run_check 1; else run_check 0; fi
@@ -823,17 +871,23 @@ while session_up; do
       health_up
       if [ $(( now - at )) -ge "${C1_CHANNEL_STEADY_S:-600}" ]; then chan_restarts=0; fi
     elif waiting_signin; then
-      :
+      signin_held=1
     else
-      down_since="${at:-$first_up}"
+      if [ -n "$signin_held" ]; then
+        signin_held=""; signin_end=$now
+        bashio::log.info "His screen no longer waits on the sign-in: the wait for his Discord channel starts again from now"
+      fi
+      # The grace runs from his session's start, or from the end of a sign-in wait, whichever is later.
+      grace_from=$up_since; [ "$signin_end" -le "$grace_from" ] || grace_from=$signin_end
+      down_since="${at:-$first_up}"; [ "$down_since" -ge "$signin_end" ] || down_since=$signin_end
       if [ "$st" = server-down ] && [ -n "$at" ] && [ $(( now - at )) -gt "${C1_SERVER_DOWN_S:-60}" ] \
-         && [ $(( now - up_since )) -gt "${C1_SERVER_DOWN_S:-60}" ]; then
+         && [ $(( now - grace_from )) -gt "${C1_SERVER_DOWN_S:-60}" ]; then
         why="the Discord plugin's server has been stopped $(( now - at )) seconds and the broker couldn't keep it running"
       elif [ "$st" = down ] && [ -n "$at" ] && [ $(( now - at )) -gt "${C1_CHANNEL_DOWN_S:-90}" ] \
-         && [ $(( now - up_since )) -gt "${C1_CHANNEL_DOWN_S:-90}" ]; then
+         && [ $(( now - grace_from )) -gt "${C1_CHANNEL_DOWN_S:-90}" ]; then
         why="his session's Discord channel has been down $(( now - at )) seconds"
-      elif [ -z "$st" ] && [ $(( now - up_since )) -gt "${C1_FIRST_CONNECT_S:-180}" ]; then
-        why="his session, signed in, hasn't connected to Discord in $(( now - up_since )) seconds since it started"
+      elif [ -z "$st" ] && [ $(( now - grace_from )) -gt "${C1_FIRST_CONNECT_S:-180}" ]; then
+        why="his session, signed in, hasn't connected to Discord in $(( now - grace_from )) seconds since it started"
       fi
       # Past 3 restarts of his session for its channel, or 10 minutes down: the App restarts itself.
       if [ $(( now - down_since )) -ge "${C1_SELF_RESTART_S:-600}" ]; then
