@@ -21,19 +21,8 @@ panel_icon: mdi:account-tie
 panel_title: Cain
 panel_admin: true
 homeassistant_api: false
-# The Supervisor's API, with the backup role only (0.14.0): the rollback helper (root's alone,
-# rollback/helper.ts) lists this App's backups, reads a restore job's state, and, only when
-# rollback_armed is on, restores the pre-install backup within 24 hours of an install that keeps
-# crashing. It never removes a backup. The backup role reaches every /backups endpoint (taking,
-# removing and restoring any backup, full restores included), so the token stays root's alone (s6's
-# saved environment, c1/lock.sh run); Cain's own user and the watcher never have it.
-hassio_api: true
-hassio_role: backup
+hassio_api: false
 auth_api: false
-# This App's own config folder, as /config (0.14.0): the durable record of restores, outside
-# /data, which a restore puts back as the backup held it. Root's alone (c1/lock.sh run).
-map:
-  - addon_config:rw
 backup: cold
 # The link's two keys stay out of backups: whoever holds a backup can't sign a Ship
 # tap or update main with them. A restored Pi makes new ones (RELEASING.md, "If the
@@ -41,8 +30,6 @@ backup: cold
 backup_exclude:
   - "link/deploy_key*"
   - "link/ship.key*"
-  # The record of restores (0.14.0) stays out of backups, so a restore never brings an older one back.
-  - "rollback-record.json*"
 timeout: 30
 # Keys, entered by Dane here, never shown or logged. github_token: the record
 # keeper's GitHub fine-grained token for the org repo only (Contents read and write).
@@ -59,12 +46,9 @@ timeout: 30
 # session can read that file, so a compromised session can read the URL: keep it like a key. A leaked
 # URL can mask an outage or fake a failure. Empty: no heartbeat, and the morning check-in says so.
 # probe_heartbeat_url (0.14.0): the probe's own outside heartbeat, a second check at the same service
-# as heartbeat_url (its own ping URL). Pinged only after a probe that passed (every 5 minutes), so
-# the service alarms the owner when Cain stops answering, not only when the App stops. Read only by
+# as heartbeat_url (its own ping URL). Pinged only after a liveness pass that passed (every 5 minutes),
+# so the service alarms the owner when Cain's parts stop running, not only when the App stops. Read only by
 # the probe's own subshell (the run script), never by Cain's session, never logged. Empty: no ping.
-# rollback_armed (0.14.0): the automatic rollback within a day of an install that keeps crashing.
-# Off by default: a rollback that would have run only alarms, on both routes. Turn it on only after
-# the six Pi drills in DOCS.md ("Is Cain really answering") have all passed.
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
@@ -86,7 +70,6 @@ options:
   pc_jobs_repo: "HyndeSyte/pc-jobs"
   heartbeat_url: ""
   probe_heartbeat_url: ""
-  rollback_armed: false
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -103,4 +86,3 @@ schema:
   pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?
   heartbeat_url: password?
   probe_heartbeat_url: password?
-  rollback_armed: bool

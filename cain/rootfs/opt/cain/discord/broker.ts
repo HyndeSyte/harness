@@ -71,7 +71,6 @@ export interface BrokerDeps {
   setTimer?: (ms: number, f: () => void) => unknown;
   clearTimer?: (t: unknown) => void;
   probeAnswered?: () => void;                          // his session gave the hourly liveness check's fixed answer
-  reached?: (messageId: string) => void;               // a message of his channel was handed to his session (the probe's round trip)
 }
 
 interface Pending { method: string; tool?: string; args?: Record<string, unknown>; outbox?: string; note?: string; timer?: unknown; initialize?: boolean }
@@ -273,13 +272,7 @@ export class BrokerSession {
       return void this.d.toClient(JSON.stringify(m));
     }
     if (typeof m.method === "string" && m.id === undefined) {
-      if (SERVER_NOTES.has(m.method)) {
-        this.d.toClient(JSON.stringify(m));
-        // The message round trip (probe/core.ts): the id of each of his messages handed to his
-        // session, noted after it went, so the probe can tell one the link saw never arrived.
-        const id = m.method === "notifications/claude/channel" ? String(m.params?.meta?.message_id ?? "") : "";
-        if (/^\d{15,22}$/.test(id)) { try { this.d.reached?.(id); } catch (e) { this.d.log(`couldn't note a message for the probe: ${String(e).slice(0, 80)}`); } }
-      }
+      if (SERVER_NOTES.has(m.method)) this.d.toClient(JSON.stringify(m));
       else this.d.log(`dropped a server notification: ${m.method.slice(0, 60)}`);
       return;
     }

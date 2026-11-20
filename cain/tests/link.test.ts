@@ -132,15 +132,14 @@ describe("reactions", () => {
 });
 
 describe("the gateway protocol", () => {
-  test("identifies for reactions and direct messages, then resumes its session", () => {
+  test("identifies for reactions only, then resumes its session", () => {
     const sent: any[] = [];
     const seen: any[] = [];
     const p = new Protocol((o) => sent.push(o), () => "tok", { interaction: (d) => seen.push(d) }, () => 0);
     p.handle({ op: 10, d: { heartbeat_interval: 41250 } });
     expect(sent[0].op).toBe(2);
     expect(sent[0].d.intents).toBe(INTENTS);
-    // Reactions, and (Cain 0.14.0) direct messages, of which the link keeps only his ids for the probe.
-    expect(INTENTS).toBe((1 << 13) | (1 << 12));
+    expect(INTENTS).toBe(1 << 13);
     p.handle({ op: 0, s: 1, t: "READY", d: { session_id: "s", resume_gateway_url: "wss://gateway-x.discord.gg" } });
     p.handle({ op: 0, s: 2, t: "INTERACTION_CREATE", d: { id: "i" } });
     expect(seen).toEqual([{ id: "i" }]);

@@ -45,13 +45,12 @@ RUN apt-get update \
 ENV DISABLE_AUTOUPDATER=1
 
 # C1: Cain's session runs as its own user, and the Discord plugin's server as another, so
-# neither reaches a key root keeps. 0.14.0: the rollback watcher runs as a third, watch. Fixed ids: /data keeps numeric owners across versions.
+# neither reaches a key root keeps. Fixed ids: /data keeps numeric owners across versions.
 RUN groupadd -g 1000 cain && useradd -u 1000 -g cain -d /data/cain -M -s /bin/bash cain \
-    && groupadd -g 1001 discord && useradd -u 1001 -g discord -d /data/discord -M -s /usr/sbin/nologin discord \
-    && groupadd -g 1002 watch && useradd -u 1002 -g watch -d /data/watcher -M -s /usr/sbin/nologin watch
+    && groupadd -g 1001 discord && useradd -u 1001 -g discord -d /data/discord -M -s /usr/sbin/nologin discord
 
 COPY rootfs /
-RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh /opt/cain/c1/*.sh /opt/cain/as-cain /opt/cain/as-watch
+RUN chmod a+x /etc/services.d/*/run /etc/services.d/*/finish /opt/cain/*.sh /opt/cain/c1/*.sh /opt/cain/as-cain
 # The record keeper's copy (/data/record) is root's; record.sh reads it as cain, and git refuses
 # a repository another user owns (Nov 19, Cain 0.13.5).
 RUN git config --system --add safe.directory /data/record

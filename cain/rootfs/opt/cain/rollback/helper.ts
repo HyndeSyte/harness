@@ -1,3 +1,9 @@
+// DORMANT IN CAIN 0.14.0: this file ships but nothing runs it. The run script never starts it, the
+// App has no Supervisor API (hassio_api: false), no backup role, no config map and no switch, so it
+// has no token, no record folder and nothing that could arm it; run by hand, it refuses and exits.
+// It waits for the restore release, which needs the drills in DOCS.md ("What the restore release
+// needs") to pass first. The watcher it reads a flag from is not in this release either.
+//
 // The rollback helper (Cain 0.14.0), root's, and as small as the Supervisor's token allows: the
 // only process here that calls the Supervisor's backup API. Its token reaches every /backups
 // endpoint (list, take, remove, restore, full restores included), so it stays root's alone: read
@@ -311,11 +317,16 @@ export async function restoreStep(d: HelperDeps): Promise<string | null> {
 }
 
 if (import.meta.main) {
+  console.error("[cain] rollback: dormant until the restore release (Cain 0.14.0 ships no restore): nothing done");
+  process.exit(2);
+}
+// The code the restore release will run, kept as it was (unreachable: the block above exits).
+if (import.meta.main) {
   const asWatch = (args: string[]) => Bun.spawnSync([env.AS_WATCH ?? "/opt/cain/as-watch", ...args], { timeout: 10_000 });
   const deps = (): HelperDeps => ({
     dir: env.PROBE_DIR ?? "/data/probe", watcher: env.WATCHER_DIR ?? "/data/watcher", linkState: env.CAIN_LINK_STATE ?? "/data/link/state.json",
     record: env.ROLLBACK_RECORD ?? "/config/rollback-record.json",
-    now: Math.floor(Date.now() / 1000), armed: env.ROLLBACK_ARMED === "true", sup: supervisor(),
+    now: Math.floor(Date.now() / 1000), armed: false /* no switch in this release */, sup: supervisor(),
     readAsWatch: (f) => { const r = asWatch(["head", "-c", "64", f]); return r.exitCode === 0 ? r.stdout.toString() : null; },
     removeAsWatch: (f) => { asWatch(["rm", "-f", f]); },
     notice: (...args) => Bun.spawnSync(["timeout", "-k", "2", "90", env.PROBE_NOTICE ?? "/opt/cain/notice.sh", ...args], { stdout: "inherit", stderr: "inherit", env: { ...env, NOTICE_LOCK_S: "20" } }).exitCode ?? 1,

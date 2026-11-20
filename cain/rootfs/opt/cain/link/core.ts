@@ -3346,10 +3346,7 @@ export class Link {
 }
 
 // -- the gateway protocol, without the socket (main.ts owns the socket) ----------------
-// DIRECT_MESSAGE_REACTIONS, and (Cain 0.14.0) DIRECT_MESSAGES for the probe's message round trip:
-// of a message only its id is kept, and only for one of his in a DM (main.ts); its words are never
-// read, kept or logged.
-export const INTENTS = (1 << 13) | (1 << 12);
+export const INTENTS = 1 << 13;          // DIRECT_MESSAGE_REACTIONS: reactions, never messages
 export const FATAL: Record<number, string> = { 4004: "token refused", 4010: "invalid shard",
   4011: "sharding required", 4012: "invalid version", 4013: "invalid intents", 4014: "intents not allowed" };
 
@@ -3360,7 +3357,7 @@ export class Protocol {
   interval = 0;
   lastAck = 0;
   constructor(private send: (o: unknown) => void, private token: () => string,
-              private on: { ready?: () => void; interaction?: (d: any) => void; reaction?: (d: any) => void; message?: (d: any) => void },
+              private on: { ready?: () => void; interaction?: (d: any) => void; reaction?: (d: any) => void },
               private now: () => number = Date.now) {}
 
   identifyOrResume(): void {
@@ -3386,7 +3383,6 @@ export class Protocol {
         else if (m.t === "RESUMED") this.on.ready?.();
         else if (m.t === "INTERACTION_CREATE") this.on.interaction?.(m.d);
         else if (m.t === "MESSAGE_REACTION_ADD") this.on.reaction?.(m.d);
-        else if (m.t === "MESSAGE_CREATE") this.on.message?.(m.d);
         return "ok";
     }
     return "ok";

@@ -1,30 +1,23 @@
-// The probe and the rollback rule (Cain 0.14.0): what decides, with no files, clocks or network,
-// so the tests can drive every edge. probe/main.ts (root) gathers the facts and acts; rollback/
-// watcher.ts (the watch user) reads what the probe kept and raises a flag; rollback/helper.ts
-// (root) decides again from root's own records and is the only part that may restore.
+// The probe (Cain 0.14.0): what decides, with no files, clocks or network, so the tests can drive
+// every edge. probe/main.ts (root) gathers the facts and acts. This release only alarms.
 //
-// What the probe measures (DOCS.md, "Is Cain really answering"):
+// What the probe measures (DOCS.md, "What 0.14.0 does"):
 //   - liveness, every 5 minutes, with no model call: the Discord plugin's process is up, his tmux
 //     session is there, the link's Discord gateway connection is up and acknowledged recently, and
 //     typed input went into his session since the last check-in over an hour old. These show his
-//     parts are running, not that he answers you;
+//     parts are running, not that he answers you: they can say alive while messages are lost;
 //   - the hourly liveness check of his session: a fixed line handed to his session by root's
 //     broker, which he must answer with the fixed reply through the reply tool. It shows his
-//     session takes a turn, not that your messages reach him;
-//   - the message round trip, the one real check of service: the link (root's) notes the id of each
-//     of your Discord messages it sees, the broker notes the ids that reached his session, and a
-//     message the link saw that didn't reach his session within 10 minutes fails the probe.
-// All of these alarm only. Nothing the probe sees ever rolls a release back.
+//     session takes a turn, not that your messages reach him. A real round trip is a later item.
+//   - the starts of his session, kept in /data with how the run before each ended, and the boots of
+//     the App's container: a crash loop (more than 3 crash starts in 30 minutes) and a boot loop
+//     (more than 3 boots in 30 minutes) alarm. A crash start is one whose run ended, unasked, within
+//     5 minutes of its start; a later non-zero exit is "self" (his own user can cause one), alarms
+//     once a stretch and never counts.
 //
-// The rollback rule (off by default: rollback_armed in the App's options):
-//   - the only trigger is a crash loop: more than 3 starts of his session in 30 minutes, within 24
-//     hours of an install, each counted only when the run before it ended in a crash (a non-zero
-//     exit neither s6 nor the Supervisor asked for, recorded by the run script), never the first
-//     start after the container boots;
-//   - only to a version installed from a signed Ship, only from the Supervisor's pre-install
-//     backup of this App, once per install, and never again for a version already rolled back;
-//   - while the switch is off, a rollback that would have run alarms on both routes and does
-//     nothing.
+// The rollback rule below (decide, the record of restores, installs, backups) ships dormant: only
+// rollback/helper.ts uses it, and the run script never starts the helper in this release. It stays
+// for the restore release (DOCS.md, "What the restore release needs").
 
 export const PASS_EVERY_S = 300;
 export const ASK_EVERY_S = 3600;
@@ -32,10 +25,11 @@ export const ANSWER_S = 20 * 60;
 export const WORK_MAX_S = 60 * 60;               // a turn at work extends the hourly window this much at most
 export const STARTS_WINDOW_S = 30 * 60;
 export const STARTS_MAX = 3;                     // more than this many crash starts in the window
+export const SHORT_RUN_S = 5 * 60;               // a run that ended unasked within this of its start is a crash
+export const BOOTS_MAX = 3;                      // more than this many container boots in the window
 export const INSTALL_WINDOW_S = 24 * 3600;
 export const GATEWAY_ACK_S = 180;                // Discord acknowledges the link's heartbeat every ~41 s
 export const INPUT_GRACE_S = 3600;               // a check-in has its hour to go in (watch.sh)
-export const MESSAGE_S = 10 * 60;                // a message the link saw must reach his session within this
 export const CHECKIN_SLOTS = ["0710", "1230", "1730"];
 export const DRILL_S = 45 * 60;                  // a drill holds the rollback back this long
 export const REFUSALS_MAX = 3;                   // Supervisor refusals in a row before the alarm
@@ -47,13 +41,12 @@ export const PROBE_CHAT = "000000000000000000";
 export const PROBE_REPLY = "probe answered";
 export const PROBE_LINE = `Hourly liveness check from your App, not from Dane: answer at once with the reply tool, chat_id ${PROBE_CHAT}, text exactly "${PROBE_REPLY}", and nothing else. Nothing to tell him.`;
 
-export type Layer = "plugin" | "tmux" | "gateway" | "input" | "messages";
+export type Layer = "plugin" | "tmux" | "gateway" | "input";
 export const LAYER_WORDS: Record<Layer, string> = {
   plugin: "the Discord plugin isn't running",
   tmux: "his session isn't there",
   gateway: "the link's Discord connection isn't acknowledged",
   input: "nothing typed has gone into his session since the last check-in",
-  messages: "a message of yours the link saw didn't reach his session within 10 minutes",
 };
 
 // What his screen shows, read from a capture of his pane (prompt-state.sh for his prompt, and the
@@ -79,7 +72,6 @@ export interface Facts {
   gateway: { state: string; ack: number } | null;   // the link's /run/cain/link-gateway.state
   delivered: number | null;                      // /data/checkin.delivered: when typed input last went in
   slot: number | null;                           // the last check-in, over INPUT_GRACE_S old (lastSlot)
-  lost?: string[];                               // message ids the link saw that never reached his session
 }
 
 export function layers(f: Facts): Layer[] {
@@ -88,33 +80,7 @@ export function layers(f: Facts): Layer[] {
   if (!f.tmux) failed.push("tmux");
   if (!f.gateway || f.gateway.state !== "connected" || !(f.gateway.ack > 0) || f.now - f.gateway.ack > GATEWAY_ACK_S) failed.push("gateway");
   if (f.slot !== null && !(f.delivered !== null && f.delivered >= f.slot)) failed.push("input");
-  if (f.lost && f.lost.length > 0) failed.push("messages");
   return failed;
-}
-
-// -- the message round trip ----------------------------------------------------------------------
-// "<id> <epoch seconds>" lines: the link's (ids of his messages it saw) and the broker's (ids that
-// reached his session). Ids are Discord snowflakes; anything else is skipped.
-export function parseIds(text: string): Map<string, number> {
-  const out = new Map<string, number>();
-  for (const l of text.split("\n")) {
-    const [id, t] = l.trim().split(/\s+/);
-    if (/^\d{15,22}$/.test(id ?? "") && Number.isSafeInteger(Number(t)) && Number(t) > 0 && !out.has(id)) out.set(id, Number(t));
-  }
-  return out;
-}
-// The messages the link saw at least MESSAGE_S ago (and within a day) that never reached his
-// session. since: only messages seen after it count (the probe's own start, so a message from
-// before the App started isn't held against it).
-export function lostMessages(seen: Map<string, number>, reached: Map<string, number>, now: number, since = 0): string[] {
-  const out: string[] = [];
-  for (const [id, t] of seen) if (t >= since && t <= now - MESSAGE_S && t > now - 86400 && !reached.has(id)) out.push(id);
-  return out.sort();
-}
-// A notes file kept short: the last day, at most 500 lines.
-export function pruneIds(text: string, now: number): string {
-  const keep = [...parseIds(text)].filter(([, t]) => t > now - 86400).slice(-500);
-  return keep.map(([id, t]) => `${id} ${t}\n`).join("");
 }
 
 // The offset of a time zone from UTC at an instant, in seconds (east positive).
@@ -187,9 +153,8 @@ export function pass(f: Facts, h: Hourly, o: { screen?: Screen; stopped?: boolea
 // alarm from outside.
 export function shouldPing(p: Pass): boolean { return p.ok === true && p.failed.length === 0; }
 // The alarm the App raises for a pass, or null: two failed passes in a row (or a missed hourly
-// answer, or a lost message, at once); a sign-in or API screen as that, at once; never while the
-// owner's Stop holds.
-export type AlarmKind = "probe" | "messages" | "needs-signin" | "api-down";
+// answer, at once); a sign-in or API screen as that, at once; never while the owner's Stop holds.
+export type AlarmKind = "probe" | "needs-signin" | "api-down";
 export function alarmFor(recent: Pass[]): AlarmKind | null {
   const last = recent.at(-1);
   if (!last) return null;
@@ -197,7 +162,6 @@ export function alarmFor(recent: Pass[]): AlarmKind | null {
   if (st === "stopped" || st === "ok") return null;
   if (st === "signin") return "needs-signin";
   if (st === "api") return "api-down";
-  if (last.failed.includes("messages")) return "messages";
   if (last.failed.includes("answer")) return "probe";
   const before = recent.at(-2);
   const bst = before ? before.status ?? (before.ok ? "ok" : "failed") : "ok";
@@ -210,35 +174,48 @@ export function failedWords(p: Pass): string {
   return w.join("; ");
 }
 
-// -- starts of his session --------------------------------------------------------------------------
+// -- starts of his session, and boots of the App -----------------------------------------------------
 // The starts file: one "<epoch seconds> <how the run before it ended>" line per start of his
-// session, root's, in /data, so nothing in his session or its restart can reset it. The run script
-// says how the run before ended: "boot" (the first start after the container boots: no run
-// before it in this container), "asked" (the run script, s6 or the Supervisor ended it, or it ended
-// on a signal they send), "clean" (exit 0), "unknown" (no exit code kept), or "crash-<code>" (a
-// non-zero exit no one asked for). Only crash starts count.
-export const END_KINDS = /^(boot|asked|clean|unknown|crash-\d{1,3})$/;
-// How the run before ended, from what the run script saw: whether it ended the session itself, and
-// the exit code session.sh kept (null: none kept).
-export function endKind(o: { first: boolean; askedByUs: boolean; code: number | null }): string {
+// session, root's, in /data, so nothing in his session or its restart can reset it. How the run
+// before ended comes from what root alone saw (endKind):
+//   boot           the first start in this container (no session ran here before it);
+//   asked          the run script recorded its own stop request for that very run before it ended
+//                  (a root-owned mark naming the run, never a guess from an exit code or a signal);
+//   crash-<how>    unasked, within SHORT_RUN_S of its start: <how> is the exit code kept, "clean"
+//                  for 0, or "unknown" when none was kept. Only these count toward a crash loop;
+//   clean, unknown unasked, later than that, exit 0 or no code kept;
+//   self-<code>    unasked, later than that, a non-zero exit. His own user can end his session with
+//                  any code, so these never count toward a loop: they alarm once a stretch.
+export const END_KINDS = /^(boot|asked|clean|unknown|crash-(clean|unknown|\d{1,3})|self-\d{1,3})$/;
+// ran: seconds from the run's start to when root saw it end (null: not known, counted as short).
+export function endKind(o: { first: boolean; asked: boolean; code: number | null; ran: number | null }): string {
   if (o.first) return "boot";
-  if (o.askedByUs) return "asked";
-  if (o.code === null) return "unknown";
-  if (o.code === 0) return "clean";
-  if (o.code === 129 || o.code === 130 || o.code === 143) return "asked";   // SIGHUP, SIGINT, SIGTERM: tmux, s6, the Supervisor
-  return `crash-${o.code}`;
+  if (o.asked) return "asked";
+  const short = o.ran === null || o.ran <= SHORT_RUN_S;
+  const code = o.code === null ? null : Math.abs(Math.trunc(o.code)) % 1000;
+  if (short) return `crash-${code === null ? "unknown" : code === 0 ? "clean" : code}`;
+  if (code === null) return "unknown";
+  if (code === 0) return "clean";
+  return `self-${code}`;
 }
-export function parseStarts(text: string): number[] {
-  return text.split("\n").map((l) => l.trim().split(/\s+/)).filter((p) => /^crash-\d+$/.test(p[1] ?? ""))
-    .map((p) => Number(p[0])).filter((n) => Number.isSafeInteger(n) && n > 0);
-}
+const startLines = (text: string, kind: RegExp) => text.split("\n").map((l) => l.trim().split(/\s+/)).filter((p) => kind.test(p[1] ?? ""))
+  .map((p) => Number(p[0])).filter((n) => Number.isSafeInteger(n) && n > 0);
+// The crash starts only.
+export function parseStarts(text: string): number[] { return startLines(text, /^crash-/); }
+// The starts after a run that ended on its own, late, with a non-zero code.
+export function parseSelf(text: string): number[] { return startLines(text, /^self-\d+$/); }
 export function startsIn(starts: number[], now: number, since = 0, window = STARTS_WINDOW_S): number {
   return starts.filter((t) => t > now - window && t <= now && t >= since).length;
 }
 export function tooManyStarts(starts: number[], now: number, since = 0): boolean {
   return startsIn(starts, now, since) > STARTS_MAX;
 }
-// The file kept short: the last day, at most 500 lines.
+// The boots file: one "<epoch seconds>" line per boot of the App's container, in /data.
+export function parseBoots(text: string): number[] {
+  return text.split("\n").map((l) => Number(l.trim().split(/\s+/)[0])).filter((n) => Number.isSafeInteger(n) && n > 0);
+}
+export function tooManyBoots(boots: number[], now: number): boolean { return startsIn(boots, now) > BOOTS_MAX; }
+// A file kept short: the last day, at most 500 lines.
 export function pruneStarts(text: string, now: number): string {
   const keep = text.split("\n").filter((l) => { const n = Number(l.trim().split(/\s+/)[0]); return Number.isSafeInteger(n) && n > now - 86400; });
   return keep.slice(-500).map((l) => `${l}\n`).join("");
@@ -353,7 +330,7 @@ export type Decision =
   | { do: "alarm"; code: "again" | "unsigned" | "no-backup"; why: string };
 
 // The one trigger: a crash loop since the install. Nothing else, a failed probe, a missed hourly
-// answer, a lost message or a network loss included, ever arms a rollback.
+// answer or a network loss included, ever arms a rollback.
 export function trigger(w: WatchIn): string | null {
   const i = w.install!;
   if (tooManyStarts(w.starts, w.now, i.at)) return `his session crashed and started ${startsIn(w.starts, w.now, i.at)} times in 30 minutes`;

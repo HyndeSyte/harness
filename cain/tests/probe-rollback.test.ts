@@ -1,21 +1,20 @@
-// Cain 0.14.0: the probe (liveness, the hourly liveness check, the message round trip), the count
-// of crash starts kept in /data, and the rollback within 24 hours of an install: off by default,
-// armed only by a crash loop, never deleting a backup, with a durable record outside /data
-// (rootfs/opt/cain/probe, rootfs/opt/cain/rollback, the broker and the link's notes).
+// Cain 0.14.0: the probe (liveness, the hourly liveness check), the count of crash starts and of
+// container boots kept in /data, and their alarms. The rollback code (probe/core.ts decide, rollback/
+// helper.ts) ships dormant: tested here as code, never started by the run script, with no Supervisor
+// access, no map and no switch in config.yaml.
 import { describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   afterStart, alarmFor, askDue, type Backup, decide, endKind, type Facts, FLAG, hourlyState, inWindow, type Install, isFlag,
-  lastSlot, layers, localTime, lostMessages, parseIds, parseRecord, parseStarts, pass, type Pass, preInstall, PROBE_CHAT, PROBE_LINE,
-  PROBE_REPLY, restoreBody, screenOf, shouldPing, signedFromLink, startsIn, tooManyStarts, type WatchIn,
+  lastSlot, layers, localTime, parseBoots, parseRecord, parseSelf, parseStarts, pass, preInstall, PROBE_CHAT, PROBE_LINE,
+  PROBE_REPLY, restoreBody, screenOf, shouldPing, signedFromLink, startsIn, tooManyBoots, tooManyStarts, type WatchIn,
 } from "../rootfs/opt/cain/probe/core";
-import { paths, recordInstall, recordStart, runPass, type PassDeps } from "../rootfs/opt/cain/probe/main";
-import { act, look } from "../rootfs/opt/cain/rollback/watcher";
+import { classify, markAsked, markGone, paths, recordBoot, recordInstall, recordStart, runPass, sessionStart, type PassDeps } from "../rootfs/opt/cain/probe/main";
 import { allowed, boot, type HelperDeps, jobState, keepBackup, keepSigned, removeFile, restoreStep, type Sup, takeFlag } from "../rootfs/opt/cain/rollback/helper";
 import { BrokerSession } from "../rootfs/opt/cain/discord/broker";
-import { INTENTS, Protocol } from "../rootfs/opt/cain/link/core";
+import { INTENTS } from "../rootfs/opt/cain/link/core";
 
 const TZ = "America/New_York";
 const T = localTime(2026, 11, 20, 10, 0, TZ);          // a Friday, 10:00 in New York
@@ -26,7 +25,7 @@ const MAIN = join(ROOT, "rootfs/opt/cain/probe/main.ts");
 const src = (p: string) => readFileSync(join(ROOT, p), "utf8");
 
 function good(now = T): Facts {
-  return { now, plugin: true, tmux: true, gateway: { state: "connected", ack: now - 30 }, delivered: now - 600, slot: lastSlot(now, TZ), lost: [] };
+  return { now, plugin: true, tmux: true, gateway: { state: "connected", ack: now - 30 }, delivered: now - 600, slot: lastSlot(now, TZ) };
 }
 
 describe("the liveness layers, each failing alone", () => {
@@ -49,58 +48,30 @@ describe("the liveness layers, each failing alone", () => {
     expect(lastSlot(localTime(2026, 11, 20, 13, 0, TZ), TZ)).toBe(slot);
     expect(lastSlot(localTime(2026, 11, 21, 0, 5, TZ), TZ)).toBe(localTime(2026, 11, 20, 17, 30, TZ));
   });
-  test("a lost message", () => { expect(layers({ ...good(), lost: ["123456789012345678"] })).toEqual(["messages"]); });
 });
 
-describe("the message round trip", () => {
-  const A = "111111111111111111", B = "222222222222222222", C = "333333333333333333";
-  test("a message the link saw that didn't reach his session within 10 minutes is lost", () => {
-    const seen = parseIds(`${A} ${T - 700}\n${B} ${T - 599}\n${C} ${T - 900}\nnot-an-id 5\n`);
-    const reached = parseIds(`${C} ${T - 890}\n`);
-    expect(lostMessages(seen, reached, T)).toEqual([A]);                  // B is under 10 minutes old
-    expect(lostMessages(seen, reached, T + 2)).toEqual([A, B]);
-    expect(lostMessages(seen, reached, T, T - 650)).toEqual([]);          // seen before the probe's start
-    expect(lostMessages(parseIds(`${A} ${T - 700}\n`), parseIds(`${A} ${T}\n`), T)).toEqual([]);   // reached late still counts as reached
-  });
-  test("the broker notes each of his messages handed to his session, never the hourly check", async () => {
-    const reached: string[] = [];
-    const s = new BrokerSession({ toClient: () => {}, toServer: () => {}, close: () => {}, gate: async () => ({ kind: "refuse", reason: "x" }), sent: () => {},
-      readsOk: () => "", outbox: { make: () => ({ dir: "", paths: [] }), drop: () => {} }, log: () => {}, session: "t", reached: (id) => reached.push(id) });
-    s.fromServer(JSON.stringify({ jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: "hi", meta: { chat_id: "9", message_id: A } } }));
-    s.fromServer(JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { meta: { message_id: B } } }));
-    await s.fromClient(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
-    s.fromServer(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { capabilities: {} } }));
-    s.probe("0000123");
-    expect(reached).toEqual([A]);
-  });
-  test("the link sees his DMs: the gateway asks for direct messages, and hands each create over", () => {
-    expect(INTENTS).toBe((1 << 13) | (1 << 12));
-    const got: any[] = [];
-    const p = new Protocol(() => {}, () => "t", { message: (d) => got.push(d) });
-    p.handle({ op: 0, t: "MESSAGE_CREATE", s: 3, d: { id: A, author: { id: "5" } } });
-    expect(got.map((d) => d.id)).toEqual([A]);
-    // Only the id of his own DM messages is kept, never their words (link/main.ts).
+describe("no second Discord connection, no message text", () => {
+  test("the link's gateway asks for reactions only, and keeps no message ids", () => {
+    expect(INTENTS).toBe(1 << 13);
     const main = src("rootfs/opt/cain/link/main.ts");
-    const fn = main.slice(main.indexOf("function seenMessage"), main.indexOf("}\n", main.indexOf("function seenMessage")));
-    expect(fn).toContain("d?.guild_id");
-    expect(fn).toContain("!== owner");
-    expect(fn).not.toContain("content");
-    expect(fn).toContain("mode: 0o600");
+    expect(main).not.toContain("seenMessage");
+    expect(main).not.toContain("MESSAGE_CREATE");
+    expect(src("rootfs/opt/cain/link/core.ts")).not.toContain("MESSAGE_CREATE");
+    for (const f of ["rootfs/opt/cain/discord/broker.ts", "rootfs/opt/cain/discord/broker-main.ts", "rootfs/opt/cain/probe/main.ts", "rootfs/opt/cain/probe/core.ts"]) {
+      expect(src(f)).not.toMatch(/reached|probe\/seen|lostMessages|parseIds/);
+    }
   });
-  test("a lost message fails the probe at once and alarms that messages aren't reaching Cain", async () => {
-    const dir = tmp(); world(dir);
-    const { d, p, notices, pings } = passDeps(dir);
-    mkdirSync(p.run, { recursive: true });
-    writeFileSync(p.since, `${T - 3600}\n`);
-    writeFileSync(p.seen, `${A} ${T - 700}\n`);
-    const r = await runPass(d);
-    expect(r.failed).toEqual(["messages"]);
-    expect(pings).toEqual([]);
-    expect(notices).toEqual([["tell", "messages", "1 message"]]);
-    writeFileSync(p.reached, `${A} ${T + 10}\n`);
-    world(dir, T + 300);
-    expect((await runPass({ ...d, now: T + 300 })).ok).toBe(true);
-    expect(notices.at(-1)).toEqual(["clear", "probe"]);
+  test("the broker notes nothing of his messages", () => {
+    const notes: string[] = [];
+    const s = new BrokerSession({ toClient: () => {}, toServer: () => {}, close: () => {}, gate: async () => ({ kind: "refuse", reason: "x" }), sent: () => {},
+      readsOk: () => "", outbox: { make: () => ({ dir: "", paths: [] }), drop: () => {} }, log: (m) => notes.push(m), session: "t" });
+    s.fromServer(JSON.stringify({ jsonrpc: "2.0", method: "notifications/claude/channel", params: { content: "hi", meta: { chat_id: "9", message_id: "111111111111111111" } } }));
+    expect(notes.join(" ")).not.toContain("111111111111111111");
+  });
+  test("the messages alarm is gone", () => {
+    const r = Bun.spawnSync(["bash", join(ROOT, "rootfs/opt/cain/notice.sh"), "text", "messages", ""]);
+    expect(r.exitCode).toBe(2);
+    expect(src("rootfs/opt/cain/notice.sh")).not.toContain("Messages aren't reaching Cain");
   });
 });
 
@@ -215,12 +186,9 @@ describe("the probe's alarms and its outside heartbeat", () => {
     expect(screenOf("Retrying in 8 seconds… (attempt 3/10)\n✻ Working (esc to interrupt)\n", "other")).toBe("api");
     expect(screenOf("", "other")).toBe("other");
   });
-  test("the old way has no broker: no hourly ask, no round trip", async () => {
+  test("the old way has no broker: no hourly ask", async () => {
     const dir = tmp(); world(dir);
     const { d, p } = passDeps(dir, { mode: "old", screen: () => "ready" });
-    mkdirSync(p.run, { recursive: true });
-    writeFileSync(p.seen, `111111111111111111 ${T - 9000}\n`);
-    writeFileSync(p.since, `${T - 99999}\n`);
     expect((await runPass(d)).ok).toBe(true);
     expect(existsSync(p.ask)).toBe(false);
   });
@@ -228,54 +196,147 @@ describe("the probe's alarms and its outside heartbeat", () => {
 
 describe("crash starts, kept in /data", () => {
   test("how the run before ended", () => {
-    expect(endKind({ first: true, askedByUs: false, code: 1 })).toBe("boot");
-    expect(endKind({ first: false, askedByUs: true, code: 1 })).toBe("asked");
-    expect(endKind({ first: false, askedByUs: false, code: null })).toBe("unknown");
-    expect(endKind({ first: false, askedByUs: false, code: 0 })).toBe("clean");
-    for (const c of [129, 130, 143]) expect(endKind({ first: false, askedByUs: false, code: c })).toBe("asked");
-    expect(endKind({ first: false, askedByUs: false, code: 1 })).toBe("crash-1");
-    expect(endKind({ first: false, askedByUs: false, code: 137 })).toBe("crash-137");
+    expect(endKind({ first: true, asked: false, code: 1, ran: 10 })).toBe("boot");
+    expect(endKind({ first: false, asked: true, code: 1, ran: 10 })).toBe("asked");
+    expect(endKind({ first: false, asked: true, code: 137, ran: 9000 })).toBe("asked");
+    // Within 5 minutes of its start, unasked: a crash start, whatever code it kept.
+    expect(endKind({ first: false, asked: false, code: null, ran: 150 })).toBe("crash-unknown");
+    expect(endKind({ first: false, asked: false, code: 0, ran: 150 })).toBe("crash-clean");
+    expect(endKind({ first: false, asked: false, code: 1, ran: 300 })).toBe("crash-1");
+    expect(endKind({ first: false, asked: false, code: 143, ran: 20 })).toBe("crash-143");    // a signal is no proof it was asked
+    expect(endKind({ first: false, asked: false, code: 1, ran: null })).toBe("crash-1");
+    // Later: exit 0 clean, no code unknown, a non-zero exit "self".
+    expect(endKind({ first: false, asked: false, code: 0, ran: 301 })).toBe("clean");
+    expect(endKind({ first: false, asked: false, code: null, ran: 301 })).toBe("unknown");
+    expect(endKind({ first: false, asked: false, code: 137, ran: 301 })).toBe("self-137");
+    expect(endKind({ first: false, asked: false, code: 143, ran: 9000 })).toBe("self-143");
   });
-  test("only starts after a crash count; the first after a boot, restarts the App asked for and clean exits never", () => {
-    const text = [`${T} boot`, `${T + 10} asked`, `${T + 20} clean`, `${T + 30} unknown`, `${T + 40} session`, `${T + 50} crash-1`, `${T + 60} crash-137`].join("\n");
-    expect(parseStarts(text)).toEqual([T + 50, T + 60]);
-  });
-  test("a sliding 30-minute window across restarts and a reboot", () => {
-    const dir = tmp();
-    const notices: string[][] = [];
-    const n = (...a: string[]) => { notices.push(a); return 0; };
-    const p = () => paths({ PROBE_DIR: join(dir, "probe") });
-    expect(recordStart(p(), T, "boot", n)).toBe(0);
-    for (const [i, t] of [T + 100, T + 400, T + 800].entries()) expect(recordStart(p(), t, "crash-1", n)).toBe(i + 1);
-    expect(recordStart(p(), T + 900, "asked", n)).toBe(3);         // the run script's own restart: not counted
-    expect(notices).toEqual([]);
-    // A new process, the same file: the fourth crash start in 30 minutes alarms.
-    const b = Bun.spawnSync(["bun", MAIN, "start", "crash-139"], { env: { ...process.env, PROBE_DIR: join(dir, "probe"), PROBE_NOTICE: "/bin/true" } });
-    expect(b.stdout.toString().trim()).toMatch(/^\d+ crash starts in 30 minutes$/);
-    expect(readFileSync(join(dir, "probe", "starts"), "utf8").trim().split("\n").at(-1)).toMatch(/^\d+ crash-139$/);
-    const dir2 = tmp(), p2 = () => paths({ PROBE_DIR: join(dir2, "probe") });
-    for (const t of [T, T + 400, T + 800]) recordStart(p2(), t, "crash-1", n);
-    expect(recordStart(p2(), T + 1000, "crash-1", n)).toBe(4);
-    expect(notices).toEqual([["tell", "restarts", "4 crashes and starts in 30 minutes"]]);
-    expect(recordStart(p2(), T + 2600, "crash-1", n)).toBe(2);
-    expect(notices.at(-1)).toEqual(["clear", "restarts"]);
-    // A kind that isn't one is kept as unknown, so it never counts.
-    recordStart(p2(), T + 2700, "crash-1; rm -rf /", n);
-    expect(readFileSync(join(dir2, "probe", "starts"), "utf8").trim().split("\n").at(-1)).toBe(`${T + 2700} unknown`);
+  test("only crash starts count; boot, asked, clean, unknown and self never", () => {
+    const text = [`${T} boot`, `${T + 10} asked`, `${T + 20} clean`, `${T + 30} unknown`, `${T + 40} self-1`, `${T + 50} crash-1`,
+      `${T + 60} crash-unknown`, `${T + 70} crash-clean`].join("\n");
+    expect(parseStarts(text)).toEqual([T + 50, T + 60, T + 70]);
+    expect(parseSelf(text)).toEqual([T + 40]);
   });
   test("the window's edges", () => {
     expect(startsIn([T - 1800, T - 1799, T - 10, T], T)).toBe(3);
     expect(tooManyStarts([T - 1799, T - 900, T - 10, T], T)).toBe(true);
     expect(tooManyStarts([T - 1800, T - 900, T - 10, T], T)).toBe(false);
   });
-  test("the run script records the exit: the first start after boot, its own ends, signals and exit codes", () => {
+  test("asked only by the run script's own root-owned mark for that very run", () => {
+    const dir = tmp(), p = paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run") });
+    const n = () => 0;
+    expect(markAsked(p)).toBe(false);                                     // no run to mark
+    expect(sessionStart(p, T, null, n)).toBe("boot");                     // the first start in this container
+    expect(markAsked(p)).toBe(true);
+    expect(classify(p, T + 60, 143)).toBe("asked");
+    // A mark naming another run (an old one, or one his user wrote somehow) is no mark.
+    writeFileSync(p.asked, "0000000000000000\n");
+    expect(classify(p, T + 60, 143)).toBe("crash-143");
+    // A run already seen gone can't be marked asked after the fact.
+    markGone(p, T + 30);
+    expect(markAsked(p)).toBe(false);
+    expect(classify(p, T + 900, 1)).toBe("crash-1");                     // it ran 30 s, as root saw it
+    // The mark is root's alone.
+    expect(src("rootfs/opt/cain/c1/lock.sh")).toContain("install -d -m 0700 -o root -g root /run/cain/probe");
+  });
+  test("the Nov 19 shape: a start every 2.5 minutes for an hour, exits unknown or 0, within a day of an install, alarms", () => {
+    const dir = tmp(), p = paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run") });
+    const notices: string[][] = [];
+    const n = (...a: string[]) => { notices.push(a); return 0; };
+    recordInstall(p, "0.13.3", T - 86400 * 3);
+    recordInstall(p, "0.13.4", T - 3 * 3600);                             // installed three hours before
+    expect(sessionStart(p, T, null, n)).toBe("boot");
+    const kinds: string[] = [];
+    for (let i = 1; i <= 24; i++) {
+      const t = T + i * 150;
+      if (i % 3 !== 0) markGone(p, t - 10);                              // mostly seen gone; sometimes not before the next start
+      kinds.push(sessionStart(p, t, i % 2 ? null : 0, n));
+    }
+    expect(new Set(kinds)).toEqual(new Set(["crash-unknown", "crash-clean"]));
+    const told = notices.filter((x) => x[0] === "tell");
+    expect(told.map((x) => x[1])).toEqual(["restarts", "rollback-disarmed"]);   // once for the loop, not each start
+    expect(told[0][2]).toBe("4 crash starts in 30 minutes");
+    expect(told[1][2]).toContain("Cain 0.13.4");
+  });
+  test("six self-kills after the 5-minute mark never count", () => {
+    const dir = tmp(), p = paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run") });
+    const notices: string[][] = [];
+    const n = (...a: string[]) => { notices.push(a); return 0; };
+    recordInstall(p, "0.13.5", T - 86400);
+    recordInstall(p, "0.14.0", T - 600);
+    let t = T;
+    sessionStart(p, t, null, n);
+    for (let i = 0; i < 6; i++) {
+      markGone(p, t + 301);                                               // his own user ended it 5 minutes and a second in
+      t += 310;
+      expect(sessionStart(p, t, 137, n)).toBe("self-137");
+    }
+    expect(parseStarts(readFileSync(p.starts, "utf8"))).toEqual([]);
+    expect(notices).toEqual([["tell", "self-ended", "exit 137"]]);        // once for the stretch, and nothing else
+    // The stretch ends 30 minutes after the last such end.
+    recordStart(p, t + 1801, "clean", n);
+    expect(notices.at(-1)).toEqual(["clear", "self"]);
+  });
+  test("a sliding 30-minute window across a new process; a new loop after the last ended alarms again", () => {
+    const dir = tmp(), p = () => paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run") });
+    const notices: string[][] = [];
+    const n = (...a: string[]) => { notices.push(a); return 0; };
+    recordInstall(p(), "0.13.5", T - 86400 * 2);
+    recordInstall(p(), "0.14.0", T - 60);
+    for (const t of [T, T + 400, T + 800]) recordStart(p(), t, "crash-1", n);
+    expect(recordStart(p(), T + 900, "asked", n)).toBe(3);
+    expect(notices).toEqual([]);
+    expect(recordStart(p(), T + 1000, "crash-unknown", n)).toBe(4);
+    expect(notices.map((x) => x[1])).toEqual(["restarts", "rollback-disarmed"]);
+    expect(recordStart(p(), T + 2600, "crash-1", n)).toBe(2);
+    expect(notices.at(-1)).toEqual(["clear", "restarts"]);
+    for (const t of [T + 2700, T + 2800, T + 2900]) recordStart(p(), t, "crash-1", n);
+    expect(notices.filter((x) => x[1] === "rollback-disarmed").length).toBe(2);     // the new loop says it again
+    // A kind that isn't one is kept as unknown, so it never counts.
+    recordStart(p(), T + 9000, "crash-1; rm -rf /", n);
+    expect(readFileSync(join(dir, "probe", "starts"), "utf8").trim().split("\n").at(-1)).toBe(`${T + 9000} unknown`);
+    // A separate process on the same files.
+    const b = Bun.spawnSync(["bun", MAIN, "session-start", "1"], { env: { ...process.env, PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, "run"), PROBE_NOTICE: "/bin/true" } });
+    expect(b.stdout.toString().trim()).toBe("the run before: boot");
+  });
+  test("outside a day of an install, a crash loop says only that he keeps crashing", () => {
+    const dir = tmp(), p = paths({ PROBE_DIR: join(dir, "probe") });
+    const notices: string[][] = [];
+    const n = (...a: string[]) => { notices.push(a); return 0; };
+    recordInstall(p, "0.14.0", T - 86400 * 3);
+    for (const t of [T, T + 100, T + 200, T + 300]) recordStart(p, t, "crash-1", n);
+    expect(notices.map((x) => x[1])).toEqual(["restarts"]);
+  });
+  test("container boots, counted once per container: more than 3 in 30 minutes alarms that the App keeps restarting", () => {
+    const dir = tmp();
+    const notices: string[][] = [];
+    const n = (...a: string[]) => { notices.push(a); return 0; };
+    const container = (i: number) => paths({ PROBE_DIR: join(dir, "probe"), PROBE_RUN: join(dir, `run-${i}`) });
+    for (let i = 0; i < 3; i++) expect(recordBoot(container(i), T + i * 300, n)).toBe(true);
+    expect(recordBoot(container(2), T + 700, n)).toBe(false);             // the run script again, same container
+    expect(notices).toEqual([]);
+    recordBoot(container(3), T + 900, n);
+    expect(notices).toEqual([["tell", "boots", "4 starts of the App in 30 minutes"]]);
+    expect(parseBoots(readFileSync(join(dir, "probe", "boots"), "utf8")).length).toBe(4);
+    expect(tooManyBoots([T, T + 1, T + 2], T + 2)).toBe(false);
+    recordBoot(container(4), T + 3000, n);
+    expect(notices.at(-1)).toEqual(["clear", "boots"]);
+  });
+  test("the run script: boots counted, its own stop request marked, the end seen, the code passed on, no signal guess", () => {
     const run = src("rootfs/etc/services.d/cain/run");
-    expect(run).toContain("first_start=1; ended_by_us=0");
-    expect(run).toContain('timeout 30 bun "$OPT/probe/main.ts" start "$(last_end)"');
-    const end = run.slice(run.indexOf("end_his_session() {"), run.indexOf("end_his_session() {") + 200);
-    expect(end).toContain("ended_by_us=1");
-    expect(run).toContain("129|130|143) echo asked");
+    expect(run).toContain('timeout 30 bun "$OPT/probe/main.ts" boot');
+    expect(run).toContain('timeout 30 bun "$OPT/probe/main.ts" session-start "$(last_code)"');
+    const end = run.slice(run.indexOf("end_his_session() {"), run.indexOf("end_his_session() {") + 400);
+    expect(end.indexOf("session-asked")).toBeGreaterThan(0);
+    expect(end.indexOf("session-asked")).toBeLessThan(end.indexOf("kill-session"));
+    expect(run.split("session_gone").length - 1).toBeGreaterThanOrEqual(4);
+    expect(run).not.toMatch(/129\|130\|143|first_start|ended_by_us/);
     expect(src("rootfs/opt/cain/session.sh")).toContain('printf \'%s\\n\' "$rc" > "$exitf"');
+  });
+  test("during the owner's saved Stop the crash and boot alarms still fire: they read no Stop", () => {
+    const main = src("rootfs/opt/cain/probe/main.ts");
+    const fns = main.slice(main.indexOf("export function recordStart"), main.indexOf("export function recordInstall"));
+    expect(fns).not.toMatch(/readStop|stop\.json|d\.stopped|stopped\(/);
   });
 });
 
@@ -293,12 +354,6 @@ describe("installs and the 24-hour window", () => {
     const r = afterStart(prev, "0.14.0", T + 500, "0.14.0");
     expect(r.fresh).toBe(false);
     expect(inWindow(r.install, T + 500)).toBe(false);
-    const dir = tmp(), p = paths({ PROBE_DIR: join(dir, "probe"), ROLLBACK_RECORD: join(dir, "config", "rollback-record.json") });
-    recordInstall(p, "0.14.0", T);
-    recordInstall(p, "0.14.1", T + 100);
-    mkdirSync(join(dir, "config"));
-    writeFileSync(p.record, JSON.stringify({ format: 1, restores: [{ bad: "0.14.1", target: "0.14.0", slug: "a1b2c3d4", at: T + 200 }] }));
-    expect(recordInstall(p, "0.14.0", T + 300)!.at).toBe(0);
   });
   test("the edges: from the install up to, not including, 24 hours on", () => {
     const i: Install = { id: "x", version: "0.14.1", previous: "0.14.0", at: T };
@@ -322,7 +377,7 @@ describe("the rollback decision", () => {
     expect(decide(w({ starts: LOOP.slice(1) })).do).toBe("none");
     expect(decide(w({ starts: [T - 300, T - 200, T - 100, T + 100] })).do).toBe("none");   // crashes before the install
   });
-  test("a failed probe, a missed hourly answer, lost input, a lost message or a network loss never roll back", () => {
+  test("a failed probe, a missed hourly answer, lost input or a network loss never roll back", () => {
     // decide() reads no probe pass at all: whatever the probe saw, only crash starts count.
     expect(decide(w({ starts: [] }))).toEqual({ do: "none", why: "no crash loop" });
     expect(Object.keys(w())).not.toContain("passes");
@@ -417,7 +472,16 @@ function setup(dir: string, signed = true) {
 const record = (dir: string) => JSON.parse(readFileSync(join(dir, "config", "rollback-record.json"), "utf8"));
 const restores = (calls: string[]) => calls.filter((c) => c.includes("/restore/"));
 
-describe("the helper", () => {
+describe("the helper, dormant in this release (its code, driven by hand)", () => {
+  test("run by hand it refuses and exits, and nothing starts it", () => {
+    const r = Bun.spawnSync(["bun", join(ROOT, "rootfs/opt/cain/rollback/helper.ts"), "loop"], { timeout: 20_000 });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr.toString()).toContain("dormant until the restore release");
+    expect(src("rootfs/opt/cain/rollback/helper.ts").split("\n").slice(0, 3).join(" ")).toContain("DORMANT IN CAIN 0.14.0");
+    const run = src("rootfs/etc/services.d/cain/run");
+    expect(run).not.toMatch(/bun "\$OPT\/rollback\/helper\.ts"|watcher\.ts|as-watch|rollback_armed|ROLLBACK_ARMED/);
+    expect(src("rootfs/opt/cain/rollback/helper.ts")).not.toContain("env.ROLLBACK_ARMED");
+  });
   test("never deletes a backup: no DELETE in the code, and the Supervisor wrapper refuses one", () => {
     for (const f of ["rootfs/opt/cain/rollback/helper.ts", "rootfs/opt/cain/probe/core.ts", "rootfs/opt/cain/probe/main.ts", "tools/probe-drill.sh"])
       expect(src(f)).not.toMatch(/"DELETE"|-X DELETE|backups remove|backups rm/);
@@ -445,13 +509,13 @@ describe("the helper", () => {
     const { sup, calls } = fakeSup();
     const h = helper(dir, sup);
     keepSigned(h.d); await keepBackup(h.d);
-    expect(act(look(T + 3600, join(dir, "probe")), join(dir, "watcher"))).toContain("a rollback is due");
+    writeFileSync(join(dir, "watcher", "request"), `${FLAG}\n`);
     expect(await takeFlag(h.d)).toBe("disarmed");
     expect(h.notices).toEqual([["tell", "rollback-disarmed", expect.stringContaining("from 0.14.1 back to 0.14.0")]]);
     expect(restores(calls)).toEqual([]);
     expect(existsSync(join(dir, "config", "rollback-record.json"))).toBe(false);
     // Once for the install.
-    act(look(T + 3660, join(dir, "probe")), join(dir, "watcher"));
+    writeFileSync(join(dir, "watcher", "request"), `${FLAG}\n`);
     expect(await takeFlag({ ...h.d, now: T + 3660 })).toBeNull();
     expect(h.notices.length).toBe(1);
     expect(await restoreStep(h.d)).toBeNull();
@@ -461,14 +525,14 @@ describe("the helper", () => {
     const { sup, calls } = fakeSup();
     const h = helper(dir, sup, { armed: true });
     keepSigned(h.d); await keepBackup(h.d);
-    act(look(T + 3600, join(dir, "probe")), join(dir, "watcher"));
+    writeFileSync(join(dir, "watcher", "request"), `${FLAG}\n`);
     expect(await takeFlag(h.d)).toBe("restoring");
     expect(h.notices[0]).toEqual(["flush", "rollback", expect.stringContaining("from 0.14.1 back to 0.14.0")]);
     expect(restores(calls)).toEqual([`POST /backups/a1b2c3d4/restore/partial {"addons":["${SELF}"],"background":true}`]);
     expect(record(dir)).toEqual({ format: 1, restores: [{ bad: "0.14.1", target: "0.14.0", slug: "a1b2c3d4", at: T + 3600, why: expect.stringContaining("crashed"), job: "0123456789abcdef0123456789abcdef" }] });
     expect(JSON.parse(readFileSync(join(dir, "probe", "restores.json"), "utf8")).bad).toEqual(["0.14.1"]);
     // One per install.
-    act(look(T + 3700, join(dir, "probe")), join(dir, "watcher"));
+    writeFileSync(join(dir, "watcher", "request"), `${FLAG}\n`);
     expect(await takeFlag({ ...h.d, now: T + 3700 })).toBeNull();
     expect(restores(calls).length).toBe(1);
   });
@@ -477,21 +541,20 @@ describe("the helper", () => {
     const { sup, calls } = fakeSup();
     const h = helper(dir, sup, { armed: true, flush: 3 });
     keepSigned(h.d); await keepBackup(h.d);
-    act(look(T + 3600, join(dir, "probe")), join(dir, "watcher"));
+    writeFileSync(join(dir, "watcher", "request"), `${FLAG}\n`);
     expect(await takeFlag(h.d)).toBe("waiting: alarms not through");
     expect(restores(calls)).toEqual([]);
     expect(existsSync(join(dir, "config", "rollback-record.json"))).toBe(false);
     const ok = helper(dir, sup, { armed: true });
     expect(await restoreStep(ok.d)).toBe("restoring");
   });
-  test("armed: a failed probe, a missed answer, a lost message or a network loss never restore", async () => {
+  test("armed: a failed probe, a missed answer or a network loss never restore", async () => {
     const dir = tmp(); setup(dir);
     writeFileSync(join(dir, "probe", "starts"), `${T + 100} boot\n${T + 200} asked\n${T + 300} asked\n${T + 400} unknown\n${T + 500} clean\n`);
-    writeFileSync(join(dir, "probe", "passes.jsonl"), [T + 3300, T + 3600].map((at) => JSON.stringify({ at, ok: false, failed: ["plugin", "gateway", "input", "messages", "answer"], hourly: "timeout", status: "failed" })).join("\n"));
+    writeFileSync(join(dir, "probe", "passes.jsonl"), [T + 3300, T + 3600].map((at) => JSON.stringify({ at, ok: false, failed: ["plugin", "gateway", "input", "answer"], hourly: "timeout", status: "failed" })).join("\n"));
     const { sup, calls } = fakeSup();
     const h = helper(dir, sup, { armed: true });
     keepSigned(h.d); await keepBackup(h.d);
-    expect(act(look(T + 3600, join(dir, "probe")), join(dir, "watcher"))).toBe("no crash loop");
     writeFileSync(join(dir, "watcher", "request"), `${FLAG}\n`);           // a flag raised anyway
     expect(await takeFlag(h.d)).toBeNull();
     expect(restores(calls)).toEqual([]);
@@ -573,7 +636,7 @@ describe("the helper", () => {
   });
 });
 
-describe("the next start reads the record, not the clock", () => {
+describe("the dormant helper's record, as code", () => {
   function recorded(dir: string, extra: object = {}) {
     setup(dir);
     mkdirSync(join(dir, "config"));
@@ -587,9 +650,6 @@ describe("the next start reads the record, not the clock", () => {
     expect(record(dir).restores[0].outcome).toBe("done");
     expect(h.relayed[0]).toContain("rolled back to Cain 0.14.0 from 0.14.1");
     expect(h.notices.filter((n) => n[1] === "rollback-failed")).toEqual([]);
-    const env = { ...process.env, PROBE_DIR: join(dir, "probe"), ROLLBACK_RECORD: join(dir, "config", "rollback-record.json") };
-    expect(Bun.spawnSync(["bun", MAIN, "lines", "morning"], { env }).stdout.toString()).toContain("Moving section");
-    expect(Bun.spawnSync(["bun", MAIN, "lines", "morning"], { env }).stdout.toString()).toBe("");
   });
   test("the job failed, or its state is unknown: an alarm", async () => {
     for (const [job, want] of [[{ ok: true, data: { done: true, errors: [{ message: "x" }] } }, "failed"], [{ ok: false, message: "forbidden" }, "unknown"], [{ ok: true, data: { done: false } }, "unknown"]] as const) {
@@ -655,111 +715,93 @@ describe("the broker's hourly liveness check", () => {
 
 describe("notice.sh", () => {
   const NOTICE = join(ROOT, "rootfs/opt/cain/notice.sh");
-  test("each new alarm has a title and a text with no em dash; the probe's say they are liveness", () => {
-    for (const k of ["probe", "messages", "needs-signin", "api-down", "restarts", "rollback", "rollback-disarmed", "rollback-failed", "rollback-again",
-      "rollback-unsigned", "rollback-nobackup", "rollback-record", "rollback-unavailable"]) {
+  const t = (k: string) => Bun.spawnSync(["bash", NOTICE, "text", k, ""]).stdout.toString();
+  test("each 0.14.0 alarm has a title and a text with no em dash; the probe's say they are liveness", () => {
+    for (const k of ["probe", "needs-signin", "api-down", "restarts", "rollback-disarmed", "self-ended", "boots"]) {
       const r = Bun.spawnSync(["bash", NOTICE, "text", k, "a cause"]);
       expect(r.exitCode).toBe(0);
       const [title, msg] = r.stdout.toString().split("\n");
       expect(title.length).toBeGreaterThan(5);
-      expect(msg).not.toContain("—");
+      expect(msg).not.toContain("\u2014");
     }
-    const t = (k: string) => Bun.spawnSync(["bash", NOTICE, "text", k, ""]).stdout.toString();
     expect(t("probe")).toContain("liveness checks");
     expect(t("probe")).toContain("not that he answers you");
-    expect(t("messages")).toContain("Messages aren't reaching Cain");
     expect(t("needs-signin")).toContain("Cain needs sign-in");
     expect(t("api-down")).toContain("The model's API isn't answering");
-    expect(t("rollback-disarmed")).toContain("A rollback would have run");
-    expect(t("rollback-unavailable")).toContain("rollback is unavailable");
-    expect(t("rollback-unavailable")).toContain("Backup before update");
-    expect(t("rollback")).toContain("outside heartbeat check for him stays silent after that, the restore itself failed");
+    expect(t("restarts")).toContain("Cain keeps crashing");
+    expect(t("self-ended")).toContain("Cain's session ended on its own");
+    expect(t("boots")).toContain("Cain's App keeps restarting");
+    expect(t("rollback-disarmed")).toContain("A rollback of Cain would have run");
+    expect(t("rollback-disarmed")).toContain("not in this release");
   });
-  test("flush answers 0 only once Discord and Home Assistant both took the alarm", async () => {
-    const dir = tmp();
-    const opt = join(dir, "opt");
-    mkdirSync(opt);
-    writeFileSync(join(opt, "alert.sh"), "#!/bin/bash\nexit 0\n"); chmodSync(join(opt, "alert.sh"), 0o755);
-    const hooked: string[] = [];
-    const server = Bun.serve({ port: 0, fetch: async (r) => { hooked.push(new URL(r.url).pathname); return new Response("ok"); } });
-    const run = async (opts: object) => {
-      writeFileSync(join(dir, "options.json"), JSON.stringify(opts));
-      const p = Bun.spawn(["bash", NOTICE, "flush", "rollback", "from 0.14.1 back to 0.14.0"], { env: { ...process.env, NOTICE_DATA: join(dir, "data"), NOTICE_OPT: opt,
-        NOTICE_OPTIONS: join(dir, "options.json"), NOTICE_DIR: join(dir, "notice.d"), NOTICE_URL: `http://127.0.0.1:${server.port}` }, stdout: "pipe", stderr: "pipe" });
-      return await p.exited;
-    };
-    try {
-      expect(await run({})).toBe(3);                                       // no hook: Home Assistant can't have it
-      expect(await run({ notice_hook: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" })).toBe(0);
-      expect(hooked.at(-1)).toBe("/api/webhook/a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6");
-    } finally { server.stop(true); }
+  test("the rollback alarms that only a restore would raise are gone, and nothing says heartbeat silence means a failed restore", () => {
+    for (const k of ["messages", "rollback", "rollback-failed", "rollback-again", "rollback-unsigned", "rollback-nobackup", "rollback-record", "rollback-unavailable"])
+      expect(Bun.spawnSync(["bash", NOTICE, "text", k, ""]).exitCode).toBe(2);
+    for (const f of ["rootfs/opt/cain/notice.sh", "DOCS.md", "CHANGELOG.md"]) expect(src(f)).not.toMatch(/stays silent[^.]*restore[^.]*failed|silence[^.]*restore[^.]*failed/i);
+    expect(src("rootfs/opt/cain/notice.sh")).not.toMatch(/^\s*flush\)/m);
+  });
+  test("a cleared crash loop takes the rollback alarm down with it, so the next loop says it again", () => {
+    expect(src("rootfs/opt/cain/notice.sh")).toContain('restarts) groups="restarts rollback"');
   });
 });
 
 describe("the boundary", () => {
+  test("no Supervisor access, no map and no switch in this release", () => {
+    const cfg = readFileSync(join(ROOT, "config.yaml"), "utf8");
+    expect(cfg).toContain("hassio_api: false\n");
+    expect(cfg).not.toMatch(/hassio_role|addon_config|^map:|rollback_armed|rollback-record/m);
+    const lock = src("rootfs/opt/cain/c1/lock.sh");
+    expect(lock).not.toMatch(/C1_CONFIG|\/config|watcher|-g watch/);
+    expect(src("Dockerfile")).not.toMatch(/watch|as-watch/);
+    expect(existsSync(join(ROOT, "rootfs/opt/cain/as-watch"))).toBe(false);
+    expect(existsSync(join(ROOT, "rootfs/opt/cain/rollback/watcher.ts"))).toBe(false);
+  });
   test("/run/cain is root's, and his group may pass through it but not list it; what root keeps there is root's alone", () => {
     const lock = src("rootfs/opt/cain/c1/lock.sh");
     expect(lock).toContain("install -d -m 0710 -o root -g cain /run/cain ");
     expect(lock).not.toMatch(/install -d -m 07[5-7]\d -o root -g cain \/run\/cain \|\|/);
     expect(lock).toContain("install -d -m 0700 -o root -g root /run/cain/probe");
-    expect(lock).toContain('install -d -m 0750 -o root -g watch "$D/probe"');
-    expect(lock).toContain('install -d -m 0700 -o watch -g watch "$D/watcher"');
-    expect(lock).toMatch(/chown root:root "\$\{C1_CONFIG:-\/config\}" && chmod 0700/);
-    // The gateway state and the round trip's notes: root's, 0600, inside root's folders.
+    expect(lock).toContain('install -d -m 0700 -o root -g root "$D/probe"');
+    expect(lock).toContain('own "$D/probe" root:root 0700');
     expect(src("rootfs/opt/cain/link/main.ts")).toContain('writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\\n`, { mode: 0o600 })');
-    expect(src("rootfs/opt/cain/discord/broker-main.ts")).toContain("appendFileSync(file, `${id} ${now}\\n`, { mode: 0o600 })");
-    // uid 1000 may read nothing of those (the start's own check, c1/contract.ts ROOT_FOR_HIM).
+    expect(src("rootfs/opt/cain/probe/main.ts")).toContain("export function writeWhole(p: string, body: string, mode = 0o600)");
     const contract = src("rootfs/opt/cain/c1/contract.ts");
     const allowList = contract.slice(contract.indexOf("const ROOT_FOR_HIM"), contract.indexOf("];", contract.indexOf("const ROOT_FOR_HIM")));
     expect(allowList).not.toMatch(/probe|gateway|config|watcher/);
   });
-  test("neither the Supervisor token nor the probe URL reaches a command line or a log", () => {
+  test("the probe URL reaches no command line or log", () => {
     const run = src("rootfs/etc/services.d/cain/run");
     const unset = run.indexOf("unset HEARTBEAT_URL PROBE_PING_URL");
     expect(unset).toBeGreaterThan(0);
-    for (const child of ["tmux -u new-session", "link/main.ts", "checkin.sh", "probe/main.ts", "rollback/watcher.ts", "rollback/helper.ts"]) expect(unset).toBeLessThan(run.indexOf(child));
+    for (const child of ["tmux -u new-session", "link/main.ts", "checkin.sh", "probe/main.ts"]) expect(unset).toBeLessThan(run.indexOf(child));
     expect(run.split("PROBE_PING_URL=").length).toBe(2);
     const at = run.indexOf("PROBE_PING_URL=");
     expect(run.slice(at, run.indexOf(") &", at))).toContain('bun "$OPT/probe/main.ts" loop');
     expect(run).not.toMatch(/echo[^\n]*PROBE_PING_URL|log[^\n]*PROBE_PING_URL/);
-    expect(run).toContain('"$OPT/as-watch" bun "$OPT/rollback/watcher.ts" loop');
-    // The probe: the URL leaves the environment at once, is sent by fetch, and no child gets it.
     const main = src("rootfs/opt/cain/probe/main.ts");
     expect(main).toContain("delete env.PROBE_PING_URL");
     expect(main.match(/Bun\.spawnSync\(/g)!.length).toBe(main.match(/PROBE_PING_URL: _drop/g)!.length);
     expect(main).not.toMatch(/log\([^)]*\$\{url|console\.[a-z]+\([^)]*\$\{url/);
-    // The helper: the token read from root's file for each call, sent only as a fetch header.
-    const helperSrc = src("rootfs/opt/cain/rollback/helper.ts");
-    expect(helperSrc).not.toMatch(/spawn[^\n]*token|log\([^)]*token\b/i);
-    expect(helperSrc).toContain("authorization: `Bearer ${token}`");
-    // The drill: never reads or prints either.
     const drill = src("tools/probe-drill.sh");
     expect(drill).not.toMatch(/HASSIO_TOKEN|PROBE_PING_URL|probe_heartbeat_url|options\.json/);
-    // The token's file is named once, as a path uid 1000 must fail to read, and what is read goes nowhere.
     const tokenLines = drill.split("\n").filter((l) => l.includes("SUPERVISOR_TOKEN") && !l.trimStart().startsWith("#"));
     expect(tokenLines.length).toBe(1);
     expect(tokenLines[0]).toMatch(/^\s+for f in /);
-    expect(drill).toContain(`as_cain sh -c "head -c 1 '$f' >/dev/null 2>&1"`);
     expect(drill).not.toMatch(/curl[^\n]*[Aa]uthorization/);
-  });
-  test("the switch is root's and off by default; the helper alone reads it", () => {
-    const cfg = readFileSync(join(ROOT, "config.yaml"), "utf8");
-    expect(cfg).toContain("  rollback_armed: false\n");
-    expect(cfg).toContain("  rollback_armed: bool\n");
-    const run = src("rootfs/etc/services.d/cain/run");
-    expect(run.split("rollback_armed").length - 1).toBeGreaterThanOrEqual(1);
-    const at = run.indexOf("bashio::config 'rollback_armed'");
-    expect(run.slice(at, run.indexOf(") &", at))).toContain('bun "$OPT/rollback/helper.ts" loop');
   });
 });
 
 describe("the drill", () => {
-  test("six numbered steps, and the switch only after all six pass", () => {
+  test("only this release's steps: 1, 1b, 2, 3 and 4; the rest wait for the restore release", () => {
     const drill = src("tools/probe-drill.sh");
-    for (const n of [1, 2, 3, 4, 5, 6]) expect(drill).toMatch(new RegExp(`^  ${n}\\)`, "m"));
+    for (const n of ["1", "1b", "2", "3", "4"]) expect(drill).toMatch(new RegExp(`^  ${n}\\)`, "m"));
+    for (const n of ["5", "6", "7", "8"]) expect(drill).not.toMatch(new RegExp(`^  ${n}\\)`, "m"));
+    expect(drill).toContain("restore release");
     expect(drill).toContain("docker exec -u 1000");
+    expect(drill).not.toMatch(/rollback_armed|helper\.ts (loop|boot|restore)|\/config\//);
     const docs = src("DOCS.md");
-    expect(docs).toContain("rollback_armed");
-    expect(docs).toMatch(/only after all six/);
+    expect(docs).toContain("Backup before update");
+    expect(docs).toMatch(/auto-update off/i);
+    expect(docs).not.toContain("rollback_armed");
   });
 });

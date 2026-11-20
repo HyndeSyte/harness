@@ -2,13 +2,12 @@
 
 ## 0.14.0
 
-- The App now checks on Cain every 5 minutes: that his Discord plugin, his session and his Discord connection are up, and once an hour that his session answers a short check that never reaches you. These are liveness checks: they show his parts run, not that he answers you.
-- The real check: each message you send him on Discord must reach his session within 10 minutes, or you hear "Messages aren't reaching Cain". The App keeps only the message's id, never its words.
-- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every check passes, so your phone hears from outside when he stops, even if the Pi is down.
-- Fewer false alarms: nothing alarms while your Stop holds, a sign-in screen says "Cain needs sign-in", an API outage says "The model's API isn't answering", and a long turn isn't counted as a missed answer.
-- When his session keeps crashing (more than 3 crashes in 30 minutes), you hear it on your phone and in Discord. Restarts the App or Home Assistant asked for, and the first start after a reboot, don't count.
-- An automatic rollback for an update that keeps crashing within a day, off for now: a new option, `rollback_armed`, stays off until it has been drilled on the Pi. While off, you hear "A rollback of Cain would have run" and nothing is done. It never deletes a backup.
-- Turn on Home Assistant's Backup before update for the Cain App: after each update the App checks that backup is there, and tells you at once if it isn't.
+- The App now checks every 5 minutes that Cain's parts are running (his Discord plugin, his session, his Discord connection), and once an hour that his session answers a short check that never reaches you. These are liveness checks: they can say he's alive while a message of yours is lost.
+- When his session keeps crashing (more than 3 crashes in 30 minutes), you hear "Cain keeps crashing" on your phone and in Discord. A restart the App asked for, the first start after a reboot, and an end long after a start don't count.
+- When the whole App keeps restarting (more than 3 times in 30 minutes), you hear "Cain's App keeps restarting".
+- If his session ends on its own with an error after running a while, you hear it once: "Cain's session ended on its own".
+- A crash loop within a day of an update also says "A rollback of Cain would have run", with how to restore by hand. This release has no automatic restore.
+- A new option, `probe_heartbeat_url`: a second check at your outside heartbeat service, pinged only while every liveness check passes. Fewer false alarms: nothing from the liveness checks while your Stop holds, and a sign-in or API outage on his screen is named as that.
 
 ## 0.13.5
 

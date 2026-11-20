@@ -112,17 +112,11 @@ CAIN = ROOT / "cain"
 def test_cain_config_denies_every_api_and_mapping():
     cfg = flat_yaml(CAIN / "config.yaml")
     assert cfg["slug"] == "cain"
-    for api in ("homeassistant_api", "auth_api"):
+    for api in ("homeassistant_api", "hassio_api", "auth_api"):
         assert cfg[api] == "false", api
-    # Cain 0.14.0: the Supervisor's API with the backup role only, for the rollback helper's one
-    # restore of the pre-install backup (rollback/helper.ts); no other role. One mapping: this
-    # App's own config folder, read-write, for the record of restores outside /data, kept out of
-    # backups.
-    assert cfg["hassio_api"] == "true" and cfg["hassio_role"] == "backup"
-    assert cfg["map"] == ["addon_config:rw"]
-    assert "rollback-record.json*" in [x.strip('"') for x in cfg["backup_exclude"]]
-    for risky in ("ports", "host_network", "privileged", "full_access", "docker_api",
-                  "devices", "image"):
+    # Cain 0.14.0 asks for no Supervisor API and no mapping: the restore waits for its own release.
+    for risky in ("map", "ports", "host_network", "privileged", "full_access", "docker_api",
+                  "devices", "hassio_role", "image"):
         assert risky not in cfg, risky
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099" and cfg["panel_admin"] == "true"
     assert cfg["init"] == "false"
@@ -131,19 +125,19 @@ def test_cain_config_denies_every_api_and_mapping():
     # Assistant user id, not a key), the alarms' webhook id, hidden like a key (C1
     # second review: the App's alarms reach Home Assistant without its API), the PC
     # job keeper's token and repo name, the security watch's and the probe's heartbeat URLs
-    # (secrets like keys: password fields), and the rollback's switch, off by default. Nothing else.
+    # (secrets like keys: password fields). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
         '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  notice_hook: ""\n'
-        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\n  rollback_armed: false\nschema:\n'
+        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
-        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n  rollback_armed: bool\n")
+        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():

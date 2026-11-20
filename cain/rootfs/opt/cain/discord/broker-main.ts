@@ -3,7 +3,7 @@
 // The bot token goes only into that process's environment, through the spawn call itself:
 // never into a command line, which any user can read in /proc.
 // One connection at a time: a new one replaces the old, whose server is stopped.
-import { appendFileSync, chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, renameSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { pinProblem } from "./pin";
@@ -12,7 +12,6 @@ import { checkAccess, ownerDm } from "../hooks/discord-read";
 import { SentSpool } from "./spool";
 import { BrokerSession, fileOutbox, MAX_LINE } from "./broker";
 import { gateSend, sentNote } from "./gate-call";
-import { pruneIds } from "../probe/core";
 
 const env = process.env;
 const SOCK = env.CAIN_DISCORD_SOCK ?? "/run/cain/discord.sock";
@@ -155,7 +154,6 @@ function connection(sock: Socket): void {
     session: name,
     setTimer: (ms, f) => setTimeout(f, ms),
     clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
-    reached: (id) => noteId(`${PROBE_RUN}/reached`, id),
     probeAnswered: () => {
       mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });
       writeFileSync(`${PROBE_RUN}/answered.tmp`, `${Math.floor(Date.now() / 1000)}\n`, { mode: 0o600 });
@@ -179,14 +177,6 @@ function connection(sock: Socket): void {
     for await (const chunk of proc.stderr) read(dec.decode(chunk, { stream: true }));
   })();
   void proc.exited.then((code) => { log(`the plugin's server stopped (${code})`); session.serverGone(); });
-}
-
-// A message id for the probe's round trip ("<id> <seconds>"), root's alone, kept to the last day.
-function noteId(file: string, id: string): void {
-  mkdirSync(PROBE_RUN, { recursive: true, mode: 0o700 });
-  const now = Math.floor(Date.now() / 1000);
-  appendFileSync(file, `${id} ${now}\n`, { mode: 0o600 });
-  try { if (statSync(file).size > 64_000) { writeFileSync(`${file}.tmp`, pruneIds(readFileSync(file, "utf8"), now), { mode: 0o600 }); renameSync(`${file}.tmp`, file); } } catch { /* next time */ }
 }
 
 // The probe's ask: handed to his session once a connection has started (every 5 seconds a look).

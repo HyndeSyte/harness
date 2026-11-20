@@ -1,26 +1,29 @@
 // The probe (Cain 0.14.0), root's, outside his session, like watch.sh (probe/core.ts has the rule).
-// What it measures is liveness, not proof of service, except the message round trip:
+// What it measures is liveness: it can say alive while messages are lost. This release only alarms.
 //   bun main.ts loop                 a pass every 5 minutes, for good (the run script starts it)
 //   bun main.ts pass                 one pass, now
-//   bun main.ts start <end>          one start of his session, kept in /data with how the run before
-//                                    it ended (boot, asked, clean, unknown, crash-<code>: the run
-//                                    script says), and the restart alarm raised or taken down
+//   bun main.ts boot                 the App's container booted: counted in /data once per container,
+//                                    and the boot-loop alarm raised or taken down
+//   bun main.ts session-asked        the run script is about to stop his session: a root-owned mark
+//                                    naming that very run, so its end is "asked"
+//   bun main.ts session-gone         the run script saw his session gone: when, for how long it ran
+//   bun main.ts session-start [code] his session starts: the run before it classed (boot, asked,
+//                                    crash-*, clean, unknown, self-*) from root's own marks and the exit
+//                                    code session.sh kept, kept in /data, and the alarms raised or down
 //   bun main.ts install <version>    the version this start runs: an install when it changed
-//   bun main.ts drill [minutes]      a drill under way (cain/tools/probe-drill.sh): no rollback meanwhile
-//   bun main.ts lines morning        the check-in's line about a restore on record, once (checkin.sh)
 // The probe's own heartbeat URL (probe_heartbeat_url) comes in PROBE_PING_URL, is read once
 // and taken out of the environment, and is never logged, written anywhere or put on a command
 // line (fetch sends it; no child process gets it). It is pinged only after a pass that passed:
-// the outside service alarms Dane when the pings stop. Every alarm here alarms only: nothing the
-// probe sees ever rolls a release back.
-import { appendFileSync, chmodSync, chownSync, closeSync, existsSync, fsyncSync, openSync, writeSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+// the outside service alarms Dane when the pings stop.
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, openSync, writeSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { heartbeatUrl } from "../security/core";
 import { readStop } from "../stop";
 import {
-  afterStart, alarmFor, askDue, END_KINDS, failedWords, type Facts, hourlyState, type Hourly, type Install, lastSlot, lostMessages,
-  parseIds, parseRecord, pass, type RestoreRecord, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseStarts, type Screen, screenOf, shouldPing,
-  startsIn, STARTS_MAX, tooManyStarts, unsettled,
+  afterStart, alarmFor, askDue, endKind, END_KINDS, failedWords, type Facts, hourlyState, type Hourly, type Install, inWindow, lastSlot,
+  parseBoots, pass, type RestoreRecord, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts, type Screen, screenOf, shouldPing,
+  startsIn, STARTS_MAX, STARTS_WINDOW_S, tooManyBoots, tooManyStarts,
 } from "./core";
 
 const env = process.env;
@@ -30,12 +33,11 @@ export const paths = (e: Record<string, string | undefined> = env) => {
   return {
     dir: D, run: R,
     starts: join(D, "starts"), install: join(D, "install.json"), passes: join(D, "passes.jsonl"), hourly: join(D, "hourly.json"),
-    alive: join(D, "alive"), drill: join(D, "drill"), alarmed: join(D, "alarmed"),
+    alive: join(D, "alive"), alarmed: join(D, "alarmed"), boots: join(D, "boots"),
     ask: join(R, "ask"), answered: join(R, "answered"),
-    // The message round trip: ids of his messages the link saw, and ids that reached his session.
-    seen: e.PROBE_SEEN ?? join(R, "seen"), reached: e.PROBE_REACHED ?? join(R, "reached"), since: join(R, "since"),
-    // The durable record of restores, outside /data (rollback/helper.ts writes it).
-    record: e.ROLLBACK_RECORD ?? "/config/rollback-record.json",
+    // This container's marks (tmpfs: a new container starts with none): his session's run as root
+    // started it, the run script's own stop request for that run, and that this container booted.
+    session: join(R, "session.json"), asked: join(R, "asked"), booted: join(R, "booted"),
     delivered: e.CHECKIN_DELIVERED ?? "/data/checkin.delivered",
     gateway: e.PROBE_GATEWAY ?? "/run/cain/link-gateway.state",
     mode: e.PROBE_MODE_FILE ?? "/run/cain/mode",
@@ -46,22 +48,20 @@ export const paths = (e: Record<string, string | undefined> = env) => {
   };
 };
 type Paths = ReturnType<typeof paths>;
-const WATCH_GID = Number(env.WATCH_GID ?? 1002);
 
 const text = (p: string) => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 const json = <T>(p: string): T | null => { try { return JSON.parse(readFileSync(p, "utf8")) as T; } catch { return null; } };
 const num = (p: string) => { const n = Number((text(p) ?? "").trim().split(/\s+/)[0]); return Number.isFinite(n) && n > 0 ? n : null; };
-// Whole or not at all, root's, readable by the watch user's group (it raises the flag).
-export function writeWhole(p: string, body: string, mode = 0o640): void {
-  mkdirSync(dirname(p), { recursive: true, mode: 0o750 });
+// Whole or not at all, root's alone.
+export function writeWhole(p: string, body: string, mode = 0o600): void {
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
   writeFileSync(`${p}.tmp`, body, { mode });
-  try { chownSync(`${p}.tmp`, 0, WATCH_GID); } catch { /* not root (tests) */ }
   chmodSync(`${p}.tmp`, mode);
   renameSync(`${p}.tmp`, p);
 }
 const log = (m: string) => console.log(`[cain] probe: ${m}`);
-// The durable record of restores (/config): root's alone, whole or not at all, synced before the
-// rename, since a restore call may follow at once and replace this container.
+// The durable record of restores: root's alone, whole or not at all, synced before the rename.
+// Used only by the dormant rollback/helper.ts (not started in this release).
 export function writeRecord(path: string, r: RestoreRecord): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const fd = openSync(`${path}.tmp`, "w", 0o600);
@@ -113,8 +113,7 @@ export interface PassDeps {
   notice: (...args: string[]) => number;             // notice.sh's exit code
 }
 
-// One pass: the facts, the hourly liveness check and its answer, the message round trip, the pass
-// kept, the ping only when it passed, and the alarm raised once a stretch and taken down when a
+// One pass: the facts, the hourly liveness check and its answer, the pass kept, the ping only when it passed, and the alarm raised once a stretch and taken down when a
 // pass goes through. While the owner's Stop holds: no ask and no alarm.
 export async function runPass(d: PassDeps): Promise<Pass> {
   const { p, now } = d;
@@ -122,13 +121,9 @@ export async function runPass(d: PassDeps): Promise<Pass> {
   const ans = num(p.answered);
   if (ans && h.asked && ans >= h.asked && !(h.answered && h.answered >= h.asked)) h.answered = ans;
   const own = d.mode === "own";
-  // The round trip counts only messages seen since the probe first ran in this container.
-  let since = num(p.since);
-  if (!since) { try { mkdirSync(p.run, { recursive: true, mode: 0o700 }); writeFileSync(p.since, `${now}\n`, { mode: 0o600 }); } catch { /* next pass */ } since = now; }
-  const lost = own ? lostMessages(parseIds(text(p.seen) ?? ""), parseIds(text(p.reached) ?? ""), now, since) : [];
   const facts: Facts = {
     now, plugin: d.plugin(), tmux: d.tmux(), gateway: gatewayState(p),
-    delivered: num(p.delivered), slot: lastSlot(now, d.tz), lost,
+    delivered: num(p.delivered), slot: lastSlot(now, d.tz),
   };
   const screen = d.screen();
   // A Stop file that can't be read silences nothing: only his saved Stop does.
@@ -161,7 +156,7 @@ export async function runPass(d: PassDeps): Promise<Pass> {
   const had = (text(p.alarmed) ?? "").trim().split(/\s+/)[1] ?? (existsSync(p.alarmed) ? "probe" : "");
   // Stopped on purpose (the mode file says none), his stop's own alarm already tells Dane why.
   if (kind && kind !== had && d.mode !== "none") {
-    const cause = kind === "needs-signin" || kind === "api-down" ? "" : kind === "messages" ? `${lost.length} message${lost.length === 1 ? "" : "s"}` : failedWords(result);
+    const cause = kind === "needs-signin" || kind === "api-down" ? "" : failedWords(result);
     if (d.notice("tell", kind, cause) <= 1) writeWhole(p.alarmed, `${now} ${kind}\n`, 0o600);
   } else if (result.status === "ok" && had) {
     if (d.notice("clear", "probe") <= 1) rmSync(p.alarmed, { force: true });
@@ -169,37 +164,107 @@ export async function runPass(d: PassDeps): Promise<Pass> {
   return result;
 }
 
-// One start of his session, kept with how the run before it ended; the restart alarm (more than 3
-// crash starts in 30 minutes) raised or down. Alarm only.
+// -- his session's runs, as root saw them ----------------------------------------------------------
+interface Run { id: string; at: number; ended?: number }
+const readRun = (p: Paths): Run | null => {
+  const r = json<Run>(p.session);
+  return r && typeof r.id === "string" && Number.isFinite(r.at) ? r : null;
+};
+// The run script is about to stop his session: the mark names that very run. Root's alone; his own
+// user can't write it, so no exit of his can pass for one the App asked for.
+export function markAsked(p: Paths): boolean {
+  const r = readRun(p);
+  if (!r || r.ended) return false;
+  writeWhole(p.asked, `${r.id}\n`);
+  return true;
+}
+// The run script saw his session gone: the first time it saw so is when the run ended.
+export function markGone(p: Paths, now: number): void {
+  const r = readRun(p);
+  if (r && !r.ended) writeWhole(p.session, JSON.stringify({ ...r, ended: now }));
+}
+// How the run before this start ended, from root's own marks: no run in this container (boot), the
+// run script's stop request for that run (asked), and how long it ran (to when root saw it end, or
+// now when it didn't); the exit code is session.sh's, his to write, so it alone never makes a start
+// "asked" and never counts a late end toward a loop.
+export function classify(p: Paths, now: number, code: number | null): string {
+  const r = readRun(p);
+  if (!r) return "boot";
+  const asked = (text(p.asked) ?? "").trim() === r.id;
+  const ran = (r.ended ?? now) - r.at;
+  return endKind({ first: false, asked, code, ran: ran >= 0 ? ran : null });
+}
+// One start of his session: the run before it classed and kept, this run's mark written, and the
+// alarms raised or taken down. Alarm only.
+export function sessionStart(p: Paths, now: number, code: number | null, notice: PassDeps["notice"]): string {
+  const kind = classify(p, now, code);
+  recordStart(p, now, kind, notice);
+  writeWhole(p.session, JSON.stringify({ id: randomBytes(8).toString("hex"), at: now }));
+  rmSync(p.asked, { force: true });
+  return kind;
+}
 export function recordStart(p: Paths, now: number, end: string, notice: PassDeps["notice"]): number {
   const kind = END_KINDS.test(end) ? end : "unknown";
-  mkdirSync(p.dir, { recursive: true, mode: 0o750 });
-  appendFileSync(p.starts, `${now} ${kind}\n`, { mode: 0o640 });
+  mkdirSync(p.dir, { recursive: true, mode: 0o700 });
+  appendFileSync(p.starts, `${now} ${kind}\n`, { mode: 0o600 });
   writeWhole(p.starts, pruneStarts(text(p.starts) ?? "", now));
+  // A late non-zero exit no one asked for: his own user can cause one, so it alarms once a stretch
+  // ("Cain's session ended on its own") and never counts toward a loop.
+  const self = `${p.alarmed}-self`;
+  if (/^self-/.test(kind) && !existsSync(self) && notice("tell", "self-ended", `exit ${kind.slice(5)}`) <= 1) writeWhole(self, `${now}\n`);
   return checkStarts(p, now, notice);
 }
+// The crash loop (more than 3 crash starts in 30 minutes): "Cain keeps crashing", and within a day
+// of an install "A rollback of Cain would have run" too, once for each new loop (one that starts
+// after the last one ended); both come down once the count is back under. A stretch of "ended on its
+// own" ends after 30 minutes with no such end. None of this is silenced by the owner's Stop: a
+// stopped session never starts, so it never counts.
 export function checkStarts(p: Paths, now: number, notice: PassDeps["notice"]): number {
-  const starts = parseStarts(text(p.starts) ?? "");
+  const all = text(p.starts) ?? "";
+  const starts = parseStarts(all);
   const n = startsIn(starts, now);
   const flag = `${p.alarmed}-starts`;
   if (tooManyStarts(starts, now)) {
-    if (!existsSync(flag) && notice("tell", "restarts", `${n} crashes and starts in 30 minutes`) <= 1) writeWhole(flag, `${now}\n`, 0o600);
+    if (!existsSync(flag) && notice("tell", "restarts", `${n} crash starts in 30 minutes`) <= 1) {
+      writeWhole(flag, `${now}\n`);
+      const i = json<Install>(p.install);
+      if (inWindow(i, now)) notice("tell", "rollback-disarmed", `Cain ${i!.version}, installed within the last day`);
+    }
   } else if (existsSync(flag) && n <= STARTS_MAX) {
     if (notice("clear", "restarts") <= 1) rmSync(flag, { force: true });
+  }
+  const self = `${p.alarmed}-self`;
+  if (existsSync(self) && startsIn(parseSelf(all), now) === 0 && (num(self) ?? 0) <= now - STARTS_WINDOW_S) {
+    if (notice("clear", "self") <= 1) rmSync(self, { force: true });
+  }
+  return n;
+}
+// The App's container booted: counted once per container (a mark in /run, which a new container
+// starts without), and more than 3 boots in 30 minutes alarms "Cain's App keeps restarting".
+export function recordBoot(p: Paths, now: number, notice: PassDeps["notice"]): boolean {
+  if (existsSync(p.booted)) return false;
+  writeWhole(p.booted, `${now}\n`);
+  mkdirSync(p.dir, { recursive: true, mode: 0o700 });
+  appendFileSync(p.boots, `${now}\n`, { mode: 0o600 });
+  writeWhole(p.boots, pruneStarts(text(p.boots) ?? "", now));
+  checkBoots(p, now, notice);
+  return true;
+}
+export function checkBoots(p: Paths, now: number, notice: PassDeps["notice"]): number {
+  const boots = parseBoots(text(p.boots) ?? "");
+  const n = startsIn(boots, now);
+  const flag = `${p.alarmed}-boots`;
+  if (tooManyBoots(boots, now)) {
+    if (!existsSync(flag) && notice("tell", "boots", `${n} starts of the App in 30 minutes`) <= 1) writeWhole(flag, `${now}\n`);
+  } else if (existsSync(flag)) {
+    if (notice("clear", "boots") <= 1) rmSync(flag, { force: true });
   }
   return n;
 }
 
-// The restore on record still to be settled names the version it restored to: a start on that
-// version is the rollback, never a new install.
-export function restoredTo(p: Paths): string | null {
-  const r = parseRecord(text(p.record));
-  if (r === "damaged") return null;
-  return unsettled(r)?.target ?? null;
-}
 export function recordInstall(p: Paths, version: string, now: number): Install | null {
   const prev = json<Install>(p.install);
-  const { install, fresh } = afterStart(prev, version, now, restoredTo(p));
+  const { install, fresh } = afterStart(prev, version, now);
   if (install && install !== prev) writeWhole(p.install, JSON.stringify(install));
   if (fresh && install) log(`installed: Cain ${install.version} (was ${install.previous}); the next 24 hours are watched`);
   return install;
@@ -234,38 +299,30 @@ if (import.meta.main) {
   const [cmd, arg] = process.argv.slice(2);
   if (cmd === "loop") {
     const b = heartbeatUrl(url);
-    log(`liveness every 5 minutes, and the message round trip; its outside heartbeat ${b.kind === "ok" ? "on" : b.kind === "invalid" ? "set but not usable" : "off (probe_heartbeat_url is empty)"}`);
+    log(`liveness every 5 minutes; its outside heartbeat ${b.kind === "ok" ? "on" : b.kind === "invalid" ? "set but not usable" : "off (probe_heartbeat_url is empty)"}`);
     await Bun.sleep(Number(env.PROBE_FIRST_S ?? 120) * 1000);
     for (;;) {
-      try { await runPass(deps()); checkStarts(p, now(), noticeCall(p)); } catch (e) { log(`a pass failed: ${(e as Error).name}`); }
+      try { await runPass(deps()); } catch (e) { log(`a pass failed: ${(e as Error).name}`); }
+      try { checkStarts(p, now(), noticeCall(p)); checkBoots(p, now(), noticeCall(p)); } catch (e) { log(`the start count failed: ${(e as Error).name}`); }
       await Bun.sleep(PASS_EVERY_S * 1000);
     }
   } else if (cmd === "pass") {
     const r = await runPass(deps());
     console.log(r.ok ? "passed" : `${r.status}: ${failedWords(r)}`);
-  } else if (cmd === "start") {
-    console.log(`${recordStart(p, now(), arg ?? "unknown", noticeCall(p))} crash starts in 30 minutes`);
+  } else if (cmd === "boot") {
+    console.log(recordBoot(p, now(), noticeCall(p)) ? "boot counted" : "this container's boot was counted already");
+  } else if (cmd === "session-asked") {
+    console.log(markAsked(p) ? "marked: this run's end was asked for" : "no run of his to mark");
+  } else if (cmd === "session-gone") {
+    markGone(p, now());
+  } else if (cmd === "session-start") {
+    const raw = (arg ?? "").replace(/[^0-9]/g, "").slice(0, 8);
+    console.log(`the run before: ${sessionStart(p, now(), raw === "" ? null : Number(raw), noticeCall(p))}`);
   } else if (cmd === "install") {
     const i = recordInstall(p, arg ?? "", now());
     console.log(i ? `${i.version} since ${i.at || "before the probe"}` : "no version");
-  } else if (cmd === "drill") {
-    const m = Math.min(120, Math.max(1, Number(arg ?? 45) || 45));
-    writeWhole(p.drill, `${now() - 45 * 60 + m * 60}\n`);
-    console.log(`drill under way: no rollback for ${m} minutes`);
-  } else if (cmd === "lines") {
-    // A restore on record, settled at a start (rollback/helper.ts boot) and not told yet, once,
-    // for the morning's Moving section. The helper marks it told.
-    const r = parseRecord(text(p.record));
-    const last = r === "damaged" ? null : r.restores.at(-1);
-    if (r === "damaged") console.log("Rollback record: the App's record of restores can't be read. Put it in today's Moving section in one line; Dane was told.");
-    else if (last && last.outcome && !last.reported && !last.drill && now() - last.at < 2 * 86400) {
-      const how = last.outcome === "done" ? `restored Cain ${last.target} in place of ${last.bad}` : last.outcome === "not run" ? `tried to restore Cain ${last.target} in place of ${last.bad}, and the restore didn't happen` : `restored Cain ${last.target} in place of ${last.bad}, but the Supervisor's job for it ${last.outcome === "failed" ? "failed" : "has no known outcome"}`;
-      console.log(`Rollback: the App ${how}, because ${last.why ?? "the update kept crashing"}. Put it in today's Moving section in one line. Dane was told when it happened.`);
-      last.reported = true;
-      writeRecord(p.record, r);
-    }
   } else {
-    console.error("usage: main.ts loop | pass | start <end> | install <version> | drill [minutes] | lines morning");
+    console.error("usage: main.ts loop | pass | boot | session-asked | session-gone | session-start [code] | install <version>");
     process.exit(2);
   }
 }
