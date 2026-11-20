@@ -61,6 +61,15 @@ TERM at the bound gets KILL 5 seconds later. terminal/run makes /run/cain-web it
 (root:nogroup 0750, as lock.sh does), so nginx and /health no longer wait on the run script. The mark
 holds the time it was written: a crash inside the window (any exit but 0, 3 or a caught TERM) removes
 it, so it alarms and reports as a crash, and a TERM stop more than the wait plus 30 seconds after it is
-logged as "stopped during the self-restart window", not a self-restart. probe-drill.sh 7's gate also
+logged as "stopped during the self-restart window", not a self-restart. (Fifth round, below, refines
+this.) probe-drill.sh 7's gate also
 reads the Watchdog switch through the Supervisor's info call (must be on) and needs a /health 200 to
 the Supervisor's address in nginx's note of 200s during its 3 minutes.
+
+Fifth round (the fourth outside review): inside the window only a TERM (256 with signal 15) is the
+Supervisor's stop; a death by any other signal (the OOM killer's 9) removes the mark, pings "stopped on
+an error" and halts with 128 plus the signal. The mark is written again just before the 2-minute wait,
+so the finish script's wait-plus-30-seconds window measures from the last action, not from before the
+call. The exit route writes the word fallback into the mark, and an exit 3 counts as a self-restart only
+with it (a stray 3 under errexit is a crash, from the EXIT trap and in finish). A failed restart call
+whose Supervisor no longer answers the info call is logged as unreachable, apart from a refusal.

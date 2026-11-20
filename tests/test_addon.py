@@ -711,9 +711,9 @@ def test_no_stop_is_silent(tmp_path):
     # decision after the Supervisor's restart call, and from the Pi drill's root-only mark.
     assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3"]
     exit_fn = _run_fns(run, "self_exit() {", "self_tried=0")
-    # Fourth round: the mark holds the time it was written (self_mark); the exit route writes it only if
-    # the restart decision didn't already.
-    assert exit_fn.index("[ -s /run/cain/self-restart ] || self_mark") < exit_fn.index("health_down") < exit_fn.index("exit 3")
+    # Fourth round: the mark holds the time it was written (self_mark). Fifth round: the exit route writes
+    # it with the word fallback, which finish and the EXIT trap need before they take a 3 for the fallback.
+    assert exit_fn.index("""printf '%s fallback\\n' "$(date +%s)" > /run/cain/self-restart""") < exit_fn.index("health_down") < exit_fn.index("exit 3")
     assert "self_mark() { { date +%s > /run/cain/self-restart; } 2>/dev/null || true; }" in run
     self_fn = _run_fns(run, "self_restart() {", "# When his channel went down")
     assert self_fn.index("    restart)") < self_fn.index("      self_mark") < self_fn.index("end_his_session || true") \

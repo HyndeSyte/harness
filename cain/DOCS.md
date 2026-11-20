@@ -363,7 +363,10 @@ container was killed, it stayed down 10 minutes with no alarm, since every alarm
   Supervisor take the call, or not answer it within 30 seconds, but not stop the App within 2 minutes
   after, it stops on an error then; the Supervisor's watchdog starts it again. The two can overlap only
   if the Supervisor takes longer than about 150 seconds to stop the App. A Stop of yours, or a crash,
-  inside that window is not called a self-restart. The App's log says "Asking the Supervisor for the
+  inside that window is not called a self-restart: the window measures from the App's last step of the
+  restart (it notes the time again just before its 2-minute wait), and a crash in it, a kill by any
+  signal but the Supervisor's normal stop (an out-of-memory kill, say) included, alarms and is reported
+  as a crash. If the Supervisor can't be reached at all, the App's log says so, apart from a refusal. The App's log says "Asking the Supervisor for the
   App's restart" just before the call. A line saying the Supervisor took it rarely shows, because on
   a real success the Supervisor stops the App before it answers. The real sign of a self-restart is
   the outside heartbeat's failure ping, "restarting itself (self-restart, exit code 256)", followed

@@ -502,7 +502,7 @@ describe("the finish script on a self-restart (the outside review's third findin
     if (!at) dirs.push(d);
     for (const s of ["run/cain", "results", "bin"]) mkdirSync(join(d, s), { recursive: true });
     for (const f of ["curl.args", "halted", "results/exitcode"]) rmSync(join(d, f), { force: true });
-    if (marked) writeFileSync(join(d, "run/cain/self-restart"), "");
+    if (marked) writeFileSync(join(d, "run/cain/self-restart"), code === "3" ? `${Math.floor(Date.now() / 1000)} fallback\n` : "");
     writeFileSync(join(d, "bin/curl"), `#!/bin/bash\ncat > /dev/null\nfor a in "$@"; do printf '%s\\n' "$a"; done > "${d}/curl.args"\nexit 0\n`, { mode: 0o755 });
     writeFileSync(join(d, "bin/halt"), `#!/bin/bash\necho halted > "${d}/halted"\n`, { mode: 0o755 });
     const src = readFileSync(FINISH, "utf8").split("\n").slice(1).join("\n")
@@ -579,7 +579,7 @@ describe("the finish script on a self-restart (the outside review's third findin
     writeFileSync(join(d, "opt/notice.sh"), `#!/bin/bash\necho "$*" >> "${d}/notices"\n`, { mode: 0o755 });
     const top = lines.slice(1, termTrap + 1).join("\n").replaceAll("/run/cain", join(d, "run/cain"))
       .replace("OPT=/opt/cain", `OPT=${join(d, "opt")}`).replace(/^stop_asked\(\) \{.*$/m, "stop_asked() { :; }");
-    const p = Bun.spawnSync(["bash", "-c", `set -o errexit\n${top}\ndate +%s > ${join(d, "run/cain/self-restart")}\n${end}\n`], { stdout: "pipe", stderr: "pipe" });
+    const p = Bun.spawnSync(["bash", "-c", `set -o errexit\n${top}\nSELF_MARK=${join(d, "run/cain/self-restart")}\ndate +%s > "$SELF_MARK"\n${end}\n`], { stdout: "pipe", stderr: "pipe" });
     const notices = existsSync(join(d, "notices")) ? readFileSync(join(d, "notices"), "utf8").trim() : "";
     return { code: p.exitCode, signal: p.signalCode, marked: existsSync(join(d, "run/cain/self-restart")), notices, dir: d };
   }
@@ -591,7 +591,7 @@ describe("the finish script on a self-restart (the outside review's third findin
     expect(r.out).not.toContain("restart itself");
   });
   test.skipIf(process.platform === "win32")("the deliberate fallback (exit 3) and a caught TERM keep the mark, and neither alarms from the trap", () => {
-    const three = inWindow("exit 3");
+    const three = inWindow("printf '%s fallback\\n' \"$(date +%s)\" > \"$SELF_MARK\"; exit 3");
     expect([three.code, three.marked, three.notices]).toEqual([3, true, ""]);
     const term = inWindow("kill -TERM $$; sleep 5");
     expect([term.signal, term.marked, term.notices]).toEqual(["SIGTERM", true, ""]);
@@ -613,8 +613,74 @@ describe("the finish script on a self-restart (the outside review's third findin
     writeFileSync(join(late, "run/cain/self-restart"), "");
     expect(finish("256", "15", false, late).body).toContain("self-restart, exit code 256");
     // The exit route (3) is the run script's own fallback, after its wait: a self-restart whatever the age.
-    writeFileSync(join(late, "run/cain/self-restart"), `${now - 600}\n`);
+    writeFileSync(join(late, "run/cain/self-restart"), `${now - 600} fallback\n`);
     expect(finish("3", "", false, late).body).toContain("self-restart, exit code 3");
+  });
+  // Fifth round, the fourth outside review's first gap: only TERM is the Supervisor's stop.
+  test.skipIf(process.platform === "win32")("a death by signal 9 inside the window is a crash: the mark goes, the heartbeat hears an error, and it halts", () => {
+    const d = mkdtempSync(join(tmpdir(), "cain-kill9-"));
+    dirs.push(d);
+    mkdirSync(join(d, "run/cain"), { recursive: true });
+    writeFileSync(join(d, "run/cain/self-restart"), `${Math.floor(Date.now() / 1000) - 10}\n`);
+    const r = finish("256", "9", false, d);
+    expect([r.body, r.halted, r.exitcode]).toEqual(["stopped on an error", true, "137"]);
+    expect(r.out).toContain("died of signal 9 during the self-restart window");
+    expect(r.out).not.toContain("restart itself");
+    expect(existsSync(join(d, "run/cain/self-restart"))).toBe(false);
+    // SIGSEGV too; TERM in the same window is still the self-restart, and nothing halts.
+    writeFileSync(join(d, "run/cain/self-restart"), `${Math.floor(Date.now() / 1000) - 10}\n`);
+    expect(finish("256", "11", false, d).exitcode).toBe("139");
+    writeFileSync(join(d, "run/cain/self-restart"), `${Math.floor(Date.now() / 1000) - 10}\n`);
+    const term = finish("256", "15", false, d);
+    expect([term.body?.includes("self-restart, exit code 256"), term.halted]).toEqual([true, false]);
+    // Without a mark, a signal death is as before (no halt here; the probe classes the stop).
+    expect(finish("256", "9", false, d).halted).toBe(false);
+  });
+  // Fifth round, the second gap: the window measures from the run script's last action. self_mark is
+  // written again just before the 2-minute wait, in both branches that wait.
+  test.skipIf(process.platform === "win32")("a mark first written 160 s ago and re-stamped 40 s ago is the self-restart; one 160 s old and never re-stamped is not", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const d = mkdtempSync(join(tmpdir(), "cain-restamp-"));
+    dirs.push(d);
+    mkdirSync(join(d, "run/cain"), { recursive: true });
+    const mark = join(d, "run/cain/self-restart");
+    writeFileSync(mark, `${now - 160}\n`);
+    writeFileSync(mark, `${now - 40}\n`);                                           // re-stamped, as self_mark does
+    expect(finish("256", "15", false, d).body).toContain("self-restart, exit code 256");
+    writeFileSync(mark, `${now - 160}\n`);
+    const old = finish("256", "15", false, d);
+    expect(old.body).toBe(null);
+    expect(old.out).toContain("stopped during the self-restart window");
+    const run = readFileSync(join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "run"), "utf8");
+    const waits = [...run.matchAll(/\n( *)self_mark\n\1nap "\$\{C1_SELF_STOP_WAIT_S:-120\}"\n/g)];
+    expect(waits.length).toBe(2);
+    expect(run.split('nap "${C1_SELF_STOP_WAIT_S:-120}"').length - 1).toBe(2);
+  });
+  // Fifth round, follow-up: an exit 3 is the fallback only with the word fallback in the mark.
+  test.skipIf(process.platform === "win32")("the fallback writes its word and finish reports a self-restart; a stray exit 3 alarms and is a crash", () => {
+    const RUN = join(import.meta.dir, "..", "rootfs", "etc", "services.d", "cain", "run");
+    const run = readFileSync(RUN, "utf8");
+    const fns = run.slice(run.indexOf("self_mark() {"), run.indexOf("self_tried=0"));
+    const d = mkdtempSync(join(tmpdir(), "cain-fallback-"));
+    dirs.push(d);
+    mkdirSync(join(d, "run/cain"), { recursive: true });
+    const mark = join(d, "run/cain/self-restart");
+    writeFileSync(mark, `${Math.floor(Date.now() / 1000) - 100}\n`);
+    const p = Bun.spawnSync(["bash", "-c", `health_down() { :; }\n${fns.replaceAll("/run/cain", join(d, "run/cain"))}\nself_exit\n`]);
+    expect(p.exitCode).toBe(3);
+    expect(readFileSync(mark, "utf8")).toMatch(/^\d+ fallback\n$/);
+    const r = finish("3", "", false, d);
+    expect(r.body).toContain("restarting itself (self-restart, exit code 3)");
+    expect([r.halted, r.exitcode]).toEqual([true, "3"]);
+    // A stray 3 in the window, from the run script's real top: the trap drops the mark and alarms, and
+    // even a mark left without the word is a crash in finish.
+    const stray = inWindow("exit 3");
+    expect([stray.code, stray.marked, stray.notices]).toEqual([3, false, "tell exited"]);
+    expect([finish("3", "", false, stray.dir).body, finish("3", "", false, stray.dir).halted]).toEqual(["stopped on an error", true]);
+    writeFileSync(mark, `${Math.floor(Date.now() / 1000)}\n`);
+    const kept = finish("3", "", false, d);
+    expect([kept.body, kept.halted, kept.exitcode]).toEqual(["stopped on an error", true, "3"]);
+    expect(kept.out).toContain("without its fallback's mark");
   });
 });
 

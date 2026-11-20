@@ -33,11 +33,18 @@ def _start(tmp_path, as_cain=None, signed_in=True, screen=None):
     # The Supervisor, stubbed after the harness's own stubs: its answer to /addons/self/info (STUB_WATCHDOG
     # true or false as the JSON the Supervisor sends, or STUB_SUP_BODY whole) with STUB_SUP_RC as its
     # status, and its restart call (STUB_RESTART_RC: 0 took it, else refused).
-    stubs = ('bashio::api.supervisor() { echo "supervisor $*" >> ' + calls.as_posix() + '; '
+    # Fifth round: STUB_SUP_DOWN_AFTER_RESTART makes the Supervisor unreachable (curl's 7) once the restart
+    # call was made; STUB_LOG notes the run script's warnings as "log <text>"; STUB_RESTART_HANG makes the
+    # restart call hang in the real /bin/sleep (not the harness's quick stub), for 20 seconds at most.
+    down = (tmp_path / "supervisor-down").as_posix()
+    stubs = ('bashio::log.warning() { [ -z "${STUB_LOG:-}" ] || echo "log $*" >> ' + calls.as_posix() + '; }\n'
+             'bashio::api.supervisor() { echo "supervisor $*" >> ' + calls.as_posix() + '; '
+             '[ -z "${STUB_SUP_DOWN_AFTER_RESTART:-}" ] || [ ! -e ' + down + ' ] || return 7; '
              'if [ -n "${STUB_SUP_BODY:-}" ]; then printf "%s" "$STUB_SUP_BODY"; '
              'else printf \'{"result":"ok","data":{"watchdog":%s}}\' "${STUB_WATCHDOG:-true}"; fi; return "${STUB_SUP_RC:-0}"; }\n'
-             'bashio::addon.restart() { echo "addon-restart" >> ' + calls.as_posix() + '; '
-             '[ -z "${STUB_RESTART_HANG:-}" ] || { echo "restart-asked $(date +%s)" >> ' + calls.as_posix() + '; sleep 300; }; '
+             'bashio::addon.restart() { echo "addon-restart" >> ' + calls.as_posix() + '; : > ' + down + '; '
+             '[ -z "${STUB_RESTART_HANG:-}" ] || { echo "restart-asked $(date +%s)" >> ' + calls.as_posix() + '; /bin/sleep 20; '
+             'echo "restart-returned" >> ' + calls.as_posix() + '; }; '
              'return "${STUB_RESTART_RC:-0}"; }\n')
     marker = "export C1_PROC_ROOT="
     i = text.index("\n", text.index(marker)) + 1
@@ -104,21 +111,29 @@ def test_a_restart_call_that_hangs_past_its_bound_waits_before_the_exit_route(tm
     """Fourth round, the third outside review's first finding: a restart call with no answer within its
     bound (124) may still be carried out by the Supervisor, so the App waits the same 2 minutes
     (C1_SELF_STOP_WAIT_S, 4 seconds here) before it takes the exit route, instead of exiting at once.
-    The mark holds the time it was written, before the call."""
+    The mark holds the time it was written, before the call. Fifth round: the call hangs in the real
+    /bin/sleep (the harness's sleep returns at once, so before, the stand-in never hung and the test held
+    for a call that answered too); only the timed-out branch (124) logs that the call wasn't answered, and
+    the mark is written again just before the wait."""
     _needs_posix()
     calls, stop, bindir, runc = _start(tmp_path)
     runc.mkdir(parents=True, exist_ok=True)
     (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
     # The harness's sleep returns at once; this one also notes the waits this test looks for (the KILL's
     # 5 seconds after the TERM, and the self-stop wait, 7 here) and the exit route's 503 mark as it stands.
+    # At the KILL's wait it sets the mark back to an old time, so the self-stop wait shows the re-stamp.
     health = runc.parent / "cain-web" / "www" / "health-down"
+    mark = runc / "self-restart"
     sleep = bindir / "sleep"
     sleep.write_text(sleep.read_text().replace("exec /bin/sleep 0.05",
                      f'case "$1" in 5|7) echo "sleep $1 health-down=$([ -e {health.as_posix()} ] && echo yes || echo no)" >> {calls.as_posix()};; esac\n'
+                     f'case "$1" in 5) [ -e {mark.as_posix()} ] && [ ! -e {mark.as_posix()}.aged ] && {{ echo 1000 > {mark.as_posix()}; : > {mark.as_posix()}.aged; }};; '
+                     f'7) echo "mark at wait $(cat {mark.as_posix()})" >> {calls.as_posix()};; esac\n'
                      "exec /bin/sleep 0.05"))
+    t0 = time.time()
     alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=40,
                                    C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1",
-                                   STUB_RESTART_HANG="1", C1_SELF_CALL_S="1", C1_SELF_STOP_WAIT_S="7")
+                                   STUB_RESTART_HANG="1", C1_SELF_CALL_S="1", C1_SELF_STOP_WAIT_S="7", STUB_LOG="1")
     assert not alive, lines[:40]
     asked = [l for l in lines if l.startswith("restart-asked ")]
     assert len(asked) == 1, lines[:40]
@@ -130,8 +145,36 @@ def test_a_restart_call_that_hangs_past_its_bound_waits_before_the_exit_route(tm
     assert "sleep 7 health-down=no" in lines[i:], lines[i:]
     assert lines.index("sleep 5 health-down=no", i) < lines.index("sleep 7 health-down=no", i)
     assert health.exists() and (runc / "self-restart").exists(), lines[:40]
-    mark_at = int((runc / "self-restart").read_text().strip())
-    assert asked_at - 5 <= mark_at <= asked_at
+    # The call really hung and was cut off: it never returned, and the whole run took far less than its 20 s.
+    assert "restart-returned" not in lines and time.time() - t0 < 20, lines[i:]
+    # Only the timed-out branch (124) logs this; the success and refusal branches log otherwise.
+    assert any(l.startswith("log The Supervisor didn't answer the restart call within 30 seconds") for l in lines), lines[i:]
+    assert not any("took the restart" in l or "refused the restart call" in l for l in lines), lines[i:]
+    # The mark was written again after the call, just before the wait (the KILL's wait had set it to 1000).
+    at_wait = [l for l in lines if l.startswith("mark at wait ")]
+    assert len(at_wait) == 1 and int(at_wait[0].split()[3]) >= asked_at, lines[i:]
+    # The exit route then writes the word fallback, which finish needs to take its 3 for a self-restart.
+    assert (runc / "self-restart").read_text().split()[1:] == ["fallback"]
+    assert "notice.sh tell exited" not in lines
+
+
+def test_a_restart_call_that_fails_with_the_supervisor_unreachable_is_logged_apart_and_takes_the_fallback(tmp_path):
+    """Fifth round follow-up: a failed restart call (not a timeout) with the Supervisor no longer answering
+    is logged as unreachable, not as a refusal, and the exit route follows at once with the fallback's
+    word in the mark, so the finish script reports it as a self-restart failure ping and halts."""
+    _needs_posix()
+    calls, stop, bindir, runc = _start(tmp_path)
+    runc.mkdir(parents=True, exist_ok=True)
+    (runc / "discord.state").write_text(f"down {int(time.time()) - 660}\n")
+    alive, lines, err = _run_whole(tmp_path, calls, stop, bindir, until=lambda l: False, timeout=30,
+                                   C1_CHECK_FIRST_S="0", C1_RUNNING_S="0", C1_CHANNEL_DOWN_S="1", STUB_RESTART_RC="1",
+                                   STUB_SUP_DOWN_AFTER_RESTART="1", C1_SELF_STOP_WAIT_S="3600", STUB_LOG="1")
+    assert not alive, lines[:40]
+    logs = [l for l in lines if l.startswith("log ")]
+    assert any("the Supervisor doesn't answer (unreachable, not a refusal)" in l for l in logs), logs
+    assert not any("refused the restart call" in l for l in logs), logs
+    assert "sleep 3600" not in lines
+    assert (runc / "self-restart").read_text().split()[1:] == ["fallback"]
     assert "notice.sh tell exited" not in lines
 
 
@@ -148,6 +191,7 @@ def test_a_refused_restart_call_still_exits_at_once(tmp_path):
     assert not alive and time.time() - t0 < 30, lines[:40]
     assert "addon-restart" in lines and (runc / "self-restart").exists()
     assert "sleep 3600" not in lines
+    assert (runc / "self-restart").read_text().split()[1:] == ["fallback"]
 
 
 @pytest.mark.parametrize("decision,switch", [("wait", "true"), ("off", "false"), ("unknown", "true")])

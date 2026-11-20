@@ -58,12 +58,13 @@ checked_now() {
 # self-restart. The mark is written again only just before a self-restart request, and the finish
 # script deletes it once it has read it, so it is used exactly once.
 rm -f /run/cain/self-restart /run/cain-web/www/health-down 2>/dev/null || true
-# Fourth round: the mark is live from just before the restart request until the real stop (up to about
-# 150 seconds). An exit in that window that is neither 0, nor 3 (the deliberate fallback), nor a caught
-# TERM (term_caught, set by the TERM trap below) is a crash: the mark goes, so it alarms here and the
-# finish script reports it as a crash.
+# Fourth round: the mark is live from just before the restart request until the real stop. An exit in
+# that window that is neither 0, nor 3 (the deliberate fallback), nor a caught TERM (term_caught, set by
+# the TERM trap below) is a crash: the mark goes, so it alarms here and the finish script reports it as
+# a crash. Fifth round: an exit 3 counts as the fallback only when self_exit wrote the word fallback into
+# the mark; a stray 3 (a command failing under errexit) is a crash like any other.
 term_caught=""
-trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ -z "$term_caught" ]; then rm -f /run/cain/self-restart 2>/dev/null || true; fi; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && [ ! -e /run/cain/self-restart ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
+trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -z "$term_caught" ] && { [ "$rc" -ne 3 ] || ! grep -qw fallback /run/cain/self-restart 2>/dev/null; }; then rm -f /run/cain/self-restart 2>/dev/null || true; fi; if [ "$rc" -gt 0 ] && [ "$rc" -lt 128 ] && [ ! -e /run/cain/self-restart ]; then "$OPT/notice.sh" tell exited || true; fi' EXIT
 # The run of his session this script started, as it holds it in memory (probe/main.ts session-start
 # hands it back). A stop counts as asked only when root's mark, the run on file and this all name the
 # same run; after s6 restarts this script it is empty, and the run before is classed by its timing.
@@ -797,9 +798,12 @@ waiting_signin() {
 # The exit route (the fallback, and what probe-drill.sh 7 proves on the Pi): the mark the finish
 # script and the EXIT trap read, the health page's 503, then exit 3. The finish script records 3 as
 # the container's exit code and halts it, and the Supervisor's watchdog starts the App again.
+# Fifth round: the mark holds the time of the last action (written before the restart call, written
+# again just before the 2-minute wait), and self_exit adds the word fallback, which the finish script
+# and the EXIT trap need before they take an exit 3 for the fallback.
 self_mark() { { date +%s > /run/cain/self-restart; } 2>/dev/null || true; }
 self_exit() {
-  [ -s /run/cain/self-restart ] || self_mark
+  { printf '%s fallback\n' "$(date +%s)" > /run/cain/self-restart; } 2>/dev/null || true
   health_down
   exit 3
 }
@@ -832,14 +836,24 @@ self_restart() {   # self_restart <kind> <cause>: never returns when the App res
       # its 30 seconds (124) waits the same 2 minutes, since the Supervisor may still carry it out; only a
       # definite refusal (any other code) stops at once. So the fallback overlaps the Supervisor's own
       # restart only when the Supervisor takes longer than about 150 seconds (30 plus 120) to stop it.
+      # Fifth round: the mark is written again just before the wait, so the finish script's window (the
+      # wait plus 30 seconds) measures from the last action, not from before the call.
+      # A failed call that isn't a timeout is a refusal only when the Supervisor still answers; when it
+      # doesn't (curl couldn't reach it), that is logged as such. Either way the fallback follows.
       case "$rrc" in
         0) bashio::log.info "The Supervisor took the restart before stopping the App; waiting for it to stop the App"
+           self_mark
            nap "${C1_SELF_STOP_WAIT_S:-120}"
            bashio::log.warning "The Supervisor didn't stop the App within 2 minutes of taking its restart: the App stops on an error instead" ;;
         124) bashio::log.warning "The Supervisor didn't answer the restart call within 30 seconds; waiting 2 minutes in case it still restarts the App"
+           self_mark
            nap "${C1_SELF_STOP_WAIT_S:-120}"
            bashio::log.warning "The Supervisor didn't stop the App within 2 minutes of the unanswered restart call: the App stops on an error instead" ;;
-        *) bashio::log.warning "The Supervisor refused the restart call ($rrc): the App stops on an error instead, for its watchdog to start it again" ;;
+        *) if [ "$(watchdog_switch)" = unknown ]; then
+             bashio::log.warning "The restart call failed ($rrc) and the Supervisor doesn't answer (unreachable, not a refusal): the App stops on an error instead, for its watchdog to start it again"
+           else
+             bashio::log.warning "The Supervisor refused the restart call ($rrc): the App stops on an error instead, for its watchdog to start it again"
+           fi ;;
       esac
       self_exit ;;
     wait) health_up; bashio::log.info "A self-restart is due ($2), but the App restarted itself for this already within 30 minutes: his session is restarted instead" ;;

@@ -38,22 +38,37 @@ heartbeat_fail() {
 # Third round: the mark is read once and deleted at once, so it is consumed exactly once: a later stop
 # or crash in the same container (/run kept, as when s6 restarts the service) is never taken for a
 # self-restart. The run script also clears it at its very top.
-# Fourth round: the mark holds the time (epoch seconds) the run script wrote it, just before its restart
-# request. A TERM stop (256) later than the run script's 2-minute wait (C1_SELF_STOP_WAIT_S) plus 30
-# seconds after it isn't the Supervisor carrying out that request: it is reported as a stop during the
-# self-restart window (the owner's own Stop, say), not as a self-restart. A mark with no time (from an
-# earlier version) counts as before.
+# Fourth round: the mark holds the time (epoch seconds) the run script wrote it. Fifth round: that is the
+# time of its last action (before its restart request, and again just before its 2-minute wait), so a
+# TERM stop (256 and signal 15) later than the wait (C1_SELF_STOP_WAIT_S) plus 30 seconds after it isn't
+# the Supervisor carrying out that request: it is reported as a stop during the self-restart window (the
+# owner's own Stop, say), not as a self-restart. A mark with no time (from an earlier version) counts as
+# before. Fifth round, also: only TERM is the Supervisor's stop. A death by any other signal in the
+# window (the OOM killer's 9, a SIGSEGV) is a crash: the mark goes, the heartbeat hears "stopped on an
+# error", and the container halts as on a crash. And an exit 3 is the run script's fallback only when
+# the mark carries the word fallback (self_exit writes it); a stray 3 is a crash.
 self_restart_mark=""
+window_crash=""
+crash_signal=""
 if [ -e /run/cain/self-restart ]; then
   self_restart_mark=1
-  mark_at="$(head -c 20 /run/cain/self-restart 2>/dev/null | tr -cd '0-9')"
+  mark_text="$(head -c 64 /run/cain/self-restart 2>/dev/null | head -n 1 || true)"
+  mark_at="$(printf '%s' "${mark_text%% *}" | tr -cd '0-9')"
   rm -f /run/cain/self-restart 2>/dev/null || true
-  if [[ "${APP_EXIT_CODE}" -eq 256 ]] && [ -n "${mark_at}" ] \
+  if [[ "${APP_EXIT_CODE}" -eq 256 ]] && [[ "${2:-}" != "15" ]]; then
+    self_restart_mark=""
+    window_crash=1
+    crash_signal="$(printf '%s' "${2:-}" | tr -cd '0-9')"
+    bashio::log.warning "Cain's App died of signal ${2:-unknown} during the self-restart window: a crash, not the self-restart"
+  elif [[ "${APP_EXIT_CODE}" -eq 256 ]] && [ -n "${mark_at}" ] \
      && [ $(( $(date +%s) - mark_at )) -gt $(( ${C1_SELF_STOP_WAIT_S:-120} + 30 )) ]; then
     self_restart_mark=""
-    bashio::log.warning "Cain's App was stopped during the self-restart window, $(( $(date +%s) - mark_at )) seconds after it asked for its restart: a stop, not the self-restart"
+    bashio::log.warning "Cain's App was stopped during the self-restart window, $(( $(date +%s) - mark_at )) seconds after its last step of the restart: a stop, not the self-restart"
+  elif [[ "${APP_EXIT_CODE}" -eq 3 ]] && [[ " ${mark_text} " != *" fallback "* ]]; then
+    self_restart_mark=""
+    bashio::log.warning "Cain's App exited with 3 during the self-restart window without its fallback's mark: a crash, not the self-restart"
   fi
-  unset mark_at
+  unset mark_at mark_text
 fi
 if [ -n "${self_restart_mark}" ]; then
   # The App restarting itself (Cain 0.15.0, the run script's self_restart): already told and kept in
@@ -68,6 +83,13 @@ if [ -n "${self_restart_mark}" ]; then
     echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
     exec /run/s6/basedir/bin/halt
   fi
+fi
+if [ -n "${window_crash}" ]; then
+  # A signal other than TERM inside the self-restart window (above): a crash, told and halted as one,
+  # with 128 plus the signal as the container's exit code.
+  heartbeat_fail "stopped on an error"
+  echo "$(( 128 + ${crash_signal:-0} ))" > /run/s6-linux-init-container-results/exitcode
+  exec /run/s6/basedir/bin/halt
 fi
 if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
   bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
