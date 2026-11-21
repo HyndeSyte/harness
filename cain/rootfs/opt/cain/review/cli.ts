@@ -58,16 +58,6 @@ switch (cmd) {
     // again before every call.
     const g = privacyCheck(b, terms());
     if (!g.ok) fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
-    // The round cap and the usage guard, here first so he hears at once (the runner decides again when
-    // it takes the brief, and its answer is the one that counts).
-    const rounds = readRounds(cfg.roundsFile!);
-    if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
-    const a = admit(rounds!, b, roundCap());
-    if (!a.ok) fail(a.why, 3);
-    const label = labelOf(b.label)!;
-    const gv = guard(label, `review ${b.id} (${(a as any).key}, round ${(a as any).round})`, { settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile,
-      logFile: cfg.guardLog!, tz: cfg.tz, now: new Date() });
-    if (!gv.ok) fail(`held by the usage guard: it's labelled ${label}, and ${gv.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`, 3);
     // A seat whose monthly cap is reached runs nothing until the month turns (the runner
     // checks before every call). A review whose seats are all there is refused here, at once,
     // and nothing is left (Cain 0.13.0, read here from the spend file his group may read).
@@ -78,6 +68,16 @@ switch (cmd) {
     const capped = [...seats].filter((s) => atCap(ledger, month, settings()?.caps ?? cfg.caps, s));
     if (capped.length && capped.length === seats.size)
       fail(`blocked: the monthly cap is reached for ${capped.map((s) => LABEL[s]).join(", ")}. Nothing was queued; raise the cap in the App's options if wanted, or wait for the month to turn.`, 3);
+    // The round cap and the usage guard, here first so he hears at once (the runner decides again when
+    // it takes the brief, and its answer is the one that counts).
+    const rounds = readRounds(cfg.roundsFile!);
+    if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
+    const a = admit(rounds!, b, roundCap());
+    if (!a.ok) fail(a.why, 3);
+    const label = labelOf(b.label)!;
+    const gv = guard(label, `review ${b.id} (${(a as any).key}, round ${(a as any).round})`, { settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile,
+      logFile: cfg.guardLog!, tz: cfg.tz, now: new Date() });
+    if (!gv.ok) fail(`held by the usage guard: it's labelled ${label}, and ${gv.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`, 3);
     leave(b);
     out(b.id);
     if (capped.length) console.error(`Queued, but ${capped.map((s) => LABEL[s]).join(", ")} won't run: its monthly cap is reached.`);

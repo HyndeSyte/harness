@@ -130,12 +130,14 @@ def test_cain_config_denies_every_api_and_mapping():
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  owner_user_id: ""\n  notice_hook: ""\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n'
+        '  owner_user_id: ""\n  notice_hook: ""\n'
         '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
+        "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n"
+        "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
         "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n")
 
@@ -2653,8 +2655,9 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
             '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector"])' in auth.replace("\r\n", "\n"))
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and
-    # /pc-notice (the keeper runs as root, so being root is its key).
-    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice"])' in auth
+    # /pc-notice (the keeper runs as root, so being root is its key), and (Cain 0.16.0) the
+    # review runner's decision card at the round cap, so Cain can't post it.
+    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision"])' in auth
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")
