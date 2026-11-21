@@ -18,3 +18,5 @@ ac6bbfe3bc989089cf59c031360bec57a91eb97d:cain/tests/owner-gate.test.ts:generic-a
 cb2e92b6d9d8fb850c87efba4149d83364b16fe1:tests/test_watch.py:generic-api-key:501
 # A dummy review service key ("test-key-0123456789abcdef") the test's local fake server checks.
 91458797b0d51400404db57e0f8a57045639b099:cain/tests/review.test.ts:generic-api-key:391
+# A made-up "token=abc123def456" value in a scrub test: checks a refusal built from an exception is not kept as his words.
+12eaacbd1300e2c8f3e581663fe669adbff5b088:tests/test_outbox_round28.py:generic-api-key:58
