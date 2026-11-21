@@ -16,7 +16,7 @@ import { closeSync, fchmodSync, fchownSync, fsyncSync, mkdirSync, openSync, read
 import { dirname, join } from "node:path";
 import { CAIN_GID, ROOT_UID } from "../capfiles.ts";
 import { grantedNote } from "./core.ts";
-import { countedRounds, groupOf, type Rounds } from "./rounds.ts";
+import { countedRounds, decisionOf, groupOf, type Rounds } from "./rounds.ts";
 
 export const GRANTS_FORMAT = 1;
 export const GRANT_MAX = 3;                   // one card grants 1 to 3 rounds
@@ -28,7 +28,13 @@ export type GrantRec = {
   message: string;                            // the card's Discord message
   reason: string;                             // the reason Cain gave on the card
   item: string | null; pr: string | null;
+  // Cain 0.18.1 (third review of 0.18.0): the state his tap approved, the very values the tap's final
+  // re-check compared under the change key's lock: the pull request's head (null for a change key with no
+  // pull request), the change's newest decision id (or null), the round count used, and the cap before
+  // this grant. The runner counts the grant only while that state still holds when a round claims it.
+  bound?: GrantBinding;
 };
+export type GrantBinding = { head: string | null; decision: string | null; used: number; cap: number };
 export type Grants = { format: number; grants: GrantRec[] };
 export const emptyGrants = (): Grants => ({ format: GRANTS_FORMAT, grants: [] });
 
@@ -53,8 +59,77 @@ export function grantsFor(r: Rounds, g: Grants | null, key: string): GrantRec[] 
   return g.grants.filter((x) => group.has(x.key)).sort((a, b) => a.at.localeCompare(b.at));
 }
 export const grantedRounds = (list: GrantRec[]) => list.reduce((n, x) => n + x.rounds, 0);
-export function effectiveCap(base: number, r: Rounds, g: Grants | null, key: string): number {
-  return base + grantedRounds(grantsFor(r, g, key));
+
+// Cain 0.18.1: a grant counts toward the cap only once a round claimed it, or while its binding still
+// matches the change as it is (so the next round may claim it). Why one doesn't count:
+export type StaleWhy = "head" | "decision" | "rounds" | "cap" | "unbound";
+export const STALE_SHORT: Record<StaleWhy, string> = {
+  head: "the pull request moved on", decision: "a newer decision came", rounds: "its rounds moved on",
+  cap: "its cap changed", unbound: "it was given before grants were bound",
+};
+export const STALE_LONG: Record<StaleWhy, string> = {
+  head: "it was given for the pull request as it stood then, but the pull request has new commits since",
+  decision: "a newer decision on the change came after it was given",
+  rounds: "the change's review rounds moved on after it was given",
+  cap: "the change's cap changed after it was given",
+  unbound: "it was granted before grants were bound to the change as it stood, so it can't be matched to what he approved",
+};
+export type Standing = {
+  counting: GrantRec[];                       // claimed by a round already: count in full
+  claimable: GrantRec[];                      // binding matches now: the next round claims them
+  waiting: GrantRec[];                        // bound to a head, and the brief named none: not matched, not voided
+  stale: { rec: GrantRec; why: StaleWhy }[];  // never count
+  prior: number;                              // the cap from the claimed grants alone
+};
+export const validBinding = (b: any): b is GrantBinding => !!b && typeof b === "object"
+  && (b.head === null || (typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)))
+  && (b.decision === null || typeof b.decision === "string")
+  && Number.isInteger(b.used) && b.used >= 0 && Number.isInteger(b.cap) && b.cap >= 1;
+// Which round claimed which grant (the runner's rounds file, RoundRec.claims), across the group.
+export function claimsOf(r: Rounds, key: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const k of groupOf(r, key)) for (const x of r.changes[k]?.rounds ?? []) for (const id of x.claims ?? []) if (!out.has(id)) out.set(id, x.id);
+  return out;
+}
+// head: the pull request's head now (the brief's), null when the brief named none, undefined when not
+// known here (status lines and the link: the head is checked only when a round claims the grant).
+export function standing(base: number, r: Rounds, g: Grants | null, key: string, head?: string | null): Standing {
+  const list = grantsFor(r, g, key);
+  const claimed = claimsOf(r, key);
+  const counting = list.filter((x) => claimed.has(x.id));
+  const prior = base + grantedRounds(counting);
+  const used = countedRounds(r, key).length;
+  const dec = decisionOf(r, key)?.id ?? null;
+  const s: Standing = { counting, claimable: [], waiting: [], stale: [], prior };
+  for (const x of list) {
+    if (claimed.has(x.id)) continue;
+    const voided = r.grants_void?.[x.id];
+    const b = x.bound;
+    const why: StaleWhy | null = voided ? voided.why
+      : !validBinding(b) ? "unbound"
+      : b.decision !== dec ? "decision"
+      : b.used !== used ? "rounds"
+      : b.cap !== prior ? "cap"
+      : b.head !== null && typeof head === "string" && head.toLowerCase() !== b.head ? "head"
+      : null;
+    if (why) s.stale.push({ rec: x, why });
+    else if (b!.head !== null && head === null) s.waiting.push(x);
+    else s.claimable.push(x);
+  }
+  return s;
+}
+// The grants that count now (claimed, or claimable), in time order.
+export const countingGrants = (s: Standing) => [...s.counting, ...s.claimable].sort((a, b) => a.at.localeCompare(b.at));
+export function effectiveCap(base: number, r: Rounds, g: Grants | null, key: string, head?: string | null): number {
+  const s = standing(base, r, g, key, head);
+  return s.prior + grantedRounds(s.claimable);
+}
+// "1 grant no longer counts: the pull request moved on"; "" when every grant counts.
+export function staleWords(s: Pick<Standing, "stale">): string {
+  if (!s.stale.length) return "";
+  const whys = [...new Set(s.stale.map((x) => STALE_SHORT[x.why]))];
+  const n = s.stale.length;
+  return `${n} grant${n === 1 ? "" : "s"} no longer count${n === 1 ? "s" : ""}: ${whys.join("; ")}`;
 }
 
 // "2 granted by Dane on Nov 21", or "3 granted by Dane (Nov 21, Nov 22)"; "" when none.

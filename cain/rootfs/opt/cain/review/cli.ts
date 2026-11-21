@@ -17,7 +17,7 @@ import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, s
 import { configFromEnv } from "./config.ts";
 import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
-import { capWords, grantsFor, grantWords, readGrants } from "./grants.ts";
+import { capWords, countingGrants, grantWords, readGrants, staleWords, standing } from "./grants.ts";
 import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
@@ -75,7 +75,7 @@ switch (cmd) {
     // it takes the brief, and its answer is the one that counts).
     const rounds = readRounds(cfg.roundsFile!);
     if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
-    const a = admit(rounds!, b, roundCap(), grants(), cfg.tz);
+    const a = admit(rounds!, b, roundCap(), grants(), cfg.tz, true);
     if (!a.ok) fail(a.why, 3);
     const label = labelOf(b.label)!;
     // Round 2: the guard's log is root's (0640); a refusal here goes to the link, which decides again and
@@ -108,9 +108,12 @@ switch (cmd) {
     // Cain 0.18.0: which round of the change's cap it is, with the grants that raised the cap now.
     if (r!.change && r!.round) {
       const rounds = readRounds(cfg.roundsFile!);
-      const g = rounds ? grantsFor(rounds, grants(), r!.change) : [];
       const base = r!.base_cap ?? (r!.granted?.length ? roundCap() : (r!.cap ?? roundCap()));
-      out(`  ${r!.change}: ${capWords(r!.round, base, g, cfg.tz)}${r!.round_kind === "fixes" ? " (fix-only)" : " (full)"}${rounds ? "" : " (the rounds file can't be read: grants not shown)"}`);
+      // 0.18.1: only the grants that still count; one bound to an older head or decision is said apart.
+      const st = rounds ? standing(base, rounds, grants(), r!.change) : null;
+      const g = st ? countingGrants(st) : [];
+      const sw = st ? staleWords(st) : "";
+      out(`  ${r!.change}: ${capWords(r!.round, base, g, cfg.tz)}${sw ? `, ${sw}` : ""}${r!.round_kind === "fixes" ? " (fix-only)" : " (full)"}${rounds ? "" : " (the rounds file can't be read: grants not shown)"}`);
     }
     break;
   }
@@ -170,9 +173,10 @@ switch (cmd) {
       const done = countedRounds(rounds, key);
       if (!done.length || done[done.length - 1].at < since) continue;
       const d = decisionOf(rounds, key);
-      const g = grantsFor(rounds, gr, key);
+      const st = standing(capN, rounds, gr, key);
+      const g = countingGrants(st);
       const eff = capN + g.reduce((n, x) => n + x.rounds, 0);
-      const gw = grantWords(g, cfg.tz);
+      const gw = [grantWords(g, cfg.tz), staleWords(st)].filter(Boolean).join("; ");
       const atCapNow = done.length >= eff;
       const dec = d && d.round >= done.length ? `, decision card ${d.state === "posted" ? "with him" : "owed"}` : atCapNow ? ", at the cap" : "";
       open.push(`  ${group.join(" + ")}: ${done.length} of ${eff} round${eff === 1 ? "" : "s"}${gw ? ` (${gw})` : ""}${dec}`);

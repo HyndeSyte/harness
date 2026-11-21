@@ -325,6 +325,31 @@ Since the second review of 0.18.0:
 - `review.sh status <id>`, `review.sh spend` and Cain's "Review done" line show the raised cap and the
   grants, for example "round 4 of 5, 2 granted by Dane on Nov 21".
 
+#### A grant is bound to what you approved (since 0.18.1)
+
+The link's lock serializes your taps, but GitHub and the review runner can still move between your
+tap's last check and the moment the grant is written: a push, or a new decision, in that gap. So each
+grant now carries the state your tap checked, under the same lock: the pull request's head commit
+(none for a change with no pull request), the newest decision on the change (or none), the rounds used
+and the cap before the grant. The runner holds every grant to that:
+
+- A grant counts once a round has claimed it, or while its binding still matches the change as it is.
+  The first round past the cap claims it: the runner checks the brief's head, the newest decision and
+  the round count against the grant (a change with no pull request: the decision and the count only),
+  and keeps which round claimed it in `/data/review-rounds.json`, so no grant is claimed twice. Once
+  claimed, all its rounds count, as the fixes move the head on.
+- A grant whose binding no longer matches doesn't count: the round is refused at the cap with a plain
+  line saying why (for example, it was given for the pull request as it stood then, but the pull
+  request has new commits since). The runner keeps it as void in its rounds file and Cain hears it
+  once, so he can ask you for a fresh grant card. A brief that names no head can't claim a grant bound
+  to a head and is refused without voiding it.
+- Grants written by 0.18.0 carry no binding: they never count. The runner finds them once at its first
+  start after the update, logs each and tells Cain once; the grants file itself is never changed.
+- `review.sh status <id>`, `review.sh spend` and Cain's round line say when a grant doesn't count, for
+  example "1 grant no longer counts: the pull request moved on".
+- The link's own view follows the same rule: a grant bound to an older head, decision or count, or to
+  nothing, doesn't keep a fresh grant card from going out.
+
 ### Labels (since 0.16.0)
 
 Every brief, and every Build or Ship job Cain starts, carries one label: `core` (Cain answering you,

@@ -478,6 +478,9 @@ export type Review = {
   // Cain 0.18.0: the owner's grants that raised its cap (cap is then base_cap plus their rounds), as the
   // runner read them when it took the brief.
   granted?: { rounds: number; at: string }[]; base_cap?: number;
+  // Cain 0.18.1: grants of the change that didn't count when the runner took the brief, in a few words
+  // ("1 grant no longer counts: the pull request moved on").
+  stale_grants?: string;
 };
 // "round 4 of 5, 2 granted by Dane on Nov 21" for a round under a raised cap; "" when none was granted.
 export function grantedNote(r: Pick<Review, "granted">, tz = "America/New_York"): string {
@@ -662,7 +665,7 @@ export function relayLine(r: Review): string {
 // how many serious findings are left. Ids, counts and fixed words only.
 export function roundLine(r: Review): string | null {
   if (!r.change || !r.round) return null;
-  const g = grantedNote(r);
+  const g = [grantedNote(r), r.stale_grants ?? ""].filter(Boolean).join(", ");
   const of = r.cap ? ` of ${r.cap}${g ? `, ${g},` : ""}` : "";
   const kind = r.round_kind === "fixes" ? "fix-only" : "full";
   // Round 2: a round that ended with no seat answering is lost, and still counts.

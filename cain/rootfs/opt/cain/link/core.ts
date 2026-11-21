@@ -86,7 +86,7 @@ import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, imperative, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { keyOfRef, safeId } from "../review/core";
-import { effectiveCap, GRANT_MAX, grantedRounds, grantsFor, GrantUnsaved, lastRound, type GrantRec, type Grants } from "../review/grants";
+import { countingGrants, effectiveCap, GRANT_MAX, grantedRounds, GrantUnsaved, lastRound, standing, type GrantRec, type Grants } from "../review/grants";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
@@ -1667,9 +1667,8 @@ export class Link {
     const base = this.d.roundCap?.() ?? 3;
     const used = countedRounds(rounds, key).length;
     if (!used) throw new Refusal(`${key} has had no review round yet: nothing to grant`);
-    const had = grantsFor(rounds, grants, key);
-    const cap = effectiveCap(base, rounds, grants, key);
-    if (used < cap) throw new Refusal(`${key} has rounds left (${used} of ${cap} used): nothing to grant. Submit its next fix-only round as usual`);
+    // 0.18.1: the cap counts only grants that still count (claimed by a round, or still bound to the change
+    // as it is, its pull request's head included): checked once the head is read, below.
     const last = lastRound(rounds, key);
     if (last.state === "running" || last.state === "none") throw new Refusal(`${key}'s last review round hasn't finished yet: ask once it has`);
     this.mayAsk(meta.item);
@@ -1685,6 +1684,10 @@ export class Link {
       if (typeof h !== "string") throw new Refusal(`the pull request's head can't be read from GitHub right now (${h.unknown}), so no grant card can go out: ask again in a minute`);
       head = h;
     }
+    const st = standing(base, rounds, grants, key, prUrl ? head : undefined);
+    const had = countingGrants(st);
+    const cap = effectiveCap(base, rounds, grants, key, prUrl ? head : undefined);
+    if (used < cap) throw new Refusal(`${key} has rounds left (${used} of ${cap} used): nothing to grant. Submit its next fix-only round as usual`);
     const w = this.cainWords("grant", "grant card", why.replace(/[.\s]+$/, ""), { rules: CARD_RULES, buttons: [grantLabel(n), GRANT_NO], known: this.liveLabels() }, { reviewed: true });
     const left = last.state === "lost" ? "its last round did not complete, so what it would have found isn't known"
       : last.serious ? `its last round still left ${last.serious === 1 ? "one serious finding" : `${last.serious} serious findings`}`
@@ -1788,8 +1791,15 @@ export class Link {
     try { rounds = this.d.rounds?.() ?? null; } catch { rounds = null; }
     try { grants = this.d.grants?.() ?? null; } catch { grants = null; }
     if (!rounds || !grants) return { line: grantRetry("The review records"), retry: true };
+    // 0.18.1: the pull request's head is read first, so the cap counts only the grants still bound to it.
+    let h: string | undefined;
+    if (g.pr) {
+      const x = await this.headNow(g.pr);
+      if (typeof x !== "string") return { line: grantRetry("The pull request's newest commit"), retry: true };
+      h = x;
+    }
     const used = countedRounds(rounds, g.key).length;
-    const cap = effectiveCap(this.d.roundCap?.() ?? 3, rounds, grants, g.key);
+    const cap = effectiveCap(this.d.roundCap?.() ?? 3, rounds, grants, g.key, h);
     if (used < cap) return { line: "That change has rounds left now, so this grant isn't needed" };
     const last = lastRound(rounds, g.key);
     if (last.state === "running" || last.state === "none") return { line: "That change has a review round running now, so this grant can't be written" };
@@ -1803,11 +1813,7 @@ export class Link {
     if (g.used !== used || g.cap !== cap) return { line: "That change's review rounds have moved on since this card went up, so this grant can't be written" };
     if (g.decision === undefined || g.head === undefined) return { line: "This card was posted before grants were bound to the change as it stood, so this grant can't be written" };
     if ((decisionOf(rounds, g.key)?.id ?? null) !== g.decision) return { line: "A newer decision on that change has come since this card went up, so this grant can't be written" };
-    if (g.pr) {
-      const h = await this.headNow(g.pr);
-      if (typeof h !== "string") return { line: grantRetry("The pull request's newest commit"), retry: true };
-      if (h !== g.head) return { line: "That pull request has new commits since this card went up, so this grant can't be written" };
-    }
+    if (g.pr && h !== g.head) return { line: "That pull request has new commits since this card went up, so this grant can't be written" };
     return null;
   }
 
@@ -1856,7 +1862,10 @@ export class Link {
       return { note: ` No rounds were granted: ${g.key} stays at its cap.`, replaced: [] };
     }
     const rec: GrantRec = { id: `${g.key}+${msgId}`, key: g.key, rounds: g.rounds, by: "owner", at: new Date(at).toISOString(),
-      message: msgId, reason: g.reason, item: m.item && m.item !== "none" ? m.item : null, pr: g.pr };
+      message: msgId, reason: g.reason, item: m.item && m.item !== "none" ? m.item : null, pr: g.pr,
+      // 0.18.1: bound to the state the card was posted on, which grantBlock's final re-check (just now, under
+      // this change key's lock) found unchanged: the runner counts it only while that state still holds.
+      bound: { head: g.head ?? null, decision: g.decision ?? null, used: g.used!, cap: g.cap! } };
     let kept: { rec: GrantRec; existed: boolean };
     try {
       if (!this.d.grant) throw new GrantUnsaved("the link has nowhere to keep it");

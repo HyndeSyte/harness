@@ -16,7 +16,7 @@ import {
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
-import { effectiveCap, readGrants, type Grants } from "./grants.ts";
+import { effectiveCap, grantWords, readGrants, STALE_LONG, standing, staleWords, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
@@ -267,6 +267,9 @@ export class Runner {
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
     const a = admit(rounds, b, this.roundCap, this.grants(), this.cfg.tz);
+    // 0.18.1: grants no longer bound to the change as it is are kept as void (in the rounds file, the
+    // runner's own) and told to Cain once, whether this round is refused or runs under other grants.
+    if (a.key && a.stale?.length && this.voidGrants(rounds, a.key, a.stale)) writeRounds(file, rounds);
     if (!a.ok) return a.why;
     const label = labelOf(b.label)!;
     if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
@@ -276,14 +279,52 @@ export class Runner {
     }
     const r = newReview(b, this.now());
     Object.assign(r, { change: a.key, round: a.round, cap: a.cap, round_kind: a.kind,
-      ...(a.granted.length ? { granted: a.granted.map((g) => ({ rounds: g.rounds, at: g.at })), base_cap: this.roundCap } : {}) });
+      ...(a.granted.length ? { granted: a.granted.map((g) => ({ rounds: g.rounds, at: g.at })), base_cap: this.roundCap } : {}),
+      ...(a.stale.length ? { stale_grants: staleWords(a) } : {}) });
     if (a.kind === "fixes") r.earlier = this.earlierFindings(rounds, a.key);
     // The round is kept before the review is queued: a stop between the two counts a round that never
     // ran (fails safe), never runs one that wasn't counted.
     addRound(rounds, b, a, this.now().toISOString());
     writeRounds(file, rounds);
     saveReview(this.cfg.queueDir, r);
+    if (a.claims.length) this.log(`review ${b.id} (${a.key}, round ${a.round}) claimed the owner's grant${a.claims.length === 1 ? "" : "s"} ${a.claims.join(", ")}`);
     return null;
+  }
+  // Grants found not to count, kept under grants_void once each, logged and told to Cain once (the link
+  // delivers the relay queue). True when any was new (the caller writes the rounds file).
+  private voidGrants(rounds: Rounds, key: string, stale: { rec: GrantRec; why: StaleWhy }[]): boolean {
+    const v = rounds.grants_void ??= {};
+    let any = false;
+    for (const { rec, why } of stale) {
+      if (v[rec.id]) continue;
+      v[rec.id] = { why, at: this.now().toISOString(), key: rec.key };
+      any = true;
+      const n = rec.rounds;
+      this.log(`the owner's grant ${rec.id} (${n} round${n === 1 ? "" : "s"} for ${rec.key}) doesn't count: ${why}`);
+      this.relay(`Dane's grant of ${n} more review round${n === 1 ? "" : "s"} for ${rec.key} (${grantWords([rec], this.cfg.tz).replace(/^\d+ /, "")}) no longer counts: ${STALE_LONG[why]}. `
+        + `So a round past ${key}'s cap is refused. If the change still needs more fix rounds, ask him for a fresh grant with keeper.sh review-grant once its last round is done; the old grant stays on file and never counts. Nothing else to tell him.`);
+    }
+    return any;
+  }
+  // 0.18.1: grants written by 0.18.0 carry no binding, so they never count: found once at the runner's
+  // start (retried each tick until both files read), kept as void, logged and told to Cain once each.
+  private swept = false;
+  sweepUnbound(): void {
+    const file = this.cfg.roundsFile;
+    if (this.swept || !file || this.capOff || !this.cfg.grantsFile) return;
+    const rounds = readRounds(file), g = this.grants();
+    if (!rounds || !g) return;
+    this.swept = true;
+    const seen = new Set<string>();
+    let any = false;
+    for (const x of g.grants) {
+      if (seen.has(x.key)) continue;
+      seen.add(x.key);
+      const st = standing(this.roundCap, rounds, g, x.key);
+      const unbound = st.stale.filter((y) => y.why === "unbound");
+      if (unbound.length && this.voidGrants(rounds, x.key, unbound)) any = true;
+    }
+    if (any) writeRounds(file, rounds);
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
   private earlierFindings(rounds: Rounds, key: string): string[] {
@@ -387,7 +428,7 @@ export class Runner {
   }
 
   async tick(): Promise<void> {
-    try { this.recoverLost(); this.ingest(); await this.reviews(); }
+    try { this.recoverLost(); this.sweepUnbound(); this.ingest(); await this.reviews(); }
     finally {
       if (this.publishOwed) this.publishReviewed();
       try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }

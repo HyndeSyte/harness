@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.18.1
+
+- A grant of more review rounds now holds the state you approved with your tap: the pull request's newest commit, the newest decision, the rounds used and the cap before it.
+- If the pull request gets new commits, or a newer decision comes, between your tap and the next round, the grant no longer counts: that round is refused, Cain hears once why, and he can ask you again on a fresh card.
+- A grant is used up by one round: the round that claims it is kept, so it can't be claimed twice.
+- Grants made before this version no longer count. They stay on file, and Cain hears once so he can ask you again if the change still needs rounds.
+- Cain's review lines say when a grant no longer counts, like "1 grant no longer counts: the pull request moved on".
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart: nothing about those changed here.
+
 ## 0.18.0
 
 - When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".

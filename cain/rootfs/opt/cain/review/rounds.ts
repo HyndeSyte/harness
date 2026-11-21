@@ -27,13 +27,14 @@
 import { chmodSync, chownSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
-import { grantsFor, grantedRounds, grantWords, type GrantRec, type Grants } from "./grants.ts";
+import { countingGrants, grantedRounds, grantWords, standing, STALE_LONG, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
 
 export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
 
 export type RoundState = "started" | "answered" | "lost";
-export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundState; blocked?: boolean; done?: boolean; serious?: number };
+// claims (0.18.1): the owner's grants this round claimed (their ids): each grant is claimed by exactly one round.
+export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundState; blocked?: boolean; done?: boolean; serious?: number; claims?: string[] };
 export type DecisionRec = {
   id: string;                        // the decision's own id: "<key>#<round>", what the link files the tap under
   key: string; round: number; serious: number;
@@ -42,7 +43,10 @@ export type DecisionRec = {
   lost?: boolean;                    // the cap's last round never produced a result (round 2)
 };
 export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec; past?: DecisionRec[] };
-export type Rounds = { format: number; changes: Record<string, ChangeRec> };
+// grants_void (0.18.1): grants the runner found no longer bound to the change as it is (or never bound),
+// by grant id, kept so each is told to Cain once and never counts again. The grants file isn't touched.
+export type VoidRec = { why: StaleWhy; at: string; key: string };
+export type Rounds = { format: number; changes: Record<string, ChangeRec>; grants_void?: Record<string, VoidRec> };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
 
@@ -92,12 +96,17 @@ export function decisionOf(r: Rounds, key: string): DecisionRec | null {
   return best;
 }
 
-export type Admit = { ok: true; key: string; round: number; kind: RoundKind; links: string[]; cap: number; granted: GrantRec[] } | { ok: false; why: string };
+// stale (0.18.1): grants of the group that don't count, with why (the runner keeps the new ones under
+// grants_void and tells Cain once); claims: the grants this round claims.
+export type Admit = { ok: true; key: string; round: number; kind: RoundKind; links: string[]; cap: number; granted: GrantRec[]; claims: string[]; stale: { rec: GrantRec; why: StaleWhy }[] }
+  | { ok: false; why: string; key?: string; stale?: { rec: GrantRec; why: StaleWhy }[] };
 
 // Whether a brief may be a new round, and which: the rules A and C of the cap, before anything is
 // queued. The reason is plain, names the count and the rule, and is what review.sh prints.
 // grants (0.18.0): the owner's grants, read by the caller (null when they can't be read: none count).
-export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null = null, tz?: string): Admit {
+// headUnknown (0.18.1): review.sh's early check, which doesn't hold the head GitHub has; a grant's head is
+// then checked only by the runner, which decides, keeps a grant that moved on as void and tells Cain once.
+export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null = null, tz?: string, headUnknown = false): Admit {
   const key = changeKeyOf(b);
   if (!key) return { ok: false, why: "a brief names the change it reviews: pr for a pull request, or change (a stable key) for a plan or document. Nothing was queued." };
   const links: string[] = [];
@@ -107,23 +116,32 @@ export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null =
     if (old !== key) links.push(old);
   }
   // The group as it will be with this brief's link.
-  const view: Rounds = { format: r.format, changes: { ...r.changes } };
+  const view: Rounds = { ...r, changes: { ...r.changes } };
   if (links.length) view.changes[key] = { ...(view.changes[key] ?? { rounds: [] }), links: [...new Set([...(view.changes[key]?.links ?? []), ...links])] };
   const done = countedRounds(view, key);
   const n = done.length;
-  const granted = grantsFor(view, grants, key);
+  // 0.18.1: a grant counts once claimed, or when its binding matches the change as it is now, the brief's
+  // head included; this round claims the matching ones when it's past the cap without them.
+  const st = standing(base, view, grants, key, headUnknown ? undefined : (b.head ?? null));
+  const claims = n >= st.prior ? st.claimable.map((x) => x.id) : [];
+  const granted = n >= st.prior ? countingGrants(st) : st.counting;
   const cap = base + grantedRounds(granted);
   if (n >= cap) {
     const d = decisionOf(view, key);
     const g = grantWords(granted, tz);
-    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}. No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} More rounds come only from a grant: Cain asks with keeper.sh review-grant, and only the owner's tap on that card grants them; it never exempts the change from the rule. Nothing was queued.` };
+    const notes = [
+      ...st.stale.map((x) => ` His grant of ${x.rec.rounds} more round${x.rec.rounds === 1 ? "" : "s"} (${grantWords([x.rec], tz).replace(/^\d+ /, "")}) doesn't count: ${STALE_LONG[x.why]}.`),
+      ...st.waiting.map((x) => ` His grant of ${x.rounds} more round${x.rounds === 1 ? "" : "s"} was given for the pull request at a given head, and this brief names no head, so it can't be matched: send the brief again with the pull request's head.`),
+    ].join("");
+    const fresh = st.stale.length ? " If the change still needs rounds, a fresh grant card is the way: keeper.sh review-grant." : "";
+    return { ok: false, key, stale: st.stale, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}.${notes}${fresh} No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} More rounds come only from a grant: Cain asks with keeper.sh review-grant, and only the owner's tap on that card grants them; it never exempts the change from the rule. Nothing was queued.` };
   }
   const kind: RoundKind = b.round_kind ?? (n === 0 ? "full" : "fixes");
   if (kind === "full" && n > 0)
     return { ok: false, why: `refused: ${key} has had ${n} round${n === 1 ? "" : "s"} already, so this one is a fix-only round: leave round_kind out or set it to fixes, and list only the fixes. Nothing was queued.` };
   if (kind === "fixes" && n === 0)
     return { ok: false, why: `refused: ${key} has had no round yet, so there's nothing to check fixes against: its first round is full. Nothing was queued.` };
-  return { ok: true, key, round: n + 1, kind, links, cap, granted };
+  return { ok: true, key, round: n + 1, kind, links, cap, granted, claims, stale: st.stale };
 }
 
 // Kept once the review is queued.
@@ -132,7 +150,7 @@ export function addRound(r: Rounds, b: Brief, a: Extract<Admit, { ok: true }>, a
   if (a.links.length) c.links = [...new Set([...(c.links ?? []), ...a.links])];
   if (b.pr) c.pr = b.pr;
   c.topic = b.topic;
-  c.rounds.push({ id: b.id, at, kind: a.kind, state: "started" });
+  c.rounds.push({ id: b.id, at, kind: a.kind, state: "started", ...(a.claims.length ? { claims: a.claims } : {}) });
 }
 
 export function roundById(r: Rounds, key: string, id: string): RoundRec | null {
