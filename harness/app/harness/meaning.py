@@ -52,6 +52,7 @@ from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from . import caldav, family_rules, google_cal, ical, policy, render
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .engines import call_with_retries
 from .family_gmail import DROP_AFTER, DROP_BEFORE, DROP_TITLE, PICK_AFTER, PICK_BEFORE, PICK_TITLE, _is_real, _short, plan as old_plan, school_plan
 from .ledger import Ledger, iso
@@ -1160,7 +1161,7 @@ class MeaningShadow:
                 try:
                     j = parse_judgment(res.output, span_of(item.occ, self.tz), cand_ids)
                 except JudgmentError as e:
-                    why = str(e)
+                    why = scrubbed(e)
             elif res is not None:
                 why = res.status
             store(self.ledger, ev, item, self.tz, j, examples_ver=ver,

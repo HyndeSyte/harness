@@ -395,6 +395,9 @@ def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime
     return fit("\n".join(lines))
 
 
-def proposal_buttons(nonce: str) -> list[list[tuple[str, str]]]:
-    return [[("Approve", approvals.callback_data("approve", nonce)),
-             ("Decline", approvals.callback_data("decline", nonce))]]
+def proposal_buttons(nonce: str, *, approve: str = "Approve",
+                     decline: str = "Decline") -> list[list[tuple[str, str]]]:
+    """Approve and Decline; an add whose slot already holds one like it says Add anyway and Leave
+    it (calendar_change, 0.24.0), the same tap underneath."""
+    return [[(approve, approvals.callback_data("approve", nonce)),
+             (decline, approvals.callback_data("decline", nonce))]]

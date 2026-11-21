@@ -69,7 +69,7 @@ DROP_OFF = change("family", "remove", "school drop-off")          # as the model
 class Gmail(FakeGmail):
     """His Gmail calendar as the Google API gives it, all-day events too."""
 
-    def events_between(self, address, start, end):
+    def events_between(self, address, start, end, fresh=False):
         out = []
         for e in self.events.values():
             if e.get("status") == "cancelled":
@@ -114,7 +114,7 @@ class Morning:
                             requests=queue.Queue(), poll_timeout=0, family_add=self.fa, calendar_change=self.cc)
         self.c.discord = DiscordKeeper(self.d, store.get, store.set)
         self.c.discord_chat = LinkChat(self.link, paused=lambda: commands.is_paused(ledger))
-        self.c.handovers = Inbox(lambda: TOKEN)
+        self.c.handovers = Inbox.for_tests(lambda: TOKEN)
         self.seed()
         self.days_done()
         self.c.startup()
@@ -164,9 +164,11 @@ class Morning:
 
     # -- what he does ---------------------------------------------------------------------------
     def he_says(self, text, *, ago=5, **extra):
-        mid = str(80000 + len(self.d.hist))
-        when = (self.clock() - timedelta(seconds=ago)).isoformat()
-        self.d.hist.insert(0, {"id": mid, "content": text, "timestamp": when, "author": {"id": OWNER}, **extra})
+        """His message, with a real Discord id: a snowflake whose time is when he sent it."""
+        sent = self.clock() - timedelta(seconds=ago)
+        mid = str(((int(sent.timestamp() * 1000) - 1_420_070_400_000) << 22) + len(self.d.hist))
+        self.d.hist.insert(0, {"id": mid, "content": text, "timestamp": sent.isoformat(), "author": {"id": OWNER},
+                               **extra})
         return mid
 
     def send(self, h):
@@ -427,7 +429,7 @@ def test_a_copy_that_fails_says_where_it_went_through(m):
     assert m.gmail_times(PT_ID) == ("11:30", "12:30")
     assert receipt.startswith("That stopped partway.") or receipt.startswith("Only part")
     assert ("Partly done: Move PT to 11:30 to 12:30 today (Gmail and Family). It went through on Gmail, "
-            "not on the Family copy, because someone changed that event since") in receipt
+            "not on the Family copy, because the event changed there since your card") in receipt
 
 
 # -- g. a block Harness made is found where it is -----------------------------------------------

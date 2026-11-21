@@ -24,7 +24,7 @@ turns them into his calendar and lets him correct it, all model-free:
     but not confirmed, with the same buttons:
     [Not mine] removes it and stores "nothing" for that kind; [Wrong time] removes it and
     stores the obligation with its window marked untrusted, so the next one asks;
-    [Just this once] removes only that block and stores nothing. A block removed by hand on
+    [Not this time] removes only that block and stores nothing. A block removed by hand on
     Google teaches nothing.
   * What he told Cain a kind of event means, sent by Cain from his record (handover.py
     /meanings), stored as confirmed examples with source "dane-via-cain". Strictly checked:
@@ -76,7 +76,7 @@ CRITICAL_ASK = {"supervision": "are you watching the kids?", "transport": "are y
 CRITICAL_BUTTONS = (("Yes", "yes"), ("No", "no"), ("Depends", "depends"))
 PRESENCE_BUTTONS = (("All of it", "all"), ("Part of it", "part"), ("No", "no"))
 UNDO_BUTTONS = (("Not mine", "not_mine"), ("Wrong time", "wrong_time"),
-                ("Just this once", "once"))
+                ("Not this time", "once"))
 ANSWERS = frozenset(c for _, c in CRITICAL_BUTTONS + PRESENCE_BUTTONS)
 UNDOS = frozenset(c for _, c in UNDO_BUTTONS)
 
@@ -753,7 +753,7 @@ class MeaningLive:
         said = render.escape(r["said"])
         return {"not_mine": f"Taking it off your Gmail. I'll leave {said} off from now on.",
                 "wrong_time": f"Taking it off your Gmail. Next time {said} comes up, I'll ask first.",
-                "once": "Taking it off your Gmail, just this once."}[code]
+                "once": "Taking it off your Gmail, this time only."}[code]
 
     # -- questions ---------------------------------------------------------------------------------
     def tick(self, *, paused: bool) -> None:

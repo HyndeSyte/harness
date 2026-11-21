@@ -51,6 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zoneinfo import ZoneInfo
 
 from . import ical
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 
 log = logging.getLogger("harness.family")
 
@@ -277,7 +278,7 @@ class FamilyInbox:
                 push = parse(body, entity=self.entity, now=now,
                              last_generated=datetime.fromisoformat(last) if last else None)
             except Rejected as e:
-                self._refused(now, str(e))
+                self._refused(now, scrubbed(e))
                 raise
             if not pinned:
                 self._d["key_hash"] = _hash(key)
@@ -431,7 +432,7 @@ def make_handler(inbox: FamilyInbox, allowed_peers: tuple[str, ...]):
                 code = (HTTPStatus.UNAUTHORIZED if str(e) in ("no key", "wrong key")
                         else HTTPStatus.CONFLICT if str(e) == "replayed"
                         else HTTPStatus.BAD_REQUEST)
-                return self._send(code, str(e))
+                return self._send(code, scrubbed(e))
             return self._send(HTTPStatus.NO_CONTENT)
 
     return Handler

@@ -1,0 +1,6 @@
+# Not part of the image: what's left by running the tests or Python locally. The build id
+# (buildid.py) skips these too, so the image's id equals the source tree's (tenth round).
+**/__pycache__
+**/*.pyc
+**/*.pyo
+app/BUILD_ID

@@ -293,6 +293,91 @@ def _one_change(c: Any) -> None:
             raise ChangeRefusal("one day of a series can't run longer than 24 hours")
 
 
+_NEEDS = {"remove": ("dates",), "end_series": ("dates", "days"), "move": ("dates", "start", "end"),
+          "add": ("start", "end"), "add_series": ("start", "end", "days", "until", "every"),
+          "rule": ("kind",)}
+
+
+_LOAD_BEARING = ("calendar", "op", "title", "dates", "start", "end", "days", "kind")
+
+
+def _sound(key: str, value: str) -> bool:
+    """A load-bearing field as the model wrote it, well formed: a repair never makes one so."""
+    if key == "calendar":
+        return value in ("family", "gmail")
+    if key == "dates":
+        return all(DATE_RE.fullmatch(x) for x in value.split(","))
+    if key in ("start", "end"):
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
+    return True
+
+
+def repair_fields(output) -> tuple[dict | None, list[str]]:
+    """A calendar change whose shape is off only in fields that can't change what it does: a field
+    its op doesn't use filled in, a cosmetic one (its location, the summary) left out or null, a key
+    that isn't one. Those are made empty or dropped, and the result is parsed again like any reply,
+    with the fields it touched named, for the card. What it does (the calendar, the op, the event's
+    title and days, its start and end, the days a series repeats on, a rule's kind) is never filled
+    in or reshaped: if one of those its op uses is missing or malformed, there's no repair and the
+    one retry runs (Nov 15: a message with two changes failed twice on the reply's shape).
+    (None, []): nothing to repair, or nothing it may."""
+    if not isinstance(output, dict) or output.get("type") != "proposal" \
+            or output.get("effect_type") != CALENDAR_CHANGE:
+        return None, []
+    params = output.get("params")
+    changes = params.get("changes") if isinstance(params, dict) else None
+    if not isinstance(changes, list) or not changes:
+        return None, []
+    fixed, touched = [], []
+    for c in changes:
+        if not isinstance(c, dict) or not isinstance(c.get("op"), str) or c["op"] not in _NEEDS:
+            return None, []
+        needs = set(_NEEDS[c["op"]])
+        bearing = {k for k in _LOAD_BEARING if k in ("calendar", "op", "title") or k in needs}
+        if c["op"] == "end_series":
+            bearing.discard("days")              # empty: every day of the week
+        for key in bearing:
+            v = c.get(key)
+            if not isinstance(v, str) or not v or v != v.strip() or not _sound(key, v):
+                return None, []
+        keep = needs | {"calendar", "op", "title", "location"}
+        one = {}
+        for key in sorted(_CHANGE_KEYS | {"kind", "every"}):
+            v = c.get(key)
+            if key in bearing:
+                one[key] = v
+                continue
+            was = v
+            if v is None or key not in keep:
+                v = ""
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and key == "every":
+                v = str(int(v))
+            if not isinstance(v, str):
+                return None, []
+            v = v.strip()
+            if key in c and v != was:            # an optional key left out is no repair
+                touched.append(key)
+            one[key] = v
+        touched += [k for k in c if k not in one]
+        fixed.append(one)
+    out = {k: output[k] for k in ("type", "effect_type", "summary") if k in output}
+    if not isinstance(out.get("summary"), str) or not out["summary"].strip():
+        out["summary"] = "calendar change"
+        touched.append("summary")
+    out["params"] = {"changes": fixed}
+    if out == output:
+        return None, []
+    return out, sorted(set(touched))
+
+
+def repair(output) -> dict | None:
+    return repair_fields(output)[0]
+
+
 def _changes_shape(p: dict) -> str | None:
     if not p["changes"]:
         raise ChangeRefusal("I couldn't tell what to change")

@@ -66,7 +66,7 @@ its own.
   one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
   one late ping doesn't page you. A second check, pinged only while every liveness check of Cain passes,
   is `probe_heartbeat_url` (**What 0.14.0 does**, below).
-- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.17.0). So Cain
+- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.18.0). So Cain
   can set those checks' grace and period himself, paste a Healthchecks.io management API key once in
   this App's Configuration (in Healthchecks.io: the project's Settings, API Access, a read-write key,
   not the read-only one), then restart the App. Only Cain's link has it; Cain's own user never reads
@@ -293,7 +293,7 @@ reads it but can't write it. The runner writes its own refusals; Cain's Build ho
 send theirs to the link, which checks the guard again itself and writes only a real refusal. If the
 link can't be reached the run is still refused, and the refusal says the hold wasn't logged. Since
 the third round of fixes that route is bounded: at most 6 holds written a minute from each caller (since
-0.17.0's second round, a check that passes doesn't count against them: checks have their own limit of 30 a
+0.18.0's second round, a check that passes doesn't count against them: checks have their own limit of 30 a
 minute, refused with their own reason and no alarm), an
 identical hold logged once in 10 minutes, its description checked like a card (one that fails is
 logged as "a build labelled" and its label), and the log rotated at 256 KB keeping one previous file
@@ -303,7 +303,7 @@ only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and th
 every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
 check-in hands Cain the same two lines for his daily usage row.
 
-What it reads for the plan (since 0.17.0): Cain's Claude Code transcripts under
+What it reads for the plan (since 0.18.0): Cain's Claude Code transcripts under
 `/data/cain/.claude/projects`, subagent transcripts included, and the week's allowance you set by hand,
 the option `plan_weekly_allowance_tokens` (default 4200000000; 0 means not set, and the reading is
 "unknown" as in 0.16.0). The plan's week starts Sunday 12:00 AM in the App's time zone (America/New_York),
@@ -318,14 +318,14 @@ which counts as unknown (it holds other work). Each file's count is kept in `/da
 again and a growing one is read on from where it stopped.
 
 The guard's rules don't change: an unknown reading, an incomplete one, or one older than a day counts as
-below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.17.0
+below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.18.0
 the link decides every `other` Build job too, not only the ones Cain's hook would refuse: a job runs only
 when both readings let it and the link answered. `review.sh guard`'s first line says the percent of the
 week's allowance left, the tokens counted and the week's start, and how many transcript files were read
 and skipped; its second line names each seat's share left and whether other work is held. `review.sh
 spend` shows the runner's own caps and each open change's round count.
 
-Reading it without holding up Discord (0.17.0, second round of review fixes). The first reading after an
+Reading it without holding up Discord (0.18.0, second round of review fixes). The first reading after an
 install is cold: about 100 transcripts and 250 MB on the Pi's SD card. So the review runner warms the cache
 at the App's start and again whenever the week turns (and every 15 minutes between), and the link reads the
 plan in a child process of its own, waiting at most 2 seconds: a reading not ready by then counts as
@@ -356,7 +356,7 @@ fraction). Only you change the option, in the App's Configuration; Cain and the 
 also set `plan_allowance_set_on` (the date, YYYY-MM-DD) and `plan_allowance_derivation` (how you worked it out,
 in a line); the runner writes both beside the allowance, and `review.sh guard`'s first line prints them.
 
-The third round of review fixes (0.17.0):
+The third round of review fixes (0.18.0):
 
 - Alarms never hold up your taps. Each alarm the link raises or clears starts the App's notice script in
   the background, with its own 40 second limit, and the link never waits for it; a notice that fails is

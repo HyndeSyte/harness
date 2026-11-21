@@ -112,7 +112,7 @@ def question_text(place: str, title: str, start: datetime) -> str:
     """A fixed template, the location and the title cleaned and cut short. Nothing a model wrote."""
     from .meaning import shown            # meaning.py imports family_gmail; keep this module light
     return (f"Where is {render.escape(shown(place))}? (for {render.escape(shown(title))}, {_day(start)}) "
-            "Reply with an address, or tap Skip.")
+            "Reply with an address, or skip it with the button below.")
 
 
 class PlaceBook:

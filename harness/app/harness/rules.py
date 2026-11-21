@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 from . import choices, effects, render
+from .scrub import OwnerRefusal
 from .ledger import Ledger, _null, iso
 
 RULE_TYPES = frozenset({"presentation", "drafting", "routing_preference",
@@ -54,8 +55,8 @@ CARD_TTL_S = 7 * 24 * 3600
 AWAITING = ("pending", "legacy_pending")
 
 
-class RuleError(ValueError):
-    pass
+class RuleError(OwnerRefusal, ValueError):
+    """His words: why a rule can't be kept (twenty-eighth round: owner text, scrub.OwnerRefusal)."""
 
 
 @dataclass(frozen=True)

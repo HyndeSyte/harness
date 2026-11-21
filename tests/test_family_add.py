@@ -491,7 +491,7 @@ def test_the_receipt_comes_from_the_response_and_has_undo(on):
     on.press(on.last(), "Approve")
     _, text, buttons, _ = on.with_button("Undo")
     assert "Added to the Family calendar" in text and "HTTP" not in text and "job" not in text
-    assert text.endswith("Nothing to do if that's right; tap Undo if it's wrong.")
+    assert text.endswith("Nothing to do if that's right; the button below takes it off if it's wrong.")
     assert "Tue Oct 27, 2026, 3:00 PM to 4:00 PM EDT" in text
     [job] = on.jobs("executed")
     assert on.receipt(job["id"])["uid"] == caldav.uid_for(
