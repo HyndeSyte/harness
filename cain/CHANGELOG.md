@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.18.0
+## 0.19.0
 
 - The usage guard now reads your plan's week: the tokens Cain used since Sunday 12:00 AM against a weekly allowance you set by hand, the new option `plan_weekly_allowance_tokens` (about 4.2 billion to start, worked out from your usage page on Nov 21). Other work runs again while more than 25% of the week is left; the App's docs say how to work the number out again.
 - The token count is right now: each reply counts once instead of once per part, every transcript changed this week is read (subagents too), and a count that had to skip a file says so and holds other work instead of looking complete.
@@ -24,6 +24,21 @@
 - The link writes the Build hook's "not ready" hold line only when its own plan reading is not ready the same way; any other such request is refused and not counted.
 - A heartbeat change whose line couldn't be posted to you now raises an alarm naming the check, at most hourly, and the line is checked against the message gate's rules first.
 - Leftover temp files from an interrupted reset mark write are cleaned up, never one still being written.
+
+## 0.18.0
+
+- When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".
+- Only your tap grants them; Cain's ask alone adds nothing. The rule of three rounds stays, and a grant never lifts the armed rollback that shipping with a risk named needs.
+- If a granted round still leaves something serious, the "Hold it" or "Ship it with that risk" card comes to you again for it.
+- Cain's review lines now show the raised cap, like "round 4 of 5, 2 granted by Dane on Nov 21".
+- Your Grant tap checks everything again before it adds a round: if the change has rounds left by then, a round is running, someone else is working on it, everything is stopped, or its rounds moved on since the card went up, nothing is granted, the card loses its buttons and you see one line saying why.
+- One grant card at a time for a change: Cain can't send a second while one is open, and when you grant on one, any other open grant card for that change loses its buttons ("Replaced by a newer grant").
+- The file that keeps your grants stays readable by Cain's review lines every time it's written or made again.
+- Two taps on a grant card, or the same tap arriving twice, add the rounds once: the second finds the card already answered.
+- A grant card holds the pull request's newest commit and the newest decision from when it went up; if either changed by your tap, nothing is granted and you see why.
+- A grant card that went out of date, or whose message is gone, no longer blocks a new one: it loses its buttons ("Replaced by a newer card") and the new card goes up.
+- If the records can't be read for a moment when you tap Grant, the card stays up and asks you to try again in a minute.
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.17.0
 

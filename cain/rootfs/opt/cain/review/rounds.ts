@@ -19,9 +19,15 @@
 // counted but its review never made it to the queue). A lost round still counts (the count stays
 // conservative), and a lost round that is the cap's last owes the decision card too, saying the final
 // review did not complete.
+//
+// Cain 0.18.0: the cap for a change is the base cap plus the rounds the owner granted it (grants.ts), on
+// his tap only. A round under the raised cap is fix-only like any later round. A granted round that again
+// leaves something serious at the raised cap owes a new decision card (one per round number): the newest
+// decision is the one that counts, and the earlier ones are kept under `past`.
 import { chmodSync, chownSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
+import { grantsFor, grantedRounds, grantWords, type GrantRec, type Grants } from "./grants.ts";
 
 export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
@@ -35,7 +41,7 @@ export type DecisionRec = {
   state: "owed" | "posted"; at: string; message?: string; tries?: number;
   lost?: boolean;                    // the cap's last round never produced a result (round 2)
 };
-export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec };
+export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec; past?: DecisionRec[] };
 export type Rounds = { format: number; changes: Record<string, ChangeRec> };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
@@ -79,16 +85,19 @@ export function countedRounds(r: Rounds, key: string): (RoundRec & { key: string
   return groupOf(r, key).flatMap((k) => (r.changes[k]?.rounds ?? []).map((x) => ({ ...x, key: k })))
     .filter((x) => !x.blocked).sort((a, b) => a.at.localeCompare(b.at));
 }
+// The group's newest decision (the highest round): since 0.18.0 a granted round can owe another.
 export function decisionOf(r: Rounds, key: string): DecisionRec | null {
-  for (const k of groupOf(r, key)) if (r.changes[k]?.decision) return r.changes[k].decision!;
-  return null;
+  let best: DecisionRec | null = null;
+  for (const k of groupOf(r, key)) { const d = r.changes[k]?.decision; if (d && (!best || d.round > best.round)) best = d; }
+  return best;
 }
 
-export type Admit = { ok: true; key: string; round: number; kind: RoundKind; links: string[] } | { ok: false; why: string };
+export type Admit = { ok: true; key: string; round: number; kind: RoundKind; links: string[]; cap: number; granted: GrantRec[] } | { ok: false; why: string };
 
 // Whether a brief may be a new round, and which: the rules A and C of the cap, before anything is
 // queued. The reason is plain, names the count and the rule, and is what review.sh prints.
-export function admit(r: Rounds, b: Brief, cap: number): Admit {
+// grants (0.18.0): the owner's grants, read by the caller (null when they can't be read: none count).
+export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null = null, tz?: string): Admit {
   const key = changeKeyOf(b);
   if (!key) return { ok: false, why: "a brief names the change it reviews: pr for a pull request, or change (a stable key) for a plan or document. Nothing was queued." };
   const links: string[] = [];
@@ -102,16 +111,19 @@ export function admit(r: Rounds, b: Brief, cap: number): Admit {
   if (links.length) view.changes[key] = { ...(view.changes[key] ?? { rounds: [] }), links: [...new Set([...(view.changes[key]?.links ?? []), ...links])] };
   const done = countedRounds(view, key);
   const n = done.length;
+  const granted = grantsFor(view, grants, key);
+  const cap = base + grantedRounds(granted);
   if (n >= cap) {
     const d = decisionOf(view, key);
-    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${cap}. No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} Nothing was queued.` };
+    const g = grantWords(granted, tz);
+    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}. No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} More rounds come only from a grant: Cain asks with keeper.sh review-grant, and only the owner's tap on that card grants them; it never exempts the change from the rule. Nothing was queued.` };
   }
   const kind: RoundKind = b.round_kind ?? (n === 0 ? "full" : "fixes");
   if (kind === "full" && n > 0)
     return { ok: false, why: `refused: ${key} has had ${n} round${n === 1 ? "" : "s"} already, so this one is a fix-only round: leave round_kind out or set it to fixes, and list only the fixes. Nothing was queued.` };
   if (kind === "fixes" && n === 0)
     return { ok: false, why: `refused: ${key} has had no round yet, so there's nothing to check fixes against: its first round is full. Nothing was queued.` };
-  return { ok: true, key, round: n + 1, kind, links };
+  return { ok: true, key, round: n + 1, kind, links, cap, granted };
 }
 
 // Kept once the review is queued.

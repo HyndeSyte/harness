@@ -52,6 +52,7 @@ export function linkRoutes(d: RouteDeps) {
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/decision": return json(await link.decision(b));
+        case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
         case "/guard-hold": return json(await link.guardHoldFor(b, caller));
         // The heartbeat checks' grace and period at Healthchecks.io (0.17.0): the link holds the key.

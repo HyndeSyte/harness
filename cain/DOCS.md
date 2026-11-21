@@ -66,7 +66,7 @@ its own.
   one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
   one late ping doesn't page you. A second check, pinged only while every liveness check of Cain passes,
   is `probe_heartbeat_url` (**What 0.14.0 does**, below).
-- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.18.0). So Cain
+- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.19.0). So Cain
   can set those checks' grace and period himself, paste a Healthchecks.io management API key once in
   this App's Configuration (in Healthchecks.io: the project's Settings, API Access, a read-write key,
   not the read-only one), then restart the App. Only Cain's link has it; Cain's own user never reads
@@ -271,6 +271,71 @@ Since the second round of fixes in 0.16.0:
   next sweep. If you tap the other answer after a restart cut a tap short, your first answer stands,
   and the card says "Already answered".
 
+#### More rounds, granted by your tap (since 0.18.0)
+
+The rule stays three rounds a change. Your decision on Nov 21: for a critical change whose last round
+still left something serious, the exception is more fix rounds, granted by you, never an exemption
+from the rule. So:
+
+- Only you can grant, and only by a tap. Cain can ask with
+  `keeper.sh review-grant --item <item> --change <pull request or change key> --rounds <1 to 3> "<why>"`.
+  You get a card: what the change does (Cain's words) and its pull request number, how many rounds it
+  has used and what the last one left (the review runner's own count of serious findings, never
+  Cain's), how many rounds the grant adds, and two buttons, "Grant <n> more rounds" and "No". It
+  expires at the next morning check-in like Cain's asks. Cain's command writes nothing: only your
+  "Grant" tap does. The link refuses the command while the change still has rounds left (nothing to
+  grant), while its last round is still running, while its item is held by another session, while
+  Stop holds, and while another grant card for the same change is still open (one open card a change:
+  the refusal names when the open one went up).
+- Your "Grant" tap checks all of that again before anything is written: the change is still at its
+  cap, no round of it is running, no other session holds its item, Stop is clear, and its round count
+  and cap are still the ones the card was posted with. If any of it no longer holds, nothing is
+  written, the card loses its buttons, and you see one plain line saying why (for example "That change
+  has rounds left now, so this grant isn't needed"). When a grant is written, any other open grant card
+  for the same change loses its buttons ("Replaced by a newer grant").
+- Your tap is written to disk first, in `/data/review-grants.json` (root:cain 0640 at every write and
+  every time it's made again, so the review runner and review.sh can read it; written only by the
+  link): the change, how many rounds, that you granted it, when, the card's message and Cain's reason.
+  It is also noted in the link's log and beside your other taps in `/data/link/review-decisions.json`.
+  If it can't be written, the card stays up and you're told your grant wasn't saved. A grant is for
+  one change; a replacement pull request carries it over, as it carries the rounds.
+- The cap for that change is then 3 plus what you granted. Each granted round is fix-only, carrying
+  the earlier findings, like any round after the first. When the cap is reached again, the runner's
+  refusal says how a grant works.
+- If a granted round at the raised cap still leaves something serious, the decision card ("Hold it" or
+  "Ship it with that risk") comes again, for that round. A "Hold it" on an earlier card doesn't stop a
+  later granted round. The Ship card rules stay: it needs a review whose last round left nothing
+  serious, or your "Ship it with that risk" on the newest decision card, which still needs the App's
+  rollback armed. While a granted round is running, or left something serious with rounds still to
+  go, no Ship card goes out.
+- What a grant never does: exempt a change from the rule, or from the armed-rollback condition on
+  shipping with a risk named.
+
+Since the second review of 0.18.0:
+
+- Your tap is one operation at a time for each change. The re-check, the grant's write and the card's
+  consumption (marked used, its buttons off, any other open grant card for that change retired) run
+  under one lock for the change key, inside the link. A second delivery of the same tap, or a second
+  quick tap on the same card, waits for the first and then finds the card used: nothing more is
+  written. A tap on another grant card for the same change waits the same way and is refused.
+- The card is bound to the change as it was when the card went up: beside the round count and cap it
+  keeps the pull request's head commit and the newest decision on the change (none, if there was
+  none). Your Grant tap reads both again: if the pull request has new commits, or a newer decision has
+  come, nothing is written, the card loses its buttons and you see one line saying why, as for the
+  other checks. No card goes out while the pull request's head can't be read from GitHub.
+- An open grant card never blocks for good. Before Cain's next grant card for the same change is
+  refused because one is open, the link looks at the open one: when its head moved, a newer decision
+  came, its round count or cap changed, or its message is gone from the chat, it loses its buttons
+  ("Replaced by a newer card"), stops counting as open, and the new card goes up. A card that is still
+  current keeps refusing a second one. A card whose buttons were taken off for any reason no longer
+  counts as open, and what counts as open is read from the link's own records on disk, so it holds
+  across a restart of the link.
+- A passing failure at your tap (the review records, who holds the change, or the pull request's head
+  can't be read just then) writes nothing and keeps the card up: you see one line saying to try again
+  in a minute.
+- `review.sh status <id>`, `review.sh spend` and Cain's "Review done" line show the raised cap and the
+  grants, for example "round 4 of 5, 2 granted by Dane on Nov 21".
+
 ### Labels (since 0.16.0)
 
 Every brief, and every Build or Ship job Cain starts, carries one label: `core` (Cain answering you,
@@ -293,7 +358,7 @@ reads it but can't write it. The runner writes its own refusals; Cain's Build ho
 send theirs to the link, which checks the guard again itself and writes only a real refusal. If the
 link can't be reached the run is still refused, and the refusal says the hold wasn't logged. Since
 the third round of fixes that route is bounded: at most 6 holds written a minute from each caller (since
-0.18.0's second round, a check that passes doesn't count against them: checks have their own limit of 30 a
+0.19.0's second round, a check that passes doesn't count against them: checks have their own limit of 30 a
 minute, refused with their own reason and no alarm), an
 identical hold logged once in 10 minutes, its description checked like a card (one that fails is
 logged as "a build labelled" and its label), and the log rotated at 256 KB keeping one previous file
@@ -303,7 +368,7 @@ only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and th
 every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
 check-in hands Cain the same two lines for his daily usage row.
 
-What it reads for the plan (since 0.18.0): Cain's Claude Code transcripts under
+What it reads for the plan (since 0.19.0): Cain's Claude Code transcripts under
 `/data/cain/.claude/projects`, subagent transcripts included, and the week's allowance you set by hand,
 the option `plan_weekly_allowance_tokens` (default 4200000000; 0 means not set, and the reading is
 "unknown" as in 0.16.0). The plan's week starts Sunday 12:00 AM in the App's time zone (America/New_York),
@@ -318,14 +383,14 @@ which counts as unknown (it holds other work). Each file's count is kept in `/da
 again and a growing one is read on from where it stopped.
 
 The guard's rules don't change: an unknown reading, an incomplete one, or one older than a day counts as
-below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.18.0
+below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.19.0
 the link decides every `other` Build job too, not only the ones Cain's hook would refuse: a job runs only
 when both readings let it and the link answered. `review.sh guard`'s first line says the percent of the
 week's allowance left, the tokens counted and the week's start, and how many transcript files were read
 and skipped; its second line names each seat's share left and whether other work is held. `review.sh
 spend` shows the runner's own caps and each open change's round count.
 
-Reading it without holding up Discord (0.18.0, second round of review fixes). The first reading after an
+Reading it without holding up Discord (0.19.0, second round of review fixes). The first reading after an
 install is cold: about 100 transcripts and 250 MB on the Pi's SD card. So the review runner warms the cache
 at the App's start and again whenever the week turns (and every 15 minutes between), and the link reads the
 plan in a child process of its own, waiting at most 2 seconds: a reading not ready by then counts as
@@ -356,7 +421,7 @@ fraction). Only you change the option, in the App's Configuration; Cain and the 
 also set `plan_allowance_set_on` (the date, YYYY-MM-DD) and `plan_allowance_derivation` (how you worked it out,
 in a line); the runner writes both beside the allowance, and `review.sh guard`'s first line prints them.
 
-The third round of review fixes (0.18.0):
+The third round of review fixes (0.19.0):
 
 - Alarms never hold up your taps. Each alarm the link raises or clears starts the App's notice script in
   the background, with its own 40 second limit, and the link never waits for it; a notice that fails is

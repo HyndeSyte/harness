@@ -158,6 +158,13 @@
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
+#   keeper.sh review-grant --item P46 --change <pull request url or change key> --rounds <1-3> "why"
+#                                        a card asking him to grant a change at its review-round cap more
+#                                        fix rounds: what it does (your line), the rounds it used and what
+#                                        the last left (the runner's record), with "Grant <n> more rounds"
+#                                        and "No". Only his tap writes the grant; this writes nothing.
+#                                        Refused while the change has rounds left, its item is held by
+#                                        another holder, or Stop holds
 set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
@@ -196,7 +203,7 @@ if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts
 case "$cmd" in
   handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;
   fastpath) url="$harness/fastpath"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   key-expiry|key-ack) url="$link/key-note"; ctx=harness-relay-v1 ;;
   hc-check|hc-set) url="$link/hc"; ctx=harness-relay-v1 ;;
@@ -237,7 +244,7 @@ fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke="" change="" rounds=""
 case "$cmd" in
   handover)
     rest=()
@@ -257,7 +264,7 @@ case "$cmd" in
     set -- ${rest[@]+"${rest[@]}"} ;;
 esac
 case "$cmd" in
-  show|ask|ship|answered|check|reply|connector)
+  show|ask|ship|answered|check|reply|connector|review-grant)
     rest=()
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -267,6 +274,10 @@ case "$cmd" in
             --item) item="$2" ;; --question) question="$2" ;; --reply-to) reply_to="$2" ;;
             --pr) pr="$2" ;; --head) head="$2" ;; --edit) edit="$2" ;; --review) review="$2" ;;
           esac
+          shift 2 ;;
+        --change|--rounds)
+          [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
+          if [ "$1" = --change ]; then change="$2"; else rounds="$2"; fi
           shift 2 ;;
         *) rest+=("$1"); shift ;;
       esac
@@ -372,6 +383,11 @@ case "$cmd" in
             done
             [ -n "$name" ] && [ -n "$grace" ] || { echo '{"status":"error","said":"usage: keeper.sh hc-set <check name> --grace <seconds> [--period <seconds>]"}'; exit 2; }
             body=$(jq -nc --arg n "$name" --arg g "$grace" --arg p "$period" '{cmd: "set", name: $n, grace: $g} + (if $p == "" then {} else {period: $p} end)') ;;
+  review-grant)
+    [[ "$rounds" =~ ^[1-3]$ ]] || { echo '{"status":"error","said":"--rounds takes 1, 2 or 3"}'; exit 2; }
+    [ -n "$change" ] || { echo '{"status":"error","said":"--change takes the pull request url or the change key"}'; exit 2; }
+    body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg c "$change" --arg n "$rounds" --arg r "$reply_to" \
+      '{item: $it, change: $c, rounds: ($n | tonumber), text: $t} + (if $r == "" then {} else {reply_to: $r} end)') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac

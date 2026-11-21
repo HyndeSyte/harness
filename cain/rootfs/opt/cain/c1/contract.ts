@@ -19,7 +19,7 @@ export const RUNS: Record<State, { oldRootSession: boolean; uid1000: "none" | "v
 
 // Cain's routes and root's (/sent), as in link/auth.ts; kept here too so this module stands alone.
 const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
-  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/hc"]);
+  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/hc", "/review-grant"]);
 
 export interface Asked {
   signed: boolean;        // a signature that verifies with the specialist's key
@@ -53,6 +53,7 @@ const ROOT_FOR_HIM = [
   /^\/data\/record-holds\.json$/,
   /^\/data\/review-queue\/[^/]+$/,
   /^\/data\/review-(spend|health|rounds|settings)\.json$/,   // rounds and settings: the round cap's count and the runner's caps (0.16.0)
+  /^\/data\/review-grants\.json$/,                     // the owner's grants of extra review rounds (0.18.0): root:cain 0640, the link writes, he reads
   /^\/data\/review-guard\.log$/,                        // the usage guard's refusals (0.16.0): root:cain 0640, root writes (round 2), he reads
   /^\/data\/review-useful\.jsonl$/,
   /^\/data\/review-private-terms\.txt$/,
