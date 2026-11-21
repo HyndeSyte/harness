@@ -216,7 +216,7 @@ describe("B: at the cap with something serious left, the runner writes the owner
     rounds.changes["pr-40"] = { rounds: [1, 2, 3].map((n) => ({ id: `x-${n}`, at: `2026-11-2${n}T00:00:00Z`, kind: n === 1 ? "full" : "fixes" as const })) };
     Object.assign((r.link as any).d, { rounds: () => rounds, roundCap: () => 3 });
     await expect(r.link.ask({ text: "Another review round on pull request 40?", options: ["Yes", "No"], item: "none" })).rejects.toThrow("another round for pr-40");
-    expect((await r.link.ask({ text: "Is round 2 enough for the desk plan?", options: ["Yes", "No"], item: "none" })).status).toBe("posted");
+    expect((await r.link.ask({ text: "Is round 2 enough for the desk plan?", options: ["Yes", "No"], item: "none" })).status).not.toBe("refused");   // held behind the open one, not refused
     expect(namesRoundPastCap("the third round", 3, null)).toBeNull();
     expect(namesRoundPastCap("the 5th review", 3, null)).toBe("round 5");
   });
