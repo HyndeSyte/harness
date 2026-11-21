@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.17.1
+## 0.17.0
 
 - Cain knows the calendar specialist never writes its tap journal without its lock, sends one waiting card per outage even when reads come and go, starts only with its journal on local storage, says "storage" when it can't lock or write its journal, and stops a tap whose count it may have lost until Dane puts it back.
 
