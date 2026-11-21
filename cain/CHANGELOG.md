@@ -6,9 +6,11 @@
 - Right after Cain starts following an install, the App asks him its liveness line once and tells the Keeper whether he answered. No answer within 10 minutes counts as a failed install.
 - If the Keeper rolled Cain back or gave up on a rollback, Cain's bot tells you that in one line, once, after his next start.
 - "Ship it with that risk" now reads the Keeper to see whether the rollback is armed, instead of a file nothing wrote. Until both drills have run and you have set the Keeper's two Healthchecks checks, it still reads as not armed, and the card says why.
-- Cain's health check for Home Assistant's Watchdog (/health) still only says whether the App is running, so a Discord outage doesn't make the Watchdog restart him. A new readiness check beside it (/ready) answers only while his Discord connection is up, and the Keeper reads that one after an install.
+- Cain's health check for Home Assistant's Watchdog (/health) still only says whether the App is running, so a Discord outage doesn't make the Watchdog restart him. A new readiness check beside it (/ready) answers only while his Discord connection is up, and the Keeper reports it after an install as chat connected or not.
 - Two new options: `keeper_url` (already filled in) and `keeper_token` (the same token you give the Keeper for Cain).
 - "Ship it with that risk" reads as armed only while the Keeper's heartbeat and alert checks have answered in the last 10 minutes and none of its alerts is stuck, so a Healthchecks outage shows as not armed until it passes.
+- One Ship tap starts one Ship run: a second run on the same tap is refused, and Cain's link registers that run's install with the Keeper itself, so nothing writes the Keeper's options any more.
+- The Keeper decides on /health (Cain running and alive), not /ready: a Discord outage is reported as "chat not connected", never a reason to roll Cain back.
 
 ## 0.18.0
 

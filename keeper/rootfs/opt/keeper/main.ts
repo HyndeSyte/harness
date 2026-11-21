@@ -3,6 +3,8 @@
 //                                     the HTTP service on port 8097 (the internal App network only)
 //   bun main.ts drill-record <id>     a drill record from the keeper's own result for that attempt
 //                                     (asks the running service; it decides from its own state alone)
+//   bun main.ts phone-test            (0.1.3) the phone test drill: pages each watched App's alert check once
+//   bun main.ts phone-confirm         (0.1.3) once that page reached the owner's phone: records it (60 days)
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
@@ -29,7 +31,8 @@ export function healthUrl(hp: string): string | null {
   const m = /^([A-Za-z0-9.-]{1,253}:\d{1,5})(\/[A-Za-z0-9._\/-]{0,64})?$/.exec(hp);
   return m ? `http://${m[1]}${m[2] || "/health"}` : null;
 }
-// The same host's liveness address, /health (0.1.2: the confirm window's extension asks it).
+// The same host's liveness address, /health: the one the install check and the rollback's confirmation
+// decide on (0.1.3); the health address's own path (Cain's /ready) is only reported, as chat connected.
 export function liveUrl(hp: string): string | null {
   const m = /^([A-Za-z0-9.-]{1,253}:\d{1,5})(\/[A-Za-z0-9._\/-]{0,64})?$/.exec(hp);
   return m ? `http://${m[1]}/health` : null;
@@ -51,8 +54,8 @@ async function serve(): Promise<void> {
   if (me && me.version && me.version !== version) log(`the Supervisor says this is ${me.version}, the image says ${version}: the image's is bound`);
   const k = new Keeper({
     now: Date.now, version, self,
-    appInfo: sup.appInfo, backupInfo: sup.backupInfo, restore: sup.restore, job: sup.job,
-    health: (hp) => get200(healthUrl(hp)),
+    appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, job: sup.job, restoreJobs: sup.restoreJobs,
+    ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
       try { const r = await fetch(url, { method: "POST", body, redirect: "manual", signal: AbortSignal.timeout(10_000), headers: { "content-type": "text/plain" } }); return r.status >= 200 && r.status < 300; }
@@ -64,7 +67,7 @@ async function serve(): Promise<void> {
     save: (s: State) => { try { writeWhole(STATE, JSON.stringify(s)); } catch (e) { log(`couldn't save its state: ${String((e as Error)?.message ?? e).slice(0, 80)}`); } },
     log,
   }, readJson(STATE));
-  // 0.1.2: options that lack the tokens or the Healthchecks URLs get the ones kept in /data (logged).
+  // 0.1.3: the options as they are; nothing is filled in from a kept copy.
   k.useOptions(readJson(OPTIONS));
   k.start();
   const o = k.opts;
@@ -81,6 +84,11 @@ async function serve(): Promise<void> {
   await tick();
   setInterval(tick, POLL_MS);
   setInterval(() => k.heartbeat(), HEARTBEAT_MS);
+  // The dead-man check (0.1.3): its own timer, apart from the poll, so it stops only with the process.
+  let deadmanSaid = false;
+  const deadman = async () => { const ok = await k.deadman().catch(() => false); if (!ok && !deadmanSaid && k.opts.hc_deadman) log("a dead-man ping wasn't delivered: tried again in a minute"); deadmanSaid = !ok; };
+  void deadman();
+  setInterval(() => { void deadman(); }, HEARTBEAT_MS);
 }
 
 if (import.meta.main) {
@@ -91,8 +99,13 @@ if (import.meta.main) {
     const j: any = r ? await r.json().catch(() => null) : null;
     console.log(j?.ok ? `drill recorded: ${arg}` : `no drill record: ${j?.why ?? "the keeper's service didn't answer"}`);
     process.exit(j?.ok ? 0 : 1);
+  } else if (cmd === "phone-test" || cmd === "phone-confirm") {
+    const r = await fetch(`http://127.0.0.1:${PORT}/${cmd}`, { method: "POST", body: "{}" }).catch(() => null);
+    const j: any = r ? await r.json().catch(() => null) : null;
+    console.log(j?.ok ? (cmd === "phone-test" ? "phone test sent: confirm with phone-confirm once it reached your phone" : "phone test recorded") : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
+    process.exit(j?.ok ? 0 : 1);
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm | selftest"); process.exit(2); }
 }

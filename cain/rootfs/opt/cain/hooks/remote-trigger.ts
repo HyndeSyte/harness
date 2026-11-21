@@ -9,6 +9,10 @@
 //   - a Ship run carries the Ship token from his Ship tap (../ship-token.ts): signed by
 //     the link's Ship key, not expired, and for the pull request and full head sha the
 //     job names;
+//   - (0.19.0, with Keeper 0.1.3) one Ship run per token: once the checks pass, the hook asks the link
+//     (POST /ship-pass, Cain's key), which refuses a token it already let through, records it spent
+//     (root's /data/trust) and registers the installs with the keeper App (../link/ship-pass.ts). A link
+//     that doesn't answer refuses the run;
 //   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all;
 //   - (Cain 0.16.0) a run carries one label, core, commitment, necessary-fix or other: in its body's
 //     "label" field or on a "Label: <label>" line of its text (both, and they must agree); none is
@@ -26,7 +30,7 @@ import { readFileSync } from "node:fs";
 import { parseHolds } from "../link/core.ts";
 import { findToken, publicKey, pullOf, readToken, signedAt } from "../ship-token.ts";
 import { readStop, type StopState, stoppedWhy } from "../stop.ts";
-import { decide as guardDecide, labelOf, paths, postHold, readings, type Label, type Verdict } from "../guard.ts";
+import { CAIN_KEY_FILE, decide as guardDecide, labelOf, LINK_URL, paths, postHold, readings, type Label, type Verdict } from "../guard.ts";
 import { TEST_MODE_VAR, testMode } from "../capfiles.ts";
 
 export const BUILD = "trig_015FTxexzFDZyjYjzw39bPv8";
@@ -177,6 +181,36 @@ export async function decideWithGuard(call: any, holdsText: string | null, env: 
   return decide(call, holdsText, { ...env, guard: () => ({ ...h.v, logged: sent.logged, ...(sent.passes ? { linkPasses: true } : {}) }) });
 }
 
+// (0.19.0) The link's answer for a Ship run's token: "ok" lets it through once, anything else refuses.
+export type Pass = { ok: true } | { ok: false; why: string };
+export async function postShipPass(token: string, o: { url?: string; key?: string; keyFile?: string; ms?: number; fetch?: typeof fetch } = {}): Promise<Pass> {
+  let key = o.key ?? "";
+  if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { ok: false, why: "this start has no key for the link" }; } }
+  try {
+    const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/ship-pass`, { method: "POST", body: JSON.stringify({ token }),
+      headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(o.ms ?? 5_000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (r.ok && j?.status === "ok") return { ok: true };
+    return { ok: false, why: String(j?.said ?? `the link answered ${j?.status ?? r.status}`).slice(0, 300) };
+  } catch (e) { return { ok: false, why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
+}
+
+// The whole decision: the checks (decide, with the usage guard), then for a Ship run that passed them the
+// link's one-run-per-token pass, last, so only a run that would otherwise start spends its token.
+export async function decideAll(call: any, holdsText: string | null, env: Env,
+    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean; passes?: boolean }>,
+    pass: (token: string) => Promise<Pass>): Promise<string> {
+  const first = await decideWithGuard(call, holdsText, env, reading, post);
+  if (first) return first;
+  const t = call?.tool_input;
+  if (call?.tool_name !== undefined && call.tool_name !== "RemoteTrigger") return "";
+  if (!t || String(t.action ?? "") !== "run" || String(t.trigger_id ?? "") !== SHIP) return "";
+  const token = findToken(typeof t.body?.text === "string" ? t.body.text : "");
+  if (!token) return "A Ship job carries the Ship token from his relayed Ship tap.";
+  const p = await pass(token);
+  return p.ok ? "" : `The link didn't let this Ship run start: ${p.why}.`;
+}
+
 if (import.meta.main) {
   let reason: string;
   if (testMode()) reason = `${TEST_MODE_VAR} is set, a tests-only variable, so no Build or Ship run starts. The App's run script never sets it: log it as a Build item.`;
@@ -185,7 +219,8 @@ if (import.meta.main) {
     const now = Date.now();
     const reading = (label: Label, what: string): Verdict => label !== "other" ? { ok: true }
       : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now) }), new Date(now));
-    try { reason = await decideWithGuard(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w)); }
+    try { reason = await decideAll(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w),
+      (tok) => postShipPass(tok)); }
     catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {

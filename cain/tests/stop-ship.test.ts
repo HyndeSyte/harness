@@ -287,7 +287,9 @@ describe("the RemoteTrigger hook, with Stop and signed Ship", () => {
     const good = run(job(tokenFor(PR, SHA1, Date.now())));
     expect(await hook(good, null)).toContain("Nothing runs");            // no Stop file: nothing runs
     expect(await hook(good, true)).toContain("Everything has been stopped");
-    expect(await hook(good, false)).toBe("");
+    // 0.19.0: past every check a Ship run still needs the link's one-run-per-token pass; with no key for
+    // the link here it is refused, never let through.
+    expect(await hook(good, false)).toContain("The link didn't let this Ship run start");
   });
 });
 

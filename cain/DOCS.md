@@ -232,10 +232,12 @@ Since 0.19.0 the link reads that from the Keeper App (`GET /armed` with Cain's `
 minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
 binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
 the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
-Until the Keeper has run both drills for the App, its Healthchecks checks are set, and (Keeper 0.1.2,
-worked out at every read) its heartbeat and a non-paging log ping to each of its alert checks reached
-Healthchecks within the last 10 minutes with no alert of it stuck for over 2 minutes, that card is
-refused and says what isn't armed (the Keeper's own documentation has the drills and the five conditions). The cap is the option
+Until the Keeper has run both drills for the App, its Healthchecks checks are set (Keeper 0.1.3: a
+dead-man check too, and an alert check of its own for each watched App), its phone test drill is
+confirmed, and (worked out at every read) its heartbeat, its dead-man ping and a non-paging log ping to
+each of its alert checks reached Healthchecks within the last 10 minutes with no alert of it stuck for
+over 2 minutes, that card is refused and says what isn't armed (the Keeper's own documentation has the
+drills and the conditions). The cap is the option
 `review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
 card in the link's `/data/link/review-decisions.json`.
 
@@ -510,9 +512,21 @@ bad one back from the backup taken just before it. Cain's part:
   and on any other path):
   - `/health`, the Watchdog's URL, is liveness: 200 while the App runs, 503 only while a self-restart
     is due. It doesn't depend on Discord, so a Discord outage doesn't make the Watchdog restart him.
-  - `/ready`, the one the Keeper asks after an install (its `health` option names the path), is
-    readiness: 200 only while the link's Discord connection is up and Discord acknowledged it within 5
-    minutes, 503 otherwise.
+  - `/ready` (its `health` option names the path) is readiness: 200 only while the link's Discord
+    connection is up and Discord acknowledged it within 5 minutes, 503 otherwise. Since Keeper 0.1.3 the
+    Keeper decides an install and a rollback on `/health` alone and only reports `/ready`, as "chat
+    connected" or "chat not connected (degraded)": a Discord outage never rolls Cain back.
+- One Ship run per Ship tap, and its registration with the Keeper (with Keeper 0.1.3). When Cain starts a
+  Ship run, his RemoteTrigger hook checks the token as before, then asks the link (`POST /ship-pass`,
+  Cain's key). The link refuses a token it has already let through (a second Ship run on one tap), keeps
+  the spent ids (hashes, never the token) in root's `/data/trust/ship-passes.json`, and registers each
+  install the tap makes with the Keeper over the Keeper's own service (`POST /attempt` with Cain's
+  `keeper_token`): the token itself, the pull request, the head, the App's version before and after (each
+  `config.yaml` at the pull request's base and head) and the verdict probe's hash at the head. The Keeper
+  checks the token's signature with the link's public Ship key (its `ship_public_key` option: the line
+  `Ship key (public): ...` in this App's log), spends it once per App and takes the App-only backup
+  itself. A link that doesn't answer refuses the Ship run. Nothing writes the Keeper's options. The
+  link registers only the Apps the Keeper watches by default (Cain).
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

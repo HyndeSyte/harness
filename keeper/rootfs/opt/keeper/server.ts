@@ -1,15 +1,20 @@
 // The keeper's own HTTP service, on Home Assistant's internal App network only (172.30.32.0/23):
 //   GET  /attempt   the open attempt of the caller's App (its id, from and to), or none
+//   POST /attempt   (0.1.3) Cain's App only: register an install, {token, app, pr, head, from_version,
+//                   to_version, probe_hash, kind?, backup_slug?}, the token being the owner's signed Ship
+//                   token, verified here (core.ts registerAttempt); 202 registered, else refused
 //   POST /verdict   {app, version, attempt, result: PASS|FAIL, reason}: the caller's App's probe verdict
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
 //                   version and a timestamp refreshed every minute
 //   GET  /last      the last owner line about the caller's App
 //   POST /drill-record {attempt}   from this container only (keeper drill-record)
-// Every request but /drill-record carries an App's own token (Authorization: Bearer <token>, the
+//   POST /phone-test, POST /phone-confirm   (0.1.3) from this container only: the phone test drill
+// Every request but those from this container carries an App's own token (Authorization: Bearer <token>, the
 // keeper's option tokens maps App slug to token). Anything else is refused and logged.
 import { SLUG, type Keeper } from "./core.ts";
 
 export const MAX_BODY = 4096;
+const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm"]);
 // Home Assistant's internal network (the Supervisor's hassio network): 172.30.32.0/23.
 export function internal(ip: string): boolean {
   const v4 = ip.replace(/^::ffff:/i, "");
@@ -22,10 +27,10 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 
 export async function handle(k: Keeper, req: Request, ip: string, log: (m: string) => void, allow: (ip: string) => boolean = internal): Promise<Response> {
   const url = new URL(req.url);
-  if (url.pathname === "/drill-record" && req.method === "POST") {
-    if (!loopback(ip)) { log(`refused /drill-record from ${ip}: only from inside the keeper`); return json({ status: "refused" }, 403); }
+  if (LOCAL.has(url.pathname) && req.method === "POST") {
+    if (!loopback(ip)) { log(`refused ${url.pathname} from ${ip}: only from inside the keeper`); return json({ status: "refused" }, 403); }
     const b = await body(req);
-    const r = k.drillRecord(String(b?.attempt ?? ""));
+    const r = url.pathname === "/drill-record" ? k.drillRecord(String(b?.attempt ?? "")) : url.pathname === "/phone-test" ? k.phoneTest() : k.phoneConfirm();
     return json(r, r.ok ? 200 : 409);
   }
   if (!allow(ip)) { log(`refused ${req.method} ${url.pathname} from ${ip}: not the internal App network`); return json({ status: "refused" }, 403); }
@@ -35,6 +40,12 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (req.method === "GET" && url.pathname === "/attempt") {
     const a = k.openAttempt(caller);
     return json(a ? { app: caller, attempt: a.id, from_version: a.from, to_version: a.to, status: a.status } : { app: caller, attempt: null });
+  }
+  if (req.method === "POST" && url.pathname === "/attempt") {
+    const b = await body(req);
+    if (b === undefined || !b || typeof b !== "object") { log(`refused a registration from ${caller}: its body isn't JSON`); return json({ status: "refused", why: "not JSON" }, 400); }
+    const r = await k.registerAttempt(caller, b);
+    return json(r.body, r.status);
   }
   if (req.method === "POST" && url.pathname === "/verdict") {
     const b = await body(req);

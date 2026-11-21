@@ -818,7 +818,8 @@ create, update or run any other routine.
      `"job": "ship <title>"`, and once that's done, RemoteTrigger `run` on Ship with
      body `{"text": "Install pull request <url>, landed in main at <full head sha>. Ship token: <the token, exactly as relayed>. Dane tapped Ship at <time>."}`;
      a hook refuses a Ship run without his token for that pull request and head, or
-     once it has run out (2 hours). Write /data/jobs/<cse_X> as `ship | <title>`. When
+     once it has run out (2 hours), and a second Ship run on a token that already started one (one tap,
+     one run: if the install must run again, show a new Ship card for the same pull request and head). Write /data/jobs/<cse_X> as `ship | <title>`. When
      it finishes, tell him in one line what's now running, or why it isn't installed.
      If it ends with `Home Assistant connector: needs signing in again` (or `no
      answer`), nothing was installed: treat it as Home Assistant first says.

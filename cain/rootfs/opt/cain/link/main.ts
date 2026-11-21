@@ -35,6 +35,8 @@
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
 //     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
 //                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
+//     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the token spent once (a second
+//                                       run on it is refused) and the installs registered with the keeper App (0.19.0)
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
@@ -74,6 +76,7 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -383,7 +386,22 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 
 // The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
 // exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
-const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ };
+// The Ship pass (0.19.0, with Keeper 0.1.3): one Ship run per token, and its installs registered with the
+// keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
+const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
+const shipPassDeps: PassDeps = {
+  pub: () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } },
+  now: Date.now,
+  load: () => { try { return readFileSync(SHIP_PASSES, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; return "unreadable"; } },
+  store: (text) => writeSynced(SHIP_PASSES, text),
+  register: (tok, claim) => {
+    void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`),
+      post: (body) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/attempt", body, 30_000) : Promise.resolve(null) }, tok, claim)
+      .catch((e) => console.log(`[cain] link: keeper registration failed: ${String(e).slice(0, 80)}`));
+  },
+  log: (l) => console.log(`[cain] link: ${l}`),
+};
+const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ, shipPass: (b: any) => shipPass(shipPassDeps, b) };
 const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept

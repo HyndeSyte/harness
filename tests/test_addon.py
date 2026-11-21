@@ -2666,7 +2666,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant"])'
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/ship-pass"])'
             in auth.replace("\r\n", "\n"))
     # Cain 0.18.0: /review-grant is Cain's card asking Dane for extra review rounds; only his tap writes one.
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and

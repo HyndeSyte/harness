@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+- Keeper now checks your Ship tap itself. An install is registered with the signed token from your tap, and Keeper checks its signature with Cain's public Ship key (the new option `ship_public_key`). A made up or reused registration is refused, each tap counts once per App, and Cain starts only one Ship run per tap.
+- Nothing writes Keeper's options during a Ship any more. Cain's link registers the install with Keeper directly, and Keeper takes the App-only backup itself.
+- A rollback counts as done only when Home Assistant's restore job says it finished. If Cain is seen coming back at the old version without that, or the restore call got a server error or no answer, you hear "unresolved" and Keeper never restores again by itself. A restore is sent a second time only when Home Assistant turned it down before starting anything.
+- A Discord outage can no longer cause or fail a rollback. Keeper decides on whether Cain is running and alive; whether chat is connected is only reported ("chat not connected (degraded)").
+- With more than one App watched, each needs its own alert check. A new dead-man check (`hc_deadman`) pages you if Keeper itself dies. Arming now also needs a phone test: Keeper pages you once as a drill, and you confirm it reached your phone (good for 60 days).
+- Keeper no longer keeps its own copy of its tokens and Healthchecks addresses: if they disappear from its options, it is simply not armed until you put them back.
+
 ## 0.1.2
 
 - A rollback is sent a second time only when the first provably never ran: the Supervisor answered it with an error, or the restore job it named is seen ended with errors while the App isn't back. Anything unclear is "unresolved": Keeper never restores again by itself, keeps checking on every poll, and tells you once more when it knows how it ended.
