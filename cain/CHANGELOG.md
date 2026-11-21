@@ -1,17 +1,12 @@
 # Changelog
 
-## 0.18.1
-
-- Cain's health check for Home Assistant's Watchdog (/health) is back to "is the App running": it no longer goes down when Discord is unreachable, so a Discord outage doesn't make the Watchdog restart him.
-- A new readiness check beside it (/ready) answers only while his Discord connection is up. The Keeper reads that one after an install.
-
 ## 0.18.0
 
 - Cain now works with the new Keeper App, which checks every install of Cain for 15 minutes and rolls a bad one back by itself from the backup taken just before it.
 - Right after Cain starts following an install, the App asks him its liveness line once and tells the Keeper whether he answered. No answer within 10 minutes counts as a failed install.
 - If the Keeper rolled Cain back or gave up on a rollback, Cain's bot tells you that in one line, once, after his next start.
 - "Ship it with that risk" now reads the Keeper to see whether the rollback is armed, instead of a file nothing wrote. Until both drills have run and you have set the Keeper's two Healthchecks checks, it still reads as not armed, and the card says why.
-- Cain's health check now answers only while his Discord connection is up, so the Keeper (and Home Assistant's Watchdog) see an App that can't reach Discord as unhealthy.
+- Cain's health check for Home Assistant's Watchdog (/health) still only says whether the App is running, so a Discord outage doesn't make the Watchdog restart him. A new readiness check beside it (/ready) answers only while his Discord connection is up, and the Keeper reads that one after an install.
 - Two new options: `keeper_url` (already filled in) and `keeper_token` (the same token you give the Keeper for Cain).
 
 ## 0.17.0

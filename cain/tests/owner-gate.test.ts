@@ -184,7 +184,7 @@ function render(dir: string, port: number, upstream: number, health = { port: 0,
   // Fourth round: the note of each /health 200 (time and address, for probe-drill.sh 7's gate) too.
   swap(/access_log \/run\/cain-web\/health-ok\.log /, `access_log ${dir}/health-ok.log `);
   swap(/if \(-f \/run\/cain-web\/www\/health-down\)/, `if (-f ${dir}/health-down)`);
-  // Cain 0.18.0: the link's gateway mark (link/health-gate.ts), on /ready since 0.18.1.
+  // Cain 0.18.0: the link's gateway mark (link/health-gate.ts) on /ready.
   swap(/if \(!-f \/run\/cain-web\/www\/health-gateway\)/, `if (!-f ${dir}/health-gateway)`);
   swap(/^user nobody nogroup;$/m, "");
   // Root's pages (C1: /run/cain-web/www) and the upstreams (C1: unix sockets only nginx's workers and
@@ -361,7 +361,7 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
     expect((await at(f.port, "/health"))[0]).toBe(404);
   });
 
-  // Cain 0.18.1: /health is liveness (it no longer depends on Discord's gateway) and /ready, beside it,
+  // Cain 0.18.0 (first review fix): /health is liveness (it no longer depends on Discord's gateway) and /ready, beside it,
   // is readiness: 200 only while the link's gateway mark is there, 503 otherwise.
   test("/health is liveness and /ready readiness: the gateway mark moves /ready alone", async () => {
     const h = healthOf.get(owned)!;

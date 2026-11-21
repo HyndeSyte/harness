@@ -12,7 +12,7 @@ import { CAIN_SLUG, lastRepeat, probeHash, verdictRun, type Reply } from "../roo
 const src = (f: string) => readFileSync(join(import.meta.dir, "..", f), "utf8");
 const NOW = Date.parse("2026-11-21T15:00:00Z");
 
-describe("/ready tied to the gateway (0.18.1: /health is liveness only)", () => {
+describe("/ready tied to the gateway (/health is liveness only)", () => {
   test("healthy only while connected and acknowledged within 5 minutes", () => {
     expect(gatewayHealthy(true, NOW - 1000, NOW)).toBe(true);
     expect(gatewayHealthy(true, NOW - ACK_WITHIN_MS - 1, NOW)).toBe(false);
