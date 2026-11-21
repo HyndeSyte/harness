@@ -78,6 +78,7 @@
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
 #   notice.sh hooked                 0 when notice_hook is set, well formed (no lock)
+#   notice.sh say <line>             one line of the keeper App's to his bot, as it is (no lock, no state)
 #   notice.sh text <alarm> [cause]   an alarm's title and text, one line each (tests, docs)
 # Exits 0 when done, 1 when something stays to be kept or sent (said on stderr), 2 on a wrong
 # use, 75 when it couldn't have the lock.
@@ -454,7 +455,13 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart|review|decisions|holds | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  # (0.18.0) One line from the keeper App to his bot, as it is, once per call: the probe calls it once per
+  # line and keeps which line it said (probe/keeper.ts). No group, no repeat, no Home Assistant push.
+  say) l="$(printf '%s' "${2:-}" | tr '\r\n' '  ' | sed 's/ *\xe2\x80\x94 */, /g; s/add-on/App/g; s/  */ /g; s/ $//' | cut -c1-400)"
+    [ -n "$l" ] || exit 2
+    if discord_send "$l"; then echo "[cain] the keeper's line went to his bot"; exit 0; fi
+    echo "[cain] the keeper's line didn't reach his bot: tried again at the next start" >&2; exit 1 ;;
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart|review|decisions|holds | tick | probe | proven | hooked | say <line> | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \

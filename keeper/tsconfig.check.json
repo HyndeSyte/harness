@@ -1,0 +1,16 @@
+// For the bun check's step that fails on names and imports that don't resolve (as cain/tsconfig.check.json).
+{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "types": ["bun"],
+    "typeRoots": ["/tmp/tscheck/node_modules/@types"],
+    "lib": ["esnext", "dom"]
+  },
+  "include": ["rootfs/opt/keeper/**/*.ts", "tests/**/*.ts"]
+}

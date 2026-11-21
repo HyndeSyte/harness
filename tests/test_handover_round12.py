@@ -566,5 +566,6 @@ def test_cains_rules_keeper_and_docs_name_this_rounds_behaviour():
         assert words in docs, words
     assert "migrate-restore <schema> <build>" in keeper
     for log in ((ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## ", 2)[1],
-                (ROOT / "cain" / "CHANGELOG.md").read_text().split("\n## ", 2)[1]):
+                # Cain's section for the release that carried this round (0.17.0), not whichever is newest.
+                (ROOT / "cain" / "CHANGELOG.md").read_text().split("\n## 0.17.0\n", 1)[1].split("\n## ", 1)[0]):
         assert "Unprotected" in log or "restore" in log.lower()

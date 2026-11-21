@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.17.0"
+version: "0.18.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -65,6 +65,11 @@ timeout: 30
 # review_round_cap: outside review rounds a change may have (the owner's rule: 3). The runner keeps it;
 # Cain's own user can't change it. usage_reserve_percent: the usage guard's reserve floor, a share of
 # the week's plan allowance and of each review seat's monthly cap that "other" work may not spend.
+# keeper_url, keeper_token (0.18.0): the keeper App (keeper/ in this repo) on Home Assistant's internal
+# network, and Cain's own token there (the same token as the keeper's tokens entry for this App, at
+# least 16 characters). The probe gives the keeper its verdict on an install of Cain with it, and the
+# link reads whether the keeper's way back from a bad install is armed. Read only by the run script's link and
+# probe subshells, never by Cain's session, never logged. Empty: no verdicts, and never armed.
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
 # "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
@@ -85,6 +90,8 @@ options:
   pc_jobs_repo: "HyndeSyte/pc-jobs"
   heartbeat_url: ""
   probe_heartbeat_url: ""
+  keeper_url: "http://0fcc2575-keeper:8097"
+  keeper_token: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -103,3 +110,5 @@ schema:
   pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?
   heartbeat_url: password?
   probe_heartbeat_url: password?
+  keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?
+  keeper_token: password?

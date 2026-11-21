@@ -2774,7 +2774,7 @@ export class Link {
   private heldForRollback(m: Shown, existed = false): string {
     const dec = m.decision!;
     let a: { armed: boolean; why: string };
-    try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the probe's rollback record can't be read` }; }
+    try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the keeper's rollback record can't be read` }; }
     if (a.armed) return "";
     const what = `${dec.key}${dec.pr ? ` (${dec.pr})` : ""}`;
     const why = `held: he chose to ship it with the risk named, but ${a.why}, so a Ship card is refused until a release arms it`;

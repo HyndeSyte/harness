@@ -73,10 +73,12 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
+import { gatewayHealthy, writeGatewayMark } from "./health-gate";
+import { KEEPER_URL, keeperCall, probeHash } from "../probe/keeper";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
@@ -266,7 +268,8 @@ const link = new Link({
   // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
   // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
   capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
-  armed: () => readArmed(),
+  // 0.18.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
+  armed: () => keeperArmedText(keeperReplies, Date.now(), PROBE_HASH),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
   decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
   roundCap: () => roundCapNow(),
@@ -288,6 +291,25 @@ const link = new Link({
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
 });
+
+// -- the keeper App's armed state (0.18.0) -------------------------------------------------------------
+// Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
+// that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
+// (keeper_token, the run script hands it in KEEPER_TOKEN) and is never logged.
+const KEEPER_TOKEN = process.env.KEEPER_TOKEN ?? "";
+delete process.env.KEEPER_TOKEN;
+const KEEPER_BASE = (process.env.KEEPER_URL || KEEPER_URL).replace(/\/+$/, "");
+const PROBE_HASH = probeHash();
+const keeperReplies: Record<string, KeeperReply | undefined> = {};
+async function askKeeper(): Promise<void> {
+  for (const [app, slug] of Object.entries(KEEPER_SLUGS)) {
+    if (!KEEPER_TOKEN) { keeperReplies[app] = { error: "no keeper_token set" }; continue; }
+    const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/armed?app=${slug}`);
+    keeperReplies[app] = r ? { status: r.status, body: JSON.stringify(r.body) } : { error: "no answer" };
+  }
+}
+void askKeeper();
+setInterval(() => { void askKeeper(); }, 60_000);
 
 // -- the gateway's health, for the Harness page ------------------------------------
 let connected = false;
@@ -530,4 +552,7 @@ setInterval(() => {
     writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
     renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
   } catch { /* the probe then sees an old time, and fails that layer */ }
+  // Cain's /ready (0.18.0, health-gate.ts; /health is liveness only): 200 only while the gateway is connected and acknowledged.
+  writeGatewayMark(gatewayHealthy(connected, proto.lastAck, Date.now()));
 }, 30_000);
+writeGatewayMark(false);

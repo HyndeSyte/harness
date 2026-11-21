@@ -227,9 +227,15 @@ round is refused, with the count and the rule. If the third still leaves somethi
 runner itself sends you one card: what the piece is, the serious finding in one line, and "Hold it"
 or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
 round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
-after "Ship it with that risk" it goes only while the probe's rollback of a bad install is armed for
-that App (read from `/data/probe/rollback-armed.json`; the probe in 0.15.0 writes no such record, so
-until a release arms it, that card is refused and says what isn't armed). The cap is the option
+after "Ship it with that risk" it goes only while the rollback of a bad install is armed for that App.
+Since 0.18.0 the link reads that from the Keeper App (`GET /armed` with Cain's `keeper_token`, every
+minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
+binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
+the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
+Until the Keeper has run both drills for the App, its Healthchecks checks are set, and (Keeper 0.1.2,
+worked out at every read) its heartbeat and a non-paging log ping to each of its alert checks reached
+Healthchecks within the last 10 minutes with no alert of it stuck for over 2 minutes, that card is
+refused and says what isn't armed (the Keeper's own documentation has the drills and the five conditions). The cap is the option
 `review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
 card in the link's `/data/link/review-decisions.json`.
 
@@ -248,8 +254,8 @@ Since the second round of fixes in 0.16.0:
   until a release arms it, so holding is the working choice. A tap on "Ship it with that risk" then
   records the change as held, on the guard's log below, and Cain is told.
 - At each start the review runner and the link check the owner and mode of these files (the rounds
-  file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file, and the rollback
-  record when there). One that's wrong turns the cap and the guard off (no review round, no `other`
+  file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file; the rollback record
+  is no longer a file since 0.18.0). One that's wrong turns the cap and the guard off (no review round, no `other`
   Build, and Ship decisions paused for every pull request: no Ship card for any change) and raises
   one alarm naming it. Since the third round of fixes the check runs again every minute, so they come
   back on by themselves, and the alarm clears, once the file is right; no restart needed.
@@ -425,6 +431,25 @@ or a pause that lasts, restore two backups from just before the update, Cain's f
 calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
+
+## What 0.18.0 does: working with the Keeper
+
+The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a
+bad one back from the backup taken just before it. Cain's part:
+
+- Right after each start of his session, the App asks the Keeper whether an install of this version is
+  being watched. If one is, it asks his session the liveness line once and gives the Keeper its
+  verdict: PASS, or FAIL when he didn't answer within 10 minutes.
+- If the Keeper's last line about Cain is a rollback or a give-up, his bot says that line to you once.
+- Two checks on port 8098, both for Home Assistant's internal network only (404 to any other address
+  and on any other path):
+  - `/health`, the Watchdog's URL, is liveness: 200 while the App runs, 503 only while a self-restart
+    is due. It doesn't depend on Discord, so a Discord outage doesn't make the Watchdog restart him.
+  - `/ready`, the one the Keeper asks after an install (its `health` option names the path), is
+    readiness: 200 only while the link's Discord connection is up and Discord acknowledged it within 5
+    minutes, 503 otherwise.
+- The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
+  `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 
 ## What 0.15.0 does: Cain stays on Discord
 
