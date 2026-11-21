@@ -474,7 +474,15 @@ with_session() {
 }
 if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
-( while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done ) &
+# 0.17.0: the Healthchecks.io management key (healthchecks_api_key) goes into the link's environment
+# alone, never traced or printed; the link takes it out of its environment at once (link/healthchecks.ts).
+(
+  { set +x; } 2>/dev/null
+  HEALTHCHECKS_API_KEY="$(bashio::config 'healthchecks_api_key' 2>/dev/null || true)"
+  [ "$HEALTHCHECKS_API_KEY" = "null" ] && HEALTHCHECKS_API_KEY=""
+  export HEALTHCHECKS_API_KEY
+  while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done
+) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
 # App's options and goes only into its environment.
 (
@@ -511,6 +519,9 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   # Cain's user can't set them; the runner writes what it uses to /data/review-settings.json.
   REVIEW_ROUND_CAP="$(opt review_round_cap)"
   USAGE_RESERVE_PERCENT="$(opt usage_reserve_percent)"
+  # The week's plan allowance in tokens (0.17.0), set by hand; the runner writes it to the same file.
+  PLAN_WEEKLY_ALLOWANCE_TOKENS="$(opt plan_weekly_allowance_tokens)"
+  export PLAN_WEEKLY_ALLOWANCE_TOKENS
   export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
     REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT

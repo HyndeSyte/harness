@@ -73,11 +73,18 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { hcCall } from "./healthchecks";
+import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, holdLogTrouble, markHoldWritten, readArmed, readDecided, readReset, recordDecision,
+  roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps, unreadableDecisions } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
+
+// 0.17.0: the Healthchecks.io management key, from the App's option healthchecks_api_key, in this
+// process alone: taken out of the environment at once, so nothing the link starts inherits it.
+const HC_KEY = (process.env.HEALTHCHECKS_API_KEY ?? "").trim();
+delete process.env.HEALTHCHECKS_API_KEY;
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
 // their old places only for the old way of starting, before the first cutover).
@@ -225,11 +232,22 @@ sweepTemps(DECIDED, capLog);
 // while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
 let asideUp: boolean | null = null;
 const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisions"); asideUp = true; };
+let badUp: string | null = null;
+let holdLogUp: boolean | null = null;
 const capSweep = () => {
   capOff = selfCheck({ log: capLog, prev: capOff });
   const a = asideOf(DECIDED);
   if (a.length && asideUp !== true) asideAlarm(a[0]);
   else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
+  // 0.17.0: a stored answer that isn't one of its card's options keeps its alarm up until none is; the
+  // guard log's alarm clears once the log reads again.
+  const bad = a.length ? [] : unreadableDecisions(readDecided(DECIDED));
+  const badKey = bad.join(",");
+  if (badKey && badKey !== badUp) { raiseAlarm(`the decision${bad.length === 1 ? "" : "s"} ${bad.slice(0, 3).join(", ")}`, capLog, "review-decision"); badUp = badKey; }
+  else if (!badKey && badUp !== "") { if (badUp) capLog("every stored answer at the review cap is one of its card's options again"); clearAlarm(capLog, "decision"); badUp = ""; }
+  const logTrouble = holdLogTrouble(GUARD_LOG);
+  if (!logTrouble && holdLogUp !== false) { clearAlarm(capLog, "holdlog"); holdLogUp = false; }
+  else if (logTrouble && holdLogUp !== true) { raiseAlarm(logTrouble, capLog, "review-holdlog"); holdLogUp = true; }
 };
 
 const link = new Link({
@@ -269,6 +287,9 @@ const link = new Link({
   armed: () => readArmed(),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
   decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
+  // 0.17.0: the hold-written flag on his decision's record, and the reset mark (paused while a copy stands).
+  holdWritten: (id) => markHoldWritten(DECIDED, id),
+  decisionsReset: () => asideOf(DECIDED).length ? NaN : readReset(DECIDED),
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
   capOff: () => capOff,
@@ -354,7 +375,8 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 
 // The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
 // exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
-const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ };
+const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ,
+  hc: (b: unknown) => hcCall(b, { key: () => HC_KEY, log: (l) => console.log(`[cain] link: ${l}`) }) };
 const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept

@@ -17,17 +17,21 @@
 // The runner (root) appends itself; the Build hook and review.sh, which run as Cain, send the hold to
 // the link (POST /guard-hold), which decides again from its own readings and appends only a refusal.
 //
-// The silent gap (round 3): the Build hook decides a Build run alone and asks the link only when its own
-// reading refuses (hooks/remote-trigger.ts decideWithGuard). That is safe only while the plan reader can
-// never return a real fraction (plan-usage.ts answers unknown, so "other" is always refused and a pass
-// from the hook alone can't happen). Before plan-usage.ts returns anything but unknown, the link must
-// decide every "other" Build run first, and LINK_DECIDES_BUILDS below must say so; cap.test.ts fails
-// while the reader can return a fraction and this is false.
+// The silent gap (round 3): the Build hook used to decide a Build run alone and ask the link only when
+// its own reading refused, which was safe only while the plan reader could never return a real fraction.
+// Cain 0.17.0: the plan reader divides by the week's allowance (plan-usage.ts), so it can, and the link
+// now decides every "other" Build run first (hooks/remote-trigger.ts decideWithGuard asks it every time:
+// a run passes only when the hook's reading and the link's both let it, and the link answered).
+// LINK_DECIDES_BUILDS says so; cap.test.ts checks the hook keeps asking.
 import { appendFileSync, readFileSync } from "node:fs";
 import { readPlanUsage, type PlanReading } from "./plan-usage.ts";
 import { capPaths } from "./capfiles.ts";
 
-export const LINK_DECIDES_BUILDS = false;
+// The week's allowance by default (0.17.0): the App's option plan_weekly_allowance_tokens, set by hand
+// (DOCS.md, "Usage guard"). The runner writes the value it uses into the settings file.
+export const DEFAULT_WEEKLY_ALLOWANCE = 4_200_000_000;
+
+export const LINK_DECIDES_BUILDS = true;
 export const LABELS = ["core", "commitment", "necessary-fix", "other"] as const;
 export type Label = typeof LABELS[number];
 export const DEFAULT_RESERVE_PERCENT = 25;
@@ -40,7 +44,7 @@ const SEAT_LABEL: Record<Seat, string> = { openai: "OpenAI", gemini: "Gemini", p
 // Constants (capfiles.ts); an environment override only in test mode.
 export const paths = (env: Record<string, string | undefined> = process.env) => {
   const p = capPaths(env);
-  return { settings: p.settings, spend: p.spend, log: p.guardLog, tz: env.CHECKIN_TZ ?? "America/New_York" };
+  return { settings: p.settings, spend: p.spend, log: p.guardLog, cache: p.planCache, tz: env.CHECKIN_TZ ?? "America/New_York" };
 };
 
 // What the runner writes at its start (review/runner.ts writeSettings): the caps and the cap it really
@@ -48,6 +52,7 @@ export const paths = (env: Record<string, string | undefined> = process.env) => 
 export type Settings = {
   format: number; written_at: string; round_cap: number; reserve_percent: number;
   caps: { gemini: number; perplexity: number; claude: number; openaiRuns: number }; review_limit: number;
+  weekly_allowance_tokens?: number;                 // 0.17.0: the week's allowance; missing or 0: not set (unknown)
 };
 export function readSettings(path: string): Settings | null {
   try {
@@ -92,7 +97,8 @@ export function decide(label: Label, r: Readings, now: Date): Verdict {
   const age = now.getTime() - Date.parse(p.at);
   if (p.fraction === null) return { ok: false, floor: "plan", why: `the plan's usage is unknown (${p.reason}), which counts as below the ${r.floor}% reserve floor` };
   if (!Number.isFinite(age) || age > STALE_MS) return { ok: false, floor: "plan", why: `the plan's usage reading is more than a day old, which counts as below the ${r.floor}% reserve floor` };
-  if (1 - p.fraction < floor) return { ok: false, floor: "plan", why: `the plan has ${Math.round((1 - p.fraction) * 100)}% of the week's allowance left, below the ${r.floor}% reserve floor` };
+  if (p.complete === false) return { ok: false, floor: "plan", why: `the plan's usage reading is incomplete (${p.skipped ?? "some"} transcript files not counted), which counts as below the ${r.floor}% reserve floor` };
+  if (1 - p.fraction < floor) return { ok: false, floor: "plan", why: `the plan has ${Math.round(Math.max(0, 1 - p.fraction) * 100)}% of the week's allowance left, below the ${r.floor}% reserve floor` };
   if (!r.seats) return { ok: false, floor: "seats", why: `${r.seatsWhy ?? "the review seats' spend can't be read"}, which counts as below the ${r.floor}% reserve floor` };
   const low = r.seats.filter((s) => s.left === null || s.left < floor);
   if (low.length) return { ok: false, floor: `seat ${low.map((s) => s.seat).join(", ")}`,
@@ -103,14 +109,18 @@ export function decide(label: Label, r: Readings, now: Date): Verdict {
 export function monthOf(now: Date, tz: string): string { return now.toLocaleDateString("en-CA", { timeZone: tz }).slice(0, 7); }
 
 // Everything read now: the runner's settings, the spend file, the plan.
-export function readings(o: { settingsFile: string; spendFile: string; tz: string; now: Date; plan?: () => PlanReading }): Readings {
+export function readings(o: { settingsFile: string; spendFile: string; tz: string; now: Date; plan?: () => PlanReading; cacheFile?: string | null }): Readings {
   const settings = readSettings(o.settingsFile);
   let ledger: any = null;
   try { ledger = JSON.parse(readFileSync(o.spendFile, "utf8")); }
   catch (e: any) { ledger = e?.code === "ENOENT" ? {} : null; }
   const s = seatsLeft(ledger, settings, monthOf(o.now, o.tz));
   let plan: PlanReading;
-  try { plan = (o.plan ?? (() => readPlanUsage({ now: o.now })))(); }
+  const allowance = Number(settings?.weekly_allowance_tokens ?? 0);
+  // Root's parts (the runner, the link) keep the reader's cache; Cain's parts only read it.
+  const root = typeof process.getuid === "function" && process.getuid() === 0;
+  const cacheFile = o.cacheFile === undefined ? capPaths().planCache : o.cacheFile;
+  try { plan = (o.plan ?? (() => readPlanUsage({ now: o.now, tz: o.tz, allowance, cacheFile, saveCache: root })))(); }
   catch (e) { plan = { fraction: null, at: o.now.toISOString(), reason: `the reader failed: ${String(e).slice(0, 80)}`, tokens_week: null, files: 0 }; }
   return { plan, seats: s.seats, ...(s.why ? { seatsWhy: s.why } : {}), floor: settings?.reserve_percent ?? DEFAULT_RESERVE_PERCENT };
 }
@@ -128,7 +138,7 @@ export function logLine(now: Date, label: Label, what: string, v: Extract<Verdic
 // reason comes back, with whether it was logged. With neither, nothing is logged (review.sh's own first
 // look, which sends the hold to the link instead).
 export function guard(label: Label, what: string, o: { settingsFile: string; spendFile: string; logFile?: string; log?: (line: string) => void;
-    tz: string; now: Date; plan?: () => PlanReading }): Verdict {
+    tz: string; now: Date; plan?: () => PlanReading; cacheFile?: string | null }): Verdict {
   if (label !== "other") return { ok: true };
   const v = decide(label, readings(o), o.now);
   if (!v.ok && (o.log || o.logFile)) {
@@ -162,9 +172,12 @@ export async function postHold(label: Label, what: string, o: { url?: string; ke
 // The guard's reading in two lines, for Cain's daily usage row (review.sh guard).
 export function guardLines(r: Readings, now: Date): [string, string] {
   const p = r.plan;
+  const pct = (f: number) => Math.round(Math.max(0, 1 - f) * 100);
+  const files = `${p.files} transcript file${p.files === 1 ? "" : "s"} read, ${p.skipped ?? 0} skipped`;
+  const counted = p.tokens_week !== null ? `${p.tokens_week} tokens counted since ${p.week_start ?? "the week's start"}` : "";
   const plan = p.fraction === null
-    ? `Plan: unknown (${p.reason}${p.tokens_week !== null ? `; ${p.tokens_week} tokens recorded in the last 7 days` : ""})`
-    : `Plan: ${Math.round((1 - p.fraction) * 100)}% of the week's allowance left (read ${p.at})`;
+    ? `Plan: unknown (${p.reason}${counted ? `; ${counted}` : ""}; ${files})`
+    : `Plan: ${pct(p.fraction)}% of the week's allowance left (${counted}, of ${p.allowance}; ${files}; read ${p.at})`;
   const v = decide("other", r, now);
   const seats = r.seats
     ? `Seats: ${r.seats.map((s) => `${SEAT_LABEL[s.seat as Seat] ?? s.seat} ${s.left === null ? "?" : `${Math.round(s.left * 100)}%`} left`).join(", ") || "none capped"}`

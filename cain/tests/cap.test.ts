@@ -310,7 +310,7 @@ describe("E: labels and the usage guard", () => {
 });
 
 describe("F: the plan-usage reader, and an unknown or stale reading fails closed", () => {
-  test("it reads the week's tokens from the transcripts, and says why the fraction is unknown", () => {
+  test("it reads the week's tokens from the transcripts, and with no allowance says why the fraction is unknown", () => {
     const home = mkdtempSync(join(tmpdir(), "home-"));
     const proj = join(home, ".claude", "projects", "-data-work");
     mkdirSync(proj, { recursive: true });
@@ -320,7 +320,7 @@ describe("F: the plan-usage reader, and an unknown or stale reading fails closed
     utimesSync(join(proj, "old.jsonl"), new Date("2026-10-01"), new Date("2026-10-01"));
     const r = readPlanUsage({ dir: join(home, ".claude", "projects"), now: NOW });
     expect(r).toMatchObject({ fraction: null, tokens_week: 200, files: 1 });
-    expect(r.reason).toContain("not the plan's weekly allowance");
+    expect(r.reason).toContain("the week's allowance isn't set");
     expect(readPlanUsage({ dir: join(home, "none"), now: NOW })).toMatchObject({ fraction: null, tokens_week: null });
   });
   test("unknown, or older than a day, counts as below the floor for other work", () => {
@@ -992,27 +992,22 @@ describe("round 3, fix 6: the hook names its own reading when the link's passes"
 });
 
 describe("round 3, fix 7: no silent gap between the plan reader and the hook", () => {
-  test("while the hook alone decides a Build run, the plan reader never returns a real fraction", () => {
-    if (LINK_DECIDES_BUILDS) return;                                           // the link decides first: the gap is closed
-    // Behaviour: whatever the transcripts hold, the fraction is unknown.
+  // Cain 0.17.0: the reader returns a real fraction (the week's allowance), so the link decides every
+  // other-labelled Build run first, and the hook must ask it every time, not only when it refuses.
+  test("the reader can return a fraction, so the link decides every other Build run", async () => {
+    expect(LINK_DECIDES_BUILDS).toBe(true);
     const home = mkdtempSync(join(tmpdir(), "r3-plan-"));
     const proj = join(home, ".claude", "projects", "p");
     mkdirSync(proj, { recursive: true });
-    const line = (n: number) => JSON.stringify({ timestamp: NOW.toISOString(), message: { usage: { input_tokens: n, output_tokens: n } } });
-    writeFileSync(join(proj, "a.jsonl"), [line(5_000_000), line(1), '{"usage": {"plan_fraction": 0.5, "weekly_limit": 100}}'].join("\n"));
-    for (const dir of [join(home, ".claude", "projects"), join(home, "none")]) {
-      const p = readPlanUsage({ dir, now: NOW });
-      expect([dir, p.fraction]).toEqual([dir, null]);
-    }
-    // Code: every fraction the reader returns is null, and the hook asks the link only when it refuses.
-    const reader = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/plan-usage.ts"), "utf8");
-    const body = reader.slice(reader.indexOf("export function readPlanUsage"));
-    const returned = [...body.matchAll(/fraction:\s*([^,}]+)/g)].map((m) => m[1].trim());
-    expect(returned.length).toBeGreaterThan(0);
-    expect(returned.every((v) => v === "null")).toBe(true);
+    writeFileSync(join(proj, "a.jsonl"), JSON.stringify({ timestamp: NOW.toISOString(), message: { id: "m", usage: { input_tokens: 10, output_tokens: 10 } } }) + "\n");
+    expect(readPlanUsage({ dir: join(home, ".claude", "projects"), now: NOW, allowance: 100 }).fraction).toBeCloseTo(0.2);
     const hook = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/hooks/remote-trigger.ts"), "utf8");
-    expect(hook).toContain("if (!held) return first;");
-    const guardSrc = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/guard.ts"), "utf8");
-    expect(guardSrc).toContain("The silent gap (round 3)");
+    expect(hook).not.toContain("if (!held) return first;");
+    const holds = keeperHolds({ P1: { holder: "cain", branches: ["claude/x"] } });
+    const call = { tool_name: "RemoteTrigger", tool_input: { action: "run", trigger_id: BUILD, body: { text: "Branch: claude/x\nLabel: other\nDo it." } } };
+    let asked = 0;
+    const why = await decideWithGuard(call, holds, { stop: { stopped: false, at: null } }, () => ({ ok: true }), async () => { asked++; return { logged: false }; });
+    expect(asked).toBe(1);
+    expect(why).toContain("Held by the usage guard");
   });
 });

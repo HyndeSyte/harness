@@ -12,6 +12,8 @@
 //   /data/review-guard.log              root:cain 0640   the runner and the link append, Cain reads
 //   /data/link/review-decisions.json    root:root 0600   the link's own (when there)
 //   /data/probe/rollback-armed.json     root, no group or other write (the probe's, when there)
+//   /data/review-plan-cache.json        root:cain 0640   the plan reader's cache (0.17.0): root's parts write
+//                                       it, Cain's only read it, and only while root owns it; never alarmed
 // A file that is wrong turns the cap and guard features off and raises one alarm naming it.
 import { lstatSync, readFileSync, type Stats } from "node:fs";
 
@@ -31,6 +33,7 @@ export const FILES = {
   decisions: "/data/link/review-decisions.json",
   armed: "/data/probe/rollback-armed.json",
   home: "/data/cain",
+  planCache: "/data/review-plan-cache.json",
 } as const;
 
 export const capPaths = (env: Record<string, string | undefined> = process.env) => ({
@@ -41,6 +44,7 @@ export const capPaths = (env: Record<string, string | undefined> = process.env) 
   decisions: pathOf("CAIN_REVIEW_DECISIONS", FILES.decisions, env),
   armed: pathOf("CAIN_ROLLBACK_ARMED", FILES.armed, env),
   home: pathOf("CAIN_HOME", FILES.home, env),
+  planCache: pathOf("REVIEW_PLAN_CACHE", FILES.planCache, env),
 });
 
 export const ROOT_UID = 0;

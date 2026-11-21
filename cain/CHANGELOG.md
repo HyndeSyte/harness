@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.17.0
+
+- The usage guard now reads your plan's week: the tokens Cain used since Sunday 12:00 AM against a weekly allowance you set by hand, the new option `plan_weekly_allowance_tokens` (about 4.2 billion to start, worked out from your usage page on Nov 21). Other work runs again while more than 25% of the week is left; the App's docs say how to work the number out again.
+- The token count is right now: each reply counts once instead of once per part, every transcript changed this week is read (subagents too), and a count that had to skip a file says so and holds other work instead of looking complete.
+- `review.sh guard` says the percent of the week left, the tokens counted, when the week started, and how many transcript files were read and skipped.
+- The link now decides every other-labelled Build job, not only the ones Cain's own check would hold.
+- Review-cap decision cards: a saved answer that isn't one of the card's two choices is treated as unreadable (nothing passed on, the card says so, an alarm names it); a tap while answers are paused says so and points to the alarm; a card from before a reset is replaced with a new one; a hold line is never written twice, and an unreadable guard log raises an alarm instead of a guess.
+- Badly formed hold calls no longer use up the hold route's per-minute limit.
+- Cain can read and set the grace and period of your Healthchecks.io heartbeat checks himself, once you paste a read-write management key into the new option `healthchecks_api_key`.
+
 ## 0.16.0
 
 - Outside reviews now stop at three rounds per piece of work, counted by the review service itself, which Cain can't change. A new id or a replacement pull request for the same work doesn't start the count again, and a fourth round is refused with the count and the rule.

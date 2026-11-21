@@ -42,6 +42,8 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
     // it reads what the runner wrote to settingsFile (../guard.ts readSettings).
     roundCap: Math.max(1, Math.floor(num(env.REVIEW_ROUND_CAP, d.roundCap!))) || d.roundCap,
     reservePercent: Math.min(100, num(env.USAGE_RESERVE_PERCENT, d.reservePercent!)),
+    // 0.17.0: the week's allowance in tokens (0: not set), the same way: the runner writes it for the rest.
+    weeklyAllowance: Math.floor(num(env.PLAN_WEEKLY_ALLOWANCE_TOKENS, d.weeklyAllowance!)),
     // Round 2: the cap's and guard's paths are constants (../capfiles.ts), overridden only in test mode.
     roundsFile: capPaths(env).rounds,
     settingsFile: capPaths(env).settings,

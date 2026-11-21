@@ -47,7 +47,10 @@
 # guard has the wrong owner or mode at a start, so the review runner and the link keep both off; capfiles.ts).
 # Since its third round, "decisions" (kind "review-decisions": the link's file of his answers at the review cap
 # didn't parse and was moved aside; cleared once the copy is gone) and "holds" (kind "review-holds": the usage
-# guard's hold route hit its cap; cleared after an hour without another).
+# guard's hold route hit its cap; cleared after an hour without another). Since 0.17.0, "decision" (kind
+# "review-decision": a decision's stored answer isn't one of its card's options; cleared once none is) and
+# "holdlog" (kind "review-holdlog": the usage guard's log couldn't be read, so a hold line may be missing;
+# cleared once it reads again).
 # Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
@@ -126,6 +129,8 @@ group_of() {
     review-files) echo review ;;
     review-decisions) echo decisions ;;
     review-holds) echo holds ;;
+    review-decision) echo decision ;;
+    review-holdlog) echo holdlog ;;
     self-off) echo watchdog ;;
     self-refused|self-loops) echo selfrestart ;;
     nginx) echo panel ;;
@@ -220,6 +225,10 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain's file of your answers on review-cap decision cards didn't parse, so the App moved it aside, never deleting it${c}. While that moved-aside copy stands, no new answer on such a card is kept and Ship cards for changes at the cap stay refused; the App doesn't set this file up again by itself. The step that turns answers back on: as root on the Pi, remove the moved-aside copy named above, or rename it so its name no longer starts with review-decisions.json.corrupt-. Answers are kept again as soon as it is gone, and the link's next sweep clears this. Cain files it for a fix. $DETAILS" ;;
     review-holds) T="Cain's usage-guard holds hit their limit"
       M="Cain's usage guard hold route hit its limit${c}. Every held build is still refused; past the limit a hold isn't logged until the next minute, and a full log is rotated keeping one previous file. The App clears this after an hour without another. Cain files it for a fix. $DETAILS" ;;
+    review-decision) T="A review-cap decision of yours can't be read"
+      M="A saved answer on one of your review-cap decision cards isn't one of that card's two choices${c}, so the App treats it as unreadable: nothing was passed on, no hold was written, its card says so, and Ship cards for that change stay refused. The way back: as root on the Pi, take that decision's entry out of /data/link/review-decisions.json (the card can then be answered again), or move the whole file aside. This clears once no saved answer is out of place. Cain files it for a fix. $DETAILS" ;;
+    review-holdlog) T="Cain's usage-guard log can't be read"
+      M="Cain's usage-guard log couldn't be read${c}, so the App can't tell whether a hold line was already written, and one may be missing: Cain lists holds from it. Nothing more is written to it on a guess. This clears once the log reads again. Cain files it for a fix. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -243,6 +252,8 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
     review) CT="Cain's review safeguards are back on"; CM="Cain's review-round cap and usage guard are on again, and Ship decisions resume: their files are the App's alone." ;;
     decisions) CT="Cain's review-cap answers are kept again"; CM="The moved-aside copy of Cain's file of your review-cap answers is gone, so new answers are kept again." ;;
+    decision) CT="Your review-cap answers read right again"; CM="Every saved answer on your review-cap decision cards is one of its card's choices again." ;;
+    holdlog) CT="Cain's usage-guard log reads again"; CM="Cain's usage-guard log can be read again, so holds are checked and written as before." ;;
     holds) CT="Cain's usage-guard holds are back under their limit"; CM="Cain's usage guard hold route stayed under its limit for an hour." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }

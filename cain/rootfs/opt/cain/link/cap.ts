@@ -14,6 +14,12 @@
 //     writes resume once it's gone, the next sweep clears the alarm); the record as kept is returned
 //     and drives the card, the relay and the hold line; a failed write removes its temp file, and stale
 //     temp files are swept at the link's start; the guard's log is capped in size and rotated root-side.
+//     Cain 0.17.0 (the cap build's follow-ups): a stored choice that isn't one of the card's options is
+//     unreadable (fail closed: no relay, no hold line, the card says so, an alarm names it, and the cap's
+//     state is unknown); the hold line's duplicate check is backed by a hold_written flag on the record,
+//     and a guard log that can't be read raises an alarm instead of a guess; a tap while a moved-aside copy
+//     stands says decisions are paused (DecisionsPaused); the move-aside leaves a reset mark
+//     ("<file>.reset", its time), and a card posted before it is refused and posted again.
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
 //     it installs, read from the probe's record (/data/probe/rollback-armed.json), never from Cain.
@@ -93,7 +99,7 @@ export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | nu
   return null;
 }
 
-export type Decided = Record<string, { choice: string; at: number }>;
+export type Decided = Record<string, { choice: string; at: number; hold_written?: boolean }>;
 // A moved-aside copy beside the file: "<name>.corrupt-<time>".
 export function asideOf(path: string): string[] {
   try { return readdirSync(dirname(path)).filter((n) => n.startsWith(`${basename(path)}.corrupt-`)).map((n) => join(dirname(path), n)); }
@@ -104,6 +110,11 @@ const parseDecided = (text: string): Decided | null => {
 };
 // His taps; {} when there's no file yet; null when it can't be read, doesn't parse, or a copy that
 // didn't parse was moved aside (until that's settled no tap counts: the Ship card fails closed).
+// The decisions whose stored choice isn't one of the card's options (a damaged or hand-edited file).
+export function unreadableDecisions(d: Decided | null): string[] {
+  if (!d) return [];
+  return Object.entries(d).filter(([, v]) => !v || typeof v.choice !== "string" || !(DECISION_OPTIONS as readonly string[]).includes(v.choice)).map(([k]) => k);
+}
 export function readDecided(path: string): Decided | null {
   if (asideOf(path).length) return null;
   let text: string;
@@ -135,16 +146,43 @@ export function sweepTemps(path: string, log: (m: string) => void = () => {}): n
 }
 
 export class DecisionsUnsaved extends Error {}
+// Decisions are paused (0.17.0): a moved-aside copy stands, or the reset mark can't be read. The tap's
+// reply says so and points to the alarm.
+export class DecisionsPaused extends DecisionsUnsaved {}
+// The reset mark (0.17.0): written when a decisions file that didn't parse is moved aside, holding the
+// time (ms). It stays after the copy is gone: a decision card posted before it is from the old file, so
+// a tap on it is refused and the card posted again (Link.onQuestion).
+export const resetOf = (path: string) => `${path}.reset`;
+// The time of the last move-aside; null: none ever; NaN: the mark is there and can't be read.
+export function readReset(path: string): number | null {
+  let t: string;
+  try { t = readFileSync(resetOf(path), "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? null : NaN; }
+  const n = Number(t.trim());
+  return Number.isFinite(n) && n > 0 ? n : NaN;
+}
+function writeWhole(path: string, text: string, o: { sync?: (dir: string) => void; rename?: (from: string, to: string) => void } = {}): void {
+  const tmp = tempOf(path);
+  try {
+    const fd = openSync(tmp, "w", 0o600);
+    try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+    (o.rename ?? renameSync)(tmp, path);
+    (o.sync ?? syncFolder)(dirname(path));
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* gone already, or renamed into place */ }
+    throw e;
+  }
+}
 // His tap, kept durably before the card is marked used (Link.onQuestion). The same decision tapped
 // again keeps its first answer (a retry records it once). Throws DecisionsUnsaved when it couldn't be
 // kept; a file that doesn't parse is moved aside (never overwritten), and onCorrupt hears its new name.
 // Round 3: it returns the record as kept, with existed when one was there before this tap: the caller
 // uses that choice, never the label just tapped. A write that fails removes its temp file.
-export type Kept = { choice: string; at: number; existed: boolean };
+// 0.17.0: hold_written comes back too (markHoldWritten sets it once his risk tap's hold line is written).
+export type Kept = { choice: string; at: number; existed: boolean; hold_written?: boolean };
 export function recordDecision(path: string, id: string, choice: string, at: number,
     o: { onCorrupt?: (aside: string) => void; sync?: (dir: string) => void; now?: () => number; rename?: (from: string, to: string) => void } = {}): Kept {
   const aside = asideOf(path);
-  if (aside.length) throw new DecisionsUnsaved(`his decisions file was moved aside and isn't settled yet (${asideStep(aside[0])})`);
+  if (aside.length) throw new DecisionsPaused(`his decisions file was moved aside and isn't settled yet (${asideStep(aside[0])})`);
   let text: string | null = null;
   try { text = readFileSync(path, "utf8"); }
   catch (e: any) { if (e?.code !== "ENOENT") throw new DecisionsUnsaved(`his decisions file can't be read (${String(e?.code ?? e).slice(0, 40)})`); }
@@ -152,27 +190,34 @@ export function recordDecision(path: string, id: string, choice: string, at: num
   if (text !== null) {
     const j = parseDecided(text);
     if (!j) {
-      const to = `${path}.corrupt-${new Date((o.now ?? Date.now)()).toISOString().replace(/[-:.]/g, "")}`;
+      const when = (o.now ?? Date.now)();
+      const to = `${path}.corrupt-${new Date(when).toISOString().replace(/[-:.]/g, "")}`;
       try { renameSync(path, to); } catch (e) { throw new DecisionsUnsaved(`his decisions file doesn't parse, and couldn't be moved aside (${String(e).slice(0, 60)})`); }
+      // The reset mark: cards posted before now belong to the moved-aside file.
+      try { writeWhole(resetOf(path), String(when), o); } catch { /* an unwritten mark leaves the copy standing, which pauses anyway */ }
       try { o.onCorrupt?.(to); } catch { /* the refusal stands */ }
-      throw new DecisionsUnsaved(`his decisions file didn't parse, so it was moved aside to ${to}`);
+      throw new DecisionsPaused(`his decisions file didn't parse, so it was moved aside to ${to}`);
     }
     all = j;
   }
   const had = all[id];
-  if (had && typeof had.choice === "string") return { choice: had.choice, at: Number(had.at), existed: true };
+  if (had && typeof had.choice === "string") return { choice: had.choice, at: Number(had.at), existed: true, ...(had.hold_written ? { hold_written: true } : {}) };
   all[id] = { choice, at };
-  const tmp = tempOf(path);
-  try {
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeSync(fd, JSON.stringify(all, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-    (o.rename ?? renameSync)(tmp, path);
-    (o.sync ?? syncFolder)(dirname(path));
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* gone already, or renamed into place */ }
-    throw new DecisionsUnsaved(`his decision couldn't be written (${String(e).slice(0, 80)})`);
-  }
+  try { writeWhole(path, JSON.stringify(all, null, 1), o); }
+  catch (e) { throw new DecisionsUnsaved(`his decision couldn't be written (${String(e).slice(0, 80)})`); }
   return { choice, at, existed: false };
+}
+// His risk tap's hold line is written (0.17.0): kept on the decision's record, so a retried tap after a
+// crash doesn't write a second line even when the guard's log can't tell. Throws DecisionsUnsaved.
+export function markHoldWritten(path: string, id: string, o: { sync?: (dir: string) => void; rename?: (from: string, to: string) => void } = {}): void {
+  if (asideOf(path).length) throw new DecisionsPaused("his decisions file was moved aside");
+  let all: Decided | null;
+  try { all = parseDecided(readFileSync(path, "utf8")); } catch (e) { throw new DecisionsUnsaved(`his decisions file can't be read (${String(e).slice(0, 40)})`); }
+  if (!all || !all[id]) throw new DecisionsUnsaved("his decision isn't on record");
+  if (all[id].hold_written) return;
+  all[id] = { ...all[id], hold_written: true };
+  try { writeWhole(path, JSON.stringify(all, null, 1), o); }
+  catch (e) { throw new DecisionsUnsaved(`the hold mark couldn't be written (${String(e).slice(0, 80)})`); }
 }
 
 // The guard's log, bounded (round 3): one line appended, root-side. When the line would take the file
@@ -198,13 +243,21 @@ export function appendCapped(path: string, line: string, o: { max?: number; sync
 }
 // Whether the guard's log (or its one previous file) already has a line with this tag and what: his
 // risk tap's hold is written once, even when a tap is retried after a crash (round 3).
+export class HoldLogUnreadable extends Error {}
+// 0.17.0: a log (or its previous file) that is there but can't be read throws HoldLogUnreadable: a hold
+// line may be missing, and the caller raises an alarm rather than guess.
 export function holdLogged(path: string, tag: string, what: string): boolean {
   for (const f of [path, `${path}.1`]) {
     let text = "";
-    try { text = readFileSync(f, "utf8"); } catch { continue; }
+    try { text = readFileSync(f, "utf8"); }
+    catch (e: any) { if (e?.code === "ENOENT") continue; throw new HoldLogUnreadable(`${f} can't be read (${String(e?.code ?? e).slice(0, 40)})`); }
     for (const l of text.split("\n")) { const c = l.split("\t"); if (c[1] === tag && c[2] === what) return true; }
   }
   return false;
+}
+// Whether the guard's log reads (for the sweep that clears its alarm): null when it does, else why not.
+export function holdLogTrouble(path: string): string | null {
+  try { holdLogged(path, "\u0000", "\u0000"); return null; } catch (e) { return String((e as Error).message ?? e).slice(0, 120); }
 }
 
 export type CapState =
@@ -227,6 +280,7 @@ export function capStateFor(pr: string, rounds: Rounds | null, decided: Decided 
     if (!decided) return { state: "unknown", why: "his decisions at the review cap can't be read" };
     const tap = decided[d.id];
     if (!tap) return { state: "waiting", key: k, decision: d };
+    if (tap.choice !== RISK && tap.choice !== HOLD) return { state: "unknown", why: `his stored answer on the decision for ${k} isn't one of its card's options, so it can't be read` };
     return { state: tap.choice === RISK ? "risk" : "hold", key: k, decision: d };
   }
   return { state: "none" };

@@ -17,6 +17,7 @@
 //     what his tap landed, so it carries its label and isn't held. Round 2: the guard's log is root's
 //     (0640), so the hold goes to the link (POST /guard-hold, Cain's key), which decides again and
 //     appends it; if the link can't be reached the run is still refused, saying the hold wasn't logged.
+//     Cain 0.17.0: the link is asked for every "other" Build run, not only when the hook refuses.
 //     Paths are constants (../capfiles.ts), and the hook refuses every run while the test-mode
 //     variable (CAIN_TEST_MODE) is set: the production run script never sets it.
 // A refusal goes back to Cain as the reason; anything else is left to the usual
@@ -160,21 +161,31 @@ function read(path: string): string | null {
   try { return readFileSync(path, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
 
-// The guard as the hook runs it: the reading now, and a refusal sent to the link to be logged. Two
-// passes: decide() is synchronous, so the first finds whether the guard refuses, the link is asked, and
-// the second gives the reason with whether it was logged.
+// The guard as the hook runs it. Cain 0.17.0: the plan reader can return a real fraction now, so the
+// link decides every "other" Build run first (../guard.ts LINK_DECIDES_BUILDS): the hook's reading is
+// taken, then the link is asked every time (POST /guard-hold), and the run passes only when both let it
+// and the link answered "passes". Two passes: decide() is synchronous, so the first finds the run's
+// label and the hook's reading, the link is asked, and the second gives the answer.
 export async function decideWithGuard(call: any, holdsText: string | null, env: Env,
-    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean; passes?: boolean }>): Promise<string> {
-  let held: { label: Label; what: string; v: Extract<Verdict, { ok: false }> } | null = null;
+    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean; passes?: boolean; why?: string }>): Promise<string> {
+  let asked: { label: Label; what: string; v: Verdict } | null = null;
   const first = decide(call, holdsText, { ...env, guard: (label, what) => {
     const v = reading(label, what);
-    if (!v.ok) held = { label, what, v };
+    asked = { label, what, v };
     return v;
   } });
-  if (!held) return first;
-  const h = held as { label: Label; what: string; v: Extract<Verdict, { ok: false }> };
+  if (!asked) return first;
+  const h = asked as { label: Label; what: string; v: Verdict };
   const sent = await post(h.label, h.what);
-  return decide(call, holdsText, { ...env, guard: () => ({ ...h.v, logged: sent.logged, ...(sent.passes ? { linkPasses: true } : {}) }) });
+  if (h.v.ok) {
+    if (sent.passes) return first;                                  // both readings let it run
+    // The hook's reading passed, the link's didn't, or the link didn't answer: held (fail closed).
+    const v: Verdict = sent.logged
+      ? { ok: false, floor: "link", why: `the link's reading holds it${sent.why ? ` (${sent.why})` : ""}`, logged: true }
+      : { ok: false, floor: "link", why: "the link, which decides every other-labelled Build run, didn't let it run", logged: false };
+    return decide(call, holdsText, { ...env, guard: () => v });
+  }
+  return decide(call, holdsText, { ...env, guard: () => ({ ...(h.v as Extract<Verdict, { ok: false }>), logged: sent.logged, ...(sent.passes ? { linkPasses: true } : {}) }) });
 }
 
 if (import.meta.main) {
@@ -184,7 +195,7 @@ if (import.meta.main) {
     const p = paths();
     const now = Date.now();
     const reading = (label: Label, what: string): Verdict => label !== "other" ? { ok: true }
-      : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now) }), new Date(now));
+      : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now), cacheFile: p.cache }), new Date(now));
     try { reason = await decideWithGuard(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w)); }
     catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   }

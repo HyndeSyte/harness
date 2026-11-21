@@ -66,6 +66,15 @@ its own.
   one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
   one late ping doesn't page you. A second check, pinged only while every liveness check of Cain passes,
   is `probe_heartbeat_url` (**What 0.14.0 does**, below).
+- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.17.0). So Cain
+  can set those checks' grace and period himself, paste a Healthchecks.io management API key once in
+  this App's Configuration (in Healthchecks.io: the project's Settings, API Access, a read-write key,
+  not the read-only one), then restart the App. Only Cain's link has it; Cain's own user never reads
+  it, and it isn't logged. Cain uses two commands through the link: `keeper.sh hc-check <check name>`
+  prints a check's grace, period, status and last ping, and `keeper.sh hc-set <check name> --grace
+  <seconds> [--period <seconds>]` sets them and prints what the service answered. Nothing else about a
+  check can be changed, and each set is logged (the App log and `/data/link/healthchecks.log`). Without
+  a key both say "no key set".
 - **Review spend.** The morning check-in has yesterday's spend per review seat and the month
   so far against each cap, and flags a day that jumps (over 3 times the week before and at
   least $1, once the seat was used on at least 3 of those 7 days; or over a fifth of the month's
@@ -290,16 +299,35 @@ only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and th
 every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
 check-in hands Cain the same two lines for his daily usage row.
 
-What it reads for the plan: Cain's Claude Code transcripts under `/data/cain/.claude/projects` (each
-turn's token counts, the last 7 days). They record tokens used, not your plan's weekly allowance,
-and nothing else on the Pi records the allowance, so the plan reading is "unknown" today, and an
-unknown reading (or one older than a day) counts as below the floor. So for now every `other` job
-and review is held, and only `core`, `commitment` and `necessary-fix` work runs: that's on purpose,
-until there's a reliable reading. How to tell it's working: `review.sh guard`'s first line says
-"Plan: unknown" with the reason and the week's token count (a count that grows as Cain works shows it
-reads the transcripts; "no Claude Code transcripts found" means it can't), and its second line names
-each seat's share left and whether other work is held. `review.sh spend` shows the runner's own caps
-and each open change's round count.
+What it reads for the plan (since 0.17.0): Cain's Claude Code transcripts under
+`/data/cain/.claude/projects`, subagent transcripts included, and the week's allowance you set by hand,
+the option `plan_weekly_allowance_tokens` (default 4200000000; 0 means not set, and the reading is
+"unknown" as in 0.16.0). The plan's week starts Sunday 12:00 AM in the App's time zone (America/New_York),
+as the subscription's usage page says "Resets Sunday 12:00 AM", not a rolling 7 days: the reader counts
+the tokens with timestamps at or after the most recent Sunday 00:00, and divides them by the allowance.
+Each message counts once: Claude Code writes one transcript line per part of a reply, each carrying the
+same message id and token counts, so the reader takes each message id once, with the largest count seen
+for it. It reads every transcript changed since the week's start, line by line, up to 1000 files; any file
+past that bound, or that can't be read, is "skipped", and a reading with a skipped file is incomplete,
+which counts as unknown (it holds other work). Each file's count is kept in `/data/review-plan-cache.json`
+(root's; the runner and the link write it, Cain's parts only read it), so an unchanged file isn't read
+again and a growing one is read on from where it stopped.
+
+The guard's rules don't change: an unknown reading, an incomplete one, or one older than a day counts as
+below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.17.0
+the link decides every `other` Build job too, not only the ones Cain's hook would refuse: a job runs only
+when both readings let it and the link answered. `review.sh guard`'s first line says the percent of the
+week's allowance left, the tokens counted and the week's start, and how many transcript files were read
+and skipped; its second line names each seat's share left and whether other work is held. `review.sh
+spend` shows the runner's own caps and each open change's round count.
+
+Where the allowance comes from. On Nov 21, 2026 at 3:21 AM your usage page showed 35 percent of the
+week used, and the transcripts on this device held about 1.47 billion tokens (each message counted once)
+since Sunday Nov 15 00:00 local: 1.47 billion over 0.35 is about 4.2 billion. That is this device's share
+of the plan, not the plan's own limit, and it holds while this device's share of your Claude Code use
+stays about the same. To work it out again: read the percent used on your usage page, read the tokens
+counted on `review.sh guard`'s first line at the same time, and divide the tokens by that percent (as a
+fraction). Only you change the option, in the App's Configuration; Cain and the builds never do.
 
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.

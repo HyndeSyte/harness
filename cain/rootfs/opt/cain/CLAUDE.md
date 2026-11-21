@@ -732,6 +732,10 @@ keep work moving without him starting it. It is never his go on anything.
    never expires by design (the deploy and Ship keys), `/opt/cain/keeper.sh key-ack <name>
    <YYYY-MM-DD>` quiets its age line until that date, on his word. Never ask
    him for a key or the heartbeat URL in Discord: they go only into the App's options.
+   The heartbeat checks' grace and period at Healthchecks.io are yours to set:
+   `/opt/cain/keeper.sh hc-check <check name>` reads one, and
+   `/opt/cain/keeper.sh hc-set <check name> --grace <seconds> [--period <seconds>]` sets them (the
+   link holds the key; "no key set" means he hasn't pasted it into the App's options yet).
 
 ## Your record
 The organization's record is the private GitHub repo HyndeSyte/org. Don't keep facts
