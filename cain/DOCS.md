@@ -250,8 +250,15 @@ Since the second round of fixes in 0.16.0:
 - At each start the review runner and the link check the owner and mode of these files (the rounds
   file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file, and the rollback
   record when there). One that's wrong turns the cap and the guard off (no review round, no `other`
-  Build, no Ship card for a change at the cap) and raises one alarm naming it, until a start finds
-  them right.
+  Build, and Ship decisions paused for every pull request: no Ship card for any change) and raises
+  one alarm naming it. Since the third round of fixes the check runs again every minute, so they come
+  back on by themselves, and the alarm clears, once the file is right; no restart needed.
+- A decisions file that doesn't parse is moved aside, never deleted, and no new answer is kept while
+  that copy stands; the App doesn't set it up again by itself. The alarm names the copy and the step
+  back: as root on the Pi, remove it or rename it so its name no longer starts with
+  `review-decisions.json.corrupt-`. Answers are kept again at once, and the alarm clears at the link's
+  next sweep. If you tap the other answer after a restart cut a tap short, your first answer stands,
+  and the card says "Already answered".
 
 ### Labels (since 0.16.0)
 
@@ -273,7 +280,11 @@ There's no tap or flag that gets around it. Each refusal is one line in `/data/r
 never sends you a card. The log is root's (root:cain 0640, since the second round of fixes): Cain
 reads it but can't write it. The runner writes its own refusals; Cain's Build hook and `review.sh`
 send theirs to the link, which checks the guard again itself and writes only a real refusal. If the
-link can't be reached the run is still refused, and the refusal says the hold wasn't logged. The
+link can't be reached the run is still refused, and the refusal says the hold wasn't logged. Since
+the third round of fixes that route is bounded: at most 6 holds a minute from each caller, an
+identical hold logged once in 10 minutes, its description checked like a card (one that fails is
+logged as "a build labelled" and its label), and the log rotated at 256 KB keeping one previous file
+(`/data/review-guard.log.1`), with one alarm when a limit is hit. The
 guard's, the cap's and the plan reader's paths are fixed in the code; the environment can move them
 only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and the Build hook refuses
 every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning

@@ -14,6 +14,7 @@
 - A third round that never finishes (every reviewer failed, or the App stopped mid-way) still counts, and you get the decision card anyway, saying the last review didn't complete.
 - The decision card passes the same checks as every other card, waits while someone else holds its item, and says up front when shipping with the risk can't happen yet because the rollback isn't armed.
 - Cain can read the usage guard's log but no longer write it, and the App checks the review files' owners at each start, turning the cap and guard off with one alarm if one is wrong.
+- Fixes from the second outside review: if you tap the other answer on a decision card after a restart, the card, Cain and the guard's log all keep your first answer and say so; the usage guard's hold log has a size limit and per-minute limits, with one alarm when they're hit; the alarm for a damaged decisions file names it and the one step that turns answers back on; and the review files' alarm says Ship decisions are paused for every pull request, then clears by itself once the file is right, with no restart.
 
 ## 0.15.0
 

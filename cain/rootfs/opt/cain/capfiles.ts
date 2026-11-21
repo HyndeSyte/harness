@@ -1,5 +1,6 @@
 // The review-round cap's and the usage guard's files (Cain 0.16.0, round 2): where they live, who owns
-// them, and the install-time self-check the review runner and the link run at their start.
+// them, and the install-time self-check the review runner and the link run at their start (and, since
+// round 3, again at each of their sweeps).
 //
 // Paths are constants here. An environment override is honoured only behind one explicit test-mode
 // variable (CAIN_TEST_MODE=1), which the production run script never sets; the Build hook refuses to
@@ -81,15 +82,17 @@ export function checkFiles(rules: FileRule[], stat: (p: string) => Stats = lstat
 
 // The App's alarm for it, through root's notice.sh (its group "review"); tests pass their own.
 export const NOTICE = "/opt/cain/notice.sh";
-export function clearAlarm(log: (m: string) => void = console.log): void {
-  try { Bun.spawnSync(["timeout", "-k", "2", "40", NOTICE, "clear", "review"], { stdout: "inherit", stderr: "inherit" }); }
-  catch (e) { log(`couldn't clear the alarm about the review files: ${String(e).slice(0, 80)}`); }
+export function clearAlarm(log: (m: string) => void = console.log, group = "review"): void {
+  try { Bun.spawnSync(["timeout", "-k", "2", "40", NOTICE, "clear", group], { stdout: "inherit", stderr: "inherit" }); }
+  catch (e) { log(`couldn't clear the alarm (${group}): ${String(e).slice(0, 80)}`); }
 }
-export function raiseAlarm(cause: string, log: (m: string) => void = console.log): void {
+// kind (round 3): "review-files" (this check), "review-decisions" (his decisions file moved aside) or
+// "review-holds" (the guard-hold route's caps).
+export function raiseAlarm(cause: string, log: (m: string) => void = console.log, kind = "review-files"): void {
   try {
-    const r = Bun.spawnSync(["timeout", "-k", "2", "40", NOTICE, "tell", "review-files", cause], { stdout: "inherit", stderr: "inherit" });
-    if (r.exitCode !== 0) log(`the alarm about the review files didn't go yet (notice.sh ${r.exitCode}); raised again at the next start`);
-  } catch (e) { log(`couldn't raise the alarm about the review files: ${String(e).slice(0, 80)}`); }
+    const r = Bun.spawnSync(["timeout", "-k", "2", "40", NOTICE, "tell", kind, cause], { stdout: "inherit", stderr: "inherit" });
+    if (r.exitCode !== 0) log(`the alarm (${kind}) didn't go yet (notice.sh ${r.exitCode}); raised again at the next change`);
+  } catch (e) { log(`couldn't raise the alarm (${kind}): ${String(e).slice(0, 80)}`); }
 }
 
 // How Cain runs this start (the run script's /run/cain/mode): "own" (his own user), "old" (as root,
@@ -99,18 +102,30 @@ export function runMode(path = MODE_FILE): string | null {
   try { return readFileSync(path, "utf8").trim().slice(0, 10) || null; } catch { return null; }
 }
 
-// At a start: the check, with one alarm when it fails. The cause, or null when every file is right.
-// Only while he runs as his own user, the only way lock.sh sets these files up and the owners mean
-// anything; the old way (he is root) and a stopped start skip it, said in the log. A mode that can't
-// be read checks (it fails closed).
+// At a start, and again at each sweep (round 3): the check, with one alarm when it starts failing (or
+// its cause changes) and the alarm cleared once every file is right, so the features come back without a
+// restart. prev: the last finding (undefined at the start, which always raises or clears). The cause, or
+// null when every file is right. While it fails, the cap's state reads unknown for every pull request, so
+// every Ship card is refused: the alarm says so. Only while he runs as his own user, the only way lock.sh
+// sets these files up and the owners mean anything; the old way (he is root) and a stopped start skip it,
+// said in the log once. A mode that can't be read checks (it fails closed).
 export function selfCheck(o: { rules?: FileRule[]; stat?: (p: string) => Stats; alarm?: (cause: string) => void; clear?: () => void;
-    log?: (m: string) => void; mode?: string | null } = {}): string | null {
+    log?: (m: string) => void; mode?: string | null; prev?: string | null } = {}): string | null {
+  const first = o.prev === undefined;
   const mode = o.mode !== undefined ? o.mode : runMode();
-  if (mode === "old" || mode === "none") { (o.log ?? console.log)(`the review files' owners aren't checked this start (Cain runs ${mode === "old" ? "the old way" : "not at all"})`); return null; }
+  if (mode === "old" || mode === "none") {
+    if (first) (o.log ?? console.log)(`the review files' owners aren't checked this start (Cain runs ${mode === "old" ? "the old way" : "not at all"})`);
+    return null;
+  }
   const cause = checkFiles(o.rules ?? capFileRules(), o.stat);
   if (cause) {
-    (o.log ?? console.log)(`the review cap and the usage guard are off: ${cause}`);
-    (o.alarm ?? ((c) => raiseAlarm(c, o.log)))(cause);
-  } else (o.clear ?? (() => clearAlarm(o.log)))();
+    if (first || cause !== o.prev) {
+      (o.log ?? console.log)(`the review cap and the usage guard are off, and Ship decisions are paused for every pull request: ${cause}`);
+      (o.alarm ?? ((c) => raiseAlarm(c, o.log)))(cause);
+    }
+  } else if (first || o.prev !== null) {
+    if (!first) (o.log ?? console.log)("the review files are right again: the review cap, the usage guard and Ship decisions are back on");
+    (o.clear ?? (() => clearAlarm(o.log)))();
+  }
   return cause;
 }

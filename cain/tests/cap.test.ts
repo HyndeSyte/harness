@@ -447,7 +447,8 @@ describe("round 2, fix 2: the guard's log is root's; holds from Cain's side go t
     const dir = mkdtempSync(join(tmpdir(), "hold-"));
     const o = LOW(dir);
     const r = rig({ holds: keeperHolds({}) });
-    Object.assign((r.link as any).d, { guardHold: (label: any, what: string) => guard(label, what, { ...o, log: (l: string) => appendFileSync(o.log, l) }) });
+    // Round 3: the guard only decides at the link; the link appends the line itself.
+    Object.assign((r.link as any).d, { guardHold: (label: any, what: string) => guard(label, what, o), holdLog: (l: string) => { appendFileSync(o.log, l); } });
     const routes = linkRoutes({ link: r.link, toHarness: async () => true });
     const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: async (req) => {
       const url = new URL(req.url);
@@ -690,5 +691,328 @@ describe("round 2, fix 7: paths are constants; overrides only in test mode", () 
     const out = JSON.parse(r.stdout);
     expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(out.hookSpecificOutput.permissionDecisionReason).toContain("CAIN_TEST_MODE is set, a tests-only variable");
+  });
+});
+
+// Round 3: the second outside review's fixes.
+import { appendCapped, asideStep, holdLogged, sweepTemps, tempOf } from "../rootfs/opt/cain/link/cap.ts";
+import { CARD_RULES, HOLD_DEDUPE_MS, HOLDS_PER_MINUTE } from "../rootfs/opt/cain/link/core.ts";
+import { AT, RULES } from "../rootfs/opt/cain/gate/rules.ts";
+import { LINK_DECIDES_BUILDS } from "../rootfs/opt/cain/guard.ts";
+import { chmodSync, chownSync, statSync } from "node:fs";
+
+const NOTICE_SH = join(import.meta.dir, "../rootfs/opt/cain/notice.sh");
+const noticeText = (kind: string, cause: string) => spawnSync("bash", [NOTICE_SH, "text", kind, cause], { encoding: "utf8" }).stdout;
+
+describe("round 3, fix 1: the stored tap drives the card, the relay and the hold line", () => {
+  // A failure after the rename and before the card's mark: the folder's fsync fails once the record is
+  // already in place, so the card stays tappable (as after a crash there), with his first answer kept.
+  const crashRig = (file: string, holdLines: string[]) => {
+    const r = rig({ holds: keeperHolds({}) });
+    let crash = true;
+    Object.assign((r.link as any).d, {
+      armed: () => JSON.stringify({ armed: { cain: "t" } }),                  // not armed for Harness: a risk tap is held
+      decided: (id: string, c: string, at: number) => recordDecision(file, id, c, at, { sync: () => { if (crash) { crash = false; throw new Error("EIO after the rename"); } } }),
+      holdLog: (l: string) => { holdLines.push(l); },
+      hasHold: (tag: string, what: string) => holdLines.some((l) => l.split("\t")[1] === tag && l.split("\t")[2] === what),
+    });
+    return r;
+  };
+
+  test("after a crash between the durable write and the mark, a re-tap of the other choice shows and relays the first", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "r3-"));
+    const file = join(dir, "review-decisions.json");
+    const lines: string[] = [];
+    const r = crashRig(file, lines);
+    const res = await r.link.decision(DEC) as any;
+    const [hold, risk] = r.ids(res.message);
+    await r.tap(r.msg(res.message), risk);                                     // kept on disk, then the failure
+    expect(readDecided(file)).toMatchObject({ "pr-5#3": { choice: RISK } });
+    expect(r.state().messages[res.message].q!.used).toBe(false);               // the card was never marked
+    expect(lines).toEqual([]);
+    await r.tap(r.msg(res.message), hold);                                     // he taps the other choice
+    // Everything agrees on the first choice: the card, the relay line, the hold log and the file.
+    expect(String(r.msg(res.message).content)).toEndWith(`Already answered: ${RISK}`);
+    expect(String(r.msg(res.message).content)).not.toContain(`You answered: ${HOLD}`);
+    expect(r.state().messages[res.message]).toMatchObject({ label: RISK, outcome: "answered" });
+    const relay = r.relayed.filter((l) => l.includes("Dane tapped"));
+    expect(relay.length).toBe(1);
+    expect(relay[0]).toContain(`Dane tapped "${RISK}"`);
+    expect(relay[0]).not.toContain(`"${HOLD}"`);
+    expect(relay[0]).toContain("His first answer stands");
+    expect(relay[0]).toContain("It's recorded as held, not shippable yet");
+    expect(lines.length).toBe(1);                                              // the hold the crash never wrote, written once
+    expect(lines[0].split("\t").slice(1, 3)).toEqual(["review-cap", `pr-5 (${PR})`]);
+    expect(readDecided(file)!["pr-5#3"].choice).toBe(RISK);
+    expect(capStateFor(PR, { format: 1, changes: { "pr-5": { rounds: [], decision: { ...DEC, state: "posted" } } } }, readDecided(file)))
+      .toMatchObject({ state: "risk" });
+  });
+
+  test("a hold line already written before the crash is not written again", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "r3-"));
+    const file = join(dir, "review-decisions.json");
+    const lines: string[] = [];
+    const r = crashRig(file, lines);
+    const res = await r.link.decision(DEC) as any;
+    const [, risk] = r.ids(res.message);
+    await r.tap(r.msg(res.message), risk);
+    lines.push(`2026-11-21T15:00:00.000Z\treview-cap\tpr-5 (${PR})\theld: earlier\n`);  // the crash came after the hold line
+    await r.tap(r.msg(res.message), risk);                                     // the same choice again
+    expect(lines.length).toBe(1);
+    expect(String(r.msg(res.message).content)).toEndWith(`You answered: ${RISK}`);
+    expect(r.relayed.filter((l) => l.includes(`Dane tapped "${RISK}"`)).length).toBe(1);
+  });
+
+  test("the record comes back with existed, and a real hold log is read for the line", () => {
+    const dir = mkdtempSync(join(tmpdir(), "r3-"));
+    const file = join(dir, "review-decisions.json");
+    expect(recordDecision(file, "pr-5#3", RISK, 1, { sync: () => {} })).toEqual({ choice: RISK, at: 1, existed: false });
+    expect(recordDecision(file, "pr-5#3", HOLD, 2, { sync: () => {} })).toEqual({ choice: RISK, at: 1, existed: true });
+    const log = join(dir, "guard.log");
+    writeFileSync(log, `t\treview-cap\tpr-5 (${PR})\twhy\n`);
+    expect(holdLogged(log, "review-cap", `pr-5 (${PR})`)).toBe(true);
+    expect(holdLogged(log, "review-cap", "pr-6")).toBe(false);
+  });
+});
+
+describe("round 3, fix 2: the hold route is bounded", () => {
+  const refuse = () => ({ ok: false as const, floor: "plan", why: "the plan's usage is unknown" });
+  const holdRig = () => {
+    const r = rig({ holds: keeperHolds({}) });
+    const lines: string[] = [], alarms: [string, string][] = [];
+    Object.assign((r.link as any).d, { guardHold: refuse, holdLog: (l: string) => { lines.push(l); }, alarm: (k: string, c: string) => alarms.push([k, c]) });
+    return { r, lines, alarms, hold: (what: string, caller = "cain", label = "other") => (r.link as any).guardHoldFor({ label, what }, caller) };
+  };
+
+  test(`at most ${HOLDS_PER_MINUTE} calls a minute per caller, with one alarm; another caller and the next minute go on`, () => {
+    const t = holdRig();
+    for (let i = 0; i < HOLDS_PER_MINUTE; i++) expect(t.hold(`Build ${i}`).status).toBe("held");
+    expect(() => t.hold("Build 99")).toThrow(`more than ${HOLDS_PER_MINUTE} holds in a minute`);
+    expect(() => t.hold("Build 100")).toThrow("in a minute");
+    expect(t.lines.length).toBe(HOLDS_PER_MINUTE);
+    expect(t.alarms).toEqual([["review-holds", `more than ${HOLDS_PER_MINUTE} holds in a minute from cain`]]);
+    expect(t.hold("Build from root", "root").status).toBe("held");
+    t.r.later(61_000);
+    expect(t.hold("Build 101").status).toBe("held");
+    expect(t.alarms.length).toBe(1);
+    // An hour without another hit: the sweep clears the alarm.
+    const cleared: string[] = [];
+    Object.assign((t.r.link as any).d, { clearAlarm: (g: string) => cleared.push(g) });
+    (t.r.link as any).capSweep();
+    expect(cleared).toEqual([]);
+    t.r.later(3_600_000);
+    (t.r.link as any).capSweep();
+    expect(cleared).toEqual(["holds"]);
+  });
+
+  test("an identical refusal is logged once in ten minutes; a new description, or later, is logged again", () => {
+    const t = holdRig();
+    expect(t.hold("Build on claude/x")).toEqual({ status: "held", why: "the plan's usage is unknown" });
+    expect(t.hold("Build on claude/x")).toMatchObject({ status: "held", repeat: true });
+    expect(t.hold("Build on claude/x", "cain", "other")).toMatchObject({ repeat: true });
+    expect(t.lines.length).toBe(1);
+    expect(t.hold("Build on claude/y").repeat).toBeUndefined();
+    expect(t.lines.length).toBe(2);
+    t.r.later(HOLD_DEDUPE_MS);
+    expect(t.hold("Build on claude/x").repeat).toBeUndefined();
+    expect(t.lines.length).toBe(3);
+  });
+
+  test("the description goes through the card gate: one that fails is logged as a build with its label", () => {
+    for (const bad of [`Build ${"a".repeat(40)} at 2026-11-21T10:00:00Z`, "Build \u2014 now", "Build, and 3 more"]) {
+      const t = holdRig();
+      expect(t.hold(bad).status).toBe("held");
+      expect([bad, t.lines.map((l) => l.split("\t")[2])]).toEqual([bad, ["a build labelled other"]]);
+    }
+    const ok = holdRig();
+    ok.hold("Build on claude/cap-in-code");
+    expect(ok.lines.map((l) => l.split("\t")[2])).toEqual(["Build on claude/cap-in-code"]);
+  });
+
+  test("the guard's log is capped in size and rotated root-side, keeping one previous file, with one alarm", () => {
+    const dir = mkdtempSync(join(tmpdir(), "r3-"));
+    const log = join(dir, "review-guard.log");
+    writeFileSync(log, "x".repeat(95) + "\n", { mode: 0o640 });
+    const owned: number[] = [];
+    const o = { max: 100, sync: () => {}, own: (fd: number) => { owned.push(fd); } };
+    expect(appendCapped(log, "first\n", o)).toBe(true);
+    expect(readFileSync(`${log}.1`, "utf8")).toBe("x".repeat(95) + "\n");
+    expect(readFileSync(log, "utf8")).toBe("first\n");
+    expect(statSync(log).mode & 0o777).toBe(0o640);
+    expect(owned.length).toBe(1);
+    expect(appendCapped(log, "second\n", o)).toBe(false);
+    writeFileSync(log, "y".repeat(99));
+    expect(appendCapped(log, "third\n", o)).toBe(true);
+    expect(readFileSync(`${log}.1`, "utf8")).toBe("y".repeat(99));            // one previous file, the older one gone
+    expect(readdirSync(dir).sort()).toEqual(["review-guard.log", "review-guard.log.1"]);
+    // At the link: a rotation raises the same one alarm.
+    const t = holdRig();
+    Object.assign((t.r.link as any).d, { holdLog: () => true });
+    t.hold("Build on claude/z");
+    expect(t.alarms).toEqual([["review-holds", "the guard's log reached its size cap, so the App rotated it, keeping one previous file"]]);
+  });
+
+  test("a non-root uid can't append to the 0640 root:cain guard log", () => {
+    if (process.platform === "win32" || typeof process.getuid !== "function" || process.getuid() !== 0) {
+      console.log("skipped: this test needs root to drop to another uid, and this run isn't root");
+      return;
+    }
+    const dir = mkdtempSync(join(tmpdir(), "r3-perm-"));
+    chmodSync(dir, 0o755);
+    const log = join(dir, "review-guard.log");
+    writeFileSync(log, "line\n");
+    chownSync(log, 0, 1000);
+    chmodSync(log, 0o640);
+    const r = spawnSync("/bin/sh", ["-c", 'echo held >> "$1"', "sh", log], { uid: 1000, gid: 1000, encoding: "utf8" });
+    if (r.error) { console.log(`skipped: couldn't drop privileges here (${r.error.message})`); return; }
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/Permission denied/i);
+    expect(readFileSync(log, "utf8")).toBe("line\n");
+    // His group can read it.
+    const read = spawnSync("/bin/cat", [log], { uid: 1000, gid: 1000, encoding: "utf8" });
+    expect(read.stdout).toBe("line\n");
+  });
+});
+
+describe("round 3, fix 3: the moved-aside decisions file has a named way back", () => {
+  test("the alarm names the moved-aside copy and the step; writes resume once the copy is gone", () => {
+    const dir = mkdtempSync(join(tmpdir(), "r3-"));
+    const file = join(dir, "review-decisions.json");
+    writeFileSync(file, "{broken");
+    const alarms: string[] = [];
+    expect(() => recordDecision(file, "pr-5#3", HOLD, 1, { onCorrupt: (a) => alarms.push(a), sync: () => {} })).toThrow("moved aside");
+    const aside = asideOf(file)[0];
+    expect(alarms).toEqual([aside]);
+    const text = noticeText("review-decisions", aside);
+    expect(text).toContain(aside);
+    expect(text).toContain("as root on the Pi, remove the moved-aside copy named above, or rename it");
+    expect(text).toContain("the link's next sweep clears this");
+    expect(text).not.toContain("at its next start");                        // not true for this file
+    expect(() => recordDecision(file, "pr-5#3", HOLD, 2, { sync: () => {} })).toThrow(asideStep(aside));
+    // Renamed with the same prefix still counts as standing; removed (or renamed out of the pattern) it doesn't.
+    rmSync(aside);
+    expect(recordDecision(file, "pr-5#3", HOLD, 3, { sync: () => {} })).toEqual({ choice: HOLD, at: 3, existed: false });
+    expect(readDecided(file)).toMatchObject({ "pr-5#3": { choice: HOLD } });
+  });
+
+  test("a failed tap write removes its temp file, and stale temp files are swept at start", () => {
+    const dir = mkdtempSync(join(tmpdir(), "r3-"));
+    const file = join(dir, "review-decisions.json");
+    expect(() => recordDecision(file, "pr-5#3", HOLD, 1, { sync: () => {}, rename: () => { throw new Error("EIO"); } })).toThrow(DecisionsUnsaved);
+    expect(existsSync(tempOf(file))).toBe(false);
+    expect(readdirSync(dir)).toEqual([]);
+    writeFileSync(join(dir, ".review-decisions.json.4242.tmp"), "{}");
+    writeFileSync(join(dir, ".review-decisions.json.4243.tmp"), "{}");
+    writeFileSync(join(dir, "other.json"), "{}");
+    writeFileSync(join(dir, ".review-decisionsXjson.1.tmp"), "{}");
+    expect(sweepTemps(file)).toBe(2);
+    expect(readdirSync(dir).sort()).toEqual([".review-decisionsXjson.1.tmp", "other.json"]);
+  });
+});
+
+describe("round 3, fix 4: the self-check's alarm says what it stops, and the check re-runs", () => {
+  test("the alarm says Ship decisions are paused for every pull request; the check re-runs and clears once the file is right", () => {
+    const text = noticeText("review-files", "/data/review-rounds.json is owned by 1000:1000, mode 0640");
+    expect(text).toContain("Ship decisions are paused for every pull request");
+    expect(text).toContain("/data/review-rounds.json is owned by 1000:1000");
+    expect(text).toContain("turns them back on by itself once it is right, and this clears then");
+    const rules = capFileRules(capPaths({}));
+    const st = (uid: number) => ({ isSymbolicLink: () => false, isFile: () => true, uid, gid: uid === 0 ? 1000 : 1000, mode: 0o100640 }) as any;
+    let roundsUid = 1000;
+    const stat = (p: string) => {
+      if (p.endsWith("review-decisions.json") || p.endsWith("rollback-armed.json")) throw Object.assign(new Error("none"), { code: "ENOENT" });
+      return st(p.endsWith("review-rounds.json") ? roundsUid : 0);
+    };
+    const alarms: string[] = [];
+    let cleared = 0;
+    const o = { rules, stat, alarm: (c: string) => alarms.push(c), clear: () => cleared++, log: () => {}, mode: "own" };
+    let prev = selfCheck(o);                                                   // the start
+    expect(prev).toContain("review-rounds.json");
+    prev = selfCheck({ ...o, prev });                                          // a sweep, still wrong: no second alarm
+    prev = selfCheck({ ...o, prev });
+    expect(alarms.length).toBe(1);
+    expect(cleared).toBe(0);
+    roundsUid = 0;                                                             // set right: the next sweep turns it back on
+    prev = selfCheck({ ...o, prev });
+    expect(prev).toBeNull();
+    expect(cleared).toBe(1);
+    prev = selfCheck({ ...o, prev });
+    expect(cleared).toBe(1);
+  });
+
+  test("the link runs the cap's own sweep at each sweep, and the runner re-runs the check at each tick", () => {
+    const r = rig({ holds: keeperHolds({}) });
+    let n = 0;
+    Object.assign((r.link as any).d, { capSweep: () => { n++; } });
+    (r.link as any).capSweep();
+    expect(n).toBe(1);
+    const core = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/core.ts"), "utf8");
+    expect(core).toMatch(/await this\.retryDecisions\(\);\n\s*this\.capSweep\(\);/);
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    expect(main).toContain("capOff = selfCheck({ log: capLog, prev: capOff });");
+    const review = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/review/main.ts"), "utf8");
+    expect(review).toContain("runner.capOff = selfCheck({ log, prev: runner.capOff });");
+  });
+});
+
+describe("round 3, fix 5: decision cards use the identical card gate", () => {
+  test("the decision card, an ask and a Ship card hand cainWords the same rule set object, which covers every rule", async () => {
+    expect(CARD_RULES).toBe(AT.cain);
+    for (const rule of RULES) expect(CARD_RULES).toContain(rule);
+    const r = rig({ holds: keeperHolds({}) });
+    Object.assign((r.link as any).d, { armed: () => ARMED });
+    const seen: Record<string, unknown> = {};
+    const real = (r.link as any).cainWords.bind(r.link);
+    (r.link as any).cainWords = (point: string, what: string, text: string, ctx: any, also: any) => { seen[point] = ctx.rules; return real(point, what, text, ctx, also); };
+    await r.link.decision(DEC);
+    await r.link.ask({ text: "Is the packet filed?", options: ["Filed", "Not filed"], item: "none", question: "Q1" }).catch(() => {});
+    expect(seen.decision).toBe(AT.cain);
+    expect(seen.ask).toBe(AT.cain);
+    const core = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/core.ts"), "utf8");
+    expect(core).toContain('this.cainWords("ship", "Ship card", said, { rules: CARD_RULES');
+    expect(core).not.toContain('this.words("decision"');
+  });
+});
+
+describe("round 3, fix 6: the hook names its own reading when the link's passes", () => {
+  test("hook refuses, link passes: the refusal names the hook's reading and the difference", async () => {
+    const holds = keeperHolds({ P9: { holder: "cain", branches: ["claude/x"] } });
+    const call = { tool_name: "RemoteTrigger", tool_input: { action: "run", trigger_id: BUILD, body: { text: "Branch: claude/x\nLabel: other\nDo it." } } };
+    const reading = () => ({ ok: false as const, floor: "plan", why: "the plan's usage is unknown" });
+    const fake = (async () => new Response(JSON.stringify({ status: "passes" }), { status: 200 })) as unknown as typeof fetch;
+    const sent = await postHold("other", "Build on claude/x", { key: "k", fetch: fake });
+    expect(sent).toMatchObject({ logged: false, passes: true });
+    const why = await decideWithGuard(call, holds, { stop: { stopped: false, at: null } }, reading, async () => sent);
+    expect(why).toContain("by the hook's own reading the plan's usage is unknown");
+    expect(why).toContain("the two readings differ");
+    expect(why).not.toContain("the link didn't take it");
+    const why2 = await decideWithGuard(call, holds, { stop: { stopped: false, at: null } }, reading, async () => ({ logged: false }));
+    expect(why2).toContain("the link didn't take it");
+  });
+});
+
+describe("round 3, fix 7: no silent gap between the plan reader and the hook", () => {
+  test("while the hook alone decides a Build run, the plan reader never returns a real fraction", () => {
+    if (LINK_DECIDES_BUILDS) return;                                           // the link decides first: the gap is closed
+    // Behaviour: whatever the transcripts hold, the fraction is unknown.
+    const home = mkdtempSync(join(tmpdir(), "r3-plan-"));
+    const proj = join(home, ".claude", "projects", "p");
+    mkdirSync(proj, { recursive: true });
+    const line = (n: number) => JSON.stringify({ timestamp: NOW.toISOString(), message: { usage: { input_tokens: n, output_tokens: n } } });
+    writeFileSync(join(proj, "a.jsonl"), [line(5_000_000), line(1), '{"usage": {"plan_fraction": 0.5, "weekly_limit": 100}}'].join("\n"));
+    for (const dir of [join(home, ".claude", "projects"), join(home, "none")]) {
+      const p = readPlanUsage({ dir, now: NOW });
+      expect([dir, p.fraction]).toEqual([dir, null]);
+    }
+    // Code: every fraction the reader returns is null, and the hook asks the link only when it refuses.
+    const reader = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/plan-usage.ts"), "utf8");
+    const body = reader.slice(reader.indexOf("export function readPlanUsage"));
+    const returned = [...body.matchAll(/fraction:\s*([^,}]+)/g)].map((m) => m[1].trim());
+    expect(returned.length).toBeGreaterThan(0);
+    expect(returned.every((v) => v === "null")).toBe(true);
+    const hook = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/hooks/remote-trigger.ts"), "utf8");
+    expect(hook).toContain("if (!held) return first;");
+    const guardSrc = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/guard.ts"), "utf8");
+    expect(guardSrc).toContain("The silent gap (round 3)");
   });
 });

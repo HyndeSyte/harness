@@ -82,6 +82,9 @@ if (import.meta.main) {
   const checkAt = env.REVIEW_CHECK_AT ?? "0300";
   let lastCheck = "", lastTry = 0;
   while (true) {
+    // Round 3: the self-check again at each tick, so the cap and guard come back without a restart once
+    // the file is right (the alarm is raised or cleared only when its finding changes).
+    try { runner.capOff = selfCheck({ log, prev: runner.capOff }); } catch (e) { log(`self-check error: ${(e as Error).message}`); }
     try { await runner.tick(); } catch (e) { log(`tick error: ${(e as Error).message}`); }
     const now = new Date();
     const hm = now.toLocaleTimeString("en-GB", { timeZone: cfg.tz, hour: "2-digit", minute: "2-digit" }).replace(":", "");

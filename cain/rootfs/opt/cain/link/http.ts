@@ -51,7 +51,7 @@ export function linkRoutes(d: RouteDeps) {
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/decision": return json(await link.decision(b));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
-        case "/guard-hold": return json(link.guardHoldFor(b));
+        case "/guard-hold": return json(link.guardHoldFor(b, caller));
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

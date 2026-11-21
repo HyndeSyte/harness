@@ -88,7 +88,7 @@ import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, r
 import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
-import { holdLine, labelOf, type Label, type Verdict } from "../guard";
+import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import type { DecisionRec, Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
@@ -100,6 +100,14 @@ export const EXPIRED_TAP = "This card expired; nothing was done.";
 // His tap on the review cap's decision card that couldn't be kept (0.16.0, round 2): to him alone, the card stays up.
 export const DECISION_UNSAVED = "Your answer couldn't be saved, so nothing was decided yet. The card is still up: tap your answer again.";
 export const EXPIRED = "Expired";
+// The one card gate (round 3): asks, Ship cards, the review cap's decision card and a usage-guard hold's
+// description all go through cainWords with this rule set, the same object, never a copied list.
+export const CARD_RULES = AT.cain;
+// The guard-hold route's bounds (round 3): calls a minute per caller, and how long an identical refusal
+// (label and description) is logged once.
+export const HOLDS_PER_MINUTE = 6;
+export const HOLD_DEDUPE_MS = 10 * 60_000;
+export const HOLD_ALARM_QUIET_MS = 3_600_000;
 export const REPLACED = "Replaced by a newer card";
 const COMPONENT = 3;
 const ACK = 6;
@@ -683,7 +691,9 @@ export interface Deps {
   // rollback (its text; null: none), his tap on a decision card kept, the cap and the rounds now.
   capState?: (pr: string) => CapState;
   armed?: () => string | null;
-  decided?: (id: string, choice: string, at: number) => void;     // throws when his tap couldn't be kept (round 2: the card stays tappable)
+  // Throws when his tap couldn't be kept (round 2: the card stays tappable). Round 3: returns the record
+  // as kept (cap.ts recordDecision), whose choice drives the card, the relay and the hold line.
+  decided?: (id: string, choice: string, at: number) => { choice: string; at: number; existed: boolean } | void;
   roundCap?: () => number;
   rounds?: () => Rounds | null;
   // Round 2: the install-time self-check's finding (null: every file right; else the cap and guard are
@@ -691,7 +701,14 @@ export interface Deps {
   // from its own readings and logs a refusal), and one line onto the guard's log (the open list's holds).
   capOff?: () => string | null;
   guardHold?: (label: Label, what: string) => Verdict;
-  holdLog?: (line: string) => void;
+  holdLog?: (line: string) => boolean | void;                       // true: the log was rotated at its size cap (round 3)
+  // Round 3: whether the guard's log already has a hold line (tag, what); the App's alarms (kind and
+  // cause; a group cleared); and the cap's own work at each sweep (the self-check again, the decisions
+  // file's moved-aside copy).
+  hasHold?: (tag: string, what: string) => boolean;
+  alarm?: (kind: string, cause: string) => void;
+  clearAlarm?: (group: string) => void;
+  capSweep?: () => void;
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
@@ -1644,19 +1661,17 @@ export class Link {
     if (heldElsewhere(holds, item)) return `${item} is held by another holder`;
     return "";
   }
-  // The card's words through the card gate: the rules every card to him gets (dashes and "add-on"
-  // fixed; a count, machine text or a record code refuses), and the fallback with the topic when its
-  // full text fails (the topic left off too when it fails alone).
+  // The card's words through the card gate: round 3, the identical gate asks and Ship cards use
+  // (cainWords with CARD_RULES, record codes included), and the fallback with the topic when its full
+  // text fails (the topic left off too when it fails alone).
   private decisionWords(d: { topic: string; finding: string; round: number; serious: number; lost: boolean; unarmed: boolean }): string {
-    const passes = (t: string): string | null => {
-      const w = this.words("decision", "link", t, { rules: ["dash", "app", "count", "machine"] });
-      let codes: CainHit[] = [];
-      try { if (mayHaveCode(t)) codes = codesHits(t, this.itemIds()); } catch { codes = []; }
-      if (w.refused.length || codes.length) { this.report("decision", "link", [...w.hits, ...codes] as Hit[], "refused"); return null; }
-      this.report("decision", "link", w.hits, "fixed");
-      return w.text;
-    };
+    const passes = (t: string): string | null => this.cardGate("decision", "decision card", t, [...DECISION_OPTIONS]);
     return passes(decisionText(d)) ?? passes(fallbackText(d.topic, d.unarmed)) ?? this.ownWords("decision", "link", fallbackText(null, d.unarmed));
+  }
+  // The card gate as a check: the words fixed, or null when it refuses them (logged either way).
+  private cardGate(point: string, what: string, text: string, buttons: string[] = []): string | null {
+    try { return this.cainWords(point, what, text, { rules: CARD_RULES, buttons, known: this.liveLabels() }).text; }
+    catch (e) { if (e instanceof Refusal) return null; throw e; }
   }
   private capOff(): string | null {
     try { return this.d.capOff?.() ?? null; } catch (e) { return `the check failed: ${String(e).slice(0, 60)}`; }
@@ -1678,18 +1693,56 @@ export class Link {
   // The usage guard for a part of Cain's that it refused (the Build hook, review.sh; Cain's key): the
   // link decides again from its own readings, and only a refusal is appended to the guard's log, which
   // is root's (round 2). "held" once it's logged; "passes" when the link's reading lets it run.
-  guardHoldFor(b: { label?: unknown; what?: unknown }): { status: "held"; why: string } | { status: "passes" } {
+  // Round 3, bounded: at most HOLDS_PER_MINUTE calls a minute per caller (one alarm when that's hit), an
+  // identical refusal (label and description) logged once in HOLD_DEDUPE_MS, the log capped in size and
+  // rotated root-side (main.ts, cap.ts appendCapped), and the description put through the card gate
+  // before it's logged: one that fails becomes "a build labelled <label>".
+  private holdCalls = new Map<string, number[]>();
+  private holdSeen = new Map<string, number>();
+  private holdAlarmAt: number | null = null;
+  guardHoldFor(b: { label?: unknown; what?: unknown }, caller = "cain"): { status: "held"; why: string; repeat?: true } | { status: "passes" } {
     const off = this.capOff();
     if (off) throw new Refusal(`the usage guard's files aren't right (${off}), so the hold can't be logged`);
+    const now = this.d.now();
+    const calls = (this.holdCalls.get(caller) ?? []).filter((t) => now - t < 60_000);
+    if (calls.length >= HOLDS_PER_MINUTE) {
+      this.holdsCapHit(`more than ${HOLDS_PER_MINUTE} holds in a minute from ${caller}`);
+      throw new Refusal(`more than ${HOLDS_PER_MINUTE} holds in a minute: this one isn't logged. Try again in a minute`);
+    }
+    calls.push(now);
+    this.holdCalls.set(caller, calls);
     const label = labelOf(b.label === undefined ? undefined : String(b.label));
     if (!label) throw new Refusal("a hold names its label: core, commitment, necessary-fix or other");
-    const what = String(b.what ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 160);
-    if (!what) throw new Refusal("a hold says what was refused");
+    const raw = String(b.what ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 160);
+    if (!raw) throw new Refusal("a hold says what was refused");
     if (!this.d.guardHold) throw new Refusal("the link has no usage guard to log with");
+    const what = this.cardGate("hold", "hold's description", raw) ?? `a build labelled ${label}`;
     const v = this.d.guardHold(label, what);
     if (v.ok) return { status: "passes" };
-    if (v.logged === false) throw new Refusal("the hold couldn't be written to the guard's log");
+    for (const [k, t] of this.holdSeen) if (now - t >= HOLD_DEDUPE_MS) this.holdSeen.delete(k);
+    const key = `${label}\t${what}`;
+    if (this.holdSeen.has(key)) return { status: "held", why: v.why, repeat: true };
+    if (!this.d.holdLog) throw new Refusal("the hold couldn't be written to the guard's log");
+    let rotated: boolean | void;
+    try { rotated = this.d.holdLog(logLine(new Date(now), label, what, v)); }
+    catch (e) { this.log(`couldn't log a hold: ${String(e).slice(0, 80)}`); throw new Refusal("the hold couldn't be written to the guard's log"); }
+    this.holdSeen.set(key, now);
+    if (rotated === true) this.holdsCapHit("the guard's log reached its size cap, so the App rotated it, keeping one previous file");
     return { status: "held", why: v.why };
+  }
+  // One alarm when a cap of the hold route is hit; cleared at a sweep once an hour passed without one.
+  private holdsCapHit(cause: string): void {
+    const first = this.holdAlarmAt === null;
+    this.holdAlarmAt = this.d.now();
+    this.log(`the guard-hold route hit its cap: ${cause}`);
+    if (first) { try { this.d.alarm?.("review-holds", cause); } catch (e) { this.log(`couldn't raise the hold route's alarm: ${String(e).slice(0, 80)}`); } }
+  }
+  private capSweep(): void {
+    try { this.d.capSweep?.(); } catch (e) { this.log(`the review cap's sweep failed: ${String(e).slice(0, 80)}`); }
+    if (this.holdAlarmAt !== null && this.d.now() - this.holdAlarmAt >= HOLD_ALARM_QUIET_MS) {
+      this.holdAlarmAt = null;
+      try { this.d.clearAlarm?.("holds"); } catch (e) { this.log(`couldn't clear the hold route's alarm: ${String(e).slice(0, 80)}`); }
+    }
   }
 
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
@@ -1709,7 +1762,7 @@ export class Link {
     if (past) throw new Refusal(`this names ${past}, past the review-round cap of ${this.d.roundCap?.() ?? 3}: the owner's rule allows no more rounds for a change, and the review service asks him the one decision itself. Take it out`);
     // The gate, before the nonce is made: the same words always make the same card.
     const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }));
-    const w = this.cainWords("ask", "ask", asked, { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
+    const w = this.cainWords("ask", "ask", asked, { rules: CARD_RULES, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
     const options = opts.map((o) => o.text);
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = w.text;                 // no "P08 Q2: ": the item and question are data
@@ -1789,7 +1842,7 @@ export class Link {
     if (cap.state === "waiting") throw new Refusal("its last review round left something serious, and his decision on it (ship it with that risk, or hold it) is still open: no Ship card until he taps it");
     if (cap.state === "hold") throw new Refusal("he chose to hold it at the review-round cap: no Ship card for it. A fix is new work, with its own item and a new change");
     if (cap.state === "risk") risk = true;
-    const w = this.cainWords("ship", "Ship card", said, { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
+    const w = this.cainWords("ship", "Ship card", said, { rules: CARD_RULES, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
     if (risk && !this.d.facts) {
@@ -2704,7 +2757,9 @@ export class Link {
   // His "Ship it with that risk" while the rollback isn't armed (round 2): the change is recorded as
   // held, with that reason, on the guard's log (the holds Cain lists on the open list), and Cain's line
   // says so. Read again at the tap, so a rollback armed since the card went up holds nothing.
-  private heldForRollback(m: Shown): string {
+  // Round 3: written once. When his answer was already kept (a tap retried after a crash), no second
+  // line: one is written only when the log doesn't have it yet (hasHold), and none when that can't be told.
+  private heldForRollback(m: Shown, existed = false): string {
     const dec = m.decision!;
     let a: { armed: boolean; why: string };
     try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the probe's rollback record can't be read` }; }
@@ -2712,8 +2767,12 @@ export class Link {
     const what = `${dec.key}${dec.pr ? ` (${dec.pr})` : ""}`;
     const why = `held: he chose to ship it with the risk named, but ${a.why}, so a Ship card is refused until a release arms it`;
     let logged = true;
-    try { this.d.holdLog?.(holdLine(new Date(this.d.now()), "review-cap", what, why)); if (!this.d.holdLog) logged = false; }
-    catch (e) { logged = false; this.log(`couldn't record the hold for ${dec.key}: ${String(e).slice(0, 80)}`); }
+    let write = true;
+    if (existed) { try { write = this.d.hasHold ? !this.d.hasHold("review-cap", what) : false; } catch { write = false; } }
+    if (write) {
+      try { this.d.holdLog?.(holdLine(new Date(this.d.now()), "review-cap", what, why)); if (!this.d.holdLog) logged = false; }
+      catch (e) { logged = false; this.log(`couldn't record the hold for ${dec.key}: ${String(e).slice(0, 80)}`); }
+    }
     return ` It's recorded as held, not shippable yet: ${a.why}, so a Ship card for it is refused until a release arms the rollback.${logged
       ? " It's on the guard's log: list it on the open list as held." : " The hold couldn't be written to the guard's log: list it as held yourself, and log a Build item."}`;
   }
@@ -2732,27 +2791,37 @@ export class Link {
     const q = m?.q;
     const i = Number(cid.split(":")[2]);
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
-    const label = q.options[i];
+    const tapped = q.options[i];
+    let label = tapped;
     // His decision at the review-round cap (0.16.0) is kept before anything else, for the Ship card.
     // Round 2: kept durably first, and only then is the card marked used. If it can't be kept, the card
     // stays tappable and he's told, in one plain line to him alone, that his answer wasn't saved.
-    let heldNote = "";
+    // Round 3: the stored record drives everything. After a crash between the write and the card's mark,
+    // a tap of the other choice finds his first answer kept: the card says "Already answered: <it>", the
+    // relay carries it, and no second hold line is written.
+    let heldNote = "", already = false;
     if (m.decision) {
+      let kept: { choice: string; at: number; existed: boolean } | void;
       try {
         if (!this.d.decided) throw new DecisionsUnsaved("the link has nowhere to keep it");
-        this.d.decided(m.decision.id, label, this.d.now());
+        kept = this.d.decided(m.decision.id, tapped, this.d.now());
       } catch (e) {
         this.log(`couldn't keep his decision at the review cap; the card stays up: ${String(e).slice(0, 120)}`);
         await this.answer(it, ACK);
         await this.ephemeral(it, DECISION_UNSAVED);
         return "unsaved";
       }
-      if (label === RISK) heldNote = this.heldForRollback(m);
+      const existed = !!kept && kept.existed;
+      if (kept && q.options.includes(kept.choice)) label = kept.choice;
+      already = label !== tapped;
+      if (already) this.log(`his decision for ${m.decision.key} was already kept as "${label}"; a later tap of "${tapped}" changes nothing`);
+      if (label === RISK) heldNote = this.heldForRollback(m, existed);
     }
     q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
     // His Ship tap lands it in main, unless everything is stopped. Cain hears how it
     // went once it's settled, with the Ship token when it's in main.
-    let shown = `You answered: ${label}`, extra = "", landing = false;
+    let shown = already ? `Already answered: ${label}` : `You answered: ${label}`, extra = "", landing = false;
+    if (already) extra = " His first answer stands: it was kept before the link restarted, and a later tap of the other choice changed nothing.";
     const words = String(it.message.content ?? "");
     if (m.kind === "ship" && m.ship && label === "Ship") {
       if (this.stopped().stopped) {
@@ -3225,6 +3294,7 @@ export class Link {
       await this.sendOwedToggle();
       await this.retryLandings();
       await this.retryDecisions();
+      this.capSweep();
       await this.checkKey();
       await this.showDue();
       await this.decide();

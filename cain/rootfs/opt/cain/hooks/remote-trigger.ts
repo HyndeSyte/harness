@@ -116,8 +116,12 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
     const title = (text.split("\n").find((l) => /^\s*title:/i.test(l)) ?? `Build on ${branches[0]}`).trim().slice(0, 100);
     const g = lab.label !== "other" ? { ok: true as const }
       : env.guard ? env.guard(lab.label, title) : { ok: false as const, floor: "guard", why: "the usage guard couldn't run" };
+    // Round 3: when the link's own reading passed what the hook's refused, the refusal names the hook's
+    // reading and the difference, not a link that didn't take it.
     if (!g.ok)
-      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.why}. Core, commitment and necessary-fix work still run; nothing bypasses it. ${g.logged === false
+      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.linkPasses ? "by the hook's own reading " : ""}${g.why}. Core, commitment and necessary-fix work still run; nothing bypasses it. ${g.linkPasses
+        ? "The link read the guard again and its reading lets it run, so the two readings differ (a reading changed between them, or they read different files); the hook's refusal stands, and it isn't on the guard's log: try again in a minute, and log a Build item if it repeats."
+        : g.logged === false
         ? "The hold could not be logged (the link didn't take it), so it isn't on the guard's log: try again in a minute, and log a Build item if it repeats."
         : "It's on the guard's log: list it on the open list as held."}`;
     return "";
@@ -160,7 +164,7 @@ function read(path: string): string | null {
 // passes: decide() is synchronous, so the first finds whether the guard refuses, the link is asked, and
 // the second gives the reason with whether it was logged.
 export async function decideWithGuard(call: any, holdsText: string | null, env: Env,
-    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean }>): Promise<string> {
+    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean; passes?: boolean }>): Promise<string> {
   let held: { label: Label; what: string; v: Extract<Verdict, { ok: false }> } | null = null;
   const first = decide(call, holdsText, { ...env, guard: (label, what) => {
     const v = reading(label, what);
@@ -170,7 +174,7 @@ export async function decideWithGuard(call: any, holdsText: string | null, env: 
   if (!held) return first;
   const h = held as { label: Label; what: string; v: Extract<Verdict, { ok: false }> };
   const sent = await post(h.label, h.what);
-  return decide(call, holdsText, { ...env, guard: () => ({ ...h.v, logged: sent.logged }) });
+  return decide(call, holdsText, { ...env, guard: () => ({ ...h.v, logged: sent.logged, ...(sent.passes ? { linkPasses: true } : {}) }) });
 }
 
 if (import.meta.main) {

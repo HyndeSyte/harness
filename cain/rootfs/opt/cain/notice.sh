@@ -45,6 +45,9 @@
 # Supervisor's health check, didn't start; cleared once it does).
 # Since 0.16.0's second round, "review" (kind "review-files": a file of the review-round cap or the usage
 # guard has the wrong owner or mode at a start, so the review runner and the link keep both off; capfiles.ts).
+# Since its third round, "decisions" (kind "review-decisions": the link's file of his answers at the review cap
+# didn't parse and was moved aside; cleared once the copy is gone) and "holds" (kind "review-holds": the usage
+# guard's hold route hit its cap; cleared after an hour without another).
 # Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
@@ -69,6 +72,8 @@
 #   notice.sh clear turn             his long turn ended: the turn group
 #   notice.sh clear tampered         the probe's folders are right again: the tamper group
 #   notice.sh clear review           the review cap's and guard's files are right again: the review group
+#   notice.sh clear decisions        his decisions file's moved-aside copy is gone: the decisions group
+#   notice.sh clear holds            the guard's hold route stayed under its caps an hour: the holds group
 #   notice.sh tick                   the repeats, retries, the probe and its readback (every 10 minutes)
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
@@ -88,7 +93,7 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart panel review"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart panel review decisions holds"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 # What every alarm says (Cain 0.15.0): the real cause and the step the App takes itself, never a step
@@ -119,6 +124,8 @@ group_of() {
     turn-long) echo turn ;;
     tampered) echo tamper ;;
     review-files) echo review ;;
+    review-decisions) echo decisions ;;
+    review-holds) echo holds ;;
     self-off) echo watchdog ;;
     self-refused|self-loops) echo selfrestart ;;
     nginx) echo panel ;;
@@ -208,7 +215,11 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
     tampered) T="Cain's probe folder isn't the App's alone"
       M="Cain's probe folder isn't the App's alone${c}: a folder where the App keeps its liveness records, or one above it, has an owner or mode it must not have, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). The App sets its own folders up again at its next start and fixes what it can above them; Cain files the path for a fix if it stays." ;;
     review-files) T="Cain's review safeguards are off"
-      M="Cain's review-round cap and usage guard are off: one of their files isn't the App's alone${c}. Until it is right, no outside review round and no other-labelled build starts, and no Ship card goes out for a change at the cap. The App sets those files up again at its next start; Cain files it for a fix. $DETAILS" ;;
+      M="Cain's review-round cap and usage guard are off: one of their files isn't the App's alone${c}. Until that file is right, Ship decisions are paused for every pull request (no Ship card goes out for any change), and no outside review round and no other-labelled build starts. The App checks the file again every minute and turns them back on by itself once it is right, and this clears then; it also sets those files up again at its next start. Cain files it for a fix. $DETAILS" ;;
+    review-decisions) T="Cain's review-cap answers are paused"
+      M="Cain's file of your answers on review-cap decision cards didn't parse, so the App moved it aside, never deleting it${c}. While that moved-aside copy stands, no new answer on such a card is kept and Ship cards for changes at the cap stay refused; the App doesn't set this file up again by itself. The step that turns answers back on: as root on the Pi, remove the moved-aside copy named above, or rename it so its name no longer starts with review-decisions.json.corrupt-. Answers are kept again as soon as it is gone, and the link's next sweep clears this. Cain files it for a fix. $DETAILS" ;;
+    review-holds) T="Cain's usage-guard holds hit their limit"
+      M="Cain's usage guard hold route hit its limit${c}. Every held build is still refused; past the limit a hold isn't logged until the next minute, and a full log is rotated keeping one previous file. The App clears this after an hour without another. Cain files it for a fix. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -230,7 +241,9 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     selfrestart) CT="Cain's App stays up"; CM="Cain's App is up, and his Discord channel is connected." ;;
     panel) CT="Cain's App page is back"; CM="Cain's App page and its health check are running again." ;;
     tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
-    review) CT="Cain's review safeguards are back on"; CM="Cain's review-round cap and usage guard are on again: their files are the App's alone." ;;
+    review) CT="Cain's review safeguards are back on"; CM="Cain's review-round cap and usage guard are on again, and Ship decisions resume: their files are the App's alone." ;;
+    decisions) CT="Cain's review-cap answers are kept again"; CM="The moved-aside copy of Cain's file of your review-cap answers is gone, so new answers are kept again." ;;
+    holds) CT="Cain's usage-guard holds are back under their limit"; CM="Cain's usage guard hold route stayed under its limit for an hour." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -350,8 +363,8 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
     self) groups="self" ;; boots) groups="boots" ;; asked) groups="asked" ;; all) groups="all" ;; update) groups="update" ;; unseen) groups="unseen" ;;
     turn) groups="turn" ;; tampered) groups="tamper" ;; watchdog) groups="watchdog" ;; selfrestart) groups="selfrestart" ;; panel) groups="panel" ;;
-    review) groups="review" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog, selfrestart, panel or review" >&2; return 2 ;; esac
+    review) groups="review" ;; decisions) groups="decisions" ;; holds) groups="holds" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog, selfrestart, panel, review, decisions or holds" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -441,7 +454,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart|review | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart|review|decisions|holds | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \

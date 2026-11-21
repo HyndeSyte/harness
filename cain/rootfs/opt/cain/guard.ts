@@ -16,10 +16,18 @@
 // the guard never posts a card. The log is root:cain 0640 (round 2): root writes it, Cain only reads.
 // The runner (root) appends itself; the Build hook and review.sh, which run as Cain, send the hold to
 // the link (POST /guard-hold), which decides again from its own readings and appends only a refusal.
+//
+// The silent gap (round 3): the Build hook decides a Build run alone and asks the link only when its own
+// reading refuses (hooks/remote-trigger.ts decideWithGuard). That is safe only while the plan reader can
+// never return a real fraction (plan-usage.ts answers unknown, so "other" is always refused and a pass
+// from the hook alone can't happen). Before plan-usage.ts returns anything but unknown, the link must
+// decide every "other" Build run first, and LINK_DECIDES_BUILDS below must say so; cap.test.ts fails
+// while the reader can return a fraction and this is false.
 import { appendFileSync, readFileSync } from "node:fs";
 import { readPlanUsage, type PlanReading } from "./plan-usage.ts";
 import { capPaths } from "./capfiles.ts";
 
+export const LINK_DECIDES_BUILDS = false;
 export const LABELS = ["core", "commitment", "necessary-fix", "other"] as const;
 export type Label = typeof LABELS[number];
 export const DEFAULT_RESERVE_PERCENT = 25;
@@ -57,7 +65,8 @@ export function labelOf(v: unknown): Label | null {
 export type SeatLeft = { seat: string; left: number | null; why?: string };
 export type Readings = { plan: PlanReading; seats: SeatLeft[] | null; seatsWhy?: string; floor: number };
 // logged (round 2): whether a refusal reached the guard's log; false when it couldn't be logged.
-export type Verdict = { ok: true } | { ok: false; floor: string; why: string; logged?: boolean };
+// linkPasses (round 3): the link's own reading let it pass where the hook's refused (the hook names the difference).
+export type Verdict = { ok: true } | { ok: false; floor: string; why: string; logged?: boolean; linkPasses?: boolean };
 
 // Each seat's share of its monthly cap left, from the spend file and the runner's caps. A seat whose
 // cap is 0 is off and spends nothing, so it isn't counted.
@@ -131,11 +140,13 @@ export function guard(label: Label, what: string, o: { settingsFile: string; spe
 
 // A hold sent to the link by a part that runs as Cain (the Build hook, review.sh): POST /guard-hold on
 // the link's local port with Cain's own key. The link answers "held" once it appended the line. Any other
-// answer, or none, is "not logged": the caller still refuses (it fails closed) and says so.
+// answer, or none, is "not logged": the caller still refuses (it fails closed) and says so. Round 3: the
+// link answering "passes" (its own reading lets it run) comes back as passes, so the caller can name the
+// difference between the two readings.
 export const LINK_URL = "http://127.0.0.1:8097";
 export const CAIN_KEY_FILE = "/run/cain/keys/cain.key";
 export async function postHold(label: Label, what: string, o: { url?: string; key?: string; keyFile?: string; ms?: number;
-    fetch?: typeof fetch } = {}): Promise<{ logged: true; why: string } | { logged: false; why: string }> {
+    fetch?: typeof fetch } = {}): Promise<{ logged: true; why: string } | { logged: false; why: string; passes?: boolean }> {
   let key = o.key ?? "";
   if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { logged: false, why: "this start has no key for the link" }; } }
   try {
@@ -143,6 +154,7 @@ export async function postHold(label: Label, what: string, o: { url?: string; ke
       headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(o.ms ?? 5_000) });
     const j: any = await r.json().catch(() => ({}));
     if (r.ok && j?.status === "held") return { logged: true, why: String(j.why ?? "") };
+    if (r.ok && j?.status === "passes") return { logged: false, passes: true, why: "the link's own reading lets it run" };
     return { logged: false, why: `the link answered ${j?.status ?? r.status}` };
   } catch (e) { return { logged: false, why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
 }

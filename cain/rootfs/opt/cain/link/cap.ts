@@ -10,14 +10,18 @@
 //     then is the card marked used; a write that fails leaves the card tappable. A decisions file that
 //     doesn't parse is never overwritten: it's moved aside under a timestamped name, no new tap is
 //     written while a moved-aside file stands, and the App's alarm names it.
+//     Round 3: the alarm names the copy and the step back (asideStep: remove or rename it as root;
+//     writes resume once it's gone, the next sweep clears the alarm); the record as kept is returned
+//     and drives the card, the relay and the hold line; a failed write removes its temp file, and stale
+//     temp files are swept at the link's start; the guard's log is capped in size and rotated root-side.
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
 //     it installs, read from the probe's record (/data/probe/rollback-armed.json), never from Cain.
-import { closeSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, fchownSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { countedRounds, decisionOf, readRounds, type DecisionRec, type Rounds } from "../review/rounds.ts";
-import { capPaths } from "../capfiles.ts";
-import { syncFolder } from "./auth.ts";
+import { CAIN_GID, capPaths, ROOT_UID } from "../capfiles.ts";
+import { appendSynced, syncFolder } from "./auth.ts";
 
 export const HOLD = "Hold it";
 export const RISK = "Ship it with that risk";
@@ -107,14 +111,40 @@ export function readDecided(path: string): Decided | null {
   return parseDecided(text);
 }
 
+// The way back once a moved-aside copy stands (round 3): the step that turns decision writes back on.
+// It names the copy; once it's gone (removed, or renamed so its name no longer starts with the
+// decisions file's name and ".corrupt-"), the next tap is kept and the link's next sweep clears the alarm.
+export function asideStep(aside: string): string {
+  return `${aside}: remove it or rename it as root; answers are kept again once it is gone, and the link's next sweep clears the alarm`;
+}
+
+// The temp files a tap's write leaves only when the link died mid-write (round 3): swept at the link's
+// start. Only the decisions file's own temp names (".<name>.<pid>.tmp") in its folder.
+export function tempOf(path: string, pid = process.pid): string { return join(dirname(path), `.${basename(path)}.${pid}.tmp`); }
+export function sweepTemps(path: string, log: (m: string) => void = () => {}): number {
+  const re = new RegExp(`^\\.${basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.tmp$`);
+  let n = 0;
+  let names: string[] = [];
+  try { names = readdirSync(dirname(path)); } catch { return 0; }
+  for (const name of names) {
+    if (!re.test(name)) continue;
+    try { unlinkSync(join(dirname(path), name)); n++; } catch (e) { log(`couldn't remove a stale temp file ${name}: ${String(e).slice(0, 60)}`); }
+  }
+  if (n) log(`removed ${n} stale temp file${n === 1 ? "" : "s"} of ${basename(path)}`);
+  return n;
+}
+
 export class DecisionsUnsaved extends Error {}
 // His tap, kept durably before the card is marked used (Link.onQuestion). The same decision tapped
 // again keeps its first answer (a retry records it once). Throws DecisionsUnsaved when it couldn't be
 // kept; a file that doesn't parse is moved aside (never overwritten), and onCorrupt hears its new name.
+// Round 3: it returns the record as kept, with existed when one was there before this tap: the caller
+// uses that choice, never the label just tapped. A write that fails removes its temp file.
+export type Kept = { choice: string; at: number; existed: boolean };
 export function recordDecision(path: string, id: string, choice: string, at: number,
-    o: { onCorrupt?: (aside: string) => void; sync?: (dir: string) => void; now?: () => number } = {}): { choice: string; at: number } {
+    o: { onCorrupt?: (aside: string) => void; sync?: (dir: string) => void; now?: () => number; rename?: (from: string, to: string) => void } = {}): Kept {
   const aside = asideOf(path);
-  if (aside.length) throw new DecisionsUnsaved(`his decisions file was moved aside (${aside[0]}) and isn't settled yet`);
+  if (aside.length) throw new DecisionsUnsaved(`his decisions file was moved aside and isn't settled yet (${asideStep(aside[0])})`);
   let text: string | null = null;
   try { text = readFileSync(path, "utf8"); }
   catch (e: any) { if (e?.code !== "ENOENT") throw new DecisionsUnsaved(`his decisions file can't be read (${String(e?.code ?? e).slice(0, 40)})`); }
@@ -129,16 +159,52 @@ export function recordDecision(path: string, id: string, choice: string, at: num
     }
     all = j;
   }
-  if (all[id]) return all[id];
+  const had = all[id];
+  if (had && typeof had.choice === "string") return { choice: had.choice, at: Number(had.at), existed: true };
   all[id] = { choice, at };
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
+  const tmp = tempOf(path);
   try {
     const fd = openSync(tmp, "w", 0o600);
     try { writeSync(fd, JSON.stringify(all, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, path);
+    (o.rename ?? renameSync)(tmp, path);
     (o.sync ?? syncFolder)(dirname(path));
-  } catch (e) { throw new DecisionsUnsaved(`his decision couldn't be written (${String(e).slice(0, 80)})`); }
-  return all[id];
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* gone already, or renamed into place */ }
+    throw new DecisionsUnsaved(`his decision couldn't be written (${String(e).slice(0, 80)})`);
+  }
+  return { choice, at, existed: false };
+}
+
+// The guard's log, bounded (round 3): one line appended, root-side. When the line would take the file
+// past max, the file is first rotated (renamed to "<log>.1", replacing the previous one, so one previous
+// file is kept) and a new one made root:cain 0640, as c1/lock.sh makes it. Returns whether it rotated.
+export const GUARD_LOG_MAX = 256 * 1024;
+export function appendCapped(path: string, line: string, o: { max?: number; sync?: (dir: string) => void;
+    own?: (fd: number) => void } = {}): boolean {
+  const max = o.max ?? GUARD_LOG_MAX;
+  const sync = o.sync ?? syncFolder;
+  let size = 0;
+  try { size = statSync(path).size; } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
+  let rotated = false;
+  if (size > 0 && size + Buffer.byteLength(line) > max) {
+    renameSync(path, `${path}.1`);
+    const fd = openSync(path, "a", 0o640);
+    try { (o.own ?? ((f) => fchownSync(f, ROOT_UID, CAIN_GID)))(fd); fchmodSync(fd, 0o640); } finally { closeSync(fd); }
+    sync(dirname(path));
+    rotated = true;
+  }
+  appendSynced(path, line, sync);
+  return rotated;
+}
+// Whether the guard's log (or its one previous file) already has a line with this tag and what: his
+// risk tap's hold is written once, even when a tap is retried after a crash (round 3).
+export function holdLogged(path: string, tag: string, what: string): boolean {
+  for (const f of [path, `${path}.1`]) {
+    let text = "";
+    try { text = readFileSync(f, "utf8"); } catch { continue; }
+    for (const l of text.split("\n")) { const c = l.split("\t"); if (c[1] === tag && c[2] === what) return true; }
+  }
+  return false;
 }
 
 export type CapState =

@@ -73,9 +73,9 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { capState, DECISIONS_FILE, GUARD_LOG, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE } from "./cap";
+import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
-import { raiseAlarm, selfCheck } from "../capfiles";
+import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -215,8 +215,22 @@ const SHIP_REPO = "HyndeSyte/harness";
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
 // The install-time self-check of the review cap's and usage guard's files (0.16.0, round 2,
-// ../capfiles.ts): one wrong turns those features off here, with one alarm naming it.
-const capOff: string | null = selfCheck({ log: (m) => console.log(`[cain] link: ${m}`) });
+// ../capfiles.ts): one wrong turns those features off here, with one alarm naming it. Round 3: run
+// again at each sweep, so they come back without a restart once the file is right, and the alarm clears.
+const capLog = (m: string) => console.log(`[cain] link: ${m}`);
+let capOff: string | null = selfCheck({ log: capLog });
+// Round 3: a tap's temp file left by a link that died mid-write is swept at the start.
+sweepTemps(DECIDED, capLog);
+// Round 3: the alarm for his decisions file moved aside names the copy and the step back; it's raised
+// while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
+let asideUp: boolean | null = null;
+const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisions"); asideUp = true; };
+const capSweep = () => {
+  capOff = selfCheck({ log: capLog, prev: capOff });
+  const a = asideOf(DECIDED);
+  if (a.length && asideUp !== true) asideAlarm(a[0]);
+  else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
+};
 
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
@@ -253,13 +267,19 @@ const link = new Link({
   // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
   capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
   armed: () => readArmed(),
-  decided: (id, choice, at) => { recordDecision(DECIDED, id, choice, at, { onCorrupt: (aside) => raiseAlarm(`${DECIDED} didn't parse; it was moved aside to ${aside}`) }); },
+  // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
+  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
   capOff: () => capOff,
-  guardHold: (label, what) => { const p = guardPaths(); return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date(),
-    log: (line) => appendSynced(GUARD_LOG, line) }); },
-  holdLog: (line) => appendSynced(GUARD_LOG, line),
+  // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
+  // rotated root-side, keeping one previous file: cap.ts appendCapped).
+  guardHold: (label, what) => { const p = guardPaths(); return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date() }); },
+  holdLog: (line) => appendCapped(GUARD_LOG, line),
+  hasHold: (tag, what) => holdLogged(GUARD_LOG, tag, what),
+  alarm: (kind, cause) => raiseAlarm(cause, capLog, kind),
+  clearAlarm: (group) => clearAlarm(capLog, group),
+  capSweep,
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   linkHosts: () => readHosts(),
