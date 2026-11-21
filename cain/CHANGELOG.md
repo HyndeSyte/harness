@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.18.0
+
+- When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".
+- Only your tap grants them; Cain's ask alone adds nothing. The rule of three rounds stays, and a grant never lifts the armed rollback that shipping with a risk named needs.
+- If a granted round still leaves something serious, the "Hold it" or "Ship it with that risk" card comes to you again for it.
+- Cain's review lines now show the raised cap, like "round 4 of 5, 2 granted by Dane on Nov 21".
+
 ## 0.17.0
 
 - Cain knows the calendar specialist never writes its tap journal without its lock, sends one waiting card per outage even when reads come and go, starts only with its journal on local storage, says "storage" when it can't lock or write its journal, and stops a tap whose count it may have lost until Dane puts it back.

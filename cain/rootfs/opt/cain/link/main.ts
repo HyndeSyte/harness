@@ -33,6 +33,8 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
+//                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
@@ -73,7 +75,8 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
+import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
@@ -271,6 +274,10 @@ const link = new Link({
   decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
+  // 0.18.0: the owner's grants of extra review rounds (/data/review-grants.json, root:cain 0640), written
+  // here only, on his tap on Cain's grant card, durably and keeping the file's owner and mode.
+  grants: () => readGrants(GRANTS_FILE),
+  grant: (rec) => { if (capOff) throw new GrantUnsaved(`the review cap's files aren't right (${capOff})`); return recordGrant(GRANTS_FILE, rec); },
   capOff: () => capOff,
   // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
   // rotated root-side, keeping one previous file: cap.ts appendCapped).

@@ -17,9 +17,15 @@
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
 //     it installs, read from the probe's record (/data/probe/rollback-armed.json), never from Cain.
+//   - 0.18.0: extra rounds granted by his tap (../review/grants.ts) raise a change's cap. The newest
+//     decision counts; a granted round after it that left nothing serious clears the way (the Ship card
+//     needs nothing more from the cap), one still running or that left something serious with rounds
+//     still to go refuses the card until it settles, and one at the raised cap that left something serious
+//     owes a new decision card. A grant never lifts the armed-rollback condition on ship-with-risk.
 import { closeSync, fchmodSync, fchownSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { countedRounds, decisionOf, readRounds, type DecisionRec, type Rounds } from "../review/rounds.ts";
+import { effectiveCap, readGrants, type Grants } from "../review/grants.ts";
 import { CAIN_GID, capPaths, ROOT_UID } from "../capfiles.ts";
 import { appendSynced, syncFolder } from "./auth.ts";
 
@@ -32,6 +38,7 @@ export const ROUNDS_FILE = P.rounds;
 export const SETTINGS_FILE = P.settings;
 export const ARMED_FILE = P.armed;
 export const DECISIONS_FILE = P.decisions;
+export const GRANTS_FILE = P.grants;
 export const GUARD_LOG = P.guardLog;
 
 const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
@@ -72,7 +79,8 @@ export function roundCapNow(path = SETTINGS_FILE): number {
 }
 
 // Whether Cain's ask names a review round past the cap: refused at the link (Link.ask).
-export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | null): string | null {
+// grants (0.18.0): the owner's grants, so a change with granted rounds left isn't counted as at its cap.
+export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | null, grants: Grants | null = null): string | null {
   const t = String(text ?? "").toLowerCase();
   const past = (n: number) => Number.isFinite(n) && n > cap;
   for (const m of t.matchAll(/\bround\s*(?:#|no\.?|number)?\s*(\d{1,3})\b/g)) if (past(Number(m[1]))) return `round ${m[1]}`;
@@ -84,7 +92,7 @@ export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | nu
   // Another round for a change already at the cap, named by its pull request or change key.
   if (rounds && /\b(round|re-?review|review again|another review|more review)/.test(t)) {
     for (const key of Object.keys(rounds.changes)) {
-      if (countedRounds(rounds, key).length < cap) continue;
+      if (countedRounds(rounds, key).length < effectiveCap(cap, rounds, grants, key)) continue;
       const pr = /^pr-(\d+)$/.exec(key);
       const named = pr ? new RegExp(`(/pull/${pr[1]}\\b|pull request #?${pr[1]}\\b|\\bpr #?${pr[1]}\\b|#${pr[1]}\\b)`).test(t) : t.includes(key);
       if (named) return `another round for ${key}, which has had ${countedRounds(rounds, key).length}`;
@@ -210,7 +218,8 @@ export function holdLogged(path: string, tag: string, what: string): boolean {
 export type CapState =
   | { state: "none" }
   | { state: "unknown"; why: string }
-  | { state: "waiting" | "hold" | "risk"; key: string; decision: DecisionRec };
+  | { state: "waiting" | "hold" | "risk"; key: string; decision: DecisionRec }
+  | { state: "pending"; key: string; decision: DecisionRec; why: string };   // 0.18.0: a granted round after it hasn't settled clean
 
 // Where a pull request stands at the cap: its change group's decision, if any, and his tap on it.
 export function capStateFor(pr: string, rounds: Rounds | null, decided: Decided | null): CapState {
@@ -225,6 +234,16 @@ export function capStateFor(pr: string, rounds: Rounds | null, decided: Decided 
     const d = decisionOf(rounds, k);
     if (!d) continue;
     if (!decided) return { state: "unknown", why: "his decisions at the review cap can't be read" };
+    // 0.18.0: rounds after the newest decision (granted by his tap) settle it first.
+    const later = countedRounds(rounds, k).slice(d.round);
+    const last = later[later.length - 1];
+    if (last) {
+      if (last.state === "answered" && (last.serious ?? 0) === 0) return { state: "none" };
+      const why = last.state === "answered" ? `the granted review round after his decision still left something serious`
+        : last.state === "lost" ? "the granted review round after his decision was lost, so it has no result"
+        : "a granted review round after his decision is still running";
+      return { state: "pending", key: k, decision: d, why };
+    }
     const tap = decided[d.id];
     if (!tap) return { state: "waiting", key: k, decision: d };
     return { state: tap.choice === RISK ? "risk" : "hold", key: k, decision: d };

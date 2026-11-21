@@ -16,6 +16,7 @@ import {
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
+import { effectiveCap, readGrants, type Grants } from "./grants.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
@@ -39,6 +40,9 @@ export type RunnerConfig = {
   // the Build hook), and the guard's log. Absent files: the cap and guard aren't kept (tests that queue directly).
   roundCap?: number; reservePercent?: number;
   roundsFile?: string; settingsFile?: string; guardLog?: string;
+  // Cain 0.18.0: the owner's grants of extra rounds (grants.ts), written by the link on his tap only.
+  // Absent: no grants count.
+  grantsFile?: string;
 };
 
 export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile" | "termsFile" | "recordQueue" | "relayFile"> = {
@@ -262,7 +266,7 @@ export class Runner {
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
-    const a = admit(rounds, b, this.roundCap);
+    const a = admit(rounds, b, this.roundCap, this.grants(), this.cfg.tz);
     if (!a.ok) return a.why;
     const label = labelOf(b.label)!;
     if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
@@ -271,7 +275,8 @@ export class Runner {
       if (!g.ok) return `held by the usage guard: it's labelled ${label}, and ${g.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`;
     }
     const r = newReview(b, this.now());
-    Object.assign(r, { change: a.key, round: a.round, cap: this.roundCap, round_kind: a.kind });
+    Object.assign(r, { change: a.key, round: a.round, cap: a.cap, round_kind: a.kind,
+      ...(a.granted.length ? { granted: a.granted.map((g) => ({ rounds: g.rounds, at: g.at })), base_cap: this.roundCap } : {}) });
     if (a.kind === "fixes") r.earlier = this.earlierFindings(rounds, a.key);
     // The round is kept before the review is queued: a stop between the two counts a round that never
     // ran (fails safe), never runs one that wasn't counted.
@@ -319,11 +324,20 @@ export class Runner {
     writeRounds(file, rounds);
     r.rounded = true;
   }
-  // The decision card, owed once per change group, when the group is at the cap.
+  // The owner's grants (0.18.0), read fresh each time; none count when the file can't be read (fail closed).
+  grants(): Grants | null { return this.cfg.grantsFile ? readGrants(this.cfg.grantsFile) : null; }
+  capFor(rounds: Rounds, key: string): number { return effectiveCap(this.roundCap, rounds, this.grants(), key); }
+  // The decision card, owed once per change group and round, when the group is at its cap (the base cap
+  // plus his grants). Since 0.18.0 a granted round that leaves something serious at the raised cap owes
+  // a new card, whatever he tapped on the one before (a Hold doesn't stop a granted round); the newest
+  // decision is the one that counts, and the earlier one is kept under past.
   private owe(rounds: Rounds, key: string, d: Pick<DecisionRec, "topic" | "item" | "pr" | "serious" | "finding"> & { lost?: boolean }, what: string): void {
     const n = countedRounds(rounds, key).length;
-    if (n < this.roundCap || decisionOf(rounds, key)) return;
-    rounds.changes[key].decision = { id: `${key}#${n}`, key, round: n, ...d, ...(d.lost ? { lost: true } : {}), state: "owed", at: this.now().toISOString() };
+    const prev = decisionOf(rounds, key);
+    if (n < this.capFor(rounds, key) || (prev && prev.round >= n)) return;
+    const c = rounds.changes[key];
+    if (c.decision) (c.past ??= []).push(c.decision);
+    c.decision = { id: `${key}#${n}`, key, round: n, ...d, ...(d.lost ? { lost: true } : {}), state: "owed", at: this.now().toISOString() };
     this.log(`${what}: the round cap is reached for ${key} ${d.lost ? "and its last round was lost" : `with ${d.serious} serious finding(s) left`}; the owner's decision card is owed`);
   }
   // A round counted at intake whose review never reached the queue (the runner stopped between the
@@ -342,7 +356,7 @@ export class Runner {
         if (x.done || x.blocked || x.state === "lost" || x.state === "answered" || existsReview(this.cfg.queueDir, x.id)) continue;
         x.state = "lost"; x.done = true;
         const n = countedRounds(rounds, key).findIndex((y) => y.id === x.id && y.key === key) + 1;
-        lines.push(`Round ${n}${this.roundCap ? ` of ${this.roundCap}` : ""} for ${key} was lost: the review runner stopped before its review was queued, so it never ran. It still counts.`);
+        lines.push(`Round ${n} of ${this.capFor(rounds, key)} for ${key} was lost: the review runner stopped before its review was queued, so it never ran. It still counts.`);
         this.owe(rounds, key, { topic: oneLine(c.topic ?? key, 120), item: null, pr: c.pr ?? null, serious: 0, finding: "", lost: true }, `round ${x.id}`);
       }
     }
@@ -366,7 +380,7 @@ export class Runner {
       const cur = now.changes[key].decision!;
       if (msg) {
         Object.assign(cur, { state: "posted", message: msg });
-        this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. Nothing to tell him.`);
+        this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. If it's a critical change whose fix needs more rounds, the only way is a grant: keeper.sh review-grant asks him, and only his tap grants them. Nothing to tell him.`);
       } else cur.tries = (cur.tries ?? 0) + 1;
       writeRounds(file, now);
     }

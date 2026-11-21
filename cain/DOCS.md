@@ -260,6 +260,40 @@ Since the second round of fixes in 0.16.0:
   next sweep. If you tap the other answer after a restart cut a tap short, your first answer stands,
   and the card says "Already answered".
 
+#### More rounds, granted by your tap (since 0.18.0)
+
+The rule stays three rounds a change. Your decision on Nov 21: for a critical change whose last round
+still left something serious, the exception is more fix rounds, granted by you, never an exemption
+from the rule. So:
+
+- Only you can grant, and only by a tap. Cain can ask with
+  `keeper.sh review-grant --item <item> --change <pull request or change key> --rounds <1 to 3> "<why>"`.
+  You get a card: what the change does (Cain's words) and its pull request number, how many rounds it
+  has used and what the last one left (the review runner's own count of serious findings, never
+  Cain's), how many rounds the grant adds, and two buttons, "Grant <n> more rounds" and "No". It
+  expires at the next morning check-in like Cain's asks. Cain's command writes nothing: only your
+  "Grant" tap does. The link refuses the command while the change still has rounds left (nothing to
+  grant), while its last round is still running, while its item is held by another session, and while
+  Stop holds.
+- Your tap is written to disk first, in `/data/review-grants.json` (root:cain 0640, written only by the
+  link): the change, how many rounds, that you granted it, when, the card's message and Cain's reason.
+  It is also noted in the link's log and beside your other taps in `/data/link/review-decisions.json`.
+  If it can't be written, the card stays up and you're told your grant wasn't saved. A grant is for
+  one change; a replacement pull request carries it over, as it carries the rounds.
+- The cap for that change is then 3 plus what you granted. Each granted round is fix-only, carrying
+  the earlier findings, like any round after the first. When the cap is reached again, the runner's
+  refusal says how a grant works.
+- If a granted round at the raised cap still leaves something serious, the decision card ("Hold it" or
+  "Ship it with that risk") comes again, for that round. A "Hold it" on an earlier card doesn't stop a
+  later granted round. The Ship card rules stay: it needs a review whose last round left nothing
+  serious, or your "Ship it with that risk" on the newest decision card, which still needs the App's
+  rollback armed. While a granted round is running, or left something serious with rounds still to
+  go, no Ship card goes out.
+- What a grant never does: exempt a change from the rule, or from the armed-rollback condition on
+  shipping with a risk named.
+- `review.sh status <id>`, `review.sh spend` and Cain's "Review done" line show the raised cap and the
+  grants, for example "round 4 of 5, 2 granted by Dane on Nov 21".
+
 ### Labels (since 0.16.0)
 
 Every brief, and every Build or Ship job Cain starts, carries one label: `core` (Cain answering you,
