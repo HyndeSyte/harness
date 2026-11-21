@@ -1,0 +1,6 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+# The keeper's one service (main.ts). The Supervisor's token comes in through with-contenv and goes
+# only into this process; main.ts takes it out of its environment at start.
+cd /opt/keeper || exit 1
+exec bun /opt/keeper/main.ts serve

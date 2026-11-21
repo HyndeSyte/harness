@@ -291,7 +291,11 @@ health_ok_trim() {
   keep="$(tail -n 200 "$HEALTH_OK" 2>/dev/null)" || keep=""
   { : > "$HEALTH_OK" && printf '%s\n' "$keep" >> "$HEALTH_OK"; } 2>/dev/null || true
 }
-( while true; do sleep 60; health_misses || true; health_ok_trim || true; done ) &
+# Cain 0.17.0: the link's gateway mark for /health (link/health-gate.ts), removed once 2 minutes stale (the
+# link refreshes it every 30 seconds while its Discord gateway is connected), so a stopped link reads 503.
+GATEWAY_MARK=/run/cain-web/www/health-gateway
+gateway_stale() { [ -z "$(find "$GATEWAY_MARK" -mmin +2 2>/dev/null)" ] || rm -f "$GATEWAY_MARK" 2>/dev/null || true; }
+( while true; do sleep 60; health_misses || true; health_ok_trim || true; gateway_stale || true; done ) &
 
 if [ "$mode" = old ]; then
   # 0.11.0's start, unchanged: the rules copied in (c1/lock.sh old did, and checked them), the
@@ -434,6 +438,20 @@ start_his_session() {
     return 1
   fi
   bashio::log.info "Cain is running"
+  verdict_probe
+}
+# The verdict probe (probe/keeper.ts, Cain 0.17.0), right after each start of his session: when the keeper
+# App watches an install of this version, it asks his session the liveness line once and gives the keeper
+# its verdict; and it says the keeper's last rollback or give-up line to his bot once. In the background,
+# for at most 15 minutes; Cain's keeper token goes only into its environment.
+verdict_probe() {
+  (
+    { set +x; } 2>/dev/null
+    KEEPER_URL="$(bashio::config 'keeper_url' 2>/dev/null || true)"; [ "$KEEPER_URL" = "null" ] && KEEPER_URL=""
+    KEEPER_TOKEN="$(bashio::config 'keeper_token' 2>/dev/null || true)"; [ "$KEEPER_TOKEN" = "null" ] && KEEPER_TOKEN=""
+    export KEEPER_URL KEEPER_TOKEN
+    timeout -k 5 900 bun "$OPT/probe/keeper.ts" start "${version:-unknown}" 2>&1 || true
+  ) &
 }
 
 if [ "$mode" != none ] && [ -z "$held" ]; then start_his_session || true; fi
@@ -474,7 +492,15 @@ with_session() {
 }
 if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
-( while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done ) &
+# Since 0.17.0 it also reads the keeper App's armed state with Cain's keeper token (keeper_url,
+# keeper_token): in this environment only, never logged.
+(
+  { set +x; } 2>/dev/null
+  KEEPER_URL="$(bashio::config 'keeper_url' 2>/dev/null || true)"; [ "$KEEPER_URL" = "null" ] && KEEPER_URL=""
+  KEEPER_TOKEN="$(bashio::config 'keeper_token' 2>/dev/null || true)"; [ "$KEEPER_TOKEN" = "null" ] && KEEPER_TOKEN=""
+  export KEEPER_URL KEEPER_TOKEN
+  while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done
+) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
 # App's options and goes only into its environment.
 (

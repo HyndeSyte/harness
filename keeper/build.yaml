@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/apps/configuration#add-on-extended-build
+build_from:
+  aarch64: ghcr.io/home-assistant/base-debian:trixie-2026.10.3
+  amd64: ghcr.io/home-assistant/base-debian:trixie-2026.10.3

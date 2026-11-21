@@ -101,9 +101,10 @@ def test_service_runs_the_package_and_scrubs_nothing_by_shell():
 def test_repository_layout():
     repo = flat_yaml(ROOT / "repository.yaml")
     assert repo["name"] and (ADDON / "config.yaml").exists()
-    # exactly two add-ons: the harness, and Cain (which holds no harness keys)
+    # exactly three add-ons: the harness, Cain (which holds no harness keys) and, since Keeper 0.1.0,
+    # the keeper of installs (which holds no harness keys either)
     addons = sorted(p.name for p in ROOT.iterdir() if p.is_dir() and (p / "config.yaml").exists())
-    assert addons == ["cain", "harness"]
+    assert addons == ["cain", "harness", "keeper"]
 
 
 CAIN = ROOT / "cain"
@@ -125,21 +126,24 @@ def test_cain_config_denies_every_api_and_mapping():
     # Assistant user id, not a key), the alarms' webhook id, hidden like a key (C1
     # second review: the App's alarms reach Home Assistant without its API), the PC
     # job keeper's token and repo name, the security watch's and the probe's heartbeat URLs
-    # (secrets like keys: password fields). Nothing else.
+    # (secrets like keys: password fields), and (0.17.0) the keeper App's address and Cain's token
+    # there (a password field). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
         '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n'
         '  owner_user_id: ""\n  notice_hook: ""\n'
-        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\nschema:\n'
+        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\n'
+        '  keeper_url: "http://0fcc2575-keeper:8097"\n  keeper_token: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n"
         "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
-        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n")
+        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n"
+        "  keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?\n  keeper_token: password?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():

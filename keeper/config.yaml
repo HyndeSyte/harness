@@ -1,0 +1,69 @@
+# https://developers.home-assistant.io/docs/apps/configuration
+# The keeper of installs: after every install of a watched App it checks the App for 15 minutes, and
+# rolls a bad install back from the App-only backup the Ship run took just before it (DOCS.md).
+# It reads the Supervisor's App and backup info and restores App-only backups (hassio_role backup,
+# never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
+# service (port 8097) is on Home Assistant's internal App network only, with no host port.
+name: Keeper
+version: "0.1.0"
+slug: keeper
+description: >-
+  Checks every App install for 15 minutes and rolls a bad one back from the
+  backup taken just before it.
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: auto
+hassio_api: true
+hassio_role: backup
+homeassistant_api: false
+auth_api: false
+ingress: false
+watchdog: tcp://[HOST]:[PORT:8097]
+timeout: 20
+# watch: the App slugs it watches. health: each watched App's health address on the internal
+# network ("slug=host:port"; the keeper asks http://host:port/health). tokens: each App's own token
+# ("slug=token", at least 16 characters; the same token is that App's keeper_token option).
+# hc_done, hc_failed: the two Healthchecks.io ping URLs (DOCS.md); with either unset the keeper only
+# logs its lines and is not armable. health_grace_s: after a watched App first starts, failed /health
+# polls count only after this many seconds. attempt: written by the Ship run through the Home
+# Assistant connector just before an install (RELEASING.md, Ship); leave it alone by hand.
+options:
+  watch:
+    - 0fcc2575_cain
+  health:
+    - "0fcc2575_cain=0fcc2575-cain:8098"
+  tokens: []
+  hc_done: ""
+  hc_failed: ""
+  health_grace_s: 180
+  attempt:
+    id: ""
+    app: ""
+    from_version: ""
+    to_version: ""
+    backup_slug: ""
+    install_deadline: ""
+    authorization: ""
+    probe_hash: ""
+schema:
+  watch:
+    - match(^[a-z0-9_]{1,64}$)
+  health:
+    - match(^[a-z0-9_]{1,64}=[A-Za-z0-9.-]{1,253}:[0-9]{1,5}$)
+  tokens:
+    - password
+  hc_done: password?
+  hc_failed: password?
+  health_grace_s: int(0,900)
+  attempt:
+    id: str?
+    app: str?
+    from_version: str?
+    to_version: str?
+    backup_slug: str?
+    install_deadline: str?
+    authorization: password?
+    probe_hash: str?

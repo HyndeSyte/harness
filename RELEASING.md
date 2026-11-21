@@ -1,10 +1,13 @@
 # Building and releasing
 
 For any session that changes this repo, including the cloud build and ship sessions
-Cain starts. Two Home Assistant Apps live here:
+Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.0): a check after every install of a
+  watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
+  `bun test keeper/tests`.
 
 Home Assistant offers an update when `version` in an App's `config.yaml` changes on
 `main`. So `main` is what gets installed: nothing reaches it without passing CI and
@@ -239,6 +242,7 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
 4. Run the tests:
    - Python: `python -m pytest -q -p no:cacheprovider` from the repo root.
    - Cain: `bun test cain/tests` (install Bun if missing).
+   - Keeper: `bun test keeper/tests`.
    - A change to Cain's managed settings (`cain/rootfs/opt/cain/settings.json`) also needs
      the connector check, `cain/tools/connector-check.sh`, which CI can't run (no signed-in
      account; `cain/docs/connector-check.md`). Cain runs it himself on the live server (the
@@ -318,13 +322,39 @@ for 2 hours, without which Cain can't start the job.
    (`git show <sha>:cain/rootfs/opt/cain/settings.json | sha256sum`) must equal that digest.
    Otherwise install nothing and end with
    `Connector check: no passing line for this head and its settings`.
-4. In Home Assistant: check for App updates, then update only the App(s) the pull
+4. The keeper's registration (Keeper 0.1.0), before each App's install, for every install
+   (an ordinary one too, so every install is watched); steps 4a to 4e for that App, then its update:
+   - 4a. Create a backup of that App alone through the connector (a partial backup,
+     `include_addons` that App's slug only, no Home Assistant, no folders) and note its slug.
+   - 4b. Read that backup's info through the connector and check all four: it holds that App alone,
+     Home Assistant false, no folders, and the App's version in it equals the version installed now
+     (from_version). If any fails, install nothing and report it.
+   - 4c. Write the attempt into the Keeper App's options through the connector (its `attempt`
+     option, every other option left as it is): `id` (`ship-<pr number>-<app>-<first 8 of the head
+     sha>`), `app` (the slug), `from_version`, `to_version`, `backup_slug`, `install_deadline` (now
+     plus 30 minutes, ISO 8601 UTC), `authorization` (`ship <Dane's Ship token>` after a Ship tap,
+     `drill <his drill token>` after a drill tap), and `probe_hash` (for Cain:
+     `git show <sha>:cain/rootfs/opt/cain/probe/keeper.ts | sha256sum | cut -c1-16`; for an App with no
+     verdict probe, the same of its `config.yaml`).
+   - 4d. Read the Keeper App's log through the connector, for up to 2 minutes, for the line
+     `accepting <id> <app> <from> to <to> backup <slug>`. Install nothing without it. A `refusing
+     <id>: <why>` line, or no line, stops a ship-with-risk or drill install: report the line. For an
+     ordinary install (no risk tap) the install goes on when the Keeper App isn't installed or doesn't
+     answer, and the report says it went unwatched; a `refusing` line still stops it.
+   - 4e. Never install the Keeper App itself while one of its attempts is open (its log says so):
+     wait until the attempt has ended.
+   In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. When it changed both, Cain first, then
    Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness
    with 503, so its cards wait, none lost, until Harness signs). An App already at its
    new version is skipped. Nothing else in Home Assistant: no options, no other Apps,
    no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 5. Confirm the new version is running from the update result and the App's log.
+6. After each watched install, read the Keeper App's log through the connector until the attempt
+   ends (about 15 minutes after the new version first shows, longer after a rollback): `<id>: passed`,
+   `<id>: rolled back (...)`, `<id>: gave up (...)` or `<id>: install never started`. Report that line.
+   On a rollback or a give-up the Keeper has already told Dane through its own checks; the report
+   says what was rolled back and why, and installs nothing more.
 
 The job is a cloud session, not a process on the Pi: Home Assistant's Supervisor does
 each update, so replacing Cain's container doesn't stop the job before Harness. If the

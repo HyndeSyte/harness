@@ -37,6 +37,8 @@ jobs:
         with:
           bun-version: "1.4.4"
       - run: bun test cain/tests
+      # The keeper App's tests (Keeper 0.1.0): the same Bun.
+      - run: bun test keeper/tests
       # Claude Code's own updater is off in Cain's image (DISABLE_AUTOUPDATER), so its fixes arrive
       # only with App releases. A note when a newer Claude Code than the image's pin exists: a warning
       # on the run, never a failure (the lookup needs the network; no answer says so and passes).
@@ -58,6 +60,9 @@ jobs:
           /tmp/tscheck/node_modules/.bin/tsc -p cain/tsconfig.check.json > /tmp/tsc.txt || true
           if grep -E "error TS(2304|2305|2307|2552|2724)" /tmp/tsc.txt; then exit 1; fi
           echo "every name and import resolves ($(grep -c 'error TS' /tmp/tsc.txt) type nits not gated)"
+          /tmp/tscheck/node_modules/.bin/tsc -p keeper/tsconfig.check.json > /tmp/tsc-keeper.txt || true
+          if grep -E "error TS(2304|2305|2307|2552|2724)" /tmp/tsc-keeper.txt; then exit 1; fi
+          echo "the keeper's names and imports resolve too ($(grep -c 'error TS' /tmp/tsc-keeper.txt) type nits not gated)"
       # C1's image test: Cain's real image (amd64 here; the Pi is arm64, where the first start
       # checks the real Discord login and a real Claude session before it switches), the
       # switch to his own user run on a fake /data and interrupted at every point.
@@ -81,6 +86,30 @@ jobs:
           --build-arg BUILD_FROM="$(sed -n 's/^  aarch64: //p' cain/build.yaml)" cain
       - name: The switch to his own user, in the image (cain/tests/image/c1.sh)
         run: bash cain/tests/image/c1.sh cain-c1-test
+
+  # The keeper App's image (Keeper 0.1.0), built on amd64 and arm64 (the Pi's), its self-test run in it.
+  # Not a required check by name, but a Ship card waits for every check on its head to pass.
+  keeper-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build the keeper's image (amd64)
+        run: >-
+          docker build -q -t keeper-test --build-arg BUILD_ARCH=amd64
+          --build-arg BUILD_FROM="$(sed -n 's/^  amd64: //p' keeper/build.yaml)" keeper
+      - name: The keeper's self-test, in the image
+        run: docker run --rm --entrypoint bun keeper-test /opt/keeper/main.ts selftest
+
+  keeper-image-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build the keeper's image (aarch64)
+        run: >-
+          docker build -q -t keeper-test --build-arg BUILD_ARCH=aarch64
+          --build-arg BUILD_FROM="$(sed -n 's/^  aarch64: //p' keeper/build.yaml)" keeper
+      - name: The keeper's self-test, in the image
+        run: docker run --rm --entrypoint bun keeper-test /opt/keeper/main.ts selftest
 
   # The PC job worker runs on Dane's Windows PC: its tests run on Windows too. Not a
   # required check (RELEASING.md); pytest and bun above stay the gate.

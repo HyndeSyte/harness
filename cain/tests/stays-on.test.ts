@@ -757,6 +757,6 @@ describe("run_bounded and the health check's 404 line", () => {
     expect(out[0]).toContain("answered 404 to: 10.0.0.7 (1), 172.30.33.5 (2)");
     expect(readFileSync(miss, "utf8")).toBe("");
     expect(Bun.spawnSync(["bash", "-c", sh("")], { stdout: "pipe" }).stdout.toString()).toBe("");   // nothing new: no line
-    expect(RUN).toContain("( while true; do sleep 60; health_misses || true; health_ok_trim || true; done ) &");           // at most once a minute
+    expect(RUN).toContain("( while true; do sleep 60; health_misses || true; health_ok_trim || true; gateway_stale || true; done ) &");           // at most once a minute
   });
 });
