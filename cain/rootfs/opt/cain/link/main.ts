@@ -73,8 +73,10 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { capState, readArmed, readDecided, roundCapNow, ROUNDS_FILE } from "./cap";
+import { capState, DECISIONS_FILE, GUARD_LOG, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE } from "./cap";
 import { readRounds } from "../review/rounds";
+import { raiseAlarm, selfCheck } from "../capfiles";
+import { guard, paths as guardPaths } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
@@ -91,8 +93,8 @@ const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the ke
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
-const REPO_DIR = `${DIR}/repo.git`;
-const DECIDED = `${DIR}/review-decisions.json`;     // his taps on the review runner's decision cards (0.16.0, cap.ts)                  // the link's own copy, for landing his Ship taps
+const REPO_DIR = `${DIR}/repo.git`;                  // the link's own copy, for landing his Ship taps
+const DECIDED = DECISIONS_FILE;                      // his taps on the review runner's decision cards (0.16.0, cap.ts): /data/link/review-decisions.json
 const KNOWN_HOSTS = "/opt/cain/link/github_known_hosts";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
@@ -212,6 +214,10 @@ const github: MergeDeps = { api: githubApi, git: gitRun, stopped: () => readStop
 const SHIP_REPO = "HyndeSyte/harness";
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
+// The install-time self-check of the review cap's and usage guard's files (0.16.0, round 2,
+// ../capfiles.ts): one wrong turns those features off here, with one alarm naming it.
+const capOff: string | null = selfCheck({ log: (m) => console.log(`[cain] link: ${m}`) });
+
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
@@ -242,15 +248,18 @@ const link = new Link({
   reviewed: () => readReviewed(),
   // The review-round cap (0.16.0, cap.ts): the runner's rounds, his taps on its decision cards (the
   // link's own file), and the probe's record of the rollback, read as they are now.
-  capState: (pr) => capState(pr, DECIDED),
+  // Round 2: his tap kept durably before the card is marked used; a decisions file that doesn't parse
+  // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
+  // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
+  capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
   armed: () => readArmed(),
-  decided: (id, choice, at) => {
-    const all = readDecided(DECIDED) ?? {};
-    all[id] = { choice, at };
-    writeSynced(DECIDED, JSON.stringify(all, null, 1));
-  },
+  decided: (id, choice, at) => { recordDecision(DECIDED, id, choice, at, { onCorrupt: (aside) => raiseAlarm(`${DECIDED} didn't parse; it was moved aside to ${aside}`) }); },
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
+  capOff: () => capOff,
+  guardHold: (label, what) => { const p = guardPaths(); return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date(),
+    log: (line) => appendSynced(GUARD_LOG, line) }); },
+  holdLog: (line) => appendSynced(GUARD_LOG, line),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   linkHosts: () => readHosts(),

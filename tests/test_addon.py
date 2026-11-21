@@ -2653,11 +2653,12 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector"])' in auth.replace("\r\n", "\n"))
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold"])' in auth.replace("\r\n", "\n"))
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and
     # /pc-notice (the keeper runs as root, so being root is its key), and (Cain 0.16.0) the
-    # review runner's decision card at the round cap, so Cain can't post it.
-    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision"])' in auth
+    # review runner's decision card at the round cap, so Cain can't post it; and (its second round)
+    # the usage guard's hold, which the link decides again before it writes root's guard log.
+    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold"])' in auth
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

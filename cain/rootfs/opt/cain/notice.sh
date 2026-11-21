@@ -43,6 +43,8 @@
 # "server-gone" join "session", and "self-restart" (the App restarting itself now) joins "stop". Since
 # 0.15.0's second round, "panel" (kind "nginx": the App's web server, which serves its page and the
 # Supervisor's health check, didn't start; cleared once it does).
+# Since 0.16.0's second round, "review" (kind "review-files": a file of the review-round cap or the usage
+# guard has the wrong owner or mode at a start, so the review runner and the link keep both off; capfiles.ts).
 # Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
@@ -66,6 +68,7 @@
 #   notice.sh clear unseen           his session's unseen restarts are back under the limit: the unseen group
 #   notice.sh clear turn             his long turn ended: the turn group
 #   notice.sh clear tampered         the probe's folders are right again: the tamper group
+#   notice.sh clear review           the review cap's and guard's files are right again: the review group
 #   notice.sh tick                   the repeats, retries, the probe and its readback (every 10 minutes)
 #   notice.sh probe                  the probe, now
 #   notice.sh proven                 0 when a probe was read back moved within two days (no lock)
@@ -85,7 +88,7 @@ QUEUE="${RELAY_QUEUE:-$D/relay.queue}"
 OPTIONS="${NOTICE_OPTIONS:-$D/options.json}"
 URL="${NOTICE_URL:-http://homeassistant:8123}"
 DAY="${NOTICE_DAY_S:-86400}"
-GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart panel"
+GROUPS_ALL="stop session switch screen deliver phone probe restarts self boots asked all update unseen turn tamper watchdog selfrestart panel review"
 export TZ="${CHECKIN_TZ:-America/New_York}"
 
 # What every alarm says (Cain 0.15.0): the real cause and the step the App takes itself, never a step
@@ -115,6 +118,7 @@ group_of() {
     unseen-loop) echo unseen ;;
     turn-long) echo turn ;;
     tampered) echo tamper ;;
+    review-files) echo review ;;
     self-off) echo watchdog ;;
     self-refused|self-loops) echo selfrestart ;;
     nginx) echo panel ;;
@@ -203,6 +207,8 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain's turn has been running for ${mins:-over 120} minutes without a break. This may be normal for a long job, or he may be stuck on one task. The App's hourly liveness check waits no more than 2 hours for a turn, so it goes in anyway. $SELFRESTART $DETAILS" ;;
     tampered) T="Cain's probe folder isn't the App's alone"
       M="Cain's probe folder isn't the App's alone${c}: a folder where the App keeps its liveness records, or one above it, has an owner or mode it must not have, so the App stopped reading and writing there, and its liveness checks and outside heartbeat ping are off until it is right (this alarm comes again each day meanwhile). The App sets its own folders up again at its next start and fixes what it can above them; Cain files the path for a fix if it stays." ;;
+    review-files) T="Cain's review safeguards are off"
+      M="Cain's review-round cap and usage guard are off: one of their files isn't the App's alone${c}. Until it is right, no outside review round and no other-labelled build starts, and no Ship card goes out for a change at the cap. The App sets those files up again at its next start; Cain files it for a fix. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -224,6 +230,7 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     selfrestart) CT="Cain's App stays up"; CM="Cain's App is up, and his Discord channel is connected." ;;
     panel) CT="Cain's App page is back"; CM="Cain's App page and its health check are running again." ;;
     tamper) CT="Cain's probe folders are right again"; CM="Cain's probe folders are the App's alone again, and its liveness checks run." ;;
+    review) CT="Cain's review safeguards are back on"; CM="Cain's review-round cap and usage guard are on again: their files are the App's alone." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }
 # A cause, as it may go to him: one line, plain, short.
@@ -343,7 +350,8 @@ clear_groups() {   # clear_groups running|switched|screen|delivered|phone
     delivered) groups="deliver" ;; phone) groups="phone" ;; probe) groups="probe" ;; restarts) groups="restarts" ;;
     self) groups="self" ;; boots) groups="boots" ;; asked) groups="asked" ;; all) groups="all" ;; update) groups="update" ;; unseen) groups="unseen" ;;
     turn) groups="turn" ;; tampered) groups="tamper" ;; watchdog) groups="watchdog" ;; selfrestart) groups="selfrestart" ;; panel) groups="panel" ;;
-    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog, selfrestart or panel" >&2; return 2 ;; esac
+    review) groups="review" ;;
+    *) echo "notice: clear running, switched, screen, delivered, phone, probe, restarts, self, boots, asked, all, update, unseen, turn, tampered, watchdog, selfrestart, panel or review" >&2; return 2 ;; esac
   for g in $groups; do
     load "$g" || continue
     if [ "$clear" != 1 ]; then
@@ -433,7 +441,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
+  *) echo "usage: notice.sh tell <alarm> [cause] | clear running|switched|screen|delivered|phone|probe|restarts|self|boots|asked|all|update|unseen|turn|tampered|watchdog|selfrestart|review | tick | probe | proven | hooked | text <alarm> [cause]" >&2; exit 2 ;; esac
 # One writer at a time: the start, the check and the ticks may all call it, and none goes on
 # without the lock.
 mkdir -p "$DIR" 2>/dev/null && exec 9>"$DIR/.lock" \

@@ -59,10 +59,13 @@ export const KEEP_MS = 8 * 24 * 3_600_000;
 
 export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"]);
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
-  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector"]);
+  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold"]);
+// /guard-hold (0.16.0, round 2): the Build hook and review.sh run as Cain and can't open root's socket,
+// so they send a usage-guard hold with his key; the link decides it again from its own readings and
+// appends only a real refusal to the guard's log, which Cain can no longer write.
 // Root's services, on the unix socket only: what Cain sent (his edit allowlist) and the cards.
 // The review runner's decision card at the round cap (0.16.0): root's alone, so Cain can't post it.
-export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision"]);
+export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold"]);
 
 export function sameKey(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);

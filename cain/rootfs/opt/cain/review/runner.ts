@@ -253,9 +253,13 @@ export class Runner {
       reserve_percent: this.cfg.reservePercent ?? DEFAULT_RESERVE_PERCENT, caps: this.cfg.caps, review_limit: this.cfg.reviewLimit }, null, 1));
   }
   // A brief of Cain's into the queue, as a new round of its change, or the reason it isn't (null: queued).
+  // The install-time self-check's finding (../capfiles.ts, main.ts): while set, the cap and guard are off,
+  // so no brief is taken (fail closed) and no round is settled or decision card posted.
+  capOff: string | null = null;
   admitAndQueue(b: Brief): string | null {
     const file = this.cfg.roundsFile;
     if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
+    if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
     const a = admit(rounds, b, this.roundCap);
@@ -288,11 +292,12 @@ export class Runner {
     }
     return [];
   }
-  // A finished round, kept in the rounds file once: blocked or unanswered rounds don't count, and the
-  // cap's last round with a serious finding left owes the owner one decision card for the change.
+  // A finished round, kept in the rounds file once: answered, or lost (no seat answered: it still counts);
+  // a round blocked for privacy sent nothing and doesn't count. The cap's last round owes the owner one
+  // decision card for the change when it left a serious finding, or when it was lost (round 2).
   private settleRound(r: Review): void {
     const file = this.cfg.roundsFile;
-    if (!file || !r.change || r.rounded || !FINAL.includes(r.status)) return;
+    if (!file || this.capOff || !r.change || r.rounded || !FINAL.includes(r.status)) return;
     const rounds = readRounds(file);
     if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s round is settled next tick`); return; }
     const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
@@ -300,25 +305,55 @@ export class Runner {
     if (rec) {
       rec.done = true;
       if (r.status === "blocked: privacy") rec.blocked = true;
-      else if (!r.seats.some((s) => s.state === "done")) rec.blocked = true;   // nothing answered: not a round
-      if (r.round_kind === "fixes") rec.serious = serious.length;
+      else rec.state = r.seats.some((s) => s.state === "done") ? "answered" : "lost";
+      if (r.round_kind === "fixes" && rec.state === "answered") rec.serious = serious.length;
     }
-    if (rec && !rec.blocked && r.round_kind === "fixes" && serious.length && countedRounds(rounds, r.change).length >= this.roundCap
-        && !decisionOf(rounds, r.change)) {
-      const c = rounds.changes[r.change];
+    if (rec && !rec.blocked) {
       const b = r.brief;
-      c.decision = { id: `${r.change}#${countedRounds(rounds, r.change).length}`, key: r.change, round: countedRounds(rounds, r.change).length,
-        serious: serious.length, topic: oneLine(b?.topic ?? c.topic ?? r.change, 120), finding: oneLine(serious[0].problem, 160),
-        item: b?.item ?? null, pr: b?.pr ?? c.pr ?? null, state: "owed", at: this.now().toISOString() };
-      this.log(`review ${shownId(r)}: the round cap is reached for ${r.change} with ${serious.length} serious finding(s) left; the owner's decision card is owed`);
+      const c = rounds.changes[r.change];
+      const base = { topic: oneLine(b?.topic ?? c.topic ?? r.change, 120), item: b?.item ?? null, pr: b?.pr ?? c.pr ?? null };
+      if (rec.state === "lost") this.owe(rounds, r.change, { ...base, serious: 0, finding: "", lost: true }, `review ${shownId(r)}`);
+      else if (r.round_kind === "fixes" && serious.length)
+        this.owe(rounds, r.change, { ...base, serious: serious.length, finding: oneLine(serious[0].problem, 160) }, `review ${shownId(r)}`);
     }
     writeRounds(file, rounds);
     r.rounded = true;
   }
+  // The decision card, owed once per change group, when the group is at the cap.
+  private owe(rounds: Rounds, key: string, d: Pick<DecisionRec, "topic" | "item" | "pr" | "serious" | "finding"> & { lost?: boolean }, what: string): void {
+    const n = countedRounds(rounds, key).length;
+    if (n < this.roundCap || decisionOf(rounds, key)) return;
+    rounds.changes[key].decision = { id: `${key}#${n}`, key, round: n, ...d, ...(d.lost ? { lost: true } : {}), state: "owed", at: this.now().toISOString() };
+    this.log(`${what}: the round cap is reached for ${key} ${d.lost ? "and its last round was lost" : `with ${d.serious} serious finding(s) left`}; the owner's decision card is owed`);
+  }
+  // A round counted at intake whose review never reached the queue (the runner stopped between the
+  // two writes) is lost, found once at the runner's start: it still counts, Cain hears it named, and
+  // at the cap it owes the decision card.
+  private recovered = false;
+  recoverLost(): void {
+    const file = this.cfg.roundsFile;
+    if (this.recovered || !file || this.capOff) return;
+    const rounds = readRounds(file);
+    if (!rounds) return;                               // tried again next tick
+    this.recovered = true;
+    const lines: string[] = [];
+    for (const [key, c] of Object.entries(rounds.changes)) {
+      for (const x of c.rounds) {
+        if (x.done || x.blocked || x.state === "lost" || x.state === "answered" || existsReview(this.cfg.queueDir, x.id)) continue;
+        x.state = "lost"; x.done = true;
+        const n = countedRounds(rounds, key).findIndex((y) => y.id === x.id && y.key === key) + 1;
+        lines.push(`Round ${n}${this.roundCap ? ` of ${this.roundCap}` : ""} for ${key} was lost: the review runner stopped before its review was queued, so it never ran. It still counts.`);
+        this.owe(rounds, key, { topic: oneLine(c.topic ?? key, 120), item: null, pr: c.pr ?? null, serious: 0, finding: "", lost: true }, `round ${x.id}`);
+      }
+    }
+    if (!lines.length) return;
+    writeRounds(file, rounds);
+    for (const l of lines) this.relay(`${l} Nothing to tell him.`);
+  }
   // Owed decision cards, through the link. Exactly one per change: once posted it's never posted again.
   async postOwed(): Promise<void> {
     const file = this.cfg.roundsFile;
-    if (!file || !this.deps.postDecision) return;
+    if (!file || !this.deps.postDecision || this.capOff) return;
     const rounds = readRounds(file);
     if (!rounds) return;
     for (const [key, c] of Object.entries(rounds.changes)) {
@@ -331,14 +366,14 @@ export class Runner {
       const cur = now.changes[key].decision!;
       if (msg) {
         Object.assign(cur, { state: "posted", message: msg });
-        this.relay(`The review cap is reached for ${key}: its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. Nothing to tell him.`);
+        this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. Nothing to tell him.`);
       } else cur.tries = (cur.tries ?? 0) + 1;
       writeRounds(file, now);
     }
   }
 
   async tick(): Promise<void> {
-    try { this.ingest(); await this.reviews(); }
+    try { this.recoverLost(); this.ingest(); await this.reviews(); }
     finally {
       if (this.publishOwed) this.publishReviewed();
       try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }

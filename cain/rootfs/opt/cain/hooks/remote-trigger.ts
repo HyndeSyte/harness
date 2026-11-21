@@ -14,7 +14,11 @@
 //     "label" field or on a "Label: <label>" line of its text (both, and they must agree); none is
 //     "other". A Build run goes through the usage guard (../guard.ts): "other" is refused while the
 //     plan or a review seat is below the reserve floor, logged, with no bypass. A Ship run only installs
-//     what his tap landed, so it carries its label and isn't held.
+//     what his tap landed, so it carries its label and isn't held. Round 2: the guard's log is root's
+//     (0640), so the hold goes to the link (POST /guard-hold, Cain's key), which decides again and
+//     appends it; if the link can't be reached the run is still refused, saying the hold wasn't logged.
+//     Paths are constants (../capfiles.ts), and the hook refuses every run while the test-mode
+//     variable (CAIN_TEST_MODE) is set: the production run script never sets it.
 // A refusal goes back to Cain as the reason; anything else is left to the usual
 // permission rules. If the call, the holds, the Ship key or the Stop state can't be
 // read, it's refused.
@@ -22,7 +26,8 @@ import { readFileSync } from "node:fs";
 import { parseHolds } from "../link/core.ts";
 import { findToken, publicKey, pullOf, readToken, signedAt } from "../ship-token.ts";
 import { readStop, type StopState, stoppedWhy } from "../stop.ts";
-import { guard, labelOf, paths, type Label, type Verdict } from "../guard.ts";
+import { decide as guardDecide, labelOf, paths, postHold, readings, type Label, type Verdict } from "../guard.ts";
+import { TEST_MODE_VAR, testMode } from "../capfiles.ts";
 
 export const BUILD = "trig_015FTxexzFDZyjYjzw39bPv8";
 export const SHIP = "trig_015NTtUUC5DN82zDJBwmcq1r";
@@ -112,7 +117,9 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
     const g = lab.label !== "other" ? { ok: true as const }
       : env.guard ? env.guard(lab.label, title) : { ok: false as const, floor: "guard", why: "the usage guard couldn't run" };
     if (!g.ok)
-      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.why}. Core, commitment and necessary-fix work still run; nothing bypasses it. It's on the guard's log: list it on the open list as held.`;
+      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.why}. Core, commitment and necessary-fix work still run; nothing bypasses it. ${g.logged === false
+        ? "The hold could not be logged (the link didn't take it), so it isn't on the guard's log: try again in a minute, and log a Build item if it repeats."
+        : "It's on the guard's log: list it on the open list as held."}`;
     return "";
   }
   // Ship: his signed tap, for the pull request and head this job names.
@@ -149,14 +156,34 @@ function read(path: string): string | null {
   try { return readFileSync(path, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
 
+// The guard as the hook runs it: the reading now, and a refusal sent to the link to be logged. Two
+// passes: decide() is synchronous, so the first finds whether the guard refuses, the link is asked, and
+// the second gives the reason with whether it was logged.
+export async function decideWithGuard(call: any, holdsText: string | null, env: Env,
+    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean }>): Promise<string> {
+  let held: { label: Label; what: string; v: Extract<Verdict, { ok: false }> } | null = null;
+  const first = decide(call, holdsText, { ...env, guard: (label, what) => {
+    const v = reading(label, what);
+    if (!v.ok) held = { label, what, v };
+    return v;
+  } });
+  if (!held) return first;
+  const h = held as { label: Label; what: string; v: Extract<Verdict, { ok: false }> };
+  const sent = await post(h.label, h.what);
+  return decide(call, holdsText, { ...env, guard: () => ({ ...h.v, logged: sent.logged }) });
+}
+
 if (import.meta.main) {
   let reason: string;
-  const p = paths();
-  const now = Date.now();
-  const g = (label: Label, what: string) => guard(label, what, { settingsFile: p.settings, spendFile: p.spend, logFile: p.log, tz: p.tz, now: new Date(now) });
-  try { reason = decide(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now, guard: g }); }
-  catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
+  if (testMode()) reason = `${TEST_MODE_VAR} is set, a tests-only variable, so no Build or Ship run starts. The App's run script never sets it: log it as a Build item.`;
+  else {
+    const p = paths();
+    const now = Date.now();
+    const reading = (label: Label, what: string): Verdict => label !== "other" ? { ok: true }
+      : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now) }), new Date(now));
+    try { reason = await decideWithGuard(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w)); }
+    catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
+  }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {
     hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }));
-  process.exit(0);
 }

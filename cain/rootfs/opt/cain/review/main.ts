@@ -8,6 +8,7 @@ import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
 import type { DecisionRec } from "./rounds.ts";
+import { selfCheck } from "../capfiles.ts";
 import { claudeSeat } from "./seats/claude.ts";
 import { geminiSeat } from "./seats/gemini.ts";
 import { codexSeat, codexSignedIn } from "./seats/openai.ts";
@@ -15,6 +16,22 @@ import { perplexitySeat } from "./seats/perplexity.ts";
 import { CodexLogin, handle } from "./signin.ts";
 
 const log = (m: string) => console.log(`[review] ${m}`);
+
+// The owner's decision card at the review cap (Cain 0.16.0): through the link's root socket (only root
+// can open it), which builds the card's words itself and files his tap. The message id once it's up;
+// null while it isn't (the link didn't answer, or it waits on its item's hold: round 2), tried again.
+export function decisionPoster(linkSock: string, log: (m: string) => void) {
+  return async (d: DecisionRec): Promise<string | null> => {
+    const res = await fetch("http://link/decision", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
+      body: JSON.stringify(d), signal: AbortSignal.timeout(45_000) } as any);
+    const j: any = await res.json().catch(() => ({}));
+    if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
+    // Round 2: its item is held by another holder; the link keeps it waiting and posts it once that clears.
+    if (res.ok && j?.status === "held") return null;
+    log(`the link didn't post the decision card for ${d.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
+    return null;
+  };
+}
 
 if (import.meta.main) {
   const env = process.env;
@@ -33,17 +50,7 @@ if (import.meta.main) {
   if (keys.anthropic) seats.claude = claudeSeat({ key: keys.anthropic, model: cfg.models.claude, selftestModel: "claude-haiku-5-5",
     version: env.ANTHROPIC_VERSION_HEADER || undefined });
 
-  // The owner's decision card at the review cap (Cain 0.16.0): through the link's root socket (only
-  // root can open it), which builds the card's words itself and files his tap.
-  const linkSock = env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
-  const postDecision = async (d: DecisionRec): Promise<string | null> => {
-    const res = await fetch("http://link/decision", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
-      body: JSON.stringify(d), signal: AbortSignal.timeout(45_000) } as any);
-    const j: any = await res.json().catch(() => ({}));
-    if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
-    log(`the link didn't post the decision card for ${d.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
-    return null;
-  };
+  const postDecision = decisionPoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log);
   const runner = new Runner(cfg, {
     seats, log, postDecision,
     stopped: () => readStop().stopped,
@@ -54,6 +61,9 @@ if (import.meta.main) {
   runner.publishReviewed();
   // The cap and caps it really uses, for review.sh and the Build hook (run as Cain).
   try { runner.writeSettings(); } catch (e) { log(`couldn't write its settings for review.sh: ${(e as Error).message}`); }
+  // The install-time self-check (Cain 0.16.0, round 2, ../capfiles.ts): a file of the cap's or guard's
+  // with the wrong owner or mode turns both off here (no brief is taken), with one alarm naming it.
+  runner.capOff = selfCheck({ log });
 
   // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx. On a unix socket
   // only nginx's workers and root can open (C1): a TCP port could be taken by Cain's user while

@@ -6,18 +6,29 @@
 //     or names a review round past the cap (a round number above it, or another round for a change
 //     already at the cap), the way a Reviewed line not from the service is refused.
 //   - His tap on it is kept by the link (/data/link/review-decisions.json) and relayed like any tap.
+//     Round 2: kept durably first (temp file in the same folder, fsync, rename, folder fsync), and only
+//     then is the card marked used; a write that fails leaves the card tappable. A decisions file that
+//     doesn't parse is never overwritten: it's moved aside under a timestamped name, no new tap is
+//     written while a moved-aside file stands, and the App's alarm names it.
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
 //     it installs, read from the probe's record (/data/probe/rollback-armed.json), never from Cain.
-import { readFileSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { countedRounds, decisionOf, readRounds, type DecisionRec, type Rounds } from "../review/rounds.ts";
+import { capPaths } from "../capfiles.ts";
+import { syncFolder } from "./auth.ts";
 
 export const HOLD = "Hold it";
 export const RISK = "Ship it with that risk";
 export const DECISION_OPTIONS = [HOLD, RISK] as const;
-export const ROUNDS_FILE = process.env.REVIEW_ROUNDS ?? "/data/review-rounds.json";
-export const SETTINGS_FILE = process.env.REVIEW_SETTINGS ?? "/data/review-settings.json";
-export const ARMED_FILE = process.env.CAIN_ROLLBACK_ARMED ?? "/data/probe/rollback-armed.json";
+// Constants (../capfiles.ts); an environment override only in test mode.
+const P = capPaths();
+export const ROUNDS_FILE = P.rounds;
+export const SETTINGS_FILE = P.settings;
+export const ARMED_FILE = P.armed;
+export const DECISIONS_FILE = P.decisions;
+export const GUARD_LOG = P.guardLog;
 
 const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
 const ORDINALS = ["zeroth", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth"];
@@ -28,12 +39,23 @@ const clean = (s: string, max: number) => {
 };
 
 // The card's words: what the piece is (the brief's own topic), what the serious finding is (one line),
-// the question, and the recommendation first.
-export function decisionText(d: Pick<DecisionRec, "topic" | "finding" | "round" | "serious">): string {
+// the question, and the recommendation first. Round 2: a final round that never produced a result (lost)
+// says so instead of a finding; with the rollback not armed, one sentence up front says a Ship would be
+// refused until a release arms it, so holding it is the working choice. No counts (the card gate's
+// count rule): more than one serious finding is said in words.
+export const UNARMED_LINE = "The App's rollback isn't armed yet, so shipping it with the risk would be refused until a release arms it, and holding it is the working choice.";
+export const FALLBACK_LINE = "A serious finding remains; see the item";
+export function decisionText(d: Pick<DecisionRec, "topic" | "finding" | "round" | "serious"> & { lost?: boolean; unarmed?: boolean }): string {
   const n = d.round >= 0 && d.round < ORDINALS.length ? ORDINALS[d.round] : `round ${d.round}`;
-  const more = d.serious > 1 ? ` (and ${d.serious - 1} more serious finding${d.serious > 2 ? "s" : ""})` : "";
-  return `${clean(d.topic, 120)}: the ${n} and last outside review still found something serious${more}: ${clean(d.finding, 160).replace(/[.\s]+$/, "")}. `
-    + "No more review rounds are allowed for it. Ship it with that risk, or hold it? I recommend holding it until it's fixed.";
+  const lead = d.unarmed ? `${UNARMED_LINE} ` : "";
+  const ask = "No more review rounds are allowed for it. Ship it with that risk, or hold it? I recommend holding it until it's fixed.";
+  if (d.lost) return `${lead}${clean(d.topic, 120)}: the ${n} and last outside review did not complete, so nothing it would have found is known. ${ask}`;
+  const more = d.serious > 1 ? " (it was not the only one)" : "";
+  return `${lead}${clean(d.topic, 120)}: the ${n} and last outside review still found something serious${more}: ${clean(d.finding, 160).replace(/[.\s]+$/, "")}. ${ask}`;
+}
+// The card's words when its full text fails the card gate: a fixed line and the brief's topic.
+export function fallbackText(topic: string | null, unarmed = false): string {
+  return `${unarmed ? `${UNARMED_LINE} ` : ""}${FALLBACK_LINE}${topic ? `: ${clean(topic, 120).replace(/[.\s]+$/, "")}.` : "."} Ship it with that risk, or hold it? I recommend holding it until it's fixed.`;
 }
 // The question as Cain's relayed tap line quotes it: the topic only, never the seats' words.
 export function decisionSummary(d: Pick<DecisionRec, "topic">): string {
@@ -68,9 +90,55 @@ export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | nu
 }
 
 export type Decided = Record<string, { choice: string; at: number }>;
+// A moved-aside copy beside the file: "<name>.corrupt-<time>".
+export function asideOf(path: string): string[] {
+  try { return readdirSync(dirname(path)).filter((n) => n.startsWith(`${basename(path)}.corrupt-`)).map((n) => join(dirname(path), n)); }
+  catch { return []; }
+}
+const parseDecided = (text: string): Decided | null => {
+  try { const j = JSON.parse(text); return j && typeof j === "object" && !Array.isArray(j) ? j : null; } catch { return null; }
+};
+// His taps; {} when there's no file yet; null when it can't be read, doesn't parse, or a copy that
+// didn't parse was moved aside (until that's settled no tap counts: the Ship card fails closed).
 export function readDecided(path: string): Decided | null {
-  try { const j = JSON.parse(readFileSync(path, "utf8")); return j && typeof j === "object" ? j : null; }
-  catch (e: any) { return e?.code === "ENOENT" ? {} : null; }
+  if (asideOf(path).length) return null;
+  let text: string;
+  try { text = readFileSync(path, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? {} : null; }
+  return parseDecided(text);
+}
+
+export class DecisionsUnsaved extends Error {}
+// His tap, kept durably before the card is marked used (Link.onQuestion). The same decision tapped
+// again keeps its first answer (a retry records it once). Throws DecisionsUnsaved when it couldn't be
+// kept; a file that doesn't parse is moved aside (never overwritten), and onCorrupt hears its new name.
+export function recordDecision(path: string, id: string, choice: string, at: number,
+    o: { onCorrupt?: (aside: string) => void; sync?: (dir: string) => void; now?: () => number } = {}): { choice: string; at: number } {
+  const aside = asideOf(path);
+  if (aside.length) throw new DecisionsUnsaved(`his decisions file was moved aside (${aside[0]}) and isn't settled yet`);
+  let text: string | null = null;
+  try { text = readFileSync(path, "utf8"); }
+  catch (e: any) { if (e?.code !== "ENOENT") throw new DecisionsUnsaved(`his decisions file can't be read (${String(e?.code ?? e).slice(0, 40)})`); }
+  let all: Decided = {};
+  if (text !== null) {
+    const j = parseDecided(text);
+    if (!j) {
+      const to = `${path}.corrupt-${new Date((o.now ?? Date.now)()).toISOString().replace(/[-:.]/g, "")}`;
+      try { renameSync(path, to); } catch (e) { throw new DecisionsUnsaved(`his decisions file doesn't parse, and couldn't be moved aside (${String(e).slice(0, 60)})`); }
+      try { o.onCorrupt?.(to); } catch { /* the refusal stands */ }
+      throw new DecisionsUnsaved(`his decisions file didn't parse, so it was moved aside to ${to}`);
+    }
+    all = j;
+  }
+  if (all[id]) return all[id];
+  all[id] = { choice, at };
+  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
+  try {
+    const fd = openSync(tmp, "w", 0o600);
+    try { writeSync(fd, JSON.stringify(all, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(tmp, path);
+    (o.sync ?? syncFolder)(dirname(path));
+  } catch (e) { throw new DecisionsUnsaved(`his decision couldn't be written (${String(e).slice(0, 80)})`); }
+  return all[id];
 }
 
 export type CapState =
@@ -97,7 +165,7 @@ export function capStateFor(pr: string, rounds: Rounds | null, decided: Decided 
   }
   return { state: "none" };
 }
-export function capState(pr: string, decidedFile: string): CapState {
+export function capState(pr: string, decidedFile: string = DECISIONS_FILE): CapState {
   return capStateFor(pr, readRounds(ROUNDS_FILE), readDecided(decidedFile));
 }
 

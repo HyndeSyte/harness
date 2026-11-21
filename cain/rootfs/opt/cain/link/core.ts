@@ -87,7 +87,8 @@ import { decideSend, type CardsView, type CardView, type Decision, type Writer }
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
-import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, namesRoundPastCap, type CapState } from "./cap";
+import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
+import { holdLine, labelOf, type Label, type Verdict } from "../guard";
 import type { DecisionRec, Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
@@ -96,6 +97,8 @@ import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
 export const EXPIRED_TAP = "This card expired; nothing was done.";
+// His tap on the review cap's decision card that couldn't be kept (0.16.0, round 2): to him alone, the card stays up.
+export const DECISION_UNSAVED = "Your answer couldn't be saved, so nothing was decided yet. The card is still up: tap your answer again.";
 export const EXPIRED = "Expired";
 export const REPLACED = "Replaced by a newer card";
 const COMPONENT = 3;
@@ -322,7 +325,7 @@ export interface Shown {
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
-  decision?: { id: string; key: string; pr: string | null };   // the review runner's decision card at the round cap (0.16.0, cap.ts)
+  decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
 }
 // The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
 // tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
@@ -356,6 +359,9 @@ export interface State {
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
   pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
+  // The review runner's decision cards waiting while their item is held by another holder (0.16.0,
+  // round 2), by decision id: one each, tried again at each sweep until the hold clears.
+  decisions?: Record<string, Partial<DecisionRec> & { since: number }>;
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -677,9 +683,15 @@ export interface Deps {
   // rollback (its text; null: none), his tap on a decision card kept, the cap and the rounds now.
   capState?: (pr: string) => CapState;
   armed?: () => string | null;
-  decided?: (id: string, choice: string, at: number) => void;
+  decided?: (id: string, choice: string, at: number) => void;     // throws when his tap couldn't be kept (round 2: the card stays tappable)
   roundCap?: () => number;
   rounds?: () => Rounds | null;
+  // Round 2: the install-time self-check's finding (null: every file right; else the cap and guard are
+  // off), the usage guard as the link runs it for a part of Cain's that was refused (it decides again
+  // from its own readings and logs a refusal), and one line onto the guard's log (the open list's holds).
+  capOff?: () => string | null;
+  guardHold?: (label: Label, what: string) => Verdict;
+  holdLog?: (line: string) => void;
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
@@ -1578,17 +1590,37 @@ export class Link {
   // The owner's one decision at the review-round cap (0.16.0, cap.ts): only the review runner asks for
   // it, on root's socket. The link writes its words and its fixed options, files it under the brief's
   // item (or none), and it stays up until he taps it. The same decision posted twice is one card.
-  async decision(d: Partial<DecisionRec>): Promise<{ status: "posted"; message: string }> {
+  // Round 2: its words go through the same card gate as every other card to him (counts, machine text,
+  // record codes), with a fixed fallback and the topic when they fail; the item's hold is checked as for
+  // any ask, and a decision for an item held by another holder waits (one per decision, tried again at
+  // each sweep) and answers "held"; a lost final round says so; and while the rollback isn't armed the
+  // card says up front that a Ship would be refused.
+  async decision(d: Partial<DecisionRec>): Promise<{ status: "posted"; message: string } | { status: "held"; said: string }> {
+    const off = this.capOff();
+    if (off) throw new Refusal(`the review cap's files aren't right (${off}), so no decision card goes out until they are`);
     const id = String(d.id ?? ""), key = String(d.key ?? "");
     if (!/^[a-z0-9][a-z0-9-]{2,63}#\d{1,3}$/.test(id) || !id.startsWith(`${key}#`)) throw new Refusal("a decision needs its id and change key");
+    const lost = d.lost === true;
     const round = Number(d.round), serious = Number(d.serious);
-    if (!Number.isInteger(round) || round < 1 || !Number.isInteger(serious) || serious < 1) throw new Refusal("a decision needs its round and its serious findings");
-    if (!String(d.topic ?? "").trim() || !String(d.finding ?? "").trim()) throw new Refusal("a decision needs its topic and its finding");
+    if (!Number.isInteger(round) || round < 1 || !Number.isInteger(serious) || serious < (lost ? 0 : 1)) throw new Refusal("a decision needs its round and its serious findings");
+    if (!String(d.topic ?? "").trim() || (!lost && !String(d.finding ?? "").trim())) throw new Refusal("a decision needs its topic and its finding");
     const item = d.item && ITEM.test(String(d.item)) ? String(d.item).toUpperCase() : "none";
     const pr = d.pr && PULL.test(String(d.pr)) ? String(d.pr) : null;
     const prior = Object.entries(this.d.load().messages).find(([, m]) => m.decision?.id === id);
     if (prior) return { status: "posted", message: prior[0] };
-    const text = this.ownWords("decision", "link", decisionText({ topic: String(d.topic), finding: String(d.finding), round, serious }));
+    // The item's hold, as for any ask: held by another holder (or the holds can't be read) waits.
+    const wait = this.decisionWaits(item);
+    if (wait) {
+      const s = this.d.load();
+      const had = s.decisions?.[id];
+      (s.decisions ??= {})[id] = { ...d, id, key, item, pr, since: had?.since ?? this.d.now() };
+      this.d.save(s);
+      if (!had) this.log(`the decision card for ${key} waits: ${wait}`);
+      return { status: "held", said: `the decision card waits: ${wait}; the link tries again at each sweep` };
+    }
+    let unarmed = false;
+    try { unarmed = !armedFor(null, this.d.armed?.() ?? null).armed; } catch { unarmed = true; }
+    const text = this.decisionWords({ topic: String(d.topic), finding: String(d.finding ?? ""), round, serious, lost, unarmed });
     const options = [...DECISION_OPTIONS];
     const nonce = stableNonce("decision", id);
     return this.serial(async () => {
@@ -1597,10 +1629,67 @@ export class Link {
       const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"), { nonce });
       const s = this.d.load();
       this.remember(s, msg, { kind: "ask", item, question: "", posted: this.d.now(), expires: null, buttons: true, labels: [...options],
-        q: { q: decisionSummary({ topic: String(d.topic) }), options, used: false }, decision: { id, key, pr } });
+        q: { q: decisionSummary({ topic: String(d.topic) }), options, used: false }, decision: { id, key, pr, ...(unarmed ? { unarmed: true } : {}) } });
+      if (s.decisions?.[id]) delete s.decisions[id];
       this.d.save(s);
       return { status: "posted" as const, message: String(msg.id) };
     });
+  }
+  // Why a decision card for this item can't go up now ("" when it can): another holder has the item, or
+  // the holds can't be read.
+  private decisionWaits(item: string): string {
+    if (item === "none") return "";
+    const holds = parseHolds(this.files().holds);
+    if (holds === null) return "the holds can't be read";
+    if (heldElsewhere(holds, item)) return `${item} is held by another holder`;
+    return "";
+  }
+  // The card's words through the card gate: the rules every card to him gets (dashes and "add-on"
+  // fixed; a count, machine text or a record code refuses), and the fallback with the topic when its
+  // full text fails (the topic left off too when it fails alone).
+  private decisionWords(d: { topic: string; finding: string; round: number; serious: number; lost: boolean; unarmed: boolean }): string {
+    const passes = (t: string): string | null => {
+      const w = this.words("decision", "link", t, { rules: ["dash", "app", "count", "machine"] });
+      let codes: CainHit[] = [];
+      try { if (mayHaveCode(t)) codes = codesHits(t, this.itemIds()); } catch { codes = []; }
+      if (w.refused.length || codes.length) { this.report("decision", "link", [...w.hits, ...codes] as Hit[], "refused"); return null; }
+      this.report("decision", "link", w.hits, "fixed");
+      return w.text;
+    };
+    return passes(decisionText(d)) ?? passes(fallbackText(d.topic, d.unarmed)) ?? this.ownWords("decision", "link", fallbackText(null, d.unarmed));
+  }
+  private capOff(): string | null {
+    try { return this.d.capOff?.() ?? null; } catch (e) { return `the check failed: ${String(e).slice(0, 60)}`; }
+  }
+  // Decisions waiting on an item's hold, tried again at each sweep.
+  private async retryDecisions(): Promise<void> {
+    const waiting = Object.values(this.d.load().decisions ?? {});
+    for (const d of waiting) {
+      try { await this.decision(d); }
+      catch (e) {
+        this.log(`a waiting decision card didn't go: ${String(e).slice(0, 80)}`);
+        if (e instanceof Refusal && !/files aren't right/.test(e.message)) {           // it can never go: dropped, the runner asks again
+          const s = this.d.load(); if (s.decisions?.[String(d.id)]) { delete s.decisions[String(d.id)]; this.d.save(s); }
+        }
+      }
+    }
+  }
+
+  // The usage guard for a part of Cain's that it refused (the Build hook, review.sh; Cain's key): the
+  // link decides again from its own readings, and only a refusal is appended to the guard's log, which
+  // is root's (round 2). "held" once it's logged; "passes" when the link's reading lets it run.
+  guardHoldFor(b: { label?: unknown; what?: unknown }): { status: "held"; why: string } | { status: "passes" } {
+    const off = this.capOff();
+    if (off) throw new Refusal(`the usage guard's files aren't right (${off}), so the hold can't be logged`);
+    const label = labelOf(b.label === undefined ? undefined : String(b.label));
+    if (!label) throw new Refusal("a hold names its label: core, commitment, necessary-fix or other");
+    const what = String(b.what ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 160);
+    if (!what) throw new Refusal("a hold says what was refused");
+    if (!this.d.guardHold) throw new Refusal("the link has no usage guard to log with");
+    const v = this.d.guardHold(label, what);
+    if (v.ok) return { status: "passes" };
+    if (v.logged === false) throw new Refusal("the hold couldn't be written to the guard's log");
+    return { status: "held", why: v.why };
   }
 
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
@@ -2612,6 +2701,23 @@ export class Link {
     catch (e) { this.log(`couldn't sign a Ship tap: ${String(e).slice(0, 80)}`); return null; }
   }
 
+  // His "Ship it with that risk" while the rollback isn't armed (round 2): the change is recorded as
+  // held, with that reason, on the guard's log (the holds Cain lists on the open list), and Cain's line
+  // says so. Read again at the tap, so a rollback armed since the card went up holds nothing.
+  private heldForRollback(m: Shown): string {
+    const dec = m.decision!;
+    let a: { armed: boolean; why: string };
+    try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the probe's rollback record can't be read` }; }
+    if (a.armed) return "";
+    const what = `${dec.key}${dec.pr ? ` (${dec.pr})` : ""}`;
+    const why = `held: he chose to ship it with the risk named, but ${a.why}, so a Ship card is refused until a release arms it`;
+    let logged = true;
+    try { this.d.holdLog?.(holdLine(new Date(this.d.now()), "review-cap", what, why)); if (!this.d.holdLog) logged = false; }
+    catch (e) { logged = false; this.log(`couldn't record the hold for ${dec.key}: ${String(e).slice(0, 80)}`); }
+    return ` It's recorded as held, not shippable yet: ${a.why}, so a Ship card for it is refused until a release arms the rollback.${logged
+      ? " It's on the guard's log: list it on the open list as held." : " The hold couldn't be written to the guard's log: list it as held yourself, and log a Build item."}`;
+  }
+
   private tapLine(m: Shown, label: string, msgId: string): string {
     const where = `(Discord message ${msgId}; its card shows his answer. If it needs words from you, reply with reply_to ${msgId})`;
     if (m.kind === "ship" && m.ship)
@@ -2627,12 +2733,23 @@ export class Link {
     const i = Number(cid.split(":")[2]);
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
     const label = q.options[i];
-    q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
     // His decision at the review-round cap (0.16.0) is kept before anything else, for the Ship card.
+    // Round 2: kept durably first, and only then is the card marked used. If it can't be kept, the card
+    // stays tappable and he's told, in one plain line to him alone, that his answer wasn't saved.
+    let heldNote = "";
     if (m.decision) {
-      try { this.d.decided?.(m.decision.id, label, this.d.now()); }
-      catch (e) { this.log(`couldn't keep his decision at the review cap: ${String(e).slice(0, 80)}`); }
+      try {
+        if (!this.d.decided) throw new DecisionsUnsaved("the link has nowhere to keep it");
+        this.d.decided(m.decision.id, label, this.d.now());
+      } catch (e) {
+        this.log(`couldn't keep his decision at the review cap; the card stays up: ${String(e).slice(0, 120)}`);
+        await this.answer(it, ACK);
+        await this.ephemeral(it, DECISION_UNSAVED);
+        return "unsaved";
+      }
+      if (label === RISK) heldNote = this.heldForRollback(m);
     }
+    q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
     // His Ship tap lands it in main, unless everything is stopped. Cain hears how it
     // went once it's settled, with the Ship token when it's in main.
     let shown = `You answered: ${label}`, extra = "", landing = false;
@@ -2656,7 +2773,7 @@ export class Link {
     // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
     // can't be marked answered and never reach him. A landing tells him when it settles
     // (the sweep settles one the link was cut off from).
-    if (!landing) this.d.relay(this.tapLine(m, label, msgId) + extra);
+    if (!landing) this.d.relay(this.tapLine(m, label, msgId) + extra + heldNote);
     const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
     if (ok) {
       const s2 = this.d.load();
@@ -3107,6 +3224,7 @@ export class Link {
       this.backfillLabels();
       await this.sendOwedToggle();
       await this.retryLandings();
+      await this.retryDecisions();
       await this.checkKey();
       await this.showDue();
       await this.decide();

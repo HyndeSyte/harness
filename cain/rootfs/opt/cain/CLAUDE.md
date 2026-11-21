@@ -491,14 +491,17 @@ second view adds value; skip it for small, obvious things.
   (ship it with that risk, or hold it), filed under the brief's `"item": "<PENDING id>"`: never ask
   him that yourself, never offer another round (the link refuses both), and wait for his tap. A
   Ship card for it waits on that tap; after "Hold it" there is none, and after "Ship it with that
-  risk" it goes only while the App's rollback is armed (the link says what isn't).
+  risk" it goes only while the App's rollback is armed (the link says what isn't). A last round
+  that never finishes is lost: it still counts, and the same card comes, saying so. A card whose
+  item someone else holds waits until the hold clears.
 - Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
   (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own
   line in the job's text. The usage guard refuses other work while the plan or a review seat is below
   its reserve floor, and an unknown plan reading counts as below: nothing bypasses it. Never label
-  work to get past it. Each refusal is a line in /data/review-guard.log: list those as held on the
-  open list. `/opt/cain/review.sh guard` prints the guard's reading in two lines: put them in your
+  work to get past it. Each refusal is a line in /data/review-guard.log (yours to read, not to
+  write): list those as held on the open list, and so a refusal that says the hold could not be
+  logged. `/opt/cain/review.sh guard` prints the guard's reading in two lines: put them in your
   daily usage row.
 - A Claude stand-in ("substituted") is a reading, not an independent review. Never
   call a review independent unless the line says so.

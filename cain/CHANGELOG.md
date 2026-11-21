@@ -10,6 +10,10 @@
 - Your plan's weekly use can't be read on the Pi yet (only the tokens used are recorded, not the allowance), so for now every "other" job and review is held; core, commitment and necessary-fix work runs as before.
 - Two new options: `review_round_cap` (3) and `usage_reserve_percent` (25).
 - Cain's spend readout now shows the caps the review service really uses, and how many rounds each open piece of work has had.
+- Fixes from the first outside review: your tap on the decision card is saved before the card counts as answered, and if saving fails the card stays up and you're told to tap again; a damaged decisions file is set aside, never written over, and raises the App's alarm.
+- A third round that never finishes (every reviewer failed, or the App stopped mid-way) still counts, and you get the decision card anyway, saying the last review didn't complete.
+- The decision card passes the same checks as every other card, waits while someone else holds its item, and says up front when shipping with the risk can't happen yet because the rollback isn't armed.
+- Cain can read the usage guard's log but no longer write it, and the App checks the review files' owners at each start, turning the cap and guard off with one alarm if one is wrong.
 
 ## 0.15.0
 

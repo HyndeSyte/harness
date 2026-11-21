@@ -13,9 +13,12 @@
 //     /data/review-settings.json; Codex in runs). Caps or spend that can't be read count as below.
 // There is no tap or flag that bypasses it. Every refusal is one line appended to
 // /data/review-guard.log (time, label, what was refused, which floor), which Cain reads to list holds;
-// the guard never posts a card.
+// the guard never posts a card. The log is root:cain 0640 (round 2): root writes it, Cain only reads.
+// The runner (root) appends itself; the Build hook and review.sh, which run as Cain, send the hold to
+// the link (POST /guard-hold), which decides again from its own readings and appends only a refusal.
 import { appendFileSync, readFileSync } from "node:fs";
 import { readPlanUsage, type PlanReading } from "./plan-usage.ts";
+import { capPaths } from "./capfiles.ts";
 
 export const LABELS = ["core", "commitment", "necessary-fix", "other"] as const;
 export type Label = typeof LABELS[number];
@@ -26,12 +29,11 @@ export const SEAT_NAMES = ["openai", "gemini", "perplexity", "claude"] as const;
 type Seat = typeof SEAT_NAMES[number];
 const SEAT_LABEL: Record<Seat, string> = { openai: "OpenAI", gemini: "Gemini", perplexity: "Perplexity", claude: "Claude" };
 
-export const paths = (env: Record<string, string | undefined> = process.env) => ({
-  settings: env.REVIEW_SETTINGS ?? "/data/review-settings.json",
-  spend: env.REVIEW_SPEND ?? "/data/review-spend.json",
-  log: env.REVIEW_GUARD_LOG ?? "/data/review-guard.log",
-  tz: env.CHECKIN_TZ ?? "America/New_York",
-});
+// Constants (capfiles.ts); an environment override only in test mode.
+export const paths = (env: Record<string, string | undefined> = process.env) => {
+  const p = capPaths(env);
+  return { settings: p.settings, spend: p.spend, log: p.guardLog, tz: env.CHECKIN_TZ ?? "America/New_York" };
+};
 
 // What the runner writes at its start (review/runner.ts writeSettings): the caps and the cap it really
 // uses, so review.sh and the Build hook, run as Cain, read the runner's numbers and not their own.
@@ -54,7 +56,8 @@ export function labelOf(v: unknown): Label | null {
 
 export type SeatLeft = { seat: string; left: number | null; why?: string };
 export type Readings = { plan: PlanReading; seats: SeatLeft[] | null; seatsWhy?: string; floor: number };
-export type Verdict = { ok: true } | { ok: false; floor: string; why: string };
+// logged (round 2): whether a refusal reached the guard's log; false when it couldn't be logged.
+export type Verdict = { ok: true } | { ok: false; floor: string; why: string; logged?: boolean };
 
 // Each seat's share of its monthly cap left, from the spend file and the runner's caps. A seat whose
 // cap is 0 is off and spends nothing, so it isn't counted.
@@ -104,17 +107,44 @@ export function readings(o: { settingsFile: string; spendFile: string; tz: strin
 }
 
 // One line of the guard's log, for each refusal: time, label, what was refused, which floor.
+const cleanCell = (s: string) => String(s ?? "").replace(/[\t\r\n\u0000-\u001f\u007f]+/g, " ").slice(0, 160);
+export function holdLine(now: Date, tag: string, what: string, why: string): string {
+  return `${now.toISOString()}\t${cleanCell(tag)}\t${cleanCell(what)}\t${cleanCell(why)}\n`;
+}
 export function logLine(now: Date, label: Label, what: string, v: Extract<Verdict, { ok: false }>): string {
-  const clean = (s: string) => s.replace(/[\t\r\n]+/g, " ").slice(0, 160);
-  return `${now.toISOString()}\t${label}\t${clean(what)}\t${clean(v.floor)}: ${clean(v.why)}\n`;
+  return holdLine(now, label, what, `${cleanCell(v.floor)}: ${cleanCell(v.why)}`);
 }
 
-// The guard as the runner and the hook call it: refused work is logged, and the reason comes back.
-export function guard(label: Label, what: string, o: { settingsFile: string; spendFile: string; logFile: string; tz: string; now: Date; plan?: () => PlanReading }): Verdict {
+// The guard as the runner and the link call it: a refusal is logged (logFile, or the log sink), and the
+// reason comes back, with whether it was logged. With neither, nothing is logged (review.sh's own first
+// look, which sends the hold to the link instead).
+export function guard(label: Label, what: string, o: { settingsFile: string; spendFile: string; logFile?: string; log?: (line: string) => void;
+    tz: string; now: Date; plan?: () => PlanReading }): Verdict {
   if (label !== "other") return { ok: true };
   const v = decide(label, readings(o), o.now);
-  if (!v.ok) { try { appendFileSync(o.logFile, logLine(o.now, label, what, v)); } catch { /* the refusal stands either way */ } }
+  if (!v.ok && (o.log || o.logFile)) {
+    try { const line = logLine(o.now, label, what, v); if (o.log) o.log(line); else appendFileSync(o.logFile!, line); v.logged = true; }
+    catch { v.logged = false; /* the refusal stands either way */ }
+  }
   return v;
+}
+
+// A hold sent to the link by a part that runs as Cain (the Build hook, review.sh): POST /guard-hold on
+// the link's local port with Cain's own key. The link answers "held" once it appended the line. Any other
+// answer, or none, is "not logged": the caller still refuses (it fails closed) and says so.
+export const LINK_URL = "http://127.0.0.1:8097";
+export const CAIN_KEY_FILE = "/run/cain/keys/cain.key";
+export async function postHold(label: Label, what: string, o: { url?: string; key?: string; keyFile?: string; ms?: number;
+    fetch?: typeof fetch } = {}): Promise<{ logged: true; why: string } | { logged: false; why: string }> {
+  let key = o.key ?? "";
+  if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { logged: false, why: "this start has no key for the link" }; } }
+  try {
+    const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/guard-hold`, { method: "POST", body: JSON.stringify({ label, what: String(what).slice(0, 200) }),
+      headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(o.ms ?? 5_000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (r.ok && j?.status === "held") return { logged: true, why: String(j.why ?? "") };
+    return { logged: false, why: `the link answered ${j?.status ?? r.status}` };
+  } catch (e) { return { logged: false, why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
 }
 
 // The guard's reading in two lines, for Cain's daily usage row (review.sh guard).

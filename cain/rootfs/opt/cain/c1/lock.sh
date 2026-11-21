@@ -111,8 +111,12 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   [ -L "$D/review-settings.json" ] && rm -f "$D/review-settings.json"
   [ -e "$D/review-settings.json" ] || printf '{}\n' > "$D/review-settings.json"
   for f in record-holds.json review-spend.json review-health.json review-rounds.json review-settings.json; do own "$D/$f" root:cain 0640; done
-  # The usage guard's log (0.16.0): the runner and his Build hook both append; he reads it.
-  for f in review-useful.jsonl review-private-terms.txt session.log review-guard.log; do
+  # The usage guard's log (0.16.0, round 2): root's to write (the runner, and the link for his Build
+  # hook and review.sh), his to read only: root:cain 0640, made here when missing.
+  [ -L "$D/review-guard.log" ] && rm -f "$D/review-guard.log"
+  [ -e "$D/review-guard.log" ] || : > "$D/review-guard.log"
+  own "$D/review-guard.log" root:cain 0640
+  for f in review-useful.jsonl review-private-terms.txt session.log; do
     [ -L "$D/$f" ] && rm -f "$D/$f"
     [ -e "$D/$f" ] || : > "$D/$f"
     own "$D/$f" root:cain 0660

@@ -13,6 +13,12 @@
 //
 // When the cap's last round leaves a serious finding, the group gets one decision card (decision:
 // owed, then posted), written by the runner through the link; Cain can't post it another way.
+//
+// Round 2: each round is kept as started (at intake, before it runs), then answered, or lost: ended
+// without a result (every seat failed, or a crash recovered at the runner's start, where the round was
+// counted but its review never made it to the queue). A lost round still counts (the count stays
+// conservative), and a lost round that is the cap's last owes the decision card too, saying the final
+// review did not complete.
 import { chmodSync, chownSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
@@ -20,12 +26,14 @@ import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
 export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
 
-export type RoundRec = { id: string; at: string; kind: RoundKind; blocked?: boolean; done?: boolean; serious?: number };
+export type RoundState = "started" | "answered" | "lost";
+export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundState; blocked?: boolean; done?: boolean; serious?: number };
 export type DecisionRec = {
   id: string;                        // the decision's own id: "<key>#<round>", what the link files the tap under
   key: string; round: number; serious: number;
   topic: string; finding: string; item: string | null; pr: string | null;
   state: "owed" | "posted"; at: string; message?: string; tries?: number;
+  lost?: boolean;                    // the cap's last round never produced a result (round 2)
 };
 export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec };
 export type Rounds = { format: number; changes: Record<string, ChangeRec> };
@@ -112,7 +120,7 @@ export function addRound(r: Rounds, b: Brief, a: Extract<Admit, { ok: true }>, a
   if (a.links.length) c.links = [...new Set([...(c.links ?? []), ...a.links])];
   if (b.pr) c.pr = b.pr;
   c.topic = b.topic;
-  c.rounds.push({ id: b.id, at, kind: a.kind });
+  c.rounds.push({ id: b.id, at, kind: a.kind, state: "started" });
 }
 
 export function roundById(r: Rounds, key: string, id: string): RoundRec | null {

@@ -233,6 +233,26 @@ until a release arms it, that card is refused and says what isn't armed). The ca
 `review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
 card in the link's `/data/link/review-decisions.json`.
 
+Since the second round of fixes in 0.16.0:
+- Your tap on that card is written to disk first, and the card counts as answered only once it is.
+  If the write fails, the card stays up and you get one line saying your answer couldn't be saved and
+  you can tap again. A decisions file that doesn't parse is never written over: it's moved aside under
+  a name with the time in it, no new tap is written while it stands, and the App's alarm names it.
+- Each round is kept as started, then answered or lost (it ended without a result: every seat failed,
+  or the runner stopped before the review was queued). A lost round still counts, and when the last
+  round the cap allows is lost, the card comes anyway, saying the final review did not complete.
+- The card's words pass the same checks as every other card to you; if they don't, the card says "A
+  serious finding remains; see the item" with the piece's name. If its item is held by another
+  session, the card waits and goes out once the hold clears.
+- While the rollback isn't armed, the card says so first, in one sentence: a Ship would be refused
+  until a release arms it, so holding is the working choice. A tap on "Ship it with that risk" then
+  records the change as held, on the guard's log below, and Cain is told.
+- At each start the review runner and the link check the owner and mode of these files (the rounds
+  file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file, and the rollback
+  record when there). One that's wrong turns the cap and the guard off (no review round, no `other`
+  Build, no Ship card for a change at the cap) and raises one alarm naming it, until a start finds
+  them right.
+
 ### Labels (since 0.16.0)
 
 Every brief, and every Build or Ship job Cain starts, carries one label: `core` (Cain answering you,
@@ -250,7 +270,13 @@ work while the week's plan allowance left, or any review seat's monthly cap left
 runner really uses), is below the reserve floor, the option `usage_reserve_percent` (default 25).
 There's no tap or flag that gets around it. Each refusal is one line in `/data/review-guard.log`
 (time, label, what was refused, which floor), and Cain lists those holds on the open list; the guard
-never sends you a card. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
+never sends you a card. The log is root's (root:cain 0640, since the second round of fixes): Cain
+reads it but can't write it. The runner writes its own refusals; Cain's Build hook and `review.sh`
+send theirs to the link, which checks the guard again itself and writes only a real refusal. If the
+link can't be reached the run is still refused, and the refusal says the hold wasn't logged. The
+guard's, the cap's and the plan reader's paths are fixed in the code; the environment can move them
+only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and the Build hook refuses
+every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
 check-in hands Cain the same two lines for his daily usage row.
 
 What it reads for the plan: Cain's Claude Code transcripts under `/data/cain/.claude/projects` (each

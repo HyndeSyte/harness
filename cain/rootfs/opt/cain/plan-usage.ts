@@ -10,6 +10,7 @@
 // guard fails closed on it for "other" work. The owner decides the next step (DOCS.md, "Usage guard").
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { capPaths } from "./capfiles.ts";
 
 export type PlanReading = {
   fraction: number | null;           // of the week's allowance used, 0..1; null: unknown
@@ -23,7 +24,8 @@ export const MAX_FILES = 400;
 export const MAX_BYTES = 64 * 1024 * 1024;
 const WEEK_MS = 7 * 86_400_000;
 
-export function transcriptsDir(home = process.env.CAIN_HOME ?? "/data/cain"): string { return join(home, ".claude", "projects"); }
+// Round 2: a constant (capfiles.ts), overridden only in test mode.
+export function transcriptsDir(home = capPaths().home): string { return join(home, ".claude", "projects"); }
 
 function walk(dir: string, out: { path: string; mtime: number; size: number }[], depth = 0): void {
   if (depth > 3) return;

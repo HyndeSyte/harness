@@ -17,7 +17,7 @@ import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, s
 import { configFromEnv } from "./config.ts";
 import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
-import { guard, guardLines, labelOf, readSettings, readings } from "../guard.ts";
+import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
 const usefulFile = process.env.REVIEW_USEFUL ?? join(dirname(cfg.spendFile), "review-useful.jsonl");
@@ -75,9 +75,15 @@ switch (cmd) {
     const a = admit(rounds!, b, roundCap());
     if (!a.ok) fail(a.why, 3);
     const label = labelOf(b.label)!;
-    const gv = guard(label, `review ${b.id} (${(a as any).key}, round ${(a as any).round})`, { settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile,
-      logFile: cfg.guardLog!, tz: cfg.tz, now: new Date() });
-    if (!gv.ok) fail(`held by the usage guard: it's labelled ${label}, and ${gv.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`, 3);
+    // Round 2: the guard's log is root's (0640); a refusal here goes to the link, which decides again and
+    // logs it. Not reached: still refused, and said so.
+    const what = `review ${b.id} (${(a as any).key}, round ${(a as any).round})`;
+    const gv = guard(label, what, { settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile, tz: cfg.tz, now: new Date() });
+    if (!gv.ok) {
+      const h = await postHold(label, what);
+      fail(`held by the usage guard: it's labelled ${label}, and ${gv.why}. Core, commitment and necessary-fix work still run; ${h.logged
+        ? "this is on the guard's log (review.sh guard)" : `the hold could not be logged (${h.why})`}. Nothing was queued.`, 3);
+    }
     leave(b);
     out(b.id);
     if (capped.length) console.error(`Queued, but ${capped.map((s) => LABEL[s]).join(", ")} won't run: its monthly cap is reached.`);

@@ -652,6 +652,9 @@ export function roundLine(r: Review): string | null {
   if (!r.change || !r.round) return null;
   const of = r.cap ? ` of ${r.cap}` : "";
   const kind = r.round_kind === "fixes" ? "fix-only" : "full";
+  // Round 2: a round that ended with no seat answering is lost, and still counts.
+  if (r.status === "incomplete" && !r.seats.some((s) => s.state === "done"))
+    return `Round ${r.round}${of} for ${r.change} (${kind}) was lost: no seat answered, so it has no result. It still counts.`;
   if (r.round_kind !== "fixes") return `Round ${r.round}${of} for ${r.change} (${kind}).`;
   const n = seriousLeft(r).length;
   return `Round ${r.round}${of} for ${r.change} (${kind}): ${n} serious finding${n === 1 ? "" : "s"} left.`;
