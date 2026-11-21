@@ -5,6 +5,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { pinSocket } from "../pinned.ts";
 import { readStop } from "../stop.ts";
+import { pullNow } from "../pullnow.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
 import type { DecisionRec } from "./rounds.ts";
@@ -53,6 +54,8 @@ if (import.meta.main) {
   const postDecision = decisionPoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log);
   const runner = new Runner(cfg, {
     seats, log, postDecision,
+    // 0.18.1 (fourth review): the pull request's head a grant's claim is pinned to, read as the link reads it.
+    pull: pullNow,
     stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });

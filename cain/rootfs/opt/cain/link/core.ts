@@ -352,7 +352,10 @@ export interface Shown {
     used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
     // Second review: the state it was posted on, checked again at the tap: the pull request's head commit (null for a
     // change that isn't a pull request) and the id of the change's newest decision then (null: none). Missing: unbound.
-    head?: string | null; decision?: string | null };
+    head?: string | null; decision?: string | null;
+    // 0.18.1 (fourth review): the cap before this grant from the base and the grants a round claimed already,
+    // never an outstanding one: what the binding records, and what the runner checks it against.
+    prior?: number };
 }
 // The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
 // tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
@@ -1704,13 +1707,13 @@ export class Link {
     // Under the change key's lock (the one his taps take), then one post at a time: an open card for the key is
     // retired when what it was posted on is stale, and otherwise refuses this one.
     return this.underKey(`grant:${key}`, () => this.serial(async () => {
-      await this.openGrantCard(key, { used, cap, decision, head, pr: prUrl });
+      await this.openGrantCard(key, { used, cap, decision, head, pr: prUrl, prior: st.prior });
       const msg = await this.postCard(shown, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
         { replyTo: meta.replyTo, nonce });
       const s = this.d.load();
       this.remember(s, msg, { kind: "ask", item: meta.item, question, posted: now, expires: this.askExpiry(now), buttons: true, labels: [...options],
         q: { q: `Grant ${key} ${n} more review round${n === 1 ? "" : "s"}?`, options, used: false },
-        grant: { key, rounds: n, pr: prUrl, reason: w.text, used, cap, head, decision } });
+        grant: { key, rounds: n, pr: prUrl, reason: w.text, used, cap, head, decision, prior: st.prior } });
       const replaced = this.markReplaced(s, String(msg.id));
       this.d.save(s);
       await this.stripAll(replaced);
@@ -1749,14 +1752,14 @@ export class Link {
   // one went up. Second review: it never deadlocks. An open card whose bound state is stale (the head moved, a
   // newer decision, the round count or cap changed, a card bound to nothing, or its message gone from the chat) is
   // retired first: its open state cleared on disk, its buttons taken off with "Replaced by a newer card".
-  private async openGrantCard(key: string, now: { used: number; cap: number; decision: string | null; head: string | null; pr: string | null }): Promise<void> {
+  private async openGrantCard(key: string, now: { used: number; cap: number; decision: string | null; head: string | null; pr: string | null; prior: number }): Promise<void> {
     const at = this.d.now();
     const open = Object.entries(this.d.load().messages).filter(([, m]) => m.grant?.key === key && live(m, at) && !m.q?.used);
     const standing: [string, Shown][] = [];
     for (const [id, m] of open) {
       const g = m.grant!;
-      let why = g.used !== now.used || g.cap !== now.cap ? "its round count or cap changed"
-        : g.decision === undefined || g.head === undefined ? "it was bound to nothing"
+      let why = g.used !== now.used || g.cap !== now.cap || (g.prior !== undefined && g.prior !== now.prior) ? "its round count or cap changed"
+        : g.decision === undefined || g.head === undefined || g.prior === undefined ? "it was bound to nothing"
         : g.decision !== now.decision ? "a newer decision came"
         : (g.pr ?? now.pr) && g.head !== now.head ? "the pull request's head moved"
         : "";
@@ -1799,7 +1802,10 @@ export class Link {
       h = x;
     }
     const used = countedRounds(rounds, g.key).length;
-    const cap = effectiveCap(this.d.roundCap?.() ?? 3, rounds, grants, g.key, h);
+    const base = this.d.roundCap?.() ?? 3;
+    const cap = effectiveCap(base, rounds, grants, g.key, h);
+    // Fourth review: the prior cap the binding records is the base plus the claimed grants alone.
+    const prior = standing(base, rounds, grants, g.key, h).prior;
     if (used < cap) return { line: "That change has rounds left now, so this grant isn't needed" };
     const last = lastRound(rounds, g.key);
     if (last.state === "running" || last.state === "none") return { line: "That change has a review round running now, so this grant can't be written" };
@@ -1810,8 +1816,8 @@ export class Link {
       if (heldElsewhere(holds, item)) return { line: "That change is being worked on by another session now, so this grant can't be written" };
       if (closedItems(f.pending).has(item.toUpperCase())) return { line: "That change's item is closed now, so this grant isn't needed" };
     }
-    if (g.used !== used || g.cap !== cap) return { line: "That change's review rounds have moved on since this card went up, so this grant can't be written" };
-    if (g.decision === undefined || g.head === undefined) return { line: "This card was posted before grants were bound to the change as it stood, so this grant can't be written" };
+    if (g.used !== used || g.cap !== cap || (g.prior !== undefined && g.prior !== prior)) return { line: "That change's review rounds have moved on since this card went up, so this grant can't be written" };
+    if (g.decision === undefined || g.head === undefined || g.prior === undefined) return { line: "This card was posted before grants were bound to the change as it stood, so this grant can't be written" };
     if ((decisionOf(rounds, g.key)?.id ?? null) !== g.decision) return { line: "A newer decision on that change has come since this card went up, so this grant can't be written" };
     if (g.pr && h !== g.head) return { line: "That pull request has new commits since this card went up, so this grant can't be written" };
     return null;
@@ -1865,7 +1871,8 @@ export class Link {
       message: msgId, reason: g.reason, item: m.item && m.item !== "none" ? m.item : null, pr: g.pr,
       // 0.18.1: bound to the state the card was posted on, which grantBlock's final re-check (just now, under
       // this change key's lock) found unchanged: the runner counts it only while that state still holds.
-      bound: { head: g.head ?? null, decision: g.decision ?? null, used: g.used!, cap: g.cap! } };
+      // Fourth review: cap is the prior cap (base plus claimed grants only), as the runner checks it.
+      bound: { head: g.head ?? null, decision: g.decision ?? null, used: g.used!, cap: g.prior! } };
     let kept: { rec: GrantRec; existed: boolean };
     try {
       if (!this.d.grant) throw new GrantUnsaved("the link has nowhere to keep it");

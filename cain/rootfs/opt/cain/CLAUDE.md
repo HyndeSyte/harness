@@ -720,7 +720,9 @@ second view adds value; skip it for small, obvious things.
   cap brings the service's decision card again (after a Hold too); a grant never lifts the armed
   rollback a risk tap needs. A grant is bound to the pull request's head and the decision it was given
   for: when the pull request has moved on (or a newer decision came) before a round claims it, that
-  round is refused at the cap and you hear once why, so ask him for a fresh grant then.
+  round is refused at the cap and you hear once why, so ask him for a fresh grant then. The runner reads
+  the head on GitHub itself before a round claims a grant: a brief whose head isn't GitHub's is refused
+  and the grant stays as it was, so read the head again and send the brief with it.
 - Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
   (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own

@@ -35,10 +35,10 @@ function rig() {
 }
 
 describe("the runner takes briefs from the inbox", () => {
-  test("a brief becomes a fresh review in the queue, and leaves the inbox", () => {
+  test("a brief becomes a fresh review in the queue, and leaves the inbox", async () => {
     const t = rig();
     writeFileSync(join(t.cfg.inboxDir!, "2026-11-14-lock-plan.json"), JSON.stringify(brief()));
-    t.runner.ingest();
+    await t.runner.ingest();
     const r = loadReview(t.cfg.queueDir, "2026-11-14-lock-plan")!;
     expect(r).not.toBeNull();
     expect(r.status).toBe(newReview(brief(), new Date()).status);
@@ -46,13 +46,13 @@ describe("the runner takes briefs from the inbox", () => {
     expect(t.inbox()).toEqual([]);
   });
 
-  test("a file shaped like a finished review is refused, and no Reviewed line comes of it", () => {
+  test("a file shaped like a finished review is refused, and no Reviewed line comes of it", async () => {
     const t = rig();
     const forged = newReview(brief({ id: "2026-11-14-forged" }), new Date()) as any;
     forged.status = "done"; forged.finished_at = "2026-11-14T19:00:00Z";
     for (const s of forged.seats) { s.state = "done"; s.verdict = "approve"; s.findings = []; s.model = "m"; }
     writeFileSync(join(t.cfg.inboxDir!, "2026-11-14-forged.json"), JSON.stringify(forged));
-    t.runner.ingest();
+    await t.runner.ingest();
     expect(loadReview(t.cfg.queueDir, "2026-11-14-forged")).toBeNull();
     expect(t.inbox()).toEqual([]);
     expect(t.relays().join("\n")).toContain("not a brief");
@@ -61,39 +61,39 @@ describe("the runner takes briefs from the inbox", () => {
     expect(JSON.stringify(lines)).not.toContain("2026-11-14-forged");
   });
 
-  test("a brief whose id is taken is refused, and the review that has it is untouched", () => {
+  test("a brief whose id is taken is refused, and the review that has it is untouched", async () => {
     const t = rig();
     const kept = newReview(brief(), new Date("2026-11-14T18:00:00Z"));
     saveReview(t.cfg.queueDir, kept);
     writeFileSync(join(t.cfg.inboxDir!, "2026-11-14-lock-plan.json"), JSON.stringify(brief({ body: "Something else." })));
-    t.runner.ingest();
+    await t.runner.ingest();
     expect(loadReview(t.cfg.queueDir, "2026-11-14-lock-plan")!.brief!.body).toBe(kept.brief!.body);
     expect(t.relays().join("\n")).toContain("already exists");
   });
 
-  onLinux("a symlink in the inbox is refused, and what it points at isn't read", () => {
+  onLinux("a symlink in the inbox is refused, and what it points at isn't read", async () => {
     const t = rig();
     const target = join(t.dir, "elsewhere.json");
     writeFileSync(target, JSON.stringify(brief({ id: "2026-11-14-via-link" })));
     symlinkSync(target, join(t.cfg.inboxDir!, "2026-11-14-via-link.json"));
-    t.runner.ingest();
+    await t.runner.ingest();
     expect(loadReview(t.cfg.queueDir, "2026-11-14-via-link")).toBeNull();
     expect(t.relays().join("\n")).toContain("symlink");
   });
 
-  onLinux("a file of another user's is refused", () => {
+  onLinux("a file of another user's is refused", async () => {
     const t = rig();
     t.runner.cfg.inboxUid = me + 1;
     writeFileSync(join(t.cfg.inboxDir!, "2026-11-14-lock-plan.json"), JSON.stringify(brief()));
-    t.runner.ingest();
+    await t.runner.ingest();
     expect(loadReview(t.cfg.queueDir, "2026-11-14-lock-plan")).toBeNull();
     expect(t.relays().join("\n")).toContain("not his");
   });
 
-  test("temp files being written are left alone", () => {
+  test("temp files being written are left alone", async () => {
     const t = rig();
     writeFileSync(join(t.cfg.inboxDir!, ".2026-11-14-lock-plan.123.tmp"), "{");
-    t.runner.ingest();
+    await t.runner.ingest();
     expect(t.inbox()).toEqual([".2026-11-14-lock-plan.123.tmp"]);
     expect(t.relays()).toEqual([]);
   });
@@ -139,12 +139,12 @@ describe("review.sh submit leaves a brief and never writes the queue", () => {
     expect(again.stderr).toContain("already exists");
   });
 
-  test("after the runner takes it, status reads the queue", () => {
+  test("after the runner takes it, status reads the queue", async () => {
     const t = rig();
     const f = join(t.dir, "b.json");
     writeFileSync(f, JSON.stringify(brief()));
     t.cli("submit", f);
-    t.runner.ingest();
+    await t.runner.ingest();
     expect(t.cli("status", "2026-11-14-lock-plan").stdout).toContain("2026-11-14-lock-plan:");
   });
 });

@@ -5,7 +5,10 @@
 - A grant of more review rounds now holds the state you approved with your tap: the pull request's newest commit, the newest decision, the rounds used and the cap before it.
 - If the pull request gets new commits, or a newer decision comes, between your tap and the next round, the grant no longer counts: that round is refused, Cain hears once why, and he can ask you again on a fresh card.
 - A grant is used up by one round: the round that claims it is kept, so it can't be claimed twice.
-- Grants made before this version no longer count. They stay on file, and Cain hears once so he can ask you again if the change still needs rounds.
+- Grants you gave before this version are kept: the rounds already run after one are counted as its rounds, and the rest stay available to the next round. Nothing you granted is thrown away, and Cain hears once per change what was kept.
+- Before a round uses one of your grants, the review service reads the pull request's newest commit on GitHub itself. If it isn't the one Cain's request names, the request is turned back and the grant stays as it was; if GitHub can't be read, the request waits a minute and tries again.
+- A late or out-of-date request can no longer cancel a grant you gave: only the review service's own check against GitHub can.
+- Two grants waiting on the same change are both used by the next round, and both count in full.
 - Cain's review lines say when a grant no longer counts, like "1 grant no longer counts: the pull request moved on".
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart: nothing about those changed here.
 

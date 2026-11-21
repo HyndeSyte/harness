@@ -46,7 +46,11 @@ export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; top
 // grants_void (0.18.1): grants the runner found no longer bound to the change as it is (or never bound),
 // by grant id, kept so each is told to Cain once and never counts again. The grants file isn't touched.
 export type VoidRec = { why: StaleWhy; at: string; key: string };
-export type Rounds = { format: number; changes: Record<string, ChangeRec>; grants_void?: Record<string, VoidRec> };
+// grants_adopted (0.18.1, fourth review): grants from 0.18.0 (no binding) that no round had run under at the
+// upgrade's one-time sweep, kept so the next round may claim them as if bound to the change as it is then (the
+// pull request's head read from GitHub at that claim). The owner's tap is on file; nothing from 0.18.0 is voided.
+export type AdoptRec = { at: string; key: string };
+export type Rounds = { format: number; changes: Record<string, ChangeRec>; grants_void?: Record<string, VoidRec>; grants_adopted?: Record<string, AdoptRec> };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
 

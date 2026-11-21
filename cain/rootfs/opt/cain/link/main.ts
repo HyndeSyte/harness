@@ -67,7 +67,8 @@ import { ensureStop, readStop, TRUST_DIR, writeStop } from "../stop";
 import { KEEPER_SENT, noteAt } from "../gate/held";
 import { readHosts } from "../gate/hosts";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
+import { discordError, Link, Protocol, PULL, type State } from "./core";
+import { pullNow } from "../pullnow";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
@@ -167,33 +168,7 @@ function readOr(path: string): string | null {
   catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
 
-// A pull request now. GitHub's API says whether it's open and its head; when that
-// can't be read (it allows 60 asks an hour without a key), the head alone comes from
-// GitHub's own refs. Nothing it can't tell takes a card off.
-async function pullNow(pr: string): Promise<Pull | null> {
-  const m = PULL.exec(pr);
-  if (!m) return null;
-  try {
-    const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, { redirect: "error",
-      headers: { accept: "application/vnd.github+json", "user-agent": "cain-link" }, signal: AbortSignal.timeout(15000) });
-    if (r.ok) {
-      const j: any = await r.json();
-      const head = String(j?.head?.sha ?? "");
-      return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null,
-        merged: j?.merged === true };
-    }
-  } catch { /* fall back to the refs */ }
-  try {
-    const p = Bun.spawn(["git", "-c", "credential.helper=", "ls-remote", `https://github.com/${m[1]}/${m[2]}.git`, `refs/pull/${m[3]}/head`],
-      { stdout: "pipe", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_TERMINAL_PROMPT: "0", HOME: "/tmp" } });
-    const timer = setTimeout(() => p.kill(), 20000);
-    const out = await new Response(p.stdout).text();
-    await p.exited;
-    clearTimeout(timer);
-    const sha = out.trim().split(/\s+/)[0] ?? "";
-    return { head: /^[0-9a-f]{40}$/.test(sha) ? sha : null, open: null };
-  } catch { return null; }
-}
+// A pull request now: ../pullnow.ts (shared with the review runner since 0.18.1).
 
 // The Ship key: made once, never printed. No key: Ship taps carry no token, and Ship
 // runs are refused until it's fixed.

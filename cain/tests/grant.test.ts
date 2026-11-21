@@ -46,18 +46,29 @@ function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer> } = {}) {
   writeFileSync(cfg.termsFile, "# terms\nAcme Corp\n");
   const posted: DecisionRec[] = [];
   let seat = o.seat ?? answerWith("SERIOUS: the keeper can lose the way back");
-  const runner = new Runner(cfg, { seats: { gemini: async (i) => seat(i) }, now: () => NOW, rand: () => 0.5, log: () => {},
-    postDecision: async (d) => { posted.push(d); return `m-${posted.length}`; } });
+  // 0.18.1 (fourth review): GitHub's head for the pull request, as the runner reads it before a claim (null: can't be read).
+  let gh: string | null = HEAD_A;
+  const ghReads: string[] = [];
+  const logs: string[] = [];
+  const runner = new Runner(cfg, { seats: { gemini: async (i) => seat(i) }, now: () => NOW, rand: () => 0.5, log: (m) => logs.push(m),
+    postDecision: async (d) => { posted.push(d); return `m-${posted.length}`; },
+    pull: async (pr) => { ghReads.push(pr); return gh === null ? null : { head: gh }; } });
   runner.writeSettings();
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
-  return { dir, cfg, runner, posted, relays, setSeat: (f: typeof seat) => { seat = f; },
+  // A brief as the inbox takes it: GitHub's head read first when its round would claim a grant, then admitted
+  // in one step pinned to that head ("waits" when GitHub can't be read: nothing taken).
+  const take = async (b: Brief): Promise<string | null> => {
+    const h = await runner.githubHead(b);
+    return h === null ? "waits" : runner.admitAndQueue(b, h);
+  };
+  return { dir, cfg, runner, posted, relays, take, logs, ghReads, setGh: (h: string | null) => { gh = h; }, setSeat: (f: typeof seat) => { seat = f; },
     rounds: () => readRounds(cfg.roundsFile!)!, grants: () => readGrants(cfg.grantsFile!),
     grant: (key: string, n: number, over: Partial<GrantRec> = {}) => recordGrant(cfg.grantsFile!,
       grantRec(key, n, { bound: bindNow(readRounds(cfg.roundsFile!)!, readGrants(cfg.grantsFile!), key), ...over }), { sync: () => {}, owner: OWN }),
     get: (id: string) => loadReview(cfg.queueDir, id)! };
 }
 async function threeRounds(t: ReturnType<typeof runnerRig>, over: Partial<Brief> = {}) {
-  for (const id of ["k-1", "k-2", "k-3"]) { expect(t.runner.admitAndQueue(brief({ id, ...over }))).toBeNull(); await t.runner.tick(); }
+  for (const id of ["k-1", "k-2", "k-3"]) { expect(await t.take(brief({ id, ...over }))).toBeNull(); await t.runner.tick(); }
 }
 
 describe("the grant raises the cap by exactly the rounds it names", () => {
@@ -81,19 +92,19 @@ describe("the grant raises the cap by exactly the rounds it names", () => {
   test("a fourth round is refused without a grant, saying how a grant works, and runs as fix-only with one", async () => {
     const t = runnerRig();
     await threeRounds(t);
-    const why = t.runner.admitAndQueue(brief({ id: "k-4" }))!;
+    const why = await t.take(brief({ id: "k-4" }))!;
     expect(why).toContain("pr-46 has had 3 outside review rounds, and the owner's rule allows at most 3.");
     expect(why).toContain("keeper.sh review-grant");
     expect(why).toContain("only the owner's tap on that card grants them");
     expect(loadReview(t.cfg.queueDir, "k-4")).toBeNull();
     t.grant("pr-46", 2);
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
     expect(t.get("k-4")).toMatchObject({ change: "pr-46", round: 4, cap: 5, base_cap: 3, round_kind: "fixes" });
     expect(t.get("k-4").earlier?.length).toBeGreaterThan(0);                  // the earlier findings go with it, as today
     await t.runner.tick();
-    expect(t.runner.admitAndQueue(brief({ id: "k-5" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-5" }))).toBeNull();
     await t.runner.tick();
-    const sixth = t.runner.admitAndQueue(brief({ id: "k-6" }))!;
+    const sixth = await t.take(brief({ id: "k-6" }))!;
     expect(sixth).toContain("has had 5 outside review rounds, and the owner's rule allows at most 3, plus 2 granted by Dane on Nov 21, so 5.");
     expect(countedRounds(t.rounds(), "pr-46").length).toBe(5);
   });
@@ -103,14 +114,14 @@ describe("the grant raises the cap by exactly the rounds it names", () => {
     await threeRounds(t);
     t.grant("pr-46", 1);
     // The fix moves to pull request 48, superseding 46: the grant counts for the group.
-    expect(t.runner.admitAndQueue(brief({ id: "s-4", pr: PRN(48), supersedes: PRN(46) }))).toBeNull();
+    expect(await t.take(brief({ id: "s-4", pr: PRN(48), supersedes: PRN(46) }))).toBeNull();
     expect(t.get("s-4")).toMatchObject({ change: "pr-48", round: 4, cap: 4 });
     await t.runner.tick();
-    expect(t.runner.admitAndQueue(brief({ id: "s-5", pr: PRN(48) }))).toContain("has had 4");
+    expect(await t.take(brief({ id: "s-5", pr: PRN(48) }))).toContain("has had 4");
     // A grant made for the new key counts for the old one too.
     t.grant("pr-48", 1);
     expect(effectiveCap(3, t.rounds(), t.grants(), "pr-46")).toBe(5);
-    expect(t.runner.admitAndQueue(brief({ id: "s-5b", pr: PRN(46) }))).toBeNull();
+    expect(await t.take(brief({ id: "s-5b", pr: PRN(46) }))).toBeNull();
   });
 
   test("the grants file: kept whole, root:cain 0640 kept, one per card, never written over when it doesn't parse", () => {
@@ -276,7 +287,7 @@ describe("the runner honours the grant, and the decision card comes again", () =
     expect(t.posted.map((d) => d.id)).toEqual(["pr-46#3"]);
     // He held it; then granted one more round. The Hold doesn't stop the granted round.
     t.grant("pr-46", 1);
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
     await t.runner.tick(); await t.runner.tick();
     expect(t.posted.map((d) => d.id)).toEqual(["pr-46#3", "pr-46#4"]);
     expect(t.posted[1]).toMatchObject({ round: 4, serious: 1, item: "P46" });
@@ -294,13 +305,13 @@ describe("the runner honours the grant, and the decision card comes again", () =
     const held = { "pr-46#3": { choice: HOLD, at: 1 } };
     expect(capStateFor(PRN(46), t.rounds(), held)).toMatchObject({ state: "hold" });
     t.grant("pr-46", 2);
-    t.runner.admitAndQueue(brief({ id: "k-4" }));
+    await t.take(brief({ id: "k-4" }));
     expect(capStateFor(PRN(46), t.rounds(), held)).toMatchObject({ state: "pending", why: expect.stringContaining("still running") });
     await t.runner.tick(); await t.runner.tick();
     expect(t.posted.length).toBe(1);                                            // round 4 of 5 still serious: no card yet
     expect(capStateFor(PRN(46), t.rounds(), held)).toMatchObject({ state: "pending", why: expect.stringContaining("still left something serious") });
     t.setSeat(answerWith("FOLLOW-UP: a wording nit"));
-    t.runner.admitAndQueue(brief({ id: "k-5" }));
+    await t.take(brief({ id: "k-5" }));
     await t.runner.tick(); await t.runner.tick();
     expect(t.posted.length).toBe(1);
     expect(capStateFor(PRN(46), t.rounds(), held)).toEqual({ state: "none" });
@@ -321,7 +332,7 @@ describe("the record for Cain shows the effective cap and the grants", () => {
     const t = runnerRig();
     await threeRounds(t);
     t.grant("pr-46", 2);
-    t.runner.admitAndQueue(brief({ id: "k-4" }));
+    await t.take(brief({ id: "k-4" }));
     await t.runner.tick();
     const line = roundLine(t.get("k-4"))!;
     expect(line).toBe("Round 4 of 5, 2 granted by Dane on Nov 21, for pr-46 (fix-only): 1 serious finding left.");
@@ -737,6 +748,17 @@ describe("the grant carries the state his tap approved", () => {
     expect(effectiveCap(3, atCap(2), t.box.grants, "pr-46", HEAD_A)).toBe(5);
   });
 
+  test("fourth review, 4: the binding's cap is the prior cap, the base plus the claimed grants only", async () => {
+    const r = atCap(2);
+    r.changes["pr-46"].rounds.push({ id: "x-4", at: "2026-11-24T00:00:00Z", kind: "fixes", state: "answered", serious: 1, claims: ["pr-46+11"] });
+    const t = linkRig(r, { format: 1, grants: [grantRec("pr-46", 1)] });
+    const id = ((await ask(t.r, { rounds: 1 })) as any).message;
+    await t.r.tap(t.r.msg(id), grantIds(t, id)[0]);
+    expect(t.written[0].bound).toEqual({ head: HEAD_A, decision: null, used: 4, cap: standing(3, r, t.box.grants, "pr-46").prior });
+    expect(t.written[0].bound!.cap).toBe(4);
+    expect(admit(r, brief({ id: "x-5" }), 3, t.box.grants)).toMatchObject({ ok: true, round: 5, cap: 5, claims: [`pr-46+${id}`] });
+  });
+
   test("a change key with no pull request binds on the decision and the count only", async () => {
     const r = emptyRounds();
     r.changes["plan-x"] = { topic: "A plan", rounds: [1, 2, 3].map((n) => ({ id: `p-${n}`, at: `2026-11-2${n - 1}T00:00:00Z`, kind: (n === 1 ? "full" : "fixes") as any, state: "answered" as const, ...(n === 3 ? { serious: 1 } : {}) })) };
@@ -750,31 +772,105 @@ describe("the grant carries the state his tap approved", () => {
 });
 
 describe("the runner counts a grant only while its binding holds", () => {
-  test("the head moved after the tap's final check: no extra round, told to Cain once, the grant kept", async () => {
+  test("the head moved after the tap's final check: the runner reads it on GitHub, and only then voids the grant, told to Cain once", async () => {
     const t = runnerRig();
     await threeRounds(t);
     t.grant("pr-46", 1);                                         // bound to head A, as his tap read it
-    // The push lands between the tap and the round: the brief names the new head.
-    const why = t.runner.admitAndQueue(brief({ id: "k-4", head: HEAD_B }))!;
+    // The push lands after the tap: GitHub's head is B. A brief naming B is checked against GitHub's head, which
+    // agrees, so the grant's binding (head A) is found stale against GitHub and voided.
+    t.setGh(HEAD_B);
+    const why = (await t.take(brief({ id: "k-4", head: HEAD_B })))!;
     expect(why).toContain("pr-46 has had 3 outside review rounds, and the owner's rule allows at most 3.");
     expect(why).toContain("doesn't count: it was given for the pull request as it stood then, but the pull request has new commits since");
     expect(why).not.toContain(HEAD_A); expect(why).not.toContain(HEAD_B);
+    expect(t.ghReads).toEqual([PRN(46)]);
     expect(loadReview(t.cfg.queueDir, "k-4")).toBeNull();
     const told = t.relays().filter((l) => l.includes("no longer counts"));
     expect(told.length).toBe(1);
     expect(told[0]).toContain("Dane's grant of 1 more review round for pr-46 (granted by Dane on Nov 21) no longer counts");
     expect(told[0]).toContain("keeper.sh review-grant");
     expect(t.rounds().grants_void?.[`pr-46+11`]).toMatchObject({ why: "head", key: "pr-46" });
-    // Asked again, even with the old head: it never counts again, and Cain isn't told twice.
-    expect(t.runner.admitAndQueue(brief({ id: "k-4b", head: HEAD_A }))).toContain("doesn't count");
+    // Asked again: it never counts again, and Cain isn't told twice.
+    expect(await t.take(brief({ id: "k-4b", head: HEAD_B }))).toContain("doesn't count");
     expect(t.relays().filter((l) => l.includes("no longer counts")).length).toBe(1);
     expect(t.grants()!.grants.length).toBe(1);                   // never deleted
     // A fresh grant bound to the new head counts.
     t.grant("pr-46", 1, { id: "pr-46+fresh", bound: bindNow(t.rounds(), t.grants(), "pr-46", HEAD_B) });
-    expect(t.runner.admitAndQueue(brief({ id: "k-4c", head: HEAD_B }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4c", head: HEAD_B }))).toBeNull();
     expect(t.get("k-4c")).toMatchObject({ round: 4, cap: 4 });
   });
 
+  test("fourth review, 1: the brief names the approved head but GitHub has moved on: refused, nothing claimed, nothing voided", async () => {
+    const t = runnerRig();
+    await threeRounds(t);
+    t.grant("pr-46", 1);                                         // approved at head A
+    t.setGh(HEAD_B);                                             // a push after Cain read the head, before the claim
+    const why = (await t.take(brief({ id: "k-4", head: HEAD_A })))!;
+    expect(why).toContain("the pull request's head on GitHub is not the one the brief names; send it again with the current head");
+    expect(why).toContain("No grant was claimed or voided");
+    expect(loadReview(t.cfg.queueDir, "k-4")).toBeNull();
+    const r = t.rounds();
+    expect(r.grants_void).toBeUndefined();
+    expect(r.changes["pr-46"].rounds.length).toBe(3);
+    expect(r.changes["pr-46"].rounds.flatMap((x) => x.claims ?? [])).toEqual([]);
+    expect(t.relays().filter((l) => l.includes("no longer counts")).length).toBe(0);
+  });
+
+  test("fourth review, 1: while GitHub can't be read the brief waits in the inbox, logged once, and is taken once it can", async () => {
+    const t = runnerRig();
+    t.cfg.inboxDir = join(t.dir, "inbox"); t.cfg.inboxUid = process.getuid!();
+    mkdirSync(t.cfg.inboxDir, { recursive: true });
+    await threeRounds(t);
+    t.grant("pr-46", 1);
+    t.setGh(null);
+    writeFileSync(join(t.cfg.inboxDir, "k-4.json"), JSON.stringify(brief({ id: "k-4" })));
+    await t.runner.ingest(); await t.runner.ingest();
+    expect(existsSync(join(t.cfg.inboxDir, "k-4.json"))).toBe(true);
+    expect(loadReview(t.cfg.queueDir, "k-4")).toBeNull();
+    expect(t.rounds().changes["pr-46"].rounds.length).toBe(3);
+    expect(t.rounds().grants_void).toBeUndefined();
+    expect(t.logs.filter((l) => l.includes("review brief k-4 waits in the inbox")).length).toBe(1);
+    t.setGh(HEAD_A);
+    await t.runner.ingest();
+    expect(existsSync(join(t.cfg.inboxDir, "k-4.json"))).toBe(false);
+    expect(t.get("k-4")).toMatchObject({ round: 4, cap: 4 });
+    expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4")?.claims).toEqual(["pr-46+11"]);
+  });
+
+  test("fourth review, 2: a stale brief leaves the grant available, and the next brief on the approved head claims it", async () => {
+    const t = runnerRig();
+    await threeRounds(t);
+    t.setGh(HEAD_B);
+    t.grant("pr-46", 1, { bound: bindNow(t.rounds(), t.grants(), "pr-46", HEAD_B) });   // he approved head B
+    // A delayed brief naming the older head A.
+    expect(await t.take(brief({ id: "k-4", head: HEAD_A }))).toContain("the pull request's head on GitHub is not the one the brief names");
+    expect(t.rounds().grants_void).toBeUndefined();
+    expect(standing(3, t.rounds(), t.grants(), "pr-46", HEAD_B).claimable.map((x) => x.id)).toEqual(["pr-46+11"]);
+    expect(await t.take(brief({ id: "k-4b", head: HEAD_B }))).toBeNull();
+    expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4b")?.claims).toEqual(["pr-46+11"]);
+    expect(t.get("k-4b")).toMatchObject({ round: 4, cap: 4 });
+  });
+
+  test("fourth review, 4: two outstanding grants are both claimed by the one round, in time order, and the allowance is right", async () => {
+    const t = runnerRig();
+    await threeRounds(t);
+    const b = bindNow(t.rounds(), t.grants(), "pr-46");
+    t.grant("pr-46", 1, { id: "pr-46+first", at: "2026-11-21T17:40:00Z", bound: b });
+    // The second's binding: the prior cap is the base plus claimed grants only, so the first (outstanding) isn't in it.
+    expect(standing(3, t.rounds(), t.grants(), "pr-46").prior).toBe(3);
+    t.grant("pr-46", 2, { id: "pr-46+second", at: "2026-11-21T17:45:00Z", bound: bindNow(t.rounds(), t.grants(), "pr-46") });
+    expect(t.grants()!.grants[1].bound!.cap).toBe(3);
+    expect(effectiveCap(3, t.rounds(), t.grants(), "pr-46", HEAD_A)).toBe(6);
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
+    expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4")?.claims).toEqual(["pr-46+first", "pr-46+second"]);
+    expect(t.get("k-4")).toMatchObject({ round: 4, cap: 6 });
+    expect(t.rounds().grants_void).toBeUndefined();
+    // Claimed, both count in full: rounds 5 and 6 run with no further claim, a seventh is refused.
+    for (const id of ["k-5", "k-6"]) { await t.runner.tick(); await t.runner.tick(); expect(await t.take(brief({ id }))).toBeNull(); }
+    await t.runner.tick(); await t.runner.tick();
+    expect(await t.take(brief({ id: "k-7" }))).toContain("has had 6 outside review rounds");
+    expect(t.rounds().changes["pr-46"].rounds.flatMap((x) => x.claims ?? [])).toEqual(["pr-46+first", "pr-46+second"]);
+  });
   test("a new decision landing in that window: no extra round", async () => {
     const t = runnerRig();
     await threeRounds(t);
@@ -782,7 +878,7 @@ describe("the runner counts a grant only while its binding holds", () => {
     const r = t.rounds();
     r.changes["pr-46"].decision = { ...r.changes["pr-46"].decision!, id: "pr-46#3b" };
     writeFileSync(t.cfg.roundsFile!, JSON.stringify(r));
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toContain("doesn't count: a newer decision on the change came after it was given");
+    expect(await t.take(brief({ id: "k-4" }))).toContain("doesn't count: a newer decision on the change came after it was given");
     expect(loadReview(t.cfg.queueDir, "k-4")).toBeNull();
     expect(t.rounds().grants_void?.["pr-46+11"]?.why).toBe("decision");
   });
@@ -794,7 +890,7 @@ describe("the runner counts a grant only while its binding holds", () => {
     const r = t.rounds();
     r.changes["pr-46"].rounds.push({ id: "k-x", at: "2026-11-21T17:49:00Z", kind: "fixes", state: "answered", done: true, serious: 0 });
     writeFileSync(t.cfg.roundsFile!, JSON.stringify(r));
-    expect(t.runner.admitAndQueue(brief({ id: "k-5" }))).toContain("doesn't count: the change's review rounds moved on after it was given");
+    expect(await t.take(brief({ id: "k-5" }))).toContain("doesn't count: the change's review rounds moved on after it was given");
     expect(loadReview(t.cfg.queueDir, "k-5")).toBeNull();
   });
 
@@ -802,21 +898,21 @@ describe("the runner counts a grant only while its binding holds", () => {
     const t = runnerRig();
     await threeRounds(t);
     t.grant("pr-46", 1);
-    expect(t.runner.admitAndQueue(brief({ id: "k-4", head: undefined }))).toContain("this brief names no head, so it can't be matched");
+    expect(await t.take(brief({ id: "k-4", head: undefined }))).toContain("this brief names no head, so it can't be matched");
     expect(t.rounds().grants_void).toBeUndefined();
-    expect(t.runner.admitAndQueue(brief({ id: "k-4b" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4b" }))).toBeNull();
   });
 
   test("a matching binding claims exactly one round, and a second claim is refused", async () => {
     const t = runnerRig();
     await threeRounds(t);
     t.grant("pr-46", 1);
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
     expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4")?.claims).toEqual(["pr-46+11"]);
     await t.runner.tick(); await t.runner.tick();
     // Claimed: it counts in full whatever the head does now, and only that once.
     expect(effectiveCap(3, t.rounds(), t.grants(), "pr-46", HEAD_B)).toBe(4);
-    const why = t.runner.admitAndQueue(brief({ id: "k-5" }))!;
+    const why = await t.take(brief({ id: "k-5" }))!;
     expect(why).toContain("has had 4 outside review rounds, and the owner's rule allows at most 3, plus 1 granted by Dane on Nov 21, so 4.");
     expect(loadReview(t.cfg.queueDir, "k-5")).toBeNull();
     const claims = t.rounds().changes["pr-46"].rounds.flatMap((x) => x.claims ?? []);
@@ -827,37 +923,63 @@ describe("the runner counts a grant only while its binding holds", () => {
     const t = runnerRig({ seat: answerWith("SERIOUS: still wrong") });
     await threeRounds(t);
     t.grant("pr-46", 2);
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
     await t.runner.tick();
-    expect(t.runner.admitAndQueue(brief({ id: "k-5", head: HEAD_B }))).toBeNull();
+    expect(await t.take(brief({ id: "k-5", head: HEAD_B }))).toBeNull();
     expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-5")?.claims).toBeUndefined();
   });
 
-  test("a grant written without a binding (0.18.0) doesn't count, is logged and told once, and is kept", async () => {
+  test("fourth review, 3: on real 0.18.0 records the upgrade credits the round run under one grant and keeps the other claimable; neither is void", async () => {
     const t = runnerRig();
-    await threeRounds(t);
-    t.grant("pr-46", 2, { bound: undefined });
-    expect(t.grants()!.grants[0].bound).toBeUndefined();
+    // The rounds file as 0.18.0 writes it: no claims, no grants_void; a decision on round 3, then round 4 run
+    // under his first grant (given at 13:00), and his second grant (15:00) with no round after it.
+    const rr = (id: string, at: string, kind: string, serious: number) => ({ id, at, kind, state: "answered", done: true, serious });
+    const r018 = { format: 1, changes: { "pr-46": { pr: PRN(46), topic: "The rollback keeper", rounds: [
+      rr("k-1", "2026-11-21T10:00:00.000Z", "full", 2), rr("k-2", "2026-11-21T11:00:00.000Z", "fixes", 1),
+      rr("k-3", "2026-11-21T12:00:00.000Z", "fixes", 1), rr("k-4", "2026-11-21T14:00:00.000Z", "fixes", 1) ],
+      decision: { id: "pr-46#4", key: "pr-46", round: 4, serious: 1, topic: "The rollback keeper", finding: "SERIOUS: x", item: "P46", pr: PRN(46), state: "posted", at: "2026-11-21T14:05:00.000Z", message: "m-2" },
+      past: [{ id: "pr-46#3", key: "pr-46", round: 3, serious: 1, topic: "The rollback keeper", finding: "SERIOUS: x", item: "P46", pr: PRN(46), state: "posted", at: "2026-11-21T12:05:00.000Z", message: "m-1" }] } } };
+    writeFileSync(t.cfg.roundsFile!, JSON.stringify(r018, null, 1));
+    // The grants file as 0.18.0's link writes it: no binding.
+    const g018 = (id: string, n: number, at: string) => ({ id, key: "pr-46", rounds: n, by: "owner", at, message: id.split("+")[1], reason: "The rollback keeper", item: "P46", pr: PRN(46) });
+    writeFileSync(t.cfg.grantsFile!, JSON.stringify({ format: 1, grants: [g018("pr-46+111", 1, "2026-11-21T13:00:00.000Z"), g018("pr-46+222", 1, "2026-11-21T15:00:00.000Z")] }, null, 1));
     const logs: string[] = [];
-    // The runner after the update: it finds the old grant once at its start.
-    const fresh = new Runner(t.cfg, { seats: { gemini: answerWith() }, now: () => NOW, rand: () => 0.5, log: (m) => logs.push(m), postDecision: async () => "m" });
+    const fresh = new Runner(t.cfg, { seats: { gemini: answerWith() }, now: () => NOW, rand: () => 0.5, log: (m) => logs.push(m), postDecision: async () => "m",
+      pull: async () => ({ head: HEAD_A }) });
     await fresh.tick(); await fresh.tick();
-    const told = t.relays().filter((l) => l.includes("no longer counts"));
+    const r = t.rounds();
+    expect(r.changes["pr-46"].rounds.find((x) => x.id === "k-4")?.claims).toEqual(["pr-46+111"]);
+    expect(r.grants_adopted?.["pr-46+222"]).toMatchObject({ key: "pr-46" });
+    expect(r.grants_void).toBeUndefined();
+    const st = standing(3, r, t.grants(), "pr-46");
+    expect(st.counting.map((x) => x.id)).toEqual(["pr-46+111"]);
+    expect(st.claimable.map((x) => x.id)).toEqual(["pr-46+222"]);
+    expect(st.stale).toEqual([]);
+    expect(logs.filter((l) => l.includes("pr-46+111") && l.includes("credited with the round run after it (k-4)")).length).toBe(1);
+    expect(logs.filter((l) => l.includes("pr-46+222") && l.includes("no round ran after it")).length).toBe(1);
+    const told = t.relays().filter((l) => l.includes("earlier grants for pr-46"));
     expect(told.length).toBe(1);
-    expect(told[0]).toContain("it was granted before grants were bound to the change as it stood");
-    expect(logs.filter((l) => l.includes("doesn't count: unbound")).length).toBe(1);
-    expect(t.rounds().grants_void?.["pr-46+12"]?.why).toBe("unbound");
-    // Restarted again: not told again.
-    const again = new Runner(t.cfg, { seats: { gemini: answerWith() }, now: () => NOW, rand: () => 0.5, log: (m) => logs.push(m), postDecision: async () => "m" });
+    expect(told[0]).toContain("is credited with the round already run after it");
+    expect(told[0]).toContain("had no round run under it yet, so the next round claims it");
+    expect(told[0]).toContain("None was voided");
+    // Restarted again: nothing changes, nothing is told again.
+    const again = new Runner(t.cfg, { seats: { gemini: answerWith() }, now: () => NOW, rand: () => 0.5, log: (m) => logs.push(m), postDecision: async () => "m",
+      pull: async () => ({ head: HEAD_A }) });
     await again.tick();
-    expect(t.relays().filter((l) => l.includes("no longer counts")).length).toBe(1);
-    expect(fresh.admitAndQueue(brief({ id: "k-4" }))).toContain("doesn't count: it was granted before grants were bound");
-    expect(t.grants()!.grants.length).toBe(1);
-    // The link offers a fresh card for it: the old grant doesn't raise the cap there either.
-    const u = linkRig(atCap(2), { format: 1, grants: [grantRec("pr-46", 2, { bound: undefined })] });
-    expect((await ask(u.r)).status).toBe("posted");
+    expect(t.relays().filter((l) => l.includes("earlier grants for pr-46")).length).toBe(1);
+    expect(t.rounds()).toEqual(r);
+    // The next round claims the second, pinned to GitHub's head, and runs as round 5 of 5.
+    const h = await again.githubHead(brief({ id: "k-5" }));
+    expect(h).toBe(HEAD_A);
+    expect(again.admitAndQueue(brief({ id: "k-5" }), h!)).toBeNull();
+    expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-5")?.claims).toEqual(["pr-46+222"]);
+    expect(loadReview(t.cfg.queueDir, "k-5")).toMatchObject({ round: 5, cap: 5 });
+    expect(t.grants()!.grants.length).toBe(2);                   // the grants file isn't touched
+    // The link reads the same records: an adopted grant still to be claimed is rounds left, so no grant card.
+    const ad = atCap(2); ad.grants_adopted = { "pr-46+12": { at: NOW.toISOString(), key: "pr-46" } };
+    const u = linkRig(ad, { format: 1, grants: [grantRec("pr-46", 2, { bound: undefined })] });
+    expect(String((await ask(u.r).catch((e) => e)).message ?? "")).toContain("has rounds left (3 of 5 used)");
   });
-
   test("the link offers a fresh card when the grant on file is bound to an older head", async () => {
     const u = linkRig(atCap(2), { format: 1, grants: [grantRec("pr-46", 1, { bound: { head: HEAD_B, decision: null, used: 3, cap: 3 } })] });
     const res = await ask(u.r);
@@ -871,10 +993,11 @@ describe("status, spend and the round line say when a grant no longer counts", (
     const t = runnerRig();
     await threeRounds(t);
     t.grant("pr-46", 1);
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
     await t.runner.tick(); await t.runner.tick();
     t.grant("pr-46", 1, { id: "pr-46+second" });                          // bound to round 4's decision and head A
-    expect(t.runner.admitAndQueue(brief({ id: "k-5", head: HEAD_B }))).toContain("the pull request has new commits since");
+    t.setGh(HEAD_B);                                                       // a push since, as GitHub has it
+    expect(await t.take(brief({ id: "k-5", head: HEAD_B }))).toContain("the pull request has new commits since");
     expect(staleWords(standing(3, t.rounds(), t.grants(), "pr-46"))).toBe("1 grant no longer counts: the pull request moved on");
     const env = { ...process.env, REVIEW_QUEUE: t.cfg.queueDir, REVIEW_SPEND: t.cfg.spendFile, REVIEW_ROUNDS: t.cfg.roundsFile, REVIEW_SETTINGS: t.cfg.settingsFile,
       REVIEW_GRANTS: t.cfg.grantsFile, CAIN_HOME: join(t.dir, "home"), REVIEW_GUARD_LOG: join(t.dir, "guard.log"), CAIN_TEST_MODE: "1" };
@@ -887,11 +1010,11 @@ describe("status, spend and the round line say when a grant no longer counts", (
   test("the relay's round line names a grant that didn't count when the round was taken", async () => {
     const t = runnerRig();
     await threeRounds(t);
-    t.grant("pr-46", 2, { id: "pr-46+old", bound: undefined });           // left by 0.18.0
+    t.grant("pr-46", 2, { id: "pr-46+old", bound: { ...bindNow(t.rounds(), t.grants(), "pr-46"), decision: "pr-46#2" } });   // given before a newer decision
     t.grant("pr-46", 1, { id: "pr-46+new" });
-    expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
+    expect(await t.take(brief({ id: "k-4" }))).toBeNull();
     await t.runner.tick();
-    expect(roundLine(t.get("k-4"))).toBe("Round 4 of 4, 1 granted by Dane on Nov 21, 1 grant no longer counts: it was given before grants were bound, for pr-46 (fix-only): 1 serious finding left.");
+    expect(roundLine(t.get("k-4"))).toBe("Round 4 of 4, 1 granted by Dane on Nov 21, 1 grant no longer counts: a newer decision came, for pr-46 (fix-only): 1 serious finding left.");
     expect(t.relays().filter((l) => l.includes("no longer counts:") && l.startsWith("Dane's grant")).length).toBe(1);
   });
 });

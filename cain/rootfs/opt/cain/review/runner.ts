@@ -16,7 +16,7 @@ import {
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
-import { effectiveCap, grantWords, readGrants, STALE_LONG, standing, staleWords, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
+import { effectiveCap, grantWords, readGrants, STALE_LONG, standing, staleWords, sweepUnbound, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
@@ -65,6 +65,9 @@ export type RunnerDeps = {
   // the message id, or null when it didn't go (tried again next tick). Absent: never posted.
   postDecision?: (d: DecisionRec) => Promise<string | null>;
   plan?: () => PlanReading;                        // the plan-usage reading (../plan-usage.ts), for the guard
+  // Cain 0.18.1 (fourth review): a pull request as GitHub has it now (../pullnow.ts, the link's own read), for
+  // the head a round that claims a grant is pinned to. null, or a null head: can't tell (the brief waits).
+  pull?: (pr: string) => Promise<{ head: string | null } | null>;
 };
 
 export type SpendRow = { usd: number; runs: number; findings: number; searches: number };
@@ -229,23 +232,51 @@ export class Runner {
   // can make a review look run, or put a line on a Ship card. Each file is taken once and
   // removed, whatever it held; one that isn't a plain file of his, or isn't a brief, is
   // refused and he hears why.
-  ingest(): void {
+  // Cain 0.18.1 (fourth review): a brief whose round would claim a grant of the owner's waits in the inbox,
+  // untaken, while GitHub's head for its pull request can't be read (retried next tick, logged once); it is
+  // taken once the head is read, and the claim is pinned to that head (admitAndQueue).
+  private waitingBriefs = new Set<string>();
+  async ingest(): Promise<void> {
     const dir = this.cfg.inboxDir;
     if (!dir) return;
     let names: string[];
     try { names = readdirSync(dir).filter((n) => n.endsWith(".json") && !n.startsWith(".")).sort(); }
     catch { return; }
+    const still = new Set<string>();
     for (const name of names) {
       const path = join(dir, name);
       const got = readOwned(path, this.cfg.inboxUid ?? CAIN_UID, 256 * 1024);
+      const p = got.ok ? parseBrief(got.text) : null;
+      const gh = p?.brief && !existsReview(this.cfg.queueDir, p.brief.id) ? await this.githubHead(p.brief) : undefined;
+      if (gh === null) {
+        still.add(name);
+        if (!this.waitingBriefs.has(name)) this.log(`review brief ${p!.brief!.id} waits in the inbox: its round would claim the owner's grant, and GitHub's head for ${p!.brief!.pr} can't be read now; tried again next tick`);
+        continue;
+      }
       try { unlinkSync(path); } catch { /* already gone */ }
       if (!got.ok) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken (${got.why}). Submit it again with review.sh. Nothing to tell him.`); continue; }
-      const p = parseBrief(got.text);
-      if (!p.brief) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken: not a brief: ${p.error}. Nothing to tell him.`); continue; }
-      if (existsReview(this.cfg.queueDir, p.brief.id)) { this.relay(`Review brief ${p.brief.id} wasn't taken: a review with that id already exists; use a new id. Nothing to tell him.`); continue; }
-      const why = this.admitAndQueue(p.brief);
-      if (why) this.relay(`Review brief ${p.brief.id} wasn't taken: ${why} Nothing to tell him.`);
+      if (!p!.brief) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken: not a brief: ${p!.error}. Nothing to tell him.`); continue; }
+      if (existsReview(this.cfg.queueDir, p!.brief.id)) { this.relay(`Review brief ${p!.brief.id} wasn't taken: a review with that id already exists; use a new id. Nothing to tell him.`); continue; }
+      const why = this.admitAndQueue(p!.brief, gh);
+      if (why) this.relay(`Review brief ${p!.brief.id} wasn't taken: ${why} Nothing to tell him.`);
     }
+    this.waitingBriefs = still;
+  }
+
+  // GitHub's head for the brief's pull request, read by the runner itself, when its round would claim a grant
+  // (fourth review): undefined when no claim is in view (nothing to read), null when GitHub can't be read now.
+  async githubHead(b: Brief): Promise<string | null | undefined> {
+    const file = this.cfg.roundsFile;
+    if (!file || this.capOff || !b.pr || !b.head) return undefined;
+    const rounds = readRounds(file);
+    if (!rounds) return undefined;
+    const a = admit(rounds, b, this.roundCap, this.grants(), this.cfg.tz, true);
+    if (!a.ok || !a.claims.length) return undefined;
+    if (!this.deps.pull) return null;
+    try {
+      const p = await this.deps.pull(b.pr);
+      return p?.head && /^[0-9a-f]{40}$/.test(p.head) ? p.head : null;
+    } catch { return null; }
   }
 
   // ---- the review-round cap and the usage guard (Cain 0.16.0; rounds.ts, ../guard.ts) ----
@@ -260,13 +291,28 @@ export class Runner {
   // The install-time self-check's finding (../capfiles.ts, main.ts): while set, the cap and guard are off,
   // so no brief is taken (fail closed) and no round is settled or decision card posted.
   capOff: string | null = null;
-  admitAndQueue(b: Brief): string | null {
+  // gh (0.18.1, fourth review): the pull request's head as the runner read it from GitHub (githubHead) for this
+  // brief, or undefined when it wasn't read. From here to the write of the rounds file nothing awaits: the
+  // rounds and grants are read afresh, and the decision, round count and prior cap are checked in the same
+  // step that records the claim (one write of the rounds file; the runner is its only writer, one tick at a time).
+  // A round that would claim a grant is pinned to GitHub's head: the brief's head must be that head, or the brief
+  // is refused and no grant is claimed or voided. A grant is voided only by checks against GitHub's head and the
+  // runner's own records, never against a brief's claim.
+  admitAndQueue(b: Brief, gh?: string): string | null {
     const file = this.cfg.roundsFile;
     if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
-    const a = admit(rounds, b, this.roundCap, this.grants(), this.cfg.tz);
+    const grants = this.grants();
+    if (gh !== undefined && (b.head ?? "").toLowerCase() !== gh.toLowerCase())
+      return "the pull request's head on GitHub is not the one the brief names; send it again with the current head. No grant was claimed or voided. Nothing was queued.";
+    // With GitHub's head: the brief's head, now verified. Without it: the head isn't checked at all (a brief with a
+    // pull request and no head still waits on one, as before), so no grant is voided for a head.
+    const headless = !!b.pr && !b.head;
+    const a = admit(rounds, b, this.roundCap, grants, this.cfg.tz, gh === undefined && !headless);
+    if (a.ok && a.claims.length && b.pr && gh === undefined)
+      return "its round would claim the owner's grant, and the pull request's head on GitHub wasn't read for it; send it again. No grant was claimed or voided. Nothing was queued.";
     // 0.18.1: grants no longer bound to the change as it is are kept as void (in the rounds file, the
     // runner's own) and told to Cain once, whether this round is refused or runs under other grants.
     if (a.key && a.stale?.length && this.voidGrants(rounds, a.key, a.stale)) writeRounds(file, rounds);
@@ -287,7 +333,7 @@ export class Runner {
     addRound(rounds, b, a, this.now().toISOString());
     writeRounds(file, rounds);
     saveReview(this.cfg.queueDir, r);
-    if (a.claims.length) this.log(`review ${b.id} (${a.key}, round ${a.round}) claimed the owner's grant${a.claims.length === 1 ? "" : "s"} ${a.claims.join(", ")}`);
+    if (a.claims.length) this.log(`review ${b.id} (${a.key}, round ${a.round}) claimed the owner's grant${a.claims.length === 1 ? "" : "s"} ${a.claims.join(", ")}${gh ? ` at GitHub's head ${gh}` : ""}`);
     return null;
   }
   // Grants found not to count, kept under grants_void once each, logged and told to Cain once (the link
@@ -296,7 +342,8 @@ export class Runner {
     const v = rounds.grants_void ??= {};
     let any = false;
     for (const { rec, why } of stale) {
-      if (v[rec.id]) continue;
+      // Fourth review: a grant from 0.18.0 (no binding) is never voided: the upgrade's sweep credits or adopts it.
+      if (v[rec.id] || why === "unbound") continue;
       v[rec.id] = { why, at: this.now().toISOString(), key: rec.key };
       any = true;
       const n = rec.rounds;
@@ -306,25 +353,36 @@ export class Runner {
     }
     return any;
   }
-  // 0.18.1: grants written by 0.18.0 carry no binding, so they never count: found once at the runner's
-  // start (retried each tick until both files read), kept as void, logged and told to Cain once each.
+  // 0.18.1 (fourth review): grants written by 0.18.0 carry no binding and 0.18.0 recorded no claims. Once, at the
+  // runner's start (retried each tick until both files read): each is credited with the rounds that ran after it
+  // (claims on those rounds) or, with none, adopted for the next round (grants.ts sweepUnbound). Nothing is voided.
+  // Each decision logged once; Cain told once a change what was credited. Idempotent: a grant credited or adopted
+  // already is passed over, so a restart changes nothing.
   private swept = false;
   sweepUnbound(): void {
     const file = this.cfg.roundsFile;
     if (this.swept || !file || this.capOff || !this.cfg.grantsFile) return;
     const rounds = readRounds(file), g = this.grants();
     if (!rounds || !g) return;
+    const done = sweepUnbound(rounds, g, this.now().toISOString());
+    if (done.length) writeRounds(file, rounds);
     this.swept = true;
-    const seen = new Set<string>();
-    let any = false;
-    for (const x of g.grants) {
-      if (seen.has(x.key)) continue;
-      seen.add(x.key);
-      const st = standing(this.roundCap, rounds, g, x.key);
-      const unbound = st.stale.filter((y) => y.why === "unbound");
-      if (unbound.length && this.voidGrants(rounds, x.key, unbound)) any = true;
+    const byKey = new Map<string, typeof done>();
+    for (const d of done) {
+      const n = d.rec.rounds;
+      this.log(`the owner's grant ${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, given before grants were bound): `
+        + (d.adopted ? "no round ran after it, so the next round may claim it" : `credited with the round${d.credited.length === 1 ? "" : "s"} run after it (${d.credited.join(", ")})`));
+      byKey.set(d.rec.key, [...(byKey.get(d.rec.key) ?? []), d]);
     }
-    if (any) writeRounds(file, rounds);
+    for (const [key, list] of byKey) {
+      const parts = list.map((d) => {
+        const n = d.rec.rounds, c = d.credited.length;
+        const g1 = `his grant of ${n} more round${n === 1 ? "" : "s"} (${grantWords([d.rec], this.cfg.tz).replace(/^\d+ /, "")})`;
+        return d.adopted ? `${g1} had no round run under it yet, so the next round claims it`
+          : `${g1} is credited with the ${c === 1 ? "round" : `${c} rounds`} already run after it${c < n ? `, and its other ${n - c === 1 ? "round stays" : `${n - c} rounds stay`} available` : ""}`;
+      });
+      this.relay(`The review runner kept Dane's earlier grants for ${key} through the update: ${parts.join("; ")}. None was voided. Nothing to tell him.`);
+    }
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
   private earlierFindings(rounds: Rounds, key: string): string[] {
@@ -428,7 +486,7 @@ export class Runner {
   }
 
   async tick(): Promise<void> {
-    try { this.recoverLost(); this.sweepUnbound(); this.ingest(); await this.reviews(); }
+    try { this.recoverLost(); this.sweepUnbound(); await this.ingest(); await this.reviews(); }
     finally {
       if (this.publishOwed) this.publishReviewed();
       try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }

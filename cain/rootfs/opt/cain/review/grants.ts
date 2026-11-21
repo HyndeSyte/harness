@@ -79,7 +79,10 @@ export type Standing = {
   claimable: GrantRec[];                      // binding matches now: the next round claims them
   waiting: GrantRec[];                        // bound to a head, and the brief named none: not matched, not voided
   stale: { rec: GrantRec; why: StaleWhy }[];  // never count
-  prior: number;                              // the cap from the claimed grants alone
+  // The cap from the base and the claimed grants alone (fourth review): the prior cap a candidate's binding is
+  // checked against, never counting the candidate or any other outstanding grant. The link's tap records the
+  // same value as the binding's cap.
+  prior: number;
 };
 export const validBinding = (b: any): b is GrantBinding => !!b && typeof b === "object"
   && (b.head === null || (typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)))
@@ -91,8 +94,11 @@ export function claimsOf(r: Rounds, key: string): Map<string, string> {
   for (const k of groupOf(r, key)) for (const x of r.changes[k]?.rounds ?? []) for (const id of x.claims ?? []) if (!out.has(id)) out.set(id, x.id);
   return out;
 }
-// head: the pull request's head now (the brief's), null when the brief named none, undefined when not
-// known here (status lines and the link: the head is checked only when a round claims the grant).
+// head: the pull request's head now, as GitHub gave it to the runner (fourth review: never a brief's own claim),
+// null when the brief named none, undefined when not known here (status lines, review.sh's early check, and
+// the runner before a claim: the head is checked only when a round claims the grant, against GitHub's head).
+// A grant from 0.18.0 the upgrade's sweep adopted (Rounds.grants_adopted) is claimable as if bound to the
+// change as it is; a pull request's one waits on a brief that names a head like any other.
 export function standing(base: number, r: Rounds, g: Grants | null, key: string, head?: string | null): Standing {
   const list = grantsFor(r, g, key);
   const claimed = claimsOf(r, key);
@@ -105,6 +111,10 @@ export function standing(base: number, r: Rounds, g: Grants | null, key: string,
     if (claimed.has(x.id)) continue;
     const voided = r.grants_void?.[x.id];
     const b = x.bound;
+    if (!voided && !validBinding(b) && r.grants_adopted?.[x.id]) {
+      if (x.pr && head === null) s.waiting.push(x); else s.claimable.push(x);
+      continue;
+    }
     const why: StaleWhy | null = voided ? voided.why
       : !validBinding(b) ? "unbound"
       : b.decision !== dec ? "decision"
@@ -118,6 +128,33 @@ export function standing(base: number, r: Rounds, g: Grants | null, key: string,
   }
   return s;
 }
+// The upgrade's one-time sweep of grants written by 0.18.0 (fourth review): none of them carries a binding, and
+// 0.18.0 recorded no claims, so the rounds already run under them are found by time. For each unbound grant not
+// claimed, voided or adopted yet, in time order: the rounds of its change group later than the grant, not
+// attributed to a grant already, up to its count, are credited to it (its id written as a claim on those rounds,
+// so it counts as claimed from then on, in full: its unused rounds stay available). One with no round after it
+// is adopted (claimable by the next round as if bound to the change as it is then). Nothing is voided. Changes
+// r in place; the decisions, one per grant, for the log and for Cain (one line a change).
+export type SweepDecision = { rec: GrantRec; credited: string[]; adopted: boolean };
+export function sweepUnbound(r: Rounds, g: Grants, at: string): SweepDecision[] {
+  const out: SweepDecision[] = [];
+  const list = [...g.grants].sort((a, b) => a.at.localeCompare(b.at));
+  for (const x of list) {
+    if (validBinding(x.bound) || r.grants_void?.[x.id] || r.grants_adopted?.[x.id] || claimsOf(r, x.key).has(x.id)) continue;
+    const later = countedRounds(r, x.key).filter((y) => y.at > x.at && !(y.claims ?? []).length).slice(0, x.rounds);
+    const credited: string[] = [];
+    for (const y of later) {
+      const rec = r.changes[y.key]?.rounds.find((z) => z.id === y.id);
+      if (!rec) continue;
+      rec.claims = [...(rec.claims ?? []), x.id];
+      credited.push(y.id);
+    }
+    if (!credited.length) (r.grants_adopted ??= {})[x.id] = { at, key: x.key };
+    out.push({ rec: x, credited, adopted: !credited.length });
+  }
+  return out;
+}
+
 // The grants that count now (claimed, or claimable), in time order.
 export const countingGrants = (s: Standing) => [...s.counting, ...s.claimable].sort((a, b) => a.at.localeCompare(b.at));
 export function effectiveCap(base: number, r: Rounds, g: Grants | null, key: string, head?: string | null): number {

@@ -334,17 +334,34 @@ grant now carries the state your tap checked, under the same lock: the pull requ
 and the cap before the grant. The runner holds every grant to that:
 
 - A grant counts once a round has claimed it, or while its binding still matches the change as it is.
-  The first round past the cap claims it: the runner checks the brief's head, the newest decision and
-  the round count against the grant (a change with no pull request: the decision and the count only),
-  and keeps which round claimed it in `/data/review-rounds.json`, so no grant is claimed twice. Once
-  claimed, all its rounds count, as the fixes move the head on.
-- A grant whose binding no longer matches doesn't count: the round is refused at the cap with a plain
-  line saying why (for example, it was given for the pull request as it stood then, but the pull
-  request has new commits since). The runner keeps it as void in its rounds file and Cain hears it
-  once, so he can ask you for a fresh grant card. A brief that names no head can't claim a grant bound
-  to a head and is refused without voiding it.
-- Grants written by 0.18.0 carry no binding: they never count. The runner finds them once at its first
-  start after the update, logs each and tells Cain once; the grants file itself is never changed.
+  The binding's cap is the cap before the grant counting only the base and the grants a round has
+  claimed already, never another grant still waiting (the link records it so, and the runner checks it
+  so), and one round claims every grant whose binding matches, in time order, keeping all their ids.
+  Once claimed, all its rounds count, as the fixes move the head on; no grant is claimed twice.
+- The claim is checked against GitHub, never against the brief alone (fourth review). When a round
+  would claim a grant, the runner first reads the pull request's head from GitHub itself, the same
+  way the link reads it at your tap (`pullnow.ts`: GitHub's API, then GitHub's refs, no token), and
+  pins the round to that commit. The brief's head must be GitHub's head; if it isn't, the brief is
+  refused ("the pull request's head on GitHub is not the one the brief names; send it again with the
+  current head") and nothing is claimed or voided. Then, with no wait between, it reads the rounds and
+  grants afresh and checks the newest decision, the round count and the prior cap in the same step
+  that records the claim: one write of `/data/review-rounds.json`, which only the runner writes, one
+  tick at a time. While GitHub can't be read, the brief waits in the inbox untaken (logged once) and
+  is tried again next tick; it never claims meanwhile.
+- A grant is voided only by checks against GitHub's head and the runner's own records (the decision,
+  the round count, the prior cap), never against a brief's claim. A voided grant doesn't count: the
+  round is refused at the cap with a plain line saying why (for example, it was given for the pull
+  request as it stood then, but the pull request has new commits since). The runner keeps it as void
+  in its rounds file and Cain hears it once, so he can ask you for a fresh grant card. A brief that
+  names no head can't claim a grant bound to a head and is refused without voiding it.
+- Grants written by 0.18.0 carry no binding, and 0.18.0 recorded no claims. At its first start after
+  the update the runner sweeps them once, in time order: each is credited with the rounds of its change
+  that ran after it, not already credited to another grant, up to its count (written as claims on those
+  rounds, so it counts as claimed, in full: its unused rounds stay available). One with no round after
+  it is kept in the rounds file as adopted (`grants_adopted`): the next round claims it as if it were
+  bound to the change as it is then, its pull request's head read from GitHub at that claim. Nothing
+  from 0.18.0 is voided. Each decision is logged once and Cain hears once per change what was kept;
+  the grants file itself is never changed, and a restart changes nothing.
 - `review.sh status <id>`, `review.sh spend` and Cain's round line say when a grant doesn't count, for
   example "1 grant no longer counts: the pull request moved on".
 - The link's own view follows the same rule: a grant bound to an older head, decision or count, or to
