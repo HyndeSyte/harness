@@ -52,7 +52,8 @@ const ROOT_FOR_HIM = [
   /^\/data\/record-outcomes\/[^/]+$/,
   /^\/data\/record-holds\.json$/,
   /^\/data\/review-queue\/[^/]+$/,
-  /^\/data\/review-(spend|health)\.json$/,
+  /^\/data\/review-(spend|health|rounds|settings)\.json$/,   // rounds and settings: the round cap's count and the runner's caps (0.16.0)
+  /^\/data\/review-guard\.log$/,                        // the usage guard's refusals (0.16.0)
   /^\/data\/review-useful\.jsonl$/,
   /^\/data\/review-private-terms\.txt$/,
   /^\/data\/gate\/[^/]+$/,

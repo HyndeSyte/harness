@@ -104,7 +104,12 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
     install -d -m 2750 -o root -g cain "$D/$q"
     find "$D/$q" -mindepth 1 -maxdepth 1 -type f -exec chgrp cain {} + -exec chmod 0640 {} +
   done
-  # The review-round count and the settings the runner uses (0.16.0): root writes, he reads.
+  # The review-round count and the settings the runner uses (0.16.0): root writes, he reads. Made
+  # here when missing, so the runner's first write keeps root:cain (it keeps a file's owner and mode).
+  [ -L "$D/review-rounds.json" ] && rm -f "$D/review-rounds.json"
+  [ -e "$D/review-rounds.json" ] || printf '{"format": 1, "changes": {}}\n' > "$D/review-rounds.json"
+  [ -L "$D/review-settings.json" ] && rm -f "$D/review-settings.json"
+  [ -e "$D/review-settings.json" ] || printf '{}\n' > "$D/review-settings.json"
   for f in record-holds.json review-spend.json review-health.json review-rounds.json review-settings.json; do own "$D/$f" root:cain 0640; done
   # The usage guard's log (0.16.0): the runner and his Build hook both append; he reads it.
   for f in review-useful.jsonl review-private-terms.txt session.log review-guard.log; do
