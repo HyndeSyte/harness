@@ -5,9 +5,10 @@
 // every rollback paged, the heartbeat-delivery gate on /armed, and the restart-loop rule.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMIT_MS, REWIND_MS, WATCH_MS, optionsHash, parseOptions, parseAuthorization, type AppInfo, type BackupInfo, type JobState, type RestoreResult, type State } from "../rootfs/opt/keeper/core.ts";
-import { healthUrl } from "../rootfs/opt/keeper/main.ts";
+import { healthUrl, liveUrl } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
 import { handle, internal } from "../rootfs/opt/keeper/server.ts";
 
@@ -17,21 +18,27 @@ const T0 = Date.parse("2026-11-21T15:00:00Z");
 const EMPTY = { id: "", app: "", from_version: "", to_version: "", backup_slug: "", install_deadline: "", authorization: "", probe_hash: "" };
 const HASH = "abcdef0123456789";
 // Polls from a fail to the end of the confirm window (the restore, then 5 minutes started and healthy).
-const ROLL = CONFIRM_MS / POLL_MS + 3;
+const ROLL = CONFIRM_MS / POLL_MS + 4;
+
+// A well formed authorization (0.1.2): its token hash differs per id, so ids don't replay each other.
+const AUTH = (id: string, kind = "ship", over: { exp?: number; pr?: string; head?: string } = {}) =>
+  `${kind} sha256=${createHash("sha256").update(`tok-${id}`).digest("hex")} pr=${over.pr ?? "46"} head=${over.head ?? "7d7b5f9".padEnd(40, "0")} expires=${new Date(over.exp ?? T0 + 3_600_000).toISOString()}`;
 
 function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null } = {}) {
   let now = T0;
   const logs: string[] = [];
   const pings: { url: string; body: string }[] = [];
   const restores: { backup: string; app: string }[] = [];
-  const clears: string[] = [];
+  const jobCalls: string[] = [];
   let saved: State | null = null;
   const app: AppInfo = { version: "0.16.0", state: "started" };
   const f = {
-    app, healthy: true, infoUp: true, pingOk: true, restoreQueue: [] as RestoreResult[],
-    // the Supervisor's jobs list: what job() answers (null: unreadable); clearOk: the own-options write
-    jobs: { found: false } as JobState | null, clearOk: true,
-    backup: o.backup === null ? null : { homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], ...(o.backup ?? {}) } as BackupInfo | null,
+    app, healthy: true, alive: true, infoUp: true, pingOk: true, restoreQueue: [] as RestoreResult[],
+    // the Supervisor's jobs list, by job id (jobsUp false: unreadable); finishJobs: a default restore's
+    // job is listed done without errors
+    jobs: {} as Record<string, JobState>, jobsUp: true,
+    pingFails: (_url: string) => !f.pingOk,
+    backup: o.backup === null ? null : { homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: false, ...(o.backup ?? {}) } as BackupInfo | null,
     onRestore: () => { app.version = "0.16.0"; app.state = "started"; },
     options: {
       watch: [CAIN], health: [`${CAIN}=0fcc2575-cain:8098`], tokens: [`${CAIN}=${TOKEN}`],
@@ -46,26 +53,31 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     backupInfo: async () => f.backup,
     restore: async (backup, a) => {
       restores.push({ backup, app: a });
-      const r = f.restoreQueue.shift() ?? { kind: "started", job: null };
-      if (r.kind === "started" && !r.job) f.onRestore();
-      return r;
+      const r = f.restoreQueue.shift();
+      if (r) return r;
+      // the default: the Supervisor takes it as job job-<n>, which runs and finishes
+      const id = `job-${restores.length}`;
+      f.jobs[id] = { found: true, uuid: id, done: true, errors: 0 };
+      f.onRestore();
+      return { kind: "started", job: id };
     },
-    job: async () => f.jobs,
-    clearAttempt: async (id) => { clears.push(id); if (f.clearOk && f.options.attempt?.id === id) f.options.attempt = { ...f.options.attempt, ...EMPTY }; return f.clearOk ? { ok: true, why: "" } : { ok: false, why: "403 refused" }; },
+    job: async (uuid) => { jobCalls.push(uuid); return f.jobsUp ? f.jobs[uuid] ?? { found: false } : null; },
     health: async () => f.healthy,
-    ping: async (url, body) => { pings.push({ url, body }); return f.pingOk; },
+    live: async () => f.alive,
+    ping: async (url, body) => { pings.push({ url, body }); return !f.pingFails(url); },
     options: () => JSON.parse(JSON.stringify(f.options)),
     save: (s) => { saved = JSON.parse(JSON.stringify(s)); },
     log: (l) => logs.push(l),
   }, o.saved ?? null);
-  k.opts = parseOptions(f.options);
+  k.useOptions(f.options);
   k.start();
   const r = {
-    k, f, logs, pings, restores, clears, get saved() { return saved; },
+    k, f, logs, pings, restores, jobCalls, get saved() { return saved; },
     get now() { return now; }, advance(ms: number) { now += ms; },
     register(over: any = {}) {
-      f.options.attempt = { id: "a1", app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup_slug: "b1234567",
-        install_deadline: new Date(now + 30 * 60_000).toISOString(), authorization: "ship", probe_hash: HASH, ...over };
+      const id = over.id ?? "a1";
+      f.options.attempt = { id, app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup_slug: "b1234567",
+        install_deadline: new Date(now + 30 * 60_000).toISOString(), authorization: AUTH(id), probe_hash: HASH, ...over };
     },
     async poll(n = 1) { for (let i = 0; i < n; i++) { await k.poll(); now += POLL_MS; } },
     install(state = "started") { app.version = "0.17.0"; app.state = state; },
@@ -118,11 +130,23 @@ describe("registration and the backup check", () => {
     const r = rig(); r.register(); await r.poll(3);
     expect(r.logs.filter((l) => l.startsWith("accepting")).length).toBe(1);
   });
-  test("authorization: ship, ship with a token, drill with a token (kept only as a hash)", () => {
-    expect(parseAuthorization("ship")?.kind).toBe("ship");
-    expect(parseAuthorization("drill tok-12345678")?.tokenHash).toMatch(/^[0-9a-f]{16}$/);
-    expect(parseAuthorization("drill")).toBeNull();
-    expect(parseAuthorization("merge")).toBeNull();
+  test("authorization (0.1.2): the token's sha256, the pull request, its head and the expiry; never a token", () => {
+    const a = parseAuthorization(AUTH("x"))!;
+    expect(a.kind).toBe("ship");
+    expect(a.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(a.pr).toBe(46);
+    expect(a.head).toMatch(/^[0-9a-f]{40}$/);
+    expect(a.expires).toBe(T0 + 3_600_000);
+    expect(parseAuthorization(AUTH("x", "drill"))?.kind).toBe("drill");
+    const h = "a".repeat(64), head = "b".repeat(40);
+    expect(parseAuthorization(`ship sha256=${h} pr=46 head=${head} expires=1795000000`)?.expires).toBe(1795000000_000);
+    expect(parseAuthorization(`ship expires=1795000000 head=${head} pr=46 sha256=${h}`)?.pr).toBe(46);   // any order
+    for (const bad of ["ship", "drill tok-12345678", "ship ship1.abc.def", `merge sha256=${h} pr=46 head=${head} expires=1795000000`,
+      `ship sha256=${h.slice(1)} pr=46 head=${head} expires=1795000000`, `ship sha256=${h.toUpperCase()} pr=46 head=${head} expires=1795000000`,
+      `ship sha256=${h} pr=0 head=${head} expires=1795000000`, `ship sha256=${h} pr=46 head=${head.slice(2)} expires=1795000000`,
+      `ship sha256=${h} pr=46 head=${head} expires=soon`, `ship sha256=${h} pr=46 pr=47 head=${head}`,
+      `ship sha256=${h} pr=46 head=${head} expires=1795000000 token=ship1.x.y`])
+      expect([bad, parseAuthorization(bad)]).toEqual([bad, null]);
   });
 });
 
@@ -173,7 +197,7 @@ describe("the watch", () => {
     await r.poll(); expect(r.a().trigger?.kind).toBe("health");
   });
   test("the health grace: failures in the first seconds after the start don't count", async () => {
-    const r = rig({ opts: { health_grace_s: 180 } }); r.register(); await r.poll(); r.f.healthy = false; r.install(); await r.poll(5);
+    const r = rig({ opts: { health_grace_s: 180 } }); r.register(); await r.poll(); r.install(); await r.poll(); r.f.healthy = false; await r.poll(4);
     expect(r.a().status).toBe("watching");
     await r.poll(4); expect(r.a().trigger?.kind).toBe("health");
   });
@@ -225,10 +249,12 @@ describe("the restore", () => {
     expect(Object.keys(r.k.st.attempts)).toEqual(["a1"]);
     expect(r.logs.some((l) => l.startsWith("unregistered"))).toBe(false);
   });
-  test("a restart while restoring: the restore isn't started twice, only reconciled and confirmed", async () => {
+  test("a restart while restoring: the restore isn't started twice, only reconciled (the App seen down, then back) and confirmed", async () => {
     const r = rig(); r.register(); await r.poll(); r.install(); await r.poll(); r.verdict("FAIL");
-    const st = JSON.parse(JSON.stringify(r.k.st)); st.attempts.a1.restore.inflight = true;
-    const r2 = rig({ saved: st }); r2.f.app.version = "0.16.0";
+    const st = JSON.parse(JSON.stringify(r.k.st)); Object.assign(st.attempts.a1.restore, { inflight: true, tries: 1, sentAt: r.now });
+    const r2 = rig({ saved: st }); r2.f.app.version = "0.17.0"; r2.f.app.state = "stopped";
+    await r2.poll(2);
+    r2.f.app.version = "0.16.0"; r2.f.app.state = "started";
     await r2.poll(ROLL);
     expect(r2.restores).toEqual([]);
     expect(r2.a().status).toBe("rolled back");
@@ -295,7 +321,7 @@ describe("the Healthchecks queue", () => {
     expect(r.k.st.outstanding[CAIN]).toBe(true);
     await r.poll(3);
     expect(r.k.st.outstanding[CAIN]).toBeUndefined();
-    const last = r.pings.filter((p) => p.url.startsWith("https://hc-ping.example/failed")).at(-1)!;
+    const last = r.pings.filter((p) => p.url.startsWith("https://hc-ping.example/failed") && !p.url.endsWith("/log")).at(-1)!;
     expect(last.url).toBe("https://hc-ping.example/failed");
   });
   test("every rollback pages the phone: a fail ping with the line when it starts, the success ping with the line once confirmed", async () => {
@@ -317,7 +343,7 @@ describe("the Healthchecks queue", () => {
     expect(r.a().status).toBe("rolled back");
     expect(r.k.st.queue.map((q) => q.kind)).toEqual(["rolling back", "rolled back"]);
     r.f.pingOk = true; r.advance(10 * 60_000); await r.poll();
-    const lines = r.pings.filter((p) => p.url.startsWith("https://hc-ping.example/failed")).map((p) => p.url.endsWith("/fail") ? "fail" : "ok");
+    const lines = r.pings.filter((p) => p.url.startsWith("https://hc-ping.example/failed") && !p.url.endsWith("/log")).map((p) => p.url.endsWith("/fail") ? "fail" : "ok");
     expect(lines.slice(-2)).toEqual(["fail", "ok"]);
     expect(r.k.st.queue).toEqual([]);
   });
@@ -336,7 +362,7 @@ describe("the Healthchecks queue", () => {
 describe("drills and the armed record", () => {
   async function drill(r: ReturnType<typeof rig>, id: string, how: "verdict" | "exit") {
     r.f.app.version = "0.16.0"; r.f.app.state = "started";
-    r.register({ id, authorization: "drill tap-token-123456" }); await r.poll();
+    r.register({ id, authorization: AUTH(id, "drill") }); await r.poll();
     r.install(how === "exit" ? "error" : "started"); await r.poll();
     if (how === "verdict") r.k.verdict(CAIN, { app: CAIN, version: "0.17.0", attempt: id, result: "FAIL", reason: "drill" });
     await r.poll(ROLL);
@@ -363,7 +389,8 @@ describe("drills and the armed record", () => {
   test("an options change, a new probe hash, unset Healthchecks URLs, 60 days or a rewind drop the armed record", async () => {
     const armed = async () => { const r = rig(); await drill(r, "d1", "verdict"); await drill(r, "d2", "exit"); expect(r.k.armedView(CAIN).armed).toBe(true); return r; };
     let r = await armed(); r.f.options.health_grace_s = 60; await r.poll(); expect(r.k.armedView(CAIN).armed).toBe(false);
-    r = await armed(); r.f.options.hc_done = ""; await r.poll(); expect(r.k.armedView(CAIN).armed).toBe(false);
+    r = await armed(); r.f.options.hc_done = "https://hc-ping.example/done2"; await r.poll(); expect(r.k.armedView(CAIN).armed).toBe(false);
+    r = await armed(); r.f.options.hc_failed = "https://hc-ping.example/failed2"; await r.poll(); expect(r.k.armedView(CAIN).armed).toBe(false);
     r = await armed(); r.register({ id: "a9", probe_hash: "ffffffffffffffff" }); await r.poll(); expect(r.k.armedView(CAIN).armed).toBe(false);
     r = await armed(); r.advance(61 * 86_400_000); await r.poll(); expect(r.k.armedView(CAIN).armed).toBe(false);
     r = await armed();
@@ -407,108 +434,146 @@ describe("options", () => {
   });
 });
 
-// -- 0.1.1: the first review's fixes ---------------------------------------------------------------
+// -- 0.1.1 and 0.1.2: the review fixes -------------------------------------------------------------
 async function failed(r: ReturnType<typeof rig>) { r.register(); await r.poll(); r.install(); await r.poll(); r.verdict("FAIL"); }
 async function drillOf(r: ReturnType<typeof rig>, id: string, how: "verdict" | "exit") {
   r.f.app.version = "0.16.0"; r.f.app.state = "started";
-  r.register({ id, authorization: "drill tap-token-123456" }); await r.poll();
+  r.register({ id, authorization: AUTH(id, "drill") }); await r.poll();
   r.install(how === "exit" ? "error" : "started"); await r.poll();
   if (how === "verdict") r.k.verdict(CAIN, { app: CAIN, version: "0.17.0", attempt: id, result: "FAIL", reason: "drill" });
   await r.poll(ROLL);
   expect(r.a(id).status).toBe("rolled back");
 }
-async function armedRig() { const r = rig(); await drillOf(r, "d1", "verdict"); await drillOf(r, "d2", "exit"); expect(r.k.armedView(CAIN).armed).toBe(true); return r; }
+async function armedRig(opts?: any) { const r = rig({ opts }); await drillOf(r, "d1", "verdict"); await drillOf(r, "d2", "exit"); expect(r.k.armedView(CAIN).armed).toBe(true); return r; }
+const LIMIT_POLLS = RESTORE_LIMIT_MS / POLL_MS + 2;
 
-describe("one restore job per attempt: the reconcile", () => {
+describe("the restore is sent again only when the first provably never ran (0.1.2)", () => {
   test("the job id in the answer is saved before anything else", async () => {
-    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-1" }); r.f.jobs = { found: true, uuid: "job-1", done: false, errors: 0 };
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-x" }); r.f.jobs["job-x"] = { found: true, uuid: "job-x", done: false, errors: 0 };
     await failed(r); await r.poll();
-    expect(r.saved!.attempts.a1.restore!.job).toBe("job-1");
-    expect(r.logs.some((l) => l.includes("running as job job-1"))).toBe(true);
+    expect(r.saved!.attempts.a1.restore!.job).toBe("job-x");
+    expect(r.logs.some((l) => l.includes("running as job job-x"))).toBe(true);
   });
-  test("a timeout, then the job seen running, then done: never sent twice, and confirmed", async () => {
-    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" }); r.f.jobs = { found: false };
-    await failed(r); await r.poll();
-    expect(r.restores.length).toBe(1);
-    expect(r.logs.some((l) => l.includes("got no answer (TimeoutError); reconciling"))).toBe(true);
-    r.f.jobs = { found: true, uuid: "job-7", done: false, errors: 0 }; await r.poll(4);
-    expect(r.a().status).toBe("restoring");
-    expect(r.a().restore!.job).toBe("job-7");
-    r.f.jobs = { found: true, uuid: "job-7", done: true, errors: 0 }; r.f.app.version = "0.16.0"; r.f.app.state = "started";
-    await r.poll(ROLL);
-    expect(r.a().status).toBe("rolled back");
-    expect(r.restores.length).toBe(1);
-  });
-  test("a job seen ended with errors and the App not back: the restore is sent again", async () => {
-    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
-    await failed(r); await r.poll();
-    r.f.jobs = { found: true, uuid: "job-2", done: true, errors: 1 }; await r.poll();
-    expect(r.logs.some((l) => l.includes("ended without restoring (1 error)"))).toBe(true);
-    await r.poll(3 + ROLL);
-    expect(r.restores.length).toBe(2);
-    expect(r.a().status).toBe("rolled back");
-  });
-  test("a job ended with errors but the App back at from_version counts as landed, not sent again", async () => {
-    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TypeError" });
-    await failed(r); await r.poll();
-    r.f.jobs = { found: true, uuid: "job-3", done: true, errors: 2 }; r.f.app.version = "0.16.0"; r.f.app.state = "started";
-    await r.poll(ROLL);
-    expect(r.restores.length).toBe(1);
-    expect(r.a().status).toBe("rolled back");
-  });
-  test("the job unknown and the App not back: nothing sent again, unresolved at the limit, the owner paged", async () => {
-    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" }); r.f.jobs = { found: false };
-    await failed(r);
-    r.f.jobs = null;                                 // the jobs list can't be read either, for a while
-    await r.poll(6);
-    r.f.jobs = { found: false };
-    await r.poll(RESTORE_LIMIT_MS / POLL_MS);
-    expect(r.restores.length).toBe(1);
-    expect(r.a().status).toBe("unresolved");
-    expect(r.logs.some((l) => l.startsWith("a1: unresolved ("))).toBe(true);
-    expect(r.pings.some((p) => p.url.endsWith("/failed/fail") && p.body.includes("can't tell whether its rollback"))).toBe(true);
-    // the next start reconciles again: the job is found done, so it goes on to the confirm window
-    const st = JSON.parse(JSON.stringify(r.k.st));
-    const r2 = rig({ saved: st }); r2.f.app.version = "0.17.0";
-    expect(r2.logs.some((l) => l.startsWith("reconciling a1"))).toBe(true);
-    r2.f.jobs = { found: true, uuid: "job-9", done: true, errors: 0 }; r2.f.onRestore();
-    await r2.poll(ROLL);
-    expect(r2.a().status).toBe("rolled back");
-    expect(r2.restores).toEqual([]);
-  });
-  test("still unknown at the next start: it stays unresolved, nothing is sent", async () => {
-    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
-    await failed(r); await r.poll(RESTORE_LIMIT_MS / POLL_MS + 2);
-    expect(r.a().status).toBe("unresolved");
-    const r2 = rig({ saved: JSON.parse(JSON.stringify(r.k.st)) }); r2.f.app.version = "0.17.0"; r2.f.app.state = "error";
-    await r2.poll(3);
-    expect(r2.a().status).toBe("unresolved");
-    expect(r2.restores).toEqual([]);
-    expect(r2.logs.some((l) => l.includes("still unresolved at this start"))).toBe(true);
-  });
-  test("a restart in the middle of the call: reconciled from the job, never sent again", async () => {
-    const r = rig(); await failed(r);
-    const st = JSON.parse(JSON.stringify(r.k.st)); Object.assign(st.attempts.a1.restore, { inflight: true, tries: 1, sentAt: r.now });
-    const r2 = rig({ saved: st }); r2.f.app.version = "0.17.0"; r2.f.app.state = "stopped";
-    r2.f.jobs = { found: true, uuid: "job-4", done: false, errors: 0 }; await r2.poll(3);
-    expect(r2.restores).toEqual([]);
-    expect(r2.a().restore!.job).toBe("job-4");
-    r2.f.jobs = { found: true, uuid: "job-4", done: true, errors: 0 }; r2.f.onRestore();
-    await r2.poll(ROLL);
-    expect(r2.a().status).toBe("rolled back");
-    expect(r2.restores).toEqual([]);
-  });
-  test("a refusal the Supervisor answered ended the request: it may be sent again", async () => {
+  test("an explicit error answer (nothing executed) sends it again", async () => {
     const r = rig(); r.f.restoreQueue.push({ kind: "refused", retry: true, why: "500 boom" });
     await failed(r); await r.poll(3 + ROLL);
     expect(r.restores.length).toBe(2);
     expect(r.a().status).toBe("rolled back");
   });
+  test("the job named by the answer's id, seen ended with errors with the App not back: sent again", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-e" }); r.f.jobs["job-e"] = { found: true, uuid: "job-e", done: true, errors: 1 };
+    await failed(r); await r.poll(2);
+    expect(r.logs.some((l) => l.includes("the restore job job-e ended without restoring (1 error, 0fcc2575_cain at 0.17.0)"))).toBe(true);
+    await r.poll(3 + ROLL);
+    expect(r.restores.length).toBe(2);
+    expect(r.a().status).toBe("rolled back");
+  });
+  test("the job by its id ended with errors but the App at from_version: never sent again", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-e" }); r.f.jobs["job-e"] = { found: true, uuid: "job-e", done: true, errors: 2 };
+    await failed(r); r.f.app.version = "0.16.0"; r.f.app.state = "started";
+    await r.poll(LIMIT_POLLS);
+    expect(r.restores.length).toBe(1);
+    expect(r.a().status).toBe("unresolved");
+  });
+  test("no job id in the answer, and a job listed for the same backup: never sent again, and that job never looked at", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: null });
+    r.f.jobs["other"] = { found: true, uuid: "other", done: true, errors: 1 };
+    await failed(r); await r.poll(LIMIT_POLLS);
+    expect(r.restores.length).toBe(1);
+    expect(r.jobCalls).toEqual([]);
+    expect(r.a().status).toBe("unresolved");
+    expect(r.logs.some((l) => l.includes("gave no job id"))).toBe(true);
+  });
+  test("no answer at all: never sent again on that alone", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
+    await failed(r); await r.poll(LIMIT_POLLS);
+    expect(r.restores.length).toBe(1);
+    expect(r.a().status).toBe("unresolved");
+  });
+  test("version plus started alone never counts as landed; the App seen down after the call, then back, does", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
+    await failed(r); await r.poll();
+    r.f.app.version = "0.16.0"; r.f.app.state = "started";    // back, but never seen down after the call
+    await r.poll(LIMIT_POLLS);
+    expect(r.a().status).toBe("unresolved");
+    const r2 = rig(); r2.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
+    await failed(r2); await r2.poll();
+    r2.f.app.state = "stopped"; await r2.poll();
+    r2.f.app.version = "0.16.0"; r2.f.app.state = "started"; await r2.poll(ROLL);
+    expect(r2.a().status).toBe("rolled back");
+    expect(r2.restores.length).toBe(1);
+  });
+  test("the job by its id still running, then done: landed, never sent twice", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-7" }); r.f.jobs["job-7"] = { found: true, uuid: "job-7", done: false, errors: 0 };
+    await failed(r); await r.poll(4);
+    expect(r.a().status).toBe("restoring");
+    expect(r.logs.filter((l) => l.includes("job job-7 is still running")).length).toBe(1);   // logged once, not every poll
+    r.f.jobs["job-7"] = { found: true, uuid: "job-7", done: true, errors: 0 }; r.f.onRestore();
+    await r.poll(ROLL);
+    expect(r.a().status).toBe("rolled back");
+    expect(r.restores.length).toBe(1);
+  });
+  test("a restart in the middle of the call: fenced, reconciled from the App's states only", async () => {
+    const r = rig(); await failed(r);
+    const st = JSON.parse(JSON.stringify(r.k.st)); Object.assign(st.attempts.a1.restore, { inflight: true, tries: 1, sentAt: r.now });
+    const r2 = rig({ saved: st }); r2.f.app.version = "0.17.0"; r2.f.app.state = "started";
+    await r2.poll(LIMIT_POLLS + 4);
+    expect(r2.restores).toEqual([]);
+    expect(r2.a().status).toBe("unresolved");
+  });
+});
+
+describe("unresolved: fenced, reconciled on every poll, and told once known (0.1.2)", () => {
+  test("reconciled while the keeper runs: the App seen down and back moves it to rolled back, with one follow-up line", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
+    await failed(r); await r.poll(LIMIT_POLLS);
+    expect(r.a().status).toBe("unresolved");
+    const first = r.pings.findIndex((p) => p.url.endsWith("/failed/fail") && p.body.includes("can't tell whether its rollback"));
+    expect(first).toBeGreaterThanOrEqual(0);
+    await r.poll(10);
+    expect(r.a().status).toBe("unresolved");
+    expect(r.logs.filter((l) => l.startsWith("a1: still unresolved")).length).toBe(1);
+    r.f.app.state = "stopped"; await r.poll();
+    r.f.app.version = "0.16.0"; r.f.app.state = "started"; await r.poll(ROLL);
+    expect(r.a().status).toBe("rolled back");
+    expect(r.restores.length).toBe(1);
+    const follow = r.pings.filter((p, i) => i > first && p.body.startsWith("Keeper rolled back Cain"));
+    expect(follow.length).toBe(1);
+  });
+  test("the job by its id found ended with errors later, the App not back: gave up, one follow-up line, nothing sent", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-u" }); r.f.jobs["job-u"] = { found: true, uuid: "job-u", done: false, errors: 0 };
+    await failed(r); await r.poll(LIMIT_POLLS);
+    expect(r.a().status).toBe("unresolved");
+    r.f.jobs["job-u"] = { found: true, uuid: "job-u", done: true, errors: 1 }; await r.poll(3);
+    expect(r.a().status).toBe("gave up");
+    expect(r.restores.length).toBe(1);
+    expect(r.pings.filter((p) => p.body.startsWith("Keeper gave up on Cain")).length).toBe(1);
+  });
+  test("across a restart and far past the limit it stays fenced: nothing is ever sent", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "unknown", why: "TimeoutError" });
+    await failed(r); await r.poll(LIMIT_POLLS);
+    expect(r.a().status).toBe("unresolved");
+    const r2 = rig({ saved: JSON.parse(JSON.stringify(r.k.st)) }); r2.f.app.version = "0.17.0"; r2.f.app.state = "error";
+    expect(r2.logs.some((l) => l.startsWith("reconciling a1"))).toBe(true);
+    r2.advance(3 * 3_600_000);
+    await r2.poll(3 * LIMIT_POLLS);
+    expect(r2.a().status).toBe("unresolved");
+    expect(r2.restores).toEqual([]);
+  });
+  test("the job by its id found finished after a restart: on to the confirm window and rolled back", async () => {
+    const r = rig(); r.f.restoreQueue.push({ kind: "started", job: "job-9" }); r.f.jobs["job-9"] = { found: true, uuid: "job-9", done: false, errors: 0 };
+    await failed(r); await r.poll(LIMIT_POLLS);
+    expect(r.a().status).toBe("unresolved");
+    const r2 = rig({ saved: JSON.parse(JSON.stringify(r.k.st)) }); r2.f.jobs["job-9"] = { found: true, uuid: "job-9", done: true, errors: 0 }; r2.f.onRestore();
+    await r2.poll(ROLL);
+    expect(r2.a().status).toBe("rolled back");
+    expect(r2.restores).toEqual([]);
+  });
 });
 
 describe("the restart-loop rule after a restore", () => {
   test("started, then stopped or error, more than twice in the confirm window: gave up", async () => {
-    const r = rig(); await failed(r); await r.poll();
+    const r = rig(); await failed(r); await r.poll(2);
     expect(r.a().restore!.called).toBe(true);
     for (const st of ["started", "stopped", "started", "error", "started", "stopped"]) { r.f.app.state = st; await r.poll(); }
     expect(r.a().status).toBe("gave up");
@@ -516,14 +581,87 @@ describe("the restart-loop rule after a restore", () => {
     expect(r.pings.some((p) => p.url.endsWith("/fail") && p.body.includes("keeps restarting"))).toBe(true);
   });
   test("one or two stops that settle still roll back", async () => {
-    const r = rig(); await failed(r); await r.poll();
+    const r = rig(); await failed(r); await r.poll(2);
     for (const st of ["started", "stopped", "started", "error", "started"]) { r.f.app.state = st; await r.poll(); }
     await r.poll(ROLL);
     expect(r.a().status).toBe("rolled back");
   });
 });
 
-describe("a registration can't change the keeper's settings, and is spent once", () => {
+describe("the confirm window's one extension (0.1.2)", () => {
+  test("started and alive but not ready at the end of the window: extended once by 5 minutes, then rolled back once ready", async () => {
+    const r = rig(); await failed(r); await r.poll(2);
+    r.f.healthy = false; r.f.alive = true;
+    await r.poll(CONFIRM_MS / POLL_MS + 1);
+    expect(r.a().status).toBe("restoring");
+    expect(r.logs.some((l) => l.includes("extended once, by 5 minutes"))).toBe(true);
+    r.f.healthy = true; await r.poll(CONFIRM_MS / POLL_MS + 1);
+    expect(r.a().status).toBe("rolled back");
+  });
+  test("still not ready after the extension: gave up; never extended twice", async () => {
+    const r = rig(); await failed(r); await r.poll(2);
+    r.f.healthy = false;
+    await r.poll(2 * CONFIRM_MS / POLL_MS + 3);
+    expect(r.a().status).toBe("gave up");
+    expect(r.a().why).toContain("10 minutes");
+    expect(r.logs.filter((l) => l.includes("extended once")).length).toBe(1);
+  });
+  test("not alive either: no extension", async () => {
+    const r = rig(); await failed(r); await r.poll(2);
+    r.f.healthy = false; r.f.alive = false;
+    await r.poll(CONFIRM_MS / POLL_MS + 2);
+    expect(r.a().status).toBe("gave up");
+  });
+});
+
+describe("readiness during the watch (0.1.2)", () => {
+  test("failures count only after one 200 since the App's start; an App never ready fails at the end, not before", async () => {
+    const r = rig(); r.register(); await r.poll(); r.f.healthy = false; r.install(); await r.poll(10);
+    expect(r.a().status).toBe("watching");
+    r.verdict("PASS"); await r.poll(WATCH_MS / POLL_MS);
+    expect(r.a().trigger?.kind).toBe("watch-end");
+  });
+  test("a restart of the App resets it: failures after the restart wait for a new 200", async () => {
+    const r = rig(); r.register(); await r.poll(); r.install(); await r.poll();
+    r.f.app.state = "stopped"; await r.poll(); r.f.app.state = "started"; r.f.healthy = false; await r.poll(5);
+    expect(r.a().status).toBe("watching");
+    r.f.healthy = true; await r.poll(); r.f.healthy = false; await r.poll(3);
+    expect(r.a().trigger?.kind).toBe("health");
+  });
+});
+
+describe("the authorization at registration (0.1.2)", () => {
+  for (const [name, over, why] of [
+    ["the old plain form", { authorization: "ship" }, "isn't \"ship\" or \"drill\""],
+    ["a token in place of its hash", { authorization: "ship ship1.abcdefghijklmnopqrstuvwxyz.sig" }, "isn't \"ship\" or \"drill\""],
+    ["an expiry that has passed", { authorization: AUTH("a1", "ship", { exp: T0 - 1000 }) }, "has expired"],
+    ["an expiry further off than a token lasts", { authorization: AUTH("a1", "ship", { exp: T0 + 3 * 3_600_000 }) }, "further off"],
+  ] as const) {
+    test(`${name} is refused as unprotected, and nothing is restored for it`, async () => {
+      const r = rig(); r.register(over); await r.poll();
+      expect(r.a().status).toBe("unprotected");
+      expect(r.logs.some((l) => l.startsWith("refusing a1: ") && l.includes(why))).toBe(true);
+      r.install("error"); await r.poll(5);
+      expect(r.restores).toEqual([]);
+    });
+  }
+  test("the token hash is kept with the spent record, and no token is anywhere in the state", async () => {
+    const r = rig(); r.register(); await r.poll();
+    const h = createHash("sha256").update("tok-a1").digest("hex");
+    expect(r.k.st.spent.find((x) => x.id === "a1")?.auth).toBe(h);
+    expect(r.a().authHash).toBe(h);
+    expect(JSON.stringify(r.saved)).not.toContain("tok-a1");
+  });
+  test("a registration for another version than the one installed ends as install never started, with no restore", async () => {
+    const r = rig(); r.register({ install_deadline: new Date(T0 + 60_000).toISOString() }); await r.poll();
+    r.f.app.version = "0.17.5"; r.f.app.state = "error";
+    r.advance(2 * 60_000); await r.poll(5);
+    expect(r.a().status).toBe("never started");
+    expect(r.restores).toEqual([]);
+  });
+});
+
+describe("a registration can't change the keeper's settings, and counts once", () => {
   for (const [name, over] of [
     ["drops the tokens", { tokens: [] }],
     ["changes Cain's token", { tokens: [`${CAIN}=someone-elses-token-0123`] }],
@@ -537,62 +675,141 @@ describe("a registration can't change the keeper's settings, and is spent once",
       expect(r.logs).toContain("refusing a1: the registration changed the keeper's own settings");
       expect(r.k.appOfToken(TOKEN)).toBe(CAIN);
       expect(r.k.opts.hc_done).toBe("https://hc-ping.example/done");
-      expect(r.k.opts.hc_failed).toBe("https://hc-ping.example/failed");
+      expect(r.k.alertUrl(CAIN)).toBe("https://hc-ping.example/failed");
       expect(r.pings.some((p) => p.url === "https://hc-ping.example/failed/fail" && p.body.includes("changed the keeper's own settings"))).toBe(true);
       await r.poll(3);
-      expect(r.k.appOfToken(TOKEN)).toBe(CAIN);           // still, while that registration stands in the options
-      expect(r.clears).toEqual([]);
+      expect(r.k.appOfToken(TOKEN)).toBe(CAIN);
     });
   }
-  test("the same settings with a new registration are accepted; a settings change with no registration is the owner's and taken", async () => {
+  test("the same settings with a new registration are accepted; a token change with no registration is the owner's and taken", async () => {
     const r = rig(); await r.poll(); r.register(); await r.poll();
     expect(r.a().status).toBe("accepted");
     r.f.options.tokens = [`${CAIN}=a-new-token-0123456789`]; await r.poll();
     expect(r.k.appOfToken("a-new-token-0123456789")).toBe(CAIN);
   });
-  test("accepted: the authorization is spent and cleared from the keeper's options", async () => {
-    const r = rig(); r.register({ authorization: "ship tap-token-abcdefgh" }); await r.poll();
-    expect(r.clears).toEqual(["a1"]);
-    expect(r.f.options.attempt.authorization).toBe("");
-    expect(r.k.st.spent.find((x) => x.id === "a1")?.cleared).toBe(true);
-    expect(JSON.stringify(r.saved)).not.toContain("tap-token-abcdefgh");
-  });
-  test("a spent registration written again is refused as a replay, once", async () => {
-    const r = rig(); r.register(); const first = { ...r.f.options.attempt }; await r.poll();
-    r.f.options.attempt = first; await r.poll(3);
-    expect(r.logs.filter((l) => l === "refusing a1: a replay: that registration was spent and cleared").length).toBe(1);
-    expect(r.logs.filter((l) => l.startsWith("accepting")).length).toBe(1);
-    r.f.options.attempt = { ...first, to_version: "0.18.0" }; await r.poll();
-    expect(r.logs).toContain("refusing a1: a replay: that id was spent with other fields");
-    expect(r.pings.filter((p) => p.body.includes("a replay")).length).toBe(2);
-    expect(r.a().status).toBe("accepted");                 // the attempt it was spent for is untouched
-  });
-  test("when the Supervisor refuses the clear, the spent registration left in the options isn't a replay", async () => {
-    const r = rig(); r.f.clearOk = false; r.register(); await r.poll(3);
-    expect(r.logs.some((l) => l.startsWith("couldn't clear a1 from the keeper's options (403 refused)"))).toBe(true);
+  test("an accepted registration left in the options is ignored silently: no replay line, no ping", async () => {
+    const r = rig(); r.register(); await r.poll();
+    const before = r.pings.filter((p) => !p.body.startsWith("keeper ")).length;
+    await r.poll(20);
     expect(r.logs.some((l) => l.includes("replay"))).toBe(false);
-    r.f.options.attempt = { ...r.f.options.attempt, backup_slug: "b7654321" }; await r.poll();
-    expect(r.logs).toContain("refusing a1: a replay: that id was spent with other fields");
+    expect(r.logs.filter((l) => l.startsWith("accepting")).length).toBe(1);
+    expect(r.pings.filter((p) => !p.body.startsWith("keeper ")).length).toBe(before);
+    expect(r.f.options.attempt.id).toBe("a1");             // the keeper never empties it
   });
-  test("a registration never drops the armed record (the options hash is over the static options only)", async () => {
+  test("the same id with other fields is a replay: refused once, reported once", async () => {
+    const r = rig(); r.register(); const first = { ...r.f.options.attempt }; await r.poll();
+    r.f.options.attempt = { ...first, to_version: "0.18.0" }; await r.poll(3);
+    expect(r.logs.filter((l) => l === "refusing a1: a replay: that id was spent with other fields").length).toBe(1);
+    expect(r.pings.filter((p) => p.body.includes("a replay")).length).toBe(1);
+    expect(r.a().status).toBe("accepted");                 // the attempt it was spent for is untouched
+    r.f.options.attempt = first; await r.poll(2);           // the accepted one again: silent
+    expect(r.pings.filter((p) => p.body.includes("a replay")).length).toBe(1);
+  });
+  test("the same authorization hash under another id is a replay: refused once, reported once", async () => {
+    const r = rig(); r.register(); await r.poll(); r.install(); await r.poll(); r.verdict("PASS"); await r.poll(WATCH_MS / POLL_MS + 1);
+    expect(r.a().status).toBe("passed");
+    r.f.app.version = "0.16.0";
+    r.register({ id: "a2", authorization: AUTH("a1") }); await r.poll(4);
+    expect(r.a("a2").status).toBe("unprotected");
+    expect(r.logs.filter((l) => l === "refusing a2: a replay: that authorization was spent under a1").length).toBe(1);
+    expect(r.pings.filter((p) => p.body.includes("a replay")).length).toBe(1);
+  });
+  test("one Ship tap's hash for a second App (one registration per App) isn't a replay", async () => {
+    const H = "0fcc2575_harness";
+    const r = rig({ opts: { watch: [CAIN, H], hc_failed: "https://hc-ping.example/failed" } }); r.register(); await r.poll();
+    r.register({ id: "h1", app: H, authorization: AUTH("a1") }); await r.poll();
+    expect(r.logs.some((l) => l.startsWith("refusing h1: a replay"))).toBe(false);
+  });
+  test("a registration never drops the drills (the options hash is over the static options only)", async () => {
     const r = await armedRig();
     const before = r.k.armedView(CAIN).binding;
     r.register({ id: "a7" }); await r.poll();
     expect(r.a("a7").status).toBe("accepted");
     expect(r.k.armedView(CAIN).armed).toBe(true);
     expect(r.k.armedView(CAIN).binding).toEqual(before);
-    r.register({ id: "a8", tokens: undefined }); r.f.options.tokens = []; await r.poll();   // a clobbering one: refused, still armed
+    r.register({ id: "a8" }); r.f.options.tokens = [`${CAIN}=someone-elses-token-0123`]; await r.poll();   // a clobbering one: refused, still armed
     expect(r.a("a8").status).toBe("unprotected");
     expect(r.k.armedView(CAIN).armed).toBe(true);
   });
 });
 
-describe("a protected backup is refused", () => {
-  test("protected true: unprotected before any accepting line, with its why", async () => {
-    const r = rig({ backup: { protected: true } }); r.register(); await r.poll();
+describe("the kept settings survive a wiped options file (0.1.2)", () => {
+  test("a start with blank options uses the kept tokens and URLs, with one line logged", async () => {
+    const r = rig(); await r.poll();
+    expect(r.saved!.kept!.tokens[CAIN]).toBe(TOKEN);
+    const st = JSON.parse(JSON.stringify(r.k.st));
+    const r2 = rig({ saved: st, opts: { tokens: [], hc_done: "", hc_failed: [] } });
+    expect(r2.k.appOfToken(TOKEN)).toBe(CAIN);
+    expect(r2.k.opts.hc_done).toBe("https://hc-ping.example/done");
+    expect(r2.k.alertUrl(CAIN)).toBe("https://hc-ping.example/failed");
+    await r2.poll(5);
+    expect(r2.logs.filter((l) => l === "the options lack tokens, hc_done, hc_failed: the ones kept in /data are used").length).toBe(1);
+    expect(r2.k.appOfToken(TOKEN)).toBe(CAIN);
+    expect(r2.k.armable()).toBe(true);
+  });
+  test("whatever the options carry is kept", async () => {
+    const r = rig(); await r.poll();
+    r.f.options.hc_done = "https://hc-ping.example/done-new"; await r.poll();
+    expect(r.saved!.kept!.hc_done).toBe("https://hc-ping.example/done-new");
+  });
+  test("a registration arriving with the settings missing is still refused", async () => {
+    const r = rig(); await r.poll();
+    r.f.options.tokens = []; r.register(); await r.poll();
     expect(r.a().status).toBe("unprotected");
-    expect(r.logs.some((l) => l.startsWith("accepting"))).toBe(false);
-    expect(r.logs.some((l) => l.startsWith("refusing a1: its backup is password-protected"))).toBe(true);
+    expect(r.k.appOfToken(TOKEN)).toBe(CAIN);
+  });
+});
+
+describe("the keeper never writes options (0.1.2)", () => {
+  test("a whole cycle through the real Supervisor calls over a recording fake: no write but the restore", async () => {
+    const calls: { method: string; path: string; body: any }[] = [];
+    const app = { version: "0.16.0", state: "started" };
+    const options: any = { watch: [CAIN], health: [`${CAIN}=c:8098`], tokens: [`${CAIN}=${TOKEN}`], hc_done: "https://hc/done", hc_failed: ["https://hc/failed"], health_grace_s: 0,
+      attempt: { id: "a1", app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup_slug: "b1", install_deadline: new Date(T0 + 1_800_000).toISOString(), authorization: AUTH("a1"), probe_hash: HASH } };
+    let job: any = null;
+    const http = async (url: string, init: RequestInit) => {
+      const path = url.replace("http://supervisor", "");
+      calls.push({ method: String(init.method), path, body: init.body ? JSON.parse(String(init.body)) : undefined });
+      const ok = (data: any) => new Response(JSON.stringify({ result: "ok", data }), { status: 200 });
+      if (path === "/addons/self/info") return ok({ slug: "0fcc2575_keeper", version: "0.1.2", options });
+      if (path === `/addons/${CAIN}/info`) return ok(app);
+      if (path === "/backups/b1/info") return ok({ homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: false });
+      if (path === "/backups/b1/restore/partial") { job = { name: "x", uuid: "j1", done: true, errors: [], child_jobs: [] }; app.version = "0.16.0"; app.state = "started"; return ok({ job_id: "j1" }); }
+      if (path === "/jobs/info") return ok({ jobs: job ? [job] : [] });
+      return new Response(JSON.stringify({ result: "error" }), { status: 404 });
+    };
+    const sup = supervisor("t", "http://supervisor", http);
+    let now = T0;
+    const k = new Keeper({ now: () => now, version: "0.1.2", self: "0fcc2575_keeper", appInfo: sup.appInfo, backupInfo: sup.backupInfo, restore: sup.restore, job: sup.job,
+      health: async () => true, live: async () => true, ping: async () => true, options: () => sup.selfOptions(), save: () => {}, log: () => {} }, null);
+    k.useOptions(options); k.start();
+    const poll = async (n: number) => { for (let i = 0; i < n; i++) { await k.poll(); now += POLL_MS; } };
+    await poll(1); expect(k.st.attempts.a1.status).toBe("accepted");
+    app.version = "0.17.0"; await poll(1);
+    k.verdict(CAIN, { app: CAIN, version: "0.17.0", attempt: "a1", result: "FAIL", reason: "x" });
+    await poll(ROLL);
+    expect(k.st.attempts.a1.status).toBe("rolled back");
+    const writes = calls.filter((c) => c.method !== "GET");
+    expect(writes.map((c) => `${c.method} ${c.path}`)).toEqual(["POST /backups/b1/restore/partial"]);
+    expect(writes[0].body).toEqual({ homeassistant: false, addons: [CAIN], folders: [], background: true });
+    expect(calls.some((c) => c.path.includes("options"))).toBe(false);
+  });
+  test("no code path names the options endpoint", () => {
+    for (const f of ["core.ts", "supervisor.ts", "main.ts", "server.ts"]) {
+      const src = readFileSync(join(import.meta.dir, "..", "rootfs", "opt", "keeper", f), "utf8");
+      expect([f, /addons\/self\/options|clearAttempt/.test(src)]).toEqual([f, false]);
+    }
+  });
+});
+
+describe("a backup must show protected false", () => {
+  test("protected true or missing: unprotected before any accepting line, with its why", async () => {
+    for (const backup of [{ protected: true }, { protected: undefined }]) {
+      const r = rig({ backup }); r.register(); await r.poll();
+      expect(r.a().status).toBe("unprotected");
+      expect(r.logs.some((l) => l.startsWith("accepting"))).toBe(false);
+      expect(r.logs.some((l) => l.startsWith("refusing a1: its backup isn't shown as made without a password"))).toBe(true);
+    }
   });
   test("protected false is accepted", async () => {
     const r = rig({ backup: { protected: false } }); r.register(); await r.poll();
@@ -600,37 +817,108 @@ describe("a protected backup is refused", () => {
   });
 });
 
-describe("arming needs a live alert path", () => {
-  test("/armed is armed only while a heartbeat was delivered in the last 10 minutes; a stale one drops the record", async () => {
+describe("alert checks per App (0.1.2)", () => {
+  const H = "0fcc2575_harness";
+  test("hc_failed as a single URL, a map or the list form", () => {
+    expect(parseOptions({ hc_failed: "https://x/a" }).hc_failed).toEqual({ "*": "https://x/a" });
+    expect(parseOptions({ hc_failed: { [CAIN]: "https://x/c" } }).hc_failed).toEqual({ [CAIN]: "https://x/c" });
+    expect(parseOptions({ hc_failed: ["https://x/a?k=v", `${CAIN}=https://x/c`] }).hc_failed).toEqual({ "*": "https://x/a?k=v", [CAIN]: "https://x/c" });
+    expect(parseOptions({ hc_failed: [] }).hc_failed).toEqual({});
+  });
+  test("each App's lines go to its own alert check, and a success ping clears only its own", async () => {
+    const r = rig({ opts: { hc_failed: [`${CAIN}=https://hc-ping.example/cain`, "https://hc-ping.example/rest"] } });
+    await failed(r); await r.poll(ROLL);
+    expect(r.a().status).toBe("rolled back");
+    const cain = r.pings.filter((p) => p.url.startsWith("https://hc-ping.example/cain") && !p.url.endsWith("/log"));
+    expect(cain.map((p) => p.url)).toEqual(["https://hc-ping.example/cain/fail", "https://hc-ping.example/cain"]);
+    expect(r.pings.some((p) => p.url.startsWith("https://hc-ping.example/rest") && !p.url.endsWith("/log"))).toBe(false);
+    expect(r.k.alertUrl(H)).toBe("https://hc-ping.example/rest");
+    r.k.st.outstanding[H] = true;                          // another App's incident stands
+    r.k.owner(CAIN, "x", "a Cain line", true); await r.poll(5);
+    expect(r.k.st.outstanding[H]).toBe(true);
+  });
+  test("not armable until every watched App has an alert check", () => {
+    const r = rig({ opts: { watch: [CAIN, H], hc_failed: [`${CAIN}=https://hc-ping.example/cain`] } });
+    expect(r.k.armable()).toBe(false);
+    const r2 = rig({ opts: { watch: [CAIN, H], hc_failed: [`${CAIN}=https://hc-ping.example/cain`, `${H}=https://hc-ping.example/h`] } });
+    expect(r2.k.armable()).toBe(true);
+  });
+  test("a non-paging log ping goes to each alert check every heartbeat period, and its delivery is kept", async () => {
+    const r = rig({ opts: { hc_failed: [`${CAIN}=https://hc-ping.example/cain`, "https://hc-ping.example/rest"] } });
+    await r.poll(2 * HC_HEARTBEAT_MS / POLL_MS);
+    for (const u of ["https://hc-ping.example/cain/log", "https://hc-ping.example/rest/log"])
+      expect([u, r.pings.filter((p) => p.url === u).length]).toEqual([u, 2]);
+    expect(Object.values(r.k.st.logDelivered).length).toBe(2);
+    expect(r.pings.some((p) => p.url.endsWith("/fail"))).toBe(false);
+  });
+});
+
+describe("/armed is computed on every read, from its five conditions (0.1.2)", () => {
+  test("not stored: the state has no armed record", async () => {
     const r = await armedRig();
-    const last = r.k.st.hcDelivered;
-    r.f.pingOk = false;
-    for (let i = 0; i < 2 * DELIVERY_MS / POLL_MS; i++) {
-      await r.k.poll();
-      expect([i, r.k.armedView(CAIN).armed]).toEqual([i, r.now - last <= DELIVERY_MS]);
-      r.advance(POLL_MS);
-    }
+    expect((r.saved as any).armed).toBeUndefined();
+  });
+  test("1. the Healthchecks URLs: an App with no alert check is not armed", async () => {
+    const r = await armedRig({ watch: [CAIN] });
+    r.k.opts = { ...r.k.opts, watch: [CAIN, "0fcc2575_harness"], hc_failed: { [CAIN]: "https://hc-ping.example/failed" } };
+    expect(r.k.armedView(CAIN).why).toContain("not armable");
+  });
+  test("2. the drills under the current binding: a new probe hash drops them", async () => {
+    const r = await armedRig(); r.register({ id: "a9", probe_hash: "ffffffffffffffff" }); await r.poll();
+    expect(r.k.armedView(CAIN).armed).toBe(false);
+    expect(r.k.armedView(CAIN).why).toContain("no drills on record");
+  });
+  test("3. the heartbeat: an outage reads as not armed and recovers by itself, the drills kept", async () => {
+    const r = await armedRig();
+    r.f.pingFails = (u) => u === "https://hc-ping.example/done";
+    await r.poll(DELIVERY_MS / POLL_MS + 2);
     expect(r.k.armedView(CAIN).armed).toBe(false);
     expect(r.k.armedView(CAIN).why).toContain("no heartbeat ping was delivered");
-    expect(r.k.st.armed[CAIN]).toBeUndefined();
-    expect(r.logs.some((l) => l.startsWith("disarmed for 0fcc2575_cain: no heartbeat ping was delivered"))).toBe(true);
+    expect(Object.keys(r.k.st.drills[CAIN] ?? {}).length).toBe(2);
+    r.f.pingFails = () => false; await r.poll(3);
+    expect(r.k.armedView(CAIN).armed).toBe(true);
   });
-  test("a heartbeat ping that wasn't delivered is tried again a minute later", async () => {
-    const r = rig(); r.f.pingOk = false; await r.poll(); r.f.pingOk = true; await r.poll(2);
-    expect(r.pings.filter((p) => p.body === "keeper heartbeat").length).toBe(2);
-    expect(r.k.delivered()).toBe(true);
+  test("4. each alert check's log ping: an outage of one reads as not armed and recovers", async () => {
+    const r = await armedRig();
+    r.f.pingFails = (u) => u.endsWith("/failed/log");
+    await r.poll(DELIVERY_MS / POLL_MS + 2);
+    expect(r.k.armedView(CAIN).why).toContain("log ping");
+    r.f.pingFails = () => false; await r.poll(3);
+    expect(r.k.armedView(CAIN).armed).toBe(true);
+  });
+  test("5. a fail ping waiting undelivered for more than 2 minutes: not armed until it goes", async () => {
+    const r = await armedRig();
+    r.f.pingFails = (u) => u.endsWith("/fail");
+    r.k.owner(CAIN, "x", "a line", true);
+    await r.poll(2);
+    expect(r.k.armedView(CAIN).armed).toBe(true);      // waiting, under 2 minutes
+    await r.poll(4);
+    expect(r.k.armedView(CAIN).why).toContain("waited undelivered");
+    r.f.pingFails = () => false; r.advance(10 * 60_000); await r.poll(2);
+    expect(r.k.armedView(CAIN).armed).toBe(true);
+  });
+  test("each read reflects the moment: a heartbeat older than 10 minutes reads as not armed with no poll between", async () => {
+    const r = await armedRig();
+    r.advance(DELIVERY_MS + 60_000);
+    expect(r.k.armedView(CAIN).armed).toBe(false);
   });
 });
 
 describe("the health address names its path", () => {
-  test("host:port/path asks that path; no path is /health; anything else isn't asked", () => {
+  test("host:port/path asks that path; no path is /health; anything else isn't asked; liveness is the host's /health", () => {
     expect(healthUrl("0fcc2575-cain:8098/ready")).toBe("http://0fcc2575-cain:8098/ready");
     expect(healthUrl("0fcc2575-cain:8098")).toBe("http://0fcc2575-cain:8098/health");
     expect(healthUrl("0fcc2575-cain:8098/ready?x=1")).toBeNull();
     expect(healthUrl("http://x:1/ready")).toBeNull();
+    expect(liveUrl("0fcc2575-cain:8098/ready")).toBe("http://0fcc2575-cain:8098/health");
     const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
     expect(cfg).toContain(`- "0fcc2575_cain=0fcc2575-cain:8098/ready"`);
     expect(parseOptions({ health: ["0fcc2575_cain=0fcc2575-cain:8098/ready"] }).health[CAIN]).toBe("0fcc2575-cain:8098/ready");
+  });
+  test("the options schema: authorization is no password field, hc_failed a list", () => {
+    const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
+    expect(cfg).toMatch(/^    authorization: str\?$/m);
+    expect(cfg).toMatch(/^  hc_failed:\n    - password$/m);
   });
 });
 
@@ -646,7 +934,7 @@ describe("the Supervisor calls", () => {
     };
     return { calls, sup: supervisor("t", "http://supervisor", http) };
   }
-  test("the restore is a background job: its id comes back; an error answer is refused; no answer is unknown", async () => {
+  test("the restore passes the background flag: its id comes back; an error answer is refused; no answer or a 2xx non-result is unknown", async () => {
     let f = fake({ "POST /backups/b1/restore/partial": { result: "ok", data: { job_id: "abc" } } });
     expect(await f.sup.restore("b1", CAIN)).toEqual({ kind: "started", job: "abc" });
     expect(f.calls[0].body).toEqual({ homeassistant: false, addons: [CAIN], folders: [], background: true });
@@ -654,25 +942,24 @@ describe("the Supervisor calls", () => {
     expect((await f.sup.restore("b1", CAIN)).kind).toBe("refused");
     f = fake({ "POST /backups/b1/restore/partial": new Error("timeout") });
     expect((await f.sup.restore("b1", CAIN)).kind).toBe("unknown");
+    f = fake({ "POST /backups/b1/restore/partial": { result: "weird" } });
+    expect((await f.sup.restore("b1", CAIN)).kind).toBe("unknown");
   });
-  test("the job is read from /jobs/info, by id or as the newest partial restore of that backup since the call", async () => {
+  test("the job is read from /jobs/info by its id only: a restore job of the same backup is never taken for it", async () => {
     const jobs = [{ name: "backup_manager_partial_restore", reference: "b1", uuid: "u1", done: false, errors: [], created: "2026-11-21T15:00:10+00:00", child_jobs: [
       { name: "x", reference: null, uuid: "u2", done: true, errors: [{ message: "e" }], created: "2026-11-21T15:00:11+00:00", child_jobs: [] }] }];
     const f = fake({ "GET /jobs/info": { result: "ok", data: { jobs } } });
-    expect(await f.sup.job("u2", "b1", 0)).toEqual({ found: true, uuid: "u2", done: true, errors: 1 });
-    expect(await f.sup.job(null, "b1", T0)).toEqual({ found: true, uuid: "u1", done: false, errors: 0 });
-    expect(await f.sup.job(null, "b1", T0 + 3_600_000)).toEqual({ found: false });
-    expect(await fake({}).sup.job("u1", "b1", 0)).toBeNull();
+    expect(await f.sup.job("u2")).toEqual({ found: true, uuid: "u2", done: true, errors: 1 });
+    expect(await f.sup.job("u-other")).toEqual({ found: false });
+    expect(await f.sup.job("")).toEqual({ found: false });
+    expect(await fake({}).sup.job("u1")).toBeNull();
   });
-  test("the clear writes the keeper's own options back whole with the attempt emptied, only while it is that registration", async () => {
-    const options = { watch: [CAIN], tokens: ["x=y"], hc_done: "h", attempt: { id: "a1", authorization: "ship tok-12345678" } };
-    const f = fake({ "GET /addons/self/info": { result: "ok", data: { slug: "k", options } }, "POST /addons/self/options": { result: "ok" } });
-    expect(await f.sup.clearAttempt("a1")).toEqual({ ok: true, why: "" });
-    const w = f.calls.find((c) => c.method === "POST")!;
-    expect(w.path).toBe("/addons/self/options");
-    expect(w.body.options).toEqual({ ...options, attempt: EMPTY });
-    expect((await f.sup.clearAttempt("a2")).ok).toBe(false);
+  test("its own options are only read", async () => {
+    const options = { watch: [CAIN], attempt: { id: "a1" } };
+    const f = fake({ "GET /addons/self/info": { result: "ok", data: { slug: "k", options } } });
     expect(await f.sup.selfOptions()).toEqual(options);
+    expect((f.sup as any).clearAttempt).toBeUndefined();
+    expect(f.calls.every((c) => c.method === "GET")).toBe(true);
   });
   test("the backup info carries its protected flag", async () => {
     const f = fake({ "GET /backups/b1/info": { result: "ok", data: { homeassistant: null, addons: [], folders: [], protected: true } } });

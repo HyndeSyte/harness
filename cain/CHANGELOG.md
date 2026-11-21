@@ -8,6 +8,7 @@
 - "Ship it with that risk" now reads the Keeper to see whether the rollback is armed, instead of a file nothing wrote. Until both drills have run and you have set the Keeper's two Healthchecks checks, it still reads as not armed, and the card says why.
 - Cain's health check for Home Assistant's Watchdog (/health) still only says whether the App is running, so a Discord outage doesn't make the Watchdog restart him. A new readiness check beside it (/ready) answers only while his Discord connection is up, and the Keeper reads that one after an install.
 - Two new options: `keeper_url` (already filled in) and `keeper_token` (the same token you give the Keeper for Cain).
+- "Ship it with that risk" reads as armed only while the Keeper's heartbeat and alert checks have answered in the last 10 minutes and none of its alerts is stuck, so a Healthchecks outage shows as not armed until it passes.
 
 ## 0.17.0
 

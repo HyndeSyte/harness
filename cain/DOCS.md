@@ -232,9 +232,10 @@ Since 0.18.0 the link reads that from the Keeper App (`GET /armed` with Cain's `
 minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
 binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
 the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
-Until the Keeper has run both drills for the App, its two Healthchecks checks are set and (Keeper
-0.1.1) its heartbeat reached Healthchecks within the last 10 minutes, that card is
-refused and says what isn't armed (the Keeper's own documentation has the drills). The cap is the option
+Until the Keeper has run both drills for the App, its Healthchecks checks are set, and (Keeper 0.1.2,
+worked out at every read) its heartbeat and a non-paging log ping to each of its alert checks reached
+Healthchecks within the last 10 minutes with no alert of it stuck for over 2 minutes, that card is
+refused and says what isn't armed (the Keeper's own documentation has the drills and the five conditions). The cap is the option
 `review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
 card in the link's `/data/link/review-decisions.json`.
 

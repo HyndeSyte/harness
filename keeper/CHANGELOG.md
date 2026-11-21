@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- A rollback is sent a second time only when the first provably never ran: the Supervisor answered it with an error, or the restore job it named is seen ended with errors while the App isn't back. Anything unclear is "unresolved": Keeper never restores again by itself, keeps checking on every poll, and tells you once more when it knows how it ended.
+- Keeper counts a rollback as done only from its restore job, or from seeing the App stop and come back at the old version, never from the version alone.
+- No secret in Keeper's options any more: an install's registration carries only a fingerprint of your Ship tap, its pull request, its commit and when it runs out. Keeper refuses one that has run out or isn't in that shape, and never writes its own options.
+- Keeper's tokens and Healthchecks addresses are kept in its own storage, so options that lost them keep working, and Keeper says so in its log.
+- Each App can have its own alert check (`hc_failed`), and Keeper checks every 5 minutes, without paging you, that each alert check still answers. "Armed" now holds only while the heartbeat and every alert check answered in the last 10 minutes and no alert has been stuck for over 2 minutes; it comes back by itself after an outage.
+- Cain's readiness counts as failing only after it has been ready once since he started, and after a rollback Keeper waits 5 more minutes once if Cain is running but Discord isn't connected yet. A long Discord outage can still fail an install check, and then you hear it.
+
 ## 0.1.1
 
 - A rollback is never started twice. Keeper keeps the Supervisor's job for each restore and, if it loses track of one (no answer, or a restart), checks that job and Cain's version before doing anything more. If it still can't tell, it stops and tells you ("unresolved") instead of restoring again.

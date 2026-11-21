@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.1"
+version: "0.1.2"
 slug: keeper
 description: >-
   Checks every App install for 15 minutes and rolls a bad one back from the
@@ -24,15 +24,18 @@ ingress: false
 watchdog: tcp://[HOST]:[PORT:8097]
 timeout: 20
 # watch: the App slugs it watches. health: each watched App's health address on the internal
-# network ("slug=host:port/path", 0.1.1; with no path the keeper asks http://host:port/health). Cain's
-# is /ready, his readiness (Discord's gateway up); his /health is liveness only, for the Watchdog. tokens: each App's own token
-# ("slug=token", at least 16 characters; the same token is that App's keeper_token option).
-# hc_done, hc_failed: the two Healthchecks.io ping URLs (DOCS.md); with either unset the keeper only
-# logs its lines and is not armable. health_grace_s: after a watched App first starts, failed /health
-# polls count only after this many seconds. attempt: written by the Ship run through the Home
-# Assistant connector just before an install (RELEASING.md, Ship); leave it alone by hand. Since 0.1.1
-# the keeper reads its options through the Supervisor each poll and, once it has accepted an attempt,
-# empties attempt itself (every other option left as it is).
+# network ("slug=host:port/path"; with no path the keeper asks http://host:port/health). Cain's is
+# /ready, his readiness (Discord's gateway up); his /health is liveness only, for the Watchdog.
+# tokens: each App's own token ("slug=token", at least 16 characters; the same token is that App's
+# keeper_token option). hc_done: the heartbeat check's ping URL. hc_failed (0.1.2): the alert check,
+# one plain ping URL for every App, or per App entries "slug=URL" (DOCS.md); with hc_done or an App's
+# alert check unset the keeper only logs and is not armable. The keeper keeps the tokens and the
+# Healthchecks URLs in /data and uses the kept ones while the options lack them. health_grace_s: after a
+# watched App first starts, failed health polls count only after this many seconds. attempt: written by
+# the Ship run through the Home Assistant connector just before an install (RELEASING.md, Ship), every
+# other option written back as it was; leave it alone by hand. Its authorization holds no token, only
+# the token's SHA-256, the pull request, its head and the token's expiry. The keeper reads its options
+# through the Supervisor each poll and never writes them.
 options:
   watch:
     - 0fcc2575_cain
@@ -40,7 +43,7 @@ options:
     - "0fcc2575_cain=0fcc2575-cain:8098/ready"
   tokens: []
   hc_done: ""
-  hc_failed: ""
+  hc_failed: []
   health_grace_s: 180
   attempt:
     id: ""
@@ -59,7 +62,8 @@ schema:
   tokens:
     - password
   hc_done: password?
-  hc_failed: password?
+  hc_failed:
+    - password
   health_grace_s: int(0,900)
   attempt:
     id: str?
@@ -68,5 +72,5 @@ schema:
     to_version: str?
     backup_slug: str?
     install_deadline: str?
-    authorization: password?
+    authorization: str?
     probe_hash: str?

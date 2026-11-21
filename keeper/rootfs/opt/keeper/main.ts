@@ -6,7 +6,7 @@
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
-import { HEARTBEAT_MS, Keeper, POLL_MS, parseOptions, type State } from "./core.ts";
+import { HEARTBEAT_MS, Keeper, POLL_MS, type State } from "./core.ts";
 import { handle } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -29,6 +29,15 @@ export function healthUrl(hp: string): string | null {
   const m = /^([A-Za-z0-9.-]{1,253}:\d{1,5})(\/[A-Za-z0-9._\/-]{0,64})?$/.exec(hp);
   return m ? `http://${m[1]}${m[2] || "/health"}` : null;
 }
+// The same host's liveness address, /health (0.1.2: the confirm window's extension asks it).
+export function liveUrl(hp: string): string | null {
+  const m = /^([A-Za-z0-9.-]{1,253}:\d{1,5})(\/[A-Za-z0-9._\/-]{0,64})?$/.exec(hp);
+  return m ? `http://${m[1]}/health` : null;
+}
+async function get200(url: string | null): Promise<boolean> {
+  if (!url) return false;
+  try { const r = await fetch(url, { signal: AbortSignal.timeout(5_000), redirect: "manual" }); return r.status === 200; } catch { return false; }
+}
 const readJson = (p: string): unknown => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } };
 
 async function serve(): Promise<void> {
@@ -42,26 +51,24 @@ async function serve(): Promise<void> {
   if (me && me.version && me.version !== version) log(`the Supervisor says this is ${me.version}, the image says ${version}: the image's is bound`);
   const k = new Keeper({
     now: Date.now, version, self,
-    appInfo: sup.appInfo, backupInfo: sup.backupInfo, restore: sup.restore, job: sup.job, clearAttempt: sup.clearAttempt,
-    health: async (hp) => {
-      const url = healthUrl(hp);
-      if (!url) return false;
-      try { const r = await fetch(url, { signal: AbortSignal.timeout(5_000), redirect: "manual" }); return r.status === 200; } catch { return false; }
-    },
+    appInfo: sup.appInfo, backupInfo: sup.backupInfo, restore: sup.restore, job: sup.job,
+    health: (hp) => get200(healthUrl(hp)),
+    live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
       try { const r = await fetch(url, { method: "POST", body, redirect: "manual", signal: AbortSignal.timeout(10_000), headers: { "content-type": "text/plain" } }); return r.status >= 200 && r.status < 300; }
       catch { return false; }
     },
-    // 0.1.1: the options as the Supervisor holds them (the file is written only at the keeper's start);
-    // the Supervisor not answering keeps the last ones read in force.
+    // The options as the Supervisor holds them (the file is written only at the keeper's start); the
+    // Supervisor not answering keeps the last ones read in force. The keeper never writes options.
     options: () => sup.selfOptions(),
     save: (s: State) => { try { writeWhole(STATE, JSON.stringify(s)); } catch (e) { log(`couldn't save its state: ${String((e as Error)?.message ?? e).slice(0, 80)}`); } },
     log,
   }, readJson(STATE));
-  const o = parseOptions(readJson(OPTIONS));
-  k.opts = o;
+  // 0.1.2: options that lack the tokens or the Healthchecks URLs get the ones kept in /data (logged).
+  k.useOptions(readJson(OPTIONS));
   k.start();
-  log(`Keeper ${version} watching ${o.watch.join(", ") || "nothing"}; Healthchecks ${o.hc_done && o.hc_failed ? "set" : "not set, so the keeper is not armable"}`);
+  const o = k.opts;
+  log(`Keeper ${version} watching ${o.watch.join(", ") || "nothing"}; Healthchecks ${k.armable() ? "set" : "not all set, so the keeper is not armable"}`);
   process.on("SIGTERM", () => {
     const open = k.open();
     if (open.length) log(`stopping with ${open.map((a) => `${a.id} (${a.status})`).join(", ")} open: it resumes at the next start, and an update of the keeper should wait until it ends`);
