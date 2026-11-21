@@ -455,7 +455,7 @@ case "${1:-}" in tell|clear|tick|probe) ;; text) alarm "${2:-}" "$(plain "${3:-}
           f="$(head -n 1 "$PROVEN" 2>/dev/null | cut -s -d' ' -f2)"; h="$(hook)" || exit 1
           [ -n "$t" ] && [ "$f" = "$(hash16 "$h")" ] && [ $(( $(date +%s) - t )) -le $((2 * DAY)) ]; exit ;;
   hooked) hook >/dev/null; exit ;;
-  # (0.18.0) One line from the keeper App to his bot, as it is, once per call: the probe calls it once per
+  # (0.19.0) One line from the keeper App to his bot, as it is, once per call: the probe calls it once per
   # line and keeps which line it said (probe/keeper.ts). No group, no repeat, no Home Assistant push.
   say) l="$(printf '%s' "${2:-}" | tr '\r\n' '  ' | sed 's/ *\xe2\x80\x94 */, /g; s/add-on/App/g; s/  */ /g; s/ $//' | cut -c1-400)"
     [ -n "$l" ] || exit 2

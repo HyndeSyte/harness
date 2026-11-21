@@ -1,4 +1,4 @@
-// The verdict probe (Cain 0.18.0), root's, run once right after each start of his session by the run
+// The verdict probe (Cain 0.19.0), root's, run once right after each start of his session by the run
 // script, outside his session. It talks to the keeper App (keeper/ in this repo) over Home Assistant's
 // internal App network with Cain's own token (options keeper_url, keeper_token):
 //   - GET /attempt: when an install of Cain is being watched (an attempt is open), it asks his session

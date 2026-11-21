@@ -620,7 +620,7 @@ describe("round 2, fix 6: the install-time self-check, and the decision route en
     const { ["/data/link/review-decisions.json"]: _a, ...required } = good;
     expect(selfCheck({ ...o, stat: stat(required) })).toBeNull();                         // the optional one may be missing
     expect(selfCheck({ ...o, stat: stat({ ...good, "/data/review-rounds.json": st(1000, 1000, 0o640) }) })).toBe("/data/review-rounds.json is owned by 1000:1000, mode 0640");
-    expect(capFileRules(capPaths({})).some((r) => r.path.includes("rollback-armed"))).toBe(false);   // 0.18.0: read from the keeper
+    expect(capFileRules(capPaths({})).some((r) => r.path.includes("rollback-armed"))).toBe(false);   // 0.19.0: read from the keeper
     expect(selfCheck({ ...o, stat: stat({ ...good, "/data/link/review-decisions.json": st(0, 1000, 0o664) }) })).toContain("review-decisions.json");
     expect(selfCheck({ ...o, stat: stat({ ...good, "/data/review-settings.json": st(0, 1000, 0o640, true) }) })).toBe("/data/review-settings.json is a symlink");
     const { ["/data/review-guard.log"]: _c, ...noLog } = good;

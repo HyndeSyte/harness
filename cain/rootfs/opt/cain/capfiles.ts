@@ -10,8 +10,9 @@
 //   /data/review-rounds.json            root:cain 0640   the runner writes, Cain reads
 //   /data/review-settings.json          root:cain 0640   the runner writes, Cain reads
 //   /data/review-guard.log              root:cain 0640   the runner and the link append, Cain reads
+//   /data/review-grants.json            root:cain 0640   the link writes (his grant taps, 0.18.0), the runner and Cain read
 //   /data/link/review-decisions.json    root:root 0600   the link's own (when there)
-// (0.18.0: the rollback's armed state is no longer a file here: the link reads it from the keeper App,
+// (0.19.0: the rollback's armed state is no longer a file here: the link reads it from the keeper App,
 // link/cap.ts keeperArmed.)
 // A file that is wrong turns the cap and guard features off and raises one alarm naming it.
 import { lstatSync, readFileSync, type Stats } from "node:fs";
@@ -30,6 +31,7 @@ export const FILES = {
   guardLog: "/data/review-guard.log",
   spend: "/data/review-spend.json",
   decisions: "/data/link/review-decisions.json",
+  grants: "/data/review-grants.json",
   home: "/data/cain",
 } as const;
 
@@ -39,6 +41,7 @@ export const capPaths = (env: Record<string, string | undefined> = process.env) 
   guardLog: pathOf("REVIEW_GUARD_LOG", FILES.guardLog, env),
   spend: pathOf("REVIEW_SPEND", FILES.spend, env),
   decisions: pathOf("CAIN_REVIEW_DECISIONS", FILES.decisions, env),
+  grants: pathOf("REVIEW_GRANTS", FILES.grants, env),
   home: pathOf("CAIN_HOME", FILES.home, env),
 });
 
@@ -55,6 +58,7 @@ export function capFileRules(p = capPaths()): FileRule[] {
     { path: p.settings, uid: ROOT_UID, gid: CAIN_GID, mode: 0o640 },
     { path: p.guardLog, uid: ROOT_UID, gid: CAIN_GID, mode: 0o640 },
     { path: p.decisions, uid: ROOT_UID, gid: ROOT_UID, mode: 0o600, optional: true },
+    { path: p.grants, uid: ROOT_UID, gid: CAIN_GID, mode: 0o640, optional: true },
   ];
 }
 

@@ -17,6 +17,7 @@ import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, s
 import { configFromEnv } from "./config.ts";
 import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
+import { capWords, grantsFor, grantWords, readGrants } from "./grants.ts";
 import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
@@ -29,6 +30,8 @@ const terms = () => { try { return readFileSync(cfg.termsFile, "utf8"); } catch 
 // environment, which is Cain's: his caps and round cap would be the defaults, not the App's options.
 const settings = () => readSettings(cfg.settingsFile!);
 const roundCap = () => settings()?.round_cap ?? DEFAULT_ROUND_CAP;
+// Cain 0.18.0: the owner's grants of extra rounds (the link's file, root:cain 0640); null: can't be read.
+const grants = () => cfg.grantsFile ? readGrants(cfg.grantsFile) : null;
 
 function money(n: number) { return `$${n.toFixed(2)}`; }
 
@@ -72,7 +75,7 @@ switch (cmd) {
     // it takes the brief, and its answer is the one that counts).
     const rounds = readRounds(cfg.roundsFile!);
     if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
-    const a = admit(rounds!, b, roundCap());
+    const a = admit(rounds!, b, roundCap(), grants(), cfg.tz);
     if (!a.ok) fail(a.why, 3);
     const label = labelOf(b.label)!;
     // Round 2: the guard's log is root's (0640); a refusal here goes to the link, which decides again and
@@ -101,6 +104,13 @@ switch (cmd) {
       const who = s.stands_in_for ? `claude for ${s.stands_in_for} (substituted)` : s.seat;
       const what = s.state === "done" ? `${s.verdict}, ${s.findings?.length ?? 0} finding(s), ${s.model}` : s.error ? `${s.error.kind}: ${s.error.detail}. Fix: ${s.error.fix}` : "";
       out(`  ${who}: ${s.state}${what ? `, ${what}` : ""}${s.next_at ? `, next try ${s.next_at}` : ""}`);
+    }
+    // Cain 0.18.0: which round of the change's cap it is, with the grants that raised the cap now.
+    if (r!.change && r!.round) {
+      const rounds = readRounds(cfg.roundsFile!);
+      const g = rounds ? grantsFor(rounds, grants(), r!.change) : [];
+      const base = r!.base_cap ?? (r!.granted?.length ? roundCap() : (r!.cap ?? roundCap()));
+      out(`  ${r!.change}: ${capWords(r!.round, base, g, cfg.tz)}${r!.round_kind === "fixes" ? " (fix-only)" : " (full)"}${rounds ? "" : " (the rounds file can't be read: grants not shown)"}`);
     }
     break;
   }
@@ -148,6 +158,7 @@ switch (cmd) {
     const rounds = readRounds(cfg.roundsFile!);
     const capN = roundCap();
     if (!rounds) { out(`Review rounds (cap ${capN}): the rounds file can't be read`); break; }
+    const gr = grants();
     const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
     const seen = new Set<string>();
     const open: string[] = [];
@@ -159,9 +170,14 @@ switch (cmd) {
       const done = countedRounds(rounds, key);
       if (!done.length || done[done.length - 1].at < since) continue;
       const d = decisionOf(rounds, key);
-      open.push(`  ${group.join(" + ")}: ${done.length} of ${capN} round${capN === 1 ? "" : "s"}${d ? `, decision card ${d.state === "posted" ? "with him" : "owed"}` : done.length >= capN ? ", at the cap" : ""}`);
+      const g = grantsFor(rounds, gr, key);
+      const eff = capN + g.reduce((n, x) => n + x.rounds, 0);
+      const gw = grantWords(g, cfg.tz);
+      const atCapNow = done.length >= eff;
+      const dec = d && d.round >= done.length ? `, decision card ${d.state === "posted" ? "with him" : "owed"}` : atCapNow ? ", at the cap" : "";
+      open.push(`  ${group.join(" + ")}: ${done.length} of ${eff} round${eff === 1 ? "" : "s"}${gw ? ` (${gw})` : ""}${dec}`);
     }
-    out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}):`);
+    out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}${gr ? "" : "; the grants file can't be read, so no grants count"}):`);
     out(open.length ? open.join("\n") : "  no open changes");
     break;
   }

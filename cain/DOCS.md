@@ -228,7 +228,7 @@ runner itself sends you one card: what the piece is, the serious finding in one 
 or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
 round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
 after "Ship it with that risk" it goes only while the rollback of a bad install is armed for that App.
-Since 0.18.0 the link reads that from the Keeper App (`GET /armed` with Cain's `keeper_token`, every
+Since 0.19.0 the link reads that from the Keeper App (`GET /armed` with Cain's `keeper_token`, every
 minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
 binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
 the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
@@ -255,7 +255,7 @@ Since the second round of fixes in 0.16.0:
   records the change as held, on the guard's log below, and Cain is told.
 - At each start the review runner and the link check the owner and mode of these files (the rounds
   file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file; the rollback record
-  is no longer a file since 0.18.0). One that's wrong turns the cap and the guard off (no review round, no `other`
+  is no longer a file since 0.19.0). One that's wrong turns the cap and the guard off (no review round, no `other`
   Build, and Ship decisions paused for every pull request: no Ship card for any change) and raises
   one alarm naming it. Since the third round of fixes the check runs again every minute, so they come
   back on by themselves, and the alarm clears, once the file is right; no restart needed.
@@ -265,6 +265,71 @@ Since the second round of fixes in 0.16.0:
   `review-decisions.json.corrupt-`. Answers are kept again at once, and the alarm clears at the link's
   next sweep. If you tap the other answer after a restart cut a tap short, your first answer stands,
   and the card says "Already answered".
+
+#### More rounds, granted by your tap (since 0.18.0)
+
+The rule stays three rounds a change. Your decision on Nov 21: for a critical change whose last round
+still left something serious, the exception is more fix rounds, granted by you, never an exemption
+from the rule. So:
+
+- Only you can grant, and only by a tap. Cain can ask with
+  `keeper.sh review-grant --item <item> --change <pull request or change key> --rounds <1 to 3> "<why>"`.
+  You get a card: what the change does (Cain's words) and its pull request number, how many rounds it
+  has used and what the last one left (the review runner's own count of serious findings, never
+  Cain's), how many rounds the grant adds, and two buttons, "Grant <n> more rounds" and "No". It
+  expires at the next morning check-in like Cain's asks. Cain's command writes nothing: only your
+  "Grant" tap does. The link refuses the command while the change still has rounds left (nothing to
+  grant), while its last round is still running, while its item is held by another session, while
+  Stop holds, and while another grant card for the same change is still open (one open card a change:
+  the refusal names when the open one went up).
+- Your "Grant" tap checks all of that again before anything is written: the change is still at its
+  cap, no round of it is running, no other session holds its item, Stop is clear, and its round count
+  and cap are still the ones the card was posted with. If any of it no longer holds, nothing is
+  written, the card loses its buttons, and you see one plain line saying why (for example "That change
+  has rounds left now, so this grant isn't needed"). When a grant is written, any other open grant card
+  for the same change loses its buttons ("Replaced by a newer grant").
+- Your tap is written to disk first, in `/data/review-grants.json` (root:cain 0640 at every write and
+  every time it's made again, so the review runner and review.sh can read it; written only by the
+  link): the change, how many rounds, that you granted it, when, the card's message and Cain's reason.
+  It is also noted in the link's log and beside your other taps in `/data/link/review-decisions.json`.
+  If it can't be written, the card stays up and you're told your grant wasn't saved. A grant is for
+  one change; a replacement pull request carries it over, as it carries the rounds.
+- The cap for that change is then 3 plus what you granted. Each granted round is fix-only, carrying
+  the earlier findings, like any round after the first. When the cap is reached again, the runner's
+  refusal says how a grant works.
+- If a granted round at the raised cap still leaves something serious, the decision card ("Hold it" or
+  "Ship it with that risk") comes again, for that round. A "Hold it" on an earlier card doesn't stop a
+  later granted round. The Ship card rules stay: it needs a review whose last round left nothing
+  serious, or your "Ship it with that risk" on the newest decision card, which still needs the App's
+  rollback armed. While a granted round is running, or left something serious with rounds still to
+  go, no Ship card goes out.
+- What a grant never does: exempt a change from the rule, or from the armed-rollback condition on
+  shipping with a risk named.
+
+Since the second review of 0.18.0:
+
+- Your tap is one operation at a time for each change. The re-check, the grant's write and the card's
+  consumption (marked used, its buttons off, any other open grant card for that change retired) run
+  under one lock for the change key, inside the link. A second delivery of the same tap, or a second
+  quick tap on the same card, waits for the first and then finds the card used: nothing more is
+  written. A tap on another grant card for the same change waits the same way and is refused.
+- The card is bound to the change as it was when the card went up: beside the round count and cap it
+  keeps the pull request's head commit and the newest decision on the change (none, if there was
+  none). Your Grant tap reads both again: if the pull request has new commits, or a newer decision has
+  come, nothing is written, the card loses its buttons and you see one line saying why, as for the
+  other checks. No card goes out while the pull request's head can't be read from GitHub.
+- An open grant card never blocks for good. Before Cain's next grant card for the same change is
+  refused because one is open, the link looks at the open one: when its head moved, a newer decision
+  came, its round count or cap changed, or its message is gone from the chat, it loses its buttons
+  ("Replaced by a newer card"), stops counting as open, and the new card goes up. A card that is still
+  current keeps refusing a second one. A card whose buttons were taken off for any reason no longer
+  counts as open, and what counts as open is read from the link's own records on disk, so it holds
+  across a restart of the link.
+- A passing failure at your tap (the review records, who holds the change, or the pull request's head
+  can't be read just then) writes nothing and keeps the card up: you see one line saying to try again
+  in a minute.
+- `review.sh status <id>`, `review.sh spend` and Cain's "Review done" line show the raised cap and the
+  grants, for example "round 4 of 5, 2 granted by Dane on Nov 21".
 
 ### Labels (since 0.16.0)
 
@@ -432,7 +497,7 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
-## What 0.18.0 does: working with the Keeper
+## What 0.19.0 does: working with the Keeper
 
 The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a
 bad one back from the backup taken just before it. Cain's part:

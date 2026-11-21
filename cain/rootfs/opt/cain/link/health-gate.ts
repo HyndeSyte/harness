@@ -1,4 +1,4 @@
-// Cain's readiness tied to the link's Discord gateway (Cain 0.18.0: on /ready, beside the
+// Cain's readiness tied to the link's Discord gateway (Cain 0.19.0: on /ready, beside the
 // liveness /health). nginx answers /ready (port 8098, the keeper App's check; /health stays the
 // Supervisor's watchdog URL, liveness only) 200 only while the mark below stands; the
 // link writes it every 30 seconds only while its Discord gateway is connected and Discord acknowledged a

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.18.0
+## 0.19.0
 
 - Cain now works with the new Keeper App, which checks every install of Cain for 15 minutes and rolls a bad one back by itself from the backup taken just before it.
 - Right after Cain starts following an install, the App asks him its liveness line once and tells the Keeper whether he answered. No answer within 10 minutes counts as a failed install.
@@ -9,6 +9,21 @@
 - Cain's health check for Home Assistant's Watchdog (/health) still only says whether the App is running, so a Discord outage doesn't make the Watchdog restart him. A new readiness check beside it (/ready) answers only while his Discord connection is up, and the Keeper reads that one after an install.
 - Two new options: `keeper_url` (already filled in) and `keeper_token` (the same token you give the Keeper for Cain).
 - "Ship it with that risk" reads as armed only while the Keeper's heartbeat and alert checks have answered in the last 10 minutes and none of its alerts is stuck, so a Healthchecks outage shows as not armed until it passes.
+
+## 0.18.0
+
+- When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".
+- Only your tap grants them; Cain's ask alone adds nothing. The rule of three rounds stays, and a grant never lifts the armed rollback that shipping with a risk named needs.
+- If a granted round still leaves something serious, the "Hold it" or "Ship it with that risk" card comes to you again for it.
+- Cain's review lines now show the raised cap, like "round 4 of 5, 2 granted by Dane on Nov 21".
+- Your Grant tap checks everything again before it adds a round: if the change has rounds left by then, a round is running, someone else is working on it, everything is stopped, or its rounds moved on since the card went up, nothing is granted, the card loses its buttons and you see one line saying why.
+- One grant card at a time for a change: Cain can't send a second while one is open, and when you grant on one, any other open grant card for that change loses its buttons ("Replaced by a newer grant").
+- The file that keeps your grants stays readable by Cain's review lines every time it's written or made again.
+- Two taps on a grant card, or the same tap arriving twice, add the rounds once: the second finds the card already answered.
+- A grant card holds the pull request's newest commit and the newest decision from when it went up; if either changed by your tap, nothing is granted and you see why.
+- A grant card that went out of date, or whose message is gone, no longer blocks a new one: it loses its buttons ("Replaced by a newer card") and the new card goes up.
+- If the records can't be read for a moment when you tap Grant, the card stays up and asks you to try again in a minute.
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.17.0
 

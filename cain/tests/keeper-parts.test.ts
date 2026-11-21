@@ -1,4 +1,4 @@
-// Cain 0.18.0: Cain's parts for the keeper App (keeper/): /health tied to the link's Discord gateway, the
+// Cain 0.19.0: Cain's parts for the keeper App (keeper/): /health tied to the link's Discord gateway, the
 // link's armed read from the keeper failing closed on each bad case, and the probe's verdict and the
 // keeper's last line said once.
 import { describe, expect, test } from "bun:test";

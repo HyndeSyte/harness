@@ -154,7 +154,7 @@ ask() {   # ask <from address> <path>: the status code nginx answers
   case "$1" in 172.30.40.*) net="$hout"; to=172.30.40.10 ;; esac
   docker run --rm --network "$net" --ip "$1" --entrypoint curl "$IMG" -s -o /dev/null -m 5 -w '%{http_code}' "http://$to:8098$2" || true
 }
-# Cain 0.18.0 (first review fix): /health is liveness (200 with no link running here), and /ready, beside it, answers
+# Cain 0.19.0 (first review fix): /health is liveness (200 with no link running here), and /ready, beside it, answers
 # 503 until the link's gateway mark is there, then 200 once it is, written as the link writes it
 # (link/health-gate.ts).
 up=""

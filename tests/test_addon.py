@@ -270,7 +270,7 @@ def test_cain_terminal_is_reachable_only_through_ingress():
     assert "access_log /run/cain-web/health-miss.log cain_health_miss if=$cain_health_miss;" in loc
     assert loc.index("if ($cain_health_from != 1) { return 404;") < loc.index("health-down")
     assert "location / { return 404; }" in health and "proxy_pass" not in health and "alias" not in health
-    # Cain 0.18.0 (first review fix): /health is liveness only (no gateway mark); /ready, beside it on the same server, is
+    # Cain 0.19.0 (first review fix): /health is liveness only (no gateway mark); /ready, beside it on the same server, is
     # readiness (the link's gateway mark), behind the same address check.
     assert "health-gateway" not in loc.split("location = /ready {")[0]
     ready = health.split("location = /ready {")[1].split("location / {")[0]
@@ -2666,7 +2666,9 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold"])' in auth.replace("\r\n", "\n"))
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant"])'
+            in auth.replace("\r\n", "\n"))
+    # Cain 0.18.0: /review-grant is Cain's card asking Dane for extra review rounds; only his tap writes one.
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and
     # /pc-notice (the keeper runs as root, so being root is its key), and (Cain 0.16.0) the
     # review runner's decision card at the round cap, so Cain can't post it; and (its second round)

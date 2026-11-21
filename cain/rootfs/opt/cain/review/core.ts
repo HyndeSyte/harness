@@ -475,7 +475,19 @@ export type Review = {
   // Cain 0.16.0: the change it's a round of, which round (1 for the first), of how many the cap allows,
   // its kind, and for a fix-only round the earlier findings it checks the fixes against.
   change?: string; round?: number; cap?: number; round_kind?: RoundKind; earlier?: string[]; rounded?: boolean;
+  // Cain 0.18.0: the owner's grants that raised its cap (cap is then base_cap plus their rounds), as the
+  // runner read them when it took the brief.
+  granted?: { rounds: number; at: string }[]; base_cap?: number;
 };
+// "round 4 of 5, 2 granted by Dane on Nov 21" for a round under a raised cap; "" when none was granted.
+export function grantedNote(r: Pick<Review, "granted">, tz = "America/New_York"): string {
+  const g = r.granted ?? [];
+  if (!g.length) return "";
+  const n = g.reduce((a, x) => a + x.rounds, 0);
+  const day = (at: string) => { try { return new Date(at).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: tz }); } catch { return at.slice(0, 10); } };
+  const days = [...new Set(g.map((x) => day(x.at)))];
+  return `${n} granted by Dane ${days.length === 1 ? `on ${days[0]}` : `(${days.join(", ")})`}`;
+}
 // The serious findings a fix-only round left: every answer's findings marked serious (an unmarked one
 // counts as serious: the runner marks it so, failing safe).
 export function seriousLeft(r: Pick<Review, "seats" | "round_kind">): Finding[] {
@@ -650,7 +662,8 @@ export function relayLine(r: Review): string {
 // how many serious findings are left. Ids, counts and fixed words only.
 export function roundLine(r: Review): string | null {
   if (!r.change || !r.round) return null;
-  const of = r.cap ? ` of ${r.cap}` : "";
+  const g = grantedNote(r);
+  const of = r.cap ? ` of ${r.cap}${g ? `, ${g},` : ""}` : "";
   const kind = r.round_kind === "fixes" ? "fix-only" : "full";
   // Round 2: a round that ended with no seat answering is lost, and still counts.
   if (r.status === "incomplete" && !r.seats.some((s) => s.state === "done"))

@@ -33,6 +33,8 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
+//                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
@@ -73,7 +75,8 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
+import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
@@ -268,12 +271,16 @@ const link = new Link({
   // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
   // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
   capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
-  // 0.18.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
+  // 0.19.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
   armed: () => keeperArmedText(keeperReplies, Date.now(), PROBE_HASH),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
   decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
+  // 0.18.0: the owner's grants of extra review rounds (/data/review-grants.json, root:cain 0640), written
+  // here only, on his tap on Cain's grant card, durably, made root:cain 0640 at every write and recreation.
+  grants: () => readGrants(GRANTS_FILE),
+  grant: (rec) => { if (capOff) throw new GrantUnsaved(`the review cap's files aren't right (${capOff})`); return recordGrant(GRANTS_FILE, rec); },
   capOff: () => capOff,
   // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
   // rotated root-side, keeping one previous file: cap.ts appendCapped).
@@ -292,7 +299,7 @@ const link = new Link({
   writeReplay: (r) => writeReplayReport(r),
 });
 
-// -- the keeper App's armed state (0.18.0) -------------------------------------------------------------
+// -- the keeper App's armed state (0.19.0) -------------------------------------------------------------
 // Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
 // that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
 // (keeper_token, the run script hands it in KEEPER_TOKEN) and is never logged.
@@ -552,7 +559,7 @@ setInterval(() => {
     writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
     renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
   } catch { /* the probe then sees an old time, and fails that layer */ }
-  // Cain's /ready (0.18.0, health-gate.ts; /health is liveness only): 200 only while the gateway is connected and acknowledged.
+  // Cain's /ready (0.19.0, health-gate.ts; /health is liveness only): 200 only while the gateway is connected and acknowledged.
   writeGatewayMark(gatewayHealthy(connected, proto.lastAck, Date.now()));
 }, 30_000);
 writeGatewayMark(false);
