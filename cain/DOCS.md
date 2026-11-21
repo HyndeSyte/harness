@@ -299,6 +299,29 @@ from the rule. So:
   go, no Ship card goes out.
 - What a grant never does: exempt a change from the rule, or from the armed-rollback condition on
   shipping with a risk named.
+
+Since the second review of 0.18.0:
+
+- Your tap is one operation at a time for each change. The re-check, the grant's write and the card's
+  consumption (marked used, its buttons off, any other open grant card for that change retired) run
+  under one lock for the change key, inside the link. A second delivery of the same tap, or a second
+  quick tap on the same card, waits for the first and then finds the card used: nothing more is
+  written. A tap on another grant card for the same change waits the same way and is refused.
+- The card is bound to the change as it was when the card went up: beside the round count and cap it
+  keeps the pull request's head commit and the newest decision on the change (none, if there was
+  none). Your Grant tap reads both again: if the pull request has new commits, or a newer decision has
+  come, nothing is written, the card loses its buttons and you see one line saying why, as for the
+  other checks. No card goes out while the pull request's head can't be read from GitHub.
+- An open grant card never blocks for good. Before Cain's next grant card for the same change is
+  refused because one is open, the link looks at the open one: when its head moved, a newer decision
+  came, its round count or cap changed, or its message is gone from the chat, it loses its buttons
+  ("Replaced by a newer card"), stops counting as open, and the new card goes up. A card that is still
+  current keeps refusing a second one. A card whose buttons were taken off for any reason no longer
+  counts as open, and what counts as open is read from the link's own records on disk, so it holds
+  across a restart of the link.
+- A passing failure at your tap (the review records, who holds the change, or the pull request's head
+  can't be read just then) writes nothing and keeps the card up: you see one line saying to try again
+  in a minute.
 - `review.sh status <id>`, `review.sh spend` and Cain's "Review done" line show the raised cap and the
   grants, for example "round 4 of 5, 2 granted by Dane on Nov 21".
 

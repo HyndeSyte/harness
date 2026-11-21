@@ -15,12 +15,13 @@ import { capWords, effectiveCap, emptyGrants, grantWords, readGrants, recordGran
 import type { SeatAnswer, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
 import { HOLD, RISK, capStateFor } from "../rootfs/opt/cain/link/cap.ts";
 import { CAIN_ROUTES, ROOT_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth.ts";
-import { GRANT_REPLACED, GRANT_UNSAVED, grantLabel } from "../rootfs/opt/cain/link/core.ts";
+import { GRANT_REPLACED, GRANT_UNSAVED, grantLabel, grantRetry, REPLACED } from "../rootfs/opt/cain/link/core.ts";
 import { capFileRules } from "../rootfs/opt/cain/capfiles.ts";
 import { DAY, keeperHolds, rig } from "./link-rig";
 
 const NOW = new Date("2026-11-21T17:50:00Z");          // Nov 21, 12:50 PM in New York
 const PRN = (n: number) => `https://github.com/HyndeSyte/harness/pull/${n}`;
+const HEAD_A = "a".repeat(40), HEAD_B = "b".repeat(40);
 const brief = (over: Partial<Brief> = {}): Brief => ({
   id: "2026-11-21-keeper-a", topic: "The rollback keeper", question: "Is this sound?", body: "Keep a way back.",
   needs_facts: false, consequential: false, seats: ["gemini"], pr: PRN(46), label: "necessary-fix", item: "P46", ...over,
@@ -132,12 +133,14 @@ describe("the grant raises the cap by exactly the rounds it names", () => {
 // ---- The card ----
 function linkRig(rounds: Rounds, grants: Grants | null, o: { holds?: Record<string, any> } = {}) {
   const r = rig({ holds: keeperHolds(o.holds ?? {}) });
+  r.pulls[PRN(46)] = { head: HEAD_A, open: true };                             // the pull request's head, as GitHub has it
   const written: GrantRec[] = [];
   const decided: [string, string][] = [];
-  const box = { rounds, grants, fail: false };
+  const box = { rounds, grants, fail: false, calls: 0 };
   Object.assign((r.link as any).d, {
     rounds: () => box.rounds, grants: () => box.grants, roundCap: () => 3,
     grant: (rec: GrantRec) => {
+      box.calls++;
       if (box.fail) throw new GrantUnsaved("disk full");
       const had = written.find((x) => x.id === rec.id);
       if (had) return { rec: had, existed: true };
@@ -410,9 +413,6 @@ describe("his Grant tap checks everything again before it writes", () => {
       "That change's review rounds have moved on since this card went up, so this grant can't be written");
   });
 
-  test("unreadable records write nothing", async () => {
-    await refusedBy((t) => { t.box.grants = null; }, "The review records can't be read right now, so this grant can't be written");
-  });
 
   test("No still writes nothing and needs no checks", async () => {
     const t = linkRig(atCap(2), emptyGrants());
@@ -488,5 +488,220 @@ describe("the grants file stays root:cain 0640, readable by Cain's user", () => 
     expect(() => recordGrant(f, grantRec("pr-46", 1), { sync: () => {} })).toThrow(GrantUnsaved);
     expect(existsSync(f)).toBe(false);
     expect(require("node:fs").readdirSync(dir)).toEqual([]);
+  });
+});
+
+// ---- Second review of 0.18.0: the tap serialized, the card bound to the reviewed state, no deadlock ----
+const decided3 = (r: Rounds, id = "pr-46#3"): Rounds => {
+  r.changes["pr-46"].decision = { id, key: "pr-46", round: 3, serious: 2, topic: "t", finding: "f", item: "P46", pr: PRN(46), state: "posted", at: "2026-11-21T12:00:00Z" };
+  return r;
+};
+const grantIds = (t: ReturnType<typeof linkRig>, id: string) => t.r.ids(id);
+
+describe("one serialized operation per change key", () => {
+  test("two deliveries of the same tap at once write exactly one grant; the second is a dead tap", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    const [cid] = grantIds(t, id);
+    const msg = t.r.msg(id);
+    const outs = await Promise.all([t.r.tap(msg, cid), t.r.tap(msg, cid)]);
+    expect(outs.filter((o) => o === "to Cain").length).toBe(1);
+    expect(outs.filter((o) => String(o).startsWith("dead:")).length).toBe(1);
+    expect(t.box.calls).toBe(1);
+    expect(t.written.length).toBe(1);
+    expect(t.r.relayed.filter((l) => l.includes('Dane tapped "Grant 2 more rounds"')).length).toBe(1);
+    expect(t.r.logs.filter((l) => l.includes("Dane granted 2 more review rounds")).length).toBe(1);
+  });
+
+  test("two rapid taps on one card, Grant then No, keep the first answer only", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    const [grant, no] = grantIds(t, id);
+    const msg = t.r.msg(id);
+    const outs = await Promise.all([t.r.tap(msg, grant), t.r.tap(msg, no)]);
+    expect(outs[0]).toBe("to Cain");
+    expect(String(outs[1])).toStartWith("dead:");
+    expect(t.written.length).toBe(1);
+    expect(t.r.relayed.join("\n")).not.toContain("No rounds were granted");
+  });
+
+  test("taps on two cards for the same key at once write one grant", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    // A second open card for the same key (one that slipped past the one-card rule): made by filing the first under
+    // another key while the second goes up, then back.
+    const s = t.r.state(); s.messages[a].grant!.key = "pr-other"; t.r.setState(s);
+    t.r.later(60_000);
+    const b = ((await ask(t.r, { rounds: 1, text: "The rollback keeper, one more round" })) as any).message;
+    const s2 = t.r.state(); s2.messages[a].grant!.key = "pr-46"; s2.messages[a].outcome = undefined; s2.messages[a].buttons = true;
+    if (s2.messages[a].q) s2.messages[a].q!.used = false; t.r.setState(s2);
+    const outs = await Promise.all([t.r.tap(t.r.msg(a), grantIds(t, a)[0]), t.r.tap(t.r.msg(b), grantIds(t, b)[0])]);
+    expect(outs.filter((o) => o === "to Cain").length).toBe(1);
+    expect(t.box.calls).toBe(1);
+    expect(t.written.length).toBe(1);
+  });
+});
+
+describe("the card is bound to the reviewed state", () => {
+  test("it records the pull request's head and the newest decision beside the count and cap", async () => {
+    const t = linkRig(decided3(atCap(2)), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    expect(t.r.state().messages[id].grant).toMatchObject({ used: 3, cap: 3, head: HEAD_A, decision: "pr-46#3" });
+    const u = linkRig(atCap(2), emptyGrants());
+    const id2 = ((await ask(u.r)) as any).message;
+    expect(u.r.state().messages[id2].grant).toMatchObject({ head: HEAD_A, decision: null });
+  });
+
+  test("no card while the pull request's head can't be read", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    delete t.r.pulls[PRN(46)];
+    await expect(ask(t.r)).rejects.toThrow("the pull request's head can't be read from GitHub right now");
+  });
+
+  test("a head change between posting and tap refuses and writes nothing", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    t.r.pulls[PRN(46)] = { head: HEAD_B, open: true };
+    const line = "That pull request has new commits since this card went up, so this grant can't be written";
+    expect(await t.r.tap(t.r.msg(id), grantIds(t, id)[0])).toBe(`refused: ${line}`);
+    expect(t.box.calls).toBe(0);
+    expect(t.r.buttons(id)).toEqual([]);
+    expect(t.r.ephemerals().map((e: any) => e.content)).toContain(`${line}.`);
+  });
+
+  test("a newer decision between posting and tap refuses and writes nothing", async () => {
+    const t = linkRig(decided3(atCap(2)), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    t.box.rounds = decided3(atCap(2), "pr-46#3b");
+    const line = "A newer decision on that change has come since this card went up, so this grant can't be written";
+    expect(await t.r.tap(t.r.msg(id), grantIds(t, id)[0])).toBe(`refused: ${line}`);
+    expect(t.box.calls).toBe(0);
+    // A decision where there was none refuses too.
+    const u = linkRig(atCap(2), emptyGrants());
+    const id2 = ((await ask(u.r)) as any).message;
+    u.box.rounds = decided3(atCap(2));
+    expect(await u.r.tap(u.r.msg(id2), grantIds(u, id2)[0])).toBe(`refused: ${line}`);
+    expect(u.box.calls).toBe(0);
+  });
+
+  test("a card bound to nothing (no head or decision on it) writes nothing", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    const s = t.r.state(); delete s.messages[id].grant!.head; t.r.setState(s);
+    expect(String(await t.r.tap(t.r.msg(id), grantIds(t, id)[0]))).toStartWith("refused: This card was posted before grants were bound");
+    expect(t.box.calls).toBe(0);
+  });
+});
+
+describe("the one-open-card rule never deadlocks", () => {
+  const retired = (t: ReturnType<typeof linkRig>, id: string) => {
+    expect(t.r.state().messages[id]).toMatchObject({ outcome: "replaced", buttons: false, q: { used: true } });
+    expect(t.r.buttons(id)).toEqual([]);
+    expect(String(t.r.msg(id).content)).toContain(REPLACED);
+  };
+  const again = (t: ReturnType<typeof linkRig>) => ask(t.r, { rounds: 1, text: "The rollback keeper, one more round" });
+
+  test("an open card whose head moved is retired and replaced", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    t.r.pulls[PRN(46)] = { head: HEAD_B, open: true };
+    const res = await again(t);
+    expect(res.status).toBe("posted");
+    retired(t, a);
+    expect(REPLACED).toBe("Replaced by a newer card");
+    const b = (res as any).message;
+    expect(t.r.state().messages[b].grant).toMatchObject({ head: HEAD_B });
+    // The old card's tap writes nothing; the new one's writes its grant.
+    await t.r.tap(t.r.msg(a), `q:x:0`);
+    expect(t.box.calls).toBe(0);
+    expect(await t.r.tap(t.r.msg(b), grantIds(t, b)[0])).toBe("to Cain");
+    expect(t.written.map((w) => w.message)).toEqual([b]);
+  });
+
+  test("a newer decision, or a changed round count or cap, retires it too", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    t.box.rounds = decided3(atCap(2));
+    expect((await again(t)).status).toBe("posted");
+    retired(t, a);
+    const u = linkRig(atCap(2), emptyGrants());
+    const c = ((await ask(u.r)) as any).message;
+    const s = u.r.state(); s.messages[c].grant!.cap = 2; u.r.setState(s);   // posted on another cap
+    expect((await again(u)).status).toBe("posted");
+    retired(u, c);
+  });
+
+  test("an open card whose message is gone from the chat is retired", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    t.r.spy.onCall = (method, path) => { if (path.endsWith(`/messages/${a}`)) throw new Error("discord 404: Unknown Message"); };
+    expect((await again(t)).status).toBe("posted");
+    expect(t.r.state().messages[a]).toMatchObject({ outcome: "replaced", buttons: false, q: { used: true } });
+  });
+
+  test("a card that isn't stale still refuses a second; a Discord read that fails isn't taken as gone", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    t.r.failing.add(`GET /channels/`);
+    await expect(again(t)).rejects.toThrow(`a grant card for pr-46 is already open`);
+    expect(t.r.state().messages[a].outcome).toBeUndefined();
+  });
+
+  test("a card whose buttons were stripped no longer blocks a new one", async () => {
+    // A refused tap whose answer Discord didn't take: the buttons still show, but the card is done on disk.
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    t.r.stop.stopped = true; t.r.stop.at = t.r.t.now;
+    t.r.failing.add("/interactions/");
+    expect(String(await t.r.tap(t.r.msg(a), grantIds(t, a)[0]))).toStartWith("refused: Everything is stopped");
+    t.r.failing.delete("/interactions/");
+    t.r.stop.stopped = false;
+    expect((await again(t)).status).toBe("posted");
+    // Buttons taken off without an outcome (the message edited by the sweep): not open either.
+    const u = linkRig(atCap(2), emptyGrants());
+    const c = ((await ask(u.r)) as any).message;
+    const s = u.r.state(); s.messages[c].buttons = false; u.r.setState(s);
+    expect((await again(u)).status).toBe("posted");
+  });
+
+  test("a passing failure at the tap keeps the buttons and says to try again in a minute", async () => {
+    for (const [what, breakIt] of [
+      ["The review records", (t: ReturnType<typeof linkRig>) => { t.box.grants = null; }],
+      ["Who is working on that change", (t: ReturnType<typeof linkRig>) => { t.r.files.holds = "{not json"; }],
+      ["The pull request's newest commit", (t: ReturnType<typeof linkRig>) => { delete t.r.pulls[PRN(46)]; }],
+    ] as const) {
+      const t = linkRig(atCap(2), emptyGrants());
+      const id = ((await ask(t.r)) as any).message;
+      const holds = t.r.files.holds, grants = t.box.grants, pull = t.r.pulls[PRN(46)];
+      breakIt(t);
+      expect(await t.r.tap(t.r.msg(id), grantIds(t, id)[0])).toBe("retry");
+      expect(t.box.calls).toBe(0);
+      expect(t.r.buttons(id)).toEqual(["Grant 2 more rounds", "No"]);
+      expect(t.r.state().messages[id]).toMatchObject({ buttons: true, q: { used: false } });
+      expect(t.r.state().messages[id].outcome).toBeUndefined();
+      expect(t.r.ephemerals().map((e: any) => e.content)).toContain(grantRetry(what));
+      expect(t.r.relayed.join("\n")).not.toContain("Dane tapped");
+      // A minute later it reads again, and his tap writes the grant.
+      t.r.files.holds = holds; t.box.grants = grants; t.r.pulls[PRN(46)] = pull;
+      expect(await t.r.tap(t.r.msg(id), grantIds(t, id)[0])).toBe("to Cain");
+      expect(t.written.length).toBe(1);
+    }
+    expect(grantRetry("The review records")).toBe("The review records can't be read right now, so nothing was granted yet. The card is still up: try again in a minute.");
+  });
+
+  test("after a link restart the open state is read back from disk", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    t.r.restart();
+    await expect(again(t)).rejects.toThrow(`a grant card for pr-46 is already open`);
+    t.r.pulls[PRN(46)] = { head: HEAD_B, open: true };
+    t.r.restart();
+    const res = await again(t);
+    expect(res.status).toBe("posted");
+    retired(t, a);
+    const b = (res as any).message;
+    t.r.restart();
+    expect(await t.r.tap(t.r.msg(b), grantIds(t, b)[0])).toBe("to Cain");
+    expect(t.written.length).toBe(1);
   });
 });

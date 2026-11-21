@@ -90,7 +90,7 @@ import { effectiveCap, GRANT_MAX, grantedRounds, grantsFor, GrantUnsaved, lastRo
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
-import { countedRounds, type DecisionRec, type Rounds } from "../review/rounds";
+import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
@@ -108,6 +108,11 @@ export const grantLabel = (n: number) => `Grant ${n} more round${n === 1 ? "" : 
 // change is written, and a grant tap whose checks no longer hold writes nothing; its card says why.
 export const GRANT_REPLACED = "Replaced by a newer grant";
 const GRANT_REFUSED = "Nothing was granted: ";
+// Second review of 0.18.0: a passing failure at his Grant tap (the holds file, the runner's records or the pull
+// request's head can't be read just then) keeps the card's buttons, and he's told to try again in a minute.
+export const grantRetry = (what: string) => `${what} can't be read right now, so nothing was granted yet. The card is still up: try again in a minute.`;
+// How long his tap waits for GitHub's answer on the pull request's head, so it's answered within Discord's 3 seconds.
+const GRANT_HEAD_MS = 2000;
 export const EXPIRED = "Expired";
 // The one card gate (round 3): asks, Ship cards, the review cap's decision card and a usage-guard hold's
 // description all go through cainWords with this rule set, the same object, never a copied list.
@@ -344,7 +349,10 @@ export interface Shown {
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
   grant?: { key: string; rounds: number; pr: string | null; reason: string;       // Cain's grant card for extra review rounds (0.18.0, ../review/grants.ts)
-    used?: number; cap?: number };   // the runner's round count and the change's cap when it was posted: checked again at the tap
+    used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
+    // Second review: the state it was posted on, checked again at the tap: the pull request's head commit (null for a
+    // change that isn't a pull request) and the id of the change's newest decision then (null: none). Missing: unbound.
+    head?: string | null; decision?: string | null };
 }
 // The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
 // tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
@@ -901,6 +909,7 @@ type Put = { message: string; first: boolean; fromLink?: boolean };
 
 export class Link {
   private chain: Promise<unknown> = Promise.resolve();
+  private keyLocks = new Map<string, Promise<void>>();   // one operation at a time for each grant change key (underKey)
   private sweeping = false;
   private headChecked = new Map<string, number>();
   private going = new Map<number, Promise<Put>>();   // cards being put up now (putUp)
@@ -1668,6 +1677,14 @@ export class Link {
     const pm = /^pr-(\d+)$/.exec(key);
     const prUrl = (PULL.test(ref) ? ref : null) ?? rounds.changes[key]?.pr ?? null;
     const prNum = pm ? pm[1] : (prUrl ? /\/pull\/(\d+)$/.exec(prUrl)?.[1] ?? null : null);
+    // Second review: the card is bound to the state it's posted on, the pull request's head and the newest decision.
+    const decision = decisionOf(rounds, key)?.id ?? null;
+    let head: string | null = null;
+    if (prUrl) {
+      const h = await this.headNow(prUrl);
+      if (typeof h !== "string") throw new Refusal(`the pull request's head can't be read from GitHub right now (${h.unknown}), so no grant card can go out: ask again in a minute`);
+      head = h;
+    }
     const w = this.cainWords("grant", "grant card", why.replace(/[.\s]+$/, ""), { rules: CARD_RULES, buttons: [grantLabel(n), GRANT_NO], known: this.liveLabels() }, { reviewed: true });
     const left = last.state === "lost" ? "its last round did not complete, so what it would have found isn't known"
       : last.serious ? `its last round still left ${last.serious === 1 ? "one serious finding" : `${last.serious} serious findings`}`
@@ -1675,67 +1692,132 @@ export class Link {
     const prior = had.length ? `, ${grantedRounds(had)} of them granted by you before` : "";
     const text = `${w.text}${prNum ? ` (pull request ${prNum})` : ""}. It has used all ${used} of its outside review rounds${prior}, and ${left}. `
       + `Grant it ${n} more fix round${n === 1 ? "" : "s"}, for ${cap + n} in all? A grant only allows more rounds: it never exempts the change from the rule, and shipping it with a risk named still needs the App's rollback armed.`;
-    this.openGrantCard(key);
     const shown = this.cardGate("grant", "grant card", text, [grantLabel(n), GRANT_NO]);
     if (!shown) throw new Refusal("the grant card's words didn't pass the card gate: say what the change does in plain words, with no record codes, counts or machine text");
     const options = [grantLabel(n), GRANT_NO];
     const question = `grant:${key}`;
     const now = this.d.now();
     const nonce = stableNonce("grant", meta.item, key, String(n), shown, String(cap));
-    return this.serial(async () => {
-      this.openGrantCard(key);                     // again, one at a time: two requests can't both post
+    // Under the change key's lock (the one his taps take), then one post at a time: an open card for the key is
+    // retired when what it was posted on is stale, and otherwise refuses this one.
+    return this.underKey(`grant:${key}`, () => this.serial(async () => {
+      await this.openGrantCard(key, { used, cap, decision, head, pr: prUrl });
       const msg = await this.postCard(shown, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"),
         { replyTo: meta.replyTo, nonce });
       const s = this.d.load();
       this.remember(s, msg, { kind: "ask", item: meta.item, question, posted: now, expires: this.askExpiry(now), buttons: true, labels: [...options],
         q: { q: `Grant ${key} ${n} more review round${n === 1 ? "" : "s"}?`, options, used: false },
-        grant: { key, rounds: n, pr: prUrl, reason: w.text, used, cap } });
+        grant: { key, rounds: n, pr: prUrl, reason: w.text, used, cap, head, decision } });
       const replaced = this.markReplaced(s, String(msg.id));
       this.d.save(s);
       await this.stripAll(replaced);
       this.log(`a grant card for ${key} (${n} more round${n === 1 ? "" : "s"}) went to him`);
       return { status: "posted" as const, message: String(msg.id),
         said: `Posted. Only his tap grants the rounds; you'll hear it like any tap. Until then ${key} stays at its cap of ${cap}.` };
-    });
+    }));
+  }
+
+  // One operation at a time for each key (second review of 0.18.0): his grant taps and a new grant card for the
+  // same change key run one after another, in this process, so two can't both pass the checks before either writes.
+  private underKey<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.keyLocks.get(key) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const tail = run.then(() => {}, () => {});
+    this.keyLocks.set(key, tail);
+    void tail.then(() => { if (this.keyLocks.get(key) === tail) this.keyLocks.delete(key); });
+    return run;
+  }
+
+  // A pull request's head now, as GitHub has it, within GRANT_HEAD_MS (his tap is answered within Discord's 3
+  // seconds), or why it can't be told.
+  private async headNow(pr: string): Promise<string | { unknown: string }> {
+    if (!this.d.pull) return { unknown: "the link can't read pull requests" };
+    const p = await within(Promise.resolve().then(() => this.d.pull!(pr)).catch(() => null), GRANT_HEAD_MS);
+    return p?.head ? p.head : { unknown: p ? "GitHub gave no head" : "GitHub didn't answer" };
+  }
+
+  // Whether a card's message is gone from his DM: only Discord's own 404 says so (anything else can't tell).
+  private async messageGone(id: string): Promise<boolean> {
+    try { const { dm } = await this.identity(); await this.rest("GET", `/channels/${dm}/messages/${id}`); return false; }
+    catch (e) { return /discord 404/.test(String(e)); }
   }
 
   // One open grant card a change key (first review of 0.18.0): a second is refused, naming when the open
-  // one went up.
-  private openGrantCard(key: string): void {
-    const now = this.d.now();
-    const open = Object.entries(this.d.load().messages).find(([, m]) => m.grant?.key === key && live(m, now) && !m.q?.used);
-    if (!open) return;
-    const [id, m] = open;
-    const at = m.posted ?? snowflakeTime(id);
-    throw new Refusal(`a grant card for ${key} is already open (posted at ${at ? clockTime(at, this.d.tz) : "an unknown time"}, Discord message ${id}): `
+  // one went up. Second review: it never deadlocks. An open card whose bound state is stale (the head moved, a
+  // newer decision, the round count or cap changed, a card bound to nothing, or its message gone from the chat) is
+  // retired first: its open state cleared on disk, its buttons taken off with "Replaced by a newer card".
+  private async openGrantCard(key: string, now: { used: number; cap: number; decision: string | null; head: string | null; pr: string | null }): Promise<void> {
+    const at = this.d.now();
+    const open = Object.entries(this.d.load().messages).filter(([, m]) => m.grant?.key === key && live(m, at) && !m.q?.used);
+    const standing: [string, Shown][] = [];
+    for (const [id, m] of open) {
+      const g = m.grant!;
+      let why = g.used !== now.used || g.cap !== now.cap ? "its round count or cap changed"
+        : g.decision === undefined || g.head === undefined ? "it was bound to nothing"
+        : g.decision !== now.decision ? "a newer decision came"
+        : (g.pr ?? now.pr) && g.head !== now.head ? "the pull request's head moved"
+        : "";
+      if (!why && (await this.messageGone(id))) why = "its message is gone from the chat";
+      if (!why) { standing.push([id, m]); continue; }
+      const s = this.d.load();
+      const r = s.messages[id];
+      if (!r || r.outcome || !r.buttons) continue;
+      r.outcome = "replaced"; r.why = "replaced";
+      if (r.q) r.q.used = true;
+      this.d.save(s);
+      this.log(`an open grant card for ${key} was stale (${why}): retired for the new one`);
+      await this.strip(id);
+    }
+    if (!standing.length) return;
+    const [id, m] = standing[0];
+    const posted = m.posted ?? snowflakeTime(id);
+    throw new Refusal(`a grant card for ${key} is already open (posted at ${posted ? clockTime(posted, this.d.tz) : "an unknown time"}, Discord message ${id}): `
       + "no second one while it stands. He answers that one, or it expires at the next morning check-in");
   }
 
   // Everything the card was posted on, checked again at his Grant tap before anything is written (first
   // review of 0.18.0): Stop clear, the cap's files right, the change still at its cap with no round
   // running, its item held by no one else and not closed, and the runner's round count and the change's
-  // cap still what the card was posted on. The plain line for him when one fails, or null.
-  private grantBlock(g: NonNullable<Shown["grant"]>, item: string): string | null {
-    if (this.stopped().stopped) return "Everything is stopped, so this grant can't be written until you tap Turn back on";
-    if (this.capOff()) return "The review records aren't set up right just now, so this grant can't be written";
+  // cap still what the card was posted on. Second review: run under the change key's lock, and also the
+  // newest decision and the pull request's head still the ones the card was bound to. The plain line for him
+  // when one fails (retry: a passing failure to read, which keeps the card up), or null.
+  private async grantBlock(g: NonNullable<Shown["grant"]>, item: string): Promise<{ line: string; retry?: boolean } | null> {
+    if (this.stopped().stopped) return { line: "Everything is stopped, so this grant can't be written until you tap Turn back on" };
+    if (this.capOff()) return { line: "The review records aren't set up right just now, so this grant can't be written" };
     let rounds: Rounds | null = null, grants: Grants | null = null;
     try { rounds = this.d.rounds?.() ?? null; } catch { rounds = null; }
     try { grants = this.d.grants?.() ?? null; } catch { grants = null; }
-    if (!rounds || !grants) return "The review records can't be read right now, so this grant can't be written";
+    if (!rounds || !grants) return { line: grantRetry("The review records"), retry: true };
     const used = countedRounds(rounds, g.key).length;
     const cap = effectiveCap(this.d.roundCap?.() ?? 3, rounds, grants, g.key);
-    if (used < cap) return "That change has rounds left now, so this grant isn't needed";
+    if (used < cap) return { line: "That change has rounds left now, so this grant isn't needed" };
     const last = lastRound(rounds, g.key);
-    if (last.state === "running" || last.state === "none") return "That change has a review round running now, so this grant can't be written";
+    if (last.state === "running" || last.state === "none") return { line: "That change has a review round running now, so this grant can't be written" };
     if (item && item !== "none") {
       const f = this.files();
       const holds = parseHolds(f.holds);
-      if (holds === null) return "Who is working on that change can't be read right now, so this grant can't be written";
-      if (heldElsewhere(holds, item)) return "That change is being worked on by another session now, so this grant can't be written";
-      if (closedItems(f.pending).has(item.toUpperCase())) return "That change's item is closed now, so this grant isn't needed";
+      if (holds === null) return { line: grantRetry("Who is working on that change"), retry: true };
+      if (heldElsewhere(holds, item)) return { line: "That change is being worked on by another session now, so this grant can't be written" };
+      if (closedItems(f.pending).has(item.toUpperCase())) return { line: "That change's item is closed now, so this grant isn't needed" };
     }
-    if (g.used !== used || g.cap !== cap) return "That change's review rounds have moved on since this card went up, so this grant can't be written";
+    if (g.used !== used || g.cap !== cap) return { line: "That change's review rounds have moved on since this card went up, so this grant can't be written" };
+    if (g.decision === undefined || g.head === undefined) return { line: "This card was posted before grants were bound to the change as it stood, so this grant can't be written" };
+    if ((decisionOf(rounds, g.key)?.id ?? null) !== g.decision) return { line: "A newer decision on that change has come since this card went up, so this grant can't be written" };
+    if (g.pr) {
+      const h = await this.headNow(g.pr);
+      if (typeof h !== "string") return { line: grantRetry("The pull request's newest commit"), retry: true };
+      if (h !== g.head) return { line: "That pull request has new commits since this card went up, so this grant can't be written" };
+    }
     return null;
+  }
+
+  // A passing failure at his Grant tap: nothing written, the card keeps its buttons and stays open, and he's told
+  // in one line, to him alone, to try again in a minute. Cain isn't told: nothing happened yet.
+  private async grantRetryTap(it: any, g: NonNullable<Shown["grant"]>, line: string): Promise<string> {
+    this.log(`his tap on the grant card for ${g.key} wrote nothing for now, the card stays up: ${line}`);
+    await this.answer(it, ACK);
+    await this.ephemeral(it, line);
+    return "retry";
   }
 
   // A grant tap that failed its checks: nothing written, the card loses its buttons and says why, and he
@@ -1764,7 +1846,8 @@ export class Link {
   // the same change key; "No" writes nothing. Either way it's logged, and kept beside his other taps
   // (decided). The line for Cain and the cards replaced, "unsaved" when the grant couldn't be kept (he was
   // told; the card stays tappable), or { out } when its checks failed (answered already).
-  private async grantTap(it: any, s: State, m: Shown, msgId: string, label: string): Promise<{ note: string; replaced: string[] } | "unsaved" | { out: string }> {
+  // His checks (grantBlock) ran just before, under the same lock, and s is read after them.
+  private async grantTap(it: any, s: State, m: Shown, msgId: string, label: string): Promise<{ note: string; replaced: string[] } | "unsaved"> {
     const g = m.grant!;
     const at = this.d.now();
     if (label === GRANT_NO) {
@@ -1772,8 +1855,6 @@ export class Link {
       try { this.d.decided?.(`grant:${g.key}:${msgId}`, label, at); } catch (e) { this.log(`couldn't keep his No on the grant card beside his taps: ${String(e).slice(0, 80)}`); }
       return { note: ` No rounds were granted: ${g.key} stays at its cap.`, replaced: [] };
     }
-    const block = this.grantBlock(g, m.item);
-    if (block) return { out: await this.grantRefused(it, s, msgId, block, label) };
     const rec: GrantRec = { id: `${g.key}+${msgId}`, key: g.key, rounds: g.rounds, by: "owner", at: new Date(at).toISOString(),
       message: msgId, reason: g.reason, item: m.item && m.item !== "none" ? m.item : null, pr: g.pr };
     let kept: { rec: GrantRec; existed: boolean };
@@ -2476,12 +2557,12 @@ export class Link {
       this.log("tap refused: card was changed after it was posted");
       return "refused: card was changed after it was posted";
     }
+    // A tap on a grant card (second review of 0.18.0): the re-check, the grant's write and the card's consumption
+    // run under one lock for its change key, so a second delivery of the tap, or a second tap, waits and then
+    // finds the card used: a dead tap, nothing written.
+    if (rec.grant && cid.startsWith("q:")) return this.underKey(`grant:${rec.grant.key}`, () => this.grantTapLocked(it, cid, msgId));
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
-      // A grant card's item moved to another holder or closed: his tap is told why in plain words.
-      if (why && rec.grant && cid.startsWith("q:") && (why === "held elsewhere" || why === "item closed"))
-        return this.grantRefused(it, s, msgId, why === "item closed" ? "That change's item is closed now, so this grant isn't needed"
-          : "That change is being worked on by another session now, so this grant can't be written");
       if (why) {
         rec.outcome = why === "answered" ? "answered" : "expired"; rec.why = why;
         this.d.save(s);
@@ -2491,6 +2572,31 @@ export class Link {
     if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId);
     if (cid === RESUME) { this.setStop(false); return this.stopTap(it, cid, msgId); }
     return this.toSpecialist(it, cid, msgId);
+  }
+
+  // His tap on a grant card, under its change key's lock: the card read again from disk, as the tap before it
+  // left it, then the same checks as any tap's, then his answer.
+  private async grantTapLocked(it: any, cid: string, msgId: string): Promise<string> {
+    const s = this.d.load();
+    const rec = s.messages[msgId];
+    if (!rec) return this.deadTap(it, msgId, "not a card the link knows");
+    if (rec.outcome || rec.q?.used) return this.deadTap(it, msgId, rec.why ?? rec.outcome ?? "answered");
+    if (digest(it.message.content ?? "", it.message.components) !== rec.digest) {
+      await this.answer(it, ACK);
+      this.log("tap refused: card was changed after it was posted");
+      return "refused: card was changed after it was posted";
+    }
+    const why = this.deadReason(rec, this.d.now());
+    // Its item moved to another holder or closed: his tap is told why in plain words.
+    if (why === "held elsewhere" || why === "item closed")
+      return this.grantRefused(it, s, msgId, why === "item closed" ? "That change's item is closed now, so this grant isn't needed"
+        : "That change is being worked on by another session now, so this grant can't be written");
+    if (why) {
+      rec.outcome = why === "answered" ? "answered" : "expired"; rec.why = why;
+      this.d.save(s);
+      return this.deadTap(it, msgId, why);
+    }
+    return this.onQuestion(it, cid, msgId);
   }
 
   // Stop and Turn back on go on to the calendar specialist, whose notice says what
@@ -3000,12 +3106,21 @@ export class Link {
   }
 
   private async onQuestion(it: any, cid: string, msgId: string): Promise<string> {
-    const s = this.d.load();
-    const m = s.messages[msgId];
-    const q = m?.q;
+    let s = this.d.load();
+    let m = s.messages[msgId];
+    let q = m?.q;
     const i = Number(cid.split(":")[2]);
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
     const tapped = q.options[i];
+    // His Grant tap (second review of 0.18.0): under the change key's lock (onInteraction), everything is checked
+    // again first, the head read from GitHub included; then the state is read afresh for the write and the card.
+    if (m.grant && tapped !== GRANT_NO) {
+      const block = await this.grantBlock(m.grant, m.item);
+      if (block?.retry) return this.grantRetryTap(it, m.grant, block.line);
+      s = this.d.load(); m = s.messages[msgId]; q = m?.q;
+      if (!m || !q || q.used || m.outcome) return this.deadTap(it, msgId, "answered");
+      if (block) return this.grantRefused(it, s, msgId, block.line, tapped);
+    }
     let label = tapped;
     // His decision at the review-round cap (0.16.0) is kept before anything else, for the Ship card.
     // Round 2: kept durably first, and only then is the card marked used. If it can't be kept, the card
@@ -3035,7 +3150,6 @@ export class Link {
     if (m.grant) {
       const done = await this.grantTap(it, s, m, msgId, tapped);
       if (done === "unsaved") return "unsaved";
-      if ("out" in done) return done.out;
       heldNote = done.note; replaced = done.replaced;
     }
     q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
@@ -3726,7 +3840,8 @@ export class Link {
     const line = outcomeLine(m);
     const gone = () => {
       const s = this.d.load();
-      if (s.messages[id]) { s.messages[id].buttons = false; s.messages[id].off = this.d.now(); this.d.save(s); }
+      const r = s.messages[id];
+      if (r) { r.buttons = false; r.off = this.d.now(); if (r.q) r.q.used = true; this.d.save(s); }
       return "done" as const;
     };
     const failed = (e: unknown) => {

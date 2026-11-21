@@ -710,8 +710,11 @@ second view adds value; skip it for small, obvious things.
   The link builds the card (the rounds used and what the last left come from the runner's record)
   with "Grant <n> more rounds" and "No"; your command writes nothing, and a grant is his tap only.
   It's refused while the change has rounds left, while its last round runs, for an item someone else
-  holds, while Stop holds, and while a grant card for that change is still open (one at a time). His
-  Grant tap checks all of it again first: if it no longer holds, nothing is granted and you hear why;
+  holds, while Stop holds, and while a grant card for that change is still open (one at a time; an open
+  one that went out of date, with a new head, a newer decision or rounds moved on, or whose message is
+  gone, is replaced by your new one). His
+  Grant tap checks all of it again first, the pull request's head and its newest decision included: if
+  it no longer holds, nothing is granted and you hear why;
   ask again only once the change is at its cap with its last round done. On his Grant tap the change's cap goes up by exactly that many: submit
   the next fix-only round as usual. A granted round that again leaves something serious at the raised
   cap brings the service's decision card again (after a Hold too); a grant never lifts the armed
