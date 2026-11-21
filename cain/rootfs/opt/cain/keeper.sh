@@ -150,6 +150,11 @@
 #                                        the same gate rules, and records it as his own reply (he may edit it)
 #   keeper.sh link-host <host>           adds a host Cain cites to the gate's list (a link to a host off it
 #                                        is only noted in the gate report, never held)
+#   keeper.sh hc-check <check name>      a heartbeat check at Healthchecks.io: its grace, period, status and
+#                                        last ping (0.17.0; the link holds the key: "no key set" without one)
+#   keeper.sh hc-set <check name> --grace <seconds> [--period <seconds>]
+#                                        sets that check's grace (and period) and prints what the service
+#                                        answered; nothing else can be set, and each set is logged
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
@@ -201,6 +206,7 @@ case "$cmd" in
   show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   key-expiry|key-ack) url="$link/key-note"; ctx=harness-relay-v1 ;;
+  hc-check|hc-set) url="$link/hc"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
 esac
 if [ "$cmd" = fastpath ]; then
@@ -365,6 +371,18 @@ case "$cmd" in
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
   key-expiry|key-ack) body=$(jq -nc --arg c "$cmd" --arg n "${1:-}" --arg d "${2:-}" '{cmd: $c, name: $n, date: $d}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
+  hc-check) [ $# -eq 1 ] && [ -n "$1" ] || { echo '{"status":"error","said":"usage: keeper.sh hc-check <check name>"}'; exit 2; }
+            body=$(jq -nc --arg n "$1" '{cmd: "check", name: $n}') ;;
+  hc-set)   name="${1:-}"; shift || true; grace="" period=""
+            while [ $# -gt 0 ]; do
+              case "$1" in
+                --grace) [ $# -ge 2 ] || { echo '{"status":"error","said":"--grace needs seconds"}'; exit 2; }; grace="$2"; shift 2 ;;
+                --period) [ $# -ge 2 ] || { echo '{"status":"error","said":"--period needs seconds"}'; exit 2; }; period="$2"; shift 2 ;;
+                *) jq -nc --arg f "$1" '{status: "error", said: ("only --grace and --period can be set; refused: " + $f)}'; exit 2 ;;
+              esac
+            done
+            [ -n "$name" ] && [ -n "$grace" ] || { echo '{"status":"error","said":"usage: keeper.sh hc-set <check name> --grace <seconds> [--period <seconds>]"}'; exit 2; }
+            body=$(jq -nc --arg n "$name" --arg g "$grace" --arg p "$period" '{cmd: "set", name: $n, grace: $g} + (if $p == "" then {} else {period: $p} end)') ;;
   review-grant)
     [[ "$rounds" =~ ^[1-3]$ ]] || { echo '{"status":"error","said":"--rounds takes 1, 2 or 3"}'; exit 2; }
     [ -n "$change" ] || { echo '{"status":"error","said":"--change takes the pull request url or the change key"}'; exit 2; }

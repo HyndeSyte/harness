@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.19.0
+
+- The usage guard now reads your plan's week: the tokens Cain used since Sunday 12:00 AM against a weekly allowance you set by hand, the new option `plan_weekly_allowance_tokens` (about 4.2 billion to start, worked out from your usage page on Nov 21). Other work runs again while more than 25% of the week is left; the App's docs say how to work the number out again.
+- The token count is right now: each reply counts once instead of once per part, every transcript changed this week is read (subagents too), and a count that had to skip a file says so and holds other work instead of looking complete.
+- `review.sh guard` says the percent of the week left, the tokens counted, when the week started, and how many transcript files were read and skipped.
+- The link now decides every other-labelled Build job, not only the ones Cain's own check would hold.
+- Review-cap decision cards: a saved answer that isn't one of the card's two choices is treated as unreadable (nothing passed on, the card says so, an alarm names it); a tap while answers are paused says so and points to the alarm; a card from before a reset is replaced with a new one; a hold line is never written twice, and an unreadable guard log raises an alarm instead of a guess.
+- Badly formed hold calls no longer use up the hold route's per-minute limit.
+- Cain can read and set the grace and period of your Healthchecks.io heartbeat checks himself, once you paste a read-write management key into the new option `healthchecks_api_key`.
+- Second round of review fixes: your taps are never held up by the usage guard's reading. The link reads the plan in the background with a 2 second limit (a reading not ready by then holds other work), and the review runner warms that reading when the App starts and when the week turns.
+- Cain's Build hook no longer reads a cold plan count itself: it asks the link first, and a reading still not ready refuses the job as "plan reading not ready", with a line on the guard's log. An alarm says when the plan count's cache can't be kept or isn't root's.
+- The week's count keeps a high-water mark: if it ever goes down within a week (a transcript deleted, cut short or re-timed), other work is held and an alarm says what went down. The docs now say plainly what the count can and can't be trusted for.
+- Two new options, `plan_allowance_set_on` and `plan_allowance_derivation`, record when and how the allowance was worked out; `review.sh guard` prints both.
+- Your review-cap answers: the reset mark is written safely before the old file is moved aside (and the file stays put if the mark can't be written, with an alarm), and a mark that can't be read raises an alarm naming the file and how to clear it.
+- Passing Build checks no longer use up the usage guard's limit of 6 holds a minute; checks have their own, higher limit.
+- Heartbeat checks: grace and period are each capped at one hour, and every change Cain makes is posted to you in one line with the old and new values. The Healthchecks key now reaches the link in a root-only file, never an environment its helper programs could see.
+- Third round of review fixes: the App's alarms no longer hold up your taps. The link starts each alarm in the background with its own time limit, so a tap is answered while an alarm is still being sent.
+- The plan count's high-water mark can no longer go down when the review runner and the link both save it at once: each keeps the larger mark, and a reading behind the newer one holds other work until the next reading catches up.
+- If the reset mark of your review-cap answers can't be read, the App writes it again with the current time instead of asking you to delete it, so cards from before the reset still can't be answered. If it can't, the alarm names the one command to run as root.
+- A plan reader that keeps failing (two readings in a row, or half an hour with none complete) now raises its own alarm with the cause, and it clears with the next complete reading.
+- While a new plan reading runs long, a reading from the last 2 minutes is used with its own reason, so a missing allowance is no longer reported as "out of time".
+- The link writes the Build hook's "not ready" hold line only when its own plan reading is not ready the same way; any other such request is refused and not counted.
+- A heartbeat change whose line couldn't be posted to you now raises an alarm naming the check, at most hourly, and the line is checked against the message gate's rules first.
+- Leftover temp files from an interrupted reset mark write are cleaned up, never one still being written.
+
 ## 0.18.0
 
 - When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".

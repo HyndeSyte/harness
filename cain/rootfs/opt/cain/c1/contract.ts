@@ -19,7 +19,7 @@ export const RUNS: Record<State, { oldRootSession: boolean; uid1000: "none" | "v
 
 // Cain's routes and root's (/sent), as in link/auth.ts; kept here too so this module stands alone.
 const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
-  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant"]);
+  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/hc", "/review-grant"]);
 
 export interface Asked {
   signed: boolean;        // a signature that verifies with the specialist's key

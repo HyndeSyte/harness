@@ -6,6 +6,7 @@ import { since } from "../stop";
 import { boundedText, type Caller, routeAllowed } from "./auth";
 import { noteKey } from "../security/main";
 import { type Link, Refusal, SAID_MAX } from "./core";
+import type { HcAnswer } from "./healthchecks";
 
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
@@ -14,6 +15,7 @@ export interface RouteDeps {
   link: Link;
   toHarness: (path: string, body: unknown) => Promise<boolean>;
   tz?: string;
+  hc?: (b: unknown) => Promise<HcAnswer>;          // 0.17.0: keeper.sh hc-check and hc-set (healthchecks.ts)
 }
 
 // One request, from a caller already proven: refused unless the route is the caller's.
@@ -52,7 +54,9 @@ export function linkRoutes(d: RouteDeps) {
         case "/decision": return json(await link.decision(b));
         case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
-        case "/guard-hold": return json(link.guardHoldFor(b, caller));
+        case "/guard-hold": return json(await link.guardHoldFor(b, caller));
+        // The heartbeat checks' grace and period at Healthchecks.io (0.17.0): the link holds the key.
+        case "/hc": return json(d.hc ? await d.hc(b) : { status: "refused", said: "no key set" });
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

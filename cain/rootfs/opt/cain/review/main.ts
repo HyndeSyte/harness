@@ -8,7 +8,9 @@ import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
 import type { DecisionRec } from "./rounds.ts";
-import { selfCheck } from "../capfiles.ts";
+import { capPaths, selfCheck } from "../capfiles.ts";
+import { PlanCacheAlarm, readSettings } from "../guard.ts";
+import { readPlanUsage, weekStart } from "../plan-usage.ts";
 import { claudeSeat } from "./seats/claude.ts";
 import { geminiSeat } from "./seats/gemini.ts";
 import { codexSeat, codexSignedIn } from "./seats/openai.ts";
@@ -30,6 +32,34 @@ export function decisionPoster(linkSock: string, log: (m: string) => void) {
     if (res.ok && j?.status === "held") return null;
     log(`the link didn't post the decision card for ${d.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
     return null;
+  };
+}
+
+// The plan reader's cache, warmed by root (0.17.0, round 2 of the review fixes): at the runner's start,
+// whenever the plan's week turns, and every WARM_MS between, so the link's reading (in its own child
+// process, ../plan-read.ts) and the Build hook's (run as Cain, which never scans a cold week itself) find
+// it warm. Synchronous, in this process: nothing here waits on Discord. Each warm reading goes to the
+// cache alarm (a failed write or a cache the trust check refuses; a count below the week's mark).
+// Round 3 of 0.17.0's review fixes: each warm is a reading asked, and one that throws counts as a failure,
+// so a reader that keeps failing (or is always incomplete) raises the plan alarm (guard.ts PlanCacheAlarm).
+export const WARM_MS = 15 * 60_000;
+export function planWarmer(o: { settingsFile: string; cacheFile: string; tz: string; dir?: string; alarm: PlanCacheAlarm; log: (m: string) => void;
+    now?: () => Date; read?: typeof readPlanUsage }) {
+  let week = "", at = 0;
+  return (force = false): boolean => {
+    const now = (o.now ?? (() => new Date()))();
+    const w = weekStart(now, o.tz).toISOString();
+    if (!force && w === week && now.getTime() - at < WARM_MS) return false;
+    const turned = week !== "" && w !== week;
+    week = w; at = now.getTime();
+    o.alarm.asked();
+    try {
+      const allowance = Number(readSettings(o.settingsFile)?.weekly_allowance_tokens ?? 0);
+      const r = (o.read ?? readPlanUsage)({ now, tz: o.tz, allowance, cacheFile: o.cacheFile, saveCache: true, ...(o.dir ? { dir: o.dir } : {}) });
+      o.alarm.saw(r);
+      o.log(`plan cache warmed${turned ? " (the week turned)" : ""}: ${r.files} transcript files, ${r.skipped ?? 0} skipped, cache ${r.cache_write ?? "unchanged"}`);
+    } catch (e) { o.log(`couldn't warm the plan cache: ${String(e).slice(0, 80)}`); o.alarm.failed(`the plan reader failed in the review runner (${String(e).slice(0, 80)})`); }
+    return true;
   };
 }
 
@@ -79,6 +109,9 @@ if (import.meta.main) {
     }
   } catch (e) { log(`sign-in page didn't start: ${(e as Error).message}`); }
 
+  // Round 2: the plan cache warmed now, before the loop, and again when the week turns.
+  const warm = planWarmer({ settingsFile: cfg.settingsFile!, cacheFile: capPaths().planCache, tz: cfg.tz, alarm: new PlanCacheAlarm({ log }), log });
+  warm(true);
   const checkAt = env.REVIEW_CHECK_AT ?? "0300";
   let lastCheck = "", lastTry = 0;
   while (true) {
@@ -86,6 +119,7 @@ if (import.meta.main) {
     // the file is right (the alarm is raised or cleared only when its finding changes).
     try { runner.capOff = selfCheck({ log, prev: runner.capOff }); } catch (e) { log(`self-check error: ${(e as Error).message}`); }
     try { await runner.tick(); } catch (e) { log(`tick error: ${(e as Error).message}`); }
+    warm();
     const now = new Date();
     const hm = now.toLocaleTimeString("en-GB", { timeZone: cfg.tz, hour: "2-digit", minute: "2-digit" }).replace(":", "");
     const day = now.toLocaleDateString("en-CA", { timeZone: cfg.tz });

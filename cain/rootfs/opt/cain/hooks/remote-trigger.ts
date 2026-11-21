@@ -17,6 +17,15 @@
 //     what his tap landed, so it carries its label and isn't held. Round 2: the guard's log is root's
 //     (0640), so the hold goes to the link (POST /guard-hold, Cain's key), which decides again and
 //     appends it; if the link can't be reached the run is still refused, saying the hold wasn't logged.
+//     Cain 0.17.0: the link is asked for every "other" Build run, not only when the hook refuses.
+//     Round 2 of its review fixes: the hook has its own budget (HOOK_BUDGET_MS, under the 15 seconds
+//     Claude Code gives it) and never scans a cold week itself: on a cold or missing plan cache it asks
+//     the link first (the link, as root, reads and warms the cache), then reads once more; if its reading
+//     still isn't ready it refuses with the named reason ("plan reading not ready: cache cold", or "out of
+//     time") and has the link write that hold line. The two-pass rule stays: a run passes only when the
+//     hook's reading and the link's both let it, and the link answered.
+//     What it can be trusted for: guard.ts says (the count rests on Cain's own transcripts not being
+//     altered); the hook is an accident guard, not a wall.
 //     Paths are constants (../capfiles.ts), and the hook refuses every run while the test-mode
 //     variable (CAIN_TEST_MODE) is set: the production run script never sets it.
 // A refusal goes back to Cain as the reason; anything else is left to the usual
@@ -119,7 +128,7 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
     // Round 3: when the link's own reading passed what the hook's refused, the refusal names the hook's
     // reading and the difference, not a link that didn't take it.
     if (!g.ok)
-      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.linkPasses ? "by the hook's own reading " : ""}${g.why}. Core, commitment and necessary-fix work still run; nothing bypasses it. ${g.linkPasses
+      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.linkPasses ? "by the hook's own reading " : ""}${g.why}. Core, commitment and necessary-fix work still run, and labelling work to get past the guard is against the rules. ${g.linkPasses
         ? "The link read the guard again and its reading lets it run, so the two readings differ (a reading changed between them, or they read different files); the hook's refusal stands, and it isn't on the guard's log: try again in a minute, and log a Build item if it repeats."
         : g.logged === false
         ? "The hold could not be logged (the link didn't take it), so it isn't on the guard's log: try again in a minute, and log a Build item if it repeats."
@@ -160,22 +169,52 @@ function read(path: string): string | null {
   try { return readFileSync(path, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
 
-// The guard as the hook runs it: the reading now, and a refusal sent to the link to be logged. Two
-// passes: decide() is synchronous, so the first finds whether the guard refuses, the link is asked, and
-// the second gives the reason with whether it was logged.
+// The guard as the hook runs it. Cain 0.17.0: the plan reader can return a real fraction now, so the
+// link decides every "other" Build run first (../guard.ts LINK_DECIDES_BUILDS): the hook's reading is
+// taken, then the link is asked every time (POST /guard-hold), and the run passes only when both let it
+// and the link answered "passes". Two passes: decide() is synchronous, so the first finds the run's
+// label and the hook's reading, the link is asked, and the second gives the answer.
+// Round 2: a hook reading that wasn't ready (notReady: a cold cache, or out of time) asks the link first;
+// when the link's reading passes, the hook reads once more (the link has warmed the cache), and if that
+// still isn't ready the run is refused with the named reason, its hold line written by the link (post's
+// hook field). A real refusal of the hook's own stays as before.
+export type Post = (label: Label, what: string, hook?: string) => Promise<{ logged: boolean; passes?: boolean; why?: string }>;
 export async function decideWithGuard(call: any, holdsText: string | null, env: Env,
-    reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean; passes?: boolean }>): Promise<string> {
-  let held: { label: Label; what: string; v: Extract<Verdict, { ok: false }> } | null = null;
+    reading: (label: Label, what: string) => Verdict, post: Post): Promise<string> {
+  let asked: { label: Label; what: string; v: Verdict } | null = null;
   const first = decide(call, holdsText, { ...env, guard: (label, what) => {
     const v = reading(label, what);
-    if (!v.ok) held = { label, what, v };
+    asked = { label, what, v };
     return v;
   } });
-  if (!held) return first;
-  const h = held as { label: Label; what: string; v: Extract<Verdict, { ok: false }> };
+  if (!asked) return first;
+  const h = asked as { label: Label; what: string; v: Verdict };
   const sent = await post(h.label, h.what);
-  return decide(call, holdsText, { ...env, guard: () => ({ ...h.v, logged: sent.logged, ...(sent.passes ? { linkPasses: true } : {}) }) });
+  const again = (v: Verdict) => decide(call, holdsText, { ...env, guard: () => v });
+  if (h.v.ok) {
+    if (sent.passes) return first;                                  // both readings let it run
+    // The hook's reading passed, the link's didn't, or the link didn't answer: held (fail closed).
+    return again(sent.logged
+      ? { ok: false, floor: "link", why: `the link's reading holds it${sent.why ? ` (${sent.why})` : ""}`, logged: true }
+      : { ok: false, floor: "link", why: "the link, which decides every other-labelled Build run, didn't let it run", logged: false });
+  }
+  if (h.v.notReady && sent.passes) {
+    // The link read (and warmed the cache) and lets it run: the hook reads once more, within its budget.
+    const v2 = reading(h.label, h.what);
+    if (v2.ok) return again(v2);                                    // both readings let it run now
+    if (v2.notReady) {
+      const hold = await post(h.label, h.what, v2.notReady);         // the hook's own hold line, written by the link
+      return again({ ...v2, logged: hold.logged });
+    }
+    return again({ ...v2, logged: false, linkPasses: true });
+  }
+  return again({ ...(h.v as Extract<Verdict, { ok: false }>), logged: sent.logged, ...(sent.passes ? { linkPasses: true } : {}) });
 }
+
+// The hook's own budget (round 2): Claude Code kills it at 15 seconds (settings.json); it answers by 12.
+export const HOOK_BUDGET_MS = 12_000;
+// What the budget leaves for one step, never less than half a second.
+export const left = (deadline: number, now = Date.now()) => Math.max(500, deadline - now);
 
 if (import.meta.main) {
   let reason: string;
@@ -183,9 +222,13 @@ if (import.meta.main) {
   else {
     const p = paths();
     const now = Date.now();
+    const deadline = now + HOOK_BUDGET_MS;
+    // The hook's reading: from a warm cache only (coldOk false), and stopping at its share of the budget.
     const reading = (label: Label, what: string): Verdict => label !== "other" ? { ok: true }
-      : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now) }), new Date(now));
-    try { reason = await decideWithGuard(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w)); }
+      : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(), cacheFile: p.cache,
+          coldOk: false, deadline: Math.min(deadline - 4_000, Date.now() + 5_000) }), new Date());
+    const post: Post = (l, w, hook) => postHold(l, w, { ms: Math.min(5_000, left(deadline) - 300), ...(hook ? { hook } : {}) });
+    try { reason = await decideWithGuard(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, post); }
     catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {

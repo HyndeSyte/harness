@@ -125,21 +125,30 @@ def test_cain_config_denies_every_api_and_mapping():
     # Assistant user id, not a key), the alarms' webhook id, hidden like a key (C1
     # second review: the App's alarms reach Home Assistant without its API), the PC
     # job keeper's token and repo name, the security watch's and the probe's heartbeat URLs
-    # (secrets like keys: password fields). Nothing else.
+    # (secrets like keys: password fields), and (0.17.0) the week's plan allowance (with its date and
+    # derivation) and the
+    # Healthchecks.io management key (a password field). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
         '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n'
+        '  plan_weekly_allowance_tokens: 4200000000\n'
+        '  plan_allowance_set_on: "2026-11-21"\n'
+        '  plan_allowance_derivation: "35 percent of the week used on the usage page against about 1.47 billion'
+        ' tokens since Sunday on this device"\n'
         '  owner_user_id: ""\n  notice_hook: ""\n'
-        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\nschema:\n'
+        '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\n'
+        '  healthchecks_api_key: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
         "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n"
+        "  plan_weekly_allowance_tokens: int(0,1000000000000)\n"
+        "  plan_allowance_set_on: match(^(\\d{4}-\\d{2}-\\d{2})?$)?\n  plan_allowance_derivation: str?\n"
         "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
-        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n")
+        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n  healthchecks_api_key: password?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():
@@ -2656,7 +2665,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant"])'
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/hc", "/review-grant"])'
             in auth.replace("\r\n", "\n"))
     # Cain 0.18.0: /review-grant is Cain's card asking Dane for extra review rounds; only his tap writes one.
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and
