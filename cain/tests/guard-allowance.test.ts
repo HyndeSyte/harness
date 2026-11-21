@@ -390,19 +390,20 @@ describe("C3: while a moved-aside file stands, and after writes resume on a fres
 });
 
 describe("C4: a schema-invalid hold call is refused before it counts", () => {
-  test(`bad calls don't use up the ${HOLDS_PER_MINUTE} a minute`, () => {
+  test(`bad calls don't use up the ${HOLDS_PER_MINUTE} a minute`, async () => {
     const r = rig({ holds: keeperHolds({}) });
     const lines: string[] = [];
     Object.assign((r.link as any).d, { guardHold: () => ({ ok: false, floor: "plan", why: "low" }), holdLog: (l: string) => { lines.push(l); } });
     const hold = (b: any) => (r.link as any).guardHoldFor(b, "cain");
     for (let i = 0; i < HOLDS_PER_MINUTE * 3; i++) {
-      expect(() => hold({ label: "bogus", what: "x" })).toThrow("names its label");
-      expect(() => hold({ label: "other" })).toThrow("says what was refused");
-      expect(() => hold({ label: "other", what: { not: "text" } })).toThrow("says what was refused");
-      expect(() => hold({ label: 7, what: "x" })).toThrow("names its label");
+      await expect(hold({ label: "bogus", what: "x" })).rejects.toThrow("names its label");
+      await expect(hold({ label: "other" })).rejects.toThrow("says what was refused");
+      await expect(hold({ label: "other", what: { not: "text" } })).rejects.toThrow("says what was refused");
+      await expect(hold({ label: 7, what: "x" })).rejects.toThrow("names its label");
+      await expect(hold({ label: "other", what: "x", hook: "anything" })).rejects.toThrow("a hook's hold is one of");
     }
-    for (let i = 0; i < HOLDS_PER_MINUTE; i++) expect(hold({ label: "other", what: `Build ${i}` }).status).toBe("held");
-    expect(() => hold({ label: "other", what: "Build 99" })).toThrow("in a minute");
+    for (let i = 0; i < HOLDS_PER_MINUTE; i++) expect((await hold({ label: "other", what: `Build ${i}` })).status).toBe("held");
+    await expect(hold({ label: "other", what: "Build 99" })).rejects.toThrow("in a minute");
     expect(lines.length).toBe(HOLDS_PER_MINUTE);
   });
 });
@@ -479,12 +480,17 @@ describe("D: hc-check and hc-set through the link", () => {
   test("the route is Cain's, the key reaches only the link's process, and keeper.sh sends exactly the fields", () => {
     expect(CAIN_ROUTES.has("/hc")).toBe(true);
     const run = readFileSync(join(import.meta.dir, "../rootfs/etc/services.d/cain/run"), "utf8");
-    const at = run.indexOf("HEALTHCHECKS_API_KEY=");
+    const at = run.indexOf('hc_key="$(bashio::config');
     expect(at).toBeGreaterThan(0);
-    expect(run.slice(at, run.indexOf("\n) &", at))).toContain('bun "$OPT/link/main.ts"');
-    expect(run.split('HEALTHCHECKS_API_KEY="$(').length).toBe(2);              // read from the options in one place only
+    const sub = run.slice(at, run.indexOf("\n) &", at));
+    expect(sub).toContain('bun "$OPT/link/main.ts"');
+    expect(sub).toContain("mkdir -m 0700 /run/cain-hc");
+    expect(sub).toContain("umask 077; printf '%s' \"$hc_key\" > /run/cain-hc/key");
+    expect(sub).toContain("unset hc_key");
+    expect(run).not.toContain("export HEALTHCHECKS_API_KEY");                  // round 2: never in an environment
+    expect(run.split("bashio::config 'healthchecks_api_key'").length).toBe(2); // read from the options in one place only
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
-    expect(main).toContain("delete process.env.HEALTHCHECKS_API_KEY;");
+    expect(main).toContain("const HC_KEY = takeKey();");
     const cfg = readFileSync(join(import.meta.dir, "../config.yaml"), "utf8");
     expect(cfg).toContain("  healthchecks_api_key: password?\n");
   });

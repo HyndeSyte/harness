@@ -20,6 +20,11 @@
 //     and a guard log that can't be read raises an alarm instead of a guess; a tap while a moved-aside copy
 //     stands says decisions are paused (DecisionsPaused); the move-aside leaves a reset mark
 //     ("<file>.reset", its time), and a card posted before it is refused and posted again.
+//     Round 2 of 0.17.0's review fixes: the reset mark is written whole (temp file, fsync, rename) before
+//     the move-aside, and when it can't be written the file isn't moved aside at all (an alarm says so),
+//     so a crash on either side of the rename never leaves a moved-aside file without its mark. A mark
+//     that can't be read raises its own alarm naming the mark file and how to clear it; CapAlarms keeps
+//     the three alarms of the decisions file and the guard's log, raised and cleared by the link's sweep.
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
 //     it installs, read from the probe's record (/data/probe/rollback-armed.json), never from Cain.
@@ -179,8 +184,11 @@ function writeWhole(path: string, text: string, o: { sync?: (dir: string) => voi
 // uses that choice, never the label just tapped. A write that fails removes its temp file.
 // 0.17.0: hold_written comes back too (markHoldWritten sets it once his risk tap's hold line is written).
 export type Kept = { choice: string; at: number; existed: boolean; hold_written?: boolean };
+// Round 2: onMarkFailed hears why the reset mark couldn't be written (the file then stays where it is);
+// moveAside is the move itself (tests stop it to stand for a crash).
 export function recordDecision(path: string, id: string, choice: string, at: number,
-    o: { onCorrupt?: (aside: string) => void; sync?: (dir: string) => void; now?: () => number; rename?: (from: string, to: string) => void } = {}): Kept {
+    o: { onCorrupt?: (aside: string) => void; onMarkFailed?: (why: string) => void; sync?: (dir: string) => void; now?: () => number;
+      rename?: (from: string, to: string) => void; moveAside?: (from: string, to: string) => void } = {}): Kept {
   const aside = asideOf(path);
   if (aside.length) throw new DecisionsPaused(`his decisions file was moved aside and isn't settled yet (${asideStep(aside[0])})`);
   let text: string | null = null;
@@ -192,9 +200,16 @@ export function recordDecision(path: string, id: string, choice: string, at: num
     if (!j) {
       const when = (o.now ?? Date.now)();
       const to = `${path}.corrupt-${new Date(when).toISOString().replace(/[-:.]/g, "")}`;
-      try { renameSync(path, to); } catch (e) { throw new DecisionsUnsaved(`his decisions file doesn't parse, and couldn't be moved aside (${String(e).slice(0, 60)})`); }
-      // The reset mark: cards posted before now belong to the moved-aside file.
-      try { writeWhole(resetOf(path), String(when), o); } catch { /* an unwritten mark leaves the copy standing, which pauses anyway */ }
+      // The reset mark first, whole and synced: cards posted before now belong to the file about to be moved
+      // aside. A crash after it and before the move leaves the file in place (the next tap marks again and
+      // moves it); a crash after the move leaves both. If the mark can't be written, nothing is moved.
+      try { writeWhole(resetOf(path), String(when), o); }
+      catch (e) {
+        const why = `${resetOf(path)} couldn't be written (${String((e as Error)?.message ?? e).slice(0, 60)})`;
+        try { o.onMarkFailed?.(why); } catch { /* the refusal stands */ }
+        throw new DecisionsPaused(`his decisions file doesn't parse, and its reset mark ${why}, so it wasn't moved aside`);
+      }
+      try { (o.moveAside ?? renameSync)(path, to); } catch (e) { throw new DecisionsUnsaved(`his decisions file doesn't parse, and couldn't be moved aside (${String(e).slice(0, 60)})`); }
       try { o.onCorrupt?.(to); } catch { /* the refusal stands */ }
       throw new DecisionsPaused(`his decisions file didn't parse, so it was moved aside to ${to}`);
     }
@@ -254,6 +269,47 @@ export function holdLogged(path: string, tag: string, what: string): boolean {
     for (const l of text.split("\n")) { const c = l.split("\t"); if (c[1] === tag && c[2] === what) return true; }
   }
   return false;
+}
+// The alarms of his decisions file and the guard's log (round 2), each raised once when it starts (or its
+// cause changes) and cleared once it's gone, by the link's sweep (main.ts):
+//   "review-decision"   a stored answer isn't one of its card's options (cleared once none is);
+//   "review-holdlog"    the guard's log can't be read (cleared once it reads);
+//   "review-resetmark"  the reset mark is there and can't be read, which pauses every decision (cleared once
+//                       it reads again or is gone);
+//   "review-resetwrite" the reset mark couldn't be written, so a decisions file that didn't parse wasn't moved
+//                       aside (raised at once by markFailed; cleared once the file reads or was moved aside).
+export class CapAlarms {
+  private bad: string | null = null;
+  private holdLog: boolean | null = null;
+  private mark: boolean | null = null;
+  private markWrite: string | null = null;
+  constructor(private o: { decided: string; guardLog: string; raise: (kind: string, cause: string) => void; clear: (group: string) => void; log?: (m: string) => void }) {}
+  markFailed(why: string): void {
+    (this.o.log ?? (() => {}))(`his decisions file wasn't moved aside: ${why}`);
+    if (why !== this.markWrite) { this.o.raise("review-resetwrite", why); this.markWrite = why; }
+  }
+  sweep(): void {
+    const log = this.o.log ?? (() => {});
+    const aside = asideOf(this.o.decided);
+    const decided = aside.length ? null : readDecided(this.o.decided);
+    const bad = unreadableDecisions(decided);
+    const badKey = bad.join(",");
+    if (badKey && badKey !== this.bad) { this.o.raise("review-decision", `the decision${bad.length === 1 ? "" : "s"} ${bad.slice(0, 3).join(", ")}`); this.bad = badKey; }
+    else if (!badKey && this.bad !== "") { if (this.bad) log("every stored answer at the review cap is one of its card's options again"); this.o.clear("decision"); this.bad = ""; }
+    const trouble = holdLogTrouble(this.o.guardLog);
+    if (!trouble && this.holdLog !== false) { this.o.clear("holdlog"); this.holdLog = false; }
+    else if (trouble && this.holdLog !== true) { this.o.raise("review-holdlog", trouble); this.holdLog = true; }
+    const r = readReset(this.o.decided);
+    const markBad = r !== null && Number.isNaN(r);
+    if (markBad && this.mark !== true) {
+      log(`the reset mark ${resetOf(this.o.decided)} can't be read: decisions are paused`);
+      this.o.raise("review-resetmark", resetOf(this.o.decided)); this.mark = true;
+    } else if (!markBad && this.mark !== false) { if (this.mark) log("the reset mark reads again (or is gone): decisions resume"); this.o.clear("resetmark"); this.mark = false; }
+    if (this.markWrite !== "" && (decided !== null || aside.length)) {
+      if (this.markWrite) log("his decisions file reads, or was moved aside: the reset mark's write alarm clears");
+      this.o.clear("resetwrite"); this.markWrite = "";
+    }
+  }
 }
 // Whether the guard's log reads (for the sweep that clears its alarm): null when it does, else why not.
 export function holdLogTrouble(path: string): string | null {

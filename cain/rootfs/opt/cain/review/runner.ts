@@ -16,7 +16,7 @@ import {
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
-import { DEFAULT_RESERVE_PERCENT, DEFAULT_WEEKLY_ALLOWANCE, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
+import { DEFAULT_ALLOWANCE_DERIVATION, DEFAULT_ALLOWANCE_SET_ON, DEFAULT_RESERVE_PERCENT, DEFAULT_WEEKLY_ALLOWANCE, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
 export type RunnerConfig = {
@@ -37,7 +37,7 @@ export type RunnerConfig = {
   // Cain 0.16.0: the review-round cap and the usage guard's reserve floor (the App's options, root's),
   // where the rounds are kept, where the runner writes the settings it really uses (for review.sh and
   // the Build hook), and the guard's log. Absent files: the cap and guard aren't kept (tests that queue directly).
-  roundCap?: number; reservePercent?: number; weeklyAllowance?: number;
+  roundCap?: number; reservePercent?: number; weeklyAllowance?: number; allowanceSetOn?: string; allowanceDerivation?: string;
   roundsFile?: string; settingsFile?: string; guardLog?: string;
 };
 
@@ -49,6 +49,7 @@ export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile
   models: { gemini: "gemini-3.8-flash", geminiBig: "gemini-4-argon", perplexity: "perplexity/sonar", claude: "claude-opus-5-5" },
   hourlyS: 3_600, tz: "America/New_York",
   roundCap: DEFAULT_ROUND_CAP, reservePercent: DEFAULT_RESERVE_PERCENT, weeklyAllowance: DEFAULT_WEEKLY_ALLOWANCE,
+  allowanceSetOn: DEFAULT_ALLOWANCE_SET_ON, allowanceDerivation: DEFAULT_ALLOWANCE_DERIVATION,
 };
 
 export type Unavailable = { kind: ErrorKind; detail: string } | null;
@@ -251,7 +252,8 @@ export class Runner {
     if (!this.cfg.settingsFile) return;
     writeAtomic(this.cfg.settingsFile, JSON.stringify({ format: SETTINGS_FORMAT, written_at: this.now().toISOString(), round_cap: this.roundCap,
       reserve_percent: this.cfg.reservePercent ?? DEFAULT_RESERVE_PERCENT, caps: this.cfg.caps, review_limit: this.cfg.reviewLimit,
-      weekly_allowance_tokens: this.cfg.weeklyAllowance ?? DEFAULT_WEEKLY_ALLOWANCE }, null, 1));
+      weekly_allowance_tokens: this.cfg.weeklyAllowance ?? DEFAULT_WEEKLY_ALLOWANCE,
+      allowance_set_on: this.cfg.allowanceSetOn ?? DEFAULT_ALLOWANCE_SET_ON, allowance_derivation: this.cfg.allowanceDerivation ?? DEFAULT_ALLOWANCE_DERIVATION }, null, 1));
   }
   // A brief of Cain's into the queue, as a new round of its change, or the reason it isn't (null: queued).
   // The install-time self-check's finding (../capfiles.ts, main.ts): while set, the cap and guard are off,

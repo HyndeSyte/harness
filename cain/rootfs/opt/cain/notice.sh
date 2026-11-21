@@ -50,7 +50,13 @@
 # guard's hold route hit its cap; cleared after an hour without another). Since 0.17.0, "decision" (kind
 # "review-decision": a decision's stored answer isn't one of its card's options; cleared once none is) and
 # "holdlog" (kind "review-holdlog": the usage guard's log couldn't be read, so a hold line may be missing;
-# cleared once it reads again).
+# cleared once it reads again). Since 0.17.0's second round of review fixes, "resetmark" (kind "review-resetmark":
+# the decisions file's reset mark can't be read, so decisions are paused; cleared once it reads again or is gone),
+# "resetwrite" (kind "review-resetwrite": the reset mark couldn't be written, so a decisions file that didn't parse
+# wasn't moved aside; cleared once the file reads or was moved aside), "plancache" (kind "review-plancache": the plan
+# reader's cache couldn't be written, or the trust check refused it; at most hourly; cleared after a good write) and
+# "planshrink" (kind "review-planshrink": the week's token count fell below its high-water mark; cleared by the next
+# complete reading that doesn't).
 # Within a group a newer
 # alarm replaces the last.
 # Each says what happened and the way back, in plain words: it reaches him as it is. When one
@@ -131,6 +137,10 @@ group_of() {
     review-holds) echo holds ;;
     review-decision) echo decision ;;
     review-holdlog) echo holdlog ;;
+    review-resetmark) echo resetmark ;;
+    review-resetwrite) echo resetwrite ;;
+    review-plancache) echo plancache ;;
+    review-planshrink) echo planshrink ;;
     self-off) echo watchdog ;;
     self-refused|self-loops) echo selfrestart ;;
     nginx) echo panel ;;
@@ -229,6 +239,14 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="A saved answer on one of your review-cap decision cards isn't one of that card's two choices${c}, so the App treats it as unreadable: nothing was passed on, no hold was written, its card says so, and Ship cards for that change stay refused. The way back: as root on the Pi, take that decision's entry out of /data/link/review-decisions.json (the card can then be answered again), or move the whole file aside. This clears once no saved answer is out of place. Cain files it for a fix. $DETAILS" ;;
     review-holdlog) T="Cain's usage-guard log can't be read"
       M="Cain's usage-guard log couldn't be read${c}, so the App can't tell whether a hold line was already written, and one may be missing: Cain lists holds from it. Nothing more is written to it on a guess. This clears once the log reads again. Cain files it for a fix. $DETAILS" ;;
+    review-resetmark) T="Your review-cap answers are paused"
+      M="The reset mark of Cain's file of your review-cap answers can't be read${c}, so no answer on a review-cap decision card is kept and Ship cards for changes at the cap stay refused. The way back: as root on the Pi, remove that mark file (rm /data/link/review-decisions.json.reset), or write the time of the last reset into it in milliseconds. Cards from before a reset are then refused and posted again. This clears once the mark reads again or is gone. Cain files it for a fix. $DETAILS" ;;
+    review-resetwrite) T="Your review-cap answers can't be reset"
+      M="Cain's file of your review-cap answers didn't parse, and its reset mark couldn't be written${c}, so the App did not move the file aside: no answer on a review-cap decision card is kept until it can. The way back: as root on the Pi, check the disk has room and /data/link is writable; the next tap tries again. This clears once the file reads or was moved aside. Cain files it for a fix. $DETAILS" ;;
+    review-plancache) T="Cain's usage guard can't keep its plan count"
+      M="Cain's plan reader couldn't keep its count${c}. Until it can, each reading starts cold, and Cain's Build jobs labelled other may be held as not ready. Core, commitment and necessary-fix work still runs. The way back: as root on the Pi, check the disk has room and that /data/review-plan-cache.json is a plain file owned by root, group cain, mode 0640 (remove it and the App writes it again). This clears after the next good write. Cain files it for a fix. $DETAILS" ;;
+    review-planshrink) T="Cain's plan count went down"
+      M="Cain's count of this week's plan use went down${c}, which only happens when a transcript of his was deleted, cut short or re-timed. Until the count is back at its mark, the plan's reading is unknown, so his work labelled other is held. Core, commitment and necessary-fix work still runs. Look at what changed in /data/cain/.claude/projects. This clears with the next reading that isn't below the mark, or when the week turns on Sunday. Cain files it for a fix. $DETAILS" ;;
     *) return 1 ;;
   esac
 }
@@ -254,6 +272,10 @@ cleared_text() {   # sets CT and CM, what a cleared alarm of a group says
     decisions) CT="Cain's review-cap answers are kept again"; CM="The moved-aside copy of Cain's file of your review-cap answers is gone, so new answers are kept again." ;;
     decision) CT="Your review-cap answers read right again"; CM="Every saved answer on your review-cap decision cards is one of its card's choices again." ;;
     holdlog) CT="Cain's usage-guard log reads again"; CM="Cain's usage-guard log can be read again, so holds are checked and written as before." ;;
+    resetmark) CT="Your review-cap answers are kept again"; CM="The reset mark of Cain's file of your review-cap answers reads again, or is gone, so answers are kept again." ;;
+    resetwrite) CT="Your review-cap answers file is settled"; CM="Cain's file of your review-cap answers reads again, or was moved aside with its reset mark." ;;
+    plancache) CT="Cain's plan count is kept again"; CM="Cain's plan reader wrote its count again, so readings go on from it." ;;
+    planshrink) CT="Cain's plan count is back"; CM="Cain's count of this week's plan use is no longer below its mark." ;;
     holds) CT="Cain's usage-guard holds are back under their limit"; CM="Cain's usage guard hold route stayed under its limit for an hour." ;;
     *) CT="Cain is back"; CM="Cain is running again." ;; esac
 }

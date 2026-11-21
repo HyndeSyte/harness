@@ -474,13 +474,19 @@ with_session() {
 }
 if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
-# 0.17.0: the Healthchecks.io management key (healthchecks_api_key) goes into the link's environment
-# alone, never traced or printed; the link takes it out of its environment at once (link/healthchecks.ts).
+# 0.17.0: the Healthchecks.io management key (healthchecks_api_key), for the link alone, never traced or
+# printed. Round 2 of its review fixes: in a root-only file (/run/cain-hc/key, folder 0700, file 0600), not
+# the link's environment: Bun hands every child the environment it started with, whatever the link deletes,
+# so a key there would reach git, curl and notice.sh (link/healthchecks.ts takeKey).
 (
   { set +x; } 2>/dev/null
-  HEALTHCHECKS_API_KEY="$(bashio::config 'healthchecks_api_key' 2>/dev/null || true)"
-  [ "$HEALTHCHECKS_API_KEY" = "null" ] && HEALTHCHECKS_API_KEY=""
-  export HEALTHCHECKS_API_KEY
+  hc_key="$(bashio::config 'healthchecks_api_key' 2>/dev/null || true)"
+  [ "$hc_key" = "null" ] && hc_key=""
+  rm -rf /run/cain-hc 2>/dev/null || true
+  if mkdir -m 0700 /run/cain-hc 2>/dev/null; then
+    ( umask 077; printf '%s' "$hc_key" > /run/cain-hc/key ) 2>/dev/null || bashio::log.error "Couldn't keep the Healthchecks key for the link"
+  else bashio::log.error "Couldn't set up /run/cain-hc for the Healthchecks key"; fi
+  unset hc_key
   while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done
 ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the
@@ -521,7 +527,10 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   USAGE_RESERVE_PERCENT="$(opt usage_reserve_percent)"
   # The week's plan allowance in tokens (0.17.0), set by hand; the runner writes it to the same file.
   PLAN_WEEKLY_ALLOWANCE_TOKENS="$(opt plan_weekly_allowance_tokens)"
-  export PLAN_WEEKLY_ALLOWANCE_TOKENS
+  # Round 2 of its review fixes: when it was set and how it was worked out, written beside it.
+  PLAN_ALLOWANCE_SET_ON="$(opt plan_allowance_set_on)"
+  PLAN_ALLOWANCE_DERIVATION="$(opt plan_allowance_derivation)"
+  export PLAN_WEEKLY_ALLOWANCE_TOKENS PLAN_ALLOWANCE_SET_ON PLAN_ALLOWANCE_DERIVATION
   export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
     REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT

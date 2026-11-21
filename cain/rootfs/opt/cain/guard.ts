@@ -11,7 +11,7 @@
 //     counts as below the floor (it fails closed);
 //   - each review seat: its month-to-date spend against its monthly cap (the runner's caps, from
 //     /data/review-settings.json; Codex in runs). Caps or spend that can't be read count as below.
-// There is no tap or flag that bypasses it. Every refusal is one line appended to
+// No tap or flag of Cain's turns it off (what it can and can't be trusted for is below). Every refusal is one line appended to
 // /data/review-guard.log (time, label, what was refused, which floor), which Cain reads to list holds;
 // the guard never posts a card. The log is root:cain 0640 (round 2): root writes it, Cain only reads.
 // The runner (root) appends itself; the Build hook and review.sh, which run as Cain, send the hold to
@@ -23,13 +23,27 @@
 // now decides every "other" Build run first (hooks/remote-trigger.ts decideWithGuard asks it every time:
 // a run passes only when the hook's reading and the link's both let it, and the link answered).
 // LINK_DECIDES_BUILDS says so; cap.test.ts checks the hook keeps asking.
+//
+// What it can be trusted for (0.17.0, round 2 of the review fixes). The settings file and the plan
+// reader's cache are root's (root:cain 0640): Cain's user reads them and can't change them. The plan's
+// raw count is read from Cain's own transcripts, which Cain's user owns and could delete, truncate or
+// re-time: the count relies on them not being altered. The reader's high-water mark (plan-usage.ts) holds
+// a count that goes down within a week and raises an alarm naming what shrank; a count kept low from the
+// start of a week isn't caught. And the allowance is this device's share of the plan, worked out by hand
+// from the usage page (its date and derivation are in the settings, and review.sh guard prints them), not
+// the plan's own limit. So the guard is a safeguard against Cain overspending by accident, not a wall
+// against a session that set out to get around it.
 import { appendFileSync, readFileSync } from "node:fs";
-import { readPlanUsage, type PlanReading } from "./plan-usage.ts";
-import { capPaths } from "./capfiles.ts";
+import { NOT_READY, readPlanUsage, type PlanReading } from "./plan-usage.ts";
+import { capPaths, clearAlarm, raiseAlarm } from "./capfiles.ts";
 
 // The week's allowance by default (0.17.0): the App's option plan_weekly_allowance_tokens, set by hand
 // (DOCS.md, "Usage guard"). The runner writes the value it uses into the settings file.
 export const DEFAULT_WEEKLY_ALLOWANCE = 4_200_000_000;
+// When it was set and how (round 2): the App's options plan_allowance_set_on and plan_allowance_derivation,
+// written by the runner into the settings file beside the allowance, and printed by review.sh guard.
+export const DEFAULT_ALLOWANCE_SET_ON = "2026-11-21";
+export const DEFAULT_ALLOWANCE_DERIVATION = "35 percent of the week used on the usage page against about 1.47 billion tokens since Sunday on this device";
 
 export const LINK_DECIDES_BUILDS = true;
 export const LABELS = ["core", "commitment", "necessary-fix", "other"] as const;
@@ -53,6 +67,8 @@ export type Settings = {
   format: number; written_at: string; round_cap: number; reserve_percent: number;
   caps: { gemini: number; perplexity: number; claude: number; openaiRuns: number }; review_limit: number;
   weekly_allowance_tokens?: number;                 // 0.17.0: the week's allowance; missing or 0: not set (unknown)
+  allowance_set_on?: string;                        // round 2: the date the allowance was set (YYYY-MM-DD)
+  allowance_derivation?: string;                    // round 2: how it was worked out, in the owner's words
 };
 export function readSettings(path: string): Settings | null {
   try {
@@ -68,10 +84,13 @@ export function labelOf(v: unknown): Label | null {
 }
 
 export type SeatLeft = { seat: string; left: number | null; why?: string };
-export type Readings = { plan: PlanReading; seats: SeatLeft[] | null; seatsWhy?: string; floor: number };
+export type Readings = { plan: PlanReading; seats: SeatLeft[] | null; seatsWhy?: string; floor: number;
+  allowance?: { set_on: string | null; derivation: string | null } };      // round 2: when and how the allowance was set
 // logged (round 2): whether a refusal reached the guard's log; false when it couldn't be logged.
 // linkPasses (round 3): the link's own reading let it pass where the hook's refused (the hook names the difference).
-export type Verdict = { ok: true } | { ok: false; floor: string; why: string; logged?: boolean; linkPasses?: boolean };
+// notReady (0.17.0, round 2): the plan's reading wasn't ready in time (a cold cache, or out of time); the
+// Build hook names it and has the link write the hold line.
+export type Verdict = { ok: true } | { ok: false; floor: string; why: string; logged?: boolean; linkPasses?: boolean; notReady?: string };
 
 // Each seat's share of its monthly cap left, from the spend file and the runner's caps. A seat whose
 // cap is 0 is off and spends nothing, so it isn't counted.
@@ -95,6 +114,7 @@ export function decide(label: Label, r: Readings, now: Date): Verdict {
   const floor = r.floor / 100;
   const p = r.plan;
   const age = now.getTime() - Date.parse(p.at);
+  if (p.not_ready) return { ok: false, floor: "plan", notReady: p.not_ready, why: `${p.reason.startsWith(NOT_READY) ? p.reason : `${NOT_READY}: ${p.not_ready}`}, which counts as below the ${r.floor}% reserve floor` };
   if (p.fraction === null) return { ok: false, floor: "plan", why: `the plan's usage is unknown (${p.reason}), which counts as below the ${r.floor}% reserve floor` };
   if (!Number.isFinite(age) || age > STALE_MS) return { ok: false, floor: "plan", why: `the plan's usage reading is more than a day old, which counts as below the ${r.floor}% reserve floor` };
   if (p.complete === false) return { ok: false, floor: "plan", why: `the plan's usage reading is incomplete (${p.skipped ?? "some"} transcript files not counted), which counts as below the ${r.floor}% reserve floor` };
@@ -109,7 +129,9 @@ export function decide(label: Label, r: Readings, now: Date): Verdict {
 export function monthOf(now: Date, tz: string): string { return now.toLocaleDateString("en-CA", { timeZone: tz }).slice(0, 7); }
 
 // Everything read now: the runner's settings, the spend file, the plan.
-export function readings(o: { settingsFile: string; spendFile: string; tz: string; now: Date; plan?: () => PlanReading; cacheFile?: string | null }): Readings {
+// deadline and coldOk (round 2): the Build hook's budget, and its rule that it never scans a cold week itself.
+export function readings(o: { settingsFile: string; spendFile: string; tz: string; now: Date; plan?: () => PlanReading; cacheFile?: string | null;
+    deadline?: number; coldOk?: boolean }): Readings {
   const settings = readSettings(o.settingsFile);
   let ledger: any = null;
   try { ledger = JSON.parse(readFileSync(o.spendFile, "utf8")); }
@@ -120,9 +142,41 @@ export function readings(o: { settingsFile: string; spendFile: string; tz: strin
   // Root's parts (the runner, the link) keep the reader's cache; Cain's parts only read it.
   const root = typeof process.getuid === "function" && process.getuid() === 0;
   const cacheFile = o.cacheFile === undefined ? capPaths().planCache : o.cacheFile;
-  try { plan = (o.plan ?? (() => readPlanUsage({ now: o.now, tz: o.tz, allowance, cacheFile, saveCache: root })))(); }
+  try { plan = (o.plan ?? (() => readPlanUsage({ now: o.now, tz: o.tz, allowance, cacheFile, saveCache: root,
+    ...(o.deadline !== undefined ? { deadline: o.deadline } : {}), ...(o.coldOk !== undefined ? { coldOk: o.coldOk } : {}) })))(); }
   catch (e) { plan = { fraction: null, at: o.now.toISOString(), reason: `the reader failed: ${String(e).slice(0, 80)}`, tokens_week: null, files: 0 }; }
-  return { plan, seats: s.seats, ...(s.why ? { seatsWhy: s.why } : {}), floor: settings?.reserve_percent ?? DEFAULT_RESERVE_PERCENT };
+  return { plan, seats: s.seats, ...(s.why ? { seatsWhy: s.why } : {}), floor: settings?.reserve_percent ?? DEFAULT_RESERVE_PERCENT,
+    ...(settings ? { allowance: { set_on: settings.allowance_set_on ?? null, derivation: settings.allowance_derivation ?? null } } : {}) };
+}
+
+// The plan reader's alarms, for root's parts (round 2): "review-plancache" when the cache can't be written
+// or the trust check refuses it (owner, group or mode), raised at most once an hour unless its cause
+// changes, and cleared after a good write; "review-planshrink" when a reading fell below this week's
+// high-water mark, naming what shrank, cleared by the next reading that doesn't.
+export class PlanCacheAlarm {
+  private up: string | null = null;
+  private at = 0;
+  private shrinkUp: string | null = null;
+  constructor(private o: { raise?: (kind: string, cause: string) => void; clear?: (group: string) => void; log?: (m: string) => void; now?: () => number; quietMs?: number } = {}) {}
+  private raise(kind: string, cause: string) { (this.o.raise ?? ((k, c) => raiseAlarm(c, this.o.log, k)))(kind, cause); }
+  private clear(group: string) { (this.o.clear ?? ((g) => clearAlarm(this.o.log, g)))(group); }
+  // One reading's outcome (a PlanReading from a part that writes the cache).
+  saw(p: Partial<PlanReading>): void {
+    const now = (this.o.now ?? Date.now)();
+    const trouble = p.cache_write && p.cache_write !== "ok" ? p.cache_write : p.cache_untrusted ? `the plan reader's cache was refused by the trust check: ${p.cache_untrusted}` : null;
+    if (trouble) {
+      if (trouble !== this.up || now - this.at >= (this.o.quietMs ?? 3_600_000)) {
+        (this.o.log ?? console.log)(`the plan reader's cache: ${trouble}`);
+        this.raise("review-plancache", trouble.slice(0, 200)); this.up = trouble; this.at = now;
+      }
+    } else if (p.cache_write === "ok" && this.up !== "") {
+      if (this.up) (this.o.log ?? console.log)("the plan reader's cache was written again");
+      this.clear("plancache"); this.up = "";
+    }
+    if (p.shrank) {
+      if (p.shrank !== this.shrinkUp) { (this.o.log ?? console.log)(`the plan's count shrank: ${p.shrank}`); this.raise("review-planshrink", p.shrank.slice(0, 200)); this.shrinkUp = p.shrank; }
+    } else if (p.complete && this.shrinkUp !== "") { this.clear("planshrink"); this.shrinkUp = ""; }
+  }
 }
 
 // One line of the guard's log, for each refusal: time, label, what was refused, which floor.
@@ -155,12 +209,14 @@ export function guard(label: Label, what: string, o: { settingsFile: string; spe
 // difference between the two readings.
 export const LINK_URL = "http://127.0.0.1:8097";
 export const CAIN_KEY_FILE = "/run/cain/keys/cain.key";
+// hook (0.17.0, round 2): the Build hook's own refusal when its reading wasn't ready ("cache cold" or
+// "out of time"); the link writes that hold line without its own reading.
 export async function postHold(label: Label, what: string, o: { url?: string; key?: string; keyFile?: string; ms?: number;
-    fetch?: typeof fetch } = {}): Promise<{ logged: true; why: string } | { logged: false; why: string; passes?: boolean }> {
+    fetch?: typeof fetch; hook?: string } = {}): Promise<{ logged: true; why: string } | { logged: false; why: string; passes?: boolean }> {
   let key = o.key ?? "";
   if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { logged: false, why: "this start has no key for the link" }; } }
   try {
-    const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/guard-hold`, { method: "POST", body: JSON.stringify({ label, what: String(what).slice(0, 200) }),
+    const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/guard-hold`, { method: "POST", body: JSON.stringify({ label, what: String(what).slice(0, 200), ...(o.hook ? { hook: o.hook } : {}) }),
       headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(o.ms ?? 5_000) });
     const j: any = await r.json().catch(() => ({}));
     if (r.ok && j?.status === "held") return { logged: true, why: String(j.why ?? "") };
@@ -178,9 +234,11 @@ export function guardLines(r: Readings, now: Date): [string, string] {
   const plan = p.fraction === null
     ? `Plan: unknown (${p.reason}${counted ? `; ${counted}` : ""}; ${files})`
     : `Plan: ${pct(p.fraction)}% of the week's allowance left (${counted}, of ${p.allowance}; ${files}; read ${p.at})`;
+  // Round 2: when the allowance was set and how it was worked out, from the runner's settings.
+  const set = r.allowance ? `; the allowance was set ${r.allowance.set_on ?? "on a date not recorded"}, from ${r.allowance.derivation ?? "a derivation not recorded"}` : "";
   const v = decide("other", r, now);
   const seats = r.seats
     ? `Seats: ${r.seats.map((s) => `${SEAT_LABEL[s.seat as Seat] ?? s.seat} ${s.left === null ? "?" : `${Math.round(s.left * 100)}%`} left`).join(", ") || "none capped"}`
     : `Seats: unknown (${r.seatsWhy ?? "can't be read"})`;
-  return [`${plan}.`, `${seats}. Floor ${r.floor}%: ${v.ok ? "other work may run" : `other work is held (${v.floor})`}; core, commitment and necessary-fix work always may.`];
+  return [`${plan}${set}.`, `${seats}. Floor ${r.floor}%: ${v.ok ? "other work may run" : `other work is held (${v.floor})`}; core, commitment and necessary-fix work always may.`];
 }

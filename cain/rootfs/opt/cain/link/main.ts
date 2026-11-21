@@ -73,18 +73,18 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { hcCall } from "./healthchecks";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, holdLogTrouble, markHoldWritten, readArmed, readDecided, readReset, recordDecision,
-  roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps, unreadableDecisions } from "./cap";
+import { hcCall, takeKey } from "./healthchecks";
+import { PlanRefresher } from "../plan-read";
+import { appendCapped, asideOf, CapAlarms, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, markHoldWritten, readArmed, readReset, recordDecision,
+  roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
-import { guard, paths as guardPaths } from "../guard";
+import { guard, paths as guardPaths, PlanCacheAlarm } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // 0.17.0: the Healthchecks.io management key, from the App's option healthchecks_api_key, in this
-// process alone: taken out of the environment at once, so nothing the link starts inherits it.
-const HC_KEY = (process.env.HEALTHCHECKS_API_KEY ?? "").trim();
-delete process.env.HEALTHCHECKS_API_KEY;
+// process alone. Round 2: read from its root-only file, never the environment (healthchecks.ts takeKey).
+const HC_KEY = takeKey();
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
 // their old places only for the old way of starting, before the first cutover).
@@ -232,23 +232,23 @@ sweepTemps(DECIDED, capLog);
 // while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
 let asideUp: boolean | null = null;
 const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisions"); asideUp = true; };
-let badUp: string | null = null;
-let holdLogUp: boolean | null = null;
+// 0.17.0: the stored answers, the guard's log and (round 2) the reset mark's alarms, kept by cap.ts CapAlarms.
+const capAlarms = new CapAlarms({ decided: DECIDED, guardLog: GUARD_LOG, log: capLog,
+  raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
 const capSweep = () => {
   capOff = selfCheck({ log: capLog, prev: capOff });
   const a = asideOf(DECIDED);
   if (a.length && asideUp !== true) asideAlarm(a[0]);
   else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
-  // 0.17.0: a stored answer that isn't one of its card's options keeps its alarm up until none is; the
-  // guard log's alarm clears once the log reads again.
-  const bad = a.length ? [] : unreadableDecisions(readDecided(DECIDED));
-  const badKey = bad.join(",");
-  if (badKey && badKey !== badUp) { raiseAlarm(`the decision${bad.length === 1 ? "" : "s"} ${bad.slice(0, 3).join(", ")}`, capLog, "review-decision"); badUp = badKey; }
-  else if (!badKey && badUp !== "") { if (badUp) capLog("every stored answer at the review cap is one of its card's options again"); clearAlarm(capLog, "decision"); badUp = ""; }
-  const logTrouble = holdLogTrouble(GUARD_LOG);
-  if (!logTrouble && holdLogUp !== false) { clearAlarm(capLog, "holdlog"); holdLogUp = false; }
-  else if (logTrouble && holdLogUp !== true) { raiseAlarm(logTrouble, capLog, "review-holdlog"); holdLogUp = true; }
+  capAlarms.sweep();
 };
+
+// The plan reading (0.17.0, round 2): in a child process with a time budget (../plan-read.ts), never on
+// this event loop, so a tap is answered while a cold read runs. Its cache alarm (guard.ts PlanCacheAlarm)
+// hears each reading. The first reading starts now, which warms the cache too.
+const planAlarm = new PlanCacheAlarm({ log: capLog });
+const plan = new PlanRefresher({ tz: process.env.CHECKIN_TZ ?? "America/New_York", log: capLog, onReading: (p) => planAlarm.saw(p) });
+void plan.read().catch(() => {});
 
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
@@ -286,7 +286,7 @@ const link = new Link({
   capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
   armed: () => readArmed(),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
-  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
+  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm, onMarkFailed: (why) => capAlarms.markFailed(why) }),
   // 0.17.0: the hold-written flag on his decision's record, and the reset mark (paused while a copy stands).
   holdWritten: (id) => markHoldWritten(DECIDED, id),
   decisionsReset: () => asideOf(DECIDED).length ? NaN : readReset(DECIDED),
@@ -295,7 +295,12 @@ const link = new Link({
   capOff: () => capOff,
   // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
   // rotated root-side, keeping one previous file: cap.ts appendCapped).
-  guardHold: (label, what) => { const p = guardPaths(); return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date() }); },
+  // Round 2 of 0.17.0's review fixes: the plan is read off this event loop, within its budget (not ready: held).
+  guardHold: async (label, what) => {
+    const reading = label === "other" ? await plan.read() : null;
+    const p = guardPaths();
+    return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date(), ...(reading ? { plan: () => reading } : {}) });
+  },
   holdLog: (line) => appendCapped(GUARD_LOG, line),
   hasHold: (tag, what) => holdLogged(GUARD_LOG, tag, what),
   alarm: (kind, cause) => raiseAlarm(cause, capLog, kind),
@@ -376,7 +381,9 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 // The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
 // exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
 const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ,
-  hc: (b: unknown) => hcCall(b, { key: () => HC_KEY, log: (l) => console.log(`[cain] link: ${l}`) }) };
+  // Round 2: every set the service takes is relayed to Cain and posted to his DM, one plain line.
+  hc: (b: unknown) => hcCall(b, { key: () => HC_KEY, log: (l) => console.log(`[cain] link: ${l}`),
+    announce: async (line) => { link.relayLine(`${line} Nothing to tell him: the link posted it to him.`); await link.notice(line, NOTICE_TIMEOUT_MS); } }) };
 const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept

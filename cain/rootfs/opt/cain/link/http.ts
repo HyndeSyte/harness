@@ -53,7 +53,7 @@ export function linkRoutes(d: RouteDeps) {
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/decision": return json(await link.decision(b));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
-        case "/guard-hold": return json(link.guardHoldFor(b, caller));
+        case "/guard-hold": return json(await link.guardHoldFor(b, caller));
         // The heartbeat checks' grace and period at Healthchecks.io (0.17.0): the link holds the key.
         case "/hc": return json(d.hc ? await d.hc(b) : { status: "refused", said: "no key set" });
         case "/stopped": {

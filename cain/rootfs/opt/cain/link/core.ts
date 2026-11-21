@@ -89,6 +89,7 @@ import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsPaused, DecisionsUnsaved, fallbackText, HoldLogUnreadable, namesRoundPastCap, type CapState } from "./cap";
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
+import { NOT_READY } from "../plan-usage";
 import { decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
@@ -115,6 +116,10 @@ export const CARD_RULES = AT.cain;
 // The guard-hold route's bounds (round 3): calls a minute per caller, and how long an identical refusal
 // (label and description) is logged once.
 export const HOLDS_PER_MINUTE = 6;
+// 0.17.0, round 2: verdict checks on the hold route, counted apart from real holds, and the Build hook's
+// own holds when its plan reading wasn't ready (../plan-usage.ts NOT_READY).
+export const CHECKS_PER_MINUTE = 30;
+export const HOOK_HOLDS = ["cache cold", "out of time"] as const;
 export const HOLD_DEDUPE_MS = 10 * 60_000;
 export const HOLD_ALARM_QUIET_MS = 3_600_000;
 export const REPLACED = "Replaced by a newer card";
@@ -716,7 +721,7 @@ export interface Deps {
   // off), the usage guard as the link runs it for a part of Cain's that was refused (it decides again
   // from its own readings and logs a refusal), and one line onto the guard's log (the open list's holds).
   capOff?: () => string | null;
-  guardHold?: (label: Label, what: string) => Verdict;
+  guardHold?: (label: Label, what: string) => Verdict | Promise<Verdict>;   // 0.17.0 round 2: async (the plan is read off the event loop)
   holdLog?: (line: string) => boolean | void;                       // true: the log was rotated at its size cap (round 3)
   // Round 3: whether the guard's log already has a hold line (tag, what); the App's alarms (kind and
   // cause; a group cleared); and the cap's own work at each sweep (the self-check again, the decisions
@@ -1711,14 +1716,23 @@ export class Link {
   // The usage guard for a part of Cain's that it refused (the Build hook, review.sh; Cain's key): the
   // link decides again from its own readings, and only a refusal is appended to the guard's log, which
   // is root's (round 2). "held" once it's logged; "passes" when the link's reading lets it run.
-  // Round 3, bounded: at most HOLDS_PER_MINUTE calls a minute per caller (one alarm when that's hit), an
-  // identical refusal (label and description) logged once in HOLD_DEDUPE_MS, the log capped in size and
-  // rotated root-side (main.ts, cap.ts appendCapped), and the description put through the card gate
-  // before it's logged: one that fails becomes "a build labelled <label>".
+  // Round 3, bounded: an identical refusal (label and description) logged once in HOLD_DEDUPE_MS, the log
+  // capped in size and rotated root-side (main.ts, cap.ts appendCapped), and the description put through
+  // the card gate before it's logged: one that fails becomes "a build labelled <label>".
+  // 0.17.0, round 2 of its review fixes:
+  //   - two counters per caller: every well-formed call is a verdict check (CHECKS_PER_MINUTE, refused
+  //     with its own reason and no alarm), and only a hold that is written counts against
+  //     HOLDS_PER_MINUTE (one owner-facing alarm when that's hit), so passing Build checks spend nothing
+  //     of the holds' cap;
+  //   - the reading is async (main.ts reads the plan in a child process with a time budget,
+  //     ../plan-read.ts), so a tap is never held up behind it;
+  //   - "hook": the Build hook's own refusal when its reading wasn't ready in time (a cold cache, or out
+  //     of time), one of HOOK_HOLDS only: written as the hook's hold line without the link's reading.
   private holdCalls = new Map<string, number[]>();
+  private checkCalls = new Map<string, number[]>();
   private holdSeen = new Map<string, number>();
   private holdAlarmAt: number | null = null;
-  guardHoldFor(b: { label?: unknown; what?: unknown }, caller = "cain"): { status: "held"; why: string; repeat?: true } | { status: "passes" } {
+  async guardHoldFor(b: { label?: unknown; what?: unknown; hook?: unknown }, caller = "cain"): Promise<{ status: "held"; why: string; repeat?: true } | { status: "passes" }> {
     const off = this.capOff();
     if (off) throw new Refusal(`the usage guard's files aren't right (${off}), so the hold can't be logged`);
     const now = this.d.now();
@@ -1729,25 +1743,40 @@ export class Link {
     if (typeof b.what !== "string") throw new Refusal("a hold says what was refused");
     const raw = String(b.what ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 160);
     if (!raw) throw new Refusal("a hold says what was refused");
-    const calls = (this.holdCalls.get(caller) ?? []).filter((t) => now - t < 60_000);
-    if (calls.length >= HOLDS_PER_MINUTE) {
+    if (b.hook !== undefined && (typeof b.hook !== "string" || !(HOOK_HOLDS as readonly string[]).includes(b.hook)))
+      throw new Refusal(`a hook's hold is one of: ${HOOK_HOLDS.join(", ")}`);
+    if (b.hook !== undefined && label !== "other") throw new Refusal("only an other-labelled Build is held");
+    const recent = (m: Map<string, number[]>) => (m.get(caller) ?? []).filter((t) => now - t < 60_000);
+    const checks = recent(this.checkCalls);
+    if (checks.length >= CHECKS_PER_MINUTE) {
+      this.log(`the guard-hold route refused a check: more than ${CHECKS_PER_MINUTE} guard checks in a minute from ${caller}`);
+      throw new Refusal(`more than ${CHECKS_PER_MINUTE} guard checks in a minute: this one wasn't checked, so it doesn't run. Try again in a minute`);
+    }
+    checks.push(now);
+    this.checkCalls.set(caller, checks);
+    if (!this.d.guardHold) throw new Refusal("the link has no usage guard to log with");
+    const what = this.cardGate("hold", "hold's description", raw) ?? `a build labelled ${label}`;
+    const v: Verdict = b.hook !== undefined
+      ? { ok: false, floor: "plan", why: `the Build hook's own reading: ${NOT_READY}: ${String(b.hook)}, which counts as below the reserve floor` }
+      : await this.d.guardHold(label, what);
+    if (v.ok) return { status: "passes" };
+    const at = this.d.now();
+    for (const [k, t] of this.holdSeen) if (at - t >= HOLD_DEDUPE_MS) this.holdSeen.delete(k);
+    const key = `${label}\t${what}\t${b.hook ?? ""}`;
+    if (this.holdSeen.has(key)) return { status: "held", why: v.why, repeat: true };
+    // Only a hold that is written counts against the holds' cap.
+    const holds = recent(this.holdCalls);
+    if (holds.length >= HOLDS_PER_MINUTE) {
       this.holdsCapHit(`more than ${HOLDS_PER_MINUTE} holds in a minute from ${caller}`);
       throw new Refusal(`more than ${HOLDS_PER_MINUTE} holds in a minute: this one isn't logged. Try again in a minute`);
     }
-    calls.push(now);
-    this.holdCalls.set(caller, calls);
-    if (!this.d.guardHold) throw new Refusal("the link has no usage guard to log with");
-    const what = this.cardGate("hold", "hold's description", raw) ?? `a build labelled ${label}`;
-    const v = this.d.guardHold(label, what);
-    if (v.ok) return { status: "passes" };
-    for (const [k, t] of this.holdSeen) if (now - t >= HOLD_DEDUPE_MS) this.holdSeen.delete(k);
-    const key = `${label}\t${what}`;
-    if (this.holdSeen.has(key)) return { status: "held", why: v.why, repeat: true };
     if (!this.d.holdLog) throw new Refusal("the hold couldn't be written to the guard's log");
     let rotated: boolean | void;
-    try { rotated = this.d.holdLog(logLine(new Date(now), label, what, v)); }
+    try { rotated = this.d.holdLog(logLine(new Date(at), label, what, v)); }
     catch (e) { this.log(`couldn't log a hold: ${String(e).slice(0, 80)}`); throw new Refusal("the hold couldn't be written to the guard's log"); }
-    this.holdSeen.set(key, now);
+    holds.push(at);
+    this.holdCalls.set(caller, holds);
+    this.holdSeen.set(key, at);
     if (rotated === true) this.holdsCapHit("the guard's log reached its size cap, so the App rotated it, keeping one previous file");
     return { status: "held", why: v.why };
   }
@@ -2235,6 +2264,9 @@ export class Link {
     return "";
   }
 
+  // 0.17.0, round 2 of its review fixes: no tap path reads the plan. The usage guard's reading runs in a
+  // child process (../plan-read.ts) awaited only by the hold route, so a tap that comes during a cold
+  // read is answered within Discord's 3 seconds like any other.
   async onInteraction(it: any): Promise<string> {
     if (it?.type !== COMPONENT) return "ignored";
     const cid = String(it.data?.custom_id ?? "");

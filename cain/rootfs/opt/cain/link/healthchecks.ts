@@ -1,16 +1,32 @@
 // The heartbeat checks' timing at Healthchecks.io (Cain 0.17.0): the assistant reads and sets a check's
 // grace and period itself, through the link, which holds the management API key (the App's option
-// healthchecks_api_key, in the link's environment only; Cain's user never reads it, and it's never
-// logged or answered back).
+// healthchecks_api_key, in a root-only file only the link reads, never an environment; Cain's user never
+// reads it, and it's never logged or answered back).
 //   keeper.sh hc-check <check name>                                  POST /hc {cmd: "check", name}
 //   keeper.sh hc-set <check name> --grace <s> [--period <s>]         POST /hc {cmd: "set", name, grace, period?}
 // Only those fields: anything else in the call is refused, and a set sends Healthchecks only grace and
 // timeout (its name for the period). Each set is logged (the App log and the link's own log file).
+// Round 2 of 0.17.0's review fixes: these checks watch Cain, so a very long grace or period would mute
+// its own dead-man alarm. The link holds hard ceilings (HC_CEILING_S: one hour each), whatever keeper.sh
+// sends; a set above one is refused naming it. Every set the service takes is relayed to Cain and posted
+// to the owner's DM by the link, one plain line with the check's name and the old and new values.
+import { readFileSync } from "node:fs";
 import { appendSynced } from "./auth";
 
 export const HC_API = "https://healthchecks.io/api/v3";
 export const HC_MIN_S = 60;
 export const HC_MAX_S = 31_536_000;             // Healthchecks' own bounds for timeout and grace
+export const HC_CEILING_S = 3_600;              // round 2: the link's ceiling for grace and for period (one hour)
+
+// The key (round 2): read from its root-only file, which the run script writes from the App's option
+// (/run/cain-hc/key, folder 0700, file 0600), never from the environment: Bun gives every child the
+// environment the process started with, whatever is deleted from process.env later, so a key there would
+// reach every child the link starts (git, curl, notice.sh). A name left in the environment is dropped too.
+export const HC_KEY_FILE = "/run/cain-hc/key";
+export function takeKey(file = HC_KEY_FILE, env: Record<string, string | undefined> = process.env): string {
+  delete env.HEALTHCHECKS_API_KEY;
+  try { return readFileSync(file, "utf8").trim(); } catch { return ""; }
+}
 export const HC_LOG = "/data/link/healthchecks.log";
 const FIELDS = new Set(["cmd", "name", "grace", "period"]);
 
@@ -21,14 +37,17 @@ export type HcDeps = {
   logFile?: string | null;                                 // the set log; null: none
   now?: () => number;
   api?: string;
+  announce?: (line: string) => void | Promise<void>;     // round 2: a set the service took, to Cain and the owner's DM
 };
 export type HcAnswer = { status: "ok"; said: string; check?: Record<string, unknown> } | { status: "refused" | "error"; said: string };
 
 const clean = (s: unknown, max = 80) => String(s ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, max);
-const secs = (v: unknown): number | null => {
+const secs = (v: unknown): number | null | "over" => {
   const n = typeof v === "number" ? v : typeof v === "string" && /^\d{1,9}$/.test(v.trim()) ? Number(v.trim()) : NaN;
-  return Number.isInteger(n) && n >= HC_MIN_S && n <= HC_MAX_S ? n : null;
+  if (!Number.isInteger(n) || n < HC_MIN_S) return null;
+  return n > HC_CEILING_S ? "over" : n;
 };
+const OVER = (flag: string) => `${flag} is at most ${HC_CEILING_S} seconds (one hour): the link's ceiling for the checks that watch Cain, so a long one can't mute their alarm`;
 // What a check shows: its name, grace, period, status and last ping. Nothing else (no ping URL: it's a secret).
 export function shown(c: any): Record<string, unknown> {
   return { name: clean(c?.name), grace: Number(c?.grace) || null, period: Number(c?.timeout) || null,
@@ -36,6 +55,13 @@ export function shown(c: any): Record<string, unknown> {
 }
 const line = (c: Record<string, unknown>) =>
   `${c.name}: grace ${c.grace ?? "?"} s, period ${c.period ?? "?"} s, status ${c.status || "?"}, last ping ${c.last_ping ?? "never"}`;
+
+// The one plain line a set makes (round 2): the check's name (letters, digits and a few marks only, so it
+// reads plainly and passes the message gate) and the old and new values.
+export function setLine(name: string, before: Record<string, unknown>, after: Record<string, unknown>): string {
+  const n = String(name).replace(/[^A-Za-z0-9 ._()-]+/g, "?").replace(/\s+/g, " ").trim().slice(0, 60) || "?";
+  return `Cain set the Healthchecks.io check "${n}": grace ${before.grace ?? "?"} to ${after.grace ?? "?"} seconds, period ${before.period ?? "?"} to ${after.period ?? "?"} seconds.`;
+}
 
 export async function hcCall(b: any, d: HcDeps): Promise<HcAnswer> {
   if (!b || typeof b !== "object" || Array.isArray(b)) return { status: "refused", said: "not a Healthchecks call" };
@@ -50,11 +76,13 @@ export async function hcCall(b: any, d: HcDeps): Promise<HcAnswer> {
     if (b.grace !== undefined || b.period !== undefined) return { status: "refused", said: "hc-check reads only; use hc-set to change grace or period" };
   } else {
     const grace = secs(b.grace);
-    if (grace === null) return { status: "refused", said: `--grace is needed, in whole seconds from ${HC_MIN_S} to ${HC_MAX_S}` };
+    if (grace === "over") return { status: "refused", said: OVER("--grace") };
+    if (grace === null) return { status: "refused", said: `--grace is needed, in whole seconds from ${HC_MIN_S} to ${HC_CEILING_S}` };
     body.grace = grace;
     if (b.period !== undefined) {
       const period = secs(b.period);
-      if (period === null) return { status: "refused", said: `--period is in whole seconds from ${HC_MIN_S} to ${HC_MAX_S}` };
+      if (period === "over") return { status: "refused", said: OVER("--period") };
+      if (period === null) return { status: "refused", said: `--period is in whole seconds from ${HC_MIN_S} to ${HC_CEILING_S}` };
       body.timeout = period;
     }
   }
@@ -94,5 +122,9 @@ export async function hcCall(b: any, d: HcDeps): Promise<HcAnswer> {
   (d.log ?? console.log)(`healthchecks: set ${entry.name}: grace ${before.grace} to ${body.grace}${body.timeout ? `, period ${before.period} to ${body.timeout}` : ""}: Healthchecks.io answered ${r.status}`);
   if (d.logFile !== null) { try { appendSynced(d.logFile ?? HC_LOG, JSON.stringify(entry) + "\n"); } catch (e) { (d.log ?? console.log)(`healthchecks: couldn't write the set log: ${clean(String(e), 60)}`); } }
   if (!after) return { status: "error", said: `Healthchecks.io answered ${r.status} to the change${r.body?.error ? `: ${clean(r.body.error)}` : ""}` };
+  if (d.announce) {
+    try { await d.announce(setLine(name, before, after)); }
+    catch (e) { (d.log ?? console.log)(`healthchecks: couldn't announce the set: ${clean(String(e), 60)}`); }
+  }
   return { status: "ok", said: `Healthchecks.io answered: ${line(after)}`, check: after };
 }

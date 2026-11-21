@@ -9,6 +9,13 @@
 - Review-cap decision cards: a saved answer that isn't one of the card's two choices is treated as unreadable (nothing passed on, the card says so, an alarm names it); a tap while answers are paused says so and points to the alarm; a card from before a reset is replaced with a new one; a hold line is never written twice, and an unreadable guard log raises an alarm instead of a guess.
 - Badly formed hold calls no longer use up the hold route's per-minute limit.
 - Cain can read and set the grace and period of your Healthchecks.io heartbeat checks himself, once you paste a read-write management key into the new option `healthchecks_api_key`.
+- Second round of review fixes: your taps are never held up by the usage guard's reading. The link reads the plan in the background with a 2 second limit (a reading not ready by then holds other work), and the review runner warms that reading when the App starts and when the week turns.
+- Cain's Build hook no longer reads a cold plan count itself: it asks the link first, and a reading still not ready refuses the job as "plan reading not ready", with a line on the guard's log. An alarm says when the plan count's cache can't be kept or isn't root's.
+- The week's count keeps a high-water mark: if it ever goes down within a week (a transcript deleted, cut short or re-timed), other work is held and an alarm says what went down. The docs now say plainly what the count can and can't be trusted for.
+- Two new options, `plan_allowance_set_on` and `plan_allowance_derivation`, record when and how the allowance was worked out; `review.sh guard` prints both.
+- Your review-cap answers: the reset mark is written safely before the old file is moved aside (and the file stays put if the mark can't be written, with an alarm), and a mark that can't be read raises an alarm naming the file and how to clear it.
+- Passing Build checks no longer use up the usage guard's limit of 6 holds a minute; checks have their own, higher limit.
+- Heartbeat checks: grace and period are each capped at one hour, and every change Cain makes is posted to you in one line with the old and new values. The Healthchecks key now reaches the link in a root-only file, never an environment its helper programs could see.
 
 ## 0.16.0
 

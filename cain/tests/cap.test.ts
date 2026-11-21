@@ -474,7 +474,7 @@ describe("round 2, fix 2: the guard's log is root's; holds from Cain's side go t
       expect(readFileSync(o.log, "utf8").trim().split("\n").length).toBe(1);
       // The link decides again: a hold its own reading doesn't refuse is not logged.
       Object.assign((r.link as any).d, { guardHold: () => ({ ok: true }) });
-      expect((r.link as any).guardHoldFor({ label: "other", what: "x" })).toEqual({ status: "passes" });
+      expect(await (r.link as any).guardHoldFor({ label: "other", what: "x" })).toEqual({ status: "passes" });
       expect(readFileSync(o.log, "utf8").trim().split("\n").length).toBe(1);
     } finally { server.stop(true); }
     expect(routeAllowed("cain", "/guard-hold")).toBe(true);
@@ -637,7 +637,7 @@ describe("round 2, fix 6: the install-time self-check, and the decision route en
     const r = rig({ holds: keeperHolds({}) });
     Object.assign((r.link as any).d, { capOff: () => "x is a symlink", guardHold: () => ({ ok: false, floor: "plan", why: "low", logged: true }) });
     await expect(r.link.decision(DEC)).rejects.toThrow("files aren't right");
-    expect(() => (r.link as any).guardHoldFor({ label: "other", what: "x" })).toThrow("files aren't right");
+    await expect((r.link as any).guardHoldFor({ label: "other", what: "x" })).rejects.toThrow("files aren't right");
     expect(r.posts()).toBe(0);
   });
 
@@ -784,16 +784,16 @@ describe("round 3, fix 2: the hold route is bounded", () => {
     return { r, lines, alarms, hold: (what: string, caller = "cain", label = "other") => (r.link as any).guardHoldFor({ label, what }, caller) };
   };
 
-  test(`at most ${HOLDS_PER_MINUTE} calls a minute per caller, with one alarm; another caller and the next minute go on`, () => {
+  test(`at most ${HOLDS_PER_MINUTE} holds a minute per caller, with one alarm; another caller and the next minute go on`, async () => {
     const t = holdRig();
-    for (let i = 0; i < HOLDS_PER_MINUTE; i++) expect(t.hold(`Build ${i}`).status).toBe("held");
-    expect(() => t.hold("Build 99")).toThrow(`more than ${HOLDS_PER_MINUTE} holds in a minute`);
-    expect(() => t.hold("Build 100")).toThrow("in a minute");
+    for (let i = 0; i < HOLDS_PER_MINUTE; i++) expect((await t.hold(`Build ${i}`)).status).toBe("held");
+    await expect(t.hold("Build 99")).rejects.toThrow(`more than ${HOLDS_PER_MINUTE} holds in a minute`);
+    await expect(t.hold("Build 100")).rejects.toThrow("in a minute");
     expect(t.lines.length).toBe(HOLDS_PER_MINUTE);
     expect(t.alarms).toEqual([["review-holds", `more than ${HOLDS_PER_MINUTE} holds in a minute from cain`]]);
-    expect(t.hold("Build from root", "root").status).toBe("held");
+    expect((await t.hold("Build from root", "root")).status).toBe("held");
     t.r.later(61_000);
-    expect(t.hold("Build 101").status).toBe("held");
+    expect((await t.hold("Build 101")).status).toBe("held");
     expect(t.alarms.length).toBe(1);
     // An hour without another hit: the sweep clears the alarm.
     const cleared: string[] = [];
@@ -805,31 +805,31 @@ describe("round 3, fix 2: the hold route is bounded", () => {
     expect(cleared).toEqual(["holds"]);
   });
 
-  test("an identical refusal is logged once in ten minutes; a new description, or later, is logged again", () => {
+  test("an identical refusal is logged once in ten minutes; a new description, or later, is logged again", async () => {
     const t = holdRig();
-    expect(t.hold("Build on claude/x")).toEqual({ status: "held", why: "the plan's usage is unknown" });
-    expect(t.hold("Build on claude/x")).toMatchObject({ status: "held", repeat: true });
-    expect(t.hold("Build on claude/x", "cain", "other")).toMatchObject({ repeat: true });
+    expect(await t.hold("Build on claude/x")).toEqual({ status: "held", why: "the plan's usage is unknown" });
+    expect(await t.hold("Build on claude/x")).toMatchObject({ status: "held", repeat: true });
+    expect(await t.hold("Build on claude/x", "cain", "other")).toMatchObject({ repeat: true });
     expect(t.lines.length).toBe(1);
-    expect(t.hold("Build on claude/y").repeat).toBeUndefined();
+    expect((await t.hold("Build on claude/y")).repeat).toBeUndefined();
     expect(t.lines.length).toBe(2);
     t.r.later(HOLD_DEDUPE_MS);
-    expect(t.hold("Build on claude/x").repeat).toBeUndefined();
+    expect((await t.hold("Build on claude/x")).repeat).toBeUndefined();
     expect(t.lines.length).toBe(3);
   });
 
-  test("the description goes through the card gate: one that fails is logged as a build with its label", () => {
+  test("the description goes through the card gate: one that fails is logged as a build with its label", async () => {
     for (const bad of [`Build ${"a".repeat(40)} at 2026-11-21T10:00:00Z`, "Build \u2014 now", "Build, and 3 more"]) {
       const t = holdRig();
-      expect(t.hold(bad).status).toBe("held");
+      expect((await t.hold(bad)).status).toBe("held");
       expect([bad, t.lines.map((l) => l.split("\t")[2])]).toEqual([bad, ["a build labelled other"]]);
     }
     const ok = holdRig();
-    ok.hold("Build on claude/cap-in-code");
+    await ok.hold("Build on claude/cap-in-code");
     expect(ok.lines.map((l) => l.split("\t")[2])).toEqual(["Build on claude/cap-in-code"]);
   });
 
-  test("the guard's log is capped in size and rotated root-side, keeping one previous file, with one alarm", () => {
+  test("the guard's log is capped in size and rotated root-side, keeping one previous file, with one alarm", async () => {
     const dir = mkdtempSync(join(tmpdir(), "r3-"));
     const log = join(dir, "review-guard.log");
     writeFileSync(log, "x".repeat(95) + "\n", { mode: 0o640 });
@@ -848,7 +848,7 @@ describe("round 3, fix 2: the hold route is bounded", () => {
     // At the link: a rotation raises the same one alarm.
     const t = holdRig();
     Object.assign((t.r.link as any).d, { holdLog: () => true });
-    t.hold("Build on claude/z");
+    await t.hold("Build on claude/z");
     expect(t.alarms).toEqual([["review-holds", "the guard's log reached its size cap, so the App rotated it, keeping one previous file"]]);
   });
 
