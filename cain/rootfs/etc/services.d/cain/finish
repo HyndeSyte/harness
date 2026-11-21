@@ -1,7 +1,100 @@
 #!/usr/bin/env bashio
 declare APP_EXIT_CODE=${1}
+# The stop mark (probe/main.ts stop-finish, Cain 0.14.0). Seventh round, two phases: the run script's
+# TERM trap left only a pending mark and its nonce; this promotes the mark to asked only for a real stop,
+# the run script ended by SIGTERM (s6 passes 256 and the signal, 15), with the nonce the last start
+# record's id. That is the Supervisor stopping the App: an owner's Stop, Restart or update from Home
+# Assistant, an automation's or a watchdog's (all the same SIGTERM; the next start counts asked starts
+# in their own window). A plain exit 15, a death by SIGKILL (the OOM killer), SIGSEGV or SIGABRT is
+# never asked, and clears the mark; a pending mark this never promoted (the container killed, the power
+# lost) makes the next start count as a plain boot. Called only when the nonce is there, so a crash
+# without a TERM costs nothing here. Up to 4 seconds, inside s6's 5 second finish limit (s6-supervise's
+# own, and the Dockerfile's S6_KILL_FINISH_MAXTIME); the time it took is kept for the stop drills (t0).
+t0="${EPOCHREALTIME:-}"
+if [ -e /run/cain/probe/term ]; then
+  timeout 4 bun /opt/cain/probe/main.ts stop-finish "${APP_EXIT_CODE}" "${2:-}" "$t0" >/dev/null 2>&1 || true
+fi
+unset t0
+# The outside heartbeat's failure ping (<heartbeat_url>/fail), when one is set, with what happened as
+# its body: heartbeat_fail <words>. The URL is never logged and never on a command line (a process
+# listing shows those): curl reads it from its config on stdin (-K -), https only, no redirects, 10
+# seconds at most. printf is bash's own. Third round: -q first, so no curl config of the environment's
+# is read; two retries; and no xtrace for this block (a trace would print the URL), put back as it was.
+heartbeat_fail() {
+  local hb hb_base hb_query hb_xtrace
+  case $- in *x*) hb_xtrace=1 ;; *) hb_xtrace= ;; esac
+  { set +x; } 2>/dev/null
+  hb="$(bashio::config 'heartbeat_url' 2>/dev/null || true)"
+  if [[ "${hb}" =~ ^https://[A-Za-z0-9.-]+(:443)?(/[A-Za-z0-9._~%/-]*)?(\?[A-Za-z0-9._~%=\&-]*)?$ ]]; then
+    hb_base="${hb%%\?*}"; hb_query="${hb:${#hb_base}}"
+    printf 'url = "%s/fail%s"\n' "${hb_base%/}" "${hb_query}" \
+      | curl -q -fsS -m 10 --retry 2 --max-redirs 0 --proto '=https' -o /dev/null --data-binary "$1" -K - 2>/dev/null \
+      && bashio::log.info "Told the outside heartbeat: $1" \
+      || bashio::log.warning "Couldn't tell the outside heartbeat: $1"
+  fi
+  hb=""; hb_base=""; hb_query=""
+  if [ -n "${hb_xtrace}" ]; then set -x; fi
+}
+# Third round: the mark is read once and deleted at once, so it is consumed exactly once: a later stop
+# or crash in the same container (/run kept, as when s6 restarts the service) is never taken for a
+# self-restart. The run script also clears it at its very top.
+# Fourth round: the mark holds the time (epoch seconds) the run script wrote it. Fifth round: that is the
+# time of its last action (before its restart request, and again just before its 2-minute wait), so a
+# TERM stop (256 and signal 15) later than the wait (C1_SELF_STOP_WAIT_S) plus 30 seconds after it isn't
+# the Supervisor carrying out that request: it is reported as a stop during the self-restart window (the
+# owner's own Stop, say), not as a self-restart. A mark with no time (from an earlier version) counts as
+# before. Fifth round, also: only TERM is the Supervisor's stop. A death by any other signal in the
+# window (the OOM killer's 9, a SIGSEGV) is a crash: the mark goes, the heartbeat hears "stopped on an
+# error", and the container halts as on a crash. And an exit 3 is the run script's fallback only when
+# the mark carries the word fallback (self_exit writes it); a stray 3 is a crash.
+self_restart_mark=""
+window_crash=""
+crash_signal=""
+if [ -e /run/cain/self-restart ]; then
+  self_restart_mark=1
+  mark_text="$(head -c 64 /run/cain/self-restart 2>/dev/null | head -n 1 || true)"
+  mark_at="$(printf '%s' "${mark_text%% *}" | tr -cd '0-9')"
+  rm -f /run/cain/self-restart 2>/dev/null || true
+  if [[ "${APP_EXIT_CODE}" -eq 256 ]] && [[ "${2:-}" != "15" ]]; then
+    self_restart_mark=""
+    window_crash=1
+    crash_signal="$(printf '%s' "${2:-}" | tr -cd '0-9')"
+    bashio::log.warning "Cain's App died of signal ${2:-unknown} during the self-restart window: a crash, not the self-restart"
+  elif [[ "${APP_EXIT_CODE}" -eq 256 ]] && [ -n "${mark_at}" ] \
+     && [ $(( $(date +%s) - mark_at )) -gt $(( ${C1_SELF_STOP_WAIT_S:-120} + 30 )) ]; then
+    self_restart_mark=""
+    bashio::log.warning "Cain's App was stopped during the self-restart window, $(( $(date +%s) - mark_at )) seconds after its last step of the restart: a stop, not the self-restart"
+  elif [[ "${APP_EXIT_CODE}" -eq 3 ]] && [[ " ${mark_text} " != *" fallback "* ]]; then
+    self_restart_mark=""
+    bashio::log.warning "Cain's App exited with 3 during the self-restart window without its fallback's mark: a crash, not the self-restart"
+  fi
+  unset mark_at mark_text
+fi
+if [ -n "${self_restart_mark}" ]; then
+  # The App restarting itself (Cain 0.15.0, the run script's self_restart): already told and kept in
+  # /data by the probe. Second round: the outside heartbeat hears it as a failure every time, by its
+  # own body, so a restart that never comes back (the Supervisor never starting the App again) is
+  # raised from outside the App, which is the only place it can be. The next start's pings bring the
+  # check back up. Either route: the Supervisor's restart call (it stops the App: 256 and SIGTERM) or
+  # the exit route (exit 3, recorded as the container's exit code and halted here, for the watchdog).
+  heartbeat_fail "restarting itself (self-restart, exit code ${APP_EXIT_CODE}); it should be back within minutes"
+  if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
+    bashio::log.warning "Cain's App stops to restart itself (exit code ${APP_EXIT_CODE}); the Supervisor's watchdog starts it again"
+    echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
+    exec /run/s6/basedir/bin/halt
+  fi
+fi
+if [ -n "${window_crash}" ]; then
+  # A signal other than TERM inside the self-restart window (above): a crash, told and halted as one,
+  # with 128 plus the signal as the container's exit code.
+  heartbeat_fail "stopped on an error"
+  echo "$(( 128 + ${crash_signal:-0} ))" > /run/s6-linux-init-container-results/exitcode
+  exec /run/s6/basedir/bin/halt
+fi
 if [[ "${APP_EXIT_CODE}" -ne 0 ]] && [[ "${APP_EXIT_CODE}" -ne 256 ]]; then
   bashio::log.warning "Cain stopped with exit code ${APP_EXIT_CODE}"
+  # The outside heartbeat hears it at once (above).
+  heartbeat_fail "stopped on an error"
   echo "${APP_EXIT_CODE}" > /run/s6-linux-init-container-results/exitcode
   exec /run/s6/basedir/bin/halt
 fi

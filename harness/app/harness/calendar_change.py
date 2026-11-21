@@ -5456,16 +5456,28 @@ class CalendarChange:
                              "gmail", last))
         return out, 0
 
-    def context_for(self, text: str, now: datetime) -> list[str]:
+    def context_address(self) -> str | None:
+        """His Gmail address for context_for, or None. On the controller's thread, never in a
+        worker: finding his calendar reads the record (family_gmail._his_feed). Nothing raised."""
+        try:
+            if self.google is None or not self.google.configured():
+                return None
+            return self.address() or None
+        except Exception as e:                     # a lookup is a help, never a stop
+            log.warning("calendar context: his calendar couldn't be found: %s", type(e).__name__)
+            return None
+
+    def context_for(self, text: str, now: datetime, address: str | None) -> list[str]:
         """His Gmail events today and tomorrow, and others whose names share a word with his
         message, so the model knows what "PT" is today and "again" reads as the last one's day,
         time and place. A word of two letters counts ("PT"), in either form ("physical therapy").
-        Harness's own blocks are marked as its. In a worker; nothing raised."""
+        Harness's own blocks are marked as its. In a worker: it reads Google only, never the
+        record (address comes from context_address); nothing raised."""
         words = {w for w in title_words(_CLOCK.sub(" ", text)) if len(w) > 1} - _CONTEXT_SKIP - _FILLER
-        if self.google is None or not self.google.configured() or not self.address():
+        if not address or self.google is None:
             return []
         try:
-            events = self.google.events_between(self.address(), now - CONTEXT_BACK, now + CONTEXT_AHEAD)
+            events = self.google.events_between(address, now - CONTEXT_BACK, now + CONTEXT_AHEAD)
         except Exception as e:                     # a lookup is a help, never a stop
             log.warning("calendar context failed: %s", type(e).__name__)
             return []

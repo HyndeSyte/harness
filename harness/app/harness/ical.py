@@ -59,6 +59,9 @@ class Occurrence:
     # For offers to Family (family_copy.py). `organizer` is the address, lower-cased.
     location: str = ""
     organizer: str = ""
+    # His own answer to it, upper-cased (ACCEPTED, TENTATIVE, ...), when the calendar names him
+    # and he's on its guest list; "" otherwise. A declined one never gets this far.
+    partstat: str = ""
 
 
 @dataclass
@@ -67,6 +70,13 @@ class Window:
     calendar: str
     occurrences: list[Occurrence] = field(default_factory=list)
     unreadable: int = 0          # events that might fall in the window but couldn't be read
+    # The uids of the repeating series read in full: each one's master parsed and expanded, so an
+    # instance of it that isn't in `occurrences` is gone by the feed's own word (an excluded date,
+    # a cancelled override, or the series ended before it), not by a read cut short.
+    series: set = field(default_factory=set)
+    # Of those, the ones whose repeat rule ends (UNTIL or COUNT): a series that can stop, so the
+    # old half of a "this and following" split (family_gmail.py).
+    bounded: set = field(default_factory=set)
 
 
 # -- lines and properties -------------------------------------------------------
@@ -487,13 +497,17 @@ def _overlaps(start, end, ws: datetime, we: datetime, local: ZoneInfo) -> bool:
 
 
 def _declined(ev: Event, me: str | None) -> bool:
+    return _partstat(ev, me) == "DECLINED"
+
+
+def _partstat(ev: Event, me: str | None) -> str:
+    """His own answer on the event's guest list, upper-cased; "" when he isn't named on it."""
     if not me:
-        return False
+        return ""
     for a in ev.all("ATTENDEE"):
-        if a.value.lower().removeprefix("mailto:") == me and \
-                a.params.get("PARTSTAT", "").upper() == "DECLINED":
-            return True
-    return False
+        if a.value.lower().removeprefix("mailto:") == me:
+            return a.params.get("PARTSTAT", "").upper()
+    return ""
 
 
 def window(text: str, *, start: datetime, end: datetime, tz: str,
@@ -551,7 +565,8 @@ def window(text: str, *, start: datetime, end: datetime, tz: str,
         organizer = org.value.strip().lower().removeprefix("mailto:") if org else ""
         out.occurrences.append(Occurrence(s, e, not isinstance(s, datetime), summary, name,
                                           bool(transp and transp.value.upper() == "TRANSPARENT"),
-                                          ev.uid, instance, attendees, where, organizer))
+                                          ev.uid, instance, attendees, where, organizer,
+                                          _partstat(ev, me)))
 
     for ev in loose:
         try:
@@ -587,6 +602,9 @@ def window(text: str, *, start: datetime, end: datetime, tz: str,
                 if k in ovs:
                     continue                       # replaced by its override below
                 add(ev, inst, dur)
+            out.series.add(uid)
+            if rule.get("UNTIL") or rule.get("COUNT"):
+                out.bounded.add(uid)
         except Unreadable:
             if _maybe_relevant(ev, ev.first("RRULE"), start, end, default, local):
                 out.unreadable += 1

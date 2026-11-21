@@ -1,16 +1,23 @@
 // review.sh: Cain's way to ask for an outside review and read what came back.
-//   submit <brief.json>    queue a brief; prints its id (or "blocked: privacy ...", exit 3)
+// It runs as Cain's user (C1): it leaves a brief in the inbox and reads the queue, which only
+// the runner writes, so a review's state and its Reviewed line can only be the runner's.
+//   submit <brief.json>    leave a brief for the runner; prints its id (or "blocked: privacy ...",
+//                          exit 3, and nothing is left). The runner takes it within a tick.
 //   status <id>            the review's state and each seat's state, one line each
 //   result <id>            result.json (what goes to the record), once finished
 //   useful <id> <seat> <n> how many of that seat's findings Cain adopted (cost per useful finding)
-//   spend                  this month per seat: dollars, cap, runs, findings, useful, $ per useful
+//   spend                  this month per seat: dollars, the runner's own cap, runs, findings, useful,
+//                          $ per useful; then the round count per open change against the round cap
+//   guard                  the usage guard's reading now, in two lines (the plan, the seats and the floor)
 //   health                 the last nightly seat check
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readStop, stoppedWhy } from "../stop.ts";
-import { FINAL, LABEL, SEATS, markBlocked, newReview, parseBrief, privacyCheck, resultJson, shownId, type SeatName } from "./core.ts";
+import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
-import { existsReview, loadReview, saveReview, type Ledger, type Health } from "./runner.ts";
+import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
+import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
+import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
 const usefulFile = process.env.REVIEW_USEFUL ?? join(dirname(cfg.spendFile), "review-useful.jsonl");
@@ -18,8 +25,25 @@ const out = (s: string) => console.log(s);
 const fail = (s: string, code = 2): never => { console.error(s); process.exit(code); };
 const [cmd, a1, a2, a3] = process.argv.slice(2);
 const terms = () => { try { return readFileSync(cfg.termsFile, "utf8"); } catch { return null; } };
+// Cain 0.16.0: what the runner really uses, as it wrote it (root's file). Never this process's own
+// environment, which is Cain's: his caps and round cap would be the defaults, not the App's options.
+const settings = () => readSettings(cfg.settingsFile!);
+const roundCap = () => settings()?.round_cap ?? DEFAULT_ROUND_CAP;
 
 function money(n: number) { return `$${n.toFixed(2)}`; }
+
+// A brief waiting in the inbox for the runner.
+const inboxFile = (id: string) => (cfg.inboxDir && safeId(id) ? join(cfg.inboxDir, `${id}.json`) : "");
+const waiting = (id: string) => { const f = inboxFile(id); return !!f && existsSync(f); };
+// The brief's own fields, nothing else, written whole: a temp name the runner skips, then renamed.
+function leave(b: Brief): void {
+  const f = inboxFile(b.id);
+  if (!f) fail("no inbox for review briefs");
+  mkdirSync(cfg.inboxDir!, { recursive: true });
+  const tmp = join(cfg.inboxDir!, `.${b.id}.${process.pid}.tmp`);
+  writeFileSync(tmp, JSON.stringify(b), { mode: 0o640 });
+  renameSync(tmp, f);
+}
 
 switch (cmd) {
   case "submit": {
@@ -29,18 +53,40 @@ switch (cmd) {
     const p = parseBrief(raw);
     if (!p.brief) fail(`not a brief: ${p.error}`);
     const b = p.brief!;
-    if (existsReview(cfg.queueDir, b.id)) fail(`a review with id ${b.id} already exists; use a new id`);
-    const r = newReview(b, new Date());
-    // The gate runs here first, so Cain hears at once; the runner runs it again before every call.
+    if (existsReview(cfg.queueDir, b.id) || waiting(b.id)) fail(`a review with id ${b.id} already exists; use a new id`);
+    // The gate runs here first, so Cain hears at once and nothing is left; the runner runs it
+    // again before every call.
     const g = privacyCheck(b, terms());
-    if (!g.ok) {
-      markBlocked(r, g.why, r.created_at);
-      r.relayed = true;
-      saveReview(cfg.queueDir, r);
-      fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
+    if (!g.ok) fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
+    // A seat whose monthly cap is reached runs nothing until the month turns (the runner
+    // checks before every call). A review whose seats are all there is refused here, at once,
+    // and nothing is left (Cain 0.13.0, read here from the spend file his group may read).
+    let ledger: Ledger = {};
+    try { ledger = JSON.parse(readFileSync(cfg.spendFile, "utf8")); } catch { /* none yet */ }
+    const month = new Date().toLocaleDateString("en-CA", { timeZone: cfg.tz }).slice(0, 7);
+    const seats = new Set(newReview(b, new Date()).seats.map((s) => s.seat));
+    const capped = [...seats].filter((s) => atCap(ledger, month, settings()?.caps ?? cfg.caps, s));
+    if (capped.length && capped.length === seats.size)
+      fail(`blocked: the monthly cap is reached for ${capped.map((s) => LABEL[s]).join(", ")}. Nothing was queued; raise the cap in the App's options if wanted, or wait for the month to turn.`, 3);
+    // The round cap and the usage guard, here first so he hears at once (the runner decides again when
+    // it takes the brief, and its answer is the one that counts).
+    const rounds = readRounds(cfg.roundsFile!);
+    if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
+    const a = admit(rounds!, b, roundCap());
+    if (!a.ok) fail(a.why, 3);
+    const label = labelOf(b.label)!;
+    // Round 2: the guard's log is root's (0640); a refusal here goes to the link, which decides again and
+    // logs it. Not reached: still refused, and said so.
+    const what = `review ${b.id} (${(a as any).key}, round ${(a as any).round})`;
+    const gv = guard(label, what, { settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile, tz: cfg.tz, now: new Date() });
+    if (!gv.ok) {
+      const h = await postHold(label, what);
+      fail(`held by the usage guard: it's labelled ${label}, and ${gv.why}. Core, commitment and necessary-fix work still run; ${h.logged
+        ? "this is on the guard's log (review.sh guard)" : `the hold could not be logged (${h.why})`}. Nothing was queued.`, 3);
     }
-    saveReview(cfg.queueDir, r);
+    leave(b);
     out(b.id);
+    if (capped.length) console.error(`Queued, but ${capped.map((s) => LABEL[s]).join(", ")} won't run: its monthly cap is reached.`);
     // While stopped it's queued all the same, and nothing goes out until he turns it back on.
     const st = readStop();
     if (st.stopped) console.error(`Queued, not sent: ${stoppedWhy(st, "no review is sent")} It goes out by itself once he does.`);
@@ -48,6 +94,7 @@ switch (cmd) {
   }
   case "status": {
     const r = a1 ? loadReview(cfg.queueDir, a1) : null;
+    if (!r && a1 && waiting(a1)) { out(`${a1}: waiting for the runner to take it (within a minute)`); break; }
     if (!r) fail(`no review ${a1 ?? ""}`.trim(), 1);
     out(`${shownId(r!)}: ${r!.status}${r!.blocked_why ? ` (${r!.blocked_why.join("; ")})` : ""}${r!.record_dir ? `, record ${r!.record_dir}` : ""}, $${r!.cost_usd.toFixed(3)}`);
     for (const s of r!.seats) {
@@ -85,13 +132,42 @@ switch (cmd) {
       for (const line of readFileSync(usefulFile, "utf8").split("\n")) { try { const j = JSON.parse(line); latest.set(`${j.id}/${j.key}`, j); } catch { /* skip */ } }
       for (const j of latest.values()) if (j.month === month) useful[j.seat] = (useful[j.seat] ?? 0) + j.useful;
     }
+    const st = settings();
+    const caps = st?.caps ?? null;
     out(`${month}: seat, spent / cap, runs, findings, useful, per useful finding`);
-    const cap: Record<SeatName, string> = { openai: `${cfg.caps.openaiRuns} runs`, gemini: money(cfg.caps.gemini), perplexity: money(cfg.caps.perplexity), claude: money(cfg.caps.claude) };
+    if (!caps) out("  (the runner hasn't written its caps yet, so caps show as ?: it writes them at each start)");
+    const cap: Record<SeatName, string> = caps
+      ? { openai: `${caps.openaiRuns} runs`, gemini: money(caps.gemini), perplexity: money(caps.perplexity), claude: money(caps.claude) }
+      : { openai: "? runs", gemini: "?", perplexity: "?", claude: "?" };
     for (const s of SEATS) {
       const r = l[month]?.[s] ?? { usd: 0, runs: 0, findings: 0, searches: 0 };
       const u = useful[s] ?? 0;
       out(`  ${LABEL[s]}: ${money(r.usd)} / ${cap[s]}, ${r.runs} runs, ${r.findings} findings, ${u} useful, ${u ? money(r.usd / u) : "-"}`);
     }
+    // The round count per open change: one with no decision card yet and a round in the last 30 days.
+    const rounds = readRounds(cfg.roundsFile!);
+    const capN = roundCap();
+    if (!rounds) { out(`Review rounds (cap ${capN}): the rounds file can't be read`); break; }
+    const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const seen = new Set<string>();
+    const open: string[] = [];
+    for (const key of Object.keys(rounds.changes).sort()) {
+      const group = groupOf(rounds, key);
+      const head = group[group.length - 1];
+      if (seen.has(head)) continue;
+      group.forEach((k) => seen.add(k));
+      const done = countedRounds(rounds, key);
+      if (!done.length || done[done.length - 1].at < since) continue;
+      const d = decisionOf(rounds, key);
+      open.push(`  ${group.join(" + ")}: ${done.length} of ${capN} round${capN === 1 ? "" : "s"}${d ? `, decision card ${d.state === "posted" ? "with him" : "owed"}` : done.length >= capN ? ", at the cap" : ""}`);
+    }
+    out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}):`);
+    out(open.length ? open.join("\n") : "  no open changes");
+    break;
+  }
+  case "guard": {
+    const [a, b] = guardLines(readings({ settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile, tz: cfg.tz, now: new Date() }), new Date());
+    out(a); out(b);
     break;
   }
   case "health": {
@@ -101,5 +177,5 @@ switch (cmd) {
     break;
   }
   default:
-    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | health");
+    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health");
 }

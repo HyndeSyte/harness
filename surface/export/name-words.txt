@@ -1,0 +1,43 @@
+# Words that are also given names or surnames (surface/README.md, the proper-noun gate). None of them
+# is on the bundled common-words list: a capitalised one is gated like any name, at a sentence start or
+# not. One or more a line, lower case; `#` for a note line. Two sections:
+#
+# [names]   words whose lower-case use is a name too (a lower-case one is an unknown word);
+# [common]  ordinary English words that are also names: gated when capitalised, known in lower case
+#           ("the build will run" passes; "Will brings the drill" is gated). The dry run's private
+#           report lists each lower-case one it saw, for the owner to read.
+#
+# The [common] section holds the hand list's ordinary words and every word of common-words.txt found in
+# the bundled name lists (names/surnames.txt, Census 2000 surnames with at least 2,000 bearers, and
+# names/given-names.txt, SSA given names that reached 1 in 20,000 births in some year). A test fails if
+# common-words.txt and those lists share a word, or this file and common-words.txt do. Months and
+# weekdays stand only next to a number or a date, whatever this file says.
+
+[names]
+abby barb bea belle billy bob bobby chamberlain chip chris christian devine dick dix don doug earl
+fletcher gail hank harry howard jean jenny jerry jim jimmy jo joe kay lee les mabel mac mae marge
+mel mike mo molly moore nash nat ned nick parsons patsy queenie roger scott shelly sonny stu sue
+taylor ted terry tom tony troy val walt wes
+
+[common]
+# found in the bundled name lists (seventh round)
+an back begin book box call cancel carry check clear close cover do early few fix go hand hang he
+her just less list lock look more new pack pick plant read ring say see sell six so still till to
+via wait walk wash work you
+# the hand list's ordinary words
+amber angel april art august autumn bacon baker banks barber bell berry best bill bird bishop black
+blue bond bones booth bowman brewer bridge brook brooks brown buck bud bush butcher butler candy
+carol carpenter carter cash castle chance chandler chase cherry church clark clay cliff coach cook
+cooper crane cross crystal daisy dale dancer dawn day dean destiny dolly dot drew dyer easter eve
+faith fern field fields fish fisher flora ford forest foster fox frank french friend frost fuller
+gardener gates gene gentle ginger glen gold golden good goodman grace grant gray green grey gross
+guy hall hammer hart hawk hay hazel heather hill holder holly honey hood hope horn house hunt hunter
+iris ivy jack jade jay jewel joy judge june keen king kit knight lamb lance lane laurel law lily
+little long love lucky major march mark marsh mart mason max may melody mercy merry miller monday
+moon morning moss newman north oak olive opal page park parker pat patience pearl peg penny pepper
+person pierce pike pip piper pope poppy porter post potter power price prince quick rain ray red
+reed reeve rice rich rider rivers rob robin rock rocky rod root rose rosemary ruby rush rusty sage
+salt sandy savage sharp shepherd short silver singer sky small smith snow spring stamp steel
+sterling stone strong summer summers sun sunday sunny swan swift tad temple thursday tiny trinity
+tuesday turner victor violet wade walker wall ward warren waters weaver webb west wheeler white wild
+will willow winter wise wolf wood woods wren young

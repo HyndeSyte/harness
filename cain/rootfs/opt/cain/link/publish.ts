@@ -1,6 +1,6 @@
 // What the link writes for readers outside it (piece D):
 // - /data/trust/cards.json: the cards as the reply hook reads them when the link doesn't
-//   answer (core.ts cardsView: no text). Only root writes /data/trust; everyone reads it.
+//   answer (core.ts cardsView: no text). Only root writes /data/trust; root:cain 0640, so he reads it.
 //   Never written inside a save: a save only asks for a write (CardsWriter.soon), and one
 //   write about half a second later, whole through a temp file and a rename, carries the
 //   state as it is then. The sweep asks too, so it's fresh at least once a minute.
@@ -9,36 +9,96 @@
 // transcripts, for which of the bot's messages he sent with the Discord plugin (one bot
 // token posts them all), and which of them his reply tool made (seedReplies). They are
 // streamed in chunks and the event loop gets a turn often, so a tap is never kept waiting.
-import { createReadStream, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { closeSync, createReadStream, fstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { answerText, sentIds } from "../gate/plugin";
+import { CAIN_UID, openOwnedFd } from "../owned";
+import { KEEP_MS, writeSynced } from "./auth";
 import { cardsView, emptyState, type ReplayReport, type Sent, type State } from "./core";
+import { writePinned } from "../pinned";
+
+// Whose transcripts these are (tests set their own user), read at each call.
+const transcriptUid = () => Number(process.env.CAIN_TRANSCRIPT_UID ?? CAIN_UID);
 
 export const CARDS_FILE = process.env.CAIN_CARDS ?? "/data/trust/cards.json";
 export const REPLAY_FILE = process.env.CAIN_GATE_REPLAY ?? "/data/work/gate-replay.json";
-export const TRANSCRIPTS = process.env.CAIN_TRANSCRIPTS ?? "/data/.claude/projects";
+// Cain's own (C1: his home is /data/cain). Each file is opened only if it's a regular file of
+// his user's, never through a link (../owned.ts), since he can put anything there.
+export const TRANSCRIPTS = process.env.CAIN_TRANSCRIPTS ?? "/data/cain/.claude/projects";
 export const CARDS_DELAY_MS = 500;
 
-// The link's state file: read whole, written whole through a rename. A save tells onSave
-// (the cards writer) and writes nothing else.
-export function stateFile(path: string, onSave: () => void = () => {}) {
+// The link's state file: read whole, written whole and durably (a temp file synced, renamed,
+// its folder synced), in two copies, the second first, each holding which save it is (saveGen),
+// as the request log is (C1 re-check N2). So a card the link answered for is on disk before its
+// answer is recorded, and one damaged copy loses nothing. Both damaged is never taken quietly for
+// a fresh store: the loss is recorded first, durably (state.json.lost, its time), and only then
+// are they moved aside (state.json.damaged-<time>), so no crash between the two can make it look
+// fresh; if the loss can't be recorded, nothing is moved and load() throws (C1 re-check B1). Each
+// loss records its own time, later than any before it, even with an earlier one still on record:
+// a second loss covers the cards made since the first (and a start killed before the copies moved
+// only moves the time on, which is safe). A marker that can't be read, or doesn't hold a time,
+// counts as a loss now. lost() says so, across
+// restarts, for as long as the link remembers a signed request (KEEP_MS): the link tells Cain, and
+// a card's request id isn't trusted to find its card meanwhile. A save tells onSave (the cards
+// writer) and writes nothing else.
+export function stateFile(path: string, onSave: () => void = () => {},
+                          write: (path: string, body: string) => void = writeSynced, now = () => Date.now()) {
+  let gen = 0, whole = false, lostAt = 0, foundNow = false;
+  try {
+    const t = Number(readFileSync(`${path}.lost`, "utf8").trim());
+    if (Number.isSafeInteger(t) && t > 0) lostAt = t;
+    else { lostAt = now(); try { write(`${path}.lost`, String(lostAt)); } catch { /* lost in memory still */ } }
+  } catch (e: any) { if (e?.code !== "ENOENT") lostAt = now(); }
+  const one = (p: string): State | "absent" | "bad" => {
+    let text: string;
+    try { text = readFileSync(p, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? "absent" : "bad"; }
+    try {
+      const s = JSON.parse(text);
+      return s && typeof s === "object" && !Array.isArray(s) && s.cards && typeof s.cards === "object" && s.messages && typeof s.messages === "object" ? s : "bad";
+    } catch { return "bad"; }
+  };
   return {
     load(): State {
-      try { return JSON.parse(readFileSync(path, "utf8")); } catch { return emptyState(); }
+      // After the first look at both copies, the first is read alone while it's whole.
+      if (whole) { const s = one(path); if (typeof s === "object") return s; }
+      whole = true;
+      const a = one(path), b = one(`${path}.2`);
+      const good = [a, b].filter((x): x is State => typeof x === "object");
+      if (good.length) {
+        const best = good.reduce((x, y) => (Number(y.saveGen ?? 0) > Number(x.saveGen ?? 0) ? y : x));
+        gen = Math.max(gen, Number(best.saveGen ?? 0));
+        if (best !== a) whole = false;                  // the first copy is behind: both are read until a save
+        return best;
+      }
+      if (a === "absent" && b === "absent") return emptyState();
+      const t = Math.max(now(), lostAt + 1);
+      write(`${path}.lost`, String(t));
+      lostAt = t;
+      foundNow = true;
+      for (const p of [path, `${path}.2`]) { try { renameSync(p, `${p}.damaged-${lostAt}`); } catch { /* absent */ } }
+      return emptyState();
     },
     save(s: State): void {
-      writeFileSync(`${path}.tmp`, JSON.stringify(s), { mode: 0o600 });
-      renameSync(`${path}.tmp`, path);
+      gen += 1;
+      s.saveGen = gen;
+      const body = JSON.stringify(s);
+      try { write(`${path}.2`, body); write(path, body); }
+      catch (e) { whole = false; throw e; }             // the copies may differ: read both next time
+      whole = true;
       onSave();
+    },
+    // Found damaged by this process (so the link tells Cain once, not at every restart).
+    lostNow(): boolean { return foundNow; },
+    lost(): number {
+      if (lostAt && now() - lostAt > KEEP_MS) { lostAt = 0; try { rmSync(`${path}.lost`, { force: true }); } catch { /* gone */ } }
+      return lostAt;
     },
   };
 }
 
+// root:cain 0640 on every write (../pinned.ts, Cain 0.15.0): his session reads its DM's chat id here.
 export async function publishCards(s: State, now: number, path = CARDS_FILE): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o755 });
-  await writeFile(`${path}.tmp`, JSON.stringify(cardsView(s, now)), { mode: 0o644 });
-  await rename(`${path}.tmp`, path);
+  await writePinned(path, JSON.stringify(cardsView(s, now)));
 }
 
 // One pending write at a time, of the state as it is when the write happens.
@@ -92,7 +152,9 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f)); } catch { continue; }
     for (const f of files) {
-      try { if (statSync(f).mtimeMs < since) continue; } catch { continue; }
+      const owned = openOwnedFd(f, transcriptUid());
+      if (!owned) continue;
+      try { if (fstatSync(owned.fd).mtimeMs < since) { closeSync(owned.fd); continue; } } catch { try { closeSync(owned.fd); } catch { /* closed */ } continue; }
       const sends = new Map<string, boolean>();       // the plugin's send calls not answered yet: a reply?
       const take = (line: Buffer) => {
         if (!line.includes(NAME) && !(sends.size && line.includes(RESULT) && [...sends.keys()].some((s) => line.includes(s)))) return;
@@ -115,7 +177,7 @@ export async function readTranscripts(root: string, since: number): Promise<Sent
       };
       let parts: Buffer[] = [], held = 0, skipping = false, read = 0;
       try {
-        for await (const chunk of createReadStream(f, { highWaterMark: 64 * 1024 })) {
+        for await (const chunk of createReadStream("", { fd: owned.fd, highWaterMark: 64 * 1024, autoClose: true })) {
           const buf = chunk as Buffer;
           let pos = 0;
           for (let nl = buf.indexOf(10, pos); nl !== -1; nl = buf.indexOf(10, pos)) {   // only the new chunk is searched

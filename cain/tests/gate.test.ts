@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { cainReasons, claimsReview, CODES_WHY, codesHits, mayHaveCode, recordItems, reviewedHits, SHIP_WORDS_WHY, shipWordsHits } from "../rootfs/opt/cain/gate/cain";
 import { decideSend } from "../rootfs/opt/cain/gate/send";
-import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, imperative, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
+import { around, AT, check, DASH_WHY, DASH_WORDS, hostsOnly, LINK_WHY, linkHost, MAX_EXCERPTS, RANGE_WHY, RULES, STATIC_LABELS, verdict, whyOf } from "../rootfs/opt/cain/gate/rules";
 
 const shared = JSON.parse(readFileSync(join(import.meta.dir, "gate-cases.json"), "utf8"));
 const rulesOf = (r: ReturnType<typeof check>, result: string) => [...new Set(r.hits.filter((h) => h.result === result).map((h) => h.rule))].sort();
@@ -38,7 +38,7 @@ describe("the shared cases", () => {
 
 describe("the rules", () => {
   test("Nov 10, synthetic: tap Undo in a reply to a receipt without Undo is refused, and says which label", () => {
-    const r = check("Tap Undo on the receipt above and it's gone.", { buttons: ["Not mine", "Wrong time", "Not this time", "Stop"] });
+    const r = check("Tap Undo on the receipt above and it's gone.", { buttons: ["Not mine", "Wrong time", "Just this once", "Stop"] });
     expect(verdict(r)).toBe("refuse");
     expect(r.hits).toMatchObject([{ rule: "button", result: "refuse", label: "Undo" }]);
     expect(verdict(check("each on its own card with Undo", { buttons: ["Stop"] }))).toBe("refuse");
@@ -237,28 +237,6 @@ describe("the rules", () => {
     expect(verdict(check("Moved swim — then art."))).toBe("fix");
     expect(verdict(check("Tap Undo.", { buttons: null }))).toBe("unsure");
     expect(verdict(check("Moved swim to 4:30."))).toBe("pass");
-  });
-});
-
-describe("imperative: whether a button hit tells him to use the button (the link refuses a specialist's card only for one)", () => {
-  // The span of the label's first occurrence, as a hit's at and end give it.
-  const at = (text: string, label: string): [number, number] => { const i = text.indexOf(label); return [i, i + label.length]; };
-  const is = (text: string, label: string) => imperative(text, ...at(text, label));
-  test("tap, press, click or hit it, or the X button, any case, with quotes or bold around it", () => {
-    for (const [text, label] of [["tap Go ahead", "Go ahead"], ["press **Undo**", "Undo"], ["the Go ahead button", "Go ahead"],
-      ["Go ahead button", "Go ahead"], ["Tap Go ahead to do it now.", "Go ahead"], ["CLICK \"Undo\" if it's wrong", "Undo"],
-      ["Hit the Stop button.", "Stop"], ["Tapping on the Undo puts it back.", "Undo"], ["**Go ahead** buttons", "Go ahead"]])
-      expect([text, is(text, label)]).toEqual([text, true]);
-  });
-  test("any other mention of a label is not", () => {
-    for (const [text, label] of [["there's no Go ahead", "Go ahead"], ["Go ahead does it now", "Go ahead"], ["each on its own card with Undo.", "Undo"],
-      ["Pick Go ahead or Leave it.", "Go ahead"], ["Go ahead buttonless", "Go ahead"], ["Unhit Undo", "Undo"]])
-      expect([text, is(text, label)]).toEqual([text, false]);
-  });
-  test("a button hit's own span from check() is judged in place", () => {
-    const text = "It isn't done again and there's no Go ahead. Tap Go ahead to do it now.";
-    const hits = check(text, { rules: AT.card, buttons: [], known: ["Go ahead"] }).hits.filter((h) => h.rule === "button");
-    expect(hits.map((h) => imperative(text, h.at, h.end))).toEqual([true]);   // only the imperative one is a hit at all
   });
 });
 

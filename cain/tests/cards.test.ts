@@ -2,7 +2,7 @@
 // expiry; the sweep; taps on dead cards; replies in the thread; one ask at a time.
 import { describe, expect, test } from "bun:test";
 import { BUILD, decide, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
-const RUN = { stop: { stopped: false, at: null } };   // the hook's view: nothing stopped
+const RUN = { stop: { stopped: false, at: null }, guard: () => ({ ok: true as const }) };   // the hook's view: nothing stopped
 import { closedItems, digest, EXPIRED_TAP, nextCheckin, parseHolds, RESUME, STOP } from "../rootfs/opt/cain/link/core";
 import { BOT, DAY, DM, HOUR, keeperHolds, MIN, NOV11_8AM, OWNER, PR, pendingWith, rig, SHA1, SHA2 } from "./link-rig";
 
@@ -422,7 +422,7 @@ describe("taps on dead cards", () => {
     expect(r.answers().at(-1)).toBe(7);                               // updated in place, never a silent ack
     expect(r.updates().at(-1).components).toEqual([]);
     expect(r.updates().at(-1).content.endsWith(line)).toBe(true);
-    expect(r.ephemerals().at(-1)).toEqual({ content: EXPIRED_TAP, flags: 64, allowed_mentions: { parse: [] } });
+    expect(r.ephemerals().at(-1)).toEqual({ content: EXPIRED_TAP, flags: 64 | 4, allowed_mentions: { parse: [] } });   // previews off too (0.13.0)
     expect(r.relayed.length).toBe(before);                            // nothing reached Cain
     expect(r.harness).toEqual([]);                                    // or the specialist
   };

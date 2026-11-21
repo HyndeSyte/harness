@@ -1,0 +1,43 @@
+# The surface's Worker (surface/README.md, Deploy). Not deployed yet: no account exists.
+# Cain fills in the variables below when he sets it up; the secrets go
+# in with `wrangler secret put`, never in this file. It runs as a route on the app's own Pages
+# hostname, behind Cloudflare Access; the policy is in the README.
+name = "surface-snapshot"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+# No workers.dev host and no preview URLs: the Worker answers only on its route, behind Access.
+# CI (surface/worker/check-wrangler.ts) fails if either is missing or true.
+workers_dev = false
+preview_urls = false
+
+# The route sits on the app's own Pages hostname, so the app reads /snapshot from its own origin
+# (connect-src 'self', no CORS).
+# routes = [{ pattern = "<app hostname>/snapshot", zone_name = "<zone>" }]
+
+# The store: one Durable Object (SQLite-backed, as the free plan needs), which compares and writes
+# atomically. CI (check-wrangler.ts) fails if the binding or its migration is missing, or if a KV
+# namespace comes back.
+[[durable_objects.bindings]]
+name = "STORE"
+class_name = "SnapshotStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SnapshotStore"]
+
+[vars]
+# The exporter's Ed25519 public keys, comma-separated, each `<key id>:<raw key, base64>` (bun run
+# surface/export --keygen prints one; it is surface.pub.entry), with `:retired` after a key that may
+# no longer sign: the new key goes in beside the old before a rotation, and the old is retired after.
+SNAPSHOT_PUBLIC_KEYS = "REPLACE_WITH_KEY_ID:REPLACE_WITH_PUBLIC_KEY_BASE64"
+# The store object's name. A new name starts an empty store (the recovery for a wedged one).
+STORE_NAME = "latest"
+# The Zero Trust team domain, like https://<team>.cloudflareaccess.com.
+ACCESS_TEAM_DOMAIN = "REPLACE_WITH_TEAM_DOMAIN"
+# The Access application's audience tag (AUD); comma-separated if more than one.
+ACCESS_AUD = "REPLACE_WITH_ACCESS_AUD"
+
+# Secrets, set with `wrangler secret put <NAME>` (never written here):
+#   OWNER_EMAIL          the one identity allowed to read
+#   PUBLISHER_CLIENT_ID  the exporter's service token Client ID
+#   PUBLISHER_TOKEN      the value the exporter sends in X-Surface-Publisher

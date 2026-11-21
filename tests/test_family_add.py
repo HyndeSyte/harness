@@ -207,11 +207,13 @@ def test_the_other_effects_stay_locked_at_s1_with_the_switch_on(on, ledger):
            "params": {"start": "2026-10-27T15:00:00-04:00", "duration_min": 30}, "summary": "s"}
     on.claude.script = [result(bad), result(bad)]       # tried once more by itself, the same
     on.say("hold tuesday")
+    on.tick()                                  # the retry, unannounced (Nov 19): its outcome is said
     assert "didn't fit the allowed shapes" in on.texts()[-1]
     mirror = {"type": "proposal", "effect_type": "work_mirror_copy",
               "params": {"op": "delete", "event_id": "m1" + "a" * 20}, "summary": "s"}
     on.claude.script = [result(mirror), result(mirror)]
     on.say("mirror")
+    on.tick()
     assert "didn't fit the allowed shapes" in on.texts()[-1]
     with pytest.raises(effects.ParamError):
         effects.lookup("calendar_hold", at_least("S1"))
@@ -2133,7 +2135,7 @@ def test_a_crash_writing_the_card_leaves_no_silent_proposal(on, ledger, monkeypa
     on.claude.script = [proposal()]
     on.start()                                 # the job the restart cut off runs once more, by itself
     on.tick()
-    assert any("restarted while working" in t and "running it once more" in t for t in on.texts())
+    assert not any("running it once more" in t for t in on.texts())     # unannounced (Nov 19)
     assert ledger.db.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 1 and on.with_button("Approve")
 
 

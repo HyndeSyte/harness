@@ -268,8 +268,11 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
             except (ValueError, TypeError):
                 detail = {}
         failures.append(_failed(ledger, job, detail if isinstance(detail, dict) else {}, config.timezone))
-    dead = ledger.db.execute("SELECT COUNT(*) AS n FROM outbox WHERE state='dead'"
-                             " AND created_at>=?", (iso(since),)).fetchone()["n"]
+    # By when each one died, not when it was written: a message dropped after 7 days unsent
+    # (outbox.py MAX_AGE_S) was written long before this digest's day (C1 re-check).
+    dead = ledger.db.execute("SELECT COUNT(*) AS n FROM events WHERE kind IN"
+                             " ('delivery_failed', 'delivery_expired') AND at>=?",
+                             (iso(since),)).fetchone()["n"]
     if dead:
         failures.append(f"{dead} message(s) couldn't be delivered")
 

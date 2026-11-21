@@ -15,6 +15,7 @@ from datetime import timedelta
 
 import pytest
 
+import harness
 from harness import calendar_change, caldav, migrate
 from harness.handover import Handover
 from test_discord_keeper import OWNER  # noqa: F401
@@ -252,7 +253,7 @@ def test_a_run_from_another_version_is_refused(m, monkeypatch):
     run = run_smoke(m)
     monkeypatch.setattr(calendar_change, "app_version", lambda: "0.24.1")
     out = m.send(Handover(kind="fastpath", state="on", run=run))
-    assert out["status"] == "refused" and "started under version 0.24.0, not 0.24.1" in out["said"]
+    assert out["status"] == "refused" and f"started under version {harness.__version__}, not 0.24.1" in out["said"]
     assert not calendar_change.fast_path_on(m.ledger)
 
 

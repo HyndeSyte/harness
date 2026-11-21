@@ -68,7 +68,7 @@ describe("briefs", () => {
     expect(parseBrief('{"__proto__": {"x": 1}, "id": "abc-def", "topic": "t", "question": "q", "body": "b", "needs_facts": false, "consequential": false}').error).toBe(UNKNOWN_FIELD);
     expect(UNKNOWN_FIELD).not.toContain("notes");
     expect(parseBrief(JSON.stringify({ ...brief(), seats: ["Acme Corp"] })).error).not.toContain("Acme");
-    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "consequential", "head", "id", "needs_facts", "pr", "question", "seats", "topic"]);
+    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "change", "consequential", "head", "id", "item", "label", "needs_facts", "pr", "question", "round_kind", "seats", "supersedes", "topic"]);
   });
 
   test("a pull request's review names its pr and head (0.11.0): checked, kept on the Pi, never sent", () => {
@@ -611,7 +611,7 @@ describe("the published lines, /data/trust/reviewed.json (Cain 0.11.0)", () => {
     quiet.submit(brief());
     await quiet.runner.tick();
     expect(quiet.runner.cfg.reviewedFile).toBeUndefined();
-    expect(readdirSync(join(quiet.cfg.queueDir, "..")).sort()).toEqual(["health.json", "q", "record-queue", "relay.queue", "spend.json", "terms.txt"]);
+    expect(readdirSync(join(quiet.cfg.queueDir, "..")).sort()).toEqual(["health.json", "q", "record-queue", "relay.queue", "review-spend-days.json", "spend.json", "terms.txt"]);
   });
 
   test("the file is read whole or not at all: a missing, broken or odd file is null, odd entries left out", () => {

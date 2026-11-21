@@ -715,7 +715,7 @@ class Link:
     def __init__(self):
         self.cards = []
 
-    def card(self, text, rows, kind, *, expires=None):
+    def card(self, text, rows, kind, *, expires=None, op=None):
         self.cards.append((text, rows, kind))
         return 7
 

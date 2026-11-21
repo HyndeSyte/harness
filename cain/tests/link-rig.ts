@@ -37,7 +37,8 @@ export function keeperHolds(holds: Record<string, { holder: string; branches?: s
 }
 
 export function rig(opts: { paired?: string; now?: number; pending?: string | null; holds?: string | null; noKey?: boolean;
-    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number } = {}) {
+    noDeployKey?: boolean; facts?: boolean; keyCheck?: boolean; factsMs?: number; gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };
+    gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }> } = {}) {
   let state: State = emptyState();
   // GitHub, as the link's landings see it (merge.ts is tested on its own).
   const github = {
@@ -53,14 +54,17 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     // A Ship card's other read (with facts): the head's check runs ("missing": GitHub has no such
     // commit; null: no answer), which can hang; and what was asked, in order.
     runs: passing() as any[] | "missing" | null,
+    windows: false,                                // the head's tests.yml names pcjobs-windows (merge.ts headChecks)
     runsHang: false,
     asked: [] as string[],
+    watched: {} as Record<string, string>,         // the head a ship_gate watch accepted, by pull request (merge.ts watchAccepted)
   };
   // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
   const reviews = { list: [] as Reviewed[] | null };
   const landWaiting: (() => void)[] = [];
   const stop = { stopped: false, at: null as number | null, broken: false };
   const harnessDown = { down: false };                // the calendar specialist doesn't take taps
+  const relayFail = { n: 0 };                         // Cain's next n lines fail to queue (a disk error)
   const t = { now: opts.now ?? NOV11_8AM };
   const files: { pending: string | null; holds: string | null } = { pending: opts.pending ?? null, holds: opts.holds ?? null };
   const pulls: Record<string, Pull> = {};
@@ -74,6 +78,10 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const refusing = new Set<string>();            // the same, refused by Discord (a 403)
   const limited = new Set<string>();             // the same, answered with Discord's rate limit
   const limitN: Record<string, number> = {};     // the next n calls to a path prefix are rate limited
+  // Discord answers 400 to any edit that carries flags (naming the field, as its errors do); interactions:
+  // to a tap's answer that carries flags too; other: a 400 that names some other field instead; readOnly:
+  // to any flags value that has a bit outside the editable ones (third round).
+  const refuseFlag = { on: false, interactions: false, other: false, readOnly: false };
   const lose = { posts: 0 };                     // posts Discord makes but whose answer never arrives
   const hang = { interactions: false };          // the link stops mid-tap: its answer never returns
   // Discord is slow: posts to his DM, reads of it, or whose bot this is, wait until release()
@@ -105,7 +113,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       const seen = body.enforce_nonce && body.nonce ? nonces[body.nonce] : undefined;
       if (seen && t.now - seen.at < 5 * MIN && posted[seen.id]) return copy(posted[seen.id]);
       const msg = { id: snowflake(), content: body.content, components: body.components ?? [], author: { id: BOT },
-        ...(body.message_reference ? { message_reference: body.message_reference } : {}) };
+        ...(body.message_reference ? { message_reference: body.message_reference } : {}),
+        ...(typeof body.flags === "number" ? { flags: body.flags } : {}) };
       posted[msg.id] = msg;
       lastId = msg.id;
       if (body.nonce) nonces[body.nonce] = { id: msg.id, at: t.now };
@@ -125,13 +134,20 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     if (one && method === "PATCH") {
       const m = posted[one[1]];
       if (!m) throw new Error("discord 404: Unknown Message");
+      if (refuseFlag.readOnly && body.flags !== undefined && (body.flags & ~(4 | 4096 | 32768))) throw new Error("discord 400: Invalid Form Body (fields: flags)");
+      if (refuseFlag.other) throw new Error("discord 400: Invalid Form Body (fields: content)");
+      if (refuseFlag.on && body.flags !== undefined) throw new Error("discord 400: Invalid Form Body (fields: flags)");
       if (body.content !== undefined) m.content = body.content;
       if (body.components !== undefined) m.components = body.components;
+      if (body.flags !== undefined) m.flags = body.flags;
       if (body.content !== undefined || discord.marksButtonEdits) m.edited_timestamp = new Date(t.now).toISOString();
       return copy(m);
     }
     if (method === "POST" && path.startsWith("/interactions/")) {
       if (hang.interactions) return new Promise(() => {});
+      if (refuseFlag.readOnly && body?.data?.flags !== undefined && (body.data.flags & ~(4 | 64 | 4096 | 32768))) throw new Error("discord 400: Invalid Form Body (fields: data.flags)");
+      if (refuseFlag.interactions && body?.data?.flags !== undefined && (body.data.flags & 4)) throw new Error("discord 400: Invalid Form Body (fields: data.flags)");
+      if (refuseFlag.other) throw new Error("discord 400: Invalid Form Body (fields: data.content)");
       if (body?.type === 7 && posted[tapped]) {
         if (body.data.content !== undefined) posted[tapped].content = body.data.content;
         posted[tapped].components = body.data.components;
@@ -141,7 +157,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const deps = {
     rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
-    relay: (x: string) => { relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
+    relay: (x: string) => { if (relayFail.n > 0) { relayFail.n--; throw new Error("relay queue: EIO"); } relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
     paired: () => opts.paired ?? OWNER, log: (l: string) => { logs.push(l); },
     record: () => ({ ...files }), pull: async (pr: string) => pulls[pr] ?? null, tz: "America/New_York",
     stop: {
@@ -160,7 +176,11 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     },
     landed: opts.noDeployKey ? undefined : async (ship: { pr: string; head: string }) => github.readable ? github.main.includes(ship.head) : null,
     facts: opts.facts ? (pr: string) => { github.asked.push(`facts ${pr}`); return github.factsHang ? new Promise<Facts | null>(() => {}) : Promise.resolve(github.facts); } : undefined,
-    checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(copy(github.runs)); } : undefined,
+    checkRuns: opts.facts ? (pr: string, head: string) => { github.asked.push(`runs ${head}`); return github.runsHang ? new Promise<null>(() => {}) : Promise.resolve(Array.isArray(github.runs)
+      ? { runs: copy(github.runs), windows: github.windows || github.runs.some((x: any) => x?.name === "pcjobs-windows" && x?.app?.id === ACTIONS_APP) }
+      : github.runs); } : undefined,
+    gateWatch: opts.gateWatch ?? ((pr: string) => (github.watched[pr] ? [github.watched[pr]] : [])),
+    ...(opts.gateHead ? { gateHead: opts.gateHead } : {}),
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,
@@ -184,8 +204,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   };
   const r = {
     get link() { return link; },
-    calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github,
-    reports, replays, sent, discord, limitN, spy, reviews,
+    calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github, relayFail,
+    reports, replays, sent, discord, limitN, spy, reviews, refuseFlag,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

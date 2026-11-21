@@ -10,7 +10,7 @@
 // Holds (who holds which item) are the keeper's own: its copy in /data is the one
 // that counts, and the record's state/holds.json is put back to it if it drifts.
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync, appendFileSync, statSync, chownSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseRequest, plan, hygiene, hygieneReport, clean, expired, idleMs, holdsText, parseHolds, HOLDS_PATH, HOLD_IDLE_MS,
   type Downtime, type Holds, type Outcome, type Plan, type Request, type Tree } from "./core.ts";
@@ -37,9 +37,14 @@ class GitError extends Error {}
 function git(cfg: Config, args: string[], cwd = cfg.dir): string {
   const env: Record<string, string> = { ...process.env as any, GIT_TERMINAL_PROMPT: "0" };
   if (cfg.token) {
-    // Rewritten every time, so nothing planted there is ever used.
-    const ask = "/tmp/record-askpass.sh";
-    writeFileSync(ask, '#!/bin/sh\ncase "$1" in Username*) echo x-access-token;; *) echo "$RECORD_TOKEN";; esac\n', { mode: 0o700 });
+    // Rewritten every time, so nothing planted there is ever used, and kept in root's own
+    // folder (C1): in a shared /tmp, Cain's user could make that name first. Removed and
+    // made new (wx), so a file of anyone else's is never written through.
+    const dir = process.env.CAIN_ROOT_TMP ?? "/run/cain/root-tmp";
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const ask = join(dir, "record-askpass.sh");
+    rmSync(ask, { force: true });
+    writeFileSync(ask, '#!/bin/sh\ncase "$1" in Username*) echo x-access-token;; *) echo "$RECORD_TOKEN";; esac\n', { mode: 0o700, flag: "wx" });
     env.GIT_ASKPASS = ask; env.RECORD_TOKEN = cfg.token;
   }
   // Byte-exact files (the shas writers send are of the bytes as committed), links
@@ -162,10 +167,16 @@ type State = { holds: Holds; waiting: Waiting[]; alive?: string; downtime: Downt
 
 const stateFile = (cfg: Config) => cfg.holds ?? join(dirname(cfg.queue), "record-holds.json");
 
-function writeAtomic(file: string, text: string) {
+// A rewrite keeps the file's owner, group and mode. C1's lock.sh sets the holds copy root:cain
+// 0640 so his RemoteTrigger hook can read it; a fresh file under the run script's umask 027
+// came out root:root and refused every Build and Ship run of his (Nov 19, Cain 0.13.5).
+export function writeAtomic(file: string, text: string) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
+  let keep: { uid: number; gid: number; mode: number } | null = null;
+  try { const s = statSync(file); keep = { uid: s.uid, gid: s.gid, mode: s.mode & 0o777 }; } catch { /* a new file */ }
   writeFileSync(tmp, text);
+  if (keep) { try { chownSync(tmp, keep.uid, keep.gid); } catch { /* not ours to give */ } chmodSync(tmp, keep.mode); }
   renameSync(tmp, file);
 }
 

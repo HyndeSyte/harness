@@ -256,11 +256,11 @@ def test_a_link_refusal_for_a_named_button_falls_back_to_plain_words_and_is_reco
     real = m.link.card
     tried = []
 
-    def card(text, rows, kind, expires=None):
+    def card(text, rows, kind, expires=None, **kw):
         tried.append(text)
         if "Tap Go ahead" in text:
             raise LinkError(400, 'the card names "Go ahead", which it doesn\'t carry')
-        return real(text, rows, kind, expires)
+        return real(text, rows, kind, expires, **kw)
     m.link.card = card
     with m.ledger.tx() as db:
         m.ledger.enqueue(chat_id=1, kind="notice", db=db,
@@ -277,7 +277,7 @@ def test_a_link_refusal_for_a_named_button_falls_back_to_plain_words_and_is_reco
 
 
 def test_any_other_link_refusal_is_still_terminal(m):
-    m.link.card = lambda text, rows, kind, expires=None: (_ for _ in ()).throw(LinkError(400, "not a card"))
+    m.link.card = lambda text, rows, kind, expires=None, **kw: (_ for _ in ()).throw(LinkError(400, "not a card"))
     with m.ledger.tx() as db:
         m.ledger.enqueue(chat_id=1, kind="notice", db=db, text="Something.")
     m.c.outbox.flush()

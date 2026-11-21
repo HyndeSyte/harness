@@ -52,7 +52,7 @@ class FakeLink:
         self.up = True
         self._next = 100
 
-    def card(self, text, rows, kind, expires=None):
+    def card(self, text, rows, kind, expires=None, op=None):
         if not self.up:
             raise LinkError(0, "ConnectionRefusedError")
         self._next += 1

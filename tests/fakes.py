@@ -51,6 +51,28 @@ class SyncExecutor:
         pass
 
 
+class ThreadExecutor:
+    """Runs submitted work on a thread of its own, as the App's pool does, and waits for it: what
+    a worker may not touch (the record: SQLite refuses another thread) fails here as it would there."""
+
+    def submit(self, fn, *args, **kwargs):
+        import threading
+        fut = Future()
+
+        def go():
+            try:
+                fut.set_result(fn(*args, **kwargs))
+            except BaseException as e:
+                fut.set_exception(e)
+        t = threading.Thread(target=go, name="worker-test")
+        t.start()
+        t.join()
+        return fut
+
+    def shutdown(self, **kw):
+        pass
+
+
 class ManualExecutor:
     """Holds work until the test releases it."""
 
@@ -115,10 +137,11 @@ class FakeBot:
             raise item
         return item
 
-    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None):
+    def send_message(self, chat_id, text, buttons=None, *, html=True, kind=None, expires=None, op=None):
         if self.fail_sends:
             raise self.fail_sends.pop(0)
         self.expires = getattr(self, "expires", []) + [expires]
+        self.ops = getattr(self, "ops", []) + [op]
         self.next_message_id += 1
         self.sent.append((chat_id, text, buttons, self.next_message_id))
         self.modes.append("html" if html else "plain")

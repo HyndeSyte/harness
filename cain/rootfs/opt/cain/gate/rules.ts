@@ -60,7 +60,7 @@ export const STATIC_LABELS: readonly string[] = [
   "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
   // the calendar specialist
   "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
-  "Not this time", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
+  "Just this once", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
   "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now",
 ];
 
@@ -300,7 +300,7 @@ const VERB = "(?:[Tt]ap|[Tt]apping|[Pp]ress|[Pp]ressing|[Hh]it|[Cc]lick|[Cc]hoos
 // "with X" names a button only for labels that are never plain words: "ends with Stop",
 // "go with No" and "syncs with Gmail" (a live card's option) are just words.
 export const WITH_LABELS: readonly string[] = [
-  "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Not this time", "Turn back on", "Not now",
+  "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Just this once", "Turn back on", "Not now",
   "Use new", "Keep old", "Keep rule", "Drop rule", "All of it", "Part of it", "None wrong: stop checking",
   "Something was off: keep checking", "Open connector settings",
 ];
@@ -319,18 +319,6 @@ function named(seen: string, label: string): { at: number; end: number }[] {
     if (!starts.has(at)) { starts.add(at); out.push({ at, end }); }
   }
   return out;
-}
-
-// Whether a button hit (its label at text[at, end)) tells him to use a button: "tap X",
-// "press X", "click X", "hit X" (and their -ing forms, "tap on the X"), "the X button" or
-// "X button", any case, with quotes or bold markup around X. The link refuses a
-// specialist's card only for one of these; any other naming of a label ("there's no Go
-// ahead", "pick Undo", "with Undo") is flagged, and the card goes out as it is.
-const IMPERATIVE_BEFORE = new RegExp(`(?<![A-Za-z])(?:tap|tapping|press|pressing|click|clicking|hit|hitting)\\s+(?:on\\s+)?(?:the\\s+)?${Q}$`, "i");
-const IMPERATIVE_AFTER = new RegExp(`^${Q}\\s+buttons?(?![A-Za-z])`, "i");
-export function imperative(text: string, at: number, end: number): boolean {
-  const t = String(text ?? "");
-  return IMPERATIVE_BEFORE.test(t.slice(0, at)) || IMPERATIVE_AFTER.test(t.slice(end));
 }
 
 // Spans found so far, in order and none overlapping: a new one is taken only if it overlaps

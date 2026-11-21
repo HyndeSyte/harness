@@ -1,6 +1,7 @@
 // Where the review service keeps things, and its limits, from the environment the
 // run script gives it (the add-on's options). Shared by the runner and review.sh.
 import { DEFAULTS, type RunnerConfig } from "./runner.ts";
+import { capPaths } from "../capfiles.ts";
 
 const num = (v: string | undefined, d: number) => {
   const n = Number(v);
@@ -11,7 +12,9 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
   const d = DEFAULTS;
   return {
     queueDir: env.REVIEW_QUEUE ?? "/data/review-queue",
+    inboxDir: env.REVIEW_INBOX ?? "/data/review-inbox",
     spendFile: env.REVIEW_SPEND ?? "/data/review-spend.json",
+    spendDaysFile: env.REVIEW_SPEND_DAYS || undefined,
     healthFile: env.REVIEW_HEALTH ?? "/data/review-health.json",
     termsFile: env.REVIEW_TERMS ?? "/data/review-private-terms.txt",
     recordQueue: env.RECORD_QUEUE ?? "/data/record-queue",
@@ -34,5 +37,14 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
     },
     hourlyS: d.hourlyS,
     tz: env.CHECKIN_TZ ?? d.tz,
+    // Cain 0.16.0: set by the run script from the App's options (root's /data/options.json) in the
+    // runner's environment only. review.sh, run as Cain, never trusts its own environment for these:
+    // it reads what the runner wrote to settingsFile (../guard.ts readSettings).
+    roundCap: Math.max(1, Math.floor(num(env.REVIEW_ROUND_CAP, d.roundCap!))) || d.roundCap,
+    reservePercent: Math.min(100, num(env.USAGE_RESERVE_PERCENT, d.reservePercent!)),
+    // Round 2: the cap's and guard's paths are constants (../capfiles.ts), overridden only in test mode.
+    roundsFile: capPaths(env).rounds,
+    settingsFile: capPaths(env).settings,
+    guardLog: capPaths(env).guardLog,
   };
 }

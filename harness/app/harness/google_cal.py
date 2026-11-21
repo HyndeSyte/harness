@@ -38,6 +38,10 @@ API = "https://www.googleapis.com/calendar/v3/calendars"
 HOSTS = frozenset({"oauth2.googleapis.com", "www.googleapis.com"})
 SCOPE = "https://www.googleapis.com/auth/calendar.events"    # events only, no calendar settings
 MARK = {"harness": "family_gmail"}
+# Beside the mark, on the drive blocks around his own appointments only (family_gmail.py): what tells
+# them from a Family event's blocks and drives, which never carry it.
+KIND = "harness_kind"
+OWN_DRIVE = "own_drive"
 TIMEOUT_S = 20
 MAX_PAGES = 20
 INPUT = "google"                            # its name among the inputs (inputs.GOOGLE)
@@ -180,6 +184,7 @@ class Block:
     end: datetime
     plain: bool = True     # still only what this code wrote, but for its place
     location: str = ""     # its place as Google has it: the caller knows what it wrote there
+    kind: str = ""         # OWN_DRIVE: a drive block around his own appointment; "" any other
 
 
 FREE_PREFIX = "Maybe busy"                  # a provisional block (meaning.py): shown free
@@ -212,14 +217,15 @@ def _sound_place(location: str) -> bool:
     return drive.sound_place(location)
 
 
-def _body(uid: str, title: str, start: datetime, end: datetime, location: str = "") -> dict:
+def _body(uid: str, title: str, start: datetime, end: datetime, location: str = "", kind: str = "") -> dict:
     place = {"location": location} if location else {}
+    mark = {**MARK, KIND: kind} if kind else dict(MARK)
     return {"id": uid, "summary": title, "status": "confirmed", **place,
             "start": {"dateTime": start.isoformat()}, "end": {"dateTime": end.isoformat()},
             "visibility": "private", "transparency": "transparent" if shown_free(title) else "opaque",
             "reminders": {"useDefault": False},
             "guestsCanInviteOthers": False, "guestsCanSeeOtherGuests": False,
-            "extendedProperties": {"private": dict(MARK)}}
+            "extendedProperties": {"private": mark}}
 
 
 NOTE_MARK = {"harness": "mail_dates"}    # a date from his mail (mail_dates.py): never a block
@@ -312,6 +318,12 @@ def _occurrence(e: dict, address: str, me: str) -> "ical.Occurrence | None":
 def _ours(event: dict) -> bool:
     private = (event.get("extendedProperties") or {}).get("private") or {}
     return bool(_ID_RE.fullmatch(str(event.get("id", "")))) and private.get("harness") == MARK["harness"]
+
+
+def _kind(event: dict) -> str:
+    """What the mark says the block is for: OWN_DRIVE, or "" (a Family event's block or drive)."""
+    private = (event.get("extendedProperties") or {}).get("private") or {}
+    return OWN_DRIVE if private.get(KIND) == OWN_DRIVE else ""
 
 
 def _too_many(r) -> bool:
@@ -500,7 +512,7 @@ class GoogleCalendar:
                                          datetime.fromisoformat(event["start"][side]),
                                          datetime.fromisoformat(event["end"][side]),
                                          timed and _plain(event),
-                                         str(event.get("location") or "").strip()))
+                                         str(event.get("location") or "").strip(), _kind(event)))
                 following = page.get("nextPageToken")
             except (ValueError, KeyError, TypeError, AttributeError):
                 return None, Outcome("failed", r.status)   # not read is not empty
@@ -510,7 +522,7 @@ class GoogleCalendar:
         return None, Outcome("failed")         # more than it should ever be: don't guess
 
     def add(self, address: str, uid: str, title: str, start: datetime, end: datetime,
-            location: str = "") -> Outcome:
+            location: str = "", kind: str = "") -> Outcome:
         """A new block. Its id is fixed, so a write whose answer was lost finds itself rather
         than doubling, and is put right if the block has moved on since. "exists" is an id
         that can't be used: Google keeps a deleted one, and keeps next to nothing about it,
@@ -521,7 +533,7 @@ class GoogleCalendar:
         token, problem = self._access()
         if token is None:
             return problem
-        body = _body(uid, title, start, end, location)
+        body = _body(uid, title, start, end, location, kind)
         try:
             r = self._call(token, "POST", f"{url}?sendUpdates=none", body=body)
         except TransportError as e:
@@ -715,7 +727,7 @@ class GoogleCalendar:
             return problem
         try:
             r = self._call(token, "PUT", f"{url}/{block.id}?sendUpdates=none",
-                           body=_body(block.id, title, start, end, location), etag=block.etag)
+                           body=_body(block.id, title, start, end, location, block.kind), etag=block.etag)
         except TransportError as e:
             return Outcome("failed" if e.kind == "blocked" else "unknown")
         if r.status == 200:
@@ -788,6 +800,33 @@ class GoogleCalendar:
         if r.status == 412:
             return Outcome("changed", r.status)
         return self._answer(r)
+
+    def still_ours(self, address: str, block: Block) -> bool:
+        """The block read again by its id just before it's taken off: still carrying the add-on's mark,
+        of the same kind, not cancelled, unchanged since it was listed (its etag), and its title, start
+        and end still the ones listed. Only a clear yes."""
+        url = self._events(address)
+        if url is None or not _ID_RE.fullmatch(block.id):
+            return False
+        token, _ = self._access()
+        if token is None:
+            return False
+        try:
+            r = self._call(token, "GET", f"{url}/{block.id}")
+            if r.status != 200:
+                return False
+            found = r.json()
+        except (TransportError, ValueError):
+            return False
+        if not (isinstance(found, dict) and _ours(found) and found.get("status") != "cancelled"
+                and _kind(found) == block.kind and found.get("etag") == block.etag
+                and str(found.get("summary") or "") == block.title):
+            return False
+        try:
+            start, end = _when(found.get("start") or {}), _when(found.get("end") or {})
+        except (KeyError, TypeError, ValueError):
+            return False
+        return start == block.start and end == block.end
 
     def remove(self, address: str, block: Block) -> Outcome:
         """Only as it was just read."""

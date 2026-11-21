@@ -14,6 +14,8 @@ plugin (research preview) and your Claude plan; no API key.
 4. Type `/discord:configure` and your bot token. Then `/discord:access pair <code>`
    after you DM the bot, and `/discord:access policy allowlist`.
 5. Type `/exit`. The session starts again in 5 seconds with Discord connected.
+6. On the App's page in Home Assistant (Settings, Apps, Cain), turn on **Watchdog**. It is the
+   one switch the App can't turn on itself (below, **The Watchdog switch**).
 
 ## What Cain reads in Discord without asking
 
@@ -43,6 +45,49 @@ To find your user id, turn on **Advanced mode** in your user profile. Then go to
 Settings, People, **Users** and open your user: the id is the 32 letters and digits
 shown there. Put it in `owner_user_id` in this App's Configuration, save, and restart
 the App.
+
+## Security watch
+
+Cain's App keeps an eye on what it can see of the system's health, and Cain brings you
+anything that needs you in his morning update, one thing at a time. Nothing here acts on
+its own.
+
+- **Outside heartbeat** (`heartbeat_url`, empty by default). Make a free account at
+  Healthchecks.io (or a service like it), add a check with a 5 minute period, and paste its
+  ping URL into `heartbeat_url` in this App's Configuration, then restart the App. The App
+  pings it every 5 minutes and says so at once when it stops on an error; the service emails
+  or pushes to you itself when the pings stop, so a dead Pi reaches you without going through
+  the App. Each ping carries only how long the App has been up. The URL is not logged, not in
+  any child's environment (only the heartbeat's own process has it, and the stop ping reads it
+  through curl's standard input, never a command line); it is stored only in the App's options,
+  which is where Supervisor keeps every option, and that is fine. Cain's own Claude session can
+  read that options file too, so a compromised session could read the URL: the risk that a leaked
+  URL masks an outage or fakes a failure includes that case. Keep it like a key, and make a new
+  one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
+  one late ping doesn't page you. A second check, pinged only while every liveness check of Cain passes,
+  is `probe_heartbeat_url` (**What 0.14.0 does**, below).
+- **Review spend.** The morning check-in has yesterday's spend per review seat and the month
+  so far against each cap, and flags a day that jumps (over 3 times the week before and at
+  least $1, once the seat was used on at least 3 of those 7 days; or over a fifth of the month's
+  cap): the cheapest sign of a stolen key or a loop. It also says when the month so far, at its
+  rate, would pass a seat's cap. A seat at its monthly cap runs no reviews until the month turns.
+- **Key ages.** The App notes the day it first observed each key or token it holds (by a hash
+  of it, never the key itself) in `/data/keys.json`. The morning check-in names a key within 14
+  days of an expiry noted for it (`/opt/cain/keeper.sh key-expiry <name> <YYYY-MM-DD>`), and,
+  on Mondays, one with no expiry noted that has been the same for over 90 days. A key that never
+  expires by design (the link's deploy and Ship keys) can be acknowledged until a date
+  (`/opt/cain/keeper.sh key-ack <name> <YYYY-MM-DD>`), and its line stays quiet until then.
+- **Links.** Messages from Cain's bot no longer unfold link previews: a reply of Cain's with a
+  link goes out through the App with the preview off from the start. A link that isn't plain
+  https on its usual port, points to a bare IP address, a punycode host or a link shortener,
+  has a user name or password in it, or whose text names another site than where it leads, is
+  held for him to rewrite. The short list of sites Cain usually cites is the known hosts, noted
+  not blocked: a link to an unknown host is never held, it goes out as usual and is only noted
+  in the App's gate report ("unknown host"), apart from the report's "preview flag refused"
+  lines (Discord refused the no-preview setting on a card update, which then went without it).
+  While the App's link is restarting, a reply of Cain's with a link goes out through Discord's
+  own plugin rather than wait, noted in the report as "link down: preview not suppressed at
+  post", and its preview is turned off once the link is back.
 
 ## Cards and questions
 
@@ -168,8 +213,475 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
+### The review-round cap (since 0.16.0)
+
+A piece of work gets at most three outside review rounds, and the review runner keeps that count
+itself, where Cain can't change it. Each brief names its change (a pull request's address, or a
+stable `change` key for a plan or document); a replacement pull request or a new key names the one
+it `supersedes`, and the count carries over, so a new id or a new pull request doesn't start it
+again. The first round reads the whole change; every later round is fix-only: the seats get only the
+fixes and the earlier findings, and mark each finding serious (could lose or corrupt something of
+yours, act without your go, expose a secret, widen reach, or fail silently) or follow-up (a window
+that needs a crash or rare timing and fails safe, hardening, edge cases, wording, polish). A fourth
+round is refused, with the count and the rule. If the third still leaves something serious, the
+runner itself sends you one card: what the piece is, the serious finding in one line, and "Hold it"
+or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
+round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
+after "Ship it with that risk" it goes only while the probe's rollback of a bad install is armed for
+that App (read from `/data/probe/rollback-armed.json`; the probe in 0.15.0 writes no such record, so
+until a release arms it, that card is refused and says what isn't armed). The cap is the option
+`review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
+card in the link's `/data/link/review-decisions.json`.
+
+Since the second round of fixes in 0.16.0:
+- Your tap on that card is written to disk first, and the card counts as answered only once it is.
+  If the write fails, the card stays up and you get one line saying your answer couldn't be saved and
+  you can tap again. A decisions file that doesn't parse is never written over: it's moved aside under
+  a name with the time in it, no new tap is written while it stands, and the App's alarm names it.
+- Each round is kept as started, then answered or lost (it ended without a result: every seat failed,
+  or the runner stopped before the review was queued). A lost round still counts, and when the last
+  round the cap allows is lost, the card comes anyway, saying the final review did not complete.
+- The card's words pass the same checks as every other card to you; if they don't, the card says "A
+  serious finding remains; see the item" with the piece's name. If its item is held by another
+  session, the card waits and goes out once the hold clears.
+- While the rollback isn't armed, the card says so first, in one sentence: a Ship would be refused
+  until a release arms it, so holding is the working choice. A tap on "Ship it with that risk" then
+  records the change as held, on the guard's log below, and Cain is told.
+- At each start the review runner and the link check the owner and mode of these files (the rounds
+  file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file, and the rollback
+  record when there). One that's wrong turns the cap and the guard off (no review round, no `other`
+  Build, and Ship decisions paused for every pull request: no Ship card for any change) and raises
+  one alarm naming it. Since the third round of fixes the check runs again every minute, so they come
+  back on by themselves, and the alarm clears, once the file is right; no restart needed.
+- A decisions file that doesn't parse is moved aside, never deleted, and no new answer is kept while
+  that copy stands; the App doesn't set it up again by itself. The alarm names the copy and the step
+  back: as root on the Pi, remove it or rename it so its name no longer starts with
+  `review-decisions.json.corrupt-`. Answers are kept again at once, and the alarm clears at the link's
+  next sweep. If you tap the other answer after a restart cut a tap short, your first answer stands,
+  and the card says "Already answered".
+
+### Labels (since 0.16.0)
+
+Every brief, and every Build or Ship job Cain starts, carries one label: `core` (Cain answering you,
+the calendar, reminders, the morning message), `commitment` (your course first), `necessary-fix`
+(something broken now) or `other`. A missing label counts as `other`. A brief carries it in its
+`label` field; a job, in its `label` field or a `Label: <label>` line of its text. The first three
+always pass the usage guard (still within the round cap); `other` is what the guard can hold.
+
+### The usage guard (since 0.16.0)
+
+One Claude subscription and four paid review seats serve Cain's own work, the builds, the reviews
+and your own projects. The guard keeps `other` work from spending what your commitments need: the
+review runner asks it for every brief, and Cain's Build hook for every Build job. It refuses `other`
+work while the week's plan allowance left, or any review seat's monthly cap left (the caps the
+runner really uses), is below the reserve floor, the option `usage_reserve_percent` (default 25).
+There's no tap or flag that gets around it. Each refusal is one line in `/data/review-guard.log`
+(time, label, what was refused, which floor), and Cain lists those holds on the open list; the guard
+never sends you a card. The log is root's (root:cain 0640, since the second round of fixes): Cain
+reads it but can't write it. The runner writes its own refusals; Cain's Build hook and `review.sh`
+send theirs to the link, which checks the guard again itself and writes only a real refusal. If the
+link can't be reached the run is still refused, and the refusal says the hold wasn't logged. Since
+the third round of fixes that route is bounded: at most 6 holds a minute from each caller, an
+identical hold logged once in 10 minutes, its description checked like a card (one that fails is
+logged as "a build labelled" and its label), and the log rotated at 256 KB keeping one previous file
+(`/data/review-guard.log.1`), with one alarm when a limit is hit. The
+guard's, the cap's and the plan reader's paths are fixed in the code; the environment can move them
+only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and the Build hook refuses
+every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
+check-in hands Cain the same two lines for his daily usage row.
+
+What it reads for the plan: Cain's Claude Code transcripts under `/data/cain/.claude/projects` (each
+turn's token counts, the last 7 days). They record tokens used, not your plan's weekly allowance,
+and nothing else on the Pi records the allowance, so the plan reading is "unknown" today, and an
+unknown reading (or one older than a day) counts as below the floor. So for now every `other` job
+and review is held, and only `core`, `commitment` and `necessary-fix` work runs: that's on purpose,
+until there's a reliable reading. How to tell it's working: `review.sh guard`'s first line says
+"Plan: unknown" with the reason and the week's token count (a count that grows as Cain works shows it
+reads the transcripts; "no Claude Code transcripts found" means it can't), and its second line names
+each seat's share left and whether other work is held. `review.sh spend` shows the runner's own caps
+and each open change's round count.
+
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
+
+## Cain's own user (since 0.12.0)
+
+Cain's Claude Code session runs as its own user, `cain`, not as root. The App's keys, the
+Discord bot's token and the Supervisor's token stay root's; the Discord plugin's server runs
+as a third user, `discord`, behind a broker that checks every send (the message gate). His
+rules are Claude Code's managed settings, under `/etc/claude-code`, installed from the image
+and checked at every start. The whole design, and its review, is in the record:
+`projects/org-v2/c1-plan.md`.
+
+The move happens once, at the first start after the calendar App signs its requests (the
+calendar App 0.24.0) and the App's alarms to your phone are shown to work (below): the App
+restarts itself, checks the new setup on the Pi, and only then switches (`/opt/cain/c1/cutover.sh`, with its journal in `/data/c1`). Until then Cain runs as
+0.11.0 did. After the move there is no way back to root but restoring the backup taken before
+the update. `/data/trust/c1check.json` holds the check that runs as `cain` at every start.
+
+### If Cain stops
+
+Nothing of Cain's runs unchecked, and no stop is silent. The App stops him when a check of
+his own user finds a breach, when the move stops part way, when his start state is damaged,
+or when its safety setup doesn't check out at start; it pauses him (not a breach) when that
+check can't finish, and tries it again every 10 minutes until it does. If his session keeps
+ending soon after it starts, the App keeps starting it again, and says so at the third time.
+If a question waits on his screen, where no one answers it (one of Claude Code's own, or his
+own asked there by mistake), he can't take a message until it's answered: the App presses Esc
+after 5 minutes (15 for what looks like a sign-in or his folder's trust question, yours to answer
+on the panel if you're at it), and if that doesn't close it, starts his session fresh 5 minutes
+later (at most once an hour, and he's told to read your messages he may have missed). You hear
+only when that can't clear it (a question back within the hour of a fresh start, three closed
+with Esc within an hour, or a step the App can't keep track of), and it comes down once his
+prompt has been back 5 minutes. A draft left in his input box (not the App's own), unchanged
+for 15 minutes, is saved in his folder and cleared, and a screen the App doesn't know is saved
+and his session started fresh; he's told each time.
+The App types your taps and his check-ins into his session only after that session has passed
+its check of his own user (at every start, and every start is the App's: when Claude Code ends,
+his session ends and the App starts it again), only at his prompt, empty and steady, and it
+presses Enter only once what it typed sits whole in his input box. Each line it types carries its
+own random mark, and leaves its queue only once that mark shows in his session's transcript or
+on his screen above his input box: a question that takes the Enter leaves the line to go in later,
+once, and a line that can't be known in or not is never typed again as new (he gets it as a file,
+told to check first). A text too long or unusual to type goes as a file in his folder, the line
+typed naming it. A tap that can't go in waits, never lost, and check-ins that miss their hour
+are named in the next one, however many. If nothing goes in for half an hour while something
+waits (his screen not busy), or for two hours in all, or a draft or a screen the App doesn't know
+stays half an hour, you hear "Cain isn't getting messages", once, and when it's back; a sign-in
+waiting half an hour that no sign-in alarm told you of gets "Cain is waiting at a sign-in", with
+the way to sign in.
+If a try of the move fails, he keeps running the old way (after a restart of the App, when the
+try ran as his user) and the App says so. Each time, the App tells you itself, from outside his
+session (`/opt/cain/notice.sh`), what happened and the way back:
+
+- in Discord, from his bot, once;
+- as a push to your phone, through Home Assistant, again each day until it's fixed, and
+  replaced (with "Cain is back") once he has run two minutes and passed his check (for a
+  question on his screen, once his prompt has been back 5 minutes). It goes to your phone
+  only: no Home Assistant notification, which everyone in the house would see.
+
+Alarms are kept apart by what they're about (whether he's running, whether his session keeps
+ending, whether his move went through, whether a question keeps coming back on his screen,
+whether what the App types goes in, whether its alarms reach your phone), so one never takes
+down another.
+
+The Home Assistant side is one automation with a webhook trigger. The App has no Home
+Assistant API access, on purpose: the Supervisor's route to a notification would give every
+process of the App the run of all of Home Assistant, and this webhook can only pass an alarm on
+to your phone.
+Its id is a long random one (32 to 128 letters, digits, `-` or `_`) in this App's
+`notice_hook` option, which only the App's root and Home Assistant's admins can read, never
+Cain's own user: an id he could work out would let him send or take down an alarm. Until it's
+set, the alarms go to Discord only, and those still standing reach Home Assistant once it is
+(the App reads it at its next start). The App also posts a probe (`state: test`) daily, and
+at once when the hook is set or changed, which notifies no one: the automation notes its time
+in a helper. The App can't read Home Assistant, so it asks Cain to read that helper through his
+read-only connector and write what it says into his folder, and checks it against the probe:
+moved, the channel counts as working (the move to his own user waits for that); read and not
+moved, you hear it from his bot ("Cain's alarms reach you here only"), and Cain files it for a
+fix. No one needs to check it by hand.
+
+```yaml
+alias: Cain App alarms
+mode: queued
+max: 20
+triggers:
+  - trigger: webhook
+    webhook_id: <the notice_hook id>
+    allowed_methods: [POST]
+    local_only: true
+actions:
+  - choose:
+      - conditions: "{{ trigger.json.state == 'test' }}"
+        sequence:
+          - action: input_datetime.set_datetime
+            target: {entity_id: input_datetime.cain_alarms_checked}
+            data: {timestamp: "{{ now().timestamp() }}"}
+      - conditions: "{{ trigger.json.state in ['on', 'clear'] }}"
+        sequence:
+          - action: notify.mobile_app_<your phone>
+            data:
+              title: "{{ trigger.json.title }}"
+              message: "{{ trigger.json.message }}"
+              data:
+                tag: "cain_app_{{ trigger.json.group }}"
+                push:
+                  interruption-level: "{{ 'time-sensitive' if trigger.json.state == 'on' else 'active' }}"
+```
+
+The tag is what lets "Cain is back", or a newer alarm about the same thing, replace the one on
+your phone. `input_datetime.cain_alarms_checked` is a date-and-time helper. An alarm raised while Home
+Assistant can't be reached is sent once it can; one that clears while it can't stays to be
+taken down. Home Assistant answers every webhook post alike, found or not, so the probe's time
+in the helper is the only proof the channel works end to end, and the App has Cain read it back
+each time (above): after an update, set `notice_hook` and restart the App if it hasn't restarted
+since; the probe and its readback follow by themselves.
+
+**The way back** (the alarms say which applies): when he's stopped for a moment, nothing: the
+App restarts itself. Where an alarm says to (his session keeps ending, a question waits on his
+screen, messages don't go in, or a stop at start that a restart may clear), restart the Cain App
+(Settings, Apps, Cain, Restart). For a hard stop (first after a restart where the alarm says so),
+or a pause that lasts, restore two backups from just before the update, Cain's first and then the
+calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
+while the other is on its old version, it waits. After a restore, the calendar App may send
+again a card it sent after its backup was taken; the newest card is the one to answer.
+
+## What 0.15.0 does: Cain stays on Discord
+
+On Nov 20 two drills found gaps: when the Discord plugin's server stopped, nothing started it again,
+and Cain was off Discord for 19 minutes until the App was restarted by hand; and after the App's
+container was killed, it stayed down 10 minutes with no alarm, since every alarm runs inside the App.
+
+- **The plugin's server is supervised.** When it stops for any reason, the App starts it again
+  within seconds (waits of 1, 2, 4, 8, then 15 seconds), logs each restart with its exit code
+  ("the plugin's server stopped (0): starting it again in 1 s"), and hands it Cain's session's own
+  handshake again, so his session keeps its channel. Each stop is logged with its exit code, the
+  signal that ended it, and the last lines it wrote. While it's down, and until the new server has
+  taken that handshake, a call from his session is answered at once ("the Discord channel is
+  restarting its server; nothing was sent"), never dropped or sent to a server that isn't ready; a
+  new server that refuses the handshake, or doesn't answer it in 10 seconds, leaves the channel down
+  for the watchdog. While it's down the App names it as its own state, "the Discord plugin's
+  server", apart from his session exiting. A restart of the broker itself (the part that holds his
+  connection) is different: it ends his connection, so the state says down from that moment and the
+  App restarts his session after 90 seconds; the plugin's server comes back with his new session.
+- **The App restarts itself, as a last resort.** When his Discord channel stays down across 3
+  restarts of his session, or for 10 minutes, whichever comes first, the App ends his session and
+  asks the Supervisor to restart it (the Supervisor's own restart call, which every App may make);
+  should the Supervisor refuse, the App stops on an error (exit code 3) at once, and should the
+  Supervisor take the call, or not answer it within 30 seconds, but not stop the App within 2 minutes
+  after, it stops on an error then; the Supervisor's watchdog starts it again. The two can overlap only
+  if the Supervisor takes longer than about 150 seconds to stop the App. A Stop of yours, or a crash,
+  inside that window is not called a self-restart: the window measures from the App's last step of the
+  restart (it notes the time again just before its 2-minute wait), and a crash in it, a kill by any
+  signal but the Supervisor's normal stop (an out-of-memory kill, say) included, alarms and is reported
+  as a crash. If the Supervisor can't be reached at all, the App's log says so, apart from a refusal. The App's log says "Asking the Supervisor for the
+  App's restart" just before the call. A line saying the Supervisor took it rarely shows, because on
+  a real success the Supervisor stops the App before it answers. The real sign of a self-restart is
+  the outside heartbeat's failure ping, "restarting itself (self-restart, exit code 256)", followed
+  by a fresh start of the App. One restart per incident (30 minutes), each kept
+  in `/data/probe` with its cause and time, named in the next morning check-in, counted in 0.14.0's
+  restart counts as a restart the App asked for itself, and an alarm after 3 in 24 hours or 2 for the
+  same cause. Every self-restart also pings the outside heartbeat's failure address, so one that never
+  comes back is raised from outside. Never while his screen waits on your one-time sign-in: the 10
+  minutes and the wait for a first connection start again when the sign-in ends.
+- **A first session that never connects** (signed in, but no Discord connection 3 minutes after it
+  started) is restarted; one waiting on your sign-in never is.
+- **No alarm hands you a manual step.** Each names the real cause (the plugin's server gone, his
+  session exiting, his channel down past its restarts, the App restarting itself) and what the App
+  does about it. The one exception is the Watchdog switch below; your Claude sign-in is yours too.
+- The panel's terminal opens again: since 0.14.0 nginx couldn't reach its socket or the sign-in page.
+- A loop within a day of an install now says so for the first version that keeps the install record
+  too (0.14.0's own install didn't).
+
+### The Watchdog switch
+
+The **Watchdog** switch on the Cain App's page in Home Assistant (Settings, Apps, Cain) is the one
+thing only you can turn on, once. With it on, Home Assistant's Supervisor starts the App again by
+itself whenever its container stops on an error: a crash, a kill, running out of memory, or the App
+restarting itself by its exit route because Cain's Discord channel stayed down. It also asks the App's
+health page (`/health`, the `watchdog` URL in its configuration, answered to Home Assistant's own
+internal network, 172.30.32.0/23, where the Supervisor is, and 404 to any other address and on any
+other path; the answer is only whether the App is up) and restarts the App when that answers an
+error, which it does only in the moment a self-restart is under way. Each `/health` 404 shows in the
+App's log, at most once a minute, with the address it came from ("The health check URL (/health)
+answered 404 to: ..."), so a probe from an unexpected address can't restart the App in a loop
+unseen. With it off, a killed App stays down until someone starts it, and the App
+never restarts itself (its exit route would leave it down): it tells you once, naming this switch, and
+keeps restarting Cain's session instead. The App reads the switch through the Supervisor's own-info
+call and asks for its restart through the Supervisor's own restart call, both of which every App may
+make without an API role (`hassio_api` stays off); it has no wider access than before. Only a
+successful answer whose `watchdog` is exactly true or false counts; anything else is "unknown".
+
+If the App's web server (nginx, which serves its page and `/health`) doesn't start after 3 tries, the
+App logs nginx's own words as the cause and raises an alarm of its own, "Cain's App page is down";
+Cain himself keeps running. It comes down at the next start that works.
+
+**The exit route is relied on only once Pi drill 7 has passed** (below): it proves that the App
+stopping with exit code 3 is started again by the Supervisor within a minute. Until then the
+Supervisor's restart call is the route the App uses, with the exit route only behind it.
+
+**Drill 7 starts with a release gate: the Supervisor's health probe.** With the Watchdog switch on,
+it reads the address the Supervisor probes from, checks it is inside 172.30.32.0/23, asks `/health`
+from the Supervisor's own container and wants 200, then watches the App's log for 3 minutes for any
+`/health` 404 line. It also reads the Watchdog switch through the Supervisor's info call and wants
+it on, and wants at least one `/health` 200 to the Supervisor's own address in those 3 minutes (nginx
+notes each 200 with its time and address). If any of that fails, the exit route is not relied on and the result goes back to
+the laptop session. `bash probe-drill.sh 7 gate` runs the gate alone.
+
+## What 0.14.0 does: liveness alarms
+
+The outside heartbeat above says the App is alive. That is not the same as Cain answering: on
+Nov 19 his session restarted every two and a half minutes for about six hours while the heartbeat
+kept saying alive. 0.14.0 adds alarms for that. It only alarms: nothing in it restores or rolls
+back anything, it has no Supervisor access, and no switch.
+
+- **Liveness checks, every 5 minutes**, with no model call, from a part of the App outside Cain's
+  session: his Discord plugin is running, his session is there, the App's own Discord connection is
+  up and acknowledged in the last 3 minutes, and something the App typed reached his session since
+  the last check-in over an hour old. Two failed passes in a row alarm, once for the stretch, with
+  its all-clear when a pass goes through. A sign-in on his screen alarms "Cain needs sign-in", and
+  the model's API errors on his screen "The model's API isn't answering", instead of a failure.
+- **The hourly liveness check of his session**: once an hour the App hands his session one fixed
+  line on his Discord channel and he must answer it with a fixed reply. It shows his session takes a
+  turn. It never reaches Discord or you, and costs a few short turns of your Claude usage a day. It
+  waits while a turn is at work and for 5 minutes after a message of yours reaches him, and is asked
+  at the next 5-minute pass instead, so it never cuts in on you. A long turn doesn't count against
+  it: while his screen is at work, the 20 minutes he has to answer stretch, up to an hour more. The
+  wait has a cap: once the line has been held back for 2 hours, it goes in anyway. A turn at work for
+  2 hours without a break also raises "Cain's turn has been running for N minutes", once for that
+  stretch, and it comes down when the turn ends. The 5-minute checks above never wait on a turn.
+- **Plainly: these are liveness checks.** They show his parts run, not that he answers you. They
+  can say alive while your messages are lost. A real round trip (a message of yours seen reaching
+  his session) is a later item; this release has none, and the App reads nothing of your messages
+  (only the time one came in, for the wait above).
+- **The probe's second heartbeat check**: set `probe_heartbeat_url` to the ping URL of a second
+  check at your heartbeat service (Healthchecks.io: a check with a 5 minute period and a 15 minute
+  grace). The App pings it only after a pass where every liveness check passed, so when his parts
+  stop, or the Pi or the App is down, the pings stop and the service alarms your phone itself. The
+  URL is read only by the probe's own process, never logged, never on a command line, and never
+  reaches Cain's session.
+- **Your Stop doesn't touch any of this.** Stop stops jobs, cards and merges, not Cain's session:
+  he keeps running and answering through a Stop, so the 5-minute checks, the hourly line and both
+  heartbeat pings go on as usual, and a failure during your Stop alarms like any other. Only the
+  App's own stopped mode silences the liveness alarms and the probe's pings: when the App itself
+  stops his session on purpose (a failed safety check of his own user, for example), it has already
+  told you why with its own "Cain is stopped" notice. That is rare, and always caused by the App.
+- **Repeated early exits of his session**, counted in `/data`: every start of his session is
+  written there with how the run before it ended, from what root alone saw: the first start in a
+  container ("boot"); a stop the App's start script asked for that very run ("asked": root's mark,
+  written before the session ends, naming the run the start script holds in memory, never guessed
+  from an exit code or a signal); or how long the run lasted to when the start script saw it gone.
+  A run that ended unasked within 5 minutes of its start is an early exit, whatever exit code it
+  left. A run with no recorded exit and no valid asked mark (the start script was itself restarted
+  meanwhile, or the run died before its exit handlers ran) is an unseen end, however long it ran.
+  More than 3 early exits in 30 minutes is "Cain's session keeps exiting early", on
+  your phone through Home Assistant and in Discord; it comes down once the count is back under.
+- **Unseen ends** have their own three windows: more than 3 in 30 minutes, more than 6 in 60 minutes, or more than 8 in 24 hours
+  is "Cain's session keeps restarting", with the count and the window that tripped. The 24-hour
+  window catches a slow loop the others miss (a restart every 11 minutes all day); a pace slower than
+  all three stays under them. Its text says no clean stop was recorded (a crash, a kill, a power
+  cut, or a stop that took too long to finish (the stop drill timings show it)), and that the restarts were seen but not the exits, so it is a cadence, not a confirmed crash;
+  it never counts as an early exit. Within a day of an update it carries the update line too, since an early crash
+  before the exit handlers run looks unseen.
+- **Repeated late error exits of his session**: an unasked end after the 5-minute mark with an
+  error code is counted apart (Cain's own user can end his own session, so these never count as
+  early exits). More than 4 in 60 minutes is "Cain's session keeps ending on its own". Its text names
+  the model's API or the network as possible causes.
+- **What each of these alarms says**: the count and its window, the last exit code root kept, and,
+  when there is one, the last line of his session's log, after "session log says:" (plain characters
+  only, links taken out, at most 60 characters; the log is opened without following a link, and read
+  only when the open file is a plain file with one name, owned by root or Cain). Outside a day of an update, that is all: nothing about updates or backups.
+- **Repeated starts of his App's container**, counted in `/data` too, once per container. More than
+  3 counted in 30 minutes is "Cain's App keeps restarting". Not counted: a start after a stop the
+  Supervisor asked for, and the first two starts within 10 minutes of a version change, since an
+  update restarts the container. How a stop counts as asked: each start of the App's start script
+  makes its own id, which root keeps as the last start record in `/data`. A stop signal (a Stop,
+  Restart or update of the App from Home Assistant, or the same asked by an automation or a watchdog)
+  reaches the start script's stop handler, which leaves a nonce for that start and a pending mark
+  naming its id and the time. The stop is marked in two phases: the finish script promotes the
+  pending mark to asked only for a real stop, the start script ended by SIGTERM (s6 passes 256 and
+  signal 15), with the handler's nonce equal to the last start record's id. A plain exit 15, a death
+  by SIGKILL (the out-of-memory killer, or `docker kill`), SIGSEGV or SIGABRT is never asked, and
+  clears the mark. The next container start counts only a promoted mark, when its id is the last
+  start record's and it is under 5 minutes old. A pending mark left over means the stop never
+  finished (the container was killed, the power was lost, the finish script never ran): that start
+  counts as a plain boot, and the mark is cleared; every start of the start script, a restart by s6
+  alone included, clears any mark, so a stale one can never hide a later crash. The stop's budget sits
+  inside the Supervisor's 30 seconds with margin: 8 seconds for the services to stop (the stop
+  handler takes at most 6), 5 for a finish script (its mark at most 4), then 3 before everything left
+  is killed. The count and the record of the installed version live in `/data`, so a
+  restart of the container keeps them.
+- **Repeated asked restarts of his App**: every stop the Supervisor asks for arrives as the same
+  signal, whoever asked, so a loop of them (a Home Assistant automation, repeated restarts from the
+  App's page, a watchdog) would otherwise never count. Asked starts are kept in their own window in
+  `/data`, with two windows: more than 6 in 60 minutes, or more than 12 in 24 hours (so a requested
+  restart every 11 minutes, at most 6 an hour, still alarms within a day), is "Cain's App keeps being
+  restarted". Its text says the previous runs ended with a stop that was requested (a Restart or
+  update from Home Assistant, a backup, an automation, or the Supervisor's watchdog restarting an App
+  that looked unhealthy), to check the Supervisor log for who asked and why, and that if the watchdog
+  asked, the App looked unhealthy to it, and that is what to fix, not the watchdog. Nothing rolls
+  back by itself. Within a day of an update it carries the update line too, with the same words.
+- **Every start together**: each kind of start above is counted in its own windows, so a loop that
+  mixes kinds (5 asked restarts and 3 unseen ends in an hour) or paces one kind under its own limits
+  would stay under each of them. One combined window counts them all, whatever the kind: each
+  container start (plain, asked, or one of an update's own) and each restart of his session after an
+  early exit, an unseen end or a late error exit. More than 8 in 60 minutes, or more than 12 in 24
+  hours, is "Cain's App keeps starting", whose cause gives the counts by kind, for example "9 starts
+  in an hour: 5 asked, 3 with no clean stop recorded, 1 plain". Within a day of an update it carries
+  the update line too. The per-kind windows stay as they are. In short, the windows are: early exits,
+  more than 3 in 30 minutes; unseen ends, more than 3 in 30 minutes, more than 6 in 60 minutes, or
+  more than 8 in 24 hours; late error exits, more than 4 in 60 minutes; counted container starts, more
+  than 3 in 30 minutes; asked restarts, more than 6 in 60 minutes, or more than 12 in 24 hours; every
+  start together, more than 8 in 60 minutes, or more than 12 in 24 hours.
+- **The line that names the update**: when a loop (early exits, unseen ends, container starts, asked restarts or every start together) begins
+  within a day of a version change, a second alarm goes with it, for example: "Cain's session has
+  exited early several times since the update to Cain 0.14.0, installed 3 hours ago. Nothing rolls
+  back by itself. If a backup was made before the update, restoring it from Backups undoes the update
+  and any changes since." Only then: past that day, no alarm mentions an update. It comes down once neither
+  loop stands, and goes out again with each new loop.
+- **A long turn**: "Cain's turn has been running for N minutes" adds "This may be normal for a long
+  job."; it comes down when the turn ends.
+- **Asked stops never count as crashes**: an owner's Stop, Restart or update from Home Assistant
+  reaches the App's start script as a stop signal before anything else stops, and root records it as
+  asked before his session ends. They count only in the asked-restart windows above (more than 6 in an
+  hour, or more than 12 in a day) and in the combined window over every start, never as early exits or
+  counted container starts. His session's own end by a signal, while the start script keeps running,
+  is never asked: only the start script's own end by SIGTERM is, and his user can't signal it. Claude Code's own updater is off in this App (its version is pinned in
+  the image), so it never ends his session to update itself.
+  Claude Code fixes arrive with App releases, and the repository's CI notes when a newer Claude Code
+  than the pinned one is out.
+
+Each check is kept in `/data/probe` with its time, root's alone; the marks of this container's runs
+are in `/run/cain/probe`, root's alone too. Nothing under either can be written by Cain's own user,
+nor can either folder be renamed or replaced: every folder above them, up to `/`, is root's and not
+his to write (the App's start fixes what it can). Before every read or write there, the App checks
+the folder is root's, mode 0700 and not a symlink, and the folders above it; a missing folder is made
+that way rather than refused. The probe's files are opened without following a link and read only
+when they are plain files. If a folder isn't right, the App refuses to use it, stops the probe's
+heartbeat ping (so the outside service alarms too) and raises
+"Cain's probe folder isn't the App's alone", again each day while it lasts. Its cause names the failing path with its owner and mode in
+plain words, for example "/run is owned by user 1000, mode 0777". The way out: restarting the App
+sets its own folders up again and fixes what it can above them; if this alarm comes back with the same path, that path needs fixing by hand.
+
+### Checking it on the Pi
+
+`cain/tools/probe-drill.sh` (in the repository, run by your assistant from a shell with Docker, such
+as Home Assistant's SSH App with protection mode off) has the drills. Run them, in order,
+on the Pi after the install, before the alarms are relied on:
+
+0. The probe's folders: each folder from `/run/cain/probe` and from `/data/probe` up to `/`, with
+   its owner, its mode and the probe's verdict. Any refused folder fails the drill.
+1. uid 1000 (Cain's own user) can't read the Supervisor's token, the probe's records and marks or
+   the gateway state, can't write anything under `/run/cain/probe` or `/data/probe`, and can't list
+   `/run/cain`.
+1b. uid 1000 kills its own session 6 times after the 5-minute mark: no early exit is counted, and
+   "Cain's session keeps ending on its own" is raised once.
+2. The Nov 19 replay raises "Cain's session keeps exiting early".
+3. Kill the plugin, close the session, cut the network for 15 minutes: each alarm raises and clears.
+4. An API outage and a reboot: no false alarm.
+5. How stops are classed, each part checking what `/data` keeps and the alarms: `5 ha`, Restart the
+   App from Home Assistant 4 times within 30 minutes, each stop under 30 seconds: nothing counts;
+   `5 kill`, an abrupt termination (`docker kill`): the next start counts as a boot, never asked, and
+   no stop mark stays; `5 s6`, a restart of the start script by s6 alone: no container start counts,
+   and the mark it leaves is cleared. Each of the three prints how long the stop handler and the
+   finish script took for every stop since it began, as the App measured them: the handler must stay
+   under 6 seconds and the finish script under 4.
+6. (0.15.0) Stop the plugin's server once: it runs again within seconds, the channel says connected
+   again within 90 seconds, and his session isn't restarted for it.
+7. (0.15.0, with the Watchdog switch on) First the gate: the Supervisor's health probe comes from an
+   address in 172.30.32.0/23, gets 200, and the App's log shows no `/health` 404 for 3 minutes. Then
+   the exit route: the App stops with exit code 3 and the Supervisor starts it again within a minute.
+   The outside heartbeat hears a failure meanwhile, as expected. Until both pass, don't rely on the
+   exit route.
+
+The drill finds the container by its name (`app_<hash>_cain`, then `addon_<hash>_cain`; set
+`CAIN_CONTAINER` to pick one), checks every tool a step uses before it starts, and kills through
+`/proc` (the image has no `pkill`), inside that container only, and only the one process whose
+program and arguments are exactly the ones named: two matches are refused and nothing is killed. Any
+step reruns alone: `bash probe-drill.sh 1b`.
+
+For a hand restore to be there when the update line asks for it, keep a backup taken before each
+update of Cain: the Ship job takes one, and Home Assistant's **Backup before update** does too.
 
 ## Your record: one hand on each item (since 0.6.0)
 
@@ -304,6 +816,26 @@ same id says how it ended).
 
 The keeper looks at Cain's own queue every 2 seconds and runs as soon as something is
 in it; the record's inbox (your page, laptop sessions) is read every minute.
+
+## PC jobs (since 0.12.0)
+
+Chores that need a browser signed in as you go to a small job queue in a private repo
+of their own (`pc_jobs_repo`, default `HyndeSyte/pc-jobs`), run by the worker on your
+PC in a locked browser session, in a Chrome profile named Cain jobs. Runs are attended
+(you start them, watching): this version refuses unattended runs. The session gets four
+reading tools of Claude in Chrome and nothing that reads files, and the worker's own
+folder (with its Claude Code sign-in) is denied to it by path besides. A new Claude in Chrome or Claude Code version stops
+every run until you probe again. Cain's PC job keeper is the queue's one
+writer of jobs and holds `pc_jobs_token`, so his session never does. With no token it
+waits and does nothing. This version is read-only by enforcement: the PC worker runs
+only actions from a fixed read-only set that your signed allowlist pins to an address,
+and irreversible jobs are refused until the confirm path ships. Results are typed facts,
+each checked against a strict schema for its action (a value outside it fails the run
+and nothing of it is kept), and reason codes, read by Cain as data, never as instructions. The keeper's clock
+closes jobs past their expiry and claims whose lease ran out. The one-time setup at your
+PC, what is enforced and what isn't, the job and result formats and the browser
+session's settings and prompt are in `cain/docs/pc-jobs.md` and `cain/docs/pc-worker/`
+in this repo.
 
 ## Laptop sessions (tools, not part of the App)
 

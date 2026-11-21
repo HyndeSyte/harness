@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.12.0"
+version: "0.16.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -17,6 +17,14 @@ startup: application
 boot: auto
 ingress: true
 ingress_port: 8099
+# The Supervisor's watchdog (Cain 0.15.0): with the Watchdog switch on the App's page turned on, the
+# Supervisor starts the App again when its container stops on an error (a kill, a crash, or the App
+# restarting itself when Cain's Discord channel stays down) and when this answers an error. nginx
+# answers it to Home Assistant's internal hassio network, 172.30.32.0/23, and 404 to any other
+# address (rootfs/etc/nginx/nginx.conf), 503 only while a self-restart
+# is due (the mark is set just before the App stops). The switch is read through /addons/self/info
+# and the restart asked through /addons/self/restart, which need no API role (hassio_api stays off).
+watchdog: http://[HOST]:[PORT:8098]/health
 panel_icon: mdi:account-tie
 panel_title: Cain
 panel_admin: true
@@ -36,9 +44,29 @@ timeout: 30
 # The three API keys go only to the review runner: Gemini and Perplexity on small
 # prepaid balances (auto-reload off), Anthropic from his linked Console org (his
 # plan's monthly API credit). Caps: per review, and per seat per month.
+# pc_jobs_token: the PC job keeper's fine-grained token for the PC job queue repo only
+# (pc_jobs_repo, Contents read and write). Empty: no PC jobs.
+# heartbeat_url: the security watch's outside heartbeat (a Healthchecks.io ping URL, or any
+# https URL of that kind). Pinged every 5 minutes, and <url>/fail when the App stops on an
+# error; the service warns the owner itself when the pings stop. A secret like a key: not logged,
+# not in any child's environment (only the heartbeat's own process has it); stored only in the
+# App's options (/data/options.json, where Supervisor keeps every option: that is fine). Cain's own
+# session can read that file, so a compromised session can read the URL: keep it like a key. A leaked
+# URL can mask an outage or fake a failure. Empty: no heartbeat, and the morning check-in says so.
+# probe_heartbeat_url (0.14.0): the probe's own outside heartbeat, a second check at the same service
+# as heartbeat_url (its own ping URL). Pinged only after a liveness pass that passed (every 5 minutes),
+# the owner's Stop included (his session runs through it), so the service alarms the owner when Cain's
+# parts stop running, not only when the App stops. Only the App's own stopped mode, or a probe folder
+# that isn't right (it alarms that too), stops it. Read only by
+# the probe's own subshell (the run script), never by Cain's session, never logged. Empty: no ping.
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
+# review_round_cap: outside review rounds a change may have (the owner's rule: 3). The runner keeps it;
+# Cain's own user can't change it. usage_reserve_percent: the usage guard's reserve floor, a share of
+# the week's plan allowance and of each review seat's monthly cap that "other" work may not spend.
+# notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
+# "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
   github_token: ""
   gemini_api_key: ""
@@ -49,7 +77,14 @@ options:
   perplexity_monthly_usd: 4
   anthropic_monthly_usd: 30
   codex_monthly_runs: 200
+  review_round_cap: 3
+  usage_reserve_percent: 25
   owner_user_id: ""
+  notice_hook: ""
+  pc_jobs_token: ""
+  pc_jobs_repo: "HyndeSyte/pc-jobs"
+  heartbeat_url: ""
+  probe_heartbeat_url: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -60,4 +95,11 @@ schema:
   perplexity_monthly_usd: float(0,200)
   anthropic_monthly_usd: float(0,200)
   codex_monthly_runs: int(0,5000)
+  review_round_cap: int(1,10)
+  usage_reserve_percent: int(0,90)
   owner_user_id: match(^([0-9a-f]{32})?$)?
+  notice_hook: password?
+  pc_jobs_token: password?
+  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?
+  heartbeat_url: password?
+  probe_heartbeat_url: password?

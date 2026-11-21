@@ -1,0 +1,38 @@
+# Dependabot (security watch, Cain 0.13.0): weekly update pull requests, minor and patch
+# updates grouped into one per ecosystem. Its pull requests are proposals like any other:
+# the pr check, the tests and the owner's Ship tap still decide what reaches main.
+#
+# What each covers:
+# - pip, .github/ci: what CI installs to run the tests (pytest, PyYAML). The calendar
+#   specialist (harness/) has no Python dependencies of its own: it uses the standard
+#   library only, so there is no harness/ manifest to watch.
+# - pip, .github/ci: also the audit job's own tools (audit-requirements.txt, pinned with hashes).
+# - github-actions: the actions the workflows use, each pinned to a commit.
+# - docker, cain and harness: each App's Dockerfile base image.
+# Cain (cain/) has no npm or Bun manifest (no package.json): its TypeScript uses only Bun
+# and Node built-ins, with Bun itself pinned in its Dockerfile and in tests.yml. Add an npm
+# entry for /cain here the day a package.json appears.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /.github/ci
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: docker
+    directory: /cain
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /harness
+    schedule:
+      interval: weekly

@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "app": "harness-surface",
+  "purpose": "in-motion-snapshot",
+  "key_id": "5e5a9c129bf9fb57",
+  "made_at": "2026-11-18T10:00:00.000Z",
+  "revision": {
+    "seq": 42,
+    "commit": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "threads": [
+    {
+      "id": "P1",
+      "title": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀…",
+      "area": "other",
+      "who": "the assistant",
+      "step": "café, 中文, 𝄞 and 👩💻 … \"quoted\" \\ back",
+      "waits_for": null,
+      "outcome": "é vs é",
+      "last_moved": "2026-11-18T09:00:00.000Z",
+      "state": "moving"
+    }
+  ],
+  "excluded_rows": 1,
+  "skipped_rows": 2,
+  "sig": "bd5M/wEfYmcxd24nXXr80ewiFgnuyyVVnsnfJRDOmETDiKXYmkLBCy4wD0IdGtjMb5PWft3K02bIboQwa4svAQ=="
+}

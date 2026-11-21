@@ -21,8 +21,34 @@ else
   bashio::log.error "Could not write /etc/nginx/owner.conf, so Cain's panel stays closed"
 fi
 # Hygiene: s6's copy of the container's environment, the token included, root only.
-# That keeps it from nginx's workers, which don't run as root; not from the session.
 chmod 0700 /run/s6/container_environment 2>/dev/null || true
-nginx || bashio::log.error "nginx did not start"
-exec ttyd --interface 127.0.0.1 --port 7681 --base-path /tty --writable \
-  bash -c 'until tmux -u has-session -t cain 2>/dev/null; do sleep 1; done; exec tmux -u attach -t cain'
+# The upstreams nginx proxies to are unix sockets only nginx's workers (nobody:nogroup) and
+# root can open, never a port Cain's own user could take while one is down (C1 plan 3.9).
+# Fourth round: made here, just before nginx starts (nginx opens /run/cain-web/health-miss.log at its
+# start), with the owner and modes lock.sh gives them (root:nogroup 0750), so nginx and the health check
+# never wait on the run script. lock.sh makes them again, which changes nothing.
+install -d -m 0750 -o root -g nogroup /run/cain-web
+install -d -m 0750 -o root -g nogroup /run/cain-web/www /run/cain-web/upstream
+# nginx serves the panel and the Supervisor's health check (/health, config.yaml's watchdog URL).
+# Should it not start (Cain 0.15.0, second round), that is logged with nginx's own words as the cause,
+# after 3 tries 5 seconds apart, and raised as an alarm of its own (notice.sh tell nginx): with the
+# Supervisor's Watchdog switch on, a health check that can't be reached restarts the App, and each
+# start then says why. A start that works takes that alarm down.
+nginx_why=""
+for try in 1 2 3; do
+  if nginx_out="$(nginx 2>&1)"; then nginx_why=""; break; fi
+  nginx_why="$(printf '%s\n' "$nginx_out" | grep -v '^\s*$' | tail -n 1 | tr -d '\000-\037' | cut -c1-200)"
+  bashio::log.error "nginx did not start (try $try of 3): ${nginx_why:-no reason given}"
+  [ "$try" = 3 ] || sleep 5
+done
+if [ -n "$nginx_why" ]; then
+  bashio::log.error "nginx did not start, so the panel and the Supervisor's health check are down: ${nginx_why:-no reason given}"
+  /opt/cain/notice.sh tell nginx "${nginx_why:-no reason given}" || true
+else
+  /opt/cain/notice.sh clear panel >/dev/null 2>&1 || true
+fi
+unset nginx_out nginx_why try
+umask 0007
+rm -f /run/cain-web/upstream/ttyd.sock
+exec ttyd --interface /run/cain-web/upstream/ttyd.sock --socket-owner root:nogroup --base-path /tty --writable \
+  /opt/cain/terminal-attach.sh

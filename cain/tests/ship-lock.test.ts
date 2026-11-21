@@ -24,7 +24,7 @@ describe("his Ship tap lands it in main", () => {
     r.github.hold = true;
     const tapping = r.tap(snap(r.msg(id)), r.ids(id)[0]);
     await tick();
-    expect(r.updates().at(-1)).toEqual({ content: `${card}\n\nYou tapped Ship: landing it in main now.`, components: [], allowed_mentions: { parse: [] } });
+    expect(r.updates().at(-1)).toEqual({ content: `${card}\n\nYou tapped Ship: landing it in main now.`, components: [], allowed_mentions: { parse: [] }, flags: 4 });
     expect(r.relayed).toEqual([]);
     r.go();
     await tapping;

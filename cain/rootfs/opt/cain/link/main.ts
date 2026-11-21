@@ -2,8 +2,10 @@
 // REST calls, the sweep that posts cards Cain hasn't shown in time and takes buttons
 // off cards that stopped mattering, and a small local HTTP API.
 //
-// HTTP on port 8097, keyed with HMAC-SHA256(bot token, "harness-relay-v1"):
-//   from the calendar specialist (the Harness add-on, over the add-ons' network):
+// HTTP on port 8097. Who may call, by Cain's state (c1/contract.ts, auth.ts):
+//   from the calendar specialist (the Harness App, over the Apps' network), signed both ways
+//   with K_sign = HMAC-SHA256(bot token, "harness-link-sign-v2"); its old bare header (the
+//   relay key, HMAC-SHA256(bot token, "harness-relay-v1")) gets 503 and nothing done:
 //     POST /card {text, rows, kind, expires?}  hold a card for Cain to show (direct kinds go out now;
 //                                       one with buttons goes out by itself if he hasn't shown it in about 2 minutes)
 //     POST /buttons {card, rows}        change a card's buttons (after a tap)
@@ -25,10 +27,19 @@
 //     GET  /cards                       the cards up now, no text, and the ids of Cain's own replies (the reply hook's read);
 //                                       with no DM id yet, it asks Discord for it first, for 0.8 s at most
 //     POST /check {text, reply_to?, edit?}  what the gate does with a reply or edit, sending nothing
+//     POST /reply {text, reply_to?}    a reply of Cain's with a link (keeper.sh reply): the gate's rules, then posted
+//                                       with its preview off and recorded as his own reply (0.13.0, second round)
 //     POST /sent {tool, ids, question, call, reply_to?, net?}  what Cain just sent (the PostToolUse hook): his edit
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//   from the PC job keeper (pcjobs/main.ts), on this machine only:
+//     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
+//                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
+//                                       exactly those values when posted; a message he typed never counts
+//                                       (core.ts reuseProof); "ok", or refused with why
+//     POST /pc-notice {code, id?, job?: {site, action}, repeat?}   one of the keeper's fixed lines to him (core.ts PC_NOTICES): a stop
+//                                       condition and its fix; "posted" (a plain code it has no words for gets a generic line naming it), or refused
 // Nothing is published to the LAN: the App has no "ports:".
 //
 // The gate (piece D), enforcing since 0.10.0: the link's send points fix and refuse
@@ -44,22 +55,34 @@
 // (../stop.ts). The deploy key (deploykey.ts) is the one key main is locked to: with it
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
-import { sign as edSign, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { sign as edSign } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
+import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
 import { makeToken } from "../ship-token";
-import { ensureStop, readStop, since, TRUST_DIR, writeStop } from "../stop";
+import { ensureStop, readStop, TRUST_DIR, writeStop } from "../stop";
+import { KEEPER_SENT, noteAt } from "../gate/held";
+import { readHosts } from "../gate/hosts";
 import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
-import { Link, Protocol, PULL, type Pull, Refusal, SAID_MAX, type State } from "./core";
+import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { checkRuns, facts, inMain, land, type MergeDeps } from "./merge";
+import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { linkRoutes, rootFetch } from "./http";
+import { appendCapped, asideOf, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { readRounds } from "../review/rounds";
+import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
+import { guard, paths as guardPaths } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
-const ENV = process.env.LINK_ENV ?? "/data/.claude/channels/discord/.env";
-const ACCESS = "/data/.claude/channels/discord/access.json";
+// The bot token and the plugin's allowlist, root's since C1 (the run script points these at
+// their old places only for the old way of starting, before the first cutover).
+const ENV = process.env.LINK_ENV ?? "/data/link/discord.env";
+const ACCESS = process.env.LINK_ACCESS ?? "/data/discord/access.json";
 const DIR = process.env.LINK_DIR ?? "/data/link";
 const STATE = `${DIR}/state.json`;
 const WATCH = `${DIR}/watch.json`;
@@ -71,6 +94,7 @@ const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
 const REPO_DIR = `${DIR}/repo.git`;                  // the link's own copy, for landing his Ship taps
+const DECIDED = DECISIONS_FILE;                      // his taps on the review runner's decision cards (0.16.0, cap.ts): /data/link/review-decisions.json
 const KNOWN_HOSTS = "/opt/cain/link/github_known_hosts";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
@@ -88,10 +112,6 @@ function token(): string {
 function key(context: string): string {
   return hmacKey(token(), context);
 }
-function same(a: string, b: string): boolean {
-  const x = Buffer.from(a), y = Buffer.from(b);
-  return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
-}
 function paired(): string {
   try { return String(JSON.parse(readFileSync(ACCESS, "utf8")).allowFrom?.[0] ?? ""); } catch { return ""; }
 }
@@ -102,6 +122,16 @@ const cards = new CardsWriter(() => load(), CARDS_FILE, CARDS_DELAY_MS, (line) =
 const stateStore = stateFile(STATE, () => cards.soon());
 function load(): State { return stateStore.load(); }
 function save(s: State): void { stateStore.save(s); }
+// Read once at the start, so a store found damaged is known before anything is asked of the link.
+// One whose loss couldn't be recorded: the link doesn't start (the run script tries again in 5
+// seconds), rather than run on a store that could later pass for a fresh one (C1 re-check B1).
+try { load(); }
+catch (e) {
+  console.log(`[cain] link: ERROR: its record of cards and messages is damaged and the loss couldn't be recorded (${String(e).slice(0, 80)}); not starting until it can`);
+  process.exit(1);
+}
+if (stateStore.lostNow()) console.log("[cain] link: ERROR: its record of cards and messages was damaged on disk (both copies), kept aside, and started over");
+else if (stateStore.lost()) console.log("[cain] link: its record of cards and messages was found damaged within the last 8 days: a card's request isn't run again meanwhile");
 
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
@@ -111,7 +141,9 @@ async function rest(method: string, path: string, body?: unknown, auth = true, t
     redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
-  if (r.status >= 400) throw new Error(`discord ${r.status}: ${String(data?.message ?? "").slice(0, 100)}`);
+  // With the names of the fields Discord refused (never their values): a 400 that names flags is the
+  // only one the link sends again, without its added preview flag (core.ts quiet, third round).
+  if (r.status >= 400) throw new Error(discordError(r.status, data));
   return data;
 }
 
@@ -182,10 +214,29 @@ const github: MergeDeps = { api: githubApi, git: gitRun, stopped: () => readStop
 const SHIP_REPO = "HyndeSyte/harness";
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
+// The install-time self-check of the review cap's and usage guard's files (0.16.0, round 2,
+// ../capfiles.ts): one wrong turns those features off here, with one alarm naming it. Round 3: run
+// again at each sweep, so they come back without a restart once the file is right, and the alarm clears.
+const capLog = (m: string) => console.log(`[cain] link: ${m}`);
+let capOff: string | null = selfCheck({ log: capLog });
+// Round 3: a tap's temp file left by a link that died mid-write is swept at the start.
+sweepTemps(DECIDED, capLog);
+// Round 3: the alarm for his decisions file moved aside names the copy and the step back; it's raised
+// while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
+let asideUp: boolean | null = null;
+const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisions"); asideUp = true; };
+const capSweep = () => {
+  capOff = selfCheck({ log: capLog, prev: capOff });
+  const a = asideOf(DECIDED);
+  if (a.length && asideUp !== true) asideAlarm(a[0]);
+  else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
+};
+
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
-  relay: (text) => appendFileSync(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
+  // Durable (C1 re-check N2): a card's line to Cain is on disk before the card's request is done.
+  relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
   pull: pullNow,
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
@@ -198,12 +249,41 @@ const link = new Link({
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
   facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
-  // A Ship card reads the head's checks as the landing does (merge.ts), and the review
+  // A Ship card reads the head's checks as the landing does (merge.ts headChecks, pcjobs-windows
+  // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
-  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? checkRuns(github, p.repo, head) : null; },
+  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
+  gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
+  // 0.12.2: while a watch's acceptance stands, the card reads the gate's head through the gate's own curl wrapper
+  // (shipgate.ts gateHeadRead: curl's version read anew each time, killed at its limit, a timeout named), never fetch.
+  // It is authenticated when SHIP_GATE_GITHUB_TOKEN is set, the recommended default (without it these reads share
+  // GitHub's 60 an hour from this address with every watch).
+  gateHead: (pr, ms) => { const p = pullOf(pr); return p ? gateHeadRead(p.repo, p.pr, { ms: Math.max(1_000, ms - 500) }) : Promise.resolve({ unknown: "that isn't a pull request's address" }); },
   reviewed: () => readReviewed(),
+  // The review-round cap (0.16.0, cap.ts): the runner's rounds, his taps on its decision cards (the
+  // link's own file), and the probe's record of the rollback, read as they are now.
+  // Round 2: his tap kept durably before the card is marked used; a decisions file that doesn't parse
+  // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
+  // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
+  capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
+  armed: () => readArmed(),
+  // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
+  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
+  roundCap: () => roundCapNow(),
+  rounds: () => readRounds(ROUNDS_FILE),
+  capOff: () => capOff,
+  // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
+  // rotated root-side, keeping one previous file: cap.ts appendCapped).
+  guardHold: (label, what) => { const p = guardPaths(); return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date() }); },
+  holdLog: (line) => appendCapped(GUARD_LOG, line),
+  hasHold: (tag, what) => holdLogged(GUARD_LOG, tag, what),
+  alarm: (kind, cause) => raiseAlarm(cause, capLog, kind),
+  clearAlarm: (group) => clearAlarm(capLog, group),
+  capSweep,
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
+  linkHosts: () => readHosts(),
+  keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
@@ -262,67 +342,132 @@ async function seed(): Promise<void> {
 setTimeout(seed, 10_000);
 
 // -- HTTP -------------------------------------------------------------------------
-const LOCAL_ONLY = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped", "/look", "/cards", "/check", "/replay", "/connector", "/sent"]);
+// Three callers, each opening only its own routes (auth.ts, C1): the calendar specialist
+// signs each request with its key, never sending it; Cain shows his own key, made at each
+// start, from this machine only; root's services (the broker) use a unix socket only root
+// can open. A caller that proves nothing gets only /health's "ok".
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
-const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
+const KEYS = process.env.CAIN_KEYS ?? "/run/cain/keys";
+const LINK_SOCK = process.env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
+function cainKey(): string { try { return readFileSync(`${KEYS}/cain.key`, "utf8").trim(); } catch { return ""; } }
+const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+
+// The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
+// exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
+const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ };
+const route = linkRoutes(routeDeps);
+
+// The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept
+// and signed back, with K_sign = HMAC(bot token, "harness-link-sign-v2"). The old relay key,
+// HMAC(bot token, "harness-relay-v1"), authorizes nothing of the specialist's in any state, and
+// no signature made with it verifies, so one captured from an old Harness signs nothing (C1
+// plan 3.9).
+const requests = new RequestLog(`${DIR}/requests.json`);
+if (requests.damagedSince) console.log(`[cain] link: ERROR: its record of the specialist's operations is damaged (both copies); no new one is taken until it can't matter (8 days)`);
+else if (requests.recoveredFrom) console.log(`[cain] link: its record of the specialist's operations was read from ${requests.recoveredFrom} (the other was damaged or a step behind); nothing lost`);
+// A card's request runs again only while the cards it made are on record: a store found damaged
+// lost which request made which card, so then it's an explicit unknown too.
+// And a card's answer from before the loss names a card that's gone: the explicit unknown.
+const ops = new SignedOps(requests, Date.now, (p) => RERUN_SAFE.has(p) && !stateStore.lost(),
+  (p, s) => p === "/card" && s.status === 200 && stateStore.lost() > 0 && s.at <= stateStore.lost());
+// A body larger than any route takes is refused before it's read, signed or not (C1-7).
+const MAX_BODY = 16_384;
+// Recorded, durably, at the specialist's first signed request: until then the run script keeps
+// every process of Cain's user stopped (3.12), so an old Harness's bare key never meets one.
+// Only a write that succeeded counts: one that didn't is tried again at the next (C1-6).
+const SIGNS = `${DIR}/specialist-signs`;
+let specialistSigns = existsSync(SIGNS);
+// Who may call, by state (c1/contract.ts): old in the old way, own in the new one, stopped
+// while Cain isn't started. The run script sets it.
+const MODE: LinkMode = (["old", "own", "stopped"] as const).includes(process.env.LINK_MODE as LinkMode) ? process.env.LINK_MODE as LinkMode : "own";
+const health = (known: boolean) => json(healthBody(known, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
+// The specialist's state, for the status page and the alarm: when it last signed, and since
+// when it has sent the old key (Harness 0.23.0's header) instead. Root's file.
+const SPECIALIST_FILE = process.env.CAIN_SPECIALIST_STATE ?? "/run/cain/specialist.json";
+const specialist = { signed_at: 0, old_key_since: 0, old_key_last: 0 };
+let oldKeyRelayed = 0;
+function saveSpecialist(): void {
+  const view = { ...specialist, signs_recorded: specialistSigns, signs_error: specialistMarker.error || null,
+    history_damaged_since: requests.damagedSince || null };
+  try { writeFileSync(`${SPECIALIST_FILE}.tmp`, JSON.stringify(view), { mode: 0o600 }); renameSync(`${SPECIALIST_FILE}.tmp`, SPECIALIST_FILE); }
+  catch { /* the status page shows nothing new */ }
+}
+const specialistMarker = { error: "" };
+function signedNow(): void {
+  const first = !specialist.signed_at;
+  specialist.signed_at = Date.now(); specialist.old_key_since = 0;
+  if (!specialistSigns) {
+    try { writeSynced(SIGNS, String(Date.now())); specialistSigns = true; specialistMarker.error = ""; }
+    catch (e) { specialistMarker.error = String(e).slice(0, 80); console.log(`[cain] link: couldn't record that the specialist signs (tried again at its next request): ${specialistMarker.error}`); }
+  }
+  if (first || specialistMarker.error) saveSpecialist();
+}
+// An old key from the specialist: 503 and nothing done. In the old way that's the calendar App
+// not updated yet (the run script tells Cain after 30 minutes); after the switch it means the
+// calendar App went back to 0.23.0, so Cain hears at once, at most hourly.
+function oldKeySeen(): void {
+  const now = Date.now();
+  if (!specialist.old_key_since) specialist.old_key_since = now;
+  specialist.old_key_last = now;
+  saveSpecialist();
+  if (MODE !== "old" && now - oldKeyRelayed > 3_600_000) {
+    oldKeyRelayed = now;
+    link.relayLine("The calendar App is sending its old key again, so it went back to an older version (a restore, most likely). Its cards wait at the link, none lost. Show him a new Ship card for the pull request that last updated the calendar App, so his tap installs it again, and file a note on P33 for the laptop session.");
+  }
+}
 
 Bun.serve({
   // A Ship card asks GitHub first (a few seconds at most): the default 10 is too tight.
-  port: PORT, hostname: "0.0.0.0", idleTimeout: 30,
+  port: PORT, hostname: "0.0.0.0", idleTimeout: 30, maxRequestBodySize: MAX_BODY,
   async fetch(req, server) {
     const url = new URL(req.url);
-    const keyOk = same(req.headers.get("x-harness-key") ?? "", key("harness-relay-v1"));
-    if (req.method === "GET" && url.pathname === "/health")
-      return json(healthBody(keyOk, () => ({ discord: { connected, last_heard: lastHeard || null }, watch: watch.status() })));
-    if (!keyOk) return json({ status: "refused" }, 403);
-    const ip = server.requestIP(req)?.address ?? "";
-    if (LOCAL_ONLY.has(url.pathname) && ip !== "127.0.0.1" && ip !== "::1" && ip !== "::ffff:127.0.0.1")
-      return json({ status: "refused" }, 403);
-    if (req.method === "GET" && url.pathname === "/card-of") return json(link.cardInfo(url.searchParams.get("m") ?? ""));
-    if (req.method === "GET" && url.pathname === "/cards") return json(await link.cardsFor());
-    if (req.method !== "POST") return json({ status: "not found" }, 404);
-    const raw = await req.text();
-    if (raw.length > 16384) return json({ status: "too large" }, 413);
-    let b: any = {};
-    try { b = raw ? JSON.parse(raw) : {}; } catch { return json({ status: "not JSON" }, 400); }
-    try {
-      switch (url.pathname) {
-        case "/card": return json({ id: await link.addCard({ text: String(b.text ?? ""), rows: b.rows ?? [], kind: b.kind, expires: b.expires }) });
-        case "/buttons": await link.editButtons(Number(b.card), b.rows ?? []); return json({ status: "ok" });
-        case "/answer": await link.followup(String(b.callback ?? ""), String(b.text ?? "")); return json({ status: "ok" });
-        case "/relay": { const t = String(b.text ?? "").trim(); if (t) link.relayLine(t); return json({ status: "ok" }); }
-        case "/show": return json(await link.showCard(Number(b.id), { item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ask": return json(await link.ask({ text: String(b.text ?? ""), options: list(b.options),
-          item: b.item, question: b.question, replyTo: b.reply_to }));
-        case "/ship": return json(await link.ship({ text: String(b.text ?? ""), item: b.item, pr: b.pr, head: b.head, review: b.review, replyTo: b.reply_to }));
-        case "/answered": return json(await link.answered({ item: b.item, question: b.question }));
-        case "/replied": return json(await link.replied(b.m));
-        case "/look": return json(await link.look(b.m));
-        case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
-        case "/sent": return json(await link.sent(b, { background: true }));
-        case "/replay": return json(link.replay(b.days));
-        case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
-        case "/stopped": {
-          const st = link.stopped();
-          return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."
-            : st.at === null ? "Nothing runs: the Stop state can't be read. Tell Dane in one line, and log a Build item."
-            : `Everything has been stopped${since(st, process.env.CHECKIN_TZ)}: Dane tapped Stop. Only he can turn it back on.` });
-        }
-        case "/morning": {
-          if (list(b.options).length) throw new Refusal("the morning message asks nothing: send each decision with ask");
-          const m = await link.morningPost(String(b.text ?? ""));
-          await toHarness("/morning-posted", {});
-          return json({ status: "posted", ...m });
-        }
+    const raw = req.method === "POST" ? await boundedText(req, MAX_BODY) : "";
+    if (raw === null) return json({ status: "too large" }, 413);
+    const target = url.pathname + url.search;
+    const signKey = key(SIG_CONTEXT);
+    const id = checkRequest(req.headers.get(SIG_HEADER), signKey, req.method, target, raw);
+    if (id) {
+      signedNow();
+      const signed = (status: number, body: string) => new Response(body, { status,
+        headers: { "content-type": "application/json", [SIG_HEADER]: signResponse(signKey, id, status, body) } });
+      if (req.method !== "POST") {
+        const res = url.pathname === "/health" ? health(true) : await route(req, url, "specialist", raw);
+        return signed(res.status, await res.text());
       }
-    } catch (e) {
-      if (e instanceof Refusal) return json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400);
-      return json({ status: "error", said: String(e).slice(0, 200) }, 500);
+      // Each operation once (SignedOps): done, its stored answer; still running, the first's
+      // answer; received but never done, reconciled, never simply repeated.
+      const a = await ops.run(id, url.pathname, async () => { const res = await route(req, url, "specialist", raw, id); return { status: res.status, body: await res.text() }; });
+      if (a.status === 503 && requests.damagedSince) saveSpecialist();
+      return signed(a.status, a.body);
     }
-    return json({ status: "not found" }, 404);
+    const ip = server.requestIP(req)?.address ?? "";
+    const bare = req.headers.get("x-harness-key") ?? "";
+    const local = loopback(ip);
+    const relayKey = sameKey(bare, key("harness-relay-v1"));
+    const asked = { signed: false, relayKey, cainKey: !relayKey && sameKey(bare, cainKey()), local, path: url.pathname };
+    // The old key from anywhere but this machine is the specialist's: never taken (503, nothing
+    // done, so an old Harness keeps its card and retries), counted for the alarm.
+    if (relayKey && !local) oldKeySeen();
+    if (req.method === "GET" && url.pathname === "/health")
+      return health((relayKey && local && MODE === "old") || (asked.cainKey && local && MODE === "own"));
+    const d = linkDecides(MODE, asked);
+    if ("refuse" in d) return d.refuse === 503
+      ? json({ status: "upgrading", said: "the link takes only signed requests now" }, 503)
+      : json({ status: "refused" }, 403);
+    return route(req, url, d.caller as Caller, raw);
   },
 });
-console.log(`[cain] link listening on ${PORT}`);
+// Root's own: the broker reads the cards and says what Cain sent, and the PC job keeper checks
+// his taps and tells him what it can't do (/reuse, /pc-notice). The folder is root's.
+try { rmSync(LINK_SOCK, { force: true }); } catch { /* none */ }
+Bun.serve({ unix: LINK_SOCK, idleTimeout: 30, maxRequestBodySize: MAX_BODY, fetch: rootFetch(routeDeps, MAX_BODY) });
+try { chmodSync(LINK_SOCK, 0o600); } catch (e) { console.log(`[cain] link: couldn't close its root socket to others: ${String(e).slice(0, 80)}`); }
+
+console.log(`[cain] link listening on ${PORT} and ${LINK_SOCK}`);
+if (stateStore.lostNow())
+  link.relayLine("The link's record of cards and messages was damaged on disk (both copies) and started over, the damaged copies kept aside: buttons on cards from before now won't work, and the calendar specialist's cards from just before may need sending again (they go out as an explicit unknown, never twice). Tell Dane in one line that the Pi's storage needs a look, and keep it in PENDING until it's fixed.");
+if (requests.damagedNow)
+  link.relayLine("The link's record of what the calendar specialist asked of it is damaged on disk (both copies), so for 8 days it takes nothing new from the specialist: what the specialist sends meanwhile waits, and is dropped after 7 days, so nothing can go out twice. Tell Dane in one line that his calendar cards are paused by a storage problem on the Pi, and keep it in PENDING until it's fixed.");
 if (shipKey?.remade)
   link.relayLine("The Ship key couldn't be read, so a new one was made. Ship tokens from before it no longer count, so an install waiting on one needs a new Ship card. Nothing else to do: his next Ship tap is signed with the new key.");
 if (!deployKey)
@@ -377,3 +522,12 @@ function connect(): void {
   ws.onerror = () => {};
 }
 connect();
+// The gateway's health for the probe (probe/main.ts, Cain 0.14.0): "connected <s>" or "down <s>",
+// with when Discord last acknowledged a heartbeat (seconds), every 30 seconds. Root's, read by root.
+const GATEWAY_STATE = process.env.CAIN_LINK_GATEWAY_STATE ?? "/run/cain/link-gateway.state";
+setInterval(() => {
+  try {
+    writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
+    renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
+  } catch { /* the probe then sees an old time, and fails that layer */ }
+}, 30_000);

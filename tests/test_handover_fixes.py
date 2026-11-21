@@ -226,7 +226,7 @@ def test_a_reply_that_cant_be_repaired_is_retried_once_told_what_didnt_fit(m):
     assert len(m.claude.calls) == 2
     assert "didn't fit the allowed shapes" in m.claude.calls[1]["system"]
     assert "didn't fit" not in m.claude.calls[0]["system"]
-    assert any("running it once more by itself, from your message" in t for t in m.seen())
+    assert not any("running it once more" in t for t in m.seen())    # unannounced unless a deadline (Nov 19)
     assert out["status"] == "executed" and m.block_state("drop") == "cancelled"
 
 

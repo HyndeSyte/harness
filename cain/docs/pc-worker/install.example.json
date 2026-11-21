@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "owner_fpr": "0000000000000000000000000000000000000000000000000000000000000000",
+  "claude": "C:/Users/YOU/.local/bin/claude.exe",
+  "session_minutes": 15,
+  "unattended": false,
+  "confirm_path": false,
+  "diagnostics": false,
+  "native_host_manifest": "C:/Users/YOU/AppData/Roaming/Claude/ChromeNativeHost/com.anthropic.claude_browser_extension.json",
+  "profile": {
+    "user_data_dir": "C:/pc-worker-k7q2xz/chrome",
+    "profile_directory": "Default",
+    "profile_name": "Cain jobs",
+    "extension_id": "abcdefghijklmnopabcdefghijklmnop"
+  },
+  "other_user_data_dirs": []
+}

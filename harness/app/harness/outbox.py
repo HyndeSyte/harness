@@ -28,6 +28,9 @@ log = logging.getLogger("harness.outbox")
 
 SPACING_S = 1.1        # about one message per second
 DELAYED_AFTER_S = 600  # a reply this late says so
+# Cain's link remembers each operation 8 days (link/auth.ts KEEP_MS), so a row is never retried
+# past 7: a retry it had forgotten could be taken for a new message (C1 code review, C1-8).
+MAX_AGE_S = 7 * 24 * 3600
 
 
 def _backoff(attempts: int) -> float:
@@ -260,6 +263,13 @@ class Outbox:
             buttons = [[tuple(b) for b in r] for r in buttons]
         text = row["text"]
         written = datetime.fromisoformat(row["created_at"])
+        if (self.ledger.now() - written).total_seconds() > MAX_AGE_S:
+            with self.ledger.tx() as db:
+                db.execute("UPDATE outbox SET state='dead', last_error=? WHERE id=?",
+                           ("unsent after 7 days: dropped, never retried as new", row["id"]))
+                self.ledger.event("delivery_expired", {"outbox": row["id"], "kind": row["kind"]}, db=db)
+            log.warning("message %s unsent after 7 days: dropped", row["id"])
+            return False
         if (self.ledger.now() - written).total_seconds() > DELAYED_AFTER_S and \
                 row["kind"] != "digest":
             # He should know this isn't fresh: say when it was written.
@@ -272,7 +282,10 @@ class Outbox:
             # usual (the fence is engaged and lifted only on the controller's thread, which also runs this).
             return False
         try:
-            mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds))
+            # One operation, one id at the link across every retry, though the text may gain its
+            # "Delayed" line: the row and when it was written (unique even if the database is new).
+            mid = self._deliver(row["chat_id"], text, buttons, row["kind"], self._expires(binds),
+                                op=f"outbox-{row['id']}-{row['created_at']}")
         except ChatError as e:
             labels = refused_labels(e)
             if not labels:
@@ -373,8 +386,10 @@ class Outbox:
         return max(ends).isoformat() if ends else None
 
     def _deliver(self, chat_id: int, text: str, buttons, kind: str | None = None,
-                 expires: str | None = None) -> int:
+                 expires: str | None = None, op: str | None = None) -> int:
         lapse = {"expires": expires} if expires else {}
+        if op:
+            lapse["op"] = op
         try:
             return self.api.send_message(chat_id, text, buttons, kind=kind, **lapse)
         except ChatError as e:
@@ -383,6 +398,9 @@ class Outbox:
             if e.code == 400 and "parse" in e.description.lower():
                 if not self.ledger.fenced:
                     self.ledger.event("html_fallback", {"error": e.description[:100]})
+                # The plain retry is its own operation: the first one's refusal is its answer.
+                if op:
+                    lapse["op"] = op + "-plain"
                 return self.api.send_message(chat_id, _plain(text), buttons, html=False, kind=kind, **lapse)
             raise
 

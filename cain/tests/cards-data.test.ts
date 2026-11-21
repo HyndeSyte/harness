@@ -3,19 +3,22 @@
 // message back from Discord; the cards are published for the reply hook without text;
 // and each send point logs what the gate's rules would have done, changing nothing.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, Refusal, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
+import { CONNECTOR_LABEL, CONNECTOR_URL, cardsView, RESUME, SAID_MAX, STOP, withoutOutcome } from "../rootfs/opt/cain/link/core";
 import { CardsWriter, publishCards, readTranscripts, seedReplies, stateFile } from "../rootfs/opt/cain/link/publish";
-import { appendGate, GATE_LOG } from "../rootfs/opt/cain/gate/log";
+import { KEEP_MS, RequestLog, SignedOps, writeSynced } from "../rootfs/opt/cain/link/auth";
 import { DAY, DM, HOUR, MIN, PR, rig, SHA1 } from "./link-rig";
+
+// Transcripts are read only if they are files of Cain's user (C1); here, the test's own.
+process.env.CAIN_TRANSCRIPT_UID = String(typeof process.getuid === "function" ? process.getuid() : 0);
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 // A receipt for something the specialist did, as the Harness builds it.
-const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm1"), btn("Wrong time", "k:c:wt1"), btn("Not this time", "k:c:jo1")] },
+const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm1"), btn("Wrong time", "k:c:wt1"), btn("Just this once", "k:c:jo1")] },
   { type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
-const RECEIPT = ["Not mine", "Wrong time", "Not this time", "Stop"];
+const RECEIPT = ["Not mine", "Wrong time", "Just this once", "Stop"];
 const UNDO_ROWS = [{ type: 1, components: [btn("Undo", "k:c:u1")] }, { type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
 
 async function receipt(r: ReturnType<typeof rig>, text = "Added Swim to your Gmail.", rows = RECEIPT_ROWS, expires?: number) {
@@ -84,13 +87,13 @@ describe("Cain's lines name a card's buttons", () => {
   test("the card's first line, and the line when it went out by itself", async () => {
     const r = rig();
     await r.link.addCard({ text: "Added Swim to your Gmail.", rows: RECEIPT_ROWS, kind: "card" });
-    expect(r.relayed[0]).toContain("Its buttons: Not mine, Wrong time, Not this time, Stop.");
+    expect(r.relayed[0]).toContain("Its buttons: Not mine, Wrong time, Just this once, Stop.");
     await r.link.addCard({ text: "Today: Swim at 4:30.", rows: [], kind: "digest" });
     expect(r.relayed[1]).toContain("It has no buttons.");
     r.later(3 * MIN);
     await r.link.sweep();
     const line = r.relayed.find((l) => l.includes("went out to him by itself"))!;
-    expect(line).toContain("Its buttons: Not mine, Wrong time, Not this time, Stop.");
+    expect(line).toContain("Its buttons: Not mine, Wrong time, Just this once, Stop.");
   });
 });
 
@@ -164,13 +167,13 @@ describe("the cards, published for the reply hook", () => {
     expect(v.sent).not.toContain(old);
   });
 
-  test("written whole through a rename, readable by all", async () => {
+  test("written whole through a rename, root:cain 0640 (Cain 0.15.0: his session reads it; pinned.ts)", async () => {
     const r = rig();
     const dir = mkdtempSync(join(tmpdir(), "cards-"));
     const path = join(dir, "trust", "cards.json");
     await publishCards(r.state(), 5, path);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ written_at: 5, owner: null, dm: null, cards: [], sent: [] });
-    if (process.platform !== "win32") expect((statSync(path).mode & 0o777).toString(8)).toBe("644");
+    if (process.platform !== "win32") expect((statSync(path).mode & 0o777).toString(8)).toBe("640");
   });
 
   test("a save never writes them; one write shortly after carries the latest state", async () => {
@@ -195,8 +198,114 @@ describe("the cards, published for the reply hook", () => {
     expect(JSON.parse(readFileSync(cardsPath, "utf8")).owner).toBe("4444");
   });
 
+  test("the link's state on disk: two copies, the newer read; one damaged loses nothing; both damaged kept aside, never quietly a fresh store (C1 re-check N2)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    const store = stateFile(p);
+    const s = { ...rig().state(), owner: "4242" };
+    store.save(s);
+    expect(JSON.parse(readFileSync(`${p}.2`, "utf8")).owner).toBe("4242");
+    store.save({ ...s, owner: "4343" });
+    writeFileSync(p, "{not json");                                       // the first copy damaged
+    expect(stateFile(p).load().owner).toBe("4343");
+    const behind = JSON.stringify({ ...s, owner: "old", saveGen: 1 });
+    writeFileSync(p, behind);                                            // the first copy a save behind
+    expect(stateFile(p).load().owner).toBe("4343");
+    writeFileSync(`${p}.2`, "{oops");
+    const fresh = stateFile(p);
+    expect([fresh.load().owner, fresh.lost()]).toEqual(["old", 0]);
+    writeFileSync(p, "{oops");                                           // both damaged
+    let t = 1_800_000_000_000;
+    const lost = stateFile(p, () => {}, undefined, () => t);
+    const got = lost.load();
+    expect([got.owner, Object.keys(got.cards).length, lost.lost(), lost.lostNow()]).toEqual([undefined, 0, t, true]);
+    expect(readdirSync(dir).filter((f) => f.includes(".damaged-")).length).toBe(2);
+    lost.save(got);
+    t += KEEP_MS - 1;
+    const after = stateFile(p, () => {}, undefined, () => t);
+    expect([after.lost(), after.lostNow()]).toEqual([1_800_000_000_000, false]);         // a restart remembers, told once
+    t += 2;
+    expect(stateFile(p, () => {}, undefined, () => t).lost()).toBe(0);                    // until it can't matter
+  });
+
+  test("a loss is recorded before the damaged copies move, and a crash between the two still counts as a loss (C1 re-check B1)", () => {
+    const damaged = () => {
+      const dir = mkdtempSync(join(tmpdir(), "state-"));
+      const p = join(dir, "state.json");
+      writeFileSync(p, "{oops"); writeFileSync(`${p}.2`, "{oops");
+      return { dir, p };
+    };
+    // The marker can't be written: nothing moves, nothing passes for a fresh store, and a later
+    // start that can write it records the loss.
+    let { dir, p } = damaged();
+    const refusing = stateFile(p, () => {}, (path, body) => { if (path.endsWith(".lost")) throw new Error("EIO"); writeFileSync(path, body); });
+    expect(() => refusing.load()).toThrow("EIO");
+    expect([readdirSync(dir).sort(), refusing.lost()]).toEqual([["state.json", "state.json.2"], 0]);
+    const later = stateFile(p);
+    later.load();
+    expect([later.lost() > 0, later.lostNow(), existsSync(`${p}.lost`)]).toEqual([true, true, true]);
+    // Killed after the marker, before the copies moved: the next start finds both, records the
+    // loss again at its own time (later: safe), moves them, and says it found them.
+    ({ dir, p } = damaged());
+    const t0 = Date.now() - 60_000;
+    writeFileSync(`${p}.lost`, String(t0));
+    const resumed = stateFile(p);
+    resumed.load();
+    const t1 = resumed.lost();
+    expect([t1 > t0, resumed.lostNow(), readdirSync(dir).filter((f) => f.includes(`.damaged-${t1}`)).length]).toEqual([true, true, 2]);
+    // A marker that doesn't hold a time, or can't be read, counts as a loss now.
+    ({ dir, p } = damaged());
+    writeFileSync(`${p}.lost`, "garbage");
+    expect(stateFile(p).lost() > 0).toBe(true);
+    ({ dir, p } = damaged());
+    mkdirSync(`${p}.lost`);
+    expect(stateFile(p).lost() > 0).toBe(true);
+  });
+
+  test("a second loss before the first's window ends covers the cards made in between: their answers are the explicit unknown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    let t = 1_800_000_000_000;
+    const damage = () => { writeFileSync(p, "{oops"); writeFileSync(`${p}.2`, "{oops"); };
+    const clock = () => t;
+    stateFile(p, () => {}, undefined, clock).save(rig().state());
+    damage();
+    let store = stateFile(p, () => {}, undefined, clock);
+    store.load();                                                        // the first loss
+    expect(store.lost()).toBe(1_800_000_000_000);
+    const ops = (st: { lost(): number }) => new SignedOps(new RequestLog(join(dir, "requests.json"), t), clock, undefined,
+      (path, s) => path === "/card" && s.status === 200 && st.lost() > 0 && s.at <= st.lost());
+    t += 12 * HOUR;
+    store.save(store.load());                                            // the link goes on
+    const CARD = "e".repeat(32);
+    let runs = 0;
+    const act = async () => { runs++; return { status: 200, body: '{"id":99}' }; };
+    expect((await ops(store).run(CARD, "/card", act)).status).toBe(200);  // a card made after the first loss
+    t += 12 * HOUR;
+    damage();
+    store = stateFile(p, () => {}, undefined, clock);
+    store.load();                                                        // the second, within the first's 8 days
+    expect(store.lost()).toBe(t);
+    const a = await ops(store).run(CARD, "/card", act);
+    expect([a.status, JSON.parse(a.body).status, runs]).toEqual([409, "unknown", 1]);
+  });
+
+  test("a save that couldn't be made durable throws, and the next read takes the newer copy, not a stale first one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "state-"));
+    const p = join(dir, "state.json");
+    let failFirst = false;
+    const write = (path: string, body: string) => { if (failFirst && path === p) throw new Error("EIO"); writeFileSync(path, body); };
+    const store = stateFile(p, () => {}, write);
+    const s = rig().state();
+    store.save({ ...s, owner: "1" });
+    failFirst = true;
+    expect(() => store.save({ ...s, owner: "2" })).toThrow("EIO");       // the second copy has it, the first doesn't
+    expect(store.load().owner).toBe("2");
+    expect(() => stateFile(p, () => {}, (_p, _b) => writeSynced(_p, _b, () => { throw new Error("EIO: folder"); })).save(s)).toThrow("folder");
+  });
+
   test("the link asks for a write after each save and each sweep, and answers /cards itself", () => {
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     expect(main).toContain("const stateStore = stateFile(STATE, () => cards.soon());");
     expect(main).toContain("function save(s: State): void { stateStore.save(s); }");
     expect(main).toContain("finally { cards.soon(); setTimeout(sweepLoop, SWEEP_MS); }");
@@ -277,7 +386,7 @@ describe("the gate at the link's send points", () => {
       "name each one instead of a count", "\"Undo\" isn't one of its buttons (Yes, No)"]) expect(said).toContain(why);
     expect(said).toEndWith(". Rewrite it and send it again.");
     expect(r.posts()).toBe(0);
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     expect(main).toContain('json({ status: "refused", said: e.message.slice(0, SAID_MAX) }, 400)');
   });
 
@@ -300,7 +409,7 @@ describe("the gate at the link's send points", () => {
     expect(r.last().content).toBe("## Thu Nov 12\n• The App restarts at 4:30");
   });
 
-  test("a specialist card naming a button it lacks only in passing is posted as it is: the dash fixed, logged, and Cain told once", async () => {
+  test("a specialist card naming a button it lacks is never refused: posted as it is, logged, and Cain told once", async () => {
     const r = rig();
     const card = await r.link.addCard({ text: "Three blocks added — each on its own card with Undo.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
     expect(r.relayed.at(-1)).toContain('The message gate flags its words: "Undo" isn\'t one of its buttons. It goes out as it is');
@@ -309,29 +418,6 @@ describe("the gate at the link's send points", () => {
     expect(r.state().cards[String(card)].text).toBe("Three blocks added, each on its own card with Undo.");
     expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "posted as it is", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
     expect(r.relayed.filter((l) => l.includes("flags its words"))).toHaveLength(1);
-  });
-
-  test("a specialist card telling him to tap a button it lacks is refused: nothing posted, logged as refused, and Cain told once", async () => {
-    const r = rig();
-    const before = Object.keys(r.state().cards).length;
-    let refused: unknown = null;
-    try {
-      await r.link.addCard({ text: "Three blocks added — tap Undo on each card.", rows: [{ type: 1, components: [btn("Stop", STOP)] }], kind: "digest" });
-    } catch (e) { refused = e; }
-    expect(refused).toBeInstanceOf(Refusal);
-    expect((refused as Error).message).toBe('the card names "Undo", which it doesn\'t carry');
-    expect(Object.keys(r.state().cards)).toHaveLength(before);                 // nothing kept, nothing to show
-    expect(r.posts()).toBe(0);
-    expect(r.reports).toMatchObject([{ point: "card", writer: "specialist", did: "refused", hits: [{ rule: "dash" }, { rule: "button", label: "Undo" }] }]);
-    expect(r.relayed.filter((l) => l.includes("the link refused it"))).toHaveLength(1);
-  });
-
-  test("a specialist card naming a button it carries, or a relist card naming none, goes out", async () => {
-    const r = rig();
-    const card = await r.link.addCard({ text: "Undone? Tap Undo to take it off.", rows: [{ type: 1, components: [btn("Undo", "k:c:abc")] }], kind: "card" });
-    expect(r.state().cards[String(card)]).toBeDefined();
-    const plain = await r.link.addCard({ text: "A tap of yours (time unknown). It was on your calendar and has since been taken off, so it isn't done again and there's no Go ahead.", rows: [], kind: "card" });
-    expect(r.state().cards[String(plain)]).toBeDefined();
   });
 
   test("the specialist's numbers aren't checked as machine text; its notes after a tap get only the fixes", async () => {
@@ -393,61 +479,6 @@ describe("the gate at the link's send points", () => {
   });
 });
 
-// A tap of his from before a restore comes back on a card; Go ahead only where it's safe. One
-// whose change was since taken off his calendar says so, with no buttons, while another card's
-// Go ahead is up. Only telling him to use a button the card lacks refuses it.
-describe("a specialist card that mentions a live card's button", () => {
-  const GO = [{ type: 1, components: [btn("Go ahead", "k:c:ga1")] }];
-  const TAKEN_OFF = "A tap of yours from Mon 3:00 PM. Harness can't tell whether it was carried out. It was on your calendar and has since been taken off, so it isn't done again.";
-  const withGoAhead = async (r: ReturnType<typeof rig>) => {
-    const id = await r.link.show(await r.link.addCard({ text: "A tap of yours from Mon 2:00 PM was not carried out. Go ahead does it now.", rows: GO, kind: "card" }), { item: "none" });
-    expect(r.buttons(id)).toEqual(["Go ahead"]);                         // live: its label is known
-    return id;
-  };
-
-  test("a buttonless card that says there's no Go ahead, or names none, goes out while a Go ahead card is live", async () => {
-    const r = rig();
-    await withGoAhead(r);
-    for (const text of [TAKEN_OFF, TAKEN_OFF.replace(/\.$/, " and there's no Go ahead.")]) {
-      const card = await r.link.addCard({ text, rows: [], kind: "card" });
-      const id = await r.link.show(card, { item: "none" });
-      expect(r.msg(id).content).toBe(text);
-      expect(r.state().cards[String(card)].text).toBe(text);
-    }
-    expect(r.reports.filter((x) => x.did === "refused")).toEqual([]);
-    expect(r.relayed.filter((l) => l.includes("the link refused it"))).toEqual([]);
-  });
-
-  test("a buttonless card telling him to tap Go ahead is refused and logged; the specialist's fallback without that sentence goes out", async () => {
-    const r = rig();
-    await withGoAhead(r);
-    const posts = r.posts();
-    const told = `${TAKEN_OFF.replace(" It was on your calendar and has since been taken off, so it isn't done again.", "")} Tap Go ahead to do it now.`;
-    let refused: unknown = null;
-    try { await r.link.addCard({ text: told, rows: [], kind: "card" }); } catch (e) { refused = e; }
-    expect(refused).toBeInstanceOf(Refusal);
-    expect((refused as Error).message).toBe('the card names "Go ahead", which it doesn\'t carry');
-    expect([...(refused as Error).message.matchAll(/"([^"]+)"/g)].map((m) => m[1])).toEqual(["Go ahead"]);   // what the specialist parses
-    expect(r.posts()).toBe(posts);
-    // The gate's report holds the refusal, so the relay's "logged for a fix" is true.
-    const entry = r.reports.find((x) => x.did === "refused");
-    expect(entry).toMatchObject({ point: "card", writer: "specialist", did: "refused", hits: [{ rule: "button", result: "refuse", label: "Go ahead" }] });
-    expect(r.relayed.filter((l) => l.includes("the link refused it"))).toEqual([
-      'The calendar specialist sent a card naming "Go ahead", which isn\'t on it, so the link refused it and nothing went to him. Nothing to tell him; it\'s logged for a fix.']);
-    // In production the link's report goes to the gate's log file, one JSON line per entry.
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
-    expect(main).toContain("report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX");
-    expect(GATE_LOG).toBe("/data/work/gate-report.jsonl");
-    const log = join(mkdtempSync(join(tmpdir(), "gate-log-")), "gate-report.jsonl");
-    await appendGate({ at: r.t.now, ...entry }, log);
-    expect(JSON.parse(readFileSync(log, "utf8").trim())).toMatchObject({ point: "card", writer: "specialist", did: "refused" });
-    // The specialist's fallback: the same words with that sentence taken off, no buttons.
-    const fallback = told.replace(" Tap Go ahead to do it now.", "");
-    const card = await r.link.addCard({ text: fallback, rows: [], kind: "card" });
-    expect(r.msg(await r.link.show(card, { item: "none" })).content).toBe(fallback);
-  });
-});
-
 describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
   test("his ids go on his edit allowlist, each part of a reply; an edit only updates whether it asks something", async () => {
     const r = rig();
@@ -498,7 +529,7 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     expect(Object.keys(r.state().sent!).sort()).toEqual([reply, part1, part2].sort());
     expect(cardsView(r.state(), r.t.now).sent).not.toContain(edited);
     // The link's start and its 6-hourly pass seed through this, and nothing else.
-    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
+    const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8") + readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/http.ts"), "utf8");   // its routes are in http.ts
     expect(main).toContain("const n = await seedReplies(link, TRANSCRIPTS,");
     expect(main).not.toContain("seedSent(");
   });
@@ -557,6 +588,23 @@ describe("what Cain sent, from the PostToolUse hook (/sent)", () => {
     const said = r.relayed.length;
     await r.link.sent(note);                                               // the hook's retry of the same note
     expect(r.relayed.length).toBe(said);
+  });
+});
+
+describe("the broker's record of what went out (C1 re-check R5)", () => {
+  test("a problem with it reaches Cain, at most every 6 hours", async () => {
+    const r = rig();
+    const told = () => r.relayed.filter((x) => x.startsWith("The Discord broker says")).length;
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false });
+    expect(told()).toBe(0);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the broker couldn't keep its record of a message that went out (ENOSPC)" });
+    expect(told()).toBe(1);
+    expect(r.relayed.at(-1)).toContain("ENOSPC");
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the same again" });
+    expect(told()).toBe(1);
+    r.later(7 * HOUR);
+    await r.link.sent({ tool: "reply", ids: [r.snowflake()], question: false, spool_problem: "the same again" });
+    expect(told()).toBe(2);
   });
 });
 

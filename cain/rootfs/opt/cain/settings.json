@@ -9,6 +9,8 @@
       "Bash(/opt/cain/record.sh:*)",
       "Bash(/opt/cain/review.sh)",
       "Bash(/opt/cain/review.sh:*)",
+      "Bash(/opt/cain/pcjobs.sh)",
+      "Bash(/opt/cain/pcjobs.sh:*)",
       "mcp__plugin_discord_discord__download_attachment",
       "mcp__plugin_discord_discord__fetch_messages"
     ],
@@ -31,9 +33,39 @@
       "mcp__claude_ai_GitHub__delete_file",
       "mcp__claude_ai_GitHub__create_branch",
       "mcp__claude_ai_GitHub__merge_pull_request",
+      "mcp__claude_ai_Microsoft_365__outlook_send_mail",
+      "mcp__claude_ai_Microsoft_365__outlook_send_draft",
+      "mcp__claude_ai_Microsoft_365__outlook_forward_mail",
+      "mcp__claude_ai_Microsoft_365__outlook_create_draft",
+      "mcp__claude_ai_Microsoft_365__outlook_create_reply_draft",
+      "mcp__claude_ai_Microsoft_365__outlook_create_reply_all_draft",
+      "mcp__claude_ai_Microsoft_365__outlook_update_draft",
+      "mcp__claude_ai_Microsoft_365__outlook_delete_draft",
+      "mcp__claude_ai_Microsoft_365__outlook_create_event",
+      "mcp__claude_ai_Microsoft_365__outlook_update_event",
+      "mcp__claude_ai_Microsoft_365__outlook_delete_event",
+      "mcp__claude_ai_Microsoft_365__outlook_respond_to_event",
+      "mcp__claude_ai_Microsoft_365__outlook_batch_delete_messages",
+      "mcp__claude_ai_Microsoft_365__outlook_trash_thread",
+      "mcp__claude_ai_Microsoft_365__outlook_untrash_thread",
+      "mcp__claude_ai_Microsoft_365__outlook_batch_modify_labels",
+      "mcp__claude_ai_Microsoft_365__outlook_modify_labels",
+      "mcp__claude_ai_Microsoft_365__outlook_modify_thread_labels",
+      "mcp__claude_ai_Microsoft_365__outlook_create_label",
+      "mcp__claude_ai_Microsoft_365__outlook_update_label",
+      "mcp__claude_ai_Microsoft_365__outlook_delete_label",
+      "mcp__claude_ai_Microsoft_365__outlook_create_filter",
+      "mcp__claude_ai_Microsoft_365__outlook_delete_filter",
+      "mcp__claude_ai_Microsoft_365__outlook_set_vacation",
+      "mcp__claude_ai_Microsoft_365__sharepoint_upload_file",
+      "mcp__claude_ai_Microsoft_365__sharepoint_update_file",
+      "mcp__claude_ai_Microsoft_365__sharepoint_create_folder",
+      "mcp__claude_ai_Microsoft_365__sharepoint_copy_item",
+      "mcp__claude_ai_Microsoft_365__sharepoint_move_item",
+      "mcp__claude_ai_Microsoft_365__sharepoint_rename_item",
+      "mcp__claude_ai_Microsoft_365__sharepoint_delete_item",
+      "mcp__claude_ai_Microsoft_365__teams_create_chat",
       "Read(//data/options.json)",
-      "Read(//data/.claude/channels/discord/.env)",
-      "Edit(//data/.claude/channels/discord/.env)",
       "Read(//data/link/**)",
       "Edit(//data/link/**)",
       "Edit(//data/trust/**)",
@@ -42,53 +74,38 @@
       "Edit(//data/review-queue/**)",
       "Edit(//data/review-spend.json)",
       "Edit(//data/record-holds.json)",
-      "Edit(//data/record-holds.json.next)"
-    ]
+      "Edit(//data/record-holds.json.next)",
+      "Edit(//etc/claude-code/**)",
+      "Edit(//data/pc-jobs/**)",
+      "Edit(//data/pc-jobs-outcomes/**)",
+      "Edit(//data/pc-jobs-reuse-used.jsonl*)"
+    ],
+    "disableBypassPermissionsMode": "disable"
   },
+  "allowManagedHooksOnly": true,
+  "allowManagedPermissionRulesOnly": true,
+  "disableSideloadFlags": true,
+  "strictPluginOnlyCustomization": ["mcp", "hooks"],
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [
+    { "serverCommand": ["/usr/local/bin/bun", "/opt/cain/discord/bridge.ts"] },
+    { "serverUrl": "https://*" }
+  ],
+  "strictKnownMarketplaces": [
+    { "source": "github", "repo": "anthropics/claude-plugins-official" }
+  ],
+  "enabledPlugins": {
+    "discord@claude-plugins-official": true
+  },
+  "syncClaudeAiPlugins": false,
+  "skillOverrides": { "auto-mode-setup": "off" },
+  "promptSuggestionEnabled": false,
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "RemoteTrigger",
         "hooks": [
           { "type": "command", "command": "bun /opt/cain/hooks/remote-trigger.ts || exit 2", "timeout": 15, "onFailure": "block" }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__download_attachment",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__fetch_messages",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-read.ts || exit 2", "timeout": 15, "onFailure": "block" }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__reply",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__edit_message",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-send.ts || true", "timeout": 5 }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "mcp__plugin_discord_discord__reply",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-sent.ts || true", "timeout": 15, "async": true }
-        ]
-      },
-      {
-        "matcher": "mcp__plugin_discord_discord__edit_message",
-        "hooks": [
-          { "type": "command", "command": "bun /opt/cain/hooks/discord-sent.ts || true", "timeout": 15, "async": true }
         ]
       }
     ]

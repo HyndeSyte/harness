@@ -60,7 +60,9 @@
 // - Ship cards built from GitHub and the review service (0.11.0): the question names each
 //   App and version the tap installs, a line from GitHub has the pull request's title, how
 //   much it changes, the parts that matter most and its checks (read as the landing reads
-//   them: a failed check, or one not run yet, refuses the card; merged at that head, it's in
+//   them: a failed check, or one not run yet, refuses the card, and pcjobs-windows, whenever
+//   the head's tests.yml names it or it ran there, refuses it unless every run of it GitHub
+//   lists for that very head passed (merge.ts judgeChecks); merged at that head, it's in
 //   main already), and the last line is the review service's own for the review Cain names,
 //   which must be a review of that very head. Cain's words say only what Dane will notice, on
 //   one line. Anything going wrong while the new lines are built gives the card as it was
@@ -82,17 +84,30 @@ import { createHash } from "node:crypto";
 import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
-import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, imperative, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
+import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
+import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
+import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
+import type { DecisionRec, Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
-import { judgeChecks, type Facts, type Landed } from "./merge";
+import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
 export const EXPIRED_TAP = "This card expired; nothing was done.";
+// His tap on the review cap's decision card that couldn't be kept (0.16.0, round 2): to him alone, the card stays up.
+export const DECISION_UNSAVED = "Your answer couldn't be saved, so nothing was decided yet. The card is still up: tap your answer again.";
 export const EXPIRED = "Expired";
+// The one card gate (round 3): asks, Ship cards, the review cap's decision card and a usage-guard hold's
+// description all go through cainWords with this rule set, the same object, never a copied list.
+export const CARD_RULES = AT.cain;
+// The guard-hold route's bounds (round 3): calls a minute per caller, and how long an identical refusal
+// (label and description) is logged once.
+export const HOLDS_PER_MINUTE = 6;
+export const HOLD_DEDUPE_MS = 10 * 60_000;
+export const HOLD_ALARM_QUIET_MS = 3_600_000;
 export const REPLACED = "Replaced by a newer card";
 const COMPONENT = 3;
 const ACK = 6;
@@ -102,6 +117,8 @@ const REMEMBER_MS = 35 * 86400_000;
 const DAY = 86400_000;
 const HOUR = 3_600_000;
 const FACTS_MS = 6_000;                  // how long a Ship card waits for GitHub (its facts and checks, asked at once) before it says it couldn't read them
+// 0.12.2: the card's wait for the gate's head read ran out (an abort at its time limit), named as the gate's state unknown.
+export const GATE_HEAD_TIMED_OUT = "the read of the pull request's head from GitHub was stopped at its time limit (a timeout)";
 const SETTLE_MS = 10 * 60_000;           // a message younger than this may still be on its way into the state
 const HEAD_EVERY_MS = 5 * 60_000;        // how often a Ship card's pull request is looked at
 const LANDING_STALE_MS = 5 * 60_000;     // a landing still unsettled this long after his tap was cut off (a restart)
@@ -112,6 +129,57 @@ const STOPPED_FIRST: Landed = { ok: false, why: "his Stop came first", again: fa
 const HISTORY_PAGES = 5;                 // the one-time look over his DM: up to 500 messages back
 const ASK_GRACE_MS = 2 * 3_600_000;      // an ask lives until the first morning check-in at least this far off
 const SHOW_WAIT_MS = 2 * 60_000;         // a card with buttons Cain hasn't shown by then goes out by itself
+// The PC job keeper's lines to him (pcjobs/main.ts tell): each names what happened and the fix,
+// with its Troubleshooting row in cain/docs/pc-jobs.md.
+export const PC_NOTICES: Record<string, string> = {
+  reuse_migrated: "Your PC job keeper counted a tap of yours approving a reused value as used: an older version wrote it down without the record that could show whether its job reached your PC. If you still want that check, Cain asks you again.",
+  reuse_shallow: "Your PC job keeper can't settle a tap of yours approving a reused value, because its copy of the PC job queue is shallow. Fix: delete the pc-jobs folder in the Cain App's data and restart the App (pc-jobs.md, Troubleshooting). Other PC jobs go on, and the tap stays used meanwhile.",
+  queue_branch_missing: "Your PC job keeper stopped: the PC job queue's main branch is missing on GitHub while a tap of yours approving a reused value waits to be settled. Fix: restore the main branch in the pc-jobs repository (pc-jobs.md, Troubleshooting). The keeper goes on by itself once it is back.",
+  queue_empty_pending: "Your PC job keeper stopped: the PC job queue on GitHub is empty while a tap of yours approving a reused value waits to be settled. Fix: give the queue its first commit again, as in setup step 2 (pc-jobs.md, Troubleshooting); the tap then counts as used.",
+  reuse_store_unreadable: "Your PC job keeper can't read its record of the taps you spent on reused values, so it takes no job that reuses a value until it can. Other PC jobs go on. Fix: see the store row in pc-jobs.md, Troubleshooting.",
+  reuse_unsettled: "Your PC job keeper can't tell whether a job made from a tap of yours approving a reused value reached your PC: git gave no clear answer. The tap stays used, other PC jobs go on, and it tries again each round. If it lasts, see pc-jobs.md, Troubleshooting.",
+  reuse_push_refused: "A PC job made from a tap of yours approving a reused value didn't reach your PC's queue: GitHub refused it three times. The tap stays used for now and is settled at the keeper's next round with a successful fetch from GitHub (within a minute while GitHub answers), once that fetch shows none of it arrived; then the job is queued again by itself. If it keeps being refused, check the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  reuse_record_unreadable: "Your PC job keeper has tried for three rounds to settle a tap of yours approving a reused value, written by an older version, but a file in its copy of the PC job queue can't be read. The tap stays used and other PC jobs go on. Fix: see the reuse_record_unreadable row in pc-jobs.md, Troubleshooting.",
+  reuse_fetch_failed: "Your PC job keeper has tried for three rounds to settle a tap of yours whose job GitHub refused three times, but it couldn't fetch the PC job queue from GitHub. The tap stays used until a round's fetch succeeds. Fix: see the reuse_fetch_failed row in pc-jobs.md, Troubleshooting (usually the network or the pc_jobs_token option).",
+  hold_clear_unrecorded: "Your PC isn't taking jobs: its worker couldn't write its record of clearing a version hold (version-hold-cleared.json in the worker folder), so the hold stays. At the PC: free disk space or fix the worker folder's permissions so that file can be written, then start a run (pc-jobs.md, Troubleshooting).",
+  worker_start_refused: "Your PC isn't taking jobs: its worker refused to start because a setting meant only for its tests is set where it runs (the PC_WORKER_TEST_BUILD variable, or a preload, require, import or loader flag in NODE_OPTIONS or BUN_OPTIONS, or a bunfig.toml preload). At the PC: remove it as the worker's own refusal says, open a new terminal, then start a run (pc-jobs.md, Troubleshooting).",
+  worker_not_starting: "Jobs are waiting for your PC, or one ran out of time waiting, and its worker hasn't been heard from while they waited. If it was started and nothing happened, a setting on the PC may be stopping it before it can start or say why, such as a preload in BUN_OPTIONS or NODE_OPTIONS set in Windows' environment settings. At the PC: follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  // 0.12.2, third pass: the same condition, seen in the keeper's copy while the queue couldn't be reached for hours.
+  worker_not_starting_unconfirmed: "Jobs have been waiting for your PC and its worker hasn't been heard from, but this isn't confirmed: your PC job keeper hasn't been able to read the PC job queue reliably for hours, so its copy of the PC's last check-in may just be old. If the worker was started and nothing happened, follow the worker-not-starting row in pc-jobs.md, Troubleshooting.",
+  queue_unreachable: "Your PC job keeper hasn't been able to reach the PC job queue on GitHub for about half an hour, so new PC jobs wait and results don't come back. It keeps trying by itself. If it lasts, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  // 0.12.2: the same, raised again within a day of it clearing.
+  queue_unreachable_again: "Your PC job keeper can't reach the PC job queue on GitHub again, within a day of it coming back, so new PC jobs wait and results don't come back. It keeps trying by itself. If it keeps happening, the usual causes are the Pi's network or the pc_jobs_token option (pc-jobs.md, Troubleshooting).",
+  notice_undelivered: "Your PC job keeper had an earlier notice for you that could not be delivered, and after its update it can no longer say which one. If something about PC jobs seems stuck, see pc-jobs.md, Troubleshooting; Cain can read the keeper's log.",
+};
+export const PC_NOTICE_REPEAT = "Said again, in case it didn't reach you before:";
+// A code the keeper sends that this link has no words for (a keeper ahead of the link).
+export const PC_NOTICE_CODE = /^[a-z][a-z0-9_]{0,39}$/;
+export const PC_NOTICE_ID = /^[0-9a-f]{16,64}$/;
+export const PC_JOB_ID = /^j-\d{8}-[a-z0-9]{6}$/;
+// A PC job as the owner's line names it (0.12.0, twenty-second round): by what it does, its site and action
+// (the queue's own shapes), never by its queue id.
+const PC_SITE = /^(?=.{3,100}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+const PC_ACTION = /^[a-z][a-z0-9_]{2,39}$/;
+export const pcJobWords = (j: { site: string; action: string }) => `the job to ${j.action.replace(/_/g, " ")} on ${j.site}`;
+// A job the keeper can't name by its site and action (twenty-third round): by a time, in words, never an id.
+// Twenty-fifth round: the time is when the keeper saw the job (its record of it, or the moment it was handed the
+// job in a shape it couldn't read), not when the owner's request was queued, so it is worded "a PC browser job
+// seen by the keeper at Nov 15, 2:05 PM" ("seen by the keeper on Nov 15" when only the day is known). The
+// structured field keeps its name (queued).
+export const PC_QUEUED = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z)?$/;
+export function pcQueuedWords(queued: string, tz = "America/New_York"): string | null {
+  if (!PC_QUEUED.test(queued)) return null;
+  const day = queued.length === 10;
+  const t = Date.parse(day ? `${queued}T12:00:00Z` : queued);
+  if (!Number.isFinite(t)) return null;
+  const f = (o: Intl.DateTimeFormatOptions) => { try { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: day ? "UTC" : tz }).format(t); } catch { return new Intl.DateTimeFormat("en-US", { ...o, timeZone: "UTC" }).format(t); } };
+  return day ? `a PC browser job seen by the keeper on ${f({ month: "short", day: "numeric" })}` : `a PC browser job seen by the keeper at ${f({ month: "short", day: "numeric" })}, ${f({ hour: "numeric", minute: "2-digit" })}`;
+}
+// The notice ids the link remembers having posted (twenty-eighth round: by age, PC_NOTICE_RETAIN_MS, the keeper's
+// NOTICE_DEDUP_MS; PC_NOTICE_KEEP only bounds the store's size, far above what the keeper sends in that time).
+export const PC_NOTICE_RETAIN_MS = 30 * DAY;
+const PC_NOTICE_KEEP = 5_000;
+export const pcNoticeUnknown = (code: string) => `Your PC job keeper reported a stop condition the App does not know, code ${code}, see troubleshooting in pc-jobs.md.`;
 export const CONNECTOR_URL = "https://claude.ai/customize/connectors";   // Claude's Connectors page, where one is signed in again
 export const CONNECTOR_LABEL = "Open connector settings";
 const CONNECTOR_ONCE_MS = 12 * 3_600_000;  // one notice about the connector per item in this long
@@ -129,7 +197,7 @@ const MOVED = "stop moved";              // a message's Stop moved on: its butto
 const REPOSTED = "moved down";           // an older Stopped notice, once a newer one carries Turn back on
 export const STILL_STOPPED = "**Still stopped.** Cain's Build and Ship jobs, Ship cards and outside reviews stay stopped, and nothing lands in main, until you tap Turn back on.";
 // Machine text he never sees on a card: a full sha, a job's session id, an ISO time.
-const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"],
+const MACHINE: [RegExp, string][] = [[/\b[0-9a-f]{40}\b/i, "a commit sha"], [/\bcse_[A-Za-z0-9]/, "a job id"], [/\bj-\d{8}-[a-z0-9]{6}\b/, "a PC job id"],
   [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/, "an ISO time"]];
 const LIMIT = 2000;
 const SUPPRESS_EMBEDS = 1 << 2;
@@ -137,10 +205,92 @@ const DIRECT_KINDS = new Set(["stopped", "resumed", "alert"]);
 const ITEM = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
 const QUESTION = /^[A-Za-z0-9][A-Za-z0-9._:#-]{0,39}$/;
 const SNOWFLAKE = /^\d{15,22}$/;
+// The one answer of an owner-reuse ask that approves it (reuseProof): its first option.
+export const REUSE_YES = "Use it";
 const SHA = /^[0-9a-f]{40}$/;
 export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
 export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
+// Link previews off on everything the link puts in his DM (security watch, Cain 0.13.0): a
+// post, an ephemeral answer and a tap's new message carry Discord's SUPPRESS_EMBEDS flag from
+// the start, so a link in a message never unfurls into a preview fetched from its site.
+// Second round: the flag only ever goes onto bits already there, never clearing one.
+//   - a first post (a message, a webhook's, a tap's new message): ORed onto its own flags;
+//   - an edit that carries flags: ORed onto them and onto the message's flags as last seen;
+//   - an edit that sets words and carries none: only when the message's flags are known (the
+//     link reads them first when it doesn't know them) and lack the bit, as those flags ORed
+//     with it; one that has the bit already is sent as it was (Discord keeps a message's flags);
+//   - a tap's update of its message (type 7): ORed onto flags it carries, never added alone
+//     (answer() puts the tapped message's own flags in first when it sets words);
+//   - anything else as it was.
+// added: whether a flags value went that the caller didn't write, so a refusal of it (a 400 whose
+// body names flags) is tried once more without the added bit, with a "preview flag refused" line in
+// the gate report: a flag problem shows a preview, never a dead card.
+// Third round: every flags value that goes out is masked to the bits Discord takes on a post, an
+// edit or a tap's answer (EDITABLE_FLAGS; EPHEMERAL too on an interaction's own answer or webhook).
+// Bits Discord sets itself and only reports (HAS_THREAD, CROSSPOSTED, LOADING, HAS_SNAPSHOT and the
+// rest) never go back. known: the message's flags as last read; null: the read before an edit
+// failed or timed out, so the edit goes as the caller wrote it (masked), without the added bit.
+export const SUPPRESS_NOTIFICATIONS = 1 << 12;
+export const IS_COMPONENTS_V2 = 1 << 15;
+export const EDITABLE_FLAGS = SUPPRESS_EMBEDS | SUPPRESS_NOTIFICATIONS | IS_COMPONENTS_V2;
+export function maskFlags(flags: unknown, interaction = false): number {
+  return (Number(flags) || 0) & (EDITABLE_FLAGS | (interaction ? EPHEMERAL : 0));
+}
+export interface Quieted { body: unknown; added: boolean }
+export const MESSAGE_PATH = /^\/channels\/\d+\/messages\/(\d+)$/;
+const isInteraction = (path: string) => /^\/interactions\//.test(path) || /^\/webhooks\//.test(path);
+// The caller's own body with its flags masked and nothing added: what a retry sends after a refusal
+// that names flags, and what an edit sends when the message's flags couldn't be read.
+export function masked(path: string, body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const b = body as Record<string, any>, i = isInteraction(path);
+  const m = (o: Record<string, any>) => ("flags" in o ? { ...o, flags: maskFlags(o.flags, i) } : o);
+  return /^\/interactions\//.test(path) && b.data && typeof b.data === "object" ? { ...b, data: m(b.data) } : m(b);
+}
+export function quiet(method: string, path: string, body: unknown, known?: number | null): Quieted {
+  const same = { body, added: false };
+  if (!body || typeof body !== "object" || Array.isArray(body)) return same;
+  const b = body as Record<string, any>;
+  const interaction = isInteraction(path);
+  const or = (o: Record<string, any>, more = 0) => {
+    const base = maskFlags(o.flags, interaction);
+    const flags = maskFlags(base | more | SUPPRESS_EMBEDS, interaction);
+    return { body: { ...o, flags }, added: !("flags" in o) || flags !== base };
+  };
+  if (method === "POST" && (/^\/channels\/\d+\/messages$/.test(path) || /^\/webhooks\/[^/]+\/[^/]+$/.test(path))) return or(b);
+  if (method === "PATCH" && MESSAGE_PATH.test(path)) {
+    if (known === null) return { body: masked(path, b), added: false };
+    if ("flags" in b) return or(b, known ?? 0);
+    if (!("content" in b) || known === undefined || (known & SUPPRESS_EMBEDS)) return same;
+    return or(b, known);
+  }
+  if (method === "POST" && /^\/interactions\//.test(path) && b.data && typeof b.data === "object") {
+    if (b.type === 4 || "flags" in b.data) { const q = or(b.data); return { body: { ...b, data: q.body }, added: q.added }; }
+  }
+  return { body: masked(path, b), added: false };
+}
+// A refusal that names the flags field (Discord's 400 lists the fields it refused; the link's rest
+// puts their names after the message): only that is tried again without the added bit.
+export const namesFlags = (e: unknown) => /discord 400\b/.test(String(e)) && /\bflags\b/i.test(String(e));
+// Discord's error as the link throws it: the status, its message, and the names of the fields it
+// refused (errors: {flags: {_errors: [...]}, data: {flags: ...}}), never values.
+export function discordError(status: number, data: any): string {
+  const names: string[] = [];
+  const walk = (o: any, at: string, depth: number) => {
+    if (!o || typeof o !== "object" || depth > 4 || names.length >= 6) return;
+    for (const k of Object.keys(o)) {
+      if (k === "_errors") continue;
+      const here = at ? `${at}.${k}` : k;
+      if (/^[A-Za-z0-9_]{1,40}$/.test(k)) { if (o[k] && typeof o[k] === "object" && "_errors" in o[k]) names.push(here); walk(o[k], here, depth + 1); }
+    }
+  };
+  walk(data?.errors, "", 0);
+  return `discord ${status}: ${String(data?.message ?? "").slice(0, 100)}${names.length ? ` (fields: ${names.join(", ")})` : ""}`;
+}
+export const PRE_EDIT_READ_MS = 1_500;   // the read of a message's flags before an edit, at most
+// A path for a log line: an interaction's or webhook's token cut short.
+const shortPath = (path: string) => path.replace(/\/[^/]{40,}/g, "/…");
 
 export interface Card {
   text: string; rows: any[]; kind: string; created: number; shown: string | null; expires?: number | null;
@@ -149,6 +299,8 @@ export interface Card {
   posting?: Posting;                 // a post whose answer never came: it may be on Discord already
   told?: boolean;                    // Cain was told it couldn't go out by itself
   lapseTold?: boolean;               // Cain was told it expired before it reached him
+  req?: string;                      // the specialist's signed request that made it (C1): one request, one card
+  announce?: string;                 // Cain's line about it, kept until it went (C1 re-check F1)
 }
 // A card's post that began and never heard back: when (at), its buttons then (rows, as a
 // digest), who made it (the link by itself, or Cain's show) and the item it went under.
@@ -180,6 +332,15 @@ export interface Shown {
     tries?: number; next?: number;    // it can't land yet: how often it was tried, and when it's tried next
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
+  values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
+  decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
+}
+// The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
+// tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
+// characters; at most 3 (more, and none count).
+export function askValues(text: string): string[] {
+  const out = [...String(text ?? "").matchAll(/"([^"\r\n]{4,300})"/g)].map((m) => m[1]);
+  return out.length <= 3 ? out : [];
 }
 export interface Ask {               // Cain's question waiting behind the open one
   text: string; options: string[]; item: string; question: string; replyTo?: string; at: number; expires: number;
@@ -187,6 +348,7 @@ export interface Ask {               // Cain's question waiting behind the open 
 }
 export interface State {
   owner?: string; dm?: string; bot?: string; next: number;
+  saveGen?: number;                  // which save this is (publish.ts stateFile: the newer copy wins)
   cards: Record<string, Card>; messages: Record<string, Shown>;
   held?: Ask[];
   migrated?: boolean;                // the one-time look over cards posted before 0.7.0 is done
@@ -204,6 +366,10 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
+  pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
+  // The review runner's decision cards waiting while their item is held by another holder (0.16.0,
+  // round 2), by decision id: one each, tried again at each sweep until the hold clears.
+  decisions?: Record<string, Partial<DecisionRec> & { since: number }>;
 }
 // last: the newest part of what he sent; asks: its last line asks something. Seeded ids
 // have neither, so they never hold the moving Stop.
@@ -514,12 +680,40 @@ export interface Deps {
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
-  checkRuns?: (pr: string, head: string) => Promise<any[] | "missing" | null>;   // the head's check runs (merge.ts checkRuns)
+  checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
+  gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
+  // 0.12.2: the pull request's head as the gate reads it (shipgate.ts gateHeadRead, through its curl wrapper), within ms:
+  // the head, or the gate's state unknown, named. Absent (the tests' rig): the facts' head is used, as before.
+  gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }>;
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
+  // The review-round cap (0.16.0, cap.ts): where a pull request stands at it, the probe's record of the
+  // rollback (its text; null: none), his tap on a decision card kept, the cap and the rounds now.
+  capState?: (pr: string) => CapState;
+  armed?: () => string | null;
+  // Throws when his tap couldn't be kept (round 2: the card stays tappable). Round 3: returns the record
+  // as kept (cap.ts recordDecision), whose choice drives the card, the relay and the hold line.
+  decided?: (id: string, choice: string, at: number) => { choice: string; at: number; existed: boolean } | void;
+  roundCap?: () => number;
+  rounds?: () => Rounds | null;
+  // Round 2: the install-time self-check's finding (null: every file right; else the cap and guard are
+  // off), the usage guard as the link runs it for a part of Cain's that was refused (it decides again
+  // from its own readings and logs a refusal), and one line onto the guard's log (the open list's holds).
+  capOff?: () => string | null;
+  guardHold?: (label: Label, what: string) => Verdict;
+  holdLog?: (line: string) => boolean | void;                       // true: the log was rotated at its size cap (round 3)
+  // Round 3: whether the guard's log already has a hold line (tag, what); the App's alarms (kind and
+  // cause; a group cleared); and the cap's own work at each sweep (the self-check again, the decisions
+  // file's moved-aside copy).
+  hasHold?: (tag: string, what: string) => boolean;
+  alarm?: (kind: string, cause: string) => void;
+  clearAlarm?: (group: string) => void;
+  capSweep?: () => void;
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
+  linkHosts?: () => ReadonlySet<string>;
+  keeperSent?: (at: number) => void;                               // a keeper.sh reply went out (gate/held.ts: the check-in's waiting line)                           // the hosts Cain normally cites (gate/hosts.ts); absent: no notices
   // The replay: Cain's own replies and edits as his transcripts have them (since a time),
   // where its report goes, and the pause between pages of his DM (tests: 0).
   transcripts?: (since: number) => Sent | Promise<Sent>;
@@ -699,9 +893,61 @@ export class Link {
   constructor(private d: Deps) {
     // Every call to Discord, noting a rate limit: the moving Stop waits a minute after one.
     this.rest = async (...a) => {
-      try { return await d.rest(...a); }
-      catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
+      const [method, path, body, ...more] = a;
+      try {
+        const known = await this.flagsFor(method, path, body);
+        const q = quiet(method, path, body, known);
+        if (known === null) {
+          // The read failed: the edit goes as the caller wrote it, and the report notes it.
+          this.reportFlag("flags unread", path, "the message's flags couldn't be read before the edit: sent without the preview flag");
+        }
+        try { return this.sawFlags(path, await d.rest(method, path, q.body, ...more)); }
+        catch (e) {
+          if (!q.added || !/discord 400/.test(String(e))) throw e;
+          // Only a 400 that names flags is the flag's: anything else is logged, and nothing is sent twice.
+          if (!namesFlags(e)) { this.log(`Discord refused ${method} ${shortPath(path)}: ${String(e).slice(0, 160)}`); throw e; }
+          this.log(`Discord refused the preview flag on ${method} ${shortPath(path)}: sent again without it`);
+          this.reportFlag("preview flag refused", path);
+          return this.sawFlags(path, await d.rest(method, path, masked(path, body), ...more));
+        }
+      } catch (e) { if (/discord 429/.test(String(e))) this.limitedAt = d.now(); throw e; }
     };
+  }
+
+  // Each message's flags as Discord last answered them (0.13.0, second round), so an edit never
+  // sends a flags value that drops a bit the message has. Kept for the newest 500 messages.
+  private flags = new Map<string, number>();
+  private sawFlags(path: string, msg: any): any {
+    const id = msg && typeof msg === "object" && /^\/channels\/\d+\/messages/.test(path) ? String(msg.id ?? "") : "";
+    if (id && typeof msg.flags === "number") {
+      this.flags.delete(id);
+      this.flags.set(id, msg.flags);
+      if (this.flags.size > 500) this.flags.delete(this.flags.keys().next().value!);
+    }
+    return msg;
+  }
+  private reportFlag(did: string, path: string, note?: string) {
+    try { this.d.report?.({ point: "preview flag", writer: "link", hits: [], did, ...(note ? { note } : {}), ...(MESSAGE_PATH.exec(path) ? { message: MESSAGE_PATH.exec(path)![1] } : {}) }); }
+    catch (r) { this.log(`couldn't log the gate's report: ${String(r).slice(0, 80)}`); }
+  }
+  // The flags an edit has to keep: as last seen, or read from Discord now for an edit that sets words
+  // or flags of a message the link hasn't seen. undefined: nothing to keep; null: the read failed or ran
+  // past PRE_EDIT_READ_MS (third round), so the edit goes as the caller wrote it, without the added bit.
+  private async flagsFor(method: string, path: string, body: unknown): Promise<number | null | undefined> {
+    const m = method === "PATCH" ? MESSAGE_PATH.exec(path) : null;
+    if (!m || !body || typeof body !== "object" || !("content" in body || "flags" in body)) return undefined;
+    if (this.flags.has(m[1])) return this.flags.get(m[1]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const cur = this.sawFlags(path, await Promise.race([
+        this.d.rest("GET", path, undefined, true, PRE_EDIT_READ_MS),
+        new Promise((_, no) => { timer = setTimeout(() => no(new Error("TimeoutError: the read of its flags ran out of time")), PRE_EDIT_READ_MS + 100); }),
+      ]));
+      return typeof cur?.flags === "number" ? cur.flags : undefined;
+    } catch (e) {
+      this.log(`couldn't read a message's flags before an edit: ${String(e).slice(0, 80)}`);
+      return null;
+    } finally { if (timer) clearTimeout(timer); }
   }
   relayLine(text: string): void { this.d.relay(text); }
   private log(line: string) { (this.d.log ?? console.log)(`[cain] link: ${line}`); }
@@ -801,8 +1047,37 @@ export class Link {
     for (const v of [replyTo, target]) if (v !== undefined && !SNOWFLAKE.test(v)) throw new Refusal("a message id is a Discord id");
     const d = decideSend(target ? { tool: "edit", text, target } : { tool: "reply", text, replyTo }, this.cardsNow(),
       { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
-        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}) });
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}), plugin: true, hosts: this.d.linkHosts?.() ?? null });
     return { status: "ok", ...d };
+  }
+
+  // keeper.sh reply (Cain 0.13.0, second round): a reply of Cain's with a link in it, posted by the link
+  // with the preview off from the first moment (SUPPRESS_EMBEDS on the post itself), since the plugin's
+  // own reply sets no flags. The same gate as his plugin replies (decideSend, less the rule that sends
+  // links here, and with no third try): "add-on" fixed as it goes, anything else refused with what to
+  // change. The message is recorded as his own reply, not the link's, so he can still edit it, and it
+  // counts for the moving Stop like any reply of his.
+  async reply(a: { text?: unknown; replyTo?: unknown }): Promise<{ status: "posted"; message: string; said: string }> {
+    const text = String(a.text ?? "");
+    if (!text.trim()) throw new Refusal("needs the text to send");
+    const replyTo = a.replyTo === undefined || a.replyTo === null || a.replyTo === "" ? undefined : String(a.replyTo).trim();
+    if (replyTo !== undefined && !SNOWFLAKE.test(replyTo)) throw new Refusal("a message id is a Discord id");
+    const { dm } = await this.identity();
+    const d = decideSend({ tool: "reply", text, replyTo, chat: dm }, this.cardsNow(),
+      { tz: this.d.tz, now: this.d.now(), ...(claimsReview(text) ? { reviewed: this.published() } : {}),
+        ...(mayHaveCode(text) ? { items: this.itemIds() } : {}), hosts: this.d.linkHosts?.() ?? null });
+    const did = d.would === "refuse" ? "refused" : d.would === "fix" ? "fixed" : "posted";
+    if (d.hits.length && this.d.report) {
+      try { this.d.report({ point: "keeper reply", writer: "cain", hits: d.hits as Hit[], did }); }
+      catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
+    }
+    if (d.would === "refuse") throw new Refusal(d.said);
+    const words = d.would === "fix" ? d.fixed : text;
+    const msg = await this.post(words, [], replyTo ? { replyTo } : {});
+    try { this.d.keeperSent?.(this.d.now()); } catch (e) { this.log(`couldn't note a keeper reply: ${String(e).slice(0, 80)}`); }
+    await this.sent({ tool: "reply", ids: [String(msg.id)], question: asksSomething(words), call: `keeper-${String(msg.id)}`,
+      ...(replyTo ? { reply_to: replyTo } : {}) }, { background: true });
+    return { status: "posted", message: String(msg.id), said: d.would === "fix" ? `Posted, with its wording fixed: ${fixedWhat(d.hits as Hit[])}.` : "Posted." };
   }
 
   // -- Stop everything ----------------------------------------------------------
@@ -970,26 +1245,26 @@ export class Link {
   }
 
   // -- cards from specialists -------------------------------------------------
-  async addCard(c: { text: string; rows?: any[]; kind?: string; expires?: unknown }): Promise<number> {
+  async addCard(c: { text: string; rows?: any[]; kind?: string; expires?: unknown; req?: string }): Promise<number> {
+    // A request already made a card (the link stopped before it could answer, or failed): that
+    // card, never a second one. A notice that goes out at once and isn't out yet goes now: its
+    // post is once only, by its posting mark and a look in his DM first (C1 re-check R2, R3).
+    if (c.req) {
+      const had = Object.entries(this.d.load().cards).find(([, v]) => v.req === c.req);
+      if (had) {
+        const [hid, card] = had;
+        if (DIRECT_KINDS.has(card.kind) && !card.shown && !card.outcome) await this.deliverDirect(Number(hid), card.kind);
+        this.announce(Number(hid));
+        return Number(hid);
+      }
+    }
     const kind = String(c.kind ?? "reply");
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
     // The specialist's words: em dashes and "add-on" fixed, and stored that way, so the card
-    // posted is exactly the card kept. Refused only for a button it tells him to use and doesn't carry
-    // (below); anything else the gate flags goes out, and Cain hears.
+    // posted is exactly the card kept. Never refused: its outbox takes a refusal as dead,
+    // and an approval or an Undo would be lost to him. What else the gate flags, Cain hears.
     const w = this.words("card", "specialist", String(c.text ?? ""), { rules: AT.card, buttons: labelsOf(comps), known: this.liveLabels() });
-    // 0.12.0: a card that tells him to use a button it doesn't carry ("Tap Go ahead", "the Undo button")
-    // points him at something that isn't there, so it's refused, not flagged: the specialist hears why
-    // (each label in straight double quotes, which it parses), Cain once, and the gate's report logs it.
-    // A label only mentioned ("there's no Go ahead", "with Undo") is flagged and goes out as it is.
-    const text0 = String(c.text ?? "");
-    const missing = w.hits.filter((h) => h.rule === "button" && h.result === "refuse" && h.label && imperative(text0, h.at, h.end));
-    if (missing.length) {
-      this.report("card", "specialist", w.hits, "refused");
-      const said = [...new Set(missing.map((h) => `"${h.label}"`))].join(", ");
-      this.d.relay(`The calendar specialist sent a card naming ${said}, which isn't on it, so the link refused it and nothing went to him. Nothing to tell him; it's logged for a fix.`);
-      throw new Refusal(`the card names ${said}, which it doesn't carry`);
-    }
     this.report("card", "specialist", w.hits, w.refused.length ? "posted as it is" : "fixed");
     // The specialist's Stop and Turn back on notices also say what that did on Cain's
     // side, from what's true now: the link's own words.
@@ -1003,23 +1278,46 @@ export class Link {
     const expires = toMs(c.expires);
     if (expires === null && c.expires != null && c.expires !== "")
       this.log(`card ${id}: its expiry isn't a time (${String(c.expires).slice(0, 40)}), so it has none`);
-    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due };
-    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
-    this.d.save(s);
+    // Cain's line about it, kept with the card in the same save and cleared once it went, so a
+    // request that comes again after the link stopped or failed in between tells him then.
     const flagged = w.refused.length ? flaggedLine(w.refused) : "";
+    let announce = "";
     if (DIRECT_KINDS.has(kind)) {
-      const shown = await this.show(id, { item: "none" });
-      if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
-      // A Turn back on notice with a Stop of its own: a moving Stop placed meanwhile comes off.
-      if (shown && kind === "resumed") void this.inStopQueue(() => this.placeStop());
-      if (flagged) this.d.relay(`The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`);
+      if (flagged) announce = `The calendar specialist's notice (card ${id}) went out to him with words the message gate flags: ${flagged}. Nothing to do unless it matters to him; then set it right in one line of your own.`;
     } else {
       const ask = due !== null ? "It has buttons: show it now, or it goes out by itself in about 2 minutes."
         : "Show it now if it matters today, or fold it into the morning message.";
       const flag = flagged ? ` The message gate flags its words: ${flagged}. It goes out as it is; if it matters, set it right in one line of your own after it.` : "";
-      this.d.relay(`The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`);
+      announce = `The calendar specialist has a card for Dane (card ${id}): "${excerpt(text, 120)}". ${buttonsLine(labelsOf(comps))}${flag} ${ask} Run /opt/cain/keeper.sh show ${id} --item <its PENDING id, or none> (add --reply-to <his message id> when it answers a message of his). The item is only its label: the card goes out whoever holds the item, open or closed.`;
     }
+    s.cards[String(id)] = { text, rows: comps, kind, created: now, shown: null, expires, due, ...(c.req ? { req: c.req } : {}), ...(announce ? { announce } : {}) };
+    for (const [k, v] of Object.entries(s.cards)) if (v.created + REMEMBER_MS <= now) delete s.cards[k];
+    this.d.save(s);
+    if (DIRECT_KINDS.has(kind)) await this.deliverDirect(id, kind);
+    this.announce(id);
     return id;
+  }
+
+  // Tells Cain the line kept on a card, then clears it (C1 re-check F1). A card with buttons
+  // already out by itself needs no "show it" line: he heard it went out. Should the link stop
+  // between telling him and clearing it, he's told twice: harmless, since a card is posted once
+  // however often it's shown ("already out").
+  private announce(id: number): void {
+    const card = this.d.load().cards[String(id)];
+    if (!card?.announce) return;
+    if (!card.shown || DIRECT_KINDS.has(card.kind)) this.d.relay(card.announce);
+    const s = this.d.load();
+    const c = s.cards[String(id)];
+    if (c) { delete c.announce; this.d.save(s); }
+  }
+
+  // A notice that goes out at once (Stop, Turn back on, an alert), under no item.
+  private async deliverDirect(id: number, kind: string): Promise<string> {
+    const shown = await this.show(id, { item: "none" });
+    if (shown && (kind === "stopped" || kind === "resumed")) await this.retireToggles(shown);
+    // A Turn back on notice with a Stop of its own: a moving Stop placed meanwhile comes off.
+    if (shown && kind === "resumed") void this.inStopQueue(() => this.placeStop());
+    return shown;
   }
 
   async show(id: number, m: { item?: unknown; question?: unknown; replyTo?: unknown }): Promise<string> {
@@ -1301,8 +1599,150 @@ export class Link {
 
   // -- Cain's own words with buttons ----------------------------------------------
   private openAsk(s: State, now: number): [string, Shown] | null {
-    for (const [id, m] of Object.entries(s.messages)) if (m.kind === "ask" && live(m, now)) return [id, m];
+    // The runner's decision card neither waits behind Cain's asks nor holds them back (0.16.0).
+    for (const [id, m] of Object.entries(s.messages)) if (m.kind === "ask" && !m.decision && live(m, now)) return [id, m];
     return null;
+  }
+
+  // The owner's one decision at the review-round cap (0.16.0, cap.ts): only the review runner asks for
+  // it, on root's socket. The link writes its words and its fixed options, files it under the brief's
+  // item (or none), and it stays up until he taps it. The same decision posted twice is one card.
+  // Round 2: its words go through the same card gate as every other card to him (counts, machine text,
+  // record codes), with a fixed fallback and the topic when they fail; the item's hold is checked as for
+  // any ask, and a decision for an item held by another holder waits (one per decision, tried again at
+  // each sweep) and answers "held"; a lost final round says so; and while the rollback isn't armed the
+  // card says up front that a Ship would be refused.
+  async decision(d: Partial<DecisionRec>): Promise<{ status: "posted"; message: string } | { status: "held"; said: string }> {
+    const off = this.capOff();
+    if (off) throw new Refusal(`the review cap's files aren't right (${off}), so no decision card goes out until they are`);
+    const id = String(d.id ?? ""), key = String(d.key ?? "");
+    if (!/^[a-z0-9][a-z0-9-]{2,63}#\d{1,3}$/.test(id) || !id.startsWith(`${key}#`)) throw new Refusal("a decision needs its id and change key");
+    const lost = d.lost === true;
+    const round = Number(d.round), serious = Number(d.serious);
+    if (!Number.isInteger(round) || round < 1 || !Number.isInteger(serious) || serious < (lost ? 0 : 1)) throw new Refusal("a decision needs its round and its serious findings");
+    if (!String(d.topic ?? "").trim() || (!lost && !String(d.finding ?? "").trim())) throw new Refusal("a decision needs its topic and its finding");
+    const item = d.item && ITEM.test(String(d.item)) ? String(d.item).toUpperCase() : "none";
+    const pr = d.pr && PULL.test(String(d.pr)) ? String(d.pr) : null;
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.decision?.id === id);
+    if (prior) return { status: "posted", message: prior[0] };
+    // The item's hold, as for any ask: held by another holder (or the holds can't be read) waits.
+    const wait = this.decisionWaits(item);
+    if (wait) {
+      const s = this.d.load();
+      const had = s.decisions?.[id];
+      (s.decisions ??= {})[id] = { ...d, id, key, item, pr, since: had?.since ?? this.d.now() };
+      this.d.save(s);
+      if (!had) this.log(`the decision card for ${key} waits: ${wait}`);
+      return { status: "held", said: `the decision card waits: ${wait}; the link tries again at each sweep` };
+    }
+    let unarmed = false;
+    try { unarmed = !armedFor(null, this.d.armed?.() ?? null).armed; } catch { unarmed = true; }
+    const text = this.decisionWords({ topic: String(d.topic), finding: String(d.finding ?? ""), round, serious, lost, unarmed });
+    const options = [...DECISION_OPTIONS];
+    const nonce = stableNonce("decision", id);
+    return this.serial(async () => {
+      const again = Object.entries(this.d.load().messages).find(([, m]) => m.decision?.id === id);
+      if (again) return { status: "posted" as const, message: again[0] };
+      const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"), { nonce });
+      const s = this.d.load();
+      this.remember(s, msg, { kind: "ask", item, question: "", posted: this.d.now(), expires: null, buttons: true, labels: [...options],
+        q: { q: decisionSummary({ topic: String(d.topic) }), options, used: false }, decision: { id, key, pr, ...(unarmed ? { unarmed: true } : {}) } });
+      if (s.decisions?.[id]) delete s.decisions[id];
+      this.d.save(s);
+      return { status: "posted" as const, message: String(msg.id) };
+    });
+  }
+  // Why a decision card for this item can't go up now ("" when it can): another holder has the item, or
+  // the holds can't be read.
+  private decisionWaits(item: string): string {
+    if (item === "none") return "";
+    const holds = parseHolds(this.files().holds);
+    if (holds === null) return "the holds can't be read";
+    if (heldElsewhere(holds, item)) return `${item} is held by another holder`;
+    return "";
+  }
+  // The card's words through the card gate: round 3, the identical gate asks and Ship cards use
+  // (cainWords with CARD_RULES, record codes included), and the fallback with the topic when its full
+  // text fails (the topic left off too when it fails alone).
+  private decisionWords(d: { topic: string; finding: string; round: number; serious: number; lost: boolean; unarmed: boolean }): string {
+    const passes = (t: string): string | null => this.cardGate("decision", "decision card", t, [...DECISION_OPTIONS]);
+    return passes(decisionText(d)) ?? passes(fallbackText(d.topic, d.unarmed)) ?? this.ownWords("decision", "link", fallbackText(null, d.unarmed));
+  }
+  // The card gate as a check: the words fixed, or null when it refuses them (logged either way).
+  private cardGate(point: string, what: string, text: string, buttons: string[] = []): string | null {
+    try { return this.cainWords(point, what, text, { rules: CARD_RULES, buttons, known: this.liveLabels() }).text; }
+    catch (e) { if (e instanceof Refusal) return null; throw e; }
+  }
+  private capOff(): string | null {
+    try { return this.d.capOff?.() ?? null; } catch (e) { return `the check failed: ${String(e).slice(0, 60)}`; }
+  }
+  // Decisions waiting on an item's hold, tried again at each sweep.
+  private async retryDecisions(): Promise<void> {
+    const waiting = Object.values(this.d.load().decisions ?? {});
+    for (const d of waiting) {
+      try { await this.decision(d); }
+      catch (e) {
+        this.log(`a waiting decision card didn't go: ${String(e).slice(0, 80)}`);
+        if (e instanceof Refusal && !/files aren't right/.test(e.message)) {           // it can never go: dropped, the runner asks again
+          const s = this.d.load(); if (s.decisions?.[String(d.id)]) { delete s.decisions[String(d.id)]; this.d.save(s); }
+        }
+      }
+    }
+  }
+
+  // The usage guard for a part of Cain's that it refused (the Build hook, review.sh; Cain's key): the
+  // link decides again from its own readings, and only a refusal is appended to the guard's log, which
+  // is root's (round 2). "held" once it's logged; "passes" when the link's reading lets it run.
+  // Round 3, bounded: at most HOLDS_PER_MINUTE calls a minute per caller (one alarm when that's hit), an
+  // identical refusal (label and description) logged once in HOLD_DEDUPE_MS, the log capped in size and
+  // rotated root-side (main.ts, cap.ts appendCapped), and the description put through the card gate
+  // before it's logged: one that fails becomes "a build labelled <label>".
+  private holdCalls = new Map<string, number[]>();
+  private holdSeen = new Map<string, number>();
+  private holdAlarmAt: number | null = null;
+  guardHoldFor(b: { label?: unknown; what?: unknown }, caller = "cain"): { status: "held"; why: string; repeat?: true } | { status: "passes" } {
+    const off = this.capOff();
+    if (off) throw new Refusal(`the usage guard's files aren't right (${off}), so the hold can't be logged`);
+    const now = this.d.now();
+    const calls = (this.holdCalls.get(caller) ?? []).filter((t) => now - t < 60_000);
+    if (calls.length >= HOLDS_PER_MINUTE) {
+      this.holdsCapHit(`more than ${HOLDS_PER_MINUTE} holds in a minute from ${caller}`);
+      throw new Refusal(`more than ${HOLDS_PER_MINUTE} holds in a minute: this one isn't logged. Try again in a minute`);
+    }
+    calls.push(now);
+    this.holdCalls.set(caller, calls);
+    const label = labelOf(b.label === undefined ? undefined : String(b.label));
+    if (!label) throw new Refusal("a hold names its label: core, commitment, necessary-fix or other");
+    const raw = String(b.what ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 160);
+    if (!raw) throw new Refusal("a hold says what was refused");
+    if (!this.d.guardHold) throw new Refusal("the link has no usage guard to log with");
+    const what = this.cardGate("hold", "hold's description", raw) ?? `a build labelled ${label}`;
+    const v = this.d.guardHold(label, what);
+    if (v.ok) return { status: "passes" };
+    for (const [k, t] of this.holdSeen) if (now - t >= HOLD_DEDUPE_MS) this.holdSeen.delete(k);
+    const key = `${label}\t${what}`;
+    if (this.holdSeen.has(key)) return { status: "held", why: v.why, repeat: true };
+    if (!this.d.holdLog) throw new Refusal("the hold couldn't be written to the guard's log");
+    let rotated: boolean | void;
+    try { rotated = this.d.holdLog(logLine(new Date(now), label, what, v)); }
+    catch (e) { this.log(`couldn't log a hold: ${String(e).slice(0, 80)}`); throw new Refusal("the hold couldn't be written to the guard's log"); }
+    this.holdSeen.set(key, now);
+    if (rotated === true) this.holdsCapHit("the guard's log reached its size cap, so the App rotated it, keeping one previous file");
+    return { status: "held", why: v.why };
+  }
+  // One alarm when a cap of the hold route is hit; cleared at a sweep once an hour passed without one.
+  private holdsCapHit(cause: string): void {
+    const first = this.holdAlarmAt === null;
+    this.holdAlarmAt = this.d.now();
+    this.log(`the guard-hold route hit its cap: ${cause}`);
+    if (first) { try { this.d.alarm?.("review-holds", cause); } catch (e) { this.log(`couldn't raise the hold route's alarm: ${String(e).slice(0, 80)}`); } }
+  }
+  private capSweep(): void {
+    try { this.d.capSweep?.(); } catch (e) { this.log(`the review cap's sweep failed: ${String(e).slice(0, 80)}`); }
+    if (this.holdAlarmAt !== null && this.d.now() - this.holdAlarmAt >= HOLD_ALARM_QUIET_MS) {
+      this.holdAlarmAt = null;
+      try { this.d.clearAlarm?.("holds"); } catch (e) { this.log(`couldn't clear the hold route's alarm: ${String(e).slice(0, 80)}`); }
+    }
   }
 
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
@@ -1312,9 +1752,17 @@ export class Link {
     if (!asked) throw new Refusal("an ask needs its question");
     if (!raw.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
     noMachineText(asked, ...raw);
+    // The review-round cap (0.16.0): the decision at the cap is the review service's card alone, and no
+    // ask may offer a round past it.
+    if (raw.some((o) => o.toLowerCase() === RISK.toLowerCase()))
+      throw new Refusal("the decision at the review-round cap is the review service's own card: it posts it itself when the last round leaves something serious. Ask nothing about it, and offer no review round past the cap");
+    let rounds: Rounds | null = null;
+    try { rounds = this.d.rounds?.() ?? null; } catch { rounds = null; }
+    const past = namesRoundPastCap([asked, ...raw].join("\n"), this.d.roundCap?.() ?? 3, rounds);
+    if (past) throw new Refusal(`this names ${past}, past the review-round cap of ${this.d.roundCap?.() ?? 3}: the owner's rule allows no more rounds for a change, and the review service asks him the one decision itself. Take it out`);
     // The gate, before the nonce is made: the same words always make the same card.
     const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }));
-    const w = this.cainWords("ask", "ask", asked, { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
+    const w = this.cainWords("ask", "ask", asked, { rules: CARD_RULES, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
     const options = opts.map((o) => o.text);
     const fixed = fixedSaid([...w.fixed, ...opts.flatMap((o) => o.fixed)]);
     const text = w.text;                 // no "P08 Q2: ": the item and question are data
@@ -1356,7 +1804,7 @@ export class Link {
       { replyTo: e.replyTo, nonce });
     const s = this.d.load();
     this.remember(s, msg, { kind: "ask", item: e.item, question: e.question, posted: this.d.now(), expires: e.expires,
-      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false } });
+      buttons: true, labels: [...options], q: { q: excerpt(text), options, used: false }, values: askValues(text) });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
     await this.stripAll(replaced);
@@ -1386,10 +1834,22 @@ export class Link {
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(said);
     this.mayAsk(meta.item);
-    const w = this.cainWords("ship", "Ship card", said, { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
+    // The review-round cap (0.16.0, cap.ts): at the cap with a serious finding left, his decision first.
+    let risk = false;
+    let cap: CapState = { state: "none" };
+    try { cap = this.d.capState?.(pr) ?? { state: "none" }; } catch (e) { cap = { state: "unknown", why: String(e).slice(0, 80) }; }
+    if (cap.state === "unknown") throw new Refusal(`where this pull request stands at the review-round cap is unknown (${cap.why}): no Ship card until it can be read`);
+    if (cap.state === "waiting") throw new Refusal("its last review round left something serious, and his decision on it (ship it with that risk, or hold it) is still open: no Ship card until he taps it");
+    if (cap.state === "hold") throw new Refusal("he chose to hold it at the review-round cap: no Ship card for it. A fix is new work, with its own item and a new change");
+    if (cap.state === "risk") risk = true;
+    const w = this.cainWords("ship", "Ship card", said, { rules: CARD_RULES, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
-    const built = this.d.facts ? await this.shipText(pr, head, review, w.text) : { text: w.text, own: undefined };
+    if (risk && !this.d.facts) {
+      const a = armedFor(null, this.d.armed?.() ?? null);
+      if (!a.armed) throw new Refusal(`he chose to ship it with the risk named, which needs the App's rollback armed, and ${a.why}: no Ship card until it is`);
+    }
+    const built = this.d.facts ? await this.shipText(pr, head, review, w.text, risk) : { text: w.text, own: undefined };
     const text = built.text;
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
@@ -1416,11 +1876,12 @@ export class Link {
   // some time. Then GitHub is asked for the pull request and the head's check runs at once,
   // within FACTS_MS, and a part that doesn't come says so. Refused: no line for that review, a
   // review of another head or none named in it, its lines unreadable, a newer head on GitHub, a
-  // commit GitHub doesn't have, a check that failed or hasn't run. A pull request merged at
+  // commit GitHub doesn't have, a check that failed or hasn't run, pcjobs-windows (when the
+  // head's tests.yml names it or it ran there) not passed yet. A pull request merged at
   // this head is in main already: the landing asks nothing of its checks, so neither does the
   // card. Anything else going wrong while the new lines are built gives the card as it was
   // before: "Ship it?", his line and the line from GitHub as it was. Never no card.
-  private async shipText(pr: string, head: string, review: string | null, words: string): Promise<{ text: string; own: string }> {
+  private async shipText(pr: string, head: string, review: string | null, words: string, risk = false): Promise<{ text: string; own: string }> {
     const own = words.trim();
     if (!own) throw new Refusal("a Ship card needs a line saying what he'll notice");
     let rev: Reviewed | null = null;
@@ -1433,13 +1894,53 @@ export class Link {
       if (rev.head !== head || (rev.pr !== null && rev.pr.toLowerCase() !== pr.toLowerCase()))
         throw new Refusal(`review ${review} was of another head or pull request: get a review of this head as it is now`);
     }
+    // A ship_gate watch of this pull request accepted another head (twentieth round: a watch binds to
+    // the exact sha its pusher named, and its acceptance is kept by sha): a card for any other head is
+    // refused while that acceptance stands, naming it and the command that records it replaced.
+    // One live acceptance per pull request (twenty-first round): the card reads that single one; more than
+    // one live (left from before the rule) is refused, naming each, until all but one are superseded.
+    // Twenty-sixth round: a gate state that can't be read (its generation file or a kept record) refuses the card by
+    // name, never reads as no acceptance.
+    const gate = this.d.gateWatch?.(pr) ?? [];
+    // Twenty-eighth round: an acceptance whose supersede is owed (GitHub's rate limit stopped it) is not current: the
+    // card is refused by name, with the wait GitHub asked for, never left to the head read alone.
+    if (!Array.isArray(gate) && "owed" in gate)
+      throw new Refusal(`the Ship gate's watch of this pull request is waiting on a supersede: ${gate.owed}. No card goes until it is done`);
+    if (!Array.isArray(gate))
+      throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gate.unknown}. No card goes until it can be read`);
+    const watched = gate;
+    if (watched.length > 1)
+      throw new Refusal(`the Ship gate's watch of this pull request has more than one live acceptance (${watched.join(", ")}): supersede all but the one for this head (keeper.sh ship-gate --supersede <sha>) before showing its card`);
+    if (watched.length && watched[0] !== head)
+      throw new Refusal(`the Ship gate's watch of this pull request accepted ${watched.join(" and ")}, not this head: if this head replaces it (a rebase), run keeper.sh ship-gate --supersede ${watched[0]}, then watch this head with keeper.sh ship-gate --pr <number> --head ${head} --watch before showing its card`);
     const wait = this.d.factsMs ?? FACTS_MS;
     const ask = <T>(go?: () => Promise<T | null>): Promise<T | null> =>
       (go ? within(Promise.resolve().then(go).catch(() => null), wait) : Promise.resolve(null));
-    const { facts, checkRuns } = this.d;
-    const [f, runs] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head)))]);
+    const { facts, checkRuns, gateHead } = this.d;
+    // 0.12.2: while an acceptance stands, the gate's head is read through the gate's own curl wrapper (gateHead), beside
+    // the facts; its wait running out is named as a timeout, and any read that doesn't give the head is the gate's state
+    // unknown, by name.
+    const gateRead = watched.length && gateHead
+      ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
+      : Promise.resolve(null);
+    const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    // Shipped with the risk named (0.16.0): only while the rollback is armed for every App it installs.
+    if (risk) {
+      const apps = f?.bumps ? f.bumps.map((b) => b.app.toLowerCase()) : null;
+      const a = armedFor(apps, this.d.armed?.() ?? null);
+      if (!a.armed) throw new Refusal(`he chose to ship it with the risk named, which needs the App's rollback armed, and ${a.why}: no Ship card until it is`);
+    }
+    if (watched.length && gateHead) {
+      if (gh === null) throw new Refusal(`the Ship gate's state is unknown for this pull request: ${GATE_HEAD_TIMED_OUT}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (typeof gh !== "string") throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gh.unknown}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
+      if (gh !== head) throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    }
+    // Twenty-fifth round: a watch's acceptance is consumed only against the pull request's head as GitHub has it now.
+    // When one stands, a head that can't be read refuses the card (the acceptance can't be checked), never passes it.
+    if (watched.length && !gateHead && f?.head !== head)
+      throw new Refusal("the pull request's head couldn't be read from GitHub, so the Ship gate's watch acceptance can't be checked against it: show the card again in a minute");
     // Merged on GitHub at this head: the landing asks nothing of its checks, only that main has
     // the head (a squash or a rebase would leave it out). So the card asks main too, the way the
     // landing does, and says "Already in main" only when main has it.
@@ -1449,11 +1950,15 @@ export class Link {
       throw new Refusal("GitHub says it's merged, but main doesn't have that head (a squash or a rebase?), so a Ship tap can't install it");
     try {
       if (!merged && runs === "missing") throw new Refusal("GitHub doesn't have that commit: show the card for its head as it is now");
-      const checks = !merged && Array.isArray(runs) ? judgeChecks(runs) : null;
+      const checks = !merged && runs && runs !== "missing" && Array.isArray(runs.runs) ? judgeChecks(runs.runs, runs.windows === true) : null;
       const failed = checks?.find((c) => c.state === "failed");
       if (failed) throw new Refusal(`its ${failed.name} check didn't pass (${failed.conclusion}): fix it through Build first, then show a new Ship card`);
       const notRun = checks?.find((c) => c.state === "missing");
       if (notRun) throw new Refusal(`CI hasn't run ${notRun.name} on it yet: show the card once its checks have run`);
+      // Unlike a required check, a Windows run still going refuses the card: no ruleset holds
+      // main to it, so the card waits for it to pass (the landing checks it again).
+      if (checks?.some((c) => c.name === WINDOWS_CHECK && c.state === "running"))
+        throw new Refusal(`CI is still running ${WINDOWS_CHECK} on it: show the card once it has passed`);
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
@@ -1532,6 +2037,104 @@ export class Link {
       buttons: m?.buttons ? [...(m.labels ?? [])] : [], live: m ? live(m, now) : null };
   }
 
+  // -- one line from the PC job keeper (POST /pc-notice, 0.12.0 nineteenth round) -------
+  // The keeper sends only a code; the words are the link's own (PC_NOTICES), so nothing from the
+  // queue or a page reaches Discord. The keeper sends each condition once while it lasts, and marks
+  // it sent only on this answer ("posted"). A keeper newer than this link may send a code the link
+  // has no words for (0.12.0, twentieth round): a plain code (lower-case letters, digits and "_",
+  // at most 40) gets the generic line, naming the code; anything else is refused.
+  //
+  // Twenty-first round: a notice may carry its id (the keeper's, kept before it posts) and the job it
+  // is about. The link deduplicates on the id: one it has already posted is answered "posted" with that
+  // message, and nothing is posted again, so a post whose acknowledgement was lost isn't repeated.
+  // Twenty-second round: the job is named by what it does, {site, action} in the queue's own shapes, never
+  // by its queue id (Cain's rules and the gate keep those ids away from him); the notice id stays in the
+  // payload, never in the words.
+  // Twenty-eighth round: repeat, a notice the keeper re-minted under a new id because its first id may have outlived the
+  // link's record of posted ids (PC_NOTICE_RETAIN_MS): worded as a repeat, so a second showing never reads as new.
+  async pcNotice(code: unknown, job?: unknown, id?: unknown, repeat?: unknown): Promise<{ status: "posted"; message: string; duplicate?: true }> {
+    const c = String(code ?? "");
+    const base = Object.hasOwn(PC_NOTICES, c) ? PC_NOTICES[c] : PC_NOTICE_CODE.test(c) ? pcNoticeUnknown(c) : "";
+    if (!base) throw new Refusal("not a PC job keeper notice");
+    const nid = id === undefined || id === null ? null : String(id);
+    if (nid !== null && !PC_NOTICE_ID.test(nid)) throw new Refusal("not a PC job keeper notice id");
+    let named: string | null = null;
+    if (job !== undefined && job !== null) {
+      const j = job as any;
+      // Twenty-third round: or, when the keeper can't say its site and action, by when it was queued ({queued}).
+      const queued = j && typeof j === "object" && !Array.isArray(j) && Object.keys(j).length === 1 && typeof j.queued === "string" ? pcQueuedWords(j.queued, this.d.tz) : null;
+      if (queued) named = queued;
+      else {
+        if (typeof j !== "object" || Array.isArray(j) || typeof j.site !== "string" || typeof j.action !== "string" || !PC_SITE.test(j.site) || !PC_ACTION.test(j.action)
+          || Object.keys(j).some((k) => k !== "site" && k !== "action"))
+          throw new Refusal("not a PC job: a job is named by its site and action, never by its queue id");
+        named = pcJobWords({ site: j.site, action: j.action });
+      }
+    }
+    if (nid !== null) {
+      const had = this.d.load().pcNotices?.[nid];
+      if (had) return { status: "posted", message: had.msg, duplicate: true };
+    }
+    const said = named ? `${base} (It is ${named}, code ${c}.)` : base;
+    const text = repeat === true ? `${PC_NOTICE_REPEAT} ${said}` : said;
+    noMachineText(text);
+    const message = await this.notice(text);
+    if (nid !== null) {
+      const s = this.d.load();
+      const kept = Object.entries({ ...(s.pcNotices ?? {}), [nid]: { msg: message, at: this.d.now() } }).filter(([, v]) => this.d.now() - v.at <= PC_NOTICE_RETAIN_MS)
+        .sort((a, b) => b[1].at - a[1].at).slice(0, PC_NOTICE_KEEP);
+      s.pcNotices = Object.fromEntries(kept);
+      this.d.save(s);
+    }
+    return { status: "posted", message };
+  }
+
+  // -- his yes to reusing a PC result's values (POST /reuse, the PC job keeper's ask) ----
+  // A follow-up PC job may carry a value an earlier result reported only on his yes
+  // (pcjobs/core.ts, owner_reuse). Cain writes the job, so his say-so proves nothing: the
+  // keeper sends the Discord message id the job names, and the link answers from what it
+  // recorded and what Discord has, never from Cain's words. Only one thing is a yes (0.12.0):
+  // his tap on the "Use it" button, the first option, of one of Cain's asks (a tap is
+  // recorded only from him, in his DM, with Cain paired to him: who(), below), where the
+  // values the job names are exactly the values that ask quoted when the link posted it
+  // (askValues, recorded with the ask as values) and Discord still shows each of them on it.
+  // The id is the ask's own message id. A message he typed never authorises, even one that
+  // replies to the ask or quotes the value: free text can be misread, and the keeper refuses
+  // a reuse that names a plain message. One tap answers for one job: the keeper records each
+  // id it accepted in an append-only file that survives restarts (pcjobs/main.ts usedReuse).
+  // Anything else is a Refusal: an id that isn't a Discord id, a message that isn't one of
+  // Cain's asks, an ask not answered by his "Use it" tap, other values than it quoted.
+  // Discord down is an error. The keeper refuses the job on either (fail closed).
+  async reuseProof(messageId: unknown, values: unknown): Promise<{ status: "ok"; message: string; via: "tap"; ask: string; values: string[] }> {
+    const id = String(messageId ?? "").trim();
+    if (!SNOWFLAKE.test(id)) throw new Refusal("needs a Discord message id: the ask he tapped \"Use it\" on");
+    const vals = Array.isArray(values) ? values : [];
+    if (!vals.length || vals.length > 3 || !vals.every((v) => typeof v === "string" && v.length >= 4 && v.length <= 300 && !/[\u0000-\u001f\u007f]/.test(v)))
+      throw new Refusal("needs 1 to 3 values, each one line of 4 to 300 characters");
+    const want = vals as string[];
+    const { owner, dm, bot } = await this.identity();
+    if (this.d.paired() && this.d.paired() !== owner) throw new Refusal("Cain is paired with someone other than the bot's owner");
+    const s = this.d.load();
+    const rec = s.messages[id];
+    if (!rec) throw new Refusal("that isn't one of your asks: only his \"Use it\" tap on your ask approves a reuse, never a message he typed");
+    if (rec.kind !== "ask") throw new Refusal("that message is a card of the link's, not one of Cain's asks");
+    if (!(rec.outcome === "answered" && !rec.words && rec.q && rec.label !== undefined))
+      throw new Refusal("no tap of his is recorded on that ask: it was answered in words, expired, replaced or is still open");
+    if (rec.label !== rec.q.options[0] || rec.label !== REUSE_YES)
+      throw new Refusal(`he answered that ask by tapping "${rec.label}", not its first option "${REUSE_YES}"`);
+    const asked = rec.values ?? [];
+    if (!asked.length) throw new Refusal("that ask quoted no value when it was posted, so his tap approved none");
+    if (asked.length !== want.length || want.some((v) => !asked.includes(v)) || new Set(want).size !== want.length)
+      throw new Refusal("the values aren't exactly the ones that ask quoted when it was posted");
+    let msg: any;
+    try { msg = await this.rest("GET", `/channels/${dm}/messages/${id}`); }
+    catch (e) { if (/discord 404/.test(String(e))) throw new Refusal("no message with that id in his DM"); throw e; }
+    if (String(msg?.author?.id ?? "") !== bot) throw new Refusal("that ask isn't the bot's message");
+    const text = withoutOutcome(String(msg?.content ?? ""));
+    if (want.some((v) => !text.includes(v))) throw new Refusal("that ask doesn't show every value exactly as written");
+    return { status: "ok", message: id, via: "tap", ask: id, values: [...want] };
+  }
+
   // -- taps -------------------------------------------------------------------
   // Who and where: Dane, in his DM, with Cain paired to him.
   private async who(it: any): Promise<string> {
@@ -1546,7 +2149,12 @@ export class Link {
 
   private async answer(it: any, kind: number, data?: unknown): Promise<boolean> {
     try {
-      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, data ? { type: kind, data } : { type: kind }, false);
+      // A tap's update that sets words keeps the tapped message's own flags (only the ones an answer may
+      // carry: masked, third round); the rest wrapper adds the preview flag, so a refusal of it that
+      // names flags is tried once more without it.
+      const keep = kind === 7 && data && typeof data === "object" && "content" in (data as object) && !("flags" in (data as object))
+        && typeof it?.message?.flags === "number" ? { ...(data as object), flags: maskFlags(it.message.flags) } : data;
+      await this.rest("POST", `/interactions/${it.id}/${it.token}/callback`, keep ? { type: kind, data: keep } : { type: kind }, false);
       return true;
     } catch (e) {
       this.log(`couldn't answer a tap in time: ${String(e).slice(0, 80)}`);
@@ -1819,6 +2427,9 @@ export class Link {
     this.netSeen.set(key, now);
     return true;
   }
+  // When Cain last heard that the broker's record of what went out failed (discord/spool.ts).
+  private spoolToldAt = 0;
+
   async sent(n: any, o: { background?: boolean } = {}): Promise<{ status: "ok"; said: string }> {
     const ids: string[] = (Array.isArray(n?.ids) ? n.ids : []).map(String).filter((x: string) => SNOWFLAKE.test(x)).slice(0, 10);
     if (!ids.length) throw new Refusal("needs the ids of what went out");
@@ -1850,11 +2461,42 @@ export class Link {
       catch (e) { this.log(`couldn't log the gate's report: ${String(e).slice(0, 80)}`); }
       this.d.relay(`Your edit changed Discord message ${theirs}, ${m.kind === "notice" || m.kind === "morning" ? "a message" : "a card"} your App posted, not one of your replies: the message gate should have held it, and it's logged for a fix. Don't edit it again; if it needs setting right, say so in a new reply.`);
     }
+    // His replies go out through the Discord plugin, which sets no flags. One with a link is held by
+    // the reply hook (keeper.sh reply posts it with the preview off from the start); one that slipped
+    // through (the hook down, say) gets the preview turned off here, right after, best effort:
+    // a race with Discord's own fetch, so only a fallback.
+    if (tool === "reply" && n?.links === true) void this.quietReplies(ids.filter((id) => !this.linkPosted(s, id)));
     const net = netOf(n?.net);
     if (net && this.firstTime(call, tool, ids, net)) this.d.relay(netLine(tool, last, net));
+    // The broker's record of what went out failed (C1 re-check R5): Cain hears, at most every 6
+    // hours, so a disk that refuses writes doesn't go unnoticed.
+    const spoolProblem = typeof n?.spool_problem === "string" ? n.spool_problem.replace(/\s+/g, " ").trim().slice(0, 300) : "";
+    if (spoolProblem && now - this.spoolToldAt > 6 * 3_600_000) {
+      this.spoolToldAt = now;
+      this.d.relay(`The Discord broker says ${spoolProblem}. Nothing to tell him the first time. If it happens again, the Pi's storage needs a look: tell Dane in one line, and keep it in PENDING until it's fixed.`);
+    }
     const placing = this.inStopQueue(() => this.placeStop());
     if (!o.background) await placing;
     return { status: "ok", said: "Noted." };
+  }
+
+  async quietReplies(ids: string[]): Promise<number> {
+    let done = 0;
+    for (const id of ids) {
+      try {
+        const { dm } = await this.identity();
+        // Its flags first: the flag goes onto them, never in place of them.
+        const cur = await this.rest("GET", `/channels/${dm}/messages/${id}`);
+        const had = Number(cur?.flags) || 0;
+        if (had & SUPPRESS_EMBEDS) { done++; continue; }
+        await this.rest("PATCH", `/channels/${dm}/messages/${id}`, { flags: maskFlags(had | SUPPRESS_EMBEDS) });
+        done++;
+      } catch (e) {
+        if (/discord 429/.test(String(e))) break;
+        this.log(`couldn't turn a reply's link preview off: ${String(e).slice(0, 80)}`);
+      }
+    }
+    return done;
   }
 
   // Cain's replies from his transcripts (at start, and every few hours): his edit allowlist.
@@ -2112,6 +2754,29 @@ export class Link {
     catch (e) { this.log(`couldn't sign a Ship tap: ${String(e).slice(0, 80)}`); return null; }
   }
 
+  // His "Ship it with that risk" while the rollback isn't armed (round 2): the change is recorded as
+  // held, with that reason, on the guard's log (the holds Cain lists on the open list), and Cain's line
+  // says so. Read again at the tap, so a rollback armed since the card went up holds nothing.
+  // Round 3: written once. When his answer was already kept (a tap retried after a crash), no second
+  // line: one is written only when the log doesn't have it yet (hasHold), and none when that can't be told.
+  private heldForRollback(m: Shown, existed = false): string {
+    const dec = m.decision!;
+    let a: { armed: boolean; why: string };
+    try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the probe's rollback record can't be read` }; }
+    if (a.armed) return "";
+    const what = `${dec.key}${dec.pr ? ` (${dec.pr})` : ""}`;
+    const why = `held: he chose to ship it with the risk named, but ${a.why}, so a Ship card is refused until a release arms it`;
+    let logged = true;
+    let write = true;
+    if (existed) { try { write = this.d.hasHold ? !this.d.hasHold("review-cap", what) : false; } catch { write = false; } }
+    if (write) {
+      try { this.d.holdLog?.(holdLine(new Date(this.d.now()), "review-cap", what, why)); if (!this.d.holdLog) logged = false; }
+      catch (e) { logged = false; this.log(`couldn't record the hold for ${dec.key}: ${String(e).slice(0, 80)}`); }
+    }
+    return ` It's recorded as held, not shippable yet: ${a.why}, so a Ship card for it is refused until a release arms the rollback.${logged
+      ? " It's on the guard's log: list it on the open list as held." : " The hold couldn't be written to the guard's log: list it as held yourself, and log a Build item."}`;
+  }
+
   private tapLine(m: Shown, label: string, msgId: string): string {
     const where = `(Discord message ${msgId}; its card shows his answer. If it needs words from you, reply with reply_to ${msgId})`;
     if (m.kind === "ship" && m.ship)
@@ -2126,11 +2791,37 @@ export class Link {
     const q = m?.q;
     const i = Number(cid.split(":")[2]);
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
-    const label = q.options[i];
+    const tapped = q.options[i];
+    let label = tapped;
+    // His decision at the review-round cap (0.16.0) is kept before anything else, for the Ship card.
+    // Round 2: kept durably first, and only then is the card marked used. If it can't be kept, the card
+    // stays tappable and he's told, in one plain line to him alone, that his answer wasn't saved.
+    // Round 3: the stored record drives everything. After a crash between the write and the card's mark,
+    // a tap of the other choice finds his first answer kept: the card says "Already answered: <it>", the
+    // relay carries it, and no second hold line is written.
+    let heldNote = "", already = false;
+    if (m.decision) {
+      let kept: { choice: string; at: number; existed: boolean } | void;
+      try {
+        if (!this.d.decided) throw new DecisionsUnsaved("the link has nowhere to keep it");
+        kept = this.d.decided(m.decision.id, tapped, this.d.now());
+      } catch (e) {
+        this.log(`couldn't keep his decision at the review cap; the card stays up: ${String(e).slice(0, 120)}`);
+        await this.answer(it, ACK);
+        await this.ephemeral(it, DECISION_UNSAVED);
+        return "unsaved";
+      }
+      const existed = !!kept && kept.existed;
+      if (kept && q.options.includes(kept.choice)) label = kept.choice;
+      already = label !== tapped;
+      if (already) this.log(`his decision for ${m.decision.key} was already kept as "${label}"; a later tap of "${tapped}" changes nothing`);
+      if (label === RISK) heldNote = this.heldForRollback(m, existed);
+    }
     q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
     // His Ship tap lands it in main, unless everything is stopped. Cain hears how it
     // went once it's settled, with the Ship token when it's in main.
-    let shown = `You answered: ${label}`, extra = "", landing = false;
+    let shown = already ? `Already answered: ${label}` : `You answered: ${label}`, extra = "", landing = false;
+    if (already) extra = " His first answer stands: it was kept before the link restarted, and a later tap of the other choice changed nothing.";
     const words = String(it.message.content ?? "");
     if (m.kind === "ship" && m.ship && label === "Ship") {
       if (this.stopped().stopped) {
@@ -2151,7 +2842,7 @@ export class Link {
     // Cain hears it the moment it's saved as answered: if the link stopped now, a tap
     // can't be marked answered and never reach him. A landing tells him when it settles
     // (the sweep settles one the link was cut off from).
-    if (!landing) this.d.relay(this.tapLine(m, label, msgId) + extra);
+    if (!landing) this.d.relay(this.tapLine(m, label, msgId) + extra + heldNote);
     const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
     if (ok) {
       const s2 = this.d.load();
@@ -2602,6 +3293,8 @@ export class Link {
       this.backfillLabels();
       await this.sendOwedToggle();
       await this.retryLandings();
+      await this.retryDecisions();
+      this.capSweep();
       await this.checkKey();
       await this.showDue();
       await this.decide();

@@ -1,0 +1,8 @@
+{
+  "name": "surface-worker-workerd",
+  "private": true,
+  "description": "The Worker's suite under workerd (Miniflare), with a real Durable Object binding (surface/README.md, Tests).",
+  "devDependencies": {
+    "miniflare": "4.20260730.0"
+  }
+}
