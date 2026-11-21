@@ -184,6 +184,8 @@ function render(dir: string, port: number, upstream: number, health = { port: 0,
   // Fourth round: the note of each /health 200 (time and address, for probe-drill.sh 7's gate) too.
   swap(/access_log \/run\/cain-web\/health-ok\.log /, `access_log ${dir}/health-ok.log `);
   swap(/if \(-f \/run\/cain-web\/www\/health-down\)/, `if (-f ${dir}/health-down)`);
+  // Cain 0.17.0: the link's gateway mark (link/health-gate.ts).
+  swap(/if \(!-f \/run\/cain-web\/www\/health-gateway\)/, `if (!-f ${dir}/health-gateway)`);
   swap(/^user nobody nogroup;$/m, "");
   // Root's pages (C1: /run/cain-web/www) and the upstreams (C1: unix sockets only nginx's workers and
   // root can open) are moved into the temp dir and onto the stand-in's port.
@@ -247,6 +249,7 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
     writeFileSync(join(dir, "www/index.html"), "the Cain page");
     writeFileSync(join(dir, "signin.html"), "the sign-in link");
     writeFileSync(join(dir, "status.json"), '{"ready":true}');
+    writeFileSync(join(dir, "health-gateway"), "1\n");     // the link's gateway is connected (0.17.0)
     writeFileSync(join(dir, "nginx.conf"), render(dir, port, upstream!.port!, { port: hp, from }));
     const proc = Bun.spawn([NGINX!, "-p", dir, "-c", join(dir, "nginx.conf"), "-e", join(dir, "error.log"),
                             "-g", "daemon off;"], { stdout: "ignore", stderr: "pipe" });
@@ -348,6 +351,11 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
     writeFileSync(join(h.dir, "health-down"), "");
     expect(await at(h.port, "/health")).toEqual([503, "a self-restart is due"]);
     rmSync(join(h.dir, "health-down"));
+    expect(await at(h.port, "/health")).toEqual([200, "ok"]);
+    // 0.17.0: without the link's gateway mark, 503 (Discord's gateway isn't connected), and 200 once it's back.
+    rmSync(join(h.dir, "health-gateway"));
+    expect(await at(h.port, "/health")).toEqual([503, "Discord's gateway isn't connected"]);
+    writeFileSync(join(h.dir, "health-gateway"), "1\n");
     expect(await at(h.port, "/health")).toEqual([200, "ok"]);
     for (const path of ["/", "/status", "/signin", "/tty/", "/health/x", "/healthz"]) expect([path, (await at(h.port, path))[0]]).toEqual([path, 404]);
     // Not on the network (127.0.0.2/32 in this config): 404 even for /health, mark or none.
