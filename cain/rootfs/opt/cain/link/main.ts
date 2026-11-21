@@ -268,7 +268,7 @@ const link = new Link({
   // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
   // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
   capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
-  // 0.17.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
+  // 0.18.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
   armed: () => keeperArmedText(keeperReplies, Date.now(), PROBE_HASH),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
   decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
@@ -292,7 +292,7 @@ const link = new Link({
   writeReplay: (r) => writeReplayReport(r),
 });
 
-// -- the keeper App's armed state (0.17.0) -------------------------------------------------------------
+// -- the keeper App's armed state (0.18.0) -------------------------------------------------------------
 // Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
 // that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
 // (keeper_token, the run script hands it in KEEPER_TOKEN) and is never logged.
@@ -552,7 +552,7 @@ setInterval(() => {
     writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
     renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
   } catch { /* the probe then sees an old time, and fails that layer */ }
-  // Cain's /health (0.17.0, health-gate.ts): 200 only while the gateway is connected and acknowledged.
+  // Cain's /health (0.18.0, health-gate.ts): 200 only while the gateway is connected and acknowledged.
   writeGatewayMark(gatewayHealthy(connected, proto.lastAck, Date.now()));
 }, 30_000);
 writeGatewayMark(false);

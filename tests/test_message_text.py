@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 import message_rules
-from conftest import ASK_ALLOWED, asks_in, labels_of, rule_problems
+from conftest import ASK_ALLOWED, ASK_SCOPED, asks_in, labels_of, rule_problems
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "harness" / "app" / "harness"
@@ -38,6 +38,20 @@ MACHINE_VALUE = re.compile(r"(?i)\b(?:job|http|uid|nonce)\s*\{\}")
 
 # (file, words in the literal, why it may stay). Kept short: each one is a decision.
 ALLOWED = [
+    # Thirteenth round: a staged restore is swapped in only at the App's start, so his tap is followed by one ask to
+    # restart it, with the exact path, and everything taken meanwhile is answered with the same ask.
+    ("migrate.py", "Restart Harness now to put its records back",
+     "the one card after his Put them back tap: the restore is used only when the App starts (thirteenth round)"),
+    ("migrate.py", "Ready: restart Harness now",
+     "the answer on his Put them back tap, pointing at that card (thirteenth round)"),
+    ("handover.py", "Harness is waiting to restart so its records",
+     "what a request or tap gets while a staged restore waits for the restart (thirteenth round); fourteenth "
+     "round: it lives in handover.py, since Cain's handover service answers a tap with it at once, unqueued"),
+    ("setup_web.py", "A restore is staged: restart the App now",
+     "the status page while a staged restore waits for the restart (thirteenth round)"),
+    ("calendar_change.py", "Try again",
+     "the button after a calendar refused its own safety check: a new card read from the calendar just now, for "
+     "his tap, a decision, not a resend ask (eighth round)"),
     ("drive.py", "addon", "the HTTP User-Agent to OpenStreetMap: a header, never a message"),
     ("watch.py", "Restarting it should bring it back: Settings > Apps > Cain > Restart.",
      "the 30-minute line: sent once, only while Cain is still down, with the exact path"),
@@ -134,6 +148,8 @@ def test_every_allowed_literal_is_still_there_and_has_its_reason():
              for _, text in _strings(ast.parse(path.read_text(encoding="utf-8")))]
     for words, why in ASK_ALLOWED:
         assert why and any(words in text for text in every), words
+    for words, card, builder, why in ASK_SCOPED:                           # twenty-fourth, twenty-fifth rounds
+        assert why and card and any(words in text and builder.fullmatch(text) for text in every), words
 
 
 @pytest.mark.parametrize("source, what", [
@@ -212,7 +228,7 @@ def test_the_done_claim_check_catches_one():
     assert DONE_CLAIM.search("Thanks. Swim is on your calendar as yours.")
     assert DONE_CLAIM.search("Thanks. Swim stays off your calendar.")
     assert not DONE_CLAIM.search("Thanks. I'll put Swim on your calendar as yours.")
-    assert not DONE_CLAIM.search("Taking it off your Gmail, just this once.")
+    assert not DONE_CLAIM.search("Taking it off your Gmail, this time only.")
 
 
 # -- the rules, equal on both sides ------------------------------------------------------------

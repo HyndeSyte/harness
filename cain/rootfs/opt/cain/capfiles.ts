@@ -11,7 +11,7 @@
 //   /data/review-settings.json          root:cain 0640   the runner writes, Cain reads
 //   /data/review-guard.log              root:cain 0640   the runner and the link append, Cain reads
 //   /data/link/review-decisions.json    root:root 0600   the link's own (when there)
-// (0.17.0: the rollback's armed state is no longer a file here: the link reads it from the keeper App,
+// (0.18.0: the rollback's armed state is no longer a file here: the link reads it from the keeper App,
 // link/cap.ts keeperArmed.)
 // A file that is wrong turns the cap and guard features off and raises one alarm naming it.
 import { lstatSync, readFileSync, type Stats } from "node:fs";

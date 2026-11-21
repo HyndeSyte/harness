@@ -287,6 +287,14 @@ class FamilyAdd:
         except ValueError:
             return False
 
+    def tapless(self) -> bool:
+        """Adds go without their tap only while both hold (0.24.0, fifth round): his tap on the
+        bake-in card (loosened) and the no-card flag, which is off after install until his Turn on
+        tap on the smoke test's card (calendar_change.FAST_PATH). Read at offer time and again at
+        write time (_blocked): with the flag off, an add is a normal card."""
+        from .calendar_change import fast_path_on      # imported here: calendar_change imports this
+        return self.loosened() and fast_path_on(self.ledger)
+
     def problem(self) -> str:
         return self.ledger.get_meta(PROBLEM) or ""
 
@@ -319,9 +327,12 @@ class FamilyAdd:
     def status_line(self) -> str:
         if not self.enabled():
             return "Family calendar adds: off"
-        if self.loosened():
+        if self.tapless():
             return ("Family calendar adds: on, skipping the Approve tap "
                     "(receipt, Undo and /stop stay; /checkadds brings the tap back)")
+        if self.loosened():
+            return ("Family calendar adds: on, each needs your tap until the check after installing "
+                    "has passed and you turned on changes without a card")
         b = self._bake()
         return f"Family calendar adds: on, each needs your tap ({b['n']} since the last problem)"
 
@@ -348,7 +359,7 @@ class FamilyAdd:
             waiting.append(what if r["state"] == "settling" else f"the undo of {what}")
         if waiting:
             parts.append(f"Not confirmed yet, still checking: {'; '.join(waiting)}.")
-        if self.enabled() and self.loosened():
+        if self.enabled() and self.tapless():
             n = self.ledger.db.execute(
                 "SELECT COUNT(*) FROM family_adds WHERE state='created' AND created_at>=?",
                 (iso(since) if since else "",)).fetchone()[0]
@@ -473,6 +484,43 @@ class FamilyAdd:
         if any(earlier.values()):
             lines.append(f"Before this count: {counts(earlier)}.")
         return "\n".join(lines)
+
+    def tap_effect(self, op: dict) -> str:
+        """Sixteenth round: whether the Family add an Approve led to is on the calendar, read by the event's own id
+        (it comes from the proposal): "done", "unread", or eighteenth round "absent" (nothing at its address: Harness
+        can't tell whether it was added and taken off since, so it's never added again from here)."""
+        pid = str((op or {}).get("proposal") or "")
+        if not pid:
+            return "unread"
+        out, _ = self.client.fetch(self.client.href_for(caldav.uid_for(pid)))
+        return {"ok": "done", "gone": "absent"}.get(out.kind, "unread")
+
+    def undo_op(self, target: str) -> dict | None:
+        """Seventeenth round: his Undo on a Family add, named before it's acted on by the event it takes off (its
+        address, from the proposal) and the state it must read in afterwards: gone. None when nothing is open."""
+        row = self.ledger.db.execute("SELECT undo_state, etag FROM family_adds WHERE proposal_id=?",
+                                     (str(target or ""),)).fetchone()
+        if row is None or row["undo_state"] != "open":
+            return None
+        return {"effect": "undo", "kind": "family_add_undo",
+                "steps": [{"cal": "family", "how": "delete", "href": self.client.href_for(caldav.uid_for(target)),
+                           "etag": row["etag"] or ""}]}
+
+    def undo_parts(self, op: dict) -> list[str]:
+        """The read of a Family Undo's identity: "done" when the event is gone, "unread" when the calendar couldn't
+        tell. Eighteenth round: "not_done" only when it's there in the very version the add left (journaled with
+        the step); any other version is "changed": changed since, Harness can't tell, no Go ahead."""
+        got = []
+        for st in (op or {}).get("steps") or []:
+            out, _ = self.client.fetch(str(st.get("href") or ""))
+            after = str(st.get("etag") or "")
+            if out.kind == "gone":
+                got.append("done")
+            elif out.kind == "ok":
+                got.append("not_done" if after and out.etag == after else "changed")
+            else:
+                got.append("unread")
+        return got
 
     def _counted_uids(self, b: dict) -> list[str]:
         return [r["uid"] for r in self.ledger.db.execute(
@@ -680,7 +728,7 @@ class FamilyAdd:
         """After his tap on the bake-in card, an add needs no tap of its own.
         Nothing else can come through here."""
         row = db.execute("SELECT effect_type FROM proposals WHERE id=?", (proposal_id,)).fetchone()
-        if not self.loosened() or row["effect_type"] != effects.FAMILY_ADD:
+        if not self.tapless() or row["effect_type"] != effects.FAMILY_ADD:
             return False
         # Its own state: checked again just before the write (_blocked).
         db.execute("UPDATE proposals SET state='auto_approved' WHERE id=? AND state='proposed'",
@@ -858,7 +906,7 @@ class FamilyAdd:
             return "stopped", "I'm stopped, so nothing was added."
         if not self.enabled():
             return "family_add_off", "Adding to the Family calendar is off, so nothing was added."
-        if p["state"] == "auto_approved" and not self.loosened():
+        if p["state"] == "auto_approved" and not self.tapless():
             return "tap_restored", ""          # it comes back as a card (_card_again)
         try:
             checked = effects.REGISTRY[effects.FAMILY_ADD].validate(params)
@@ -1014,7 +1062,7 @@ class FamilyAdd:
             if row["etag"]:
                 buttons, binds = self._undo_button(db, row["proposal_id"])
                 self._say(db, self.chat_id, row["job_id"],
-                          text + "\nNothing to do if that's right; tap Undo if it's wrong.",
+                          text + "\nNothing to do if that's right; the button below takes it off if it's wrong.",
                           buttons=buttons, binds=binds)
             else:
                 self._say(db, self.chat_id, row["job_id"], text + "\niCloud gave no version tag for "

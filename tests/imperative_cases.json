@@ -1,0 +1,353 @@
+{
+ "imperative": [
+  [
+   "Tap Go ahead to see it.",
+   "Go ahead",
+   true
+  ],
+  [
+   "tap on the Undo button",
+   "Undo",
+   true
+  ],
+  [
+   "Press “Approve” now.",
+   "Approve",
+   true
+  ],
+  [
+   "Clicking **Undo** takes it off.",
+   "Undo",
+   true
+  ],
+  [
+   "hit the Stop",
+   "Stop",
+   true
+  ],
+  [
+   "The Undo button takes it off.",
+   "Undo",
+   true
+  ],
+  [
+   "Use the \"Add anyway\" buttons below.",
+   "Add anyway",
+   true
+  ],
+  [
+   "There's no Go ahead here.",
+   "Go ahead",
+   false
+  ],
+  [
+   "We'll go ahead with it.",
+   "go ahead",
+   false
+  ],
+  [
+   "You can undo this later.",
+   "undo",
+   false
+  ],
+  [
+   "Pick Undo if it's wrong.",
+   "Undo",
+   false
+  ],
+  [
+   "It ends with Undo.",
+   "Undo",
+   false
+  ],
+  [
+   "Go ahead does it now.",
+   "Go ahead",
+   false
+  ],
+  [
+   "Tapping elsewhere, Undo stays.",
+   "Undo",
+   false
+  ],
+  [
+   "retap Undo",
+   "Undo",
+   false
+  ],
+  [
+   "Undo buttonless",
+   "Undo",
+   false
+  ]
+ ],
+ "refusal": [
+  {
+   "text": "Done.\nTap\nGo ahead to see it.",
+   "buttons": [],
+   "known": [
+    "Go ahead"
+   ],
+   "refused": [
+    "Go ahead"
+   ]
+  },
+  {
+   "text": "Done. Tap on the\n\"Undo\" to take it off.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "It's ready. Tap Undo to take it off.",
+   "buttons": [
+    "Go ahead"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "Tap Undo to take it off.",
+   "buttons": [
+    "Undo"
+   ],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "Pick Undo if it's wrong.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "Choose\nApprove when ready.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "Press **Approve** now.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Approve"
+   ]
+  },
+  {
+   "text": "Tap “Turn on” below.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Turn on"
+   ]
+  },
+  {
+   "text": "Tap Undo both to put both back.",
+   "buttons": [
+    "Undo both"
+   ],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "It ends with Undo.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  },
+  {
+   "text": "The Undo button takes it off.",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "We'll go ahead with it. Tap\nAdd anyway to add it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Add anyway",
+    "Go ahead"
+   ],
+   "refused": [
+    "Add anyway"
+   ]
+  },
+  {
+   "text": "About your message “Tap Approve”.",
+   "buttons": [
+    "Go ahead"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "refused": [
+    "Approve"
+   ]
+  },
+  {
+   "text": "See [Undo button](https://example.com/x).",
+   "buttons": [],
+   "known": [],
+   "refused": [
+    "Undo"
+   ]
+  },
+  {
+   "text": "Code: `tap Undo` here.",
+   "buttons": [],
+   "known": [],
+   "refused": []
+  }
+ ],
+ "template": {
+  "_note": "Twenty-first round: the fixed template's every line as the link sees it, and its outcome phrases by enum. Both suites check each against the link's filter with every known label; the Python suite checks they are the outbox's own.",
+  "head": "**An update from Harness**, written Mon 9:00 AM.",
+  "job": "It's about a message of yours.",
+  "body": "Harness has an update on this; its full words couldn't be shown here.",
+  "outcomes": {
+   "done": "What it was about is done.",
+   "not_done": "What it was about isn't done.",
+   "unverified": "Harness couldn't verify how it went."
+  },
+  "known": [
+   "Go ahead",
+   "Add anyway",
+   "Leave it",
+   "Approve",
+   "Decline",
+   "Undo"
+  ]
+ },
+ "end_to_end": [
+  {
+   "name": "bold head without terminal punctuation",
+   "html": "<b>Your change is ready</b> Tap Go ahead to add it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "first": "**Your change is ready** Tap Go ahead to add it.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "outcome": "done"
+  },
+  {
+   "name": "code span holding a label",
+   "html": "<b>Done</b> Use `Go ahead` here, or tap Go ahead.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "first": "**Done** Use \\`Go ahead\\` here, or tap Go ahead.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "outcome": "done"
+  },
+  {
+   "name": "link with a label in its text",
+   "html": "<b>Done</b> See [tap Go ahead](https://example.com) for it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "first": "**Done** See \\[tap Go ahead\\]\\(https://example.com\\) for it.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "outcome": "done"
+  },
+  {
+   "name": "bold head without terminal punctuation, not done",
+   "html": "<b>Your change didn't go through</b> Tap Go ahead to try it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "outcome": "not_done",
+   "first": "**Your change didn't go through** Tap Go ahead to try it.",
+   "refused_first": [
+    "Go ahead"
+   ]
+  },
+  {
+   "name": "link with a label in its text, couldn't verify",
+   "html": "<b>Unclear</b> See [tap Go ahead](https://example.com) for it.",
+   "buttons": [
+    "Leave it"
+   ],
+   "known": [
+    "Go ahead"
+   ],
+   "outcome": "unverified",
+   "first": "**Unclear** See \\[tap Go ahead\\]\\(https://example.com\\) for it.",
+   "refused_first": [
+    "Go ahead"
+   ]
+  }
+ ],
+ "said": {
+  "_note": "Twenty-second round: owner-facing tap words checked by both suites against the link's filter with every known label (the Python suite checks they are the controller's own): the unidentified card, the internal-error card, and a part with no reason recorded and no read. Twenty-third round: the internal-error card says Harness couldn't confirm whether the change was made and asks him to check his calendar, the one ask a card may make here.",
+  "texts": [
+   "Harness couldn't tell which request this tap was for; nothing was changed. It couldn't identify this tap in its records, so nothing more is done for it from here.",
+   "Harness hit an internal error while working out what came of it, so it couldn't confirm whether the change was made. Please check your calendar to see whether it's there. It isn't taken again from here, and nothing more is done for it.",
+   "For Swim, Harness can't tell how far it got; nothing more is done for it from here.",
+   "For Swim, Lunch, Harness can't tell how far they got; nothing more is done for them from here."
+  ]
+ },
+ "refused_twice": [
+  {
+   "name": "refused twice: a label the link came to know between tries",
+   "html": "<b>Done.</b> Tap Go ahead to see it. Tap Leave it to skip it.",
+   "buttons": [
+    "Add anyway"
+   ],
+   "known_first": [
+    "Go ahead"
+   ],
+   "known_second": [
+    "Go ahead",
+    "Leave it"
+   ],
+   "outcome": "not_done",
+   "first": "**Done.** Tap Go ahead to see it. Tap Leave it to skip it.",
+   "refused_first": [
+    "Go ahead"
+   ],
+   "second": "**Done.** Tap Leave it to skip it.",
+   "refused_second": [
+    "Leave it"
+   ]
+  }
+ ],
+ "end_to_end_names": {
+  "_note": "Twenty-third round: the one canonical list of the end-to-end case names; both suites assert the cases' names equal it.",
+  "names": [
+   "bold head without terminal punctuation",
+   "code span holding a label",
+   "link with a label in its text",
+   "bold head without terminal punctuation, not done",
+   "link with a label in its text, couldn't verify"
+  ]
+ }
+}

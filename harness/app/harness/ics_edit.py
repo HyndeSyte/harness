@@ -15,14 +15,15 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import ical
+from .scrub import OwnerRefusal
 
 _FOLD = 75
 _PEOPLE = frozenset({"ATTENDEE"})
 _NOT_COPIED = frozenset({"RRULE", "RDATE", "EXDATE", "DTSTART", "DTEND", "DURATION"})
 
 
-class Cant(ValueError):
-    """Words for him: this event can't take this change."""
+class Cant(OwnerRefusal, ValueError):
+    """Words for him: this event can't take this change (twenty-eighth round: owner text, scrub.OwnerRefusal)."""
 
 
 def _unfold(ics: str) -> list[str]:

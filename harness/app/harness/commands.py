@@ -26,6 +26,7 @@ import json
 from typing import Callable
 
 from . import choices, render, rules
+from .scrub import scrub_owner as owner_scrubbed   # twenty-seventh round: his own words, known secrets only
 from .ledger import Ledger, iso
 
 STOPPED = "stopped_requests"           # his requests not acted on while stopped: job ids, in order
@@ -295,4 +296,4 @@ class Commands:
             return render.escape(rules.undo(self.ledger, target)) + \
                 f" <i>({render.escape(target)} retired)</i>"
         except rules.RuleError as e:
-            return render.escape(f"Couldn't undo {target}: {e}.")
+            return render.escape(f"Couldn't undo {target}: {owner_scrubbed(e)}.")

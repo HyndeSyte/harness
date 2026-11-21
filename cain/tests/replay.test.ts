@@ -6,7 +6,7 @@ import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { routeAllowed } from "../rootfs/opt/cain/link/auth";
-import { STOP } from "../rootfs/opt/cain/link/core";
+import { STOP, STOPPED_TOO } from "../rootfs/opt/cain/link/core";
 import { readTranscripts } from "../rootfs/opt/cain/link/publish";
 import { BOT, DAY, DM, HOUR, MIN, OWNER, PR, rig, SHA1 } from "./link-rig";
 
@@ -15,7 +15,7 @@ process.env.CAIN_TRANSCRIPT_UID = String(typeof process.getuid === "function" ? 
 
 const btn = (label: string, custom_id: string) => ({ type: 2, style: 2, label, custom_id });
 const STOP_ONLY = [{ type: 1, components: [{ ...btn("Stop", STOP), style: 4 }] }];
-const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm"), btn("Wrong time", "k:c:wt"), btn("Just this once", "k:c:jo")] }, ...STOP_ONLY];
+const RECEIPT_ROWS = [{ type: 1, components: [btn("Not mine", "k:c:nm"), btn("Wrong time", "k:c:wt"), btn("Not this time", "k:c:jo")] }, ...STOP_ONLY];
 
 // A bot message the link didn't post (Cain's plugin, or something else on the bot token).
 function botMessage(r: ReturnType<typeof rig>, content: string, o: { replyTo?: string; components?: any[]; at?: number } = {}) {
@@ -32,7 +32,7 @@ const done = async (r: ReturnType<typeof rig>) => { await r.link.whenReplayed();
 async function dm(r: ReturnType<typeof rig>) {
   const ask = (await r.link.ask({ text: "Is the add-on's packet filed?", options: ["Filed", "Not filed"], item: "P08", question: "Q2" }) as any).message;
   await r.tap(structuredClone(r.msg(ask)), r.ids(ask)[0]);
-  const digest = await r.link.addCard({ text: "Three blocks added, each on its own card with Undo.", rows: STOP_ONLY, kind: "digest" });
+  const digest = await r.link.addCard({ text: "Three blocks added, each on its own card with Undo.", rows: STOP_ONLY, kind: "digest" });   // flagged, posted as it is
   const digestMsg = await r.link.show(digest, { item: "none" });
   const card = await r.link.addCard({ text: "Added Swim to your Gmail.", rows: RECEIPT_ROWS, kind: "card" });
   const receipt = await r.link.show(card, { item: "none" });
@@ -122,7 +122,7 @@ describe("the replay", () => {
 
   test("the specialist's cards that never went out are read as the link got them", async () => {
     const r = rig();
-    await r.link.addCard({ text: "Swim moved, with Undo.", rows: STOP_ONLY, kind: "card" });   // waiting for Cain
+    await r.link.addCard({ text: "Swim moved, with Undo.", rows: STOP_ONLY, kind: "card" });   // flagged, waiting for Cain
     r.link.replay(14);
     const rep = await done(r);
     expect(rep.messages.cards_never_posted).toBe(1);
@@ -367,11 +367,14 @@ describe("the replay", () => {
 describe("the replay after the rules were tuned (0.10.0)", () => {
   test("the link's own line on a specialist's Stop notice is judged as the link's words", async () => {
     const r = rig();
-    r.stop.stopped = true; r.stop.at = r.t.now;
-    // As 0.9.0 recorded it: a specialist's Stopped notice, with the link's line, its buttons gone.
-    const card = await r.link.addCard({ text: "Stopped. Nothing runs.\n\nCain's Build and Ship jobs, Ship cards and outside reviews are stopped too, and nothing lands in main, until you tap Turn back on. A job already running finishes.",
-      rows: [], kind: "card" });
-    const id = await r.link.show(card, { item: "none" });
+    // As 0.9.0 recorded it: his Stop tap, then the specialist's Stopped notice with the link's line
+    // after it ("until you tap Turn back on"), its buttons gone. Posted as the link posts it.
+    const morning = await r.link.morning("## Thu Nov 12");
+    await r.tap(structuredClone(r.msg(morning)), STOP);
+    await r.link.addCard({ text: "Stopped. Nothing runs.", rows: [], kind: "stopped" });
+    const id = r.last().id;
+    expect(r.msg(id).content).toBe(`Stopped. Nothing runs.\n\n${STOPPED_TOO}`);
+    expect(r.buttons(id)).toEqual([]);
     r.link.replay(14);
     const rep = await done(r);
     expect(rep.list.filter((h: any) => h.message === id)).toEqual([]);   // no "can't tell" for the link's line

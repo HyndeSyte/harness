@@ -58,7 +58,7 @@ class OneRead(google_cal.GoogleCalendar):
     def __init__(self, events):
         self.events = events
 
-    def events_between(self, address, start, end):
+    def events_between(self, address, start, end, fresh=False):
         return self.events
 
 

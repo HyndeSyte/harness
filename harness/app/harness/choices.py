@@ -26,9 +26,16 @@ KINDS = frozenset({"rule_undo", "rule_keep_new", "rule_keep_old",
                    "settings_approve", "settings_decline", "family_add_enable",
                    "family_add_undo", "family_add_loosen", "family_add_keep",
                    "rule_approve", "rule_decline", "calendar_change_undo",
-                   "mail_dates_undo", "cain_question", "meaning_answer", "meaning_undo",
+                   "mail_dates_undo", "mail_dates_family", "mail_dates_gmail",
+                   "mail_dates_skip", "cain_question", "meaning_answer", "meaning_undo",
                    "place_skip", "stopped_redo", "stopped_drop", "drive_undo", "drive_skip",
-                   "drive_remove", "drive_keep"})
+                   "drive_remove", "drive_keep", "calendar_change_add_anyway",
+                   "calendar_change_propose_again", "calendar_change_which",
+                   "calendar_change_fast_on", "calendar_change_fast_keep", "calendar_change_fast_off",
+                   "calendar_change_smoke_clear", "calendar_change_try_again", "calendar_change_restart",
+                   "calendar_change_gate_open", "calendar_change_conform_again",
+                   "calendar_change_step_start", "migration_check", "migration_override",
+                   "migration_restore", "migration_clock", "tap_reconfirm"})
 PREFIX = "c"
 
 

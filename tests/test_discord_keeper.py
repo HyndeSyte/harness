@@ -152,7 +152,7 @@ def post(port, path, body, key):
 
 
 def test_the_handover_needs_the_key_made_from_the_bot_token():
-    inbox = Inbox(lambda: TOKEN)
+    inbox = Inbox.for_tests(lambda: TOKEN)
     srv = serve(inbox, port=0, host="127.0.0.1", wait_s=2)
     port = srv.server_address[1]
     try:
@@ -172,7 +172,7 @@ def test_the_handover_needs_the_key_made_from_the_bot_token():
 
 
 def test_no_token_no_handover():
-    assert not Inbox(lambda: "").key_ok(key_for(""))
+    assert not Inbox.for_tests(lambda: "").key_ok(key_for(""))
 
 
 # -- the controller, behind Cain ------------------------------------------------------------
@@ -196,7 +196,7 @@ class Rig:
                             status_box={}, requests=queue.Queue(), poll_timeout=0)
         self.c.discord = self.keeper
         self.c.discord_chat = LinkChat(self.link, paused=lambda: commands.is_paused(ledger))
-        self.c.handovers = Inbox(lambda: TOKEN)
+        self.c.handovers = Inbox.for_tests(lambda: TOKEN)
         today = clock().astimezone(ZoneInfo("America/New_York")).date().isoformat()
         with ledger.tx() as db:
             ledger.set_meta("canary_date", today, db)
@@ -381,7 +381,7 @@ MEANING_ROW = {"kind": "Pat dentist", "meaning": "kids", "said_on": "2026-10-01"
 def test_the_meanings_route_needs_the_key_and_good_rows():
     from harness import handover
     token = "tok-" + "a" * 30
-    inbox = handover.Inbox(lambda: token)
+    inbox = handover.Inbox.for_tests(lambda: token)
     srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=2)
     port = srv.server_address[1]
     try:
@@ -410,7 +410,7 @@ PLACE_ROW = {"place": "HMLC", "address": "Front desk, 12 Rink Rd, Leesburg, VA 2
 def test_the_places_route_needs_the_key_and_a_real_address():
     from harness import handover
     token = "tok-" + "b" * 30
-    inbox = handover.Inbox(lambda: token)
+    inbox = handover.Inbox.for_tests(lambda: token)
     srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=2)
     port = srv.server_address[1]
     try:

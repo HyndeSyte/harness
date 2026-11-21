@@ -77,12 +77,16 @@ class FakeGmail:
     def configured(self):
         return True
 
-    def events_between(self, address, start, end):
+    def events_between(self, address, start, end, fresh=False):
         out = []
         for e in self.events.values():
             if e.get("status") == "cancelled":
                 continue
-            when = datetime.fromisoformat(e["start"]["dateTime"])
+            side = e["start"]
+            if side.get("dateTime"):
+                when = datetime.fromisoformat(side["dateTime"])
+            else:                          # an all-day day: midnight there
+                when = datetime.combine(date.fromisoformat(side["date"]), datetime.min.time(), start.tzinfo)
             if start <= when < end:
                 out.append(copy.deepcopy(e))
         return out
@@ -91,7 +95,27 @@ class FakeGmail:
         if self.down:
             return "unknown", None
         e = self.events.get(uid)
+        if e is None and "_" in uid and uid.rsplit("_", 1)[0] in self.events:
+            e = self._instance(uid)
         return ("ok", copy.deepcopy(e)) if e is not None else ("gone", None)
+
+    def _instance(self, uid):
+        """One day of a series read by its instance id, as Google gives it (made on first read)."""
+        base, stamp = uid.rsplit("_", 1)
+        master = self.events[base]
+        try:
+            when = datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        if not master.get("recurrence") or master.get("status") == "cancelled" or not master["start"].get("dateTime"):
+            return None
+        span = datetime.fromisoformat(master["end"]["dateTime"]) - datetime.fromisoformat(master["start"]["dateTime"])
+        inst = {k: copy.deepcopy(v) for k, v in master.items() if k != "recurrence"}
+        inst.update(id=uid, recurringEventId=base, originalStartTime={"dateTime": when.isoformat()},
+                    start={"dateTime": when.isoformat()}, end={"dateTime": (when + span).isoformat()})
+        self.events[uid] = inst
+        self._bump(uid)
+        return inst
 
     def really_gone(self, address, uid):
         e = self.events.get(uid)
@@ -110,7 +134,7 @@ class FakeGmail:
     def change(self, address, uid, fields, etag):
         self.log.append(("change", uid, fields))
         if self._stale(uid, etag):
-            return caldav.Outcome("changed")
+            return caldav.Outcome("changed", 412)
         if self.answer == "ok":
             self.events[uid].update(fields)
             self._bump(uid)
@@ -119,7 +143,7 @@ class FakeGmail:
     def drop(self, address, uid, etag):
         self.log.append(("drop", uid))
         if self._stale(uid, etag):
-            return caldav.Outcome("changed")
+            return caldav.Outcome("changed", 412)
         if self.answer == "ok":
             self.events[uid]["status"] = "cancelled"
             self._bump(uid)
@@ -127,6 +151,8 @@ class FakeGmail:
 
     def insert(self, address, event):
         self.log.append(("insert", event))
+        if event["id"] in self.events:     # Google: an id already used is a 409, never a second event
+            return caldav.Outcome("exists")
         if self.answer == "ok":
             self.events[event["id"]] = copy.deepcopy(event)
             self._bump(event["id"])
@@ -418,7 +444,10 @@ def test_someone_editing_in_between_stops_the_write(r):
     r.icloud.before_write = lambda: r.icloud.human_edit(PATH, "School Day", "School Days")
     r.tell(change(dates="2026-11-23"))
     assert "School Days" in r.body() and "2026-11-23" in days_of(r.body())
-    assert "changed that event" in r.texts()[-1]
+    # 0.24.0, sixth round: refused for its version, so not applied, and one fresh card follows.
+    receipt = next(t for t in r.texts() if t.startswith("<b>Not applied.</b>"))
+    assert "The event changed since your card" in receipt and "A fresh card" in receipt
+    assert "fresh card with it as it is now" in r.texts()[-1] and r.with_button("Approve")
 
 
 def test_a_lost_answer_is_read_and_the_receipt_follows(r):
@@ -457,12 +486,28 @@ def test_off_says_so_and_changes_nothing(r):
     assert r.body() == before and "off" in r.texts()[-1]
 
 
-def test_several_changes_land_in_one_receipt(r):
+def test_several_changes_that_need_a_tap_come_one_card_each(r):
+    """0.24.0 (Nov 15): two changes in one message, one needing his tap. Each comes on its own card,
+    so he can take one and not the other; a part of a split is never done without his tap, even one
+    clear on its own (second review round)."""
     r.tell(change(dates="2026-11-23"), change(op="end_series", dates="2027-03-08"))
-    r.approve()                                # ending a series is tapped
+    assert "2026-11-23" in days_of(r.body()) and "2027-03-08" in days_of(r.body())
+    approvals = [s for s in r.bot.sent if s[2] and any(t == "Approve" for row in s[2] for t, _ in row)]
+    assert len(approvals) == 2
+    day_card = next(s for s in approvals if "Nov 23" in s[1])
+    end_card = next(s for s in approvals if s is not day_card)
+    assert "several changes in one message" in day_card[1]
+    r.press(end_card, "Approve")                    # ending a series is tapped
     days = days_of(r.body())
-    assert "2026-11-23" not in days and "2027-03-08" not in days and "2027-03-03" in days
-    assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 1
+    assert "2026-11-23" in days and "2027-03-08" not in days and "2027-03-03" in days
+    r.press(day_card, "Approve")
+    # 0.24.0, sixth round: ending the series changed its rule since the day's card, so that card's
+    # version isn't taken for the one just read: refused, not applied, and offered again as it is now.
+    assert "2026-11-23" in days_of(r.body())
+    assert any(t.startswith("<b>Not applied.</b>") for t in r.texts())
+    r.approve()
+    assert "2026-11-23" not in days_of(r.body())
+    assert len([s for s in r.bot.sent if s[2] and any(t == "Undo" for row in s[2] for t, _ in row)]) == 2
 
 
 def test_an_added_series_is_an_ordinary_event_and_undo_takes_it_off(r):
@@ -751,11 +796,15 @@ def test_a_stale_offset_gets_a_tap(r):
     assert r.with_button("Approve") and not [p for p in r.icloud.events if "/hm-" in p]
 
 
-def test_the_same_add_twice_gets_a_tap(r):
+def test_the_same_add_twice_adds_nothing_the_second_time(r):
+    """0.24.0: the very same event already there (same calendar, title, start and end) adds
+    nothing, and the receipt names it with Add anyway (fourth round: never silent)."""
     add = change(op="add", title="Dentist", start="2026-11-23T09:00:00-05:00", end="2026-11-23T10:00:00-05:00")
     r.tell(add)
     r.tell(add)
-    assert len([p for p in r.icloud.events if "/hm-" in p]) == 1 and r.with_button("Approve")
+    assert len([p for p in r.icloud.events if "/hm-" in p]) == 1
+    assert "Already there, nothing added: \u201cDentist\u201d" in r.texts()[-1]
+    assert r.with_button("Add anyway")
 
 
 def test_checkadds_brings_the_tap_back(r):
@@ -1090,11 +1139,17 @@ def test_a_gmail_series_and_one_of_its_days_are_each_checked(r):
     r.tell(change(calendar="gmail", op="move", title="harness test", dates="2026-12-08",
                   start="2026-12-08T21:00:00-05:00", end="2026-12-08T22:00:00-05:00"),
            change(calendar="gmail", op="end_series", title="harness test", dates="2026-12-15"))
-    r.approve()                                # ending a series is tapped
+    # A split message: each change on its own card (0.24.0), the move's tapped first.
+    cards = [s for s in r.bot.sent if s[2] and any(t == "Approve" for row in s[2] for t, _ in row)]
+    move = next(s for s in cards if "Move" in s[1])
+    r.press(move, "Approve")
+    r.press(next(s for s in cards if s is not move), "Approve")
     ended = list(r.gmail.events["cmS"]["recurrence"])
     day = r.gmail.events["cmS_20261209T000000Z"]
     day.update(etag='"his"', start={"dateTime": "2026-12-08T18:00:00-05:00"})    # he moved it again
-    r.press(r.with_button("Undo"), "Undo")
+    moved = next(s for s in reversed(r.bot.sent) if "Moved" in s[1] and s[2]
+                 and any(t == "Undo" for row in s[2] for t, _ in row))
+    r.press(moved, "Undo")
     assert "Not undone" in r.texts()[-1] and r.gmail.events["cmS"]["recurrence"] == ended
 
 
@@ -1689,7 +1744,7 @@ def test_a_family_move_is_read_back_by_the_day_it_moved_not_another_at_that_time
         return real(method, url, **kw)
     r.icloud.request = drops_it
     r.tell(change(op="move", dates="2026-11-23", start="2026-11-25T08:30:00-05:00",
-                  end="2026-11-25T15:00:00-05:00"), words="move monday's school to wednesday")
+                  end="2026-11-25T15:00:00-05:00"), words="move monday's school to nov 25")
     assert receipts(r) == []                   # Wednesday's own 8:30 isn't the day it moved
     r.advance(minutes=1)
     r.tick()
@@ -1856,7 +1911,10 @@ def test_a_gmail_add_he_changed_before_its_read_is_left_by_undo(r):
     r.gmail._bump(gid)
     r.advance(minutes=1)
     r.tick()
-    assert receipts(r)[-1].startswith("<b>Done.</b>")
+    # 0.24.0, third round: Done only when the calendar shows it as asked. It shows his edit, so the
+    # receipt says what it shows, with Undo.
+    assert receipts(r)[-1].startswith("<b>Not confirmed.</b>")
+    assert "shows it as “Dentist (bring forms)” at 1:00 to 2:00 on Sat Nov 21 instead" in receipts(r)[-1]
     r.press(r.with_button("Undo"), "Undo")
     assert r.texts()[-1].startswith("<b>Not undone:</b> someone changed that event since, so I left it alone.")
     assert r.gmail.events[gid].get("status") != "cancelled" and r.gmail.events[gid]["summary"] == "Dentist (bring forms)"

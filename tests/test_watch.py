@@ -348,7 +348,7 @@ def get(port, path, key):
 
 
 def test_health_needs_the_key_and_says_whether_the_loop_turns(monkeypatch):
-    inbox = handover.Inbox(lambda: TOKEN)
+    inbox = handover.Inbox.for_tests(lambda: TOKEN)
     srv = handover.serve(inbox, port=0, host="127.0.0.1", wait_s=1)
     port = srv.server_address[1]
     try:
@@ -546,7 +546,7 @@ def test_the_probe_sends_the_key_and_gets_the_detail():
 
 
 def test_the_stuck_clock_starts_at_the_first_turn():
-    inbox = handover.Inbox(lambda: TOKEN)
+    inbox = handover.Inbox.for_tests(lambda: TOKEN)
     assert inbox.health()["status"] == "starting"
     inbox.beat()
     assert inbox.health()["status"] == "ok"
@@ -591,4 +591,4 @@ VECTOR_KEY = "d8bd045641e8485f5f91e19bbcabc8dd05ae3b3b5d98dd30609c58119229450a"
 
 def test_the_handover_key_matches_the_bun_side():
     assert handover.key_for(VECTOR_TOKEN) == VECTOR_KEY
-    assert handover.Inbox(lambda: VECTOR_TOKEN).key_ok(VECTOR_KEY)
+    assert handover.Inbox.for_tests(lambda: VECTOR_TOKEN).key_ok(VECTOR_KEY)

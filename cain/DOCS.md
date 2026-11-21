@@ -228,7 +228,7 @@ runner itself sends you one card: what the piece is, the serious finding in one 
 or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
 round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
 after "Ship it with that risk" it goes only while the rollback of a bad install is armed for that App.
-Since 0.17.0 the link reads that from the Keeper App (`GET /armed` with Cain's `keeper_token`, every
+Since 0.18.0 the link reads that from the Keeper App (`GET /armed` with Cain's `keeper_token`, every
 minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
 binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
 the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
@@ -253,7 +253,7 @@ Since the second round of fixes in 0.16.0:
   records the change as held, on the guard's log below, and Cain is told.
 - At each start the review runner and the link check the owner and mode of these files (the rounds
   file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file; the rollback record
-  is no longer a file since 0.17.0). One that's wrong turns the cap and the guard off (no review round, no `other`
+  is no longer a file since 0.18.0). One that's wrong turns the cap and the guard off (no review round, no `other`
   Build, and Ship decisions paused for every pull request: no Ship card for any change) and raises
   one alarm naming it. Since the third round of fixes the check runs again every minute, so they come
   back on by themselves, and the alarm clears, once the file is right; no restart needed.
@@ -430,7 +430,7 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
-## What 0.17.0 does: working with the Keeper
+## What 0.18.0 does: working with the Keeper
 
 The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a
 bad one back from the backup taken just before it. Cain's part:

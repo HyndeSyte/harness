@@ -14,6 +14,7 @@ import logging
 from typing import Callable
 
 from . import approvals, choices, commands, render, rules
+from .scrub import scrub_owner as owner_scrubbed   # twenty-seventh round: his own words, known secrets only
 from .chat import ChatError
 from .ledger import Ledger
 
@@ -26,6 +27,11 @@ REFUSALS = {
     "unknown approval": "That button isn't valid any more.",
     "unknown choice": "That button isn't valid any more.",
     "proposal is no longer open": "That's no longer open.",
+    "replaced": "Replaced by a newer card.",
+    "replaced_by_update": "Replaced when Harness updated. Nothing was done.",
+    "confirm_after_note": "A newer note came in after this card and doesn't change it. Approve once more to go ahead as shown.",
+    "expired_after_note": "This card ran out after the newer note, before your second Approve, so nothing was done.",
+    "replaced_after_note": "A newer card replaced this one after the note, before your second Approve, so nothing was done.",
     "proposal changed after the card was shown": "That changed after you saw it; not done.",
     "policy changed since the card was shown": "The rules changed since; not done.",
 }
@@ -44,6 +50,8 @@ class Callbacks:
         self.policy_version = policy_version
         self.settings_fn = settings_fn     # (change_id, "approve"|"decline") -> message
         self.family_add = family_add       # family_add.FamilyAdd, or None
+        self.migration_fn: Callable[[str, str], str] | None = None   # (kind, target) -> message (eleventh round)
+        self.reconfirm_fn: Callable[[str], str] | None = None   # a tap relisted after a restore (fifteenth round)
 
     def handle(self, inc) -> str:
         """Returns what happened, for tests and the event log."""
@@ -73,8 +81,12 @@ class Callbacks:
             # His tap's reply says what will happen; the receipt says what did, once it's read back.
             said = (self.calendar_change.tap_words(v.proposal_id)
                     if v.action == "approve" and self.calendar_change is not None else None)
+            left = None
+            if v.action == "decline" and self.calendar_change is not None:
+                with self.ledger.tx() as db:
+                    left = self.calendar_change.decline_words(v.proposal_id, db)
             message = (said or "Approved. It will run now." if v.action == "approve"
-                       else "Declined. Nothing was done.")
+                       else left or "Declined. Nothing was done.")
         self._answer(inc, None)
         self._strip_buttons(inc)
         with self.ledger.tx() as db:
@@ -98,15 +110,20 @@ class Callbacks:
             if kind == "rule_keep_old":
                 return render.escape(rules.resolve(self.ledger, target, "old"))
         except rules.RuleError as e:
-            return render.escape(f"Nothing changed: {e}.")
+            return render.escape(f"Nothing changed: {owner_scrubbed(e)}.")
         if kind in ("settings_approve", "settings_decline") and self.settings_fn:
             return render.escape(self.settings_fn(
                 target, "approve" if kind == "settings_approve" else "decline"))
+        if kind in ("migration_check", "migration_override", "migration_restore", "migration_clock") \
+                and self.migration_fn is not None:
+            return self.migration_fn(kind, target)            # the ledger's own migration (eleventh round)
+        if kind == "tap_reconfirm" and self.reconfirm_fn is not None:
+            return self.reconfirm_fn(target)                  # the tap he made before the restore, taken now
         if kind.startswith("family_add_") and self.family_add is not None:
             return self.family_add.on_choice(kind, target)   # plain text, no model words
-        if kind == "calendar_change_undo" and self.calendar_change is not None:
+        if kind.startswith("calendar_change_") and self.calendar_change is not None:
             return self.calendar_change.on_choice(kind, target)
-        if kind == "mail_dates_undo" and self.mail_dates is not None:
+        if kind.startswith("mail_dates_") and self.mail_dates is not None:
             return self.mail_dates.on_choice(kind, target)
         if kind in ("stopped_redo", "stopped_drop"):   # what he asked while stopped
             return commands.on_stopped_choice(self.ledger, kind, target, undo=self._undo_kept)

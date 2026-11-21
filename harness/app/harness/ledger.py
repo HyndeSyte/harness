@@ -17,12 +17,17 @@ Two rules carry most of the weight:
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
+import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable, Iterable
 
+from . import scrub as _scrub
 from .canonical import canonical_hash
 
 SCHEMA_VERSION = 1
@@ -389,6 +394,7 @@ TRANSITIONS = {
     "approved": {"executed", "failed", "proposed"},
     "failed": {"received"},          # a retry of a failure that wasn't his doing (runner)
     "needs_clarification": {"received"},   # a note from Cain for the question it asked (controller)
+    "answered": {"received"},        # a note from Cain for a request answered to Cain alone (controller)
     "no_action": {"received"},       # an add he asked for while adds were off, once his tap turns them on (family_add)
     "cancelled": {"received"},       # a request he sent while stopped, at his tap on its card (commands)
 }
@@ -416,6 +422,84 @@ def iso(dt: datetime) -> str:
 
 class LedgerError(RuntimeError):
     pass
+
+
+# 0.24.0, twelfth round: the migration holds every other writer of a ledger file off (Ledger.hold_writers).
+# Keyed by the file's absolute path, so a second Ledger opened on the same file in this process waits too.
+_GATE = threading.Condition()
+_HELD: dict[str, int] = {}                 # file -> the thread holding its writers off
+_ACTIVE: dict[str, dict[int, int]] = {}    # file -> {thread: open write transactions}
+# Thirteenth round: a writer kept waiting by another thread's hold waits in bounded slices, logging each one and
+# trying again, and gives up (LedgerBusy) after WRITER_WAIT_MAX_S rather than hang. Every such wait is noted in
+# _CROSS: in the App every ledger write is on the controller's thread (Discord taps and Cain's handovers are
+# queued in memory by the HTTP threads, which never write), so a write from another thread under the hold is a
+# bug. With STRICT_HOLD on (the tests), it's an AssertionError at once.
+WRITER_WAIT_S = 5.0
+WRITER_WAIT_MAX_S = 300.0
+STRICT_HOLD = False
+_CROSS: list[dict] = []                     # {"file", "thread", "waited_s"}: writes from another thread under a hold
+
+
+class LedgerBusy(TimeoutError):
+    """A write waited WRITER_WAIT_MAX_S for another thread's hold on the ledger and gave up; nothing was written."""
+
+
+_OUTBOX_PASS = object()     # sixteenth round: the one key to the fence exemption, handed only by Ledger.outbox_tx
+
+
+class LedgerFenced(_scrub.OwnerRefusal, RuntimeError):
+    """Fourteenth round: a restore is staged, so the ledger takes no write (Ledger.fence): it fails at once with
+    the plain reason, never waits. Only the outbox's delivery bookkeeping is exempt (Ledger.outbox_tx). Twenty-eighth
+    round: that reason is owner text (scrub.OwnerRefusal), the fence's own words."""
+
+
+# Fourteenth round: the staged restore's fence is a mode flag per ledger file, not a held lock.
+_FENCED: dict[str, str] = {}               # file -> the plain reason a write is refused
+
+
+def cross_thread_writes() -> list[dict]:
+    """Writes another thread tried while a hold was on (thirteenth round): none is expected."""
+    with _GATE:
+        return list(_CROSS)
+
+
+def _scrubbed_json(value):
+    """Twenty-sixth round: a record kept as JSON text with its exception-text fields (scrub.ERROR_FIELDS) scrubbed;
+    any other value as it is. Re-encoded only when the scrub changed something.
+
+    Thirty-first round: a tag naming his words (scrub.OWNER_TAG) is honoured only in text the serialiser wrote
+    (scrub.dumps, checked with scrub.serialised); in any other text every tag is dropped before the scrub, so a tag
+    forged in plain JSON or in text from outside gets the whole scrub and never reads back as his words."""
+    if not isinstance(value, str) or not value[:1] in ("{", "["):
+        return value
+    trusted = _scrub.serialised(value)
+    if not any(f'"{f}"' in value for f in _scrub.ERROR_FIELDS) and (trusted or _scrub.OWNER_TAG not in value):
+        return value
+    try:
+        got = json.loads(value)
+    except ValueError:
+        return value
+    clean = _scrub.scrub_fields(got if trusted else _scrub.untag(got))
+    return value if clean == got else json.dumps(clean)
+
+
+def _hand_off(box: list, e: BaseException) -> None:
+    """Twenty-sixth round: an error caught whole (BaseException) handed to the code that raises it after, by name,
+    so the source scan can tell a hand-off from a swallow (tests/test_outbox_round26.py)."""
+    box.append(e)
+
+
+class TransactionAborted(BaseException):
+    """Twenty-fourth round: an enqueue savepoint whose cleanup failed, so the transaction it ran in is gone: rolled
+    back in full (or its connection closed and opened again), any outer work a caller believed pending with it. A
+    BaseException, so no caller's `except Exception` swallows it and runs later statements as if the transaction
+    held: the whole settle (the tick's work) stops there, and the main loop logs it and goes on at the next tick.
+    Its cause is the original exception, whose own cause is the cleanup's.
+
+    Twenty-fifth round: each tap's work is its own boundary. The controller catches it by name around one tap (after
+    the rollback or reopen here), puts that tap off on its back-off and goes on with the next; only reopen_failed
+    (the records were left with no working connection) still ends the tick."""
+    reopen_failed = False
 
 
 class Ledger:
@@ -462,7 +546,10 @@ class Ledger:
             "mail_dates": (("sender", "TEXT NOT NULL DEFAULT ''"), ("place", "TEXT NOT NULL DEFAULT ''"),
                            ("shown", "TEXT NOT NULL DEFAULT ''"), ("busy", "INTEGER NOT NULL DEFAULT 0"),
                            ("told", "TEXT NOT NULL DEFAULT ''"), ("reads", "INTEGER NOT NULL DEFAULT 0"),
-                           ("wrote_at", "TEXT NOT NULL DEFAULT ''"), ("told_batch", "TEXT NOT NULL DEFAULT ''")),
+                           ("wrote_at", "TEXT NOT NULL DEFAULT ''"), ("told_batch", "TEXT NOT NULL DEFAULT ''"),
+                           # 0.24.0: whose it is (mail_dates.whose): "family" and "unclear" ask on a
+                           # card and never go on his Gmail calendar by themselves.
+                           ("cal", "TEXT NOT NULL DEFAULT ''")),
             # 0.21.1: an input that stops is told (inputs.py). Its outage: the last failure's
             # kind, the first failure, how many failures and refusals were seen, what he was told
             # and by which message, whether a digest named it, when one he knew about came back,
@@ -512,18 +599,150 @@ class Ledger:
             self.set_meta("rules_need_tap", "1", db)
 
     # -- plumbing ------------------------------------------------------
-    @contextmanager
+    def _key(self) -> str:
+        return f"mem:{id(self)}" if not self.path or self.path == ":memory:" else os.path.abspath(self.path)
+
     def tx(self):
+        """One write transaction (_tx). Fails at once with LedgerFenced while a staged restore fences the ledger."""
+        return self._tx(None)
+
+    def outbox_tx(self):
+        """Fifteenth round: the one write a staged restore's fence lets through, the outbox's own delivery
+        bookkeeping (sent marks, retries, a card's button binds), so the restart card goes out and nothing is
+        posted twice. Nothing else may use it: the exemption is this method, not an argument any caller can pass.
+        Sixteenth round: asserted at run time. _tx takes the exemption only as this module's private pass, which only
+        this method hands it; anything else (True included) is refused with a TypeError. Seventeenth round, said
+        plainly: this is a guard against accidents (a stray flag or a wrong argument), not against intent. Python
+        code in the same process can reach a module-private name, so the pass stops mistakes, not a caller set on
+        getting past the fence; the controller stays the ledger's one writer by design and by review."""
+        return self._tx(_OUTBOX_PASS)
+
+    @contextmanager
+    def _tx(self, exempt_pass):
         """One write transaction. BEGIN IMMEDIATE so two writers can never
-        interleave a read-check-write."""
-        self.db.execute("BEGIN IMMEDIATE")
+        interleave a read-check-write. Twelfth round: while another thread holds this ledger's
+        writers off (hold_writers, the migration), it waits until that's over. Fourteenth round: while a
+        restore is staged (fence) it fails at once with LedgerFenced, unless fence_exempt (the outbox's own
+        delivery bookkeeping, so the restart card and replies still go out)."""
+        if exempt_pass is not None and exempt_pass is not _OUTBOX_PASS:
+            raise TypeError("the fence exemption is the outbox's own (Ledger.outbox_tx)")
+        fence_exempt = exempt_pass is _OUTBOX_PASS
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if key in _FENCED and not fence_exempt:
+                raise LedgerFenced(_FENCED[key])
+            if _HELD.get(key, me) != me:
+                self._wait_for_hold(key, me)
+            mine = _ACTIVE.setdefault(key, {})
+            mine[me] = mine.get(me, 0) + 1
         try:
-            yield self.db
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        else:
-            self.db.execute("COMMIT")
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.db
+            except BaseException:
+                # Twenty-fourth round: a transaction already ended under it (TransactionAborted closed and opened the
+                # connection again, or rolled it back) has nothing left to roll back; the error goes on as it was.
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+                raise
+            else:
+                self.db.execute("COMMIT")
+        finally:
+            with _GATE:
+                mine = _ACTIVE.get(key, {})
+                mine[me] = mine.get(me, 1) - 1
+                if mine[me] <= 0:
+                    mine.pop(me, None)
+                _GATE.notify_all()
+
+    def _wait_for_hold(self, key: str, me: int) -> None:
+        """Called with _GATE held, when another thread holds this ledger's writers off (thirteenth round)."""
+        name = threading.current_thread().name
+        _CROSS.append({"file": os.path.basename(key), "thread": name, "waited_s": 0.0})
+        if STRICT_HOLD:
+            raise AssertionError(f"a ledger write from thread {name} while another thread holds the writers")
+        start = time.monotonic()
+        while _HELD.get(key, me) != me:
+            _GATE.wait(WRITER_WAIT_S)
+            waited = time.monotonic() - start
+            _CROSS[-1]["waited_s"] = round(waited, 1)
+            if _HELD.get(key, me) == me:
+                break
+            if waited >= WRITER_WAIT_MAX_S:
+                logging.getLogger("harness.ledger").error(
+                    "a ledger write on thread %s gave up after %.0fs waiting for the hold", name, waited)
+                raise LedgerBusy(f"the ledger was held for {waited:.0f}s")
+            logging.getLogger("harness.ledger").warning(
+                "a ledger write on thread %s has waited %.0fs for the hold; trying again", name, waited)
+
+    def engage_hold(self) -> None:
+        """Thirteenth round: holds this ledger's writers off from this thread until release_hold (a staged
+        restore: everything from now on is set aside at the restart). Other threads' writes wait, bounded."""
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if _HELD.get(key) not in (None, me):
+                raise TimeoutError("another hold on the ledger is on")
+            _HELD[key] = me
+            _GATE.notify_all()
+
+    def fence(self, reason: str) -> None:
+        """Fourteenth round: a restore is staged. From now until the restart every write fails at once with
+        LedgerFenced(reason) (no lock is held, so nothing ever waits on it), except the outbox's delivery marks."""
+        with _GATE:
+            _FENCED[self._key()] = reason or "a restore is staged"
+            _GATE.notify_all()
+
+    def unfence(self) -> None:
+        with _GATE:
+            _FENCED.pop(self._key(), None)
+            _GATE.notify_all()
+
+    @property
+    def fenced(self) -> str:
+        """The fence's plain reason while a staged restore fences writes, else ""."""
+        with _GATE:
+            return _FENCED.get(self._key(), "")
+
+    def release_hold(self) -> None:
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if _HELD.get(key) == me:
+                _HELD.pop(key, None)
+            _GATE.notify_all()
+
+    @contextmanager
+    def hold_writers(self, timeout_s: float = 60.0):
+        """Twelfth round: every other thread's write transaction on this ledger file waits until this ends,
+        and the ones already open are drained first (each runs to its end). For the migration at startup: the
+        poller, Discord taps and the handover service write only through tx(), so none of them interleaves
+        with the backup or the migration. Nested holds on the same thread are fine. Raises TimeoutError when
+        an open transaction doesn't end within timeout_s (nothing is held then)."""
+        key, me = self._key(), threading.get_ident()
+        with _GATE:
+            if _HELD.get(key) == me:
+                nested = True
+            else:
+                nested = False
+                if not _GATE.wait_for(lambda: key not in _HELD, timeout_s):
+                    raise TimeoutError("another hold on the ledger didn't end")
+                _HELD[key] = me
+                drained = _GATE.wait_for(
+                    lambda: not any(n for t, n in _ACTIVE.get(key, {}).items() if t != me), timeout_s)
+                if not drained:
+                    _HELD.pop(key, None)
+                    _GATE.notify_all()
+                    raise TimeoutError("a write transaction on the ledger didn't end")
+        try:
+            yield
+        finally:
+            if not nested:
+                with _GATE:
+                    _HELD.pop(key, None)
+                    _GATE.notify_all()
+
+    def writers_held(self) -> bool:
+        with _GATE:
+            return self._key() in _HELD
 
     def now(self) -> datetime:
         return self.clock()
@@ -543,13 +762,26 @@ class Ledger:
         row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def meta_record(self, key: str):
+        """Thirtieth round: a record kept as JSON text read back with his words as OwnerText (scrub.loads); None when
+        there's none or it doesn't read."""
+        raw = self.get_meta(key)
+        if raw is None:
+            return None
+        try:
+            return _scrub.loads(raw)
+        except ValueError:
+            return None
+
     def set_meta(self, key: str, value: str, db=None) -> None:
         (db or self.db).execute(
             "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, _scrubbed_json(value)))
 
     def event(self, kind: str, detail: dict | str, db=None) -> None:
-        text = detail if isinstance(detail, str) else json.dumps(detail, sort_keys=True)
+        # Twenty-sixth round: exception text in an event's fields is scrubbed here, at the sink.
+        # Thirtieth round: his words in it (OwnerText) kept with their tag (scrub.dumps), so they read back as his.
+        text = _scrubbed_json(detail) if isinstance(detail, str) else _scrub.dumps(detail, sort_keys=True)
         (db or self.db).execute(
             "INSERT INTO events(at, kind, detail) VALUES(?, ?, ?)",
             (iso(self.now()), kind, text))
@@ -635,6 +867,37 @@ class Ledger:
     def job(self, job_id: str) -> sqlite3.Row | None:
         return self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
 
+    def made_job(self, chat_id: int, text: str, *, kind: str, db, reply_to: int | None = None,
+                 created_at: str | None = None, engine: str | None = None,
+                 started_at: str | None = None, state: str = "running") -> str:
+        """A request the harness makes itself, under an id no Discord message can have: one part of
+        a message (part_job), or a date from his mail he sent to Family (controller). Born running,
+        so it goes on to proposed like any request; never run on a model."""
+        n = db.execute("SELECT COUNT(*) FROM jobs WHERE chat_id=? AND message_id<0", (chat_id,)).fetchone()[0]
+        new = str(uuid.uuid4())
+        now = iso(self.now())
+        db.execute("INSERT INTO jobs(id, bot_id, chat_id, message_id, kind, state, text_hash,"
+                   " reply_to_message_id, created_at, updated_at, engine, started_at)"
+                   " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (new, self.bot_id(), chat_id, -(n + 1), kind, state, canonical_hash(text),
+                    reply_to, created_at or now, now, engine, started_at))
+        db.execute("INSERT INTO job_text(job_id, text) VALUES(?, ?)", (new, text))
+        return new
+
+    def part_job(self, job_id: str, *, db) -> str:
+        """Another request for one part of a message (runner._split): its own proposal, card and
+        receipt, with his words and their flags."""
+        job = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        new = self.made_job(job["chat_id"], self.job_text(job_id), kind="message_part", db=db,
+                            reply_to=job["reply_to_message_id"], created_at=job["created_at"],
+                            engine=job["engine"], started_at=job["started_at"])
+        flags = self.get_meta(f"job_flags:{job_id}")
+        if flags:
+            self.set_meta(f"job_flags:{new}", flags, db)
+        root = self.get_meta(f"job_parent:{job_id}") or job_id
+        self.set_meta(f"job_parent:{new}", root, db)     # its message: its card's quote, its reruns
+        return new
+
     def job_text(self, job_id: str) -> str:
         row = self.db.execute("SELECT text FROM job_text WHERE job_id=?",
                               (job_id,)).fetchone()
@@ -715,18 +978,118 @@ class Ledger:
     # written in ONE transaction. Sending happens afterwards and is retried,
     # so a chat outage delays a reply but never loses one, and a crash
     # between the two leaves a queued message, not a silent job.
+    # Twenty-first round: what a card's fixed template may say happened, by enum (outbox.Outbox.TEMPLATE_OUTCOMES).
+    OUTCOMES = ("done", "not_done", "unverified")
+
     def enqueue(self, *, chat_id: int, kind: str, text: str, job_id: str | None = None,
                 buttons: list | None = None, binds: list | None = None,
-                held: bool = False, db=None) -> int:
-        now = iso(self.now())
-        cur = (db or self.db).execute(
-            "INSERT INTO outbox(chat_id, job_id, kind, text, buttons_json, binds_json,"
-            " state, not_before, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (chat_id, job_id, kind, text,
-             json.dumps(buttons) if buttons else None,
-             json.dumps(binds) if binds else None,
-             "held" if held else "queued", now, now))
-        return int(cur.lastrowid)
+                held: bool = False, db=None, once: str | None = None, outcome: str | None = None) -> int:
+        """One message queued. Twenty-first round: `once`, a key naming what it's about: a message already queued
+        under that key, in any state, is never queued again, and its id is returned. `outcome`, one of OUTCOMES,
+        for the fixed template a refused card falls back to.
+
+        Twenty-second round: `once` names the card's purpose, not the tap alone (Ledger.once_key: the tap, the
+        card's kind and its outcome or attempt), so a second card with a purpose of its own for one tap (an outcome
+        and then its retry card) still goes, while a true duplicate is refused. The outcome is checked before
+        anything is written, and the row, its once-key and its outcome are written together under a savepoint, on
+        an autocommit connection as inside a transaction: all of them or none."""
+        if outcome is not None and outcome not in self.OUTCOMES:
+            raise ValueError(f"not an outcome: {outcome}")
+        conn = db or self.db
+        outer = conn.in_transaction            # twenty-third round: whether a caller's transaction holds it
+        conn.execute("SAVEPOINT enqueue")
+        try:
+            if once is not None:
+                had = conn.execute("SELECT value FROM meta WHERE key=?", (f"outbox_once:{once}",)).fetchone()
+                if had is not None:
+                    conn.execute("RELEASE SAVEPOINT enqueue")
+                    return int(had[0])
+            now = iso(self.now())
+            cur = conn.execute(
+                "INSERT INTO outbox(chat_id, job_id, kind, text, buttons_json, binds_json,"
+                " state, not_before, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (chat_id, job_id, kind, text,
+                 json.dumps(buttons) if buttons else None,
+                 json.dumps(binds) if binds else None,
+                 "held" if held else "queued", now, now))
+            oid = int(cur.lastrowid)
+            if once is not None:
+                self.set_meta(f"outbox_once:{once}", str(oid), conn)
+            if outcome is not None:
+                self.set_meta(f"outbox_outcome:{oid}", outcome, conn)
+        except BaseException as e:
+            # Twenty-third round: the rollback-to and then the release, in a finally, so a failing rollback never
+            # replaces the original exception, and never leaves the autocommit connection inside a transaction
+            # holding the write lock. If the rollback-to fails the savepoint isn't released (on the autocommit
+            # connection that would commit what it holds): its own transaction is rolled back in full (or the
+            # connection closed and opened again), and the original exception is raised with the cleanup's chained.
+            # Twenty-sixth round: each cleanup error handed off explicitly (_hand_off), chained to the original below.
+            kept: list[BaseException] = []
+            try:
+                conn.execute("ROLLBACK TO SAVEPOINT enqueue")
+            except BaseException as rb:        # noqa: BLE001: kept, chained to the original below
+                _hand_off(kept, rb)
+            finally:
+                if not kept:
+                    try:
+                        conn.execute("RELEASE SAVEPOINT enqueue")
+                    except BaseException as rel:   # noqa: BLE001: kept, chained to the original below
+                        _hand_off(kept, rel)
+            cleanup: BaseException | None = kept[0] if kept else None
+            if cleanup is not None:
+                # Twenty-fourth round: a distinct error, chained as before (the original, its cause the cleanup's),
+                # since the transaction the caller believed pending is gone.
+                if isinstance(e, TransactionAborted):
+                    raise
+                reopened = self._unstick(conn, outer)
+                e.__cause__ = cleanup
+                aborted = TransactionAborted("the records' transaction was aborted: a savepoint couldn't be cleaned "
+                                             "up")
+                aborted.reopen_failed = not reopened
+                raise aborted from e
+            raise
+        conn.execute("RELEASE SAVEPOINT enqueue")
+        return oid
+
+    def _unstick(self, conn, outer: bool) -> bool:
+        """Twenty-third round: after a savepoint whose cleanup failed. Inside a caller's transaction, that
+        transaction's own rollback (its exception reaches it) ends it. On the autocommit connection the savepoint
+        opened the transaction, so it's rolled back here in full; if even that fails, the connection is closed and
+        opened again, so later writes commit. Twenty-fifth round: False only when that reopen itself failed (the
+        records have no working connection), which the TransactionAborted it raises carries as reopen_failed."""
+        if outer or not conn.in_transaction:
+            return True
+        try:
+            conn.rollback()
+            if not conn.in_transaction:
+                return True
+        except Exception:                      # noqa: BLE001: closed and opened again below
+            # Twenty-fifth round: ordinary errors only; anything else (an interrupt) goes on as it is.
+            pass
+        if conn is not self.db:
+            return True
+        logging.getLogger("harness.ledger").error("the records' connection was left inside a transaction; it's "
+                                                  "opened again")
+        try:
+            conn.close()
+        except Exception:                      # noqa: BLE001: replaced whatever its state
+            pass
+        try:
+            db = sqlite3.connect(self.path, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+        except Exception as e:                 # noqa: BLE001: said by the caller's TransactionAborted
+            logging.getLogger("harness.ledger").error("the records' connection couldn't be opened again (%s)",
+                                                      type(e).__name__)
+            return False
+        self.db = db
+        return True
+
+    @staticmethod
+    def once_key(tap: str, kind: str, purpose: str) -> str:
+        """Twenty-second round: an outbox once-key for a card about a tap: the tap, the card's kind (its outcome
+        card, its retry card, a told-once note) and its purpose (the outcome, or the attempt)."""
+        return f"tap:{tap}|{kind}|{purpose}"
 
     def release_held(self, db=None) -> int:
         cur = (db or self.db).execute(
@@ -826,7 +1189,7 @@ class Ledger:
                        f" told_kind=CASE WHEN {new} THEN '' ELSE told_kind END,"
                        f" told_outbox=CASE WHEN {new} THEN NULL ELSE told_outbox END,"
                        f" named=CASE WHEN {new} THEN 0 ELSE named END",
-                       (name, now, error[:300], kind, now, 1 if kind in NEEDS_HIM else 0))
+                       (name, now, _scrub.scrub(error)[:300], kind, now, 1 if kind in NEEDS_HIM else 0))
 
     def inputs(self) -> dict[str, sqlite3.Row]:
         return {r["name"]: r for r in self.db.execute("SELECT * FROM inputs")}

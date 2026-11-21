@@ -36,7 +36,7 @@ STATIC_LABELS = (
     "Ship", "Not now", "Stop", "Turn back on", "Start", "Open connector settings", "Do it", "I'll do it", "Drop it",
     # the calendar specialist
     "Approve", "Decline", "Undo", "Undo both", "Undo these", "Use new", "Keep old", "Not mine", "Wrong time",
-    "Just this once", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
+    "Not this time", "Yes", "No", "Depends", "All of it", "Part of it", "Skip", "Keep rule", "Drop rule",
     "Turn on", "None wrong: stop checking", "Something was off: keep checking", "Do it now",
 )
 
@@ -350,7 +350,7 @@ _VERB = "(?:[Tt]ap|[Tt]apping|[Pp]ress|[Pp]ressing|[Hh]it|[Cc]lick|[Cc]hoose|[Pp
 # "with X" names a button only for labels that are never plain words (rules.ts WITH_LABELS):
 # "ends with Stop", "go with No" and "syncs with Gmail" (a live card's option) are just words.
 WITH_LABELS = (
-    "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Just this once", "Turn back on", "Not now",
+    "Undo", "Undo both", "Undo these", "Not mine", "Wrong time", "Not this time", "Turn back on", "Not now",
     "Use new", "Keep old", "Keep rule", "Drop rule", "All of it", "Part of it", "None wrong: stop checking",
     "Something was off: keep checking", "Open connector settings",
 )

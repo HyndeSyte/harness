@@ -250,8 +250,11 @@ an open card the same way *keep checking* does, and the count starts over.
 
 It won't offer this while any standing rule is still waiting for your tap, and says so.
 
-If you tap the button to stop checking, adds go straight in without the Approve tap, up to
-5 a day. Anything with a warning still gets a card, and so does any add at a start time
+If you tap the button to stop checking, and the switch for changes without a card is on (it's off
+after every install until you tap *Turn on* on the smoke test's card; see "When Cain hands a
+request over"), adds go straight in without the Approve tap, up to 5 a day. With that switch off,
+each add is a normal card, even after this tap, and the switch is checked again at the moment of
+the write. Anything with a warning still gets a card, and so does any add at a start time
 another add already has, or from a message that looks pasted (a quoted line, an email's header
 lines, a forward, a link), any message in the 30 minutes after one, or a message sent as a reply.
 A long or several-line message is no sign of a paste: you dictate. You still get the receipt and the Undo,
@@ -305,11 +308,1008 @@ straight away when it's clear, with one receipt and an *Undo* button: "Moved PT 
   looks pasted (a quoted line, an email's header lines, a forward, a link, a phone number, words
   written to you), a reply to one, an edited or forwarded message, a note from Cain; a new length
   you didn't give, three or more events off at once, or ending a series. The card says what will
-  happen, in plain words; your tap's reply says it again.
+  happen, in plain words; your tap's reply says it again. Until the smoke test after an install has
+  passed and you've tapped *Turn on* on its card (below), every change comes on a card.
+- **One card per change.** When a message with two or more changes needs your tap, each change
+  comes on its own card, so you can take one and not the other, even one that would be clear on
+  its own. Two clear changes in your own fresh message still land together in one receipt.
+- **Done means the calendar says so.** After every change (an add, a move, which is how a time is
+  edited, a removal, a series added or ended, and the Undo of each), the days it touched are read
+  again, the way you'd see them. It's called done, with its receipt, only when that read shows it
+  as asked: an add there on its calendar with its title and time, a move at its new time and not
+  its old one, a removed event gone, an ended series with no day of it from then on. If the
+  calendar shows anything else, the receipt says "Not confirmed" and what the calendar actually
+  shows ("still shows it at the old time", "shows it at neither the old time nor the new one",
+  "doesn't list it on that day"), the record keeps it as unverified, never as done, and it's never
+  written again on its own; whatever did go through keeps its *Undo*. A move that went through on
+  Gmail but not on the Family copy says exactly that, with *Undo*. A read that disagrees is read
+  once more a few seconds later, asking past any cache, and both reads go in the log. Undo is read
+  back the same way, event by event, and says so if the calendar doesn't show it back as it was.
+- **Not seen isn't the same as not done.** A change the read back doesn't show is read again by
+  itself about 30 seconds and 2 minutes later, then once more after a longer window (10 minutes, or
+  longer when the smoke test saw the calendar's listing lag: five times the lag it saw, up to 25
+  minutes). If a read shows it as asked, a follow-up says "Confirmed". If the read at 2 minutes still
+  doesn't, a follow-up says "Not seen yet", and when it will be read for again. The last read asks
+  for the event by its own id where the calendar can (an add's fixed id, a moved or removed event's
+  id), not a day's list. Only if that doesn't show it either does a follow-up say "Not found", and
+  even then its event ids are kept and read every 30 minutes for a week: if it shows up after all,
+  you get "Done after all" with *Undo*. All of this is kept in the record, so a restart carries on
+  where it was. None of it writes anything. Asking for the same add again later first looks for that
+  change's own event (by its id) and the slot, so it finds the first write if it did land, and adds
+  nothing.
+- **Writes can't hang, or land twice.** Each write to Google or iCloud has one total deadline of 45
+  seconds, kept by the write itself: connecting, the request, every request it makes (a sign-in,
+  the calendar's name check, the write) and the whole answer, with no retries; a watchdog shuts its
+  connection at the deadline, so a server that answers a byte at a time can't keep it going.
+  Harness waits 30 seconds for it; one with no answer by then is abandoned and treated as a write
+  whose answer was lost, so it's settled by reading, never sent again blind, and its own thread
+  ends by the deadline. If three abandoned writes are still running at once, new writes wait: the
+  change comes on a card saying writes are paused, and your tap writes it once they've finished.
+  Each write carries a token recorded before it goes out. A change being written counts as in
+  progress for 2 minutes, and never less than 45 seconds after its last write went out; after that
+  it's offered again on a card only once two reads a few seconds apart both answer and both find it
+  not done (a read that can't tell leaves it in progress). A change offered again that way is read
+  for again too, like one not confirmed (30 seconds, 2 minutes, the longer window by id, then every
+  30 minutes for a week): if it shows up, "Done after all" with *Undo*, and the newer card comes
+  off. An add offered again keeps the event id of its first offer, so it can
+  never become a second event, and the calendar is searched by that id first. If the first write
+  answers after all, its token is no longer current: it's recorded as done ("Done after all"), with
+  *Undo*, and the card that offered it again comes off; if you'd already tapped that card, it found
+  the first write there and added nothing. A move or removal offered again carries the version the
+  first card was bound to (sixth round), so whichever of the two writes reaches the calendar second
+  is refused by it: one event, one Done. If the first write lands just before your tap, the card
+  comes off; if its answer was lost, your tap finds it already done, reads that first write back,
+  and says "Done after all" with its *Undo*. If writes were paused, each change on a paused card comes
+  back on a fresh card saying writes have resumed as soon as fewer than three are still running
+  (only writes still running count, so the number drops as each ends at its deadline; after a
+  restart none are), and the paused card comes off.
+- **Late receipts say whose request it was.** "Done after all" quotes your request, says the day and
+  time you asked and how it was approved (your tap on its card, or with no card from your own fresh
+  message), and says how old the request is when it's more than a day. If you'd declined the card
+  that offered it again, it's titled "Applied despite your Decline". A plain add that still reads
+  exactly as it was written is then taken off again by itself, guarded by the version just read, and
+  that same receipt says how it went: off your calendar (a read by its id shows it gone); turned
+  down, so it's still there, with *Undo* first for 30 days; or not known yet, still being read, with
+  the outcome to follow. Anything else (a move, a removal,
+  or an add changed since it was written) comes with *Undo* first, and that *Undo* lasts 30 days
+  instead of the usual week. *Undo* of a late one is sent with the event's version as it is now; if
+  the event was changed since, it's left as it is and the message says how it reads now. A late
+  landing of any card in one change's family (its first card, a card offered again, or the fresh
+  card after a refusal) takes every open card of that family off, so there's one Done.
+- **A move or removal is never sent over a change since its card.** The card keeps each event's
+  version as its read found it (Google's etag, or the iCloud resource's), byte for byte, quotes and a
+  weak marker included, and what it showed of the event: title, start, end, all day or not, the
+  series's rule, location, notes, each attendee with their answer, the organiser, and whether it shows
+  as busy or free. Notes are compared with only line endings and trailing spaces evened out, so any
+  other edit, a doubled space included, counts as a change. Just before the write, the event is read
+  again. If any of those fields reads otherwise, or its version differs from the card's (unless it's a
+  day of a Google series or an iCloud resource holding a series or several events, and every field the
+  card kept reads the same: another day's edit), nothing is sent at all: the receipt says **Not
+  applied**, that the event changed since your card, which fields changed and what it shows now, and
+  that nothing was sent to the calendar; the card is replaced and one fresh card follows, read anew so
+  it's bound to the event as it is now. Harness never sends a write it expects the calendar to refuse,
+  so a calendar that ignored If-Match couldn't apply it either. Otherwise the write is sent with the
+  version that read gave (If-Match), so anything newer than that read is still refused by Google or
+  iCloud. Each move or removal's If-Match and the calendar's answer code are in the log. Every Family
+  write is built from that same read: its own text with only the asked change made, so another day's
+  changes, exception dates, reminders and everything else in the resource stay as that read had them.
+  A day of a Google series is written as that day's own event, with only its start and end sent, never
+  the series, so other days' changes, cancellations and attendees stay. A day whose read gives back the
+  whole series isn't written: the receipt says "Not applied", that the calendar returned the whole
+  series for that day so nothing was changed, and to say to Cain whether you mean only that day or the
+  whole series, so a new card follows.
+  A write the calendar still refuses for its version (an edit between the read and the write) is read
+  by the event's id and compared with the change (title, start, end, all day or not, repeating or not;
+  a Google event read back cancelled counts as gone): when it already shows the change as asked, it's
+  Done (with nothing of Harness's there to undo, unless an earlier approval of the same change has a
+  write that never answered: then that write is read back, and it's "Done after all" with its *Undo*).
+  When the read gives back the very version that was sent, the event didn't change and the calendar
+  refused its own safety check (a weak version under a strong compare, or a version it rewrites): one
+  "Not applied" receipt that says so, both versions in the log, no fresh card, and a *Try again* button
+  that makes a new card from a fresh read of the event, for your tap (a new change family). On a calendar
+  whose cards were opened without the check after an install (below), Harness counts these refusals: from
+  the first one there, no *Try again* is offered on that calendar, and one plain message says edits there
+  can't be applied safely, naming the likely cause (the calendar gives a weak or rewritten version, an
+  etag, so its safety check can't tell an unchanged event from a changed one). Any other
+  version, even with every field the same, is a change since: "Not applied" and one fresh card. That
+  fresh card is one of the change's family: a late landing of any earlier write takes it off, and a
+  refusal reads every earlier write of the family before calling the change stale. At most one fresh
+  card per change family: if the fresh card is stale too, its receipt says what changed on the event
+  since your card and offers *Start again from now*, which makes a new card from the event as it is
+  now, for your tap, as a new change family with its own one fresh card. A refused or unsent write is
+  never "Not confirmed", never read for again and never "Not seen yet" or "Not found"; those are only
+  for writes whose outcome is unknown (no answer, or a lapsed deadline). A late add whose fixed address
+  turns out to be taken (Google's 409, iCloud's 412) is never assumed to be Harness's own write: the
+  event there is read and compared the same way, and only a match counts as there.
+- **Bound to the event the card names.** A removal or a move is bound to the very event its card or
+  receipt names (calendar, id, and for a repeating event which day of it): a different event found
+  later is never changed in its place, and nothing changes if the event isn't that one any more.
+  This holds with or without a card. Taking off one day of a repeating event says "this occurrence
+  only (the rest of the series stays)"; ending a series says "the whole series from then on". Undo
+  puts back exactly that day, or exactly that series, and reads it back. Another event like a
+  removed one still in that slot is named on the receipt. Undo of an add only ever takes off the
+  event that add made.
+- **Already there is your call, and never silent.** Asking to add the very same event that's already
+  there (the same calendar, the same title, case, spacing and punctuation aside, the same start and
+  end, all day or timed alike, repeating or not alike) adds nothing, and the receipt names the event
+  that's there with an *Add anyway* button, which adds the second one. A very short title (two
+  letters, like "PT") never counts. Anything only like it (the same title and start with another
+  end, one day of a series against a one-off, one name holding the other's words, such as "School
+  drop-off" and Harness's "Busy (school drop-off)" block, or the same title on the other calendar)
+  comes on a card naming the event that's there (its calendar, title and time) with *Add anyway* and
+  *Leave it*, and nothing is written until you tap. *Leave it* is kept as your answer, so asking
+  again later says it's settled.
+
+### When Cain hands a request over
+
+Cain doesn't pass your words on: Harness reads your DM itself.
+
+- **The message it rests on.** Cain names the message your request is in, and Harness acts on
+  that one if it's yours and from the last 30 minutes, whatever you sent after it. Without one,
+  it's your newest message, from the last 2 minutes. The same message handed over again finds
+  the same request, never the answer to something else you said.
+- **Which changes go through without a tap.** Only three paths: your own newest message, under 2
+  minutes old, with nothing of Cain's in it, not split into several changes and with no day your
+  words leave open; a date from your mail you tapped *Add to Family* on (your tap on the mail card
+  is the go); and Family adds once you've tapped "stop checking" on the bake-in card (Family
+  calendar adds, above). All three sit behind one switch, and it's **off after every install** (the
+  first start of each new version turns it off and ends any smoke run from before), so
+  every change comes on a normal card, until the smoke test below has passed on the real calendars,
+  Harness has found every item of it in its own record (`keeper.sh fastpath on <run id>`), and you
+  tap *Turn on* on the card that shows the evidence. A run with any item missing from the record is
+  refused and nothing changes; *Keep cards* leaves it off; the run, who tapped and when are kept in
+  the record; *Turn off* on that card, or `keeper.sh fastpath off`, turns it off again at any time,
+  and a change approved for a path without a tap and not yet written then comes on a card instead.
+  Turning it on again takes a new smoke run. Once on, a change with no card waits for your tap when
+  a write of Harness's on that calendar is younger than the listing lag the smoke test measured,
+  since the reads that judge duplicates may not show it yet; an add of the same event read back
+  within that lag is looked for by its own id first.
+- **After every install, cards are held per calendar until the smoke test has passed there.** Until
+  the smoke run has read back, on that calendar, a move or removal sent with If-Match on an event that
+  was there and an edit of one day of a repeating event, and the calendar has passed the conformance
+  item (it refused the run's own stale edit, removal and edit of one day of a series, below), a request
+  for that calendar comes on a card
+  that says it's waiting for the check after installing, with no *Approve*, and nothing changes. The
+  first time a request is held on a calendar after an install, one message for that calendar says
+  "Calendar changes on Gmail are held for now" (or Family), why (the check hasn't finished there yet, or
+  what it found) and what lets them through (Cain finishing the check, your *Open cards without the
+  check*, or *Test again*); further holds there aren't told one by one. While any wait, one reminder a
+  day gives the count per calendar, and a held request whose day comes gets a reminder that day. A card
+  offered before the install and tapped meanwhile is held the same way. Held cards don't run out. Once
+  that calendar's check is done, each held change comes back on a fresh card, read again then, through
+  the usual checks, for your tap: the card says how long it waited and quotes your message as every card
+  does. Only an add whose day has passed meanwhile isn't offered again: a "Dropped" receipt says so, and
+  nothing changes. A move or removal of an event whose day has passed comes back on a fresh card like
+  any other, read again then. When more than three come back at once, one message saying how many comes first. Gmail and
+  Family open separately: one can be open while the other is held. A closed gate holds every request
+  except the smoke run's own steps, live run or not: your own requests, dates from your mail and Family
+  adds that arrive while a run is live are held like any other, never tagged as tests and never taken
+  off by the run's cleanup. Only a step Cain offers with its script (`keeper.sh fastpath smoke-step <run
+  id> <step> ...`) and you start with *Start step N* is the run's, its change built from the script by
+  Harness itself; a handover naming the run (`keeper.sh handover --message <id> --smoke <run id>`) cites
+  your own message, so it's an ordinary request, held with your title, never tagged. If, during the
+  run, a calendar refuses the safety check on an event that hadn't changed, that calendar stays held
+  and you're told plainly that edits there are blocked and why, with an *Open cards without the check*
+  button. That tap, or Cain's `keeper.sh fastpath gate-open gmail` (or `family`) on your say, opens that
+  calendar's cards without the check, for when the run can't complete there; who did it and when is
+  kept in the log, its held changes come back on fresh cards, and the paths without a tap stay off. On a
+  calendar that failed the conformance item, that override also says edits there may overwrite changes
+  made elsewhere between your card and your tap; on one that refused stale edits but took a stale
+  removal, removals there stay held even after the override, and it says so. On one that turned down
+  the check's own fresh edit, there's no override at all (it would only bring refusals): *Test again*
+  runs that step once more. After an override, the first change turned down at the safety check while
+  the event hadn't changed gets a "Not applied" receipt quoting your request with *Start again from now*
+  (one new card from a fresh read); later ones there get no button. A calendar that passed the
+  conformance item and later, in normal use, takes a write without giving the event a new version (so
+  it would take a stale one too) closes again, with the same message as a failed conformance item. An
+  install is each new build: the ledger keeps the version and a build identifier (a hash of every file
+  the App ships: its code, the Dockerfile, config.yaml and the run scripts in rootfs, computed when the
+  image is built), so a rebuild of the same version, or a change to any of those files, counts as an
+  install too, and a restart doesn't. (A ledger made new, with nothing in it, counts as an install too.)
+  Even with the bake-in tap already given,
+  a Family add is a normal card while the switch is off. Each path is checked against the switch
+  again at the moment of the write. Once on, each is also checked again then: for your message,
+  a fresh read of the DM must still show it as your newest, still under 2 minutes old, with no card
+  open or replaced for it, in the same step that takes the change, and that step records your
+  newest message; if any of that fails, it comes on a card saying why, and nothing is written. Right
+  after the write the DM is read again: if you sent another message in that moment, the receipt
+  says so, keeps *Undo*, and that message is read as a correction of the change just made (on a
+  card), not as a request of its own. A message's age comes from the time inside its Discord id,
+  against the Pi's clock, with 5 seconds allowed between them: it's fresh up to 1 minute 55 seconds,
+  and one that seems to come from more than 5 seconds ahead of the Pi's clock can't be timed, so it
+  comes on a card. Every other path needs your tap on a card: a message Cain names that isn't your
+  newest, one over 2 minutes old, one that carries Cain's suggestion, each part of a split message,
+  and anything else from your mail.
+- **What that card says.** It quotes the message it acts on, on one line, with how long ago you
+  sent it, and "you sent N messages after this" when you did. It states the change exactly: what
+  happens, on which calendar, to which event, on which date and at what time. Any of those that
+  came from Cain's suggestion and not from your words is marked "(from Cain)"; a date or time in
+  neither is marked "(not in your words)".
+- **Days in your words.** "Today", "tonight", "tomorrow", a weekday ("Friday", "this Friday": the
+  soonest one, today included), "the 13th" (the soonest 13th) and a month and day count as your
+  words, counted from the day you sent the message in your time zone (the add-on's `timezone`
+  option, never UTC or the Pi's own clock, and right across a daylight saving change), so "tomorrow"
+  sent at 11:58 PM is the next day even if it's read after midnight. The rules below that leave a
+  day open (the day you sent it, and the small hours from midnight to 4 AM) use that same zone. The card shows the date with your word
+  ("date Fri Nov 13 (your "Friday")") and the receipt says how it was read ("Read from your words:
+  "Friday" as Fri Nov 13."). Some days have no one answer, so their date is marked "(not in your
+  words)" and the change comes on a card: "next Friday"; a weekday that is the day you sent it
+  ("Friday" sent on a Friday: today, or a week on?); "the 16th" sent on the 16th (today, or next
+  month?); and "tonight" sent between midnight and 4 AM (the night just ending, or the one coming?).
+- **A card stays true to itself.** Your Approve counts only for the card you tapped, and only once:
+  your tap and a newer card replacing it are one decision on that card, so they can't both win,
+  and two taps on one card do it once. When Cain adds a note, it replaces only the cards whose
+  change it corrects: the same event, or else, by name, the one card whose event's name matches;
+  those lose their buttons and the new card says it replaces the earlier one; a tap that still
+  reaches an old one is answered "Replaced by a newer card" and changes nothing. When the name
+  matches more than one card, none is replaced: a card asks which one it corrects (*Card 1*,
+  *Card 2*, and so on, or *Neither*, which puts the correction on a card of its own). The other
+  cards from that message stand, still waiting for your tap, and aren't offered twice. Whether a note
+  speaks to a card is decided by Harness's own rules in code (the same event by id, or the same kind
+  of change to an event whose name holds the other's words), not by the model. When those rules
+  can't tell (the name matches but the kind of change differs, or the same kind of change on the same
+  calendar and day), the card asking which is used (*Card 1*, and so on, or *Neither*), never a
+  guess, so a stale card isn't left standing unasked. A note that speaks to none of the open cards
+  is never dropped: it runs as a request of its own, and its one response (its card, or its
+  question) carries a line quoting the note and saying the earlier cards stay as shown. Those cards'
+  button becomes *Approve as shown*: the first tap on it only confirms you've seen there's a newer
+  note, and the next one approves; if the card ran out or was replaced in between, that second tap
+  says exactly that, and nothing is done. A note on a message whose cards you all declined, or that
+  ran out, runs it again as a new request of that same message, quoting it, on a new card. If your
+  tap on a card is still being carried out when a correction comes, the correction waits for it to
+  finish, then works from what it did.
+- **What the version before left.** The first time 0.24.0 runs, it sweeps the record once. That
+  sweep is keyed to a schema version kept in the record itself, never to the App's version, and it
+  runs as one step: if it's cut short, it runs again from the start. Any card still open from the
+  version before is replaced: its buttons come off, and a tap on it is answered "Replaced when
+  Harness updated. Nothing was done." Any change the version before had approved or was writing is
+  read back from the calendar and recorded as done, with its receipt and *Undo*, or as not
+  confirmed, with a receipt saying so; none is written again. One the version before approved but
+  never started kept no event id of its own, so it counts as done only when each part is an add whose
+  event is there and the calendar made that event after your approval (its own "created" time); a
+  move found at its time, or an event made before, could be anyone's, so it's not confirmed. A change
+  recorded as not confirmed joins the same reads as any other (30 seconds, 2 minutes, the longer
+  window by id, then every 30 minutes for a week). Then one message lists each request that was
+  replaced or not confirmed, a sentence each with your message quoted, with one *Propose again*
+  button: a tap uses up every button on its message, so it puts each request back on a card of its
+  own, and each card is approved or declined on its own, as the message says. Just before that, each
+  request's slot is read: one the calendar now shows is said as "Confirmed" instead of offered
+  again.
+- **Cain's details.** When Cain adds what it found (a date in an email) or spells out what you
+  asked, Harness works from it with your message, and the change comes on a card: your Approve
+  tap is the go. A message older than 2 minutes is still acted on that way. A handover that
+  waited over 2 minutes before Harness could read it is turned down, and Cain hands it over again.
+- **No card asks you to repeat yourself.** When Cain passed words with a request and Harness still
+  needs to know something, the question goes to Cain, who has them, and Cain answers it with a note
+  on the same message. If Cain's note answers it, the request runs again with it and the card
+  follows. If no note comes within 10 minutes, Harness asks you itself, on a card that quotes your
+  message, what Cain passed on, and the question; your reply answers it. That 10 minutes is a
+  deadline kept in the record, checked every few seconds and again right after a restart, so a
+  stalled moment or a restart can't lose it; the log says how late it fired.
+- **Nothing twice.** When a request runs again (a note from Cain, or a "not a change" looked at
+  again), what's already done from that message is shown as already done, and only the rest is
+  offered. Already done means the calendar was read back showing it (or you tapped *Leave it*). A
+  change still being written counts as in progress only for 2 minutes; after that the calendar is
+  read, and anything it doesn't show is offered again on a card, and never written again on its
+  own.
+- **"What does that mean?"** When you ask what one of its cards or messages meant, Harness reads
+  its own recent cards and answers in words. A question about what something means is never taken
+  for a change.
+- **A reply that doesn't fit.** If the model's answer is off only in fields that can't change what it
+  does (a field the change doesn't use, its location, its summary), it's tidied, the card names the
+  fields tidied, and the change comes on a card. What a change does (the calendar, the operation,
+  the event's name and days, its start and end) is never filled in or reshaped: if one of those is
+  missing or malformed, it runs once more by itself instead, told what didn't fit. If it fails
+  twice, the message says it's logged for a fix and nothing more happens with it on its own.
+
+### After every install: a smoke test on the real calendars
+
+The read back is tested against fake calendars; Google and iCloud can list a change a little
+late. So after every install the three paths without a tap stay off, and each calendar's cards are
+held (no *Approve*) until the run has read back there a fenced edit and an edit of one day of a series,
+or until it has been run once, with throwaway events on a day with
+nothing else on it (each name below is an example; use anything unmistakable). Cain starts it with
+`keeper.sh fastpath smoke-start`: Harness issues the run's id. The run owns only its own steps, and
+step ownership never rests on a model reading a message: for each one, Cain offers the step with its
+script, `keeper.sh fastpath smoke-step <run id> <step> <gmail|family> <add|move|remove> <YYYY-MM-DD>
+"<test title>" [HH:MM-HH:MM]` (the step a short name such as `gmail-add`; times for an add or a move).
+You get a card showing that script with *Start step N*; only your tap opens the step, within 30
+minutes and once, and then Harness builds the step's change from the script itself, never from your
+DM, and puts it on a card for your *Approve*. Only that request (and its fresh cards) is recorded
+under the run, titled as a test and judged. A handover naming the run (`--smoke`) is never the run's:
+a handover only reads your own messages, so it cites a real request of yours, which goes on as an
+ordinary request with your title, held like any other: a closed gate holds every request but the
+run's own steps, live run or not. The run's first add is let go at once, so its answer comes late and is
+read back a minute later like any lost answer: that's the late landing item. That is the only write
+Harness ever lets go on purpose, and only for an add of a live run.
+
+A run is bound to this build: it keeps the App version, the build identifier, the ledger's schema and
+when it started. It
+runs out after 24 hours, and stops recording at *Turn on*, at *Turn off*, at a new smoke-start or when
+it runs out. It gives one *Turn on*. A run that's used, ran out, was started under another version or
+schema, under another build, or is older than the install is refused by name: start a new one. Each add of the run is a
+test event: its title starts "Smoke test: " and it carries the run's id as a private property (on
+Gmail, the event's private extended property `harness_smoke`; on Family, an `X-HARNESS-SMOKE` line),
+and the step's own nonce beside it (`harness_smoke_nonce`, or `X-HARNESS-SMOKE-NONCE`). The run keeps
+the id it chose for every event it creates (both calendars take an id the client chooses), with that
+nonce and its day, before the write goes out; its leftover cleanup only ever takes off those: by id,
+or, when a read by that id doesn't find it (a create whose answer was lost, an id the calendar
+changed), by that exact nonce, never by the run's tag alone. That search runs from the day before the
+recorded day to the day after (the day is recorded in your time zone, and a step near midnight can
+land on either side of it), and for a series over its whole span, to the day after its last day; a
+series found that way is taken off as the series, not one day of it.
+
+On Gmail, and then the same on Family:
+
+1. An add: "add Pool test at 3 PM tomorrow". Done ("Added Smoke test: Pool test"), and the calendar
+   shows it.
+2. A move: "move Smoke test: Pool test to 4 PM". Done, and it shows at 4 only. Then *Undo* on it:
+   "Undone".
+3. A removal: "take off Smoke test: Pool test tomorrow". Done, and it's gone.
+3a. Delete and read (done by hand, and its answer noted with the run): add a throwaway event, delete
+    it in Google Calendar on the web, and read it by its id (the events API's get, from the API explorer):
+    write down whether Google answers it as `"status": "cancelled"` or with 404 or 410. Harness treats a
+    cancelled event as taken off since, and 404 or 410 at a fixed id it wrote as "can't tell whether it was
+    added and taken off"; either way it's never added again from a tap's card. This step confirms what
+    Google answers on the real calendar. On Family, the same: delete a throwaway event in the Calendar app
+    and note that a read of its address answers 404.
+3b. The storage note (done by hand, once per install, not per calendar): Harness's status page and its
+    `/health` are where it says it can't save where it got to with a tap, since the digest can't be queued
+    while the records refuse writes. Open the status page and `/health` and note that neither shows the
+    storage note or a `storage` field on a healthy install; the tests show both carry it, with no write,
+    when the records and the file beside the tap journal refuse.
+3c. The waiting note (done by hand, once per install, not per calendar): with the App's records made
+    unreadable for the set-aside list (in a test copy, not your real records), check that after three
+    tries the status page, `/health` (`waiting`) and the next digest all carry the note that taps wait, and
+    that one card came saying taps are waiting and Harness keeps retrying by itself. Put the records back
+    and note that the note clears.
+
+Cain's link watching `/health` for its `storage` and `waiting` fields and telling you is separate work, not
+in this build: it is a precondition of turning these handovers on beyond the smoke run, since the digest
+can't reach you while the records refuse writes.
+4. A card for an event that changed since it. To produce the Gmail stale card: add a throwaway
+   one-off event in Google Calendar on the web (not a series), ask Cain to move it, and when its card
+   comes, open the event in Google Calendar and change its end time by 15 minutes, save, then tap
+   *Approve*. To produce the Family stale card: add a throwaway one-off event to the Family calendar in
+   the iPhone's Calendar app, ask Cain to move it, and when its card comes, open it on the iPhone and
+   change its end time by 15 minutes, save, then tap *Approve*. Each time the receipt says "Not
+   applied" and "nothing was sent to the calendar", and a fresh card follows (tap *Decline* on it). The
+   log shows the card's version and the version just read; no write goes out.
+5. The gate's two edits, each read back: a move (step 2 counts, since it's sent with If-Match on an
+   event that was there) and a move or removal of one day of a throwaway repeating event (the series
+   step below counts on Family; on Gmail, move one day of a throwaway weekly event).
+6. The conformance item: Cain runs `keeper.sh fastpath smoke-step <run id> conformance-gmail` (and
+   `conformance-family`). It covers every write kind Harness sends with a version:
+   an edit, a removal and an edit of one day of a series. Harness adds its own one-off test event and its own short
+   series (three days), edits each with the version it had just read (the fresh edit, which must go
+   through), then sends a stale edit with the version from before that (a counter in its note, so its
+   body differs from both earlier versions), a stale removal of the one-off, and a stale edit of one day
+   of the series. Each counts as enforced only when the calendar gave its documented stale answer (412,
+   or Gmail's 409 for that case) and a read afterwards shows the stale write wasn't applied. Any other
+   answer (sign-in, a refused body, too many requests, unsupported) is unknown and keeps the gate
+   closed; Cain runs the step again. Only the run's own test events are ever written this way, and
+   they're taken off after. The gate opens only when all three are enforced. A calendar that takes a
+   stale edit never opens its cards by itself; one that turns down the fresh edit itself (it gives weak
+   versions and compares them strictly, say) is said as what was seen: Harness and that calendar don't
+   agree on event versions. Either way you get one message, once per install and calendar, saying in
+   plain words that Harness can't change that calendar safely and that you can edit it by hand in the
+   calendar app; each request held for it is passed back in that message (and any held later, at once)
+   as a line ready to copy (calendar, what, title, when), and it stays held. *Open without protection*
+   (your tap only, kept in the log; Cain's `gate-open` there just sends you that message again) lets
+   changes there go as a read-compare-write: each is read just before writing and compared with your
+   card, then sent with no If-Match, so edits made at the same time by someone else can be overwritten
+   or deleted. It opens that one calendar only: the authorisation is per calendar. Every card and
+   receipt for that calendar says *Unprotected*. A calendar
+   that turned down the fresh edit also gets *Test again*. This is never refused outright. One that
+   refuses stale edits but takes the stale removal stays closed too, with a message saying removals
+   there aren't protected; after its override, removals there stay held. The item runs again after
+   every install. Once the two edits are read back and the
+   conformance item passed on a calendar, its held cards come back.
+   The item also records each calendar's etag strength (strong, weak, or none, from every version it
+   read), and on Family it sends one PUT with no If-Match to a test event of its own and records whether
+   Family took it or refused it. That test event is far in the past (1 January 2001, 3:00 UTC), with no
+   reminder and the title "Smoke test: Harness write test (safe to delete)"; it's removed and read back
+   gone before the result is recorded, and one that can't be shown gone is recorded as unknown. Its
+   address (UID and URL) is random each run, and it's first created with `If-None-Match: *`, so it can
+   only be made where nothing is, before the PUT with no If-Match. Its address is kept in the ledger until
+   a read shows it gone; every start retries the removal (only of an event carrying that run's own tag),
+   and one still there shows on Harness's page with how many tries so far. It's safe to delete by hand. The item
+   also takes each calendar's normalisation baseline: on its own test event it writes back exactly what
+   it read, reads again, and keeps which fields the calendar rewrote by itself (see below), with the
+   zone names it writes (`zone_form`: as written, and as IANA names). The no-card flag stays off until both are recorded: `fastpath on`
+   refuses the run by name (`gmail.etag_strength`, `family.etag_strength`, `family.unguarded_put`)
+   until then.
+
+And once, on either calendar: two days of one throwaway repeating event taken off on two cards, both
+Done. The listing lag is measured from the record itself: from each write's read back by its id to
+the days, read as you'd see them, showing it. It needs at least two samples on each calendar (the
+steps above give more), each from 0 to 300 seconds, the most the duplicate and no-card checks allow.
+
+Then Cain runs `keeper.sh fastpath on <run id>`. Harness builds each item from its own record: the
+event ids, when each was asked and read back, the stale cards whose write was never sent, each
+calendar's gate (its fenced edit, series-day edit and conformance item, or the override), each
+calendar's conformance item, the two days of
+the series, the late landing and the lag samples on each calendar. Anything Cain says passed is
+ignored, and an item with no evidence in the record is refused by name, and nothing changes. A full
+run sizes the longer read window from the lag and keeps the lag for the duplicate and no-card checks,
+and comes to you on one card that lists each item's evidence (ids and times, in plain words), each
+event read again from its calendar right then and shown beside it ("now: ..."), the lag samples per
+calendar, and every path *Turn on* lets go without a card, the stored "stop checking" for Family adds
+with its date included, with *Turn on* and *Keep cards*. Only your *Turn on* turns the paths on; the
+run, who tapped and when are kept, the run is used up, and a *Turn off* button then sits on that
+card. *Turn off*, a new smoke-start and every install take any open *Turn on* card off.
+
+When the run is turned on, refused, or runs out, the run's test events still on a calendar are
+listed in one message with *Take them off*, which removes each one only if it's still as the test
+left it (sent with its version as If-Match). If a step says "Not confirmed" while the calendar does
+show the change, the log has both reads ("read back of gmail (first)" and "(fresh)"): that's the
+case to report, and the paths without a tap stay off. Nothing else to set up.
+
+### Weak versions, unprotected writes and a gate that closes again
+
+Versions (etags) are compared weakly for reads (`W/"x"` and `"x"` are the same version when the card's
+and the pre-write read's are compared), and If-Match is sent only when the calendar gave a strong
+version: a weak one never matches under If-Match's strong comparison. Where a calendar gives only weak
+versions (or none), the fence is a read-compare-write: the read just before the write is compared with
+the card, the compare is logged (`read-compare-write (it gives only a weak version)`), and the write
+goes with no If-Match. This narrows the window but doesn't prevent a stale write: an edit made by
+someone else between that read and the write can be overwritten or deleted.
+
+So every write sent without If-Match is labelled. Its receipt (the Done message, or Not confirmed) and
+an Undo sent that way say *Unprotected*, whether the calendar was opened without protection or the
+event only gave a weak version on a calendar that's otherwise protected; never a normal-looking receipt
+for an unfenced write. An approval card for a calendar opened without protection, or one the check
+found gives only weak versions, says *Unprotected* before your tap too. After such a write, its read
+back is compared with the read just before it plus the change it meant: if any field outside the change
+differs, you get a *Possibly overwritten* message naming each field with its value before and after.
+An edit wholly overwritten in the moment between the read and the write can't be seen afterwards; the
+*Unprotected* label is there for that. A calendar that rewrites fields of its own on any write doesn't
+bring that message: the difference is compared with that calendar's baseline from the check after
+installing (a no-op round trip on its test event), and only a difference matching it is left out: the
+same field added with the same value; removed, only when the value removed is the one the baseline showed
+removed (such as an empty description), never any value; a text field the baseline showed changed, to a
+value that's the same once spacing, case, escapes and parameters are set aside. Times and dates
+(`DTSTART`, `DTEND`, `RECURRENCE-ID`, `EXDATE`, `RRULE`, and all-day or timed) are never loosened that
+way: they're compared by the instant or day they resolve to, whether they're all-day, and their time
+zone, so someone changing an event's time zone or making it all-day is told, unless it's exactly the
+zone rewrite the baseline showed. A removed time is matched the same way, by what it means (instant or
+day, all-day, zone), never with its parameters set aside, and one carrying a parameter that can't be
+resolved is told. Zone names that aren't IANA names (Windows ids such as "Eastern Standard Time", older
+names such as "US/Eastern", and prefixed forms such as `/mozilla.org/.../America/New_York`) are mapped
+to their IANA name first, so a calendar that writes one form and reads back another is never told as
+someone's edit. Anything ambiguous counts as a possible lost update and is told, as is
+anything else, such as someone's real edit of the same field. A field the baseline never saw (a reminder,
+a repeat rule) raises nothing when it comes back as it went. The pinned stamps below stay out as before.
+
+A calendar the conformance item passed closes its gate again only when a write that carried If-Match,
+on a calendar meant to be protected, reads back with the event's content changed while its version
+stayed the same; the message names that write. A calendar opened without protection, and any
+read-compare-write, never closes it again that way, so there's no loop of closing and reopening. A
+write that changed nothing and kept its version never closes it. The stamps a calendar rewrites on any
+write never count as content, pinned per calendar: on Family `DTSTAMP`, `LAST-MODIFIED`, `SEQUENCE` and
+`CREATED`; on Gmail the event's `etag`, `updated`, `sequence`, `created` and `htmlLink`. A write whose
+read back doesn't show it (its version moved) still fails visibly as *Not confirmed*, and counts toward
+that calendar's gate review: the count and when are kept in the gate and the log
+(`calendar_gate_review`), for the next check after installing. It never closes the gate by itself.
+
+### Before a Ship card: the migration on a copy of the ledger
+
+Before Cain shows a Ship card for a Harness update, he rehearses the incoming build's own migration:
+`keeper.sh fastpath migrate-check --candidate <path>`, where the path is the incoming build's source
+tree (the `harness` App folder of a checkout of the pull request's head) or its image path (the
+image's `/opt/harness`), as Harness sees it; add a ledger path first to use a ledger file other than
+the live one (`keeper.sh fastpath migrate-check <path> --candidate <path>`). Harness runs the
+candidate's own code in a separate, isolated Python (`python3 -m harness.migrate <ledger path>` from
+that tree): it opens the ledger read only, copies it with SQLite's online backup API into a temporary
+file (never a plain file copy, so what's still in the write-ahead log is copied too), checks the copy's
+integrity,
+runs that build's migration and install step on the copy with no calendars, deletes the copy, and
+answers with what it found: the candidate's build id (computed by the candidate itself, as its image
+will), the schema version, whether the paths without a tap are off (they must be), whether the gate is
+set and which calendars it holds, how many *Turn on* cards are still open (none), how many rows it
+touched, and how many changes left in flight it would read from the calendars on the real run. The
+ledger itself is never touched. Without `--candidate`, the running build rehearses its own migration. Harness maps no folders, so a candidate path has to be one Harness itself can read (under its own
+`/data`, say); where none can be put, the install step below is the backstop: the new build
+rehearses itself on a copy before it moves anything.
+By hand inside the App: `python3 -m harness.migrate <ledger path> [--candidate <path>]` prints it as
+JSON.
+
+The result is kept in the live ledger, keyed by the build it rehearsed, with the SHA-256 checksum of
+the ledger copy it ran on and which build ran it, and `keeper.sh` writes it to the marker file
+`/data/markers/harness-migrate-check.json` in Cain's App. Cain's rules need that marker, saying ok and
+under 24 hours old, before a Ship card for Harness (the link itself doesn't check it yet).
+
+### At install: the rehearsal is self-serve, and a backup comes first
+
+When a new build starts and its migration is needed, it looks for a passing dry run of its very build
+id recorded in the ledger. One counts only if it rehearsed the schema version the live ledger is at now
+(each record carries the source schema version and when it ran) and is under 24 hours old; anything
+else counts as none. With none, Harness runs the dry run itself, on a copy of its own ledger inside its
+container (no outside path), records it, and on a pass takes the backup and migrates at once: a normal
+install never waits on Cain.
+
+Only a failed dry run leaves it waiting: nothing is migrated, calendar changes wait (no writes, and a
+handover is refused saying so), and you get one message saying why, whose only button is *Run check*:
+it runs the dry run again in Harness, and on a pass the records move, backup first (a second failure
+says so, with a fresh *Run check*). Cain's `keeper.sh fastpath migrate-check` does the same. The
+override is yours alone: `keeper.sh fastpath migrate-override` only posts you a card saying the move is
+unrehearsed, why the dry run failed, and that a backup is taken first; the records move only on your
+*Move them anyway* tap, once, for that build id. A tap is refused when a failed dry run for that build
+is on record that the card didn't say.
+
+While the ledger waits, the wait is never silent: the message with *Run check* is retried with backoff
+until Discord takes it (one Discord refuses for good is posted again), a reminder with *Run check* goes
+once a day while it waits, a handover refused meanwhile says why and whether that message reached you,
+and the wait shows on Harness's page and in the `/health` answer Cain's App reads (`migration`). Neither
+App has Home Assistant API access, so it isn't a Home Assistant sensor or repair issue.
+
+The migration itself holds every other writer of the ledger off (the poller, Discord taps and the
+handover service wait, and transactions already open finish first), takes the backup, and applies the
+migration as one transaction: it lands whole or not at all. Work accepted before (held requests, taps
+waiting to be handled, outcomes still being read) is in the ledger and goes on after. If the App is
+stopped in the middle, the ledger is still at its old schema with the backup beside it. A marker
+(`harness.sqlite.migrating`) spans the transaction. A start that finds it first runs
+`PRAGMA integrity_check` and reads the ledger's schema version: if the move had committed before the
+stop (the schema is at the last step's and the install step for the marker's build is recorded), the
+marker is cleared and Harness starts normally. Otherwise the next start
+doesn't try again by itself (a move that kills the App can't keep it from starting): it starts degraded,
+serving its page and Cain's `/health` (both say degraded, and why), and you get one message saying the
+move was interrupted, with *Run check* (rehearse and move again) and *Put them back* (restore the newest
+backup). A migration that fails with an error does the same. If the records can't be opened at all,
+Harness still serves its page and `/health` with status `degraded` and why, and takes nothing.
+
+The writer hold is safe for live interactions. In Harness every ledger write is on one thread, the
+controller's. Taps are never lost: Cain's link gives Discord a deferred acknowledgement and forwards the
+tap; the handover service first writes it to a journal beside the records (`harness.sqlite.taps.jsonl`,
+appended and fsynced), then queues it, and answers only once the controller has committed what the tap
+did (or says it's still working, never a final answer before a durable write); the result then reaches
+you as a follow-up. A tap caught by a stop is taken at the next start, or, if it's by then too old for
+Discord (14 minutes), you're told it wasn't taken. A tap the busy ledger can't take after the bounded
+wait stays queued and you're told once; nothing queued is dropped as the App stops (it's kept in the
+journal or you're told). A tap that can't be written to the journal whole (the append fails, a short
+write, the fsync fails) is turned down at once, never answered "working", and you're told nothing
+changed. Before a tap is acted on, the journal records its intent, naming what it leads to on a calendar
+by a stable identity (the change and the fixed id each add is written under, or the event a removal is
+bound to); one whose intent can't be written isn't acted on and you're told nothing changed. Once what it
+did is in the ledger its outcome is recorded; every journal write is checked, and one that fails is
+logged and told (a tap that went through but whose outcome couldn't be written says so). A tap with an
+intent and no outcome is "outcome unknown", never "not carried out". An error after the intent is
+written keeps that: the tap isn't refused or struck off, its intent stays, and you're told on the tap that
+Harness can't tell yet whether it went through and reads your calendar for it in about a minute. That read
+runs in the running loop (and at a start, through the same code), judged by what the records in use hold of
+the tap's decision as well as by the calendar: a tap whose approval or choice was never used up (the error
+came between the tap being taken in and its decision being recorded) didn't run, so its card says so and
+has *Go ahead*; a change whose approval was used up and which Harness's own executor is still carrying out
+stays unknown in the journal, never struck, while its job isn't finished: after the schedule below it's
+read every hour, and at every start, and settled only once its job reads finished. A read of the records
+that fails (a database or disk error, and only that) counts the same way: the tap is kept, you're told once
+that Harness's records couldn't be read just now, and it's read again on that schedule and at every start;
+it's struck only once a read answers with a finished job or a used-up choice. The log says a tap waits only
+when what it waits on changes, not at every hourly read. Any other error on that read (a fault in Harness
+itself, not in the records) is counted per tap, consecutive reads only, on its own schedule of 1, 2, 5, 15,
+30 and 60 minutes; after those six reads its outcome is recorded as an internal error: one card, with no
+*Go ahead*, says Harness hit an internal error working out what came of it, so it couldn't confirm whether
+the change was made, and asks you to check your calendar to see whether it's there (never that the records
+couldn't be read), and it's struck; it's never read hourly. Its write may have landed in full or in part,
+so the struck press is kept in the records (its request, its identity without the interaction token, and
+the last error) for tracing and to recover the request. That copy is built from the tap journal's own lines
+(the request, the identity, the error count, and the last error, journaled with each error read and with the
+outcome, or "unknown"), on every path that queues that card, in the same transaction as the card; the tap is
+never struck unless the copy is committed. That count is the tap's own: it starts again only on a read of that
+tap whose calendar answered, and such a read settles the tap, so in practice it counts every error read of the
+tap. A read that answered the records but not the calendar (the change still being carried out, or the
+calendar unreadable) leaves it as it is, and so does another tap's read. A tap whose own id can't be read is a permanent
+outcome, not a wait: one card leads with "Harness couldn't tell which request this tap was for; nothing was
+changed", with no *Go ahead*, and it's struck. The records' schedule and the calendar's keep their own
+counts: once the records read again, a calendar that can't be read still gets its own six reads. The
+calendar's count starts again each time the records read again after hold reads; a tap that went back and
+forth between the two for a long time could get more than six calendar reads in all (each schedule is
+still bounded, and the tap is read at most every 60 minutes once its schedule is used up); that is left as
+it is for the smoke run. A change whose
+approval was used up and whose job ended while the calendar reads some of it not done is a failed or
+partial outcome, never "the records took it": its card names each part that isn't done; parts safe to do
+again (a Gmail removal whose event is still there, or an add absent at its fixed id that the records' own
+run never sent) get *Go ahead*, which reads each again by its identity and puts those on a new card for
+your approval, written to the first offer's fixed ids, which are set with the new card and are the ids
+its preview reads, so what it shows is what the write finds. Parts not offered again are told apart, none
+with *Go ahead*, and nothing asks you to send anything again: an add whose write was sent, or may have
+been (absence or a change since is ambiguous, so it isn't done again; only these say its write may have
+reached your calendar); a change that leaves nothing Harness can read (a Family removal); a part whose read
+failed; and a part read plainly as not done that isn't safe to do again by itself, whose card says it was
+checked and isn't done, and to ask for it again if you still want it. A part with no reason recorded and
+no read says only that Harness can't tell how far it got, never that its write may have reached your
+calendar. An add whose step was found in its very version also gets
+no *Go ahead*: the settle record keeps that step's entry, so absence after it reads as gone since. A choice the records took and finished is said
+truthfully, with no *Go ahead* (its button is used up and its receipt says what happened). A read that
+can't answer is read again after exactly 1, 2, 5, 15, 30 and 60 minutes (six reads), and you're told once
+when the next read is, by the time written down for it (or that it's read at the next start, when that
+time couldn't be written); once the schedule runs out the card says your calendar couldn't be read, and
+the outcome is recorded as unverified. That outcome is final: a tap left recorded as unverified (the
+outcome written, then a stop before its card or strike) is finished at the next start, or by the running
+loop, with the same card saying your calendar couldn't be read, and struck; it's never taken for a tap
+Harness didn't get to. Each such tap is finished on its own, the records first: its card, a mark that it's
+queued and a flag that its strike is pending go in one transaction in the records, and only then is it
+struck from the tap journal (a rename), as a cleanup that's safe to repeat. A stop between any two of those
+steps leaves the flag, and every tick and every start strikes what it finds flagged, with no second card.
+The card is never taken back: once the outcome is final it's true. A strike that can't be written is tried
+again after 1, 2, 5, 15, 30 and then every 60 minutes, never every few seconds, its next try written in the
+records so a restart waits for it too. The mark, and the outbox's own key for that card (the tap, the
+card's kind and its outcome, so another card with a purpose of its own for the same tap still goes), mean
+no tap ever gets the same card twice, however many are left (more than ten included) and whichever of them
+fails. Exactly three cards about a tap carry such a key: that final card (the tap, "outcome", its
+outcome), the note that a tap waits (the tap, "note", "waiting": a note whose told mark can't be written to
+the tap journal is still queued only once, across a restart too), and the card that brings *Go ahead* back
+when your calendar still couldn't be read (the tap, "retry", the card its tries count on, which attempt: the
+same attempt on the same card sent twice is refused, the next attempt goes, and a tap listed again starts a
+count of its own, so its new card's first *Go ahead* always goes; an attempt that can't be read is a value of
+its own, never taken as the first). After six tries on one card, the next *Go ahead* that still can't read
+your calendar gets one card saying nothing more is done for that tap, with no *Go ahead*. The cards that
+list taps after a stop or a restore carry one too: each tap's card the tap, "relist" and that listing's
+generation (one more than the tap's last listing), and the summary and the older-taps list the listing's
+taps and generations. The tap is marked as listed, with its strike pending, in the same transaction as those
+cards; if the tap journal alone can't be rewritten, later ticks and starts only try the strike again (after
+1, 2, 5, 15, 30 and 60 minutes, kept in the records and in memory), and never read your calendar for it or
+list it again, so no second summary and no second *Go ahead* reach you. If the records themselves refuse a
+listing (its mark or any of its cards can't be written), each tap is tried on its own: the others are listed
+and settle in that same tick, and the refused tap is put off after 1, 2, 5, 15, 30 and 60 minutes (in memory
+and in the file beside the tap journal), keeping what its last calendar read found so its next try doesn't
+read your calendar again: that verdict is kept until the tap settles or is set aside, however many hourly
+tries it takes, not for a time (at most 256 such verdicts are kept; a tap your calendar showed done that loses
+its kept verdict to newer ones reads once more on its own schedule and still settles as already done, with no
+*Go ahead*, once its listing is saved, tested through eight hours of refusals). Only a read that answered is kept: one
+that couldn't read your calendar never is, so once your calendar answers again the tap is read once more and
+settles on what it shows, and a tap your calendar shows done is noted as found only once its listing is
+saved. The taps settled one by one get one
+summary between them, after their own cards, never one each. A tap listed six times already isn't listed
+again: one card says Harness has brought it back several times without finishing it and nothing more is done
+for it, with no *Go ahead*, and it's struck. Each listing's count is kept with its mark in the records and in
+the file beside the tap journal too, and the larger of the two is used whenever both read. A mark is read only
+when it's a record whose count is a whole number from 0 to 6; when the records' marks can't be read, or one
+tap's mark isn't that (not parsed, or its count missing, empty, not a whole number, below 0 or above 6), the
+count beside the journal is used, at every place a mark is read, a mark whose strike is still pending
+included, and a struck mark keeps that count rather than starting from nought. A tap whose count can't be read
+in either place is never counted from one
+again: it's stopped with a card of its own saying Harness couldn't safely try it again and nothing more is
+done for it, with no *Go ahead* (not the card for a tap brought back several times, which may not be true of
+it). The new approval card for parts done
+again belongs to its own job and carries none. A strike flag that can't be read (unparseable, or with no tap
+in it) is struck by the tap's id when its card is there, once the id and custom id read from its key match
+the tap journal's own lines for that tap (a key that doesn't match is set aside, not struck); with no card
+there, or with a key that doesn't match, one card says Harness found a cleanup step it couldn't use, left
+the tap as it is and set it aside, and that its record is kept for the set-aside taps tool; in that same
+transaction the flag is set aside: its text and the tap's own journal lines (without the interaction token)
+are kept whole in the records, later ticks and starts skip it and write nothing, and the tap isn't taken
+again. The log says so at most once an hour. An internal error's kept copy that can't be written is tried
+again on the same schedule, and after six failures the tap is set aside the same way, with that card. To
+handle a set-aside tap, with the App stopped: `python3 -m harness.migrate <records> --set-aside --taps`
+lists them, and `... --set-aside --taps export|discard|requeue '<tap key>'` handles one, each writing its
+record and its journal lines whole beside the records (harness-set-aside-taps.json) first. Export does only
+that. Discard replaces the set-aside record with a lasting discard record in one transaction, and in that same
+transaction removes the tap's pending strike, its put-off read and its listing mark (with its count), so the
+tap is never read on your calendar or taken again and its journal lines, which stay, are never rewritten; a
+pending strike or listing mark found for a discarded or set-aside tap is skipped, and a start's replay that
+can't read which taps are set aside does nothing and comes back after 1, then 5, then every 15 minutes; from
+the third such try in a row Harness's health (a "waiting" note), its status page and the digest's standing
+problems say taps from before its last start wait, with the log saying so at most once an hour, and that
+clears at the first replay that reads them, which settles every tap it had put off that's due. When that note
+first comes on, Harness also queues one card for you (once for that outage, and only where its outbox takes
+it) saying taps are waiting and it keeps retrying by itself; nothing is asked of you. The outage is kept in the
+small file beside the tap journal (whether one is open, its number from a counter there, never the clock, and
+whether its card is queued), so a restart in the middle of it, or the clock stepping, sends no second card; a
+card the outbox refuses is tried again at the next failed read under the same key, so exactly one goes. The outage
+closes only after three reads that work in a row (read a minute apart; a failed read starts the run again), never
+on the clock, so reads that keep flapping give one card, not one per failure. Where the outage can't be recorded
+in that file no card is queued, the log says so as an error, and the health and status notes still say the taps
+wait. While the records stay
+unreadable the running loop reads no calendar and writes nothing for those taps, and its own log line about
+it comes once and then at most hourly. Discard also
+takes out of the tap journal an intent that a refused requeue left for that tap (every other line, torn ones
+included, stays as it was). A requeue leaves at most one such intent for a tap, and a discard clears it. That
+rewrite holds the tap journal's own lock (`<journal>.lock`, the one every append takes, in Harness and in the
+tool) from its read to its rename and the folder's sync, so a tap written down meanwhile waits for it and is
+never lost. Nothing is ever written to the tap journal without that lock. Where it can't be taken, a strike
+(Harness's own, or the tool's discard) isn't written into the journal at all: its tombstone goes in a second file
+beside it (`<journal>.struck`) that is only ever appended to, never rewritten, replaced or removed, so no
+rewrite of the journal, even one that read the journal before the tombstone landed and renames after, can drop
+it. Every reader of the journal (Harness's, and the tool's) honours the tombstones in both files, and the next
+strike that takes the lock writes them into the journal and notes in that file how far it got. A tap or
+progress line that can't take the lock is refused (the journal left as it was, the tap answered as not taken).
+Harness's health says `storage` whenever a lock can't be taken (an append's or a strike's), with words of its
+own when the journal itself refuses a write; the lock reason clears at the next lock taken, the write reason at
+the next write that goes. The lock file is Harness's own and group-writable; created by root before there's a
+journal, it's given the owner of the journal's folder. The set-aside tool checks, before it opens or creates
+anything, that it runs as the owner of the tap journal, its lock, its two side files, the records (and their
+write-ahead files) and the records' own lock, and refuses otherwise, so a run as root or another user changes
+no file. The tap journal must be on local storage: its lock and its renames are only sound on a local file
+system, so Harness starts degraded (every tap refused, the status page saying why) unless the journal's folder is
+on one of ext4, xfs, btrfs, f2fs, overlay, tmpfs or vfat; any other type (a network file system, any fuse mount,
+a type it doesn't know) or a mount table it can't read counts as not local. Home Assistant OS keeps the App's data
+on ext4. If the rewrite fails after the discard is committed, the intent stays as an orphan:
+the discard record means it's never read on your calendar, carded or acted on (by the start's replay, the
+running loop or either resume), and the tool says so; running the same discard again clears it (and only
+that). Requeue starts the tap's listing count afresh and discard clears it, each in the same step as its
+listing mark: the count beside the tap journal is changed first and the records' transaction second, and a
+transaction the records refuse puts the count beside the journal back, so the larger of the two never brings
+back a count that was lowered. A requeue draws its round inside its own write transaction: the counter is read and
+raised there in one statement that keeps the larger of what's there and the new round, so two runs can't draw the
+same round or lower it, and the count beside the journal is written inside that transaction too, put back as it was
+if the records refuse. The small file beside the journal is never written over contents that can't be read: such a
+file is moved aside (`<file>.unreadable`) with an error in the log, and the write that found it is refused (an
+outage's card isn't sent then; the health notes still say it). Every tap whose key can still be picked out of it,
+and every tap in the journal then, has its count treated as lost: if it's listed again it's stopped with its own
+card and gets no *Go ahead*, until a requeue gives it a count again (when nothing can be picked out of it, every tap
+with a listing mark is treated so). A requeued tap's cards are keyed on its new count, so a requeued tap gets a
+fresh *Go ahead*, up to six again. That count's round (its epoch) comes from one counter in the records for
+every tap, never pruned, so even a tap whose mark and count beside the journal were both lost gets cards it
+never had before after a requeue, never ones refused as duplicates. There's no limit on requeues: each gives
+the tap up to six *Go ahead*s again, which is fine because each requeue is your own explicit act at the Pi. A tap ended after six listings (or stopped because its count couldn't be
+read) is ended for good: its mark says so whatever count or round it holds (the ended state is read before
+any other field, so a damaged round or count beside it is only logged), and it's never counted on or carded
+again. A struck mark whose count couldn't be read is kept in a "no count" state, read ahead of any count beside
+the journal, and stays that way: such a tap, if it's ever listed again, is stopped with its own card rather
+than counted from one or from a count that appears beside the journal later; only a requeue clears it. (A mark
+whose count is damaged without that state is damage, and counts on from beside the journal.) Once, at a start,
+marks written by earlier builds are put into this form (an ended mark at the old count of seven; a struck mark
+written as nought, which takes the count beside the journal, is ended at six when that count is over six, and
+gets the no-count state when there's none). Requeue checks the tap's journal
+lines carry one press for that very key (otherwise it's refused and stays set aside); a tap with an outcome
+gets its strike back with that press and is only crossed off. One with none goes by its journal alone: if it
+holds an intent, or any other sign the tap was started (a read, a delivery, or a line that can't be read but
+names that tap by a whole field: its whole key, or its press's id, with its custom id where that's still
+whole; another tap's line never counts), it goes back as outcome unknown (an intent is added when none can
+be read; if the records then refuse the requeue, it says so and the tap stays set aside, and that intent gets
+no card while it is; a later requeue uses that same intent rather than adding another), so Harness reads
+your calendar for it and gives a card, *Go ahead* at most, never acting by itself; only a journal that reads
+whole and holds that tap's press and nothing else sends it back as never acted on; a journal that can't be
+read is refused and the tap stays set aside. If the unverified outcome itself can't be
+written to the tap journal, the tap's next read is put off in the records on the same 1, 2, 5, 15, 30 and
+60 minutes, at a start too, so your calendars aren't read for it at every tick; when the records can't take
+that either (a full or read-only card takes both down at once), it's held in memory on the same schedule
+and kept in a small file beside the tap journal (`<journal>.reread`), so a start keeps the schedule. Starts
+while a tap is put off that way are counted in that file, and after three, one card says Harness has
+restarted several times without saving where it got to and reads that tap only now and then. The log line
+about it is said at most once an hour, by the time kept in that file. When even that file can't be written,
+a start waits one step of the schedule (a minute) before reading such a tap, so a crash loop doesn't read
+your calendar at every start, and Harness's health (what Cain's watch reads), its status page and the
+digest's standing problems say it can't save where it got to with a tap, with the log saying so at most once
+an hour; that clears once the file takes a write again. None of those needs a write: the health and the status
+page are built in memory and the status text and the digest's composition only read the records (tested
+through Harness's own digest composition, with its calendar, input and digest lines all there, the Family
+ones included). The digest
+still needs its message queued in the records to reach you, so while the records refuse writes the health and
+the status page are where it shows; the smoke run checks that by hand. An exception's message is scrubbed
+where it's kept or shown: the tap journal's writer, the records' writers, the set-aside tool's copy and the
+log's handler all scrub it, as does every other place Harness turns an error into words. Every key Harness
+holds, auth headers, JSON fields named for a token, secret, password or refresh token, long random-looking
+strings, and a web address's query and user part are replaced, in an older journal line's error too when it's
+copied. Words shown to you (a "Nothing changed" refusal naming your event, a stopped part's words) get only
+Harness's own keys and the link's token replaced, never the patterns, so an event called "Token: pickup"
+reaches you as written. Those words are a type of their own in the code, built only from Harness's own
+wording and your events' fields; the refusals that carry them keep their message as that type, and anything
+else handed to that light scrub (an error's text, a calendar service's answer, plain text) gets the whole scrub
+instead. That type can only be built by its factory (a fixed template filled with your event's fields) or a
+refusal's message, and the records' and tap journal's writers go by it too: only that type keeps your titles in
+the field for your words. A record kept as text keeps that type with a tag beside the field, written only from
+the type itself; the records' writer gives a tagged field the light scrub and anything else there the whole
+scrub (other error fields are scrubbed whole before the record is written), and reading the record back gives
+the tagged words back as that type, so a title like "Token: pickup" saved, read back and shown on a card
+reaches you as written. That type copies and pickles like any text. The source check finds the light scrub by
+what it was imported as, under any name, and flags any other way of building that type; it reads every module
+of Harness, subpackages included, and refuses the ways of reaching the scrub it can't follow (a star import, a
+lookup by name, the scrub module or its protected names rebound other than by a plain name, passed on as an
+argument, or subclassed), and, anywhere in Harness, dynamic imports, lookups in the module table, exec, eval,
+compile and a function's globals. It knows the scrub module by its full module path, so a file of the same name
+elsewhere is checked like any other. The tag is honoured only in text the record writer's own serialiser wrote:
+the records' writer drops a tag from any other text (plain JSON, or text from outside) before it scrubs it, so such
+text gets the whole scrub and never reads back as your words, and the source check flags a record written as plain
+JSON that carries your words or the tag. That's what's enforced: the check is a source scan, not a sandbox. A source check makes sure no error, traceback or service answer is built into them, and that the light
+scrub is only ever handed one of those refusals. The source check for errors covers format calls, an error's
+attributes, joins over its arguments, traceback formatting, the message of a refusal raised with it, and a name
+it's rebound to (simply, in a tuple, or by adding to it), and counts a call as logged or scrubbed only when it's
+made on the logger or the scrub itself. A tap that
+settles normally clears its put-off read in the same transaction as
+its card. A message's outcome for the fixed card is checked before anything is queued, and the message, its
+key and its outcome are written together or not at all; if undoing a failed write itself fails, the records'
+transaction is gone (rolled back in full, or its connection opened again so later writes still commit), and
+a distinct "transaction aborted" error, with the first error as its cause, ends that tap's step: no caller
+can catch it as an ordinary error and go on writing as if its transaction still held. Each tap is its own
+boundary, in the running loop and at a start: that error (after the rollback or the reopen) puts that one tap
+off on the 1 to 60 minute schedule and the next tap goes on; only a reopen that itself failed ends the tick,
+and a start's replay cut short is taken up again from the running loop once its time comes. A start's replay
+that puts off more than one tap comes back for the earliest of them each time, until none is left, so a tap
+carried over from the file beside the journal is never left for the next restart. An outcome-unknown tap the
+replay skips as not due yet is left to the running loop only when the tap journal holds its next read;
+otherwise the replay comes back for it at its due time, so it's settled without a restart. No catch of every error
+anywhere in Harness swallows that one: each ends by raising it or by handing it, by name, to the code that
+raises it (tested, with no list of exceptions). A calendar write's own thread hands its error to the caller
+waiting on it and signals that it's done whatever happens, so the caller always returns. You're told a tap waits only once that note is queued, so a note that couldn't be
+queued goes at the next read, or after a restart. A tap whose decision never reached the records, read
+while your calendar can't be read, says so: its *Go ahead* reads first, and if your calendar still can't
+be read nothing is done, you're told plainly, and the same *Go ahead* comes back on a new card that reads
+again when used.
+
+The policy split, and why: an add that never landed in Google across a restore gets no *Go ahead*,
+because nothing at a fixed id can't be told apart from an event added and deleted since; a tap whose
+decision never reached the records does get one, because no approval used up is not ambiguous: nothing
+it leads to ran. Only an error before the intent, or a calendar's own answer turning it down,
+is a refusal. A tap on a choice that writes a calendar names its identity too: *Add anyway* the fixed ids
+its adds are written under (made from the receipt it came from, so the same tap taken again writes to
+the same ids, and the writer reads that id before writing: a read that can't answer means nothing is
+added, and a duplicate id from Google (409) or from iCloud's `If-None-Match: *` means it's already there
+and nothing was written), *Undo* and the Family *Undo* each event, the version the change left it in
+(Google's etag, iCloud's ETag) and the state it must read in afterwards. A read finding any other version
+says it changed since and Harness can't tell, with no *Go ahead*, and the Undo writer itself sends
+If-Match on that version, so an edit of yours since is refused by the calendar, never overwritten (a day
+of a series whose content still reads exactly as the change left it is the one exception: another day's
+change gives it a new version; that compare covers every field an Undo could write: title, times,
+repeat, description, location, guests, reminders, conference details and private properties, so an
+edit of yours to any of them leaves it alone). An Undo step with no version recorded for what its change
+left (journaled before Harness kept one) gets no automatic undo: its receipt says so and asks for the
+change you want on a new card to review, and the log notes where the old content compare would have
+applied, so the smoke run sees it. A write found landed late has its version read and recorded then. *Go ahead* is offered on an allow list: only for a kind that carries a readable
+identity, or one declared as changing only Harness's own records; any other kind, a new one included,
+gets none, and its card says so. A refusal's outcome and its note
+are written before the note is posted, and the note's delivery after it, so after a restart a refused
+tap is never taken again and its note goes again only if its delivery wasn't recorded; a tap is struck
+off only once its outcome is recorded and its note delivered. A tap's age is read from Discord's own
+stamp in its id, bounded by the journal's own time: where the two differ by more than two minutes the
+journal's is used. While the clock is flagged as behind the records the age is unknown and the tap is
+reported, not taken; if that tap was on the clock card, the card is posted again. Across a restore (the
+swap applied at that start) nothing written in the journal is taken by itself. For each tap that may
+have reached a calendar, the calendar is read first for its effect by that identity; one it shows is
+marked done, with no button (an Undo already done is said by what it leaves: the event gone, back, or
+as it was). A Google event read as cancelled at its fixed id was added and deleted since: its card says so
+and has no *Go ahead*, and nothing is put back. A repeating add is read by its fixed id the same way:
+there is done (and left out of a *Go ahead*'s run); nothing there, or read as cancelled, is absent, with
+no *Go ahead*, and it's never written back (on Family a PUT with `If-None-Match: *` to an address you
+emptied would succeed). An add with nothing at its fixed id (Google answering 404
+or 410 there, or an empty Family address) can't be told from one added and deleted since: its card says
+Harness can't tell whether it was added and taken off, with no *Go ahead*, and it's never added again
+from there. A change of several parts is read part by part, each Gmail removal by its own bound event
+only: its card names which are settled, and its *Go ahead* does only the others. Which parts to leave out
+is read again just before that one run and then forgotten, so a later run of the same change leaves
+nothing out on an old read. Then one
+message counts the rest by what's recorded (carried out before the records were put back, can't tell,
+not carried out) and points at the cards below it; the newest ten each get a card that says which (a
+tap whose time can't be read always gets one, marked "time unknown"), and any older ones are listed in a
+second message by time and state. *Go ahead* reads the calendar again first: if the change is there it
+does nothing more; otherwise the tap
+goes through the usual checks on the records in use, and the write itself reads the event's fixed id
+or version first, so nothing is made twice. While Harness runs degraded without its records a tap is
+refused at once and you hear it through Cain's link. The tap journal is a required part of the
+handover service: the App doesn't start without it. No card of Harness's names a button in its prose: where a card has one,
+it says what "the button below" does. If Cain's link refuses a card all the same for telling him to use
+a button it doesn't carry, the card isn't dropped: it goes once more with only the sentences the link's own
+rule would refuse taken out (its imperative patterns and its label finder are mirrored from Cain's gate
+rules: the verbs it looks for, labels across a line break, quoted and bold labels, every label it knows;
+both sides run the same shared cases), so a sentence that merely holds the words stays; if nothing is left,
+or the card's head went with them, or the link turns it down a second time, a fixed card goes instead, in
+fixed words only (when it was written, whether it's about a message of yours, what happened where the card
+carries it, from three fixed phrases: done, not done, or Harness couldn't verify how it went, and that its
+full words couldn't be shown), with the card's own buttons, so a card is never lost to a refusal. Every line
+of it, each phrase included, is in the shared cases both sides check against the link's own rule, and each
+use is logged, so how often it's needed shows. The refusal is recorded in Harness's log, and the link writes its own gate-report
+entry. A write from any other thread while the hold is on is a bug: the tests fail on one at once, and in
+the App such a writer waits in bounded slices, logging each and trying again, and gives up after five
+minutes with an error rather than hang. The hold is always released, even when what it holds fails. The
+checkpoint and the online backup run under the hold strictly before the migration's transaction begins,
+never inside one (Harness refuses that order), so the checkpoint can't find the ledger locked.
+
+Free space is checked before the dry run's copy and before the backup: room for two copies of the ledger
+and its log plus 16 MB. The ledger is checkpointed first (`wal_checkpoint(TRUNCATE)`, folding the log in
+and emptying it) and the size is the main file plus its `-wal`. Records a restore set aside
+(`harness-replaced-*`) take room too, and a refusal for space says how much of it they hold. Without it nothing is copied (never a half-written file) and the ledger waits as
+above, saying "there isn't enough free space for a copy of the records" with how much is free and needed.
+
+Just before it migrates, Harness takes a restorable copy of the ledger after a checkpoint, with SQLite's
+online backup API (never a plain file copy), beside it in `/data`, named
+`harness-before-s<schema>-<build>-<time>.sqlite`, keyed by the source schema version and the build. The
+copy is checked before anything moves: SQLite's integrity check on it, and its rows per table against
+the live ledger; a copy that fails either means nothing is migrated and it waits as above. No new copy
+is taken when its content checksum (computed on the backup file itself) matches the newest one's
+(repeated attempts after a failure), the newest three are kept, and the oldest at each schema version is
+never deleted until a later migration has succeeded and the App has run on it for a day of run time.
+Run time is summed in the ledger from the monotonic clock, never the wall clock, and nothing is deleted
+while the clock can't be trusted (earlier than the newest time the ledger recorded, or not set yet).
+Events stamped before 1 January 2026 (written before a time sync) never count for that rule. While it
+holds pruning up, Harness's page and Cain's `/health` (`migration.pruning_stalled`) name the record
+that holds it (its number, kind and time), and when the clock is behind it by more than ten minutes you
+get one card with *Use the clock as it is now*: your tap takes the clock as right, records up to then
+stop counting for the rule, and pruning goes on. Cain's `keeper.sh fastpath migrate-clock` only posts
+that card again; nothing changes without your tap. A
+dry run dated later than now counts as none. The schema steps are numbered; a duplicate or conflicting
+step number (a ledger that recorded another step under the same number) is refused, and the ledger waits
+as above.
+
+To restore one, by its schema version and build: Cain's `keeper.sh fastpath migrate-restore <schema>
+<build>` on your say, which only posts you a card; your *Put them back* tap does it. With the App
+stopped, or while it runs degraded without its records, `python3 -m harness.migrate /data/harness.sqlite
+--restore <schema> <build>` does it from the command line. It takes the same kernel lock Harness holds
+for as long as it runs (an exclusive `flock` on `/data/harness.lock`, beside the records on the same
+volume) from finding the backup until its marker is on disk, and refuses when it can't get it (Harness
+is running normally), and says so. Harness takes that lock before it reads any marker, so a start while
+the command line is staging waits for it (up to two minutes) and then finds the staging whole. A
+Harness running degraded because its records couldn't be opened lets the lock go (it never touches
+them), so the way back doesn't need the App stopped: stage the restore, then restart the App. Either one never touches the live ledger: it checks the backup and writes only a staged
+file beside it (`harness.sqlite.restore`) and then, last, its marker (`harness.sqlite.restore.json`).
+All swapping is done by Harness itself at its next start, before it opens the ledger: it writes a swap
+marker first, checks the staged file again (`PRAGMA integrity_check`), moves the ledger it replaces
+with its `-wal` and `-shm` files to `harness-replaced-<time>.sqlite`, `-wal` and `-shm` (named as SQLite
+pairs them, so the kept log stays with its file; never a stale log left beside the restored file), then
+renames the staged file into place, which is atomic. Each step is durable across power loss, not only a
+stop: the folder is fsynced after the marker's rename, after each of the three moves, after the final
+rename and before the marker is cleared, and each finished step is recorded in the marker, so a resume
+never repeats a move. A stop or a power cut between any two steps is finished at the next start (one
+that fails its check there is set aside and the old ledger put back, also step by step). A move is
+never made over a file that's already there, and nothing at the records' name is opened beside a
+`-wal` or `-shm` it doesn't own; either one stops the start, which runs degraded and says why. The
+refusal is recorded in the swap marker with the files that caused it (if that write fails, the page and
+the command line say the refusal wasn't recorded, and the old marker stays whole). Each start looks at
+the refusal again: once the files that caused it are gone, it clears and the swap goes on. With the App
+stopped (or degraded), `python3 -m harness.migrate /data/harness.sqlite --set-aside` sorts it: what it
+moves comes from the swap's own recorded steps and what's on disk, never from names in the marker, and is
+only ever a `-wal` or `-shm` at the records' name that isn't theirs. A marker naming anything else (the
+records' own file or log, the staged restore, a kept set, anything outside the folder) is refused by
+name and nothing moves. It lists them, asks you to type yes, copies each into
+`harness-set-aside-<time>-<n>/` beside the records (a new folder each time), checks the copy byte for
+byte, only then removes the original, and clears the refusal, so the next start finishes the swap. A
+copy or fsync that fails (a full disk, say) or a copy that doesn't match takes back what it made, the
+partial copy and the folder, leaves the originals and the marker as they were, says why in plain words
+and exits non-zero. It can be run again after one cut short: its progress is kept beside the swap marker
+(the folder chosen and, per file, the copy's checked digest and whether the original was removed),
+written whole (a temporary file, fsynced, renamed, and its folder fsynced, as every such record has been
+since an earlier round), and each checked copy has its digest noted beside it in the folder too. A
+progress record that's truncated or unreadable is rebuilt from those noted digests (each copy read again
+and compared) and from which originals are still there, rather than stopping. A file with neither a good
+copy (never checked, or no longer matching) nor its original is never dropped silently: the loss is
+written into the progress record, the answer names that file, and nothing more is moved, the swap marker
+and the live records left as they were. A copy with no digest note can't be checked, so it's named as
+unverified, never skipped; the same holds for a progress record that reads whole but has no digest (null
+or missing) for a file: it's never trusted as checked and never a crash, and the answer names it. If a lost file isn't needed, `python3 -m harness.migrate /data/harness.sqlite
+--set-aside --accept-lost <name>` records it as accepted (moving nothing, the swap marker and the live
+records untouched), and the next `--set-aside` finishes the rest without it; a name that isn't recorded as
+lost is refused. This is the command line's alone; nothing of it runs at a start.
+A swap marker that can't be read (damaged or cut short) is never deleted and
+nothing is moved: the start runs degraded, and the page lists the files at the records' live and kept
+names, as `python3 -m harness.migrate /data/harness.sqlite --swap` does, for sorting by hand. The marker
+itself is always written whole (a temporary file, fsynced, renamed, and the folder fsynced). If a start
+waits the full two minutes for a restore being staged, it runs degraded, shows the wait on its page,
+tries the lock again every 5 seconds and starts normally by itself once the staging is done. While
+degraded, Harness posts one note to you through Cain's link, tried again after 1, 2, 4 minutes and so
+on (at most 30 minutes apart) up to ten tries; if none goes, its page says "Note not delivered". The restored ledger is migrated again on that start, with rows intact, rehearsing itself as
+any install does, so it doesn't need a fresh *Run check*.
+
+Once your tap stages it, Harness is fenced and takes nothing new until it restarts. The fence is a mode,
+not a held lock: any ledger write then fails at once with a plain reason, while sending messages already
+queued (and marking them sent) still works, through the ledger's one outbox-only exemption (a private pass only the outbox's own method hands over: a guard against a stray flag or wrong argument by accident, not against code set on getting past it). A card with
+buttons isn't sent while fenced, so no button is ever dead; a tap meanwhile gets the restart answer.
+After the restart, the swap sets those records aside, and every message still waiting in them (a card
+held by the fence among them, even one made in the same moment as the restart card) comes back once,
+without its buttons, which belonged to the records set aside; nothing asks again for it, and one whose
+buttons had already run out says its time has passed. If the restore isn't used after all, it
+goes out from the records as they are, its buttons bound. The loop's
+heartbeat and the clock check keep running while fenced, and the page and `/health` say fenced beside
+the loop's own beat, so a stuck or stopped loop still shows as stuck. A request or a tap is answered at once that it's waiting to
+restart (never queued), and one card asks you to restart the Harness
+App now (Settings, Apps, Harness, Restart). The card says how old the backup is and how many held
+requests, buttons not tapped yet, writes still being confirmed and changes you could still undo are in
+the records it sets aside. Once the restored ledger opens, the requests that were held in the records
+set aside come back to you, one message saying the records are back and then one per request, ready
+to copy into the calendar app. The kept ledger is opened read-write once first to fold its log in, so a
+request committed only in its `-wal` comes back too. Which have gone is recorded beside the kept files
+(`harness-replaced-<time>.sqlite.postback.json`, naming each before it's posted, and the ledger records
+the post in the same transaction), so a stop at any point neither repeats nor loses one. Every kept set whose own marker doesn't say done is
+posted back, oldest first, so two restores in a row with the first post-back cut short bring both sets'
+held requests back, once each (a post recorded in records set aside since counts only if it was
+delivered from there; one recorded the older way, without its message, counts only if that set shows
+the very post delivered, and is otherwise posted again, once). A kept set is pruned only once its own marker says done and the records aren't
+waiting on a move; one that isn't stays, counted in the space check, and the latest is always kept. The page and `/health`
+show a staged restore meanwhile. The copies beside the ledger live on the same device: a Home Assistant backup
+is the off-device copy, and one is recommended before installing (the Ship job takes one first).
 
 ## Dates from your mail
 
-With the `mail_dates` option on, dates in your mail go on your Gmail calendar. Deadlines, last
+With the `mail_dates` option on, dates in your mail go on your calendar. Deadlines, last
 days, renewals and the like are free all-day entries with no reminder, so nothing reaches work. An
 appointment the email gives a time for is a real appointment: it's busy, so work and Family see it,
 at its time with your usual reminder, and at the street address that email gave, or that another
@@ -320,6 +1320,43 @@ left alone. What lands or moves is told in one message with *Undo these* once a 
 finds it as written. If three reads don't find one, or half an hour passes without one that does,
 the message says it was written but not confirmed, still with *Undo these*, and the next digest
 names it. An entry that moves is told again, and *Undo these* on either message takes it off.
+
+**The kids' dates go on Family, never your Gmail.** A date from the kids' school, a teacher, a
+coach or the kids' doctor gets its own card naming the Family calendar, with *Add to Family* and
+*Skip*. Your tap puts it on Family as a calendar change, with its receipt and *Undo* (the
+`calendar_changes` option has to be on for that write; while it's off, the card has no *Add to
+Family* button, only *Skip*, and one line says why). When only who sent it hints at the family (a
+school's address on a note about something else), the card offers *Family* and *Skip*: a date from
+a school-type sender never goes on your Gmail. Everything else is yours and goes on your Gmail
+calendar as before, and its message says so: "From your mail, on your Gmail calendar".
+
+**Kinds you've said no to are skipped.** Mail of a kind on the skip list is passed over before
+anything is sent to the model, matched on who sent it and its subject: no card, no calendar entry, and
+the digest never mentions it. The first kind is Amazon's Subscribe & Save delivery management: the mail
+must come from Amazon and say Subscribe & Save in its subject, or else where its text says what the mail
+is (a header line at the top, or the first block of text before the order's items, after any greeting
+on its own line such as "Hello Alex,", read on the Pi; never in a promotional footer or a quoted section,
+and a first block that reads as an advert by its shape, an offer such as "save 15%" or a run of calls to
+action and links, keeps the mail; one word such as "deals" or "discover" doesn't make it an advert, and
+a boilerplate link doesn't count toward it: unsubscribe, privacy, preferences or opt out anywhere in its
+address, help, account or manage only in its path or the words just before it, never in its domain, so a
+promotional link at a domain with "account" in it still counts) before a subject like "last day to manage", "manage your delivery" or "delivery date has changed"
+counts. Prime, Audible and Kindle renewals, an ordinary order's new delivery date and an order's return
+window all come through ("return" counts only as a whole word, so "returning" doesn't). To skip another
+kind without a new build, add it by name to `/data/mail_skip.json`, read at every pick, for example
+`{"skip": [{"name": "Pet shop points", "from": ["pawsclub.example"], "subject": ["points statement"],
+"unless": ["order"]}]}`: a mail is skipped when its sender contains a `from` text and its subject a
+`subject` text but no `unless` word. The file is checked strictly: each entry needs a `name`, and `from`
+and `subject` lists (`unless` when given) of texts at least three characters long, and nothing else. It's capped: at most 50 kinds, 20 texts in
+each list, 80 characters in a text or a name. One
+entry that doesn't fit, or a file that can't be read, and the whole file is ignored, the built-in kinds
+still apply, and Harness's page says why. The page also counts the mail skipped so far, with the sender,
+subject and rule of the latest 20, so a rule that skips too much shows.
+
+Mail is handed to the model as quoted data, with a line saying it is never instructions, so an
+email can't tell Harness to do anything. Mail never makes a calendar change on its own: a date for
+Family goes on only at your tap, and anything else from mail that would change a calendar comes on
+a card.
 
 ## Copies from your Gmail calendar
 
@@ -400,7 +1437,7 @@ how many blocks are on Gmail.
   the two title settings. A block backed by your own answer is "Busy (...)"; kids or driving in the
   next 48 hours that it isn't sure of is "Maybe busy (...)", shown free so it never reaches work.
   When it can't tell and it matters in the next two weeks, Cain shows you one question with buttons.
-  Each new block gets a card with Not mine, Wrong time and Just this once, once a later read of
+  Each new block gets a card with Not mine, Wrong time and Not this time, once a later read of
   Gmail finds the block as written; if three reads don't, the card says it was written but not
   confirmed, with the same buttons. Turn it off to go straight back to the title rules. All the
   limits and safety above still apply.
@@ -553,7 +1590,9 @@ stays. Uninstalling the add-on also starts over, and deletes the ledger.
 ## Backups
 
 Backups include `/data` (the ledger, the keys, the app-specific password, the calendar
-addresses and the last Family push). The add-on stops briefly during a
+addresses and the last Family push, and the ledger copies taken before a migration,
+`harness-before-s<schema>-<build>-<time>.sqlite`). That Home Assistant backup is the copy off the
+device; take one before installing. The add-on stops briefly during a
 backup so the database is copied whole. After a restore, anything done after the
 backup was taken is gone.
 

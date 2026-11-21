@@ -16,7 +16,7 @@
 //     temp files are swept at the link's start; the guard's log is capped in size and rotated root-side.
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
-//     it installs, read from the keeper App (GET /armed with Cain's token, 0.17.0: keeperArmed below),
+//     it installs, read from the keeper App (GET /armed with Cain's token, 0.18.0: keeperArmed below),
 //     never from Cain.
 import { closeSync, fchmodSync, fchownSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -251,7 +251,7 @@ export function armedFor(apps: string[] | null, text: string | null): { armed: b
   return { armed: true, why: "" };
 }
 
-// -- the keeper's armed state (0.17.0) ----------------------------------------------------------------
+// -- the keeper's armed state (0.18.0) ----------------------------------------------------------------
 // The link asks the keeper App every minute (GET /armed?app=<slug>, Cain's own token) for each App and
 // keeps the replies; each use judges them as they stand then. Not armed: a refused token, any error, a
 // reply that isn't for that App, a timestamp older than 2 minutes, or a binding that doesn't match (the

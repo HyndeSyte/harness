@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 from .net import REDACT
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .vault import FIELDS, LABELS, TEXT_FIELDS, Vault, VaultError
 
 log = logging.getLogger("harness.web")
@@ -137,6 +138,55 @@ def render_page(app: SetupApp, user_id: str, user_name: str, flash: str = "") ->
                      ' UTC</div>')
     for note in st.get("notes") or []:
         parts.append(f'<div class="no">⚠ {_e(note)}</div>')
+    mig = st.get("migration") or {}
+    if mig.get("waiting"):
+        # Twelfth round: the ledger waiting for its move is never silent.
+        parts.append(f'<div class="no">⚠ Records not moved to this update yet: {_e(mig.get("why", ""))}. Calendar '
+                     f'changes wait. The message with Run check: {_e(mig.get("notice", "none"))}.</div>')
+    if mig.get("degraded"):
+        # Thirteenth round: a start without its records moved (or opened) is said, never a dead App.
+        parts.append(f'<div class="no">⚠ Running degraded: {_e(mig.get("why", ""))}.</div>')
+    if mig.get("restore_staged"):
+        parts.append('<div class="no">⚠ A restore is staged: restart the App now to put the records back. Nothing '
+                     'new is taken until then.</div>')
+    if mig.get("fenced"):
+        # Fifteenth round: the loop still beats while fenced; this line is redrawn by it, so a stale time here means
+        # the loop has stopped, not that a restore waits.
+        parts.append(f'<div class="muted">Fenced for the staged restore. The loop last beat at '
+                     f'{_e(str(mig.get("fenced_beat", ""))[:19])} UTC; run time {_e(mig.get("run_time_s", 0))} s. '
+                     'The clock check still runs.</div>')
+    if mig.get("lock_wait"):
+        parts.append(f'<div class="no">⚠ Waiting for a restore being staged beside the records (harness.lock is '
+                     f'held) since {_e(str(mig.get("lock_wait_since", ""))[:19])} UTC; it is tried again every '
+                     f'{_e(mig.get("lock_retry_s", ""))} s and Harness starts normally once it is free.</div>')
+    for f in mig.get("files") or []:
+        parts.append(f'<div class="muted">Beside the records: {_e(f)}</div>')
+    if mig.get("marker_unwritten"):
+        # Sixteenth round: the swap's refusal couldn't be written into its marker.
+        parts.append(f'<div class="no">⚠ The restore swap\'s refusal couldn\'t be written into its marker '
+                     f'({_e(mig["marker_unwritten"])}); the files in the way are listed above.</div>')
+    if mig.get("degraded") and mig.get("note") == "not delivered":
+        parts.append(f'<div class="no">⚠ Note not delivered: the message telling you Harness started degraded '
+                     f'didn\'t reach Cain\'s link after {_e(mig.get("note_tries", 0))} tries.</div>')
+    if st.get("mail_skip_problem"):
+        parts.append(f'<div class="no">⚠ mail_skip.json is ignored: {_e(st["mail_skip_problem"])}. Only the built-in '
+                     'kinds are skipped.</div>')
+    skipped = st.get("mail_skipped") or {}
+    if skipped.get("count"):
+        parts.append(f'<div class="muted">Mail skipped by kind: {_e(skipped["count"])} so far.</div>')
+        for r in skipped.get("recent") or []:
+            parts.append(f'<div class="muted">· {_e(r.get("sender", ""))}: {_e(r.get("subject", ""))} '
+                         f'({_e(r.get("rule", ""))})</div>')
+    stall = mig.get("pruning_stalled") or {}
+    if stall:
+        held = (f' by the record {_e(stall.get("kind", ""))} (#{_e(stall.get("event"))}) stamped '
+                f'{_e(str(stall.get("at", ""))[:19])} UTC' if stall.get("event") is not None else "")
+        parts.append(f'<div class="no">⚠ Old backups aren\'t pruned: {_e(stall.get("why", ""))}{held}.</div>')
+    for left in st.get("test_events_left") or []:
+        # Fourteenth round: the conformance item's test event (1 Jan 2001), retried at every start until gone.
+        parts.append(f'<div class="no">⚠ A Harness write test event is still on Family (from smoke run '
+                     f'{_e(left.get("run", ""))}, at {_e(left.get("href", ""))}); its removal is retried at every '
+                     f'start ({_e(left.get("tries", 0))} so far). It is safe to delete by hand.</div>')
     parts.append("</div>")
 
     parts.extend(_discord_section(st.get("discord")))
@@ -329,7 +379,7 @@ def make_handler(app: SetupApp):
                         v.set_key(f, form[f], by=name)
                         done.append(f"{LABELS[f]} saved")
                 except VaultError as e:
-                    errors.append(str(e))
+                    errors.append(scrubbed(e))
             return "; ".join(done + errors)
 
         def _post_arm(self, form, name):

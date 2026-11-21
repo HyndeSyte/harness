@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from . import calendar_feed, workmirror
+from .scrub import scrub as scrubbed   # twenty-sixth round: exception text, scrubbed
 from .ledger import Ledger, iso
 from .workmirror import Busy, MirrorConfig, MirrorConfigError, event_id
 
@@ -137,7 +138,7 @@ class MirrorShadow:
         try:
             cfg = self.config()
         except MirrorConfigError as e:
-            return {"status": "bad settings", "error": str(e)[:200]}
+            return {"status": "bad settings", "error": scrubbed(e)[:200]}
         if cfg is None:
             return {"status": "no settings"}
         if not cfg.enabled:

@@ -124,7 +124,7 @@ def stack(tmp_path):
     store = KeeperStore(str(tmp_path / "discord.json"))
     c.discord = DiscordKeeper(rest, store.get, store.set)
     c.discord_chat = chat
-    c.handovers = handover.Inbox(token, wake=c.discord.wake)
+    c.handovers = handover.Inbox.for_tests(token, wake=c.discord.wake)
     hand = handover.serve(c.handovers, port=0, host="127.0.0.1", wait_s=20)
     yield c, link, rest, an, site.server_address[1], hand.server_address[1], ledger, cap
     executor.shutdown(wait=True)
