@@ -84,7 +84,7 @@ import { createHash } from "node:crypto";
 import { cainReasons, type CainHit, claimsReview, codesHits, mayHaveCode, recordItems, reviewedHits, shipWordsHits } from "../gate/cain";
 import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
-import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
+import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, imperative, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
@@ -1262,9 +1262,21 @@ export class Link {
     const comps = (c.rows ?? []).filter((r: any) => (r.components ?? []).every((b: any) =>
       String(b.custom_id ?? "").startsWith("k:")));                  // a specialist can't make Cain's buttons
     // The specialist's words: em dashes and "add-on" fixed, and stored that way, so the card
-    // posted is exactly the card kept. Never refused: its outbox takes a refusal as dead,
-    // and an approval or an Undo would be lost to him. What else the gate flags, Cain hears.
+    // posted is exactly the card kept. Refused only for a button it tells him to use and doesn't carry
+    // (below); anything else the gate flags goes out, and Cain hears.
     const w = this.words("card", "specialist", String(c.text ?? ""), { rules: AT.card, buttons: labelsOf(comps), known: this.liveLabels() });
+    // 0.12.0: a card that tells him to use a button it doesn't carry ("Tap Go ahead", "the Undo button")
+    // points him at something that isn't there, so it's refused, not flagged: the specialist hears why
+    // (each label in straight double quotes, which it parses), Cain once, and the gate's report logs it.
+    // A label only mentioned ("there's no Go ahead", "with Undo") is flagged and goes out as it is.
+    const text0 = String(c.text ?? "");
+    const missing = w.hits.filter((h) => h.rule === "button" && h.result === "refuse" && h.label && imperative(text0, h.at, h.end));
+    if (missing.length) {
+      this.report("card", "specialist", w.hits, "refused");
+      const said = [...new Set(missing.map((h) => `"${h.label}"`))].join(", ");
+      this.d.relay(`The calendar specialist sent a card naming ${said}, which isn't on it, so the link refused it and nothing went to him. Nothing to tell him; it's logged for a fix.`);
+      throw new Refusal(`the card names ${said}, which it doesn't carry`);
+    }
     this.report("card", "specialist", w.hits, w.refused.length ? "posted as it is" : "fixed");
     // The specialist's Stop and Turn back on notices also say what that did on Cain's
     // side, from what's true now: the link's own words.

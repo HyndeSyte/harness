@@ -78,14 +78,14 @@ def like_the_link(m, extra_known=("Go ahead", "Add anyway")):
     real = m.link.card
     tried = []
 
-    def card(text, rows, kind, expires=None):
+    def card(text, rows, kind, expires=None, op=None):
         tried.append(text)
         carried = [c["label"] for r in rows or [] for c in r.get("components", [])]
         spans = outbox.refused_spans(text, carried, extra_known)
         if spans:
             said = ", ".join(f'"{lab}"' for lab in dict.fromkeys(lab for _, _, lab in spans))
             raise LinkError(400, f"the card names {said}, which it doesn't carry")
-        return real(text, rows, kind, expires)
+        return real(text, rows, kind, expires=expires, op=op)
     m.link.card = card
     return tried
 

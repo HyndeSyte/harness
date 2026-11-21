@@ -156,7 +156,7 @@ def link_knowing(m, known_by_try):
     real = m.link.card
     tried = []
 
-    def card(text, rows, kind, expires=None):
+    def card(text, rows, kind, expires=None, op=None):
         known = known_by_try[min(len(tried), len(known_by_try) - 1)]
         tried.append(text)
         carried = [c["label"] for r in rows or [] for c in r.get("components", [])]
@@ -164,7 +164,7 @@ def link_knowing(m, known_by_try):
         if spans:
             said = ", ".join(f'"{lab}"' for lab in dict.fromkeys(lab for _, _, lab in spans))
             raise LinkError(400, f"the card names {said}, which it doesn't carry")
-        return real(text, rows, kind, expires)
+        return real(text, rows, kind, expires=expires, op=op)
     m.link.card = card
     return tried
 

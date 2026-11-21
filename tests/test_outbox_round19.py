@@ -47,11 +47,11 @@ def refusing(m, when):
     real = m.link.card
     tried = []
 
-    def card(text, rows, kind, expires=None):
+    def card(text, rows, kind, expires=None, op=None):
         tried.append(text)
         if when(text.casefold()):
             raise LinkError(400, 'the card names "Go ahead", which it doesn\'t carry')
-        return real(text, rows, kind, expires)
+        return real(text, rows, kind, expires=expires, op=op)
     m.link.card = card
     return tried
 

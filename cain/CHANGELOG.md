@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.17.1
+
+- Cain knows the calendar specialist never writes its tap journal without its lock, sends one waiting card per outage even when reads come and go, starts only with its journal on local storage, says "storage" when it can't lock or write its journal, and stops a tap whose count it may have lost until Dane puts it back.
+
+- Cain knows the calendar specialist sends one waiting card per outage (a restart doesn't send a second), a requeued tap always gets a fresh Go ahead, and the specialist won't start with its tap journal on network storage (its /health says "storage" when it can't lock its journal).
+
+- Cain knows a set-aside tap Dane puts back can get a Go ahead again, a tap stopped after six listings stays stopped, and the calendar specialist sends one card when taps wait because it can't read its list of set-aside taps.
+
+- Cain knows a tap the calendar specialist brought back six times never gets a seventh Go ahead, and that its /health says "waiting" while it can't read its list of set-aside taps (taps from before its last start wait until it can).
+
+- Cain knows a tap the calendar specialist can't safely try again gets one card saying it was stopped, a tap whose calendar read failed is read again once the calendar answers, and the specialist's cards show event names as written.
+
+- Cain knows a tap the calendar specialist put off is come back to without a restart, a discarded set-aside tap is left alone for good, and taps finished one by one after a failed listing share one summary card.
+
+- Cain knows one tap the calendar specialist can't save no longer holds up the others, every tap it sets aside gets one card, and a tap brought back six times gets a last card saying nothing more is done for it.
+
+- Cain knows the calendar specialist's list of taps after a stop comes once, a last card ends a Go ahead that keeps failing, and a cleanup step it can't read is set aside with one card.
+
+- The cases both sides check name their end-to-end cards in one list, and include the specialist's card that asks you to check your calendar when it couldn't confirm a change.
+
+- The cases both sides check now cover cards that say a change isn't done or couldn't be verified, a card turned down twice, and the calendar specialist's new tap wording.
+
+- A card from the calendar specialist that the link turns down still says what happened, in a few fixed words both sides check, and the cases they share now come from real differences between how each reads a card.
+
+- The calendar specialist now reads a card the way the link does in full (the same words for buttons, a button named across a line break, every button the link knows), and a card turned down twice still reaches you as a short fixed card with its buttons.
+- Why a specialist's card has Go ahead or not: an add that never showed up in Google across a restore gets none (an empty spot can't be told apart from an event added and deleted since); a tap whose decision never reached the specialist's records gets one (nothing it leads to ran).
+
+- The calendar specialist strips from a card the link turns down only the sentence that told you to use a missing button, using the very same rule the link does, so the rest of the card reaches you.
+
+- When you send a few messages in a row, Cain can tell the calendar specialist which one your calendar request is in, so it acts on that one and not on your newest.
+- A slip in Cain's tools can no longer pass a calendar request on by accident: run with nothing, the tool only lists what it does.
+- Cain names your message with every calendar request, answers the calendar specialist's questions himself on the same message, and never asks you to repeat a change you already made in words.
+- The specialist's address can only be moved by a test, and that is logged.
+- Cain says a calendar change is done only when the specialist's read of the calendar shows it, and a note correcting one card no longer replaces the others.
+- After the calendar specialist's update, every calendar change comes on a card until a check on your real calendars has passed and you tap Turn on. Cain starts the check and hands each step over on its card; the specialist judges it from its own record, never from what Cain says, and a full one comes to you on a card showing what it saw, with Turn on and Keep cards, and a Turn off button there after.
+- When the event changed since its card, nothing is sent and Cain shows the fresh card that follows without handing it over again. Try again and Start again from now on a receipt are your taps; Cain leaves them to you.
+- After every update of the calendar specialist, Cain runs the check on your real calendars first: until it has read back on Gmail (or Family) a guarded move and an edit of one day of a repeating event, cards for that calendar wait with no Approve and come back once it's done. If the check can't finish on one, you get Open cards without the check, and Cain can open it only on your say. Each check is good for that build, for a day and for one Turn on, its test events are titled "Smoke test:", and Cain shows the message that offers to take any leftovers off.
+- Before a Ship card for a calendar specialist update, Cain runs its update on a copy of its records first, and shows the card only if that came out right.
+- Turning the no-card changes off ends the check behind them, so turning them on again takes a new one.
+- During the check on your real calendars, only the steps Cain opens for it count as the check. Your own requests that come in meanwhile are held like any other and come back on their own card, never treated as test events.
+- The check also makes each calendar prove it turns down an out of date write; one that doesn't stays on hold, and you get a message saying so with the choice to open it anyway.
+- Before a Ship card for the calendar specialist, Cain needs a fresh, passing dry run of its update on a copy of its records, kept in a file he checks.
+- Each step of the check on your real calendars now starts with your tap on a card that shows exactly what it will do; Cain can't make anything part of the check by himself, and your own requests during it stay yours.
+- Before a Ship card for the calendar specialist, Cain rehearses the incoming version's own update on a copy of its records. If an update starts without one, Cain runs it then; he moves its records without it only on your say.
+- Cain shows the specialist's messages about held requests, Test again when a calendar and the specialist don't agree on versions, and the daily reminder while requests wait.
+- After a calendar specialist update, its records move by themselves once its own rehearsal passes; only a failed one waits, with your Run check. Moving them without a rehearsal is only ever your tap on a card Cain can send you.
+- When the specialist can't change a calendar safely, Cain shows its message with your requests ready to copy and Open without protection, and leaves that choice to you; receipts there say Unprotected.
+- Cain shows the specialist's Possibly overwritten messages and cards that say Unprotected as they are, and tells you why a calendar request waits when the specialist's records haven't moved yet, pointing to its Run check message.
+- On your say, Cain can send you a card to restore the specialist's records from a backup by its version; only your Put them back tap does it, and it takes effect the next time the specialist starts.
+- After your Put them back tap, Cain shows the specialist's card asking you to restart it now, and the requests that come back to you ready to copy after the restart.
+- When the specialist starts degraded after a move that failed, Cain shows its message with Run check and Put them back and leaves the tap to you.
+- On your say, Cain can send you the card that takes the specialist's clock as right when it's behind its records and old backups aren't pruned; only your tap does it.
+- The receipt button that takes one Gmail block off without remembering anything is now "Not this time", and Cain's message checks know it by that name.
+- After a restore, Cain shows each held request the specialist passes back once, one message each.
+- After a restore, Cain shows the specialist's list of your taps from before it, each with Go ahead, and leaves those taps to you.
+- Those taps now say whether each was carried out, not carried out, or the specialist can't tell, and one already on your calendar comes with no button.
+- A specialist's card that names a button it doesn't carry no longer reaches you: the link holds it back and Cain hears why.
+- A tap card the specialist can't safely offer again comes with no Go ahead and says so, and Cain leaves it at that.
+- The link now holds back a specialist's card only when it tells you to tap or press a button it doesn't carry; a card that merely mentions one goes out, and one held back still reaches you from the specialist without that sentence.
+- After a tap cut off by an error, Cain shows the specialist's note on when it will look at your calendar again, and the card that follows.
+
 ## 0.16.0
 
 - Outside reviews now stop at three rounds per piece of work, counted by the review service itself, which Cain can't change. A new id or a replacement pull request for the same work doesn't start the count again, and a fourth round is refused with the count and the rule.
