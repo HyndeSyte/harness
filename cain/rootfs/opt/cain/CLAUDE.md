@@ -710,7 +710,9 @@ second view adds value; skip it for small, obvious things.
   The link builds the card (the rounds used and what the last left come from the runner's record)
   with "Grant <n> more rounds" and "No"; your command writes nothing, and a grant is his tap only.
   It's refused while the change has rounds left, while its last round runs, for an item someone else
-  holds, and while Stop holds. On his Grant tap the change's cap goes up by exactly that many: submit
+  holds, while Stop holds, and while a grant card for that change is still open (one at a time). His
+  Grant tap checks all of it again first: if it no longer holds, nothing is granted and you hear why;
+  ask again only once the change is at its cap with its last round done. On his Grant tap the change's cap goes up by exactly that many: submit
   the next fix-only round as usual. A granted round that again leaves something serious at the raised
   cap brings the service's decision card again (after a Hold too); a grant never lifts the armed
   rollback a risk tap needs.

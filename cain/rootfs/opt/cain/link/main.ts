@@ -275,7 +275,7 @@ const link = new Link({
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
   // 0.18.0: the owner's grants of extra review rounds (/data/review-grants.json, root:cain 0640), written
-  // here only, on his tap on Cain's grant card, durably and keeping the file's owner and mode.
+  // here only, on his tap on Cain's grant card, durably, made root:cain 0640 at every write and recreation.
   grants: () => readGrants(GRANTS_FILE),
   grant: (rec) => { if (capOff) throw new GrantUnsaved(`the review cap's files aren't right (${capOff})`); return recordGrant(GRANTS_FILE, rec); },
   capOff: () => capOff,

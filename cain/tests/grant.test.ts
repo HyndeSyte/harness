@@ -5,17 +5,17 @@
 // from the rule or from the armed-rollback condition on shipping with a risk named.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { roundLine, type Brief } from "../rootfs/opt/cain/review/core.ts";
 import { DEFAULTS, Runner, loadReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import { admit, countedRounds, decisionOf, emptyRounds, readRounds, type DecisionRec, type Rounds } from "../rootfs/opt/cain/review/rounds.ts";
-import { capWords, effectiveCap, emptyGrants, grantWords, readGrants, recordGrant, GrantUnsaved, type GrantRec, type Grants } from "../rootfs/opt/cain/review/grants.ts";
+import { capWords, effectiveCap, emptyGrants, grantWords, readGrants, recordGrant, GRANTS_OWNER, GrantUnsaved, type GrantRec, type Grants } from "../rootfs/opt/cain/review/grants.ts";
 import type { SeatAnswer, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
 import { HOLD, RISK, capStateFor } from "../rootfs/opt/cain/link/cap.ts";
 import { CAIN_ROUTES, ROOT_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth.ts";
-import { GRANT_UNSAVED, grantLabel } from "../rootfs/opt/cain/link/core.ts";
+import { GRANT_REPLACED, GRANT_UNSAVED, grantLabel } from "../rootfs/opt/cain/link/core.ts";
 import { capFileRules } from "../rootfs/opt/cain/capfiles.ts";
 import { DAY, keeperHolds, rig } from "./link-rig";
 
@@ -28,6 +28,8 @@ const brief = (over: Partial<Brief> = {}): Brief => ({
 const finding = (problem: string) => ({ rank: 1, problem, fix: "fix it" });
 const answerWith = (...problems: string[]) => async (): Promise<SeatAnswer> =>
   ({ verdict: problems.length ? "approve_with_changes" : "approve", findings: problems.map(finding), model: "m", cost_usd: 0.01 });
+// Tests don't run as root: the grants file is made with their own uid and gid (the link uses root:cain).
+const OWN = { uid: process.getuid!(), gid: process.getgid!() };
 const grantRec = (key: string, rounds: number, over: Partial<GrantRec> = {}): GrantRec =>
   ({ id: `${key}+1${rounds}`, key, rounds, by: "owner", at: NOW.toISOString(), message: `1${rounds}`, reason: "The rollback keeper", item: "P46", pr: null, ...over });
 
@@ -45,7 +47,7 @@ function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer> } = {}) {
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
   return { dir, cfg, runner, posted, relays, setSeat: (f: typeof seat) => { seat = f; },
     rounds: () => readRounds(cfg.roundsFile!)!, grants: () => readGrants(cfg.grantsFile!),
-    grant: (key: string, n: number, over: Partial<GrantRec> = {}) => recordGrant(cfg.grantsFile!, grantRec(key, n, over), { sync: () => {} }),
+    grant: (key: string, n: number, over: Partial<GrantRec> = {}) => recordGrant(cfg.grantsFile!, grantRec(key, n, over), { sync: () => {}, owner: OWN }),
     get: (id: string) => loadReview(cfg.queueDir, id)! };
 }
 async function threeRounds(t: ReturnType<typeof runnerRig>, over: Partial<Brief> = {}) {
@@ -109,14 +111,14 @@ describe("the grant raises the cap by exactly the rounds it names", () => {
     const dir = mkdtempSync(join(tmpdir(), "grants-file-"));
     const f = join(dir, "review-grants.json");
     writeFileSync(f, JSON.stringify(emptyGrants()), { mode: 0o640 });
-    const a = recordGrant(f, grantRec("pr-46", 2), { sync: () => {} });
+    const a = recordGrant(f, grantRec("pr-46", 2), { sync: () => {}, owner: OWN });
     expect(a.existed).toBe(false);
-    expect(recordGrant(f, grantRec("pr-46", 3, { id: "pr-46+12" }), { sync: () => {} })).toMatchObject({ existed: true, rec: { rounds: 2 } });   // the same card: its first grant
+    expect(recordGrant(f, grantRec("pr-46", 3, { id: "pr-46+12" }), { sync: () => {}, owner: OWN })).toMatchObject({ existed: true, rec: { rounds: 2 } });   // the same card: its first grant
     expect(readGrants(f)!.grants.length).toBe(1);
     expect(statSync(f).mode & 0o777).toBe(0o640);
     writeFileSync(f, "{not json");
     expect(readGrants(f)).toBeNull();
-    expect(() => recordGrant(f, grantRec("pr-46", 1, { id: "pr-46+2" }), { sync: () => {} })).toThrow(GrantUnsaved);
+    expect(() => recordGrant(f, grantRec("pr-46", 1, { id: "pr-46+2" }), { sync: () => {}, owner: OWN })).toThrow(GrantUnsaved);
     expect(readFileSync(f, "utf8")).toBe("{not json");
     expect(readGrants(join(dir, "none.json"))).toEqual(emptyGrants());
     // Out of range in the file: not trusted.
@@ -356,4 +358,135 @@ describe("keeper.sh review-grant", () => {
       expect(seen.length).toBe(1);
     } finally { server.stop(true); }
   }, 30_000);
+});
+
+// ---- First review of 0.18.0: the tap checks again, one open card a change, the file stays readable ----
+describe("his Grant tap checks everything again before it writes", () => {
+  const tapGrant = async (t: ReturnType<typeof linkRig>, id: string) => t.r.tap(t.r.msg(id), t.r.ids(id)[0]);
+  const refusedBy = async (change: (t: ReturnType<typeof linkRig>) => void, line: string) => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    change(t);
+    expect(await tapGrant(t, id)).toBe(`refused: ${line}`);
+    expect(t.written).toEqual([]);                                             // nothing written
+    expect(t.r.ephemerals().map((e: any) => e.content)).toContain(`${line}.`);  // one plain line to him
+    expect(t.r.buttons(id)).toEqual([]);                                        // the card's buttons off
+    expect(String(t.r.msg(id).content)).toContain("Nothing was granted: ");
+    expect(t.r.state().messages[id]).toMatchObject({ outcome: "expired", buttons: false, q: { used: true } });
+    expect(t.r.relayed.join("\n")).toContain(`but nothing was granted: ${line}`);
+    // A second tap does nothing more.
+    await tapGrant(t, id);
+    expect(t.written).toEqual([]);
+    return t;
+  };
+
+  test("the change has rounds left now (a grant from elsewhere raised its cap)", async () => {
+    await refusedBy((t) => { t.box.grants = { format: 1, grants: [grantRec("pr-46", 1, { id: "pr-46+other" })] }; },
+      "That change has rounds left now, so this grant isn't needed");
+  });
+
+  test("a round is running now", async () => {
+    await refusedBy((t) => { t.box.rounds = atCap(0, "started"); }, "That change has a review round running now, so this grant can't be written");
+  });
+
+  test("its item is held by another session now, or closed", async () => {
+    await refusedBy((t) => { t.r.files.holds = keeperHolds({ P46: { holder: "laptop:abc" } }); },
+      "That change is being worked on by another session now, so this grant can't be written");
+  });
+
+  test("Stop holds", async () => {
+    await refusedBy((t) => { t.r.stop.stopped = true; t.r.stop.at = t.r.t.now; },
+      "Everything is stopped, so this grant can't be written until you tap Turn back on");
+  });
+
+  test("the round count or cap no longer matches what the card was posted on", async () => {
+    // A fourth round counted since (granted and answered elsewhere): still at its cap, but not the card's count.
+    const moved = () => {
+      const r = atCap(2);
+      r.changes["pr-46"].rounds.push({ id: "x-4", at: "2026-11-21T10:00:00Z", kind: "fixes" as any, state: "answered", serious: 1 });
+      return r;
+    };
+    await refusedBy((t) => { t.box.rounds = moved(); t.box.grants = { format: 1, grants: [grantRec("pr-46", 1, { id: "pr-46+other" })] }; },
+      "That change's review rounds have moved on since this card went up, so this grant can't be written");
+  });
+
+  test("unreadable records write nothing", async () => {
+    await refusedBy((t) => { t.box.grants = null; }, "The review records can't be read right now, so this grant can't be written");
+  });
+
+  test("No still writes nothing and needs no checks", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    t.box.grants = { format: 1, grants: [grantRec("pr-46", 1, { id: "pr-46+other" })] };
+    expect(await t.r.tap(t.r.msg(id), t.r.ids(id)[1])).toBe("to Cain");
+    expect(t.written).toEqual([]);
+  });
+});
+
+describe("one open grant card a change key", () => {
+  test("a second card for the same key is refused, naming the open card's time; once it's answered a new one can go", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const id = ((await ask(t.r)) as any).message;
+    await expect(ask(t.r, { rounds: 1, text: "The rollback keeper, one more round" })).rejects.toThrow(`a grant card for pr-46 is already open (posted at 8:00 AM, Discord message ${id})`);
+    expect(t.r.cards().filter((c: any) => String(c.content).includes("Grant it")).length).toBe(1);
+    await t.r.tap(t.r.msg(id), t.r.ids(id)[1]);                               // No
+    expect((await ask(t.r, { rounds: 1, text: "The rollback keeper, one more round" })).status).toBe("posted");
+  });
+
+  test("a grant written takes the buttons off every other open grant card for the change", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = ((await ask(t.r)) as any).message;
+    // An older open card for the same change (one from before this rule, say): filed under it after the second went up.
+    const s = t.r.state(); s.messages[a].grant!.key = "pr-other"; t.r.setState(s);
+    t.r.later(60_000);
+    const b = ((await ask(t.r, { rounds: 1, text: "The rollback keeper, one more round" })) as any).message;
+    const s2 = t.r.state(); s2.messages[a].grant!.key = "pr-46"; s2.messages[a].outcome = undefined; s2.messages[a].buttons = true; t.r.setState(s2);
+    expect(await t.r.tap(t.r.msg(b), t.r.ids(b)[0])).toBe("to Cain");
+    expect(t.written.map((w) => w.id)).toEqual([`pr-46+${b}`]);
+    expect(t.r.state().messages[a]).toMatchObject({ outcome: "replaced", why: GRANT_REPLACED, buttons: false });
+    expect(t.r.buttons(a)).toEqual([]);
+    expect(String(t.r.msg(a).content)).toContain(GRANT_REPLACED);
+    // A tap on the replaced card writes nothing.
+    await t.r.tap(t.r.msg(a), `q:x:0`);
+    expect(t.written.length).toBe(1);
+  });
+});
+
+describe("the grants file stays root:cain 0640, readable by Cain's user", () => {
+  const cainReads = (f: string) => {
+    const st = statSync(f);
+    expect(st.mode & 0o777).toBe(0o640);
+    expect(st.mode & 0o040).toBe(0o040);                                       // group (cain) reads
+    expect(st.mode & 0o022).toBe(0);                                           // no one but the owner writes
+    expect(st.gid).toBe(OWN.gid);
+    expect(st.uid).toBe(OWN.uid);
+    accessSync(f, constants.R_OK);
+    expect(readGrants(f)).not.toBeNull();
+  };
+  test("a write with the file there, one after it was removed, and one over a file left too open", () => {
+    const dir = mkdtempSync(join(tmpdir(), "grants-mode-"));
+    const f = join(dir, "review-grants.json");
+    const old = process.umask(0o077);                                          // a strict umask can't make it root-only
+    try {
+      writeFileSync(f, JSON.stringify(emptyGrants()), { mode: 0o600 });
+      recordGrant(f, grantRec("pr-46", 1, { id: "pr-46+1" }), { sync: () => {}, owner: OWN });
+      cainReads(f);
+      rmSync(f);
+      recordGrant(f, grantRec("pr-46", 1, { id: "pr-46+2" }), { sync: () => {}, owner: OWN });
+      cainReads(f);
+      expect(readGrants(f)!.grants.map((g) => g.id)).toEqual(["pr-46+2"]);
+      writeFileSync(f, readFileSync(f)); require("node:fs").chmodSync(f, 0o666);
+      recordGrant(f, grantRec("pr-46", 1, { id: "pr-46+3" }), { sync: () => {}, owner: OWN });
+      cainReads(f);
+    } finally { process.umask(old); }
+    expect(GRANTS_OWNER).toEqual({ uid: 0, gid: 1000, mode: 0o640 });
+  });
+  test("an owner that can't be set writes nothing (never a file of the wrong owner)", () => {
+    if (process.getuid!() === 0) return;                                       // root may chown to anyone
+    const dir = mkdtempSync(join(tmpdir(), "grants-owner-"));
+    const f = join(dir, "review-grants.json");
+    expect(() => recordGrant(f, grantRec("pr-46", 1), { sync: () => {} })).toThrow(GrantUnsaved);
+    expect(existsSync(f)).toBe(false);
+    expect(require("node:fs").readdirSync(dir)).toEqual([]);
+  });
 });

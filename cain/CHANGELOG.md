@@ -6,6 +6,10 @@
 - Only your tap grants them; Cain's ask alone adds nothing. The rule of three rounds stays, and a grant never lifts the armed rollback that shipping with a risk named needs.
 - If a granted round still leaves something serious, the "Hold it" or "Ship it with that risk" card comes to you again for it.
 - Cain's review lines now show the raised cap, like "round 4 of 5, 2 granted by Dane on Nov 21".
+- Your Grant tap checks everything again before it adds a round: if the change has rounds left by then, a round is running, someone else is working on it, everything is stopped, or its rounds moved on since the card went up, nothing is granted, the card loses its buttons and you see one line saying why.
+- One grant card at a time for a change: Cain can't send a second while one is open, and when you grant on one, any other open grant card for that change loses its buttons ("Replaced by a newer grant").
+- The file that keeps your grants stays readable by Cain's review lines every time it's written or made again.
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.17.0
 

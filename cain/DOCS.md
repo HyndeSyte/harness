@@ -273,9 +273,17 @@ from the rule. So:
   Cain's), how many rounds the grant adds, and two buttons, "Grant <n> more rounds" and "No". It
   expires at the next morning check-in like Cain's asks. Cain's command writes nothing: only your
   "Grant" tap does. The link refuses the command while the change still has rounds left (nothing to
-  grant), while its last round is still running, while its item is held by another session, and while
-  Stop holds.
-- Your tap is written to disk first, in `/data/review-grants.json` (root:cain 0640, written only by the
+  grant), while its last round is still running, while its item is held by another session, while
+  Stop holds, and while another grant card for the same change is still open (one open card a change:
+  the refusal names when the open one went up).
+- Your "Grant" tap checks all of that again before anything is written: the change is still at its
+  cap, no round of it is running, no other session holds its item, Stop is clear, and its round count
+  and cap are still the ones the card was posted with. If any of it no longer holds, nothing is
+  written, the card loses its buttons, and you see one plain line saying why (for example "That change
+  has rounds left now, so this grant isn't needed"). When a grant is written, any other open grant card
+  for the same change loses its buttons ("Replaced by a newer grant").
+- Your tap is written to disk first, in `/data/review-grants.json` (root:cain 0640 at every write and
+  every time it's made again, so the review runner and review.sh can read it; written only by the
   link): the change, how many rounds, that you granted it, when, the card's message and Cain's reason.
   It is also noted in the link's log and beside your other taps in `/data/link/review-decisions.json`.
   If it can't be written, the card stays up and you're told your grant wasn't saved. A grant is for

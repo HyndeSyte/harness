@@ -3,7 +3,8 @@
 // critical change whose last round still left something serious is more fix rounds, granted by him, never
 // an exemption from the rule. So the cap for a change is the base cap plus the rounds he granted it.
 //
-// Grants are kept in /data/review-grants.json, beside the rounds file: root:cain 0640, written only by the
+// Grants are kept in /data/review-grants.json, beside the rounds file: root:cain 0640 (kept so at every
+// write and recreation, recordGrant), written only by the
 // link, and only on his tap on the card Cain's `keeper.sh review-grant` asked for (Cain's command alone
 // writes nothing). The review runner reads it to count the cap; review.sh reads it for status and spend.
 // A grant is for one change key (a pull request's "pr-<number>", or a plan's change key); a superseding
@@ -11,8 +12,9 @@
 //
 // What a grant never does: exempt a change from the rule (each granted round is a fix-only round, counted
 // like any other), or from the armed-rollback condition a Ship card with the risk named needs.
-import { chmodSync, chownSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fchmodSync, fchownSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { CAIN_GID, ROOT_UID } from "../capfiles.ts";
 import { grantedNote } from "./core.ts";
 import { countedRounds, groupOf, type Rounds } from "./rounds.ts";
 
@@ -77,22 +79,34 @@ export function lastRound(r: Rounds, key: string): LastRound {
 }
 
 export class GrantUnsaved extends Error {}
-// His tap's grant, kept durably (temp file in the same folder, fsync, rename), keeping the file's owner
-// and mode (root:cain 0640, so the runner and review.sh read it). The same card tapped again keeps its
-// first grant. Throws GrantUnsaved when it couldn't be kept: the card stays up. A file that doesn't parse
-// is never overwritten.
-export function recordGrant(path: string, rec: GrantRec, o: { sync?: (dir: string) => void } = {}): { rec: GrantRec; existed: boolean } {
+// The grants file's owner and mode, at every write and every recreation (first review of 0.18.0): root,
+// group cain, 0640, so the runner and review.sh (Cain's user, in group cain) read it and only the link
+// writes it. Never a root-only file: the owner and mode are set on the temp file itself (fchown, fchmod),
+// before it's renamed into place, whether the file was there or not; if they can't be set, nothing is
+// written. Tests pass their own uid and gid (they don't run as root).
+export const GRANTS_OWNER = { uid: ROOT_UID, gid: CAIN_GID, mode: 0o640 };
+// His tap's grant, kept durably (temp file in the same folder, fsync, rename). The same card tapped again
+// keeps its first grant. Throws GrantUnsaved when it couldn't be kept: the card stays up. A file that
+// doesn't parse is never overwritten.
+export function recordGrant(path: string, rec: GrantRec,
+  o: { sync?: (dir: string) => void; owner?: { uid: number; gid: number } } = {}): { rec: GrantRec; existed: boolean } {
   const g = readGrants(path);
   if (!g) throw new GrantUnsaved("the grants file can't be read or doesn't parse, so nothing was written over it");
   const had = g.grants.find((x) => x.id === rec.id);
   if (had) return { rec: had, existed: true };
   g.grants.push(rec);
+  const owner = o.owner ?? GRANTS_OWNER;
   mkdirSync(dirname(path), { recursive: true });
   const tmp = join(dirname(path), `.${rec.id.replace(/[^a-z0-9-]/gi, "_")}.${process.pid}.grant.tmp`);
+  try { unlinkSync(tmp); } catch { /* none left from a crash */ }
   try {
-    const fd = openSync(tmp, "w", 0o640);
-    try { writeSync(fd, JSON.stringify(g, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-    try { const s = statSync(path); chownSync(tmp, s.uid, s.gid); chmodSync(tmp, s.mode & 0o777); } catch { chmodSync(tmp, 0o640); }
+    const fd = openSync(tmp, "wx", GRANTS_OWNER.mode);
+    try {
+      fchownSync(fd, owner.uid, owner.gid);
+      fchmodSync(fd, GRANTS_OWNER.mode);          // the umask can't narrow it
+      writeSync(fd, JSON.stringify(g, null, 1));
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
     renameSync(tmp, path);
     if (o.sync) o.sync(dirname(path));
     else { try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* best effort */ } }
