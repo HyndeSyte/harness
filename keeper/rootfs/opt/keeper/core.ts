@@ -1,4 +1,4 @@
-// The keeper of installs (Keeper 0.1.0): a check after every install of a watched App, and an
+// The keeper of installs (Keeper 0.1.0, first review fixes 0.1.1): a check after every install of a watched App, and an
 // automatic rollback of a bad one from the App-only backup taken just before it.
 //
 // Everything here is plain logic over injected parts (the Supervisor, the network, the clock and the
@@ -11,7 +11,13 @@
 //   accepted     the backup holds that App alone at from_version: "accepting ..." is logged
 //   watching     to_version was seen in the App's info: 15 minutes from then
 //   restoring    a fail: marked before the restore starts, so the version change it causes is this
-//                attempt's recovery and never a new attempt, across restarts
+//                attempt's recovery and never a new attempt, across restarts. The restore runs as one
+//                Supervisor job whose id is kept with the attempt (0.1.1); a call with no answer, or a
+//                restart with a call in flight, is reconciled from the job's state and the App's info,
+//                and sent again only once the Supervisor confirms the job never started or ended
+//                without restoring
+//   unresolved   (0.1.1) the restore's outcome couldn't be established inside its limit: nothing is
+//                sent again, the owner hears, and the next start reconciles it again
 //   passed       the watch ended with every pass condition held
 //   rolled back  the restore ran and from_version is started and healthy again
 //   gave up      the restore failed, or the App didn't come back
@@ -29,6 +35,9 @@ export const RESTORE_LIMIT_MS = 15 * 60_000;     // the restore's whole limit, b
 export const CONFIRM_MS = 5 * 60_000;            // after the restore: from_version started and healthy within this
 export const REWIND_MS = 10 * 60_000;            // a heartbeat gap at start over this drops the armed state
 export const ARMED_MAX_MS = 60 * 86_400_000;     // armed and drill records last 60 days
+export const DELIVERY_MS = 10 * 60_000;          // (0.1.1) armed only while a heartbeat ping was delivered within this
+export const RESTARTS_MAX = 2;                   // (0.1.1) more stops than this after a restore, in the confirm window: gave up
+export const RESTORE_JOB = "backup_manager_partial_restore";   // the Supervisor's job name for a partial restore
 export const MAX_DEADLINE_MS = 6 * 3_600_000;    // an install deadline at most 6 hours ahead
 export const DEFAULT_HEALTH_GRACE_S = 180;
 
@@ -39,7 +48,7 @@ export interface Registration {
 }
 export interface Options {
   watch: string[];
-  health: Record<string, string>;                // slug -> "host:port"
+  health: Record<string, string>;                // slug -> "host:port" or "host:port/path" (0.1.1; no path: /health)
   tokens: Record<string, string>;                // slug -> token
   hc_done: string; hc_failed: string;
   health_grace_s: number;
@@ -70,6 +79,22 @@ export function parseOptions(raw: unknown): Options {
     attempt: any ? reg : null,
   };
 }
+// The keeper's own settings a registration must never change (0.1.1): the tokens and the two
+// Healthchecks URLs. A new registration whose options lost or changed any that were there before is
+// refused, and the ones kept in /data stay in force.
+export interface Settings { tokens: Record<string, string>; hc_done: string; hc_failed: string }
+export const settingsOf = (o: Options): Settings => ({ tokens: { ...o.tokens }, hc_done: o.hc_done, hc_failed: o.hc_failed });
+export function settingsLost(kept: Settings, o: Options): string[] {
+  const out: string[] = [];
+  for (const [app, t] of Object.entries(kept.tokens)) if (o.tokens[app] !== t) out.push(`the token for ${app}`);
+  if (kept.hc_done && o.hc_done !== kept.hc_done) out.push("hc_done");
+  if (kept.hc_failed && o.hc_failed !== kept.hc_failed) out.push("hc_failed");
+  return out;
+}
+// A registration's fields, hashed: a spent id seen again with other fields is a replay.
+export function registrationHash(r: Registration): string {
+  return sha(JSON.stringify([r.id, r.app, r.from_version, r.to_version, r.backup_slug, r.install_deadline, r.authorization, r.probe_hash])).slice(0, 16);
+}
 // The effective options' hash: every option but the registration itself (which changes with every
 // install), canonical, so an options change re-binds (and drops) the armed record.
 export function optionsHash(o: Options): string {
@@ -96,7 +121,7 @@ export function parseAuthorization(a: string): { kind: "ship" | "drill"; tokenHa
 export const appName = (slug: string) => { const b = slug.replace(/^[0-9a-f]{8}_/, ""); return b ? b[0].toUpperCase() + b.slice(1) : slug; };
 
 // -- state ----------------------------------------------------------------------------------------
-export type Status = "verifying" | "unprotected" | "accepted" | "watching" | "restoring" | "passed" | "rolled back" | "gave up" | "never started";
+export type Status = "verifying" | "unprotected" | "accepted" | "watching" | "restoring" | "passed" | "rolled back" | "gave up" | "never started" | "unresolved";
 export const OPEN: Status[] = ["verifying", "accepted", "watching", "restoring"];
 export type TriggerKind = "state-error" | "not-started" | "health" | "verdict" | "deadline" | "version-moved" | "watch-end";
 export interface Attempt {
@@ -109,19 +134,28 @@ export interface Attempt {
   health: { at: number; ok: boolean }[];         // the last three health polls while started
   verdict?: { result: "PASS" | "FAIL"; reason: string; at: number };
   trigger?: { kind: TriggerKind; words: string; at: number };
-  restore?: { tries: number; nextTry: number; limit: number; inflight: boolean; called: boolean; doneAt?: number; confirmUntil?: number; result?: string };
+  // The restore (0.1.1): inflight while a call is sent and its answer not yet kept; job the Supervisor's
+  // job id from its answer (or found in its jobs); called once the restore is known to have landed.
+  restore?: { tries: number; nextTry: number; limit: number; inflight: boolean; called: boolean; doneAt?: number; confirmUntil?: number; result?: string;
+    job?: string | null; sentAt?: number; pending?: boolean; waitingSaid?: boolean; lastState?: string; restarts?: number; recheck?: boolean };
   endedAt?: number; lineDelivered?: boolean; drillRecorded?: boolean;
 }
 export interface Binding { protocol: number; probe_hash: string; keeper_version: string; options_hash: string; backup_scope: string }
 export interface DrillRec { attempt: string; kind: "fail-verdict" | "exits-on-start"; trigger: string; restoredAt: number; lineDeliveredAt: number; binding: Binding; at: number }
 export interface LastLine { id: string; kind: string; line: string; at: number }
-export interface QueueItem { key: string; to: "done" | "failed"; fail: boolean; body: string; app: string; attempt?: string; tries: number; next: number }
+export interface QueueItem { key: string; to: "done" | "failed"; fail: boolean; body: string; app: string; attempt?: string; kind?: string; tries: number; next: number }
+// A spent registration (0.1.1): its id, its fields' hash, whether the keeper cleared it from its own
+// options, and the replays already reported.
+export interface Spent { id: string; fields: string; cleared: boolean; at: number; replays?: string[] }
 export interface State {
   format: 1;
   heartbeat: number;                             // ms, written every minute
   lastSeen: Record<string, string>;              // slug -> version
   attempts: Record<string, Attempt>;
   seen: string[];                                // registration ids already taken (never taken twice)
+  spent: Spent[];                                // (0.1.1) the same, with each one's fields and whether it was cleared
+  kept: Settings | null;                         // (0.1.1) the tokens and Healthchecks URLs last taken from the options
+  settingsHold: string;                          // (0.1.1) a registration refused for changing them, while it stands in the options
   probeHash: Record<string, string>;             // slug -> the probe_hash of its newest registration
   outstanding: Record<string, boolean>;          // slug -> a fail ping delivered, its success ping owed
   last: Record<string, LastLine>;
@@ -129,10 +163,11 @@ export interface State {
   armed: Record<string, { at: number; binding: Binding }>;
   queue: QueueItem[];
   hcPinged: number;
+  hcDelivered: number;                           // (0.1.1) the last heartbeat ping Healthchecks answered 2xx
   lines: number;                                 // a counter for line ids
 }
-export const emptyState = (): State => ({ format: 1, heartbeat: 0, lastSeen: {}, attempts: {}, seen: [], probeHash: {}, outstanding: {},
-  last: {}, drills: {}, armed: {}, queue: [], hcPinged: 0, lines: 0 });
+export const emptyState = (): State => ({ format: 1, heartbeat: 0, lastSeen: {}, attempts: {}, seen: [], spent: [], kept: null, settingsHold: "",
+  probeHash: {}, outstanding: {}, last: {}, drills: {}, armed: {}, queue: [], hcPinged: 0, hcDelivered: 0, lines: 0 });
 export function loadState(raw: unknown): State {
   const e = emptyState();
   if (!raw || typeof raw !== "object" || (raw as any).format !== 1) return e;
@@ -141,13 +176,26 @@ export function loadState(raw: unknown): State {
   return { ...e, heartbeat: Number(r.heartbeat) || 0, lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any,
     seen: Array.isArray(r.seen) ? r.seen.filter((x: unknown) => typeof x === "string").slice(-500) : [], probeHash: obj(r.probeHash) as any,
     outstanding: obj(r.outstanding) as any, last: obj(r.last) as any, drills: obj(r.drills) as any, armed: obj(r.armed) as any,
-    queue: Array.isArray(r.queue) ? r.queue : [], hcPinged: Number(r.hcPinged) || 0, lines: Number(r.lines) || 0 };
+    queue: Array.isArray(r.queue) ? r.queue : [], hcPinged: Number(r.hcPinged) || 0, lines: Number(r.lines) || 0,
+    spent: Array.isArray(r.spent) ? r.spent.filter((x: any) => x && typeof x.id === "string").slice(-500) : [],
+    kept: r.kept && typeof r.kept === "object" && r.kept.tokens && typeof r.kept.tokens === "object"
+      ? { tokens: r.kept.tokens, hc_done: s(r.kept.hc_done), hc_failed: s(r.kept.hc_failed) } : null,
+    settingsHold: s(r.settingsHold), hcDelivered: Number(r.hcDelivered) || 0 };
 }
 
 // -- the parts it is given ------------------------------------------------------------------------
 export interface AppInfo { version: string; state: string }
-export interface BackupInfo { homeassistant: unknown; addons: { slug: string; version: string }[]; folders: unknown[] }
-export type RestoreResult = { ok: true } | { ok: false; retry: boolean; why: string };
+export interface BackupInfo { homeassistant: unknown; addons: { slug: string; version: string }[]; folders: unknown[]; protected?: unknown }
+// The restore call's answer (0.1.1): started (the Supervisor took it; its job id when it gave one),
+// refused (the Supervisor answered an error: the request ended there), or unknown (no answer: a
+// timeout or a transport error, so it may be running).
+export type RestoreResult =
+  | { kind: "started"; job: string | null }
+  | { kind: "refused"; retry: boolean; why: string }
+  | { kind: "unknown"; why: string };
+// A restore job as the Supervisor's jobs list shows it: found or not (finished jobs leave the list
+// after a while), done, and its errors.
+export type JobState = { found: false } | { found: true; uuid: string; done: boolean; errors: number };
 export interface Deps {
   now: () => number;
   version: string;                               // the keeper's own version
@@ -155,9 +203,11 @@ export interface Deps {
   appInfo: (slug: string) => Promise<AppInfo | null>;
   backupInfo: (slug: string) => Promise<BackupInfo | null>;
   restore: (backup: string, app: string) => Promise<RestoreResult>;
+  job: (uuid: string | null, backup: string, since: number) => Promise<JobState | null>;   // null: the jobs list can't be read
+  clearAttempt: (id: string) => Promise<{ ok: boolean; why: string }>;                      // the keeper's own options, attempt emptied
   health: (hostPort: string) => Promise<boolean>;
   ping: (url: string, body: string) => Promise<boolean>;
-  options: () => unknown;                        // /data/options.json, re-read each poll (null: unreadable)
+  options: () => unknown | Promise<unknown>;      // the keeper's options, re-read each poll (null: unreadable)
   save: (s: State) => void;
   log: (line: string) => void;
 }
@@ -185,6 +235,8 @@ export class Keeper {
       this.st.armed = {}; this.st.drills = {};
     }
     for (const a of this.open()) this.d.log(`resuming ${a.id} ${a.app} (${a.status})`);
+    // 0.1.1: an unresolved restore is reconciled again at each start (read only: nothing is sent again).
+    for (const a of Object.values(this.st.attempts)) if (a.status === "unresolved" && a.restore) { a.restore.recheck = true; this.d.log(`reconciling ${a.id} ${a.app} again (unresolved)`); }
     this.st.heartbeat = now;
     this.save();
   }
@@ -198,30 +250,72 @@ export class Keeper {
     if (this.busy) return;
     this.busy = true;
     try {
-      const raw = this.d.options();
-      if (raw !== null) this.opts = parseOptions(raw);
+      const raw = await Promise.resolve(this.d.options()).catch(() => null);
+      if (raw !== null && raw !== undefined) this.opts = this.guard(parseOptions(raw));
       else this.d.log("the keeper's options can't be read this poll: the last ones read stay in force");
       const now = this.now();
       if (this.opts.attempt) await this.register(this.opts.attempt);
       const apps = new Set([...this.opts.watch, ...this.open().map((a) => a.app)]);
       for (const app of apps) await this.pollApp(app);
-      this.tickHeartbeat(now);
+      for (const a of Object.values(this.st.attempts)) if (a.status === "unresolved" && a.restore?.recheck) await this.recheck(a);
+      await this.tickHeartbeat(now);
       this.arm();
       this.save();
       await this.flush();
       this.save();
     } finally { this.busy = false; }
   }
+  // 0.1.1: the keeper's own settings (tokens, Healthchecks URLs) are kept in /data. A new registration
+  // whose options lost or changed any of them is refused (register reads settingsHold) and the kept
+  // ones stay in force while it stands in the options; any other read takes the options as they are.
+  private guard(o: Options): Options {
+    const k = this.st.kept;
+    const id = o.attempt?.id ?? "";
+    const fresh = !!o.attempt && !this.spent(id);
+    if (k && o.attempt && (this.st.settingsHold === id || (fresh && settingsLost(k, o).length))) {
+      if (this.st.settingsHold !== id) {
+        this.st.settingsHold = id;
+        this.d.log(`the options with registration ${id || "(no id)"} lost or changed ${settingsLost(k, o).join(", ")}: the kept ones stay in force`);
+      }
+      return { ...o, tokens: { ...o.tokens, ...k.tokens }, hc_done: k.hc_done || o.hc_done, hc_failed: k.hc_failed || o.hc_failed };
+    }
+    if (this.st.settingsHold && this.st.settingsHold !== id) this.st.settingsHold = "";
+    this.st.kept = settingsOf(o);
+    return o;
+  }
+  private spent(id: string): Spent | undefined { return this.st.spent.find((x) => x.id === id) ?? (this.st.seen.includes(id) ? { id, fields: "", cleared: false, at: 0 } : undefined); }
+  private spend(r: Registration): Spent {
+    const sp: Spent = { id: r.id, fields: registrationHash(r), cleared: false, at: this.now() };
+    this.st.spent.push(sp); if (this.st.spent.length > 500) this.st.spent.shift();
+    this.st.seen.push(r.id); if (this.st.seen.length > 500) this.st.seen.shift();
+    return sp;
+  }
 
   // -- registration ---------------------------------------------------------------------------------
   private async register(r: Registration): Promise<void> {
-    if (this.st.seen.includes(r.id)) {
+    const sp = this.spent(r.id);
+    if (sp) {
+      // 0.1.1: the authorization is consumed. The same registration still standing in the options (not
+      // cleared yet) is the one already taken; seen again after the keeper cleared it, or with other
+      // fields, it is a replay, refused (and reported once).
+      const h = registrationHash(r);
+      const replay = sp.fields !== "" && (sp.fields !== h || sp.cleared);
+      if (replay) {
+        if (!(sp.replays ??= []).includes(h)) {
+          sp.replays.push(h);
+          const why = sp.fields !== h ? "a replay: that id was spent with other fields" : "a replay: that registration was spent and cleared";
+          this.d.log(`refusing ${r.id}: ${why}`);
+          this.owner(SLUG.test(r.app) ? r.app : this.d.self, "unprotected", `Keeper refused a registration for ${SLUG.test(r.app) ? appName(r.app) : "an App"} (${r.id}): ${why}. Nothing will be rolled back for it.`, true);
+          this.save();
+        }
+        return;
+      }
       const a = this.st.attempts[r.id];
       if (a?.status === "verifying") await this.verify(a);
       return;
     }
-    if (!ID.test(r.id)) { this.d.log(`refusing a registration with no usable id`); this.st.seen.push(r.id); return; }
-    this.st.seen.push(r.id);
+    if (!ID.test(r.id)) { this.d.log(`refusing a registration with no usable id`); this.spend(r); return; }
+    this.spend(r);
     const auth = parseAuthorization(r.authorization);
     const deadline = /^\d{10,13}$/.test(r.install_deadline) ? Number(r.install_deadline) * (r.install_deadline.length <= 10 ? 1000 : 1) : Date.parse(r.install_deadline);
     const now = this.now();
@@ -230,7 +324,8 @@ export class Keeper {
       auth: auth?.kind ?? "ship", tokenHash: auth?.tokenHash ?? null, probeHash: r.probe_hash, registeredAt: now, status: "verifying",
       notStarted: 0, healthFails: 0, startedEveryPoll: true, health: [], verifyUntil: now + VERIFY_MS,
     };
-    const why = !SLUG.test(r.app) ? "its app isn't an App slug"
+    const why = this.st.settingsHold === r.id ? "the registration changed the keeper's own settings"
+      : !SLUG.test(r.app) ? "its app isn't an App slug"
       : r.app === this.d.self ? "the keeper doesn't watch its own install (it refuses to update itself while it watches)"
       : !this.opts.watch.includes(r.app) ? `${r.app} isn't in the keeper's watch list`
       : !VERSION.test(r.from_version) || !VERSION.test(r.to_version) ? "its versions aren't versions"
@@ -243,7 +338,8 @@ export class Keeper {
       : !PROBE_HASH.test(r.probe_hash) ? "its probe_hash isn't a hash"
       : this.open(r.app).length ? `another attempt for ${r.app} is open (${this.open(r.app)[0].id})`
       : null;
-    if (why && SLUG.test(r.app)) { this.st.attempts[a.id] = a; this.unprotected(a, why); return; }
+    if (why && !SLUG.test(r.app) && this.st.settingsHold === r.id) a.app = this.d.self;
+    if (why && SLUG.test(a.app)) { this.st.attempts[a.id] = a; this.unprotected(a, why); return; }
     if (why) { this.d.log(`refusing ${r.id}: ${why}`); return; }
     this.st.attempts[a.id] = a;
     this.st.probeHash[a.app] = a.probeHash;
@@ -261,10 +357,23 @@ export class Keeper {
       : addons[0].slug !== a.app ? `its backup holds ${addons[0].slug}, not ${a.app}`
       : Array.isArray(b.folders) && b.folders.length ? "its backup holds folders"
       : addons[0].version !== a.from ? `its backup holds ${a.app} ${addons[0].version}, not ${a.from}`
+      : b.protected === true ? "its backup is password-protected, and the keeper restores only a backup made without a password"
       : null;
     if (why) { this.unprotected(a, why); return; }
     a.status = "accepted"; delete a.verifyUntil;
     this.d.log(`accepting ${a.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup}`);
+    this.save();
+    await this.clear(a.id);
+  }
+  // 0.1.1: once accepted (its authorization kept only as a hash, its id spent), the registration is
+  // cleared from the keeper's own options through the Supervisor, so the plain string doesn't stay
+  // there. If the Supervisor refuses, it stays until the next registration (DOCS.md says what a backup
+  // of the keeper then carries); it is spent either way, so it can't be used again.
+  private async clear(id: string): Promise<void> {
+    const sp = this.st.spent.find((x) => x.id === id);
+    const r = await this.d.clearAttempt(id).catch((e) => ({ ok: false, why: String((e as Error)?.message ?? e).slice(0, 80) }));
+    if (r.ok) { if (sp) sp.cleared = true; this.d.log(`cleared ${id} from the keeper's options`); }
+    else this.d.log(`couldn't clear ${id} from the keeper's options (${r.why}): it stays there, spent, until the next registration`);
     this.save();
   }
   private unprotected(a: Attempt, why: string): void {
@@ -298,7 +407,7 @@ export class Keeper {
     if (was === v) return;
     this.st.lastSeen[app] = v;
     const recent = Object.values(this.st.attempts).filter((a) => a.app === app && this.now() - a.registeredAt < 86_400_000);
-    const covered = recent.some((a) => (a.to === v && a.status !== "never started") || (a.from === v && ["restoring", "rolled back", "gave up"].includes(a.status)));
+    const covered = recent.some((a) => (a.to === v && a.status !== "never started") || (a.from === v && ["restoring", "rolled back", "gave up", "unresolved"].includes(a.status)));
     if (covered) { this.d.log(`${app} is at ${v} (was ${was})`); return; }
     this.d.log(`unregistered change ${app} ${was} to ${v}: no attempt was registered for it, so nothing is restored`);
     this.owner(app, "unregistered change", `${appName(app)} changed from ${was} to ${v} with no install registered with Keeper. Nothing was rolled back.`, true);
@@ -345,50 +454,138 @@ export class Keeper {
       this.lastLine(a.app, "passed", `${appName(a.app)} ${a.to} passed Keeper's check after its install.`, a.id);
     }
   }
-  // A fail: the trigger kept, the attempt marked restoring (saved) before any restore starts.
+  // A fail: the trigger kept, the attempt marked restoring (saved) before any restore starts, and
+  // (0.1.1) the owner paged at once with a fail ping carrying the line: every rollback reaches the phone.
   private fail(a: Attempt, kind: TriggerKind, words: string): void {
     const now = this.now();
     a.trigger = { kind, words, at: now };
     a.status = "restoring";
-    a.restore = { tries: 0, nextTry: now, limit: now + RESTORE_LIMIT_MS, inflight: false, called: false };
+    a.restore = { tries: 0, nextTry: now, limit: now + RESTORE_LIMIT_MS, inflight: false, called: false, job: null };
     this.d.log(`${a.id}: fail (${words}); restoring ${a.app} from backup ${a.backup}`);
+    this.owner(a.app, "rolling back", `Keeper is rolling back ${appName(a.app)} from ${a.to} to ${a.from}: ${words}.`, true, a.id);
     this.save();
   }
 
   // -- the restore ----------------------------------------------------------------------------------
+  // One restore job per attempt (0.1.1). The call is marked in flight (saved) before it is sent, and the
+  // Supervisor's job id from its answer is saved before anything else. A call with no answer (a timeout,
+  // a transport error, or a keeper restart while it was out) is reconciled first: the job's state from
+  // the Supervisor's jobs list, and the App's info (back at from_version and started: it landed). It is
+  // sent again only when the Supervisor answered an error (the request ended there) or the job is seen
+  // ended with errors and the App isn't back. Past the limit with the outcome unknown: unresolved.
   private async restoring(a: Attempt, info: AppInfo | null, healthOk: boolean): Promise<void> {
     const r = a.restore!;
     const now = this.now();
     if (!r.called) {
-      if (r.inflight) { r.called = true; r.doneAt = now; r.confirmUntil = now + CONFIRM_MS; this.d.log(`${a.id}: a restore was under way when the keeper stopped; it isn't started again, only confirmed`); this.save(); return; }
+      if (r.inflight || r.pending) return this.reconcile(a, info);
       if (now < r.nextTry) return;
       if (now >= r.limit) return this.gaveUp(a, "the Supervisor stayed busy past the restore's limit");
-      r.inflight = true; r.tries++;
-      this.save();                                         // one restore per attempt, across restarts
-      const res = await this.d.restore(a.backup, a.app).catch((e) => ({ ok: false as const, retry: true, why: String(e).slice(0, 120) }));
+      r.inflight = true; r.tries++; r.sentAt = now; r.job = null;
+      this.save();                                         // one restore job per attempt, across restarts
+      const res: RestoreResult = await this.d.restore(a.backup, a.app).catch((e) => ({ kind: "unknown" as const, why: String((e as Error)?.message ?? e).slice(0, 120) }));
       const t = this.now();
+      if (res.kind === "started") {
+        r.inflight = false; r.job = res.job;
+        if (res.job) {
+          r.pending = true;
+          this.save();                                     // the job id, before anything else
+          this.d.log(`${a.id}: the restore of backup ${a.backup} (${a.app} alone) is running as job ${res.job}`);
+          return;
+        }
+        this.landed(a, t, `restored backup ${a.backup} (${a.app} alone)`);
+        return;
+      }
+      if (res.kind === "unknown") {
+        r.pending = true; r.inflight = false;
+        this.d.log(`${a.id}: the restore call got no answer (${res.why}); reconciling with the Supervisor before anything is sent again`);
+        this.save();
+        return;
+      }
       r.inflight = false;
-      if (res.ok) {
-        r.called = true; r.doneAt = t; r.confirmUntil = t + CONFIRM_MS;
-        this.d.log(`${a.id}: restored backup ${a.backup} (${a.app} alone); confirming ${a.from} comes back`);
-        this.save();
-        return;
-      }
-      if (res.retry && t + this.backoff(r.tries) < r.limit) {
-        r.nextTry = t + this.backoff(r.tries);
-        this.d.log(`${a.id}: the Supervisor is busy (${res.why}); the restore is tried again in ${Math.round(this.backoff(r.tries) / 1000)} seconds`);
-        this.save();
-        return;
-      }
-      return this.gaveUp(a, `the restore failed: ${res.why}`);
+      return this.again(a, res.retry, `the restore failed: ${res.why}`, t);
     }
+    // The restore landed: from_version must be read started and healthy, and the App mustn't keep
+    // restarting (started, then stopped or error, more than twice in the confirm window).
+    if (info) {
+      if (r.lastState === "started" && info.state !== "started") r.restarts = (r.restarts ?? 0) + 1;
+      r.lastState = info.state;
+      if ((r.restarts ?? 0) > RESTARTS_MAX) return this.gaveUp(a, `${a.app} keeps restarting after the restore (stopped ${r.restarts} times in its 5 minutes)`);
+    }
+    if (now < (r.confirmUntil ?? 0)) return;
     if (info && info.version === a.from && info.state === "started" && healthOk) {
       a.status = "rolled back"; a.endedAt = now; r.result = "ok";
       this.d.log(`${a.id}: rolled back (${a.app} ${a.from} started and healthy; trigger: ${a.trigger?.words})`);
       this.owner(a.app, "rolled back", `Keeper rolled back ${appName(a.app)} from ${a.to} to ${a.from}: ${a.trigger?.words ?? "a failed check"}. What the App wrote after the backup is gone.`, false, a.id);
       return;
     }
-    if (now >= (r.confirmUntil ?? 0)) return this.gaveUp(a, `${a.from} didn't come back started and healthy within 5 minutes of the restore`);
+    return this.gaveUp(a, `${a.from} wasn't started and healthy 5 minutes after the restore`);
+  }
+  private landed(a: Attempt, t: number, words: string): void {
+    const r = a.restore!;
+    r.called = true; r.pending = false; r.inflight = false; r.doneAt = t; r.confirmUntil = t + CONFIRM_MS; r.restarts = 0; delete r.lastState;
+    this.d.log(`${a.id}: ${words}; confirming ${a.from} comes back started and healthy for 5 minutes`);
+    this.save();
+  }
+  // A restore that ended without restoring: sent again inside the limit when it may succeed, else gave up.
+  private again(a: Attempt, retry: boolean, why: string, t: number): void {
+    const r = a.restore!;
+    r.pending = false; r.job = null; delete r.waitingSaid;
+    if (retry && t + this.backoff(r.tries) < r.limit) {
+      r.nextTry = t + this.backoff(r.tries);
+      this.d.log(`${a.id}: ${why}; the restore is tried again in ${Math.round(this.backoff(r.tries) / 1000)} seconds`);
+      this.save();
+      return;
+    }
+    this.gaveUp(a, why);
+  }
+  private async reconcile(a: Attempt, info: AppInfo | null): Promise<void> {
+    const r = a.restore!;
+    const now = this.now();
+    const j = await this.d.job(r.job ?? null, a.backup, r.sentAt ?? a.trigger?.at ?? 0).catch(() => null);
+    const back = !!info && info.version === a.from && info.state === "started";
+    if (j?.found) {
+      if (r.job !== j.uuid) { r.job = j.uuid; r.inflight = false; r.pending = true; this.save(); this.d.log(`${a.id}: the restore is the Supervisor's job ${j.uuid}`); }
+      if (j.done && j.errors === 0) return this.landed(a, now, `the restore job ${j.uuid} finished`);
+      if (j.done) {
+        if (back) return this.landed(a, now, `the restore job ${j.uuid} ended with errors, but ${a.app} is back at ${a.from}`);
+        return this.again(a, true, `the restore job ${j.uuid} ended without restoring (${j.errors} error${j.errors === 1 ? "" : "s"})`, now);
+      }
+      if (!r.waitingSaid) { r.waitingSaid = true; this.d.log(`${a.id}: the restore job ${j.uuid} is still running`); this.save(); }
+    } else if (back) {
+      return this.landed(a, now, `${a.app} is back at ${a.from} (the restore job is no longer listed)`);
+    } else if (!r.waitingSaid) {
+      r.waitingSaid = true;
+      this.d.log(`${a.id}: the restore's outcome isn't known yet (${j ? "no such job in the Supervisor's list" : "the Supervisor's jobs can't be read"}); nothing is sent again`);
+      this.save();
+    }
+    if (now >= r.limit) return this.unresolved(a, j ? (j.found ? `its restore job ${j.uuid} was still running at the limit` : "its restore job wasn't found and the App isn't back") : "the Supervisor's jobs couldn't be read");
+  }
+  // 0.1.1: the outcome couldn't be established: nothing is sent again, the owner hears it, and the next
+  // start reconciles it again.
+  private unresolved(a: Attempt, why: string): void {
+    a.status = "unresolved"; a.endedAt = this.now(); a.why = why;
+    if (a.restore) { a.restore.result = why; a.restore.inflight = false; a.restore.pending = true; }
+    this.d.log(`${a.id}: unresolved (${why}): nothing is restored again; the next start checks it again`);
+    this.owner(a.app, "unresolved", `Keeper can't tell whether its rollback of ${appName(a.app)} ${a.to} to ${a.from} ran: ${why}. Nothing more is restored by itself. Check the App and its backups in Home Assistant (Settings, System, Backups).`, true, a.id);
+    this.save();
+  }
+  // At a start, an unresolved attempt is reconciled again, once: landed goes on to the confirm window,
+  // a job seen ended with errors is gave up, anything else stays unresolved.
+  private async recheck(a: Attempt): Promise<void> {
+    const r = a.restore!;
+    r.recheck = false;
+    const info = await this.d.appInfo(a.app).catch(() => null);
+    const j = await this.d.job(r.job ?? null, a.backup, r.sentAt ?? 0).catch(() => null);
+    const back = !!info && info.version === a.from && info.state === "started";
+    const now = this.now();
+    if ((j?.found && j.done && j.errors === 0) || back) {
+      a.status = "restoring"; delete a.endedAt;
+      this.landed(a, now, j?.found ? `the restore job ${j.uuid} finished (found at the start)` : `${a.app} is back at ${a.from} (found at the start)`);
+      return;
+    }
+    if (j?.found && j.done) return this.gaveUp(a, `its restore job ${j.uuid} ended without restoring`);
+    this.d.log(`${a.id}: still unresolved at this start (${j ? (j.found ? "its restore job is still running" : "no such job") : "the Supervisor's jobs can't be read"})`);
+    this.save();
   }
   backoff(tries: number): number { return Math.min(240_000, POLL_MS * 2 ** Math.max(0, tries - 1)); }
   private gaveUp(a: Attempt, why: string): void {
@@ -433,26 +630,30 @@ export class Keeper {
     this.st.last[app] = l;
     return l;
   }
-  // The owner's line: logged, kept as the App's last line, and queued as a Healthchecks ping (a fail
-  // ping to hc_failed, or a success ping to hc_done carrying the line for a completed rollback).
+  // The owner's line: logged, kept as the App's last line, and queued as a Healthchecks ping to hc_failed
+  // (0.1.1): a fail ping for every alarm (a rollback starting included), a success ping carrying the line
+  // once a rollback is confirmed. No owner line rides only on the heartbeat check.
   owner(app: string, kind: string, line: string, fail: boolean, attempt?: string): void {
     const l = this.lastLine(app, kind, line, attempt);
     this.d.log(`owner: ${line}`);
     if (!hcArmable(this.opts)) this.d.log("the Healthchecks URLs aren't set, so that line reaches no one but this log (the keeper is not armable)");
-    this.st.queue.push({ key: l.id, to: fail ? "failed" : "done", fail, body: line, app, attempt, tries: 0, next: 0 });
+    this.st.queue.push({ key: l.id, to: "failed", fail, body: line, app, attempt, kind, tries: 0, next: 0 });
   }
-  // Fail pings are retried until delivered; a delivered fail leaves a success ping owed for its App.
+  // Every ping is retried until delivered. A success ping to hc_failed waits for any earlier fail ping
+  // of its App, so the phone never sees them out of order; a delivered fail leaves a success owed.
   async flush(): Promise<void> {
     const now = this.now();
     const keep: QueueItem[] = [];
     for (const q of this.st.queue) {
       const base = q.to === "done" ? this.opts.hc_done : this.opts.hc_failed;
-      if (now < q.next || !/^https:\/\/\S+$/.test(base)) { keep.push(q); continue; }
+      const behind = !q.fail && keep.some((k) => k.app === q.app && k.fail && k.to === q.to);
+      if (behind || now < q.next || !/^https:\/\/\S+$/.test(base)) { keep.push(q); continue; }
       const url = q.fail ? `${base.replace(/\/+$/, "")}/fail` : base;
       const ok = await this.d.ping(url, q.body).catch(() => false);
       if (ok) {
-        if (q.fail) this.st.outstanding[q.app] = true;
-        if (q.attempt && this.st.attempts[q.attempt]) this.st.attempts[q.attempt].lineDelivered = true;
+        if (q.fail && q.to === "failed") this.st.outstanding[q.app] = true;
+        if (!q.fail && q.to === "failed") delete this.st.outstanding[q.app];
+        if (q.kind === "rolled back" && q.attempt && this.st.attempts[q.attempt]) this.st.attempts[q.attempt].lineDelivered = true;
         if (q.attempt) this.autoDrill(q.attempt);
         continue;
       }
@@ -468,19 +669,23 @@ export class Keeper {
     if (this.open(app).length || this.appState[app] !== "started") return;
     const h = this.appHealth[app] ?? [];
     if (h.length < 3 || !h.every(Boolean)) return;
-    if (this.st.queue.some((q) => q.app === app && q.fail)) return;
+    if (this.st.queue.some((q) => q.app === app && q.to === "failed")) return;
     delete this.st.outstanding[app];
     this.st.queue.push({ key: `${app}-clear-${++this.st.lines}`, to: "failed", fail: false, body: `${appName(app)} is started and healthy again.`, app, tries: 0, next: 0 });
   }
-  // The heartbeat: the time in /data every minute, a ping to hc_done every 5 minutes.
-  private tickHeartbeat(now: number): void {
+  // The heartbeat: the time in /data every minute, a ping to hc_done every 5 minutes (a failed one tried
+  // again a minute later), and (0.1.1) the time of the last one Healthchecks answered, which arming needs.
+  private async tickHeartbeat(now: number): Promise<void> {
     this.st.heartbeat = now;
     if (now - this.st.hcPinged >= HC_HEARTBEAT_MS && /^https:\/\/\S+$/.test(this.opts.hc_done)) {
-      this.st.hcPinged = now;
-      void this.d.ping(this.opts.hc_done, "keeper heartbeat").catch(() => false);
+      const ok = await this.d.ping(this.opts.hc_done, "keeper heartbeat").catch(() => false);
+      if (ok) { this.st.hcPinged = now; this.st.hcDelivered = this.now(); }
+      else { this.st.hcPinged = now - HC_HEARTBEAT_MS + 60_000; this.d.log("the heartbeat ping to hc_done wasn't delivered: tried again in a minute"); }
     }
   }
   heartbeat(): void { this.st.heartbeat = this.now(); this.save(); }
+  // 0.1.1: the alert path is live while a heartbeat ping was delivered within the last 10 minutes.
+  delivered(now = this.now()): boolean { return this.st.hcDelivered > 0 && now - this.st.hcDelivered <= DELIVERY_MS; }
 
   // -- drills and arming ----------------------------------------------------------------------------
   // A drill record, only from the keeper's own result for one of its attempts: a drill attempt rolled
@@ -530,12 +735,14 @@ export class Keeper {
       }
       const both = d["fail-verdict"] && d["exits-on-start"];
       const prev = this.st.armed[app];
-      if (both && hcArmable(this.opts)) {
+      const live = this.delivered(now);
+      if (both && hcArmable(this.opts) && live) {
         if (!prev || JSON.stringify(prev.binding) !== JSON.stringify(cur)) { this.st.armed[app] = { at: now, binding: cur }; this.d.log(`armed for ${app}`); }
         else if (now - prev.at > ARMED_MAX_MS) { delete this.st.armed[app]; delete this.st.drills[app]; this.d.log(`disarmed for ${app}: 60 days passed`); }
       } else if (prev) {
         delete this.st.armed[app];
-        this.d.log(`disarmed for ${app}: ${!hcArmable(this.opts) ? "the Healthchecks URLs aren't set" : "a drill record no longer counts"}`);
+        this.d.log(`disarmed for ${app}: ${!hcArmable(this.opts) ? "the Healthchecks URLs aren't set"
+          : !live ? "no heartbeat ping was delivered to Healthchecks for 10 minutes, so the alert path isn't known to work" : "a drill record no longer counts"}`);
       }
     }
   }
@@ -543,9 +750,11 @@ export class Keeper {
     const a = this.st.armed[app];
     const cur = this.binding(app);
     const armable = hcArmable(this.opts);
+    const live = this.delivered();
     const why = !armable ? "the keeper is not armable: its Healthchecks URLs aren't set"
+      : !live ? "no heartbeat ping was delivered to Healthchecks in the last 10 minutes"
       : !a ? `no drills on record for ${app} under the current binding` : "";
-    return { app, armed: !!a && armable, why, armed_at: a ? new Date(a.at).toISOString() : null, binding: a ? a.binding : cur,
+    return { app, armed: !!a && armable && live, why, armed_at: a ? new Date(a.at).toISOString() : null, binding: a ? a.binding : cur,
       keeper_version: this.d.version, at: new Date(this.st.heartbeat || this.now()).toISOString() };
   }
 }

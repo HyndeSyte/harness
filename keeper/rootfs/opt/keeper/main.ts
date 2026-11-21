@@ -23,6 +23,12 @@ export function writeWhole(path: string, body: string): void {
   try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
   try { renameSync(tmp, path); } catch (e) { rmSync(tmp, { force: true }); throw e; }
 }
+// The address the keeper polls for a watched App (option health, "host:port" or "host:port/path";
+// 0.1.1: Cain's default names /ready, his readiness; no path is /health).
+export function healthUrl(hp: string): string | null {
+  const m = /^([A-Za-z0-9.-]{1,253}:\d{1,5})(\/[A-Za-z0-9._\/-]{0,64})?$/.exec(hp);
+  return m ? `http://${m[1]}${m[2] || "/health"}` : null;
+}
 const readJson = (p: string): unknown => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } };
 
 async function serve(): Promise<void> {
@@ -36,16 +42,19 @@ async function serve(): Promise<void> {
   if (me && me.version && me.version !== version) log(`the Supervisor says this is ${me.version}, the image says ${version}: the image's is bound`);
   const k = new Keeper({
     now: Date.now, version, self,
-    appInfo: sup.appInfo, backupInfo: sup.backupInfo, restore: sup.restore,
+    appInfo: sup.appInfo, backupInfo: sup.backupInfo, restore: sup.restore, job: sup.job, clearAttempt: sup.clearAttempt,
     health: async (hp) => {
-      if (!/^[A-Za-z0-9.-]{1,253}:\d{1,5}$/.test(hp)) return false;
-      try { const r = await fetch(`http://${hp}/health`, { signal: AbortSignal.timeout(5_000), redirect: "manual" }); return r.status === 200; } catch { return false; }
+      const url = healthUrl(hp);
+      if (!url) return false;
+      try { const r = await fetch(url, { signal: AbortSignal.timeout(5_000), redirect: "manual" }); return r.status === 200; } catch { return false; }
     },
     ping: async (url, body) => {
       try { const r = await fetch(url, { method: "POST", body, redirect: "manual", signal: AbortSignal.timeout(10_000), headers: { "content-type": "text/plain" } }); return r.status >= 200 && r.status < 300; }
       catch { return false; }
     },
-    options: () => readJson(OPTIONS),
+    // 0.1.1: the options as the Supervisor holds them (the file is written only at the keeper's start);
+    // the Supervisor not answering keeps the last ones read in force.
+    options: () => sup.selfOptions(),
     save: (s: State) => { try { writeWhole(STATE, JSON.stringify(s)); } catch (e) { log(`couldn't save its state: ${String((e as Error)?.message ?? e).slice(0, 80)}`); } },
     log,
   }, readJson(STATE));

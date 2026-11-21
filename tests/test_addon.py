@@ -270,6 +270,12 @@ def test_cain_terminal_is_reachable_only_through_ingress():
     assert "access_log /run/cain-web/health-miss.log cain_health_miss if=$cain_health_miss;" in loc
     assert loc.index("if ($cain_health_from != 1) { return 404;") < loc.index("health-down")
     assert "location / { return 404; }" in health and "proxy_pass" not in health and "alias" not in health
+    # Cain 0.18.1: /health is liveness only (no gateway mark); /ready, beside it on the same server, is
+    # readiness (the link's gateway mark), behind the same address check.
+    assert "health-gateway" not in loc.split("location = /ready {")[0]
+    ready = health.split("location = /ready {")[1].split("location / {")[0]
+    assert ready.index("if ($cain_health_from != 1) { return 404;") < ready.index("health-gateway")
+    assert "health-ok.log" not in ready
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
     # C1: ttyd listens on a unix socket only nginx's workers and root can open, never a port
     # Cain's own user could take while it's down; it attaches as the session's own user.

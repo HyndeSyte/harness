@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.18.1
+
+- Cain's health check for Home Assistant's Watchdog (/health) is back to "is the App running": it no longer goes down when Discord is unreachable, so a Discord outage doesn't make the Watchdog restart him.
+- A new readiness check beside it (/ready) answers only while his Discord connection is up. The Keeper reads that one after an install.
+
 ## 0.18.0
 
 - Cain now works with the new Keeper App, which checks every install of Cain for 15 minutes and rolls a bad one back by itself from the backup taken just before it.

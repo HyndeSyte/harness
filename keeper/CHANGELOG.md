@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+- A rollback is never started twice. Keeper keeps the Supervisor's job for each restore and, if it loses track of one (no answer, or a restart), checks that job and Cain's version before doing anything more. If it still can't tell, it stops and tells you ("unresolved") instead of restoring again.
+- Every rollback reaches your phone: an alert as soon as it starts, and the all clear only once the old version is running and healthy again.
+- An install whose registration changed Keeper's own tokens or Healthchecks addresses is refused, and Keeper keeps the ones it had. Each registration counts once: it is spent, cleared from Keeper's options, and refused if it comes back.
+- A password-protected backup is refused before the install, since Keeper can't restore it. Ship backups are made without a password.
+- Keeper now asks Cain's readiness address (/ready), not his liveness one.
+- "Armed" now also needs Keeper's heartbeat to have reached Healthchecks in the last 10 minutes. A rollback where Cain keeps restarting counts as failed ("gave up").
+
 ## 0.1.0
 
 - A new App, Keeper. After every install of Cain it checks him for 15 minutes, and if the install is bad (he stops, keeps failing his health check, or his own check says so) it puts back the backup taken just before the install, by itself.

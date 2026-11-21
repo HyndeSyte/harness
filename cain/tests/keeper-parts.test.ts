@@ -12,7 +12,7 @@ import { CAIN_SLUG, lastRepeat, probeHash, verdictRun, type Reply } from "../roo
 const src = (f: string) => readFileSync(join(import.meta.dir, "..", f), "utf8");
 const NOW = Date.parse("2026-11-21T15:00:00Z");
 
-describe("/health tied to the gateway", () => {
+describe("/ready tied to the gateway (0.18.1: /health is liveness only)", () => {
   test("healthy only while connected and acknowledged within 5 minutes", () => {
     expect(gatewayHealthy(true, NOW - 1000, NOW)).toBe(true);
     expect(gatewayHealthy(true, NOW - ACK_WITHIN_MS - 1, NOW)).toBe(false);
@@ -24,7 +24,15 @@ describe("/health tied to the gateway", () => {
     writeGatewayMark(true, f, () => {}); expect(existsSync(f)).toBe(true);
     writeGatewayMark(false, f, () => {}); expect(existsSync(f)).toBe(false);
     const nginx = src("rootfs/etc/nginx/nginx.conf");
-    expect(nginx).toContain('if (!-f /run/cain-web/www/health-gateway) { return 503');
+    const ready = nginx.split("location = /ready {")[1].split("}\n    location")[0];
+    expect(ready).toContain('if (!-f /run/cain-web/www/health-gateway) { return 503');
+    expect(ready.indexOf("if ($cain_health_from != 1) { return 404; }")).toBeGreaterThan(-1);
+    expect(ready.indexOf("$cain_health_from")).toBeLessThan(ready.indexOf("health-gateway"));
+    const health = nginx.split("location = /health {")[1].split("location = /ready {")[0];
+    expect(health).not.toContain("health-gateway");
+    expect(health).toContain("access_log /run/cain-web/health-ok.log cain_health_ok if=$cain_health_ok;");
+    expect(health).toContain("access_log /run/cain-web/health-miss.log cain_health_miss if=$cain_health_miss;");
+    expect(src("config.yaml")).toMatch(/^watchdog: http:\/\/\[HOST\]:\[PORT:8098\]\/health$/m);
     const run = src("rootfs/etc/services.d/cain/run");
     expect(run).toContain("GATEWAY_MARK=/run/cain-web/www/health-gateway");
     expect(run).toMatch(/gateway_stale\(\) \{ \[ -z "\$\(find "\$GATEWAY_MARK" -mmin \+2/);

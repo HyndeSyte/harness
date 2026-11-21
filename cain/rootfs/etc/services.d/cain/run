@@ -291,7 +291,7 @@ health_ok_trim() {
   keep="$(tail -n 200 "$HEALTH_OK" 2>/dev/null)" || keep=""
   { : > "$HEALTH_OK" && printf '%s\n' "$keep" >> "$HEALTH_OK"; } 2>/dev/null || true
 }
-# Cain 0.18.0: the link's gateway mark for /health (link/health-gate.ts), removed once 2 minutes stale (the
+# Cain 0.18.0: the link's gateway mark for /ready (0.18.1; link/health-gate.ts), removed once 2 minutes stale (the
 # link refreshes it every 30 seconds while its Discord gateway is connected), so a stopped link reads 503.
 GATEWAY_MARK=/run/cain-web/www/health-gateway
 gateway_stale() { [ -z "$(find "$GATEWAY_MARK" -mmin +2 2>/dev/null)" ] || rm -f "$GATEWAY_MARK" 2>/dev/null || true; }

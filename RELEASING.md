@@ -5,7 +5,7 @@ Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
-- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.0): a check after every install of a
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.1): a check after every install of a
   watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
   `bun test keeper/tests`.
 
@@ -322,27 +322,38 @@ for 2 hours, without which Cain can't start the job.
    (`git show <sha>:cain/rootfs/opt/cain/settings.json | sha256sum`) must equal that digest.
    Otherwise install nothing and end with
    `Connector check: no passing line for this head and its settings`.
-4. The keeper's registration (Keeper 0.1.0), before each App's install, for every install
+4. The keeper's registration (Keeper 0.1.0; first review fixes 0.1.1), before each App's install, for every install
    (an ordinary one too, so every install is watched); steps 4a to 4e for that App, then its update:
    - 4a. Create a backup of that App alone through the connector (a partial backup,
-     `include_addons` that App's slug only, no Home Assistant, no folders) and note its slug.
-   - 4b. Read that backup's info through the connector and check all four: it holds that App alone,
-     Home Assistant false, no folders, and the App's version in it equals the version installed now
-     (from_version). If any fails, install nothing and report it.
+     `include_addons` that App's slug only, no Home Assistant, no folders, and no password: leave the
+     password out) and note its slug.
+   - 4b. Read that backup's info through the connector and check all five: it holds that App alone,
+     Home Assistant false, no folders, `protected` false, and the App's version in it equals the version
+     installed now (from_version). If any fails, install nothing and report it. The Keeper refuses a
+     protected backup itself too (it has no password to restore it with).
    - 4c. Write the attempt into the Keeper App's options through the connector (its `attempt`
      option, every other option left as it is): `id` (`ship-<pr number>-<app>-<first 8 of the head
      sha>`), `app` (the slug), `from_version`, `to_version`, `backup_slug`, `install_deadline` (now
      plus 30 minutes, ISO 8601 UTC), `authorization` (`ship <Dane's Ship token>` after a Ship tap,
      `drill <his drill token>` after a drill tap), and `probe_hash` (for Cain:
      `git show <sha>:cain/rootfs/opt/cain/probe/keeper.ts | sha256sum | cut -c1-16`; for an App with no
-     verdict probe, the same of its `config.yaml`).
+     verdict probe, the same of its `config.yaml`). Write `attempt` alone: every other option (the
+     tokens, the Healthchecks URLs) exactly as it is. Since 0.1.1 a registration whose options lost or
+     changed a token or a URL is refused (`refusing <id>: the registration changed the keeper's own
+     settings`) and the Keeper keeps the ones it had. The authorization is one-time: the Keeper spends
+     each registration id at once and, once it has accepted it, empties `attempt` itself through the
+     Supervisor (its log says `cleared <id> ...`, or `couldn't clear <id> ...`, when the plain string
+     stays in its options, spent, until the next registration). Never write a spent id or authorization
+     again: the Keeper refuses it as a replay. Each install gets a new id and the authorization of its
+     own tap.
    - 4d. Read the Keeper App's log through the connector, for up to 2 minutes, for the line
      `accepting <id> <app> <from> to <to> backup <slug>`. Install nothing without it. A `refusing
      <id>: <why>` line, or no line, stops a ship-with-risk or drill install: report the line. For an
      ordinary install (no risk tap) the install goes on when the Keeper App isn't installed or doesn't
      answer, and the report says it went unwatched; a `refusing` line still stops it.
    - 4e. Never install the Keeper App itself while one of its attempts is open (its log says so):
-     wait until the attempt has ended.
+     wait until the attempt has ended. An attempt that ended "unresolved" counts as open for this
+     rule until its log says it was reconciled (`rolled back` or `gave up`), or Dane says go.
    In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. When it changed both, Cain first, then
    Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness
@@ -351,10 +362,14 @@ for 2 hours, without which Cain can't start the job.
    no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 5. Confirm the new version is running from the update result and the App's log.
 6. After each watched install, read the Keeper App's log through the connector until the attempt
-   ends (about 15 minutes after the new version first shows, longer after a rollback): `<id>: passed`,
-   `<id>: rolled back (...)`, `<id>: gave up (...)` or `<id>: install never started`. Report that line.
-   On a rollback or a give-up the Keeper has already told Dane through its own checks; the report
-   says what was rolled back and why, and installs nothing more.
+   ends (about 15 minutes after the new version first shows, about 5 more after a rollback):
+   `<id>: passed`, `<id>: rolled back (...)`, `<id>: gave up (...)`, `<id>: unresolved (...)` or
+   `<id>: install never started`. Report that line. A rollback runs as one Supervisor job: the Keeper
+   keeps its id and, when a call goes unanswered or it restarts, reconciles from that job and the App's
+   version before it sends anything again ("unresolved" when it can't tell: it sends nothing more by
+   itself, and checks again at its next start). On a rollback, a give-up or an unresolved attempt the
+   Keeper has already paged Dane through its own fail check; the report says what was rolled back and
+   why, and installs nothing more. Never restore or reinstall around an unresolved attempt: report it.
 
 The job is a cloud session, not a process on the Pi: Home Assistant's Supervisor does
 each update, so replacing Cain's container doesn't stop the job before Harness. If the

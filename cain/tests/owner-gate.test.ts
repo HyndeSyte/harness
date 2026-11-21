@@ -184,7 +184,7 @@ function render(dir: string, port: number, upstream: number, health = { port: 0,
   // Fourth round: the note of each /health 200 (time and address, for probe-drill.sh 7's gate) too.
   swap(/access_log \/run\/cain-web\/health-ok\.log /, `access_log ${dir}/health-ok.log `);
   swap(/if \(-f \/run\/cain-web\/www\/health-down\)/, `if (-f ${dir}/health-down)`);
-  // Cain 0.18.0: the link's gateway mark (link/health-gate.ts).
+  // Cain 0.18.0: the link's gateway mark (link/health-gate.ts), on /ready since 0.18.1.
   swap(/if \(!-f \/run\/cain-web\/www\/health-gateway\)/, `if (!-f ${dir}/health-gateway)`);
   swap(/^user nobody nogroup;$/m, "");
   // Root's pages (C1: /run/cain-web/www) and the upstreams (C1: unix sockets only nginx's workers and
@@ -352,17 +352,30 @@ describe.skipIf(!NGINX || !BASH)(`Cain's panel behind real nginx${NGINX ? "" : "
     expect(await at(h.port, "/health")).toEqual([503, "a self-restart is due"]);
     rmSync(join(h.dir, "health-down"));
     expect(await at(h.port, "/health")).toEqual([200, "ok"]);
-    // 0.18.0: without the link's gateway mark, 503 (Discord's gateway isn't connected), and 200 once it's back.
-    rmSync(join(h.dir, "health-gateway"));
-    expect(await at(h.port, "/health")).toEqual([503, "Discord's gateway isn't connected"]);
-    writeFileSync(join(h.dir, "health-gateway"), "1\n");
-    expect(await at(h.port, "/health")).toEqual([200, "ok"]);
-    for (const path of ["/", "/status", "/signin", "/tty/", "/health/x", "/healthz"]) expect([path, (await at(h.port, path))[0]]).toEqual([path, 404]);
-    // Not on the network (127.0.0.2/32 in this config): 404 even for /health, mark or none.
+    for (const path of ["/", "/status", "/signin", "/tty/", "/health/x", "/healthz", "/ready/x", "/readyz"]) expect([path, (await at(h.port, path))[0]]).toEqual([path, 404]);
+    // Not on the network (127.0.0.2/32 in this config): 404 even for /health and /ready, mark or none.
     const f = healthOf.get(foreign)!;
     expect((await at(f.port, "/health"))[0]).toBe(404);
+    expect((await at(f.port, "/ready"))[0]).toBe(404);
     writeFileSync(join(f.dir, "health-down"), "");
     expect((await at(f.port, "/health"))[0]).toBe(404);
+  });
+
+  // Cain 0.18.1: /health is liveness (it no longer depends on Discord's gateway) and /ready, beside it,
+  // is readiness: 200 only while the link's gateway mark is there, 503 otherwise.
+  test("/health is liveness and /ready readiness: the gateway mark moves /ready alone", async () => {
+    const h = healthOf.get(owned)!;
+    const at = (path: string) => fetch(`http://127.0.0.1:${h.port}${path}`).then(async (r) => [r.status, (await r.text()).trim()]);
+    expect(await at("/ready")).toEqual([200, "ready"]);
+    rmSync(join(h.dir, "health-gateway"));
+    expect(await at("/ready")).toEqual([503, "Discord's gateway isn't connected"]);
+    expect(await at("/health")).toEqual([200, "ok"]);
+    writeFileSync(join(h.dir, "health-down"), "");
+    expect(await at("/health")).toEqual([503, "a self-restart is due"]);
+    rmSync(join(h.dir, "health-down"));
+    writeFileSync(join(h.dir, "health-gateway"), "1\n");
+    expect(await at("/ready")).toEqual([200, "ready"]);
+    expect(await at("/health")).toEqual([200, "ok"]);
   });
 
   // Third round: the whole hassio network gets the answer (127.0.0.0/30 stands in for 172.30.32.0/23):

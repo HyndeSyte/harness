@@ -232,7 +232,8 @@ Since 0.18.0 the link reads that from the Keeper App (`GET /armed` with Cain's `
 minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
 binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
 the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
-Until the Keeper has run both drills for the App and its two Healthchecks checks are set, that card is
+Until the Keeper has run both drills for the App, its two Healthchecks checks are set and (Cain 0.18.1,
+Keeper 0.1.1) its heartbeat reached Healthchecks within the last 10 minutes, that card is
 refused and says what isn't armed (the Keeper's own documentation has the drills). The cap is the option
 `review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
 card in the link's `/data/link/review-decisions.json`.
@@ -439,9 +440,13 @@ bad one back from the backup taken just before it. Cain's part:
   being watched. If one is, it asks his session the liveness line once and gives the Keeper its
   verdict: PASS, or FAIL when he didn't answer within 10 minutes.
 - If the Keeper's last line about Cain is a rollback or a give-up, his bot says that line to you once.
-- His health check (`/health`, the Watchdog's URL and the Keeper's) answers 200 only while the link's
-  Discord connection is up and Discord acknowledged it within 5 minutes. With the Watchdog switch on,
-  Home Assistant now also restarts the App when Discord stays unreachable.
+- Two checks on port 8098, both for Home Assistant's internal network only (404 to any other address
+  and on any other path), since 0.18.1:
+  - `/health`, the Watchdog's URL, is liveness: 200 while the App runs, 503 only while a self-restart
+    is due. It doesn't depend on Discord, so a Discord outage doesn't make the Watchdog restart him.
+  - `/ready`, the one the Keeper asks after an install (its `health` option names the path), is
+    readiness: 200 only while the link's Discord connection is up and Discord acknowledged it within 5
+    minutes, 503 otherwise. (In 0.18.0 `/health` itself carried this; 0.18.1 split it out.)
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

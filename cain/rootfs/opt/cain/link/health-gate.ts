@@ -1,5 +1,6 @@
-// Cain's /health tied to the link's Discord gateway (Cain 0.18.0). nginx answers /health (port 8098,
-// the Supervisor's watchdog URL and the keeper App's check) 200 only while the mark below stands; the
+// Cain's readiness tied to the link's Discord gateway (Cain 0.18.0; since 0.18.1 on /ready, beside the
+// liveness /health). nginx answers /ready (port 8098, the keeper App's check; /health stays the
+// Supervisor's watchdog URL, liveness only) 200 only while the mark below stands; the
 // link writes it every 30 seconds only while its Discord gateway is connected and Discord acknowledged a
 // heartbeat within the last 5 minutes, and removes it otherwise. A mark the link stopped refreshing
 // (the link down) is removed by the run script's minute loop once it is 2 minutes old.

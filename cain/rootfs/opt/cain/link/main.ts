@@ -552,7 +552,7 @@ setInterval(() => {
     writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
     renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
   } catch { /* the probe then sees an old time, and fails that layer */ }
-  // Cain's /health (0.18.0, health-gate.ts): 200 only while the gateway is connected and acknowledged.
+  // Cain's /ready (0.18.1, health-gate.ts; /health is liveness only): 200 only while the gateway is connected and acknowledged.
   writeGatewayMark(gatewayHealthy(connected, proto.lastAck, Date.now()));
 }, 30_000);
 writeGatewayMark(false);
