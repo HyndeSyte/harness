@@ -40,6 +40,8 @@ export function decisionPoster(linkSock: string, log: (m: string) => void) {
 // process, ../plan-read.ts) and the Build hook's (run as Cain, which never scans a cold week itself) find
 // it warm. Synchronous, in this process: nothing here waits on Discord. Each warm reading goes to the
 // cache alarm (a failed write or a cache the trust check refuses; a count below the week's mark).
+// Round 3 of 0.17.0's review fixes: each warm is a reading asked, and one that throws counts as a failure,
+// so a reader that keeps failing (or is always incomplete) raises the plan alarm (guard.ts PlanCacheAlarm).
 export const WARM_MS = 15 * 60_000;
 export function planWarmer(o: { settingsFile: string; cacheFile: string; tz: string; dir?: string; alarm: PlanCacheAlarm; log: (m: string) => void;
     now?: () => Date; read?: typeof readPlanUsage }) {
@@ -50,12 +52,13 @@ export function planWarmer(o: { settingsFile: string; cacheFile: string; tz: str
     if (!force && w === week && now.getTime() - at < WARM_MS) return false;
     const turned = week !== "" && w !== week;
     week = w; at = now.getTime();
+    o.alarm.asked();
     try {
       const allowance = Number(readSettings(o.settingsFile)?.weekly_allowance_tokens ?? 0);
       const r = (o.read ?? readPlanUsage)({ now, tz: o.tz, allowance, cacheFile: o.cacheFile, saveCache: true, ...(o.dir ? { dir: o.dir } : {}) });
       o.alarm.saw(r);
       o.log(`plan cache warmed${turned ? " (the week turned)" : ""}: ${r.files} transcript files, ${r.skipped ?? 0} skipped, cache ${r.cache_write ?? "unchanged"}`);
-    } catch (e) { o.log(`couldn't warm the plan cache: ${String(e).slice(0, 80)}`); }
+    } catch (e) { o.log(`couldn't warm the plan cache: ${String(e).slice(0, 80)}`); o.alarm.failed(`the plan reader failed in the review runner (${String(e).slice(0, 80)})`); }
     return true;
   };
 }

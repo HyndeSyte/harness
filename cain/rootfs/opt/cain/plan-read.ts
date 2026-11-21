@@ -9,6 +9,12 @@
 //     budget, a finished one from the same week and the last FRESH_MS is answered instead;
 //   - the child has a hard limit (PLAN_READ_HARD_MS, 9 minutes) past which it stops reading and keeps
 //     what it read in the cache, and an environment of only the few names it needs (never a key).
+// Round 3 of the review fixes: while a new reading runs past the budget, the finished one from the same week
+// and the last FRESH_MS is answered whatever it said (a number, or unknown with its own reason: an allowance
+// of 0, a count below the mark), never relabelled "out of time"; nothing older is reused. A child that
+// fails (exits with an error, is killed at its hard limit, or prints no reading) comes back marked failed,
+// and every finished reading goes to onReading and every reading asked to onAsk, so the plan alarm
+// (guard.ts PlanCacheAlarm) hears a reader that keeps failing.
 // The review runner (root) warms the same cache at its start and whenever the plan's week turns
 // (review/main.ts), so the link's first reading after an install normally finds it warm.
 import { readPlanUsage, NOT_READY, weekStart, type PlanReading } from "./plan-usage.ts";
@@ -28,6 +34,7 @@ export type RefresherOpts = {
   tz?: string;
   now?: () => Date;
   onReading?: (p: PlanReading) => void;        // each finished reading (the cache alarm)
+  onAsk?: () => void;                          // round 3: each reading asked (the alarm for a reader that keeps failing)
   log?: (m: string) => void;
 };
 
@@ -46,7 +53,10 @@ export class PlanRefresher {
     return (async (): Promise<PlanReading> => {
       let p: ReturnType<typeof Bun.spawn>;
       try { p = Bun.spawn(cmd, { stdout: "pipe", stderr: "ignore", stdin: "ignore", env: { ...(this.o.env ?? childEnv()), PLAN_READ_HARD_MS: String(hard - 30_000 > 0 ? hard - 30_000 : hard) } }); }
-      catch (e) { return { fraction: null, at: at(), tokens_week: null, files: 0, reason: `the plan reader couldn't start (${String(e).slice(0, 60)})` }; }
+      catch (e) {
+        const why = `the plan reader couldn't start (${String(e).slice(0, 60)})`;
+        return { fraction: null, at: at(), tokens_week: null, files: 0, complete: false, failed: why, reason: why };
+      }
       const kill = setTimeout(() => { try { p.kill(9); } catch { /* gone */ } }, hard);
       try {
         const [out, code] = await Promise.all([new Response(p.stdout as ReadableStream).text(), p.exited]);
@@ -54,13 +64,15 @@ export class PlanRefresher {
         if (code !== 0 || !j || typeof j !== "object" || typeof j.at !== "string") throw new Error(`exit ${code}`);
         return j as PlanReading;
       } catch (e) {
-        return { fraction: null, at: at(), tokens_week: null, files: 0, reason: `the plan reader didn't finish (${String((e as Error)?.message ?? e).slice(0, 60)})` };
+        const why = `the plan reader didn't finish (${String((e as Error)?.message ?? e).slice(0, 60)})`;
+        return { fraction: null, at: at(), tokens_week: null, files: 0, complete: false, failed: why, reason: why };
       } finally { clearTimeout(kill); }
     })();
   }
 
   // A reading within the budget, or "not ready". Never blocks the event loop: the reading is a child's.
   async read(budgetMs = this.o.budgetMs ?? BUDGET_MS): Promise<PlanReading> {
+    try { this.o.onAsk?.(); } catch (e) { (this.o.log ?? console.log)(`the plan reading's alarm failed: ${String(e).slice(0, 80)}`); }
     if (!this.inflight) {
       const run = this.run().then((r) => {
         this.last = r; this.lastAt = (this.o.now ?? (() => new Date()))().getTime();
@@ -78,12 +90,23 @@ export class PlanRefresher {
     } finally { clearTimeout(timer); }
     const now = (this.o.now ?? (() => new Date()))();
     const sameWeek = !!this.last && (this.last.week_start ?? "") === weekStart(now, this.o.tz ?? guardPaths().tz).toISOString();
-    if (sameWeek && this.last!.fraction !== null && now.getTime() - this.lastAt < (this.o.freshMs ?? FRESH_MS)) return this.last!;
+    // Round 3: whatever the fresh reading said, with its own reason (not only a number).
+    if (sameWeek && now.getTime() - this.lastAt < (this.o.freshMs ?? FRESH_MS)) return this.last!;
     const cold = !sameWeek;
     const not_ready = cold ? "cache cold" : "out of time";
     (this.o.log ?? console.log)(`the plan reading took more than ${budgetMs} ms (${not_ready}); it goes on in the background`);
     return { fraction: null, at: now.toISOString(), tokens_week: null, files: 0, complete: false, not_ready,
       reason: `${NOT_READY}: ${not_ready} (the link's reading took more than ${Math.round(budgetMs / 100) / 10} s; it goes on and warms the cache)` };
+  }
+
+  // Round 3: the not-ready state the refresher reports now for this week ("cache cold", "out of time"), or
+  // null when its reading is ready (or another week's). The link writes the Build hook's own not-ready hold
+  // line only when this names the same state (link/core.ts guardHoldFor).
+  async notReadyNow(budgetMs?: number): Promise<string | null> {
+    const r = await this.read(budgetMs);
+    if (!r.not_ready) return null;
+    const week = weekStart((this.o.now ?? (() => new Date()))(), this.o.tz ?? guardPaths().tz).toISOString();
+    return r.week_start === undefined || r.week_start === week ? r.not_ready : null;
   }
 }
 

@@ -136,14 +136,24 @@ export function asideStep(aside: string): string {
 
 // The temp files a tap's write leaves only when the link died mid-write (round 3): swept at the link's
 // start. Only the decisions file's own temp names (".<name>.<pid>.tmp") in its folder.
+// 0.17.0, round 3 of its review fixes: the reset mark's temp names too (".<name>.reset.<pid>.tmp"), swept
+// at every sweep as well, and never an active write's: not this process's own, not one whose process is
+// alive, and not one changed in the last ACTIVE_TEMP_MS.
+export const ACTIVE_TEMP_MS = 60_000;
 export function tempOf(path: string, pid = process.pid): string { return join(dirname(path), `.${basename(path)}.${pid}.tmp`); }
-export function sweepTemps(path: string, log: (m: string) => void = () => {}): number {
-  const re = new RegExp(`^\\.${basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.tmp$`);
+const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
+export function sweepTemps(path: string, log: (m: string) => void = () => {}, o: { now?: () => number; alive?: (pid: number) => boolean } = {}): number {
+  const re = new RegExp(`^\\.${basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.reset)?\\.(\\d+)\\.tmp$`);
   let n = 0;
   let names: string[] = [];
   try { names = readdirSync(dirname(path)); } catch { return 0; }
+  const now = (o.now ?? Date.now)();
   for (const name of names) {
-    if (!re.test(name)) continue;
+    const m = re.exec(name);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    if (pid === process.pid || (o.alive ?? alive)(pid)) continue;          // a write that may be under way
+    try { if (now - statSync(join(dirname(path), name)).mtimeMs < ACTIVE_TEMP_MS) continue; } catch { continue; }
     try { unlinkSync(join(dirname(path), name)); n++; } catch (e) { log(`couldn't remove a stale temp file ${name}: ${String(e).slice(0, 60)}`); }
   }
   if (n) log(`removed ${n} stale temp file${n === 1 ? "" : "s"} of ${basename(path)}`);
@@ -164,6 +174,15 @@ export function readReset(path: string): number | null {
   try { t = readFileSync(resetOf(path), "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? null : NaN; }
   const n = Number(t.trim());
   return Number.isFinite(n) && n > 0 ? n : NaN;
+}
+// The way back from a mark that can't be read (0.17.0, round 3 of its review fixes): never a delete, which
+// would drop the reset boundary (once the moved-aside file is gone too, cards from before the reset would be
+// taken again). The mark is written again whole with the current time, a fresh boundary later than any
+// earlier reset, so every card posted before it is refused and posted again. The link's sweep does this
+// itself when it finds the mark unreadable; as root, `bun /opt/cain/link/cap.ts reset-mark` does the same.
+export const RESET_MARK_COMMAND = "bun /opt/cain/link/cap.ts reset-mark";
+export function rewriteResetMark(path: string, when: number, o: { sync?: (dir: string) => void; rename?: (from: string, to: string) => void } = {}): void {
+  writeWhole(resetOf(path), String(when), o);
 }
 function writeWhole(path: string, text: string, o: { sync?: (dir: string) => void; rename?: (from: string, to: string) => void } = {}): void {
   const tmp = tempOf(path);
@@ -274,8 +293,9 @@ export function holdLogged(path: string, tag: string, what: string): boolean {
 // cause changes) and cleared once it's gone, by the link's sweep (main.ts):
 //   "review-decision"   a stored answer isn't one of its card's options (cleared once none is);
 //   "review-holdlog"    the guard's log can't be read (cleared once it reads);
-//   "review-resetmark"  the reset mark is there and can't be read, which pauses every decision (cleared once
-//                       it reads again or is gone);
+//   "review-resetmark"  the reset mark is there and can't be read, which pauses every decision (round 3: the
+//                       sweep first writes it again whole with the current time, a fresh boundary, and raises
+//                       this only when that fails; cleared once it reads again);
 //   "review-resetwrite" the reset mark couldn't be written, so a decisions file that didn't parse wasn't moved
 //                       aside (raised at once by markFailed; cleared once the file reads or was moved aside).
 export class CapAlarms {
@@ -283,7 +303,8 @@ export class CapAlarms {
   private holdLog: boolean | null = null;
   private mark: boolean | null = null;
   private markWrite: string | null = null;
-  constructor(private o: { decided: string; guardLog: string; raise: (kind: string, cause: string) => void; clear: (group: string) => void; log?: (m: string) => void }) {}
+  constructor(private o: { decided: string; guardLog: string; raise: (kind: string, cause: string) => void; clear: (group: string) => void; log?: (m: string) => void;
+    now?: () => number; rewriteMark?: (path: string, when: number) => void }) {}
   markFailed(why: string): void {
     (this.o.log ?? (() => {}))(`his decisions file wasn't moved aside: ${why}`);
     if (why !== this.markWrite) { this.o.raise("review-resetwrite", why); this.markWrite = why; }
@@ -300,9 +321,19 @@ export class CapAlarms {
     if (!trouble && this.holdLog !== false) { this.o.clear("holdlog"); this.holdLog = false; }
     else if (trouble && this.holdLog !== true) { this.o.raise("review-holdlog", trouble); this.holdLog = true; }
     const r = readReset(this.o.decided);
-    const markBad = r !== null && Number.isNaN(r);
+    let markBad = r !== null && Number.isNaN(r);
+    let failed = "";
+    if (markBad) {
+      // Round 3: written again whole with now as a fresh boundary before decisions resume; never removed.
+      const when = (this.o.now ?? Date.now)();
+      try {
+        (this.o.rewriteMark ?? ((p, t) => rewriteResetMark(p, t)))(this.o.decided, when);
+        markBad = !(readReset(this.o.decided) === when);
+        if (!markBad) log(`the reset mark ${resetOf(this.o.decided)} couldn't be read, so it was written again with the current time: cards posted before now are refused and posted again`);
+      } catch (e) { failed = String((e as Error)?.message ?? e).slice(0, 60); }
+    }
     if (markBad && this.mark !== true) {
-      log(`the reset mark ${resetOf(this.o.decided)} can't be read: decisions are paused`);
+      log(`the reset mark ${resetOf(this.o.decided)} can't be read and couldn't be written again${failed ? ` (${failed})` : ""}: decisions are paused`);
       this.o.raise("review-resetmark", resetOf(this.o.decided)); this.mark = true;
     } else if (!markBad && this.mark !== false) { if (this.mark) log("the reset mark reads again (or is gone): decisions resume"); this.o.clear("resetmark"); this.mark = false; }
     if (this.markWrite !== "" && (decided !== null || aside.length)) {
@@ -361,4 +392,13 @@ export function armedFor(apps: string[] | null, text: string | null): { armed: b
 }
 export function readArmed(path = ARMED_FILE): string | null {
   try { return readFileSync(path, "utf8"); } catch { return null; }
+}
+
+// As root on the Pi (round 3): `bun /opt/cain/link/cap.ts reset-mark` writes the reset mark again whole with
+// the current time (RESET_MARK_COMMAND), the way back the unreadable-mark alarm names.
+if (import.meta.main) {
+  if (process.argv[2] !== "reset-mark") { console.log(`usage: ${RESET_MARK_COMMAND}`); process.exit(2); }
+  const when = Date.now();
+  try { rewriteResetMark(DECISIONS_FILE, when); console.log(`${resetOf(DECISIONS_FILE)} written again with the current time (${when}): cards posted before now are refused and posted again; the link's next sweep clears the alarm`); }
+  catch (e) { console.log(`${resetOf(DECISIONS_FILE)} couldn't be written (${String((e as Error)?.message ?? e).slice(0, 80)})`); process.exit(1); }
 }

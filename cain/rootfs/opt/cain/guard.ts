@@ -153,16 +153,60 @@ export function readings(o: { settingsFile: string; spendFile: string; tz: strin
 // or the trust check refuses it (owner, group or mode), raised at most once an hour unless its cause
 // changes, and cleared after a good write; "review-planshrink" when a reading fell below this week's
 // high-water mark, naming what shrank, cleared by the next reading that doesn't.
+// Round 3: "review-planread" when the reader keeps failing (a child that exits with an error or is killed,
+// a reading out of time, an incomplete one): after READ_FAILS_ALARM in a row, or READ_STUCK_MS with
+// readings asked and none complete, raised at most once an hour unless its kind of failure changes, naming
+// the cause, and cleared by the next complete reading. The runner's warm and the link's refresher both
+// feed it (saw for each finished reading, asked for each reading asked, failed for one that threw).
+export const READ_FAILS_ALARM = 2;
+export const READ_STUCK_MS = 30 * 60_000;
+// Why a finished reading counts as a failure of the reader, or null for a complete one.
+export function readFailure(p: Partial<PlanReading>): { kind: string; cause: string } | null {
+  if (p.failed) return { kind: "crash", cause: p.failed };
+  if (p.not_ready) return { kind: "time", cause: `the reading ran out of time (${p.reason ?? p.not_ready})` };
+  if (p.complete !== true) return { kind: "incomplete", cause: `the reading was incomplete (${p.reason ?? "some transcript files weren't counted"})` };
+  return null;
+}
 export class PlanCacheAlarm {
   private up: string | null = null;
   private at = 0;
   private shrinkUp: string | null = null;
+  private fails = 0;
+  private askedSince: number | null = null;
+  private readUp: string | null = null;                // the kind of failure raised; "" once cleared
+  private readAt = 0;
   constructor(private o: { raise?: (kind: string, cause: string) => void; clear?: (group: string) => void; log?: (m: string) => void; now?: () => number; quietMs?: number } = {}) {}
   private raise(kind: string, cause: string) { (this.o.raise ?? ((k, c) => raiseAlarm(c, this.o.log, k)))(kind, cause); }
   private clear(group: string) { (this.o.clear ?? ((g) => clearAlarm(this.o.log, g)))(group); }
+  private readTrouble(kind: string, cause: string): void {
+    const now = (this.o.now ?? Date.now)();
+    if (kind === this.readUp && now - this.readAt < (this.o.quietMs ?? 3_600_000)) return;
+    (this.o.log ?? console.log)(`the plan reader keeps failing: ${cause}`);
+    this.raise("review-planread", cause.slice(0, 200)); this.readUp = kind; this.readAt = now;
+  }
+  // A reading was asked for (round 3): READ_STUCK_MS of asking with no complete reading raises the alarm.
+  asked(): void {
+    const now = (this.o.now ?? Date.now)();
+    if (this.askedSince === null) { this.askedSince = now; return; }
+    if (now - this.askedSince >= READ_STUCK_MS)
+      this.readTrouble("stuck", `no complete plan reading in the ${Math.round((now - this.askedSince) / 60_000)} minutes readings were asked for`);
+  }
+  // A reading that threw before it finished (the runner's warm, in its own process).
+  failed(cause: string): void { this.saw({ failed: cause }); }
   // One reading's outcome (a PlanReading from a part that writes the cache).
   saw(p: Partial<PlanReading>): void {
     const now = (this.o.now ?? Date.now)();
+    const f = readFailure(p);
+    if (f) {
+      this.fails++;
+      if (this.askedSince === null) this.askedSince = now;
+      if (this.fails >= READ_FAILS_ALARM) this.readTrouble(f.kind, `${this.fails} plan readings in a row failed, the last: ${f.cause}`);
+      else if (now - this.askedSince >= READ_STUCK_MS) this.readTrouble("stuck", `no complete plan reading in ${Math.round((now - this.askedSince) / 60_000)} minutes, the last: ${f.cause}`);
+    } else {
+      this.fails = 0; this.askedSince = null;
+      if (this.readUp !== "") { if (this.readUp) (this.o.log ?? console.log)("the plan reader gave a complete reading again"); this.clear("planread"); this.readUp = ""; }
+    }
+    if (p.failed) return;
     const trouble = p.cache_write && p.cache_write !== "ok" ? p.cache_write : p.cache_untrusted ? `the plan reader's cache was refused by the trust check: ${p.cache_untrusted}` : null;
     if (trouble) {
       if (trouble !== this.up || now - this.at >= (this.o.quietMs ?? 3_600_000)) {

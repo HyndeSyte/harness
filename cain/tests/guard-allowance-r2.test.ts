@@ -180,7 +180,8 @@ describe("fix 2: the Build hook's budget and a cold cache", () => {
     const r = rig({ holds: keeperHolds({}) });
     const lines: string[] = [];
     let read = 0;
-    Object.assign((r.link as any).d, { guardHold: () => { read++; return { ok: true }; }, holdLog: (l: string) => { lines.push(l); } });
+    // Round 3: only while the link's own refresher reports the same not-ready state (guard-allowance-r3.test.ts).
+    Object.assign((r.link as any).d, { guardHold: () => { read++; return { ok: true }; }, holdLog: (l: string) => { lines.push(l); }, planNotReady: async () => "cache cold" });
     const v = await (r.link as any).guardHoldFor({ label: "other", what: "Build on claude/x", hook: "cache cold" }, "cain");
     expect(v.status).toBe("held");
     expect(read).toBe(0);
@@ -403,7 +404,9 @@ describe("fix 5: the sweep raises and clears the three alarms", () => {
     const file = tmpFile();
     const log = join(file, "..", "review-guard.log");
     const raised: [string, string][] = [], cleared: string[] = [];
-    const a = new CapAlarms({ decided: file, guardLog: log, raise: (k, c) => raised.push([k, c]), clear: (g) => cleared.push(g) });
+    // Round 3: the sweep first writes an unreadable mark again; here that write fails, so the alarm stands.
+    const a = new CapAlarms({ decided: file, guardLog: log, raise: (k, c) => raised.push([k, c]), clear: (g) => cleared.push(g),
+      rewriteMark: () => { throw new Error("EROFS"); } });
     a.sweep();                                                                 // all fine: each group cleared once at the start
     expect(raised).toEqual([]);
     expect(cleared.sort()).toEqual(["decision", "holdlog", "resetmark", "resetwrite"]);
@@ -430,8 +433,9 @@ describe("fix 5: the sweep raises and clears the three alarms", () => {
   test("notice.sh's mark alarm names the file and how to clear it", () => {
     const out = spawnSync("bash", [join(S, "notice.sh"), "text", "review-resetmark", "/data/link/review-decisions.json.reset"], { encoding: "utf8" }).stdout;
     expect(out).toContain("/data/link/review-decisions.json.reset");
-    expect(out).toContain("rm /data/link/review-decisions.json.reset");
-    expect(out).toContain("clears once the mark reads again or is gone");
+    // Round 3: never a delete; the command that writes it again (guard-allowance-r3.test.ts).
+    expect(out).toContain("bun /opt/cain/link/cap.ts reset-mark");
+    expect(out).toContain("clears once the mark reads again");
     const main = readFileSync(join(S, "link", "main.ts"), "utf8");
     expect(main).toContain("capAlarms.sweep();");
     expect(main).toContain("onMarkFailed: (why) => capAlarms.markFailed(why)");

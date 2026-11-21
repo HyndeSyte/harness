@@ -15,6 +15,7 @@
 //   /data/review-plan-cache.json        root:cain 0640   the plan reader's cache (0.17.0): root's parts write
 //                                       it, Cain's only read it, and only while root owns it; never alarmed
 // A file that is wrong turns the cap and guard features off and raises one alarm naming it.
+import { spawn } from "node:child_process";
 import { lstatSync, readFileSync, type Stats } from "node:fs";
 
 export const TEST_MODE_VAR = "CAIN_TEST_MODE";
@@ -97,6 +98,30 @@ export function raiseAlarm(cause: string, log: (m: string) => void = console.log
     const r = Bun.spawnSync(["timeout", "-k", "2", "40", NOTICE, "tell", kind, cause], { stdout: "inherit", stderr: "inherit" });
     if (r.exitCode !== 0) log(`the alarm (${kind}) didn't go yet (notice.sh ${r.exitCode}); raised again at the next change`);
   } catch (e) { log(`couldn't raise the alarm (${kind}): ${String(e).slice(0, 80)}`); }
+}
+
+// The link's alarms (0.17.0, round 3 of the review fixes): notice.sh can take up to 40 seconds (its lock,
+// then Discord and Home Assistant), and raiseAlarm above waits for it. On the link's event loop that would
+// hold up Discord's taps past their 3 seconds. So every alarm the link raises or clears starts notice.sh
+// detached, with its own timeout (timeout -k 2 40), and never waits for it: the outcome is logged when it
+// ends, and a failure to start is logged at once. The runner (not on Discord's clock) keeps the waiting
+// forms. bin: notice.sh, or (in test mode only) CAIN_NOTICE.
+export const noticeBin = (env: Record<string, string | undefined> = process.env) => pathOf("CAIN_NOTICE", NOTICE, env);
+export const NOTICE_LIMIT_S = 40;
+export function noticeDetached(args: string[], what: string, log: (m: string) => void = console.log, bin = noticeBin()): boolean {
+  try {
+    const c = spawn("timeout", ["-k", "2", String(NOTICE_LIMIT_S), bin, ...args], { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+    c.on("error", (e) => log(`couldn't start notice.sh for ${what}: ${String((e as Error)?.message ?? e).slice(0, 80)}`));
+    c.on("exit", (code, sig) => { if (code !== 0) log(`${what} didn't go yet (notice.sh ${code ?? sig}); raised again at the next change`); });
+    c.unref();
+    return true;
+  } catch (e) { log(`couldn't start notice.sh for ${what}: ${String(e).slice(0, 80)}`); return false; }
+}
+export function raiseAlarmDetached(cause: string, log: (m: string) => void = console.log, kind = "review-files", bin?: string): void {
+  noticeDetached(["tell", kind, cause], `the alarm (${kind})`, log, bin);
+}
+export function clearAlarmDetached(log: (m: string) => void = console.log, group = "review", bin?: string): void {
+  noticeDetached(["clear", group], `the alarm's clearing (${group})`, log, bin);
 }
 
 // How Cain runs this start (the run script's /run/cain/mode): "own" (his own user), "old" (as root,

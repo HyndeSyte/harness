@@ -356,6 +356,34 @@ fraction). Only you change the option, in the App's Configuration; Cain and the 
 also set `plan_allowance_set_on` (the date, YYYY-MM-DD) and `plan_allowance_derivation` (how you worked it out,
 in a line); the runner writes both beside the allowance, and `review.sh guard`'s first line prints them.
 
+The third round of review fixes (0.17.0):
+
+- Alarms never hold up your taps. Each alarm the link raises or clears starts the App's notice script in
+  the background, with its own 40 second limit, and the link never waits for it; a notice that fails is
+  in the App's log. (The review runner, which isn't on Discord's clock, still waits for its own.)
+- The high-water mark never goes down. The runner and the link both save the plan cache; each now takes a
+  short lock (`/data/review-plan-cache.json.lock`, left by a writer that died only for 30 seconds), reads
+  the mark as it is on disk, keeps the larger, and saves under the lock. A reading below the mark another
+  reading kept since it began is unknown (held) without an alarm, and the next reading catches up.
+- A plan reader that keeps failing (a child that crashes or is killed, a reading out of time, an
+  incomplete one), two in a row or half an hour of readings asked with none complete, raises an alarm
+  naming the cause, at most hourly, and the next complete reading clears it.
+- While a new reading runs long, a finished one from the same week and the last 2 minutes is answered with
+  whatever it said, its own reason included; nothing older is reused.
+- The link writes the Build hook's own "plan reading not ready" hold line only when its own reading is not
+  ready the same way this week; any other such request is refused and logged, writes nothing and counts
+  toward neither the holds' limit nor its alarm.
+- A Healthchecks.io change whose line to you can't be posted (the notice fails, or the line breaks the
+  message gate's rules: no em dash, no ISO time, no ids) raises an alarm naming the check, at most hourly.
+- The reset mark of your review-cap answers is never deleted. When it can't be read, the link's next sweep
+  writes it again whole with the current time, a fresh boundary, so every card from before it is refused
+  and posted again. If that fails the alarm names the command to run as root on the Pi:
+  `bun /opt/cain/link/cap.ts reset-mark`. The sweep also removes leftover temp files of the decisions file
+  and of the reset mark (never one whose writer is still running, or one changed in the last minute).
+
+Still to check on the Pi after installing: the link answers a tap while an alarm is being sent; the
+cache's lock file comes and goes; the 2 second link budget.
+
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
 

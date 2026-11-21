@@ -16,6 +16,14 @@
 - Your review-cap answers: the reset mark is written safely before the old file is moved aside (and the file stays put if the mark can't be written, with an alarm), and a mark that can't be read raises an alarm naming the file and how to clear it.
 - Passing Build checks no longer use up the usage guard's limit of 6 holds a minute; checks have their own, higher limit.
 - Heartbeat checks: grace and period are each capped at one hour, and every change Cain makes is posted to you in one line with the old and new values. The Healthchecks key now reaches the link in a root-only file, never an environment its helper programs could see.
+- Third round of review fixes: the App's alarms no longer hold up your taps. The link starts each alarm in the background with its own time limit, so a tap is answered while an alarm is still being sent.
+- The plan count's high-water mark can no longer go down when the review runner and the link both save it at once: each keeps the larger mark, and a reading behind the newer one holds other work until the next reading catches up.
+- If the reset mark of your review-cap answers can't be read, the App writes it again with the current time instead of asking you to delete it, so cards from before the reset still can't be answered. If it can't, the alarm names the one command to run as root.
+- A plan reader that keeps failing (two readings in a row, or half an hour with none complete) now raises its own alarm with the cause, and it clears with the next complete reading.
+- While a new plan reading runs long, a reading from the last 2 minutes is used with its own reason, so a missing allowance is no longer reported as "out of time".
+- The link writes the Build hook's "not ready" hold line only when its own plan reading is not ready the same way; any other such request is refused and not counted.
+- A heartbeat change whose line couldn't be posted to you now raises an alarm naming the check, at most hourly, and the line is checked against the message gate's rules first.
+- Leftover temp files from an interrupted reset mark write are cleaned up, never one still being written.
 
 ## 0.16.0
 

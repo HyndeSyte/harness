@@ -73,12 +73,12 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
-import { hcCall, takeKey } from "./healthchecks";
+import { HcAnnounceAlarm, hcCall, takeKey } from "./healthchecks";
 import { PlanRefresher } from "../plan-read";
 import { appendCapped, asideOf, CapAlarms, capState, DECISIONS_FILE, GUARD_LOG, holdLogged, markHoldWritten, readArmed, readReset, recordDecision,
   roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
-import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
+import { clearAlarmDetached, raiseAlarmDetached, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths, PlanCacheAlarm } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
@@ -225,8 +225,15 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 // ../capfiles.ts): one wrong turns those features off here, with one alarm naming it. Round 3: run
 // again at each sweep, so they come back without a restart once the file is right, and the alarm clears.
 const capLog = (m: string) => console.log(`[cain] link: ${m}`);
-let capOff: string | null = selfCheck({ log: capLog });
-// Round 3: a tap's temp file left by a link that died mid-write is swept at the start.
+// Round 3 of 0.17.0's review fixes: every alarm the link raises or clears starts notice.sh detached, with
+// its own timeout, and never waits for it on this event loop (../capfiles.ts raiseAlarmDetached), so a tap
+// is answered while a notice runs its 40 seconds.
+const raiseAlarm = (cause: string, log: (m: string) => void, kind: string) => raiseAlarmDetached(cause, log, kind);
+const clearAlarm = (log: (m: string) => void, group: string) => clearAlarmDetached(log, group);
+const selfAlarm = { alarm: (c: string) => raiseAlarm(c, capLog, "review-files"), clear: () => clearAlarm(capLog, "review") };
+let capOff: string | null = selfCheck({ log: capLog, ...selfAlarm });
+// Round 3: a tap's temp file left by a link that died mid-write is swept at the start (and, since 0.17.0's
+// third round of review fixes, at each sweep, the reset mark's temp names included, never a live write's).
 sweepTemps(DECIDED, capLog);
 // Round 3: the alarm for his decisions file moved aside names the copy and the step back; it's raised
 // while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
@@ -236,7 +243,8 @@ const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisi
 const capAlarms = new CapAlarms({ decided: DECIDED, guardLog: GUARD_LOG, log: capLog,
   raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
 const capSweep = () => {
-  capOff = selfCheck({ log: capLog, prev: capOff });
+  capOff = selfCheck({ log: capLog, prev: capOff, ...selfAlarm });
+  sweepTemps(DECIDED, capLog);
   const a = asideOf(DECIDED);
   if (a.length && asideUp !== true) asideAlarm(a[0]);
   else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
@@ -246,8 +254,10 @@ const capSweep = () => {
 // The plan reading (0.17.0, round 2): in a child process with a time budget (../plan-read.ts), never on
 // this event loop, so a tap is answered while a cold read runs. Its cache alarm (guard.ts PlanCacheAlarm)
 // hears each reading. The first reading starts now, which warms the cache too.
-const planAlarm = new PlanCacheAlarm({ log: capLog });
-const plan = new PlanRefresher({ tz: process.env.CHECKIN_TZ ?? "America/New_York", log: capLog, onReading: (p) => planAlarm.saw(p) });
+// Round 3: its alarms start notice.sh detached (never awaited here), and it hears every reading asked, so
+// a reader that keeps failing raises its own alarm.
+const planAlarm = new PlanCacheAlarm({ log: capLog, raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
+const plan = new PlanRefresher({ tz: process.env.CHECKIN_TZ ?? "America/New_York", log: capLog, onReading: (p) => planAlarm.saw(p), onAsk: () => planAlarm.asked() });
 void plan.read().catch(() => {});
 
 const link = new Link({
@@ -301,6 +311,8 @@ const link = new Link({
     const p = guardPaths();
     return guard(label, what, { settingsFile: SETTINGS_FILE, spendFile: p.spend, tz: p.tz, now: new Date(), ...(reading ? { plan: () => reading } : {}) });
   },
+  // Round 3: a hook-requested hold line only when this refresher reports the same not-ready state now.
+  planNotReady: () => plan.notReadyNow(),
   holdLog: (line) => appendCapped(GUARD_LOG, line),
   hasHold: (tag, what) => holdLogged(GUARD_LOG, tag, what),
   alarm: (kind, cause) => raiseAlarm(cause, capLog, kind),
@@ -380,10 +392,13 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 
 // The routes themselves, and who may call each, are in http.ts (linkRoutes), so a test serves
 // exactly what both servers here serve (0.12.0 twenty-third round; C1 put the caller in front).
+const hcAlarm = new HcAnnounceAlarm({ raise: (kind, cause) => raiseAlarm(cause, capLog, kind), clear: (group) => clearAlarm(capLog, group) });
 const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ,
   // Round 2: every set the service takes is relayed to Cain and posted to his DM, one plain line.
   hc: (b: unknown) => hcCall(b, { key: () => HC_KEY, log: (l) => console.log(`[cain] link: ${l}`),
-    announce: async (line) => { link.relayLine(`${line} Nothing to tell him: the link posted it to him.`); await link.notice(line, NOTICE_TIMEOUT_MS); } }) };
+    announce: async (line) => { link.relayLine(`${line} Nothing to tell him: the link posted it to him.`); await link.notice(line, NOTICE_TIMEOUT_MS); },
+    // Round 3: a set line that couldn't be posted raises its own alarm (at most hourly per check).
+    announceFailed: (name, why) => hcAlarm.failed(name, why), announced: () => hcAlarm.posted() }) };
 const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept

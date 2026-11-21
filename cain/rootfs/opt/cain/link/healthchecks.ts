@@ -10,7 +10,11 @@
 // its own dead-man alarm. The link holds hard ceilings (HC_CEILING_S: one hour each), whatever keeper.sh
 // sends; a set above one is refused naming it. Every set the service takes is relayed to Cain and posted
 // to the owner's DM by the link, one plain line with the check's name and the old and new values.
+// Round 3: a set whose line to the owner can't be posted (the link's notice path fails, or the message gate's
+// rules refuse the line) raises a rate-limited alarm naming the check (HcAnnounceAlarm, notice.sh "hc-announce"),
+// not only a log line; the next line that is posted clears it.
 import { readFileSync } from "node:fs";
+import { check as gateCheck, verdict as gateVerdict, type Rule } from "../gate/rules";
 import { appendSynced } from "./auth";
 
 export const HC_API = "https://healthchecks.io/api/v3";
@@ -38,7 +42,34 @@ export type HcDeps = {
   now?: () => number;
   api?: string;
   announce?: (line: string) => void | Promise<void>;     // round 2: a set the service took, to Cain and the owner's DM
+  announceFailed?: (name: string, why: string) => void;  // round 3: its line couldn't be posted (the alarm)
+  announced?: () => void;                                // round 3: its line was posted (clears the alarm)
 };
+
+// The message gate's rules for a line the link posts in its own name (round 3): what the gate refuses in
+// the assistant's words, every em dash included, so a set line never carries a dash, an ISO time or an id.
+export const HC_LINE_RULES: readonly Rule[] = ["dash", "app", "count", "machine"];
+export function lineTrouble(line: string): string | null {
+  const r = gateCheck(line, { rules: HC_LINE_RULES, refusable: true });
+  return gateVerdict(r) === "pass" ? null : [...new Set(r.hits.map((h) => h.rule))].join(", ");
+}
+
+// The alarm for a set line that couldn't be posted: at most once an hour per check; cleared by the next
+// line that is posted.
+export class HcAnnounceAlarm {
+  private last = new Map<string, number>();
+  private up = false;
+  constructor(private o: { raise: (kind: string, cause: string) => void; clear: (group: string) => void; now?: () => number; quietMs?: number }) {}
+  failed(name: string, why: string): void {
+    const now = (this.o.now ?? Date.now)();
+    const at = this.last.get(name);
+    if (at !== undefined && now - at < (this.o.quietMs ?? 3_600_000)) return;
+    this.last.set(name, now);
+    this.up = true;
+    this.o.raise("hc-announce", `the check "${name}": ${why}`.slice(0, 200));
+  }
+  posted(): void { if (this.up) { this.up = false; this.last.clear(); this.o.clear("hcset"); } }
+}
 export type HcAnswer = { status: "ok"; said: string; check?: Record<string, unknown> } | { status: "refused" | "error"; said: string };
 
 const clean = (s: unknown, max = 80) => String(s ?? "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, max);
@@ -58,8 +89,9 @@ const line = (c: Record<string, unknown>) =>
 
 // The one plain line a set makes (round 2): the check's name (letters, digits and a few marks only, so it
 // reads plainly and passes the message gate) and the old and new values.
+export const plainName = (name: string) => String(name).replace(/[^A-Za-z0-9 ._()-]+/g, "?").replace(/\s+/g, " ").trim().slice(0, 60) || "?";
 export function setLine(name: string, before: Record<string, unknown>, after: Record<string, unknown>): string {
-  const n = String(name).replace(/[^A-Za-z0-9 ._()-]+/g, "?").replace(/\s+/g, " ").trim().slice(0, 60) || "?";
+  const n = plainName(name);
   return `Cain set the Healthchecks.io check "${n}": grace ${before.grace ?? "?"} to ${after.grace ?? "?"} seconds, period ${before.period ?? "?"} to ${after.period ?? "?"} seconds.`;
 }
 
@@ -123,8 +155,17 @@ export async function hcCall(b: any, d: HcDeps): Promise<HcAnswer> {
   if (d.logFile !== null) { try { appendSynced(d.logFile ?? HC_LOG, JSON.stringify(entry) + "\n"); } catch (e) { (d.log ?? console.log)(`healthchecks: couldn't write the set log: ${clean(String(e), 60)}`); } }
   if (!after) return { status: "error", said: `Healthchecks.io answered ${r.status} to the change${r.body?.error ? `: ${clean(r.body.error)}` : ""}` };
   if (d.announce) {
-    try { await d.announce(setLine(name, before, after)); }
-    catch (e) { (d.log ?? console.log)(`healthchecks: couldn't announce the set: ${clean(String(e), 60)}`); }
+    const said = setLine(name, before, after);
+    const bad = lineTrouble(said);
+    let failed: string | null = bad ? `the message gate's rules refuse its line (${bad})` : null;
+    if (!failed) {
+      try { await d.announce(said); }
+      catch (e) { failed = `the link couldn't post its line (${clean(String(e), 60)})`; }
+    }
+    if (failed) {
+      (d.log ?? console.log)(`healthchecks: couldn't announce the set of ${clean(name)}: ${failed}`);
+      try { d.announceFailed?.(plainName(name), failed); } catch (e) { (d.log ?? console.log)(`healthchecks: couldn't raise the set line's alarm: ${clean(String(e), 60)}`); }
+    } else { try { d.announced?.(); } catch { /* the clearing is tried again at the next set */ } }
   }
   return { status: "ok", said: `Healthchecks.io answered: ${line(after)}`, check: after };
 }

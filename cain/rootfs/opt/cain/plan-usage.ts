@@ -36,14 +36,22 @@
 //   - the cache write's outcome and a cache the trust check refused come back on the reading
 //     (cache_write, cache_untrusted), for the alarm that names them (guard.ts PlanCacheAlarm).
 //
+// Round 3 of 0.17.0's review fixes: two writers (the runner's warm and the link's child) keep the same
+// cache, so the last rename used to win and could lower the high-water mark. Now a writer takes the cache's
+// lock (a lock file in the cache's folder, "<cache>.lock", made with an exclusive create), reads the mark as
+// it is on disk then, keeps the larger of the two, and renames under the lock: the mark never goes down
+// within a week. A complete reading below the mark on disk is unknown: "shrank" (alarmed) when it is below
+// the mark this reading began from, "behind" (held, not alarmed) when another writer raised the mark since.
+//
 // What the count can be trusted for (round 2). The settings (/data/review-settings.json) and this cache
 // are root's: Cain's user can read them, not change them. The raw count is not protected that way: it is
 // read from Cain's own transcripts, which Cain's user owns and could delete, truncate or re-time, and the
 // count relies on them not being altered. The high-water mark catches a count that goes down within a
 // week, not one that was kept low from the start. And the allowance is this device's share of the plan,
 // set by hand from the usage page (guard.ts, DOCS.md "Usage guard"), not the plan's own limit.
-import { closeSync, fchmodSync, fchownSync, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync,
+import { closeSync, fchmodSync, fchownSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync,
   unlinkSync, writeSync, type Stats } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { CAIN_GID, capPaths } from "./capfiles.ts";
 
@@ -61,6 +69,8 @@ export type PlanReading = {
   shrank?: string;                   // round 2: what fell below this week's high-water mark (held, and alarmed)
   cache_write?: string;              // round 2: "ok", or why the cache couldn't be written (root's parts)
   cache_untrusted?: string;          // round 2: why the trust check refused the cache file (owner, group or mode)
+  behind?: string;                   // round 3: below a mark another writer kept after this reading began (held, not alarmed)
+  failed?: string;                   // round 3: the reader itself failed (a child that exited with an error or was killed)
 };
 
 export const MAX_FILES = 1000;
@@ -214,6 +224,41 @@ export function loadCache(path: string, week: number, trust: (s: Stats) => boole
   } catch { return { cache: empty, state: "unreadable" }; }
 }
 export function readCache(path: string, week: number, trust: (s: Stats) => boolean = rootOwned): Cache { return loadCache(path, week, trust).cache; }
+// The cache's lock (round 3): "<cache>.lock", made with an exclusive create, holding a token. Held only
+// for the read, merge and rename (milliseconds). One older than LOCK_STALE_MS was left by a writer that
+// died: it is renamed aside, and dropped only if the renamed file still holds the token seen stale (else it
+// was a live lock taken meanwhile, and it is put back). Null when it couldn't be had within waitMs; the
+// error's code when the lock file can't be made at all (no such folder, a full disk).
+export const LOCK_STALE_MS = 30_000;
+export const lockOf = (path: string) => `${path}.lock`;
+export function takeLock(path: string, o: { waitMs?: number; now?: () => number; sleep?: (ms: number) => void } = {}): (() => void) | string | null {
+  const lock = lockOf(path);
+  const token = `${process.pid}.${randomBytes(8).toString("hex")}`;
+  const now = o.now ?? Date.now;
+  const until = now() + (o.waitMs ?? 2_000);
+  const sleep = o.sleep ?? ((ms: number) => Bun.sleepSync(ms));
+  for (;;) {
+    try {
+      const fd = openSync(lock, "wx", 0o600);
+      try { writeSync(fd, token); } finally { closeSync(fd); }
+      return () => { try { if (readFileSync(lock, "utf8") === token) unlinkSync(lock); } catch { /* gone */ } };
+    } catch (e: any) { if (e?.code !== "EEXIST") return String(e?.code ?? e?.message ?? e).slice(0, 60); }
+    try {
+      const st = statSync(lock);
+      if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
+        const seen = readFileSync(lock, "utf8");
+        const aside = `${lock}.stale.${process.pid}`;
+        renameSync(lock, aside);
+        if (readFileSync(aside, "utf8") === seen) unlinkSync(aside);
+        else { try { linkSync(aside, lock); } catch { /* another lock is there now */ } try { unlinkSync(aside); } catch { /* gone */ } }
+        continue;
+      }
+    } catch { /* gone meanwhile: try again */ }
+    if (now() >= until) return null;
+    sleep(5);
+  }
+}
+
 // Writes the cache whole (temp file, fsync, rename): null once written, else why not.
 export function writeCache(path: string, c: Cache, own: (fd: number) => void = (fd) => fchownSync(fd, 0, CAIN_GID)): string | null {
   const tmp = join(dirname(path), `.${path.split("/").pop()}.${process.pid}.tmp`);
@@ -252,6 +297,7 @@ export type ReadOpts = {
   deadline?: number;                      // round 2: a time (ms); past it, the files not yet read are skipped
   coldOk?: boolean;                       // round 2: false: on a cache that isn't warm, read nothing ("cache cold")
   clock?: () => number;                   // the deadline's clock (tests)
+  beforeSave?: () => void;                // round 3, tests only: runs after the count, before the cache's lock is taken
 };
 export const NOT_READY = "plan reading not ready";
 export function readPlanUsage(o: ReadOpts = {}): PlanReading {
@@ -301,19 +347,43 @@ export function readPlanUsage(o: ReadOpts = {}): PlanReading {
   for (const n of all.values()) tokens += n;
   const complete = skipped === 0;
   // The high-water mark: a complete reading below this week's mark is unknown (something shrank).
+  type Mark = { tokens: number; files: number };
+  const below = (m: Mark | null, whose: string): string[] => {
+    const out: string[] = [];
+    if (!complete || !m) return out;
+    if (tokens < m.tokens) out.push(`the tokens counted (${tokens}, below ${whose} of ${m.tokens})`);
+    if (recent.length < m.files) out.push(`the transcript files seen this week (${recent.length}, below ${whose} of ${m.files})`);
+    return out;
+  };
+  const maxMark = (...ms: (Mark | null)[]): Mark | undefined => {
+    const have = ms.filter((m): m is Mark => !!m);
+    return have.length ? { tokens: Math.max(...have.map((m) => m.tokens)), files: Math.max(...have.map((m) => m.files)) } : undefined;
+  };
   const mark = cache.hwm && cache.week === since ? cache.hwm : null;
-  const shrank: string[] = [];
-  if (complete && mark) {
-    if (tokens < mark.tokens) shrank.push(`the tokens counted (${tokens}, below this week's mark of ${mark.tokens})`);
-    if (recent.length < mark.files) shrank.push(`the transcript files seen this week (${recent.length}, below this week's mark of ${mark.files})`);
-  }
+  const shrank = below(mark, "this week's mark");
+  let behind: string[] = [];
   next.complete = complete;
-  next.hwm = complete && !shrank.length ? { tokens: Math.max(tokens, mark?.tokens ?? 0), files: Math.max(recent.length, mark?.files ?? 0) } : mark ?? undefined;
+  const own = (): Mark | null => complete && !shrank.length && !behind.length ? { tokens, files: recent.length } : null;
+  next.hwm = maxMark(mark, own());
   if (!next.hwm) delete next.hwm;
   let cache_write: string | undefined;
-  if (o.cacheFile && o.saveCache && (changed || late || Object.keys(cache.files).length !== Object.keys(next.files).length
-      || cache.complete !== next.complete || JSON.stringify(cache.hwm ?? null) !== JSON.stringify(next.hwm ?? null) || loaded.state !== "warm" && loaded.state !== "partial"))
-    cache_write = writeCache(o.cacheFile, next) ?? "ok";
+  if (o.cacheFile && o.saveCache) {
+    o.beforeSave?.();
+    // Round 3: under the cache's lock, the mark on disk now (another writer's, perhaps) is merged as the maximum.
+    const unlock = takeLock(o.cacheFile);
+    if (typeof unlock === "string") cache_write = `the plan reader's cache ${o.cacheFile} couldn't be written (its lock: ${unlock})`;
+    else if (!unlock) cache_write = `the plan reader's cache ${o.cacheFile} couldn't be locked (${lockOf(o.cacheFile)} is held), so it wasn't written`;
+    else try {
+      const disk = loadCache(o.cacheFile, since, o.trustCache);
+      const dmark = disk.cache.hwm && disk.cache.week === since ? disk.cache.hwm : null;
+      if (!shrank.length) behind = below(dmark, "the mark another reading kept since this one began");
+      next.hwm = maxMark(mark, dmark, own());
+      if (!next.hwm) delete next.hwm;
+      if (changed || late || Object.keys(disk.cache.files).length !== Object.keys(next.files).length || disk.cache.complete !== next.complete
+          || JSON.stringify(disk.cache.hwm ?? null) !== JSON.stringify(next.hwm ?? null) || disk.state !== "warm" && disk.state !== "partial")
+        cache_write = writeCache(o.cacheFile, next) ?? "ok";
+    } finally { unlock(); }
+  }
   const base = { at, files, skipped, week_start, allowance, complete, ...untrusted, ...(cache_write ? { cache_write } : {}) };
   if (!found.length)
     return { ...base, fraction: null, tokens_week: null, complete: false, reason: `no Claude Code transcripts found under ${dir}` };
@@ -323,6 +393,9 @@ export function readPlanUsage(o: ReadOpts = {}): PlanReading {
   if (shrank.length)
     return { ...base, fraction: null, tokens_week: tokens, shrank: shrank.join(" and "),
       reason: `the count shrank this week: ${shrank.join(" and ")}, so a transcript was deleted, truncated or re-timed` };
+  if (behind.length)
+    return { ...base, fraction: null, tokens_week: tokens, behind: behind.join(" and "),
+      reason: `this reading is behind a newer one: ${behind.join(" and ")}; the next reading catches up` };
   if (!allowance)
     return { ...base, fraction: null, tokens_week: tokens, reason: "the week's allowance isn't set (the App's option plan_weekly_allowance_tokens is 0)" };
   if (skipped)

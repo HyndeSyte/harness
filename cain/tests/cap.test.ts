@@ -905,7 +905,10 @@ describe("round 3, fix 3: the moved-aside decisions file has a named way back", 
     writeFileSync(join(dir, ".review-decisions.json.4243.tmp"), "{}");
     writeFileSync(join(dir, "other.json"), "{}");
     writeFileSync(join(dir, ".review-decisionsXjson.1.tmp"), "{}");
-    expect(sweepTemps(file)).toBe(2);
+    // 0.17.0, round 3: only temp files of writers no longer running and not changed in the last minute.
+    const old = (Date.now() - 120_000) / 1000;
+    for (const n of readdirSync(dir)) utimesSync(join(dir, n), old, old);
+    expect(sweepTemps(file, () => {}, { alive: () => false })).toBe(2);
     expect(readdirSync(dir).sort()).toEqual([".review-decisionsXjson.1.tmp", "other.json"]);
   });
 });
@@ -949,7 +952,7 @@ describe("round 3, fix 4: the self-check's alarm says what it stops, and the che
     const core = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/core.ts"), "utf8");
     expect(core).toMatch(/await this\.retryDecisions\(\);\n\s*this\.capSweep\(\);/);
     const main = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/link/main.ts"), "utf8");
-    expect(main).toContain("capOff = selfCheck({ log: capLog, prev: capOff });");
+    expect(main).toContain("capOff = selfCheck({ log: capLog, prev: capOff, ...selfAlarm });");
     const review = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/review/main.ts"), "utf8");
     expect(review).toContain("runner.capOff = selfCheck({ log, prev: runner.capOff });");
   });

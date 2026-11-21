@@ -722,6 +722,9 @@ export interface Deps {
   // from its own readings and logs a refusal), and one line onto the guard's log (the open list's holds).
   capOff?: () => string | null;
   guardHold?: (label: Label, what: string) => Verdict | Promise<Verdict>;   // 0.17.0 round 2: async (the plan is read off the event loop)
+  // 0.17.0 round 3: the not-ready state the link's own plan refresher reports now for this week, or null
+  // (plan-read.ts notReadyNow). A hook-requested hold line is written only when it names the same state.
+  planNotReady?: () => Promise<string | null>;
   holdLog?: (line: string) => boolean | void;                       // true: the log was rotated at its size cap (round 3)
   // Round 3: whether the guard's log already has a hold line (tag, what); the App's alarms (kind and
   // cause; a group cleared); and the cap's own work at each sweep (the self-check again, the decisions
@@ -1728,6 +1731,9 @@ export class Link {
   //     ../plan-read.ts), so a tap is never held up behind it;
   //   - "hook": the Build hook's own refusal when its reading wasn't ready in time (a cold cache, or out
   //     of time), one of HOOK_HOLDS only: written as the hook's hold line without the link's reading.
+  //     Round 3: only when the link's own refresher reports that same not-ready state for this week now;
+  //     otherwise the request is refused and logged, and nothing is written or counted toward the holds'
+  //     cap or its alarm (a caller can't have the link write a false hold line).
   private holdCalls = new Map<string, number[]>();
   private checkCalls = new Map<string, number[]>();
   private holdSeen = new Map<string, number>();
@@ -1756,6 +1762,14 @@ export class Link {
     this.checkCalls.set(caller, checks);
     if (!this.d.guardHold) throw new Refusal("the link has no usage guard to log with");
     const what = this.cardGate("hold", "hold's description", raw) ?? `a build labelled ${label}`;
+    if (b.hook !== undefined) {
+      let mine: string | null = null;
+      try { mine = this.d.planNotReady ? await this.d.planNotReady() : null; } catch (e) { mine = null; this.log(`couldn't read the link's own plan state: ${String(e).slice(0, 80)}`); }
+      if (mine !== b.hook) {
+        this.log(`the guard-hold route refused a hook's "${String(b.hook)}" hold from ${caller}: the link's own plan reading ${mine ? `is not ready as "${mine}"` : "is ready"} this week, so nothing was written`);
+        throw new Refusal(`the link's own plan reading ${mine ? `is not ready as "${mine}", not "${String(b.hook)}"` : "is ready this week"}, so this hold line wasn't written. Ask the link again for its own reading`);
+      }
+    }
     const v: Verdict = b.hook !== undefined
       ? { ok: false, floor: "plan", why: `the Build hook's own reading: ${NOT_READY}: ${String(b.hook)}, which counts as below the reserve floor` }
       : await this.d.guardHold(label, what);
