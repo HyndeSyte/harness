@@ -36,5 +36,13 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
     },
     hourlyS: d.hourlyS,
     tz: env.CHECKIN_TZ ?? d.tz,
+    // Cain 0.16.0: set by the run script from the App's options (root's /data/options.json) in the
+    // runner's environment only. review.sh, run as Cain, never trusts its own environment for these:
+    // it reads what the runner wrote to settingsFile (../guard.ts readSettings).
+    roundCap: Math.max(1, Math.floor(num(env.REVIEW_ROUND_CAP, d.roundCap!))) || d.roundCap,
+    reservePercent: Math.min(100, num(env.USAGE_RESERVE_PERCENT, d.reservePercent!)),
+    roundsFile: env.REVIEW_ROUNDS ?? "/data/review-rounds.json",
+    settingsFile: env.REVIEW_SETTINGS ?? "/data/review-settings.json",
+    guardLog: env.REVIEW_GUARD_LOG ?? "/data/review-guard.log",
   };
 }

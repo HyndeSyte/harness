@@ -479,7 +479,27 @@ second view adds value; skip it for small, obvious things.
   verdicts.md it names under reviews/ in the record, decide what to adopt, and run
   `/opt/cain/review.sh useful <id> <seat> <n>` with how many findings you adopted from
   each seat. `/opt/cain/review.sh status <id>` shows progress; `spend` and `health` show
-  cost and seat health.
+  cost (against the runner's own caps, with each open change's round count) and seat health.
+- Rounds are capped in code: the owner's rule is at most three outside review rounds per change.
+  Every brief names its change: a pull request's `pr`, or `"change": "<stable-key>"` for a plan or
+  document, the same key on every round of it. A replacement pull request or a new key for the same
+  work names `"supersedes": "<earlier key or pull request url>"`: its rounds carry over. The first
+  round is full; every later one is fix-only (`"round_kind": "fixes"`, the default then): its body
+  lists only the fixes, and the runner sends the seats the earlier findings to check them against,
+  each marked serious or follow-up. A fourth round is refused, under any id or pull request. If the
+  last round leaves something serious, the review service puts one decision in front of him itself
+  (ship it with that risk, or hold it), filed under the brief's `"item": "<PENDING id>"`: never ask
+  him that yourself, never offer another round (the link refuses both), and wait for his tap. A
+  Ship card for it waits on that tap; after "Hold it" there is none, and after "Ship it with that
+  risk" it goes only while the App's rollback is armed (the link says what isn't).
+- Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
+  calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
+  (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own
+  line in the job's text. The usage guard refuses other work while the plan or a review seat is below
+  its reserve floor, and an unknown plan reading counts as below: nothing bypasses it. Never label
+  work to get past it. Each refusal is a line in /data/review-guard.log: list those as held on the
+  open list. `/opt/cain/review.sh guard` prints the guard's reading in two lines: put them in your
+  daily usage row.
 - A Claude stand-in ("substituted") is a reading, not an independent review. Never
   call a review independent unless the line says so.
 - When you report work that was reviewed, end with its Reviewed line exactly as the
@@ -509,7 +529,7 @@ create, update or run any other routine.
    (fixes for someone else's branch go to its holder as a note). Never name a pull
    request in place of its branch. Hold the item while the job runs: `take` it with
    `"job": "<title>"` and that branch, and once that's done, RemoteTrigger `run` on
-   Build with body `{"text": "<the job>"}`; a hook refuses a Build run that doesn't
+   Build with body `{"text": "<the job>"}`, the job's text carrying its `Label: <label>` line; a hook refuses a Build run that doesn't
    name its branch, or names one someone else holds. The answer has `session_id`
    (cse_X). Write /data/jobs/<cse_X> holding one line: `build | <title>`. Then tell him
    in one line it started, with its link as words:

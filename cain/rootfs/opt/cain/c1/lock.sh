@@ -76,7 +76,8 @@ data)
   chown root:root "$D" && chmod 0711 "$D" || die "/data"
   # What section 3.2 opens to him by name; any other entry is root's alone.
   his="cain work trust record record-queue record-outcomes record-holds.json review-inbox review-queue
-review-spend.json review-health.json review-useful.jsonl review-private-terms.txt jobs gate session.log
+review-spend.json review-health.json review-useful.jsonl review-private-terms.txt review-rounds.json
+review-settings.json review-guard.log jobs gate session.log
 pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   for e in "$D"/* "$D"/.[!.]* "$D"/..?*; do
     { [ -e "$e" ] && [ ! -L "$e" ]; } || continue
@@ -103,8 +104,10 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
     install -d -m 2750 -o root -g cain "$D/$q"
     find "$D/$q" -mindepth 1 -maxdepth 1 -type f -exec chgrp cain {} + -exec chmod 0640 {} +
   done
-  for f in record-holds.json review-spend.json review-health.json; do own "$D/$f" root:cain 0640; done
-  for f in review-useful.jsonl review-private-terms.txt session.log; do
+  # The review-round count and the settings the runner uses (0.16.0): root writes, he reads.
+  for f in record-holds.json review-spend.json review-health.json review-rounds.json review-settings.json; do own "$D/$f" root:cain 0640; done
+  # The usage guard's log (0.16.0): the runner and his Build hook both append; he reads it.
+  for f in review-useful.jsonl review-private-terms.txt session.log review-guard.log; do
     [ -L "$D/$f" ] && rm -f "$D/$f"
     [ -e "$D/$f" ] || : > "$D/$f"
     own "$D/$f" root:cain 0660

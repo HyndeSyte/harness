@@ -13,7 +13,8 @@ const me = typeof process.getuid === "function" ? process.getuid() : 0;
 const onLinux = process.platform === "linux" ? test : test.skip;
 const brief = (over: Partial<Brief> = {}): Brief => ({
   id: "2026-11-14-lock-plan", topic: "A lock plan", question: "Is this plan sound?",
-  body: "Run the session as its own user and keep the keys root's.", needs_facts: false, consequential: false, ...over,
+  body: "Run the session as its own user and keep the keys root's.", needs_facts: false, consequential: false,
+  change: "lock-plan", label: "core", ...over,
 });
 
 function rig() {
@@ -27,7 +28,9 @@ function rig() {
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
   const cli = (...args: string[]) => spawnSync("bun", [CLI, ...args], { encoding: "utf8", env: { ...process.env,
     REVIEW_QUEUE: cfg.queueDir, REVIEW_INBOX: cfg.inboxDir, REVIEW_TERMS: cfg.termsFile, REVIEW_SPEND: cfg.spendFile,
-    REVIEW_HEALTH: cfg.healthFile, CAIN_TRUST: join(dir, "trust"), CAIN_STOP: join(dir, "trust", "stop.json") } });
+    REVIEW_HEALTH: cfg.healthFile, CAIN_TRUST: join(dir, "trust"), CAIN_STOP: join(dir, "trust", "stop.json"),
+    REVIEW_ROUNDS: join(dir, "rounds.json"), REVIEW_SETTINGS: join(dir, "settings.json"), REVIEW_GUARD_LOG: join(dir, "guard.log"),
+    CAIN_HOME: join(dir, "home") } });
   return { dir, cfg, runner, relays, cli, inbox: () => readdirSync(cfg.inboxDir!) };
 }
 

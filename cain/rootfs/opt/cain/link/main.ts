@@ -73,6 +73,8 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
+import { capState, readArmed, readDecided, roundCapNow, ROUNDS_FILE } from "./cap";
+import { readRounds } from "../review/rounds";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
@@ -89,7 +91,8 @@ const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the ke
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
-const REPO_DIR = `${DIR}/repo.git`;                  // the link's own copy, for landing his Ship taps
+const REPO_DIR = `${DIR}/repo.git`;
+const DECIDED = `${DIR}/review-decisions.json`;     // his taps on the review runner's decision cards (0.16.0, cap.ts)                  // the link's own copy, for landing his Ship taps
 const KNOWN_HOSTS = "/opt/cain/link/github_known_hosts";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
@@ -237,6 +240,17 @@ const link = new Link({
   // GitHub's 60 an hour from this address with every watch).
   gateHead: (pr, ms) => { const p = pullOf(pr); return p ? gateHeadRead(p.repo, p.pr, { ms: Math.max(1_000, ms - 500) }) : Promise.resolve({ unknown: "that isn't a pull request's address" }); },
   reviewed: () => readReviewed(),
+  // The review-round cap (0.16.0, cap.ts): the runner's rounds, his taps on its decision cards (the
+  // link's own file), and the probe's record of the rollback, read as they are now.
+  capState: (pr) => capState(pr, DECIDED),
+  armed: () => readArmed(),
+  decided: (id, choice, at) => {
+    const all = readDecided(DECIDED) ?? {};
+    all[id] = { choice, at };
+    writeSynced(DECIDED, JSON.stringify(all, null, 1));
+  },
+  roundCap: () => roundCapNow(),
+  rounds: () => readRounds(ROUNDS_FILE),
   keyKnown: deployKey ? () => keyStatus(SSH, SHIP_REPO, DIR) : undefined,
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   linkHosts: () => readHosts(),

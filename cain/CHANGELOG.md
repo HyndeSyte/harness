@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.0
+
+- Outside reviews now stop at three rounds per piece of work, counted by the review service itself, which Cain can't change. A new id or a replacement pull request for the same work doesn't start the count again, and a fourth round is refused with the count and the rule.
+- After the first round, each review checks only the fixes against the earlier findings, and marks each finding serious or follow-up by your rule.
+- If the third round still finds something serious, you get one card from the review service itself: what the piece is, the problem in one line, and "Hold it" or "Ship it with that risk" (holding recommended). Cain can't send that card himself or ask you for another round.
+- After "Hold it" there's no Ship card for it. After "Ship it with that risk" the Ship card goes only while the App's rollback of a bad install is armed; no release arms it yet, so for now that card is refused and says why.
+- Every review and every Build or Ship job carries a label: core, commitment, necessary-fix or other. A usage guard holds "other" work while your plan or a review seat runs below a 25% reserve, and nothing gets around it. Cain lists what it held.
+- Your plan's weekly use can't be read on the Pi yet (only the tokens used are recorded, not the allowance), so for now every "other" job and review is held; core, commitment and necessary-fix work runs as before.
+- Two new options: `review_round_cap` (3) and `usage_reserve_percent` (25).
+- Cain's spend readout now shows the caps the review service really uses, and how many rounds each open piece of work has had.
+
 ## 0.15.0
 
 - Cain stays on Discord when the Discord plugin's server stops. The App now starts it again within seconds, every time, and logs why it stopped: its exit code, the signal and its last lines. A message Cain sends in those seconds gets "try again in a few seconds" at once instead of vanishing. On Nov 20 it stopped once and nothing started it again, so Cain was off Discord for 19 minutes.

@@ -1,0 +1,363 @@
+// Cain 0.16.0: the review-round cap and the usage guard, run in code (review/rounds.ts, review/runner.ts,
+// guard.ts, plan-usage.ts, link/cap.ts, hooks/remote-trigger.ts). The owner's rule: at most three outside
+// review rounds a change; if the third still finds something serious, one decision (ship it with that
+// risk, or hold it), never a fourth round. And "other" work never spends the reserve.
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { LABELS as CORE_LABELS, prompt, parseBrief, resultJson, roundLine, seriousLeft, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
+import { DEFAULTS, Runner, loadReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
+import { admit, countedRounds, decisionOf, emptyRounds, readRounds, type DecisionRec } from "../rootfs/opt/cain/review/rounds.ts";
+import type { SeatAnswer, SeatFn, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
+import { LABELS, decide as guardDecide, guard, guardLines, readings, seatsLeft } from "../rootfs/opt/cain/guard.ts";
+import { readPlanUsage, type PlanReading } from "../rootfs/opt/cain/plan-usage.ts";
+import { DECISION_OPTIONS, HOLD, RISK, armedFor, capStateFor, namesRoundPastCap } from "../rootfs/opt/cain/link/cap.ts";
+import { ROOT_ROUTES, CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth.ts";
+import { BUILD, decide as hookDecide } from "../rootfs/opt/cain/hooks/remote-trigger.ts";
+import { keeperHolds, PR, rig, SHA1 } from "./link-rig";
+
+const NOW = new Date("2026-11-21T15:00:00Z");
+const TERMS = "# terms\nAcme Corp\n";
+const PRN = (n: number) => `https://github.com/HyndeSyte/harness/pull/${n}`;
+const brief = (over: Partial<Brief> = {}): Brief => ({
+  id: "2026-11-21-cap-a", topic: "The round cap in code", question: "Is this sound?", body: "Keep the cap in the runner.",
+  needs_facts: false, consequential: false, seats: ["gemini"], pr: PRN(40), label: "core", ...over,
+});
+const fresh = (): PlanReading => ({ fraction: 0.1, at: NOW.toISOString(), reason: "test", tokens_week: 1, files: 1 });
+
+function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer>; guard?: boolean; cap?: number; plan?: () => PlanReading } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "cap-"));
+  const cfg: RunnerConfig = { ...DEFAULTS, queueDir: join(dir, "q"), spendFile: join(dir, "spend.json"), healthFile: join(dir, "health.json"),
+    termsFile: join(dir, "terms.txt"), recordQueue: join(dir, "record-queue"), relayFile: join(dir, "relay.queue"),
+    roundsFile: join(dir, "rounds.json"), roundCap: o.cap ?? 3, settingsFile: join(dir, "settings.json"),
+    ...(o.guard ? { guardLog: join(dir, "guard.log") } : {}) };
+  writeFileSync(cfg.termsFile, TERMS);
+  const calls: SeatInput[] = [];
+  const seat: SeatFn = async (i) => { calls.push(i); return (o.seat ?? (async () => ({ verdict: "approve", findings: [], model: "m", cost_usd: 0.01 })))(i); };
+  const posted: DecisionRec[] = [];
+  let clock = NOW;
+  const runner = new Runner(cfg, { seats: { gemini: seat }, now: () => clock, rand: () => 0.5, log: () => {},
+    postDecision: async (d) => { posted.push(d); return `m-${posted.length}`; }, plan: o.plan ?? fresh });
+  runner.writeSettings();
+  const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
+  return { dir, cfg, runner, calls, posted, relays, later: (ms: number) => { clock = new Date(clock.getTime() + ms); },
+    rounds: () => readRounds(cfg.roundsFile!)!, get: (id: string) => loadReview(cfg.queueDir, id)! };
+}
+const finding = (problem: string) => ({ rank: 1, problem, fix: "fix it" });
+const answerWith = (...problems: string[]) => async (): Promise<SeatAnswer> =>
+  ({ verdict: problems.length ? "approve_with_changes" : "approve", findings: problems.map(finding), model: "m", cost_usd: 0.01 });
+
+describe("A: the runner counts rounds per change and refuses past the cap", () => {
+  test("three rounds go, the fourth is refused with the count and the rule, under a new id too", () => {
+    const t = runnerRig();
+    expect(t.runner.admitAndQueue(brief({ id: "cap-r1" }))).toBeNull();
+    expect(t.runner.admitAndQueue(brief({ id: "cap-r2" }))).toBeNull();          // fixes by default now
+    expect(t.runner.admitAndQueue(brief({ id: "cap-r3", round_kind: "fixes" }))).toBeNull();
+    expect(t.get("cap-r2")).toMatchObject({ change: "pr-40", round: 2, cap: 3, round_kind: "fixes" });
+    const why = t.runner.admitAndQueue(brief({ id: "cap-r4-new-id" }))!;
+    expect(why).toContain("pr-40 has had 3 outside review rounds");
+    expect(why).toContain("the owner's rule allows at most 3");
+    expect(loadReview(t.cfg.queueDir, "cap-r4-new-id")).toBeNull();
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(3);
+  });
+
+  test("a replacement pull request carries the count over, and so does going back to the old one", () => {
+    const t = runnerRig();
+    t.runner.admitAndQueue(brief({ id: "rep-1" }));
+    t.runner.admitAndQueue(brief({ id: "rep-2" }));
+    // The same scope moves to pull request 41: one round left between them.
+    expect(t.runner.admitAndQueue(brief({ id: "rep-3", pr: PRN(41), supersedes: PRN(40) }))).toBeNull();
+    expect(t.get("rep-3")).toMatchObject({ change: "pr-41", round: 3, round_kind: "fixes" });
+    expect(t.runner.admitAndQueue(brief({ id: "rep-4", pr: PRN(41) }))).toContain("has had 3");
+    expect(t.runner.admitAndQueue(brief({ id: "rep-5", pr: PRN(40) }))).toContain("has had 3");
+    expect(t.runner.admitAndQueue(brief({ id: "rep-6", pr: PRN(42), supersedes: PRN(41) }))).toContain("has had 3");
+  });
+
+  test("a plan's change key counts the same way, and the count survives a restart", () => {
+    const t = runnerRig();
+    const plan = { pr: undefined, change: "garden-plan" };
+    for (const id of ["gp-1", "gp-2", "gp-3"]) expect(t.runner.admitAndQueue(brief({ id, ...plan }))).toBeNull();
+    const again = new Runner(t.cfg, { seats: {}, now: () => NOW, log: () => {} });
+    expect(again.admitAndQueue(brief({ id: "gp-4", ...plan }))).toContain("garden-plan has had 3");
+    expect(again.admitAndQueue(brief({ id: "gp-5", pr: undefined, change: "garden-plan-v2", supersedes: "garden-plan" }))).toContain("has had 3");
+  });
+
+  test("a brief names its change; a full second round and a fix-only first round are refused", () => {
+    const t = runnerRig();
+    expect(t.runner.admitAndQueue(brief({ id: "nc-1", pr: undefined }))).toContain("names the change it reviews");
+    expect(t.runner.admitAndQueue(brief({ id: "nc-2", round_kind: "fixes" }))).toContain("nothing to check fixes against");
+    t.runner.admitAndQueue(brief({ id: "nc-3" }));
+    expect(t.runner.admitAndQueue(brief({ id: "nc-4", round_kind: "full" }))).toContain("fix-only round");
+  });
+
+  test("a round blocked for privacy sent nothing and doesn't count", async () => {
+    const t = runnerRig();
+    t.runner.admitAndQueue(brief({ id: "pv-1", body: "Plan for Acme Corp" }));
+    await t.runner.tick();
+    expect(t.get("pv-1").status).toBe("blocked: privacy");
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(0);
+    expect(admit(t.rounds(), brief({ id: "pv-2" }), 3)).toMatchObject({ ok: true, round: 1, kind: "full" });
+  });
+
+  test("review.sh prints the refusal and leaves nothing, reading the runner's cap and rounds", () => {
+    const t = runnerRig();
+    for (const id of ["cl-1", "cl-2", "cl-3"]) t.runner.admitAndQueue(brief({ id }));
+    const f = join(t.dir, "b.json");
+    writeFileSync(f, JSON.stringify(brief({ id: "cl-4" })));
+    mkdirSync(join(t.dir, "in"), { recursive: true });
+    const r = spawnSync("bun", [join(import.meta.dir, "../rootfs/opt/cain/review/cli.ts"), "submit", f], { encoding: "utf8", env: { ...process.env,
+      REVIEW_QUEUE: t.cfg.queueDir, REVIEW_INBOX: join(t.dir, "in"), REVIEW_TERMS: t.cfg.termsFile, REVIEW_SPEND: t.cfg.spendFile,
+      REVIEW_ROUNDS: t.cfg.roundsFile, REVIEW_SETTINGS: join(t.dir, "settings.json"), REVIEW_GUARD_LOG: join(t.dir, "guard.log"),
+      CAIN_TRUST: join(t.dir, "trust"), CAIN_STOP: join(t.dir, "trust", "stop.json"), CAIN_HOME: join(t.dir, "home") } });
+    expect(r.status).toBe(3);
+    expect(r.stderr).toContain("has had 3 outside review rounds");
+    expect(existsSync(join(t.dir, "in", "cl-4.json"))).toBe(false);
+  });
+});
+
+describe("C: fix-only re-reviews, and the serious or follow-up sort", () => {
+  test("a fixes round sends the seats only the fixes, with the earlier findings and the rule", async () => {
+    const t = runnerRig({ seat: answerWith("The cap is kept in a file Cain can write.") });
+    t.runner.admitAndQueue(brief({ id: "fx-1", body: "The whole design: keep the cap in the runner." }));
+    await t.runner.tick();
+    t.runner.admitAndQueue(brief({ id: "fx-2", body: "Fix: the rounds file is root's, 0640." }));
+    await t.runner.tick();
+    const [first, second] = t.calls;
+    expect(first.brief.round_kind).toBeUndefined();
+    expect(second.brief).toMatchObject({ round_kind: "fixes", body: "Fix: the rounds file is root's, 0640." });
+    expect(second.brief.earlier).toEqual(["Gemini: The cap is kept in a file Cain can write."]);
+    expect(second.brief.body).not.toContain("whole design");
+    const p = prompt(second.brief, "reviewer");
+    expect(p.system).toContain("Check only the listed fixes against the earlier findings");
+    expect(p.system).toContain("SERIOUS: it could lose or corrupt something of the owner's, act without his go, expose a secret, widen reach, or fail silently.");
+    expect(p.system).toContain("FOLLOW-UP: a window that needs a crash or rare timing and fails safe, hardening, edge cases, wording, polish, and tests for those.");
+    expect(p.user).toContain("<earlier>\n1. Gemini: The cap is kept in a file Cain can write.\n</earlier>");
+    expect(prompt(first.brief, "reviewer").system).not.toContain("fix-only");
+  });
+
+  test("the mark is read off each finding and kept in verdicts.md and result.json; an unmarked one counts as serious", async () => {
+    expect(validateAnswer({ verdict: "approve_with_changes", findings: [finding("SERIOUS: loses a tap"), finding("Follow-up: wording")] }).answer!.findings
+      .map((f) => [f.severity, f.problem])).toEqual([["serious", "loses a tap"], ["follow-up", "wording"]]);
+    const t = runnerRig({ seat: answerWith("SERIOUS: the card can post twice", "FOLLOW-UP: a log line is long", "no mark at all") });
+    t.runner.admitAndQueue(brief({ id: "mk-1" }));
+    await t.runner.tick();
+    t.runner.admitAndQueue(brief({ id: "mk-2" }));
+    await t.runner.tick();
+    const r = t.get("mk-2");
+    expect(r.seats[0].findings!.map((f) => f.severity)).toEqual(["serious", "follow-up", "serious"]);
+    expect(seriousLeft(r).length).toBe(2);
+    expect(verdictsMd(r)).toContain("1. [serious] the card can post twice");
+    expect(verdictsMd(r)).toContain("2. [follow-up] a log line is long");
+    expect(JSON.parse(resultJson(r))).toMatchObject({ change: "pr-40", round: 2, cap: 3, round_kind: "fixes", serious_left: 2 });
+    expect(JSON.parse(resultJson(r)).seats[0].findings[1].severity).toBe("follow-up");
+    expect(roundLine(r)).toBe("Round 2 of 3 for pr-40 (fix-only): 2 serious findings left.");
+    expect(t.relays().join("\n")).toContain("Round 2 of 3 for pr-40 (fix-only): 2 serious findings left.");
+  });
+});
+
+describe("B: at the cap with something serious left, the runner writes the owner's one decision card", () => {
+  const three = async (t: ReturnType<typeof runnerRig>, over: Partial<Brief> = {}) => {
+    for (const id of ["dc-1", "dc-2", "dc-3"]) { t.runner.admitAndQueue(brief({ id, item: "P77", ...over })); await t.runner.tick(); }
+  };
+  test("the third round's serious finding gives exactly one card, filed under the brief's item", async () => {
+    const t = runnerRig({ seat: answerWith("SERIOUS: a crash between two writes loses his tap") });
+    await three(t);
+    await t.runner.tick(); await t.runner.tick();                               // more ticks post nothing more
+    expect(t.posted.length).toBe(1);
+    expect(t.posted[0]).toMatchObject({ id: "pr-40#3", key: "pr-40", round: 3, serious: 1, item: "P77", pr: PRN(40),
+      topic: "The round cap in code", finding: "a crash between two writes loses his tap" });
+    expect(decisionOf(t.rounds(), "pr-40")).toMatchObject({ state: "posted", message: "m-1" });
+    expect(t.relays().join("\n")).toContain("put one decision in front of Dane");
+    // And the link builds it: those two options, the recommendation first, under P77.
+    const r = rig({ holds: keeperHolds({}) });
+    const res = await r.link.decision(t.posted[0]);
+    expect(r.buttons(res.message)).toEqual([HOLD, RISK]);
+    const text = String(r.msg(res.message).content);
+    expect(text).toContain("The round cap in code: the third and last outside review still found something serious: a crash between two writes loses his tap.");
+    expect(text).toContain("Ship it with that risk, or hold it? I recommend holding it");
+    expect(r.state().messages[res.message]).toMatchObject({ kind: "ask", item: "P77", decision: { id: "pr-40#3", key: "pr-40" } });
+    expect((await r.link.decision(t.posted[0])).message).toBe(res.message);    // the same decision again: no new card
+    expect(r.posts()).toBe(1);
+  });
+
+  test("no card when the third round leaves only follow-ups, or when the serious one comes before the cap", async () => {
+    const t = runnerRig({ seat: answerWith("FOLLOW-UP: a wording nit") });
+    await three(t);
+    expect(t.posted).toEqual([]);
+    const u = runnerRig({ seat: answerWith("SERIOUS: something") });
+    u.runner.admitAndQueue(brief({ id: "early-1" })); await u.runner.tick();
+    u.runner.admitAndQueue(brief({ id: "early-2" })); await u.runner.tick();
+    expect(u.posted).toEqual([]);
+  });
+
+  test("filed under none when the brief gives no item", async () => {
+    const t = runnerRig({ seat: answerWith("SERIOUS: x") });
+    for (const id of ["ni-1", "ni-2", "ni-3"]) { t.runner.admitAndQueue(brief({ id })); await t.runner.tick(); }
+    expect(t.posted[0].item).toBeNull();
+    const r = rig({ holds: keeperHolds({}) });
+    const res = await r.link.decision(t.posted[0]);
+    expect(r.state().messages[res.message].item).toBe("none");
+  });
+
+  test("only root's socket may ask for it, and Cain's ask can't pose as it or name a round past the cap", async () => {
+    expect(routeAllowed("root", "/decision")).toBe(true);
+    expect(routeAllowed("cain", "/decision")).toBe(false);
+    expect(CAIN_ROUTES.has("/decision")).toBe(false);
+    expect(ROOT_ROUTES.has("/decision")).toBe(true);
+    const r = rig({ holds: keeperHolds({}) });
+    await expect(r.link.ask({ text: "The cap is reached. Ship it or hold it?", options: ["Ship it with that risk", "Hold it"], item: "none" }))
+      .rejects.toThrow("review service's own card");
+    expect((await r.link.ask({ text: "Pause the garden plan?", options: ["Hold it", "Go on"], item: "none" })).status).toBe("posted");
+    await expect(r.link.ask({ text: "Want a fourth review round on the plan?", options: ["Yes", "No"], item: "none" })).rejects.toThrow("past the review-round cap");
+    await expect(r.link.ask({ text: "Run review round 4?", options: ["Yes", "No"], item: "none" })).rejects.toThrow("round 4");
+    const rounds = emptyRounds();
+    rounds.changes["pr-40"] = { rounds: [1, 2, 3].map((n) => ({ id: `x-${n}`, at: `2026-11-2${n}T00:00:00Z`, kind: n === 1 ? "full" : "fixes" as const })) };
+    Object.assign((r.link as any).d, { rounds: () => rounds, roundCap: () => 3 });
+    await expect(r.link.ask({ text: "Another review round on pull request 40?", options: ["Yes", "No"], item: "none" })).rejects.toThrow("another round for pr-40");
+    expect((await r.link.ask({ text: "Is round 2 enough for the desk plan?", options: ["Yes", "No"], item: "none" })).status).toBe("posted");
+    expect(namesRoundPastCap("the third round", 3, null)).toBeNull();
+    expect(namesRoundPastCap("the 5th review", 3, null)).toBe("round 5");
+  });
+});
+
+describe("D: shipping with the risk named needs the rollback armed", () => {
+  const FACTS = { head: SHA1, commits: 1, files: 2, areas: ["Cain's link"], bumps: [{ app: "Cain", version: "0.16.0" }], merged: false };
+  const decision = { id: "pr-5#3", key: "pr-5", round: 3, serious: 1, topic: "t", finding: "f", item: null, pr: PR, state: "posted" as const, at: "x" };
+  const shipRig = (state: "none" | "waiting" | "hold" | "risk", armed: string | null) => {
+    const r = rig({ facts: true, holds: keeperHolds({}) });
+    r.github.facts = structuredClone(FACTS) as any;
+    Object.assign((r.link as any).d, { capState: () => state === "none" ? { state } : { state, key: "pr-5", decision }, armed: () => armed });
+    return r;
+  };
+  const ship = (r: ReturnType<typeof rig>) => r.link.ship({ text: "Rounds are capped in code.", item: "none", pr: PR, head: SHA1 });
+
+  test("refused while his decision is open or he chose to hold it", async () => {
+    await expect(ship(shipRig("waiting", null))).rejects.toThrow("his decision on it");
+    await expect(ship(shipRig("hold", null))).rejects.toThrow("he chose to hold it");
+  });
+  test("with the risk named: refused while the rollback isn't armed, saying what isn't; allowed once it is", async () => {
+    await expect(ship(shipRig("risk", null))).rejects.toThrow("the probe has no record that its rollback of a bad install is armed");
+    await expect(ship(shipRig("risk", JSON.stringify({ armed: { harness: "2026-11-21T10:00:00Z" } })))).rejects.toThrow("isn't armed for Cain");
+    expect((await ship(shipRig("risk", JSON.stringify({ armed: { cain: "2026-11-21T10:00:00Z" } })))).status).toBe("posted");
+    expect((await ship(shipRig("none", null))).status).toBe("posted");             // a change not at the cap: as before
+  });
+  test("the state is read from the runner's rounds and his own tap, never Cain's words", async () => {
+    const rounds = emptyRounds();
+    rounds.changes["pr-5"] = { rounds: [], decision };
+    expect(capStateFor(PR, rounds, {})).toMatchObject({ state: "waiting" });
+    expect(capStateFor(PR, rounds, { "pr-5#3": { choice: HOLD, at: 1 } })).toMatchObject({ state: "hold" });
+    expect(capStateFor(PR, rounds, { "pr-5#3": { choice: RISK, at: 1 } })).toMatchObject({ state: "risk" });
+    expect(capStateFor(PR, null, {})).toMatchObject({ state: "unknown" });
+    expect(capStateFor(PRN(6), rounds, {})).toEqual({ state: "none" });
+    expect(armedFor(["cain", "harness"], JSON.stringify({ armed: { cain: "t" } }))).toMatchObject({ armed: false });
+    expect(armedFor(null, "not json")).toMatchObject({ armed: false });
+    // His tap on the card is kept for the Ship card, and relayed like any tap.
+    const r = rig({ holds: keeperHolds({}) });
+    const kept: any[] = [];
+    Object.assign((r.link as any).d, { decided: (id: string, choice: string) => kept.push([id, choice]) });
+    const res = await r.link.decision(decision);
+    const ids = r.ids(res.message);
+    await r.tap(r.msg(res.message), ids[DECISION_OPTIONS.indexOf(RISK)]);
+    expect(kept).toEqual([["pr-5#3", RISK]]);
+    expect(r.relayed.join("\n")).toContain(`Dane tapped "${RISK}"`);
+    expect(r.relayed.join("\n")).not.toContain("f.");                           // the seats' words stay off his relayed line
+  });
+});
+
+describe("E: labels and the usage guard", () => {
+  test("an other brief is refused below the floor and logged; a core one passes; there is no bypass", () => {
+    const t = runnerRig({ guard: true, plan: () => ({ ...fresh(), fraction: 0.9 }) });
+    const why = t.runner.admitAndQueue(brief({ id: "g-1", label: "other" }))!;
+    expect(why).toContain("held by the usage guard");
+    expect(why).toContain("10% of the week's allowance left, below the 25% reserve floor");
+    const log = readFileSync(t.cfg.guardLog!, "utf8").trim().split("\n");
+    expect(log.length).toBe(1);
+    expect(log[0].split("\t").slice(1, 3)).toEqual(["other", "review g-1 (pr-40, round 1)"]);
+    expect(log[0]).toContain("plan:");
+    expect(t.runner.admitAndQueue(brief({ id: "g-2", label: undefined }))).toContain("labelled other");   // none counts as other
+    for (const label of ["core", "commitment", "necessary-fix"] as const)
+      expect(guardDecide(label, { plan: { ...fresh(), fraction: null }, seats: null, floor: 25 }, NOW)).toEqual({ ok: true });
+    expect(t.runner.admitAndQueue(brief({ id: "g-3", label: "core" }))).toBeNull();
+    expect(parseBrief(JSON.stringify({ ...brief(), label: "urgent" })).error).toContain("label must be one of");
+    expect(parseBrief(JSON.stringify({ ...brief(), bypass: true })).error).toContain("a field that isn't allowed");
+    expect([...LABELS]).toEqual([...CORE_LABELS]);
+  });
+
+  test("a seat below its floor holds other work too; the Build hook asks the same guard", () => {
+    const dir = mkdtempSync(join(tmpdir(), "guard-"));
+    const settings = join(dir, "settings.json"), spend = join(dir, "spend.json"), log = join(dir, "guard.log");
+    writeFileSync(settings, JSON.stringify({ format: 1, written_at: NOW.toISOString(), round_cap: 3, reserve_percent: 25,
+      caps: { gemini: 10, perplexity: 4, claude: 30, openaiRuns: 200 }, review_limit: 1.5 }));
+    writeFileSync(spend, JSON.stringify({ "2026-11": { gemini: { usd: 8, runs: 3, findings: 0, searches: 0 } } }));
+    const o = { settingsFile: settings, spendFile: spend, logFile: log, tz: "America/New_York", now: NOW, plan: fresh };
+    const v = guard("other", "Build on claude/x", o);
+    expect(v).toMatchObject({ ok: false, floor: "seat gemini" });
+    expect((v as any).why).toContain("Gemini has 20% of its monthly cap left");
+    const holds = keeperHolds({ P9: { holder: "cain", branches: ["claude/x"] } });
+    const run = (text: string, body: any = {}) => ({ tool_name: "RemoteTrigger", tool_input: { action: "run", trigger_id: BUILD, body: { text, ...body } } });
+    const env = { stop: { stopped: false, at: null }, guard: (label: any, what: string) => guard(label, what, o) };
+    expect(hookDecide(run("Branch: claude/x\nLabel: other\nDo it."), holds, env)).toContain("Held by the usage guard");
+    expect(hookDecide(run("Branch: claude/x\nDo it."), holds, env)).toContain("labelled other");
+    expect(hookDecide(run("Branch: claude/x\nDo it.", { label: "necessary-fix" }), holds, env)).toBe("");
+    expect(hookDecide(run("Branch: claude/x\nLabel: core\nDo it.", { label: "other" }), holds, env)).toContain("one label");
+    expect(hookDecide(run("Branch: claude/x\nDo it.", { label: "core", bypass: true }), holds, env)).toContain("nothing else");
+    expect(hookDecide(run("Branch: claude/x\nDo it.", { label: "core" }), holds, { stop: { stopped: false, at: null } })).toBe("");
+    expect(hookDecide(run("Branch: claude/x\nDo it."), holds, { stop: { stopped: false, at: null } })).toContain("usage guard");   // no guard: held
+    expect(readFileSync(log, "utf8").trim().split("\n").length).toBe(3);
+  });
+});
+
+describe("F: the plan-usage reader, and an unknown or stale reading fails closed", () => {
+  test("it reads the week's tokens from the transcripts, and says why the fraction is unknown", () => {
+    const home = mkdtempSync(join(tmpdir(), "home-"));
+    const proj = join(home, ".claude", "projects", "-data-work");
+    mkdirSync(proj, { recursive: true });
+    const line = (ts: string, n: number) => JSON.stringify({ timestamp: ts, message: { usage: { input_tokens: n, output_tokens: n, cache_read_input_tokens: 0 } } });
+    writeFileSync(join(proj, "a.jsonl"), [line("2026-11-20T10:00:00Z", 100), line("2026-11-01T10:00:00Z", 999), "not json", "{}"].join("\n"));
+    writeFileSync(join(proj, "old.jsonl"), line("2026-10-01T10:00:00Z", 5000));
+    utimesSync(join(proj, "old.jsonl"), new Date("2026-10-01"), new Date("2026-10-01"));
+    const r = readPlanUsage({ dir: join(home, ".claude", "projects"), now: NOW });
+    expect(r).toMatchObject({ fraction: null, tokens_week: 200, files: 1 });
+    expect(r.reason).toContain("not the plan's weekly allowance");
+    expect(readPlanUsage({ dir: join(home, "none"), now: NOW })).toMatchObject({ fraction: null, tokens_week: null });
+  });
+  test("unknown, or older than a day, counts as below the floor for other work", () => {
+    const seats = [{ seat: "gemini", left: 0.9 }];
+    expect(guardDecide("other", { plan: { ...fresh(), fraction: null, reason: "no allowance" }, seats, floor: 25 }, NOW))
+      .toMatchObject({ ok: false, floor: "plan" });
+    const stale = { ...fresh(), at: new Date(NOW.getTime() - 25 * 3_600_000).toISOString() };
+    expect((guardDecide("other", { plan: stale, seats, floor: 25 }, NOW) as any).why).toContain("more than a day old");
+    expect(guardDecide("other", { plan: fresh(), seats, floor: 25 }, NOW)).toEqual({ ok: true });
+    expect(guardDecide("other", { plan: fresh(), seats: null, seatsWhy: "no caps", floor: 25 }, NOW)).toMatchObject({ ok: false, floor: "seats" });
+    expect(seatsLeft({}, null, "2026-11").seats).toBeNull();
+    const [a, b] = guardLines({ plan: { ...fresh(), fraction: null, reason: "no allowance" }, seats, floor: 25 }, NOW);
+    expect(a).toContain("Plan: unknown (no allowance");
+    expect(b).toContain("Floor 25%: other work is held (plan)");
+  });
+});
+
+describe("G: review.sh spend prints the runner's caps and the round counts; guard prints two lines", () => {
+  test("spend reads the caps the runner wrote, not its own environment's", () => {
+    const t = runnerRig();
+    t.cfg.caps = { gemini: 12, perplexity: 6, claude: 45, openaiRuns: 321 };
+    t.runner.writeSettings();
+    t.runner.admitAndQueue(brief({ id: "sp-1" }));
+    t.runner.admitAndQueue(brief({ id: "sp-2" }));
+    const env = { ...process.env, REVIEW_SPEND: t.cfg.spendFile, REVIEW_ROUNDS: t.cfg.roundsFile, REVIEW_SETTINGS: join(t.dir, "settings.json"),
+      REVIEW_CAP_GEMINI_USD: "8", REVIEW_CAP_CODEX_RUNS: "200", CAIN_HOME: join(t.dir, "home"), REVIEW_GUARD_LOG: join(t.dir, "guard.log") };
+    const cli = (cmd: string) => spawnSync("bun", [join(import.meta.dir, "../rootfs/opt/cain/review/cli.ts"), cmd], { encoding: "utf8", env });
+    const out = cli("spend").stdout;
+    expect(out).toContain("Gemini: $0.00 / $12.00");
+    expect(out).toContain("OpenAI: $0.00 / 321 runs");
+    expect(out).toContain("Claude: $0.00 / $45.00");
+    expect(out).not.toContain("/ $8.00");
+    expect(out).toContain("Review rounds (cap 3, the runner's):");
+    expect(out).toContain("pr-40: 2 of 3 rounds");
+    const g = cli("guard").stdout.trim().split("\n");
+    expect(g.length).toBe(2);
+    expect(g[0]).toStartWith("Plan: unknown");
+    expect(g[1]).toContain("Floor 25%: other work is held (plan)");
+  });
+});

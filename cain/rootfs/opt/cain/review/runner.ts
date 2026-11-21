@@ -11,10 +11,13 @@ import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
-  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, estimate, fixFor, independent, markBlocked, outbound, recordRequest,
-  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
+  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
+import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
+import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
+import type { PlanReading } from "../plan-usage.ts";
 
 export type RunnerConfig = {
   queueDir: string; spendFile: string; healthFile: string; termsFile: string; recordQueue: string; relayFile: string;
@@ -31,6 +34,11 @@ export type RunnerConfig = {
   maxOut: Record<SeatName, number>;
   models: { gemini: string; geminiBig: string; perplexity: string; claude: string };
   hourlyS: number; tz: string;
+  // Cain 0.16.0: the review-round cap and the usage guard's reserve floor (the App's options, root's),
+  // where the rounds are kept, where the runner writes the settings it really uses (for review.sh and
+  // the Build hook), and the guard's log. Absent files: the cap and guard aren't kept (tests that queue directly).
+  roundCap?: number; reservePercent?: number;
+  roundsFile?: string; settingsFile?: string; guardLog?: string;
 };
 
 export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile" | "termsFile" | "recordQueue" | "relayFile"> = {
@@ -40,6 +48,7 @@ export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile
   maxOut: { openai: 0, gemini: 8_192, perplexity: 4_000, claude: 16_000 },
   models: { gemini: "gemini-3.8-flash", geminiBig: "gemini-4-argon", perplexity: "perplexity/sonar", claude: "claude-opus-5-5" },
   hourlyS: 3_600, tz: "America/New_York",
+  roundCap: DEFAULT_ROUND_CAP, reservePercent: DEFAULT_RESERVE_PERCENT,
 };
 
 export type Unavailable = { kind: ErrorKind; detail: string } | null;
@@ -48,6 +57,10 @@ export type RunnerDeps = {
   unavailable?: (seat: SeatName) => Unavailable;   // e.g. Codex not signed in
   now?: () => Date; rand?: () => number; log?: (m: string) => void;
   stopped?: () => boolean;                         // Dane's Stop (../stop.ts): nothing is sent while it holds
+  // Cain 0.16.0: the owner's decision card at the review cap, posted through the link (its root socket);
+  // the message id, or null when it didn't go (tried again next tick). Absent: never posted.
+  postDecision?: (d: DecisionRec) => Promise<string | null>;
+  plan?: () => PlanReading;                        // the plan-usage reading (../plan-usage.ts), for the guard
 };
 
 export type SpendRow = { usd: number; runs: number; findings: number; searches: number };
@@ -226,13 +239,110 @@ export class Runner {
       const p = parseBrief(got.text);
       if (!p.brief) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken: not a brief: ${p.error}. Nothing to tell him.`); continue; }
       if (existsReview(this.cfg.queueDir, p.brief.id)) { this.relay(`Review brief ${p.brief.id} wasn't taken: a review with that id already exists; use a new id. Nothing to tell him.`); continue; }
-      saveReview(this.cfg.queueDir, newReview(p.brief, this.now()));
+      const why = this.admitAndQueue(p.brief);
+      if (why) this.relay(`Review brief ${p.brief.id} wasn't taken: ${why} Nothing to tell him.`);
+    }
+  }
+
+  // ---- the review-round cap and the usage guard (Cain 0.16.0; rounds.ts, ../guard.ts) ----
+  get roundCap(): number { const c = this.cfg.roundCap; return Number.isInteger(c) && c! >= 1 ? c! : DEFAULT_ROUND_CAP; }
+  // What the runner really uses, for review.sh and the Build hook, which run as Cain.
+  writeSettings(): void {
+    if (!this.cfg.settingsFile) return;
+    writeAtomic(this.cfg.settingsFile, JSON.stringify({ format: SETTINGS_FORMAT, written_at: this.now().toISOString(), round_cap: this.roundCap,
+      reserve_percent: this.cfg.reservePercent ?? DEFAULT_RESERVE_PERCENT, caps: this.cfg.caps, review_limit: this.cfg.reviewLimit }, null, 1));
+  }
+  // A brief of Cain's into the queue, as a new round of its change, or the reason it isn't (null: queued).
+  admitAndQueue(b: Brief): string | null {
+    const file = this.cfg.roundsFile;
+    if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
+    const rounds = readRounds(file);
+    if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
+    const a = admit(rounds, b, this.roundCap);
+    if (!a.ok) return a.why;
+    const label = labelOf(b.label)!;
+    if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
+      const g = guard(label, `review ${b.id} (${a.key}, round ${a.round})`, { settingsFile: this.cfg.settingsFile, spendFile: this.cfg.spendFile,
+        logFile: this.cfg.guardLog, tz: this.cfg.tz, now: this.now(), plan: this.deps.plan });
+      if (!g.ok) return `held by the usage guard: it's labelled ${label}, and ${g.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`;
+    }
+    const r = newReview(b, this.now());
+    Object.assign(r, { change: a.key, round: a.round, cap: this.roundCap, round_kind: a.kind });
+    if (a.kind === "fixes") r.earlier = this.earlierFindings(rounds, a.key);
+    // The round is kept before the review is queued: a stop between the two counts a round that never
+    // ran (fails safe), never runs one that wasn't counted.
+    addRound(rounds, b, a, this.now().toISOString());
+    writeRounds(file, rounds);
+    saveReview(this.cfg.queueDir, r);
+    return null;
+  }
+  // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
+  private earlierFindings(rounds: Rounds, key: string): string[] {
+    const done = countedRounds(rounds, key).reverse();
+    for (const x of done) {
+      const prev = loadReview(this.cfg.queueDir, x.id);
+      if (!prev || prev.status === "blocked: privacy") continue;
+      const list = prev.seats.filter((s) => s.state === "done").flatMap((s) => (s.findings ?? []).map((f) =>
+        `${seatName(s)}${f.severity ? ` [${f.severity}]` : ""}: ${oneLine(f.problem, 400)}`));
+      if (list.length) return list.slice(0, 30);
+    }
+    return [];
+  }
+  // A finished round, kept in the rounds file once: blocked or unanswered rounds don't count, and the
+  // cap's last round with a serious finding left owes the owner one decision card for the change.
+  private settleRound(r: Review): void {
+    const file = this.cfg.roundsFile;
+    if (!file || !r.change || r.rounded || !FINAL.includes(r.status)) return;
+    const rounds = readRounds(file);
+    if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s round is settled next tick`); return; }
+    const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
+    const serious = seriousLeft(r);
+    if (rec) {
+      rec.done = true;
+      if (r.status === "blocked: privacy") rec.blocked = true;
+      else if (!r.seats.some((s) => s.state === "done")) rec.blocked = true;   // nothing answered: not a round
+      if (r.round_kind === "fixes") rec.serious = serious.length;
+    }
+    if (rec && !rec.blocked && r.round_kind === "fixes" && serious.length && countedRounds(rounds, r.change).length >= this.roundCap
+        && !decisionOf(rounds, r.change)) {
+      const c = rounds.changes[r.change];
+      const b = r.brief;
+      c.decision = { id: `${r.change}#${countedRounds(rounds, r.change).length}`, key: r.change, round: countedRounds(rounds, r.change).length,
+        serious: serious.length, topic: oneLine(b?.topic ?? c.topic ?? r.change, 120), finding: oneLine(serious[0].problem, 160),
+        item: b?.item ?? null, pr: b?.pr ?? c.pr ?? null, state: "owed", at: this.now().toISOString() };
+      this.log(`review ${shownId(r)}: the round cap is reached for ${r.change} with ${serious.length} serious finding(s) left; the owner's decision card is owed`);
+    }
+    writeRounds(file, rounds);
+    r.rounded = true;
+  }
+  // Owed decision cards, through the link. Exactly one per change: once posted it's never posted again.
+  async postOwed(): Promise<void> {
+    const file = this.cfg.roundsFile;
+    if (!file || !this.deps.postDecision) return;
+    const rounds = readRounds(file);
+    if (!rounds) return;
+    for (const [key, c] of Object.entries(rounds.changes)) {
+      const d = c.decision;
+      if (!d || d.state !== "owed") continue;
+      let msg: string | null = null;
+      try { msg = await this.deps.postDecision(d); } catch (e) { this.log(`the decision card for ${key} didn't go: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
+      const now = readRounds(file);
+      if (!now?.changes[key]?.decision) continue;
+      const cur = now.changes[key].decision!;
+      if (msg) {
+        Object.assign(cur, { state: "posted", message: msg });
+        this.relay(`The review cap is reached for ${key}: its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. Nothing to tell him.`);
+      } else cur.tries = (cur.tries ?? 0) + 1;
+      writeRounds(file, now);
     }
   }
 
   async tick(): Promise<void> {
     try { this.ingest(); await this.reviews(); }
-    finally { if (this.publishOwed) this.publishReviewed(); }
+    finally {
+      if (this.publishOwed) this.publishReviewed();
+      try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }
+    }
   }
 
   private async reviews(): Promise<void> {
@@ -274,6 +384,8 @@ export class Runner {
     // on an open review is refused too.
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
+    const e = earlierCheck(r.round_kind === "fixes" ? r.earlier : undefined, this.terms());
+    if (!e.ok) return this.block(r, e.why);
     for (let pass = 0; pass < 4; pass++) {
       if (this.isStopped()) break;                       // Stop between passes: the rest waits
       const now = this.now().toISOString();
@@ -297,7 +409,7 @@ export class Runner {
     const hourly = s.state !== "queued";
     const fn = this.fnFor(s.seat);
     const b = r.brief!;
-    const out = outbound(b);   // throws on a wrong kind: nothing is sent
+    const out = outbound(b, r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined);   // throws on a wrong kind: nothing is sent
     const down = this.unavailable(s.seat) ?? this.capCheck(s.seat, out, r.cost_usd);
     if (down || !fn) return this.fail(r, s, down?.kind ?? "unconfigured", down?.detail ?? "not set up", hourly, 0);
     s.started_at = this.now().toISOString();
@@ -312,6 +424,8 @@ export class Runner {
     try {
       const a = await Promise.race([fn({ brief: out, role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
       const cost = this.addSpend(s.seat, a.cost_usd, a.findings.length, a.searches ?? 0);
+      // A fix-only round's finding a seat didn't mark counts as serious: it fails safe.
+      if (r.round_kind === "fixes") a.findings = a.findings.map((f) => { const m = readMark(f); return m.severity ? m : { ...m, severity: "serious" as const }; });
       Object.assign(s, { state: "done", verdict: a.verdict, findings: a.findings, model: a.model, tokens: a.tokens,
         cost_usd: s.cost_usd + cost, finished_at: this.now().toISOString() });
       delete s.error; delete s.next_at;
@@ -386,6 +500,7 @@ export class Runner {
   // while publishing fails he hears nothing yet, and the next tick tries both again (a final
   // review is looked at on every tick until it's relayed).
   private after(r: Review) {
+    this.settleRound(r);
     if (!r.recorded && r.brief && (r.status === "done" || r.status === "incomplete")) {
       // The same gate again before anything reaches the record: a review read
       // back as final may never have passed it, or the list may have grown.

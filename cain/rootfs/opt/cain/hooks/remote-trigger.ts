@@ -9,7 +9,12 @@
 //   - a Ship run carries the Ship token from his Ship tap (../ship-token.ts): signed by
 //     the link's Ship key, not expired, and for the pull request and full head sha the
 //     job names;
-//   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all.
+//   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all;
+//   - (Cain 0.16.0) a run carries one label, core, commitment, necessary-fix or other: in its body's
+//     "label" field or on a "Label: <label>" line of its text (both, and they must agree); none is
+//     "other". A Build run goes through the usage guard (../guard.ts): "other" is refused while the
+//     plan or a review seat is below the reserve floor, logged, with no bypass. A Ship run only installs
+//     what his tap landed, so it carries its label and isn't held.
 // A refusal goes back to Cain as the reason; anything else is left to the usual
 // permission rules. If the call, the holds, the Ship key or the Stop state can't be
 // read, it's refused.
@@ -17,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { parseHolds } from "../link/core.ts";
 import { findToken, publicKey, pullOf, readToken, signedAt } from "../ship-token.ts";
 import { readStop, type StopState, stoppedWhy } from "../stop.ts";
+import { guard, labelOf, paths, type Label, type Verdict } from "../guard.ts";
 
 export const BUILD = "trig_015FTxexzFDZyjYjzw39bPv8";
 export const SHIP = "trig_015NTtUUC5DN82zDJBwmcq1r";
@@ -29,7 +35,18 @@ const PR_LINK = /github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/i;
 
 // What a Ship run is checked against: the link's public Ship key (null: none), the Stop
 // state, and the time now.
-export interface Env { pub?: string | null; stop?: StopState; now?: number }
+export interface Env { pub?: string | null; stop?: StopState; now?: number; guard?: (label: Label, what: string) => Verdict }
+
+// A run's label: its body's "label", or a "Label: <label>" line of its text; both must agree; none is "other".
+export function runLabel(body: any, text: string): { label: Label } | { why: string } {
+  const lines = [...text.matchAll(/^[ \t]*label:[ \t]*`?([A-Za-z-]+)`?[ \t]*$/gim)].map((m) => m[1].toLowerCase());
+  const field = body?.label;
+  const named = [...new Set([...(field !== undefined ? [String(field).toLowerCase()] : []), ...lines])];
+  if (named.length > 1) return { why: `A run carries one label; this one names ${named.join(" and ")}.` };
+  const label = labelOf(named[0]);
+  if (!label) return { why: `"${clip(String(named[0]))}" isn't a label: core, commitment, necessary-fix or other.` };
+  return { label };
+}
 
 const clip = (s: string) => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 60);
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -61,9 +78,11 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
   const stop = env.stop ?? { stopped: true, at: null };
   if (stop.stopped) return stoppedWhy(stop, "no Build or Ship run starts");
   const body = t.body ?? {};
-  if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((k) => k !== "text"))
-    return 'A run\'s body is {"text": "<the job>"} and nothing else.';
+  if (typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((k) => k !== "text" && k !== "label"))
+    return 'A run\'s body is {"text": "<the job>", "label": "<its label>"} and nothing else.';
   const text = typeof body.text === "string" ? body.text : "";
+  const lab = runLabel(body, text);
+  if ("why" in lab) return lab.why;
   const holds = parseHolds(holdsText);
   if (holdsText === null || holds === null)
     return "The record keeper's holds can't be read, so the run can't be checked; try again in a minute.";
@@ -88,6 +107,12 @@ export function decide(call: any, holdsText: string | null, env: Env = {}): stri
       if (!mine)
         return `${b} isn't in a hold of yours. Take the job's item first, with "job" and that branch, and run Build once the take is done.`;
     }
+    // The usage guard, last: only a run that would otherwise start is held, and logged.
+    const title = (text.split("\n").find((l) => /^\s*title:/i.test(l)) ?? `Build on ${branches[0]}`).trim().slice(0, 100);
+    const g = lab.label !== "other" ? { ok: true as const }
+      : env.guard ? env.guard(lab.label, title) : { ok: false as const, floor: "guard", why: "the usage guard couldn't run" };
+    if (!g.ok)
+      return `Held by the usage guard: this Build is labelled ${lab.label}, and ${g.why}. Core, commitment and necessary-fix work still run; nothing bypasses it. It's on the guard's log: list it on the open list as held.`;
     return "";
   }
   // Ship: his signed tap, for the pull request and head this job names.
@@ -126,7 +151,10 @@ function read(path: string): string | null {
 
 if (import.meta.main) {
   let reason: string;
-  try { reason = decide(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now: Date.now() }); }
+  const p = paths();
+  const now = Date.now();
+  const g = (label: Label, what: string) => guard(label, what, { settingsFile: p.settings, spendFile: p.spend, logFile: p.log, tz: p.tz, now: new Date(now) });
+  try { reason = decide(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now, guard: g }); }
   catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {
     hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }));

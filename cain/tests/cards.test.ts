@@ -2,7 +2,7 @@
 // expiry; the sweep; taps on dead cards; replies in the thread; one ask at a time.
 import { describe, expect, test } from "bun:test";
 import { BUILD, decide, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
-const RUN = { stop: { stopped: false, at: null } };   // the hook's view: nothing stopped
+const RUN = { stop: { stopped: false, at: null }, guard: () => ({ ok: true as const }) };   // the hook's view: nothing stopped
 import { closedItems, digest, EXPIRED_TAP, nextCheckin, parseHolds, RESUME, STOP } from "../rootfs/opt/cain/link/core";
 import { BOT, DAY, DM, HOUR, keeperHolds, MIN, NOV11_8AM, OWNER, PR, pendingWith, rig, SHA1, SHA2 } from "./link-rig";
 

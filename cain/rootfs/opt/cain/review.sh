@@ -4,6 +4,8 @@
 #   review.sh status <id>             the review and each seat, with any fix
 #   review.sh result <id>             the machine-readable result, once finished
 #   review.sh useful <id> <seat> <n>  how many of a seat's findings were adopted
-#   review.sh spend | health          this month's spend per seat; the nightly seat check
+#   review.sh spend | health          this month's spend per seat against the runner's caps, and the
+#                                     round count per open change; the nightly seat check
+#   review.sh guard                   the usage guard's reading, in two lines
 # No keys here: they live only in the review runner's environment.
 exec bun /opt/cain/review/cli.ts "$@"

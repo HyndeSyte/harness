@@ -68,7 +68,7 @@ describe("briefs", () => {
     expect(parseBrief('{"__proto__": {"x": 1}, "id": "abc-def", "topic": "t", "question": "q", "body": "b", "needs_facts": false, "consequential": false}').error).toBe(UNKNOWN_FIELD);
     expect(UNKNOWN_FIELD).not.toContain("notes");
     expect(parseBrief(JSON.stringify({ ...brief(), seats: ["Acme Corp"] })).error).not.toContain("Acme");
-    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "consequential", "head", "id", "needs_facts", "pr", "question", "seats", "topic"]);
+    expect(Object.keys(BRIEF_FIELDS).sort()).toEqual(["body", "change", "consequential", "head", "id", "item", "label", "needs_facts", "pr", "question", "round_kind", "seats", "supersedes", "topic"]);
   });
 
   test("a pull request's review names its pr and head (0.11.0): checked, kept on the Pi, never sent", () => {

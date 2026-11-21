@@ -49,6 +49,7 @@ export function linkRoutes(d: RouteDeps) {
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
+        case "/decision": return json(await link.decision(b));
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

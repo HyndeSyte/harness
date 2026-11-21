@@ -87,6 +87,8 @@ import { decideSend, type CardsView, type CardView, type Decision, type Writer }
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
+import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, namesRoundPastCap, type CapState } from "./cap";
+import type { DecisionRec, Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
@@ -320,6 +322,7 @@ export interface Shown {
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
+  decision?: { id: string; key: string; pr: string | null };   // the review runner's decision card at the round cap (0.16.0, cap.ts)
 }
 // The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
 // tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
@@ -670,6 +673,13 @@ export interface Deps {
   gateHead?: (pr: string, ms: number) => Promise<string | { unknown: string }>;
   factsMs?: number;                                                // how long a Ship card waits for them (tests)
   reviewed?: () => Reviewed[] | null;                              // the review service's lines (../reviewed.ts); null: can't be read
+  // The review-round cap (0.16.0, cap.ts): where a pull request stands at it, the probe's record of the
+  // rollback (its text; null: none), his tap on a decision card kept, the cap and the rounds now.
+  capState?: (pr: string) => CapState;
+  armed?: () => string | null;
+  decided?: (id: string, choice: string, at: number) => void;
+  roundCap?: () => number;
+  rounds?: () => Rounds | null;
   keyKnown?: () => Promise<"known" | "refused" | "host key" | null>;   // does GitHub still know the deploy key; null: no answer
   // The gate (piece D): what the rules found at a send point, and what was done.
   report?: (r: GateReport) => void;
@@ -1560,8 +1570,37 @@ export class Link {
 
   // -- Cain's own words with buttons ----------------------------------------------
   private openAsk(s: State, now: number): [string, Shown] | null {
-    for (const [id, m] of Object.entries(s.messages)) if (m.kind === "ask" && live(m, now)) return [id, m];
+    // The runner's decision card neither waits behind Cain's asks nor holds them back (0.16.0).
+    for (const [id, m] of Object.entries(s.messages)) if (m.kind === "ask" && !m.decision && live(m, now)) return [id, m];
     return null;
+  }
+
+  // The owner's one decision at the review-round cap (0.16.0, cap.ts): only the review runner asks for
+  // it, on root's socket. The link writes its words and its fixed options, files it under the brief's
+  // item (or none), and it stays up until he taps it. The same decision posted twice is one card.
+  async decision(d: Partial<DecisionRec>): Promise<{ status: "posted"; message: string }> {
+    const id = String(d.id ?? ""), key = String(d.key ?? "");
+    if (!/^[a-z0-9][a-z0-9-]{2,63}#\d{1,3}$/.test(id) || !id.startsWith(`${key}#`)) throw new Refusal("a decision needs its id and change key");
+    const round = Number(d.round), serious = Number(d.serious);
+    if (!Number.isInteger(round) || round < 1 || !Number.isInteger(serious) || serious < 1) throw new Refusal("a decision needs its round and its serious findings");
+    if (!String(d.topic ?? "").trim() || !String(d.finding ?? "").trim()) throw new Refusal("a decision needs its topic and its finding");
+    const item = d.item && ITEM.test(String(d.item)) ? String(d.item).toUpperCase() : "none";
+    const pr = d.pr && PULL.test(String(d.pr)) ? String(d.pr) : null;
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.decision?.id === id);
+    if (prior) return { status: "posted", message: prior[0] };
+    const text = this.ownWords("decision", "link", decisionText({ topic: String(d.topic), finding: String(d.finding), round, serious }));
+    const options = [...DECISION_OPTIONS];
+    const nonce = stableNonce("decision", id);
+    return this.serial(async () => {
+      const again = Object.entries(this.d.load().messages).find(([, m]) => m.decision?.id === id);
+      if (again) return { status: "posted" as const, message: again[0] };
+      const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"), { nonce });
+      const s = this.d.load();
+      this.remember(s, msg, { kind: "ask", item, question: "", posted: this.d.now(), expires: null, buttons: true, labels: [...options],
+        q: { q: decisionSummary({ topic: String(d.topic) }), options, used: false }, decision: { id, key, pr } });
+      this.d.save(s);
+      return { status: "posted" as const, message: String(msg.id) };
+    });
   }
 
   async ask(a: { text: string; options: string[]; item?: unknown; question?: unknown; replyTo?: unknown }): Promise<AskResult> {
@@ -1571,6 +1610,14 @@ export class Link {
     if (!asked) throw new Refusal("an ask needs its question");
     if (!raw.length) throw new Refusal("an ask needs at least one option; open questions go through the reply tool");
     noMachineText(asked, ...raw);
+    // The review-round cap (0.16.0): the decision at the cap is the review service's card alone, and no
+    // ask may offer a round past it.
+    if (raw.some((o) => o.toLowerCase() === RISK.toLowerCase()))
+      throw new Refusal("the decision at the review-round cap is the review service's own card: it posts it itself when the last round leaves something serious. Ask nothing about it, and offer no review round past the cap");
+    let rounds: Rounds | null = null;
+    try { rounds = this.d.rounds?.() ?? null; } catch { rounds = null; }
+    const past = namesRoundPastCap([asked, ...raw].join("\n"), this.d.roundCap?.() ?? 3, rounds);
+    if (past) throw new Refusal(`this names ${past}, past the review-round cap of ${this.d.roundCap?.() ?? 3}: the owner's rule allows no more rounds for a change, and the review service asks him the one decision itself. Take it out`);
     // The gate, before the nonce is made: the same words always make the same card.
     const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }));
     const w = this.cainWords("ask", "ask", asked, { rules: AT.cain, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
@@ -1645,10 +1692,22 @@ export class Link {
       throw new Refusal("Everything is stopped: Dane tapped Stop, so no Ship cards until he taps Turn back on. Only he can; don't ask him to.");
     noMachineText(said);
     this.mayAsk(meta.item);
+    // The review-round cap (0.16.0, cap.ts): at the cap with a serious finding left, his decision first.
+    let risk = false;
+    let cap: CapState = { state: "none" };
+    try { cap = this.d.capState?.(pr) ?? { state: "none" }; } catch (e) { cap = { state: "unknown", why: String(e).slice(0, 80) }; }
+    if (cap.state === "unknown") throw new Refusal(`where this pull request stands at the review-round cap is unknown (${cap.why}): no Ship card until it can be read`);
+    if (cap.state === "waiting") throw new Refusal("its last review round left something serious, and his decision on it (ship it with that risk, or hold it) is still open: no Ship card until he taps it");
+    if (cap.state === "hold") throw new Refusal("he chose to hold it at the review-round cap: no Ship card for it. A fix is new work, with its own item and a new change");
+    if (cap.state === "risk") risk = true;
     const w = this.cainWords("ship", "Ship card", said, { rules: AT.cain, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
-    const built = this.d.facts ? await this.shipText(pr, head, review, w.text) : { text: w.text, own: undefined };
+    if (risk && !this.d.facts) {
+      const a = armedFor(null, this.d.armed?.() ?? null);
+      if (!a.armed) throw new Refusal(`he chose to ship it with the risk named, which needs the App's rollback armed, and ${a.why}: no Ship card until it is`);
+    }
+    const built = this.d.facts ? await this.shipText(pr, head, review, w.text, risk) : { text: w.text, own: undefined };
     const text = built.text;
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
@@ -1680,7 +1739,7 @@ export class Link {
   // this head is in main already: the landing asks nothing of its checks, so neither does the
   // card. Anything else going wrong while the new lines are built gives the card as it was
   // before: "Ship it?", his line and the line from GitHub as it was. Never no card.
-  private async shipText(pr: string, head: string, review: string | null, words: string): Promise<{ text: string; own: string }> {
+  private async shipText(pr: string, head: string, review: string | null, words: string, risk = false): Promise<{ text: string; own: string }> {
     const own = words.trim();
     if (!own) throw new Refusal("a Ship card needs a line saying what he'll notice");
     let rev: Reviewed | null = null;
@@ -1725,6 +1784,12 @@ export class Link {
     const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    // Shipped with the risk named (0.16.0): only while the rollback is armed for every App it installs.
+    if (risk) {
+      const apps = f?.bumps ? f.bumps.map((b) => b.app.toLowerCase()) : null;
+      const a = armedFor(apps, this.d.armed?.() ?? null);
+      if (!a.armed) throw new Refusal(`he chose to ship it with the risk named, which needs the App's rollback armed, and ${a.why}: no Ship card until it is`);
+    }
     if (watched.length && gateHead) {
       if (gh === null) throw new Refusal(`the Ship gate's state is unknown for this pull request: ${GATE_HEAD_TIMED_OUT}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
       if (typeof gh !== "string") throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gh.unknown}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
@@ -2563,6 +2628,11 @@ export class Link {
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
     const label = q.options[i];
     q.used = true; m.outcome = "answered"; m.label = label; m.why = "answered";
+    // His decision at the review-round cap (0.16.0) is kept before anything else, for the Ship card.
+    if (m.decision) {
+      try { this.d.decided?.(m.decision.id, label, this.d.now()); }
+      catch (e) { this.log(`couldn't keep his decision at the review cap: ${String(e).slice(0, 80)}`); }
+    }
     // His Ship tap lands it in main, unless everything is stopped. Cain hears how it
     // went once it's settled, with the Ship token when it's in main.
     let shown = `You answered: ${label}`, extra = "", landing = false;

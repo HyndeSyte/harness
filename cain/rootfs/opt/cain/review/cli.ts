@@ -6,7 +6,9 @@
 //   status <id>            the review's state and each seat's state, one line each
 //   result <id>            result.json (what goes to the record), once finished
 //   useful <id> <seat> <n> how many of that seat's findings Cain adopted (cost per useful finding)
-//   spend                  this month per seat: dollars, cap, runs, findings, useful, $ per useful
+//   spend                  this month per seat: dollars, the runner's own cap, runs, findings, useful,
+//                          $ per useful; then the round count per open change against the round cap
+//   guard                  the usage guard's reading now, in two lines (the plan, the seats and the floor)
 //   health                 the last nightly seat check
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -14,6 +16,8 @@ import { readStop, stoppedWhy } from "../stop.ts";
 import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
 import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
+import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
+import { guard, guardLines, labelOf, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
 const usefulFile = process.env.REVIEW_USEFUL ?? join(dirname(cfg.spendFile), "review-useful.jsonl");
@@ -21,6 +25,10 @@ const out = (s: string) => console.log(s);
 const fail = (s: string, code = 2): never => { console.error(s); process.exit(code); };
 const [cmd, a1, a2, a3] = process.argv.slice(2);
 const terms = () => { try { return readFileSync(cfg.termsFile, "utf8"); } catch { return null; } };
+// Cain 0.16.0: what the runner really uses, as it wrote it (root's file). Never this process's own
+// environment, which is Cain's: his caps and round cap would be the defaults, not the App's options.
+const settings = () => readSettings(cfg.settingsFile!);
+const roundCap = () => settings()?.round_cap ?? DEFAULT_ROUND_CAP;
 
 function money(n: number) { return `$${n.toFixed(2)}`; }
 
@@ -50,6 +58,16 @@ switch (cmd) {
     // again before every call.
     const g = privacyCheck(b, terms());
     if (!g.ok) fail(`blocked: privacy (${g.why.join("; ")}). Nothing was sent.`, 3);
+    // The round cap and the usage guard, here first so he hears at once (the runner decides again when
+    // it takes the brief, and its answer is the one that counts).
+    const rounds = readRounds(cfg.roundsFile!);
+    if (!rounds) fail("blocked: the review rounds file can't be read, so no round can be counted. Nothing was queued; log it as a Build item.", 3);
+    const a = admit(rounds!, b, roundCap());
+    if (!a.ok) fail(a.why, 3);
+    const label = labelOf(b.label)!;
+    const gv = guard(label, `review ${b.id} (${(a as any).key}, round ${(a as any).round})`, { settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile,
+      logFile: cfg.guardLog!, tz: cfg.tz, now: new Date() });
+    if (!gv.ok) fail(`held by the usage guard: it's labelled ${label}, and ${gv.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`, 3);
     // A seat whose monthly cap is reached runs nothing until the month turns (the runner
     // checks before every call). A review whose seats are all there is refused here, at once,
     // and nothing is left (Cain 0.13.0, read here from the spend file his group may read).
@@ -57,7 +75,7 @@ switch (cmd) {
     try { ledger = JSON.parse(readFileSync(cfg.spendFile, "utf8")); } catch { /* none yet */ }
     const month = new Date().toLocaleDateString("en-CA", { timeZone: cfg.tz }).slice(0, 7);
     const seats = new Set(newReview(b, new Date()).seats.map((s) => s.seat));
-    const capped = [...seats].filter((s) => atCap(ledger, month, cfg.caps, s));
+    const capped = [...seats].filter((s) => atCap(ledger, month, settings()?.caps ?? cfg.caps, s));
     if (capped.length && capped.length === seats.size)
       fail(`blocked: the monthly cap is reached for ${capped.map((s) => LABEL[s]).join(", ")}. Nothing was queued; raise the cap in the App's options if wanted, or wait for the month to turn.`, 3);
     leave(b);
@@ -108,13 +126,42 @@ switch (cmd) {
       for (const line of readFileSync(usefulFile, "utf8").split("\n")) { try { const j = JSON.parse(line); latest.set(`${j.id}/${j.key}`, j); } catch { /* skip */ } }
       for (const j of latest.values()) if (j.month === month) useful[j.seat] = (useful[j.seat] ?? 0) + j.useful;
     }
+    const st = settings();
+    const caps = st?.caps ?? null;
     out(`${month}: seat, spent / cap, runs, findings, useful, per useful finding`);
-    const cap: Record<SeatName, string> = { openai: `${cfg.caps.openaiRuns} runs`, gemini: money(cfg.caps.gemini), perplexity: money(cfg.caps.perplexity), claude: money(cfg.caps.claude) };
+    if (!caps) out("  (the runner hasn't written its caps yet, so caps show as ?: it writes them at each start)");
+    const cap: Record<SeatName, string> = caps
+      ? { openai: `${caps.openaiRuns} runs`, gemini: money(caps.gemini), perplexity: money(caps.perplexity), claude: money(caps.claude) }
+      : { openai: "? runs", gemini: "?", perplexity: "?", claude: "?" };
     for (const s of SEATS) {
       const r = l[month]?.[s] ?? { usd: 0, runs: 0, findings: 0, searches: 0 };
       const u = useful[s] ?? 0;
       out(`  ${LABEL[s]}: ${money(r.usd)} / ${cap[s]}, ${r.runs} runs, ${r.findings} findings, ${u} useful, ${u ? money(r.usd / u) : "-"}`);
     }
+    // The round count per open change: one with no decision card yet and a round in the last 30 days.
+    const rounds = readRounds(cfg.roundsFile!);
+    const capN = roundCap();
+    if (!rounds) { out(`Review rounds (cap ${capN}): the rounds file can't be read`); break; }
+    const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const seen = new Set<string>();
+    const open: string[] = [];
+    for (const key of Object.keys(rounds.changes).sort()) {
+      const group = groupOf(rounds, key);
+      const head = group[group.length - 1];
+      if (seen.has(head)) continue;
+      group.forEach((k) => seen.add(k));
+      const done = countedRounds(rounds, key);
+      if (!done.length || done[done.length - 1].at < since) continue;
+      const d = decisionOf(rounds, key);
+      open.push(`  ${group.join(" + ")}: ${done.length} of ${capN} round${capN === 1 ? "" : "s"}${d ? `, decision card ${d.state === "posted" ? "with him" : "owed"}` : done.length >= capN ? ", at the cap" : ""}`);
+    }
+    out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}):`);
+    out(open.length ? open.join("\n") : "  no open changes");
+    break;
+  }
+  case "guard": {
+    const [a, b] = guardLines(readings({ settingsFile: cfg.settingsFile!, spendFile: cfg.spendFile, tz: cfg.tz, now: new Date() }), new Date());
+    out(a); out(b);
     break;
   }
   case "health": {
@@ -124,5 +171,5 @@ switch (cmd) {
     break;
   }
   default:
-    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | health");
+    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health");
 }

@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.15.0"
+version: "0.16.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -62,6 +62,9 @@ timeout: 30
 # owner_user_id: the Home Assistant user id of the one person Cain's panel opens
 # for (not a key). While it's empty, the panel answers Forbidden to everyone. Its
 # pattern takes "" too: Supervisor checks any value that's there, optional or not.
+# review_round_cap: outside review rounds a change may have (the owner's rule: 3). The runner keeps it;
+# Cain's own user can't change it. usage_reserve_percent: the usage guard's reserve floor, a share of
+# the week's plan allowance and of each review seat's monthly cap that "other" work may not spend.
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
 # "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
@@ -74,6 +77,8 @@ options:
   perplexity_monthly_usd: 4
   anthropic_monthly_usd: 30
   codex_monthly_runs: 200
+  review_round_cap: 3
+  usage_reserve_percent: 25
   owner_user_id: ""
   notice_hook: ""
   pc_jobs_token: ""
@@ -90,6 +95,8 @@ schema:
   perplexity_monthly_usd: float(0,200)
   anthropic_monthly_usd: float(0,200)
   codex_monthly_runs: int(0,5000)
+  review_round_cap: int(1,10)
+  usage_reserve_percent: int(0,90)
   owner_user_id: match(^([0-9a-f]{32})?$)?
   notice_hook: password?
   pc_jobs_token: password?

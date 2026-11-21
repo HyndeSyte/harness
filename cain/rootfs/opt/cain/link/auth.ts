@@ -61,7 +61,8 @@ export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/rela
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
   "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector"]);
 // Root's services, on the unix socket only: what Cain sent (his edit allowlist) and the cards.
-export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice"]);
+// The review runner's decision card at the round cap (0.16.0): root's alone, so Cain can't post it.
+export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision"]);
 
 export function sameKey(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);

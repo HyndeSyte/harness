@@ -7,6 +7,7 @@ import { pinSocket } from "../pinned.ts";
 import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
+import type { DecisionRec } from "./rounds.ts";
 import { claudeSeat } from "./seats/claude.ts";
 import { geminiSeat } from "./seats/gemini.ts";
 import { codexSeat, codexSignedIn } from "./seats/openai.ts";
@@ -32,14 +33,27 @@ if (import.meta.main) {
   if (keys.anthropic) seats.claude = claudeSeat({ key: keys.anthropic, model: cfg.models.claude, selftestModel: "claude-haiku-5-5",
     version: env.ANTHROPIC_VERSION_HEADER || undefined });
 
+  // The owner's decision card at the review cap (Cain 0.16.0): through the link's root socket (only
+  // root can open it), which builds the card's words itself and files his tap.
+  const linkSock = env.CAIN_LINK_SOCK ?? "/run/cain/link.sock";
+  const postDecision = async (d: DecisionRec): Promise<string | null> => {
+    const res = await fetch("http://link/decision", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
+      body: JSON.stringify(d), signal: AbortSignal.timeout(45_000) } as any);
+    const j: any = await res.json().catch(() => ({}));
+    if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
+    log(`the link didn't post the decision card for ${d.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
+    return null;
+  };
   const runner = new Runner(cfg, {
-    seats, log,
+    seats, log, postDecision,
     stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });
   log(`seats: ${(["openai", "gemini", "perplexity", "claude"] as const).map((s) => `${s} ${runner.unavailable(s) ? "off" : "on"}`).join(", ")}`);
   // The Reviewed lines, rebuilt from the queue: a restart loses none (../reviewed.ts).
   runner.publishReviewed();
+  // The cap and caps it really uses, for review.sh and the Build hook (run as Cain).
+  try { runner.writeSettings(); } catch (e) { log(`couldn't write its settings for review.sh: ${(e as Error).message}`); }
 
   // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx. On a unix socket
   // only nginx's workers and root can open (C1): a TCP port could be taken by Cain's user while

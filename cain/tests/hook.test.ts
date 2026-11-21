@@ -19,7 +19,7 @@ const holds = keeperHolds({
 });
 // Running (not stopped), with the link's public Ship key; his token for PR 5 at SHA.
 const NOW = Date.now();
-const RUN = { pub: SHIP_PUB, stop: { stopped: false, at: null }, now: NOW };
+const RUN = { pub: SHIP_PUB, stop: { stopped: false, at: null }, now: NOW, guard: () => ({ ok: true as const }) };
 const TOKEN = makeToken(claimFor(PR5, SHA, NOW)!, (d) => edSign(null, d, SHIP_KEYS.privateKey));
 const GOOD_BUILD = "Branch: claude/one-voice-cards\nFix the sweep. Done when tests pass.";
 const GOOD_SHIP = `Install pull request ${PR5}, landed in main at ${SHA}. Ship token: ${TOKEN}. Dane tapped Ship at 9:40.`;
@@ -98,7 +98,8 @@ describe("the RemoteTrigger hook", () => {
     writeFileSync(join(dir, "stop.json"), JSON.stringify({ stopped: false, at: 0 }));   // running, as the link writes it
     const hook = async (input: string) => {
       const p = Bun.spawn(["bun", HOOK], { stdin: new TextEncoder().encode(input), stdout: "pipe", stderr: "pipe",
-        env: { ...process.env, CAIN_HOLDS: join(dir, "record-holds.json"), CAIN_SHIP_PUB: join(dir, "ship.pub"), CAIN_STOP_FILE: join(dir, "stop.json") } });
+        env: { ...process.env, CAIN_HOLDS: join(dir, "record-holds.json"), CAIN_SHIP_PUB: join(dir, "ship.pub"), CAIN_STOP_FILE: join(dir, "stop.json"),
+          REVIEW_GUARD_LOG: join(dir, "guard.log"), REVIEW_SETTINGS: join(dir, "settings.json"), REVIEW_SPEND: join(dir, "spend.json"), CAIN_HOME: join(dir, "home") } });
       const out = await new Response(p.stdout).text();
       expect(await p.exited).toBe(0);
       return out;
@@ -107,7 +108,7 @@ describe("the RemoteTrigger hook", () => {
     expect(denied.hookSpecificOutput.hookEventName).toBe("PreToolUse");
     expect(denied.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(denied.hookSpecificOutput.permissionDecisionReason).toContain("never a pull request");
-    expect(await hook(JSON.stringify(run(BUILD, GOOD_BUILD)))).toBe("");
+    expect(await hook(JSON.stringify(run(BUILD, `${GOOD_BUILD}\nLabel: core`)))).toBe("");
     expect(await hook(JSON.stringify(run(SHIP, GOOD_SHIP)))).toBe("");
     expect(JSON.parse(await hook("not json")).hookSpecificOutput.permissionDecision).toBe("deny");
   });

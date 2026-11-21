@@ -213,6 +213,57 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
+### The review-round cap (since 0.16.0)
+
+A piece of work gets at most three outside review rounds, and the review runner keeps that count
+itself, where Cain can't change it. Each brief names its change (a pull request's address, or a
+stable `change` key for a plan or document); a replacement pull request or a new key names the one
+it `supersedes`, and the count carries over, so a new id or a new pull request doesn't start it
+again. The first round reads the whole change; every later round is fix-only: the seats get only the
+fixes and the earlier findings, and mark each finding serious (could lose or corrupt something of
+yours, act without your go, expose a secret, widen reach, or fail silently) or follow-up (a window
+that needs a crash or rare timing and fails safe, hardening, edge cases, wording, polish). A fourth
+round is refused, with the count and the rule. If the third still leaves something serious, the
+runner itself sends you one card: what the piece is, the serious finding in one line, and "Hold it"
+or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
+round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
+after "Ship it with that risk" it goes only while the probe's rollback of a bad install is armed for
+that App (read from `/data/probe/rollback-armed.json`; the probe in 0.15.0 writes no such record, so
+until a release arms it, that card is refused and says what isn't armed). The cap is the option
+`review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
+card in the link's `/data/link/review-decisions.json`.
+
+### Labels (since 0.16.0)
+
+Every brief, and every Build or Ship job Cain starts, carries one label: `core` (Cain answering you,
+the calendar, reminders, the morning message), `commitment` (your course first), `necessary-fix`
+(something broken now) or `other`. A missing label counts as `other`. A brief carries it in its
+`label` field; a job, in its `label` field or a `Label: <label>` line of its text. The first three
+always pass the usage guard (still within the round cap); `other` is what the guard can hold.
+
+### The usage guard (since 0.16.0)
+
+One Claude subscription and four paid review seats serve Cain's own work, the builds, the reviews
+and your own projects. The guard keeps `other` work from spending what your commitments need: the
+review runner asks it for every brief, and Cain's Build hook for every Build job. It refuses `other`
+work while the week's plan allowance left, or any review seat's monthly cap left (the caps the
+runner really uses), is below the reserve floor, the option `usage_reserve_percent` (default 25).
+There's no tap or flag that gets around it. Each refusal is one line in `/data/review-guard.log`
+(time, label, what was refused, which floor), and Cain lists those holds on the open list; the guard
+never sends you a card. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
+check-in hands Cain the same two lines for his daily usage row.
+
+What it reads for the plan: Cain's Claude Code transcripts under `/data/cain/.claude/projects` (each
+turn's token counts, the last 7 days). They record tokens used, not your plan's weekly allowance,
+and nothing else on the Pi records the allowance, so the plan reading is "unknown" today, and an
+unknown reading (or one older than a day) counts as below the floor. So for now every `other` job
+and review is held, and only `core`, `commitment` and `necessary-fix` work runs: that's on purpose,
+until there's a reliable reading. How to tell it's working: `review.sh guard`'s first line says
+"Plan: unknown" with the reason and the week's token count (a count that grows as Cain works shows it
+reads the transcripts; "no Claude Code transcripts found" means it can't), and its second line names
+each seat's share left and whether other work is held. `review.sh spend` shows the runner's own caps
+and each open change's round count.
+
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
 

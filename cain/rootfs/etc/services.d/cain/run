@@ -507,8 +507,13 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   REVIEW_CAP_PERPLEXITY_USD="$(opt perplexity_monthly_usd)"
   REVIEW_CAP_ANTHROPIC_USD="$(opt anthropic_monthly_usd)"
   REVIEW_CAP_CODEX_RUNS="$(opt codex_monthly_runs)"
+  # The review-round cap and the usage guard's floor (Cain 0.16.0): in this environment only, so
+  # Cain's user can't set them; the runner writes what it uses to /data/review-settings.json.
+  REVIEW_ROUND_CAP="$(opt review_round_cap)"
+  USAGE_RESERVE_PERCENT="$(opt usage_reserve_percent)"
   export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
-    REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS
+    REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
+    REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT
   mkdir -p -m 700 /data/codex
   while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
 ) &

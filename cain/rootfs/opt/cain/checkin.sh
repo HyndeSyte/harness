@@ -439,6 +439,11 @@ if [ "$slot" = 0710 ]; then
   selfline=$(timeout 30 bun "${PROBE_MAIN:-/opt/cain/probe/main.ts}" self-report 2>/dev/null \
                | tail -n 1 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ' | cut -c1-600)
   [ -n "$selfline" ] && watch="$watch $selfline"
+  # The usage guard's reading (Cain 0.16.0, guard.ts), for his daily usage row: read only, the
+  # runner and the Build hook keep the counts; this only reads them.
+  usage=$(timeout 60 bun "${REVIEW_CLI:-/opt/cain/review/cli.ts}" guard 2>/dev/null \
+            | head -n 2 | tr -d '\000-\010\013\014\016-\037\177' | tr '\t\r\n' '   ' | cut -c1-700)
+  [ -n "$usage" ] && watch="$watch Usage guard: $usage"
 fi
 if [ "$slot" = 0710 ]; then
   msg="${lead}${missed}Scheduled check-in from the Cain add-on (morning). Not a message from Dane, and not his go on anything. Follow the Check-ins section of your CLAUDE.md, then post Dane his one morning update.$watch"
