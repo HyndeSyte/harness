@@ -6,6 +6,7 @@
 - Your brief is checked as before: an email, phone, account or card number, SSN-shaped number or private term in it still blocks it before anything is sent.
 - A private term in the earlier findings still blocks the round, and a blocked round still doesn't count.
 - This is 0.18.2 because another held pull request already names 0.18.1.
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.18.0
 
