@@ -213,7 +213,7 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
-### The privacy backstop (since 0.18.2)
+### The privacy backstop (since 0.18.1)
 
 Before anything goes to a seat, the review runner checks it in code and fails closed. Over the
 brief (its topic, question, body and id) it runs every built-in pattern (an email address, a phone

@@ -101,7 +101,7 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(admit(t.rounds(), brief({ id: "pv-2" }), 3)).toMatchObject({ ok: true, round: 1, kind: "full" });
   });
 
-  // Cain 0.18.2: the earlier findings are the service's own verdicts, so only the owner's terms list runs over
+  // Cain 0.18.1: the earlier findings are the service's own verdicts, so only the owner's terms list runs over
   // them; the brief still gets every built-in pattern and the list.
   test("earlierCheck runs only the terms list over the earlier findings, and still fails closed without one", () => {
     expect(earlierCheck(["Claude: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });

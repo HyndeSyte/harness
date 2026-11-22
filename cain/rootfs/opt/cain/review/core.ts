@@ -222,7 +222,7 @@ export function reviewCheck(r: Review, termsText: string | null): { ok: true } |
 
 // The earlier findings a fix-only round sends (Cain 0.16.0). Over the brief, privacyCheck runs every
 // built-in pattern and the owner's private-terms list. Over the earlier findings it runs only the
-// terms list (Cain 0.18.2): they are the review service's own verdicts from the round before, already
+// terms list (Cain 0.18.1): they are the review service's own verdicts from the round before, already
 // sent to the same seats in the round that produced them, and they carry tool version strings (a web
 // search tool's name ends in an eight-digit date) that the built-in number patterns read as an account
 // number, which blocked every fix-only round after one. A term from the owner's list still blocks them,
