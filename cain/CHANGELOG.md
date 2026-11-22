@@ -3,16 +3,18 @@
 ## 0.18.1
 
 - A grant of more review rounds now holds the state you approved with your tap: the pull request's newest commit, the newest decision, the rounds used and the cap before it.
-- If the pull request gets new commits, or a newer decision comes, between your tap and the next round, the grant no longer counts: that round is refused, Cain hears once why, and he can ask you again on a fresh card.
+- If the pull request gets new commits, or a newer decision comes, between your tap and the next round, the grant no longer counts: that round is refused, and Cain can ask you again on a fresh card.
+- When a grant of yours stops counting, for any reason, you get one plain message saying so, and Cain hears once.
 - A grant is used up by one round: the round that claims it is kept, so it can't be claimed twice.
-- Grants you gave before this version are replayed once against the rounds as they ran: a round counts against one of them only if it went past the cap and needed it. Nothing you granted is thrown away, and Cain hears once per change what was counted.
-- Rounds of such a grant that were never used wait for you: one card per change asks whether to keep them for the pull request as it stands now, with Keep and Drop. Until you tap Keep they don't count; Keep ties them to the newest commit as GitHub has it when you tap, and Drop ends them.
+- Grants you gave before this version are replayed once against the rounds as they ran: each round past the limit of three uses one round of the earliest earlier grant with rounds left.
+- Rounds of those earlier grants that no round needed are let go, and you get one plain message per change saying how many. There is no card about them: if a change needs more rounds, Cain asks you on a fresh grant card.
+- Before that replay, copies of the review records are kept beside them, so the replay can be checked afterwards with `review.sh sweep-dry-run`.
 - Before a round uses one of your grants, the review service reads the pull request's newest commit on GitHub itself. If it isn't the one Cain's request names, the request is turned back and the grant stays as it was.
-- If GitHub can't be read, that request waits on its own, trying again less and less often (at most every 15 minutes), and other reviews go ahead meanwhile. Cain hears once after 15 minutes, and after a day the request is turned back.
-- A late or out-of-date request can no longer cancel a grant you gave, and neither can a GitHub read that lags behind: a grant is cancelled for new commits only when GitHub shows the commit you approved is older than the newest one.
+- A grant is cancelled for new commits only when GitHub shows the commit you approved is older than the newest one. If GitHub can't show that, the request is turned back and nothing is cancelled.
+- Each GitHub read gives up after 20 seconds, and all of them back off together when GitHub doesn't answer, at most 15 minutes apart. Other reviews go ahead meanwhile.
+- A request that waits on GitHub for 15 minutes brings you one message that the review waits on GitHub, and after a day it is turned back. A restart keeps those times.
 - Tapping a grant card twice, or the same card coming again, never grants twice.
-- Two read-only checks to run after installing: `review.sh sweep-dry-run` shows what the replay of earlier grants decides, and `review.sh host-read` shows GitHub's answer for a pull request both ways it is read.
-- Two grants waiting on the same change are both used by the next round, and both count in full.
+- Two read-only checks: `review.sh sweep-dry-run` shows what the replay of earlier grants decides, and `review.sh host-read` shows GitHub's answer for a pull request both ways it is read.
 - Cain's review lines say when a grant no longer counts, like "1 grant no longer counts: the pull request moved on".
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart: nothing about those changed here.
 

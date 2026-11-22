@@ -36,9 +36,6 @@ export type GrantRec = {
   // Fifth review: the card's own id (the link's stable nonce for it), the same however often the card is tapped,
   // its tap redelivered or the card sent again: the grants file holds at most one grant per card id.
   card?: string;
-  // Fifth review, never in the file: a 0.18.0 grant's unused rounds the owner kept on his Keep tap (effectiveGrants).
-  // Held to the head and the decision he kept them for; the round count may move under the cap meanwhile.
-  kept?: boolean;
 };
 export type GrantBinding = { head: string | null; decision: string | null; used: number; cap: number };
 export type Grants = { format: number; grants: GrantRec[] };
@@ -85,9 +82,6 @@ export type Standing = {
   claimable: GrantRec[];                      // binding matches now: the next round claims them
   waiting: GrantRec[];                        // bound to a head, and the brief named none: not matched, not voided
   stale: { rec: GrantRec; why: StaleWhy }[];  // never count
-  // Fifth review: a 0.18.0 grant's allowance the upgrade's replay found unused, waiting for the owner's Keep or Drop
-  // card: it never counts until his Keep binds it.
-  pending: { rec: GrantRec; unused: number }[];
   // The cap from the base and the claimed grants alone (fourth review): the prior cap a candidate's binding is
   // checked against, never counting the candidate or any other outstanding grant. The link's tap records the
   // same value as the binding's cap.
@@ -97,41 +91,39 @@ export const validBinding = (b: any): b is GrantBinding => !!b && typeof b === "
   && (b.head === null || (typeof b.head === "string" && /^[0-9a-f]{40}$/.test(b.head)))
   && (b.decision === null || typeof b.decision === "string")
   && Number.isInteger(b.used) && b.used >= 0 && Number.isInteger(b.cap) && b.cap >= 1;
-// Which round claimed which grant (the runner's rounds file, RoundRec.claims), across the group.
+// Which round claimed which grant (the runner's rounds file, RoundRec.claims), across the group: the first round
+// to claim each grant id.
 export function claimsOf(r: Rounds, key: string): Map<string, string> {
   const out = new Map<string, string>();
   for (const k of groupOf(r, key)) for (const x of r.changes[k]?.rounds ?? []) for (const id of x.claims ?? []) if (!out.has(id)) out.set(id, x.id);
   return out;
 }
-// Fifth review: the id under which a 0.18.0 grant's unused allowance, once the owner kept it, is claimed.
-export const KEPT = "#kept";
-// The grants of a key's group as they count (fifth review). A grant with a binding is itself. A 0.18.0 grant the
-// upgrade's replay handled (Rounds.grants_legacy) counts only the rounds that needed it (credited; those rounds
-// carry its id as a claim), and its unused allowance only once the owner kept it, as a grant of its own ("<id>#kept")
-// bound to the change at his Keep tap; while it waits for his tap it's pending, and after his Drop it's nothing.
-// A 0.18.0 grant the replay hasn't handled yet is itself, unbound: it never counts.
-export function effectiveGrants(r: Rounds, g: Grants | null, key: string): { list: GrantRec[]; pending: { rec: GrantRec; unused: number }[] } {
-  const list: GrantRec[] = [], pending: { rec: GrantRec; unused: number }[] = [];
-  for (const x of grantsFor(r, g, key)) {
-    const L = validBinding(x.bound) ? undefined : r.grants_legacy?.[x.id];
-    if (!L) { list.push(x); continue; }
-    if (L.credited.length) list.push({ ...x, rounds: L.credited.length });
-    if (L.unused > 0 && L.state === "pending") pending.push({ rec: x, unused: L.unused });
-    if (L.unused > 0 && L.state === "kept" && validBinding(L.bound)) list.push({ ...x, id: `${x.id}${KEPT}`, rounds: L.unused, bound: L.bound, kept: true });
-  }
-  return { list, pending };
+// How many rounds of the group claim each grant id. A bound grant is claimed by one round, for all its rounds; a
+// grant from before grants were bound is claimed by each round past the base cap the one-time replay debited it for.
+export function claimCounts(r: Rounds, key: string): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const k of groupOf(r, key)) for (const x of r.changes[k]?.rounds ?? []) for (const id of x.claims ?? []) out.set(id, (out.get(id) ?? 0) + 1);
+  return out;
+}
+// The grants of a key's group as they count (sixth review). A grant with a binding is itself. A grant from before
+// grants were bound (0.18.0, no binding) counts only for the rounds the one-time replay debited it for (each carries
+// its id as a claim), never more: its unused rounds were let go (grants_void, why "unbound"). One the replay hasn't
+// handled yet is itself, unbound: it never counts.
+export function effectiveGrants(r: Rounds, g: Grants | null, key: string): GrantRec[] {
+  const n = claimCounts(r, key);
+  return grantsFor(r, g, key).flatMap((x) => validBinding(x.bound) ? [x] : n.get(x.id) ? [{ ...x, rounds: Math.min(x.rounds, n.get(x.id)!) }] : [x]);
 }
 // head: the pull request's head now, as GitHub gave it to the runner (fourth review: never a brief's own claim),
 // null when the brief named none, undefined when not known here (status lines, review.sh's early check, and
 // the runner before a claim: the head is checked only when a round claims the grant, against GitHub's head).
 export function standing(base: number, r: Rounds, g: Grants | null, key: string, head?: string | null): Standing {
-  const { list, pending } = effectiveGrants(r, g, key);
+  const list = effectiveGrants(r, g, key);
   const claimed = claimsOf(r, key);
   const counting = list.filter((x) => claimed.has(x.id));
   const prior = base + grantedRounds(counting);
   const used = countedRounds(r, key).length;
   const dec = decisionOf(r, key)?.id ?? null;
-  const s: Standing = { counting, claimable: [], waiting: [], stale: [], pending, prior };
+  const s: Standing = { counting, claimable: [], waiting: [], stale: [], prior };
   for (const x of list) {
     if (claimed.has(x.id)) continue;
     const voided = r.grants_void?.[x.id];
@@ -139,8 +131,8 @@ export function standing(base: number, r: Rounds, g: Grants | null, key: string,
     const why: StaleWhy | null = voided ? voided.why
       : !validBinding(b) ? "unbound"
       : b.decision !== dec ? "decision"
-      : !x.kept && b.used !== used ? "rounds"
-      : !x.kept && b.cap !== prior ? "cap"
+      : b.used !== used ? "rounds"
+      : b.cap !== prior ? "cap"
       : b.head !== null && typeof head === "string" && head.toLowerCase() !== b.head ? "head"
       : null;
     if (why) s.stale.push({ rec: x, why });
@@ -149,19 +141,20 @@ export function standing(base: number, r: Rounds, g: Grants | null, key: string,
   }
   return s;
 }
-// The upgrade's one-time sweep of grants written by 0.18.0 (fifth review). None of them carries a binding, and 0.18.0
-// recorded no claims, so each change group's rounds are replayed in time order against the allowance in effect at
-// each round: the base cap plus the rounds already allowed by grants (a round's claims of bound grants, and the
-// legacy rounds credited so far). A round within that allowance needed no grant; a round past it is attributed to
-// the earliest 0.18.0 grant given before it with allowance left (its id written as a claim on that round). Whatever
-// a grant has left is pending (Rounds.grants_legacy), never claimable until the owner's Keep. Nothing is voided and
-// the grants file isn't touched. Changes r in place; one decision per grant, for the log, for Cain and for the card.
-export type SweepDecision = { rec: GrantRec; credited: string[]; unused: number };
-export function sweepLegacy(r: Rounds, g: Grants, base: number, at: string): SweepDecision[] {
-  const out: SweepDecision[] = [];
-  const todo = g.grants.filter((x) => !validBinding(x.bound) && !r.grants_legacy?.[x.id] && !r.grants_void?.[x.id]);
+// The upgrade's one-time replay of grants written by 0.18.0 (sixth review). None of them carries a binding, and 0.18.0
+// recorded no claims. For each change group, its rounds are replayed in time order: the base cap decides whether a
+// round needed a grant (rounds a bound grant's claim already covers aside), and each round past it debits exactly one
+// round from the earliest pre-binding grant given before it that has rounds left (by grant time, then grant id),
+// written as a claim on that round. Whatever a pre-binding grant has left is then let go (voided, why "unbound"):
+// a fresh grant card is the way to more rounds. Changes r in place, and touches neither the grants file nor any
+// bound grant. One decision per grant, for the log, the notices and the dry run.
+export type ReplayDecision = { rec: GrantRec; credited: string[]; unused: number };
+export function replayUnbound(r: Rounds, g: Grants, base: number, at: string): ReplayDecision[] {
+  const out: ReplayDecision[] = [];
+  const todo = g.grants.filter((x) => !validBinding(x.bound) && !r.grants_void?.[x.id] && !claimCounts(r, x.key).has(x.id));
+  const byTime = (a: GrantRec, b: GrantRec) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id);
   const groups = new Map<string, GrantRec[]>();
-  for (const x of [...todo].sort((a, b) => a.at.localeCompare(b.at))) {
+  for (const x of [...todo].sort(byTime)) {
     const gk = groupOf(r, x.key).join(" ");
     groups.set(gk, [...(groups.get(gk) ?? []), x]);
   }
@@ -170,27 +163,21 @@ export function sweepLegacy(r: Rounds, g: Grants, base: number, at: string): Swe
     const byId = new Map(grantsFor(r, g, key).map((x) => [x.id, x]));
     const left = new Map(mine.map((x) => [x.id, x.rounds]));
     const credited = new Map(mine.map((x) => [x.id, [] as string[]]));
-    let extra = 0;
+    let bound = 0;                                       // rounds already covered by bound grants' claims
     countedRounds(r, key).forEach((y, i) => {
-      for (const id of y.claims ?? []) {
-        if (id.endsWith(KEPT)) { extra += r.grants_legacy?.[id.slice(0, -KEPT.length)]?.unused ?? 0; continue; }
-        if (r.grants_legacy?.[id]) { extra += 1; continue; }
-        const x = byId.get(id);
-        if (x && validBinding(x.bound)) extra += x.rounds;
-      }
-      if (i + 1 <= base + extra) return;               // within the allowance in effect then: it needed no grant
+      for (const id of y.claims ?? []) { const x = byId.get(id); if (x && validBinding(x.bound)) bound += x.rounds; }
+      if (i + 1 <= base + bound) return;                 // within the base cap (or a bound grant's rounds): no credit
       const c = mine.find((x) => x.at < y.at && left.get(x.id)! > 0);
       if (!c) return;
       left.set(c.id, left.get(c.id)! - 1);
-      extra += 1;
       credited.get(c.id)!.push(y.id);
       const rec = r.changes[y.key]?.rounds.find((z) => z.id === y.id);
       if (rec) rec.claims = [...(rec.claims ?? []), c.id];
     });
     for (const x of mine) {
-      const unused = left.get(x.id)!, cr = credited.get(x.id)!;
-      (r.grants_legacy ??= {})[x.id] = { key: x.key, at, credited: cr, unused, state: unused > 0 ? "pending" : "used" };
-      out.push({ rec: x, credited: cr, unused });
+      const unused = left.get(x.id)!;
+      if (unused > 0) (r.grants_void ??= {})[x.id] = { why: "unbound", at, key: x.key, rounds: unused };
+      out.push({ rec: x, credited: credited.get(x.id)!, unused });
     }
   }
   return out;

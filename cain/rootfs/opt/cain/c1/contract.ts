@@ -53,6 +53,7 @@ const ROOT_FOR_HIM = [
   /^\/data\/record-holds\.json$/,
   /^\/data\/review-queue\/[^/]+$/,
   /^\/data\/review-(spend|health|rounds|settings)\.json$/,   // rounds and settings: the round cap's count and the runner's caps (0.16.0)
+  /^\/data\/review-(rounds|grants)\.pre-0\.18\.1\.json$/,  // the copies the runner kept before its one-time replay (0.18.1): root:cain 0640, for review.sh sweep-dry-run
   /^\/data\/review-grants\.json$/,                     // the owner's grants of extra review rounds (0.18.0): root:cain 0640, the link writes, he reads
   /^\/data\/review-guard\.log$/,                        // the usage guard's refusals (0.16.0): root:cain 0640, root writes (round 2), he reads
   /^\/data\/review-useful\.jsonl$/,

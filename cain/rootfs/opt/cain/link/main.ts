@@ -78,7 +78,7 @@ import { loadShipKey } from "./shipkey";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
-import { readRounds, updateRounds } from "../review/rounds";
+import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
@@ -253,25 +253,6 @@ const link = new Link({
   // here only, on his tap on Cain's grant card, durably, made root:cain 0640 at every write and recreation.
   grants: () => readGrants(GRANTS_FILE),
   grant: (rec) => { if (capOff) throw new GrantUnsaved(`the review cap's files aren't right (${capOff})`); return recordGrant(GRANTS_FILE, rec); },
-  // 0.18.1 (fifth review): his Keep or Drop on an earlier grant's unused rounds, into the runner's rounds file under
-  // its lock (the grants file isn't touched).
-  legacyAnswer: (ids, choice, at, message, bind) => {
-    if (capOff) throw new Error(`the review cap's files aren't right (${capOff})`);
-    const n = updateRounds(ROUNDS_FILE, (r) => {
-      const bound = bind(r);
-      let k = 0;
-      for (const id of ids) {
-        const L = r.grants_legacy?.[id];
-        if (!L || L.state !== "pending") continue;
-        L.state = choice; L.answered = { at, message };
-        if (choice === "kept") L.bound = bound;
-        k++;
-      }
-      return k || false;
-    });
-    if (n === null) throw new Error("the review rounds file can't be read");
-    return n || 0;
-  },
   capOff: () => capOff,
   // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
   // rotated root-side, keeping one previous file: cap.ts appendCapped).

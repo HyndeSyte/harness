@@ -2663,8 +2663,8 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # /pc-notice (the keeper runs as root, so being root is its key), and (Cain 0.16.0) the
     # review runner's decision card at the round cap, so Cain can't post it; and (its second round)
     # the usage guard's hold, which the link decides again before it writes root's guard log.
-    # Cain 0.18.1 (fifth review): and the runner's Keep or Drop card for an earlier grant's unused rounds.
-    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold", "/legacy-grant"])' in auth
+    # Cain 0.18.1 (sixth review): and the runner's plain notices for the owner, in the link's own words.
+    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold", "/review-notice"])' in auth
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

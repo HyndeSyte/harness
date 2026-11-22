@@ -347,53 +347,66 @@ and the cap before the grant. The runner holds every grant to that:
   grants afresh and checks the newest decision, the round count and the prior cap in the same step
   that records the claim: one write of `/data/review-rounds.json`, which only the runner writes, one
   tick at a time. While GitHub can't be read, the brief waits in the inbox untaken (logged once) and
-  is tried again next tick; it never claims meanwhile.
+  is tried again as the backoff below allows; it never claims meanwhile.
 - A grant is voided only by checks against GitHub's head and the runner's own records (the decision,
   the round count, the prior cap), never against a brief's claim. A voided grant doesn't count: the
   round is refused at the cap with a plain line saying why (for example, it was given for the pull
   request as it stood then, but the pull request has new commits since). The runner keeps it as void
   in its rounds file and Cain hears it once, so he can ask you for a fresh grant card. A brief that
   names no head can't claim a grant bound to a head and is refused without voiding it.
-- Grants written by 0.18.0 carry no binding, and 0.18.0 recorded no claims. At its first start after
-  the update the runner replays them once (fifth review): each change group's rounds, in time order,
-  against the allowance in effect at each round, which is the base cap plus the rounds already allowed
-  by grants given before it. A round within that allowance needed no grant and is credited to none (so a
-  grant given after round two is not used up by round three, which the base cap of three allowed
-  anyway). A round past it is credited to the earliest 0.18.0 grant given before it that has rounds left,
-  written as a claim on that round, and the grant counts for those credited rounds only. Whatever a grant
-  has left is pending (`grants_legacy` in the rounds file): it never counts, and a round past the cap is
-  refused with a plain line saying the allowance waits for your confirmation. Nothing from 0.18.0 is
-  voided, the grants file itself is never changed, and a restart changes nothing.
-- A pending allowance needs your confirmation on one card per change, which the runner owes and the
-  link posts: "You granted N more review rounds for pull request 48 before grants were bound to a
-  commit; M of them are unused. Keep them for the pull request as it stands now (newest commit read from
-  GitHub when you tap)?", with Keep and Drop. Keep takes the same lock as a grant tap and re-checks the
-  same things (Stop clear, the cap's files right, the records readable, the item not held elsewhere,
-  the pull request's newest commit read from GitHub at your tap), then writes the binding into the
-  runner's rounds file (under that file's lock, so the runner's own writes never cross it): the unused
-  rounds count from then on, for that commit and the newest decision, and the next round past the cap
-  claims them. If GitHub can't be read, or Stop holds, nothing is written and the card stays up. Drop
-  records them as dropped: they never count. Cain is told once per change what was credited and what
-  waits, and never asks you about it himself.
-- GitHub's read is never in the way of other changes (fifth review). A brief that would claim a grant
-  waits for GitHub's head on its own: a tick waits at most two seconds for that read and goes on with
-  the other briefs (the inbox takes them), and a failed or rate-limited read backs off, from a minute,
-  doubling to 15 minutes, never every tick. After 15 minutes of waiting Cain hears once that the claim
-  waits on GitHub; after 24 hours the brief is refused with a plain line and no longer read for. The
-  wait is counted from when the runner first finds the brief waiting since it started.
-- Voiding needs proof (fifth review). A grant is voided for its head only when its bound commit is
-  provably superseded: GitHub's compare says the bound commit is an ancestor of the head read now, or,
-  when the compare can't tell (or the history was rewritten), two reads at least one tick apart agree
-  on the newer head. Otherwise the brief is refused, "isn't proven newer yet", and nothing is voided,
-  so a lagging read that returns an older commit than the one you approved leaves your grant intact.
+- Grants written by 0.18.0 carry no binding, and 0.18.0 recorded no claims. At the runner's first tick
+  after the update it replays them once (sixth review): for each change group, its rounds in time order,
+  where the base cap decides whether a round needed a grant. Each round past the base cap debits exactly
+  one round from the earliest 0.18.0 grant given before it that still has rounds left (by the grant's
+  time, then its id), written as a claim on that round, and the grant counts for those rounds only. So a
+  grant given after round two is not used up by round three, which the base cap of three allowed anyway,
+  and a two-round grant followed by a fourth round has one round claimed and one left over.
+- Rounds of a 0.18.0 grant that no round needed are let go: voided once, recorded in the rounds file
+  under `grants_void` with the reason "unbound" and how many rounds. You get one plain notice per change
+  through the link, in its own words ("Before grants were tied to a commit, you granted extra review
+  rounds for pull request 48. 1 of them was never used and is now let go. If it needs more rounds, Cain
+  can ask you again."), and Cain hears once. There is no card about old grants: if the change needs more
+  rounds, a fresh grant card is the way. The grants file itself is never changed.
+- The replay is one commit (sixth review). Its claims, its voids, the notices it owes and its done
+  marker (`replayed`) are built in memory and written in one atomic rename of the rounds file. A crash
+  before that rename leaves the file as it was, and the replay runs again from scratch at the next start;
+  after it, a restart changes nothing. The notices are delivered after the commit and marked sent, each
+  once by its id (a crash in between can say one twice, never lose it).
+- Just before the replay, the runner keeps copies of both files beside them, as they were:
+  `/data/review-rounds.pre-0.18.1.json` and `/data/review-grants.pre-0.18.1.json` (root:cain 0640, kept
+  once, never written over), so the dry run below can be pointed at the state before the replay.
+- GitHub's read is never in the way of other changes, and it has hard edges (fifth and sixth reviews).
+  A brief that would claim a grant waits for GitHub's head on its own: a tick waits at most two seconds
+  for that read and goes on with the other briefs. Each GitHub request (the head read and each compare)
+  has a hard deadline of 20 seconds; at most one read is in flight for a brief, and every read carries a
+  sequence number, so an answer that comes late, or isn't the latest read's, is discarded. Every GitHub
+  read shares one backoff: a failed, rate-limited or timed-out read (the compare included) waits a
+  minute, doubling to 15 minutes, and the next try's time is kept in the rounds file. The wait is judged
+  on when the brief first waited, also kept in the rounds file, at every tick whether or not a read has
+  answered: after 15 minutes Cain hears once, and you get one plain notice ("The review of pull request
+  48 waits on GitHub: its newest commit can't be read right now. It keeps trying by itself."); after 24
+  hours the brief is refused with a plain line and no longer read for. A restart keeps all of it.
+- Voiding needs positive proof (sixth review). A grant is voided for its head only when GitHub's compare
+  positively says the commit you approved is a strict ancestor of the head read now. When the compare
+  can't be read, fails, or says the histories diverged or are identical, the brief is refused ("the pull
+  request's head isn't proven newer than the one the grant was given for") and nothing is voided or
+  claimed, however many reads agree. So a lagging read that returns an older commit than the one you
+  approved leaves your grant intact.
+- When a grant of yours is voided for any reason (new commits, a newer decision, rounds or cap moved
+  on, or rounds of an old grant let go), you are told once through the link, in plain words, and Cain
+  hears once.
 - The grant write is idempotent per card (fifth review). Each grant carries the card's own id, and the
   grants file keeps at most one grant per card: a second tap on the same card, a redelivered tap or the
   card sent again never writes a second grant.
-- Two checks for you after installing (fifth review), both read only:
-  - `/opt/cain/review.sh sweep-dry-run` runs the replay on copies of the live rounds and grants files
-    and prints, for each grant from before grants were bound, the rounds it would credit, what would be
-    pending and that nothing is voided (and, once the runner has replayed them, what it recorded). It
-    writes nothing.
+- The rounds file has one writer again: the runner, one tick at a time, writing by temp file and atomic
+  rename. The link only reads it.
+- Two checks for you, both read only:
+  - `/opt/cain/review.sh sweep-dry-run [rounds file] [grants file]` runs the replay on copies of the two
+    files (the live ones by default) and prints, for each grant from before grants were bound, the rounds
+    it credits and how many it lets go. It writes nothing. Before the install, run it on copies of the
+    live files; after it, the live files say they were replayed, and pointing it at the pre-replay copies
+    (`review.sh sweep-dry-run /data/review-rounds.pre-0.18.1.json /data/review-grants.pre-0.18.1.json`)
+    shows what the runner did.
   - `/opt/cain/review.sh host-read <pull request number>` reads that pull request's head once through
     GitHub's API and once through its refs, the two paths the shared read uses, and prints both.
 - `review.sh status <id>`, `review.sh spend` and Cain's round line say when a grant doesn't count, for

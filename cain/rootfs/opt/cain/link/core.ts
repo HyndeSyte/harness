@@ -86,11 +86,11 @@ import { asksSomething, snowflakeTime } from "../gate/plugin";
 import { decideSend, type CardsView, type CardView, type Decision, type Writer } from "../gate/send";
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, imperative, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { keyOfRef, safeId } from "../review/core";
-import { countingGrants, effectiveCap, GRANT_MAX, grantedRounds, GrantUnsaved, lastRound, standing, type GrantBinding, type GrantRec, type Grants } from "../review/grants";
+import { countingGrants, effectiveCap, GRANT_MAX, grantedRounds, GrantUnsaved, lastRound, standing, type GrantRec, type Grants, type StaleWhy } from "../review/grants";
 import { freshReviewed, type Reviewed } from "../reviewed";
 import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, DecisionsUnsaved, fallbackText, namesRoundPastCap, type CapState } from "./cap";
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
-import { countedRounds, decisionOf, type DecisionRec, type LegacyCard, type Rounds } from "../review/rounds";
+import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
@@ -222,6 +222,12 @@ const SNOWFLAKE = /^\d{15,22}$/;
 // The one answer of an owner-reuse ask that approves it (reuseProof): its first option.
 export const REUSE_YES = "Use it";
 const SHA = /^[0-9a-f]{40}$/;
+// Why a grant of his stopped counting, in his words (the review runner's notice, Cain 0.18.1).
+export const REVIEW_VOID_WHY: Record<StaleWhy, string> = {
+  head: "the pull request has new commits since you granted it", decision: "a newer decision on it came after you granted it",
+  rounds: "its review rounds moved on after you granted it", cap: "its round limit changed after you granted it",
+  unbound: "it was granted before grants were tied to a commit",
+};
 export const PULL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
 export type Rest = (method: string, path: string, body?: unknown, auth?: boolean, timeoutMs?: number) => Promise<any>;
@@ -358,8 +364,6 @@ export interface Shown {
     prior?: number;
     // Fifth review: the card's own id (its stable nonce), written with the grant so a card counts once.
     card?: string };
-  // 0.18.1 (fifth review): the review runner's Keep or Drop card for a 0.18.0 grant's unused rounds (one a change).
-  legacy?: { key: string; ids: string[]; granted: number; unused: number; pr: string | null; item: string | null };
 }
 // The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
 // tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
@@ -393,6 +397,7 @@ export interface State {
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
   pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
+  reviewNotices?: Record<string, { msg: string; at: number }>;   // the review runner's notice ids already posted (Cain 0.18.1)
   // The review runner's decision cards waiting while their item is held by another holder (0.16.0,
   // round 2), by decision id: one each, tried again at each sweep until the hold clears.
   decisions?: Record<string, Partial<DecisionRec> & { since: number }>;
@@ -728,11 +733,6 @@ export interface Deps {
   // (../review/grants.ts recordGrant; throws when it couldn't be kept: the card stays up).
   grants?: () => Grants | null;
   grant?: (rec: GrantRec) => { rec: GrantRec; existed: boolean };
-  // 0.18.1 (fifth review): his Keep or Drop on the card for a 0.18.0 grant's unused rounds, written into the runner's
-  // rounds file under its lock (../review/rounds.ts updateRounds): bind builds the binding from the rounds as read
-  // under that lock. How many of the ids were still pending and now carry his answer; throws when nothing could be
-  // written (the card stays up).
-  legacyAnswer?: (ids: string[], choice: "kept" | "dropped", at: string, message: string, bind: (r: Rounds) => GrantBinding | undefined) => number;
   // Round 2: the install-time self-check's finding (null: every file right; else the cap and guard are
   // off), the usage guard as the link runs it for a part of Cain's that was refused (it decides again
   // from its own readings and logs a refusal), and one line onto the guard's log (the open list's holds).
@@ -1913,129 +1913,10 @@ export class Link {
     return { replaced, note: ` He granted ${g.key} ${g.rounds} more fix round${g.rounds === 1 ? "" : "s"}.${cap} Submit the next fix-only round with review.sh as usual; if the last granted round still leaves something serious, the review service puts the decision to him again.` };
   }
 
-  // -- an earlier grant's unused rounds (0.18.1, fifth review) ------------------------
-  // The review runner's card, one a change, for a grant given before grants were bound to a commit whose rounds the
-  // upgrade's replay found partly unused: Keep binds them to the change as it stands at his tap (the pull request's
-  // newest commit read from GitHub then), Drop ends them. Its words are the link's own; root's socket only. The same
-  // change posted again is the one card. It neither waits behind Cain's asks nor holds them back, and doesn't expire.
-  static readonly LEGACY_KEEP = "Keep";
-  static readonly LEGACY_DROP = "Drop";
-  legacyText(c: { key: string; granted: number; unused: number; pr: string | null }): string {
-    const n = /^pr-(\d+)$/.exec(c.key)?.[1] ?? (c.pr ? /\/pull\/(\d+)$/.exec(c.pr)?.[1] : null);
-    const what = n ? `pull request ${n}` : `the change ${c.key}`;
-    const s = (k: number) => (k === 1 ? "" : "s");
-    return `You granted ${c.granted} more review round${s(c.granted)} for ${what} before grants were bound to a commit; ${c.unused} of them ${c.unused === 1 ? "is" : "are"} unused. `
-      + (n ? "Keep them for the pull request as it stands now (newest commit read from GitHub when you tap)?" : "Keep them for the change as it stands now?");
-  }
-  async legacyGrant(d: Partial<LegacyCard>): Promise<{ status: "posted"; message: string }> {
-    const off = this.capOff();
-    if (off) throw new Refusal(`the review cap's files aren't right (${off}), so no card goes out until they are`);
-    const key = String(d.key ?? "");
-    const ids = Array.isArray(d.ids) ? d.ids.map(String).filter((x) => /^[a-z0-9][a-z0-9-]{0,63}\+[A-Za-z0-9_-]{1,40}$/.test(x)) : [];
-    const granted = Number(d.granted), unused = Number(d.unused);
-    if (!/^[a-z0-9][a-z0-9-]{2,63}$/.test(key) || !ids.length) throw new Refusal("a Keep or Drop card needs its change key and grant ids");
-    if (!Number.isInteger(granted) || !Number.isInteger(unused) || unused < 1 || unused > granted) throw new Refusal("a Keep or Drop card needs its granted and unused rounds");
-    const pr = d.pr && PULL.test(String(d.pr)) ? String(d.pr) : null;
-    const item = d.item && ITEM.test(String(d.item)) ? String(d.item).toUpperCase() : null;
-    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.legacy?.key === key);
-    if (prior) return { status: "posted", message: prior[0] };
-    const options = [Link.LEGACY_KEEP, Link.LEGACY_DROP];
-    const text = this.cardGate("legacy", "Keep or Drop card", this.legacyText({ key, granted, unused, pr }), options)
-      ?? this.ownWords("legacy", "link", this.legacyText({ key, granted, unused, pr }));
-    const nonce = stableNonce("legacy", key, ids.join(","));
-    return this.serial(async () => {
-      const again = Object.entries(this.d.load().messages).find(([, m]) => m.legacy?.key === key);
-      if (again) return { status: "posted" as const, message: again[0] };
-      const msg = await this.postCard(text, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"), { nonce });
-      const s = this.d.load();
-      this.remember(s, msg, { kind: "ask", item: "none", question: "", posted: this.d.now(), expires: null, buttons: true, labels: [...options],
-        q: { q: `Keep the earlier grant's unused review rounds for ${key}?`, options, used: false }, legacy: { key, ids, granted, unused, pr, item } });
-      this.d.save(s);
-      this.log(`the Keep or Drop card for ${key}'s earlier grant went up`);
-      return { status: "posted" as const, message: String(msg.id) };
-    });
-  }
-  // His tap on it, under the change key's lock (the one grant taps take). Keep re-checks as a grant tap does (Stop
-  // clear, the cap's files right, the records readable, the item not held elsewhere or closed, the pull request's
-  // head read from GitHub now) and then writes the binding into the runner's rounds file under its lock; a passing
-  // failure keeps the card up. Drop writes "dropped". The grants file is never touched.
-  private async legacyTapLocked(it: any, cid: string, msgId: string): Promise<string> {
-    const s = this.d.load();
-    const m = s.messages[msgId];
-    if (!m?.legacy || !m.q) return this.deadTap(it, msgId, "not a card the link knows");
-    if (m.outcome || m.q.used) return this.deadTap(it, msgId, m.why ?? m.outcome ?? "answered");
-    if (digest(it.message.content ?? "", it.message.components) !== m.digest) {
-      await this.answer(it, ACK);
-      this.log("tap refused: card was changed after it was posted");
-      return "refused: card was changed after it was posted";
-    }
-    const i = Number(cid.split(":")[2]);
-    if (!(i >= 0 && i < m.q.options.length)) return this.deadTap(it, msgId, "answered");
-    const tapped = m.q.options[i];
-    const L = m.legacy;
-    const keep = tapped === Link.LEGACY_KEEP;
-    const wait = async (line: string): Promise<string> => {
-      this.log(`his tap on the Keep or Drop card for ${L.key} wrote nothing for now, the card stays up: ${line}`);
-      await this.answer(it, ACK);
-      await this.ephemeral(it, `${line} The card is still up: try again in a minute.`);
-      return "retry";
-    };
-    let head: string | null = null;
-    if (keep) {
-      if (this.stopped().stopped) return wait("Everything is stopped, so nothing was kept yet.");
-      if (this.capOff()) return wait("The review records aren't set up right just now, so nothing was kept yet.");
-      let rounds: Rounds | null = null, grants: Grants | null = null;
-      try { rounds = this.d.rounds?.() ?? null; } catch { rounds = null; }
-      try { grants = this.d.grants?.() ?? null; } catch { grants = null; }
-      if (!rounds || !grants) return wait("The review records can't be read right now, so nothing was kept yet.");
-      if (L.item) {
-        const f = this.files();
-        const holds = parseHolds(f.holds);
-        if (holds === null) return wait("Who is working on that change can't be read right now, so nothing was kept yet.");
-        if (heldElsewhere(holds, L.item)) return wait("That change is being worked on by another session now, so nothing was kept yet.");
-      }
-      if (L.pr) {
-        const h = await this.headNow(L.pr);
-        if (typeof h !== "string") return wait("The pull request's newest commit can't be read from GitHub right now, so nothing was kept yet.");
-        head = h;
-      }
-    }
-    const base = this.d.roundCap?.() ?? 3;
-    let n: number;
-    try {
-      if (!this.d.legacyAnswer) throw new Error("the link has nowhere to keep it");
-      n = this.d.legacyAnswer(L.ids, keep ? "kept" : "dropped", new Date(this.d.now()).toISOString(), msgId, (r) => keep ? {
-        head, decision: decisionOf(r, L.key)?.id ?? null, used: countedRounds(r, L.key).length,
-        cap: standing(base, r, this.d.grants?.() ?? null, L.key).prior } : undefined);
-    } catch (e) {
-      this.log(`couldn't keep his ${tapped} on the Keep or Drop card for ${L.key}; the card stays up: ${String(e).slice(0, 120)}`);
-      return wait("Your answer couldn't be saved, so nothing changed yet.");
-    }
-    const s2 = this.d.load();
-    const m2 = s2.messages[msgId];
-    if (!m2?.q) return this.deadTap(it, msgId, "answered");
-    m2.q.used = true; m2.outcome = "answered"; m2.label = tapped; m2.why = "answered";
-    const content = withLine(String(it.message.content ?? ""), `You answered: ${tapped}`);
-    m2.digest = digest(content, []);
-    this.d.save(s2);
-    try { this.d.decided?.(`legacy:${L.key}:${msgId}`, tapped, this.d.now()); } catch (e) { this.log(`couldn't keep his ${tapped} beside his taps: ${String(e).slice(0, 80)}`); }
-    this.log(`Dane tapped ${tapped} on the Keep or Drop card for ${L.key}: ${n} grant${n === 1 ? "" : "s"} ${keep ? "kept" : "dropped"}${keep && head ? ` at head ${head}` : ""}`);
-    const u = `${L.unused} unused review round${L.unused === 1 ? "" : "s"}`;
-    this.d.relay(`Dane tapped "${tapped}" on the review service's card about his earlier grant for ${L.key} (Discord message ${msgId}). `
-      + (!n ? "It had been answered already, so nothing changed." : keep
-        ? `Its ${u} now count for ${L.pr ? "the pull request at its newest commit as he tapped" : "the change as it stood when he tapped"}: the next round past the cap claims them, with the head he kept them for. Submit the next fix-only round as usual.`
-        : `Its ${u} are dropped and never count. If the change needs more rounds, ask with keeper.sh review-grant once it's at its cap with its last round done.`)
-      + " Nothing to tell him.");
-    const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
-    const s3 = this.d.load();
-    if (s3.messages[msgId]) { s3.messages[msgId].buttons = !ok; if (ok) s3.messages[msgId].off = this.d.now(); this.d.save(s3); }
-    return `answered: ${tapped}`;
-  }
-
   // -- Cain's own words with buttons ----------------------------------------------
   private openAsk(s: State, now: number): [string, Shown] | null {
     // The runner's decision card neither waits behind Cain's asks nor holds them back (0.16.0).
-    for (const [id, m] of Object.entries(s.messages)) if (m.kind === "ask" && !m.decision && !m.grant && !m.legacy && live(m, now)) return [id, m];
+    for (const [id, m] of Object.entries(s.messages)) if (m.kind === "ask" && !m.decision && !m.grant && live(m, now)) return [id, m];
     return null;
   }
 
@@ -2526,6 +2407,45 @@ export class Link {
     return { status: "posted", message };
   }
 
+  // -- a plain notice from the review runner (POST /review-notice, Cain 0.18.1, sixth review) ----------
+  // The runner sends only facts: the kind (a grant from before grants were bound let go, a grant voided, a review
+  // waiting on GitHub), the change key, its pull request, the rounds and why. The words are the link's own, so
+  // nothing from the runner's files reaches Discord as text. Each notice id is posted once: one already posted is
+  // answered "posted" with that message, so a post whose answer was lost isn't repeated.
+  async reviewNotice(b: any): Promise<{ status: "posted"; message: string; duplicate?: true }> {
+    const id = String(b?.id ?? ""), kind = String(b?.kind ?? ""), key = String(b?.key ?? "");
+    if (!/^(unbound|void|waits):[A-Za-z0-9#+._-]{1,120}$/.test(id) || !id.startsWith(`${kind}:`)) throw new Refusal("not a review notice id");
+    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(key)) throw new Refusal("a review notice needs its change key");
+    const pr = b?.pr && PULL.test(String(b.pr)) ? String(b.pr) : null;
+    const rounds = b?.rounds === null || b?.rounds === undefined ? null : Number(b.rounds);
+    if (rounds !== null && !(Number.isInteger(rounds) && rounds >= 1 && rounds <= 99)) throw new Refusal("a review notice's rounds are a small whole number");
+    const why = b?.why === null || b?.why === undefined ? null : String(b.why);
+    if (why !== null && !Object.hasOwn(REVIEW_VOID_WHY, why)) throw new Refusal("not a reason a grant stops counting");
+    const n = pr ? /\/pull\/(\d+)$/.exec(pr)![1] : /^pr-(\d+)$/.exec(key)?.[1] ?? null;
+    const what = n ? `pull request ${n}` : `the change ${key}`;
+    const s = (k: number) => (k === 1 ? "" : "s");
+    let text: string;
+    if (kind === "unbound") {
+      if (rounds === null) throw new Refusal("a notice of rounds let go needs the rounds");
+      text = `Before grants were tied to a commit, you granted extra review rounds for ${what}. ${rounds} of them ${rounds === 1 ? "was" : "were"} never used and ${rounds === 1 ? "is" : "are"} now let go. If it needs more rounds, Cain can ask you again.`;
+    } else if (kind === "void") {
+      if (rounds === null || why === null) throw new Refusal("a notice of a grant voided needs its rounds and why");
+      text = `Your grant of ${rounds} more review round${s(rounds)} for ${what} no longer counts: ${REVIEW_VOID_WHY[why as StaleWhy]}. If it needs more rounds, Cain can ask you again.`;
+    } else if (kind === "waits") {
+      text = `The review of ${what} waits on GitHub: its newest commit can't be read right now. It keeps trying by itself.`;
+    } else throw new Refusal("not a review notice");
+    const had = this.d.load().reviewNotices?.[id];
+    if (had) return { status: "posted", message: had.msg, duplicate: true };
+    noMachineText(text);
+    const message = await this.notice(text);
+    const st = this.d.load();
+    const kept = Object.entries({ ...(st.reviewNotices ?? {}), [id]: { msg: message, at: this.d.now() } }).filter(([, v]) => this.d.now() - v.at <= PC_NOTICE_RETAIN_MS)
+      .sort((x, y) => y[1].at - x[1].at).slice(0, PC_NOTICE_KEEP);
+    st.reviewNotices = Object.fromEntries(kept);
+    this.d.save(st);
+    return { status: "posted", message };
+  }
+
   // -- his yes to reusing a PC result's values (POST /reuse, the PC job keeper's ask) ----
   // A follow-up PC job may carry a value an earlier result reported only on his yes
   // (pcjobs/core.ts, owner_reuse). Cain writes the job, so his say-so proves nothing: the
@@ -2707,8 +2627,6 @@ export class Link {
     // run under one lock for its change key, so a second delivery of the tap, or a second tap, waits and then
     // finds the card used: a dead tap, nothing written.
     if (rec.grant && cid.startsWith("q:")) return this.underKey(`grant:${rec.grant.key}`, () => this.grantTapLocked(it, cid, msgId));
-    // Fifth review: his Keep or Drop on an earlier grant's unused rounds, under the same change key's lock.
-    if (rec.legacy && cid.startsWith("q:")) return this.underKey(`grant:${rec.legacy.key}`, () => this.legacyTapLocked(it, cid, msgId));
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
       if (why) {

@@ -10,8 +10,9 @@
 //                          $ per useful; then the round count per open change against the round cap
 //   guard                  the usage guard's reading now, in two lines (the plan, the seats and the floor)
 //   health                 the last nightly seat check
-//   sweep-dry-run          (0.18.1) the upgrade's replay of grants from before grants were bound, run on copies of the
-//                          live rounds and grants files: prints each credit, pending allowance and void, writes nothing
+//   sweep-dry-run [rounds] [grants]  (0.18.1) the upgrade's one-time replay of grants from before grants were bound,
+//                          run on copies of the live rounds and grants files (or the two named, such as the copies the
+//                          runner kept before its replay): prints each credit and the rounds let go, writes nothing
 //   host-read <pr>         (0.18.1) the shared GitHub read of a pull request (number or address), once through the API
 //                          and once through the refs, and what each gave
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -21,7 +22,7 @@ import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, s
 import { configFromEnv } from "./config.ts";
 import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
-import { capWords, countingGrants, grantWords, readGrants, staleWords, standing, sweepLegacy } from "./grants.ts";
+import { capWords, countingGrants, grantWords, readGrants, replayUnbound, staleWords, standing } from "./grants.ts";
 import { PULL_URL, pullViaApi, pullViaRefs } from "../pullnow.ts";
 import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
@@ -201,25 +202,29 @@ switch (cmd) {
     for (const s of SEATS) { const x = h[s]; out(`  ${LABEL[s]}: ${!x ? "not checked yet" : x.ok ? `ok (${x.at})` : `${x.kind}: ${x.detail}. Fix: ${x.fix}`}`); }
     break;
   }
-  // Fifth review: the owner's post-install checks. Both write nothing.
+  // The owner's post-install checks (0.18.1). Both write nothing.
   case "sweep-dry-run": {
-    const rounds = readRounds(cfg.roundsFile!), gr = grants();
-    if (!rounds) fail("the review rounds file can't be read, so the replay can't be shown", 3);
-    if (!gr) fail("the review grants file can't be read, so the replay can't be shown", 3);
-    const copy = structuredClone(rounds!);
+    // Sixth review: the live files by default; after the update, point it at the copies the runner kept just before
+    // its replay (review-rounds.pre-0.18.1.json and review-grants.pre-0.18.1.json beside them).
+    const rf = a1 || cfg.roundsFile!, gf = a2 || cfg.grantsFile!;
+    const rounds = readRounds(rf), gr = gf ? readGrants(gf) : null;
+    if (!rounds) fail(`the review rounds file (${rf}) can't be read, so the replay can't be shown`, 3);
+    if (!gr) fail(`the review grants file (${gf}) can't be read, so the replay can't be shown`, 3);
     const base = roundCap();
-    const done = sweepLegacy(copy, structuredClone(gr!), base, new Date().toISOString());
-    const before = Object.keys(rounds!.grants_legacy ?? {}).length;
-    out(`Replay of grants from before grants were bound (base cap ${base}), on copies; nothing was written:`);
-    if (!done.length) out(before ? `  nothing left to replay: the runner replayed ${before} grant${before === 1 ? "" : "s"} already` : "  no grant from before grants were bound");
-    for (const d of done) {
-      const n = d.rec.rounds;
-      out(`  ${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, ${grantWords([d.rec], cfg.tz).replace(/^\d+ /, "")}): `
-        + `credit ${d.credited.length ? d.credited.join(", ") : "none"}; pending ${d.unused}${d.unused ? " (waits for his Keep or Drop card)" : ""}; void none`);
+    out(`Replay of grants from before grants were bound (base cap ${base}), on copies of ${rf} and ${gf}; nothing was written:`);
+    if (rounds!.replayed) {
+      out(`  the runner replayed these already (${rounds!.replayed}); to see what it did, run it on the copies kept before:`);
+      out(`  review.sh sweep-dry-run ${join(dirname(rf), "review-rounds.pre-0.18.1.json")} ${join(dirname(gf), "review-grants.pre-0.18.1.json")}`);
+    } else {
+      const done = replayUnbound(structuredClone(rounds!), structuredClone(gr!), base, new Date().toISOString());
+      if (!done.length) out("  no grant from before grants were bound");
+      for (const d of done) {
+        const n = d.rec.rounds;
+        out(`  ${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, ${grantWords([d.rec], cfg.tz).replace(/^\d+ /, "")}): `
+          + `credit ${d.credited.length ? d.credited.join(", ") : "none"}; let go ${d.unused}`);
+      }
     }
-    for (const [id, v] of Object.entries(rounds!.grants_void ?? {})) out(`  ${id}: void already (${v.why}, for ${v.key})`);
-    for (const [id, L] of Object.entries(rounds!.grants_legacy ?? {}))
-      out(`  ${id}: replayed already: credit ${L.credited.length ? L.credited.join(", ") : "none"}; ${L.unused} unused, ${L.state}`);
+    for (const [id, v] of Object.entries(rounds!.grants_void ?? {})) out(`  ${id}: void already (${v.why}${v.rounds ? `, ${v.rounds} round${v.rounds === 1 ? "" : "s"} let go` : ""}, for ${v.key})`);
     break;
   }
   case "host-read": {
@@ -236,5 +241,5 @@ switch (cmd) {
     break;
   }
   default:
-    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health | sweep-dry-run | host-read <pr>");
+    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health | sweep-dry-run [rounds] [grants] | host-read <pr>");
 }

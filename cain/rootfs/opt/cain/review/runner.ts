@@ -12,11 +12,12 @@ import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
   FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
-  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  keyOfRef, newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
-import { DEFAULT_ROUND_CAP, RoundsBusy, addRound, admit, countedRounds, decisionOf, readRounds, withRoundsLock, writeRounds, type DecisionRec, type LegacyCard, type Rounds } from "./rounds.ts";
-import { effectiveCap, grantWords, readGrants, STALE_LONG, staleWords, sweepLegacy, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
+import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type OwedNotice, type Rounds } from "./rounds.ts";
+import { effectiveCap, grantWords, readGrants, replayUnbound, STALE_LONG, staleWords, type GrantRec, type Grants, type ReplayDecision, type StaleWhy } from "./grants.ts";
+import { CAIN_GID, ROOT_UID } from "../capfiles.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
@@ -44,8 +45,9 @@ export type RunnerConfig = {
   // Absent: no grants count.
   grantsFile?: string;
   // 0.18.1 (fifth review): how long one tick waits on a GitHub read before it goes on with the other briefs
-  // (the read goes on in the background; default 2 seconds).
-  hostWaitMs?: number;
+  // (the read goes on in the background; default 2 seconds). Sixth review: each GitHub request's hard deadline
+  // (default 20 seconds), and the owner of the copies kept before the one-time replay (default root:cain).
+  hostWaitMs?: number; hostDeadlineMs?: number; preReplayOwner?: { uid: number; gid: number };
 };
 
 export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile" | "termsFile" | "recordQueue" | "relayFile"> = {
@@ -71,19 +73,38 @@ export type RunnerDeps = {
   // Cain 0.18.1 (fourth review): a pull request as GitHub has it now (../pullnow.ts, the link's own read), for
   // the head a round that claims a grant is pinned to. null, or a null head: can't tell (the brief waits).
   pull?: (pr: string) => Promise<{ head: string | null } | null>;
-  // Fifth review: GitHub's compare of two commits of the pull request's repository (../pullnow.ts compareHeads):
-  // "ahead" when head is a descendant of base. null: can't tell. The proof a grant's bound head is superseded.
+  // GitHub's compare of two commits of the pull request's repository (../pullnow.ts compareHeads): "ahead" when head
+  // is a strict descendant of base. null: can't tell. The only proof a grant's bound head is superseded.
   compare?: (pr: string, base: string, head: string) => Promise<"ahead" | "behind" | "diverged" | "identical" | null>;
-  // Fifth review: the owner's Keep or Drop card for a 0.18.0 grant's unused allowance, posted through the link (its
-  // root socket); the message id, or null when it didn't go (tried again next tick). Absent: never posted.
-  postLegacy?: (c: LegacyCard) => Promise<string | null>;
+  // Sixth review: a plain notice for the owner (a grant let go or voided, a review waiting on GitHub), posted through
+  // the link in its own words (its root socket); the message id, or null when it didn't go (tried again next tick).
+  postNotice?: (n: OwedNotice) => Promise<string | null>;
+  // Tests only: called just before the one-time replay's commit (a throw there is a crash before it).
+  crashPoint?: (where: string) => void;
 };
 
-// The code host's read for a brief that would claim a grant (fifth review): a failure or rate limit backs off, from
-// a minute, doubling to 15 minutes; after 15 minutes of waiting Cain is told once, and after 24 hours the brief is
-// refused and the runner stops reading for it.
+// The code host's read for a brief that would claim a grant (sixth review): each request has a hard deadline of 20
+// seconds; a failure, rate limit or deadline backs off every GitHub read, from a minute, doubling to 15 minutes;
+// after 15 minutes of waiting Cain and the owner are told once, and after 24 hours the brief is refused and the
+// runner stops reading for it.
+export const HOST_DEADLINE_MS = 20_000;
 export const HOST_BACKOFF_MIN_MS = 60_000, HOST_BACKOFF_MAX_MS = 15 * 60_000;
 export const HOST_NOTICE_MS = 15 * 60_000, HOST_GIVE_UP_MS = 24 * 3_600_000;
+// The copies of the rounds and grants files kept just before the one-time replay (sixth review), beside them.
+export const PRE_ROUNDS = "review-rounds.pre-0.18.1.json", PRE_GRANTS = "review-grants.pre-0.18.1.json";
+// A copy of a file as it is, once (an existing copy is the earliest and is kept), root:cain 0640 (tests pass their
+// own owner; not root, the owner isn't set). A source not there yet is copied as nothing.
+export function keepPreReplay(src: string, dst: string, owner?: { uid: number; gid: number }): void {
+  if (existsSync(dst)) return;
+  let text: string;
+  try { text = readFileSync(src, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return; throw e; }
+  const tmp = join(dirname(dst), `.pre-${process.pid}-${Date.now()}.tmp`);
+  writeFileSync(tmp, text, { mode: 0o640 });
+  const o = owner ?? (process.getuid?.() === 0 ? { uid: ROOT_UID, gid: CAIN_GID } : null);
+  if (o) chownSync(tmp, o.uid, o.gid);
+  chmodSync(tmp, 0o640);
+  renameSync(tmp, dst);
+}
 
 export type SpendRow = { usd: number; runs: number; findings: number; searches: number };
 export type Ledger = Record<string, Partial<Record<SeatName, SpendRow>>>;
@@ -249,13 +270,19 @@ export class Runner {
   // refused and he hears why.
   // Cain 0.18.1 (fourth review): a brief whose round would claim a grant of the owner's waits in the inbox,
   // untaken, while GitHub's head for its pull request can't be read; it is taken once the head is read, and the
-  // claim is pinned to that head (admitAndQueue). Fifth review: that read never holds up the other briefs (a tick
-  // waits at most hostWaitMs for it, then goes on; the read finishes in the background and the next tick uses it),
-  // a failed read backs off (a minute, doubling to 15 minutes, never every tick), Cain is told once after 15 minutes
-  // of waiting, and after 24 hours the brief is refused and no longer read for. The wait is counted from when this
-  // runner first found the brief waiting.
-  private waitingBriefs = new Map<string, { since: number; next: number; delay: number; told: boolean;
-    read?: { p: Promise<string | null>; done: boolean; head: string | null } }>();
+  // claim is pinned to that head (admitAndQueue). Sixth review: that read never holds up the other briefs (a tick
+  // waits at most hostWaitMs for it, then goes on; the read finishes in the background and the next tick uses it).
+  // Each GitHub request (the head read and each compare) has a hard deadline (hostDeadlineMs, 20 seconds); at most
+  // one read is in flight per brief, and every read carries a sequence number: an answer that isn't the latest
+  // read's for a brief still being read for is discarded. A failed read (no answer, an error, a rate limit, the
+  // deadline) moves the one backoff every GitHub read shares (host_backoff in the rounds file: a minute, doubling to
+  // 15 minutes, its next try kept so a restart keeps it). The wait is judged on when the brief first waited
+  // (host_waits in the rounds file, so a restart keeps it), every tick, whether or not a read has answered: after
+  // 15 minutes Cain is told once and the owner once (a plain notice through the link), after 24 hours the brief is
+  // refused and no longer read for.
+  private hostReads = new Map<string, { seq: number; done: boolean; head: string | null; p: Promise<void> }>();
+  private hostSeq = 0;
+  private latestSeq = new Map<string, number>();
   async ingest(): Promise<void> {
     const dir = this.cfg.inboxDir;
     if (!dir) return;
@@ -275,60 +302,84 @@ export class Runner {
         if (h === "wait") continue;
         if (h === "stop") {
           try { unlinkSync(path); } catch { /* already gone */ }
-          this.waitingBriefs.delete(name);
           this.relay(`Review brief ${b.id} wasn't taken: its round would claim the owner's grant, and GitHub's head for its pull request couldn't be read for 24 hours, so the runner stopped trying. Send it again once GitHub answers. No grant was claimed or voided. Nothing to tell him.`);
           continue;
         }
         gh = h;
       }
-      this.waitingBriefs.delete(name);
-      if (got.ok && p!.brief && !existsReview(this.cfg.queueDir, p!.brief.id)) {
-        let why: string | null;
-        try { why = this.admitAndQueue(p!.brief, gh); }
-        catch (e) {
-          if (!(e instanceof RoundsBusy)) throw e;
-          this.log(`review brief ${p!.brief.id} stays in the inbox for now: ${e.message}`);
-          continue;
-        }
-        try { unlinkSync(path); } catch { /* already gone */ }
-        if (why) this.relay(`Review brief ${p!.brief.id} wasn't taken: ${why} Nothing to tell him.`);
+      this.endWait(name);
+      try { unlinkSync(path); } catch { /* already gone */ }
+      if (b) {
+        const why = this.admitAndQueue(b, gh);
+        if (why) this.relay(`Review brief ${b.id} wasn't taken: ${why} Nothing to tell him.`);
         continue;
       }
-      try { unlinkSync(path); } catch { /* already gone */ }
       if (!got.ok) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken (${got.why}). Submit it again with review.sh. Nothing to tell him.`); continue; }
       if (!p!.brief) { this.relay(`A review brief in the inbox (${name.slice(0, 80)}) wasn't taken: not a brief: ${p!.error}. Nothing to tell him.`); continue; }
       this.relay(`Review brief ${p!.brief.id} wasn't taken: a review with that id already exists; use a new id. Nothing to tell him.`);
     }
-    for (const name of [...this.waitingBriefs.keys()]) if (!seen.has(name)) this.waitingBriefs.delete(name);
+    // A brief gone from the inbox no longer waits.
+    const file = this.cfg.roundsFile;
+    const r = file ? readRounds(file) : null;
+    const gone = Object.keys(r?.host_waits ?? {}).filter((n) => !seen.has(n));
+    for (const n of [...this.hostReads.keys()]) if (!seen.has(n)) this.endWait(n);
+    if (file && r && gone.length) { for (const n of gone) delete r.host_waits![n]; writeRounds(file, r); }
   }
-  // GitHub's head for a waiting brief, through the backoff: the head, "wait" (not read yet, or backing off), or
-  // "stop" (24 hours without a read).
+  // A brief no longer waits: its read (if any) is let go, so a late answer is discarded, and its wait record goes.
+  private endWait(name: string): void {
+    this.hostReads.delete(name); this.latestSeq.delete(name);
+    const file = this.cfg.roundsFile;
+    const r = file ? readRounds(file) : null;
+    if (file && r?.host_waits?.[name]) { delete r.host_waits[name]; writeRounds(file, r); }
+  }
+  // GitHub's head for a waiting brief: the head, "wait" (not read yet, backing off, or GitHub didn't answer), or
+  // "stop" (24 hours since it first waited).
   private async hostHead(name: string, b: Brief): Promise<string | "wait" | "stop"> {
+    const file = this.cfg.roundsFile!;
     const now = this.now().getTime();
-    let w = this.waitingBriefs.get(name);
-    if (!w) { w = { since: now, next: now, delay: 0, told: false }; this.waitingBriefs.set(name, w); }
-    if (now - w.since >= HOST_GIVE_UP_MS) return "stop";
-    if (!w.read && now >= w.next) {
-      const r: NonNullable<typeof w.read> = { p: this.readHead(b), done: false, head: null };
-      r.p.then((h) => { r.done = true; r.head = h; }, () => { r.done = true; r.head = null; });
-      w.read = r;
-    }
-    if (w.read) {
-      const r = w.read;
-      if (!r.done) await Promise.race([r.p.catch(() => null), Bun.sleep(this.cfg.hostWaitMs ?? 2000)]);
-      if (r.done) {
-        w.read = undefined;
-        if (r.head) return r.head;
-        w.delay = Math.min(Math.max(HOST_BACKOFF_MIN_MS, w.delay * 2), HOST_BACKOFF_MAX_MS);
-        w.next = now + w.delay;
-        this.log(`review brief ${b.id} waits in the inbox: its round would claim the owner's grant, and GitHub's head for ${b.pr} can't be read now; read again in ${Math.round(w.delay / 1000)} seconds`);
+    let rounds = readRounds(file);
+    if (!rounds) return "wait";
+    const w = rounds.host_waits?.[name];
+    if (w) {
+      const since = Date.parse(w.since);
+      if (now - since >= HOST_GIVE_UP_MS) { this.endWait(name); return "stop"; }
+      if (!w.told && now - since >= HOST_NOTICE_MS) {
+        w.told = true;
+        this.oweNotice(rounds, { id: `cain-waits:${b.id}`, to: "cain", kind: "waits", key: keyOfRef(b.pr!) ?? b.id, pr: b.pr ?? null,
+          text: `Review brief ${b.id} waits: its round would claim the owner's grant, and GitHub's head for its pull request hasn't been readable for 15 minutes. The runner keeps trying, backing off up to 15 minutes between reads, and refuses the brief after 24 hours. Other briefs aren't held up. He's told once, in the App's own words, that the review waits on GitHub. Nothing else to tell him.` });
+        this.oweNotice(rounds, { id: `waits:${b.id}`, to: "owner", kind: "waits", key: keyOfRef(b.pr!) ?? b.id, pr: b.pr ?? null });
+        writeRounds(file, rounds);
+        this.deliverCain();
       }
     }
-    if (!w.told && now - w.since >= HOST_NOTICE_MS) {
-      w.told = true;
-      this.relay(`Review brief ${b.id} waits: its round would claim the owner's grant, and GitHub's head for its pull request hasn't been readable for 15 minutes. The runner keeps trying, backing off up to 15 minutes between reads, and refuses the brief after 24 hours. Other briefs aren't held up. Nothing to tell him.`);
+    let r = this.hostReads.get(name);
+    if (!r) {
+      const bo = rounds.host_backoff;
+      if (!bo || now >= Date.parse(bo.next)) r = this.startRead(name, b);
+    }
+    if (r && !r.done) await Promise.race([r.p, Bun.sleep(this.cfg.hostWaitMs ?? 2000)]);
+    if (r?.done) {
+      this.hostReads.delete(name);
+      if (r.head) return r.head;
+    }
+    rounds = readRounds(file);
+    if (rounds && !rounds.host_waits?.[name]) {
+      (rounds.host_waits ??= {})[name] = { since: new Date(now).toISOString(), id: b.id, pr: b.pr! };
+      writeRounds(file, rounds);
+      this.log(`review brief ${b.id} waits in the inbox: its round would claim the owner's grant, and GitHub's head for ${b.pr} hasn't been read yet`);
     }
     return "wait";
+  }
+  private startRead(name: string, b: Brief) {
+    const seq = ++this.hostSeq;
+    this.latestSeq.set(name, seq);
+    const r = { seq, done: false, head: null as string | null, p: Promise.resolve() };
+    r.p = this.readHead(b).then((h) => {
+      if (this.latestSeq.get(name) !== seq) { this.log(`a GitHub read for review brief ${b.id} answered after it was replaced; its answer was discarded`); return; }
+      r.done = true; r.head = h;
+    });
+    this.hostReads.set(name, r);
+    return r;
   }
 
   // Whether the brief's round would claim a grant (so GitHub's head must be read for it first).
@@ -345,34 +396,57 @@ export class Runner {
   async githubHead(b: Brief): Promise<string | null | undefined> {
     return this.claimInView(b) ? this.readHead(b) : undefined;
   }
-  // Fifth review: a grant is voided for its head only when that head is provably superseded: GitHub's compare says
-  // the bound head is an ancestor of the head read now, or (when the compare can't tell, or the history was
-  // rewritten) two reads at least one tick apart agree on the newer head. Each read is noted here, with the proof
-  // for each grant bound to another head; admitAndQueue refuses the brief, voiding nothing, without it.
-  private tickNo = 0;
-  private headSeen = new Map<string, { head: string; tick: number }>();
+  // One GitHub request under its hard deadline: null when it doesn't answer in time (its late answer is discarded)
+  // or fails.
+  private async hostCall<T>(what: string, f: () => Promise<T | null>): Promise<T | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let late = false;
+    const deadline = new Promise<null>((res) => { timer = setTimeout(() => { late = true; res(null); }, this.cfg.hostDeadlineMs ?? HOST_DEADLINE_MS); });
+    const call = f().then((v) => { if (late) this.log(`GitHub's answer for ${what} came after its deadline and was discarded`); return v; }, () => null);
+    try { return await Promise.race([call, deadline]); }
+    finally { clearTimeout(timer); }
+  }
+  // The shared backoff: a failed read moves it on, a whole read that answered clears it.
+  private hostFailed(): void {
+    const file = this.cfg.roundsFile;
+    const r = file ? readRounds(file) : null;
+    if (!file || !r) return;
+    const delay = Math.min(Math.max(HOST_BACKOFF_MIN_MS, (r.host_backoff?.delay ?? 0) * 2), HOST_BACKOFF_MAX_MS);
+    r.host_backoff = { next: new Date(this.now().getTime() + delay).toISOString(), delay };
+    writeRounds(file, r);
+    this.log(`a GitHub read didn't answer; every GitHub read waits ${Math.round(delay / 1000)} seconds`);
+  }
+  private hostAnswered(): void {
+    const file = this.cfg.roundsFile;
+    const r = file ? readRounds(file) : null;
+    if (file && r?.host_backoff) { delete r.host_backoff; writeRounds(file, r); }
+  }
+  // Sixth review: a grant is voided for its head only on positive proof that its head is superseded: GitHub's compare
+  // says the bound head is a strict ancestor of the head read now ("ahead"). A compare that can't be read, fails, or
+  // says diverged, identical or behind proves nothing, and admitAndQueue refuses the brief, voiding nothing.
   private headProof = new Map<string, string>();
   private async readHead(b: Brief): Promise<string | null> {
     if (!this.deps.pull || !b.pr) return null;
-    let head: string | null = null;
-    try { const p = await this.deps.pull(b.pr); head = p?.head && /^[0-9a-f]{40}$/.test(p.head) ? p.head : null; } catch { head = null; }
-    if (!head) return null;
-    const prev = this.headSeen.get(b.pr);
-    const agreed = !!prev && prev.head === head && prev.tick < this.tickNo;
-    if (!prev || prev.head !== head) this.headSeen.set(b.pr, { head, tick: this.tickNo });
+    const pr = b.pr;
+    const p = await this.hostCall(`the head of ${pr}`, () => this.deps.pull!(pr));
+    const head = p?.head && /^[0-9a-f]{40}$/.test(p.head) ? p.head : null;
+    if (!head) { this.hostFailed(); return null; }
+    let failed = false;
     const file = this.cfg.roundsFile;
     const rounds = file ? readRounds(file) : null;
     if (rounds) {
       const a = admit(rounds, { ...b, head }, this.roundCap, this.grants(), this.cfg.tz);
       for (const { rec, why } of a.stale ?? []) {
         if (why !== "head" || rounds.grants_void?.[rec.id] || !rec.bound?.head) continue;
-        let cmp: Awaited<ReturnType<NonNullable<RunnerDeps["compare"]>>> = null;
-        try { cmp = (await this.deps.compare?.(b.pr, rec.bound.head, head)) ?? null; } catch { cmp = null; }
-        const proven = cmp === "ahead" || ((cmp === null || cmp === "diverged") && agreed);
+        const base = rec.bound.head;
+        const cmp = this.deps.compare ? await this.hostCall(`the compare of two commits of ${pr}`, () => this.deps.compare!(pr, base, head)) : null;
+        if (cmp === null) failed = true;
+        const proven = cmp === "ahead";
         if (proven) this.headProof.set(rec.id, head); else this.headProof.delete(rec.id);
-        this.log(`the owner's grant ${rec.id} is bound to another head than GitHub's now: ${proven ? `proven superseded (${cmp === "ahead" ? "GitHub's compare shows the granted commit as an ancestor" : "two reads a tick apart agree"})` : `not proven superseded (${cmp ?? "the compare can't tell"}${agreed ? "" : ", one read only"}), so it's left as it is`}`);
+        this.log(`the owner's grant ${rec.id} is bound to another head than GitHub's now: ${proven ? "proven superseded (GitHub's compare shows the granted commit as an ancestor)" : `not proven superseded (${cmp ?? "the compare didn't answer"}), so it's left as it is`}`);
       }
     }
+    if (failed) this.hostFailed(); else this.hostAnswered();
     return head;
   }
 
@@ -395,14 +469,14 @@ export class Runner {
   // A round that would claim a grant is pinned to GitHub's head: the brief's head must be that head, or the brief
   // is refused and no grant is claimed or voided. A grant is voided only by checks against GitHub's head and the
   // runner's own records, never against a brief's claim.
-  // Fifth review: one read, check and write of the rounds file under its lock (rounds.ts withRoundsLock), since the
-  // link writes the owner's Keep or Drop into it; RoundsBusy when the lock can't be had (the inbox keeps the brief).
   admitAndQueue(b: Brief, gh?: string): string | null {
+    const why = this.admitInner(b, gh);
+    this.deliverCain();                                // what a void owed Cain, once the rounds file has it
+    return why;
+  }
+  private admitInner(b: Brief, gh?: string): string | null {
     const file = this.cfg.roundsFile;
     if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
-    return withRoundsLock(file, () => this.admitLocked(file, b, gh));
-  }
-  private admitLocked(file: string, b: Brief, gh?: string): string | null {
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
@@ -415,13 +489,14 @@ export class Runner {
     const a = admit(rounds, b, this.roundCap, grants, this.cfg.tz, gh === undefined && !headless);
     if (a.ok && a.claims.length && b.pr && gh === undefined)
       return "its round would claim the owner's grant, and the pull request's head on GitHub wasn't read for it; send it again. No grant was claimed or voided. Nothing was queued.";
-    // Fifth review: a grant is voided for its head only on proof that its head is superseded (readHead); without it
-    // the brief is refused and nothing is voided or claimed.
+    // Sixth review: a grant is voided for its head only on GitHub's positive proof that its head is superseded
+    // (readHead); without it the brief is refused and nothing is voided or claimed.
     const unproven = (a.stale ?? []).filter((x) => x.why === "head" && !rounds.grants_void?.[x.rec.id] && this.headProof.get(x.rec.id) !== gh);
     if (unproven.length)
-      return "GitHub's head for the pull request isn't the one the owner's grant was bound to, and it isn't proven newer yet (GitHub's compare didn't show the granted commit as its ancestor, and no second read a tick later agreed): send it again in a minute. No grant was claimed or voided. Nothing was queued.";
+      return "the pull request's head isn't proven newer than the one the grant was given for (GitHub's compare didn't show the granted commit as an ancestor of the head now, or didn't answer): send it again in a minute. No grant was claimed or voided. Nothing was queued.";
     // 0.18.1: grants no longer bound to the change as it is are kept as void (in the rounds file, the
-    // runner's own) and told to Cain once, whether this round is refused or runs under other grants.
+    // runner's own) and told to Cain and to the owner once each, whether this round is refused or runs under
+    // other grants.
     if (a.key && a.stale?.length && this.voidGrants(rounds, a.key, a.stale)) writeRounds(file, rounds);
     if (!a.ok) return a.why;
     const label = labelOf(b.label)!;
@@ -443,106 +518,114 @@ export class Runner {
     if (a.claims.length) this.log(`review ${b.id} (${a.key}, round ${a.round}) claimed the owner's grant${a.claims.length === 1 ? "" : "s"} ${a.claims.join(", ")}${gh ? ` at GitHub's head ${gh}` : ""}`);
     return null;
   }
-  // Grants found not to count, kept under grants_void once each, logged and told to Cain once (the link
-  // delivers the relay queue). True when any was new (the caller writes the rounds file).
+  // Grants found not to count, kept under grants_void once each, logged, and owed to Cain (the relay queue) and to
+  // the owner (a plain notice through the link) once each, in the same write. True when any was new (the caller
+  // writes the rounds file, then delivers Cain's).
   private voidGrants(rounds: Rounds, key: string, stale: { rec: GrantRec; why: StaleWhy }[]): boolean {
     const v = rounds.grants_void ??= {};
     let any = false;
     for (const { rec, why } of stale) {
-      // A grant from 0.18.0 (no binding) is never voided: the upgrade's replay credits it or leaves it pending.
+      // A grant from 0.18.0 (no binding) is voided only by the one-time replay, for its unused rounds.
       if (v[rec.id] || why === "unbound") continue;
       v[rec.id] = { why, at: this.now().toISOString(), key: rec.key };
       any = true;
       const n = rec.rounds;
       this.log(`the owner's grant ${rec.id} (${n} round${n === 1 ? "" : "s"} for ${rec.key}) doesn't count: ${why}`);
-      this.relay(`Dane's grant of ${n} more review round${n === 1 ? "" : "s"} for ${rec.key} (${grantWords([rec], this.cfg.tz).replace(/^\d+ /, "")}) no longer counts: ${STALE_LONG[why]}. `
-        + `So a round past ${key}'s cap is refused. If the change still needs more fix rounds, ask him for a fresh grant with keeper.sh review-grant once its last round is done; the old grant stays on file and never counts. Nothing else to tell him.`);
+      this.oweNotice(rounds, { id: `cain-void:${rec.id}`, to: "cain", kind: "void", key: rec.key, pr: rec.pr ?? rounds.changes[rec.key]?.pr ?? null, rounds: n, why,
+        text: `Dane's grant of ${n} more review round${n === 1 ? "" : "s"} for ${rec.key} (${grantWords([rec], this.cfg.tz).replace(/^\d+ /, "")}) no longer counts: ${STALE_LONG[why]}. `
+          + `So a round past ${key}'s cap is refused. If the change still needs more fix rounds, ask him for a fresh grant with keeper.sh review-grant once its last round is done; the old grant stays on file and never counts. He's told once, in the App's own words, that it no longer counts. Nothing else to tell him.` });
+      this.oweNotice(rounds, { id: `void:${rec.id}`, to: "owner", kind: "void", key: rec.key, pr: rec.pr ?? rounds.changes[rec.key]?.pr ?? null, rounds: n, why });
     }
     return any;
   }
-  // 0.18.1 (fifth review): grants written by 0.18.0 carry no binding and 0.18.0 recorded no claims. Once, at the
-  // runner's start (retried each tick until both files read): each change group's rounds are replayed against the
-  // allowance in effect at each round, and only the rounds that needed a grant are credited (claims on those rounds);
-  // what a grant has left is pending until the owner's Keep or Drop card (grants.ts sweepLegacy), one card per
-  // change, owed here and posted through the link. Nothing is voided. Each decision logged once; Cain told once a
-  // change. Idempotent: a grant the replay handled already is passed over, so a restart changes nothing.
-  private swept = false;
-  sweepUnbound(): void {
+  // ---- what the runner owes Cain and the owner (sixth review): rounds.notices, once each by id ----
+  private oweNotice(rounds: Rounds, n: Omit<OwedNotice, "state" | "at">): void {
+    const all = rounds.notices ??= {};
+    if (all[n.id]) return;
+    all[n.id] = { ...n, state: "owed", at: this.now().toISOString() };
+  }
+  // Cain's owed notices into the relay queue, then marked sent (a crash between the two can say one twice, never
+  // lose it). Sent notices older than 30 days are let go.
+  deliverCain(): void {
     const file = this.cfg.roundsFile;
-    if (this.swept || !file || this.capOff || !this.cfg.grantsFile) return;
-    const g = this.grants();
-    if (!g) return;
-    let done: ReturnType<typeof sweepLegacy> = [];
-    let cards: LegacyCard[] = [];
-    try {
-      const ok = withRoundsLock(file, () => {
-        const rounds = readRounds(file);
-        if (!rounds) return false;
-        done = sweepLegacy(rounds, g, this.roundCap, this.now().toISOString());
-        cards = this.oweLegacyCards(rounds, done);
-        if (done.length) writeRounds(file, rounds);
-        return true;
-      });
-      if (!ok) return;
-    } catch (e) {
-      if (e instanceof RoundsBusy) { this.log(`the upgrade's sweep of earlier grants waits: ${e.message}`); return; }
-      throw e;
+    const r = file ? readRounds(file) : null;
+    if (!file || !r?.notices) return;
+    let changed = false;
+    const old = this.now().getTime() - 30 * 86_400_000;
+    for (const [id, n] of Object.entries(r.notices)) {
+      if (n.state === "sent" && Date.parse(n.at) < old) { delete r.notices[id]; changed = true; continue; }
+      if (n.to !== "cain" || n.state !== "owed") continue;
+      if (n.text) this.relay(n.text);
+      n.state = "sent"; changed = true;
     }
-    this.swept = true;
-    const byKey = new Map<string, typeof done>();
+    if (changed) writeRounds(file, r);
+  }
+  // The owner's owed notices, through the link (its words, its root socket); tried again each tick until posted.
+  async postOwedNotices(): Promise<void> {
+    this.deliverCain();
+    const file = this.cfg.roundsFile;
+    if (!file || !this.deps.postNotice || this.capOff) return;
+    const rounds = readRounds(file);
+    if (!rounds?.notices) return;
+    for (const [id, n] of Object.entries(rounds.notices)) {
+      if (n.to !== "owner" || n.state !== "owed") continue;
+      let msg: string | null = null;
+      try { msg = await this.deps.postNotice(n); } catch (e) { this.log(`the notice ${id} didn't go: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
+      const now = readRounds(file);
+      const cur = now?.notices?.[id];
+      if (!now || !cur || cur.state !== "owed") continue;
+      if (msg) Object.assign(cur, { state: "sent", message: msg }); else cur.tries = (cur.tries ?? 0) + 1;
+      writeRounds(file, now);
+      if (msg) this.log(`the owner's notice ${id} went up`);
+    }
+  }
+  // 0.18.1 (sixth review): grants written by 0.18.0 carry no binding and 0.18.0 recorded no claims. Once, at the
+  // runner's first tick after the update (tried again each tick until both files read): copies of both files go
+  // beside them first (review-rounds.pre-0.18.1.json, review-grants.pre-0.18.1.json, root:cain 0640, for
+  // review.sh sweep-dry-run), then each change group's rounds are replayed (grants.ts replayUnbound): each round
+  // past the base cap debits one round from the earliest earlier pre-binding grant with rounds left, as a claim
+  // on that round, and the rounds left over are let go (grants_void, why "unbound"), owed to Cain and to the owner
+  // once a change. The claims, the voids, the notices owed and the done marker (replayed) are built in memory and
+  // committed in one rename: a crash before it replays from scratch, and after it a restart changes nothing.
+  private replayed = false;
+  replayOnce(): void {
+    const file = this.cfg.roundsFile, gfile = this.cfg.grantsFile;
+    if (this.replayed || !file || this.capOff || !gfile) return;
+    const rounds = readRounds(file), g = this.grants();
+    if (!rounds || !g) return;
+    if (rounds.replayed) { this.replayed = true; return; }
+    try {
+      keepPreReplay(file, join(dirname(file), PRE_ROUNDS), this.cfg.preReplayOwner);
+      keepPreReplay(gfile, join(dirname(gfile), PRE_GRANTS), this.cfg.preReplayOwner);
+    } catch (e) { this.log(`the copies before the replay of earlier grants couldn't be written, so it waits: ${String((e as Error)?.message ?? e).slice(0, 120)}`); return; }
+    const at = this.now().toISOString();
+    const next = structuredClone(rounds);
+    const done = replayUnbound(next, g, this.roundCap, at);
+    const byKey = new Map<string, ReplayDecision[]>();
     for (const d of done) {
       const n = d.rec.rounds, c = d.credited.length;
       this.log(`the owner's grant ${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, given before grants were bound): replayed: `
-        + `${c ? `credited with the round${c === 1 ? "" : "s"} that needed it (${d.credited.join(", ")})` : "no round needed it"}`
-        + `${d.unused ? `; ${d.unused} unused, pending the owner's Keep or Drop card` : ""}`);
+        + `${c ? `credited with the round${c === 1 ? "" : "s"} past the base cap that needed it (${d.credited.join(", ")})` : "no round past the base cap needed it"}`
+        + `${d.unused ? `; ${d.unused} unused, let go` : ""}`);
       byKey.set(d.rec.key, [...(byKey.get(d.rec.key) ?? []), d]);
     }
     for (const [key, list] of byKey) {
       const granted = list.reduce((n, d) => n + d.rec.rounds, 0), credited = list.reduce((n, d) => n + d.credited.length, 0);
       const unused = list.reduce((n, d) => n + d.unused, 0);
-      const card = cards.find((c) => c.key === key);
-      this.relay(`The review runner replayed Dane's earlier grants for ${key} (given before grants were bound to a commit) through the update: `
-        + `${granted} round${granted === 1 ? "" : "s"} granted, ${credited} credited to rounds that went past the cap and needed ${credited === 1 ? "it" : "them"}`
-        + `${unused ? `, ${unused} unused. The unused ${unused === 1 ? "round doesn't" : "rounds don't"} count until he confirms on the review service's Keep or Drop card, which ${card ? "goes to him by itself" : "couldn't be owed"}; don't ask him about it yourself, and his tap comes to you like any tap.` : "."} None was voided. Nothing to tell him.`);
+      const pr = list.find((d) => d.rec.pr)?.rec.pr ?? next.changes[key]?.pr ?? null;
+      const s = (k: number) => (k === 1 ? "" : "s");
+      this.oweNotice(next, { id: `cain-unbound:${key}`, to: "cain", kind: "unbound", key, pr, rounds: unused,
+        text: `The review runner replayed Dane's earlier grants for ${key} (given before grants were bound to a commit) through the update: `
+          + `${granted} round${s(granted)} granted, ${credited} credited to rounds past the base cap that needed ${credited === 1 ? "it" : "them"}`
+          + (unused ? `, ${unused} unused and let go: they never count. He's told once, in the App's own words, that they were let go. If the change still needs rounds, ask him for a fresh grant with keeper.sh review-grant once its last round is done. Nothing else to tell him.`
+            : ". Nothing was let go. Nothing to tell him.") });
+      if (unused) this.oweNotice(next, { id: `unbound:${key}`, to: "owner", kind: "unbound", key, pr, rounds: unused });
     }
-  }
-  // One Keep or Drop card per change with a pending allowance, owed in the rounds file (posted by postOwedLegacy).
-  private oweLegacyCards(rounds: Rounds, done: { rec: GrantRec; unused: number }[]): LegacyCard[] {
-    const out: LegacyCard[] = [];
-    const byKey = new Map<string, { rec: GrantRec; unused: number }[]>();
-    for (const d of done) if (d.unused > 0) byKey.set(d.rec.key, [...(byKey.get(d.rec.key) ?? []), d]);
-    for (const [key, list] of byKey) {
-      if (rounds.legacy_cards?.[key]) continue;
-      const c = rounds.changes[key];
-      const card: LegacyCard = { key, ids: list.map((d) => d.rec.id), granted: list.reduce((n, d) => n + d.rec.rounds, 0),
-        unused: list.reduce((n, d) => n + d.unused, 0), item: list.find((d) => d.rec.item)?.rec.item ?? null,
-        pr: list.find((d) => d.rec.pr)?.rec.pr ?? c?.pr ?? null, topic: oneLine(c?.topic ?? key, 120), state: "owed", at: this.now().toISOString() };
-      (rounds.legacy_cards ??= {})[key] = card;
-      out.push(card);
-    }
-    return out;
-  }
-  // Owed Keep or Drop cards, through the link; once posted never posted again.
-  async postOwedLegacy(): Promise<void> {
-    const file = this.cfg.roundsFile;
-    if (!file || !this.deps.postLegacy || this.capOff) return;
-    const rounds = readRounds(file);
-    if (!rounds) return;
-    for (const [key, c] of Object.entries(rounds.legacy_cards ?? {})) {
-      if (c.state !== "owed") continue;
-      let msg: string | null = null;
-      try { msg = await this.deps.postLegacy(c); } catch (e) { this.log(`the Keep or Drop card for ${key} didn't go: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
-      try {
-        withRoundsLock(file, () => {
-          const now = readRounds(file);
-          const cur = now?.legacy_cards?.[key];
-          if (!now || !cur || cur.state !== "owed") return;
-          if (msg) Object.assign(cur, { state: "posted", message: msg }); else cur.tries = (cur.tries ?? 0) + 1;
-          writeRounds(file, now);
-        });
-      } catch (e) { if (!(e instanceof RoundsBusy)) throw e; this.log(`the Keep or Drop card for ${key}: ${e.message}`); }
-      if (msg) this.log(`the owner's Keep or Drop card for ${key}'s earlier grant is up`);
-    }
+    next.replayed = at;
+    this.deps.crashPoint?.("replay-commit");
+    writeRounds(file, next);
+    this.replayed = true;
+    this.deliverCain();
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
   private earlierFindings(rounds: Rounds, key: string): string[] {
@@ -562,12 +645,6 @@ export class Runner {
   private settleRound(r: Review): void {
     const file = this.cfg.roundsFile;
     if (!file || this.capOff || !r.change || r.rounded || !FINAL.includes(r.status)) return;
-    // Fifth review: under the rounds file's lock; busy, it's settled next tick.
-    try { withRoundsLock(file, () => this.settleLocked(file, r)); }
-    catch (e) { if (!(e instanceof RoundsBusy)) throw e; this.log(`review ${shownId(r)}'s round is settled next tick: ${e.message}`); }
-  }
-  private settleLocked(file: string, r: Review): void {
-    if (!r.change) return;
     const rounds = readRounds(file);
     if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s round is settled next tick`); return; }
     const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
@@ -612,10 +689,6 @@ export class Runner {
   recoverLost(): void {
     const file = this.cfg.roundsFile;
     if (this.recovered || !file || this.capOff) return;
-    try { withRoundsLock(file, () => this.recoverLocked(file)); }
-    catch (e) { if (!(e instanceof RoundsBusy)) throw e; this.log(`the check for lost rounds waits: ${e.message}`); }
-  }
-  private recoverLocked(file: string): void {
     const rounds = readRounds(file);
     if (!rounds) return;                               // tried again next tick
     this.recovered = true;
@@ -644,27 +717,23 @@ export class Runner {
       if (!d || d.state !== "owed") continue;
       let msg: string | null = null;
       try { msg = await this.deps.postDecision(d); } catch (e) { this.log(`the decision card for ${key} didn't go: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
-      const told = withRoundsLock(file, () => {
-        const now = readRounds(file);
-        if (!now?.changes[key]?.decision) return false;
-        const cur = now.changes[key].decision!;
-        if (msg) Object.assign(cur, { state: "posted", message: msg }); else cur.tries = (cur.tries ?? 0) + 1;
-        writeRounds(file, now);
-        return !!msg;
-      });
-      if (told) {
+      const now = readRounds(file);
+      if (!now?.changes[key]?.decision) continue;
+      const cur = now.changes[key].decision!;
+      if (msg) Object.assign(cur, { state: "posted", message: msg }); else cur.tries = (cur.tries ?? 0) + 1;
+      writeRounds(file, now);
+      if (msg) {
         this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. If it's a critical change whose fix needs more rounds, the only way is a grant: keeper.sh review-grant asks him, and only his tap grants them. Nothing to tell him.`);
       }
     }
   }
 
   async tick(): Promise<void> {
-    this.tickNo++;
-    try { this.recoverLost(); this.sweepUnbound(); await this.ingest(); await this.reviews(); }
+    try { this.recoverLost(); this.replayOnce(); await this.ingest(); await this.reviews(); }
     finally {
       if (this.publishOwed) this.publishReviewed();
       try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }
-      try { await this.postOwedLegacy(); } catch (e) { this.log(`owed Keep or Drop cards: ${(e as Error).message}`); }
+      try { await this.postOwedNotices(); } catch (e) { this.log(`owed notices: ${(e as Error).message}`); }
     }
   }
 

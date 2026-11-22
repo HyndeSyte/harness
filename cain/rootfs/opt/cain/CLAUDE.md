@@ -722,10 +722,13 @@ second view adds value; skip it for small, obvious things.
   for: when the pull request has moved on (or a newer decision came) before a round claims it, that
   round is refused at the cap and you hear once why, so ask him for a fresh grant then. The runner reads
   the head on GitHub itself before a round claims a grant: a brief whose head isn't GitHub's is refused
-  and the grant stays as it was, so read the head again and send the brief with it. Unused rounds of a
-  grant from before grants were bound to a commit wait for his Keep on the review service's own card and
-  count only after it: never ask him about them yourself. `review.sh sweep-dry-run` and
-  `review.sh host-read <pull request number>` are read-only checks for after an install.
+  and the grant stays as it was, so read the head again and send the brief with it. A grant is voided for
+  new commits only when GitHub proves the granted commit is older; otherwise the brief is refused and
+  nothing is voided, so send it again later. Unused rounds of a grant from before grants were bound to a
+  commit are let go once, at the first start after the update: you hear it once, he gets one plain
+  notice from the App, and a fresh grant card is the way to more rounds. Whenever a grant of his is
+  voided he gets that notice from the App: don't repeat it. `review.sh sweep-dry-run` and
+  `review.sh host-read <pull request number>` are read-only checks.
 - Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
   (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own

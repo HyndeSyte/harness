@@ -24,10 +24,10 @@
 // his tap only. A round under the raised cap is fix-only like any later round. A granted round that again
 // leaves something serious at the raised cap owes a new decision card (one per round number): the newest
 // decision is the one that counts, and the earlier ones are kept under `past`.
-import { chmodSync, chownSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, chownSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
-import { countingGrants, grantedRounds, grantWords, standing, STALE_LONG, type GrantBinding, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
+import { countingGrants, grantedRounds, grantWords, standing, STALE_LONG, type GrantRec, type Grants, type StaleWhy } from "./grants.ts";
 
 export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
@@ -43,24 +43,25 @@ export type DecisionRec = {
   lost?: boolean;                    // the cap's last round never produced a result (round 2)
 };
 export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec; past?: DecisionRec[] };
-// grants_void (0.18.1): grants the runner found no longer bound to the change as it is (or never bound),
-// by grant id, kept so each is told to Cain once and never counts again. The grants file isn't touched.
-export type VoidRec = { why: StaleWhy; at: string; key: string };
-// grants_legacy (0.18.1, fifth review): grants from 0.18.0 (no binding), by grant id, as the upgrade's one-time sweep
-// replayed them (grants.ts sweepLegacy): the rounds that needed each (credited: those rounds carry its id as a claim,
-// and it counts for those rounds only), and its allowance left (unused), which is pending, never claimable, until
-// the owner confirms it on the Keep or Drop card. His Keep binds it to the change as it stood at his tap (bound, the
-// pull request's head read from GitHub then); his Drop ends it. Written by the runner (the sweep) and by the link
-// (his tap), each under the rounds file's lock (withRoundsLock). The grants file isn't touched.
-export type LegacyState = "used" | "pending" | "kept" | "dropped";
-export type LegacyRec = { key: string; at: string; credited: string[]; unused: number; state: LegacyState;
-  bound?: GrantBinding; answered?: { at: string; message: string } };
-// legacy_cards (fifth review): the Keep or Drop card, one per change, owed by the runner and posted by the link
-// (its root socket), tried again each tick until it's up. Cain is told once per change, when it's owed.
-export type LegacyCard = { key: string; ids: string[]; granted: number; unused: number; item: string | null; pr: string | null;
-  topic: string; state: "owed" | "posted"; at: string; message?: string; tries?: number };
+// grants_void (0.18.1): grants the runner found no longer bound to the change as it is (or, from before grants
+// were bound, rounds the one-time replay found unused), by grant id, kept so each is told once and never counts
+// again. rounds: the rounds let go (an unbound grant's unused ones). The grants file isn't touched.
+export type VoidRec = { why: StaleWhy; at: string; key: string; rounds?: number };
+// notices (0.18.1, sixth review): what the runner owes Cain (through the relay queue) and the owner (a plain notice
+// through the link's root socket, in the link's own words), each once, by id. Written in the same rename as what
+// they tell (a void, the replay, a wait), delivered after, and marked sent.
+export type NoticeKind = "unbound" | "void" | "waits";
+export type OwedNotice = { id: string; to: "cain" | "owner"; kind: NoticeKind; key: string; pr: string | null; rounds?: number; why?: StaleWhy;
+  text?: string; state: "owed" | "sent"; at: string; message?: string; tries?: number };
+// host_waits (sixth review): a brief waiting in the inbox on GitHub's head read, by inbox file name: when it first
+// waited (the 15-minute notice and the 24-hour refusal are judged on it, so a restart keeps them) and whether the
+// notice went. host_backoff: the one backoff every GitHub read shares (the head read and the compare), its next
+// try and its delay (a minute, doubling to 15 minutes).
+export type HostWait = { since: string; id: string; pr: string; told?: boolean };
+export type HostBackoff = { next: string; delay: number };
+// replayed (sixth review): when the one-time replay of grants from before grants were bound was committed.
 export type Rounds = { format: number; changes: Record<string, ChangeRec>; grants_void?: Record<string, VoidRec>;
-  grants_legacy?: Record<string, LegacyRec>; legacy_cards?: Record<string, LegacyCard> };
+  notices?: Record<string, OwedNotice>; host_waits?: Record<string, HostWait>; host_backoff?: HostBackoff; replayed?: string };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
 
@@ -76,55 +77,13 @@ export function readRounds(path: string): Rounds | null {
   } catch { return null; }
 }
 
-// Written whole (temp file, rename), keeping the file's owner and mode as the runner's other files do.
+// Written whole (temp file, rename: one atomic commit), keeping the file's owner and mode as the runner's other files do.
 export function writeRounds(path: string, r: Rounds): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = join(dirname(path), `.rounds-${process.pid}-${Date.now()}.tmp`);
   writeFileSync(tmp, JSON.stringify(r, null, 1), { mode: 0o640 });
   try { const s = statSync(path); chownSync(tmp, s.uid, s.gid); chmodSync(tmp, s.mode & 0o777); } catch { /* a new file */ }
   renameSync(tmp, path);
-}
-
-// The rounds file's lock (0.18.1, fifth review): since the owner's Keep or Drop tap is written into the rounds file by
-// the link, the runner's writes and the link's are each one read, change and write under this lock, so neither
-// writes over the other's. An exclusive create of "<file>.lock" holding a token; one older than staleMs is taken
-// over (renamed aside, then the exclusive create again, so one contender wins). Waits up to waitMs, then throws
-// RoundsBusy (the caller writes nothing: the runner tries again next tick; the link keeps the card up).
-export class RoundsBusy extends Error {}
-const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-export function withRoundsLock<T>(path: string, fn: () => T, o: { waitMs?: number; staleMs?: number } = {}): T {
-  const lock = `${path}.lock`, token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  const until = Date.now() + (o.waitMs ?? 3000), stale = o.staleMs ?? 30_000;
-  mkdirSync(dirname(path), { recursive: true });
-  for (;;) {
-    try { const fd = openSync(lock, "wx", 0o600); try { writeSync(fd, token); } finally { closeSync(fd); } break; }
-    catch (e: any) {
-      if (e?.code !== "EEXIST") throw new RoundsBusy(`the rounds file's lock can't be taken (${String(e?.code ?? e)})`);
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > stale) {
-          const aside = `${lock}.stale-${process.pid}-${Date.now()}`;
-          renameSync(lock, aside);
-          try { unlinkSync(aside); } catch { /* gone */ }
-          continue;
-        }
-      } catch { continue; }                          // it went meanwhile: try again
-      if (Date.now() > until) throw new RoundsBusy("the rounds file is busy (another writer holds its lock)");
-      sleepSync(15);
-    }
-  }
-  try { return fn(); }
-  finally { try { if (readFileSync(lock, "utf8") === token) unlinkSync(lock); } catch { /* taken over, or gone */ } }
-}
-// One read, change and write of the rounds file under its lock. fn returns false to write nothing. null when the
-// file can't be read (nothing written).
-export function updateRounds<T>(path: string, fn: (r: Rounds) => T | false): T | false | null {
-  return withRoundsLock(path, () => {
-    const r = readRounds(path);
-    if (!r) return null;
-    const out = fn(r);
-    if (out !== false) writeRounds(path, r);
-    return out;
-  });
 }
 
 // Every key linked to this one by supersedes, either way, itself included.
@@ -188,8 +147,6 @@ export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null =
     const notes = [
       ...st.stale.map((x) => ` His grant of ${x.rec.rounds} more round${x.rec.rounds === 1 ? "" : "s"} (${grantWords([x.rec], tz).replace(/^\d+ /, "")}) doesn't count: ${STALE_LONG[x.why]}.`),
       ...st.waiting.map((x) => ` His grant of ${x.rounds} more round${x.rounds === 1 ? "" : "s"} was given for the pull request at a given head, and this brief names no head, so it can't be matched: send the brief again with the pull request's head.`),
-      // Fifth review: a 0.18.0 grant's unused allowance waits for his Keep or Drop card, and never counts before it.
-      ...st.pending.map((x) => ` His earlier grant of ${x.rec.rounds} more round${x.rec.rounds === 1 ? "" : "s"} (${grantWords([x.rec], tz).replace(/^\d+ /, "")}), from before grants were bound to a commit, has ${x.unused} unused round${x.unused === 1 ? "" : "s"} waiting for his confirmation on the review service's Keep or Drop card: ${x.unused === 1 ? "it doesn't" : "they don't"} count until he taps Keep. Don't ask him about it yourself.`),
     ].join("");
     const fresh = st.stale.length ? " If the change still needs rounds, a fresh grant card is the way: keeper.sh review-grant." : "";
     return { ok: false, key, stale: st.stale, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}.${notes}${fresh} No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} More rounds come only from a grant: Cain asks with keeper.sh review-grant, and only the owner's tap on that card grants them; it never exempts the change from the rule. Nothing was queued.` };

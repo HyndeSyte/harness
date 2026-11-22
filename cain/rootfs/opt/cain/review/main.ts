@@ -8,7 +8,7 @@ import { readStop } from "../stop.ts";
 import { compareHeads, pullNow } from "../pullnow.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
-import type { DecisionRec, LegacyCard } from "./rounds.ts";
+import type { DecisionRec, OwedNotice } from "./rounds.ts";
 import { selfCheck } from "../capfiles.ts";
 import { claudeSeat } from "./seats/claude.ts";
 import { geminiSeat } from "./seats/gemini.ts";
@@ -34,14 +34,15 @@ export function decisionPoster(linkSock: string, log: (m: string) => void) {
   };
 }
 
-// The owner's Keep or Drop card for an earlier grant's unused rounds (0.18.1, fifth review): the same root socket.
-export function legacyPoster(linkSock: string, log: (m: string) => void) {
-  return async (c: LegacyCard): Promise<string | null> => {
-    const res = await fetch("http://link/legacy-grant", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
-      body: JSON.stringify(c), signal: AbortSignal.timeout(45_000) } as any);
+// A plain notice for the owner (0.18.1, sixth review): a grant let go or voided, a review waiting on GitHub. The
+// runner sends only the facts (kind, change, pull request, rounds, why); the words are the link's own.
+export function noticePoster(linkSock: string, log: (m: string) => void) {
+  return async (n: OwedNotice): Promise<string | null> => {
+    const res = await fetch("http://link/review-notice", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: n.id, kind: n.kind, key: n.key, pr: n.pr, rounds: n.rounds ?? null, why: n.why ?? null }), signal: AbortSignal.timeout(45_000) } as any);
     const j: any = await res.json().catch(() => ({}));
     if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
-    log(`the link didn't post the Keep or Drop card for ${c.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
+    log(`the link didn't post the notice ${n.id}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
     return null;
   };
 }
@@ -68,9 +69,9 @@ if (import.meta.main) {
     seats, log, postDecision,
     // 0.18.1 (fourth review): the pull request's head a grant's claim is pinned to, read as the link reads it.
     pull: pullNow,
-    // Fifth review: the proof a grant's bound head is superseded, and the Keep or Drop card through the link.
+    // The only proof a grant's bound head is superseded, and the owner's plain notices through the link (sixth review).
     compare: compareHeads,
-    postLegacy: legacyPoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log),
+    postNotice: noticePoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log),
     stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });
