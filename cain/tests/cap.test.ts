@@ -7,8 +7,8 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LABELS as CORE_LABELS, earlierCheck, prompt, parseBrief, resultJson, roundLine, seriousLeft, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
-import { DEFAULTS, Runner, loadReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
+import { LABELS as CORE_LABELS, PAYLOAD_SEP, earlierCheck, normalizeText, outbound, payloadCheck, payloadParts, privacyCheck, prompt, parseBrief, resultJson, roundLine, scanFindingsOnly, scanStrict, seriousLeft, validYmd, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
+import { DEFAULTS, ENQUEUE_BUSY, ENQUEUE_LOCK, Runner, loadReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import { admit, countedRounds, decisionOf, emptyRounds, readRounds, type DecisionRec } from "../rootfs/opt/cain/review/rounds.ts";
 import type { SeatAnswer, SeatFn, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
 import { LABELS, decide as guardDecide, guard, guardLines, readings, seatsLeft } from "../rootfs/opt/cain/guard.ts";
@@ -106,7 +106,8 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
   // a valid year-month-day date. The brief still gets every built-in pattern and the list.
   test("earlierCheck lets a tool name ending in a date through", () => {
     expect(earlierCheck(["Claude: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
-    expect(earlierCheck(["Claude: pinned since 20250305, see the tool list"], TERMS)).toEqual({ ok: true });
+    // Cain 0.18.2: a bare eight-digit date is no longer excused.
+    expect(earlierCheck(["Claude: pinned since 20250305, see the tool list"], TERMS)).toEqual({ ok: false, why: ["an account or card number in the earlier findings"] });
     expect(earlierCheck(undefined, null)).toEqual({ ok: true });
   });
   test("earlierCheck still blocks a phone-shaped number in the earlier findings", () => {
@@ -200,11 +201,10 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(t.get("gu-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
     expect(t.calls.length).toBe(1);
   });
-  test("earlierCheck: only an eight-digit valid date passes, glued or bare (the bare date on purpose)", () => {
+  test("earlierCheck: only a glued eight-digit valid date passes (Cain 0.18.2: a bare date blocks)", () => {
     const acct = { ok: false, why: ["an account or card number in the earlier findings"] };
     expect(earlierCheck(["Gemini: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
-    // A bare eight-digit valid date is accepted on purpose (DOCS.md, the privacy backstop).
-    expect(earlierCheck(["Gemini: pinned since 20250305"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Gemini: pinned since 20250305"], TERMS)).toEqual(acct);
     expect(earlierCheck(["Gemini: the account is 87654321"], TERMS)).toEqual(acct);              // bare, not a date
     expect(earlierCheck(["Gemini: card_4111111111111111"], TERMS)).toEqual(acct);                // glued, Luhn-valid 16
     expect(earlierCheck(["Gemini: x4111111111111111"], TERMS)).toEqual(acct);                    // glued to a letter
@@ -1187,5 +1187,206 @@ describe("round 3, fix 7: no silent gap between the plan reader and the hook", (
     expect(hook).toContain("if (!held) return first;");
     const guardSrc = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/guard.ts"), "utf8");
     expect(guardSrc).toContain("The silent gap (round 3)");
+  });
+});
+
+// Cain 0.18.2: the first review's tightening of the earlier-findings backstop.
+describe("0.18.2: glued dates only, a real calendar check, Luhn over grouped runs, provenance", () => {
+  const ACCT = { ok: false, why: ["an account or card number in the earlier findings"] };
+  const blocksBrief = (body: string) => privacyCheck(brief({ id: "b-1", body }), TERMS);
+
+  test("item 1: a glued valid date passes; a bare valid date blocks", () => {
+    expect(earlierCheck(["Gemini: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Gemini: tool20250305 is pinned"], TERMS)).toEqual({ ok: true });     // glued to a letter
+    expect(earlierCheck(["Gemini: pinned since 20250305"], TERMS)).toEqual(ACCT);
+    expect(earlierCheck(["20250305"], TERMS)).toEqual(ACCT);                                     // nothing before it at all
+  });
+  test("item 1: a glued date followed by a space and 4, 8 or 9 non-Luhn digits blocks, glued and bare", () => {
+    for (const tail of ["1234", "12345678", "123456789"]) {
+      expect([tail, earlierCheck([`Gemini: web_search_20250305 ${tail}`], TERMS)]).toEqual([tail, ACCT]);
+      expect([tail, earlierCheck([`Gemini: since 20250305 ${tail}`], TERMS)]).toEqual([tail, ACCT]);
+    }
+  });
+  test("item 1: the leap day passes glued in a leap year and blocks in a year that isn't one", () => {
+    expect(earlierCheck(["Gemini: tool_20240229"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Gemini: tool_20000229"], TERMS)).toEqual({ ok: true });              // 2000: a leap year
+    expect(earlierCheck(["Gemini: tool_20230229"], TERMS)).toEqual(ACCT);
+    expect(earlierCheck(["Gemini: tool_19000229"], TERMS)).toEqual(ACCT);                      // 1900: not a leap year
+    expect(validYmd("20240229")).toBe(true);
+    expect(validYmd("20230229")).toBe(false);
+  });
+  test("item 1: month 00 and 13, day 00 and April 31 block", () => {
+    for (const d of ["20250005", "20251305", "20250300", "20250431"]) {
+      expect([d, validYmd(d)]).toEqual([d, false]);
+      expect([d, earlierCheck([`Gemini: tool_${d}`], TERMS)]).toEqual([d, ACCT]);
+    }
+    expect(validYmd("20250430")).toBe(true);
+  });
+
+  test("item 2: a hyphen-grouped card number blocks in the brief and in the findings", async () => {
+    expect(blocksBrief("Card 4111-1111-1111-1111 is on file.")).toEqual({ ok: false, why: ["an account or card number"] });
+    expect(earlierCheck(["Gemini: the log prints 4111-1111-1111-1111"], TERMS)).toEqual(ACCT);
+    expect(earlierCheck(["Gemini: the log prints 4111 1111-1111 1111"], TERMS)).toEqual(ACCT);  // mixed joins
+    expect(earlierCheck(["Gemini: the log prints 4111-1111-1111-1112"], TERMS)).toEqual({ ok: true });  // not Luhn-valid
+    // Through the runner: a fix-only round whose earlier findings hold it is blocked, nothing sent.
+    const t = runnerRig({ seat: answerWith("The log prints 4111-1111-1111-1111 in full.") });
+    t.runner.admitAndQueue(brief({ id: "hy-1" }));
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "hy-2", body: "Fix: the log masks it." }))).toBeNull();
+    await t.runner.tick();
+    expect(t.get("hy-2").status).toBe("blocked: privacy");
+    expect(t.get("hy-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+    // And in a brief through the runner.
+    const u = runnerRig();
+    u.runner.admitAndQueue(brief({ id: "hy-3", body: "Card 4111-1111-1111-1111 is on file." }));
+    await u.runner.tick();
+    expect(u.get("hy-3").status).toBe("blocked: privacy");
+    expect(u.calls.length).toBe(0);
+  });
+
+  test("item 3: both excused shapes block in a brief, by its check and by the payload's", async () => {
+    for (const body of ["Pin the web_search_20250305 tool.", "Pinned since 20250305."]) {
+      expect([body, blocksBrief(body)]).toEqual([body, { ok: false, why: ["an account or card number"] }]);
+      expect([body, payloadCheck(outbound(brief({ body })), TERMS)]).toEqual([body, { ok: false, why: ["an account or card number"] }]);
+      const t = runnerRig();
+      t.runner.admitAndQueue(brief({ id: "ex-1", body }));
+      await t.runner.tick();
+      expect(t.get("ex-1").status).toBe("blocked: privacy");
+      expect(t.calls.length).toBe(0);
+    }
+  });
+  test("item 3: the findings mode is its own named entry point, and the brief's check never calls it", () => {
+    expect(scanStrict.length).toBe(2);                                        // no mode parameter to pass
+    const terms = { entries: [] };
+    expect(scanStrict("tool_20250305", terms)).toEqual(["an account or card number"]);
+    expect(scanFindingsOnly("tool_20250305", terms)).toEqual([]);
+    const core = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/review/core.ts"), "utf8");
+    const fn = (name: string) => { const i = core.indexOf(`export function ${name}(`); return core.slice(i, core.indexOf("\n}\n", i)); };
+    expect(fn("privacyCheck")).toContain("scanStrict(");
+    expect(fn("privacyCheck")).not.toContain("scanFindingsOnly");
+    expect(fn("reviewCheck")).not.toContain("scanFindingsOnly");
+    // Only the earlier-findings span goes to the findings rules: earlierCheck and payloadCheck's span.
+    const callers = [...core.matchAll(/scanFindingsOnly\(/g)].length;
+    expect(callers).toBe(3);                                                   // its definition, earlierCheck, payloadCheck
+    expect(fn("payloadCheck")).toContain("scanFindingsOnly(normalizeText(parts.findings)");
+    const runner = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/review/runner.ts"), "utf8");
+    expect(runner).not.toContain("scanFindingsOnly");
+  });
+
+  test("item 4: a matching queue record carrying findings-like text with a date and a private-looking value sends neither", async () => {
+    const t = runnerRig({ seat: answerWith("The stored finding.") });
+    t.runner.admitAndQueue(brief({ id: "pq-1" }));
+    await t.runner.tick();
+    expect(t.rounds().changes["pr-40"].rounds[0].findings).toEqual(["Gemini: The stored finding."]);
+    // The round's queue record, still that round of this change, is given other findings and a findings field.
+    const f = join(t.cfg.queueDir, "pq-1.json");
+    const j = JSON.parse(readFileSync(f, "utf8"));
+    j.seats[0].findings = [{ rank: 1, problem: "Pinned since 20250305; call 555-867-5309.", fix: "x" }];
+    j.findings = ["Gemini: Pinned since 20250305; call 555-867-5309."];
+    j.earlier = ["Gemini: Pinned since 20250305; call 555-867-5309."];
+    writeFileSync(f, JSON.stringify(j));
+    expect(t.runner.admitAndQueue(brief({ id: "pq-2", body: "Fix: done." }))).toBeNull();
+    expect(t.get("pq-2").earlier).toEqual(["Gemini: The stored finding."]);
+    await t.runner.tick();
+    expect(t.get("pq-2").status).toBe("done");
+    const sent = JSON.stringify(t.calls[1].brief);
+    expect(sent).toContain("The stored finding.");
+    expect(sent).not.toContain("20250305");
+    expect(sent).not.toContain("555-867-5309");
+  });
+  test("item 4: the lookup's key is the brief's validated change: one naming another change's key can't read its findings", async () => {
+    const answers = ["Finding of pr-40.", "Finding of plan-a.", "Finding of pr-41.", "Second of pr-41."];
+    let n = 0;
+    const t = runnerRig({ seat: async () => answerWith(answers[n++] ?? "Later.")() });
+    t.runner.admitAndQueue(brief({ id: "ck-1" }));
+    await t.runner.tick();
+    // A plan brief naming pull request 40's key as its change, with its own id: refused whole, nothing queued.
+    for (const over of [{ pr: undefined, change: "pr-40" }, { pr: PRN(41), change: "pr-40" }]) {
+      const why = t.runner.admitAndQueue(brief({ id: "ck-x", body: "Fix: done.", ...over }));
+      expect(why).toContain("can't be shaped like a pull request's key");
+      expect(existsSync(join(t.cfg.queueDir, "ck-x.json"))).toBe(false);
+    }
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(1);
+    // A pull request brief naming a plan's change key: its key is the pull request's, so it reads only its own.
+    expect(t.runner.admitAndQueue(brief({ id: "ck-p1", pr: undefined, change: "plan-a" }))).toBeNull();
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "ck-41a", pr: PRN(41) }))).toBeNull();
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "ck-41b", pr: PRN(41), change: "plan-a", body: "Fix: done." }))).toBeNull();
+    expect(t.get("ck-41b")).toMatchObject({ change: "pr-41", round: 2 });
+    expect(t.get("ck-41b").earlier).toEqual(["Gemini: Finding of pr-41."]);
+    expect(countedRounds(t.rounds(), "plan-a").length).toBe(1);
+  });
+  test("item 4: a same-change replay of a round id resolves to the original record: findings and count unchanged", async () => {
+    const t = runnerRig({ seat: answerWith("Original finding.") });
+    t.runner.admitAndQueue(brief({ id: "rp-1" }));
+    await t.runner.tick();
+    const queueBefore = readFileSync(join(t.cfg.queueDir, "rp-1.json"), "utf8");
+    const roundsBefore = readFileSync(t.cfg.roundsFile!, "utf8");
+    const why = t.runner.admitAndQueue(brief({ id: "rp-1", body: "Fix: a replay that wants to change things." }));
+    expect(why).toContain("already a round of pr-40");
+    expect(why).toContain("Nothing was queued.");
+    expect(readFileSync(join(t.cfg.queueDir, "rp-1.json"), "utf8")).toBe(queueBefore);
+    expect(readFileSync(t.cfg.roundsFile!, "utf8")).toBe(roundsBefore);
+    // Even with its queue record gone, the rounds record refuses the id; the count stays at one.
+    rmSync(join(t.cfg.queueDir, "rp-1.json"));
+    expect(t.runner.admitAndQueue(brief({ id: "rp-1", round_kind: "fixes", body: "Fix: again." }))).toContain("already a round of pr-40");
+    expect(countedRounds(t.rounds(), "pr-40").map((x) => x.id)).toEqual(["rp-1"]);
+    expect(t.rounds().changes["pr-40"].rounds[0].findings).toEqual(["Gemini: Original finding."]);
+  });
+  test("item 4: an id is checked against the queue too, under the enqueue lock: two queued briefs can't share one", async () => {
+    const t = runnerRig();
+    expect(t.runner.admitAndQueue(brief({ id: "dup-1" }))).toBeNull();
+    // The rounds record loses the id (an old or edited file): the queue still holds it, so the second is refused.
+    const j = JSON.parse(readFileSync(t.cfg.roundsFile!, "utf8"));
+    j.changes["pr-40"].rounds = [];
+    writeFileSync(t.cfg.roundsFile!, JSON.stringify(j));
+    const queued = readFileSync(join(t.cfg.queueDir, "dup-1.json"), "utf8");
+    const why = t.runner.admitAndQueue(brief({ id: "dup-1", pr: PRN(41), body: "Another change, the same id." }));
+    expect(why).toContain("already queued");
+    expect(readFileSync(join(t.cfg.queueDir, "dup-1.json"), "utf8")).toBe(queued);
+    expect(t.rounds().changes["pr-41"]).toBeUndefined();
+    // While another enqueue holds the lock, nothing is queued; a lock left over a minute ago is taken over.
+    const lock = join(t.cfg.queueDir, ENQUEUE_LOCK);
+    writeFileSync(lock, "");
+    expect(t.runner.admitAndQueue(brief({ id: "lk-1", pr: PRN(42) }))).toBe(ENQUEUE_BUSY);
+    expect(existsSync(join(t.cfg.queueDir, "lk-1.json"))).toBe(false);
+    expect(t.rounds().changes["pr-42"]).toBeUndefined();
+    const old = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, old, old);
+    expect(t.runner.admitAndQueue(brief({ id: "lk-1", pr: PRN(42) }))).toBeNull();
+    expect(existsSync(lock)).toBe(false);
+    expect(t.get("lk-1").change).toBe("pr-42");
+    // The runner never reads the lock as a review.
+    await t.runner.tick();
+  });
+
+  test("item 5: the payload's spans are checked apart, with a separator nothing joins across", () => {
+    // Findings ending in four digits, joined to a body starting with digits.
+    const o = outbound(brief({ question: "Is build 4321", body: "5678 is the next build." }), { earlier: ["Gemini: see build 1234"] });
+    const parts = payloadParts(o);
+    expect(parts.findings).toBe("1. Gemini: see build 1234");
+    expect(parts.strict).toBe(`The round cap in code\nIs build 4321${PAYLOAD_SEP}${PAYLOAD_SEP}5678 is the next build.`);
+    expect(payloadCheck(o, TERMS)).toEqual({ ok: true });
+    // Joined plainly, the digits on either side would read as one run of eight.
+    expect(scanStrict(normalizeText(`see build 1234\n5678 is the next build.`), { entries: [] })).toEqual(["an account or card number"]);
+    expect(scanStrict(normalizeText(`Is build 4321\n5678 is`), { entries: [] })).toEqual(["an account or card number"]);
+    // The strict rules still see the body and the findings rules still see the span.
+    expect(payloadCheck(outbound(brief({ body: "Call 555-867-5309." }), { earlier: ["Gemini: ok"] }), TERMS)).toEqual({ ok: false, why: ["a phone number"] });
+    expect(payloadCheck({ ...o, earlier: ["Gemini: since 20250305"] }, TERMS)).toEqual(ACCT);
+    expect(payloadCheck({ ...o, earlier: ["Gemini: tool_20250305"] }, TERMS)).toEqual({ ok: true });
+    // The excuse doesn't reach the strict side: a glued date in the body blocks next to excused findings.
+    expect(payloadCheck({ ...o, body: "Pin tool_20250305." }, TERMS)).toEqual({ ok: false, why: ["an account or card number"] });
+    // The span is what the seats' prompt carries.
+    expect(prompt(o, "reviewer").user).toContain(`<earlier>\n${parts.findings}\n</earlier>`);
+  });
+
+  test("item 8: the round 2 findings of the earlier-digits change pass the findings check", () => {
+    const text = readFileSync(join(import.meta.dir, "earlier-round2-findings.txt"), "utf8");
+    const lines = text.split("\n").filter((l) => l.trim() && !l.startsWith("#"));
+    expect(lines.length).toBeGreaterThan(0);
+    expect(earlierCheck(lines, TERMS)).toEqual({ ok: true });
+    expect(payloadCheck(outbound(brief({ body: "Fix: done." }), { earlier: lines }), TERMS)).toEqual({ ok: true });
   });
 });

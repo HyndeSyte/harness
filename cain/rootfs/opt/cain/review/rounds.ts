@@ -33,7 +33,9 @@ export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
 
 export type RoundState = "started" | "answered" | "lost";
-export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundState; blocked?: boolean; done?: boolean; serious?: number };
+// findings (Cain 0.18.2): the round's seat answers' findings as they arrived, one line each, the only source a later
+// fix-only round's earlier findings are built from (runner.ts, keepFindings and earlierFindings).
+export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundState; blocked?: boolean; done?: boolean; serious?: number; findings?: string[] };
 export type DecisionRec = {
   id: string;                        // the decision's own id: "<key>#<round>", what the link files the tap under
   key: string; round: number; serious: number;

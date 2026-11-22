@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.18.2
+
+- A fix-only review round is still let through when the earlier findings hold a tool name ending in a date, but only that: a date written as eight digits on its own, or followed by more digits, now blocks the round, and the date has to be a real one (leap days included).
+- A card number written in groups with hyphens or spaces now blocks, in your brief and in the earlier findings.
+- The earlier findings sent with a fix-only round now come only from the seats' answers as the review runner kept them when they arrived; findings from rounds answered before this version aren't sent.
+- A review id can't be used twice: not for another change, not for the same change again, and not while a review with that id is queued.
+- A brief can't name a change key that looks like a pull request's.
+
 ## 0.18.1
 
 - A fix-only review round is no longer blocked because the earlier round's findings hold a tool name ending in a date (or a date written as eight digits).
