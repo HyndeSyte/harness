@@ -11,6 +11,13 @@
 - Grading is blind: names and markers are taken out of every answer, two graders from different families score each answer, and neither grades its own family's answers.
 - Real reviews always go first: trials pause while one is waiting or running, and back off a seat that hit a rate limit.
 - The research questions run only once you have approved them and their answer notes, and Perplexity stays on its own model unless you approve otherwise.
+- Codex takes part only once a sandbox check on the Pi proves it can't read anything of yours; otherwise it is left out of the trial and never grades, and the report says so.
+- The spend stop now keeps a safety margin under the budget, gives money back only when a provider clearly charged nothing, counts Codex in calls rather than dollars, and keeps each seat's trial calls well inside its limits so real reviews always have room.
+- Your approval of the research questions, their answer notes and the grading rules is now three entries in this App's options (Cain gives you the values), and so is letting Perplexity use another lab's model. Nothing Cain can write counts as your approval.
+- Search and page fetching are off for trials built from your record; only the research questions you approved go out with search.
+- Every provider, model and level is checked once before any spend; one that fails is left out and named in the report.
+- A third grader, Google's, so every answer is graded by two graders from outside its own company; the report ranks only answers graded by the same pair.
+- The cost per good answer now counts failed and retried attempts too, and costs without a bill are shown apart.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.18.1
@@ -33,6 +40,13 @@
 - A grant card holds the pull request's newest commit and the newest decision from when it went up; if either changed by your tap, nothing is granted and you see why.
 - A grant card that went out of date, or whose message is gone, no longer blocks a new one: it loses its buttons ("Replaced by a newer card") and the new card goes up.
 - If the records can't be read for a moment when you tap Grant, the card stays up and asks you to try again in a minute.
+- Codex takes part only once a sandbox check on the Pi proves it can't read anything of yours; otherwise it is left out of the trial and never grades, and the report says so.
+- The spend stop now keeps a safety margin under the budget, gives money back only when a provider clearly charged nothing, counts Codex in calls rather than dollars, and keeps each seat's trial calls well inside its limits so real reviews always have room.
+- Your approval of the research questions, their answer notes and the grading rules is now three entries in this App's options (Cain gives you the values), and so is letting Perplexity use another lab's model. Nothing Cain can write counts as your approval.
+- Search and page fetching are off for trials built from your record; only the research questions you approved go out with search.
+- Every provider, model and level is checked once before any spend; one that fails is left out and named in the report.
+- A third grader, Google's, so every answer is graded by two graders from outside its own company; the report ranks only answers graded by the same pair.
+- The cost per good answer now counts failed and retried attempts too, and costs without a bill are shown apart.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.17.0

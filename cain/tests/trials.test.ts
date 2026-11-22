@@ -5,7 +5,7 @@
 // No live provider call: every provider is a fake, or a real adapter over a fake fetch or exec.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -17,7 +17,7 @@ import {
   datedPrice, disagreements, gradePrompt, makeLabels, normalizeCandidate, parseBriefTxt, parseGrades, pickReviewTasks, planOf, worstOf, worstOfCeiling,
   type ReviewDir, type Suite,
 } from "../rootfs/opt/cain/trials/core.ts";
-import { RESEARCH_APPROVAL, RESEARCH_QUESTIONS, TrialRunner, latestRun, paths, readBudget, requestError, reviewDirs, type TrialDeps } from "../rootfs/opt/cain/trials/runner.ts";
+import { RESEARCH_QUESTIONS, TrialRunner, latestRun, paths, readBudget, requestError, researchHashes, reviewDirs, takeInboxFile, type TrialDeps } from "../rootfs/opt/cain/trials/runner.ts";
 import { buildReport } from "../rootfs/opt/cain/trials/report.ts";
 import {
   CLAUDE_FETCH_TOOL, CLAUDE_SEARCH_TOOL, CODEX_NO_MODEL, claudeProvider, codexProvider, geminiProvider, modelsFromCatalog, perplexityProvider,
@@ -52,12 +52,19 @@ function writeRecord(recordDir: string, n: number, extra: (i: number) => Partial
 const QUESTIONS = Array.from({ length: 30 }, (_, i) => ({ kind: i < 15 ? "fact" : "listing", question: `Cain's own note ${i + 1}: SECRET-CONTEXT-${i}`,
   sent_text: `What is the current release of tool number ${i + 1}?`, as_of: "2026-11-20", must_contain: "the current version and its source",
   sources: [{ url: "https://example.com/releases", read_on: "2026-11-19" }], no_reliable_answer: i < 3 }));
-function writeQuestions(recordDir: string, questions: any = { questions: QUESTIONS }, approve: boolean | object = true) {
+// The research approval lives in the App's options (a file of the runner's own uid here, standing in for
+// root's /data/options.json): the three hashes, and third-party routing only when given.
+function writeQuestions(recordDir: string, questions: any = { questions: QUESTIONS }, approve: boolean | object = true, optionsFile?: string) {
   const text = JSON.stringify(questions);
   mkdirSync(join(recordDir, "projects/harness/trials"), { recursive: true });
   writeFileSync(join(recordDir, RESEARCH_QUESTIONS), text);
-  if (approve) writeFileSync(join(recordDir, RESEARCH_APPROVAL), JSON.stringify({ questions_sha256: createHash("sha256").update(text).digest("hex"),
-    approved_by: "owner", approved_on: "2026-11-21", ...(typeof approve === "object" ? approve : {}) }));
+  if (approve && optionsFile) approveInOptions(recordDir, optionsFile, typeof approve === "object" ? approve : {});
+}
+function approveInOptions(recordDir: string, optionsFile: string, extra: object = {}) {
+  const h = researchHashes(recordDir).hashes!;
+  writeFileSync(optionsFile, JSON.stringify({ trials_budget_usd: 40, trials_research_questions_sha256: h.questions, trials_research_notes_sha256: h.notes,
+    trials_research_rubric_sha256: h.rubric, ...extra }), { mode: 0o600 });
+  chmodSync(optionsFile, 0o600);
 }
 
 // ---- fakes ----
@@ -86,24 +93,27 @@ function fake(o: FakeOpts): Spy {
     }
     return { ...base, text: o.text?.(input) ?? "The answer is 42. https://example.com/a", urls: ["https://example.com/a"] };
   };
-  const validate = async (input: any) => { await input.wire.fetch(`https://fake-${o.seat}.example/validate`, { method: "POST", body: JSON.stringify({ model: input.model }) }); return { bill: { usd: 0.0001, how: "estimated" as const } }; };
+  const validate = async (input: any) => { await input.wire.fetch(`https://fake-${o.seat}.example/validate`, { method: "POST", body: JSON.stringify({ model: input.model }) }); return { bill: { usd: 0.0001, how: "estimated" as const }, served: o.served?.(input) ?? input.model }; };
   return { ask, validate, calls };
 }
-function fakeCodex(o: Partial<FakeOpts> & { models?: string[] | null; version?: string } = {}): Spy & CodexProvider {
+function fakeCodex(o: Partial<FakeOpts> & { models?: string[] | null; version?: string; isolated?: boolean } = {}): Spy & CodexProvider {
   const f = fake({ seat: "codex", cost: 0, how: "billed", ...o });
-  return Object.assign(f, { validate: undefined, version: async () => o.version ?? "codex-cli 0.130.0", models: async () => (o.models === undefined ? ["gpt-6.2-sol", "gpt-6.2-astra"] : o.models) });
+  return Object.assign(f, { validate: undefined, version: async () => o.version ?? "codex-cli 0.130.0", models: async () => (o.models === undefined ? ["gpt-6.2-sol", "gpt-6.2-astra"] : o.models),
+    isolation: async () => (o.isolated === false ? { ok: false, mode: "none" as const, detail: "a sandboxed command ran and gave output", at: "2026-11-22T15:00:00Z" } : { ok: true, mode: "rules" as const, detail: "fake", at: "2026-11-22T15:00:00Z" }) }) as any;
 }
 
 function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Partial<RunnerConfig["caps"]>; record?: (i: number) => any;
   providers?: Partial<TrialDeps["providers"]>; stopped?: () => boolean; fetchBody?: any; fetch?: TrialDeps["fetch"]; exec?: TrialDeps["exec"];
-  questions?: boolean | object; reviewSeats?: Partial<Record<string, SeatFn>>; inbox?: boolean; timeoutScale?: number } = {}) {
+  questions?: boolean | object; reviewSeats?: Partial<Record<string, SeatFn>>; inbox?: boolean; timeoutScale?: number; seatLimits?: any } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "trials-"));
   const cfg: RunnerConfig = { ...DEFAULTS, caps: { ...DEFAULTS.caps, ...(o.caps ?? {}) }, queueDir: join(dir, "q"), spendFile: join(dir, "spend.json"), healthFile: join(dir, "health.json"),
     termsFile: join(dir, "terms.txt"), recordQueue: join(dir, "record-queue"), relayFile: join(dir, "relay.queue"), reservePercent: 25 };
   writeFileSync(cfg.termsFile, o.terms ?? TERMS);
   const recordDir = join(dir, "record");
+  const optionsFile = join(dir, "options.json");
+  writeFileSync(optionsFile, JSON.stringify({ trials_budget_usd: 40 }), { mode: 0o600 });
   writeRecord(recordDir, o.reviews ?? 2, o.record);
-  if (o.questions) writeQuestions(recordDir, { questions: QUESTIONS }, o.questions);
+  if (o.questions) writeQuestions(recordDir, { questions: QUESTIONS }, o.questions, optionsFile);
   let clock = new Date("2026-11-22T15:00:00Z");
   const review = new Runner(cfg, { seats: (o.reviewSeats ?? {}) as any, now: () => clock, rand: () => 0.5, log: () => {}, stopped: o.stopped ?? (() => false) });
   const providers = { claude: fake({ seat: "claude", cost: 0.05 }), gemini: fake({ seat: "gemini", cost: 0.01 }), perplexity: fake({ seat: "perplexity", cost: 0.003, how: "billed" }),
@@ -118,7 +128,8 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
   };
   const tdir = join(dir, "trials");
   const inboxDir = join(dir, "inbox");
-  const trials = new TrialRunner({ dir: tdir, recordDir, budgetUsd: o.budget ?? 40, seatGapMs: 0, timeoutScale: o.timeoutScale, ...(o.inbox ? { inboxDir, inboxUid: process.getuid!() } : {}) }, deps);
+  const trials = new TrialRunner({ dir: tdir, recordDir, budgetUsd: o.budget ?? 40, seatGapMs: 0, timeoutScale: o.timeoutScale, inboxDir, inboxUids: [process.getuid!()],
+    optionsFile, optionsUid: process.getuid!(), ...(o.seatLimits ? { seatLimits: o.seatLimits } : {}) }, deps);
   const runAll = async (suite: "review-seats" | "research" = "review-seats", max = 3000) => {
     for (let i = 0; i < max; i++) {
       const ticked = await trials.tick();
@@ -128,11 +139,20 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
     }
   };
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
-  return { dir, tdir, cfg, recordDir, review, trials, deps, providers, fetched, runAll, relays, inboxDir,
+  return { dir, tdir, cfg, recordDir, review, trials, deps, providers, fetched, runAll, relays, inboxDir, optionsFile,
     advance: (ms: number) => { clock = new Date(clock.getTime() + ms); }, now: () => clock };
 }
 const outputCalls = (t: ReturnType<typeof rig>) => ["gemini", "codex", "perplexity"].reduce((a, s) => a + t.providers[s].calls.filter((c: AskInput) => !c.schema && c.user !== "ready?").length, 0);
-const graderCalls = (t: ReturnType<typeof rig>) => t.providers.claude.calls.filter((c: AskInput) => c.schema).length + t.providers.codex.calls.filter((c: AskInput) => c.schema).length;
+const graderCalls = (t: ReturnType<typeof rig>) => ["claude", "codex", "gemini"].reduce((a, s) => a + t.providers[s].calls.filter((c: AskInput) => c.schema).length, 0);
+// A request as Cain leaves it: a file in the inbox, taken on the next ingest. What the runner said of it.
+let inboxSeq = 0;
+function submit(t: { inboxDir: string; trials: TrialRunner }, req: any): string | null {
+  mkdirSync(t.inboxDir, { recursive: true });
+  const name = `${Date.now()}-${++inboxSeq}.json`;
+  writeFileSync(join(t.inboxDir, name), JSON.stringify(req));
+  const r = t.trials.ingest().find((x) => x.name === name);
+  return r ? r.why : "not taken";
+}
 const suiteOf = (t: ReturnType<typeof rig>, name = "review-seats"): Suite => JSON.parse(readFileSync(paths(t.tdir).suite(name), "utf8"));
 
 describe("tasks", () => {
@@ -162,11 +182,15 @@ describe("the spend bound: hard ceilings in every request", () => {
     expect(c.steps).toBe(LIMITS.claudeAnswerSearches + 1);
     expect(c.maxOut).toBe(LIMITS.claudeAnswerOut);
     expect(worstOfCeiling(c)).toBeCloseTo(c.steps * (c.contextTokens * 4 + c.maxOut * 20) / 1e6 + 3 * 0.01, 9);
-    // Gemini: the thinking budget counts at the output price, and Argon is bounded at its December price in November.
-    const g = callShape("review-seats", { id: "o", kind: "output", task: "q", config: "gemini:gemini-4-argon" }, { id: "q", kind: "review", brief: { topic: "t", question: "q", body: "b", needs_facts: false, consequential: false }, originals: [] });
+    // Gemini: Argon's maxOutputTokens covers its thinking (its docs), so the enforced output ceiling is the bound;
+    // where the docs don't confirm that (3.8 Flash), the thinking allowance is added. Argon is bounded at its
+    // December price in November.
+    const rt = { id: "q", kind: "review" as const, brief: { topic: "t", question: "q", body: "b", needs_facts: false, consequential: false }, originals: [] };
+    const g = callShape("review-seats", { id: "o", kind: "output", task: "q", config: "gemini:gemini-4-argon" }, rt);
     const gc = ceilingOf(g, 1_000)!;
-    expect(gc.maxOut).toBe(LIMITS.geminiReviewOut + LIMITS.geminiThinking);
+    expect(gc.maxOut).toBe(LIMITS.geminiReviewOut);
     expect(gc.price).toEqual({ in: 4, out: 20 });
+    expect(ceilingOf(callShape("review-seats", { id: "o", kind: "output", task: "q", config: "gemini:gemini-3.8-flash" }, rt), 1_000)!.maxOut).toBe(LIMITS.geminiReviewOut + LIMITS.geminiThinkingAllowance);
     // A configuration that can't be given a ceiling is refused.
     expect(ceilingOf({ ...g, thinking: undefined }, 1_000)).toBeNull();
     expect(ceilingOf({ ...callShape("research", { id: "o", kind: "output", task: "q", config: "perplexity:low" }, t), maxSteps: 0 }, 1_000)).toBeNull();
@@ -203,40 +227,69 @@ describe("the spend bound: hard ceilings in every request", () => {
       return new Response(JSON.stringify({ modelVersion: "gemini-3.8-flash-002", usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, thoughtsTokenCount: 20 },
         candidates: [{ content: { parts: [{ text: "Answer." }] }, groundingMetadata: { webSearchQueries: ["q1"], groundingChunks: [{ web: { uri: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/abc", title: "example.org" } }] } }] }), { status: 200 }); }) as any });
     const r = await geminiProvider({ key: "g-test-key-123456" }).ask({ wire, signal: sig(), day: DAY, model: "gemini-3.8-flash", system: "s", user: "u", maxOut: 6000, thinking: 4096, search: true });
-    expect(seen[0].body.generationConfig).toMatchObject({ maxOutputTokens: 6000, thinkingConfig: { thinkingBudget: 4096 } });
+    // Only the field its docs say the model takes: thinkingLevel (thinkingBudget beside it is a 400 on Gemini 4).
+    expect(seen[0].body.generationConfig).toEqual({ maxOutputTokens: 6000, thinkingConfig: { thinkingLevel: "low" } });
     expect(seen[0].body.tools).toEqual([{ googleSearch: {} }]);
     expect(r.urls).toEqual(["https://example.org"]);
     expect(r.bill!.usd).toBeCloseTo((100 * 0.75 + 70 * 3.75) / 1e6 + 0.014, 9);
     expect(wire.queries).toEqual(["q1"]);
   });
 
-  test("Codex runs with no config, no web search, a read-only sandbox, in a fresh empty folder", async () => {
-    let cmd: string[] = [];
-    const exec = async (c: string[]) => { cmd = c; writeFileSync(c[c.indexOf("-o") + 1], JSON.stringify({ verdict: "approve", findings: [] })); return { code: 0, stdout: "", stderr: "" }; };
-    const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), "{}");
+  test("Codex runs with no config, no web search, the read-only profile, rules forbidding every command, the daemon off, in a fresh empty folder", async () => {
+    let cmd: string[] = [], env: Record<string, string> = {}, rules = "", auth = "";
+    const exec = async (c: string[], o: any) => {
+      cmd = c; env = o.env;
+      if (env.CODEX_HOME) { rules = readFileSync(join(env.CODEX_HOME, "rules", "default.rules"), "utf8"); auth = readFileSync(join(env.CODEX_HOME, "auth.json"), "utf8"); }
+      writeFileSync(c[c.indexOf("-o") + 1], JSON.stringify({ verdict: "approve", findings: [] })); return { code: 0, stdout: "", stderr: "" };
+    };
+    const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), '{"tokens":"t"}'); writeFileSync(join(home, "config.toml"), "[mcp_servers.x]\n");
+    const bin = join(home, "fake-codex"); writeFileSync(bin, "");
     const wire = makeWire({ terms: () => TERMS, fetch: null as any, exec: exec as any });
-    await codexProvider({ home }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief: { topic: "t", question: "q", body: "b", needs_facts: true, consequential: false }, maxOut: 0 });
+    const brief = { topic: "t", question: "q", body: "b", needs_facts: true, consequential: false };
+    // Without a mode the run's self-test proved, Codex isn't started at all.
+    await expect(codexProvider({ home, bin }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0 })).rejects.toThrow(/isn't isolated/);
+    expect(cmd).toEqual([]);
+    await codexProvider({ home, bin }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "rules" });
+    const line = cmd.join(" ");
+    expect(cmd[0]).toBe(bin);
+    expect(cmd.slice(1, 4)).toEqual(["-c", "features.daemon_auto_start=false", "exec"]);
     expect(cmd).toContain("--ignore-user-config");
-    expect(cmd.join(" ")).toContain('web_search="disabled"');
-    expect(cmd.join(" ")).toContain("--sandbox read-only");
-    expect(cmd.join(" ")).toContain(`model_context_window=${LIMITS.codexContextWindow}`);
-    expect(cmd.join(" ")).not.toContain('web_search="live"');
+    expect(line).toContain('web_search="disabled"');
+    expect(line).toContain('default_permissions=":read-only"');
+    expect(line).not.toContain("--sandbox");
+    expect(line).toContain(`model_context_window=${LIMITS.codexContextWindow}`);
+    expect(line).not.toContain('web_search="live"');
+    // An isolated CODEX_HOME: a copy of only auth.json, and an exec policy forbidding every program.
+    expect(env.CODEX_HOME).not.toBe(home);
+    expect(auth).toBe('{"tokens":"t"}');
+    expect(rules).toContain('decision="forbidden"');
+    for (const p of ["sh", "bash", "cat", "/bin/cat", "python3", "env"]) expect(rules).toContain(JSON.stringify(p));
+    expect(Object.keys(env).sort()).toEqual(["CODEX_HOME", "HOME", "LANG", "PATH"]);
+    // Under bubblewrap: new namespaces, a fresh /proc, a cleared environment, only the trial folders bound.
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    await codexProvider({ home, bin, bwrap: bw }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "bwrap" }).catch(() => {});
+    expect(cmd[0]).toBe(bw);
+    for (const f of ["--unshare-pid", "--die-with-parent", "--new-session", "--clearenv", "--proc"]) expect(cmd).toContain(f);
+    expect(cmd.join(" ")).not.toContain("/data");
+    expect(cmd.join(" ")).not.toContain(home + "/auth.json");
+    expect(cmd[cmd.indexOf("-o") + 1]).toBe("/trial/io/answer.txt");
+    expect(Object.keys(env)).toEqual(["PATH"]);
   });
 });
 
 describe("the spend bound: one atomic check-and-reserve", () => {
   test("a run that would pass the budget makes no call at all, stops, and says so", async () => {
     const t = rig({ budget: 0.3 });
-    expect(t.trials.request({ kind: "run", suite: "review-seats" })).toBeNull();
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     expect(st.status).toBe("stopped");
     expect(st.stop!.reason).toBe("budget");
-    expect(st.stop!.detail).toContain("wasn't started");
+    expect(st.stop!.detail).toMatch(/wasn't (started|made)/);
     expect(outputCalls(t)).toBe(0);
     expect(readBudget(t.tdir).spent_usd).toBeLessThanOrEqual(0.3);
     expect(t.relays().some((r) => r.includes("stopped") && r.includes("trials budget"))).toBe(true);
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     expect(outputCalls(t)).toBe(0);
   });
@@ -262,14 +315,14 @@ describe("the spend bound: one atomic check-and-reserve", () => {
     const t = rig({ reviews: 1 });
     const gem = fake({ seat: "gemini", impl: async (i) => { if (i.brief) { const b = JSON.parse(readFileSync(paths(t.tdir).budget, "utf8")); seenState = Object.values<any>(b.reservations).map((r) => r.state).join(","); } } });
     t.deps.providers.gemini = gem;
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     expect(seenState).toBe("dispatched");
   });
 
   test("a crash just before dispatch charges nothing; just after, its worst case once, and the call runs again", async () => {
     const t = rig({ reviews: 1 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     const st = latestRun(t.tdir, "review-seats")!;
     const [first, second] = callsFor(suiteOf(t));
     const dead = new Ledger(t.tdir, `${process.pid}:dead`);
@@ -292,7 +345,7 @@ describe("the spend bound: one atomic check-and-reserve", () => {
     let n = 0;
     const gem = fake({ seat: "gemini", cost: null, impl: async (i) => { if (i.brief && i.model === "gemini-4-neon" && n++ === 0) throw new SeatError("transient", "HTTP 503: the service had an error"); } });
     const t = rig({ reviews: 1, providers: { gemini: gem } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     const b = readBudget(t.tdir);
@@ -311,7 +364,7 @@ describe("the spend bound: one atomic check-and-reserve", () => {
         return new Response(body, { status: 200 });
       }) as any });
     // The checks before any spend can't finish against a server that cuts off: the run stops, each cut-off check held at its worst case.
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const b = readBudget(t.tdir);
     expect(b.entries.length).toBeGreaterThan(0);
@@ -321,13 +374,13 @@ describe("the spend bound: one atomic check-and-reserve", () => {
 
   test("both graders are held before a task's first call: grading still runs when outputs run out of budget", async () => {
     const t0 = rig({ reviews: 2 });
-    t0.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t0, { kind: "run", suite: "review-seats" });
     const s = suiteOf(t0);
-    const shape = callShape("review-seats", { id: "g", kind: "grade", task: s.tasks[0].id, grader: "claude" }, s.tasks[0]);
-    const { gradeCharsBound } = await import("../rootfs/opt/cain/trials/core.ts");
-    const hold = worstOf(shape, gradeCharsBound(s, s.tasks[0]))!;
-    const t = rig({ reviews: 2, budget: hold + 0.06 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    const { gradeCharsBound, marginOf } = await import("../rootfs/opt/cain/trials/core.ts");
+    const hold = (["claude", "gemini"] as const).reduce((a, g) => a + worstOf(callShape("review-seats", { id: "g", kind: "grade", task: s.tasks[0].id, grader: g }, s.tasks[0]), gradeCharsBound(s, s.tasks[0]))!, 0);
+    // The budget: the overrun margin kept free, both paid graders' hold, and a little for the checks and outputs.
+    const t = rig({ reviews: 2, budget: marginOf(s) + hold + 0.06 });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     const task1 = suiteOf(t).tasks[0].id, task2 = suiteOf(t).tasks[1].id;
@@ -335,15 +388,17 @@ describe("the spend bound: one atomic check-and-reserve", () => {
     expect(st.stop!.detail).toContain(task2);
     expect(Object.entries(st.calls).some(([id, c]) => id.startsWith(`out|${task1}`) && c.status === "skipped" && /trials budget/.test(c.error ?? ""))).toBe(true);
     expect(st.calls[`grade|${task1}|claude`].status).toBe("done");
-    expect(st.calls[`grade|${task1}|codex`].status).toBe("done");
+    // Codex grades only the outputs of other families it is on the panel of: here those ran short of budget.
+    expect(["done", "skipped"]).toContain(st.calls[`grade|${task1}|codex`].status);
+    expect(st.calls[`grade|${task1}|gemini`].status).toBe("done");
     expect(Object.keys(st.calls).some((id) => id.startsWith(`out|${task2}|`) && !id.includes("original"))).toBe(false);
-    expect(readBudget(t.tdir).spent_usd).toBeLessThanOrEqual(hold + 0.06 + 1e-9);
+    expect(readBudget(t.tdir).spent_usd).toBeLessThanOrEqual(t.trials.budget + 1e-9);
     expect(Object.keys(readBudget(t.tdir).holds).length).toBe(0);
   });
 
   test("grading spend counts against the budget and reaches the review service's ledger", async () => {
     const t = rig({ reviews: 1 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
     const b = readBudget(t.tdir);
@@ -357,7 +412,7 @@ describe("the spend bound: one atomic check-and-reserve", () => {
   test("trials never spend into the reserve kept for real reviews", async () => {
     // Gemini's cap of $0.30 with a 25% reserve leaves $0.225: Argon's and Carbon's worst cases (about $0.25) don't fit.
     const t = rig({ caps: { gemini: 0.3 }, reviews: 1 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     expect(Object.values(st.calls).some((c) => c.status === "held")).toBe(true);
@@ -368,7 +423,7 @@ describe("the spend bound: one atomic check-and-reserve", () => {
 
   test("nothing is sent while Dane's Stop holds", async () => {
     const t = rig({ stopped: () => true });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     for (let i = 0; i < 5; i++) await t.trials.tick();
     expect(t.fetched.length).toBe(0);
   });
@@ -392,7 +447,7 @@ describe("the private-terms check on the final request", () => {
     const gem = fake({ seat: "gemini", impl: async () => undefined });
     const leaky: Spy = { ...gem, ask: async (i) => { gem.calls.push(i); await i.wire.fetch("https://g.example", { method: "POST", body: JSON.stringify({ systemInstruction: "Remember Pat." }) }); throw new Error("unreachable"); } };
     const t = rig({ reviews: 1, providers: { gemini: leaky } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     const blocked = Object.entries(st.calls).filter(([id, c]) => id.includes("|gemini:") && c.status === "blocked");
@@ -404,7 +459,7 @@ describe("the private-terms check on the final request", () => {
 
   test("stored briefs and adopted notes are checked when the suite is built", async () => {
     const t = rig({ reviews: 2, record: (i) => (i === 0 ? { body: "Ask Pat about the lock." } : i === 1 ? { adopted: "- tell Acme Corp\n" } : {}) });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     const s = suiteOf(t);
     const t0 = s.tasks.find((x) => x.id.includes("plan-0"))! as any, t1 = s.tasks.find((x) => x.id.includes("plan-1"))! as any;
     expect(t0.notes.join(" ")).toContain("calls are blocked");
@@ -419,28 +474,30 @@ describe("the private-terms check on the final request", () => {
 
   test("a model output carrying a private term blocks its task's grading", async () => {
     const t = rig({ reviews: 1, providers: { perplexity: fake({ seat: "perplexity", findings: () => [{ problem: "Acme Corp is named", fix: "x" }] }) } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
-    expect(Object.entries(st.calls).filter(([id]) => id.startsWith("grade|")).every(([, c]) => c.status === "blocked")).toBe(true);
-    expect(graderCalls(t)).toBe(0);
+    // Its panel (Claude and OpenAI) is blocked; the Google grader, not on that output's panel, never reads it.
+    expect(Object.entries(st.calls).filter(([id]) => id.startsWith("grade|") && !id.endsWith("|gemini")).every(([, c]) => c.status === "blocked")).toBe(true);
+    expect(t.providers.claude.calls.filter((c: AskInput) => c.schema).length + t.providers.codex.calls.filter((c: AskInput) => c.schema).length).toBe(0);
+    for (const c of t.providers.gemini.calls as AskInput[]) expect(JSON.stringify(c)).not.toContain("Acme");
   });
 
   test("research: only the checked sent text leaves; a question whose text carries a term isn't kept", async () => {
     const t = rig({ questions: true });
-    expect(t.trials.request({ kind: "run", suite: "research" })).toBeNull();
+    expect(submit(t, { kind: "run", suite: "research" })).toBeNull();
     await t.runAll("research");
     expect(t.fetched.length).toBeGreaterThan(0);
     for (const f of t.fetched) expect(f.body).not.toContain("SECRET-CONTEXT");
     const t2 = rig();
-    writeQuestions(t2.recordDir, { questions: QUESTIONS.map((q, i) => (i === 7 ? { ...q, sent_text: "What does Acme Corp charge?" } : q)) });
-    expect(t2.trials.request({ kind: "run", suite: "research" })).toContain("blocked: privacy");
+    writeQuestions(t2.recordDir, { questions: QUESTIONS.map((q, i) => (i === 7 ? { ...q, sent_text: "What does Acme Corp charge?" } : q)) }, true, t2.optionsFile);
+    expect(submit(t2, { kind: "run", suite: "research" })).toContain("blocked: privacy");
     expect(existsSync(paths(t2.tdir).suite("research"))).toBe(false);
   });
 
   test("a provider's own search queries are logged and checked: a hit raises an alarm and stops the run", async () => {
     const t = rig({ reviews: 1, fetchBody: { candidates: [{ groundingMetadata: { webSearchQueries: ["Pat lock policy"] } }] } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     expect(st.stop!.reason).toBe("privacy");
@@ -452,13 +509,16 @@ describe("the private-terms check on the final request", () => {
   test("with no private-terms list nothing leaves", async () => {
     const t = rig({ reviews: 1 });
     writeFileSync(t.cfg.termsFile, "");
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     expect(t.fetched.length).toBe(0);
   });
 });
 
 describe("Codex isolation", () => {
+  // This canary runs over a fake exec: it shows only that nothing of Cain's is handed in (argv, environment,
+  // files, the working folder). Whether a real Codex could read anything is what the sandbox self-test on the
+  // Pi decides (sandbox.ts), tested below with its judge and its process-group kill.
   test("canary: a key.json and a private term beside the working folder never reach Codex", async () => {
     const t = rig({ reviews: 1 });
     // The trials folder holds the blind key and a private note, as in production.
@@ -472,9 +532,13 @@ describe("Codex isolation", () => {
       for (const a of cmd) try { if (a.startsWith("/") && statSync(a).isFile()) files.push(readFileSync(a, "utf8")); } catch { /* not a file */ }
       const work = cmd.includes("-C") ? cmd[cmd.indexOf("-C") + 1] : "";
       seen.push({ cmd, env: o.env, workEntries: work ? readdirSync(work) : [], files });
-      if (cmd[1] === "--version") return { code: 0, stdout: "codex-cli 0.130.0\n", stderr: "" };
-      if (cmd[1] === "debug") return { code: 0, stdout: JSON.stringify({ models: [{ slug: "gpt-6.2-sol" }, { slug: "gpt-6.2-astra" }] }), stderr: "" };
+      if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.130.0\n", stderr: "" };
+      if (cmd.includes("debug")) return { code: 0, stdout: JSON.stringify({ models: [{ slug: "gpt-6.2-sol" }, { slug: "gpt-6.2-astra" }] }), stderr: "" };
       const out = cmd[cmd.indexOf("-o") + 1];
+      if (cmd[cmd.length - 1].startsWith("This is a sandbox check")) {
+        writeFileSync(out, "Both commands were refused.");
+        return { code: 0, stdout: [1, 2].map((n) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat ${n}`, status: "declined", aggregated_output: "" } })).join("\n"), stderr: "" };
+      }
       const schema = cmd.includes("--output-schema") ? readFileSync(cmd[cmd.indexOf("--output-schema") + 1], "utf8") : "";
       if (schema.includes("adopted_covered")) {
         const labels = [...cmd[cmd.length - 1].matchAll(/<candidate label="([A-Z]\d\d)">/g)].map((m) => m[1]);
@@ -483,22 +547,29 @@ describe("Codex isolation", () => {
       return { code: 0, stdout: "", stderr: "" };
     };
     t.deps.exec = exec as any;
-    t.deps.providers.codex = codexProvider({ home });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    const bin = join(home, "fake-codex"); writeFileSync(bin, "");
+    t.deps.providers.codex = codexProvider({ home, bin, bwrap: null });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
-    expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
-    const asks = seen.filter((s) => s.cmd[1] === "exec");
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("done");
+    expect(st.preflight!.codex_isolation).toMatchObject({ ok: true, mode: "rules" });
+    const selfTests = seen.filter((s) => s.cmd[s.cmd.length - 1].startsWith("This is a sandbox check"));
+    expect(selfTests.length).toBe(1);
+    const asks = seen.filter((s) => s.cmd.includes("exec") && !selfTests.includes(s));
     expect(asks.length).toBe(4);   // three review configurations and one grading call
     for (const s of seen) {
       const all = [...s.cmd, ...Object.values(s.env), ...s.files].join("\n");
       for (const canary of ["CANARY-KEY-7f3a", "CANARY-NOTE-91b2", "Pat", t.tdir, "/data/"]) expect(all).not.toContain(canary);
       expect(s.workEntries).toEqual([]);
-      expect(Object.keys(s.env).sort()).toEqual(["CODEX_HOME", "HOME", "LANG", "PATH"]);
+      expect(Object.keys(s.env).filter((k) => k !== "TRIAL_CANARY").sort()).toEqual(["CODEX_HOME", "HOME", "LANG", "PATH"]);
+      expect(s.env.CODEX_HOME).not.toBe(home);
+      expect(s.cmd.slice(1, 3)).toEqual(["-c", "features.daemon_auto_start=false"]);
     }
     for (const s of asks) {
       expect(s.cmd).toContain("--ignore-user-config");
       expect(s.cmd).toContain('web_search="disabled"');
-      expect(s.cmd[s.cmd.indexOf("--sandbox") + 1]).toBe("read-only");
+      expect(s.cmd).toContain('default_permissions=":read-only"');
     }
   });
 
@@ -507,13 +578,14 @@ describe("Codex isolation", () => {
     const exec = async (cmd: string[]) => { writeFileSync(cmd[cmd.indexOf("-o") + 1], "{\"verdict\":\"approve\",\"findings\":[]}");
       return { code: 0, stdout: `${JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "cat /data/x" } })}\n`, stderr: "" }; };
     const wire = makeWire({ terms: () => TERMS, fetch: null as any, exec: exec as any });
-    await expect(codexProvider({ home }).ask({ wire, signal: sig(), day: DAY, model: "", brief: { topic: "t", question: "q", body: "b", needs_facts: false, consequential: false }, maxOut: 0 }))
+    const bin = join(home, "fake-codex"); writeFileSync(bin, "");
+    await expect(codexProvider({ home, bin }).ask({ wire, signal: sig(), day: DAY, model: "", brief: { topic: "t", question: "q", body: "b", needs_facts: false, consequential: false }, maxOut: 0, codexMode: "rules" }))
       .rejects.toThrow(/used a tool/);
   });
 });
 
 describe("the Perplexity contract", () => {
-  test("a preset by name, the model pinned, hard limits, its own bill, output message items, the served model and its queries", async () => {
+  test("the level in effort, the model pinned, hard limits, its own bill, output message items, the served model and its queries", async () => {
     const seen: any[] = [];
     const wire = makeWire({ terms: () => TERMS, exec: null as any, fetch: (async (url: string, init: any) => { seen.push({ url, body: JSON.parse(init.body) });
       return new Response(JSON.stringify({ status: "completed", model: "perplexity/sonar-pro",
@@ -522,7 +594,8 @@ describe("the Perplexity contract", () => {
         usage: { input_tokens: 10, output_tokens: 10, cost: { currency: "USD", total_cost: 0.0123 } } }), { status: 200 }); }) as any });
     const r = await perplexityProvider({ key: "pplx-test-key-123" }).ask({ wire, signal: sig(), day: DAY, model: "perplexity/sonar", setting: "low", system: "s", user: "u", maxOut: 400, maxSteps: 3, search: true });
     const body = seen[0].body;
-    expect(body.preset).toBe("low");
+    expect(body.effort).toBe("low");
+    expect(body.preset).toBeUndefined();
     expect(body.model).toBe("perplexity/sonar");
     expect(body.max_steps).toBe(3);
     expect(body.max_output_tokens).toBe(400);
@@ -537,7 +610,7 @@ describe("the Perplexity contract", () => {
 
   test("without the owner's approval the levels are pinned to Perplexity's own model", async () => {
     const t = rig({ questions: true });
-    t.trials.request({ kind: "run", suite: "research" });
+    submit(t, { kind: "run", suite: "research" });
     await t.runAll("research");
     const asks = t.providers.perplexity.calls as AskInput[];
     expect(asks.length).toBe(90);
@@ -547,8 +620,9 @@ describe("the Perplexity contract", () => {
 
   test("an output served by another lab's model is labelled so, and that lab's grader never reads it", async () => {
     const pp = fake({ seat: "perplexity", cost: 0.004, how: "billed", served: (i) => (i.setting === "medium" ? "openai/gpt-6.2-sol" : "perplexity/sonar") });
-    const t = rig({ questions: { perplexity_third_party_routing: true }, providers: { perplexity: pp } });
-    t.trials.request({ kind: "run", suite: "research" });
+    // Unpinned, a level is priced as an unlisted model (and fast at the priority rate): the seat's cap is raised here.
+    const t = rig({ questions: { trials_perplexity_third_party_routing: true }, providers: { perplexity: pp }, caps: { perplexity: 400 } });
+    submit(t, { kind: "run", suite: "research" });
     await t.runAll("research");
     const st = latestRun(t.tdir, "research")!;
     expect(st.status).toBe("done");
@@ -568,7 +642,7 @@ describe("the Perplexity contract", () => {
       for (const l of labels) expect(key[`q${task.padStart(2, "0")}`][l]).not.toContain("claude:");
     }
     const report = buildReport(t.tdir, "research", 40);
-    expect(report).toContain("perplexity:medium (served by openai/gpt-6.2-sol) [another lab's model: openai]");
+    expect(report).toContain("perplexity effort medium (unpinned) (served by openai/gpt-6.2-sol) [another lab's model: openai]");
     expect(report).toContain("own family, not graded");
   });
 });
@@ -576,7 +650,7 @@ describe("the Perplexity contract", () => {
 describe("Codex model discovery", () => {
   test("a model the catalog doesn't list is skipped as not listed; with no catalog, a tiny probe decides, refused said apart", async () => {
     const t = rig({ reviews: 1, providers: { codex: fakeCodex({ models: ["gpt-6.2-sol"] }) } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     expect(st.preflight!.codex_version).toBe("codex-cli 0.130.0");
@@ -586,7 +660,7 @@ describe("Codex model discovery", () => {
 
     const probe = fakeCodex({ models: null, impl: async (i) => { if (i.model === "gpt-6.2-astra") throw new SeatError("refused", "Codex: error: model 'gpt-6.2-astra' is not supported"); } });
     const t2 = rig({ reviews: 1, providers: { codex: probe } });
-    t2.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t2, { kind: "run", suite: "review-seats" });
     await t2.runAll();
     const st2 = latestRun(t2.tdir, "review-seats")!;
     expect(st2.preflight!.skip["codex:gpt-6.2-astra"]).toContain("refused by the installed Codex");
@@ -621,7 +695,7 @@ describe("blind grading made blind", () => {
     const dirty = (seat: string) => fake({ seat, cost: seat === "codex" ? 0 : 0.01, findings: () => [{ problem: DIRTY, fix: "Ask Claude [7]" }], text: () => DIRTY });
     const t = rig({ reviews: 2, providers: { gemini: dirty("gemini"), perplexity: dirty("perplexity"), codex: Object.assign(fakeCodex(), { ask: dirty("codex").ask }) },
       record: (i) => ({ body: `Gemini and OpenAI review seats, plan ${i} [3].` }) });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const prompts = [...t.providers.claude.calls].filter((c: AskInput) => c.schema).map((c: AskInput) => `${c.system}\n${c.user}`);
     expect(prompts.length).toBe(2);
@@ -650,7 +724,7 @@ describe("blind grading made blind", () => {
 
   test("no grader grades its own family; the report shows each grader beside the combined score", async () => {
     const t = rig({ reviews: 1 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     const key = JSON.parse(readFileSync(paths(t.tdir).key("review-seats", st.run), "utf8"));
@@ -660,7 +734,7 @@ describe("blind grading made blind", () => {
     expect(codexLabels.some((c: string) => c.includes("codex:") || c.includes("original:openai"))).toBe(false);
     expect(codexLabels.some((c: string) => c.includes("gemini:"))).toBe(true);
     const report = buildReport(t.tdir, "review-seats", 40);
-    expect(report).toContain("| Score, Claude | Score, OpenAI | Combined (all tasks) | Combined (matched) |");
+    expect(report).toContain("| Score, Claude | Score, OpenAI | Score, Google | Combined (all tasks) | Combined (matched) |");
     expect(report).toMatch(/codex:default[^\n]*own family, not graded/);
     expect(report).toContain("Recall of adopted notes");
   });
@@ -689,7 +763,7 @@ describe("real reviews first", () => {
   test("a hung trial call is aborted at its deadline and doesn't delay a queued review", async () => {
     const hung = fake({ seat: "gemini", impl: (i) => (i.brief ? new Promise((_, rej) => i.signal.addEventListener("abort", () => rej(new SeatError("timeout", "aborted")))) : Promise.resolve(undefined)) });
     const t = rig({ reviews: 1, providers: { gemini: hung }, reviewSeats: { openai: seat, gemini: seat, perplexity: seat, claude: seat }, timeoutScale: 0.002 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await toPreflightDone(t);
     let trialDone = false;
     const tp = t.trials.tick().then(() => { trialDone = true; });
@@ -704,7 +778,7 @@ describe("real reviews first", () => {
 
   test("a review arriving mid-trial runs first; the trial goes on after it", async () => {
     const t = rig({ reviews: 1, reviewSeats: { openai: seat, gemini: seat, perplexity: seat, claude: seat } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await toPreflightDone(t);
     await t.trials.tick();
     const before = outputCalls(t);
@@ -721,7 +795,7 @@ describe("real reviews first", () => {
     let n = 0;
     const gem = fake({ seat: "gemini", impl: async (i) => { if (i.brief && n++ === 0) throw new SeatError("quota", "HTTP 429: rate limited"); } });
     const t = rig({ reviews: 1, providers: { gemini: gem } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await toPreflightDone(t);
     await t.trials.tick();
     const st = latestRun(t.tdir, "review-seats")!;
@@ -748,23 +822,26 @@ describe("prices and the checks before any spend", () => {
     expect(ceilingPrice("someone-new")).toEqual({ in: 10, out: 50 });
   });
 
-  test("Claude refusing the tool setup stops the run before any trial call", async () => {
+  test("Claude refusing its check disables Claude (its grader too), named in the report; the others go on", async () => {
     const claude = fake({ seat: "claude" });
     claude.validate = async () => { throw new SeatError("refused", "HTTP 400: the service refused the request"); };
     const t = rig({ reviews: 1, providers: { claude } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
-    expect(st.stop!.reason).toBe("unavailable");
-    expect(st.stop!.detail).toContain("Claude refused");
-    expect(outputCalls(t)).toBe(0);
+    expect(st.status).toBe("done");
+    expect(st.preflight!.graders_off!.claude).toContain("Claude refused");
+    expect(claude.calls.length).toBe(0);
+    expect(st.calls["pre|claude"].cost_usd).toBe(0);           // a 4xx with no usage: released
+    expect(buildReport(t.tdir, "review-seats", 40)).toContain("Off this run: the Claude grader is off");
+    expect(outputCalls(t)).toBeGreaterThan(0);
   });
 
   test("a Gemini model not served is skipped; today's default not served stops the run before any spend", async () => {
     const gem = fake({ seat: "gemini" });
-    gem.validate = async (i: any) => { if (i.model === "gemini-4-neon") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const } }; };
+    gem.validate = async (i: any) => { if (i.model === "gemini-4-neon") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; };
     const t = rig({ reviews: 1, providers: { gemini: gem } });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     expect(st.status).toBe("done");
@@ -772,9 +849,9 @@ describe("prices and the checks before any spend", () => {
     expect(gem.calls.some((c) => c.model === "gemini-4-neon")).toBe(false);
 
     const gem2 = fake({ seat: "gemini" });
-    gem2.validate = async (i: any) => { if (i.model === "gemini-3.8-flash") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const } }; };
+    gem2.validate = async (i: any) => { if (i.model === "gemini-3.8-flash") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; };
     const t2 = rig({ reviews: 1, providers: { gemini: gem2 } });
-    t2.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t2, { kind: "run", suite: "review-seats" });
     await t2.runAll();
     const st2 = latestRun(t2.tdir, "review-seats")!;
     expect(st2.stop!.detail).toContain("today's default Gemini model");
@@ -821,11 +898,24 @@ describe("the research suite's design", () => {
   test("the runner refuses the suite until the owner's approval names the questions, and stops if they change", async () => {
     const t = rig();
     writeQuestions(t.recordDir, { questions: QUESTIONS }, false);
-    expect(t.trials.request({ kind: "run", suite: "research" })).toContain("hasn't approved");
-    writeQuestions(t.recordDir, { questions: QUESTIONS }, { approved_by: "cain" });
-    expect(t.trials.request({ kind: "run", suite: "research" })).toContain("owner approved");
-    writeQuestions(t.recordDir);
-    expect(t.trials.request({ kind: "run", suite: "research" })).toBeNull();
+    expect(submit(t, { kind: "run", suite: "research" })).toContain("hasn't approved");
+    // An approval written as the assistant's user (the old record file, or a file Cain could write) is ignored.
+    const h = researchHashes(t.recordDir).hashes!;
+    writeFileSync(join(t.recordDir, "projects/harness/trials/research-approved.json"), JSON.stringify({ questions_sha256: h.questions, approved_by: "owner", approved_on: "2026-11-21", perplexity_third_party_routing: true }));
+    expect(submit(t, { kind: "run", suite: "research" })).toContain("hasn't approved");
+    // The App's options, but writable by others: they don't count.
+    approveInOptions(t.recordDir, t.optionsFile);
+    chmodSync(t.optionsFile, 0o666);
+    expect(submit(t, { kind: "run", suite: "research" })).toContain("isn't root's alone");
+    // Owned by another uid than the runner's options owner: ignored too.
+    const other = new TrialRunner({ ...t.trials.cfg, optionsUid: process.getuid!() + 1 }, t.deps);
+    chmodSync(t.optionsFile, 0o600);
+    expect(other.approval()).toMatchObject({ ok: false });
+    // A rubric or answer-note hash that doesn't match is refused, naming what changed.
+    writeFileSync(t.optionsFile, JSON.stringify({ trials_research_questions_sha256: h.questions, trials_research_notes_sha256: h.notes, trials_research_rubric_sha256: "0".repeat(64) }), { mode: 0o600 });
+    expect(submit(t, { kind: "run", suite: "research" })).toContain("the rubric changed");
+    approveInOptions(t.recordDir, t.optionsFile);
+    expect(submit(t, { kind: "run", suite: "research" })).toBeNull();
     // The questions change after the suite is frozen: nothing is sent.
     writeFileSync(join(t.recordDir, RESEARCH_QUESTIONS), JSON.stringify({ questions: QUESTIONS.slice().reverse() }));
     await t.runAll("research");
@@ -837,9 +927,10 @@ describe("the research suite's design", () => {
   test("the abstention rubric, matched sets, coverage, denominators, and no difference within the noise", async () => {
     const claudeAnswers = fake({ seat: "claude", cost: 0.05 });
     const t = rig({ questions: true, providers: { claude: claudeAnswers } });
-    t.trials.request({ kind: "run", suite: "research" });
+    submit(t, { kind: "run", suite: "research" });
     await t.runAll("research");
     const st = latestRun(t.tdir, "research")!;
+    if (st.status !== "done") console.log("DBG", JSON.stringify(st.stop));
     expect(st.status).toBe("done");
     // Graders are told the date and the abstention outcomes.
     const g = (claudeAnswers.calls as AskInput[]).find((c) => c.schema)!;
@@ -849,13 +940,15 @@ describe("the research suite's design", () => {
     expect(g.fetch).toBe(true);
     expect(g.allowedDomains).toEqual(["example.com"]);
     const report = buildReport(t.tdir, "research", 40);
-    expect(report).toContain("matched set: the 30 tasks");
+    expect(report).toContain("OpenAI and Google: 30 tasks");
+    expect(report).toContain("Claude and OpenAI: 30 tasks");
+    expect(report).toContain("Flagged: the panels differ");
     expect(report).toContain("Rubric points: correct 2");
     expect(report).toContain("no clear difference");
-    // Perplexity is billed: a cost per acceptable answer with its denominators. Gemini and Claude are estimates: none.
-    expect(report).toMatch(/perplexity:fast[^\n]*\(\$0\.0900 billed over 30 acceptable of 30 graded\)/);
-    expect(report).toMatch(/gemini:gemini-3\.8-flash\+search[^\n]*not given: some costs are estimates/);
-    expect(report).toMatch(/30\/30; grades claude 30, codex 30; missing 0/);
+    // Every attempt in the numerator, with its denominators; estimates marked as such.
+    expect(report).toMatch(/perplexity\/sonar at effort fast[^\n]*\$0\.0030 \(\$0\.0900 over 30 attempts, failed, retried and ungraded included, for 30 acceptable of 30 graded\)/);
+    expect(report).toMatch(/gemini:gemini-3\.8-flash\+search[^\n]*for 30 acceptable of 30 graded; includes estimates/);
+    expect(report).toMatch(/30\/30; grades claude 30, codex 30, gemini 0; missing 0/);
   });
 });
 
@@ -867,7 +960,9 @@ describe("the plan and trial.sh", () => {
     const p = planOf(suite);
     expect(p.lines.length).toBe(2 * (REVIEW_CONFIGS.length + GRADERS.length));
     expect(p.refused).toEqual([]);
-    expect(p.lines.find((l) => l.who === "gemini:gemini-4-argon")!.limits).toContain("thinkingBudget");
+    expect(p.lines.find((l) => l.who === "gemini:gemini-4-argon")!.limits).toContain("thinkingLevel low (thinking included)");
+    expect(p.lines.find((l) => l.who === "gemini:gemini-3.8-flash")!.limits).toContain(`+${LIMITS.geminiThinkingAllowance} thinking allowance`);
+    expect(p.lines.find((l) => l.who === "gemini:gemini-3.8-flash")!.limits).not.toContain("thinkingBudget");
     expect(p.lines.find((l) => l.who === "perplexity:sonar")!.limits).toContain("max_steps 3");
     expect(t.fetched.length).toBe(0);
     expect(RESEARCH_CONFIGS.find((c) => c.id === "perplexity:fast")!.setting).toBe("fast");
@@ -884,11 +979,18 @@ describe("the plan and trial.sh", () => {
     expect(existsSync(join(t.dir, "inbox"))).toBe(false);
     const r2 = spawnSync("bun", [CLI, "run", "research"], { encoding: "utf8", env });
     expect(r2.status).not.toBe(0);
-    expect(r2.stderr).toContain("questions file");
+    expect(r2.stderr).toContain("can't run");
     writeQuestions(t.recordDir);
+    // trial.sh can't read the App's options: it shows what the runner found there when it started.
+    mkdirSync(t.tdir, { recursive: true });
+    writeFileSync(join(t.tdir, "settings.json"), JSON.stringify({ budget_usd: 40, research_approval: { ok: true, third_party: false } }));
     const r3 = spawnSync("bun", [CLI, "plan", "research"], { encoding: "utf8", env });
-    expect(r3.stdout).toContain("approved by the owner");
+    expect(r3.stdout).toContain("approved by the owner in the App's options");
     expect(r3.stdout).toContain("pinned to Perplexity's own model");
+    const hh = researchHashes(t.recordDir).hashes!;
+    expect(r3.stdout).toContain(`trials_research_questions_sha256 ${hh.questions}`);
+    expect(r3.stdout).toContain(`trials_research_rubric_sha256 ${hh.rubric}`);
+    expect(r3.stdout).toContain("perplexity/sonar at effort fast");
     const r4 = spawnSync("bun", [CLI, "run", "review-seats", "--retry"], { encoding: "utf8", env });
     expect(r4.status).toBe(0);
     const files = readdirSync(join(t.dir, "inbox"));
@@ -900,18 +1002,18 @@ describe("the plan and trial.sh", () => {
 describe("resumption", () => {
   test("a stopped suite resumes without re-running finished calls or counting spend twice", async () => {
     const t0 = rig({ reviews: 2 });
-    t0.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t0, { kind: "run", suite: "review-seats" });
     const s = suiteOf(t0);
     const { gradeCharsBound } = await import("../rootfs/opt/cain/trials/core.ts");
     const hold = worstOf(callShape("review-seats", { id: "g", kind: "grade", task: s.tasks[0].id, grader: "claude" }, s.tasks[0]), gradeCharsBound(s, s.tasks[0]))!;
     const t = rig({ reviews: 2, budget: hold + 0.06 });
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st1 = latestRun(t.tdir, "review-seats")!;
     expect(st1.stop!.reason).toBe("budget");
     const made1 = outputCalls(t);
     t.trials.cfg.budgetUsd = 40;
-    t.trials.request({ kind: "run", suite: "review-seats" });
+    submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st2 = latestRun(t.tdir, "review-seats")!;
     expect(st2.run).toBe(st1.run);
@@ -923,5 +1025,380 @@ describe("resumption", () => {
     const outs = t.providers.gemini.calls.filter((c: AskInput) => c.brief).map((c: AskInput) => `${c.brief!.topic}|${c.model}`);
     expect(outs.filter((m: string, i: number, a: string[]) => a.indexOf(m) !== i)).toEqual([]);
     expect(outputCalls(t)).toBeGreaterThan(made1);
+  });
+});
+
+// ---- The second review's fixes (Cain 0.19.0, third round) ----
+import { groupExec, judgeSelfTest, forbidAllRules, programNames } from "../rootfs/opt/cain/trials/sandbox.ts";
+import { GEMINI_MODELS, PERPLEXITY_PRIORITY, SEARCH_RESULT_TOKENS, marginOf, panelFor, perplexityPrice, toolViolation } from "../rootfs/opt/cain/trials/core.ts";
+import { ownerAlive, ownerToken } from "../rootfs/opt/cain/trials/ledger.ts";
+import { withUsage } from "../rootfs/opt/cain/trials/calls.ts";
+
+const rt = (needs = false) => ({ id: "r1", kind: "review" as const, brief: { topic: "t", question: "q", body: "b", needs_facts: needs, consequential: false }, originals: [] });
+const qt = { id: "q", kind: "fact" as const, sent_text: "What is x?", as_of: DAY, must_contain: "m", sources: [], no_reliable_answer: false };
+
+describe("Codex isolation before launch", () => {
+  test("the self-test's judge passes only when Codex tried and every attempt was refused before it ran, with no canary back", () => {
+    const ev = (item: any) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "cat x", ...item } });
+    expect(judgeSelfTest({ code: 0, stdout: [ev({ status: "declined", aggregated_output: "" }), ev({ status: "declined" })].join("\n"), stderr: "", answer: "refused" }, ["K1", "K2"]).ok).toBe(true);
+    expect(judgeSelfTest({ code: 0, stdout: ev({ status: "failed", aggregated_output: "bash: No such file or directory" }), stderr: "", answer: "" }, ["K1"]).ok).toBe(true);
+    // A command that ran, a canary that came back, or no attempt at all: not isolated.
+    expect(judgeSelfTest({ code: 0, stdout: ev({ status: "completed", exit_code: 0, aggregated_output: "hello" }), stderr: "", answer: "" }, ["K1"]).ok).toBe(false);
+    expect(judgeSelfTest({ code: 0, stdout: ev({ status: "declined" }), stderr: "", answer: "the key is K1" }, ["K1"]).detail).toContain("came back");
+    expect(judgeSelfTest({ code: 0, stdout: "", stderr: "", answer: "I won't run commands." }, ["K1"]).detail).toContain("proves nothing");
+    expect(judgeSelfTest({ code: 1, stdout: "", stderr: "not signed in", answer: "" }, ["K1"]).ok).toBe(false);
+  });
+
+  test("the real self-test, through the provider: a leak or no attempt means not isolated; refusals in both modes pass", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), "{}");
+    const bin = join(home, "fake-codex"); writeFileSync(bin, "");
+    const prompts: string[] = [];
+    const leak = async (cmd: string[], o: any) => {
+      const p = cmd[cmd.length - 1]; prompts.push(p);
+      const keyFile = /cat (\S+planted-key\.txt)/.exec(p)![1];
+      const k = existsSync(keyFile) ? readFileSync(keyFile, "utf8") : "";
+      return { code: 0, stdout: JSON.stringify({ type: "item.completed", item: { type: "command_execution", status: "completed", exit_code: 0, aggregated_output: k } }), stderr: "" };
+    };
+    const w = makeWire({ terms: () => TERMS, fetch: null as any, exec: leak as any });
+    const iso = await codexProvider({ home, bin, bwrap: null }).isolation(w, sig());
+    expect(iso.ok).toBe(false);
+    expect(prompts[0]).toContain(`/proc/${process.pid}/environ`);
+    const refuse = async (cmd: string[]) => ({ code: 0, stdout: JSON.stringify({ type: "item.completed", item: { type: "command_execution", status: "declined" } }), stderr: "" });
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    const seen: string[][] = [];
+    const w2 = makeWire({ terms: () => TERMS, fetch: null as any, exec: (async (cmd: string[], o: any) => { seen.push(cmd); return refuse(cmd); }) as any });
+    const iso2 = await codexProvider({ home, bin, bwrap: bw }).isolation(w2, sig());
+    expect(iso2).toMatchObject({ ok: true, mode: "bwrap" });
+    expect(seen[0][0]).toBe(bw);
+  });
+
+  test("not isolated: every Codex configuration is skipped as not isolated and Codex never grades", async () => {
+    const codex = fakeCodex({ isolated: false });
+    const t = rig({ reviews: 1, providers: { codex } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("done");
+    expect(codex.calls.length).toBe(0);
+    for (const [id, c] of Object.entries(st.calls)) if (id.includes("|codex") && !id.startsWith("pre|")) expect(c.status).toBe("skipped");
+    expect(st.calls["pre|codex|isolation"].how).toBe("plan call");
+    expect(st.calls["out|" + suiteOf(t).tasks[0].id + "|codex:default"].error).toContain("not isolated");
+    expect(st.preflight!.graders_off!.codex).toContain("not isolated");
+    // Google's outputs, with Codex out, still get the Claude grader; the report says Codex wasn't isolated.
+    const report = buildReport(t.tdir, "review-seats", 40);
+    expect(report).toContain("isolation: not isolated");
+  });
+
+  test("Codex starts in its own process group, and on abort no child outlives it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pgroup-"));
+    const pidFile = join(dir, "child.pid");
+    const ctl = new AbortController();
+    const p = groupExec(["sh", "-c", `sleep 30 & echo $! > ${pidFile}; sleep 30`], { env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, signal: ctl.signal });
+    for (let i = 0; i < 200 && !(existsSync(pidFile) && readFileSync(pidFile, "utf8").trim()); i++) await Bun.sleep(20);
+    const child = Number(readFileSync(pidFile, "utf8").trim());
+    expect(child).toBeGreaterThan(0);
+    ctl.abort();
+    const r = await p;
+    expect(r.code).not.toBe(0);
+    await Bun.sleep(100);
+    // Gone, or only a zombie waiting for its reaper (killed, not running).
+    let state = "gone"; try { const st = readFileSync(`/proc/${child}/stat`, "utf8"); state = st.slice(st.lastIndexOf(")") + 2, st.lastIndexOf(")") + 3); } catch { /* gone */ }
+    expect(["gone", "Z", "X"]).toContain(state);
+  });
+
+  test("the exec policy forbids every program on PATH by name and path", () => {
+    const names = programNames("/bin:/usr/bin");
+    const rules = forbidAllRules(names);
+    expect(rules).toMatch(/^prefix_rule\(pattern=\[\[/m);
+    expect(rules).toContain('decision="forbidden"');
+    for (const n of ["sh", "bash", "/bin/sh", "cat", "/usr/bin/env", "python3"]) expect(rules).toContain(JSON.stringify(n));
+  });
+});
+
+describe("a true spend bound", () => {
+  test("Claude: answerers don't fetch; the grader's fetch carries max_content_tokens and the worst case counts uses x content plus search allowances, per step", () => {
+    const ans = callShape("research", { id: "o", kind: "output", task: "q", config: "claude:claude-opus-5-5+search" }, qt);
+    expect(ans.fetch).toBe(false);
+    const g = callShape("research", { id: "g", kind: "grade", task: "q", grader: "claude" }, qt);
+    expect(g.fetch).toBe(true);
+    const c = ceilingOf(g, 3_000)!;
+    expect(c.steps).toBe(LIMITS.claudeGradeFetches + 1);
+    expect(c.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + LIMITS.claudeGradeFetches * LIMITS.claudeFetchTokens);
+    const ca = ceilingOf(ans, 3_000)!;
+    expect(ca.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + LIMITS.claudeAnswerSearches * SEARCH_RESULT_TOKENS);
+  });
+
+  test("Perplexity: the search tool's max tokens per call in the worst case, and the fast level at the priority rate", async () => {
+    const low = ceilingOf(callShape("research", { id: "o", kind: "output", task: "q", config: "perplexity:low" }, qt), 1_000)!;
+    const fast = ceilingOf(callShape("research", { id: "o", kind: "output", task: "q", config: "perplexity:fast" }, qt), 1_000)!;
+    expect(low.contextTokens).toBe(Math.ceil(1_000 / 3) + 500 + 4_000 + LIMITS.perplexitySteps * LIMITS.perplexityCallsPerStep * LIMITS.perplexitySearchTokens);
+    expect(fast.price).toEqual({ in: low.price.in * PERPLEXITY_PRIORITY, out: low.price.out * PERPLEXITY_PRIORITY });
+    expect(perplexityPrice("perplexity/sonar", "fast").out).toBe(2.5 * 2);
+    // With no bill, usage is read at the priority rate for the fast level, with the search calls' fees.
+    const wire = makeWire({ terms: () => TERMS, exec: null as any, fetch: (async () => new Response(JSON.stringify({ status: "completed", model: "perplexity/sonar",
+      output: [{ type: "message", content: [{ type: "output_text", text: "A." }] }], usage: { input_tokens: 1000, output_tokens: 100, tool_calls_details: { search_web: { invocation: 2 } } } }), { status: 200 })) as any });
+    const r = await perplexityProvider({ key: "pplx-test-key-123" }).ask({ wire, signal: sig(), day: DAY, model: "perplexity/sonar", setting: "fast", system: "s", user: "u", maxOut: 400, search: true });
+    expect(r.bill!.how).toBe("estimated");
+    expect(r.bill!.usd).toBeCloseTo((1000 * 0.5 + 100 * 5) / 1e6 + 2 * 0.0025, 9);
+  });
+
+  test("Gemini: only the field each model takes; Argon refusing at the check is skipped (its grader too) and the run goes on", async () => {
+    expect(Object.values(GEMINI_MODELS).every((m) => "level" in m.thinking)).toBe(true);
+    const gem = fake({ seat: "gemini" });
+    gem.validate = async (i: any) => { if (i.model === "gemini-4-argon") throw new SeatError("refused", "HTTP 400: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; };
+    const t = rig({ reviews: 1, providers: { gemini: gem } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("done");
+    expect(st.preflight!.skip["gemini:gemini-4-argon"]).toContain("refused the trial's settings");
+    expect(st.preflight!.graders_off!.gemini).toContain("refused");
+    expect(gem.calls.filter((c) => c.schema).length).toBe(0);
+  });
+
+  test("one cap with an overrun margin: admission keeps the largest call's worst case free, so a one-call overshoot stays under the cap", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+    const l = new Ledger(dir);
+    const req = (call: string, usd: number) => ({ suite: "s", run: "r", call, attempt: 1, seat: null, usd, runs: 0 });
+    expect(l.reserve(req("a", 0.6), 1.0, undefined, { marginUsd: 0.5 }).ok).toBe(false);   // 0.6 + 0.5 > 1.0
+    const ok = l.reserve(req("b", 0.5), 1.0, undefined, { marginUsd: 0.5 });
+    expect(ok.ok).toBe(true);
+    // It overshoots by its whole worst case: still within the cap.
+    l.settle((ok as any).id, 1.0, "billed");
+    expect(l.read().spent_usd).toBeLessThanOrEqual(1.0);
+    expect(l.reserve(req("c", 0.01), 1.0, undefined, { marginUsd: 0.5 }).ok).toBe(false);
+    // The runner's margin is the suite's largest single worst case.
+    const t = rig({ reviews: 1 });
+    submit(t, { kind: "run", suite: "review-seats" });
+    const s = suiteOf(t);
+    expect(marginOf(s)).toBeCloseTo(Math.max(0.5, ...planOf(s).lines.map((x) => x.worst_usd ?? 0)), 9);
+  });
+
+  test("a reservation is released only on an authoritative zero: a 4xx with no usage, or usage showing zero; otherwise kept", async () => {
+    const gem = fake({ seat: "gemini", impl: async (i) => {
+      if (!i.brief) return;
+      if (i.model === "gemini-4-argon") throw withUsage(new SeatError("bad_output", "an empty answer"), "zero");
+      if (i.model === "gemini-4-neon") throw new SeatError("refused", "HTTP 400: the service refused the request");
+      if (i.model === "gemini-4-carbon") throw new SeatError("transient", "HTTP 503: the service had an error");
+      if (i.model === "gemini-4-hydrogen") return { text: "{}", answer: { verdict: "approve", findings: [] }, urls: [], served: i.model, bill: null, tokens: { input: 0, output: 0 }, searches: 0 };
+    } });
+    const t = rig({ reviews: 1, providers: { gemini: gem } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const b = readBudget(t.tdir);
+    const charged = (m: string) => b.entries.filter((e) => e.call.startsWith("out|") && e.call.endsWith(`gemini:${m}`));
+    expect(charged("gemini-4-argon")).toEqual([]);
+    expect(charged("gemini-4-neon")).toEqual([]);
+    expect(charged("gemini-4-carbon").length).toBe(2);   // tried twice, each kept at its worst case
+    expect(charged("gemini-4-carbon").every((e) => e.how === "reserved (no bill)" && e.usd > 0.01)).toBe(true);
+    expect(charged("gemini-4-hydrogen")[0].how).toBe("reserved (no bill)");
+  });
+
+  test("Codex counts calls against its per-window allowance, never dollars, and the report says so", async () => {
+    const t = rig({ reviews: 1 });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const b = readBudget(t.tdir);
+    const codex = b.entries.filter((e) => e.seat === "openai");
+    expect(codex.length).toBeGreaterThan(0);
+    expect(codex.every((e) => e.usd === 0 && e.how === "plan call")).toBe(true);
+    expect(buildReport(t.tdir, "review-seats", 40)).toMatch(/Codex calls count against the plan's call allowance, never as dollars: \d+ calls/);
+  });
+
+  test("ownership: pid, boot id and start time; a restart while another process sits between reserve and dispatch leaves its reservation alone", async () => {
+    const mine = ownerToken();
+    expect(mine.split(":").length).toBe(4);
+    const boot = mine.split(":")[1];
+    const alive = ownerAlive("1:x:0:aa", { boot, alive: (p) => p === 4242, start: () => "777" });
+    expect(alive(`4242:${boot}:777:bb`)).toBe(true);
+    expect(alive(`4242:${boot}:778:bb`)).toBe(false);      // the pid now runs something that started later
+    expect(alive(`4242:other-boot:777:bb`)).toBe(false);   // another boot
+    expect(alive(`4243:${boot}:777:bb`)).toBe(false);      // not running
+
+    // Process A reserves, then waits before dispatching; process B (this one) restarts and recovers.
+    const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+    const script = join(dir, "a.ts");
+    writeFileSync(script, `import { existsSync, writeFileSync } from "node:fs";\nimport { Ledger } from ${JSON.stringify(LEDGER)};\nconst [d, go, ready] = process.argv.slice(2);\nconst l = new Ledger(d);\nconst r = l.reserve({ suite: "s", run: "r", call: "c", attempt: 1, seat: null, usd: 0.1, runs: 0 }, 1.0);\nwriteFileSync(ready, "");\nwhile (!existsSync(go)) await Bun.sleep(5);\nconsole.log(JSON.stringify({ reserved: r.ok, dispatched: l.dispatched((r as any).id) }));\n`);
+    const go = join(dir, "go"), ready = join(dir, "ready");
+    const a = Bun.spawn(["bun", script, join(dir, "t"), go, ready], { stdout: "pipe", stderr: "pipe" });
+    for (let i = 0; i < 400 && !existsSync(ready); i++) await Bun.sleep(10);
+    const b = new Ledger(join(dir, "t"));
+    const rec = b.recover(ownerAlive(b.owner));
+    expect((rec as any).released.length).toBe(0);
+    expect(Object.keys(b.read().reservations).length).toBe(1);
+    writeFileSync(go, "");
+    expect(JSON.parse((await new Response(a.stdout).text()).trim())).toEqual({ reserved: true, dispatched: true });
+    // A reservation whose owner is gone (another boot) is released by the restart, and its owner can't then send.
+    const ghost = new Ledger(join(dir, "g"), `999999:another-boot:1:cc`);
+    const r = ghost.reserve({ suite: "s", run: "r", call: "c", attempt: 1, seat: null, usd: 0.1, runs: 0 }, 1.0);
+    const b2 = new Ledger(join(dir, "g"));
+    expect((b2.recover(ownerAlive(b2.owner)) as any).released.length).toBe(1);
+    expect(ghost.dispatched((r as any).id)).toBe(false);
+  });
+
+  test("a reservation gone between reserve and dispatch means nothing is sent", async () => {
+    const t = rig({ reviews: 1 });
+    const orig = t.trials.ledger.dispatched.bind(t.trials.ledger);
+    let n = 0;
+    t.trials.ledger.dispatched = (id: string) => { if (id.includes("out|") && id.includes("gemini:gemini-4-argon") && n++ === 0) { t.trials.ledger.release(id); } return orig(id); };
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    // The first attempt found its reservation gone and sent nothing; the call ran later on a fresh reservation.
+    expect(t.providers.gemini.calls.filter((c: AskInput) => c.brief && c.model === "gemini-4-argon").length).toBe(1);
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
+  });
+});
+
+describe("provider tools only on checked text", () => {
+  test("the review-seats suite sends no search, fetch or grounding; a review-seats call with search on is refused", async () => {
+    for (const c of REVIEW_CONFIGS) expect(callShape("review-seats", { id: "o", kind: "output", task: "r1", config: c.id }, rt(true)).search).toBe(false);
+    const t = rig({ reviews: 1 });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    const suite = suiteOf(t), task = suite.tasks[0];
+    const spec = { id: `out|${task.id}|gemini:gemini-4-argon|again`, kind: "output" as const, task: task.id, config: "gemini:gemini-4-argon" };
+    const shape = { ...callShape("review-seats", spec, task), search: true };
+    expect(toolViolation("review-seats", spec, shape)).toContain("off for review-seats");
+    const before = t.providers.gemini.calls.length;
+    expect(await t.trials.attempt(st, suite, spec, task, shape)).toBe("settled");
+    expect(st.calls[spec.id].status).toBe("blocked");
+    expect(t.providers.gemini.calls.length).toBe(before);
+    // The research suite: answerers search; the grader may fetch only cited domains.
+    expect(toolViolation("research", { id: "o", kind: "output", task: "q", config: "perplexity:low" }, callShape("research", { id: "o", kind: "output", task: "q", config: "perplexity:low" }, qt))).toBeNull();
+    expect(toolViolation("review-seats", { id: "g", kind: "grade", task: "r1", grader: "claude" }, { ...callShape("review-seats", { id: "g", kind: "grade", task: "r1", grader: "claude" }, rt()), fetch: true })).toContain("only in the research suite");
+  });
+
+  test("an unpinned Perplexity call without the owner's approval in the App's options is refused", async () => {
+    const t = rig({ questions: true });
+    submit(t, { kind: "run", suite: "research" });
+    await t.runAll("research");
+    const st = latestRun(t.tdir, "research")!;
+    const suite = suiteOf(t, "research"), task = suite.tasks[0];
+    const spec = { id: `out|${task.id}|perplexity:low|unpinned`, kind: "output" as const, task: task.id, config: "perplexity:low" };
+    const shape = callShape("research", spec, task, false);
+    expect(shape.model).toBe("");
+    const before = t.providers.perplexity.calls.length;
+    await t.trials.attempt(st, suite, spec, task, shape);
+    expect(st.calls[spec.id].error).toContain("needs the owner's research approval");
+    expect(t.providers.perplexity.calls.length).toBe(before);
+  });
+});
+
+describe("inbox hardening", () => {
+  test("a symlink, a FIFO, an oversized file and a file from another uid are refused; a good file is moved and parsed from its descriptor", () => {
+    const dir = mkdtempSync(join(tmpdir(), "inbox-"));
+    const taken = join(dir, "taken"), uid = process.getuid!();
+    const secret = join(dir, "secret.json"); writeFileSync(secret, JSON.stringify({ kind: "run", suite: "review-seats" }));
+    symlinkSync(secret, join(dir, "link.json"));
+    expect(takeInboxFile(join(dir, "link.json"), taken, [uid])).toEqual({ ok: false, why: "it is a link" });
+    expect(existsSync(join(dir, "link.json"))).toBe(false);
+    spawnSync("mkfifo", [join(dir, "fifo.json")]);
+    expect(takeInboxFile(join(dir, "fifo.json"), taken, [uid])).toEqual({ ok: false, why: "it isn't a regular file" });
+    writeFileSync(join(dir, "big.json"), "x".repeat(5_000));
+    expect((takeInboxFile(join(dir, "big.json"), taken, [uid]) as any).why).toContain("larger than");
+    writeFileSync(join(dir, "other.json"), "{}");
+    expect((takeInboxFile(join(dir, "other.json"), taken, [uid + 1]) as any).why).toContain("isn't from a sender");
+    writeFileSync(join(dir, "good.json"), JSON.stringify({ kind: "run", suite: "review-seats" }));
+    const g = takeInboxFile(join(dir, "good.json"), taken, [uid]) as any;
+    expect(g.ok).toBe(true);
+    expect(JSON.parse(g.text)).toEqual({ kind: "run", suite: "review-seats" });
+    expect(existsSync(join(dir, "good.json"))).toBe(false);
+    expect(g.moved.startsWith(taken)).toBe(true);
+    expect(existsSync(secret)).toBe(true);
+  });
+
+  test("a paid run or a resume starts only from a file taken from the inbox", async () => {
+    const t = rig({ reviews: 1 });
+    expect(t.trials.request({ kind: "run", suite: "review-seats" })).toContain("only from a request file");
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    // A symlinked request in the inbox starts nothing.
+    mkdirSync(t.inboxDir, { recursive: true });
+    const real = join(t.dir, "req.json"); writeFileSync(real, JSON.stringify({ kind: "run", suite: "review-seats" }));
+    symlinkSync(real, join(t.inboxDir, "a.json"));
+    expect(t.trials.ingest()[0].why).toContain("it is a link");
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("running");
+  });
+});
+
+describe("the Perplexity check and its pinned model", () => {
+  test("one tiny call per level with the pinned model and no owner text; a level served by another model is disabled", async () => {
+    const pp = fake({ seat: "perplexity", cost: 0.003, how: "billed" });
+    const checks: any[] = [];
+    pp.validate = async (i: any) => { checks.push(i); return { bill: { usd: 0.0001, how: "billed" as const }, served: i.setting === "medium" ? "perplexity/sonar-pro" : i.model }; };
+    const t = rig({ questions: true, providers: { perplexity: pp } });
+    submit(t, { kind: "run", suite: "research" });
+    await t.runAll("research");
+    const st = latestRun(t.tdir, "research")!;
+    expect(checks.map((c) => c.setting).sort()).toEqual(["fast", "low", "medium"]);
+    expect(checks.every((c) => c.model === "perplexity/sonar" && !c.user && !c.system && c.search === true)).toBe(true);
+    expect(st.preflight!.skip["perplexity:medium"]).toContain("not the pinned perplexity/sonar");
+    expect((pp.calls as AskInput[]).some((c) => c.setting === "medium")).toBe(false);
+    expect(buildReport(t.tdir, "research", 40)).toContain("perplexity/sonar at effort low");
+    // The real adapter's check: effort, the pinned model, a tiny cap, one step, nothing of the owner's.
+    const seen: any[] = [];
+    const wire = makeWire({ terms: () => TERMS, exec: null as any, fetch: (async (_u: string, init: any) => { seen.push(JSON.parse(init.body)); return new Response(JSON.stringify({ model: "perplexity/sonar", usage: { input_tokens: 5, output_tokens: 2 } }), { status: 200 }); }) as any });
+    const v = await perplexityProvider({ key: "pplx-test-key-123" }).validate!({ wire, signal: sig(), day: DAY, model: "perplexity/sonar", setting: "low", search: true });
+    expect(v.served).toBe("perplexity/sonar");
+    expect(seen[0]).toEqual({ input: "Reply with the word ready.", max_output_tokens: LIMITS.validateOut, max_steps: 1, tools: [{ type: "web_search", max_tokens: LIMITS.perplexityValidateSearchTokens }], effort: "low", model: "perplexity/sonar" });
+  });
+
+  test("a later response from another model stops the run", async () => {
+    let n = 0;
+    const pp = fake({ seat: "perplexity", cost: 0.003, how: "billed", served: (i) => (i.setting === "low" && ++n > 2 ? "openai/gpt-6.2-sol" : i.model) });
+    const t = rig({ questions: true, providers: { perplexity: pp } });
+    submit(t, { kind: "run", suite: "research" });
+    await t.runAll("research");
+    const st = latestRun(t.tdir, "research")!;
+    expect(st.status).toBe("stopped");
+    expect(st.stop!.reason).toBe("model");
+    expect(st.stop!.detail).toContain("not perplexity/sonar");
+  });
+});
+
+describe("quota headroom for real reviews", () => {
+  test("a seat's trial allowance per window is kept: its calls wait for the window, before any 429", async () => {
+    const t = rig({ reviews: 3, seatLimits: { gemini: { windowMin: 60, seatCalls: 4, headroomPct: 50 } } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("done");
+    const ats = readBudget(t.tdir).entries.filter((e) => e.seat === "gemini").map((e) => Date.parse(e.at)).sort((a, b) => a - b);
+    expect(ats.length).toBeGreaterThan(2);
+    // Never more than 2 trial calls on the seat in any hour.
+    for (let i = 2; i < ats.length; i++) expect(ats[i] - ats[i - 2]).toBeGreaterThanOrEqual(60 * 60_000);
+  });
+});
+
+describe("the grading panel", () => {
+  test("every candidate gets two graders from outside its family; with Codex out, the panel narrows and the ranking is flagged", () => {
+    expect(panelFor("google", ["claude", "codex", "gemini"])).toEqual(["claude", "codex"]);
+    expect(panelFor("anthropic", ["claude", "codex", "gemini"])).toEqual(["codex", "gemini"]);
+    expect(panelFor("openai", ["claude", "codex", "gemini"])).toEqual(["claude", "gemini"]);
+    expect(panelFor("perplexity", ["claude", "codex", "gemini"])).toEqual(["claude", "codex"]);
+    expect(panelFor("google", ["claude", "gemini"])).toEqual(["claude"]);
+    expect(GRADERS.map((g) => g.family).sort()).toEqual(["anthropic", "google", "openai"]);
+  });
+});
+
+describe("cost reporting", () => {
+  test("failed and retried attempts count in the numerator; unresolved billing is reported apart", async () => {
+    let n = 0;
+    const pp = fake({ seat: "perplexity", cost: 0.003, how: "billed", impl: async (i) => {
+      if (i.setting === "low" && n++ === 0) throw withUsage(new SeatError("bad_output", "the answer ran out of room", 0.02), "some");
+      if (i.setting === "medium" && i.user && /tool number 1\?/.test(i.user)) throw new SeatError("transient", "HTTP 502: the service had an error");
+    } });
+    const t = rig({ questions: true, providers: { perplexity: pp } });
+    submit(t, { kind: "run", suite: "research" });
+    await t.runAll("research");
+    const report = buildReport(t.tdir, "research", 40);
+    const low = report.split("\n").find((l) => l.startsWith("| perplexity/sonar at effort low"))!;
+    expect(low).toContain("31 attempts");
+    expect(low).toContain("estimated $0.0200");
+    const med = report.split("\n").find((l) => l.startsWith("| perplexity/sonar at effort medium"))!;
+    expect(med).toMatch(/unresolved billing not in it/);
+    expect(med.split("|")[11].trim()).not.toBe("-");
   });
 });

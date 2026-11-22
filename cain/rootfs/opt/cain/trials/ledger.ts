@@ -14,13 +14,28 @@
 //   figure keeps the whole reservation. Released with no charge only when the call never left (a privacy
 //   block on the wire) or the provider refused it outright (HTTP 4xx: key, credit, rate limit, malformed).
 // - A retry reserves again.
+//
+// Second review round (Cain 0.19.0):
+// - One cap across every seat, probe, grader and retry, with a fixed overrun margin: a call is admitted only
+//   while the budget left after it is at least the margin (the largest single call's worst case), so even a
+//   call that overshoots its own reservation by its whole worst case stays under the cap.
+// - A reservation is released only on an authoritative zero: nothing left at all, an HTTP 4xx with no usage
+//   in it, or a usage block showing zero. Anything else keeps it (the runner decides; release() is only its
+//   tool).
+// - Codex on the ChatGPT plan has no bill: its calls count against a per-window call allowance, never as
+//   dollars. Every seat has a trial allowance per window (calls) that leaves headroom for real reviews; a seat
+//   whose allowance is used waits for its window, before any 429.
+// - Ownership: each reservation names its owner by pid, boot id and the process's start time. A restart
+//   releases (or, once sent, charges) only reservations whose owner is gone: another boot, a pid that isn't
+//   running, or a pid now running something that started at another time. Marking a call dispatched happens
+//   under the same lock and fails if the reservation is gone or isn't this owner's, and then nothing is sent.
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, chownSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { ReviewSeatName } from "./core.ts";
 
-export type How = "billed" | "estimated" | "reserved (no bill)" | "worst case (cut off)";
-export type BudgetEntry = { suite: string; run: string; call: string; usd: number; how: How; at: string; attempt?: number };
+export type How = "billed" | "estimated" | "reserved (no bill)" | "worst case (cut off)" | "plan call";
+export type BudgetEntry = { suite: string; run: string; call: string; usd: number; how: How; at: string; attempt?: number; seat?: ReviewSeatName | null; calls?: number };
 export type Reservation = {
   id: string; suite: string; run: string; call: string; attempt: number; seat: ReviewSeatName | null;
   usd: number; runs: number; drawn: number; hold?: string; state: "reserved" | "dispatched"; owner: string; at: string;
@@ -67,15 +82,27 @@ const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuf
 export const STALE_LOCK_MS = 30_000;
 
 export type SeatCheck = (seat: ReviewSeatName, outstanding: { usd: number; runs: number }, need: { usd: number; runs: number }) => string | null;
+// A seat's trial allowance: at most `allowance` trial calls in any `ms` (a rolling window).
+export type SeatWindow = { ms: number; allowance: number };
 export type ReserveReq = { suite: string; run: string; call: string; attempt: number; seat: ReviewSeatName | null; usd: number; runs: number; hold?: string };
-export type ReserveResult = { ok: true; id: string } | { ok: false; reason: "budget" | "seat" | "busy"; detail: string; committed?: number };
+export type ReserveOpts = { marginUsd?: number; window?: (seat: ReviewSeatName) => SeatWindow | null };
+export type ReserveResult = { ok: true; id: string } | { ok: false; reason: "budget" | "seat" | "busy" | "window"; detail: string; committed?: number; retryAt?: string };
+
+// Calls a seat has made or has out within its window: settled entries and live reservations.
+export function windowUse(b: Budget, seat: ReviewSeatName, sinceIso: string): { used: number; oldest: string | null } {
+  const ats: string[] = [];
+  for (const e of b.entries) if (e.seat === seat && e.at >= sinceIso) for (let i = 0; i < (e.calls ?? 1); i++) ats.push(e.at);
+  for (const r of Object.values(b.reservations)) if (r.seat === seat) ats.push(r.at);
+  ats.sort();
+  return { used: ats.length, oldest: ats[0] ?? null };
+}
 
 export class Ledger {
   readonly path: string; readonly lockPath: string; readonly owner: string;
   constructor(public dir: string, owner?: string, private now: () => Date = () => new Date()) {
     this.path = join(dir, "budget.json");
     this.lockPath = join(dir, "budget.lock");
-    this.owner = owner ?? `${process.pid}:${randomBytes(6).toString("hex")}`;
+    this.owner = owner ?? ownerToken();
   }
   read(): Budget { return readBudgetFile(this.path); }
   private iso() { return this.now().toISOString(); }
@@ -114,16 +141,27 @@ export class Ledger {
     } finally { this.unlock(token); }
   }
 
-  reserve(req: ReserveReq, budgetUsd: number, seatCheck?: SeatCheck): ReserveResult {
+  reserve(req: ReserveReq, budgetUsd: number, seatCheck?: SeatCheck, opts: ReserveOpts = {}): ReserveResult {
     const id = `${req.suite}|${req.run}|${req.call}|${req.attempt}`;
+    const margin = Math.max(0, opts.marginUsd ?? 0);
     const r = this.with<ReserveResult>((b) => {
-      if (b.reservations[id]) return { value: { ok: true, id }, write: false };
+      if (b.reservations[id]) return { value: b.reservations[id].owner === this.owner ? { ok: true, id } : { ok: false, reason: "busy", detail: "another process holds this call's reservation" }, write: false };
       const hold = req.hold ? b.holds[req.hold] : undefined;
       const drawn = hold ? Math.min(hold.usd, req.usd) : 0;
       const committed = committedOf(b);
       const extra = req.usd - drawn;
-      if (committed + extra > budgetUsd + 1e-9) return { value: { ok: false, reason: "budget", committed,
-        detail: `it could cost up to $${req.usd.toFixed(2)}, and with $${committed.toFixed(2)} spent or reserved that would pass the trials budget of $${budgetUsd.toFixed(2)}` }, write: false };
+      if (committed + extra > budgetUsd - margin + 1e-9) return { value: { ok: false, reason: "budget", committed,
+        detail: `it could cost up to $${req.usd.toFixed(2)}, and with $${committed.toFixed(2)} spent or reserved that would leave less than the $${margin.toFixed(2)} overrun margin under the trials budget of $${budgetUsd.toFixed(2)}` }, write: false };
+      const win = req.seat && opts.window ? opts.window(req.seat) : null;
+      if (req.seat && win) {
+        const since = new Date(this.now().getTime() - win.ms).toISOString();
+        const u = windowUse(b, req.seat, since);
+        if (u.used + 1 > win.allowance) {
+          const retryAt = new Date((u.oldest ? Date.parse(u.oldest) : this.now().getTime()) + win.ms + 1_000).toISOString();
+          return { value: { ok: false, reason: "window", retryAt,
+            detail: `${req.seat} has used its trial allowance of ${win.allowance} calls in ${Math.round(win.ms / 60_000)} minutes (the rest is headroom kept for real reviews)` }, write: false };
+        }
+      }
       if (req.seat && seatCheck) {
         const out = Object.values(b.reservations).filter((x) => x.seat === req.seat).reduce((a, x) => ({ usd: a.usd + x.usd, runs: a.runs + x.runs }), { usd: 0, runs: 0 });
         const why = seatCheck(req.seat, out, { usd: req.usd, runs: req.runs });
@@ -136,10 +174,11 @@ export class Ledger {
     });
     return "busy" in r ? { ok: false, reason: "busy", detail: "the trials budget is locked by another process" } : r;
   }
+  // Marked sent under the lock: false (and nothing may be sent) when the reservation is gone, or isn't ours.
   dispatched(id: string): boolean {
     const r = this.with<boolean>((b) => {
       const x = b.reservations[id];
-      if (!x) return { value: false, write: false };
+      if (!x || x.owner !== this.owner) return { value: false, write: false };
       x.state = "dispatched";
       return { value: true, write: true };
     });
@@ -152,7 +191,7 @@ export class Ledger {
       if (!x) return { value: false, write: false };
       delete b.reservations[id];
       const charged = round6(Math.max(0, usd));
-      b.entries.push({ suite: x.suite, run: x.run, call: x.call, attempt: x.attempt, usd: charged, how, at: this.iso() });
+      b.entries.push({ suite: x.suite, run: x.run, call: x.call, attempt: x.attempt, usd: charged, how, at: x.at, seat: x.seat, calls: 1 });
       b.spent_usd = round6(b.spent_usd + charged);
       return { value: true, write: true };
     });
@@ -174,12 +213,12 @@ export class Ledger {
     return r === true;
   }
   // A task's hold: kept if it is already there (a resume), otherwise reserved whole or not at all.
-  hold(key: string, info: { suite: string; run: string; task: string }, usd: number, budgetUsd: number): ReserveResult {
+  hold(key: string, info: { suite: string; run: string; task: string }, usd: number, budgetUsd: number, marginUsd = 0): ReserveResult {
     const r = this.with<ReserveResult>((b) => {
       if (b.holds[key] || Object.values(b.reservations).some((x) => x.hold === key)) return { value: { ok: true, id: key }, write: false };
       const committed = committedOf(b);
-      if (committed + usd > budgetUsd + 1e-9) return { value: { ok: false, reason: "budget", committed,
-        detail: `the task's calls and both its graders could cost up to $${usd.toFixed(2)}, and with $${committed.toFixed(2)} spent or reserved that would pass the trials budget of $${budgetUsd.toFixed(2)}` }, write: false };
+      if (committed + usd > budgetUsd - marginUsd + 1e-9) return { value: { ok: false, reason: "budget", committed,
+        detail: `the task's graders could cost up to $${usd.toFixed(2)}, and with $${committed.toFixed(2)} spent or reserved that would leave less than the $${marginUsd.toFixed(2)} overrun margin under the trials budget of $${budgetUsd.toFixed(2)}` }, write: false };
       b.holds[key] = { ...info, usd: round6(usd), owner: this.owner, at: this.iso() };
       return { value: { ok: true, id: key }, write: true };
     });
@@ -202,7 +241,7 @@ export class Ledger {
         if (alive(x.owner)) continue;
         delete b.reservations[x.id];
         if (x.state === "dispatched") {
-          b.entries.push({ suite: x.suite, run: x.run, call: x.call, attempt: x.attempt, usd: x.usd, how: "worst case (cut off)", at: this.iso() });
+          b.entries.push({ suite: x.suite, run: x.run, call: x.call, attempt: x.attempt, usd: x.usd, how: "worst case (cut off)", at: x.at, seat: x.seat, calls: 1 });
           b.spent_usd = round6(b.spent_usd + x.usd);
           charged.push(x);
         } else {
@@ -215,13 +254,40 @@ export class Ledger {
   }
 }
 
-// Whether a reservation's owner may still be running: this process's own token, or another live process.
-// The same pid with another token is an earlier run of this process (a restart reused the pid).
-export function ownerAlive(mine: string) {
+// Who owns a reservation: pid, boot id, the process's start time (clock ticks since boot, from
+// /proc/<pid>/stat) and a random part, so a pid reused after a restart, or the same pid on another boot, isn't
+// taken for the owner.
+export function bootId(): string {
+  try { return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim().replace(/[^a-f0-9-]/gi, "").slice(0, 40) || "noboot"; } catch { return "noboot"; }
+}
+export function startTicks(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return rest[19] ?? null;   // field 22 overall: starttime
+  } catch { return null; }
+}
+export function ownerToken(pid = process.pid): string {
+  return `${pid}:${bootId()}:${startTicks(pid) ?? "0"}:${randomBytes(6).toString("hex")}`;
+}
+// Whether a reservation's owner may still be running: this process's own token, or another live process on
+// this boot that started when the owner did. The same pid with another token is an earlier run of this
+// process (a restart reused the pid). A token from before this round (pid:random) is judged by its pid alone.
+export function ownerAlive(mine: string, o: { boot?: string; alive?: (pid: number) => boolean; start?: (pid: number) => string | null } = {}) {
+  const boot = o.boot ?? bootId();
+  const alive = o.alive ?? ((pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } });
+  const start = o.start ?? startTicks;
   return (owner: string): boolean => {
     if (owner === mine) return true;
-    const pid = Number(owner.split(":")[0]);
-    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
-    try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; }
+    const parts = owner.split(":");
+    const pid = Number(parts[0]);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === Number(mine.split(":")[0])) return false;
+    if (parts.length >= 4) {
+      if (parts[1] !== boot) return false;              // another boot: that process is gone
+      if (!alive(pid)) return false;
+      const s = start(pid);
+      return s === null || parts[2] === "0" || s === parts[2];
+    }
+    return alive(pid);
   };
 }

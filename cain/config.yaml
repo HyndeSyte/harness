@@ -68,6 +68,10 @@ timeout: 30
 # trials_budget_usd (0.19.0): the one budget for every model trial and its grading (trial.sh), across all
 # suites, in dollars of API spend. A call that could pass it isn't made and the trial stops. The owner's to
 # set: nothing else raises it.
+# trials_research_*_sha256 (0.19.0): the owner's approval of the research suite, the hashes `trial.sh plan
+# research` prints (the questions file, its answer notes, the rubric); empty means not approved. Read only from
+# these options (root's file), never from anything Cain's user can write. trials_perplexity_third_party_routing:
+# let Perplexity's levels route to another lab's model (off: pinned to Perplexity's own).
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
 # "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
@@ -83,6 +87,10 @@ options:
   review_round_cap: 3
   usage_reserve_percent: 25
   trials_budget_usd: 40
+  trials_research_questions_sha256: ""
+  trials_research_notes_sha256: ""
+  trials_research_rubric_sha256: ""
+  trials_perplexity_third_party_routing: false
   owner_user_id: ""
   notice_hook: ""
   pc_jobs_token: ""
@@ -102,6 +110,10 @@ schema:
   review_round_cap: int(1,10)
   usage_reserve_percent: int(0,90)
   trials_budget_usd: float(0,500)
+  trials_research_questions_sha256: match(^([0-9a-f]{64})?$)?
+  trials_research_notes_sha256: match(^([0-9a-f]{64})?$)?
+  trials_research_rubric_sha256: match(^([0-9a-f]{64})?$)?
+  trials_perplexity_third_party_routing: bool
   owner_user_id: match(^([0-9a-f]{32})?$)?
   notice_hook: password?
   pc_jobs_token: password?

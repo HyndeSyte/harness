@@ -4,31 +4,31 @@
 // service's own prompt and answer schema (review/core.ts prompt, ANSWER_SCHEMA), as the seat does, but
 // through these adapters, which add the ceilings the seats don't need for real reviews.
 //
-// Read 2026-11-22:
-// - Claude (platform.claude.com, web search and web fetch tool pages): web_search_20260318 and
-//   web_fetch_20260318 are the latest types; max_uses caps each; allowed_callers ["direct"] turns dynamic
-//   filtering off so search results come back as citation blocks; web fetch citations are off unless asked;
-//   count_tokens refuses server tools, so the check before any spend is a 16-token call with the tools on.
-//   max_tokens covers thinking.
-// - Perplexity Agent API (its Python SDK's request and response types; the docs site wasn't reachable from
-//   the build): preset is a string field (the presets page names the levels fast, low and medium); model
-//   pins a model, and response.model names the one that answered; max_steps (1 to 100) and
-//   max_output_tokens cap a run; the web_search tool takes max_tokens; fetch_url is a tool of its own, left
-//   out here; output items of type "message" carry output_text parts with annotations, and items of type
-//   "search_results" carry the queries; usage.cost.total_cost is the bill in USD.
-// - Codex CLI (openai/codex at its current head): `codex debug models` prints the model catalog as one JSON
-//   object; exec takes --ignore-user-config (no config.toml, so no MCP servers), -c web_search="disabled",
-//   --sandbox read-only, -C, --ephemeral, --json, -o, --output-schema, -m; `codex --version` prints it. It has
-//   no output-token or turn setting: exec runs one turn, and model_context_window bounds what it reads.
-// - Gemini API (its Python SDK's types): maxOutputTokens and thinkingConfig.thinkingBudget; whether thinking
-//   counts inside maxOutputTokens isn't stated, so both are counted at the output price.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+// Read 2026-11-22 (second review round; DOCS.md "Provider contracts" has the detail and what each page left open):
+// - Claude (platform.claude.com, read directly): web_search_20260318 and web_fetch_20260318 are the latest types;
+//   max_uses caps each; allowed_callers ["direct"] turns dynamic filtering off; web fetch takes
+//   max_content_tokens and allowed_domains and costs only tokens; search is $10 per 1,000 and its results
+//   count as input (no documented ceiling on their size); max_tokens covers thinking.
+// - Perplexity Agent API (docs.perplexity.ai through search results limited to it): the level goes in
+//   `effort` (`preset` read back as an alias); model overrides the level's model; max_steps and
+//   max_output_tokens cap a run; the web_search tool's max_tokens caps each call's search context; fetch_url
+//   is a tool of its own, left out; usage.cost.total_cost is the bill and usage.tool_calls_details.search_web
+//   the searches; the priority tier is 2x the token rates.
+// - Codex CLI (openai/codex at its head): exec takes --ignore-user-config (rules in CODEX_HOME/rules still load),
+//   -c overrides (web_search="disabled", default_permissions=":read-only", features.daemon_auto_start=false),
+//   -C, --ephemeral, --json, -o, --output-schema, -m; it has no output-token or turn setting: exec runs one turn,
+//   and model_context_window bounds what it reads.
+// - Gemini API (ai.google.dev through search results limited to it): thinkingLevel on Gemini 4 Argon and 3.8
+//   Flash (thinkingBudget deprecated on Gemini 4, a 400 beside thinkingLevel); Argon's maxOutputTokens counts
+//   thought tokens; grounding is billed per search query on Gemini 3 and newer.
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ANSWER_SCHEMA, SeatError, prompt, validateAnswer, type Answer, type Outbound } from "../review/core.ts";
+import { randomBytes } from "node:crypto";
+import { freshDirs, judgeSelfTest, selfTestPrompt, which, wrap, type Dirs, type Isolation, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
+import { ANSWER_SCHEMA, SeatError, prompt, validateAnswer, type Answer, type ErrorKind, type Outbound } from "../review/core.ts";
 import { postJson } from "../review/seats/common.ts";
 import { classifyCodex } from "../review/seats/openai.ts";
-import { GROUNDING_USD, LIMITS, estimateUsd, lastJson } from "./core.ts";
+import { GROUNDING_USD, LIMITS, estimateUsd, geminiModel, lastJson, perplexityPrice } from "./core.ts";
 import { CLAUDE_SEARCH_USD, PERPLEXITY_SEARCH_USD } from "../review/core.ts";
 import type { Wire } from "./guard.ts";
 
@@ -41,26 +41,36 @@ export type AskInput = {
   fetch?: boolean; maxFetches?: number; allowedDomains?: string[];
   setting?: string; maxSteps?: number;          // Perplexity preset and steps
   schema?: object;                              // a JSON answer in this shape (grades)
+  codexMode?: IsolationMode;                    // Codex: the isolation the run's self-test proved
 };
 // bill: the provider's own figure (billed), or tokens at the list price (estimated); null when there is no
-// usable figure, so the reservation stands.
-export type Bill = { usd: number; how: "billed" | "estimated" } | null;
+// usable figure, so the reservation stands. Codex on the plan has no bill at all ("plan call").
+export type Bill = { usd: number; how: "billed" | "estimated" | "plan call" } | null;
+// What the answer said about usage: none (no usage block), zero (a usage block showing nothing used), or some.
+// Only "zero" (or an HTTP 4xx with no usage) releases a reservation (runner.ts).
+export type Usage = "none" | "zero" | "some";
 export type AskResult = {
   text: string; json?: any; answer?: Answer; urls: string[]; served: string; bill: Bill;
-  tokens: { input: number; output: number }; searches: number;
+  tokens: { input: number; output: number }; searches: number; usage?: Usage;
 };
 export type AskFn = (input: AskInput) => Promise<AskResult>;
-export type ValidateFn = (input: Omit<AskInput, "maxOut"> & { maxOut?: number }) => Promise<{ bill: Bill }>;
+export type ValidateFn = (input: Omit<AskInput, "maxOut"> & { maxOut?: number }) => Promise<{ bill: Bill; served?: string; usage?: Usage }>;
 export type Provider = { ask: AskFn; validate?: ValidateFn };
 export type CodexProvider = Provider & {
-  version: (wire: Wire, signal: AbortSignal) => Promise<string | null>;
-  models: (wire: Wire, signal: AbortSignal) => Promise<string[] | null>;
+  version: (wire: Wire, signal: AbortSignal, mode?: IsolationMode) => Promise<string | null>;
+  models: (wire: Wire, signal: AbortSignal, mode?: IsolationMode) => Promise<string[] | null>;
+  isolation: (wire: Wire, signal: AbortSignal) => Promise<Isolation>;
 };
+// An error that carries what the provider said about usage, so a reservation is released only on an
+// authoritative zero.
+export function withUsage<E extends SeatError>(e: E, usage: Usage): E { (e as any).usage = usage; return e; }
+export const usageOf = (e: unknown): Usage => ((e as any)?.usage === "zero" || (e as any)?.usage === "some" ? (e as any).usage : "none");
 
 const uniq = (xs: string[]) => [...new Set(xs.filter((u) => /^https?:\/\//i.test(u)))].slice(0, 40);
 const URLS = /https?:\/\/[^\s)\]>"']+/g;
 const withBill = (cost: number | null, how: "billed" | "estimated" = "estimated"): Bill => (cost === null || !Number.isFinite(cost) ? null : { usd: cost, how });
 const reviewPrompt = (b: Outbound, role: "reviewer" | "facts") => prompt(b, role);
+const tokenUsage = (present: boolean, inT: number, outT: number, extra = 0): Usage => (!present ? "none" : inT + outT + extra > 0 ? "some" : "zero");
 
 // ---- Claude ----
 export const CLAUDE_SEARCH_TOOL = "web_search_20260318";
@@ -75,6 +85,16 @@ export function claudeTools(i: Pick<AskInput, "search" | "maxSearches" | "fetch"
 export function claudeProvider(o: { key: string; base?: string; version?: string }): Provider {
   const base = o.base ?? "https://api.anthropic.com";
   const headers = () => ({ "x-api-key": o.key, "anthropic-version": o.version ?? "2026-10-21" });
+  const read = (j: any, input: { model: string; day: string }) => {
+    const u = j?.usage;
+    const inT = Number(u?.input_tokens ?? 0) + Number(u?.cache_read_input_tokens ?? 0) + Number(u?.cache_creation_input_tokens ?? 0);
+    const outT = Number(u?.output_tokens ?? 0);
+    const searches = Number(u?.server_tool_use?.web_search_requests ?? 0) || 0;
+    const ok = !!u && Number.isFinite(inT) && Number.isFinite(outT);
+    const usage = tokenUsage(ok, inT, outT, searches);
+    const est = ok ? estimateUsd(input.model, input.day, inT, outT) : null;
+    return { inT, outT, searches, usage, bill: usage === "zero" ? { usd: 0, how: "estimated" as const } : withBill(est === null ? null : est + searches * CLAUDE_SEARCH_USD) };
+  };
   const ask: AskFn = async (input) => {
     const tools = claudeTools(input);
     const body: any = { model: input.model, max_tokens: input.maxOut, system: input.system ?? "", messages: [{ role: "user", content: input.user ?? "" }] };
@@ -84,12 +104,7 @@ export function claudeProvider(o: { key: string; base?: string; version?: string
     } else if (input.schema) body.output_config = { format: { type: "json_schema", schema: input.schema } };
     // One request: a paused turn isn't continued, so the steps stay within the tool uses plus one.
     const j = await postJson(input.wire.fetch, `${base}/v1/messages`, headers(), body, input.signal, [o.key]);
-    const u = j?.usage;
-    const inT = Number(u?.input_tokens ?? 0) + Number(u?.cache_read_input_tokens ?? 0) + Number(u?.cache_creation_input_tokens ?? 0);
-    const outT = Number(u?.output_tokens ?? 0);
-    const searches = Number(u?.server_tool_use?.web_search_requests ?? 0);
-    const est = u && Number.isFinite(inT) && Number.isFinite(outT) && (inT > 0 || outT > 0) ? estimateUsd(input.model, input.day, inT, outT) : null;
-    const bill = withBill(est === null ? null : est + searches * CLAUDE_SEARCH_USD);
+    const { inT, outT, searches, usage, bill } = read(j, input);
     const blocks = Array.isArray(j?.content) ? j.content : [];
     let text = ""; const urls: string[] = [];
     for (const b of blocks) if (b?.type === "text") {
@@ -98,22 +113,24 @@ export function claudeProvider(o: { key: string; base?: string; version?: string
     }
     const stop = String(j?.stop_reason ?? "");
     const cost = bill?.usd ?? 0;
-    if (stop === "refusal") throw new SeatError("refused", "Claude declined", cost);
-    if (stop === "max_tokens") throw new SeatError("bad_output", "the answer ran out of room before it finished", cost);
-    if (stop === "pause_turn") throw new SeatError("bad_output", "the turn paused at its tool limit before it finished", cost);
-    if (!text.trim()) throw new SeatError("bad_output", "an empty answer", cost);
+    const fail = (kind: ErrorKind, why: string) => withUsage(new SeatError(kind, why, cost), usage);
+    if (stop === "refusal") throw fail("refused", "Claude declined");
+    if (stop === "max_tokens") throw fail("bad_output", "the answer ran out of room before it finished");
+    if (stop === "pause_turn") throw fail("bad_output", "the turn paused at its tool limit before it finished");
+    if (!text.trim()) throw fail("bad_output", "an empty answer");
     const json = input.schema ? lastJson(text) : undefined;
-    if (input.schema && !json) throw new SeatError("bad_output", "the answer was not JSON", cost);
+    if (input.schema && !json) throw fail("bad_output", "the answer was not JSON");
     for (const m of text.matchAll(URLS)) urls.push(m[0]);
-    return { text, json, urls: uniq(urls), served: String(j?.model ?? input.model), bill, tokens: { input: inT, output: outT }, searches };
+    return { text, json, urls: uniq(urls), served: String(j?.model ?? input.model), bill, tokens: { input: inT, output: outT }, searches, usage };
   };
-  // The check before any spend: the same model and tool types, 16 tokens out.
+  // The check before any spend, from the installed build: the same model, the suite's tool paths (web search
+  // max_uses 1, and the grader's fetch where the suite uses it), a tiny output cap.
   const validate: ValidateFn = async (input) => {
     const tools = claudeTools(input);
     const body: any = { model: input.model, max_tokens: input.maxOut ?? LIMITS.validateOut, messages: [{ role: "user", content: "Reply with the word ready." }], ...(tools.length ? { tools } : {}) };
     const j = await postJson(input.wire.fetch, `${base}/v1/messages`, headers(), body, input.signal, [o.key]);
-    const u = j?.usage;
-    return { bill: withBill(u ? estimateUsd(input.model, input.day, Number(u.input_tokens ?? 0), Number(u.output_tokens ?? 0)) : null) };
+    const r = read(j, input);
+    return { bill: r.bill, served: String(j?.model ?? input.model), usage: r.usage };
   };
   return { ask, validate };
 }
@@ -132,6 +149,13 @@ export function groundingUrls(cand: any): string[] {
   }
   return out;
 }
+// The generation settings a model gets: maxOutputTokens, and only the thinking field its docs say it takes
+// (core.ts GEMINI_MODELS): thinkingLevel on the Gemini 4 and 3.8 models (sending thinkingBudget with it is a
+// 400 there), thinkingBudget only where a model is listed with one.
+export function geminiGeneration(model: string, maxOut: number): any {
+  const g = geminiModel(model);
+  return { maxOutputTokens: maxOut, thinkingConfig: "level" in g.thinking ? { thinkingLevel: g.thinking.level } : { thinkingBudget: g.thinking.budget } };
+}
 export function geminiProvider(o: { key: string; base?: string; schemaField?: "responseFormat" | "responseJsonSchema" }): Provider {
   const base = o.base ?? "https://generativelanguage.googleapis.com";
   const field = o.schemaField ?? "responseFormat";
@@ -139,70 +163,88 @@ export function geminiProvider(o: { key: string; base?: string; schemaField?: "r
     const body: any = {
       systemInstruction: { parts: [{ text: system }] },
       contents: [{ role: "user", parts: [{ text: user }] }],
-      generationConfig: { maxOutputTokens: maxOut, thinkingConfig: { thinkingBudget: input.thinking ?? LIMITS.geminiThinking }, ...(schema ? geminiSchema(field, schema) : {}) },
+      generationConfig: { ...geminiGeneration(input.model, maxOut), ...(schema ? geminiSchema(field, schema) : {}) },
     };
     if (input.search) body.tools = [{ googleSearch: {} }];
     return postJson(input.wire.fetch, `${base}/v1beta/models/${encodeURIComponent(input.model)}:generateContent`, { "x-goog-api-key": o.key }, body, input.signal, [o.key]);
   };
   const billOf = (j: any, input: AskInput) => {
     const u = j?.usageMetadata;
-    if (!u) return { bill: null as Bill, inT: 0, outT: 0 };
+    if (!u) return { bill: null as Bill, inT: 0, outT: 0, usage: "none" as Usage };
     const inT = Number(u.promptTokenCount ?? 0) + Number(u.toolUsePromptTokenCount ?? 0);
     const outT = Number(u.candidatesTokenCount ?? 0) + Number(u.thoughtsTokenCount ?? 0);
+    const usage = tokenUsage(true, inT, outT);
     const est = estimateUsd(input.model, input.day, inT, outT);
-    const grounded = input.search && !!j?.candidates?.[0]?.groundingMetadata;
-    return { bill: withBill(est === null ? null : est + (grounded ? GROUNDING_USD : 0)), inT, outT };
+    // Grounding on Gemini 3 and newer is billed per search query the model ran (the free share is ignored here).
+    const queries = input.search ? (j?.candidates?.[0]?.groundingMetadata?.webSearchQueries ?? []).length : 0;
+    return { bill: usage === "zero" ? { usd: 0, how: "estimated" as const } : withBill(est === null ? null : est + queries * GROUNDING_USD), inT, outT, usage };
   };
   const ask: AskFn = async (input) => {
     const p = input.brief ? reviewPrompt(input.brief, "reviewer") : { system: input.system ?? "", user: input.user ?? "" };
     const j = await call(input, input.maxOut, p.system, p.user, input.brief ? ANSWER_SCHEMA : input.schema);
-    if (j?.promptFeedback?.blockReason) throw new SeatError("refused", `Gemini blocked it (${String(j.promptFeedback.blockReason).slice(0, 40)})`);
+    const { bill, inT, outT, usage } = billOf(j, input);
+    const cost = bill?.usd ?? 0;
+    const fail = (kind: ErrorKind, why: string) => withUsage(new SeatError(kind, why, cost), usage);
+    if (j?.promptFeedback?.blockReason) throw fail("refused", `Gemini blocked it (${String(j.promptFeedback.blockReason).slice(0, 40)})`);
     const cand = j?.candidates?.[0];
     const text = (cand?.content?.parts ?? []).filter((x: any) => typeof x?.text === "string" && !x.thought).map((x: any) => x.text).join("");
-    const { bill, inT, outT } = billOf(j, input);
-    const cost = bill?.usd ?? 0;
-    if (cand?.finishReason === "MAX_TOKENS") throw new SeatError("bad_output", "the answer ran out of room before it finished", cost);
-    if (!text.trim()) throw new SeatError("bad_output", "an empty answer", cost);
+    if (cand?.finishReason === "MAX_TOKENS") throw fail("bad_output", "the answer ran out of room before it finished");
+    if (!text.trim()) throw fail("bad_output", "an empty answer");
     const urls = groundingUrls(cand);
     for (const m of text.matchAll(URLS)) urls.push(m[0]);
     let answer: Answer | undefined; let json: any;
-    if (input.brief) { const v = validateAnswer(text); if (!v.answer) throw new SeatError("bad_output", v.error!, cost); answer = v.answer; }
-    else if (input.schema) { json = lastJson(text); if (!json) throw new SeatError("bad_output", "the answer was not JSON", cost); }
+    if (input.brief) { const v = validateAnswer(text); if (!v.answer) throw fail("bad_output", v.error!); answer = v.answer; }
+    else if (input.schema) { json = lastJson(text); if (!json) throw fail("bad_output", "the answer was not JSON"); }
     return { text, json, answer, urls: uniq(urls), served: String(j?.modelVersion ?? input.model), bill, tokens: { input: inT, output: outT },
-      searches: (cand?.groundingMetadata?.webSearchQueries ?? []).length };
+      searches: (cand?.groundingMetadata?.webSearchQueries ?? []).length, usage };
   };
-  // The check before any spend: the same model and generation settings, 16 tokens out. A model Google
+  // The check before any spend: the same model and generation settings, a tiny output. A model Google
   // doesn't serve answers 404; settings it won't take answer 400.
   const validate: ValidateFn = async (input) => {
     const full = { ...input, maxOut: input.maxOut ?? LIMITS.validateOut } as AskInput;
     const j = await call(full, full.maxOut, "Reply with the word ready.", "ready?");
-    return { bill: billOf(j, full).bill };
+    const b = billOf(j, full);
+    return { bill: b.bill, served: String(j?.modelVersion ?? input.model), usage: b.usage };
   };
   return { ask, validate };
 }
 
 // ---- Perplexity Agent API ----
-export const PERPLEXITY_PRESET_FIELD = "preset";
+// The level goes in `effort` (the Agent API's field for it); a response may name it `effort` or, as an alias,
+// `preset`. The fast level is priced at the priority rate (core.ts perplexityPrice).
+export const PERPLEXITY_LEVEL_FIELD = "effort";
 export function perplexityProvider(o: { key: string; base?: string }): Provider {
   const base = o.base ?? "https://api.perplexity.ai";
+  const send = (input: AskInput, body: any) => postJson(input.wire.fetch, `${base}/v1/agent`, { authorization: `Bearer ${o.key}` }, body, input.signal, [o.key]);
+  const readBill = (j: any, input: AskInput, served: string) => {
+    const u = j?.usage;
+    const inT = Number(u?.input_tokens ?? 0), outT = Number(u?.output_tokens ?? 0);
+    const det = u?.tool_calls_details ?? {};
+    const searches = Number(det?.search_web?.invocation ?? det?.web_search?.invocation ?? det?.search_web ?? det?.web_search ?? 0) || 0;
+    const billed = Number(u?.cost?.total_cost);
+    const usage = tokenUsage(!!u, inT, outT, searches + (Number.isFinite(billed) ? billed : 0));
+    let bill: Bill = null;
+    if (Number.isFinite(billed) && billed >= 0 && u?.cost?.total_cost !== null && u?.cost?.total_cost !== undefined) bill = { usd: billed, how: "billed" };
+    else if (u && served) {
+      const p = perplexityPrice(served, input.setting);
+      bill = { usd: (inT * p.in + outT * p.out) / 1e6 + searches * PERPLEXITY_SEARCH_USD, how: "estimated" };
+    }
+    if (usage === "zero") bill = { usd: 0, how: bill?.how ?? "estimated" };
+    return { inT, outT, searches, usage, bill };
+  };
   const ask: AskFn = async (input) => {
     const p = input.brief ? reviewPrompt(input.brief, "facts") : { system: input.system ?? "", user: input.user ?? "" };
     const body: any = { input: p.user, instructions: p.system, max_output_tokens: input.maxOut, max_steps: input.maxSteps ?? LIMITS.perplexitySteps,
       tools: input.search ? [{ type: "web_search", max_tokens: LIMITS.perplexitySearchTokens }] : [] };
-    if (input.setting) body[PERPLEXITY_PRESET_FIELD] = input.setting;
+    if (input.setting) body[PERPLEXITY_LEVEL_FIELD] = input.setting;
     if (input.model) body.model = input.model;
     if (input.brief) body.response_format = { type: "json_schema", json_schema: { name: "review", schema: ANSWER_SCHEMA } };
-    const j = await postJson(input.wire.fetch, `${base}/v1/agent`, { authorization: `Bearer ${o.key}` }, body, input.signal, [o.key]);
+    const j = await send(input, body);
     const served = typeof j?.model === "string" ? j.model : "";
-    const u = j?.usage;
-    const inT = Number(u?.input_tokens ?? 0), outT = Number(u?.output_tokens ?? 0);
-    const searches = Number(u?.tool_calls_details?.web_search?.invocation ?? u?.tool_calls_details?.search_web?.invocation ?? u?.tool_calls_details?.web_search ?? 0) || 0;
-    const billed = Number(u?.cost?.total_cost);
-    let bill: Bill = null;
-    if (Number.isFinite(billed) && billed >= 0 && u?.cost?.total_cost !== null && u?.cost?.total_cost !== undefined) bill = { usd: billed, how: "billed" };
-    else if (u && served) { const est = estimateUsd(served, input.day, inT, outT); bill = withBill(est === null ? null : est + searches * PERPLEXITY_SEARCH_USD); }
-    if (j?.status && !["completed", "succeeded"].includes(String(j.status)))
-      throw new SeatError(j.status === "failed" ? "transient" : "bad_output", `the run ended as ${String(j.status).slice(0, 30)}`, bill?.usd ?? 0);
+    const { inT, outT, searches, usage, bill } = readBill(j, input, served || input.model);
+    const cost = bill?.usd ?? 0;
+    const fail = (kind: ErrorKind, why: string) => withUsage(new SeatError(kind, why, cost), usage);
+    if (j?.status && !["completed", "succeeded"].includes(String(j.status))) throw fail(j.status === "failed" ? "transient" : "bad_output", `the run ended as ${String(j.status).slice(0, 30)}`);
     let text = ""; const urls: string[] = [];
     for (const item of Array.isArray(j?.output) ? j.output : []) {
       if (item?.type === "message") for (const c of item.content ?? []) {
@@ -213,53 +255,77 @@ export function perplexityProvider(o: { key: string; base?: string }): Provider 
     }
     if (!text && typeof j?.output_text === "string") text = j.output_text;
     for (const m of text.matchAll(URLS)) urls.push(m[0]);
-    const cost = bill?.usd ?? 0;
-    if (!text.trim()) throw new SeatError("bad_output", "an empty answer", cost);
+    if (!text.trim()) throw fail("bad_output", "an empty answer");
     let answer: Answer | undefined;
-    if (input.brief) { const v = validateAnswer(text, true); if (!v.answer) throw new SeatError("bad_output", v.error!, cost); answer = v.answer; }
-    return { text, answer, urls: uniq(urls), served: served || input.model || `preset ${input.setting ?? ""}`.trim(), bill, tokens: { input: inT, output: outT }, searches };
+    if (input.brief) { const v = validateAnswer(text, true); if (!v.answer) throw fail("bad_output", v.error!); answer = v.answer; }
+    const level = String(j?.effort ?? j?.preset ?? input.setting ?? "");
+    return { text, answer, urls: uniq(urls), served: served || input.model || `level ${level}`.trim(), bill, tokens: { input: inT, output: outT }, searches, usage };
   };
-  return { ask };
+  // The check before any spend: one tiny call per level with the pinned model and no owner text, through the
+  // same tool path (web search, smallest context) when the configuration searches. The served model comes back.
+  const validate: ValidateFn = async (input) => {
+    const full = input as AskInput;
+    const body: any = { input: "Reply with the word ready.", max_output_tokens: input.maxOut ?? LIMITS.validateOut, max_steps: 1,
+      tools: input.search ? [{ type: "web_search", max_tokens: LIMITS.perplexityValidateSearchTokens }] : [] };
+    if (input.setting) body[PERPLEXITY_LEVEL_FIELD] = input.setting;
+    if (input.model) body.model = input.model;
+    const j = await send(full, body);
+    const served = typeof j?.model === "string" ? j.model : "";
+    const r = readBill(j, full, served || input.model);
+    return { bill: r.bill, served, usage: r.usage };
+  };
+  return { ask, validate };
 }
 
-// ---- Codex: codex exec in a fresh, empty folder, with nothing of Cain's ----
-// No repository, no /data path, no config.toml (so no MCP servers), web search off, a read-only sandbox,
-// an environment of PATH, CODEX_HOME (its sign-in), HOME (an empty folder) and LANG only, and the prompt as
-// its one argument. It must use no tool: any tool event in its stream fails the call.
+// ---- Codex: codex exec through the isolation wrapper (sandbox.ts), with nothing of Cain's ----
+// No repository, no /data path, no config.toml (so no MCP servers), web search off, the read-only permissions
+// profile, an exec policy forbidding every command, the shared daemon off, an isolated CODEX_HOME holding a
+// copy of only auth.json, and the prompt as its one argument. Under bubblewrap it also has no shell, no /data
+// and its own /proc. It must use no tool: any tool event in its stream fails the call. It runs only with the
+// mode the run's self-test proved (input.codexMode); without one it isn't started.
 export class CodexToolUse extends SeatError {
   constructor(tools: string[]) { super("refused", `Codex used a tool (${[...new Set(tools)].join(", ")}); its answer isn't kept`); }
 }
 export const CODEX_NO_MODEL = /(model|engine)[^\n]{0,60}(not (found|supported|available|exist)|does not exist|unknown|invalid|unsupported|isn't available|is not available|no access)|unknown model|unsupported model|invalid model/i;
-export function codexBase(o: { bin: string; work: string; out: string; schema?: string; model?: string }): string[] {
-  const cmd = [o.bin, "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--sandbox", "read-only", "-C", o.work, "-o", o.out, "--json",
-    "-c", 'web_search="disabled"', "-c", 'approval_policy="never"', "-c", `model_context_window=${LIMITS.codexContextWindow}`];
+// Every invocation: the shared daemon off (a root-level override, so it reaches every subcommand).
+export const CODEX_ROOT = ["-c", "features.daemon_auto_start=false"];
+export function codexArgs(o: { work: string; out: string; schema?: string; model?: string }): string[] {
+  const cmd = [...CODEX_ROOT, "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "-C", o.work, "-o", o.out, "--json",
+    "-c", 'web_search="disabled"', "-c", 'approval_policy="never"', "-c", 'default_permissions=":read-only"', "-c", `model_context_window=${LIMITS.codexContextWindow}`];
   if (o.schema) cmd.push("--output-schema", o.schema);
   if (o.model) cmd.push("-m", o.model);
   return cmd;
 }
-export function codexProvider(o: { home: string; bin?: string; scratch?: string; signedIn?: (home: string) => boolean }): CodexProvider {
+export function codexProvider(o: { home: string; bin?: string; bwrap?: string | null; scratch?: string; signedIn?: (home: string) => boolean }): CodexProvider {
   const bin = o.bin ?? "codex";
   const signedIn = o.signedIn ?? ((h: string) => existsSync(join(h, "auth.json")));
-  const env = (home: string) => ({ PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", CODEX_HOME: o.home, HOME: home, LANG: "C.UTF-8" });
-  const fresh = () => {
-    const tmp = mkdtempSync(join(o.scratch ?? tmpdir(), "codex-trial-"));
-    const work = join(tmp, "work"); mkdirSync(work);
-    const home = join(tmp, "home"); mkdirSync(home);
-    return { tmp, work, home };
+  const setup = (): SandboxSetup => ({ realHome: o.home, scratch: o.scratch });
+  const codexBin = () => which(bin);
+  const bwrapBin = () => (o.bwrap === null ? null : which(o.bwrap ?? "bwrap"));
+  const envFor = (mode: IsolationMode, d: Dirs, extra: Record<string, string> = {}): Record<string, string> => mode === "bwrap"
+    ? { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", ...extra }
+    : { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", CODEX_HOME: d.codexHome, HOME: d.home, LANG: "C.UTF-8", ...extra };
+  const launch = (mode: IsolationMode, d: Dirs, args: string[]) => {
+    const cb = codexBin();
+    if (!cb) throw new SeatError("unconfigured", "the Codex binary isn't installed");
+    const bw = bwrapBin();
+    if (mode === "bwrap" && !bw) throw new SeatError("refused", "bubblewrap isn't installed");
+    return wrap(mode, { ...d, bwrap: bw ?? "bwrap", codexBin: cb }, mode === "rules" ? args : args);
   };
   const ask: AskFn = async (input) => {
+    if (!input.codexMode) throw new SeatError("refused", "Codex isn't isolated this run (its self-test didn't pass), so it isn't started");
     if (!signedIn(o.home)) throw new SeatError("unconfigured", "Codex isn't signed in to ChatGPT yet");
-    const { tmp, work, home } = fresh();
+    const d = freshDirs(setup());
     try {
-      const out = join(tmp, "answer.txt");
+      const out = join(d.io, "answer.txt");
       const schemaObj = input.brief ? ANSWER_SCHEMA : input.schema;
       let schema: string | undefined;
-      if (schemaObj) { schema = join(tmp, "schema.json"); writeFileSync(schema, JSON.stringify(schemaObj)); }
-      // A review is sent with the review prompt, but with no search: Codex runs with no network here.
+      if (schemaObj) { schema = join(d.io, "schema.json"); writeFileSync(schema, JSON.stringify(schemaObj)); }
+      // A review is sent with the review prompt, but with no search: Codex runs with no tools here.
       const p = input.brief ? reviewPrompt({ ...input.brief, needs_facts: false }, "reviewer") : { system: input.system ?? "", user: input.user ?? "" };
-      const cmd = [...codexBase({ bin, work, out, schema, model: input.model || undefined }), `${p.system}\nUse no tools and run no commands: everything you need is below.\n\n${p.user}`];
+      const args = [...codexArgs({ work: d.work, out, schema, model: input.model || undefined }), `${p.system}\nUse no tools and run no commands: everything you need is below.\n\n${p.user}`];
       let r;
-      try { r = await input.wire.exec(cmd, { env: env(home), signal: input.signal }); }
+      try { r = await input.wire.exec(launch(input.codexMode, d, args), { env: envFor(input.codexMode, d), signal: input.signal, handed: schema ? [schema] : [] } as any); }
       catch (e) { if (e instanceof SeatError) throw e; throw new SeatError(input.signal.aborted ? "timeout" : "transient", `Codex didn't run: ${(e as Error).message.slice(0, 120)}`); }
       if (input.signal.aborted) throw new SeatError("timeout", "no answer before the deadline");
       let served = "", usage = { input: 0, output: 0 }, problem = "";
@@ -283,25 +349,51 @@ export function codexProvider(o: { home: string; bin?: string; scratch?: string;
       let answer: Answer | undefined; let json: any;
       if (input.brief) { const v = validateAnswer(text); if (!v.answer) throw new SeatError("bad_output", v.error!); answer = v.answer; }
       else if (input.schema) { json = lastJson(text); if (!json) throw new SeatError("bad_output", "Codex's answer was not JSON"); }
-      // The ChatGPT plan: no dollars, one run.
-      return { text, json, answer, urls: [], served: served || input.model || "Codex default model", bill: { usd: 0, how: "billed" }, tokens: usage, searches: 0 };
-    } finally { rmSync(tmp, { recursive: true, force: true }); }
+      // The ChatGPT plan: no bill at all. It counts as one call against the seat's call allowance, never as dollars.
+      return { text, json, answer, urls: [], served: served || input.model || "Codex default model", bill: { usd: 0, how: "plan call" }, tokens: usage, searches: 0 };
+    } finally { d.done(); }
   };
-  const version = async (wire: Wire, signal: AbortSignal) => {
-    const { tmp, home } = fresh();
-    try { const r = await wire.exec([bin, "--version"], { env: env(home), signal }); return r.code === 0 ? (r.stdout.trim().split("\n")[0] ?? "").slice(0, 80) || null : null; }
-    catch { return null; } finally { rmSync(tmp, { recursive: true, force: true }); }
+  // The sandbox self-test (sandbox.ts): bubblewrap first when installed, then Codex's own rules.
+  const isolation = async (wire: Wire, signal: AbortSignal): Promise<Isolation> => {
+    const at = new Date().toISOString();
+    if (!signedIn(o.home)) return { ok: false, mode: "none", detail: "Codex isn't signed in to ChatGPT yet", at };
+    if (!codexBin()) return { ok: false, mode: "none", detail: "the Codex binary isn't installed", at };
+    const modes: IsolationMode[] = bwrapBin() ? ["bwrap", "rules"] : ["rules"];
+    const why: string[] = [];
+    for (const mode of modes) {
+      const d = freshDirs(setup());
+      try {
+        const letters = (n: number) => [...randomBytes(n)].map((b) => "abcdefghijklmnop"[b % 16]).join("");
+        const k1 = `trialcanary${letters(12)}`, k2 = `trialcanary${letters(12)}`;
+        const key = join(d.tmp, "planted-key.txt");
+        writeFileSync(key, k1, { mode: 0o644 });
+        const out = join(d.io, "answer.txt");
+        const args = [...codexArgs({ work: d.work, out }), selfTestPrompt(key, process.pid)];
+        const r = await wire.exec(launch(mode, d, args), { env: envFor(mode, d, { TRIAL_CANARY: k2 }), signal, handed: [] } as any);
+        const answer = existsSync(out) ? readFileSync(out, "utf8") : "";
+        const j = judgeSelfTest({ ...r, answer }, [k1, k2, "REVIEW_", "SUPERVISOR_TOKEN", "TRIALS_BUDGET"]);
+        if (j.ok) return { ok: true, mode, detail: j.detail, at };
+        why.push(`${mode}: ${j.detail}`);
+      } catch (e) { why.push(`${mode}: ${(e as Error).message.slice(0, 160)}`); }
+      finally { d.done(); }
+    }
+    return { ok: false, mode: "none", detail: why.join("; "), at };
+  };
+  const tool = async (wire: Wire, signal: AbortSignal, mode: IsolationMode, sub: string[]) => {
+    const d = freshDirs(setup());
+    try { const env = envFor(mode, d); return await wire.exec(launch(mode, d, [...CODEX_ROOT, ...sub]), { env, signal, handed: [] } as any); }
+    finally { d.done(); }
+  };
+  const version = async (wire: Wire, signal: AbortSignal, mode: IsolationMode = "rules") => {
+    try { const r = await tool(wire, signal, mode, ["--version"]); return r.code === 0 ? (r.stdout.trim().split("\n")[0] ?? "").slice(0, 80) || null : null; }
+    catch { return null; }
   };
   // Best effort: the catalog `codex debug models` prints, or null when it can't be read.
-  const models = async (wire: Wire, signal: AbortSignal) => {
-    const { tmp, home } = fresh();
-    try {
-      const r = await wire.exec([bin, "debug", "models"], { env: env(home), signal });
-      if (r.code !== 0) return null;
-      return modelsFromCatalog(JSON.parse(r.stdout));
-    } catch { return null; } finally { rmSync(tmp, { recursive: true, force: true }); }
+  const models = async (wire: Wire, signal: AbortSignal, mode: IsolationMode = "rules") => {
+    try { const r = await tool(wire, signal, mode, ["debug", "models"]); if (r.code !== 0) return null; return modelsFromCatalog(JSON.parse(r.stdout)); }
+    catch { return null; }
   };
-  return { ask, version, models };
+  return { ask, version, models, isolation };
 }
 // Model names from the catalog's JSON, whatever its nesting: every slug, id or model field, and the keys of
 // a models map.

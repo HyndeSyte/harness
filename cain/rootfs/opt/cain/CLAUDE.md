@@ -743,18 +743,22 @@ Which models suit which of his tasks, tested on real tasks under one hard budget
 trials_budget_usd, his alone to raise). `/opt/cain/trial.sh plan <suite>` lists every call, its limits and
 its worst-case cost and makes none; `run <suite>` starts it, or resumes a stopped run without paying twice;
 `status`, `result <suite>` and `report <suite>` read back. Real reviews always go first. Suites:
-`review-seats` (tasks from the record's past reviews) and `research` (your 30 questions in the record at
-projects/harness/trials/research-questions.json: 15 facts, 15 listing or product searches, at least 3 with
-no reliable answer marked `no_reliable_answer`, each with `sent_text` (the question for a stranger, the only
-part that leaves), `as_of`, `must_contain` and dated `sources`). The research suite runs only once he has
-approved those questions and notes: show him them, and on his word file
-projects/harness/trials/research-approved.json with `questions_sha256` (of that exact file),
-`approved_by: "owner"`, `approved_on` and, only if he says so, `perplexity_third_party_routing: true`
-(otherwise Perplexity stays on its own model). A stop for the budget or a seat's cap is told to you: a
-budget stop needs his word to go on, so ask him once with the spend so far. A trials alarm (a provider's
-search queries matched a private term, or a call cost more than its ceiling) stops the run: read it and
-fix the cause before resuming. When a run ends, file its report under projects/harness/trials/ through the
-record keeper. Switching any production model is a separate change, on his word, after the reports.
+`review-seats` (tasks from the record's past reviews, sent with no search or fetch) and `research` (your 30
+questions in the record at projects/harness/trials/research-questions.json: 15 facts, 15 listing or product
+searches, at least 3 with no reliable answer marked `no_reliable_answer`, each with `sent_text` (the question
+for a stranger, the only part that leaves), `as_of`, `must_contain` and dated `sources`). The research suite
+runs only once he has approved those questions, their notes and the rubric in the App's options: show him the
+questions and notes, and give him the three values `trial.sh plan research` prints, to enter on the App's
+Configuration tab himself (trials_research_questions_sha256, trials_research_notes_sha256,
+trials_research_rubric_sha256, and trials_perplexity_third_party_routing only if he wants Perplexity to use
+another lab's model). Nothing you write counts as his approval, and you can't enter it for him. Codex takes
+part only when its sandbox check passes at the start of a run; "not isolated" in the report means it was
+left out, nothing to fix by you. A stop for the budget or a seat's cap is told to you: a budget stop needs
+his word to go on, so ask him once with the spend so far. A trials alarm (a provider's search queries
+matched a private term, or a call cost more than its ceiling) or a stop because Perplexity answered with
+another model stops the run: read it and fix the cause before resuming. When a run ends, file its report
+under projects/harness/trials/ through the record keeper. Switching any production model is a separate
+change, on his word, after the reports.
 
 ## Cloud jobs (building, without his laptop)
 Build work on the Apps (HyndeSyte/harness) runs as a cloud session you start, never

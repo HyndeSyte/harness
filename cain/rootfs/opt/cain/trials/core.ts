@@ -4,14 +4,15 @@
 // runner.ts drives them, report.ts and cli.ts (trial.sh) read it back.
 //
 // A suite is a set of tasks and a set of configurations (a seat, a model, a setting). Each task is run under
-// each configuration (an output call), then two graders from different families read every output of that
-// task under random labels (a grading call each), blind to which configuration wrote what. No grader reads
-// an output served by its own family.
+// each configuration (an output call), then graders read every output of that task under random labels (a
+// grading call each), blind to which configuration wrote what: three graders, one per family, and each output
+// read by the two from outside its own family the run can use (its panel).
 //
-// The spend stop: every request carries hard ceilings (its output cap, which covers thinking; its tool uses;
-// its steps), and a call's worst case is steps x (its context ceiling at the input price + its output cap at
+// The spend stop: every request carries hard ceilings (its output cap, and a thinking allowance where the cap
+// isn't documented to cover thinking; its tool uses; its steps), and a call's worst case is steps x (its context ceiling at the input price + its output cap at
 // the output price) + its most tool fees, at the dearest list price the model has. That worst case is
 // reserved on disk before the call is sent; a configuration that can't be given a ceiling isn't run.
+import { createHash } from "node:crypto";
 import { CLAUDE_SEARCH_USD, PERPLEXITY_SEARCH_USD, type Answer, type Outbound } from "../review/core.ts";
 
 export const SUITES = ["review-seats", "research"] as const;
@@ -35,7 +36,33 @@ export const TRIAL_PRICES: Record<string, Price[]> = {
   "perplexity/sonar": [{ in: 0.25, out: 2.5 }],
 };
 export const UNKNOWN_PRICE: Price = { in: 10, out: 50 };   // an unlisted model is priced high, never as free
-export const GROUNDING_USD = 0.014;                       // Google Search grounding: $14 per 1,000 requests past the free share
+// Google Search grounding on Gemini 3 and newer: $14 per 1,000 search queries the model runs (two queries in one
+// prompt count as two), past a free monthly share that the trials don't count on.
+export const GROUNDING_USD = 0.014;
+// Perplexity's priority tier is 2x the token rates; the fast level is priced at it, as the job asks.
+export const PERPLEXITY_PRIORITY = 2;
+export function perplexityPrice(model: string, setting?: string): Price {
+  const p = ceilingPrice(model || "unpinned-preset");
+  return setting === "fast" ? { in: p.in * PERPLEXITY_PRIORITY, out: p.out * PERPLEXITY_PRIORITY } : p;
+}
+
+// ---- Gemini: the thinking field each model takes, and whether maxOutputTokens covers thinking ----
+// From the Gemini API docs (thinking and model pages), as far as they could be read on Nov 22, 2026: Gemini 4
+// Argon takes thinkingLevel (low, medium, high; thinking can't be turned off), and thinkingBudget is deprecated
+// on Gemini 4 (sent together with thinkingLevel it is a 400); its maxOutputTokens counts thought tokens. Gemini
+// 3.8 Flash takes thinkingLevel (low, medium, high; minimal is an error). Neon, Carbon and Hydrogen weren't in
+// the docs that could be read: they get thinkingLevel low like the rest of the family, and a refusal skips them
+// at the check before any spend. Where the docs don't confirm that maxOutputTokens covers thinking, the worst
+// case adds the thinking allowance at the output price.
+export type GeminiModel = { thinking: { level: "low" | "medium" | "high" } | { budget: number }; outCoversThinking: boolean; confirmed: boolean };
+export const GEMINI_MODELS: Record<string, GeminiModel> = {
+  "gemini-4-argon": { thinking: { level: "low" }, outCoversThinking: true, confirmed: true },
+  "gemini-3.8-flash": { thinking: { level: "low" }, outCoversThinking: false, confirmed: true },
+  "gemini-4-neon": { thinking: { level: "low" }, outCoversThinking: false, confirmed: false },
+  "gemini-4-carbon": { thinking: { level: "low" }, outCoversThinking: false, confirmed: false },
+  "gemini-4-hydrogen": { thinking: { level: "low" }, outCoversThinking: false, confirmed: false },
+};
+export const geminiModel = (model: string): GeminiModel => GEMINI_MODELS[model] ?? { thinking: { level: "low" }, outCoversThinking: false, confirmed: false };
 export function datedPrice(model: string, day: string): Price | null {
   const list = TRIAL_PRICES[model];
   if (!list) return null;
@@ -59,22 +86,22 @@ export function estimateUsd(model: string, day: string, inT: number, outT: numbe
 export type TrialSeat = "gemini" | "codex" | "perplexity" | "claude" | "original";
 export type Config = {
   id: string; seat: TrialSeat; model: string;   // model "" for Codex's default and Perplexity's unpinned presets
-  setting?: string;                                // Perplexity Agent API preset (fast, low, medium)
+  setting?: string;                                // Perplexity Agent API effort level (fast, low, medium)
   search: "brief" | "always" | "never";            // brief: only when the review brief needs current facts
   optional?: boolean;                              // run only if the installed tool offers that model
   defaultModel?: boolean;                          // today's default for its seat: not served means no run at all
   note?: string;
 };
 export const REVIEW_CONFIGS: Config[] = [
-  { id: "gemini:gemini-4-argon", seat: "gemini", model: "gemini-4-argon", search: "brief", note: "the review service's model for consequential reviews" },
-  { id: "gemini:gemini-4-neon", seat: "gemini", model: "gemini-4-neon", search: "brief", optional: true },
-  { id: "gemini:gemini-4-carbon", seat: "gemini", model: "gemini-4-carbon", search: "brief", optional: true, note: "Google lists it as its strongest reasoning model" },
-  { id: "gemini:gemini-4-hydrogen", seat: "gemini", model: "gemini-4-hydrogen", search: "brief", optional: true },
-  { id: "gemini:gemini-3.8-flash", seat: "gemini", model: "gemini-3.8-flash", search: "brief", defaultModel: true, note: "today's default" },
+  { id: "gemini:gemini-4-argon", seat: "gemini", model: "gemini-4-argon", search: "never", note: "the review service's model for consequential reviews" },
+  { id: "gemini:gemini-4-neon", seat: "gemini", model: "gemini-4-neon", search: "never", optional: true },
+  { id: "gemini:gemini-4-carbon", seat: "gemini", model: "gemini-4-carbon", search: "never", optional: true, note: "Google lists it as its strongest reasoning model" },
+  { id: "gemini:gemini-4-hydrogen", seat: "gemini", model: "gemini-4-hydrogen", search: "never", optional: true },
+  { id: "gemini:gemini-3.8-flash", seat: "gemini", model: "gemini-3.8-flash", search: "never", defaultModel: true, note: "today's default" },
   { id: "codex:default", seat: "codex", model: "", search: "never", note: "Codex's default model" },
   { id: "codex:gpt-6.2-sol", seat: "codex", model: "gpt-6.2-sol", search: "never", optional: true },
   { id: "codex:gpt-6.2-astra", seat: "codex", model: "gpt-6.2-astra", search: "never", optional: true },
-  { id: "perplexity:sonar", seat: "perplexity", model: "perplexity/sonar", search: "always", note: "as today, pinned to Perplexity's own model" },
+  { id: "perplexity:sonar", seat: "perplexity", model: "perplexity/sonar", search: "never", note: "pinned to Perplexity's own model, with no search: this suite is built from the record" },
 ];
 export const RESEARCH_CONFIGS: Config[] = [
   { id: "claude:claude-opus-5-5+search", seat: "claude", model: "claude-opus-5-5", search: "always", note: "the agent's way today" },
@@ -84,16 +111,32 @@ export const RESEARCH_CONFIGS: Config[] = [
   { id: "gemini:gemini-4-hydrogen+search", seat: "gemini", model: "gemini-4-hydrogen", search: "always", optional: true },
   { id: "gemini:gemini-3.8-flash+search", seat: "gemini", model: "gemini-3.8-flash", search: "always", defaultModel: true },
 ];
+// A row's label: a pinned Perplexity level is "<model> at effort <level>", so it isn't taken for the preset.
+export function configLabel(c: Pick<Config, "id" | "seat" | "model" | "setting">, pinnedModel?: string): string {
+  if (c.seat === "perplexity" && c.setting) { const m = c.model || pinnedModel; return m ? `${m} at effort ${c.setting}` : `perplexity effort ${c.setting} (unpinned)`; }
+  return c.id;
+}
 export const configsFor = (s: SuiteName): Config[] => (s === "review-seats" ? REVIEW_CONFIGS : RESEARCH_CONFIGS);
 export const configById = (suite: SuiteName, id: string) => configsFor(suite).find((c) => c.id === id);
 // Perplexity's own stack, when the owner hasn't approved routing to a third-party model.
 export const PERPLEXITY_OWN_MODEL = "perplexity/sonar";
 
-export type Grader = { id: "claude" | "codex"; family: Family; model: string };
+// Provider-managed search, fetch and grounding are on only for suites whose every outbound field is the checked
+// research text. A suite built from the record (review-seats) sends briefs, notes and diffs: no tools at all.
+export const SUITE_TOOLS: Record<SuiteName, boolean> = { "review-seats": false, research: true };
+
+// Three graders, one per family, so every candidate gets two graders from outside its own family: its panel
+// is the first two available graders, in this order, whose family isn't the candidate's.
+export type GraderId = "claude" | "codex" | "gemini";
+export type Grader = { id: GraderId; family: Family; model: string };
 export const GRADERS: Grader[] = [
   { id: "claude", family: "anthropic", model: "claude-opus-5-5" },
   { id: "codex", family: "openai", model: "" },
+  { id: "gemini", family: "google", model: "gemini-4-argon" },
 ];
+export function panelFor(family: Family, available: GraderId[]): GraderId[] {
+  return GRADERS.filter((g) => available.includes(g.id) && g.family !== family).slice(0, 2).map((g) => g.id);
+}
 
 // The family that really served an output, from the model the provider says answered. Perplexity's levels
 // may route to another lab's model: such an output is that lab's.
@@ -198,13 +241,22 @@ export function checkQuestions(j: any): { tasks?: ResearchTask[]; error?: string
   if (tasks.filter((t) => t.no_reliable_answer).length < 3) return { error: "at least 3 questions must be marked no_reliable_answer" };
   return { tasks };
 }
+// The research approval's three hashes (App options, set by the owner in Home Assistant): the questions file as
+// it is, the answer notes (what a right answer must contain, its dated sources, and whether there is no
+// reliable answer, per question, in a fixed form), and the rubric (the outcomes, their points and the grade
+// schema).
+const sha256 = (t: string) => createHash("sha256").update(t).digest("hex");
+export function notesSha(tasks: ResearchTask[]): string {
+  return sha256(JSON.stringify(tasks.map((t) => [t.id, t.must_contain, t.sources.map((s) => [s.url, s.read_on]), t.no_reliable_answer])));
+}
+export function rubricSha(): string { return sha256(JSON.stringify({ outcomes: OUTCOMES, points: POINTS, schema: RESEARCH_GRADE_SCHEMA })); }
 // What of a research question may leave for an answering model: its sent text and its date, nothing else.
 export const researchSentText = (t: ResearchTask) => `As of ${t.as_of}: ${t.sent_text}`;
 
 // ---- Calls ----
 export type CallSpec =
   | { id: string; kind: "output"; task: string; config: string }
-  | { id: string; kind: "grade"; task: string; grader: Grader["id"] };
+  | { id: string; kind: "grade"; task: string; grader: GraderId };
 export const outputId = (task: string, config: string) => `out|${task}|${config}`;
 export const gradeId = (task: string, grader: string) => `grade|${task}|${grader}`;
 // One task at a time, as one unit: its outputs, then its two grading calls; both graders' worst case is
@@ -218,6 +270,19 @@ export function callsFor(suite: Suite): CallSpec[] {
   return out;
 }
 
+// ---- Quota headroom: each seat's trial allowance per window ----
+// The trials' own conservative reading of each seat's limits, with a share kept as headroom for real reviews:
+// a seat's trials wait for its window once the allowance is used, before any 429. Codex (the ChatGPT plan) is
+// counted only in calls, never in dollars.
+export type SeatLimit = { windowMin: number; seatCalls: number; headroomPct: number };
+export const SEAT_LIMITS: Record<ReviewSeatName, SeatLimit> = {
+  openai: { windowMin: 300, seatCalls: 40, headroomPct: 50 },
+  claude: { windowMin: 60, seatCalls: 50, headroomPct: 50 },
+  gemini: { windowMin: 60, seatCalls: 60, headroomPct: 50 },
+  perplexity: { windowMin: 60, seatCalls: 50, headroomPct: 50 },
+};
+export const trialAllowance = (l: SeatLimit) => Math.max(1, Math.floor(l.seatCalls * (1 - l.headroomPct / 100)));
+
 // ---- Hard ceilings, per request ----
 // Each is sent with the request (or is how the request is built), so the provider stops there. The context
 // allowances (what one search, or one grounding, may add to a step's input) are the one part no provider
@@ -226,15 +291,19 @@ export const LIMITS = {
   // Claude: max_tokens covers thinking; web search and fetch by max_uses; no continuation of a paused turn.
   claudeAnswerOut: 6_000, claudeAnswerSearches: 3,
   claudeGradeOut: 16_000, claudeResearchGradeOut: 12_000, claudeGradeFetches: 3, claudeFetchTokens: 4_000,
-  // Gemini: maxOutputTokens plus an explicit thinking budget, each counted at the output price.
-  geminiReviewOut: 8_192, geminiResearchOut: 6_000, geminiThinking: 4_096,
-  // Perplexity Agent API: max_steps, max_output_tokens, web_search max_tokens; no fetch_url tool.
-  perplexitySteps: 3, perplexityOut: 4_000, perplexitySearchTokens: 8_000, perplexityCallsPerStep: 3,
+  // Gemini: maxOutputTokens, and the model's own thinking field (GEMINI_MODELS); where the docs don't confirm
+  // maxOutputTokens covers thinking, the thinking allowance is added at the output price.
+  geminiReviewOut: 16_384, geminiResearchOut: 12_288, geminiGradeOut: 24_576, geminiThinkingAllowance: 16_384, geminiGroundingQueries: 6,
+  // Perplexity Agent API: max_steps, max_output_tokens, web_search max_tokens (the total search context one call
+  // adds); no fetch_url tool.
+  perplexitySteps: 3, perplexityOut: 4_000, perplexitySearchTokens: 8_000, perplexityCallsPerStep: 3, perplexityValidateSearchTokens: 1_000,
   // Codex: one turn (codex exec), no tools, on the ChatGPT plan ($0), counted as one run.
   codexContextWindow: 200_000,
   validateOut: 16,
 };
-const SEARCH_RESULT_TOKENS = 20_000;      // what one Claude search may add to a step's input, at most (allowance)
+// What one Claude search may add to a step's input. Anthropic documents no ceiling on search result content
+// (Nov 22, 2026), so this is the trials' own allowance, not a provider bound; the overrun margin covers a miss.
+export const SEARCH_RESULT_TOKENS = 20_000;
 const GROUNDING_TOKENS = 20_000;          // what Google Search grounding may add to a call's input (allowance)
 const PERPLEXITY_OVERHEAD_TOKENS = 4_000; // the agent's own instructions and tool schemas (allowance)
 export const CANDIDATE_CHARS = { review: 16_000, research: 12_000 };
@@ -251,6 +320,7 @@ export type ReviewSeatName = "openai" | "gemini" | "perplexity" | "claude";
 export type CallShape = {
   seat: TrialSeat; reviewSeat: ReviewSeatName | null; model: string; setting?: string;
   search: boolean; fetch: boolean; maxOut: number; thinking?: number; maxSearches: number; maxFetches: number; maxSteps: number;
+  // thinking (Gemini): the allowance added to the output ceiling, 0 where maxOutputTokens covers thinking.
   timeoutS: number; label: string;
 };
 export function ceilingOf(shape: CallShape, inputChars: number): Ceiling | null {
@@ -264,15 +334,16 @@ export function ceilingOf(shape: CallShape, inputChars: number): Ceiling | null 
         maxOut: shape.maxOut, toolFeesUsd: shape.maxSearches * CLAUDE_SEARCH_USD, price: ceilingPrice(shape.model), runs: 0 };
     }
     case "gemini":
-      if (shape.thinking === undefined) return null;   // no thinking budget: no ceiling, so not run
+      if (shape.thinking === undefined) return null;   // no thinking ceiling known: no ceiling, so not run
       return { steps: 1, contextTokens: inT + (shape.search ? GROUNDING_TOKENS : 0), maxOut: shape.maxOut + shape.thinking,
-        toolFeesUsd: shape.search ? GROUNDING_USD : 0, price: ceilingPrice(shape.model), runs: 0 };
+        toolFeesUsd: shape.search ? LIMITS.geminiGroundingQueries * GROUNDING_USD : 0, price: ceilingPrice(shape.model), runs: 0 };
     case "perplexity": {
       if (!shape.maxSteps) return null;
-      const searchTokens = shape.search ? shape.maxSteps * LIMITS.perplexitySearchTokens : 0;
+      // Each search call adds at most the tool's max_tokens of context; every step may make its calls.
+      const searchTokens = shape.search ? shape.maxSteps * LIMITS.perplexityCallsPerStep * LIMITS.perplexitySearchTokens : 0;
       return { steps: shape.maxSteps, contextTokens: inT + PERPLEXITY_OVERHEAD_TOKENS + searchTokens, maxOut: shape.maxOut,
         toolFeesUsd: shape.search ? shape.maxSteps * LIMITS.perplexityCallsPerStep * PERPLEXITY_SEARCH_USD : 0,
-        price: ceilingPrice(shape.model || "unpinned-preset"), runs: 0 };
+        price: perplexityPrice(shape.model, shape.setting), runs: 0 };
     }
   }
 }
@@ -287,25 +358,37 @@ export function callShape(suite: SuiteName, spec: CallSpec, task: Task, perplexi
     const g = GRADERS.find((x) => x.id === spec.grader)!;
     const research = suite === "research";
     if (g.id === "codex") return { ...base, seat: "codex", reviewSeat: "openai", model: "", maxOut: 0, timeoutS: 900, label: "grader OpenAI (Codex, default model, no tools)" };
+    if (g.id === "gemini") return { ...base, seat: "gemini", reviewSeat: "gemini", model: g.model, maxOut: LIMITS.geminiGradeOut, thinking: thinkingAllowance(g.model),
+      timeoutS: 600, label: `grader Google (${g.model}, no tools)` };
     return { ...base, seat: "claude", reviewSeat: "claude", model: g.model, fetch: research, maxFetches: research ? LIMITS.claudeGradeFetches : 0,
       maxOut: research ? LIMITS.claudeResearchGradeOut : LIMITS.claudeGradeOut, timeoutS: 600, label: `grader Claude (${g.model})` };
   }
   const c = configById(suite, spec.config)!;
   const needsFacts = task.kind === "review" ? task.brief.needs_facts : true;
-  const search = c.search === "always" || (c.search === "brief" && needsFacts);
+  const search = SUITE_TOOLS[suite] && (c.search === "always" || (c.search === "brief" && needsFacts));
   const reviewSeat: ReviewSeatName | null = c.seat === "codex" ? "openai" : c.seat === "original" ? null : c.seat;
   const timeoutS = c.seat === "codex" ? 600 : c.seat === "claude" ? 420 : c.seat === "gemini" ? 240 : 300;
   const label = c.id;
   switch (c.seat) {
     case "codex": return { ...base, seat: "codex", reviewSeat, model: c.model, maxOut: 0, timeoutS, label };
     case "claude": return { ...base, seat: "claude", reviewSeat, model: c.model, search, maxSearches: search ? LIMITS.claudeAnswerSearches : 0, maxOut: LIMITS.claudeAnswerOut, timeoutS, label };
-    case "gemini": return { ...base, seat: "gemini", reviewSeat, model: c.model, search, maxOut: suite === "review-seats" ? LIMITS.geminiReviewOut : LIMITS.geminiResearchOut, thinking: LIMITS.geminiThinking, timeoutS, label };
+    case "gemini": return { ...base, seat: "gemini", reviewSeat, model: c.model, search, maxOut: suite === "review-seats" ? LIMITS.geminiReviewOut : LIMITS.geminiResearchOut, thinking: thinkingAllowance(c.model), timeoutS, label };
     case "perplexity": {
       const model = c.model || (perplexityPinned ? PERPLEXITY_OWN_MODEL : "");
       return { ...base, seat: "perplexity", reviewSeat, model, setting: c.setting, search, maxSteps: LIMITS.perplexitySteps, maxOut: LIMITS.perplexityOut, timeoutS, label };
     }
     default: return { ...base, seat: "original", reviewSeat: null, model: c.model, maxOut: 0, timeoutS, label };
   }
+}
+export const thinkingAllowance = (model: string) => (geminiModel(model).outCoversThinking ? 0 : LIMITS.geminiThinkingAllowance);
+// Why a call breaks the tools rule, or null: tools only on checked research text; the grader's fetch only on
+// research, only to cited domains.
+export function toolViolation(suite: SuiteName, spec: CallSpec, shape: CallShape): string | null {
+  if (spec.kind === "output" && !SUITE_TOOLS[suite] && (shape.search || shape.fetch))
+    return `provider tools (search, fetch or grounding) are off for ${suite}: it is built from the record, not from checked research text`;
+  if (spec.kind === "grade" && (shape.search || (shape.fetch && suite !== "research")))
+    return "a grader may fetch only cited pages, and only in the research suite";
+  return null;
 }
 export function taskChars(t: Task): number {
   return t.kind === "review" ? t.brief.topic.length + t.brief.question.length + t.brief.body.length + 3_000 : researchSentText(t).length + 1_000;
@@ -568,9 +651,9 @@ export type PlanLine = { call: string; task: string; who: string; seat: TrialSea
 export function limitsText(s: CallShape): string {
   switch (s.seat) {
     case "claude": return `max_tokens ${s.maxOut} (thinking included)${s.maxSearches ? `, web_search max_uses ${s.maxSearches}` : ""}${s.maxFetches ? `, web_fetch max_uses ${s.maxFetches}` : ""}`;
-    case "gemini": return `maxOutputTokens ${s.maxOut}, thinkingBudget ${s.thinking}${s.search ? ", one grounded request" : ""}`;
-    case "perplexity": return `max_steps ${s.maxSteps}, max_output_tokens ${s.maxOut}${s.search ? `, web_search max_tokens ${LIMITS.perplexitySearchTokens}` : ""}, no fetch_url`;
-    case "codex": return "one turn, read-only sandbox, no tools or network, one run of the plan";
+    case "gemini": { const g = geminiModel(s.model); return `maxOutputTokens ${s.maxOut}, ${"level" in g.thinking ? `thinkingLevel ${g.thinking.level}` : `thinkingBudget ${g.thinking.budget}`}${s.thinking ? ` (+${s.thinking} thinking allowance)` : " (thinking included)"}${s.search ? `, grounding (up to ${LIMITS.geminiGroundingQueries} queries allowed for)` : ""}`; }
+    case "perplexity": return `max_steps ${s.maxSteps}, max_output_tokens ${s.maxOut}${s.setting ? `, effort ${s.setting}${s.setting === "fast" ? " (priority rate)" : ""}` : ""}${s.search ? `, web_search max_tokens ${LIMITS.perplexitySearchTokens}` : ", no tools"}, no fetch_url`;
+    case "codex": return "one turn, isolated (its run's sandbox self-test), no tools, one call of the plan's allowance";
     default: return "-";
   }
 }
@@ -585,10 +668,16 @@ export function planOf(suite: Suite, perplexityPinned = true): { lines: PlanLine
     const c = spec.kind === "output" ? configById(suite.name, spec.config) : undefined;
     const w = worstOf(s, chars);
     if (w === null) refused.push(spec.id);
-    lines.push({ call: spec.id, task: t.id, who: spec.kind === "grade" ? s.label : spec.config, seat: s.seat, model: s.model || (s.seat === "codex" ? "default" : "unpinned"),
+    lines.push({ call: spec.id, task: t.id, who: spec.kind === "grade" ? s.label : c ? configLabel(c, s.model) : spec.config, seat: s.seat, model: s.model || (s.seat === "codex" ? "default" : "unpinned"),
       setting: s.setting ?? "", search: s.search, limits: limitsText(s), worst_usd: w,
       ...(c?.optional ? { note: "only if the provider serves it" } : w === null ? { note: "no hard ceiling: refused" } : {}) });
   }
   for (const t of suite.tasks) if (t.kind === "review") originals += t.originals.length;
   return { lines, total: lines.reduce((a, l) => a + (l.worst_usd ?? 0), 0), originals, refused };
+}
+// The fixed overrun margin: at least the largest single call's worst case in the suite, and never below the
+// floor, so one call overshooting by its whole worst case still stays under the budget.
+export const MARGIN_FLOOR_USD = 0.5;
+export function marginOf(suite: Suite, perplexityPinned = true): number {
+  return Math.max(MARGIN_FLOOR_USD, ...planOf(suite, perplexityPinned).lines.map((l) => l.worst_usd ?? 0));
 }

@@ -87,7 +87,7 @@ if (import.meta.main) {
   const schemaField = env.GEMINI_SCHEMA_FIELD === "responseJsonSchema" ? "responseJsonSchema" as const : "responseFormat" as const;
   const budgetUsd = (() => { const n = Number(env.TRIALS_BUDGET_USD); return env.TRIALS_BUDGET_USD && Number.isFinite(n) && n >= 0 ? n : DEFAULT_BUDGET_USD; })();
   // Every trial call goes out through its own wire (../trials/guard.ts), which checks the final request
-  // against the private terms; Codex runs in a fresh empty folder with no config, tools or network.
+  // against the private terms; Codex runs only after its sandbox self-test passed (../trials/sandbox.ts).
   const trials = new TrialRunner({ dir: env.TRIALS_DIR ?? "/data/trials", inboxDir: env.TRIALS_INBOX ?? "/data/trials-inbox",
     recordDir: env.RECORD_DIR ?? "/data/record", budgetUsd }, {
     review: runner,
@@ -98,8 +98,11 @@ if (import.meta.main) {
       codex: codexProvider({ home: codexHome, signedIn: codexSignedIn }),
     },
   });
-  // The budget it really uses, for trial.sh (run as Cain, who can't read the App's options).
-  try { writeAtomic(`${trials.cfg.dir}/settings.json`, JSON.stringify({ budget_usd: trials.budget, written_at: new Date().toISOString() }, null, 1)); }
+  // The budget it really uses, and what it found of the research approval in the App's options (Home Assistant
+  // restarts the App when they change), for trial.sh (run as Cain, who can't read the App's options).
+  const approval = trials.approval();
+  try { writeAtomic(`${trials.cfg.dir}/settings.json`, JSON.stringify({ budget_usd: trials.budget, research_approval: approval.ok ? { ok: true, third_party: approval.third_party }
+    : { ok: false, why: (approval as { why: string }).why }, written_at: new Date().toISOString() }, null, 1)); }
   catch (e) { log(`couldn't write the trials settings: ${(e as Error).message}`); }
   (async () => {
     while (true) {
