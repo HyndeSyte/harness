@@ -417,8 +417,9 @@ provider cap:
   runs.
 
 So the ledger stops a fixed 10 percent below the budget option (at $36 of the default $40), and a call billed
-above its reservation stops the run with an alarm. **The hard stop is yours, not this code's:** give the
-trials their own API keys with a prepaid balance or a workspace spend limit (a setup step, below).
+above its reservation stops the run with an alarm. **The hard stop is yours, not this code's:** the trials
+call with the API keys in this App's options (the review service's keys), so give those keys a prepaid
+balance or a workspace spend limit (a setup step, below).
 
 - Every request carries hard ceilings the provider enforces:
   - Claude: `max_tokens` (thinking included) and `max_uses` on web search; research answerers get web
@@ -777,8 +778,10 @@ Where the provider docs and the fourth round's list differ (the docs win):
 
 ### Your setup for the trials
 
-1. Give the trials their own API keys, each with a prepaid balance or a workspace spend limit at what you are
-   willing to lose (Anthropic, Google and Perplexity). That is the hard stop; the budget option is a soft one.
+1. The trials use the API keys in this App's options (Anthropic, Google and Perplexity, shared with the review
+   service). Give each a prepaid balance or a workspace spend limit at what you are willing to lose, for
+   reviews and trials together (a key made just for this App, in its own workspace, keeps that limit apart
+   from anything else). That is the hard stop; the budget option is a soft one.
 2. Set `trials_run_allowance_usd` on the Configuration tab: at least $4 for the preflight, plus what
    `trial.sh plan` says each run takes. Cain can't set it.
 

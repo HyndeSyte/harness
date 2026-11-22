@@ -681,8 +681,8 @@ export function planOf(suite: Suite, perplexityPinned = true): { lines: PlanLine
 // a margin derived from the same worst-case guesses it guards. It is a soft bound: Anthropic documents no size
 // cap on search results, Gemini's thinkingLevel is a level and not a token cap, and grounding has no cap on its
 // query count, so a call can pass its own reservation; the margin absorbs that, and a call that cost more than
-// its reservation stops the run with an alarm. The hard stop is the owner's own trial keys with a prepaid or
-// workspace limit (DOCS.md), not this code.
+// its reservation stops the run with an alarm. The hard stop is a prepaid balance or workspace limit on the
+// API keys in the App's options, which the trials share with reviews (DOCS.md), not this code.
 export const LEDGER_MARGIN_PCT = 10;
 export const ledgerMargin = (budgetUsd: number) => Number((Math.max(0, budgetUsd) * LEDGER_MARGIN_PCT / 100).toFixed(6));
 export const ledgerCap = (budgetUsd: number) => Number((Math.max(0, budgetUsd) - ledgerMargin(budgetUsd)).toFixed(6));

@@ -3,7 +3,7 @@
 ## 0.19.0
 
 - Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call, its limits and its most possible cost first, then the run, then a plain report.
-- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. It is a soft bound with a margin: the hard stop is giving the trials their own API keys with a prepaid balance or a spend limit (DOCS.md says how).
+- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. It is a soft bound with a margin: the hard stop is a prepaid balance or a spend limit on the API keys in this App's options, which the trials share with reviews (DOCS.md says how).
 - Each task's grading is set aside before its first call, so a task is never left half graded.
 - Before any spend, near-free checks catch a model or setting a provider won't take; a model not offered is skipped and the report says why.
 - Your private terms are checked on every request exactly as it is sent, and on the search queries a provider says it ran; a hit stops the run and Cain hears of it.
