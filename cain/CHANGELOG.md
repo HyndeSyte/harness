@@ -2,12 +2,15 @@
 
 ## 0.19.0
 
-- Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call and its cost first, then the run, then a plain report.
-- A hard spend stop: one budget for every trial and its grading, the new option `trials_budget_usd` (default $40). A call that could pass it isn't made, the trial stops and says why. Only you raise it.
-- Trials never use the share of each review seat's monthly cap kept for real reviews, and stop while you have everything stopped.
-- Grading is blind: each answer gets a random label, and two graders from different families (Claude and OpenAI) score every answer without knowing which model wrote it.
-- The first suite compares the outside-review seats (Gemini 4 Argon and the newer Gemini models, Codex's models, Perplexity) on the 12 most recent past reviews; the second compares research setups on 30 real questions.
-- A stopped trial resumes where it stopped, without paying twice for anything.
+- Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call, its limits and its most possible cost first, then the run, then a plain report.
+- A hard spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it.
+- Each task's grading is set aside before its first call, so a task is never left half graded.
+- Before any spend, near-free checks catch a model or setting a provider won't take; a model not offered is skipped and the report says why.
+- Your private terms are checked on every request exactly as it is sent, and on the search queries a provider says it ran; a hit stops the run and Cain hears of it.
+- Codex runs each trial call in an empty folder with no tools, no network and nothing of yours.
+- Grading is blind: names and markers are taken out of every answer, two graders from different families score each answer, and neither grades its own family's answers.
+- Real reviews always go first: trials pause while one is waiting or running, and back off a seat that hit a rate limit.
+- The research questions run only once you have approved them and their answer notes, and Perplexity stays on its own model unless you approve otherwise.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.18.0

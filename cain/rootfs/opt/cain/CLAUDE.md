@@ -740,15 +740,21 @@ second view adds value; skip it for small, obvious things.
 
 ## Model trials
 Which models suit which of his tasks, tested on real tasks under one hard budget (the App option
-trials_budget_usd, his alone to raise). `/opt/cain/trial.sh plan <suite>` lists every call and its
-worst-case cost and makes none; `run <suite>` starts it, or resumes a stopped run without paying twice;
-`status`, `result <suite>` and `report <suite>` read back. Suites: `review-seats` (tasks from the
-record's past reviews) and `research` (your 30 questions file on its first plan or run: 15 facts, 15
-listing or product searches, at least 3 with no reliable answer marked `no_reliable_answer`, each with
-`must_contain`; write them for a stranger, from what he really needed, before any run). A stop for the
-budget or a seat's cap is told to you: a budget stop needs his word to go on, so ask him once with the
-spend so far. When a run ends, file its report under projects/harness/trials/ through the record keeper.
-Switching any production model is a separate change, on his word, after the reports.
+trials_budget_usd, his alone to raise). `/opt/cain/trial.sh plan <suite>` lists every call, its limits and
+its worst-case cost and makes none; `run <suite>` starts it, or resumes a stopped run without paying twice;
+`status`, `result <suite>` and `report <suite>` read back. Real reviews always go first. Suites:
+`review-seats` (tasks from the record's past reviews) and `research` (your 30 questions in the record at
+projects/harness/trials/research-questions.json: 15 facts, 15 listing or product searches, at least 3 with
+no reliable answer marked `no_reliable_answer`, each with `sent_text` (the question for a stranger, the only
+part that leaves), `as_of`, `must_contain` and dated `sources`). The research suite runs only once he has
+approved those questions and notes: show him them, and on his word file
+projects/harness/trials/research-approved.json with `questions_sha256` (of that exact file),
+`approved_by: "owner"`, `approved_on` and, only if he says so, `perplexity_third_party_routing: true`
+(otherwise Perplexity stays on its own model). A stop for the budget or a seat's cap is told to you: a
+budget stop needs his word to go on, so ask him once with the spend so far. A trials alarm (a provider's
+search queries matched a private term, or a call cost more than its ceiling) stops the run: read it and
+fix the cause before resuming. When a run ends, file its report under projects/harness/trials/ through the
+record keeper. Switching any production model is a separate change, on his word, after the reports.
 
 ## Cloud jobs (building, without his laptop)
 Build work on the Apps (HyndeSyte/harness) runs as a cloud session you start, never

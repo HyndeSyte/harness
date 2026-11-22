@@ -375,61 +375,145 @@ Which models suit which of your tasks, tested on real tasks with the review serv
 hard spend stop. Cain runs them with `/opt/cain/trial.sh`; the calls are made by the review runner
 (it holds the keys), in a loop of its own, so a trial never holds up a real review.
 
-The budget: `trials_budget_usd` in this App's options (default 40, in dollars of API spend) covers
-every suite and every grading call together. Before each call the runner adds that call's worst case
-(its input estimate at the input price, its output cap at the output price, its most search fees) to
-what trials have spent; if that would pass the budget, the call isn't made, the trial stops, and Cain
-hears why. Spend is recorded per call from the provider's bill where it gives one (Perplexity),
-otherwise from the tokens it reports and the review service's price table; a call cut off by a
-restart counts at its worst case. A model missing from the price table (the newer Gemini models
-today) is priced high, so those calls are counted dearer than they are until their prices are added.
-The review seats' monthly caps apply too, and trials never spend the share `usage_reserve_percent`
-keeps for real reviews: a seat without room holds its calls, and the trial stops saying which. Trial
-spend shows in `review.sh spend` and the security watch like review spend. Only you raise the budget.
+### The spend stop
 
-How to run one (as Cain):
+The budget: `trials_budget_usd` in this App's options (default 40, in dollars of API spend) covers every
+suite, every grading call and every check together. Only the App option sets it: a request to the trials
+runner can't carry a budget, a list of configurations or a run id.
 
-1. `trial.sh plan review-seats` prints every call the suite would make (task, configuration, seat,
-   model, setting, search) with its worst-case cost, and the total. No call is made. For research,
-   `trial.sh plan research <questions.json>`.
-2. `trial.sh run review-seats` (or `trial.sh run research <questions.json>` the first time; the
-   questions are fixed from then on). It runs task by task: each configuration's output, then two
-   graders.
-3. `trial.sh status` shows each suite's newest run and the budget; `trial.sh result <suite>` every
-   call's state, cost, tokens and time.
-4. `trial.sh run <suite>` again resumes a stopped run where it stopped: finished calls aren't made
-   again and nothing is counted twice (`--retry` also tries again calls that failed for good; `--new`
-   starts a fresh run).
-5. `trial.sh report <suite>` prints the report and the runner writes it to
-   `/data/trials/<suite>/report.md` (also when a run ends or stops); Cain files it in the record under
-   `projects/harness/trials/`.
+- Every request carries hard ceilings the provider enforces: Claude's `max_tokens` (thinking included)
+  and `max_uses` on web search and web fetch, with no continuation of a paused turn; Gemini's
+  `maxOutputTokens` and an explicit thinking budget; the Perplexity agent's `max_steps`,
+  `max_output_tokens` and the search tool's `max_tokens`, with no page fetching; Codex runs one turn
+  (`codex exec`) with no tools and `model_context_window` set. Codex has no output or turn setting of its
+  own: it runs on the ChatGPT plan (no dollars) and counts one run against the review seat's run cap.
+- A call's worst case is its steps times (its context ceiling at the input price plus its output cap at the
+  output price) plus its most tool fees, at the dearest list price the model has (Gemini 4 Argon and
+  Carbon at their December price even in November; a model with no list price at $10 and $50 per million
+  tokens). How much one search adds to a step's input isn't capped by any provider, so the trial allows
+  generously for it; a bill above a call's reserved worst case stops the run and raises an alarm to Cain.
+  A configuration that can't be given a ceiling is refused, not run.
+- The worst case is reserved in `/data/trials/budget.json` before the call is sent, in one locked
+  check-and-reserve shared by every suite, grader, resume and process, together with the review seat's
+  room this month (its cap, less the share `usage_reserve_percent` keeps for real reviews, less every trial
+  reservation already out on that seat). The file is fsynced, and fsynced again when the call is marked
+  as sent, just before it leaves.
+- A task is one unit: both graders' worst case is held before its first call. If the outputs then run
+  short, the rest of that task's outputs are skipped and the task is still graded; the next task doesn't
+  start.
+- Settled from the provider's bill where it gives one (Perplexity), otherwise from the tokens it reports
+  at the list price (estimated). A missing or unclear figure (no usage, a cut-off answer, a timeout, a
+  server error) keeps the whole reservation. A retry reserves again. Nothing is charged only when nothing
+  left (a privacy block) or the provider refused outright (a key, credit, rate limit or malformed request
+  answer). After a restart, a call that was reserved but never marked sent is released; one marked sent
+  counts at its worst case, once, and runs again.
+- Before any spend on a run, near-free checks: a 16-token Claude call with the trial's tool types on (an
+  unknown tool type or model fails here), a 16-token Gemini call per model with the trial's settings (a
+  model not served, or one refusing the settings, is skipped and the report says which; if today's default,
+  Gemini 3.8 Flash, isn't served the run stops), and Codex's version and model list.
+- Trial spend shows in `review.sh spend` and the security watch like review spend. Real reviews don't see
+  trial reservations; trials keep out of the reserved share instead.
 
-The suites:
+### Real reviews first
 
-- `review-seats`: the 12 most recent past reviews in the record with `result.json` and `adopted.md`
-  (full rounds only, none about this trial), each sent as it was to Gemini 4 Argon, 4 Neon, 4 Carbon,
-  4 Hydrogen and 3.8 Flash (with search grounding when the brief needs facts, as the seat does),
-  Codex with its default model and with gpt-6.2-sol and gpt-6.2-astra, and Perplexity Sonar. The
-  seats' answers kept in each review are graded too, with no new call.
-- `research`: Cain's 30 questions from the record (15 facts, 15 listing or product searches, at
-  least 3 with no reliable answer, each with a note of what a right answer must contain), to Claude
-  Opus 5.5 with web search, the Perplexity Agent API's fast, low and medium presets, and Gemini 4
-  Hydrogen and 3.8 Flash with Google Search grounding.
+While a real review is queued, running or waiting in the review inbox, no trial call starts. After a 429
+or usage-limit answer on a seat (a trial's or a real review's), that seat cools for 15 minutes, and trial
+calls on one seat are spaced at least 10 seconds apart. Every trial call has a hard wall-clock limit and is
+aborted at it; Codex's child process is killed.
 
-Grading is blind: each output gets a random label, and the key from labels to configurations is
-written apart (`key.json`) and never sent. Two graders from different families grade every output:
-Claude Opus 5.5 and OpenAI through the Codex seat. Their scores and reasons are stored per output,
-and the report flags outputs where they are more than one rubric step apart. Every task, output and
-grading prompt passes the private-terms check before it leaves; one that doesn't is never sent.
+### What leaves, and the private-terms check
 
-What it keeps, all readable by Cain and written only by the runner: `/data/trials/budget.json` (every
-call's cost and how it was known), and per suite `suite.json` (the tasks) and per run
-`<run>/state.json`, `outputs/`, `grades/` and `key.json`.
+Every call goes out through its own wire: immediately before it is sent, the final serialized request (the
+system prompt, the rubric, answer notes, every candidate, tool arguments, filenames, grader requests,
+retries) is checked against `/data/review-private-terms.txt` and its built-in patterns. A hit stops it
+before anything leaves (fail closed). Stored briefs, adopted notes, kept diffs and the research questions
+are checked when the suite is built too. A brief with a hit keeps its task but blocks its every call;
+adopted notes or a diff with a hit are left out (then recall isn't graded).
 
-Not checked against the providers' own pages here (their docs weren't reachable from the build): how
-the Perplexity Agent API takes a preset (sent as `"preset": "fast"`; a refusal shows as that call's
-error) and how the installed Codex lists its models (a model it doesn't offer is skipped when Codex
-refuses it, and the report says so). The first run shows both.
+The search queries a provider says it ran (Gemini's grounding queries, Claude's searches and fetched
+addresses, Perplexity's search results) are logged with each output and checked afterwards; a hit raises an
+alarm to Cain and stops the run. What the check can't cover: text a provider generates itself, such as a
+search query it writes from the question, is only checked after it was sent.
+
+Codex runs in a fresh, empty temporary folder, outside `/data` and any repository checkout, with
+`--ignore-user-config` (no config file, so no MCP servers), web search off, a read-only sandbox, an
+environment of only PATH, LANG, an empty HOME and its sign-in folder, and the sanitized text as its one
+argument. It is told to use no tools, and an answer whose event stream shows any tool use is thrown away.
+The read-only sandbox stops writing and network; it doesn't stop a command reading files the runner can
+read, which is why any command fails the call.
+
+### Blind grading
+
+Each output gets a random label; the key from labels to configurations is written apart (`key.json`) and
+never sent. Before a grader reads a candidate it is normalized: provider envelopes, citation markers and
+grounding metadata (a grounding redirect gives way to its page's domain), tool traces, CLI headers and
+footers, and the names models and vendors call themselves (Claude, Opus, Anthropic, Gemini, Google, GPT,
+OpenAI, Codex, Perplexity, Sonar and the like) are taken out; the brief, question and notes a grader reads
+get the same scrub. A grading prompt that still holds a name or a marker isn't sent. Candidates go in as
+untrusted data the grader is told to ignore instructions in, each cut to a fixed length, in an order
+shuffled for each grader call on its own. Two graders from different families: Claude Opus 5.5 and OpenAI
+through Codex (with no tools, so it grades on content only). No grader reads an output its own family
+served, so each family's outputs are graded by the other family alone, and the report shows each grader's
+scores beside the combined score.
+
+### The suites
+
+- `review-seats`: the 12 most recent past reviews in the record with `result.json` and `adopted.md` (full
+  rounds only, none about this trial), each sent with the review service's own prompt and answer schema to
+  Gemini 4 Argon (the review service's model for its consequential reviews), 4 Neon, 4 Carbon (which Google
+  lists as its strongest reasoning model), 4 Hydrogen and 3.8 Flash (today's default; with search
+  grounding when the brief needs facts, as the seat does), Codex with its default model and with
+  gpt-6.2-sol and gpt-6.2-astra (with no web search here), and Perplexity Sonar. The seats' answers kept in
+  each review are graded too, with no new call. Findings are graded against the brief (and the diff, when
+  the review kept one as `diff.patch`); the owner's adopted notes count only for recall, never for a score.
+- `research`: Cain's 30 questions (15 facts, 15 listing or product searches, at least 3 with no reliable
+  answer) to Claude Opus 5.5 with web search (no fetching), the Perplexity Agent API's `fast`, `low` and
+  `medium` presets, and Gemini 4 Hydrogen and 3.8 Flash with Google Search grounding. Each question is in
+  `projects/harness/trials/research-questions.json` in the record with `sent_text` (the question rewritten
+  for a stranger; nothing else of it leaves), `as_of` (the date it is asked as of), `must_contain` (what a
+  right answer needs) and dated `sources` for that note. The runner won't run the suite until
+  `projects/harness/trials/research-approved.json` says you approved those exact questions and notes
+  (`questions_sha256`, `approved_by: "owner"`, `approved_on`); if the file changes afterwards, the run
+  stops. Grading uses an explicit abstention rubric: a right "no reliable answer" earns full credit, a
+  confidently wrong answer a penalty.
+
+Perplexity's presets may route to another lab's model. Until you approve that in the approval file
+(`perplexity_third_party_routing: true`), every Perplexity call is pinned to Perplexity's own model
+(`perplexity/sonar`). The model that actually answered is stored for every call and the report labels each
+configuration by it; an output served by another lab's model is reported as that lab's, and that lab's
+grader never reads it.
+
+### Running one (as Cain)
+
+1. `trial.sh plan review-seats` (or `research`) prints every call the suite would make, its ceilings and
+   its worst-case cost, and the total. No call is made.
+2. `trial.sh run review-seats` (or `research`, once approved) starts it, task by task.
+3. `trial.sh status` shows each suite's newest run, the budget, what is reserved and held;
+   `trial.sh result <suite>` every call's state, cost (billed or estimated), tokens and time.
+4. `trial.sh run <suite>` again resumes a stopped run where it stopped (`--retry` also tries again calls
+   that failed for good; `--new` starts a fresh run). The checks before any spend run again on a resume.
+5. `trial.sh report <suite>` prints the report and the runner writes it to `/data/trials/<suite>/report.md`
+   (also when a run ends or stops); Cain files it in the record under `projects/harness/trials/`.
+
+The report labels each configuration by the model that served it, shows each grader's scores beside the
+combined one, coverage and missing grades per configuration, and the installed Codex version. Headline
+comparisons use the matched set of tasks every compared configuration answered and had graded, and a gap
+within twice the combined standard error is reported as no clear difference. Every cost is marked billed or
+estimated, and a cost per acceptable answer is given only from billed costs, with its denominators.
+
+What it keeps, all readable by Cain and written only by the runner: `/data/trials/budget.json`, and per
+suite `suite.json` (the tasks) and per run `<run>/state.json`, `outputs/` (with the served model and search
+queries), `grades/` and `key.json`.
+
+Read from the providers on Nov 22 (their own docs for Claude; the Perplexity and Gemini SDKs' types and the
+Codex source, since those docs sites weren't reachable from the build): Claude's `web_search_20260318` and
+`web_fetch_20260318`, `max_uses`, `allowed_callers: ["direct"]`; Perplexity's `preset`, `model`,
+`max_steps`, `max_output_tokens`, the search tool's `max_tokens`, `output` message items, `search_results`
+queries, `usage.cost.total_cost` and the response's `model`; `codex debug models`, `--ignore-user-config`
+and `web_search = "disabled"`. Not confirmed before a live run: which model each Perplexity preset uses,
+whether Gemini counts thinking inside `maxOutputTokens` (both are counted here), and the shape of the
+Codex model catalog (read loosely; when it can't be read, a tiny probe per model decides, and the report
+says "not listed" or "refused" apart). The first run's checks show each.
 
 ## Cain's own user (since 0.12.0)
 

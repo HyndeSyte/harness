@@ -15,7 +15,7 @@ import { codexSeat, codexSignedIn } from "./seats/openai.ts";
 import { perplexitySeat } from "./seats/perplexity.ts";
 import { CodexLogin, handle } from "./signin.ts";
 import { TrialRunner, writeAtomic } from "../trials/runner.ts";
-import { claudeAsk, codexAsk, geminiAsk, perplexityAsk } from "../trials/calls.ts";
+import { claudeProvider, codexProvider, geminiProvider, perplexityProvider } from "../trials/calls.ts";
 import { DEFAULT_BUDGET_USD } from "../trials/core.ts";
 
 const log = (m: string) => console.log(`[review] ${m}`);
@@ -86,19 +86,16 @@ if (import.meta.main) {
   // a long trial never holds up a real review, under one hard budget (the App option trials_budget_usd).
   const schemaField = env.GEMINI_SCHEMA_FIELD === "responseJsonSchema" ? "responseJsonSchema" as const : "responseFormat" as const;
   const budgetUsd = (() => { const n = Number(env.TRIALS_BUDGET_USD); return env.TRIALS_BUDGET_USD && Number.isFinite(n) && n >= 0 ? n : DEFAULT_BUDGET_USD; })();
+  // Every trial call goes out through its own wire (../trials/guard.ts), which checks the final request
+  // against the private terms; Codex runs in a fresh empty folder with no config, tools or network.
   const trials = new TrialRunner({ dir: env.TRIALS_DIR ?? "/data/trials", inboxDir: env.TRIALS_INBOX ?? "/data/trials-inbox",
     recordDir: env.RECORD_DIR ?? "/data/record", budgetUsd }, {
     review: runner,
-    seats: {
-      gemini: keys.gemini ? (m) => geminiSeat({ key: keys.gemini, model: m, bigModel: m, schemaField }) : undefined,
-      codex: (m) => (codexSignedIn(codexHome) ? codexSeat({ home: codexHome, model: m || undefined }) : undefined),
-      perplexity: keys.perplexity ? perplexitySeat({ key: keys.perplexity, model: cfg.models.perplexity }) : undefined,
-    },
-    asks: {
-      claude: keys.anthropic ? claudeAsk({ key: keys.anthropic, version: env.ANTHROPIC_VERSION_HEADER || undefined }) : undefined,
-      gemini: keys.gemini ? geminiAsk({ key: keys.gemini }) : undefined,
-      perplexity: keys.perplexity ? perplexityAsk({ key: keys.perplexity }) : undefined,
-      codex: codexAsk({ home: codexHome }),
+    providers: {
+      claude: keys.anthropic ? claudeProvider({ key: keys.anthropic, version: env.ANTHROPIC_VERSION_HEADER || undefined }) : undefined,
+      gemini: keys.gemini ? geminiProvider({ key: keys.gemini, schemaField }) : undefined,
+      perplexity: keys.perplexity ? perplexityProvider({ key: keys.perplexity }) : undefined,
+      codex: codexProvider({ home: codexHome, signedIn: codexSignedIn }),
     },
   });
   // The budget it really uses, for trial.sh (run as Cain, who can't read the App's options).
