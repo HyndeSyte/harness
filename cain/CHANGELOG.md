@@ -8,6 +8,7 @@
 - Grading is blind: each answer gets a random label, and two graders from different families (Claude and OpenAI) score every answer without knowing which model wrote it.
 - The first suite compares the outside-review seats (Gemini 4 Argon and the newer Gemini models, Codex's models, Perplexity) on the 12 most recent past reviews; the second compares research setups on 30 real questions.
 - A stopped trial resumes where it stopped, without paying twice for anything.
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.18.0
 

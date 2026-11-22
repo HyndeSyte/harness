@@ -130,13 +130,13 @@ def test_cain_config_denies_every_api_and_mapping():
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n  trials_budget_usd: 40\n'
         '  owner_user_id: ""\n  notice_hook: ""\n'
         '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n"
+        "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n  trials_budget_usd: float(0,500)\n"
         "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
         "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n")
