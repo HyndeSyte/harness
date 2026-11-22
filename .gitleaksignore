@@ -22,3 +22,7 @@ cb2e92b6d9d8fb850c87efba4149d83364b16fe1:tests/test_watch.py:generic-api-key:501
 12eaacbd1300e2c8f3e581663fe669adbff5b088:tests/test_outbox_round28.py:generic-api-key:58
 # not a test file: the baseline's own comment, as first written, quoted the made-up test value above; reworded since.
 3932ecc0e4ede7a673b56bad2068fb8881080940:.gitleaksignore:generic-api-key:21
+# A made-up Gemini key ("g-test-key-123456") passed to the trials' Gemini adapter over a fake fetch in its tests.
+edf0e0bb717b20c1d36f1e027df7fde04f76283f:cain/tests/trials.test.ts:generic-api-key:205
+# The same made-up key, for the trials' cut-off stream test against a fake fetch.
+edf0e0bb717b20c1d36f1e027df7fde04f76283f:cain/tests/trials.test.ts:generic-api-key:307
