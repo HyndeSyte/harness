@@ -5,10 +5,10 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { pinSocket } from "../pinned.ts";
 import { readStop } from "../stop.ts";
-import { pullNow } from "../pullnow.ts";
+import { compareHeads, pullNow } from "../pullnow.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
-import type { DecisionRec } from "./rounds.ts";
+import type { DecisionRec, LegacyCard } from "./rounds.ts";
 import { selfCheck } from "../capfiles.ts";
 import { claudeSeat } from "./seats/claude.ts";
 import { geminiSeat } from "./seats/gemini.ts";
@@ -30,6 +30,18 @@ export function decisionPoster(linkSock: string, log: (m: string) => void) {
     // Round 2: its item is held by another holder; the link keeps it waiting and posts it once that clears.
     if (res.ok && j?.status === "held") return null;
     log(`the link didn't post the decision card for ${d.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
+    return null;
+  };
+}
+
+// The owner's Keep or Drop card for an earlier grant's unused rounds (0.18.1, fifth review): the same root socket.
+export function legacyPoster(linkSock: string, log: (m: string) => void) {
+  return async (c: LegacyCard): Promise<string | null> => {
+    const res = await fetch("http://link/legacy-grant", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
+      body: JSON.stringify(c), signal: AbortSignal.timeout(45_000) } as any);
+    const j: any = await res.json().catch(() => ({}));
+    if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
+    log(`the link didn't post the Keep or Drop card for ${c.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
     return null;
   };
 }
@@ -56,6 +68,9 @@ if (import.meta.main) {
     seats, log, postDecision,
     // 0.18.1 (fourth review): the pull request's head a grant's claim is pinned to, read as the link reads it.
     pull: pullNow,
+    // Fifth review: the proof a grant's bound head is superseded, and the Keep or Drop card through the link.
+    compare: compareHeads,
+    postLegacy: legacyPoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log),
     stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });

@@ -66,7 +66,8 @@ export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answ
 // appends only a real refusal to the guard's log, which Cain can no longer write.
 // Root's services, on the unix socket only: what Cain sent (his edit allowlist) and the cards.
 // The review runner's decision card at the round cap (0.16.0): root's alone, so Cain can't post it.
-export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold"]);
+// /legacy-grant (0.18.1, fifth review): the review runner's Keep or Drop card for an earlier grant's unused rounds.
+export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold", "/legacy-grant"]);
 
 export function sameKey(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);

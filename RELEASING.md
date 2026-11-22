@@ -326,6 +326,13 @@ for 2 hours, without which Cain can't start the job.
    no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 5. Confirm the new version is running from the update result and the App's log.
 
+Ship checklist for Cain 0.18.1 (the owner's post-install checks, on the Pi, both read only):
+`/opt/cain/review.sh sweep-dry-run` prints what the replay of grants from before grants were bound
+credits, leaves pending and voids (it never voids), run on copies of the live rounds and grants files;
+`/opt/cain/review.sh host-read <pull request number>` reads one pull request's head through GitHub's
+API and through its refs and prints both. If any old grant has unused rounds, Dane gets one Keep or
+Drop card per change after the install; until he taps Keep they don't count.
+
 The job is a cloud session, not a process on the Pi: Home Assistant's Supervisor does
 each update, so replacing Cain's container doesn't stop the job before Harness. If the
 job ends between the two anyway, Cain's App tells Cain after 30 minutes, and a new Ship
