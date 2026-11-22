@@ -15,10 +15,13 @@
 //   bun main.ts accept-limits <code>  (0.1.7) the owner accepts DOCS.md's "Accepted limits" (code printed at start)
 //   bun main.ts hc-key <code>         (0.1.7) the Healthchecks read-only key, read from standard input (never the
 //                                     command line), checked and kept in /data/hc-key (0600); prints nothing of it
+//   bun main.ts key-code              (0.1.8) a fresh key-confirm code in the log (a re-enrollment while enrolled)
 // The owner's commands go to the loopback listener (127.0.0.1:8096), never the App network's (0.1.6).
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
-import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants as FS, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { dirname } from "node:path";
 import { HEARTBEAT_MS, type HcCheck, Keeper, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
@@ -31,20 +34,30 @@ const OPTIONS = `${DATA}/options.json`;
 // (0.1.7) The Healthchecks key's file: root-only, never in the options, and left out of the keeper's own backups
 // (config.yaml backup_exclude names it).
 export const HC_KEY_FILE = `${DATA}/hc-key`;
-export function hcKeyStore(path = HC_KEY_FILE) {
+// 0.1.8: written 0600 from its first byte (writeWhole: an exclusive temporary file opened 0600 in the data folder, the
+// key written and fsynced, then renamed into place), never a write followed by a chmod. onTemp: tests only, called
+// with the temporary file's path once the key is in it, before the rename.
+export function hcKeyStore(path = HC_KEY_FILE, onTemp?: (tmp: string) => void) {
   return {
     load: (): string => { try { return readFileSync(path, "utf8").trim(); } catch { return ""; } },
-    store: (key: string): boolean => { try { writeWhole(path, `${key}\n`); chmodSync(path, 0o600); return true; } catch { return false; } },
+    store: (key: string): boolean => { try { writeWhole(path, `${key}\n`, onTemp); return true; } catch { return false; } },
   };
 }
 export const VERSION = process.env.KEEPER_VERSION ?? "0.0.0";
 const log = (m: string) => console.log(`[keeper] ${m}`);
 
-export function writeWhole(path: string, body: string): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
-  try { renameSync(tmp, path); } catch (e) { rmSync(tmp, { force: true }); throw e; }
+// A file written whole: a temporary file beside it, created exclusively (O_EXCL, so never one that already exists)
+// with mode 0600 from its first byte, the body written and fsynced, then renamed into place and the folder fsynced
+// (0.1.8), so the state's counter is on disk before /armed answers with it.
+export function writeWhole(path: string, body: string, onTemp?: (tmp: string) => void): void {
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600);
+  try {
+    try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
+    onTemp?.(tmp);
+    renameSync(tmp, path);
+  } catch (e) { rmSync(tmp, { force: true }); throw e; }
+  try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* the folder's fsync is best effort */ }
 }
 // The address the keeper polls for a watched App (option health, "host:port" or "host:port/path";
 // 0.1.1: Cain's default names /ready, his readiness; no path is /health).
@@ -154,6 +167,7 @@ const LOCAL_CMDS: Record<string, (a: string[]) => unknown> = {
   "missed-heartbeat-confirm": (a) => ({ code: a[0] ?? "" }),
   "accept-limits": (a) => ({ code: a[0] ?? "" }),
   "hc-key": (a) => ({ code: a[0] ?? "" }),          // (0.1.7) the key itself is added from standard input
+  "key-code": () => ({}),                            // (0.1.8)
 };
 const DONE: Record<string, string> = {
   "drill-record": "drill recorded", "phone-test": "phone test sent: once the pages reached your phone, phone-confirm <code from the log> <each check>",
@@ -161,6 +175,7 @@ const DONE: Record<string, string> = {
   "missed-heartbeat": "missed-heartbeat drill started: once its page reached your phone, missed-heartbeat-confirm <code from the log>",
   "missed-heartbeat-confirm": "missed-heartbeat drill recorded",
   "accept-limits": "the accepted limits are recorded", "hc-key": "the Healthchecks read-only key is checked and kept",
+  "key-code": "a fresh key-confirm code is printed in Keeper's log",
 };
 // (0.1.7) The key from standard input, first line, trimmed; never echoed.
 async function readStdinKey(): Promise<string> {
@@ -183,5 +198,5 @@ if (import.meta.main) {
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | key-code | selftest"); process.exit(2); }
 }

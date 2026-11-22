@@ -1,4 +1,4 @@
-// The keeper of installs (Keeper 0.1.0; review fixes 0.1.1, 0.1.2, 0.1.3, 0.1.4, 0.1.5, 0.1.6 and 0.1.7): a check after every
+// The keeper of installs (Keeper 0.1.0; review fixes 0.1.1, 0.1.2, 0.1.3, 0.1.4, 0.1.5, 0.1.6, 0.1.7 and 0.1.8): a check after every
 // install of a watched App, and an automatic rollback of a bad one from the App-only backup taken just
 // before it.
 //
@@ -108,6 +108,22 @@
 //   backup name kept before the backup call, reconciled after a restart; explicit unique keys per check
 //   (option hc_unique_keys) when the derived one doesn't match.
 //
+// 0.1.8 (the eighth review's fixes):
+//   1. The accepted limits' text is version 2 (LIMITS_VERSION): an acceptance of version 1 lapses. Every claim's
+//      start and end is logged with its deadline, one line each; option drill_days (1 to 14, default 14) sets how
+//      long a phone test and a missed-heartbeat drill count, with a log reminder before each is due.
+//   2. The old option hc_api_key, while the Supervisor still holds it in the options, refuses arming and the hc-key
+//      entry (OLD_KEY_WHY). The key file is written 0600 from its first byte (main.ts hcKeyStore).
+//   3. The cancel reads the Supervisor's jobs list under the claim record's lock: an active install, update,
+//      rebuild or restore of the App, an active job on the App whose name isn't recognized, or a list that can't
+//      be read refuses it (the claim and its backup kept). A claim expired unused keeps its backup until one more
+//      poll after the deadline shows no version change.
+//   Follow-ups: every external call under the lock is bounded (LOCK_CALL_MS), a step that throws or runs past
+//   LOCK_STEP_MS is logged and the lock released, and the deadline is read again under the lock right before a
+//   claim or a consume commits; /armed is answered under the lock and only once its counter is saved; a cancel
+//   that says the link refused the enrollment logs it and prints a key code (otherwise printed at start only
+//   while unenrolled, or on demand with key-code).
+//
 // The life of an attempt (one install of one App, registered just before the install):
 //   verifying    the registration was taken (answered 202); its backup is being made and checked
 //   unprotected  the backup (or the registration) failed a check, or the install was seen outside a
@@ -158,7 +174,15 @@ export const PHONE_WINDOW_MS = 60 * 60_000;      // (0.1.3) a phone test is conf
 export const KEY_CODE_MS = 24 * 3_600_000;       // (0.1.6) the key-confirm code lasts this long (a restart prints a new one)
 export const MHB_MAX_MS = 14 * 86_400_000;       // (0.1.6) arming needs a missed-heartbeat drill confirmed within this
 export const MHB_CAP_MS = 30 * 60_000;           // (0.1.7) the missed-heartbeat drill's silence ends here at the latest
-export const LIMITS_VERSION = 1;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts
+export const LIMITS_VERSION = 2;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2)
+export const LOCK_CALL_MS = 10_000;              // (0.1.8) each external call under the claim record's lock is bounded by this
+export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the lock that runs past this is logged and the lock released
+export const DRILL_DAYS_DEFAULT = 14;            // (0.1.8) option drill_days: how long a phone test and a missed-heartbeat drill count
+// (0.1.8) The old option, while the Supervisor still holds it: arming and the hc-key entry are refused with this line.
+export const OLD_KEY_WHY = "the old option hc_api_key is still in Keeper's options: remove it, then rotate that key in the alert service";
+// (0.1.8) The link's cancel when it refused the keeper's enrollment (cain link/ship-pass.ts), and Keeper's line for it.
+export const ENROLL_BEHIND = "enrollment counter behind the link";
+export const ENROLL_REFUSED = "enrollment refused by the link";
 export const HC_KEY_CODE_MS = 24 * 3_600_000;    // (0.1.7) the hc-key and accept-limits codes last this long
 export const DROP_TRIES = 3;                     // (0.1.6) an orphan backup's delete is tried this often
 export const RESTARTS_MAX = 2;                   // more stops than this after a restore, in the confirm window: gave up
@@ -179,6 +203,7 @@ export interface Options {
   ship_public_key: string;                       // (0.1.3) the link's Ship key, public half (SPKI DER, base64)
   // (0.1.7) hc_api_key is gone from the options: the key is entered with hc-key and kept in the data folder.
   hc_unique_keys: Record<string, string>;        // (0.1.7) role (done, deadman, or an App slug) -> the check's unique key
+  drill_days: number;                            // (0.1.8) 1 to 14: how long a phone test and a missed-heartbeat drill count
 }
 const s = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 const pairs = (v: unknown): Record<string, string> => {
@@ -208,7 +233,9 @@ export function parseOptions(raw: unknown): Options {
   const o: any = raw && typeof raw === "object" ? raw : {};
   const watch = (Array.isArray(o.watch) ? o.watch : []).map(s).filter((x: string) => SLUG.test(x));
   const grace = Number(o.health_grace_s);
+  const days = Number(o.drill_days);
   return {
+    drill_days: Number.isInteger(days) && days >= 1 && days <= 14 ? days : DRILL_DAYS_DEFAULT,
     watch, health: pairs(o.health), tokens: pairs(o.tokens), hc_done: s(o.hc_done), hc_deadman: s(o.hc_deadman), hc_failed: parseAlerts(o.hc_failed),
     health_grace_s: Number.isFinite(grace) && grace >= 0 && grace <= 900 ? Math.floor(grace) : DEFAULT_HEALTH_GRACE_S,
     ship_public_key: s(o.ship_public_key).replace(/\s+/g, ""),
@@ -382,6 +409,8 @@ export interface Attempt {
   dropBackup?: boolean; backupDropped?: boolean; dropTries?: number;   // (0.1.6) an orphan backup to delete, deleted, tries
   dropCheck?: boolean;                           // (0.1.7) a claim expired unused: the jobs list is read before the delete
   dropKept?: string;                             // (0.1.7) kept, not deleted, and why
+  claimEndSaid?: boolean;                        // (0.1.8) the claim's end logged (one line)
+  quietAt?: number;                              // (0.1.8) a poll after an unused claim's deadline saw no version change
 }
 export interface Binding { protocol: number; probe_hash: string; keeper_version: string; options_hash: string; backup_scope: string }
 export interface DrillRec { attempt: string; kind: "fail-verdict" | "exits-on-start"; trigger: string; restoredAt: number; lineDeliveredAt: number; binding: Binding; at: number }
@@ -431,6 +460,8 @@ export interface State {
   phoneRun?: { id: string; at: number };          // (0.1.7) the phone test that runs, awaiting its confirm
   limits?: { version: number; at: number };       // (0.1.7) the owner's acceptance of DOCS.md's "Accepted limits"
   counter: number;                                // (0.1.7) bumped on each armed read and state write, never down
+  enrollRefused?: number;                         // (0.1.8) the link refused the enrollment (its cancel said so): a key code at start
+  drillDue?: { phone?: number; mhb?: number };    // (0.1.8) the confirm time each drill's due reminder was logged for
   mhb?: MhbRun;                                  // (0.1.6) the missed-heartbeat drill, running or awaiting its confirm
   mhbRec?: MhbRec;                               // (0.1.6) the missed-heartbeat drill, confirmed
   hcRwSaid?: string;                             // (0.1.6) the read-write key already paged (its hash)
@@ -463,6 +494,7 @@ export function loadState(raw: unknown): State {
     ...(r.codes && typeof r.codes === "object" ? { codes: obj(r.codes) as any } : {}), ...(r.mhb && Number(r.mhb.cap) > 0 && typeof r.mhb.id === "string" ? { mhb: r.mhb } : {}),
     ...(r.phoneRun && typeof r.phoneRun.id === "string" ? { phoneRun: { id: r.phoneRun.id, at: Number(r.phoneRun.at) || 0 } } : {}),
     ...(r.limits && Number(r.limits.version) > 0 ? { limits: { version: Number(r.limits.version), at: Number(r.limits.at) || 0 } } : {}), counter: Number(r.counter) > 0 ? Math.floor(Number(r.counter)) : 0,
+    ...(Number(r.enrollRefused) > 0 ? { enrollRefused: Number(r.enrollRefused) } : {}), ...(r.drillDue && typeof r.drillDue === "object" ? { drillDue: obj(r.drillDue) as any } : {}),
     ...(r.mhbRec && Number(r.mhbRec.confirmedAt) > 0 ? { mhbRec: r.mhbRec } : {}), ...(typeof r.hcRwSaid === "string" ? { hcRwSaid: r.hcRwSaid } : {}), ...(typeof r.keyChangeSaid === "string" ? { keyChangeSaid: r.keyChangeSaid } : {}), lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any, probeHash: obj(r.probeHash) as any,
     outstanding: obj(r.outstanding) as any, last: obj(r.last) as any, drills: obj(r.drills) as any, phone: obj(r.phone) as any,
     queue: Array.isArray(r.queue) ? r.queue.map((q: any) => ({ ...q, at: Number(q?.at) || 0 })) : [], hcPinged: Number(r.hcPinged) || 0, lines: Number(r.lines) || 0,
@@ -483,6 +515,19 @@ export type RestoreResult =
   | { kind: "unknown"; why: string };
 // A restore job, by its id, as the Supervisor's jobs list shows it.
 export type JobState = { found: false } | { found: true; uuid: string; done: boolean; errors: number; name?: string; reference?: string };
+// (0.1.8) The App's active jobs judged, for a cancel and an unused claim's backup: "" when none stands in the way.
+// An install, update, rebuild or restore of the App, or any job on it whose name isn't a recognized one (a backup's),
+// stands in the way; so does a list that can't be read (null).
+export const INSTALL_JOB = /install|update|rebuild|restore/i;
+export const KNOWN_JOB = /backup/i;
+export function jobsWhy(app: string, jobs: string[] | null): string {
+  if (jobs === null) return "the Supervisor's jobs list couldn't be read (an install may be running)";
+  const install = jobs.filter((n) => INSTALL_JOB.test(n));
+  if (install.length) return `an install or update of ${app} is running (${install.join(", ").slice(0, 120)})`;
+  const unknown = jobs.filter((n) => !KNOWN_JOB.test(n));
+  if (unknown.length) return `an active job on ${app} that Keeper doesn't recognize is running (${unknown.join(", ").slice(0, 120)})`;
+  return "";
+}
 export interface Deps {
   now: () => number;
   version: string;                               // the keeper's own version
@@ -493,7 +538,7 @@ export interface Deps {
   restore: (backup: string, app: string) => Promise<RestoreResult>;
   deleteBackup?: (backup: string) => Promise<boolean>;     // (0.1.6) an orphan backup's delete; false: not deleted
   backups?: () => Promise<{ slug: string; name: string }[] | null>;   // (0.1.7) the Supervisor's backups list; null: unreadable
-  activeJobs?: (app: string) => Promise<string[] | null>;  // (0.1.7) active install or update jobs of that App (their names); null: unreadable
+  activeJobs?: (app: string) => Promise<string[] | null>;  // (0.1.7) active jobs on that App (0.1.8: every name, judged by jobsWhy); null: unreadable
   hcKeyStore?: { load: () => string; store: (key: string) => boolean };   // (0.1.7) the kept Healthchecks key (a 0600 file)
   job: (uuid: string) => Promise<JobState | null>;          // by its id only; null: the jobs list can't be read
   hcChecks?: (apiKey: string) => Promise<HcCheck[] | null>;   // (0.1.5) the Healthchecks checks; null: unreadable
@@ -504,6 +549,7 @@ export interface Deps {
   save: (s: State) => boolean | void;            // (0.1.5) false: not saved (a claim is then refused)
   log: (line: string) => void;
   timer?: (ms: number) => Promise<void>;          // (0.1.4) the registration's wait for its backup (tests: a fake)
+  lockCallMs?: number; lockStepMs?: number;       // (0.1.8) the lock's bounds (LOCK_CALL_MS, LOCK_STEP_MS; tests: shorter)
 }
 export type Answer = { status: number; body: Record<string, unknown> };
 
@@ -534,10 +580,37 @@ export class Keeper {
   // (0.1.7) Every state write moves the enrollment counter on.
   save(): boolean { this.st.counter++; return this.d.save(this.st) !== false; }
   // (0.1.7) The claim record's lock: claim, cancel and consume (and expiry) run one at a time, in order.
-  record<T>(fn: () => T | Promise<T>): Promise<T> {
-    const run = this.lock.then(fn, fn);
+  // 0.1.8: a step that throws, or runs past LOCK_STEP_MS, is logged and the lock released for the next one (fallback
+  // answers for it when given, else the error goes to the caller); each external call inside is bounded (bounded()).
+  record<T>(fn: () => T | Promise<T>, fallback?: (why: string) => T): Promise<T> {
+    const stepMs = this.d.lockStepMs ?? LOCK_STEP_MS;
+    const step = async (): Promise<T> => {
+      let t: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([Promise.resolve().then(fn),
+          new Promise<never>((_, no) => { t = setTimeout(() => no(new Error(`it ran past ${stepMs / 1000} seconds`)), stepMs); (t as any)?.unref?.(); })]);
+      } catch (e) {
+        const why = String((e as Error)?.message ?? e).slice(0, 120);
+        this.d.log(`a step under the claim record's lock failed (${why}): the lock is released for the next one`);
+        if (fallback) return fallback(why);
+        throw e;
+      } finally { if (t) clearTimeout(t); }
+    };
+    const run = this.lock.then(step, step);
     this.lock = run.catch(() => undefined);
     return run;
+  }
+  // (0.1.8) An external call under the lock, bounded: null when it throws or doesn't answer within LOCK_CALL_MS.
+  async bounded<T>(call: () => Promise<T> | T, what: string): Promise<T | null> {
+    const ms = this.d.lockCallMs ?? LOCK_CALL_MS;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([Promise.resolve().then(call),
+        new Promise<null>((ok) => { t = setTimeout(() => { this.d.log(`${what} didn't answer within ${ms / 1000} seconds: taken as unreadable`); ok(null); }, ms); (t as any)?.unref?.(); })]);
+    } catch (e) {
+      this.d.log(`${what} failed (${String((e as Error)?.message ?? e).slice(0, 80)}): taken as unreadable`);
+      return null;
+    } finally { if (t) clearTimeout(t); }
   }
   private now(): number { return this.d.now(); }
 
@@ -545,7 +618,8 @@ export class Keeper {
   // options can't be read keeps the last ones read in this process.
   useOptions(raw: unknown): void {
     this.opts = parseOptions(raw);
-    if (raw && typeof raw === "object" && "hc_api_key" in (raw as object)) this.oldKeyOption = true;
+    // (0.1.8) as each read of the options holds it: the gate (OLD_KEY_WHY) lifts once the option is gone
+    this.oldKeyOption = !!raw && typeof raw === "object" && "hc_api_key" in (raw as object);
     const why = this.armableWhy();
     if (why !== this.armableSaid) { if (why) this.d.log(`not armable: ${why}`); this.armableSaid = why; }
     if (this.st.phoneHc && this.st.phoneHc !== this.hcH()) this.phoneLapse("a Healthchecks option changed");
@@ -599,10 +673,20 @@ export class Keeper {
     const was = p?.key === o ? (p.confirmed ? "its earlier confirm (a re-enrollment)" : "its unconfirmed pin") : p?.fp ?? "none";
     const now = this.now();
     this.st.pinnedKey = { key: o, fp: cur, at: p?.key === o ? p.at : now, confirmed: now, enrollId: randomBytes(8).toString("hex") };
-    delete this.st.keyChangeSaid;
+    delete this.st.keyChangeSaid; delete this.st.enrollRefused;
     this.d.log(`the owner confirmed the Ship key with fingerprint ${cur} at the device (it replaces ${was}); enrollment ${this.st.pinnedKey.enrollId}, state created ${new Date(this.st.createdAt).toISOString()}`);
     this.save();
     return { ok: true, why: "" };
+  }
+  // (0.1.8) Enrolled: the options' key is the pinned one and the owner confirmed it.
+  enrolled(): boolean { const p = this.st.pinnedKey; return !!p?.confirmed && p.key === this.opts.ship_public_key; }
+  // (0.1.8) key-code: a fresh key-confirm code on demand (the loopback command), for a re-enrollment while enrolled.
+  keyCode(): { ok: boolean; why: string } {
+    const o = this.opts.ship_public_key;
+    if (!shipKey(o)) return { ok: false, why: "ship_public_key in the options isn't an Ed25519 public key" };
+    this.d.log(`the owner asked for a key-confirm code (key-code) for the key with fingerprint ${keyFp(o)}`);
+    this.issueCode("key", KEY_CODE_MS, keyFp(o));
+    return { ok: true, why: "the code is in Keeper's log" };
   }
   // (0.1.6) One-time codes: printed once in Keeper's log, kept only as a hash, good until `until`. Each new
   // code of a kind replaces the last one. useCode answers "" when the code is good.
@@ -653,6 +737,8 @@ export class Keeper {
   // options, excluded from the keeper's backups). A refused key is never kept; a new code is printed.
   async hcKeyEnter(code: string, key: string): Promise<{ ok: boolean; why: string }> {
     const k = s(key);
+    // (0.1.8) refused while the old option is still held, before the code is spent
+    if (this.oldKeyOption) { this.d.log(`refused the Healthchecks key entered: ${OLD_KEY_WHY}; nothing was kept`); return { ok: false, why: OLD_KEY_WHY }; }
     const bad = this.useCode("hckey", code, "hc-key");
     if (bad) return { ok: false, why: bad };
     const refuse = (why: string) => {
@@ -696,9 +782,12 @@ export class Keeper {
     // (0.1.7) a drill that ran when Keeper stopped is interrupted: its code no longer counts
     const running = this.drillRunning(now);
     if (running) this.interruptDrill(running, "Keeper restarted");
-    // (0.1.6) a pin waiting for its confirm gets a new code; 0.1.7: at every start, bound to the options' key,
-    // so a confirmed key can be confirmed again (the re-enrollment after a restore or a clock correction)
-    if (shipKey(this.opts.ship_public_key)) this.issueCode("key", KEY_CODE_MS, keyFp(this.opts.ship_public_key));
+    // (0.1.6) a pin waiting for its confirm gets a new code; 0.1.8: at start only while unenrolled (no confirm, or
+    // another key in the options) or after the link refused the enrollment; otherwise on demand with key-code
+    if (shipKey(this.opts.ship_public_key) && (!this.enrolled() || this.st.enrollRefused)) {
+      if (this.st.enrollRefused) this.d.log(`the link refused Keeper's enrollment at ${new Date(this.st.enrollRefused).toISOString()}: re-enroll with key-confirm`);
+      this.issueCode("key", KEY_CODE_MS, keyFp(this.opts.ship_public_key));
+    }
     // (0.1.7) the Healthchecks key is entered (or replaced) with a code printed at every start
     this.issueCode("hckey", HC_KEY_CODE_MS, "hc-key");
     if (!this.hcKey) this.d.log("no Healthchecks read-only key is kept: enter it once with hc-key <code> (the key on standard input; DOCS, What you must set)");
@@ -709,7 +798,7 @@ export class Keeper {
       this.issueCode("limits", HC_KEY_CODE_MS, `limits-v${LIMITS_VERSION}`);
     }
     // (0.1.7) the old option, at every start while it is there
-    if (this.oldKeyOption) this.d.log("the old option hc_api_key is still in Keeper's options: remove it (Keeper ignores it; the key is entered once with hc-key and kept outside the options)");
+    if (this.oldKeyOption) this.d.log("the old option hc_api_key is still in Keeper's options: remove it (Keeper ignores it; the key is entered once with hc-key and kept outside the options), then rotate that key in the alert service, since earlier backups may hold it; until then Keeper doesn't arm and refuses hc-key");
     for (const a of this.open()) this.d.log(`resuming ${a.id} ${a.app} (${a.status})`);
     for (const a of this.unresolvedOf()) this.d.log(`reconciling ${a.id} ${a.app} on every poll (unresolved: nothing is sent again)`);
     this.st.heartbeat = now;
@@ -759,6 +848,7 @@ export class Keeper {
   // 0.1.7: checksOnly leaves out the kept key (hc-key checks the checks before any key is kept).
   armableWhy(checksOnly = false): string {
     const o = this.opts;
+    if (this.oldKeyOption) return OLD_KEY_WHY;          // (0.1.8)
     if (!HTTPS.test(o.hc_done)) return "hc_done (the heartbeat check) isn't set";
     if (!HTTPS.test(o.hc_deadman)) return "hc_deadman (the dead-man check) isn't set";
     if (!this.hcKey && !checksOnly) return "no Healthchecks read-only key is kept (enter it once with hc-key <code>, to read each check's period, grace and channels)";
@@ -919,13 +1009,15 @@ export class Keeper {
     if (s(body?.app) !== a.app || s(body?.from_version) !== a.from || s(body?.to_version) !== a.to || s(body?.backup) !== a.backup)
       return no("its App, versions or backup aren't the acceptance's");
     if (!this.st.pinnedKey?.confirmed) return no("the pinned Ship key isn't confirmed");
+    // (0.1.8) the deadline read again right before the claim commits
+    if (this.now() > (a.acceptUntil ?? 0)) { this.ended(a, "its acceptance expired unclaimed", true, true); return no("its acceptance expired"); }
     const claim = { id: `claim-${randomBytes(8).toString("hex")}`, at: now, until: now + CLAIM_MS, ...(/^[A-Za-z0-9-]{8,64}$/.test(req) ? { request: req } : {}) };
     a.claim = claim; a.status = "claimed"; a.deadline = claim.until;
     if (!this.save()) {
       delete a.claim; a.status = "accepted"; a.deadline = a.acceptUntil ?? a.deadline;
       return no("Keeper couldn't save the claim", 503);
     }
-    this.d.log(`claimed ${a.id} claim ${claim.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup} until ${new Date(claim.until).toISOString()}`);
+    this.d.log(`claimed ${a.id} claim ${claim.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup} until ${new Date(claim.until).toISOString()}`);   // (0.1.8) the claim's start line
     return { status: 200, body: { status: "claimed", id, app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, claim: claim.id, until: new Date(claim.until).toISOString(), ...this.enrollment() } };
   }
   // (0.1.5) POST /attempt/<id>/cancel, Cain's link only, when it gives up on a pass: a registration still
@@ -933,35 +1025,76 @@ export class Keeper {
   // 0.1.6: its backup (one made, or one still being made) is deleted at the next poll (dropBackups).
   // 0.1.7: under the claim record's lock (cancel()), and idempotent: a cancel already recorded answers its
   // recorded outcome again. A claim already handed to a started run (a version change seen) can't be cancelled.
-  cancelAttempt(caller: string | null, id: string, body: any): Answer {
+  // 0.1.8: jobs is the Supervisor's jobs list for the App, read under the same lock (cancel()): an active install,
+  // update, rebuild or restore of it, an active job on it whose name isn't recognized, or a list that can't be read
+  // (null) refuses the cancel, logged with why; the claim and its backup are kept (it then runs out by itself).
+  // A cancel whose why says the link refused the enrollment logs it and prints a key-confirm code.
+  cancelAttempt(caller: string | null, id: string, body: any, jobs: string[] | null): Answer {
     if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App cancels a registration` } };
     const a = this.st.attempts[id];
     if (!a) return { status: 404, body: { status: "unknown", id } };
+    const why = s(body?.why).replace(/[^\x20-\x7e]/g, " ").slice(0, 160) || "it gave up on the Ship pass";
+    if (why.startsWith(ENROLL_BEHIND) || why.startsWith(ENROLL_REFUSED)) this.enrollRefusedBy(why);
     if (a.cancel) { this.d.log(`a retry of the cancel of ${a.id}: the recorded outcome (ended)`); return { status: 200, body: { status: "ended", id, recorded: true } }; }
     if (a.firstSeenTo || a.consumedAt) {
       this.d.log(`refused a cancel of ${a.id}: its claim was handed to a started run (${appName(a.app)} ${a.to} seen)`);
       return { status: 409, body: { status: "refused", id, why: `its claim was handed to a started run (${appName(a.app)} ${a.to} was seen): it is ${a.status}, and a cancel can't end it now` } };
     }
     if (!["verifying", "accepted", "claimed"].includes(a.status)) return { status: 409, body: { status: "refused", id, why: `it is ${a.status}` } };
-    const why = s(body?.why).replace(/[^\x20-\x7e]/g, " ").slice(0, 160) || "it gave up on the Ship pass";
+    const busy = jobsWhy(a.app, jobs);
+    if (busy) {
+      this.d.log(`refused a cancel of ${a.id} (${a.status}): ${busy}; its ${a.claim ? `claim ${a.claim.id} and ` : ""}backup ${a.backup || "(being made)"} are kept`);
+      return { status: 409, body: { status: "refused", id, why: `${busy}: the cancel is refused, and the ${a.claim ? "claim and its " : ""}backup are kept` } };
+    }
     const req = s(body?.request);
     a.cancel = { at: this.now(), why, ...(/^[A-Za-z0-9-]{8,64}$/.test(req) ? { request: req } : {}) };
     this.ended(a, `cancelled by ${appName(REGISTRAR)}'s link (${why})`, false, true);
     return { status: 200, body: { status: "ended", id } };
   }
+  // (0.1.8) The link refused the keeper's enrollment (its cancel said so): logged, remembered for the next start,
+  // and a key-confirm code printed for the re-enrollment.
+  private enrollRefusedBy(why: string): void {
+    if (why.startsWith(ENROLL_BEHIND)) this.d.log(`${ENROLL_BEHIND}: re-enroll with key-confirm`);
+    else this.d.log("the link refused Keeper's enrollment: re-enroll with key-confirm");
+    this.st.enrollRefused = this.now();
+    if (shipKey(this.opts.ship_public_key)) this.issueCode("key", KEY_CODE_MS, keyFp(this.opts.ship_public_key));
+    this.save();
+  }
   // (0.1.7) The routes' entry points: claim and cancel under the claim record's lock.
-  claim(caller: string | null, id: string, body: any): Promise<Answer> { return this.record(() => this.claimAttempt(caller, id, body)); }
-  cancel(caller: string | null, id: string, body: any): Promise<Answer> { return this.record(() => this.cancelAttempt(caller, id, body)); }
+  // 0.1.8: the cancel reads the App's jobs list under the lock (bounded); a step that fails answers 503.
+  claim(caller: string | null, id: string, body: any): Promise<Answer> {
+    return this.record(() => this.claimAttempt(caller, id, body), (why) => ({ status: 503, body: { status: "refused", id, why: `Keeper's claim step failed (${why})` } }));
+  }
+  cancel(caller: string | null, id: string, body: any): Promise<Answer> {
+    return this.record(async () => {
+      const a = caller === REGISTRAR ? this.st.attempts[id] : undefined;
+      const jobs = a ? await this.appJobs(a.app) : [];
+      return this.cancelAttempt(caller, id, body, jobs);
+    }, (why) => ({ status: 503, body: { status: "refused", id, why: `Keeper's cancel step failed (${why}); nothing was cancelled` } }));
+  }
+  // (0.1.8) The App's active jobs as the Supervisor lists them (their names), bounded; null when unreadable.
+  private appJobs(app: string): Promise<string[] | null> {
+    const f = this.d.activeJobs;
+    return f ? this.bounded(() => f(app), "the Supervisor's jobs list") : Promise.resolve(null);
+  }
   // (0.1.5) An attempt that ends with nothing restored and nothing installed: its "ended" line, and (but a
   // cancellation) a notice to the owner that leaves no incident open.
   // 0.1.6: drop, its backup (made for nothing) is deleted at the next poll.
   private ended(a: Attempt, why: string, tell = true, drop = false): void {
+    this.claimEnd(a, `ended: ${why}`);
     a.status = "ended"; a.why = why; a.endedAt = this.now();
     if (drop) a.dropBackup = true;
     this.d.log(`${a.id}: ended (${why})`);
     if (tell) this.notice(a.app, "ended", `Keeper's acceptance of the install of ${appName(a.app)} ${a.to} ended: ${why}. Nothing was installed under it and nothing was rolled back.`,
       `Keeper's notice for ${appName(a.app)} ${a.to} done.`, a.id);
     this.save();
+  }
+  // (0.1.8) A claim's end, logged once with its deadline: consumed by the install it covers, expired, cancelled, or
+  // ended by the fence.
+  private claimEnd(a: Attempt, how: string): void {
+    if (!a.claim || a.claimEndSaid || a.status !== "claimed") return;
+    a.claimEndSaid = true;
+    this.d.log(`claim ${a.claim.id} of ${a.id} ended (${how}); its deadline was ${new Date(a.claim.until).toISOString()}`);
   }
   // (0.1.4) The keeper's own backup, made once and awaited (up to REGISTER_WAIT_MS), then verified. A
   // backup that fails, doesn't complete in time, or (after a restart) has an unknown outcome leaves the
@@ -1036,6 +1169,7 @@ export class Keeper {
         }
       }
       if (a.dropCheck) {
+        if (!a.quietAt) continue;                          // (0.1.8) one more poll after the deadline first
         const jobs = this.d.activeJobs ? await this.d.activeJobs(a.app).catch(() => null) : null;
         if (jobs === null) {
           a.dropTries = (a.dropTries ?? 0) + 1;
@@ -1043,8 +1177,9 @@ export class Keeper {
           this.save();
           continue;
         }
-        if (jobs.length) {
-          a.dropKept = `an install or update of ${a.app} is running (${jobs.join(", ").slice(0, 120)})`;
+        const busy = jobsWhy(a.app, jobs);
+        if (busy) {
+          a.dropKept = busy;
           this.d.log(`${a.id}: kept its backup ${a.backup}: its claim expired with no version change seen, but ${a.dropKept}`);
           this.save();
           continue;
@@ -1080,6 +1215,7 @@ export class Keeper {
   }
   private unprotected(a: Attempt, why: string, force = false): void {
     if (a.status === "unprotected" || (a.status === "ended" && !force)) return;
+    this.claimEnd(a, "the attempt is unprotected");
     a.status = "unprotected"; a.why = why; a.endedAt = this.now();
     this.d.log(`refusing ${a.id}: ${why} (UNPROTECTED: nothing will be rolled back for this install)`);
     this.owner(a.app, "unprotected", `Keeper can't protect the install of ${appName(a.app)} ${a.to || "(no version)"}: ${why}. Nothing will be rolled back for it.`, true, a.id);
@@ -1101,15 +1237,21 @@ export class Keeper {
     const wasRestoring = this.open(app).filter((a) => a.status === "restoring");
     // (0.1.7) the version change, the consume and the expiries under the claim record's lock
     await this.record(() => {
+      // (0.1.8) the time read under the lock: the consume and the expiries decide on it, not on the poll's start
+      const t = this.now();
       if (info) this.versionChange(app, info.version);
+      // (0.1.8) an unused claim's expiry: one more poll after its deadline, with the App read and no version change
+      for (const a of Object.values(this.st.attempts)) if (a.app === app && a.status === "ended" && a.dropCheck && !a.quietAt && info && info.version !== a.to && t > (a.endedAt ?? Infinity)) {
+        a.quietAt = t; this.d.log(`${a.id}: a poll after its claim's deadline saw ${app} at ${info.version}, no version change: its backup can go`);
+      }
       for (const a of this.open(app)) {
         // (0.1.4) the install seen while its registration still waits for the backup: never accepted;
         // (0.1.5) and seen while accepted but not claimed: outside a live claim
         if (a.status === "verifying" && info?.version === a.to) { this.unprotected(a, "the install began before Keeper accepted it (its backup wasn't complete)"); continue; }
         if (a.status === "accepted" && info?.version === a.to) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
-        if (a.status === "claimed" && info?.version === a.to && now > a.claim!.until) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
+        if (a.status === "claimed" && info?.version === a.to && t > a.claim!.until) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
         if (started) a.chat = chat;
-        if (a.status === "accepted" || a.status === "claimed" || a.status === "watching") this.judge(a, info, live, now);
+        if (a.status === "accepted" || a.status === "claimed" || a.status === "watching") this.judge(a, info, live, t);
       }
     });
     for (const a of wasRestoring) if (a.status === "restoring") { this.observe(a, info); await this.restoring(a, info, live); }
@@ -1132,7 +1274,12 @@ export class Keeper {
     const now = this.now();
     const live = (a: Attempt) => a.status === "claimed" && !!a.claim && now <= a.claim.until && !a.consumedAt;
     const outside = recent.find((a) => a.to === v && !a.consumedAt && (a.status === "accepted" || (a.status === "claimed" && !live(a)) || a.status === "ended"));
-    if (outside && !recent.some((a) => a.to === v && live(a))) { this.d.log(`${app} is at ${v} (was ${was}) outside a live claim of ${outside.id}`); return this.unprotected(outside, OUTSIDE_CLAIM, true); }
+    if (outside && !recent.some((a) => a.to === v && live(a))) {
+      this.d.log(`${app} is at ${v} (was ${was}) outside a live claim of ${outside.id}`);
+      // (0.1.8) an install happened: its backup is kept for a rollback by hand, never deleted as unused
+      if (outside.dropBackup && !outside.backupDropped) { outside.dropBackup = false; outside.dropKept = `${app} moved to ${v} after it ended`; if (outside.backup) this.d.log(`${outside.id}: kept its backup ${outside.backup}: ${outside.dropKept}`); }
+      return this.unprotected(outside, OUTSIDE_CLAIM, true);
+    }
     // (0.1.6) A version change during a live claim to a version other than the claimed one: uncertain.
     const wrong = recent.find((a) => live(a) && a.to !== v);
     if (wrong) { this.d.log(`${app} is at ${v} (was ${was}) during claim ${wrong.claim!.id} of ${wrong.id}, which claimed ${wrong.to}`); return this.unprotected(wrong, `${appName(app)} moved to ${v}, not the claimed ${wrong.to}, during its live claim, so the install is uncertain`); }
@@ -1144,6 +1291,7 @@ export class Keeper {
   // live: the App's liveness (/health) this poll. Readiness never enters it.
   judge(a: Attempt, info: AppInfo | null, live: boolean, now: number): void {
     if (info && a.status === "claimed" && info.version === a.to && now <= a.claim!.until) {
+      this.claimEnd(a, "consumed by the install it covers");
       a.status = "watching"; a.firstSeenTo = now; a.watchEnd = now + WATCH_MS; a.consumedAt = now;
       this.d.log(`consumed ${a.id}: ${a.app} ${a.to} seen within claim ${a.claim!.id}; this acceptance is spent and covers no other install`);
       this.d.log(`watching ${a.id}: ${a.app} ${a.to} seen, 15 minutes from now`);
@@ -1625,7 +1773,7 @@ export class Keeper {
     if (bad) return { ok: false, why: bad };
     for (const [, u] of checks) this.st.phone[checkId(u)].confirmedAt = now;
     delete this.st.phoneRun;
-    this.d.log(`phone test confirmed by the owner for ${checks.map(([n]) => n).join(", ")} (each check's page, so its channel, reaches the phone)`);
+    this.d.log(`phone test confirmed by the owner for ${checks.map(([n]) => n).join(", ")}: the owner's own attestation that each check's alert appeared on the phone (Keeper can't see the phone); good for ${this.opts.drill_days} days`);
     this.arm();
     this.save();
     return { ok: true, why: "" };
@@ -1669,7 +1817,7 @@ export class Keeper {
     if (bad) return { ok: false, why: bad };
     this.st.mhbRec = { confirmedAt: now, hc: this.hcH(), api: m.api };
     delete this.st.mhb;
-    this.d.log("missed-heartbeat drill confirmed by the owner: a missed heartbeat pages the phone (the heartbeat check's channel reaches it); good for 14 days");
+    this.d.log(`missed-heartbeat drill confirmed by the owner: the owner's own attestation that the missed heartbeat's alert appeared on the phone (Keeper can't see the phone); good for ${this.opts.drill_days} days`);
     this.arm();
     this.save();
     return { ok: true, why: "" };
@@ -1678,7 +1826,7 @@ export class Keeper {
   // checks' settings.
   private mhbOk(now: number): boolean {
     const r = this.st.mhbRec;
-    if (!r || r.hc !== this.hcH() || now - r.confirmedAt > MHB_MAX_MS) return false;
+    if (!r || r.hc !== this.hcH() || now - r.confirmedAt > this.drillMs()) return false;
     return !(this.hcSeen?.ok && this.hcSeen.hash !== r.api);
   }
   // (0.1.4) Confirmed within 14 days (0.1.5), under the current Healthchecks options and checks' settings,
@@ -1686,10 +1834,25 @@ export class Keeper {
   private phoneOk(app: string, now: number): boolean {
     if (this.st.phoneHc !== this.hcH()) return false;
     if (!this.st.phoneHcApi || (this.hcSeen?.ok && this.hcSeen.hash !== this.st.phoneHcApi)) return false;
-    return [this.alertUrl(app), this.opts.hc_deadman].every((u) => { const p = this.st.phone[checkId(u)]; return !!p?.confirmedAt && now - p.confirmedAt <= PHONE_MAX_MS; });
+    return [this.alertUrl(app), this.opts.hc_deadman].every((u) => { const p = this.st.phone[checkId(u)]; return !!p?.confirmedAt && now - p.confirmedAt <= this.drillMs(); });
+  }
+  // (0.1.8) How long a phone test and a missed-heartbeat drill count: option drill_days (1 to 14, default 14).
+  drillMs(): number { return Math.min(this.opts.drill_days, 14) * 86_400_000; }
+  // (0.1.8) A log reminder before each drill is due: a day before its window ends (half the window when that is a
+  // day or less), once per confirm. Arming lapses at the mark itself, when the drill isn't run again in time.
+  private drillReminders(now: number): void {
+    const win = this.drillMs(), lead = Math.min(86_400_000, win / 2);
+    const phoneAt = Math.min(...[...this.opts.watch.map((a) => this.alertUrl(a)), this.opts.hc_deadman].map((u) => this.st.phone[checkId(u)]?.confirmedAt ?? Infinity));
+    const due: [keyof NonNullable<State["drillDue"]>, number, string][] = [["phone", phoneAt, "the phone test (phone-test, then phone-confirm)"], ["mhb", this.st.mhbRec?.confirmedAt ?? Infinity, "the missed-heartbeat drill (missed-heartbeat, then missed-heartbeat-confirm)"]];
+    for (const [kind, at, what] of due) {
+      if (!Number.isFinite(at) || now < at + win - lead || this.st.drillDue?.[kind] === at) continue;
+      (this.st.drillDue ??= {})[kind] = at;
+      this.d.log(`drill due: run ${what} again before ${new Date(at + win).toISOString()} (drill_days ${this.opts.drill_days}); arming lapses at that mark if it isn't confirmed again`);
+    }
   }
   arm(): void {
     const now = this.now();
+    this.drillReminders(now);
     for (const app of Object.keys(this.st.drills)) {
       const cur = this.binding(app);
       const d = this.st.drills[app] ?? {};
@@ -1728,8 +1891,8 @@ export class Keeper {
       : !this.limitsOk() ? `the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION}): accept-limits <code>`
       : drill ? `${drill} is running (one drill at a time; Keeper is unarmed during a drill)`
       : valid.length < 2 ? `no drills on record for ${app} under the current binding`
-      : !this.phoneOk(app, now) ? `no phone test drill confirmed for ${app}'s alert check and the dead-man check in the last 14 days, under the current Healthchecks options and checks' settings`
-      : !this.mhbOk(now) ? "no missed-heartbeat drill confirmed in the last 14 days, under the current Healthchecks options and checks' settings"
+      : !this.phoneOk(app, now) ? `no phone test drill confirmed for ${app}'s alert check and the dead-man check in the last ${this.opts.drill_days} days, under the current Healthchecks options and checks' settings`
+      : !this.mhbOk(now) ? `no missed-heartbeat drill confirmed in the last ${this.opts.drill_days} days, under the current Healthchecks options and checks' settings`
       : !this.delivered(now) ? "no heartbeat ping was delivered to Healthchecks in the last 10 minutes"
       : !this.st.deadmanDelivered || now - this.st.deadmanDelivered > DELIVERY_MS ? "no dead-man ping was delivered to Healthchecks in the last 10 minutes"
       : this.loopStalled(now) ? "Keeper's poll loop hasn't completed in the last 3 minutes"
@@ -1739,9 +1902,15 @@ export class Keeper {
       : "";
     return { armed: !why, why, at: valid.length === 2 ? Math.max(...valid.map((r) => r!.at)) : null };
   }
-  armedView(app: string): { app: string; armed: boolean; why: string; armed_at: string | null; binding: Binding; keeper_version: string; at: string; key_fp: string; key_confirmed_at: string | null; state_created: string; enroll_id: string; counter: number } {
-    // (0.1.7) each armed read moves the enrollment counter on, saved
-    this.save();
+  // (0.1.8) GET /armed, under the claim record's lock (armed reads one at a time, between claims and consumes).
+  armed(app: string): Promise<ReturnType<Keeper["armedView"]>> {
+    return this.record(() => this.armedView(app), (why) => ({ app, armed: false, why: `Keeper's armed read failed (${why})`, armed_at: null, binding: this.binding(app), keeper_version: this.d.version, at: new Date(this.now()).toISOString() }));
+  }
+  armedView(app: string): { app: string; armed: boolean; why: string; armed_at: string | null; binding: Binding; keeper_version: string; at: string; key_fp?: string; key_confirmed_at?: string | null; state_created?: string; enroll_id?: string; counter?: number } {
+    // (0.1.7) each armed read moves the enrollment counter on, saved; 0.1.8: written whole and fsynced (main.ts
+    // writeWhole) before the answer leaves, and an answer whose counter couldn't be saved carries no enrollment
+    if (!this.save()) return { app, armed: false, why: "Keeper couldn't save its state, so this read carries no enrollment", armed_at: null, binding: this.binding(app),
+      keeper_version: this.d.version, at: new Date(this.st.heartbeat || this.now()).toISOString() };
     const v = this.armedState(app);
     return { app, armed: v.armed, why: v.why, armed_at: v.armed && v.at ? new Date(v.at).toISOString() : null, binding: this.binding(app),
       keeper_version: this.d.version, at: new Date(this.st.heartbeat || this.now()).toISOString(), ...this.enrollment() };

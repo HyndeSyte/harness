@@ -5,7 +5,7 @@ Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
-- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.7): a check after every install of a
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.8): a check after every install of a
   watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
   `bun test keeper/tests`.
 
@@ -427,7 +427,10 @@ checks its own connector, which can lapse alone.
   goes out only once Home Assistant answers again.
 
 One installer: no laptop session installs around a waiting Ship job, and nothing is
-installed from Home Assistant's own page unless Dane says so.
+installed from Home Assistant's own page unless Dane says so. Keeper 0.1.8 (Accepted limits, text version 2): a
+Ship run the link refused or that failed can leave a live claim on the Keeper for up to 30 minutes, so nothing is
+installed from Home Assistant's page while a Ship run is live, or until the Keeper's log shows no live claim (each
+claim's start and end is logged there with its deadline).
 
 ## The Keeper's setup (Dane, once, and after its state is lost)
 
@@ -435,24 +438,34 @@ At the Pi, with the SSH App, in the Keeper App's container (`docker exec addon_0
 /opt/keeper/main.ts <command>`). Keeper DOCS has each step in full.
 
 1. Options: `ship_public_key`, `tokens` (and the same token in Cain's `keeper_token`), and the Healthchecks
-   ping URLs (`hc_done`, `hc_deadman`, `hc_failed`). Keeper 0.1.7: no `hc_api_key` option any more; if it is
-   still there from 0.1.5 or 0.1.6, remove it (Keeper's log says so at every start until it's gone).
+   ping URLs (`hc_done`, `hc_deadman`, `hc_failed`), and (Keeper 0.1.8) `hc_unique_keys` with each production
+   check's unique key, so each role is matched explicitly. Keeper 0.1.7: no `hc_api_key` option any more; if it
+   is still there from 0.1.5 or 0.1.6, remove it (Keeper's log says so at every start until it's gone). Keeper
+   0.1.8: while it is there Keeper doesn't arm and refuses `hc-key`. Then rotate that key in Healthchecks (revoke
+   it, make a new read-only key), since earlier backups may hold it. Optional: `drill_days` (1 to 14, default 14).
 1a. `hc-key <code>` (Keeper 0.1.7), with the project's **read-only** Healthchecks API key on standard input,
    never on the command line (`docker exec -i addon_0fcc2575_keeper bun /opt/keeper/main.ts hc-key <code>`,
    paste the key, Enter, Ctrl-D); the code is in the Keeper's log at every start. Keeper refuses a key that
    can write, or one that doesn't see the checks, and keeps nothing then. Again after any restore of the
    Keeper App (its backups leave the key out).
 1b. `accept-limits <code>` (Keeper 0.1.7), once you have read "Accepted limits" in Keeper DOCS; the code is in
-   the Keeper's log at each start while they aren't accepted for the current text. Arming needs it.
+   the Keeper's log at each start while they aren't accepted for the current text. Arming needs it. Keeper 0.1.8
+   moved the text to version 2: accept it again.
+1c. The device checks before arming (Keeper 0.1.8, Keeper DOCS): the read-only key is the one kept and the
+   read-write key never given; each role's check identity verified on the live account and set in
+   `hc_unique_keys`; a backup of the Keeper App leaves out `/data/hc-key`.
 2. `key-confirm <fingerprint> <code>`, the fingerprint checked against `cain/SHIP_KEY_FINGERPRINT` and Cain's
-   log, the one-time code from the Keeper's log (at the pin, and since 0.1.7 at every start). Since 0.1.7 the
-   same command, with the fresh code from the latest start, is the re-enrollment after a restore of the Keeper
-   or a clock correction: Cain's link refuses an older Keeper state (a lower counter) until then.
+   log, the one-time code from the Keeper's log (at the pin; since 0.1.8 at a start only while the key isn't
+   enrolled or after Cain's link refused the enrollment, and otherwise from `key-code`). The same command, with a
+   fresh code, is the re-enrollment after a restore of the Keeper or a clock correction: Cain's link refuses an
+   older Keeper state (a lower counter) until then, and the Keeper logs `enrollment counter behind the link:
+   re-enroll with key-confirm` when it does.
 3. `phone-test`, then once the pages reached the phone, within an hour, `phone-confirm <code> cain deadman`
    (every check named in one call, Keeper 0.1.7; the code from the Keeper's log at the test).
 4. `missed-heartbeat` (Keeper 0.1.6): the heartbeat ping stops until Healthchecks shows the check down (0.1.7,
    at most 30 minutes); once that page reached the phone and the check is up again, within an hour after the
-   ping resumes, `missed-heartbeat-confirm <code>`. Arming needs it within 14 days, like the phone test, and
+   ping resumes, `missed-heartbeat-confirm <code>`. Each confirm is Dane's own attestation that the alert appeared
+   on his phone. Arming needs it within 14 days (or `drill_days`), like the phone test, and
    it lapses with it. One drill at a time: no install during a drill (Keeper turns it away and the drill is
    void).
 5. The two drills (a FAIL verdict and an exit on start), the next job.

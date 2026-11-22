@@ -80,14 +80,15 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       if (!r?.ok || !Array.isArray(r.data?.backups)) return null;
       return r.data.backups.filter((b: any) => b && typeof b.slug === "string").map((b: any) => ({ slug: b.slug, name: typeof b.name === "string" ? b.name : "" }));
     },
-    // (0.1.7) The jobs list's active (not done) jobs that install, update, rebuild or restore that App: matched on
-    // the App's slug as the job's reference and an install-like name. Null when the list can't be read.
+    // (0.1.7) The jobs list's active (not done) jobs on that App: matched on the App's slug as the job's reference.
+    // 0.1.8: every such job's name (core.ts jobsWhy judges them: an install-like or unrecognized one stands in the way;
+    // a job with no name counts as unrecognized). Null when the list can't be read.
     async activeJobs(app: string): Promise<string[] | null> {
       const r = await call("GET", "/jobs/info").catch(() => null);
       if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
       const out: string[] = [];
       const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
-        if (x.done !== true && x.reference === app && typeof x.name === "string" && /install|update|rebuild|restore/i.test(x.name)) out.push(x.name.slice(0, 60));
+        if (x.done !== true && x.reference === app) out.push(typeof x.name === "string" && x.name ? x.name.slice(0, 60) : "(a job with no name)");
         if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
       walk(r.data.jobs);
       return out;

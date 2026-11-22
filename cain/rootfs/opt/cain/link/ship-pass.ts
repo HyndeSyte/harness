@@ -35,6 +35,13 @@
 //      a clock correction. Each check compares against the record as it stood before the request was sent, so a
 //      concurrent read's newer counter can't make an answer look old. The claim carries a request id, and a
 //      claim that got no answer is asked once more with it: the keeper answers a retry with the recorded claim.
+//   9. (Keeper 0.1.8) a brand-new enrollment id (one the link has never seen) sets the recorded counter to the value
+//      that enrollment carries, however far below the old one (a keeper restored from a backup and re-enrolled by the
+//      owner), and counters only go up within that id after; a reply for an enrollment the link has since replaced
+//      (by a concurrent read) is discarded even when the record as it stood before its request allowed it. A pass
+//      refused on the enrollment cancels its registrations saying so ("enrollment counter behind the link" for an
+//      older keeper state, else "enrollment refused by the link"), so the keeper logs it and prints a key code. A
+//      second run on a token that already passed is refused naming its claims' latest expiry while one is live.
 // Why the link and not the Ship run: the Ship run is a cloud session, and the keeper's service is only
 // on Home Assistant's internal App network. The Home Assistant connector can't reach it, and the link,
 // on the same network, already talks to the keeper with Cain's token. So no options are written at all.
@@ -77,6 +84,10 @@ export function readFingerprintFile(text: string): string {
 export interface Enrollment { fp: string; stateCreated: number; confirmedAt: number; enrollId: string; counter: number; seen: string[] }
 export interface EnrollmentStore { load: () => Enrollment | null; store: (e: Enrollment) => void }
 const ENROLL_ID = /^[0-9a-f]{16}$/;
+// (Keeper 0.1.8) The why of a cancel after an enrollment refusal, as the keeper reads it (keeper core.ts ENROLL_BEHIND,
+// ENROLL_REFUSED): an older keeper state (a lower counter, an older state, an earlier enrollment), or any other refusal.
+export const ENROLL_BEHIND = "enrollment counter behind the link";
+export const ENROLL_REFUSED = "enrollment refused by the link";
 export function parseEnrollment(text: string | null): Enrollment | null {
   try {
     const j = JSON.parse(text ?? "");
@@ -90,7 +101,26 @@ export function parseEnrollment(text: string | null): Enrollment | null {
 // hasn't seen, for the committed fingerprint and confirmed after the keeper's state was created, is the owner's
 // confirm seen (a first enrollment or a re-enrollment): the record moves to it (record). The same id needs the
 // same state and confirm times and a counter no lower than the record's (a higher one is recorded).
-export function enrollmentCheck(ans: any, committed: string, linkFp: string | null, rec: Enrollment | null): { ok: true; record?: Enrollment } | { ok: false; why: string; record?: Enrollment } {
+export type EnrollmentJudged = { ok: true; record?: Enrollment } | { ok: false; why: string; record?: Enrollment; cancel?: string };
+export function enrollmentCheck(ans: any, committed: string, linkFp: string | null, rec: Enrollment | null): EnrollmentJudged {
+  const r = judgeEnrollment(ans, committed, linkFp, rec);
+  if (r.ok) return r;
+  // (Keeper 0.1.8) what the keeper is told with the cancel
+  return { ...r, cancel: /lower than|an older keeper state|earlier confirmation the link has seen replaced/.test(r.why) ? `${ENROLL_BEHIND}: ${r.why}`.slice(0, 160) : `${ENROLL_REFUSED}: ${r.why}`.slice(0, 160) };
+}
+// (Keeper 0.1.8) The reply judged against the record as it stood before its request, then against the record as it
+// stands now: a reply for an enrollment the link has since replaced (its id among the replaced ones) is discarded.
+export function enrollmentCheckNow(ans: any, committed: string, linkFp: string | null, before: Enrollment | null, store: EnrollmentStore | undefined): EnrollmentJudged {
+  const r = enrollmentCheck(ans, committed, linkFp, before);
+  if (!r.ok) return r;
+  let cur: Enrollment | null = null;
+  try { cur = store?.load() ?? null; } catch { cur = null; }
+  const eid = String(ans?.enroll_id ?? "");
+  if (cur && cur.enrollId !== eid && cur.seen.includes(eid))
+    return { ok: false, why: `the keeper's reply is for enrollment ${eid}, which the link has replaced (by ${cur.enrollId}) since the request was sent: discarded`, cancel: `${ENROLL_BEHIND}: a reply for a replaced enrollment` };
+  return r;
+}
+function judgeEnrollment(ans: any, committed: string, linkFp: string | null, rec: Enrollment | null): { ok: true; record?: Enrollment } | { ok: false; why: string; record?: Enrollment } {
   if (!FP.test(committed)) return { ok: false, why: `${FINGERPRINT_FILE} at the head holds no fingerprint (the Build run when the link's Ship key is made writes it)` };
   if (linkFp && committed !== linkFp) return { ok: false, why: `${FINGERPRINT_FILE} at the head (${committed}) isn't the link's own Ship key (${linkFp})` };
   const fp = typeof ans?.key_fp === "string" ? ans.key_fp : "";
@@ -100,7 +130,7 @@ export function enrollmentCheck(ans: any, committed: string, linkFp: string | nu
   if (!Number.isFinite(confirmed)) return { ok: false, why: "the keeper's pinned key isn't confirmed by the owner (key-confirm at the device)" };
   const eid = typeof ans?.enroll_id === "string" ? ans.enroll_id : "", counter = ans?.counter;
   if (!ENROLL_ID.test(eid) || !Number.isSafeInteger(counter) || counter < 0) return { ok: false, why: "the keeper's answer carries no enrollment id or counter (Keeper 0.1.7 or later is needed)" };
-  const again = "the owner confirms the key at the device again (key-confirm with the fresh code from the keeper's latest start)";
+  const again = "the owner confirms the key at the device again (key-code at the keeper prints a fresh code, then key-confirm with it)";
   if (!rec || rec.enrollId !== eid) {
     if (rec && rec.seen.includes(eid)) return { ok: false, why: `the keeper's enrollment ${eid} is an earlier confirmation the link has seen replaced (an older keeper state, or a replay): ${again}` };
     if (confirmed < created) return { ok: false, why: "the keeper's key was confirmed before its state was created" };
@@ -119,7 +149,7 @@ export function enrollmentCheck(ans: any, committed: string, linkFp: string | nu
 // Keeper 0.1.7: before is the record as it stood before the read was sent (main.ts loads it first).
 export function noteArmedEnrollment(ans: any, linkFp: string | null, e: EnrollmentStore | undefined, log: (l: string) => void, before?: Enrollment | null): void {
   if (!linkFp || !e) return;
-  const en = enrollmentCheck(ans, linkFp, linkFp, before === undefined ? e.load() : before);
+  const en = enrollmentCheckNow(ans, linkFp, linkFp, before === undefined ? e.load() : before, e);
   if (en.record) noteRecord(e, en.record, log);
 }
 // Keeper 0.1.7: a counter is only ever raised (a concurrent read may have stored a higher one meanwhile), and the
@@ -129,13 +159,14 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
   try {
     const cur = e.load();
     if (cur && cur.enrollId === r.enrollId) { if (r.counter > cur.counter) e.store({ ...cur, counter: r.counter }); return; }
+    if (cur && cur.seen.includes(r.enrollId)) { log(`a reply for the keeper's replaced enrollment ${r.enrollId} wasn't recorded`); return; }   // (Keeper 0.1.8)
     e.store(r); log(`the owner's confirm of the keeper's Ship key ${r.fp} seen: enrollment recorded (enrollment ${r.enrollId}, keeper state created ${new Date(r.stateCreated).toISOString()}, counter ${r.counter})`);
   } catch { log("couldn't record the keeper's enrollment"); }
 };
 
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
 export interface Claimed { attempt: string; claim: string; until: string }
-export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[] };
+export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
   apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number };
 export interface PassDeps {
@@ -191,7 +222,7 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
   else { e.state = "refused"; e.said = `the keeper didn't accept every install: ${r.said.join("; ").slice(0, 400) || "no reason"}`; }
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's outcome: the pass times out and is refused"); return; }
   d.log(r.ok ? `the keeper accepted every watched install for a Ship token (${r.accepted.map((a) => `${a.attempt} backup ${a.backup}`).join(", ") || "none watched"})` : `a Ship token's pass is refused: ${e.said}`);
-  if (!r.ok) cancelAll(d, e.attempts ?? [], "the pass is refused");
+  if (!r.ok) cancelAll(d, e.attempts ?? [], r.cancel ?? "the pass is refused");
 }
 
 // (Keeper 0.1.6) The hook refused a run the link had passed (its claim's deadline too near when it checked):
@@ -240,17 +271,20 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
     d.register(token, c.claim, (r) => settle(d, id, r), (upd) => noteEntry(d, id, upd));
     return depth ? { status: "pending", said: PENDING_SAID } : shipPass(d, body, 1);
   }
-  const refuseFor = (said: string, cancel: string[]): PassAnswer => {
+  const refuseFor = (said: string, cancel: string[], cancelWhy = "the pass is refused"): PassAnswer => {
     const all = readEntries(d.load()) ?? spent!;
     const cur = all.find((x) => x.id === id);
     if (cur) { cur.state = "refused"; cur.said = said; try { writeEntries(d, all); } catch { /* refused either way */ } }
     d.log(`a Ship token's pass is refused: ${said}`);
-    cancelAll(d, cancel, "the pass is refused");
+    cancelAll(d, cancel, cancelWhy);
     return { status: "refused", said: `${said}. ${again}` };
   };
   if (e.state === "passed") {
-    d.log(`refused a second Ship run on the token for ${where}`);
-    return { status: "spent", said: "that Ship token already started a Ship run; one tap starts one run. If the install still has to happen, show a new Ship card for the same pull request and head" };
+    // (Keeper 0.1.8) one Ship run per attempt: while its claim is live, the refusal names the claims' latest expiry
+    const live = (e.claims ?? []).map((k) => Date.parse(k.until)).filter((t) => Number.isFinite(t) && t > now);
+    const until = live.length ? new Date(Math.max(...live)).toISOString() : "";
+    d.log(`refused a second Ship run on the token for ${where}${until ? `: its claim is live until ${until}` : ""}`);
+    return { status: "spent", said: `that Ship token already started a Ship run${until ? `, and its claim at the keeper is live until ${until}` : ""}; one tap starts one run. If the install still has to happen, show a new Ship card for the same pull request and head${until ? " once that claim has ended" : ""}` };
   }
   if (e.state === "refused") return { status: "refused", said: `${e.said ?? "the keeper didn't accept the install"}. ${again}` };
   if (e.state === "registering") {
@@ -280,11 +314,11 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
     const okAns = r && r.status === 200 && j.status === "claimed" && j.id === a.attempt && j.app === a.app && j.backup === a.backup
       && (a.from === undefined || j.from_version === a.from) && (a.to === undefined || j.to_version === a.to)
       && typeof j.claim === "string" && CLAIM_ID.test(j.claim) && Number.isFinite(Date.parse(String(j.until)));
-    const en = okAns ? enrollmentCheck(j, e.fp ?? "", keyFingerprint(pub), before) : null;
+    const en = okAns ? enrollmentCheckNow(j, e.fp ?? "", keyFingerprint(pub), before, d.enrollment) : null;
     if (en?.record) noteRecord(d.enrollment, en.record, d.log);
     if (!okAns || !en || !en.ok) {
       return refuseFor(!r ? `the keeper didn't answer the claim of ${a.attempt}` : !okAns ? `the keeper refused the claim of ${a.attempt}: ${String(j?.why ?? r.status).slice(0, 160)}`
-        : `the keeper's claim of ${a.attempt} failed the enrollment check: ${(en as any).why}`, accepted.map((x) => x.attempt));
+        : `the keeper's claim of ${a.attempt} failed the enrollment check: ${(en as any).why}`, accepted.map((x) => x.attempt), (en && !en.ok && en.cancel) || undefined);
     }
     const left = Date.parse(String(j.until)) - d.now();
     if (left < CLAIM_START_MIN_MS) return refuseFor(`the keeper's claim of ${a.attempt} has ${Math.max(0, Math.floor(left / 60_000))} minutes left, under the ${CLAIM_START_MIN_MS / 60_000} a Ship run needs to start`, accepted.map((x) => x.attempt));
@@ -322,6 +356,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   const said: string[] = [];
   const accepted: Accepted[] = [];
   let ok = true;
+  let cancel: string | undefined;                       // (Keeper 0.1.8) an enrollment refusal's why, for the cancel
   const say = (l: string, bad = true) => { said.push(l); if (bad) ok = false; d.log(`keeper registration: ${l}`); };
   const now = d.now ?? Date.now, sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
   const pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
@@ -364,14 +399,14 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     }
     if (last?.status === 200 && j.status === "accepted" && j.id === attempt && j.app === slug && j.from_version === from && j.to_version === b.version
         && typeof j.backup === "string" && BACKUP_SLUG.test(j.backup)) {
-      const en = enrollmentCheck(j, committed, d.linkFp ?? null, before);
+      const en = enrollmentCheckNow(j, committed, d.linkFp ?? null, before, d.enrollment);
       if (en.record) noteRecord(d.enrollment, en.record, d.log);
-      if (!en.ok) { say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); continue; }
+      if (!en.ok) { cancel ??= en.cancel; say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); continue; }
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
     } else say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
       : last?.status === 200 ? `the keeper refused ${b.app} ${b.version}: ${String(j?.why || j?.status).slice(0, 160)}`
       : `the keeper didn't answer for ${b.app} ${b.version} (${attempt})`);
   }
-  return ok ? { ok: true, accepted, said, fp: committed } : { ok: false, said };
+  return ok ? { ok: true, accepted, said, fp: committed } : { ok: false, said, ...(cancel ? { cancel } : {}) };
 }

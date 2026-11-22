@@ -571,8 +571,8 @@ bad one back from the backup taken just before it. Cain's part:
     counter that only goes up. The link records both and refuses a lower counter (an older Keeper state, from
     a restore) and an earlier enrollment id it has seen replaced (a replayed confirm). Each answer is judged
     against the record as it stood before the request was sent. The way back after a restore of the Keeper or a
-    clock correction is the owner's `key-confirm` at the Keeper with the fresh code from its latest start: a new
-    enrollment id, which the link records.
+    clock correction is the owner's `key-confirm` at the Keeper with a fresh code (Keeper 0.1.8: from `key-code`):
+    a new enrollment id, which the link records.
   - The claim's request id: the link's claim carries one, and a claim that got no answer is asked once more with
     it; the Keeper answers that retry with the claim it recorded, never a second claim. A cancel the Keeper
     already recorded is answered the same way, and the Keeper's own expiry of an unused claim deletes its
@@ -581,6 +581,21 @@ bad one back from the backup taken just before it. Cain's part:
     is refused (the drill is then void, and is run again).
   - Two limits of the design are recorded in the Keeper's DOCS ("Accepted limits") and accepted by the owner at
     the Keeper; the rollback reads as armed only once they are.
+- With Keeper 0.1.8:
+  - Enrollment after a restore: a brand-new enrollment id (one the link has never seen, the owner's `key-confirm`)
+    is recorded at the counter it carries, however far below the old record, and counters only go up within that id
+    after. A reply for an enrollment the link has replaced meanwhile (a concurrent `/armed` read recorded a newer
+    one) is discarded, even when the record before its request allowed it. The fresh code for `key-confirm` comes
+    from the Keeper's `key-code` (or its start, while it isn't enrolled or after a refusal).
+  - A pass refused on the enrollment cancels its registrations saying so: "enrollment counter behind the link" for
+    an older Keeper state, "enrollment refused by the link" otherwise. The Keeper logs `enrollment counter behind
+    the link: re-enroll with key-confirm` and prints a code.
+  - One Ship run per attempt: a second run on a token that already passed is refused naming the claims' latest
+    expiry while one is live, since a claim at the Keeper can stay live for up to 30 minutes after a refused or
+    failed run (the Keeper's first accepted limit, text version 2). The Keeper logs each claim's start and end.
+  - The Keeper's cancel is refused while Home Assistant shows an install, update, rebuild or restore of Cain, a job
+    on Cain it doesn't recognize, or a jobs list it can't read; the claim then runs out by itself, and its backup is
+    kept until one more poll after the deadline shows no version change.
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

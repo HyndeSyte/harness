@@ -18,6 +18,7 @@
 - Cain's link now also records your confirm of the Keeper's Ship key from its minute by minute check of the Keeper, and refuses a Keeper whose saved state is older or newer than the one you confirmed.
 - If the Keeper's saved state is restored from a backup, Cain's link notices and refuses Ship runs that install Cain until you confirm the Keeper's Ship key again with the fresh code it prints at start.
 - If the Keeper doesn't answer Cain's claim at the start of a Ship run, Cain's link asks once more, and the Keeper answers with the claim it already made, never a second one.
+- Cain's link accepts a Keeper restored from a backup once you confirm its Ship key again, ignores a Keeper answer for a confirm it has since replaced, and tells the Keeper when it turns its confirm down. A second Ship run on the same tap is refused, naming when the Keeper's claim runs out.
 
 ## 0.18.0
 

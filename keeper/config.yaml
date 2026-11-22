@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.7"
+version: "0.1.8"
 slug: keeper
 description: >-
   Checks every App install for 15 minutes and rolls a bad one back from the
@@ -52,6 +52,9 @@ timeout: 20
 # backup_exclude above leaves out of this App's backups. A key that can write is refused at entry and never kept.
 # hc_unique_keys (0.1.7): optional, "role=<40 hex>" with role done, deadman or an App slug: the check's unique key
 # as the read-only API shows it, used in place of the one derived from the ping URL when that doesn't match.
+# 0.1.8: while hc_api_key is still in the options as the Supervisor holds them, Keeper doesn't arm and refuses hc-key;
+# remove it, then rotate that key (earlier backups may hold it). drill_days (0.1.8): 1 to 14, default 14, how long the
+# phone test and the missed-heartbeat drill count for arming, with a log reminder a day before each is due.
 options:
   watch:
     - 0fcc2575_cain
@@ -64,6 +67,7 @@ options:
   health_grace_s: 180
   ship_public_key: ""
   hc_unique_keys: []
+  drill_days: 14
 schema:
   watch:
     - match(^[a-z0-9_]{1,64}$)
@@ -79,3 +83,4 @@ schema:
   ship_public_key: match(^[A-Za-z0-9+/=]{0,200}$)?
   hc_unique_keys:
     - match(^(done|deadman|[a-z0-9_]{1,64})=[0-9a-fA-F]{40}$)
+  drill_days: int(1,14)?

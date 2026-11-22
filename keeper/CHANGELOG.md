@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.8
+
+- The "Accepted limits" text is now version 2, so you accept it again with `accept-limits`. It says plainly that a refused or failed Ship run can leave a live claim for up to 30 minutes, so never install Cain from Home Assistant's page while a Ship run is live or until Keeper's log shows no live claim, and that a broken phone channel in Healthchecks goes unseen until your next phone test or drill.
+- Keeper logs when each claim starts and when it ends, with its deadline, and a second Ship run on the same tap is refused naming when the live claim runs out.
+- While the old `hc_api_key` option is still in Keeper's options, Keeper won't arm and refuses `hc-key`. Remove it, then make a new read-only key in Healthchecks, since earlier backups may hold the old one.
+- The kept Healthchecks key file is private from the moment it is written.
+- A cancel from Cain's link is refused while Home Assistant shows an install of Cain, or any job on Cain Keeper doesn't recognize, or can't say; the claim and its backup are kept. An unused claim's backup waits one more check before it is deleted.
+- Keeper can't hang on a slow Home Assistant answer while it handles a claim, a cancel or an armed check, and a claim that waited past its deadline is refused.
+- New option `drill_days` (1 to 14, default 14): how long the phone test and the missed-heartbeat drill count, with a reminder in Keeper's log a day before each is due.
+- The code for confirming the Ship key again is printed at start only when it is needed; otherwise ask for one with `key-code`. If Cain's link turns down Keeper's enrollment, Keeper says so in its log and prints a code.
+
 ## 0.1.7
 
 - The Healthchecks key is no longer an option. You enter it once at the device with `hc-key` (the key typed in, never on the command line). Keeper checks it is the read-only key and sees your checks before it keeps it, keeps it where only Keeper reads it, and leaves it out of backups. Remove the old `hc_api_key` option: until you do, Keeper's log reminds you at every start.

@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash, sign as edSign } from "node:crypto";
 import { claimDeadlineWhy, decideAll, postShipPass, postShipPassCancel, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
-import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
+import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { SHIP_KEYS, SHIP_PUB, keeperHolds } from "./link-rig";
 import { generateKeyPairSync } from "node:crypto";
@@ -36,6 +36,7 @@ function link(o: { file?: string | null; storeFails?: boolean; reg?: "accept" | 
   const registered: string[] = [];
   const logs: string[] = [];
   const cancelled: string[] = [];
+  const whys: string[] = [];
   const claims: any[] = [];
   let enrolled: any = o.enrolled === undefined ? null : o.enrolled;
   let held: ((r: RegResult) => void) | null = null;
@@ -51,11 +52,11 @@ function link(o: { file?: string | null; storeFails?: boolean; reg?: "accept" | 
       else held = done;
     },
     claim: async (a, request) => { claims.push({ ...a, request }); return o.claim ? o.claim() : claimAnswer(); },
-    cancel: (a) => { cancelled.push(a); },
+    cancel: (a, why) => { cancelled.push(a); whys.push(why); },
     enrollment: { load: () => enrolled, store: (e) => { enrolled = e; } },
     log: (l) => logs.push(l),
   };
-  return { d, registered, logs, cancelled, claims, get enrolled() { return enrolled; }, get file() { return file; }, answer(r: RegResult) { held!(r); }, note(u: any) { note!(u); }, advance(ms: number) { now += ms; } };
+  return { d, registered, logs, cancelled, whys, claims, setEnrolled(e: any) { enrolled = e; }, get enrolled() { return enrolled; }, get file() { return file; }, answer(r: RegResult) { held!(r); }, note(u: any) { note!(u); }, advance(ms: number) { now += ms; } };
 }
 const passOf = (l: ReturnType<typeof link>) => async (tok: string) => { const a = await shipPass(l.d, { token: tok }); return a.status === "ok" ? { ok: true as const } : a.status === "pending" ? { ok: false as const, pending: true as const, why: a.said } : { ok: false as const, why: a.said }; };
 
@@ -409,7 +410,7 @@ describe("Keeper 0.1.6: the claim's deadline in code, and the enrollment's exact
   test("(Keeper 0.1.7) the counter: a lower one is refused (an older keeper state), a higher one recorded; a replayed earlier enrollment is refused; an answer without them is refused", () => {
     const lower = enrollmentCheck({ ...ENROLLED, counter: 9 }, FPR, FPR, REC);
     expect(lower.ok).toBe(false);
-    expect((lower as any).why).toBe("the keeper's counter (9) is lower than the 10 the link recorded: an older keeper state (a restore?) is refused; the owner confirms the key at the device again (key-confirm with the fresh code from the keeper's latest start)");
+    expect((lower as any).why).toBe("the keeper's counter (9) is lower than the 10 the link recorded: an older keeper state (a restore?) is refused; the owner confirms the key at the device again (key-code at the keeper prints a fresh code, then key-confirm with it)");
     expect(enrollmentCheck({ ...ENROLLED, counter: 25 }, FPR, FPR, REC)).toEqual({ ok: true, record: { ...REC, counter: 25 } });
     const after = { ...REC, enrollId: EID2, seen: [EID] };
     const replay = enrollmentCheck(ENROLLED, FPR, FPR, after);
@@ -454,5 +455,67 @@ describe("Keeper 0.1.7: the claim's request id", () => {
     expect(a.status).toBe("refused");
     expect(l.claims).toHaveLength(2);
     expect(l.cancelled).toContain(ACC.attempt);
+  });
+});
+
+describe("Keeper 0.1.8: enrollment after a restore, replaced replies, the cancel's why, a live claim named", () => {
+  test("a keeper restored far below the old counter and re-enrolled by the owner (a brand-new id) is recorded at its own counter and passes; counters go up from there", () => {
+    const old = { ...REC, counter: 5_000 };
+    const restored = { ...ENROLLED, key_confirmed_at: T(NOW - 60_000), enroll_id: EID2, counter: 3 };
+    const r = enrollmentCheck(restored, FPR, FPR, old);
+    expect(r).toEqual({ ok: true, record: { ...old, confirmedAt: NOW - 60_000, enrollId: EID2, counter: 3, seen: [EID] } });
+    const rec = (r as any).record;
+    expect(enrollmentCheck({ ...restored, counter: 4 }, FPR, FPR, rec)).toEqual({ ok: true, record: { ...rec, counter: 4 } });
+    expect(enrollmentCheck({ ...restored, counter: 3 }, FPR, FPR, rec)).toEqual({ ok: true });
+    const lower = enrollmentCheck({ ...restored, counter: 2 }, FPR, FPR, rec);
+    expect(lower.ok).toBe(false);
+    expect((lower as any).cancel.startsWith(`${ENROLL_BEHIND}: `)).toBe(true);
+    // and through a whole pass: the old record far ahead, the re-enrolled keeper's claim passes
+    const l = link({ enrolled: old, claim: async () => claimAnswer({ key_confirmed_at: T(NOW - 60_000), enroll_id: EID2, counter: 3 }) });
+    return shipPass(l.d, { token: TOKEN }).then((a) => { expect(a.status).toBe("ok"); expect(l.enrolled.enrollId).toBe(EID2); expect(l.enrolled.counter).toBe(3); });
+  });
+  test("a reply for an enrollment the link has replaced since the request was sent is discarded, though the record before the request allowed it", async () => {
+    const replaced = { ...REC, enrollId: EID2, confirmedAt: NOW - 1_000, counter: 2, seen: [EID] };
+    let rec: any = REC;
+    const store = { load: () => rec, store: (e: any) => { rec = e; } };
+    rec = replaced;                                         // a concurrent /armed read recorded the re-enrollment meanwhile
+    const r = enrollmentCheckNow({ ...ENROLLED, counter: 11 }, FPR, FPR, REC, store);
+    expect(r.ok).toBe(false);
+    expect((r as any).why).toContain(`is for enrollment ${EID}, which the link has replaced (by ${EID2})`);
+    expect(rec).toEqual(replaced);                          // nothing recorded from it
+    // the same across a claim: the keeper's answer arrives after the re-enrollment was recorded
+    const l = link({ enrolled: REC, claim: async () => { l.setEnrolled(replaced); return claimAnswer({ counter: 11 }); } });
+    const a = await shipPass(l.d, { token: TOKEN });
+    expect(a.status).toBe("refused");
+    expect((a as any).said).toContain("which the link has replaced");
+    expect(l.enrolled).toEqual(replaced);
+    expect(l.whys.every((w) => w.startsWith(ENROLL_BEHIND))).toBe(true);
+    // and from the /armed read: a stale reply never puts the replaced enrollment back
+    noteArmedEnrollment({ ...ENROLLED, counter: 12 }, FPR, store, () => {}, REC);
+    expect(rec).toEqual(replaced);
+  });
+  test("a claim refused on the enrollment cancels saying so: an older keeper state as the counter behind, anything else as refused", async () => {
+    const behind = link({ enrolled: REC, claim: async () => claimAnswer({ counter: 9 }) });
+    expect((await shipPass(behind.d, { token: TOKEN })).status).toBe("refused");
+    expect(behind.whys.length).toBeGreaterThan(0);
+    expect(behind.whys.every((w) => w.startsWith(`${ENROLL_BEHIND}: `) && w.length <= 160)).toBe(true);
+    const other = link({ enrolled: REC, claim: async () => claimAnswer({ key_confirmed_at: T(NOW - 5_000_000) }) });
+    expect((await shipPass(other.d, { token: TOKEN })).status).toBe("refused");
+    expect(other.whys.every((w) => w.startsWith(`${ENROLL_REFUSED}: `))).toBe(true);
+    // a keeper refusal that isn't about the enrollment cancels as before
+    const plain = link({ claim: async () => ({ status: 409, body: { status: "refused", why: "it is ended" } }) });
+    await shipPass(plain.d, { token: TOKEN });
+    expect(plain.whys.every((w) => w === "the pass is refused")).toBe(true);
+  });
+  test("one Ship run per attempt: a second run on a token whose claim is live is refused naming the claim's latest expiry", async () => {
+    const l = link();
+    expect((await shipPass(l.d, { token: TOKEN })).status).toBe("ok");
+    const again = await shipPass(l.d, { token: TOKEN });
+    expect(again.status).toBe("spent");
+    expect((again as any).said).toContain(`its claim at the keeper is live until ${T(NOW + 1_800_000)}`);
+    l.advance(1_800_000 + 1_000);
+    const later = await shipPass(l.d, { token: TOKEN });
+    expect((later as any).said).not.toContain("live until");
+    expect((later as any).said).toContain("already started a Ship run");
   });
 });

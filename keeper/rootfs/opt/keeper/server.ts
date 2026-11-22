@@ -9,10 +9,11 @@
 //                               backup, request?}; one claimant, valid 30 minutes (0.1.7: a retry with the same
 //                               request reads the recorded claim)
 //   POST /attempt/<id>/cancel   (0.1.5) Cain's App only: the link gave up on the pass, {why} (0.1.7: a retry reads
-//                               the recorded outcome; refused once the claim was handed to a started run)
+//                               the recorded outcome; refused once the claim was handed to a started run; 0.1.8:
+//                               refused while the jobs list shows an install or an unrecognized job, or can't be read)
 //   POST /verdict   {app, version, attempt, result: PASS|FAIL, reason}: the caller's App's probe verdict
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
-//                   version and a timestamp refreshed every minute
+//                   version and a timestamp refreshed every minute (0.1.8: under the claim record's lock)
 //   GET  /last      the last owner line about the caller's App
 // Every request carries an App's own token (Authorization: Bearer <token>, the keeper's option tokens maps App
 // slug to token). Anything else is refused and logged.
@@ -28,13 +29,14 @@
 //   POST /missed-heartbeat-confirm {code}   (0.1.6) the owner saw its page on the phone
 //   POST /accept-limits {code}              (0.1.7) the owner accepts DOCS.md's "Accepted limits" (its text version)
 //   POST /hc-key {code, key}                (0.1.7) the Healthchecks read-only key, checked, then kept (0600, data folder)
+//   POST /key-code                          (0.1.8) a fresh key-confirm code in the log, for a re-enrollment while enrolled
 // The confirm commands' real gate is the container's network mode (host_network: false, config.yaml): only a
 // process inside Keeper's own container reaches its loopback. The codes in the log aren't secret from anyone
 // who can read Keeper's log; they show the confirmer read the log for that very challenge.
 import { SLUG, type Keeper } from "./core.ts";
 
 export const MAX_BODY = 4096;
-export const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm", "/missed-heartbeat", "/missed-heartbeat-confirm", "/accept-limits", "/hc-key"]);
+export const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm", "/missed-heartbeat", "/missed-heartbeat-confirm", "/accept-limits", "/hc-key", "/key-code"]);
 // Home Assistant's internal network (the Supervisor's hassio network): 172.30.32.0/23.
 export function internal(ip: string): boolean {
   const v4 = ip.replace(/^::ffff:/i, "");
@@ -55,6 +57,7 @@ export async function handleLocal(k: Keeper, req: Request, ip: string, log: (m: 
   if (url.pathname === "/phone-test" || url.pathname === "/missed-heartbeat") await k.refreshHc();
   const r = url.pathname === "/hc-key" ? await k.hcKeyEnter(str(b?.code), str(b?.key))
     : url.pathname === "/accept-limits" ? k.acceptLimits(str(b?.code))
+    : url.pathname === "/key-code" ? k.keyCode()
     : url.pathname === "/drill-record" ? k.drillRecord(str(b?.attempt)) : url.pathname === "/phone-test" ? k.phoneTest()
     : url.pathname === "/key-confirm" ? k.keyConfirm(str(b?.fingerprint), str(b?.code))
     : url.pathname === "/missed-heartbeat" ? k.missedHeartbeat()
@@ -98,7 +101,7 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (req.method === "GET" && url.pathname === "/armed") {
     const app = url.searchParams.get("app") || caller;
     if (!SLUG.test(app)) return json({ status: "refused", why: "not an App slug" }, 400);
-    return json(k.armedView(app));
+    return json(await k.armed(app));   // (0.1.8) under the claim record's lock, its counter saved first
   }
   if (req.method === "GET" && url.pathname === "/last") {
     const l = k.st.last[caller];
