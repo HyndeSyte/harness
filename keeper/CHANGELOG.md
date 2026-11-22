@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.4
+
+- A Ship install now starts only after Keeper has made and checked Cain's backup. Keeper answers the registration only once that backup is complete, and Cain's Ship run waits for that answer. If the backup fails or takes over 4 minutes, you are paged "unprotected" and nothing is installed. Each acceptance covers one install only.
+- Keeper no longer sends a restore a second time on its own until a drill on the device has recorded what Home Assistant's restore job is called. Until then a turned-down restore is "unresolved", and you are paged.
+- Keeper remembers the first Ship key it sees and tells you its fingerprint. A different key in its options is refused until you confirm it at the device with `key-confirm`.
+- The dead-man check now only says "alive" while Keeper's checks are actually running. If they stall for 3 minutes, the dead-man check pages you.
+- The phone test now pages the dead-man check too. It lasts 30 days, and lapses when you change a Healthchecks option or a page fails to reach Healthchecks. Each check must be its own Healthchecks check.
+- If an install passes but chat was down for most of its 15 minutes, you are paged so you can roll it back by hand. Keeper doesn't roll it back.
+- A Ship tap from before Keeper's state was created (a fresh install or a restore of Keeper) is refused.
+
 ## 0.1.3
 
 - Keeper now checks your Ship tap itself. An install is registered with the signed token from your tap, and Keeper checks its signature with Cain's public Ship key (the new option `ship_public_key`). A made up or reused registration is refused, each tap counts once per App, and Cain starts only one Ship run per tap.

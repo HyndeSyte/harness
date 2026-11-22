@@ -1,11 +1,11 @@
-// The Ship pass (Cain 0.19.0, with Keeper 0.1.3): the RemoteTrigger hook lets one Ship run through per
-// token, the link keeps the spent ids, and the installs are registered with the keeper App over its
-// own service (link/ship-pass.ts, hooks/remote-trigger.ts decideAll).
+// The Ship pass (Cain 0.19.0, with Keeper 0.1.3 and 0.1.4): the RemoteTrigger hook lets one Ship run
+// through per token, and only once the keeper App accepted every watched install (its backup made and
+// verified); the link keeps the ids and their state (link/ship-pass.ts, hooks/remote-trigger.ts decideAll).
 import { describe, expect, test } from "bun:test";
 import { createHash, sign as edSign } from "node:crypto";
 import { decideAll, postShipPass, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
-import { passId, registerInstalls, shipPass, type PassDeps } from "../rootfs/opt/cain/link/ship-pass";
+import { PASS_WAIT_MS, passId, registerInstalls, shipPass, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { SHIP_KEYS, SHIP_PUB, keeperHolds } from "./link-rig";
 import { generateKeyPairSync } from "node:crypto";
@@ -19,16 +19,27 @@ const SHIP_TEXT = `Install pull request ${PR}, landed in main at ${SHA}. Ship to
 const call = { tool_name: "RemoteTrigger", tool_input: { action: "run", trigger_id: SHIP, body: { text: SHIP_TEXT } } };
 const ENV = { pub: SHIP_PUB, stop: { stopped: false, at: null }, now: NOW };
 
-function link(o: { file?: string | null; storeFails?: boolean } = {}) {
+const ACCEPTED: RegResult = { ok: true, accepted: [{ app: "0fcc2575_cain", attempt: "ship-46-cain-01234567", backup: "kb1" }], said: [] };
+// The link's pass with a fake keeper: "accept" answers at once, "refuse" refuses, "hold" keeps the answer
+// until the test gives it (the keeper still making the backup).
+function link(o: { file?: string | null; storeFails?: boolean; reg?: "accept" | "refuse" | "hold" } = {}) {
   let file: string | null = o.file ?? null;
+  let now = NOW;
   const registered: string[] = [];
   const logs: string[] = [];
+  let held: ((r: RegResult) => void) | null = null;
   const d: PassDeps = {
-    pub: () => SHIP_PUB, now: () => NOW, load: () => file,
+    pub: () => SHIP_PUB, now: () => now, load: () => file,
     store: (t) => { if (o.storeFails) throw new Error("disk"); file = t; },
-    register: (tok) => { registered.push(tok); }, log: (l) => logs.push(l),
+    register: (tok, _c, done) => {
+      registered.push(tok);
+      if ((o.reg ?? "accept") === "accept") done(ACCEPTED);
+      else if (o.reg === "refuse") done({ ok: false, said: ["the keeper refused Cain 0.19.0: its backup failed"] });
+      else held = done;
+    },
+    log: (l) => logs.push(l),
   };
-  return { d, registered, logs, get file() { return file; } };
+  return { d, registered, logs, get file() { return file; }, answer(r: RegResult) { held!(r); }, advance(ms: number) { now += ms; } };
 }
 
 describe("the hook lets one Ship run through per token", () => {
@@ -42,6 +53,42 @@ describe("the hook lets one Ship run through per token", () => {
     expect(again).toContain("The link didn't let this Ship run start");
     expect(again).toContain("already started a Ship run");
     expect(l.registered).toEqual([TOKEN]);
+  });
+  test("(Keeper 0.1.4) the run waits for the keeper's acceptance: pending refuses with a try-again line, then one run passes", async () => {
+    const l = link({ reg: "hold" });
+    const pass = async (tok: string) => { const a = shipPass(l.d, { token: tok }); return a.status === "ok" ? { ok: true as const } : a.status === "pending" ? { ok: false as const, pending: true as const, why: a.said } : { ok: false as const, why: a.said }; };
+    const go = () => decideAll(call, keeperHolds({}), ENV, () => ({ ok: true }), async () => ({ logged: true }), pass);
+    const first = await go();
+    expect(first).toContain("This Ship run hasn't started yet");
+    expect(first).toContain("start the same Ship run again in a minute");
+    expect(await go()).toContain("hasn't started yet");
+    expect(l.registered).toEqual([TOKEN]);                 // registered once, however often it is asked
+    l.answer(ACCEPTED);
+    expect(await go()).toBe("");
+    expect(await go()).toContain("already started a Ship run");
+  });
+  test("(Keeper 0.1.4) a keeper refusal, or no acceptance within the wait, refuses the pass for good", async () => {
+    const r = link({ reg: "refuse" });
+    const a = shipPass(r.d, { token: TOKEN });
+    expect(a.status).toBe("refused");
+    expect((a as any).said).toContain("its backup failed");
+    expect(shipPass(r.d, { token: TOKEN }).status).toBe("refused");
+    const slow = link({ reg: "hold" });
+    expect(shipPass(slow.d, { token: TOKEN }).status).toBe("pending");
+    slow.advance(PASS_WAIT_MS + 1_000);
+    const late = shipPass(slow.d, { token: TOKEN });
+    expect(late.status).toBe("refused");
+    expect((late as any).said).toContain("within 6 minutes");
+    slow.answer(ACCEPTED);                                 // an acceptance after the pass gave up isn't kept
+    expect(shipPass(slow.d, { token: TOKEN }).status).toBe("refused");
+  });
+  test("(Keeper 0.1.4) the hook asks again while pending, within its budget, and lets the run through on ok", async () => {
+    let n = 0;
+    const fake = (async () => new Response(JSON.stringify(++n < 3 ? { status: "pending", said: "the keeper is taking the backup" } : { status: "ok" }), { status: 200 })) as unknown as typeof fetch;
+    expect(await postShipPass(TOKEN, { key: "k", fetch: fake, pauseMs: 1 })).toEqual({ ok: true });
+    expect(n).toBe(3);
+    const always = (async () => new Response(JSON.stringify({ status: "pending", said: "the keeper is taking the backup" }), { status: 200 })) as unknown as typeof fetch;
+    expect(await postShipPass(TOKEN, { key: "k", fetch: always, pauseMs: 5, budgetMs: 30 })).toEqual({ ok: false, pending: true, why: "the keeper is taking the backup" });
   });
   test("a run the checks refuse never spends its token; a Build run never asks for a pass", async () => {
     let asked = 0;
@@ -72,7 +119,7 @@ describe("the link's pass", () => {
   test("records the token's id (never the token) before it answers ok, and registers the installs", () => {
     const l = link();
     const a = shipPass(l.d, { token: TOKEN });
-    expect(a).toEqual({ status: "ok", pr: 46, head: SHA });
+    expect(a).toEqual({ status: "ok", pr: 46, head: SHA, accepted: ACCEPTED.ok ? ACCEPTED.accepted : [] });
     expect(l.file).toContain(passId(TOKEN));
     expect(l.file).not.toContain(TOKEN);
     expect(l.registered.length).toBe(1);
@@ -84,6 +131,8 @@ describe("the link's pass", () => {
     const l = link(); shipPass(l.d, { token: TOKEN });
     expect(shipPass(l.d, { token: TOKEN }).status).toBe("spent");
     expect(shipPass(link({ file: "garbage" }).d, { token: TOKEN }).status).toBe("refused");
+    // a format 1 record (Keeper 0.1.3's link) still counts its tokens as spent
+    expect(shipPass(link({ file: JSON.stringify({ format: 1, spent: [{ id: passId(TOKEN), exp: 9e9 }] }) }).d, { token: TOKEN }).status).toBe("spent");
     const w = link({ storeFails: true });
     expect(shipPass(w.d, { token: TOKEN }).status).toBe("refused");
     expect(w.registered).toEqual([]);
@@ -109,19 +158,32 @@ describe("the registration with the keeper App (POST /attempt)", () => {
     const f = m ? files[`${m[1]}@${m[2]}`] : undefined;
     return f ? { status: 200, body: f } : { status: 404, body: null };
   };
-  test("each watched App the tap installs: the token, its pull request and head, both versions and the probe hash; nothing for an unwatched App", async () => {
+  const acceptance = { status: "accepted", id: "ship-46-cain-01234567", app: "0fcc2575_cain", from_version: "0.18.0", to_version: "0.19.0", backup: "kb1", until: "x" };
+  test("each watched App the tap installs: the token, its pull request and head, both versions and the probe hash; ok only on its acceptance with a backup slug", async () => {
     const posted: any[] = [];
     const c = (claimFor(PR, SHA, NOW))!;
-    const said = await registerInstalls({ api, log: () => {}, post: async (b) => { posted.push(b); return { status: 202, body: { id: "ship-46-cain-01234567" } }; } }, TOKEN, c);
+    const r = await registerInstalls({ api, log: () => {}, post: async (b) => { posted.push(b); return { status: 200, body: acceptance }; } }, TOKEN, c);
     expect(posted).toEqual([{ token: TOKEN, app: "0fcc2575_cain", pr: 46, head: SHA, from_version: "0.18.0", to_version: "0.19.0", kind: "ship",
       probe_hash: createHash("sha256").update("// the probe\n").digest("hex").slice(0, 16) }]);
-    expect(said).toEqual(["Cain 0.18.0 to 0.19.0 registered as ship-46-cain-01234567"]);
+    expect(r).toEqual({ ok: true, accepted: [{ app: "0fcc2575_cain", attempt: "ship-46-cain-01234567", backup: "kb1" }], said: ["Cain 0.18.0 to 0.19.0 accepted as ship-46-cain-01234567, backup kb1"] });
   });
-  test("a keeper that refuses or doesn't answer is logged; a base that can't be read registers nothing", async () => {
+  test("every watched App the pull request changes must be accepted: a refusal, no answer, an answer without a backup, or an unreadable base refuses", async () => {
     const c = (claimFor(PR, SHA, NOW))!;
-    expect(await registerInstalls({ api, log: () => {}, post: async () => ({ status: 409, body: { why: "a replay" } }) }, TOKEN, c)).toEqual(["the keeper refused Cain 0.19.0: a replay"]);
-    expect(await registerInstalls({ api, log: () => {}, post: async () => null }, TOKEN, c)).toEqual(["the keeper didn't answer for Cain 0.19.0"]);
+    expect(await registerInstalls({ api, log: () => {}, post: async () => ({ status: 409, body: { why: "a replay" } }) }, TOKEN, c)).toEqual({ ok: false, said: ["the keeper refused Cain 0.19.0: a replay"] });
+    expect(await registerInstalls({ api, log: () => {}, post: async () => null }, TOKEN, c)).toEqual({ ok: false, said: ["the keeper didn't answer for Cain 0.19.0"] });
+    expect((await registerInstalls({ api, log: () => {}, post: async () => ({ status: 200, body: { ...acceptance, backup: "" } }) }, TOKEN, c)).ok).toBe(false);
+    expect((await registerInstalls({ api, log: () => {}, post: async () => ({ status: 202, body: { id: "ship-46-cain-01234567" } }) }, TOKEN, c)).ok).toBe(false);
+    expect((await registerInstalls({ api, log: () => {}, post: async () => ({ status: 200, body: { ...acceptance, to_version: "0.20.0" } }) }, TOKEN, c)).ok).toBe(false);
     const none = await registerInstalls({ api: async () => ({ status: 500, body: null }), log: () => {}, post: async () => { throw new Error("never"); } }, TOKEN, c);
-    expect(none[0]).toContain("nothing was registered");
+    expect(none.ok).toBe(false);
+    expect(none.said[0]).toContain("nothing was registered");
+  });
+  test("a pull request that changes no watched App passes with nothing to accept", async () => {
+    const c = (claimFor(PR, SHA, NOW))!;
+    const harnessOnly = async (path: string) => path.includes("cain/config.yaml") && path.endsWith(SHA) ? { status: 200, body: b64('version: "0.18.0"\n') } : api(path);
+    let posted = 0;
+    const r = await registerInstalls({ api: harnessOnly, log: () => {}, post: async () => { posted++; return null; } }, TOKEN, c);
+    expect(r).toEqual({ ok: true, accepted: [], said: [] });
+    expect(posted).toBe(0);
   });
 });

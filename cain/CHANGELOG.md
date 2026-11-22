@@ -11,6 +11,7 @@
 - "Ship it with that risk" reads as armed only while the Keeper's heartbeat and alert checks have answered in the last 10 minutes and none of its alerts is stuck, so a Healthchecks outage shows as not armed until it passes.
 - One Ship tap starts one Ship run: a second run on the same tap is refused, and Cain's link registers that run's install with the Keeper itself, so nothing writes the Keeper's options any more.
 - The Keeper decides on /health (Cain running and alive), not /ready: a Discord outage is reported as "chat not connected", never a reason to roll Cain back.
+- A Ship run that installs Cain starts only after the Keeper has made and checked his backup. Meanwhile Cain is told to start the run again in a minute. If the Keeper refuses, doesn't answer, or isn't set up, the Ship run doesn't start and Cain tells you why.
 
 ## 0.18.0
 

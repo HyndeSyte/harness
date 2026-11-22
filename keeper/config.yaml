@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.3"
+version: "0.1.4"
 slug: keeper
 description: >-
   Checks every App install for 15 minutes and rolls a bad one back from the
@@ -29,11 +29,13 @@ timeout: 20
 # "chat connected" or "chat not connected (degraded)". tokens: each App's own token ("slug=token", at
 # least 16 characters; the same token is that App's keeper_token option); Cain's also registers installs
 # (POST /attempt). hc_done: the heartbeat check's ping URL. hc_deadman (0.1.3): the dead-man check's ping
-# URL, pinged every minute from the keeper's own timer. hc_failed: the alert check, one plain ping URL
+# URL, pinged every minute from the keeper's own timer (0.1.4: only while its poll loop completes, else its
+# /fail). Every check must be a distinct Healthchecks check, by the uuid or slug in its URL's path. hc_failed: the alert check, one plain ping URL
 # when one App is watched, or per App entries "slug=URL" (with more than one App watched each needs its
 # own: a shared one is not armable). ship_public_key (0.1.3): the public half of Cain's link's Ship key
 # (base64, the line "Ship key (public): ..." in Cain's log); public, so safe here; the keeper verifies
-# every registration's Ship token with it. health_grace_s: after a watched App first starts, failed
+# every registration's Ship token with it. 0.1.4: the first key seen is pinned in the keeper's state; a
+# changed key here is refused until confirmed at the device (key-confirm <fingerprint>, DOCS.md). health_grace_s: after a watched App first starts, failed
 # liveness polls count only after this many seconds. The keeper reads its options through the Supervisor
 # each poll, never writes them, and keeps no copy of them. No registration is ever written here (0.1.3).
 options:

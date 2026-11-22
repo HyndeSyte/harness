@@ -3,8 +3,10 @@
 //                                     the HTTP service on port 8097 (the internal App network only)
 //   bun main.ts drill-record <id>     a drill record from the keeper's own result for that attempt
 //                                     (asks the running service; it decides from its own state alone)
-//   bun main.ts phone-test            (0.1.3) the phone test drill: pages each watched App's alert check once
-//   bun main.ts phone-confirm         (0.1.3) once that page reached the owner's phone: records it (60 days)
+//   bun main.ts phone-test            (0.1.3) the phone test drill: pages each watched App's alert check once,
+//                                     and (0.1.4) the dead-man check
+//   bun main.ts phone-confirm         (0.1.3) once those pages reached the owner's phone: records it (30 days)
+//   bun main.ts key-confirm <fp>      (0.1.4) the owner confirms a changed ship_public_key by its fingerprint
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
@@ -78,7 +80,8 @@ async function serve(): Promise<void> {
     k.save();
     process.exit(0);
   });
-  Bun.serve({ port: PORT, hostname: "0.0.0.0", idleTimeout: 30, maxRequestBodySize: 4096,
+  // idleTimeout 255 (Bun's most): POST /attempt answers only once the keeper's backup is done (0.1.4, up to 4 minutes).
+  Bun.serve({ port: PORT, hostname: "0.0.0.0", idleTimeout: 255, maxRequestBodySize: 4096,
     fetch: (req, server) => handle(k, req, server.requestIP(req)?.address ?? "", log) });
   const tick = async () => { try { await k.poll(); } catch (e) { log(`a poll failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`); } };
   await tick();
@@ -86,7 +89,13 @@ async function serve(): Promise<void> {
   setInterval(() => k.heartbeat(), HEARTBEAT_MS);
   // The dead-man check (0.1.3): its own timer, apart from the poll, so it stops only with the process.
   let deadmanSaid = false;
-  const deadman = async () => { const ok = await k.deadman().catch(() => false); if (!ok && !deadmanSaid && k.opts.hc_deadman) log("a dead-man ping wasn't delivered: tried again in a minute"); deadmanSaid = !ok; };
+  // 0.1.4: only while the poll loop completed within 3 minutes; otherwise its /fail ping, logged loudly.
+  const deadman = async () => {
+    const stalled = k.loopStalled();
+    const ok = await k.deadman().catch(() => false);
+    if (!ok && !deadmanSaid && k.opts.hc_deadman) log(stalled ? "THE POLL LOOP HASN'T COMPLETED FOR OVER 3 MINUTES: the dead-man check gets its fail ping, not keeper alive" : "a dead-man ping wasn't delivered: tried again in a minute");
+    deadmanSaid = !ok;
+  };
   void deadman();
   setInterval(() => { void deadman(); }, HEARTBEAT_MS);
 }
@@ -104,8 +113,13 @@ if (import.meta.main) {
     const j: any = r ? await r.json().catch(() => null) : null;
     console.log(j?.ok ? (cmd === "phone-test" ? "phone test sent: confirm with phone-confirm once it reached your phone" : "phone test recorded") : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
     process.exit(j?.ok ? 0 : 1);
+  } else if (cmd === "key-confirm") {
+    const r = await fetch(`http://127.0.0.1:${PORT}/key-confirm`, { method: "POST", body: JSON.stringify({ fingerprint: arg ?? "" }) }).catch(() => null);
+    const j: any = r ? await r.json().catch(() => null) : null;
+    console.log(j?.ok ? `Ship key confirmed: ${arg}` : `not confirmed: ${j?.why ?? "the keeper's service didn't answer"}`);
+    process.exit(j?.ok ? 0 : 1);
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm | key-confirm <fingerprint> | selftest"); process.exit(2); }
 }

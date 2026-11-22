@@ -9,10 +9,13 @@
 //   - a Ship run carries the Ship token from his Ship tap (../ship-token.ts): signed by
 //     the link's Ship key, not expired, and for the pull request and full head sha the
 //     job names;
-//   - (0.19.0, with Keeper 0.1.3) one Ship run per token: once the checks pass, the hook asks the link
-//     (POST /ship-pass, Cain's key), which refuses a token it already let through, records it spent
-//     (root's /data/trust) and registers the installs with the keeper App (../link/ship-pass.ts). A link
-//     that doesn't answer refuses the run;
+//   - (0.19.0, with Keeper 0.1.3 and 0.1.4) one Ship run per token, and only once the keeper accepted its
+//     installs: once the checks pass, the hook asks the link (POST /ship-pass, Cain's key), which registers
+//     every watched App the run installs with the keeper App and answers "pending" until the keeper has
+//     made and verified each one's backup, then "ok" once (the token spent; a second run on it is
+//     refused). The hook asks again for a few seconds while it is pending, then refuses the run with a
+//     line telling Cain to start the same run again in a minute (../link/ship-pass.ts). A link that
+//     doesn't answer, or a refused pass, refuses the run;
 //   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all;
 //   - (Cain 0.16.0) a run carries one label, core, commitment, necessary-fix or other: in its body's
 //     "label" field or on a "Label: <label>" line of its text (both, and they must agree); none is
@@ -182,17 +185,28 @@ export async function decideWithGuard(call: any, holdsText: string | null, env: 
 }
 
 // (0.19.0) The link's answer for a Ship run's token: "ok" lets it through once, anything else refuses.
-export type Pass = { ok: true } | { ok: false; why: string };
-export async function postShipPass(token: string, o: { url?: string; key?: string; keyFile?: string; ms?: number; fetch?: typeof fetch } = {}): Promise<Pass> {
+// (Keeper 0.1.4) "pending" (the keeper is still making the backup) is asked again every second or so
+// within budgetMs (the hook's whole limit is 15 seconds), then refuses with the link's line, which tells
+// Cain to start the same run again in a minute.
+export type Pass = { ok: true } | { ok: false; why: string; pending?: true };
+export const PASS_BUDGET_MS = 10_000;
+export async function postShipPass(token: string, o: { url?: string; key?: string; keyFile?: string; ms?: number; fetch?: typeof fetch; budgetMs?: number; pauseMs?: number } = {}): Promise<Pass> {
   let key = o.key ?? "";
   if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { ok: false, why: "this start has no key for the link" }; } }
-  try {
-    const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/ship-pass`, { method: "POST", body: JSON.stringify({ token }),
-      headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(o.ms ?? 5_000) });
-    const j: any = await r.json().catch(() => ({}));
-    if (r.ok && j?.status === "ok") return { ok: true };
-    return { ok: false, why: String(j?.said ?? `the link answered ${j?.status ?? r.status}`).slice(0, 300) };
-  } catch (e) { return { ok: false, why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
+  const until = Date.now() + (o.budgetMs ?? PASS_BUDGET_MS);
+  for (;;) {
+    let j: any;
+    try {
+      const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/ship-pass`, { method: "POST", body: JSON.stringify({ token }),
+        headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(Math.max(500, Math.min(o.ms ?? 5_000, until - Date.now()))) });
+      j = await r.json().catch(() => ({}));
+      if (r.ok && j?.status === "ok") return { ok: true };
+      if (!(r.ok && j?.status === "pending")) return { ok: false, why: String(j?.said ?? `the link answered ${j?.status ?? r.status}`).slice(0, 300) };
+    } catch (e) { return { ok: false, why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
+    const pause = o.pauseMs ?? 1_500;
+    if (Date.now() + pause >= until) return { ok: false, pending: true, why: String(j?.said ?? "the keeper hasn't accepted the install yet").slice(0, 300) };
+    await Bun.sleep(pause);
+  }
 }
 
 // The whole decision: the checks (decide, with the usage guard), then for a Ship run that passed them the
@@ -208,7 +222,7 @@ export async function decideAll(call: any, holdsText: string | null, env: Env,
   const token = findToken(typeof t.body?.text === "string" ? t.body.text : "");
   if (!token) return "A Ship job carries the Ship token from his relayed Ship tap.";
   const p = await pass(token);
-  return p.ok ? "" : `The link didn't let this Ship run start: ${p.why}.`;
+  return p.ok ? "" : p.pending ? `This Ship run hasn't started yet: ${p.why}.` : `The link didn't let this Ship run start: ${p.why}.`;
 }
 
 if (import.meta.main) {

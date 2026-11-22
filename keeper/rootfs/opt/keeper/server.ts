@@ -1,20 +1,23 @@
 // The keeper's own HTTP service, on Home Assistant's internal App network only (172.30.32.0/23):
 //   GET  /attempt   the open attempt of the caller's App (its id, from and to), or none
 //   POST /attempt   (0.1.3) Cain's App only: register an install, {token, app, pr, head, from_version,
-//                   to_version, probe_hash, kind?, backup_slug?}, the token being the owner's signed Ship
-//                   token, verified here (core.ts registerAttempt); 202 registered, else refused
+//                   to_version, probe_hash, kind?}, the token being the owner's signed Ship token, verified
+//                   here with the pinned key (core.ts registerAttempt). 0.1.4: answered only once the
+//                   keeper's backup is complete and verified, 200 {status: "accepted", id, backup, ...}, or
+//                   refused (up to about 4 minutes: the backup)
 //   POST /verdict   {app, version, attempt, result: PASS|FAIL, reason}: the caller's App's probe verdict
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
 //                   version and a timestamp refreshed every minute
 //   GET  /last      the last owner line about the caller's App
 //   POST /drill-record {attempt}   from this container only (keeper drill-record)
 //   POST /phone-test, POST /phone-confirm   (0.1.3) from this container only: the phone test drill
+//   POST /key-confirm {fingerprint}   (0.1.4) from this container only: the owner confirms a changed Ship key
 // Every request but those from this container carries an App's own token (Authorization: Bearer <token>, the
 // keeper's option tokens maps App slug to token). Anything else is refused and logged.
 import { SLUG, type Keeper } from "./core.ts";
 
 export const MAX_BODY = 4096;
-const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm"]);
+const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm"]);
 // Home Assistant's internal network (the Supervisor's hassio network): 172.30.32.0/23.
 export function internal(ip: string): boolean {
   const v4 = ip.replace(/^::ffff:/i, "");
@@ -30,7 +33,8 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (LOCAL.has(url.pathname) && req.method === "POST") {
     if (!loopback(ip)) { log(`refused ${url.pathname} from ${ip}: only from inside the keeper`); return json({ status: "refused" }, 403); }
     const b = await body(req);
-    const r = url.pathname === "/drill-record" ? k.drillRecord(String(b?.attempt ?? "")) : url.pathname === "/phone-test" ? k.phoneTest() : k.phoneConfirm();
+    const r = url.pathname === "/drill-record" ? k.drillRecord(String(b?.attempt ?? "")) : url.pathname === "/phone-test" ? k.phoneTest()
+      : url.pathname === "/key-confirm" ? k.keyConfirm(String(b?.fingerprint ?? "")) : k.phoneConfirm();
     return json(r, r.ok ? 200 : 409);
   }
   if (!allow(ip)) { log(`refused ${req.method} ${url.pathname} from ${ip}: not the internal App network`); return json({ status: "refused" }, 403); }

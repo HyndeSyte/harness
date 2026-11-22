@@ -524,9 +524,20 @@ bad one back from the backup taken just before it. Cain's part:
   `keeper_token`): the token itself, the pull request, the head, the App's version before and after (each
   `config.yaml` at the pull request's base and head) and the verdict probe's hash at the head. The Keeper
   checks the token's signature with the link's public Ship key (its `ship_public_key` option: the line
-  `Ship key (public): ...` in this App's log), spends it once per App and takes the App-only backup
-  itself. A link that doesn't answer refuses the Ship run. Nothing writes the Keeper's options. The
-  link registers only the Apps the Keeper watches by default (Cain).
+  `Ship key (public): ...` in this App's log; since Keeper 0.1.4 pinned on first use, a changed one needs
+  confirming at the device), spends it once per App and takes the App-only backup itself. A link that
+  doesn't answer refuses the Ship run. Nothing writes the Keeper's options. The link registers only the
+  Apps the Keeper watches by default (Cain).
+- With Keeper 0.1.4, the Ship run waits for the Keeper's acceptance. The Keeper answers a registration
+  only once its backup is complete and verified, with the backup's slug, and the link answers the hook
+  "ok" only once every watched App the run installs is accepted (a run that installs no watched App
+  passes at once). Meanwhile the link answers "pending" and the hook refuses the run with "This Ship run
+  hasn't started yet: ... start the same Ship run again in a minute"; Cain does so, up to 6 times. A
+  Keeper refusal, no answer within 5 minutes, anything the link can't read, or no acceptance within 6
+  minutes refuses the pass for good: nothing is installed, and a new Ship card makes a new token. So while
+  the Keeper isn't installed or set up (its `ship_public_key`, its `tokens` and this App's `keeper_token`),
+  no Ship run that installs Cain starts. The Ship run itself still reads the Keeper's `accepting <id> ...`
+  line before it installs and stops without it (RELEASING.md, Ship).
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

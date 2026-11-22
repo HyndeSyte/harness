@@ -3,9 +3,10 @@
 // Home Assistant API, no manager role, and (0.1.2) no write of any options, its own included. 0.1.3: it also makes the App-only backup of an
 // install it registered (POST /backups/new/partial, within the backup role). The token
 // comes from the environment the Supervisor gives the App (SUPERVISOR_TOKEN) and is never logged.
-import type { AppInfo, BackupInfo, JobState, RestoreResult } from "./core.ts";
+import { type AppInfo, type BackupInfo, type JobState, REGISTER_WAIT_MS, type RestoreJobsSeen, type RestoreResult } from "./core.ts";
 
-export const BACKUP_CALL_MS = 10 * 60_000;
+// (0.1.4) The backup call waits as long as the registration's answer does.
+export const BACKUP_CALL_MS = REGISTER_WAIT_MS;
 export interface Http { (url: string, init: RequestInit): Promise<Response> }
 
 export function supervisor(token: string, base = "http://supervisor", http: Http = fetch) {
@@ -39,7 +40,7 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       const r = await call("GET", `/backups/${encodeURIComponent(slug)}/info`);
       if (!r.ok || !r.data) return null;
       return { homeassistant: r.data.homeassistant ?? null, addons: Array.isArray(r.data.addons) ? r.data.addons.map((a: any) => ({ slug: String(a?.slug ?? ""), version: String(a?.version ?? "") })) : [],
-        folders: Array.isArray(r.data.folders) ? r.data.folders : [], protected: r.data.protected };
+        folders: Array.isArray(r.data.folders) ? r.data.folders : [], protected: r.data.protected, ...(typeof r.data.date === "string" ? { date: r.data.date } : {}) };
     },
     // (0.1.3) The keeper's own backup of one App: partial, that App alone, no Home Assistant, no folders,
     // no password, and background false, so the call answers once the backup is complete, with its slug.
@@ -55,10 +56,10 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
     // The partial restore: that App alone, Home Assistant false, no folders, and the Supervisor's
     // background flag passed explicitly (background: true): the Supervisor answers once the job has
     // started, with its id, which the keeper keeps before anything else. 0.1.3: only a 4xx is a refusal
-    // (the Supervisor turned it down before running it: busy with another job, a bad request; a missing
-    // backup or a refused permission is never sent again), and even then core.ts sends it again only
-    // once the jobs list shows no restore of that backup. A 5xx, no answer, or a 2xx that isn't a result
-    // is "unknown": it may have been accepted, so it is never sent again.
+    // (the Supervisor turned it down: busy with another job, a bad request; a missing backup or a refused
+    // permission is never sent again), and (0.1.4) core.ts sends it again only with a restore job name a
+    // device drill recorded, once, when the jobs list shows no such job. A 5xx, no answer, or a 2xx that
+    // isn't a result is "unknown": it may have been accepted, so it is never sent again.
     async restore(backup: string, app: string): Promise<RestoreResult> {
       try {
         const r = await call("POST", `/backups/${encodeURIComponent(backup)}/restore/partial`, { homeassistant: false, addons: [app], folders: [], background: true }, 120_000);
@@ -81,20 +82,25 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       walk(r.data.jobs);
       const hit = uuid ? all.find((x) => x.uuid === uuid) : undefined;
       if (!hit) return { found: false };
-      return { found: true, uuid: String(hit.uuid), done: hit.done === true, errors: Array.isArray(hit.errors) ? hit.errors.length : 0 };
+      return { found: true, uuid: String(hit.uuid), done: hit.done === true, errors: Array.isArray(hit.errors) ? hit.errors.length : 0,
+        ...(typeof hit.name === "string" ? { name: hit.name.slice(0, 120) } : {}), ...(typeof hit.reference === "string" ? { reference: hit.reference.slice(0, 120) } : {}) };
     },
-    // (0.1.3) The restore jobs the jobs list shows for one backup (a job whose name says restore and whose
-    // reference is that backup's slug), child jobs included. Only used to prove a refused restore never
-    // ran (none listed); null when the list can't be read.
-    async restoreJobs(backup: string): Promise<number | null> {
+    // (0.1.4) The jobs list read against the restore job name a device drill recorded, child jobs
+    // included: jobs of exactly that name whose reference is that backup (matching), and jobs it can't
+    // classify (no name, a name that says restore but isn't the recorded one, or the recorded name with a
+    // reference that isn't text). Jobs whose names don't say restore are other work. Null when the list
+    // can't be read. Only used to show a refused restore never ran.
+    async restoreJobs(backup: string, name: string): Promise<RestoreJobsSeen | null> {
       const r = await call("GET", "/jobs/info").catch(() => null);
       if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
-      let n = 0;
+      const seen = { matching: 0, unclassified: 0 };
       const walk = (xs: any[]) => { for (const x of xs) { if (x && typeof x === "object") {
-        if (/restore/i.test(String(x.name ?? "")) && String(x.reference ?? "") === backup) n++;
+        if (typeof x.name !== "string" || !x.name) seen.unclassified++;
+        else if (x.name === name) { if (typeof x.reference !== "string") seen.unclassified++; else if (x.reference === backup) seen.matching++; }
+        else if (/restore/i.test(x.name)) seen.unclassified++;
         if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } } };
       walk(r.data.jobs);
-      return n;
+      return seen;
     },
   };
 }

@@ -35,8 +35,9 @@
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
 //     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
 //                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
-//     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the token spent once (a second
-//                                       run on it is refused) and the installs registered with the keeper App (0.19.0)
+//     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the installs registered with the
+//                                       keeper App, "pending" until it accepted every watched one (backup made and
+//                                       verified), then "ok" once, the token spent (a second run on it is refused) (0.19.0)
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
@@ -76,7 +77,7 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
-import { type PassDeps, registerInstalls, shipPass } from "./ship-pass";
+import { ATTEMPT_WAIT_MS, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -394,10 +395,13 @@ const shipPassDeps: PassDeps = {
   now: Date.now,
   load: () => { try { return readFileSync(SHIP_PASSES, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; return "unreadable"; } },
   store: (text) => writeSynced(SHIP_PASSES, text),
-  register: (tok, claim) => {
+  // Keeper 0.1.4: each POST /attempt answers only once the keeper's backup is complete and verified (up to
+  // about 4 minutes), so the wait is ATTEMPT_WAIT_MS; the pass stays "pending" meanwhile (ship-pass.ts).
+  register: (tok, claim, done) => {
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`),
-      post: (body) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/attempt", body, 30_000) : Promise.resolve(null) }, tok, claim)
-      .catch((e) => console.log(`[cain] link: keeper registration failed: ${String(e).slice(0, 80)}`));
+      post: (body) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/attempt", body, ATTEMPT_WAIT_MS) : Promise.resolve(null) }, tok, claim)
+      .then(done)
+      .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
   },
   log: (l) => console.log(`[cain] link: ${l}`),
 };
