@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.0
+
+- Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call and its cost first, then the run, then a plain report.
+- A hard spend stop: one budget for every trial and its grading, the new option `trials_budget_usd` (default $40). A call that could pass it isn't made, the trial stops and says why. Only you raise it.
+- Trials never use the share of each review seat's monthly cap kept for real reviews, and stop while you have everything stopped.
+- Grading is blind: each answer gets a random label, and two graders from different families (Claude and OpenAI) score every answer without knowing which model wrote it.
+- The first suite compares the outside-review seats (Gemini 4 Argon and the newer Gemini models, Codex's models, Perplexity) on the 12 most recent past reviews; the second compares research setups on 30 real questions.
+- A stopped trial resumes where it stopped, without paying twice for anything.
+
 ## 0.18.0
 
 - When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".

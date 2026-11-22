@@ -77,7 +77,7 @@ data)
   # What section 3.2 opens to him by name; any other entry is root's alone.
   his="cain work trust record record-queue record-outcomes record-holds.json review-inbox review-queue
 review-spend.json review-health.json review-useful.jsonl review-private-terms.txt review-rounds.json
-review-settings.json review-grants.json review-guard.log jobs gate session.log
+review-settings.json review-grants.json review-guard.log trials trials-inbox jobs gate session.log
 pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   for e in "$D"/* "$D"/.[!.]* "$D"/..?*; do
     { [ -e "$e" ] && [ ! -L "$e" ]; } || continue
@@ -99,7 +99,10 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   own "$D/discord" root:discord 0751   # he may pass through to the inbox, nothing else
   own "$D/discord/access.json" root:discord 0640
   own "$D/discord/inbox" discord:cain 2750
-  for q in record-queue review-inbox jobs pc-jobs-queue; do install -d -m 2770 -o root -g cain "$D/$q"; done
+  for q in record-queue review-inbox trials-inbox jobs pc-jobs-queue; do install -d -m 2770 -o root -g cain "$D/$q"; done
+  # The model trials (0.19.0): only the runner writes /data/trials, he reads it (its files at any depth).
+  install -d -m 2750 -o root -g cain "$D/trials"
+  find "$D/trials" -mindepth 1 \( -type d -exec chgrp cain {} + -exec chmod 2750 {} + \) -o \( -type f -exec chgrp cain {} + -exec chmod 0640 {} + \)
   for q in record-outcomes review-queue gate pc-jobs-outcomes; do
     install -d -m 2750 -o root -g cain "$D/$q"
     find "$D/$q" -mindepth 1 -maxdepth 1 -type f -exec chgrp cain {} + -exec chmod 0640 {} +

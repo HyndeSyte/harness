@@ -369,6 +369,68 @@ and each open change's round count.
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
 
+## Model trials (since 0.19.0)
+
+Which models suit which of your tasks, tested on real tasks with the review service's keys, under one
+hard spend stop. Cain runs them with `/opt/cain/trial.sh`; the calls are made by the review runner
+(it holds the keys), in a loop of its own, so a trial never holds up a real review.
+
+The budget: `trials_budget_usd` in this App's options (default 40, in dollars of API spend) covers
+every suite and every grading call together. Before each call the runner adds that call's worst case
+(its input estimate at the input price, its output cap at the output price, its most search fees) to
+what trials have spent; if that would pass the budget, the call isn't made, the trial stops, and Cain
+hears why. Spend is recorded per call from the provider's bill where it gives one (Perplexity),
+otherwise from the tokens it reports and the review service's price table; a call cut off by a
+restart counts at its worst case. A model missing from the price table (the newer Gemini models
+today) is priced high, so those calls are counted dearer than they are until their prices are added.
+The review seats' monthly caps apply too, and trials never spend the share `usage_reserve_percent`
+keeps for real reviews: a seat without room holds its calls, and the trial stops saying which. Trial
+spend shows in `review.sh spend` and the security watch like review spend. Only you raise the budget.
+
+How to run one (as Cain):
+
+1. `trial.sh plan review-seats` prints every call the suite would make (task, configuration, seat,
+   model, setting, search) with its worst-case cost, and the total. No call is made. For research,
+   `trial.sh plan research <questions.json>`.
+2. `trial.sh run review-seats` (or `trial.sh run research <questions.json>` the first time; the
+   questions are fixed from then on). It runs task by task: each configuration's output, then two
+   graders.
+3. `trial.sh status` shows each suite's newest run and the budget; `trial.sh result <suite>` every
+   call's state, cost, tokens and time.
+4. `trial.sh run <suite>` again resumes a stopped run where it stopped: finished calls aren't made
+   again and nothing is counted twice (`--retry` also tries again calls that failed for good; `--new`
+   starts a fresh run).
+5. `trial.sh report <suite>` prints the report and the runner writes it to
+   `/data/trials/<suite>/report.md` (also when a run ends or stops); Cain files it in the record under
+   `projects/harness/trials/`.
+
+The suites:
+
+- `review-seats`: the 12 most recent past reviews in the record with `result.json` and `adopted.md`
+  (full rounds only, none about this trial), each sent as it was to Gemini 4 Argon, 4 Neon, 4 Carbon,
+  4 Hydrogen and 3.8 Flash (with search grounding when the brief needs facts, as the seat does),
+  Codex with its default model and with gpt-6.2-sol and gpt-6.2-astra, and Perplexity Sonar. The
+  seats' answers kept in each review are graded too, with no new call.
+- `research`: Cain's 30 questions from the record (15 facts, 15 listing or product searches, at
+  least 3 with no reliable answer, each with a note of what a right answer must contain), to Claude
+  Opus 5.5 with web search, the Perplexity Agent API's fast, low and medium presets, and Gemini 4
+  Hydrogen and 3.8 Flash with Google Search grounding.
+
+Grading is blind: each output gets a random label, and the key from labels to configurations is
+written apart (`key.json`) and never sent. Two graders from different families grade every output:
+Claude Opus 5.5 and OpenAI through the Codex seat. Their scores and reasons are stored per output,
+and the report flags outputs where they are more than one rubric step apart. Every task, output and
+grading prompt passes the private-terms check before it leaves; one that doesn't is never sent.
+
+What it keeps, all readable by Cain and written only by the runner: `/data/trials/budget.json` (every
+call's cost and how it was known), and per suite `suite.json` (the tasks) and per run
+`<run>/state.json`, `outputs/`, `grades/` and `key.json`.
+
+Not checked against the providers' own pages here (their docs weren't reachable from the build): how
+the Perplexity Agent API takes a preset (sent as `"preset": "fast"`; a refusal shows as that call's
+error) and how the installed Codex lists its models (a model it doesn't offer is skipped when Codex
+refuses it, and the report says so). The first run shows both.
+
 ## Cain's own user (since 0.12.0)
 
 Cain's Claude Code session runs as its own user, `cain`, not as root. The App's keys, the

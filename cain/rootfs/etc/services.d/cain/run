@@ -511,9 +511,12 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   # Cain's user can't set them; the runner writes what it uses to /data/review-settings.json.
   REVIEW_ROUND_CAP="$(opt review_round_cap)"
   USAGE_RESERVE_PERCENT="$(opt usage_reserve_percent)"
+  # The model trials' one budget (0.19.0, trials/runner.ts): only in this environment, so Cain's user
+  # can't set it; the runner writes what it uses to /data/trials/settings.json.
+  TRIALS_BUDGET_USD="$(opt trials_budget_usd)"
   export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
-    REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT
+    REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT TRIALS_BUDGET_USD
   mkdir -p -m 700 /data/codex
   while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
 ) &

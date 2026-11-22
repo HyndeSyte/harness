@@ -9,6 +9,8 @@
       "Bash(/opt/cain/record.sh:*)",
       "Bash(/opt/cain/review.sh)",
       "Bash(/opt/cain/review.sh:*)",
+      "Bash(/opt/cain/trial.sh)",
+      "Bash(/opt/cain/trial.sh:*)",
       "Bash(/opt/cain/pcjobs.sh)",
       "Bash(/opt/cain/pcjobs.sh:*)",
       "mcp__plugin_discord_discord__download_attachment",

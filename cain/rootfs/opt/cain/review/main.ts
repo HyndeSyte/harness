@@ -14,6 +14,9 @@ import { geminiSeat } from "./seats/gemini.ts";
 import { codexSeat, codexSignedIn } from "./seats/openai.ts";
 import { perplexitySeat } from "./seats/perplexity.ts";
 import { CodexLogin, handle } from "./signin.ts";
+import { TrialRunner, writeAtomic } from "../trials/runner.ts";
+import { claudeAsk, codexAsk, geminiAsk, perplexityAsk } from "../trials/calls.ts";
+import { DEFAULT_BUDGET_USD } from "../trials/core.ts";
 
 const log = (m: string) => console.log(`[review] ${m}`);
 
@@ -78,6 +81,36 @@ if (import.meta.main) {
       pinSocket(sock);                                 // root:nogroup 0770, as ttyd's (../pinned.ts)
     }
   } catch (e) { log(`sign-in page didn't start: ${(e as Error).message}`); }
+
+  // The model trials (Cain 0.19.0, ../trials/runner.ts): the same keys and seats, in a loop of their own so
+  // a long trial never holds up a real review, under one hard budget (the App option trials_budget_usd).
+  const schemaField = env.GEMINI_SCHEMA_FIELD === "responseJsonSchema" ? "responseJsonSchema" as const : "responseFormat" as const;
+  const budgetUsd = (() => { const n = Number(env.TRIALS_BUDGET_USD); return env.TRIALS_BUDGET_USD && Number.isFinite(n) && n >= 0 ? n : DEFAULT_BUDGET_USD; })();
+  const trials = new TrialRunner({ dir: env.TRIALS_DIR ?? "/data/trials", inboxDir: env.TRIALS_INBOX ?? "/data/trials-inbox",
+    recordDir: env.RECORD_DIR ?? "/data/record", budgetUsd }, {
+    review: runner,
+    seats: {
+      gemini: keys.gemini ? (m) => geminiSeat({ key: keys.gemini, model: m, bigModel: m, schemaField }) : undefined,
+      codex: (m) => (codexSignedIn(codexHome) ? codexSeat({ home: codexHome, model: m || undefined }) : undefined),
+      perplexity: keys.perplexity ? perplexitySeat({ key: keys.perplexity, model: cfg.models.perplexity }) : undefined,
+    },
+    asks: {
+      claude: keys.anthropic ? claudeAsk({ key: keys.anthropic, version: env.ANTHROPIC_VERSION_HEADER || undefined }) : undefined,
+      gemini: keys.gemini ? geminiAsk({ key: keys.gemini }) : undefined,
+      perplexity: keys.perplexity ? perplexityAsk({ key: keys.perplexity }) : undefined,
+      codex: codexAsk({ home: codexHome }),
+    },
+  });
+  // The budget it really uses, for trial.sh (run as Cain, who can't read the App's options).
+  try { writeAtomic(`${trials.cfg.dir}/settings.json`, JSON.stringify({ budget_usd: trials.budget, written_at: new Date().toISOString() }, null, 1)); }
+  catch (e) { log(`couldn't write the trials settings: ${(e as Error).message}`); }
+  (async () => {
+    while (true) {
+      let busy = false;
+      try { busy = await trials.tick(); } catch (e) { log(`trials tick error: ${(e as Error).message}`); }
+      await Bun.sleep(busy ? 1_000 : Number(env.REVIEW_INTERVAL_S ?? 15) * 1000);
+    }
+  })();
 
   const checkAt = env.REVIEW_CHECK_AT ?? "0300";
   let lastCheck = "", lastTry = 0;
