@@ -141,13 +141,11 @@ def test_a_version_main_already_has_in_its_changelog_is_taken():
     assert problems == ["cain 0.4.6 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
 
 
-def test_a_changelog_heading_main_already_has_is_taken_too():
-    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), log("0.4.5", "0.4.4"))}
-    head = {"harness": state()["harness"], "cain": (cfg("0.4.6"), log("0.4.4", "0.4.5"))}
-    problems = check_pr.check_versions(["cain/run.sh"], base, head)
-    assert 'cain/CHANGELOG.md should open with "## 0.4.6"; its first section is "0.4.4".' in problems
-    assert "cain 0.4.4 is taken: main's cain/CHANGELOG.md already has it. Step the version again." in problems
-    assert len(problems) == 2
+def test_a_version_main_has_as_a_heading_is_taken_even_with_a_different_config():
+    # main's config is behind its CHANGELOG: the heading alone makes the version taken.
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), log("0.5.0", "0.4.5"))}
+    problems = check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.5.0", "0.4.5")))
+    assert problems == ["cain 0.5.0 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
 
 
 def test_a_fresh_version_is_not_taken_and_an_unchanged_app_is_never_asked():
