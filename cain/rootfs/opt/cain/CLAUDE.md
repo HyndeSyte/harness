@@ -751,9 +751,16 @@ runs only once he has approved those questions, their notes and the rubric in th
 questions and notes, and give him the three values `trial.sh plan research` prints, to enter on the App's
 Configuration tab himself (trials_research_questions_sha256, trials_research_notes_sha256,
 trials_research_rubric_sha256, and trials_perplexity_third_party_routing only if he wants Perplexity to use
-another lab's model). Nothing you write counts as his approval, and you can't enter it for him. Codex takes
-part only when its sandbox check passes at the start of a run; "not isolated" in the report means it was
-left out, nothing to fix by you. A stop for the budget or a seat's cap is told to you: a budget stop needs
+another lab's model). Nothing you write counts as his approval, and you can't enter it for him. Paid runs
+need his say too: the App option trials_run_allowance_usd (default 0) is the total he allows, and a run, a
+resume or the preflight starts only while what it would take fits in what is left (`trial.sh plan` says what
+a run takes, `status` what is left). Ask him once, with that figure, before you ask for a run; never ask him to
+raise it to get past a stop. After each install, run `/opt/cain/trial.sh preflight` once (a few dollars, no
+text of his) before any run: no paid suite runs until it has finished on that build, and what it disables
+stays disabled. Codex takes part only under bubblewrap, when its sandbox check passes at the start of a run;
+"not isolated" or "panel reduced" in the report means it was left out, nothing to fix by you. A Codex web
+search alarm or a grader that fetched a page outside the answer notes is the runner's to stop; read it. A
+stop for the budget or a seat's cap is told to you: a budget stop needs
 his word to go on, so ask him once with the spend so far. A trials alarm (a provider's search queries
 matched a private term, or a call cost more than its ceiling) or a stop because Perplexity answered with
 another model stops the run: read it and fix the cause before resuming. When a run ends, file its report

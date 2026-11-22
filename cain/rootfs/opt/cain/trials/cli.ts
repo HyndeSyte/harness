@@ -4,8 +4,12 @@
 // command only: the budget is the App's option, the configurations and run ids are the runner's.
 //   plan <suite> [questions.json]          every call the suite would make, its ceilings, its worst-case cost,
 //                                          the total (research: the record's questions, or a file to preview)
+//   preflight                              the checks before any spend for every configuration, with no owner
+//                                          text, under a cap of a few dollars; no paid suite runs on a build
+//                                          until its record exists for this build on this machine
 //   run <suite> [--retry] [--new]          start the suite, or resume its newest run (--new: a fresh run;
-//                                          --retry: try again calls that failed for good)
+//                                          --retry: try again calls that failed for good). It starts only while
+//                                          the owner's run allowance (an App option) covers its cap
 //   status                                 each suite's newest run, and the trials budget
 //   result <suite>                         the newest run's state: every call, its cost, tokens and time
 //   report <suite>                         the report (the runner also writes it to /data/trials/<suite>/report.md)
@@ -16,15 +20,17 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readStop } from "../stop.ts";
-import { DEFAULT_BUDGET_USD, checkQuestions, isSuite, marginOf, pickReviewTasks, planOf, type Suite, type SuiteName } from "./core.ts";
-import { RESEARCH_QUESTIONS, latestRun, readBudget, readSuite, researchHashes, reviewDirs } from "./runner.ts";
-import { committedOf } from "./ledger.ts";
+import { DEFAULT_BUDGET_USD, LEDGER_MARGIN_PCT, checkQuestions, isSuite, ledgerCap, pickReviewTasks, planOf, researchPrivacy, type ResearchTask, type Suite, type SuiteName } from "./core.ts";
+import { PREFLIGHT_CAP_USD, RESEARCH_QUESTIONS, buildId, latestRun, machineId, preflightError, readBudget, readPreflight, readSuite, researchHashes, reviewDirs } from "./runner.ts";
+import { committedOf, grantedOf } from "./ledger.ts";
 import { buildReport } from "./report.ts";
 
 const env = process.env;
 const dir = env.TRIALS_DIR ?? "/data/trials";
 const inbox = env.TRIALS_INBOX ?? "/data/trials-inbox";
 const recordDir = env.RECORD_DIR ?? "/data/record";
+const termsFile = env.REVIEW_TERMS ?? "/data/review-private-terms.txt";
+const terms = (): string | null => { try { return readFileSync(termsFile, "utf8"); } catch { return null; } };
 const out = (s: string) => console.log(s);
 const fail = (s: string, code = 2): never => { console.error(s); process.exit(code); };
 // The budget the runner really uses, as it wrote it (root's file), never this process's environment.
@@ -36,6 +42,12 @@ const approvalSeen = (): { ok: boolean; why: string; third: boolean } => {
   return a && typeof a === "object" ? { ok: a.ok === true, why: String(a.why ?? ""), third: a.third_party === true } : { ok: false, why: "the runner hasn't said yet", third: false };
 };
 const money = (n: number) => `$${n.toFixed(2)}`;
+// This build and machine as the runner itself reported them (it computes them as root, from its own files), or
+// as this process computes them when the runner hasn't said yet. The runner checks the preflight record again.
+const runnerBuild = (): string => { const b = settings()?.build; return typeof b === "string" && b ? b : buildId(); };
+const runnerMachine = (): string => { const m = settings()?.machine; return typeof m === "string" && m ? m : machineId(); };
+// The owner's run allowance as the runner last read it from the App's options (trial.sh can't read them).
+const allowanceSeen = (): number | null => { const a = settings()?.run_allowance_usd; return typeof a === "number" && Number.isFinite(a) ? a : null; };
 
 const args = process.argv.slice(2);
 const flags = new Set(args.filter((a) => a.startsWith("--")));
@@ -60,9 +72,12 @@ function suiteFor(name: SuiteName, file?: string): { suite: Suite; thirdParty: b
   try { questions = JSON.parse(readFileSync(path, "utf8")); } catch { fail(`can't read ${path} as JSON`); }
   const q = checkQuestions(questions);
   if (!q.tasks) fail(`the questions aren't right: ${q.error}`);
+  // The plan step refuses questions or answer notes that match the review service's private-terms list.
+  const bad = researchPrivacy(q.tasks as ResearchTask[], terms());
+  if (bad.length) fail(`refused: these research questions or their answer notes match the private-terms list (${termsFile}), so no plan is shown and nothing can run: ${bad.map((b) => `${b.id} (${b.why.join("; ")})`).join(", ")}. Fix them, then have the owner approve the new hashes.`);
   return { suite: { format: 2, name, created_at: now, tasks: q.tasks!, skipped: [] }, thirdParty, approval: file ? "a preview of a file, not the record's approved questions" : approval };
 }
-function leave(req: { kind: string; suite: string; mode?: string }, name: string) {
+function leave(req: { kind: string; suite?: string; mode?: string }, name: string) {
   mkdirSync(inbox, { recursive: true });
   const f = join(inbox, `${Date.now()}-${name}.json`);
   const tmp = join(inbox, `.${name}.${process.pid}.tmp`);
@@ -81,7 +96,11 @@ switch (cmd) {
     if (p.originals) out(`plus ${p.originals} original seat answers from the record, graded with no new call`);
     const b = readBudget(dir);
     out(`Total worst case: ${money(p.total)} over ${p.lines.length} calls. Trials budget: ${money(Number.isFinite(b.spent_usd) ? committedOf(b) : NaN)} spent or reserved of ${money(budget())}.`);
-    out(`Worst case: steps x (the context ceiling at the input price + the output cap, and a thinking allowance where it isn't covered, at the output price) + the most tool fees, at the dearest list price the model has (an unlisted model is priced high; Perplexity's fast level at the priority rate). Admission keeps an overrun margin of ${money(marginOf(s, !thirdParty))} (the largest single call's worst case) under the budget. Codex runs on the ChatGPT plan: no dollars, each call counted against its trial allowance. Before any spend the runner checks each model, level and tool path once, and Codex's sandbox.`);
+    out(`Worst case: steps x (the context ceiling at the input price + the output cap, and a thinking allowance where it isn't covered, at the output price) + the most tool fees, at the dearest list price the model has (an unlisted model is priced high; Perplexity's fast level at the priority rate; Gemini grounding at a conservative allowance of queries). It is a soft bound: search results, Gemini's thinking level and grounding's query count have no provider cap. The ledger stops at ${money(ledgerCap(budget()))}, a fixed ${LEDGER_MARGIN_PCT}% below the budget. The hard stop is the owner's own trial keys with a prepaid or workspace limit. Codex runs on the ChatGPT plan: no dollars, each call counted against its trial allowance, and only under bubblewrap once its self-test passed.`);
+    const al = allowanceSeen(), cap = Math.min(ledgerCap(budget()), p.total + PREFLIGHT_CAP_USD);
+    out(`A run of this suite takes ${money(cap)} of the owner's run allowance (its worst case plus its checks, at most the ledger's cap); the allowance ${al === null ? "isn't known yet (the runner hasn't said)" : `is ${money(al)}, ${money(grantedOf(readBudget(dir)) || 0)} granted so far`}.`);
+    const pfe = preflightError(readPreflight(dir), runnerBuild(), runnerMachine());
+    if (pfe) out(`Before any run: ${pfe}.`);
     if (name === "research") {
       out(thirdParty ? "Perplexity's levels may route to another lab's model: the owner approved that." : "Perplexity's levels are pinned to Perplexity's own model: routing to another lab's model needs the owner's approval first.");
       const h = researchHashes(recordDir);
@@ -91,9 +110,20 @@ switch (cmd) {
     for (const n of s.skipped) out(`left out: ${n}`);
     break;
   }
+  case "preflight": {
+    if (a1) fail("trial.sh preflight takes nothing more");
+    const cur = readPreflight(dir);
+    if (cur?.status === "running") fail("the preflight is already running: trial.sh status shows it");
+    leave({ kind: "preflight" }, "preflight");
+    out(`left for the trials runner: the preflight, the checks before any spend for every configuration (no owner text), under a cap of ${money(PREFLIGHT_CAP_USD)} from the owner's run allowance. It takes it within a minute; trial.sh status shows how it went.`);
+    break;
+  }
   case "run": {
     const name = suiteArg();
     if (a2) fail("a run takes no file: the research questions come from the record, once the owner has approved them");
+    // No paid suite runs until the preflight's record exists for this build on this machine (the runner checks again).
+    const pfe = preflightError(readPreflight(dir), runnerBuild(), runnerMachine());
+    if (pfe) fail(`the ${name} suite can't run: ${pfe}`);
     if (name === "research") {
       const a = approvalSeen();
       if (!a.ok) fail(`the research suite can't run: ${a.why}`);
@@ -106,6 +136,10 @@ switch (cmd) {
   }
   case "status": {
     const b = readBudget(dir);
+    const pr = readPreflight(dir), pfe = preflightError(pr, runnerBuild(), runnerMachine());
+    out(`Preflight: ${pfe ? pfe : `done on this build${Object.keys(pr!.disabled).length ? `; disabled: ${Object.entries(pr!.disabled).map(([c, w]) => `${c} (${w})`).join("; ")}` : "; nothing disabled"}`}.`);
+    const al = allowanceSeen();
+    out(`Owner's run allowance: ${al === null ? "not known yet" : money(al)}; granted to runs so far: ${money(grantedOf(b) || 0)}.`);
     out(`Trials budget: ${money(b.spent_usd)} spent of ${money(budget())}${Object.keys(b.reservations ?? {}).length ? `; ${money(Object.values(b.reservations).reduce((a, r) => a + r.usd, 0))} reserved for calls out` : ""}${Object.keys(b.holds ?? {}).length ? `; ${money(Object.values(b.holds).reduce((a, h) => a + h.usd, 0))} held for grading` : ""}.`);
     for (const name of ["review-seats", "research"] as SuiteName[]) {
       const st = latestRun(dir, name);
@@ -131,5 +165,5 @@ switch (cmd) {
     break;
   }
   default:
-    fail("usage: trial.sh plan <review-seats|research> [questions.json] | run <suite> [--retry] [--new] | result <suite> | report <suite> | status");
+    fail("usage: trial.sh plan <review-seats|research> [questions.json] | preflight | run <suite> [--retry] [--new] | result <suite> | report <suite> | status");
 }

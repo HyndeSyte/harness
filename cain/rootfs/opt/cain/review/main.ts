@@ -102,7 +102,7 @@ if (import.meta.main) {
   // restarts the App when they change), for trial.sh (run as Cain, who can't read the App's options).
   const approval = trials.approval();
   try { writeAtomic(`${trials.cfg.dir}/settings.json`, JSON.stringify({ budget_usd: trials.budget, research_approval: approval.ok ? { ok: true, third_party: approval.third_party }
-    : { ok: false, why: (approval as { why: string }).why }, written_at: new Date().toISOString() }, null, 1)); }
+    : { ok: false, why: (approval as { why: string }).why }, run_allowance_usd: trials.allowance(), build: trials.build, machine: trials.machine, written_at: new Date().toISOString() }, null, 1)); }
   catch (e) { log(`couldn't write the trials settings: ${(e as Error).message}`); }
   (async () => {
     while (true) {

@@ -20,7 +20,7 @@ import {
 import { RESEARCH_QUESTIONS, TrialRunner, latestRun, paths, readBudget, requestError, researchHashes, reviewDirs, takeInboxFile, type TrialDeps } from "../rootfs/opt/cain/trials/runner.ts";
 import { buildReport } from "../rootfs/opt/cain/trials/report.ts";
 import {
-  CLAUDE_FETCH_TOOL, CLAUDE_SEARCH_TOOL, CODEX_NO_MODEL, claudeProvider, codexProvider, geminiProvider, modelsFromCatalog, perplexityProvider,
+  CLAUDE_FETCH_TOOL, CLAUDE_SEARCH_TOOL, CODEX_NO_MODEL, CODEX_WEB_SEARCH_EVENT, claudeProvider, codexProvider, geminiProvider, modelsFromCatalog, perplexityProvider,
   type AskFn, type AskInput, type AskResult, type CodexProvider, type Provider,
 } from "../rootfs/opt/cain/trials/calls.ts";
 import { Ledger } from "../rootfs/opt/cain/trials/ledger.ts";
@@ -30,6 +30,15 @@ const CLI = join(import.meta.dir, "../rootfs/opt/cain/trials/cli.ts");
 const LEDGER = join(import.meta.dir, "../rootfs/opt/cain/trials/ledger.ts");
 const TERMS = "# terms\nAcme Corp\nPat\n";
 const DAY = "2026-11-22";
+// The owner's run allowance in the rig's options, large enough for every test's runs unless a test sets its own.
+const ALLOWANCE = 1000;
+const BUILD = "test-build", MACHINE = "test-machine";
+// The build's preflight record, as a finished `trial.sh preflight` leaves it (no checks seeded: each run checks).
+function writePreflightRecord(tdir: string, over: any = {}) {
+  mkdirSync(tdir, { recursive: true });
+  writeFileSync(join(tdir, "preflight.json"), JSON.stringify({ format: 1, id: "p20261122-140000", status: "done", build: BUILD, machine: MACHINE,
+    started_at: "2026-11-22T14:00:00Z", finished_at: "2026-11-22T14:05:00Z", cap_usd: 4, suites: {}, disabled: {}, ...over }));
+}
 const sig = () => new AbortController().signal;
 
 const briefTxt = (topic: string, body: string, facts = false) =>
@@ -62,10 +71,20 @@ function writeQuestions(recordDir: string, questions: any = { questions: QUESTIO
 }
 function approveInOptions(recordDir: string, optionsFile: string, extra: object = {}) {
   const h = researchHashes(recordDir).hashes!;
-  writeFileSync(optionsFile, JSON.stringify({ trials_budget_usd: 40, trials_research_questions_sha256: h.questions, trials_research_notes_sha256: h.notes,
+  writeFileSync(optionsFile, JSON.stringify({ trials_budget_usd: 40, trials_run_allowance_usd: ALLOWANCE, trials_research_questions_sha256: h.questions, trials_research_notes_sha256: h.notes,
     trials_research_rubric_sha256: h.rubric, ...extra }), { mode: 0o600 });
   chmodSync(optionsFile, 0o600);
 }
+
+// What the bubblewrap wrapper maps: a path under /trial inside is the host folder bound there.
+function bwrapHost(cmd: string[], p: string): string {
+  for (let i = 0; i < cmd.length - 2; i++) if (cmd[i] === "--bind" && (p === cmd[i + 2] || p.startsWith(cmd[i + 2] + "/"))) return cmd[i + 1] + p.slice(cmd[i + 2].length);
+  return p;
+}
+const outOf = (cmd: string[]) => bwrapHost(cmd, cmd[cmd.indexOf("-o") + 1]);
+// A Codex self-test's JSONL: one refused attempt per probe (or the commands given).
+const refusedProbes = (pid = process.pid, cmds?: string[]) => (cmds ?? ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${pid}/environ`])
+  .map((c) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: c, status: "failed", exit_code: 127, aggregated_output: "bwrap: execvp bash: No such file or directory" } })).join("\n");
 
 // ---- fakes ----
 type Spy = Provider & { calls: AskInput[] };
@@ -99,19 +118,20 @@ function fake(o: FakeOpts): Spy {
 function fakeCodex(o: Partial<FakeOpts> & { models?: string[] | null; version?: string; isolated?: boolean } = {}): Spy & CodexProvider {
   const f = fake({ seat: "codex", cost: 0, how: "billed", ...o });
   return Object.assign(f, { validate: undefined, version: async () => o.version ?? "codex-cli 0.130.0", models: async () => (o.models === undefined ? ["gpt-6.2-sol", "gpt-6.2-astra"] : o.models),
-    isolation: async () => (o.isolated === false ? { ok: false, mode: "none" as const, detail: "a sandboxed command ran and gave output", at: "2026-11-22T15:00:00Z" } : { ok: true, mode: "rules" as const, detail: "fake", at: "2026-11-22T15:00:00Z" }) }) as any;
+    isolation: async () => (o.isolated === false ? { ok: false, mode: "none" as const, detail: "a sandboxed command ran and gave output", at: "2026-11-22T15:00:00Z" } : { ok: true, mode: "bwrap" as const, detail: "fake", at: "2026-11-22T15:00:00Z" }) }) as any;
 }
 
 function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Partial<RunnerConfig["caps"]>; record?: (i: number) => any;
   providers?: Partial<TrialDeps["providers"]>; stopped?: () => boolean; fetchBody?: any; fetch?: TrialDeps["fetch"]; exec?: TrialDeps["exec"];
-  questions?: boolean | object; reviewSeats?: Partial<Record<string, SeatFn>>; inbox?: boolean; timeoutScale?: number; seatLimits?: any } = {}) {
+  questions?: boolean | object; reviewSeats?: Partial<Record<string, SeatFn>>; inbox?: boolean; timeoutScale?: number; seatLimits?: any;
+  allowance?: number; noPreflight?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "trials-"));
   const cfg: RunnerConfig = { ...DEFAULTS, caps: { ...DEFAULTS.caps, ...(o.caps ?? {}) }, queueDir: join(dir, "q"), spendFile: join(dir, "spend.json"), healthFile: join(dir, "health.json"),
     termsFile: join(dir, "terms.txt"), recordQueue: join(dir, "record-queue"), relayFile: join(dir, "relay.queue"), reservePercent: 25 };
   writeFileSync(cfg.termsFile, o.terms ?? TERMS);
   const recordDir = join(dir, "record");
   const optionsFile = join(dir, "options.json");
-  writeFileSync(optionsFile, JSON.stringify({ trials_budget_usd: 40 }), { mode: 0o600 });
+  writeFileSync(optionsFile, JSON.stringify({ trials_budget_usd: 40, trials_run_allowance_usd: o.allowance ?? ALLOWANCE }), { mode: 0o600 });
   writeRecord(recordDir, o.reviews ?? 2, o.record);
   if (o.questions) writeQuestions(recordDir, { questions: QUESTIONS }, o.questions, optionsFile);
   let clock = new Date("2026-11-22T15:00:00Z");
@@ -128,8 +148,9 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
   };
   const tdir = join(dir, "trials");
   const inboxDir = join(dir, "inbox");
+  if (!o.noPreflight) writePreflightRecord(tdir);
   const trials = new TrialRunner({ dir: tdir, recordDir, budgetUsd: o.budget ?? 40, seatGapMs: 0, timeoutScale: o.timeoutScale, inboxDir, inboxUids: [process.getuid!()],
-    optionsFile, optionsUid: process.getuid!(), ...(o.seatLimits ? { seatLimits: o.seatLimits } : {}) }, deps);
+    optionsFile, optionsUid: process.getuid!(), build: BUILD, machine: MACHINE, ...(o.seatLimits ? { seatLimits: o.seatLimits } : {}) }, deps);
   const runAll = async (suite: "review-seats" | "research" = "review-seats", max = 3000) => {
     for (let i = 0; i < max; i++) {
       const ticked = await trials.tick();
@@ -235,45 +256,94 @@ describe("the spend bound: hard ceilings in every request", () => {
     expect(wire.queries).toEqual(["q1"]);
   });
 
-  test("Codex runs with no config, no web search, the read-only profile, rules forbidding every command, the daemon off, in a fresh empty folder", async () => {
-    let cmd: string[] = [], env: Record<string, string> = {}, rules = "", auth = "";
+  test("Codex runs only under bubblewrap: no config, web search off, the read-only profile, the daemon off, in a fresh empty folder", async () => {
+    let cmd: string[] = [], env: Record<string, string> = {}, auth = "";
+    const cmds: string[][] = [];
     const exec = async (c: string[], o: any) => {
-      cmd = c; env = o.env;
-      if (env.CODEX_HOME) { rules = readFileSync(join(env.CODEX_HOME, "rules", "default.rules"), "utf8"); auth = readFileSync(join(env.CODEX_HOME, "auth.json"), "utf8"); }
-      writeFileSync(c[c.indexOf("-o") + 1], JSON.stringify({ verdict: "approve", findings: [] })); return { code: 0, stdout: "", stderr: "" };
+      cmd = c; env = o.env; cmds.push(c);
+      auth = readFileSync(join(bwrapHost(c, "/trial/codex-home"), "auth.json"), "utf8");
+      writeFileSync(outOf(c), JSON.stringify({ verdict: "approve", findings: [{ rank: 1, problem: "p", fix: "f" }] })); return { code: 0, stdout: "", stderr: "" };
     };
     const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), '{"tokens":"t"}'); writeFileSync(join(home, "config.toml"), "[mcp_servers.x]\n");
     const bin = join(home, "fake-codex"); writeFileSync(bin, "");
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
     const wire = makeWire({ terms: () => TERMS, fetch: null as any, exec: exec as any });
     const brief = { topic: "t", question: "q", body: "b", needs_facts: true, consequential: false };
-    // Without a mode the run's self-test proved, Codex isn't started at all.
-    await expect(codexProvider({ home, bin }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0 })).rejects.toThrow(/isn't isolated/);
-    expect(cmd).toEqual([]);
-    await codexProvider({ home, bin }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "rules" });
+    // Without the mode the run's self-test proved under bubblewrap, Codex isn't started at all; with no bubblewrap neither.
+    await expect(codexProvider({ home, bin, bwrap: bw }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0 })).rejects.toThrow(/isn't isolated/);
+    await expect(codexProvider({ home, bin, bwrap: bw }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "rules" as any })).rejects.toThrow(/isn't isolated/);
+    await expect(codexProvider({ home, bin, bwrap: null }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "bwrap" })).rejects.toThrow(/bubblewrap isn't installed/);
+    expect(cmds).toEqual([]);
+    await codexProvider({ home, bin, bwrap: bw }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "bwrap" });
     const line = cmd.join(" ");
-    expect(cmd[0]).toBe(bin);
-    expect(cmd.slice(1, 4)).toEqual(["-c", "features.daemon_auto_start=false", "exec"]);
-    expect(cmd).toContain("--ignore-user-config");
-    expect(line).toContain('web_search="disabled"');
+    // Under bubblewrap: new namespaces, a fresh /proc, a cleared environment, only the trial folders bound.
+    expect(cmd[0]).toBe(bw);
+    for (const f of ["--unshare-pid", "--die-with-parent", "--new-session", "--clearenv", "--proc"]) expect(cmd).toContain(f);
+    const inner = cmd.slice(cmd.indexOf("/opt/codex/codex", cmd.indexOf("--setenv")) + 1);
+    expect(inner.slice(0, 5)).toEqual(["-c", "features.daemon_auto_start=false", "-c", 'web_search="disabled"', "exec"]);
+    expect(inner).toContain("--ignore-user-config");
     expect(line).toContain('default_permissions=":read-only"');
     expect(line).not.toContain("--sandbox");
     expect(line).toContain(`model_context_window=${LIMITS.codexContextWindow}`);
     expect(line).not.toContain('web_search="live"');
-    // An isolated CODEX_HOME: a copy of only auth.json, and an exec policy forbidding every program.
-    expect(env.CODEX_HOME).not.toBe(home);
-    expect(auth).toBe('{"tokens":"t"}');
-    expect(rules).toContain('decision="forbidden"');
-    for (const p of ["sh", "bash", "cat", "/bin/cat", "python3", "env"]) expect(rules).toContain(JSON.stringify(p));
-    expect(Object.keys(env).sort()).toEqual(["CODEX_HOME", "HOME", "LANG", "PATH"]);
-    // Under bubblewrap: new namespaces, a fresh /proc, a cleared environment, only the trial folders bound.
-    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
-    await codexProvider({ home, bin, bwrap: bw }).ask({ wire, signal: sig(), day: DAY, model: "gpt-6.2-sol", brief, maxOut: 0, codexMode: "bwrap" }).catch(() => {});
-    expect(cmd[0]).toBe(bw);
-    for (const f of ["--unshare-pid", "--die-with-parent", "--new-session", "--clearenv", "--proc"]) expect(cmd).toContain(f);
-    expect(cmd.join(" ")).not.toContain("/data");
-    expect(cmd.join(" ")).not.toContain(home + "/auth.json");
+    expect(line).not.toContain("/data");
+    expect(line).not.toContain(home + "/auth.json");
+    expect(line).not.toContain("default.rules");
     expect(cmd[cmd.indexOf("-o") + 1]).toBe("/trial/io/answer.txt");
-    expect(Object.keys(env)).toEqual(["PATH"]);
+    // An isolated CODEX_HOME: a copy of only auth.json; bubblewrap itself starts with a fixed PATH and nothing else.
+    expect(auth).toBe('{"tokens":"t"}');
+    expect(env).toEqual({ PATH: "/usr/bin:/bin" });
+  });
+
+  test("web search is off on every Codex invocation, trial and grading alike; a web search event stops the call", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), "{}");
+    const bin = join(home, "fake-codex"); writeFileSync(bin, "");
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    const cmds: string[][] = []; const opts: any[] = [];
+    let search = false;
+    const exec = async (c: string[], o: any) => {
+      cmds.push(c); opts.push(o);
+      if (c.includes("--version")) return { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" };
+      if (c.includes("debug")) return { code: 0, stdout: "{}", stderr: "" };
+      writeFileSync(outOf(c), JSON.stringify({ verdict: "approve", findings: [{ rank: 1, problem: "p", fix: "f" }] }));
+      return { code: 0, stdout: search ? JSON.stringify({ type: "item.completed", item: { type: "web_search", query: "anything" } }) : "", stderr: "" };
+    };
+    const wire = () => makeWire({ terms: () => TERMS, fetch: null as any, exec: exec as any });
+    const p = codexProvider({ home, bin, bwrap: bw });
+    const brief = { topic: "t", question: "q", body: "b", needs_facts: true, consequential: false };
+    await p.ask({ wire: wire(), signal: sig(), day: DAY, model: "", brief, maxOut: 0, codexMode: "bwrap" });
+    await p.ask({ wire: wire(), signal: sig(), day: DAY, model: "", system: "grade", user: "x", schema: { type: "object" }, maxOut: 0, codexMode: "bwrap" });
+    await p.version(wire(), sig()); await p.models(wire(), sig());
+    expect(cmds.length).toBe(4);
+    for (const c of cmds) {
+      const inner = c.slice(c.lastIndexOf("/opt/codex/codex") + 1);
+      expect(inner.slice(0, 4)).toEqual(["-c", "features.daemon_auto_start=false", "-c", 'web_search="disabled"']);
+    }
+    // Both asks (an answer and a grade) carry it again on exec's own line.
+    for (const c of cmds.slice(0, 2)) expect(c.slice(c.indexOf("exec")).join(" ")).toContain('-c web_search="disabled"');
+    // Every launch asks the process group to be killed as soon as a web search event shows.
+    for (const o of opts) expect(String(o.stopOn)).toContain("web_search");
+    search = true;
+    await expect(p.ask({ wire: wire(), signal: sig(), day: DAY, model: "", brief, maxOut: 0, codexMode: "bwrap" })).rejects.toThrow(/web search although search is off/);
+    // The real process group: a web search line kills it at once.
+    const r: any = await groupExec(["sh", "-c", `echo '{"type":"item.started","item":{"type":"web_search"}}'; sleep 20; echo late`], { env: { PATH: "/usr/bin:/bin" }, signal: sig(), stopOn: CODEX_WEB_SEARCH_EVENT } as any);
+    expect(r.stopped).toBe(true);
+    expect(r.stdout).not.toContain("late");
+  });
+
+  test("a Codex call that searched the web is stopped and counted at its worst case (one plan call), with an alarm", async () => {
+    const codex = fakeCodex({ impl: async (i) => { if (!i.schema) { const { CodexWebSearch } = await import("../rootfs/opt/cain/trials/calls.ts"); throw new CodexWebSearch(); } } });
+    const t = rig({ reviews: 1, providers: { codex } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    const c = st.calls[`out|${suiteOf(t).tasks[0].id}|codex:default`];
+    expect(c.status).toBe("failed");
+    expect(c.final).toBe(true);
+    expect(c.error).toContain("web search");
+    expect(c.how).toBe("plan call");
+    expect(c.spend!.plan_calls).toBe(1);
+    expect(t.relays().some((r) => /Trials alarm: Codex ran a web search/.test(r))).toBe(true);
   });
 });
 
@@ -376,10 +446,10 @@ describe("the spend bound: one atomic check-and-reserve", () => {
     const t0 = rig({ reviews: 2 });
     submit(t0, { kind: "run", suite: "review-seats" });
     const s = suiteOf(t0);
-    const { gradeCharsBound, marginOf } = await import("../rootfs/opt/cain/trials/core.ts");
+    const { gradeCharsBound } = await import("../rootfs/opt/cain/trials/core.ts");
     const hold = (["claude", "gemini"] as const).reduce((a, g) => a + worstOf(callShape("review-seats", { id: "g", kind: "grade", task: s.tasks[0].id, grader: g }, s.tasks[0]), gradeCharsBound(s, s.tasks[0]))!, 0);
-    // The budget: the overrun margin kept free, both paid graders' hold, and a little for the checks and outputs.
-    const t = rig({ reviews: 2, budget: marginOf(s) + hold + 0.06 });
+    // The budget: both paid graders' hold and a little for the checks and outputs, with the 10 percent margin kept free.
+    const t = rig({ reviews: 2, budget: (hold + 0.06) / 0.9 });
     submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
@@ -529,17 +599,17 @@ describe("Codex isolation", () => {
     const seen: { cmd: string[]; env: Record<string, string>; workEntries: string[]; files: string[] }[] = [];
     const exec = async (cmd: string[], o: { env: Record<string, string> }) => {
       const files: string[] = [];
-      for (const a of cmd) try { if (a.startsWith("/") && statSync(a).isFile()) files.push(readFileSync(a, "utf8")); } catch { /* not a file */ }
-      const work = cmd.includes("-C") ? cmd[cmd.indexOf("-C") + 1] : "";
+      for (const a of cmd) try { const h = bwrapHost(cmd, a); if (h.startsWith("/") && statSync(h).isFile()) files.push(readFileSync(h, "utf8")); } catch { /* not a file */ }
+      const work = cmd.includes("-C") ? bwrapHost(cmd, cmd[cmd.indexOf("-C") + 1]) : "";
       seen.push({ cmd, env: o.env, workEntries: work ? readdirSync(work) : [], files });
-      if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.130.0\n", stderr: "" };
+      if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" };
       if (cmd.includes("debug")) return { code: 0, stdout: JSON.stringify({ models: [{ slug: "gpt-6.2-sol" }, { slug: "gpt-6.2-astra" }] }), stderr: "" };
-      const out = cmd[cmd.indexOf("-o") + 1];
+      const out = outOf(cmd);
       if (cmd[cmd.length - 1].startsWith("This is a sandbox check")) {
-        writeFileSync(out, "Both commands were refused.");
-        return { code: 0, stdout: [1, 2].map((n) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat ${n}`, status: "declined", aggregated_output: "" } })).join("\n"), stderr: "" };
+        writeFileSync(out, "Every command was refused.");
+        return { code: 0, stdout: refusedProbes(), stderr: "" };
       }
-      const schema = cmd.includes("--output-schema") ? readFileSync(cmd[cmd.indexOf("--output-schema") + 1], "utf8") : "";
+      const schema = cmd.includes("--output-schema") ? readFileSync(bwrapHost(cmd, cmd[cmd.indexOf("--output-schema") + 1]), "utf8") : "";
       if (schema.includes("adopted_covered")) {
         const labels = [...cmd[cmd.length - 1].matchAll(/<candidate label="([A-Z]\d\d)">/g)].map((m) => m[1]);
         writeFileSync(out, JSON.stringify({ outputs: labels.map((label) => ({ label, score: 3, reason: "ok", findings: [], adopted_covered: [] })) }));
@@ -548,12 +618,13 @@ describe("Codex isolation", () => {
     };
     t.deps.exec = exec as any;
     const bin = join(home, "fake-codex"); writeFileSync(bin, "");
-    t.deps.providers.codex = codexProvider({ home, bin, bwrap: null });
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    t.deps.providers.codex = codexProvider({ home, bin, bwrap: bw });
     submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
     expect(st.status).toBe("done");
-    expect(st.preflight!.codex_isolation).toMatchObject({ ok: true, mode: "rules" });
+    expect(st.preflight!.codex_isolation).toMatchObject({ ok: true, mode: "bwrap" });
     const selfTests = seen.filter((s) => s.cmd[s.cmd.length - 1].startsWith("This is a sandbox check"));
     expect(selfTests.length).toBe(1);
     const asks = seen.filter((s) => s.cmd.includes("exec") && !selfTests.includes(s));
@@ -562,9 +633,11 @@ describe("Codex isolation", () => {
       const all = [...s.cmd, ...Object.values(s.env), ...s.files].join("\n");
       for (const canary of ["CANARY-KEY-7f3a", "CANARY-NOTE-91b2", "Pat", t.tdir, "/data/"]) expect(all).not.toContain(canary);
       expect(s.workEntries).toEqual([]);
-      expect(Object.keys(s.env).filter((k) => k !== "TRIAL_CANARY").sort()).toEqual(["CODEX_HOME", "HOME", "LANG", "PATH"]);
-      expect(s.env.CODEX_HOME).not.toBe(home);
-      expect(s.cmd.slice(1, 3)).toEqual(["-c", "features.daemon_auto_start=false"]);
+      expect(s.env).toEqual({ PATH: "/usr/bin:/bin" });
+      expect(s.cmd[0]).toBe(bw);
+      expect(s.cmd).toContain("--clearenv");
+      const inner = s.cmd.slice(s.cmd.lastIndexOf("/opt/codex/codex") + 1);
+      expect(inner.slice(0, 4)).toEqual(["-c", "features.daemon_auto_start=false", "-c", 'web_search="disabled"']);
     }
     for (const s of asks) {
       expect(s.cmd).toContain("--ignore-user-config");
@@ -575,11 +648,12 @@ describe("Codex isolation", () => {
 
   test("a Codex answer that used a tool isn't kept", async () => {
     const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), "{}");
-    const exec = async (cmd: string[]) => { writeFileSync(cmd[cmd.indexOf("-o") + 1], "{\"verdict\":\"approve\",\"findings\":[]}");
+    const exec = async (cmd: string[]) => { writeFileSync(outOf(cmd), "{\"verdict\":\"approve\",\"findings\":[]}");
       return { code: 0, stdout: `${JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "cat /data/x" } })}\n`, stderr: "" }; };
     const wire = makeWire({ terms: () => TERMS, fetch: null as any, exec: exec as any });
     const bin = join(home, "fake-codex"); writeFileSync(bin, "");
-    await expect(codexProvider({ home, bin }).ask({ wire, signal: sig(), day: DAY, model: "", brief: { topic: "t", question: "q", body: "b", needs_facts: false, consequential: false }, maxOut: 0, codexMode: "rules" }))
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    await expect(codexProvider({ home, bin, bwrap: bw }).ask({ wire, signal: sig(), day: DAY, model: "", brief: { topic: "t", question: "q", body: "b", needs_facts: false, consequential: false }, maxOut: 0, codexMode: "bwrap" }))
       .rejects.toThrow(/used a tool/);
   });
 });
@@ -970,7 +1044,8 @@ describe("the plan and trial.sh", () => {
 
   test("trial.sh plan prints the ceilings and the total and leaves nothing; run leaves only the suite and the command", () => {
     const t = rig({ reviews: 2 });
-    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json") };
+    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json"), REVIEW_TERMS: t.cfg.termsFile };
+    writeFileSync(join(t.tdir, "settings.json"), JSON.stringify({ budget_usd: 40, build: BUILD, machine: MACHINE, run_allowance_usd: 50 }));
     const r = spawnSync("bun", [CLI, "plan", "review-seats"], { encoding: "utf8", env });
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("No call is made");
@@ -983,7 +1058,7 @@ describe("the plan and trial.sh", () => {
     writeQuestions(t.recordDir);
     // trial.sh can't read the App's options: it shows what the runner found there when it started.
     mkdirSync(t.tdir, { recursive: true });
-    writeFileSync(join(t.tdir, "settings.json"), JSON.stringify({ budget_usd: 40, research_approval: { ok: true, third_party: false } }));
+    writeFileSync(join(t.tdir, "settings.json"), JSON.stringify({ budget_usd: 40, build: BUILD, machine: MACHINE, run_allowance_usd: 50, research_approval: { ok: true, third_party: false } }));
     const r3 = spawnSync("bun", [CLI, "plan", "research"], { encoding: "utf8", env });
     expect(r3.stdout).toContain("approved by the owner in the App's options");
     expect(r3.stdout).toContain("pinned to Perplexity's own model");
@@ -1029,8 +1104,8 @@ describe("resumption", () => {
 });
 
 // ---- The second review's fixes (Cain 0.19.0, third round) ----
-import { groupExec, judgeSelfTest, forbidAllRules, programNames } from "../rootfs/opt/cain/trials/sandbox.ts";
-import { GEMINI_MODELS, PERPLEXITY_PRIORITY, SEARCH_RESULT_TOKENS, marginOf, panelFor, perplexityPrice, toolViolation } from "../rootfs/opt/cain/trials/core.ts";
+import { PROBES, groupExec, judgeSelfTest } from "../rootfs/opt/cain/trials/sandbox.ts";
+import { GEMINI_MODELS, PERPLEXITY_PRIORITY, SEARCH_RESULT_TOKENS, ledgerCap, ledgerMargin, panelFor, perplexityPrice, toolViolation } from "../rootfs/opt/cain/trials/core.ts";
 import { ownerAlive, ownerToken } from "../rootfs/opt/cain/trials/ledger.ts";
 import { withUsage } from "../rootfs/opt/cain/trials/calls.ts";
 
@@ -1038,7 +1113,7 @@ const rt = (needs = false) => ({ id: "r1", kind: "review" as const, brief: { top
 const qt = { id: "q", kind: "fact" as const, sent_text: "What is x?", as_of: DAY, must_contain: "m", sources: [], no_reliable_answer: false };
 
 describe("Codex isolation before launch", () => {
-  test("the self-test's judge passes only when Codex tried and every attempt was refused before it ran, with no canary back", () => {
+  test("the self-test's judge passes only when Codex tried every probe and every attempt was refused before it ran, with no canary back", () => {
     const ev = (item: any) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "cat x", ...item } });
     expect(judgeSelfTest({ code: 0, stdout: [ev({ status: "declined", aggregated_output: "" }), ev({ status: "declined" })].join("\n"), stderr: "", answer: "refused" }, ["K1", "K2"]).ok).toBe(true);
     expect(judgeSelfTest({ code: 0, stdout: ev({ status: "failed", aggregated_output: "bash: No such file or directory" }), stderr: "", answer: "" }, ["K1"]).ok).toBe(true);
@@ -1047,29 +1122,60 @@ describe("Codex isolation before launch", () => {
     expect(judgeSelfTest({ code: 0, stdout: ev({ status: "declined" }), stderr: "", answer: "the key is K1" }, ["K1"]).detail).toContain("came back");
     expect(judgeSelfTest({ code: 0, stdout: "", stderr: "", answer: "I won't run commands." }, ["K1"]).detail).toContain("proves nothing");
     expect(judgeSelfTest({ code: 1, stdout: "", stderr: "not signed in", answer: "" }, ["K1"]).ok).toBe(false);
+    // With the probes named: each of the four must have been attempted (and refused).
+    expect(PROBES.map((p) => p.id)).toEqual(["read", "absolute", "builtin", "environ"]);
+    expect(judgeSelfTest({ code: 0, stdout: refusedProbes(4242), stderr: "", answer: "" }, ["K1"], { pid: 4242 }).ok).toBe(true);
+    for (let skip = 0; skip < 4; skip++) {
+      const cmds = ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo $line", "cat /proc/4242/environ"].filter((_, i) => i !== skip);
+      const j = judgeSelfTest({ code: 0, stdout: refusedProbes(4242, cmds), stderr: "", answer: "" }, ["K1"], { pid: 4242 });
+      expect(j.ok).toBe(false);
+      expect(j.detail).toContain(PROBES[skip].what);
+    }
+    // The builtin read or the absolute-path binary that ran is a leak.
+    const ran = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "read -r line < /trial/planted-key.txt", status: "completed", exit_code: 0, aggregated_output: "x" } });
+    expect(judgeSelfTest({ code: 0, stdout: `${refusedProbes(4242)}\n${ran}`, stderr: "", answer: "" }, ["K1"], { pid: 4242 }).ok).toBe(false);
   });
 
-  test("the real self-test, through the provider: a leak or no attempt means not isolated; refusals in both modes pass", async () => {
+  test("the real self-test, through the provider: bubblewrap only, it must start, and every probe must be refused", async () => {
     const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), "{}");
     const bin = join(home, "fake-codex"); writeFileSync(bin, "");
-    const prompts: string[] = [];
-    const leak = async (cmd: string[], o: any) => {
-      const p = cmd[cmd.length - 1]; prompts.push(p);
-      const keyFile = /cat (\S+planted-key\.txt)/.exec(p)![1];
-      const k = existsSync(keyFile) ? readFileSync(keyFile, "utf8") : "";
-      return { code: 0, stdout: JSON.stringify({ type: "item.completed", item: { type: "command_execution", status: "completed", exit_code: 0, aggregated_output: k } }), stderr: "" };
-    };
-    const w = makeWire({ terms: () => TERMS, fetch: null as any, exec: leak as any });
-    const iso = await codexProvider({ home, bin, bwrap: null }).isolation(w, sig());
-    expect(iso.ok).toBe(false);
-    expect(prompts[0]).toContain(`/proc/${process.pid}/environ`);
-    const refuse = async (cmd: string[]) => ({ code: 0, stdout: JSON.stringify({ type: "item.completed", item: { type: "command_execution", status: "declined" } }), stderr: "" });
     const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    // No bubblewrap: not isolated, and nothing is run at all (there is no fallback).
+    const none: string[][] = [];
+    const iso0 = await codexProvider({ home, bin, bwrap: null }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: (async (c: string[]) => { none.push(c); return { code: 0, stdout: "", stderr: "" }; }) as any }), sig());
+    expect(iso0).toMatchObject({ ok: false, mode: "none" });
+    expect(iso0.detail).toContain("bubblewrap isn't installed");
+    expect(none).toEqual([]);
+    // Bubblewrap that can't start in the container: not isolated, and the probes never run.
+    const tried: string[][] = [];
+    const cant = async (c: string[]) => { tried.push(c); return { code: 1, stdout: "", stderr: "bwrap: No permissions to creating new namespace" }; };
+    const iso1 = await codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: cant as any }), sig());
+    expect(iso1.ok).toBe(false);
+    expect(iso1.detail).toContain("bubblewrap can't start");
+    expect(tried.length).toBe(1);
+    expect(tried[0]).toContain("--version");
+    // A leak through any probe: not isolated.
+    const prompts: string[] = [];
+    const leak = async (cmd: string[]) => {
+      if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" };
+      const p = cmd[cmd.length - 1]; prompts.push(p);
+      return { code: 0, stdout: [refusedProbes(), JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "/bin/cat /trial/planted-key.txt", status: "completed", exit_code: 0, aggregated_output: "REVIEW_GEMINI_KEY=x" } })].join("\n"), stderr: "" };
+    };
+    const iso2 = await codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: leak as any }), sig());
+    expect(iso2.ok).toBe(false);
+    for (const want of ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt", `cat /proc/${process.pid}/environ`]) expect(prompts[0]).toContain(want);
+    // A probe Codex didn't attempt: not isolated.
+    const skip = async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" }
+      : { code: 0, stdout: refusedProbes(process.pid, ["cat /trial/planted-key.txt", `cat /proc/${process.pid}/environ`]), stderr: "" };
+    const iso3 = await codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: skip as any }), sig());
+    expect(iso3.ok).toBe(false);
+    expect(iso3.detail).toContain("absolute-path");
+    // Every probe tried and refused, under bubblewrap: isolated.
     const seen: string[][] = [];
-    const w2 = makeWire({ terms: () => TERMS, fetch: null as any, exec: (async (cmd: string[], o: any) => { seen.push(cmd); return refuse(cmd); }) as any });
-    const iso2 = await codexProvider({ home, bin, bwrap: bw }).isolation(w2, sig());
-    expect(iso2).toMatchObject({ ok: true, mode: "bwrap" });
-    expect(seen[0][0]).toBe(bw);
+    const refuse = async (cmd: string[]) => { seen.push(cmd); return cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" } : { code: 0, stdout: refusedProbes(), stderr: "" }; };
+    const iso4 = await codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: refuse as any }), sig());
+    expect(iso4).toMatchObject({ ok: true, mode: "bwrap" });
+    expect(seen.every((c) => c[0] === bw && c.includes("--clearenv"))).toBe(true);
   });
 
   test("not isolated: every Codex configuration is skipped as not isolated and Codex never grades", async () => {
@@ -1087,6 +1193,11 @@ describe("Codex isolation before launch", () => {
     // Google's outputs, with Codex out, still get the Claude grader; the report says Codex wasn't isolated.
     const report = buildReport(t.tdir, "review-seats", 40);
     expect(report).toContain("isolation: not isolated");
+    expect(report).toContain("Panel reduced: OpenAI is off");
+    // Google's outputs are graded by Claude alone with Codex out: that ranking is left out.
+    expect(report).toContain("Rankings that rest on one grader are left out");
+    expect(report).toMatch(/gemini:gemini-3\.8-flash \|[^\n]*left out: one grader/);
+    expect(report).not.toMatch(/the top is gemini/);
   });
 
   test("Codex starts in its own process group, and on abort no child outlives it", async () => {
@@ -1106,13 +1217,6 @@ describe("Codex isolation before launch", () => {
     expect(["gone", "Z", "X"]).toContain(state);
   });
 
-  test("the exec policy forbids every program on PATH by name and path", () => {
-    const names = programNames("/bin:/usr/bin");
-    const rules = forbidAllRules(names);
-    expect(rules).toMatch(/^prefix_rule\(pattern=\[\[/m);
-    expect(rules).toContain('decision="forbidden"');
-    for (const n of ["sh", "bash", "/bin/sh", "cat", "/usr/bin/env", "python3"]) expect(rules).toContain(JSON.stringify(n));
-  });
 });
 
 describe("a true spend bound", () => {
@@ -1167,11 +1271,14 @@ describe("a true spend bound", () => {
     l.settle((ok as any).id, 1.0, "billed");
     expect(l.read().spent_usd).toBeLessThanOrEqual(1.0);
     expect(l.reserve(req("c", 0.01), 1.0, undefined, { marginUsd: 0.5 }).ok).toBe(false);
-    // The runner's margin is the suite's largest single worst case.
-    const t = rig({ reviews: 1 });
-    submit(t, { kind: "run", suite: "review-seats" });
-    const s = suiteOf(t);
-    expect(marginOf(s)).toBeCloseTo(Math.max(0.5, ...planOf(s).lines.map((x) => x.worst_usd ?? 0)), 9);
+    // The runner's margin is a fixed 10 percent of the budget option, not the worst-case guesses it guards.
+    expect(ledgerMargin(40)).toBe(4);
+    expect(ledgerCap(40)).toBe(36);
+    const t = rig({ reviews: 1, budget: 40 });
+    expect(t.trials.marginFor()).toBe(4);
+    const big = new Ledger(join(t.dir, "l2"));
+    expect(big.reserve(req("x", 36.01), 40, undefined, { marginUsd: ledgerMargin(40) }).ok).toBe(false);
+    expect(big.reserve(req("y", 36), 40, undefined, { marginUsd: ledgerMargin(40) }).ok).toBe(true);
   });
 
   test("a reservation is released only on an authoritative zero: a 4xx with no usage, or usage showing zero; otherwise kept", async () => {
@@ -1400,5 +1507,316 @@ describe("cost reporting", () => {
     const med = report.split("\n").find((l) => l.startsWith("| perplexity/sonar at effort medium"))!;
     expect(med).toMatch(/unresolved billing not in it/);
     expect(med.split("|")[11].trim()).not.toBe("-");
+  });
+});
+
+// ---- The fourth round's fixes ----
+import { PREFLIGHT_CAP_USD, preflightError, readPreflight, thinkingCover } from "../rootfs/opt/cain/trials/runner.ts";
+import { GROUNDING_USD, fetchAllowed, fetchableUrl, noteFetchUrls, researchPrivacy, stripQuery } from "../rootfs/opt/cain/trials/core.ts";
+import { groundingQueryCount } from "../rootfs/opt/cain/trials/calls.ts";
+
+const runReq = { kind: "run", suite: "review-seats" };
+const setAllowance = (t: ReturnType<typeof rig>, usd: number, extra: object = {}) => {
+  const cur = JSON.parse(readFileSync(t.optionsFile, "utf8"));
+  writeFileSync(t.optionsFile, JSON.stringify({ ...cur, trials_run_allowance_usd: usd, ...extra }), { mode: 0o600 });
+};
+
+describe("paid runs need the owner's say: the run allowance in the App's options", () => {
+  test("default 0: no run starts, nothing is sent, and the refusal names the option", async () => {
+    const t = rig({ reviews: 1, allowance: 0 });
+    const why = submit(t, runReq);
+    expect(why).toContain("can't start");
+    expect(why).toContain("trials_run_allowance_usd");
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    await t.runAll();
+    expect(t.fetched.length).toBe(0);
+    expect(outputCalls(t) + graderCalls(t)).toBe(0);
+  });
+
+  test("a run starts only while the allowance covers its cap; a second run beyond it is refused", async () => {
+    const t = rig({ reviews: 1 });
+    // A first request freezes the suite so its cap can be read; the grant is what the allowance counts.
+    setAllowance(t, 0);
+    expect(submit(t, runReq)).toContain("can't start");
+    const cap = t.trials.runCapFor(suiteOf(t));
+    expect(cap).toBeGreaterThan(PREFLIGHT_CAP_USD);
+    expect(cap).toBeLessThanOrEqual(36);
+    setAllowance(t, cap + 1);
+    expect(submit(t, runReq)).toBeNull();
+    await t.runAll();
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
+    const b = readBudget(t.tdir);
+    expect(Object.values(b.grants!).map((g) => g.cap_usd)).toEqual([cap]);
+    // The run spent far less than its cap, but the allowance counts caps: a second run is refused.
+    expect(b.spent_usd).toBeLessThan(cap);
+    t.advance(2_000);
+    const why = submit(t, { kind: "run", suite: "review-seats", mode: "new" });
+    expect(why).toContain("can't start");
+    expect(why).toContain("already granted");
+    // Only the owner raising it lets the next run start.
+    setAllowance(t, 2 * cap + 1);
+    t.advance(2_000);
+    expect(submit(t, { kind: "run", suite: "review-seats", mode: "new" })).toBeNull();
+  });
+
+  test("an allowance lowered under a run stops it before its next call, and a resume waits for it", async () => {
+    const t = rig({ reviews: 2 });
+    submit(t, runReq);
+    await t.trials.tick(); await t.trials.tick();
+    setAllowance(t, 1);
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("stopped");
+    expect(st.stop!.reason).toBe("allowance");
+    expect(submit(t, runReq)).toContain("can't resume");
+    setAllowance(t, ALLOWANCE);
+    expect(submit(t, runReq)).toBeNull();
+    await t.runAll();
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
+  });
+
+  test("read only from root's options file: a file others can write, a link or the inbox never counts", () => {
+    const t = rig({ reviews: 1 });
+    chmodSync(t.optionsFile, 0o666);
+    expect(t.trials.allowance()).toBe(0);
+    chmodSync(t.optionsFile, 0o600);
+    expect(t.trials.allowance()).toBe(ALLOWANCE);
+    // A request carrying an allowance is refused at the inbox: the inbox only submits.
+    expect(submit(t, { ...runReq, allowance_usd: 999 })).toContain("a field a request may not");
+    expect(requestError({ kind: "preflight", suite: "research" })).toContain("only its kind");
+    expect(requestError({ kind: "preflight" })).toBeNull();
+  });
+
+  test("a run's reservations and task holds never pass its granted cap", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+    const l = new Ledger(dir);
+    expect(l.grant("s|r", { suite: "s", run: "r" }, 1.0, 1.5)).toMatchObject({ ok: true, cap: 1, fresh: true });
+    expect(l.grant("s|r2", { suite: "s", run: "r2" }, 1.0, 1.5)).toMatchObject({ ok: false, reason: "allowance" });
+    const req = (call: string, usd: number) => ({ suite: "s", run: "r", call, attempt: 1, seat: null, usd, runs: 0 });
+    expect(l.reserve(req("a", 0.6), 40, undefined, { runCapUsd: 1 }).ok).toBe(true);
+    const over = l.reserve(req("b", 0.5), 40, undefined, { runCapUsd: 1 });
+    expect(over).toMatchObject({ ok: false, reason: "allowance" });
+    expect(l.hold("s|r|t", { suite: "s", run: "r", task: "t" }, 0.5, 40, 0, 1)).toMatchObject({ ok: false, reason: "allowance" });
+    // Another run's spend doesn't count against this one's cap.
+    expect(l.reserve({ ...req("c", 0.3), run: "other" }, 40, undefined, { runCapUsd: 0.3 }).ok).toBe(true);
+  });
+});
+
+describe("the Supervisor token is out of the assistant's reach", () => {
+  test("the start unsets it before anything starts, and the session's own check refuses unless root's environments and the token file are unreadable", () => {
+    const run = readFileSync(join(import.meta.dir, "../rootfs/etc/services.d/cain/run"), "utf8");
+    const unset = run.indexOf("unset SUPERVISOR_TOKEN HASSIO_TOKEN");
+    expect(unset).toBeGreaterThan(0);
+    for (const start of ["new-session -d -s cain", 'bun "$OPT/review/main.ts"']) expect(run.indexOf(start)).toBeGreaterThan(unset);
+    const check = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/c1/check.ts"), "utf8");
+    expect(check).toContain("/run/s6/container_environment/SUPERVISOR_TOKEN");
+    expect(check).toContain('"/data/options.json"');
+    expect(check).toMatch(/can't read root process \$\{pid\}'s environment/);
+  });
+
+  test("a process of the assistant's user can't read a root process's /proc environ (run where the tests are root)", () => {
+    if (process.getuid?.() !== 0) return;   // needs root to start the stand-in runner and drop to another uid
+    const { spawn, spawnSync: sync } = require("node:child_process");
+    const token = `fake-supervisor-${randomBytesHex()}`;
+    const runner = spawn("sleep", ["20"], { env: { SUPERVISOR_TOKEN: token, PATH: "/usr/bin:/bin" } });
+    try {
+      const uid = Number(process.env.CAIN_UID ?? 1000);
+      const r = sync("cat", [`/proc/${runner.pid}/environ`], { uid, gid: uid, encoding: "utf8" });
+      expect(r.status).not.toBe(0);
+      expect(String(r.stdout)).not.toContain(token);
+      expect(String(r.stderr)).toMatch(/Permission denied/);
+      // And nothing the assistant's user starts inherits it: its environment is built without the token.
+      const e = sync("env", [], { uid, gid: uid, encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
+      expect(String(e.stdout)).not.toContain("SUPERVISOR_TOKEN");
+    } finally { runner.kill("SIGKILL"); }
+  });
+});
+const randomBytesHex = () => createHash("sha256").update(String(Math.random())).digest("hex").slice(0, 12);
+
+describe("the spend stop is a soft bound with a fixed margin", () => {
+  test("every Gemini reservation with grounding carries the multi-query fee allowance, and the bill counts every query executed", async () => {
+    const t: any = { kind: "research", id: "q1", sent_text: "x", as_of: "2026-11-20", must_contain: "y", sources: [], no_reliable_answer: false };
+    const on = callShape("research", { id: "o", kind: "output", task: "q1", config: "gemini:gemini-3.8-flash+search" }, t);
+    expect(on.search).toBe(true);
+    expect(LIMITS.geminiGroundingQueries).toBeGreaterThanOrEqual(20);
+    expect(ceilingOf(on, 100)!.toolFeesUsd).toBeCloseTo(LIMITS.geminiGroundingQueries * GROUNDING_USD, 9);
+    const j = { candidates: [{ groundingMetadata: { webSearchQueries: ["a", "b", "c"] } }, { groundingMetadata: { webSearchQueries: ["d"] } }],
+      usageMetadata: { promptTokenCount: 1000, candidatesTokenCount: 100, thoughtsTokenCount: 0 } };
+    expect(groundingQueryCount(j)).toBe(4);
+    const wire = makeWire({ terms: () => TERMS, exec: null as any, fetch: (async () => new Response(JSON.stringify({ ...j, candidates: [{ ...j.candidates[0], content: { parts: [{ text: "ok" }] } }, j.candidates[1]] }), { status: 200 })) as any });
+    const r = await geminiProvider({ key: "k" }).ask({ wire, signal: sig(), day: DAY, model: "gemini-3.8-flash", system: "s", user: "u", maxOut: 100, search: true });
+    expect(r.searches).toBe(4);
+    const tokens = (1000 * 0.75 + 100 * 3.75) / 1e6;
+    expect(r.bill!.usd).toBeCloseTo(tokens + 4 * GROUNDING_USD, 9);
+  });
+
+  test("the research grader fetches only the exact HTML pages of the answer notes, query strings stripped", () => {
+    expect(fetchableUrl("https://example.com/a/b?utm=1&id=2#top")).toBe("https://example.com/a/b");
+    expect(fetchableUrl("https://example.com/report.pdf")).toBeNull();
+    expect(fetchableUrl("https://example.com/sheet.XLSX?x=1")).toBeNull();
+    expect(fetchableUrl("ftp://example.com/a")).toBeNull();
+    expect(fetchableUrl("https://user:pw@example.com/a")).toBeNull();
+    expect(stripQuery("https://example.com/p?q=private")).toBe("https://example.com/p");
+    const task: any = { kind: "research", id: "q1", sent_text: "What is the release?", as_of: "2026-11-20", must_contain: "the version", no_reliable_answer: false,
+      sources: [{ url: "https://example.com/releases?ref=mine", read_on: "2026-11-19" }, { url: "https://docs.example.org/notes.pdf", read_on: "2026-11-19" }] };
+    expect(noteFetchUrls(task)).toEqual(["https://example.com/releases"]);
+    const gp = gradePrompt(task, [{ label: "A10", output: { call: "", config: "", text: "See https://other.example/x?y=1", urls: ["https://other.example/x?y=1"] } as any }]);
+    expect(gp.user).toContain("<pages>\nhttps://example.com/releases\n</pages>");
+    expect(gp.user).not.toContain("ref=mine");
+    expect(gp.system).toContain("fetch only the pages listed under <pages>");
+    expect(fetchAllowed("https://example.com/releases?x=1", noteFetchUrls(task))).toBe(true);
+    expect(fetchAllowed("https://example.com/releases/", noteFetchUrls(task))).toBe(true);
+    expect(fetchAllowed("https://example.com/other", noteFetchUrls(task))).toBe(false);
+    expect(fetchAllowed("https://other.example/x", noteFetchUrls(task))).toBe(false);
+  });
+
+  test("in a run, the Claude grader's fetch is bound to the notes' pages, and a fetch beyond them blocks its grades with an alarm", async () => {
+    let fetchedOutside = false;
+    const claude = fake({ seat: "claude", cost: 0.05, impl: async (i) => {
+      if (i.schema && i.fetch && !fetchedOutside) { fetchedOutside = true; i.wire.fetched.push("https://evil.example/collect?d=1"); }
+      else if (i.schema && i.fetch) i.wire.fetched.push("https://example.com/releases?utm=x");
+    } });
+    const t = rig({ questions: true, providers: { claude } });
+    submit(t, { kind: "run", suite: "research" });
+    await t.runAll("research");
+    const graded = claude.calls.filter((c) => c.schema);
+    expect(graded.length).toBeGreaterThan(0);
+    for (const c of graded) { expect(c.fetch).toBe(true); expect(c.allowedDomains).toEqual(["example.com"]); expect(c.user).toContain("<pages>\nhttps://example.com/releases\n</pages>"); }
+    const st = latestRun(t.tdir, "research")!;
+    const blocked = Object.entries(st.calls).filter(([id, c]) => id.startsWith("grade|") && id.endsWith("|claude") && c.status === "blocked");
+    expect(blocked.length).toBe(1);
+    expect(blocked[0][1].error).toContain("not cited in the answer notes");
+    expect(t.relays().some((r) => /a grader fetched 1 page outside the answer notes/.test(r))).toBe(true);
+    // The others, whose only fetch was a note's page, were kept.
+    expect(Object.entries(st.calls).filter(([id, c]) => id.startsWith("grade|") && id.endsWith("|claude") && c.status === "done").length).toBe(graded.length - 1);
+  });
+});
+
+describe("the first install is preflight-only", () => {
+  test("no paid suite runs until a preflight record exists for this build on this machine", async () => {
+    const t = rig({ reviews: 1, noPreflight: true });
+    expect(submit(t, runReq)).toContain("no preflight has run on this build");
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    // A record from another build, or another machine, doesn't count.
+    writePreflightRecord(t.tdir, { build: "older-build" });
+    expect(submit(t, runReq)).toContain("another build");
+    writePreflightRecord(t.tdir, { machine: "another-pi" });
+    expect(submit(t, runReq)).toContain("another machine");
+    writePreflightRecord(t.tdir, { status: "stopped", stop: "Claude didn't answer" });
+    expect(submit(t, runReq)).toContain("didn't finish");
+    // trial.sh run says the same before it leaves anything.
+    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox2"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json"), REVIEW_TERMS: t.cfg.termsFile };
+    writeFileSync(join(t.tdir, "settings.json"), JSON.stringify({ budget_usd: 40, build: BUILD, machine: MACHINE }));
+    const r = spawnSync("bun", [CLI, "run", "review-seats"], { encoding: "utf8", env });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("didn't finish");
+    expect(existsSync(join(t.dir, "inbox2"))).toBe(false);
+    const p = spawnSync("bun", [CLI, "preflight"], { encoding: "utf8", env });
+    expect(p.status).toBe(0);
+    const files = readdirSync(join(t.dir, "inbox2"));
+    expect(JSON.parse(readFileSync(join(t.dir, "inbox2", files[0]), "utf8"))).toEqual({ kind: "preflight" });
+  });
+
+  test("trial.sh preflight runs every check with no owner text, under its cap, pins Perplexity, and writes its record; a failed check stays disabled, named", async () => {
+    const gemini = fake({ seat: "gemini", cost: 0.01 });
+    // Argon is listed as covering its thinking in its output cap: a check showing otherwise disables it.
+    gemini.validate = async (input: any) => {
+      await input.wire.fetch("https://fake-gemini.example/validate", { method: "POST", body: JSON.stringify({ model: input.model }) });
+      if (input.model === "gemini-4-neon") throw new SeatError("refused", "HTTP 404: model not found");
+      const thinking = input.model === "gemini-4-argon" ? { thoughts: 120, answer: 2, maxOut: 16 } : { thoughts: 10, answer: 2, maxOut: 16 };
+      return { bill: { usd: 0.0001, how: "estimated" as const }, served: input.model, thinking };
+    };
+    const t = rig({ reviews: 1, questions: { trials_perplexity_third_party_routing: true }, noPreflight: true, providers: { gemini } });
+    expect(submit(t, { kind: "preflight" })).toBeNull();
+    expect(submit(t, { kind: "preflight" })).toContain("already running");
+    for (let i = 0; i < 200 && readPreflight(t.tdir)?.status === "running"; i++) await t.trials.tick();
+    const rec = readPreflight(t.tdir)!;
+    expect(rec.status).toBe("done");
+    expect(rec.build).toBe(BUILD); expect(rec.machine).toBe(MACHINE);
+    expect(preflightError(rec, BUILD, MACHINE)).toBeNull();
+    // Its own grant from the allowance, a few dollars, and every check within it.
+    const b = readBudget(t.tdir);
+    expect(b.grants![`preflight|${rec.id}`].cap_usd).toBe(PREFLIGHT_CAP_USD);
+    expect(b.entries.every((e) => e.suite === "preflight" && e.run === rec.id)).toBe(true);
+    expect(b.spent_usd).toBeLessThanOrEqual(PREFLIGHT_CAP_USD);
+    // No owner text left: no question, no brief, no record of his.
+    for (const f of t.fetched) for (const bit of ["tool number", "SECRET-CONTEXT", "Run step", "Plan 0"]) expect(f.body).not.toContain(bit);
+    expect(outputCalls(t) + graderCalls(t)).toBe(0);
+    // Perplexity: each level checked with the pinned model, even though the owner allowed third-party routing.
+    const ppChecks = t.fetched.filter((f) => f.url.includes("fake-perplexity") && f.url.endsWith("/validate")).map((f) => JSON.parse(f.body).model);
+    expect(ppChecks.length).toBe(4);   // the review suite's pinned model, and the research suite's three levels
+    expect(ppChecks.every((m) => m === "perplexity/sonar")).toBe(true);
+    // Claude: the research tool path (search and the grader's fetch, direct callers) was checked.
+    expect(rec.suites.research!.ids.claude).toContain("web_fetch_20260318 max_uses 1");
+    // Gemini: each model's thinking field taken; Argon's cap didn't cover its thinking, so it is disabled, named;
+    // Neon isn't served. Both stay disabled.
+    expect(rec.suites["review-seats"]!.thinking["gemini-4-argon"]).toBe("no");
+    expect(rec.disabled["gemini:gemini-4-argon"]).toContain("didn't cover its thinking");
+    expect(rec.disabled["gemini:gemini-4-neon"]).toContain("isn't served");
+    expect(rec.disabled["grader:gemini"]).toContain("the Gemini grader is off");
+    // Codex: the sandbox self-test passed under bubblewrap, and the daemon is off on every invocation.
+    expect(rec.suites["review-seats"]!.codex_isolation).toMatchObject({ ok: true, mode: "bwrap" });
+    expect(rec.codex_daemon).toContain("daemon_auto_start=false");
+    expect(t.relays().some((r) => /The trials preflight finished/.test(r))).toBe(true);
+
+    // A run on this build now starts, takes the record's verdicts without paying for them again, and keeps the
+    // disabled configurations disabled, named as the preflight's.
+    const before = t.fetched.length;
+    expect(submit(t, runReq)).toBeNull();
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("done");
+    expect(st.calls[`out|${suiteOf(t).tasks[0].id}|gemini:gemini-4-argon`].error).toContain("at the build's preflight");
+    expect(st.calls[`out|${suiteOf(t).tasks[0].id}|gemini:gemini-4-neon`].status).toBe("skipped");
+    expect(Object.keys(st.calls).filter((id) => id.startsWith("pre|gemini") || id === "pre|claude" || id.startsWith("pre|perplexity"))).toEqual([]);
+    expect(st.calls["pre|codex|isolation"]).toBeDefined();   // the sandbox self-test runs again for every run
+    expect(t.fetched.slice(before).some((f) => f.url.endsWith("/validate"))).toBe(false);
+  });
+
+  test("the preflight needs the owner's allowance too", async () => {
+    const t = rig({ reviews: 1, noPreflight: true, allowance: 1 });
+    expect(submit(t, { kind: "preflight" })).toContain("can't start");
+    expect(readPreflight(t.tdir)).toBeNull();
+    expect(thinkingCover({ thoughts: 0, answer: 2, maxOut: 16 })).toBe("unknown");
+    expect(thinkingCover({ thoughts: 10, answer: 2, maxOut: 16 })).toBe("yes");
+    expect(thinkingCover({ thoughts: 100, answer: 2, maxOut: 16 })).toBe("no");
+  });
+});
+
+describe("research suite privacy at the plan step", () => {
+  test("trial.sh plan research refuses questions or answer notes that match the private-terms list", () => {
+    const qs = QUESTIONS.map((q, i) => (i === 4 ? { ...q, must_contain: "what Pat said about it" } : i === 7 ? { ...q, sources: [{ url: "https://acme-corp.example/Acme Corp", read_on: "2026-11-19" }] } : q));
+    const t = rig({ reviews: 1 });
+    writeQuestions(t.recordDir, { questions: qs });
+    const tasks = checkQuestions({ questions: qs }).tasks!;
+    const bad = researchPrivacy(tasks as any, TERMS);
+    expect(bad.map((b) => b.id).length).toBe(2);
+    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json"), REVIEW_TERMS: t.cfg.termsFile };
+    const r = spawnSync("bun", [CLI, "plan", "research"], { encoding: "utf8", env });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("match the private-terms list");
+    for (const b of bad) expect(r.stderr).toContain(b.id);
+    expect(r.stdout).not.toContain("Total worst case");
+    // With no terms list at all, nothing is planned either.
+    const r2 = spawnSync("bun", [CLI, "plan", "research"], { encoding: "utf8", env: { ...env, REVIEW_TERMS: join(t.dir, "missing.txt") } });
+    expect(r2.status).not.toBe(0);
+    // A clean set plans.
+    writeQuestions(t.recordDir);
+    const r3 = spawnSync("bun", [CLI, "plan", "research"], { encoding: "utf8", env });
+    expect(r3.status).toBe(0);
+  });
+});
+
+describe("the preflight's verdicts in a run", () => {
+  test("today's default Gemini model disabled at the preflight stops a run before any spend on the trial", async () => {
+    const t = rig({ reviews: 1 });
+    writePreflightRecord(t.tdir, { disabled: { "gemini:gemini-3.8-flash": "skipped: gemini-3.8-flash isn't served (HTTP 404)" } });
+    expect(submit(t, runReq)).toBeNull();
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("stopped");
+    expect(st.stop!.reason).toBe("unavailable");
+    expect(st.stop!.detail).toContain("at the build's preflight");
+    expect(outputCalls(t) + graderCalls(t)).toBe(0);
   });
 });

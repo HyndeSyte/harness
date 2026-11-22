@@ -48,23 +48,34 @@ export function extractQueries(j: any): string[] {
   }
   return q;
 }
-// Codex's JSONL events: the queries it searched, and whether it used any tool at all (it must use none).
+// The pages a provider says it fetched (Claude's web_fetch server tool calls), so the runner can hold a grader
+// to the exact pages it may read.
+export function extractFetches(j: any): string[] {
+  const out: string[] = [];
+  for (const b of Array.isArray(j?.content) ? j.content : []) if (b?.type === "server_tool_use" && b?.name === "web_fetch" && typeof b.input?.url === "string") out.push(b.input.url);
+  return out;
+}
+// Codex's JSONL events: the queries it searched, whether it used any tool at all (it must use none), and
+// whether it searched the web (search is off on every call: one search event stops the call).
 const CODEX_TOOL_ITEMS = new Set(["command_execution", "file_change", "mcp_tool_call", "web_search", "patch_apply", "exec_command"]);
-export function codexEvents(stdout: string): { queries: string[]; tools: string[] } {
+const CODEX_SEARCH_TYPES = new Set(["web_search", "web_search_begin", "web_search_end", "web_search_call"]);
+export function codexEvents(stdout: string): { queries: string[]; tools: string[]; webSearch: number } {
   const queries: string[] = [], tools: string[] = [];
+  let webSearch = 0;
   for (const line of stdout.split("\n")) {
     if (!line.trim().startsWith("{")) continue;
     let ev: any; try { ev = JSON.parse(line); } catch { continue; }
     const it = ev?.item ?? ev?.msg ?? ev;
     const t = String(it?.type ?? "");
+    if (CODEX_SEARCH_TYPES.has(t) || CODEX_SEARCH_TYPES.has(String(ev?.type ?? ""))) webSearch++;
     if (CODEX_TOOL_ITEMS.has(t)) { tools.push(t); if (typeof it.query === "string") queries.push(it.query); }
   }
-  return { queries, tools };
+  return { queries, tools, webSearch };
 }
 
-export type Wire = { fetch: Fetch; exec: Exec; queries: string[]; codexTools: string[]; sent: number };
+export type Wire = { fetch: Fetch; exec: Exec; queries: string[]; fetched: string[]; codexTools: string[]; codexWebSearch: number; sent: number };
 export function makeWire(o: { terms: () => string | null; fetch: Fetch; exec: Exec }): Wire {
-  const w: Wire = { queries: [], codexTools: [], sent: 0, fetch: null as any, exec: null as any };
+  const w: Wire = { queries: [], fetched: [], codexTools: [], codexWebSearch: 0, sent: 0, fetch: null as any, exec: null as any };
   const check = (text: string) => {
     const c = textCheck(text, o.terms());
     if (!c.ok) throw new PrivacyBlock((c as { why: string[] }).why);
@@ -73,7 +84,7 @@ export function makeWire(o: { terms: () => string | null; fetch: Fetch; exec: Ex
     check(`${url}\n${wireText(init?.body ?? "")}`);
     w.sent++;
     const r = await o.fetch(url, init);
-    try { const j = await r.clone().json(); w.queries.push(...extractQueries(j)); } catch { /* not JSON, or cut off */ }
+    try { const j = await r.clone().json(); w.queries.push(...extractQueries(j)); w.fetched.push(...extractFetches(j)); } catch { /* not JSON, or cut off */ }
     return r;
   };
   w.exec = async (cmd, opts) => {
@@ -85,7 +96,7 @@ export function makeWire(o: { terms: () => string | null; fetch: Fetch; exec: Ex
     w.sent++;
     const r = await o.exec(cmd, opts);
     const ev = codexEvents(r.stdout);
-    w.queries.push(...ev.queries); w.codexTools.push(...ev.tools);
+    w.queries.push(...ev.queries); w.codexTools.push(...ev.tools); w.codexWebSearch += ev.webSearch;
     return r;
   };
   return w;

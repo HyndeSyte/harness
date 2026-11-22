@@ -3,7 +3,7 @@
 ## 0.19.0
 
 - Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call, its limits and its most possible cost first, then the run, then a plain report.
-- A hard spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it.
+- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. It is a soft bound with a margin: the hard stop is giving the trials their own API keys with a prepaid balance or a spend limit (DOCS.md says how).
 - Each task's grading is set aside before its first call, so a task is never left half graded.
 - Before any spend, near-free checks catch a model or setting a provider won't take; a model not offered is skipped and the report says why.
 - Your private terms are checked on every request exactly as it is sent, and on the search queries a provider says it ran; a hit stops the run and Cain hears of it.
@@ -11,13 +11,19 @@
 - Grading is blind: names and markers are taken out of every answer, two graders from different families score each answer, and neither grades its own family's answers.
 - Real reviews always go first: trials pause while one is waiting or running, and back off a seat that hit a rate limit.
 - The research questions run only once you have approved them and their answer notes, and Perplexity stays on its own model unless you approve otherwise.
-- Codex takes part only once a sandbox check on the Pi proves it can't read anything of yours; otherwise it is left out of the trial and never grades, and the report says so.
-- The spend stop now keeps a safety margin under the budget, gives money back only when a provider clearly charged nothing, counts Codex in calls rather than dollars, and keeps each seat's trial calls well inside its limits so real reviews always have room.
+- Codex takes part only under bubblewrap, once a sandbox check on the Pi proves it can't read anything of yours; otherwise it is left out of the trial and never grades, and the report says so.
+- The spend stop keeps a fixed 10 percent of the budget back as a margin, gives money back only when a provider clearly charged nothing, counts Codex in calls rather than dollars, and keeps each seat's trial calls well inside its limits so real reviews always have room.
 - Your approval of the research questions, their answer notes and the grading rules is now three entries in this App's options (Cain gives you the values), and so is letting Perplexity use another lab's model. Nothing Cain can write counts as your approval.
 - Search and page fetching are off for trials built from your record; only the research questions you approved go out with search.
 - Every provider, model and level is checked once before any spend; one that fails is left out and named in the report.
 - A third grader, Google's, so every answer is graded by two graders from outside its own company; the report ranks only answers graded by the same pair.
 - The cost per good answer now counts failed and retried attempts too, and costs without a bill are shown apart.
+- Paid trial runs need your say: a new option, `trials_run_allowance_usd` (default 0), is the total you allow for them. A run starts only while what it could take fits in what is left, a second run beyond it is refused, and lowering it stops a run before its next call. Cain can't change it.
+- After installing, nothing paid runs until a short check of every model and setting has run on this version (`trial.sh preflight`, a few dollars, none of your text). Anything that fails it stays switched off and is named.
+- Codex runs only inside its locked-down sandbox, with web search off on every call; one that searches anyway is stopped, its answer thrown away, and Cain hears of it.
+- When a grader is left out, the report says the panel was reduced, and no ranking rests on a single grader.
+- The research questions and their notes are checked against your private list before Cain can even plan them, and the research grader only reads the exact pages named in the notes, with any tracking part of the address removed and PDFs left out.
+- Gemini's searches are allowed for generously in what a call could cost, then counted as Google reports them.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.18.1

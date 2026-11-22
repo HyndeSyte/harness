@@ -6,7 +6,8 @@
 // every attempt's cost (failed, retried and ungraded ones included) in the cost numerator, with estimates
 // marked and unresolved billing (charged at its worst case for want of a bill) reported apart; Codex calls
 // counted against the plan's call allowance, never as dollars; differences within the noise reported as no
-// clear difference.
+// clear difference. Fourth round: when a grader is off (Codex not isolated, or a grader's check failed) the
+// report says the panel was reduced, and a ranking that rests on one grader is left out.
 import { readFileSync } from "node:fs";
 import {
   GRADERS, PERPLEXITY_OWN_MODEL, POINTS, configLabel, configsFor, differs, disagreements, familyOf, meanSe, seatOfConfig, type OutputGrade, type SuiteName,
@@ -117,7 +118,10 @@ export function buildReport(dir: string, suiteName: SuiteName, budget: number): 
   // Panels: the graders that scored a configuration. Rankings are only among configurations one panel scored.
   const panelOf = (r: Row) => GRADERS.map((g) => g.id).filter((g) => (r.byGrader[g]?.size ?? 0) > 0).join("+") || "none";
   const metric = (r: Row) => (suiteName === "research" ? r.points : r.combined);
-  const compareRows = all.filter((r) => metric(r).size > 0);
+  // Only configurations scored by at least two graders are ranked: a ranking on one grader is left out.
+  const singleGrader = (r: Row) => panelOf(r) !== "none" && panelOf(r).split("+").length < 2;
+  const compareRows = all.filter((r) => metric(r).size > 0 && !singleGrader(r));
+  const oneGrader = all.filter((r) => metric(r).size > 0 && singleGrader(r));
   const panels = [...new Set(compareRows.map(panelOf))];
   // The matched set, per panel: tasks every configuration that panel scored has a score for.
   const matchedOf = (panel: string) => { const rs = compareRows.filter((r) => panelOf(r) === panel); return suite.tasks.map((t) => t.id).filter((t) => rs.every((r) => metric(r).has(t))); };
@@ -138,11 +142,13 @@ export function buildReport(dir: string, suiteName: SuiteName, budget: number): 
     `Trials budget: ${money(b.spent_usd)} spent of ${money(budget)} across every suite. This run: ${money(runCost)}; grading billed ${money(gradeBilled)}, estimated ${money(gradeEst)}; unresolved billing (charged at its worst case for want of a bill) in grading ${money(gradeRes)}.`,
     `Graders: Claude (${[...(graderServed.claude ?? new Set(["claude-opus-5-5"]))].join(", ")}), OpenAI (Codex: ${[...(graderServed.codex ?? new Set(["its default model"]))].join(", ")}) and Google (${[...(graderServed.gemini ?? new Set(["gemini-4-argon"]))].join(", ")}), blind; each output is graded by the two from outside its own family the run could use.${Object.keys(pf?.graders_off ?? {}).length ? ` Off this run: ${Object.values(pf!.graders_off!).join("; ")}.` : ""}`,
     `Codex installed: ${pf?.codex_version ?? "version not read"}; isolation: ${pf?.codex_isolation ? (pf.codex_isolation.ok ? `${pf.codex_isolation.mode} (${pf.codex_isolation.detail})` : `not isolated (${pf.codex_isolation.detail})`) : "not tested"}.`,
+    ...(Object.keys(pf?.graders_off ?? {}).length ? [`Panel reduced: ${Object.entries(pf!.graders_off!).map(([g, why]) => `${graderName(g)} is off (${why})`).join("; ")}. Rankings that rest on one grader are left out${oneGrader.length ? ` (${oneGrader.map((r) => label(r)).join(", ")})` : ""}.`] : []),
+    ...(!Object.keys(pf?.graders_off ?? {}).length && oneGrader.length ? [`Left out of the rankings, graded by one grader only: ${oneGrader.map((r) => label(r)).join(", ")}.`] : []),
     `Codex calls count against the plan's call allowance, never as dollars: ${all.reduce((a, r) => a + r.planCalls, 0) + gradePlan} call${all.reduce((a, r) => a + r.planCalls, 0) + gradePlan === 1 ? "" : "s"} this run.`, "",
     `Headline comparisons rank only configurations scored by the same graders (a panel), each on its own matched set: the tasks every configuration of that panel answered and had graded. ${panels.map((p) => `${panelName(p)}: ${matchedBy[p].length} task${matchedBy[p].length === 1 ? "" : "s"}${tops[p] ? `, the top is ${label(tops[p]!.r)}` : ""}`).join("; ") || "No graded output yet"}. A gap within twice the combined standard error is reported as no clear difference.`,
     ...(panels.length > 1 ? ["", `Flagged: the panels differ (${panels.map(panelName).join("; ")}), so the combined scores across panels are not a like-for-like ranking; compare within a panel only.`] : []), "",
   ];
-  const vsTop = (r: Row) => { const top = tops[panelOf(r)]; const m = onMatched(r); if (!top || !m) return "-"; if (r === top.r) return "top of its panel"; return differs(m, top.m!) ? "below the top" : "no clear difference"; };
+  const vsTop = (r: Row) => { if (singleGrader(r)) return "left out: one grader"; const top = tops[panelOf(r)]; const m = onMatched(r); if (!top || !m) return "-"; if (r === top.r) return "top of its panel"; return differs(m, top.m!) ? "below the top" : "no clear difference"; };
   const graderCols = (r: Row) => GRADERS.map((g) => (ownFamily(r, g.id) && !r.byGrader[g.id]?.size ? "own family, not graded" : fmt(meanSe([...(r.byGrader[g.id]?.values() ?? [])].map((x) => x.score))))).join(" | ");
   const coverage = (r: Row) => `${r.outputs}/${r.tasks}; grades ${GRADERS.map((g) => `${g.id} ${r.byGrader[g.id]?.size ?? 0}`).join(", ")}; missing ${Math.max(0, r.outputs - r.combined.size)}`;
   const costs = (r: Row) => `billed ${money(r.billed)}, estimated ${money(r.estimated)}${r.planCalls ? `, Codex plan calls ${r.planCalls}` : ""}`;

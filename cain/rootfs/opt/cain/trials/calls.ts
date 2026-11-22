@@ -14,8 +14,8 @@
 //   max_output_tokens cap a run; the web_search tool's max_tokens caps each call's search context; fetch_url
 //   is a tool of its own, left out; usage.cost.total_cost is the bill and usage.tool_calls_details.search_web
 //   the searches; the priority tier is 2x the token rates.
-// - Codex CLI (openai/codex at its head): exec takes --ignore-user-config (rules in CODEX_HOME/rules still load),
-//   -c overrides (web_search="disabled", default_permissions=":read-only", features.daemon_auto_start=false),
+// - Codex CLI (openai/codex at its head): exec takes --ignore-user-config, -c overrides (web_search="disabled",
+//   default_permissions=":read-only", features.daemon_auto_start=false),
 //   -C, --ephemeral, --json, -o, --output-schema, -m; it has no output-token or turn setting: exec runs one turn,
 //   and model_context_window bounds what it reads.
 // - Gemini API (ai.google.dev through search results limited to it): thinkingLevel on Gemini 4 Argon and 3.8
@@ -24,7 +24,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { freshDirs, judgeSelfTest, selfTestPrompt, which, wrap, type Dirs, type Isolation, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
+import { BWRAP_ENV, KEY_FILE, freshDirs, judgeSelfTest, selfTestPrompt, which, wrap, type Dirs, type Isolation, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
 import { ANSWER_SCHEMA, SeatError, prompt, validateAnswer, type Answer, type ErrorKind, type Outbound } from "../review/core.ts";
 import { postJson } from "../review/seats/common.ts";
 import { classifyCodex } from "../review/seats/openai.ts";
@@ -54,11 +54,14 @@ export type AskResult = {
   tokens: { input: number; output: number }; searches: number; usage?: Usage;
 };
 export type AskFn = (input: AskInput) => Promise<AskResult>;
-export type ValidateFn = (input: Omit<AskInput, "maxOut"> & { maxOut?: number }) => Promise<{ bill: Bill; served?: string; usage?: Usage }>;
+// thinking (Gemini): the check's thought and answer tokens against the output cap it sent, so the preflight can
+// tell whether that cap covers thinking (thought + answer tokens never above it) or not.
+export type ThinkingSeen = { thoughts: number; answer: number; maxOut: number };
+export type ValidateFn = (input: Omit<AskInput, "maxOut"> & { maxOut?: number }) => Promise<{ bill: Bill; served?: string; usage?: Usage; thinking?: ThinkingSeen }>;
 export type Provider = { ask: AskFn; validate?: ValidateFn };
 export type CodexProvider = Provider & {
-  version: (wire: Wire, signal: AbortSignal, mode?: IsolationMode) => Promise<string | null>;
-  models: (wire: Wire, signal: AbortSignal, mode?: IsolationMode) => Promise<string[] | null>;
+  version: (wire: Wire, signal: AbortSignal) => Promise<string | null>;
+  models: (wire: Wire, signal: AbortSignal) => Promise<string[] | null>;
   isolation: (wire: Wire, signal: AbortSignal) => Promise<Isolation>;
 };
 // An error that carries what the provider said about usage, so a reservation is released only on an
@@ -139,6 +142,12 @@ export function claudeProvider(o: { key: string; base?: string; version?: string
 const geminiSchema = (schemaField: "responseFormat" | "responseJsonSchema", schema: object) => schemaField === "responseJsonSchema"
   ? { responseMimeType: "application/json", responseJsonSchema: schema }
   : { responseFormat: { text: { mimeType: "APPLICATION_JSON", schema } } };
+// The search queries Gemini says it executed for grounding, over every candidate (each one is billed).
+export function groundingQueryCount(j: any): number {
+  let n = 0;
+  for (const c of Array.isArray(j?.candidates) ? j.candidates : []) { const q = c?.groundingMetadata?.webSearchQueries; if (Array.isArray(q)) n += q.length; }
+  return n;
+}
 // A grounding redirect names its provider: its page's domain (the chunk's title) stands in for it.
 export function groundingUrls(cand: any): string[] {
   const out: string[] = [];
@@ -175,8 +184,9 @@ export function geminiProvider(o: { key: string; base?: string; schemaField?: "r
     const outT = Number(u.candidatesTokenCount ?? 0) + Number(u.thoughtsTokenCount ?? 0);
     const usage = tokenUsage(true, inT, outT);
     const est = estimateUsd(input.model, input.day, inT, outT);
-    // Grounding on Gemini 3 and newer is billed per search query the model ran (the free share is ignored here).
-    const queries = input.search ? (j?.candidates?.[0]?.groundingMetadata?.webSearchQueries ?? []).length : 0;
+    // Grounding on Gemini 3 and newer is billed per search query the model ran (the free share is ignored here),
+    // with no documented cap on their number: the count is reconciled from every candidate's groundingMetadata.
+    const queries = input.search ? groundingQueryCount(j) : 0;
     return { bill: usage === "zero" ? { usd: 0, how: "estimated" as const } : withBill(est === null ? null : est + queries * GROUNDING_USD), inT, outT, usage };
   };
   const ask: AskFn = async (input) => {
@@ -196,7 +206,7 @@ export function geminiProvider(o: { key: string; base?: string; schemaField?: "r
     if (input.brief) { const v = validateAnswer(text); if (!v.answer) throw fail("bad_output", v.error!); answer = v.answer; }
     else if (input.schema) { json = lastJson(text); if (!json) throw fail("bad_output", "the answer was not JSON"); }
     return { text, json, answer, urls: uniq(urls), served: String(j?.modelVersion ?? input.model), bill, tokens: { input: inT, output: outT },
-      searches: (cand?.groundingMetadata?.webSearchQueries ?? []).length, usage };
+      searches: input.search ? groundingQueryCount(j) : 0, usage };
   };
   // The check before any spend: the same model and generation settings, a tiny output. A model Google
   // doesn't serve answers 404; settings it won't take answer 400.
@@ -204,7 +214,9 @@ export function geminiProvider(o: { key: string; base?: string; schemaField?: "r
     const full = { ...input, maxOut: input.maxOut ?? LIMITS.validateOut } as AskInput;
     const j = await call(full, full.maxOut, "Reply with the word ready.", "ready?");
     const b = billOf(j, full);
-    return { bill: b.bill, served: String(j?.modelVersion ?? input.model), usage: b.usage };
+    const u = j?.usageMetadata;
+    const thinking = u ? { thoughts: Number(u.thoughtsTokenCount ?? 0) || 0, answer: Number(u.candidatesTokenCount ?? 0) || 0, maxOut: full.maxOut } : undefined;
+    return { bill: b.bill, served: String(j?.modelVersion ?? input.model), usage: b.usage, ...(thinking ? { thinking } : {}) };
   };
   return { ask, validate };
 }
@@ -277,21 +289,30 @@ export function perplexityProvider(o: { key: string; base?: string }): Provider 
   return { ask, validate };
 }
 
-// ---- Codex: codex exec through the isolation wrapper (sandbox.ts), with nothing of Cain's ----
-// No repository, no /data path, no config.toml (so no MCP servers), web search off, the read-only permissions
-// profile, an exec policy forbidding every command, the shared daemon off, an isolated CODEX_HOME holding a
-// copy of only auth.json, and the prompt as its one argument. Under bubblewrap it also has no shell, no /data
-// and its own /proc. It must use no tool: any tool event in its stream fails the call. It runs only with the
-// mode the run's self-test proved (input.codexMode); without one it isn't started.
+// ---- Codex: codex exec through the bubblewrap wrapper (sandbox.ts), with nothing of Cain's ----
+// No repository, no /data path, no config.toml (so no MCP servers), web search off on every invocation (trial,
+// grading, self-test and probes alike), the read-only permissions profile, the shared daemon off, an isolated
+// CODEX_HOME holding a copy of only auth.json, the prompt as its one argument, and under bubblewrap no shell,
+// no /data, its own /proc and a cleared environment. It must use no tool: any tool event in its stream fails
+// the call; a web search event stops it at once (its process group is killed) and the call counts at its worst
+// case. It runs only once the run's self-test passed under bubblewrap (input.codexMode); without that it isn't
+// started. There is no other mode.
 export class CodexToolUse extends SeatError {
   constructor(tools: string[]) { super("refused", `Codex used a tool (${[...new Set(tools)].join(", ")}); its answer isn't kept`); }
 }
+export class CodexWebSearch extends SeatError {
+  constructor() { super("refused", "Codex ran a web search although search is off on every call: the call was stopped, its answer isn't kept, and it counts at its worst case"); }
+}
+// A web search item or event in Codex's JSON stream: the call is stopped as soon as it shows.
+export const CODEX_WEB_SEARCH_EVENT = /"type"\s*:\s*"web_search(?:_begin|_end|_call)?"/;
 export const CODEX_NO_MODEL = /(model|engine)[^\n]{0,60}(not (found|supported|available|exist)|does not exist|unknown|invalid|unsupported|isn't available|is not available|no access)|unknown model|unsupported model|invalid model/i;
-// Every invocation: the shared daemon off (a root-level override, so it reaches every subcommand).
-export const CODEX_ROOT = ["-c", "features.daemon_auto_start=false"];
+// Every invocation: the shared daemon off and web search off (root-level overrides, so they reach every
+// subcommand, the version and model probes included).
+export const CODEX_WEB_SEARCH_OFF = 'web_search="disabled"';
+export const CODEX_ROOT = ["-c", "features.daemon_auto_start=false", "-c", CODEX_WEB_SEARCH_OFF];
 export function codexArgs(o: { work: string; out: string; schema?: string; model?: string }): string[] {
   const cmd = [...CODEX_ROOT, "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "-C", o.work, "-o", o.out, "--json",
-    "-c", 'web_search="disabled"', "-c", 'approval_policy="never"', "-c", 'default_permissions=":read-only"', "-c", `model_context_window=${LIMITS.codexContextWindow}`];
+    "-c", CODEX_WEB_SEARCH_OFF, "-c", 'approval_policy="never"', "-c", 'default_permissions=":read-only"', "-c", `model_context_window=${LIMITS.codexContextWindow}`];
   if (o.schema) cmd.push("--output-schema", o.schema);
   if (o.model) cmd.push("-m", o.model);
   return cmd;
@@ -302,18 +323,17 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
   const setup = (): SandboxSetup => ({ realHome: o.home, scratch: o.scratch });
   const codexBin = () => which(bin);
   const bwrapBin = () => (o.bwrap === null ? null : which(o.bwrap ?? "bwrap"));
-  const envFor = (mode: IsolationMode, d: Dirs, extra: Record<string, string> = {}): Record<string, string> => mode === "bwrap"
-    ? { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", ...extra }
-    : { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", CODEX_HOME: d.codexHome, HOME: d.home, LANG: "C.UTF-8", ...extra };
-  const launch = (mode: IsolationMode, d: Dirs, args: string[]) => {
+  const launch = (d: Dirs, args: string[]) => {
     const cb = codexBin();
     if (!cb) throw new SeatError("unconfigured", "the Codex binary isn't installed");
     const bw = bwrapBin();
-    if (mode === "bwrap" && !bw) throw new SeatError("refused", "bubblewrap isn't installed");
-    return wrap(mode, { ...d, bwrap: bw ?? "bwrap", codexBin: cb }, mode === "rules" ? args : args);
+    if (!bw) throw new SeatError("refused", "bubblewrap isn't installed, and Codex runs only under it");
+    return wrap({ ...d, bwrap: bw, codexBin: cb }, args);
   };
+  const run = (wire: Wire, d: Dirs, args: string[], signal: AbortSignal) =>
+    wire.exec(launch(d, args), { env: { ...BWRAP_ENV }, signal, stopOn: CODEX_WEB_SEARCH_EVENT } as any) as Promise<{ code: number; stdout: string; stderr: string; stopped?: boolean }>;
   const ask: AskFn = async (input) => {
-    if (!input.codexMode) throw new SeatError("refused", "Codex isn't isolated this run (its self-test didn't pass), so it isn't started");
+    if (input.codexMode !== "bwrap") throw new SeatError("refused", "Codex isn't isolated this run (its self-test under bubblewrap didn't pass), so it isn't started");
     if (!signedIn(o.home)) throw new SeatError("unconfigured", "Codex isn't signed in to ChatGPT yet");
     const d = freshDirs(setup());
     try {
@@ -325,8 +345,10 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
       const p = input.brief ? reviewPrompt({ ...input.brief, needs_facts: false }, "reviewer") : { system: input.system ?? "", user: input.user ?? "" };
       const args = [...codexArgs({ work: d.work, out, schema, model: input.model || undefined }), `${p.system}\nUse no tools and run no commands: everything you need is below.\n\n${p.user}`];
       let r;
-      try { r = await input.wire.exec(launch(input.codexMode, d, args), { env: envFor(input.codexMode, d), signal: input.signal, handed: schema ? [schema] : [] } as any); }
+      try { r = await run(input.wire, d, args, input.signal); }
       catch (e) { if (e instanceof SeatError) throw e; throw new SeatError(input.signal.aborted ? "timeout" : "transient", `Codex didn't run: ${(e as Error).message.slice(0, 120)}`); }
+      // A web search, whatever else happened: stopped, not kept, counted at its worst case.
+      if (r.stopped || input.wire.codexWebSearch > 0 || CODEX_WEB_SEARCH_EVENT.test(r.stdout)) throw new CodexWebSearch();
       if (input.signal.aborted) throw new SeatError("timeout", "no answer before the deadline");
       let served = "", usage = { input: 0, output: 0 }, problem = "";
       for (const line of r.stdout.split("\n")) {
@@ -353,44 +375,49 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
       return { text, json, answer, urls: [], served: served || input.model || "Codex default model", bill: { usd: 0, how: "plan call" }, tokens: usage, searches: 0 };
     } finally { d.done(); }
   };
-  // The sandbox self-test (sandbox.ts): bubblewrap first when installed, then Codex's own rules.
+  // The sandbox self-test (sandbox.ts), under bubblewrap only: bubblewrap must start (codex --version inside it),
+  // then every probe must be attempted and refused, with no canary or runner marker back.
   const isolation = async (wire: Wire, signal: AbortSignal): Promise<Isolation> => {
     const at = new Date().toISOString();
-    if (!signedIn(o.home)) return { ok: false, mode: "none", detail: "Codex isn't signed in to ChatGPT yet", at };
-    if (!codexBin()) return { ok: false, mode: "none", detail: "the Codex binary isn't installed", at };
-    const modes: IsolationMode[] = bwrapBin() ? ["bwrap", "rules"] : ["rules"];
-    const why: string[] = [];
-    for (const mode of modes) {
-      const d = freshDirs(setup());
-      try {
-        const letters = (n: number) => [...randomBytes(n)].map((b) => "abcdefghijklmnop"[b % 16]).join("");
-        const k1 = `trialcanary${letters(12)}`, k2 = `trialcanary${letters(12)}`;
-        const key = join(d.tmp, "planted-key.txt");
-        writeFileSync(key, k1, { mode: 0o644 });
-        const out = join(d.io, "answer.txt");
-        const args = [...codexArgs({ work: d.work, out }), selfTestPrompt(key, process.pid)];
-        const r = await wire.exec(launch(mode, d, args), { env: envFor(mode, d, { TRIAL_CANARY: k2 }), signal, handed: [] } as any);
-        const answer = existsSync(out) ? readFileSync(out, "utf8") : "";
-        const j = judgeSelfTest({ ...r, answer }, [k1, k2, "REVIEW_", "SUPERVISOR_TOKEN", "TRIALS_BUDGET"]);
-        if (j.ok) return { ok: true, mode, detail: j.detail, at };
-        why.push(`${mode}: ${j.detail}`);
-      } catch (e) { why.push(`${mode}: ${(e as Error).message.slice(0, 160)}`); }
-      finally { d.done(); }
-    }
-    return { ok: false, mode: "none", detail: why.join("; "), at };
-  };
-  const tool = async (wire: Wire, signal: AbortSignal, mode: IsolationMode, sub: string[]) => {
+    const no = (detail: string): Isolation => ({ ok: false, mode: "none", detail, at });
+    if (!signedIn(o.home)) return no("Codex isn't signed in to ChatGPT yet");
+    if (!codexBin()) return no("the Codex binary isn't installed");
+    if (!bwrapBin()) return no("bubblewrap isn't installed, and Codex runs only under it");
+    const start = freshDirs(setup());
+    try {
+      const r = await run(wire, start, [...CODEX_ROOT, "--version"], signal);
+      if (r.code !== 0 || !r.stdout.trim()) return no(`bubblewrap can't start Codex in this container (exit ${r.code}${r.stderr.trim() ? `: ${r.stderr.trim().replace(/\s+/g, " ").slice(0, 120)}` : ""})`);
+    } catch (e) { return no(`bubblewrap can't start Codex in this container (${(e as Error).message.slice(0, 120)})`); }
+    finally { start.done(); }
     const d = freshDirs(setup());
-    try { const env = envFor(mode, d); return await wire.exec(launch(mode, d, [...CODEX_ROOT, ...sub]), { env, signal, handed: [] } as any); }
+    try {
+      const letters = (n: number) => [...randomBytes(n)].map((b) => "abcdefghijklmnop"[b % 16]).join("");
+      const k1 = `trialcanary${letters(12)}`;
+      const key = join(d.tmp, KEY_FILE);
+      writeFileSync(key, k1, { mode: 0o644 });
+      const out = join(d.io, "answer.txt");
+      const args = [...codexArgs({ work: d.work, out }), selfTestPrompt(key, process.pid)];
+      const r = await run(wire, d, args, signal);
+      if (r.stopped || CODEX_WEB_SEARCH_EVENT.test(r.stdout)) return no("Codex ran a web search during the self-test although search is off");
+      const answer = existsSync(out) ? readFileSync(out, "utf8") : "";
+      // The runner's environment markers: a key variable's name, the Supervisor's token name, the trials budget.
+      const j = judgeSelfTest({ ...r, answer }, [k1, "REVIEW_", "SUPERVISOR_TOKEN", "TRIALS_BUDGET"], { pid: process.pid });
+      return j.ok ? { ok: true, mode: "bwrap", detail: j.detail, at } : no(`bwrap: ${j.detail}`);
+    } catch (e) { return no(`bwrap: ${(e as Error).message.slice(0, 160)}`); }
     finally { d.done(); }
   };
-  const version = async (wire: Wire, signal: AbortSignal, mode: IsolationMode = "rules") => {
-    try { const r = await tool(wire, signal, mode, ["--version"]); return r.code === 0 ? (r.stdout.trim().split("\n")[0] ?? "").slice(0, 80) || null : null; }
+  const tool = async (wire: Wire, signal: AbortSignal, sub: string[]) => {
+    const d = freshDirs(setup());
+    try { return await run(wire, d, [...CODEX_ROOT, ...sub], signal); }
+    finally { d.done(); }
+  };
+  const version = async (wire: Wire, signal: AbortSignal) => {
+    try { const r = await tool(wire, signal, ["--version"]); return r.code === 0 ? (r.stdout.trim().split("\n")[0] ?? "").slice(0, 80) || null : null; }
     catch { return null; }
   };
   // Best effort: the catalog `codex debug models` prints, or null when it can't be read.
-  const models = async (wire: Wire, signal: AbortSignal, mode: IsolationMode = "rules") => {
-    try { const r = await tool(wire, signal, mode, ["debug", "models"]); if (r.code !== 0) return null; return modelsFromCatalog(JSON.parse(r.stdout)); }
+  const models = async (wire: Wire, signal: AbortSignal) => {
+    try { const r = await tool(wire, signal, ["debug", "models"]); if (r.code !== 0) return null; return modelsFromCatalog(JSON.parse(r.stdout)); }
     catch { return null; }
   };
   return { ask, version, models, isolation };

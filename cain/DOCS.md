@@ -407,10 +407,23 @@ The budget: `trials_budget_usd` in this App's options (default 40, in dollars of
 suite, every grading call, every probe and every retry together. Only the App option sets it: a request to
 the trials runner can't carry a budget, a list of configurations or a run id.
 
+It is a soft bound, with a margin, not a hard one (fourth round). Some of what a call can cost has no
+provider cap:
+
+- Anthropic documents no size cap on web search results (they count as input tokens);
+- Gemini's `thinkingLevel` is a level, not a token cap, so on a model whose `maxOutputTokens` doesn't cover
+  thinking, the thinking it does is bounded only by the trials' own allowance;
+- Gemini grounding is billed per search query executed, with no documented cap on how many queries one call
+  runs.
+
+So the ledger stops a fixed 10 percent below the budget option (at $36 of the default $40), and a call billed
+above its reservation stops the run with an alarm. **The hard stop is yours, not this code's:** give the
+trials their own API keys with a prepaid balance or a workspace spend limit (a setup step, below).
+
 - Every request carries hard ceilings the provider enforces:
   - Claude: `max_tokens` (thinking included) and `max_uses` on web search; research answerers get web
-    search only (no fetch); the grader's web fetch carries `max_content_tokens` and is limited to the
-    domains the answers cited. A paused turn isn't continued.
+    search only (no fetch); the grader's web fetch carries `max_content_tokens`, direct callers only, and
+    is limited to the pages cited in the answer notes (below). A paused turn isn't continued.
   - Gemini: `maxOutputTokens`, and only the thinking field the docs say each model takes (below).
   - Perplexity: `max_steps`, `max_output_tokens`, the search tool's `max_tokens`, no page fetching.
   - Codex: one turn (`codex exec`), no tools, `model_context_window` set.
@@ -422,12 +435,13 @@ the trials runner can't carry a budget, a list of configurations or a run id.
   - Perplexity: each search call's `max_tokens` at every step, and the fast level at the priority rate (2x
     the token rates).
   - Gemini: the enforced output ceiling, plus a thinking allowance only where the docs don't say
-    `maxOutputTokens` covers thinking, and grounding at its per-query price for up to 6 queries.
+    `maxOutputTokens` covers thinking, and, with grounding on, a conservative fee allowance of 24 search
+    queries at the per-query price. The bill is then reconciled from the queries each candidate's
+    `groundingMetadata` says were executed.
   - A configuration that can't be given a ceiling is refused, not run.
-- One cap across every seat, probe, grader and retry, with a fixed overrun margin: a call is admitted only
-  while the budget left after it is at least the largest single call's worst case in the suite (at least
-  $0.50). So a call that overshoots its own reservation by its whole worst case still stays under the
-  budget, and a bill above a call's reserved worst case also stops the run and raises an alarm to Cain.
+- One cap across every seat, probe, grader and retry: the ledger's cap sits a fixed 10 percent below the
+  budget option, not a margin worked out from the same worst-case guesses it guards. A bill above a call's
+  reserved worst case stops the run and raises an alarm to Cain.
 - The worst case is reserved in `/data/trials/budget.json` before the call is sent, in one locked
   check-and-reserve shared by every suite, grader, resume and process. It is checked together with the
   review seat's room this month (its cap, less the share `usage_reserve_percent` keeps for real reviews,
@@ -450,6 +464,33 @@ the trials runner can't carry a budget, a list of configurations or a run id.
   allowance, never as dollars, and the report says how many there were.
 - Trial spend shows in `review.sh spend` and the security watch like review spend. Real reviews don't see
   trial reservations; trials keep out of the reserved share instead.
+
+### Your say on paid runs: the run allowance (App option)
+
+`trials_run_allowance_usd` (default 0) is your say on paid trial runs, a total in dollars, read only from
+this App's options (root's file), under the same rules as the research approval. A run, a resume and the
+preflight start only while what they would take, their cap, fits in what is left of it:
+
+- a run's cap is its plan's worst case plus its own checks, never above the ledger's cap; the preflight's is
+  $4;
+- the cap is granted once, when the run starts, and counted against the allowance whether the run spends it
+  or not, so a second run beyond the allowance is refused even if the first spent little;
+- a run's calls and task holds never pass its own cap;
+- lowering the allowance below what was granted stops a running run before its next call, and a resume waits
+  until you raise it again.
+
+With the default 0, nothing paid runs. Cain's inbox stays a submission channel only: a request asks, and only
+your allowance decides. `trial.sh plan` says what a run of a suite would take; `trial.sh status` shows the
+allowance the runner read and what is granted.
+
+### The Supervisor's token
+
+The App's start unsets `SUPERVISOR_TOKEN` (and `HASSIO_TOKEN`) before it starts anything, so neither Cain's
+processes nor the review and trials runner hold it. Cain's processes run as his own user, and his session's
+own check refuses to start unless every root process's `/proc/<pid>/environ`, s6's saved copy of the token and
+`/data/options.json` are unreadable to him. So a change of the App's options through the Supervisor's API (a
+raised allowance, an approval) isn't open to Cain. The tests check the start script's order and that a process
+of another user can't read a root process's environment; the live check is Cain's own session check on the Pi.
 
 ### Real reviews first, and quota headroom
 
@@ -482,8 +523,16 @@ adopted notes or a diff with a hit are left out (then recall isn't graded).
 Provider tools only on checked text: provider-managed search, fetch and grounding are on only for the
 research suite, whose every outbound field is the checked research text. The review-seats suite is built
 from the record (briefs, notes, diffs), so every call in it goes with no tools at all; one with search on is
-refused before it is sent. The grader's fetch (research only) is limited to the domains the answers cited,
-with `max_content_tokens`.
+refused before it is sent. The research grader's fetch takes only the exact pages cited in the answer notes,
+each with its query string and fragment stripped, and only pages that are HTML (a PDF, an office file, an
+archive, an image or a data file is left out before the fetch). Claude's fetch tool can be bounded only by
+domain (`allowed_domains`), not by page, so the request is bounded to those pages' domains, the grader is told
+to fetch only the listed pages, and a grading call whose fetches went to any other page is thrown away,
+counted at its cost, with an alarm to Cain.
+
+The plan step (`trial.sh plan research`) refuses questions or answer notes (what a right answer must contain,
+the sources) that match the private-terms list, naming them, and shows no plan; with no list at all it shows
+none either.
 
 The search queries a provider says it ran (Gemini's grounding queries, Claude's searches and fetched
 addresses, Perplexity's search results) are logged with each output and checked afterwards; a hit raises an
@@ -492,48 +541,43 @@ search query it writes from the question, is only checked after it was sent.
 
 ### Codex isolation, before launch
 
-A Codex trial or grading call runs only when a sandbox self-test passed at the start of the run. Every Codex
-invocation (the self-test, its version and model list, each call) is launched through a wrapper that gives
-it only three things:
+Codex runs only under bubblewrap (fourth round: the earlier fallback to Codex's own rules file is gone). A
+Codex trial or grading call runs only when the run's sandbox self-test passed under that same wrapper. Every
+Codex invocation (the self-test, its version and model list, each call) is launched through bubblewrap with:
 
-- an empty temp folder;
-- the Codex binary (a static build, so no libraries);
-- an isolated `CODEX_HOME` holding a copy of only its sign-in file, `auth.json`. A sign-in Codex refreshed
-  during the call is copied back; nothing else comes back.
+- new mount, pid, ipc and uts namespaces; a fresh `/proc` (the runner's own environment file isn't there);
+  an empty `/tmp`; no shell, no `/bin`, no `/data`; a cleared environment;
+- read-only: the Codex binary (a static build, so no libraries) and the few files a TLS connection needs
+  (`resolv.conf`, `hosts`, the CA certificates); the network stays, so Codex can reach OpenAI;
+- an empty temp folder for the work, an empty home, and an isolated `CODEX_HOME` holding a copy of only its
+  sign-in file, `auth.json` (a sign-in Codex refreshed during the call is copied back; nothing else comes
+  back).
 
-The wrapper is one of two:
+The self-test runs the real binary on the Pi, once per run (and again on a resume, and in the preflight):
 
-- **bubblewrap**, when the container allows it: new mount, pid, ipc and uts namespaces; a fresh `/proc`
-  (the runner's own environment file isn't there); an empty `/tmp`; no shell, no `/bin`, no `/data`; a
-  cleared environment. Read-only: the binary and the few files a TLS connection needs (`resolv.conf`,
-  `hosts`, the CA certificates). The network stays, so Codex can reach OpenAI.
-- **Codex's own controls**, otherwise: the built-in read-only permissions profile
-  (`default_permissions = ":read-only"`), and an exec policy in the isolated home, `rules/default.rules`.
-  It marks every program on PATH (by name and by path) and the usual shells and interpreters as
-  `forbidden`, so a command is refused before it runs. The job named the file `defaults.rules`; Codex's
-  source loads `rules/default.rules` from `CODEX_HOME`, also with `--ignore-user-config`, so that is the
-  name used.
+1. bubblewrap must start at all: `codex --version` inside it;
+2. Codex is asked to run four probes, and each must be attempted and refused (or find nothing to run): a
+   plain read of a planted key file, the same read by an absolute-path binary (`/bin/cat`), a
+   shell-builtin-only read (a redirection, no program), and the runner's own environment under `/proc`;
+3. no canary or marker of the runner's environment may appear anywhere in what came back.
 
-The self-test runs the real binary on the Pi, once per run (and again on a resume), through the same wrapper,
-bubblewrap first. It asks the sandboxed shell to read a planted key file and the runner's own environment
-file under `/proc`. It passes only when all three hold:
+If bubblewrap isn't installed or can't start in the container, or any probe isn't refused, Codex is "not
+isolated": every Codex configuration is skipped, Codex never grades, and the report says the panel was
+reduced; a ranking that would rest on one grader is left out. The self-test counts as one Codex call.
 
-- Codex tried;
-- every attempt was refused before it ran, or found no shell to run;
-- no canary or secret marker appears anywhere in what came back.
+Every invocation passes `-c features.daemon_auto_start=false` and `-c web_search="disabled"` before the
+subcommand, and the call's own `exec` line carries `web_search="disabled"` again. Codex has no `--no-daemon`
+on `codex exec` (it runs its own in-process server); the shared daemon's switch is that feature flag, and
+inside bubblewrap's own pid namespace with `--die-with-parent` nothing it started outlives it. Each invocation
+also has `--ignore-user-config` (no config file, so no MCP servers). It starts in its own process group, and
+the whole group is killed on abort, at once when a web search event shows in its output, and when it ends.
+A call that searched the web is stopped, its answer isn't kept, it counts at its worst case (one call of the
+plan's allowance), and Cain hears an alarm. An answer whose event stream shows any other tool use is thrown
+away.
 
-If the self-test can't prove isolation, every Codex configuration is skipped and reported as "not
-isolated", and Codex never grades. The self-test counts as one Codex call.
-
-Every invocation passes `-c features.daemon_auto_start=false`. Codex has no `--no-daemon` on `codex exec`
-(it runs its own in-process server and never starts the shared daemon); the shared daemon's switch is that
-feature flag. Each invocation also has `--ignore-user-config` (no config file, so no MCP servers) and web
-search off. It starts in its own process group, and the whole group is killed on abort and again when it
-ends, so no child outlives it. An answer whose event stream shows any tool use is thrown away.
-
-The fake-exec canary in the tests only shows that nothing of Cain's is handed in (command line, environment,
-files, working folder). It says nothing about what a real Codex could read: that is what the self-test on
-the Pi decides.
+The fake-exec tests show what is handed in (command line, environment, files, working folder) and how the
+self-test is judged. They say nothing about what a real Codex could read: that is what the self-test on the
+Pi decides.
 
 ### Blind grading
 
@@ -553,9 +597,10 @@ each cut to a fixed length, in an order shuffled for each grader call on its own
 Three graders, one per family: Claude Opus 5.5, OpenAI through Codex (no tools, so it grades on content
 only) and Google's Gemini 4 Argon (no tools). Each output's panel is the first two of those the run can use
 whose family isn't its own, so every candidate gets two graders from outside its family. With Codex not
-isolated, Google's outputs get Claude alone. The report shows each grader's scores beside the combined
-score, ranks only configurations the same panel scored (each panel on its own matched set), and flags the
-combined ranking across panels as not like for like.
+isolated (or any grader's check failed), the report says "Panel reduced" and why, and Google's outputs get
+Claude alone: a ranking that rests on one grader is left out. The report shows each grader's scores beside
+the combined score, ranks only configurations at least two graders of the same panel scored (each panel on
+its own matched set), and flags the combined ranking across panels as not like for like.
 
 ### The suites
 
@@ -609,36 +654,47 @@ is stored for every call:
 - an output served by another lab's model is reported as that lab's, and that lab's grader never reads it;
 - a pinned level's rows read "perplexity/sonar at effort low", so they aren't taken for the default presets.
 
-### The checks before any spend
+### The checks before any spend: `trial.sh preflight` first
 
-Before a run spends on the trial itself, each provider and the tool paths the suite really uses are
-exercised once from the installed build, with no text of yours:
+The first install is preflight-only (fourth round). `trial.sh run` refuses every paid suite until a preflight
+record exists for this build on this machine (`/data/trials/preflight.json`, kept by the runner; the build is
+the trials' own code, the machine its machine id). `trial.sh preflight` runs the checks below for every
+configuration of both suites, with no text of yours, under a cap of $4 from your run allowance, and writes
+the record:
 
-- Claude: one call with a tiny output cap. On research it uses web search `max_uses` 1 and the grader's
-  fetch `max_uses` 1; on review-seats, no tools.
+- Claude: one call with a tiny output cap; on research with web search `max_uses` 1 and the grader's fetch
+  `max_uses` 1, both for direct callers only; on review-seats, no tools.
 - Gemini: one tiny call per model (every configuration's, and the Gemini grader's) with the model's own
-  settings.
-- Perplexity: one tiny call per level with the pinned model. `response.model` must equal the pinned model;
-  a level served by another model is disabled. If a later answer comes from a model other than the one its
-  check was served by, the run stops.
-- Codex: the sandbox self-test, then its version and model list (a tiny probe per model the list can't
-  answer for).
+  thinking field. A model that refuses the field (a 400) or isn't served is disabled. The check also records
+  whether the model's output cap covered its thinking (thought and answer tokens within the cap); a model the
+  docs list as covered whose check shows otherwise is disabled, since its worst case can't be bounded.
+- Perplexity: one tiny call per level with the pinned model (pinned in the preflight even when third-party
+  routing is allowed). `response.model` must equal the pinned model; a level served by another model is
+  disabled.
+- Codex: the sandbox self-test under bubblewrap, that the daemon is off and web search off on every
+  invocation, then its version and model list (a tiny probe per model the list can't answer for).
 
-A configuration whose check fails is disabled and named in the report (Claude's grader too, when Claude's
-check fails). The run stops only if today's default Gemini model, 3.8 Flash, isn't usable. The exact model
-and tool ids each check used are kept in the run's state (`preflight.ids`).
+A configuration whose check fails stays disabled and is named, in the record, in `trial.sh status` and in
+every run's report. A run on that build takes the record's verdicts without paying for them again; only the
+Codex self-test runs again for each run (and Perplexity's levels are checked again when third-party routing
+is on). A run whose build or machine has no finished record stops before its next call. The exact model and
+tool ids each check used are kept (`preflight.ids`). The run still stops if today's default Gemini model, 3.8
+Flash, isn't usable.
 
 ### Running one (as Cain)
 
+0. Once per build: `trial.sh preflight` (above), within your run allowance.
 1. `trial.sh plan review-seats` (or `research`) prints every call the suite would make, its ceilings and
-   its worst-case cost, the overrun margin, and the total. No call is made.
+   its worst-case cost, the ledger's cap, the total, and what a run would take of your allowance. No call is
+   made.
 2. `trial.sh run review-seats` (or `research`, once approved) leaves a request in the trials inbox, and the
    runner starts it, task by task.
    - The inbox: a request file is opened without following a link (and without blocking, so a FIFO can't
      hang the runner), taken only if it is a regular file of at most 4 KB, with one link, owned by Cain's
      user. It is moved into a folder only the runner writes (`/data/trials/inbox-taken`), checked to be the
      very file opened, and parsed from that same descriptor.
-   - Anything else is removed untaken. A paid run or a resume starts only from such a file.
+   - Anything else is removed untaken. A paid run, a resume or the preflight starts only from such a file,
+     and only while your run allowance covers it.
 3. `trial.sh status` shows each suite's newest run, the budget, what is reserved and held;
    `trial.sh result <suite>` every call's state, cost (billed or estimated), tokens and time.
 4. `trial.sh run <suite>` again resumes a stopped run where it stopped (`--retry` also tries again calls
@@ -659,7 +715,8 @@ The report:
 - reports unresolved billing (charged at its worst case for want of a bill) in its own column, left out of
   the cost per acceptable answer, which comes with its denominators.
 
-What it keeps, all readable by Cain and written only by the runner: `/data/trials/budget.json`, and per
+What it keeps, all readable by Cain and written only by the runner: `/data/trials/budget.json` (with the
+grants from your allowance), `/data/trials/preflight.json`, and per
 suite `suite.json` (the tasks) and per run `<run>/state.json`, `outputs/` (with the served model and search
 queries), `grades/` and `key.json`.
 
@@ -702,11 +759,28 @@ queries), `grades/` and `key.json`.
     `--skip-git-repo-check`, `-m`, and `-c` overrides.
   - `web_search = "disabled"`.
   - `default_permissions = ":read-only"`, which can't be set beside `--sandbox`.
-  - `rules/default.rules` with `prefix_rule(..., decision="forbidden")`, loaded even with
-    `--ignore-user-config`.
   - `[features] daemon_auto_start` (no `--no-daemon` on `exec`).
   - `auth.json` in `CODEX_HOME`.
   - Codex's own Linux sandbox uses bubblewrap.
+
+Where the provider docs and the fourth round's list differ (the docs win):
+
+- The research grader's fetch "takes only the exact URLs" in the answer notes: Claude's web fetch tool takes
+  `allowed_domains`, not a list of pages, so the request is bounded by those pages' domains and any fetch of
+  another page throws the grading call away (above).
+- "Codex honouring daemon off": Codex documents the `daemon_auto_start` feature flag but no way to observe
+  that no daemon started. The preflight records the flag on every invocation, and bubblewrap's own pid
+  namespace with `--die-with-parent` ends anything it started; nothing more can be checked from outside.
+- "Each Gemini model's thinking field and whether its output cap covers thinking": for the models the docs
+  don't cover (Neon, Carbon, Hydrogen), the check can only show it when the model thinks during the check; an
+  answer with no thought tokens is recorded as unknown, and the thinking allowance stays on their worst case.
+
+### Your setup for the trials
+
+1. Give the trials their own API keys, each with a prepaid balance or a workspace spend limit at what you are
+   willing to lose (Anthropic, Google and Perplexity). That is the hard stop; the budget option is a soft one.
+2. Set `trials_run_allowance_usd` on the Configuration tab: at least $4 for the preflight, plus what
+   `trial.sh plan` says each run takes. Cain can't set it.
 
 ## Cain's own user (since 0.12.0)
 
