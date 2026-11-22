@@ -12,10 +12,13 @@
 //   bun main.ts missed-heartbeat      (0.1.6) the missed-heartbeat drill: the heartbeat ping stops until Healthchecks
 //                                     pages; prints a one-time code
 //   bun main.ts missed-heartbeat-confirm <code>   (0.1.6) once that page reached the owner's phone
+//   bun main.ts accept-limits <code>  (0.1.7) the owner accepts DOCS.md's "Accepted limits" (code printed at start)
+//   bun main.ts hc-key <code>         (0.1.7) the Healthchecks read-only key, read from standard input (never the
+//                                     command line), checked and kept in /data/hc-key (0600); prints nothing of it
 // The owner's commands go to the loopback listener (127.0.0.1:8096), never the App network's (0.1.6).
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { HEARTBEAT_MS, type HcCheck, Keeper, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
@@ -25,6 +28,15 @@ export const LOCAL_PORT = Number(process.env.KEEPER_LOCAL_PORT ?? 8096);   // (0
 const DATA = process.env.KEEPER_DATA ?? "/data";
 const STATE = `${DATA}/state.json`;
 const OPTIONS = `${DATA}/options.json`;
+// (0.1.7) The Healthchecks key's file: root-only, never in the options, and left out of the keeper's own backups
+// (config.yaml backup_exclude names it).
+export const HC_KEY_FILE = `${DATA}/hc-key`;
+export function hcKeyStore(path = HC_KEY_FILE) {
+  return {
+    load: (): string => { try { return readFileSync(path, "utf8").trim(); } catch { return ""; } },
+    store: (key: string): boolean => { try { writeWhole(path, `${key}\n`); chmodSync(path, 0o600); return true; } catch { return false; } },
+  };
+}
 export const VERSION = process.env.KEEPER_VERSION ?? "0.0.0";
 const log = (m: string) => console.log(`[keeper] ${m}`);
 
@@ -81,6 +93,7 @@ async function serve(): Promise<void> {
   const k = new Keeper({
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
+    backups: sup.backups, activeJobs: sup.activeJobs, hcKeyStore: hcKeyStore(),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
@@ -96,6 +109,9 @@ async function serve(): Promise<void> {
   }, readJson(STATE));
   // 0.1.3: the options as they are; nothing is filled in from a kept copy.
   k.useOptions(readJson(OPTIONS));
+  // (0.1.7) and as the Supervisor holds them, where an option the schema dropped (hc_api_key) still shows
+  const held = await sup.selfOptions().catch(() => null);
+  if (held) k.useOptions(held);
   k.start();
   const o = k.opts;
   log(`Keeper ${version} watching ${o.watch.join(", ") || "nothing"}; Healthchecks ${k.armable() ? "set" : "not all set, so the keeper is not armable"}`);
@@ -136,19 +152,30 @@ const LOCAL_CMDS: Record<string, (a: string[]) => unknown> = {
   "key-confirm": (a) => ({ fingerprint: a[0] ?? "", code: a[1] ?? "" }),
   "missed-heartbeat": () => ({}),
   "missed-heartbeat-confirm": (a) => ({ code: a[0] ?? "" }),
+  "accept-limits": (a) => ({ code: a[0] ?? "" }),
+  "hc-key": (a) => ({ code: a[0] ?? "" }),          // (0.1.7) the key itself is added from standard input
 };
 const DONE: Record<string, string> = {
   "drill-record": "drill recorded", "phone-test": "phone test sent: once the pages reached your phone, phone-confirm <code from the log> <each check>",
   "phone-confirm": "phone test recorded", "key-confirm": "Ship key confirmed",
   "missed-heartbeat": "missed-heartbeat drill started: once its page reached your phone, missed-heartbeat-confirm <code from the log>",
   "missed-heartbeat-confirm": "missed-heartbeat drill recorded",
+  "accept-limits": "the accepted limits are recorded", "hc-key": "the Healthchecks read-only key is checked and kept",
 };
+// (0.1.7) The key from standard input, first line, trimmed; never echoed.
+async function readStdinKey(): Promise<string> {
+  try { return (await Bun.stdin.text()).split("\n")[0].trim(); } catch { return ""; }
+}
 
 if (import.meta.main) {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === "serve") await serve();
   else if (LOCAL_CMDS[cmd]) {
-    const body = LOCAL_CMDS[cmd](rest);
+    const body: any = LOCAL_CMDS[cmd](rest);
+    if (cmd === "hc-key") {
+      if (rest.length > 1) { console.error("hc-key takes only the code: the key goes on standard input, never the command line"); process.exit(2); }
+      body.key = await readStdinKey();
+    }
     const r = await fetch(`http://127.0.0.1:${LOCAL_PORT}/${cmd}`, { method: "POST", body: JSON.stringify(body) }).catch(() => null);
     const j: any = r ? await r.json().catch(() => null) : null;
     console.log(j?.ok ? `${DONE[cmd]}${j.why ? ` (${j.why})` : ""}` : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
@@ -156,5 +183,5 @@ if (import.meta.main) {
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | selftest"); process.exit(2); }
 }

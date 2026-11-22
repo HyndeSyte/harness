@@ -29,6 +29,12 @@
 //   7. (Keeper 0.1.6) requires the keeper's state creation and confirm times to equal the recorded ones (an
 //      older or a newer state is refused; a different state counts only through a confirm newer than the
 //      record), and records the enrollment from the minute-by-minute /armed read as well as from a pass.
+//   8. (Keeper 0.1.7) records the keeper's enrollment id and counter with the enrollment, and refuses any lower
+//      counter (an older keeper state) and any earlier enrollment id it has seen (a replayed confirm); a new
+//      enrollment id, the owner's key-confirm with a fresh code, is the explicit re-enrollment after a restore or
+//      a clock correction. Each check compares against the record as it stood before the request was sent, so a
+//      concurrent read's newer counter can't make an answer look old. The claim carries a request id, and a
+//      claim that got no answer is asked once more with it: the keeper answers a retry with the recorded claim.
 // Why the link and not the Ship run: the Ship run is a cloud session, and the keeper's service is only
 // on Home Assistant's internal App network. The Home Assistant connector can't reach it, and the link,
 // on the same network, already talks to the keeper with Cain's token. So no options are written at all.
@@ -66,16 +72,24 @@ export function readFingerprintFile(text: string): string {
 
 // -- enrollment (Keeper 0.1.5) ----------------------------------------------------------------------------
 // The link's record of the last confirmed enrollment it saw: the fingerprint, the keeper's state creation
-// time and the owner's confirm time (ms), in root's /data/trust.
-export interface Enrollment { fp: string; stateCreated: number; confirmedAt: number }
+// time and the owner's confirm time (ms), in root's /data/trust. Keeper 0.1.7: the confirm's enrollment id,
+// the highest counter seen under it, and the earlier enrollment ids seen (a replay of one is refused).
+export interface Enrollment { fp: string; stateCreated: number; confirmedAt: number; enrollId: string; counter: number; seen: string[] }
 export interface EnrollmentStore { load: () => Enrollment | null; store: (e: Enrollment) => void }
+const ENROLL_ID = /^[0-9a-f]{16}$/;
 export function parseEnrollment(text: string | null): Enrollment | null {
-  try { const j = JSON.parse(text ?? ""); return FP.test(j?.fp) && Number(j.stateCreated) > 0 && Number(j.confirmedAt) > 0 ? { fp: j.fp, stateCreated: Number(j.stateCreated), confirmedAt: Number(j.confirmedAt) } : null; }
-  catch { return null; }
+  try {
+    const j = JSON.parse(text ?? "");
+    return FP.test(j?.fp) && Number(j.stateCreated) > 0 && Number(j.confirmedAt) > 0 && ENROLL_ID.test(j.enrollId) && Number.isSafeInteger(j.counter) && j.counter >= 0
+      ? { fp: j.fp, stateCreated: Number(j.stateCreated), confirmedAt: Number(j.confirmedAt), enrollId: j.enrollId, counter: j.counter,
+        seen: Array.isArray(j.seen) ? j.seen.filter((x: unknown) => typeof x === "string" && ENROLL_ID.test(x)).slice(-50) : [] } : null;
+  } catch { return null; }
 }
 // An answer from the keeper (an acceptance, a claim, or /armed) judged against the committed fingerprint
-// and the recorded enrollment. A confirm newer than the record, for the committed fingerprint and made
-// after the keeper's state was created, is the owner's confirm seen: the record moves to it (record).
+// and the recorded enrollment, as it stood before the request was sent. Keeper 0.1.7: an enrollment id the link
+// hasn't seen, for the committed fingerprint and confirmed after the keeper's state was created, is the owner's
+// confirm seen (a first enrollment or a re-enrollment): the record moves to it (record). The same id needs the
+// same state and confirm times and a counter no lower than the record's (a higher one is recorded).
 export function enrollmentCheck(ans: any, committed: string, linkFp: string | null, rec: Enrollment | null): { ok: true; record?: Enrollment } | { ok: false; why: string; record?: Enrollment } {
   if (!FP.test(committed)) return { ok: false, why: `${FINGERPRINT_FILE} at the head holds no fingerprint (the Build run when the link's Ship key is made writes it)` };
   if (linkFp && committed !== linkFp) return { ok: false, why: `${FINGERPRINT_FILE} at the head (${committed}) isn't the link's own Ship key (${linkFp})` };
@@ -84,26 +98,39 @@ export function enrollmentCheck(ans: any, committed: string, linkFp: string | nu
   const created = Date.parse(String(ans?.state_created ?? "")), confirmed = Date.parse(String(ans?.key_confirmed_at ?? ""));
   if (!Number.isFinite(created)) return { ok: false, why: "the keeper's answer doesn't say when its state was created" };
   if (!Number.isFinite(confirmed)) return { ok: false, why: "the keeper's pinned key isn't confirmed by the owner (key-confirm at the device)" };
-  let record: Enrollment | undefined;
-  if (confirmed >= created && (!rec || confirmed > rec.confirmedAt || rec.fp !== committed)) record = { fp: committed, stateCreated: created, confirmedAt: confirmed };
-  const r = record ?? rec;
-  if (!r) return { ok: false, why: "the link has recorded no confirmed enrollment of the keeper" };
-  // (Keeper 0.1.6) the very state and confirm the link recorded: an older state is refused too
-  if (created > r.stateCreated) return { ok: false, why: `the keeper's state was created ${new Date(created).toISOString()}, after the enrollment the link recorded (${new Date(r.stateCreated).toISOString()}): the owner confirms the key at the device again`, ...(record ? { record } : {}) };
-  if (created < r.stateCreated) return { ok: false, why: `the keeper's state was created ${new Date(created).toISOString()}, before the enrollment the link recorded (${new Date(r.stateCreated).toISOString()}): an older keeper state is refused; the owner confirms the key at the device again` };
-  if (confirmed !== r.confirmedAt) return { ok: false, why: `the keeper's key was confirmed ${new Date(confirmed).toISOString()}, not at the confirm the link recorded (${new Date(r.confirmedAt).toISOString()}): the owner confirms the key at the device again` };
-  return record ? { ok: true, record } : { ok: true };
+  const eid = typeof ans?.enroll_id === "string" ? ans.enroll_id : "", counter = ans?.counter;
+  if (!ENROLL_ID.test(eid) || !Number.isSafeInteger(counter) || counter < 0) return { ok: false, why: "the keeper's answer carries no enrollment id or counter (Keeper 0.1.7 or later is needed)" };
+  const again = "the owner confirms the key at the device again (key-confirm with the fresh code from the keeper's latest start)";
+  if (!rec || rec.enrollId !== eid) {
+    if (rec && rec.seen.includes(eid)) return { ok: false, why: `the keeper's enrollment ${eid} is an earlier confirmation the link has seen replaced (an older keeper state, or a replay): ${again}` };
+    if (confirmed < created) return { ok: false, why: "the keeper's key was confirmed before its state was created" };
+    return { ok: true, record: { fp: committed, stateCreated: created, confirmedAt: confirmed, enrollId: eid, counter, seen: rec ? [...rec.seen, rec.enrollId].slice(-50) : [] } };
+  }
+  if (rec.fp !== committed) return { ok: false, why: `the enrollment the link recorded is for ${rec.fp}, not the committed ${committed}: ${again}` };
+  if (counter < rec.counter) return { ok: false, why: `the keeper's counter (${counter}) is lower than the ${rec.counter} the link recorded: an older keeper state (a restore?) is refused; ${again}` };
+  // (Keeper 0.1.6) the very state and confirm the link recorded: an older or newer state is refused too
+  if (created > rec.stateCreated) return { ok: false, why: `the keeper's state was created ${new Date(created).toISOString()}, after the enrollment the link recorded (${new Date(rec.stateCreated).toISOString()}): ${again}` };
+  if (created < rec.stateCreated) return { ok: false, why: `the keeper's state was created ${new Date(created).toISOString()}, before the enrollment the link recorded (${new Date(rec.stateCreated).toISOString()}): an older keeper state is refused; ${again}` };
+  if (confirmed !== rec.confirmedAt) return { ok: false, why: `the keeper's key was confirmed ${new Date(confirmed).toISOString()}, not at the confirm the link recorded (${new Date(rec.confirmedAt).toISOString()}): ${again}` };
+  return counter > rec.counter ? { ok: true, record: { ...rec, counter } } : { ok: true };
 }
 // (Keeper 0.1.6) The enrollment seen in the keeper's minute-by-minute /armed answer, judged against the
 // link's own key's fingerprint: a confirm newer than the record is recorded there too, outside any pass.
-export function noteArmedEnrollment(ans: any, linkFp: string | null, e: EnrollmentStore | undefined, log: (l: string) => void): void {
+// Keeper 0.1.7: before is the record as it stood before the read was sent (main.ts loads it first).
+export function noteArmedEnrollment(ans: any, linkFp: string | null, e: EnrollmentStore | undefined, log: (l: string) => void, before?: Enrollment | null): void {
   if (!linkFp || !e) return;
-  const en = enrollmentCheck(ans, linkFp, linkFp, e.load());
+  const en = enrollmentCheck(ans, linkFp, linkFp, before === undefined ? e.load() : before);
   if (en.record) noteRecord(e, en.record, log);
 }
+// Keeper 0.1.7: a counter is only ever raised (a concurrent read may have stored a higher one meanwhile), and the
+// line is logged only for a new enrollment, not for each counter step.
 const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, log: (l: string) => void) => {
   if (!e || !r) return;
-  try { e.store(r); log(`the owner's confirm of the keeper's Ship key ${r.fp} seen: enrollment recorded (keeper state created ${new Date(r.stateCreated).toISOString()})`); } catch { log("couldn't record the keeper's enrollment"); }
+  try {
+    const cur = e.load();
+    if (cur && cur.enrollId === r.enrollId) { if (r.counter > cur.counter) e.store({ ...cur, counter: r.counter }); return; }
+    e.store(r); log(`the owner's confirm of the keeper's Ship key ${r.fp} seen: enrollment recorded (enrollment ${r.enrollId}, keeper state created ${new Date(r.stateCreated).toISOString()}, counter ${r.counter})`);
+  } catch { log("couldn't record the keeper's enrollment"); }
 };
 
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
@@ -118,7 +145,7 @@ export interface PassDeps {
   store: (text: string) => void;                 // writes it whole; throws on failure
   // the keeper registration, in the background; note(upd) keeps how many Apps and which attempts it made
   register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: { apps?: number; attempt?: string }) => void) => void;
-  claim?: (a: Accepted) => Promise<{ status: number; body: any } | null>;   // (0.1.5) POST /attempt/<id>/claim
+  claim?: (a: Accepted, request: string) => Promise<{ status: number; body: any } | null>;   // (0.1.5) POST /attempt/<id>/claim (Keeper 0.1.7: with its request id)
   cancel?: (attempt: string, why: string) => void;                         // (0.1.5) POST /attempt/<id>/cancel, fire and forget
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
   log: (line: string) => void;
@@ -243,12 +270,17 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   catch { return { status: "refused", said: "the link couldn't record the Ship token as spent, so no Ship run starts: try again in a minute" }; }
   const claims: Claimed[] = [];
   for (const a of accepted) {
-    const r = d.claim ? await d.claim(a).catch(() => null) : null;
+    // Keeper 0.1.7: the record as it stood before the claim was sent, and the claim's own request id; a claim that
+    // got no answer is asked once more with the same id, and the keeper answers that with the recorded claim
+    const before = d.enrollment?.load() ?? null;
+    const request = createHash("sha256").update(`ship-claim-v1\n${id}\n${a.attempt}`).digest("hex").slice(0, 32);
+    let r = d.claim ? await d.claim(a, request).catch(() => null) : null;
+    if (!r && d.claim) { d.log(`the keeper didn't answer the claim of ${a.attempt}: asking once more with the same request`); r = await d.claim(a, request).catch(() => null); }
     const j = r?.body ?? {};
     const okAns = r && r.status === 200 && j.status === "claimed" && j.id === a.attempt && j.app === a.app && j.backup === a.backup
       && (a.from === undefined || j.from_version === a.from) && (a.to === undefined || j.to_version === a.to)
       && typeof j.claim === "string" && CLAIM_ID.test(j.claim) && Number.isFinite(Date.parse(String(j.until)));
-    const en = okAns ? enrollmentCheck(j, e.fp ?? "", keyFingerprint(pub), d.enrollment?.load() ?? null) : null;
+    const en = okAns ? enrollmentCheck(j, e.fp ?? "", keyFingerprint(pub), before) : null;
     if (en?.record) noteRecord(d.enrollment, en.record, d.log);
     if (!okAns || !en || !en.ok) {
       return refuseFor(!r ? `the keeper didn't answer the claim of ${a.attempt}` : !okAns ? `the keeper refused the claim of ${a.attempt}: ${String(j?.why ?? r.status).slice(0, 160)}`
@@ -321,8 +353,10 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     d.note?.({ attempt });
     const until = now() + (d.waitMs ?? ATTEMPT_WAIT_MS);
     let last: { status: number; body: any } | null = null;
+    let before: Enrollment | null = null;
     for (;;) {
       await sleep(d.pollMs ?? POLL_MS);
+      before = d.enrollment?.load() ?? null;              // (Keeper 0.1.7) the record before this read was sent
       last = d.get ? await d.get(`/attempt/${attempt}`).catch(() => null) : null;
       j = last?.body ?? {};
       if (last?.status === 200 && j.status !== "pending") break;
@@ -330,7 +364,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     }
     if (last?.status === 200 && j.status === "accepted" && j.id === attempt && j.app === slug && j.from_version === from && j.to_version === b.version
         && typeof j.backup === "string" && BACKUP_SLUG.test(j.backup)) {
-      const en = enrollmentCheck(j, committed, d.linkFp ?? null, d.enrollment?.load() ?? null);
+      const en = enrollmentCheck(j, committed, d.linkFp ?? null, before);
       if (en.record) noteRecord(d.enrollment, en.record, d.log);
       if (!en.ok) { say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); continue; }
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });

@@ -23,7 +23,9 @@ const FPR = keyFingerprint(SHIP_PUB);
 const T = (ms: number) => new Date(ms).toISOString();
 const ACC = { app: "0fcc2575_cain", attempt: "ship-46-cain-01234567", backup: "kb1", from: "0.18.0", to: "0.19.0" };
 const ACCEPTED: RegResult = { ok: true, accepted: [ACC], said: [], fp: FPR };
-const ENROLLED = { key_fp: FPR, key_confirmed_at: T(NOW - 3_600_000), state_created: T(NOW - 7_200_000) };
+const EID = "0123456789abcdef", EID2 = "fedcba9876543210";
+const ENROLLED = { key_fp: FPR, key_confirmed_at: T(NOW - 3_600_000), state_created: T(NOW - 7_200_000), enroll_id: EID, counter: 10 };
+const REC = { fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000, enrollId: EID, counter: 10, seen: [] as string[] };
 const claimAnswer = (over: any = {}) => ({ status: 200, body: { status: "claimed", id: ACC.attempt, app: ACC.app, from_version: ACC.from, to_version: ACC.to, backup: ACC.backup,
   claim: "claim-0123456789abcdef", until: T(NOW + 1_800_000), ...ENROLLED, ...over } });
 // The link's pass with a fake keeper: "accept" answers at once, "refuse" refuses, "hold" keeps the answer
@@ -48,7 +50,7 @@ function link(o: { file?: string | null; storeFails?: boolean; reg?: "accept" | 
       else if (o.reg === "refuse") done({ ok: false, said: ["the keeper refused Cain 0.19.0: its backup failed"] });
       else held = done;
     },
-    claim: async (a) => { claims.push(a); return o.claim ? o.claim() : claimAnswer(); },
+    claim: async (a, request) => { claims.push({ ...a, request }); return o.claim ? o.claim() : claimAnswer(); },
     cancel: (a) => { cancelled.push(a); },
     enrollment: { load: () => enrolled, store: (e) => { enrolled = e; } },
     log: (l) => logs.push(l),
@@ -199,7 +201,7 @@ describe("the registration with the keeper App (Keeper 0.1.5: register, then pol
     expect(k.got).toEqual([`/attempt/${ACC.attempt}`, `/attempt/${ACC.attempt}`, `/attempt/${ACC.attempt}`]);
     expect(k.notes).toEqual([{ apps: 1 }, { attempt: ACC.attempt }]);
     expect(r).toEqual({ ok: true, accepted: [ACC], said: ["Cain 0.18.0 to 0.19.0 accepted as ship-46-cain-01234567, backup kb1"], fp: FPR });
-    expect(k.enrolled).toEqual({ fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000 });   // the owner's confirm seen
+    expect(k.enrolled).toEqual(REC);   // the owner's confirm seen
   });
   test("polling stops at 5 minutes per App: still pending is not accepted", async () => {
     const k = keeper([{ status: "pending" }]);
@@ -265,17 +267,16 @@ describe("Keeper 0.1.5: the committed fingerprint and the keeper's enrollment", 
     expect((enrollmentCheck({ ...ENROLLED }, "", FPR, null) as any).why).toContain("holds no fingerprint");
     expect((enrollmentCheck({ ...ENROLLED }, EFP, FPR, null) as any).why).toContain("isn't the link's own Ship key");
   });
-  test("the recorded state time refuses a newer keeper state until the owner confirms again", () => {
-    const rec = { fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000 };
-    expect(enrollmentCheck(ENROLLED, FPR, FPR, rec)).toEqual({ ok: true });
-    // a reinstalled keeper (newer state) still showing the old confirm time: refused
-    const newer = { key_fp: FPR, key_confirmed_at: T(NOW - 3_600_000), state_created: T(NOW - 60_000) };
-    const r = enrollmentCheck(newer, FPR, FPR, rec);
+  test("the recorded state time refuses a newer keeper state until the owner confirms again (Keeper 0.1.7: a new enrollment id)", () => {
+    expect(enrollmentCheck(ENROLLED, FPR, FPR, REC)).toEqual({ ok: true });
+    // a reinstalled keeper (newer state) still showing the old enrollment: refused
+    const newer = { ...ENROLLED, state_created: T(NOW - 60_000) };
+    const r = enrollmentCheck(newer, FPR, FPR, REC);
     expect(r.ok).toBe(false);
     expect((r as any).why).toContain("after the enrollment the link recorded");
-    // the owner's confirm on the new state: recorded, and it passes
-    const confirmed = { ...newer, key_confirmed_at: T(NOW) };
-    expect(enrollmentCheck(confirmed, FPR, FPR, rec)).toEqual({ ok: true, record: { fp: FPR, stateCreated: NOW - 60_000, confirmedAt: NOW } });
+    // the owner's confirm on the new state (a new enrollment id): recorded, and it passes
+    const confirmed = { ...newer, key_confirmed_at: T(NOW), enroll_id: EID2, counter: 3 };
+    expect(enrollmentCheck(confirmed, FPR, FPR, REC)).toEqual({ ok: true, record: { fp: FPR, stateCreated: NOW - 60_000, confirmedAt: NOW, enrollId: EID2, counter: 3, seen: [EID] } });
   });
   test("the registration refuses an acceptance whose keeper pinned another key, and one whose head carries no fingerprint", async () => {
     const files: Record<string, any> = {
@@ -309,7 +310,7 @@ describe("Keeper 0.1.5: the claim at pass time", () => {
     const l = link();
     const a = await shipPass(l.d, { token: TOKEN });
     expect(a.status).toBe("ok");
-    expect(l.claims).toEqual([ACC]);
+    expect(l.claims).toEqual([{ ...ACC, request: expect.stringMatching(/^[0-9a-f]{32}$/) }]);   // (Keeper 0.1.7) with its request id
     expect(l.logs).toContain(`Ship pass ok: ${ACC.attempt} claim claim-0123456789abcdef until ${T(NOW + 1_800_000)}`);
     expect(JSON.parse(l.file!).spent[0]).toMatchObject({ state: "passed", claims: [{ attempt: ACC.attempt, claim: "claim-0123456789abcdef" }] });
   });
@@ -394,22 +395,38 @@ describe("Keeper 0.1.6: the claim's deadline in code, and the enrollment's exact
     expect((a as any).said).toContain("has 15 minutes left, under the 20 a Ship run needs to start");
     expect(l.cancelled).toContain(ACC.attempt);
   });
-  test("an older keeper state, or another confirm time, is refused; a different state counts only through a newer confirm", () => {
-    const rec = { fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000 };
-    const older = { key_fp: FPR, key_confirmed_at: T(NOW - 3_600_000), state_created: T(NOW - 9_000_000) };
-    const r = enrollmentCheck(older, FPR, FPR, rec);
+  test("an older keeper state, or another confirm time, is refused; a different state counts only through a new enrollment", () => {
+    const older = { ...ENROLLED, state_created: T(NOW - 9_000_000) };
+    const r = enrollmentCheck(older, FPR, FPR, REC);
     expect(r.ok).toBe(false);
     expect((r as any).why).toContain("an older keeper state is refused");
     const earlierConfirm = { ...ENROLLED, key_confirmed_at: T(NOW - 5_000_000) };
-    expect((enrollmentCheck(earlierConfirm, FPR, FPR, rec) as any).why).toContain("not at the confirm the link recorded");
-    // the older state with the owner's newer confirm: recorded, and it passes
-    expect(enrollmentCheck({ ...older, key_confirmed_at: T(NOW) }, FPR, FPR, rec)).toEqual({ ok: true, record: { fp: FPR, stateCreated: NOW - 9_000_000, confirmedAt: NOW } });
+    expect((enrollmentCheck(earlierConfirm, FPR, FPR, REC) as any).why).toContain("not at the confirm the link recorded");
+    // the older state re-enrolled by the owner (a new id, whatever its clock says): recorded, and it passes
+    const re = enrollmentCheck({ ...older, key_confirmed_at: T(NOW - 8_000_000), enroll_id: EID2 }, FPR, FPR, REC);
+    expect(re).toEqual({ ok: true, record: { fp: FPR, stateCreated: NOW - 9_000_000, confirmedAt: NOW - 8_000_000, enrollId: EID2, counter: 10, seen: [EID] } });
+  });
+  test("(Keeper 0.1.7) the counter: a lower one is refused (an older keeper state), a higher one recorded; a replayed earlier enrollment is refused; an answer without them is refused", () => {
+    const lower = enrollmentCheck({ ...ENROLLED, counter: 9 }, FPR, FPR, REC);
+    expect(lower.ok).toBe(false);
+    expect((lower as any).why).toBe("the keeper's counter (9) is lower than the 10 the link recorded: an older keeper state (a restore?) is refused; the owner confirms the key at the device again (key-confirm with the fresh code from the keeper's latest start)");
+    expect(enrollmentCheck({ ...ENROLLED, counter: 25 }, FPR, FPR, REC)).toEqual({ ok: true, record: { ...REC, counter: 25 } });
+    const after = { ...REC, enrollId: EID2, seen: [EID] };
+    const replay = enrollmentCheck(ENROLLED, FPR, FPR, after);
+    expect(replay.ok).toBe(false);
+    expect((replay as any).why).toContain(`the keeper's enrollment ${EID} is an earlier confirmation the link has seen replaced`);
+    const { enroll_id: _e, counter: _c, ...bare } = ENROLLED;
+    expect((enrollmentCheck(bare, FPR, FPR, REC) as any).why).toBe("the keeper's answer carries no enrollment id or counter (Keeper 0.1.7 or later is needed)");
+    // a counter is only ever raised in the record, even when a stale answer's record is noted late
+    let rec: any = { ...REC, counter: 40 }; const logs: string[] = [];
+    noteArmedEnrollment({ ...ENROLLED, counter: 30 }, FPR, { load: () => rec, store: (e: any) => { rec = e; } }, (l) => logs.push(l), REC);
+    expect(rec.counter).toBe(40);
   });
   test("the enrollment is recorded from the minute-by-minute /armed read, outside any pass, in the link's record", () => {
     let rec: any = null; const logs: string[] = [];
     const store = { load: () => rec, store: (e: any) => { rec = e; } };
     noteArmedEnrollment({ armed: false, ...ENROLLED }, FPR, store, (l) => logs.push(l));
-    expect(rec).toEqual({ fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000 });
+    expect(rec).toEqual(REC);
     expect(logs[0]).toContain("enrollment recorded");
     // an unconfirmed or foreign pin records nothing; the same confirm again records nothing new
     noteArmedEnrollment({ key_fp: FPR, key_confirmed_at: null, state_created: T(NOW) }, FPR, store, (l) => logs.push(l));
@@ -417,5 +434,25 @@ describe("Keeper 0.1.6: the claim's deadline in code, and the enrollment's exact
     expect(logs).toHaveLength(1);
     // the link then passes a claim from that very state
     expect(enrollmentCheck(ENROLLED, FPR, FPR, rec)).toEqual({ ok: true });
+  });
+});
+
+describe("Keeper 0.1.7: the claim's request id", () => {
+  test("a claim that got no answer is asked once more with the same request id, and the keeper's recorded claim passes", async () => {
+    let n = 0;
+    const l = link({ enrolled: REC, claim: async () => (++n === 1 ? null : claimAnswer()) });
+    const a = await shipPass(l.d, { token: TOKEN });
+    expect(a.status).toBe("ok");
+    expect(l.claims).toHaveLength(2);
+    expect(l.claims[0].request).toMatch(/^[0-9a-f]{32}$/);
+    expect(l.claims[1].request).toBe(l.claims[0].request);
+    expect(l.logs).toContain(`the keeper didn't answer the claim of ${ACC.attempt}: asking once more with the same request`);
+  });
+  test("no answer to either ask refuses the pass and cancels", async () => {
+    const l = link({ enrolled: REC, claim: async () => null });
+    const a = await shipPass(l.d, { token: TOKEN });
+    expect(a.status).toBe("refused");
+    expect(l.claims).toHaveLength(2);
+    expect(l.cancelled).toContain(ACC.attempt);
   });
 });

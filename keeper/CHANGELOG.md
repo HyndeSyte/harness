@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.7
+
+- The Healthchecks key is no longer an option. You enter it once at the device with `hc-key` (the key typed in, never on the command line). Keeper checks it is the read-only key and sees your checks before it keeps it, keeps it where only Keeper reads it, and leaves it out of backups. Remove the old `hc_api_key` option: until you do, Keeper's log reminds you at every start.
+- Two limits of Keeper's design are now written in its docs ("Accepted limits"): an install of the same version made from Home Assistant's own page during a Ship run counts as the Ship run's, and a page that stops reaching your phone after a drill can go unseen for up to 14 days. You accept them once with `accept-limits`; Keeper won't arm until you do.
+- A cancelled Ship whose cancel got lost no longer leaves a backup behind: an unused claim's backup is deleted when it runs out, unless an install of Cain is still running.
+- One drill at a time: while the phone test or the missed-heartbeat drill runs, Keeper isn't armed and turns installs away. A restart or an install during a drill cancels it, so run it again.
+- The phone test is confirmed in one go, naming every check, and the missed-heartbeat drill now waits for Healthchecks to show the check down and then up again.
+- If Keeper's state is restored from a backup, Cain's link notices and waits until you confirm the Ship key again with the fresh code Keeper prints at start.
+- New option `hc_unique_keys`, only if Keeper matches the wrong Healthchecks check.
+
 ## 0.1.6
 
 - Keeper now takes only a read-only Healthchecks key. A key that could change your checks is refused, Keeper won't arm with it, and you are paged once to swap it for the project's read-only key.

@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { generateKeyPairSync, sign as edSign, type KeyObject } from "node:crypto";
 import { join } from "node:path";
 import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMIT_MS, REWIND_MS, WATCH_MS, ARMED_MAX_MS, PHONE_MAX_MS, LOOP_FRESH_MS, checkId, keyFp, optionsHash, parseOptions, readShipToken, shipKey,
-  ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, PHONE_WINDOW_MS, DROP_TRIES,
+  ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, MHB_CAP_MS, LIMITS_VERSION, PHONE_WINDOW_MS, DROP_TRIES,
   type AppInfo, type BackupInfo, type HcCheck, type JobState, type RestoreResult, type State } from "../rootfs/opt/keeper/core.ts";
 import { hcChecks, healthUrl, liveUrl } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
@@ -56,7 +56,7 @@ function hcList(opts: any, over: Record<string, Partial<HcCheck> | null>): HcChe
   return out;
 }
 
-function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean } = {}) {
+function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean; hcKey?: string; limits?: boolean } = {}) {
   let now = T0;
   const logs: string[] = [];
   const pings: { url: string; body: string }[] = [];
@@ -68,6 +68,9 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   const app: AppInfo = { version: "0.16.0", state: "started" };
   const f = {
     saveFails: false, deleteOk: true,
+    // (0.1.7) the kept Healthchecks key (a file on the device), the backups list and the active install jobs
+    hcKey: o.hcKey ?? "hc-read-key-0123456789", hcKeyWrites: 0, hcKeyWriteOk: true,
+    backupsList: [] as { slug: string; name: string }[] | null, activeJobs: [] as string[] | null,
     app, alive: true, ready: true, infoUp: true, pingOk: true, restoreQueue: [] as RestoreResult[],
     jobs: {} as Record<string, JobState>, jobsUp: true,
     hcUp: true, hcOver: {} as Record<string, Partial<HcCheck> | null>, hcReads: 0,
@@ -80,7 +83,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     options: {
       watch: [CAIN], health: [`${CAIN}=0fcc2575-cain:8098/ready`], tokens: [`${CAIN}=${TOKEN}`, `${HARNESS}=${HTOKEN}`],
       hc_done: "https://hc-ping.example/done", hc_deadman: "https://hc-ping.example/deadman", hc_failed: "https://hc-ping.example/failed",
-      health_grace_s: 0, ship_public_key: PUB, hc_api_key: "hc-read-key", ...(o.opts ?? {}),
+      health_grace_s: 0, ship_public_key: PUB, ...(o.opts ?? {}),
     } as any,
   };
   const k = new Keeper({
@@ -98,6 +101,9 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
       return { kind: "started", job: id };
     },
     deleteBackup: async (b) => { deleted.push(b); return f.deleteOk; },
+    backups: async () => f.backupsList,
+    activeJobs: async () => f.activeJobs,
+    hcKeyStore: { load: () => f.hcKey, store: (key) => { f.hcKeyWrites++; if (!f.hcKeyWriteOk) return false; f.hcKey = key; return true; } },
     job: async (uuid) => { jobCalls.push(uuid); return f.jobsUp ? f.jobs[uuid] ?? { found: false } : null; },
     hcChecks: async () => { f.hcReads++; return f.hcUp ? hcList(f.options, f.hcOver) : null; },
     timer: (ms) => f.timer(ms),
@@ -112,6 +118,8 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   k.start();
   // (0.1.5) the owner's enrollment of the pinned key at the device, as at first setup
   if (o.confirm !== false && shipKey(k.opts.ship_public_key)) k.keyConfirm(keyFp(k.opts.ship_public_key), codeIn(logs, "key-confirm"));
+  // (0.1.7) the owner's acceptance of the accepted limits, as at first setup
+  if (o.limits !== false) k.acceptLimits(codeIn(logs, "accept-limits"));
   const r = {
     k, f, logs, pings, restores, backupsMade, jobCalls, deleted, get saved() { return saved; },
     get now() { return now; }, advance(ms: number) { now += ms; },
@@ -146,14 +154,15 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     phoneConfirm(names?: string[]) { return k.phoneConfirm(codeIn(logs, "phone-confirm"), names ?? [...k.opts.watch.map((x) => x.replace(/^[0-9a-f]{8}_/, "")), "deadman"]); },
     // (0.1.6) the missed-heartbeat drill run whole: Healthchecks shows the heartbeat check down during the
     // silence, the ping resumes, it is up again, and the owner confirms
+    // 0.1.7: the silence lasts until Healthchecks shows it down; then up again after the ping resumes
     async heartbeatDrill(confirm = true) {
       await k.refreshHc();
       const s = k.missedHeartbeat(); if (!s.ok) return s;
-      const until = k.st.mhb!.until;
-      while (now < until - 5 * 60_000) await r.poll();
+      await r.poll(20);                                     // ten minutes of silence
       const was = f.hcOver.done;
       f.hcOver.done = { ...(was ?? {}), status: "down" };
-      while (now <= until + POLL_MS) await r.poll();
+      r.advance(HC_READ_MS);
+      while (!k.st.mhb?.resumedAt) await r.poll();
       if (was === undefined) delete f.hcOver.done; else f.hcOver.done = was;
       r.advance(HC_READ_MS); await r.poll();
       return confirm ? k.missedHeartbeatConfirm(codeIn(logs, "missed-heartbeat-confirm")) : { ok: true, why: "" };
@@ -320,7 +329,9 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     const v = r.k.attemptView(CAIN, ID);
     expect(v.status).toBe(200);
     expect(v.body).toEqual({ status: "accepted", id: ID, app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: "kb-late", until: new Date(T0 + ACCEPT_MS).toISOString(),
-      key_fp: keyFp(PUB), key_confirmed_at: new Date(T0).toISOString(), state_created: new Date(T0).toISOString() });
+      key_fp: keyFp(PUB), key_confirmed_at: new Date(T0).toISOString(), state_created: new Date(T0).toISOString(),
+      enroll_id: r.k.st.pinnedKey!.enrollId, counter: r.k.st.counter });
+    expect(v.body.enroll_id).toMatch(/^[0-9a-f]{16}$/);
     expect(r.backupsMade).toEqual([CAIN]);
     expect(r.k.attemptView(CAIN, "ship-1-cain-00000000").status).toBe(404);
   });
@@ -410,7 +421,8 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     expect(k.st.attempts[ID].status).toBe("rolled back");
     const writes = calls.filter((c) => c.method !== "GET");
     expect(writes.map((c) => `${c.method} ${c.path}`)).toEqual(["POST /backups/new/partial", "POST /backups/kb1/restore/partial"]);
-    expect(writes[0].body).toEqual({ name: `Keeper ${ID}`, addons: [CAIN], homeassistant: false, folders: [], background: false });
+    expect(writes[0].body).toEqual({ name: k.st.attempts[ID].backupName, addons: [CAIN], homeassistant: false, folders: [], background: false });
+    expect(k.st.attempts[ID].backupName).toMatch(new RegExp(`^Keeper ${ID} [0-9a-f]{8}$`));   // (0.1.7) attempt-specific
     expect(writes[1].body).toEqual({ homeassistant: false, addons: [CAIN], folders: [], background: true });
     expect(calls.some((c) => c.path.includes("options"))).toBe(false);
   });
@@ -458,7 +470,7 @@ describe("the watch", () => {
     expect(r.claim().status).toBe(200);
     r.advance(CLAIM_MS + 60_000); await r.poll();
     expect(r.a().status).toBe("ended");
-    expect(r.logs.some((l) => /^ship-46-cain-\w+: ended \(its claim claim-[0-9a-f]{16} expired with no version change seen\)$/.test(l))).toBe(true);
+    expect(r.logs.some((l) => /^ship-46-cain-\w+: ended \(its claim claim-[0-9a-f]{16} expired with no version change seen \(unused\)\)$/.test(l))).toBe(true);
     expect(r.restores).toEqual([]);
     expect(r.pings.some((p) => p.url.endsWith("/fail") && p.body.includes("ended: its claim"))).toBe(true);
     expect(r.k.st.outstanding).toEqual({});              // a notice: no incident left open
@@ -745,7 +757,7 @@ describe("drills and the armed record", () => {
     const r = await armedRig();
     const v = r.k.armedView(CAIN);
     expect(v.armed).toBe(true);
-    expect(v.binding).toEqual({ protocol: 1, probe_hash: HASH, keeper_version: "0.1.0", options_hash: optionsHash(parseOptions(r.f.options)), backup_scope: "app-only" });
+    expect(v.binding).toEqual({ protocol: 1, probe_hash: HASH, keeper_version: "0.1.0", options_hash: optionsHash(parseOptions(r.f.options), r.f.hcKey), backup_scope: "app-only" });
   });
   test("an undelivered owner line records no drill; a ship attempt never does", async () => {
     const r = rig(); r.f.pingOk = false;
@@ -1012,8 +1024,9 @@ describe("0.1.4: the alert gate", () => {
     r.f.pingFails = (u) => u === "https://hc-ping.example/deadman/fail";
     r.k.phoneTest(); await r.poll();
     expect(r.pings.some((p) => p.url === "https://hc-ping.example/failed/fail" && p.body.startsWith("Keeper phone test (a drill) for Cain"))).toBe(true);
-    // the dead-man page isn't acknowledged: no confirmation for it, and after 10 minutes the test lapses
-    expect(r.phoneConfirm().ok).toBe(true);              // the alert check's page alone was delivered
+    // the dead-man page isn't acknowledged: no confirmation at all (0.1.7: the test is confirmed whole), and
+    // after 10 minutes the test lapses
+    expect(r.phoneConfirm().why).toContain("no phone test page was delivered in the last hour to the dead-man check");
     expect(r.k.armedView(CAIN).armed).toBe(false);
     await r.poll(PAGE_ACK_MS / POLL_MS + 1);
     expect(r.logs.some((l) => l.startsWith("the phone test lapsed: a page (phone test) got no acknowledgment from Healthchecks within 10 minutes"))).toBe(true);
@@ -1178,9 +1191,9 @@ describe("0.1.5: enrollment of the Ship key", () => {
 });
 
 describe("0.1.5: the Healthchecks settings read", () => {
-  test("no hc_api_key: not armable, and it says so", () => {
-    const r = rig({ opts: { hc_api_key: "" } });
-    expect(r.k.armableWhy()).toContain("hc_api_key");
+  test("no Healthchecks key kept (0.1.7: hc-key): not armable, and it says so", () => {
+    const r = rig({ hcKey: "" });
+    expect(r.k.armableWhy()).toContain("no Healthchecks read-only key is kept");
     expect(r.k.phoneTest().ok).toBe(false);
   });
   for (const [name, over, why] of [
@@ -1236,7 +1249,7 @@ describe("0.1.5: the Healthchecks settings read", () => {
   });
   test("checks found by uuid (a read-only key's unique_key) or slug; (0.1.6) any ping URL in the answer is a read-write key, refused", () => {
     const U = "0f3a1c2e-1111-4222-8333-944455556666", V = "1f3a1c2e-1111-4222-8333-944455556666", W = "2f3a1c2e-1111-4222-8333-944455556666";
-    const o = parseOptions({ watch: [CAIN], hc_done: `https://hc-ping.com/${U}`, hc_deadman: `https://hc-ping.com/${V}`, hc_failed: "https://hc-ping.com/key/cain-alert", hc_api_key: "k" });
+    const o = parseOptions({ watch: [CAIN], hc_done: `https://hc-ping.com/${U}`, hc_deadman: `https://hc-ping.com/${V}`, hc_failed: "https://hc-ping.com/key/cain-alert" });
     const sha1 = (t: string) => new Bun.CryptoHasher("sha1").update(t).digest("hex");
     const list: HcCheck[] = [
       { unique_key: sha1(U), timeout: 300, grace: 600, status: "up", channels: "a" },
@@ -1248,7 +1261,14 @@ describe("0.1.5: the Healthchecks settings read", () => {
     const rw = [{ ...list[0], ping_url: `https://hc-ping.com/${U}` }, ...list.slice(1)];
     expect(judgeHc(o, rw)).toMatchObject({ ok: false, rw: true, why: HC_RW_WHY });
     // a slug fallback that matches more than one check refuses
-    expect(judgeHc(o, [...list, { slug: "cain-alert", timeout: 86400, grace: 3600, status: "up", channels: "b" }]).why).toBe("Cain's alert check: its slug cain-alert matches 2 checks the key can read (give each check its own slug, or use its uuid ping URL)");
+    expect(judgeHc(o, [...list, { slug: "cain-alert", timeout: 86400, grace: 3600, status: "up", channels: "b" }]).why).toBe("Cain's alert check: its slug cain-alert matches 2 checks the key can read (give each check its own slug, use its uuid ping URL, or set its unique key in hc_unique_keys)");
+    // (0.1.7) the owner's explicit unique key for a role wins over the derived match, and must match
+    const dup = [...list, { unique_key: "c".repeat(40), slug: "cain-alert", timeout: 86400, grace: 3600, status: "up", channels: "b" }];
+    const ex = parseOptions({ watch: [CAIN], hc_done: `https://hc-ping.com/${U}`, hc_deadman: `https://hc-ping.com/${V}`, hc_failed: "https://hc-ping.com/key/cain-alert", hc_unique_keys: [`${CAIN}=${"C".repeat(40)}`, "nosuch=1", "done=short"] });
+    expect(ex.hc_unique_keys).toEqual({ [CAIN]: "c".repeat(40) });
+    expect(judgeHc(ex, dup)).toMatchObject({ ok: true });
+    const wrong = parseOptions({ ...ex, hc_unique_keys: [`done=${"d".repeat(40)}`], watch: [CAIN], hc_failed: "https://hc-ping.com/key/cain-alert" });
+    expect(judgeHc(wrong, list).why).toBe("hc_done (the heartbeat check) isn't among the checks the kept Healthchecks key can read (by the unique key set in hc_unique_keys)");
   });
   test("main.ts reads the management API with the key in X-Api-Key and keeps only the fields it uses", async () => {
     const seen: any[] = [];
@@ -1268,10 +1288,10 @@ describe("0.1.6: a read-only Healthchecks key only", () => {
     r.advance(HC_READ_MS); await r.poll();
     const v = r.k.armedView(CAIN);
     expect([v.armed, v.why]).toEqual([false, `the Healthchecks checks refuse arming: ${HC_RW_WHY}`]);
-    expect(r.logs.filter((l) => l.startsWith("REFUSING hc_api_key: it can write"))).toHaveLength(1);
+    expect(r.logs.filter((l) => l.startsWith("REFUSING the kept Healthchecks key: it can write"))).toHaveLength(1);
     expect(r.pings.filter((p) => p.url === "https://hc-ping.example/failed/fail" && p.body.includes("can write"))).toHaveLength(1);
     r.advance(HC_READ_MS); await r.poll(3);
-    expect(r.logs.filter((l) => l.startsWith("REFUSING hc_api_key"))).toHaveLength(1);   // once per key
+    expect(r.logs.filter((l) => l.startsWith("REFUSING the kept Healthchecks key"))).toHaveLength(1);   // once per key
     expect(r.k.phoneTest().ok).toBe(false);
   });
   test("a read-only key that hides channels: armed only on the owner's per-check confirmations (phone test and missed-heartbeat drill)", async () => {
@@ -1281,12 +1301,13 @@ describe("0.1.6: a read-only Healthchecks key only", () => {
     expect(r.k.hcSeen).toMatchObject({ ok: true, hidden: ["done", "deadman", "failed"] });
     expect(r.logs.some((l) => l.includes("the key hides the channels of done, deadman, failed"))).toBe(true);
     expect(r.k.phoneTest().ok).toBe(true); await r.poll();
-    // the owner saw only the alert check's page: the dead-man check's channel isn't confirmed, so no arming
-    expect(r.phoneConfirm(["cain"]).ok).toBe(true);
-    expect((await r.heartbeatDrill()).ok).toBe(true);
-    expect(r.k.armedView(CAIN).why).toContain("no phone test drill confirmed");
+    // 0.1.7: the owner names every check in one call; naming only some confirms nothing, and the code stands
+    expect(r.phoneConfirm(["cain"]).why).toContain("not named: the dead-man check");
     expect(r.phoneConfirm(["cain", "nosuch"]).why).toContain("no such check: nosuch");
-    expect(r.phoneConfirm(["deadman"])).toEqual({ ok: true, why: "" });
+    expect(r.k.st.phone.deadman.confirmedAt).toBeUndefined();
+    expect((await r.heartbeatDrill()).why).toBe("the phone test is running: one drill at a time");
+    expect(r.phoneConfirm(["cain", "deadman"])).toEqual({ ok: true, why: "" });
+    expect((await r.heartbeatDrill()).ok).toBe(true);
     expect(r.k.armedView(CAIN).why).toBe("");
     expect(r.k.st.phone.deadman.confirmedAt).toBeGreaterThan(0);
   });
@@ -1295,37 +1316,62 @@ describe("0.1.6: a read-only Healthchecks key only", () => {
     await r.k.refreshHc(); expect(r.k.phoneTest().ok).toBe(true); await r.poll();
     expect(r.k.phoneConfirm("0123456789", ["cain", "deadman"]).why).toContain("wrong");
     expect(r.k.phoneConfirm(r.code("phone-confirm"), []).ok).toBe(false);   // each check is named
-    r.advance(PHONE_WINDOW_MS + 11 * 60_000);
-    expect(r.k.phoneConfirm(r.code("phone-confirm"), ["cain", "deadman"]).why).toContain("stale");
+    const late = rig();
+    await late.k.refreshHc(); late.k.phoneTest(); await late.poll(); late.advance(PHONE_WINDOW_MS + 11 * 60_000);
+    expect(late.k.phoneConfirm(late.code("phone-confirm"), ["cain", "deadman"]).ok).toBe(false);
+    // (0.1.7) single use: the good code confirms once; the same code again finds no test running
+    const code = r.code("phone-confirm");
+    expect(r.k.phoneConfirm(code, ["cain", "deadman"])).toEqual({ ok: true, why: "" });
+    expect(r.k.phoneConfirm(code, ["cain", "deadman"]).why).toContain("no phone test runs");
   });
-  test("the option's description and the docs say read-only only; an App backup carries the options", () => {
+  test("the config's comment and the docs say read-only only (0.1.7: the key entered with hc-key, out of the options and backups)", () => {
     const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     expect(cfg).toContain("read-only");
     expect(cfg).not.toContain("read-write key is needed");
-    expect(docs).toContain("read-only key only");
+    expect(docs).toContain("Keeper accepts a read-only key only");
     expect(docs).not.toContain("a read-write key is needed");
-    expect(docs).toContain("carries Keeper's options");
+    expect(docs).toContain("**Backups leave it out.**");
   });
 });
 
 describe("0.1.6: the missed-heartbeat drill", () => {
-  test("the heartbeat stops for the check's period plus grace plus 2 minutes, then resumes; the owner confirms within an hour with its code", async () => {
+  test("(0.1.7) the heartbeat stops until Healthchecks shows the check down (capped at 30 minutes), then resumes; never seen down: refused", async () => {
     const r = rig();
     await r.k.refreshHc();
     expect(r.k.missedHeartbeat()).toEqual({ ok: true, why: "" });
-    expect(r.k.st.mhb!.until - r.now).toBe((300 + 600) * 1000 + 2 * 60_000);
+    expect(r.k.st.mhb!.cap - r.now).toBe(MHB_CAP_MS);
     expect(r.k.missedHeartbeat().ok).toBe(false);               // one at a time
     const before = r.pings.length;
-    while (r.now < r.k.st.mhb!.until - 60_000) await r.poll();
+    while (r.now < r.k.st.mhb!.cap - 60_000) await r.poll();
     expect(r.pings.slice(before).some((p) => p.url === "https://hc-ping.example/done")).toBe(false);
     expect(r.pings.slice(before).some((p) => p.url === "https://hc-ping.example/deadman")).toBe(true);   // the dead-man goes on
-    expect(r.k.armedView(CAIN).why).not.toBe("");
-    // too early, then never seen down: refused
-    expect(r.k.missedHeartbeatConfirm(r.code("missed-heartbeat-confirm")).why).toContain("runs until");
+    expect(r.k.armedView(CAIN).why).toBe("the missed-heartbeat drill is running (one drill at a time; Keeper is unarmed during a drill)");
+    // too early, then never seen down by the cap: refused
+    expect(r.k.missedHeartbeatConfirm(r.code("missed-heartbeat-confirm")).why).toContain("runs until Healthchecks shows");
     await r.poll(4);
-    expect(r.pings.at(-1)?.url === "https://hc-ping.example/done" || r.pings.some((p, i) => i >= before && p.url === "https://hc-ping.example/done")).toBe(true);
+    expect(r.k.st.mhb!.resumedAt).toBeGreaterThan(0);
+    expect(r.logs.some((l) => l.includes("didn't show the heartbeat check down within 30 minutes"))).toBe(true);
+    expect(r.pings.some((p, i) => i >= before && p.url === "https://hc-ping.example/done")).toBe(true);
     expect(r.k.missedHeartbeatConfirm(r.code("missed-heartbeat-confirm")).why).toContain("never showed the heartbeat check down");
+  });
+  test("(0.1.7) shown down early: the ping resumes at once; the confirm waits for the check up again (a whole down-to-up cycle)", async () => {
+    const r = rig();
+    await r.k.refreshHc(); r.k.missedHeartbeat();
+    await r.poll(4);
+    r.f.hcOver.done = { status: "down" }; r.advance(HC_READ_MS); await r.poll(2);
+    expect(r.k.st.mhb!.sawDown).toBeGreaterThan(0);
+    expect(r.k.st.mhb!.resumedAt! - r.k.st.mhb!.startedAt).toBeLessThan(5 * 60_000);
+    expect(r.k.missedHeartbeatConfirm(r.code("missed-heartbeat-confirm")).why).toContain("hasn't shown the heartbeat check up again");
+    delete r.f.hcOver.done; r.advance(HC_READ_MS); await r.poll();
+    expect(r.k.missedHeartbeatConfirm(r.code("missed-heartbeat-confirm"))).toEqual({ ok: true, why: "" });
+  });
+  test("(0.1.7) a heartbeat check on a schedule: the drill is refused with a plain line", async () => {
+    const r = rig();
+    r.f.hcOver.done = { schedule: "*/5 * * * *" } as any;
+    await r.k.refreshHc();
+    expect(r.k.missedHeartbeat().why).toContain("runs on a schedule (cron)");
+    expect(r.logs).toContain("refused the missed-heartbeat drill: the heartbeat check runs on a schedule, not a period");
   });
   test("confirmed: wrong code refused, an hour late refused, and arming needs it within 14 days; it lapses with the phone test", async () => {
     const r = rig();
@@ -1441,5 +1487,275 @@ describe("0.1.6: orphan backups", () => {
     expect(await sup.deleteBackup("kb1")).toBe(true);
     expect(await sup.deleteBackup("kb2")).toBe(false);
     expect(seen).toEqual(["DELETE http://supervisor/backups/kb1", "DELETE http://supervisor/backups/kb2"]);
+  });
+});
+
+// -- 0.1.7 (the seventh review's fixes) -------------------------------------------------------------------
+describe("0.1.7: the accepted limits", () => {
+  test("arming needs the owner's accept-limits with the code printed at start; the code is bound to the text's version and used once", async () => {
+    const r = rig({ limits: false });
+    expect(r.logs.some((l) => l.includes(`aren't accepted yet: arming needs accept-limits <code>`))).toBe(true);
+    const code = r.code("accept-limits" as any);
+    expect(code).toMatch(/^[0-9a-f]{10}$/);
+    await drillOf(r, headN(1), "verdict"); await drillOf(r, headN(2), "exit");
+    r.k.phoneTest(); await r.poll(); r.phoneConfirm(); expect((await r.heartbeatDrill()).ok).toBe(true);
+    expect(r.k.armedView(CAIN).why).toBe(`the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION}): accept-limits <code>`);
+    expect(r.k.acceptLimits("0000000000").why).toContain("wrong");
+    expect(r.k.acceptLimits(code)).toEqual({ ok: true, why: "" });
+    expect(r.k.st.limits).toEqual({ version: LIMITS_VERSION, at: r.now });
+    expect(r.k.armedView(CAIN).why).toBe("");
+    expect(r.logs).toContain(`the owner accepted the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION})`);
+  });
+  test("an acceptance of another text version lapses: a new code at start, and not armed until accepted again", async () => {
+    const r = await armedRig();
+    const saved = JSON.parse(JSON.stringify(r.saved));
+    saved.limits = { version: LIMITS_VERSION + 1, at: T0 };
+    const again = rig({ saved, limits: false });
+    expect(again.logs.some((l) => l.startsWith(`the accepted limits' text changed (version ${LIMITS_VERSION + 1} accepted, now ${LIMITS_VERSION})`))).toBe(true);
+    expect(again.k.limitsOk()).toBe(false);
+    expect(again.k.armedState(CAIN).why).toContain("hasn't accepted the limits");
+    expect(again.k.acceptLimits(again.code("accept-limits" as any)).ok).toBe(true);
+  });
+  test("the DOCS carry the Accepted limits section at this text version, with both limits and what the owner can do; RELEASING's setup list has the step", () => {
+    const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
+    const sec = docs.slice(docs.indexOf("## Accepted limits"));
+    expect(sec.length).toBeGreaterThan(100);
+    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.7)`);
+    expect(sec).toContain("same-version install");
+    expect(sec).toContain("up to 14 days");
+    expect(sec).toContain("never install Cain from Home Assistant's page while a Ship run is live");
+    const rel = readFileSync(join(import.meta.dir, "..", "..", "RELEASING.md"), "utf8");
+    expect(rel).toContain("accept-limits <code>");
+    expect(rel).toContain("hc-key <code>");
+  });
+});
+
+describe("0.1.7: the Healthchecks key leaves the options (hc-key)", () => {
+  const enter = async (r: ReturnType<typeof rig>, key: string) => {
+    const res = await handleLocal(r.k, new Request("http://127.0.0.1:8096/hc-key", { method: "POST", body: JSON.stringify({ code: r.code("hc-key" as any), key }) }), "127.0.0.1", () => {});
+    return { status: res.status, body: await res.json() as any };
+  };
+  test("entered with the code printed at start: checked read-only and seeing every configured check, then kept; never logged", async () => {
+    const r = rig({ hcKey: "" });
+    expect(r.logs.some((l) => l.startsWith("no Healthchecks read-only key is kept: enter it once with hc-key <code>"))).toBe(true);
+    const a = await enter(r, "new-read-key-0123456789");
+    expect(a).toEqual({ status: 200, body: { ok: true, why: "" } });
+    expect([r.f.hcKey, r.f.hcKeyWrites, r.k.hcKey]).toEqual(["new-read-key-0123456789", 1, "new-read-key-0123456789"]);
+    expect(r.logs.some((l) => l.includes("new-read-key"))).toBe(false);
+    expect(r.k.armableWhy()).toBe("");
+    // the code was spent: the same code again is refused before any read
+    const reads = r.f.hcReads;
+    expect(String((await r.k.hcKeyEnter(codeIn(r.logs, "hc-key"), "x".repeat(20))).why)).toContain("no one-time code");
+    expect(r.f.hcReads).toBe(reads);
+  });
+  test("a key that can write is refused at entry with a plain line, and never kept; so is one that doesn't see a configured check, or a wrong code", async () => {
+    const r = rig({ hcKey: "" });
+    for (const id of ["done", "deadman", "failed"]) r.f.hcOver[id] = { ping_url: `https://hc-ping.com/${id}` } as any;
+    const rw = await enter(r, "write-key-0123456789ab");
+    expect([rw.status, rw.body.why]).toEqual([409, "that key can write (its answer shows ping URLs): enter the project's read-only API key (Project Settings, API Access)"]);
+    expect(r.logs).toContain("refused the Healthchecks key entered: that key can write (its answer shows ping URLs): enter the project's read-only API key (Project Settings, API Access); nothing was kept");
+    expect([r.f.hcKey, r.f.hcKeyWrites, r.k.hcKey]).toEqual(["", 0, ""]);
+    r.f.hcOver = { deadman: null };
+    const blind = await enter(r, "blind-key-0123456789ab");   // a new code was printed after the refusal
+    expect(blind.body.why).toBe("that key doesn't see hc_deadman (the dead-man check)");
+    expect(r.f.hcKeyWrites).toBe(0);
+    expect((await r.k.hcKeyEnter("0000000000", "good-key-0123456789ab")).why).toContain("wrong");
+    r.f.hcOver = {}; r.f.hcKeyWriteOk = false;
+    expect((await enter(r, "good-key-0123456789ab")).body.why).toBe("Keeper couldn't write the key to its data folder");
+    expect(r.k.hcKey).toBe("");
+  });
+  test("kept root-only (0600) in the data folder, never in the options, and excluded from the keeper's own backups", async () => {
+    const { hcKeyStore } = await import("../rootfs/opt/keeper/main.ts");
+    const { mkdtempSync, statSync, readFileSync: rf } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "keeper-"));
+    const st = hcKeyStore(join(dir, "hc-key"));
+    expect(st.load()).toBe("");
+    expect(st.store("stored-key-0123456789")).toBe(true);
+    expect(statSync(join(dir, "hc-key")).mode & 0o777).toBe(0o600);
+    expect(rf(join(dir, "hc-key"), "utf8")).toBe("stored-key-0123456789\n");
+    expect(st.load()).toBe("stored-key-0123456789");
+    const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
+    expect(cfg).not.toMatch(/^\s+hc_api_key:/m);
+    expect(cfg).toMatch(/^backup_exclude:\n(\s+- .+\n)*\s+- "?\*\/hc-key\*?"?$/m);
+    const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
+    expect(docs).toContain("backup_exclude");
+    expect(docs).not.toContain("carries Keeper's options, `hc_api_key`");
+    const main = readFileSync(join(import.meta.dir, "..", "rootfs", "opt", "keeper", "main.ts"), "utf8");
+    expect(main).toContain("Bun.stdin.text()");                   // the key comes from standard input
+    expect(main).toContain("the key goes on standard input, never the command line");
+  });
+  test("the old hc_api_key option still in the options: a line at every start, and the key in it is never used", async () => {
+    const r = rig({ hcKey: "", opts: { hc_api_key: "old-option-key-0123456789" } });
+    const line = "the old option hc_api_key is still in Keeper's options: remove it (Keeper ignores it; the key is entered once with hc-key and kept outside the options)";
+    expect(r.logs.filter((l) => l === line)).toHaveLength(1);
+    expect(r.k.hcKey).toBe("");
+    expect(r.k.armableWhy()).toContain("no Healthchecks read-only key is kept");
+    const again = rig({ saved: r.saved, hcKey: "", opts: { hc_api_key: "old-option-key-0123456789" } });
+    expect(again.logs.filter((l) => l === line)).toHaveLength(1);
+    const gone = rig({ saved: r.saved });
+    expect(gone.logs.includes(line)).toBe(false);
+  });
+});
+
+describe("0.1.7: the claim record (claim, cancel, consume)", () => {
+  test("a lost cancel, then the claim's expiry: the claim is unused and its backup deleted, after the jobs list shows no install", async () => {
+    const r = rig();
+    await r.register(); await r.poll(); r.claim();
+    const slug = r.a().backup;
+    // the link's cancel never reaches the keeper; the claim expires with no version change seen
+    r.advance(CLAIM_MS + 60_000); await r.poll(2);
+    expect(r.a().status).toBe("ended");
+    expect(r.deleted).toEqual([slug]);
+  });
+  test("an active install or update of the App in the jobs list keeps the backup, logged; an unreadable list keeps it too", async () => {
+    const r = rig();
+    await r.register(); await r.poll(); r.claim();
+    r.f.activeJobs = ["addon_manager_update"];
+    r.advance(CLAIM_MS + 60_000); await r.poll(3);
+    expect(r.deleted).toEqual([]);
+    expect(r.logs).toContain(`${ID}: kept its backup ${r.a().backup}: its claim expired with no version change seen, but an install or update of ${CAIN} is running (addon_manager_update)`);
+    const u = rig();
+    await u.register(); await u.poll(); u.claim();
+    u.f.activeJobs = null;
+    u.advance(CLAIM_MS + 60_000); await u.poll(DROP_TRIES + 2);
+    expect(u.deleted).toEqual([]);
+    expect(u.logs.some((l) => l.includes("the Supervisor's jobs list couldn't be read, so its backup") && l.includes("is kept"))).toBe(true);
+  });
+  test("a cancel after the claim was handed to a started run (a version change seen) is refused", async () => {
+    const r = rig();
+    await watching(r);
+    const c = r.k.cancelAttempt(CAIN, ID, { why: "late" });
+    expect(c.status).toBe(409);
+    expect(c.body.why).toBe("its claim was handed to a started run (Cain 0.17.0 was seen): it is watching, and a cancel can't end it now");
+    expect(r.a().status).toBe("watching");
+  });
+  test("a retry reads the recorded outcome: the same claim for the same request; the recorded cancel", async () => {
+    const r = rig();
+    await r.register(); await r.poll();
+    const first = r.claim(ID, { request: "req-0123456789" });
+    expect(first.status).toBe(200);
+    const again = r.claim(ID, { request: "req-0123456789" });
+    expect([again.status, again.body.claim, again.body.recorded]).toEqual([200, first.body.claim, "claimed"]);
+    expect(r.claim(ID, { request: "req-other-0000" }).status).toBe(409);   // another request: one claimant
+    expect(r.claim(ID).status).toBe(409);
+    const c = rig();
+    await c.register(); await c.poll();
+    expect(c.k.cancelAttempt(CAIN, ID, { why: "gave up", request: "cancel-0123456789" }).status).toBe(200);
+    expect(c.k.cancelAttempt(CAIN, ID, { why: "gave up" }).body).toEqual({ status: "ended", id: ID, recorded: true });
+    expect(c.logs).toContain(`a retry of the cancel of ${ID}: the recorded outcome (ended)`);
+    // a retried claim of a cancelled attempt reads why it ended
+    expect(c.claim(ID).body.why).toContain("it is ended");
+  });
+  test("claim and cancel run one at a time under the record's lock, in the order they came", async () => {
+    const r = rig();
+    await r.register(); await r.poll();
+    const a = r.a();
+    const body = { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup };
+    const [cl, ca] = await Promise.all([r.k.claim(CAIN, ID, body), r.k.cancel(CAIN, ID, { why: "x" })]);
+    expect([cl.status, ca.status]).toEqual([200, 200]);   // claimed, then the cancel ends the claim (no version change yet)
+    expect(r.a().status).toBe("ended");
+    const order: string[] = [];
+    await Promise.all([r.k.record(async () => { await Bun.sleep(5); order.push("one"); }), r.k.record(() => { order.push("two"); })]);
+    expect(order).toEqual(["one", "two"]);
+  });
+});
+
+describe("0.1.7: one drill at a time", () => {
+  test("while a drill runs Keeper is unarmed and refuses a registration, which voids the drill (its code no longer counts)", async () => {
+    const r = await armedRig();
+    await r.k.refreshHc();
+    expect(r.k.missedHeartbeat().ok).toBe(true);
+    expect(r.k.armedView(CAIN).armed).toBe(false);
+    expect(r.k.phoneTest().why).toBe("the missed-heartbeat drill is running: one drill at a time");
+    const code = r.code("missed-heartbeat-confirm");
+    const ans = await r.register({ head: headN(7) });
+    expect(String(ans.body.why)).toContain("the missed-heartbeat drill was running, and Keeper takes no registration during a drill");
+    expect(r.logs).toContain("the missed-heartbeat drill was interrupted (a registration arrived): its code no longer counts; run it again from the start");
+    expect(r.k.st.mhb).toBeUndefined();
+    expect(r.k.missedHeartbeatConfirm(code).ok).toBe(false);
+  });
+  test("a restart interrupts a running drill: its code is void, and the drill needs a fresh run", async () => {
+    const r = rig();
+    await r.k.refreshHc(); r.k.phoneTest(); await r.poll();
+    const code = r.code("phone-confirm");
+    const again = rig({ saved: r.saved });
+    expect(again.logs).toContain("the phone test was interrupted (Keeper restarted): its code no longer counts; run it again from the start");
+    expect(again.k.phoneConfirm(code, ["cain", "deadman"]).ok).toBe(false);
+    await again.k.refreshHc();
+    expect(again.k.phoneTest().ok).toBe(true);
+  });
+});
+
+describe("0.1.7: codes bound to their challenge, and the enrollment counter", () => {
+  test("a key code printed for one fingerprint doesn't confirm another; a code is used once; every start prints a key code", async () => {
+    const r = rig();
+    const pub2 = generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).toString("base64");
+    const before = codeIn(r.logs, "key-confirm");
+    r.f.options.ship_public_key = pub2; await r.poll();
+    const now2 = codeIn(r.logs, "key-confirm");
+    expect(now2).not.toBe(before);
+    // forge: the new code checked against the old fingerprint's challenge is refused; the right one works once
+    r.k.st.codes!.key!.challenge = keyFp(PUB);
+    expect(r.k.keyConfirm(keyFp(pub2), now2).why).toContain("printed for another challenge");
+    r.k.st.codes!.key!.challenge = keyFp(pub2);
+    expect(r.k.keyConfirm(keyFp(pub2), now2)).toEqual({ ok: true, why: "" });
+    expect(r.k.keyConfirm(keyFp(pub2), now2).ok).toBe(false);
+    const again = rig({ saved: r.saved, opts: { ship_public_key: pub2 }, confirm: false });
+    expect(codeIn(again.logs, "key-confirm")).toMatch(/^[0-9a-f]{10}$/);
+  });
+  test("the counter goes up with every state write and armed read; a re-enrollment with a fresh code gives a new enrollment id", async () => {
+    const r = rig();
+    const e1 = r.k.enrollment();
+    r.k.armedView(CAIN);
+    const e2 = r.k.enrollment();
+    expect(e2.counter).toBeGreaterThan(e1.counter);
+    expect(r.saved!.counter).toBe(e2.counter);
+    await r.poll();
+    expect(r.k.enrollment().counter).toBeGreaterThan(e2.counter);
+    // after a restore or a clock correction: the owner's key-confirm with the code printed at the start
+    const again = rig({ saved: r.saved, confirm: false });
+    const id1 = again.k.st.pinnedKey!.enrollId;
+    expect(again.k.keyConfirm(keyFp(PUB), again.code("key-confirm"))).toEqual({ ok: true, why: "" });
+    expect(again.k.st.pinnedKey!.enrollId).not.toBe(id1);
+    expect(again.k.enrollment()).toMatchObject({ enroll_id: again.k.st.pinnedKey!.enrollId });
+    expect(again.logs.some((l) => l.includes("it replaces its earlier confirm (a re-enrollment)"))).toBe(true);
+  });
+});
+
+describe("0.1.7: orphan backups by their own name, and the network mode", () => {
+  test("the backup's name is kept before the call; after a restart lost its slug, a cancelled attempt's backup is found by that exact name and deleted", async () => {
+    const r = rig();
+    r.f.makeBackup = () => new Promise(() => {});         // the backup call never answers in this process
+    await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
+    for (let i = 0; i < 5; i++) await Bun.sleep(0);
+    const name = r.saved!.attempts[ID].backupName!;
+    expect(name).toMatch(new RegExp(`^Keeper ${ID} [0-9a-f]{8}$`));
+    r.k.cancelAttempt(CAIN, ID, {});
+    const again = rig({ saved: r.saved });
+    again.f.backupsList = [{ slug: "kb-other", name: `Keeper ${ID} 00000000` }, { slug: "kb-mine", name }];
+    await again.poll();
+    expect(again.deleted).toEqual(["kb-mine"]);
+    expect(again.logs.some((l) => l.startsWith(`backup kb-other ("Keeper ${ID} 00000000") is Keeper's, of no attempt it knows, and no attempt uses it: kept`))).toBe(true);
+  });
+  test("an attempt left unprotected by a restart keeps its backup, named in the log; no backup made means nothing to delete", async () => {
+    const r = rig();
+    r.f.makeBackup = () => new Promise(() => {});
+    await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
+    for (let i = 0; i < 5; i++) await Bun.sleep(0);
+    const name = r.saved!.attempts[ID].backupName!;
+    const again = rig({ saved: r.saved });
+    again.f.backupsList = [{ slug: "kb-mine", name }];
+    await again.poll(2);
+    expect(again.a().status).toBe("unprotected");
+    expect(again.deleted).toEqual([]);
+    expect(again.logs.some((l) => l.startsWith(`backup kb-mine ("${name}") is Keeper's, of ${ID} (`))).toBe(true);
+  });
+  test("host_network is false in config.yaml, and the docs say the network mode is the real gate on the confirm commands", () => {
+    const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
+    expect(cfg).toMatch(/^host_network: false$/m);
+    const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
+    expect(docs).toContain("not secret from anyone who can read Keeper's log");
+    expect(docs).toContain("the container's network mode is the real gate");
   });
 });

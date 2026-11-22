@@ -73,6 +73,25 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
     async deleteBackup(slug: string): Promise<boolean> {
       try { return (await call("DELETE", `/backups/${encodeURIComponent(slug)}`)).ok; } catch { return false; }
     },
+    // (0.1.7) The backups list (GET /backups): each backup's slug and name, so a backup whose slug a restart lost
+    // is found by the attempt-specific name kept before its call. Null when it can't be read.
+    async backups(): Promise<{ slug: string; name: string }[] | null> {
+      const r = await call("GET", "/backups").catch(() => null);
+      if (!r?.ok || !Array.isArray(r.data?.backups)) return null;
+      return r.data.backups.filter((b: any) => b && typeof b.slug === "string").map((b: any) => ({ slug: b.slug, name: typeof b.name === "string" ? b.name : "" }));
+    },
+    // (0.1.7) The jobs list's active (not done) jobs that install, update, rebuild or restore that App: matched on
+    // the App's slug as the job's reference and an install-like name. Null when the list can't be read.
+    async activeJobs(app: string): Promise<string[] | null> {
+      const r = await call("GET", "/jobs/info").catch(() => null);
+      if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
+      const out: string[] = [];
+      const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
+        if (x.done !== true && x.reference === app && typeof x.name === "string" && /install|update|rebuild|restore/i.test(x.name)) out.push(x.name.slice(0, 60));
+        if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
+      walk(r.data.jobs);
+      return out;
+    },
     // The restore's job in the Supervisor's jobs list (GET /jobs/info, the backup role's info read), by
     // the id from the restore's answer and nothing else (0.1.2: no job is ever matched by its name or
     // backup). Null when the list can't be read. A finished job leaves the list after a while: not found

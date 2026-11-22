@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.6"
+version: "0.1.7"
 slug: keeper
 description: >-
   Checks every App install for 15 minutes and rolls a bad one back from the
@@ -21,6 +21,14 @@ hassio_role: backup
 homeassistant_api: false
 auth_api: false
 ingress: false
+# (0.1.7) Asserted, not left to the default: the owner's confirm commands are served only on the container's own
+# loopback (127.0.0.1:8096), and this network mode is what keeps every other container off it (keeper/tests).
+host_network: false
+# (0.1.7) The Healthchecks read-only key is kept in /data/hc-key (0600), never in the options; a Home Assistant
+# backup of this App leaves it out (the Supervisor matches these against each path in /data).
+backup_exclude:
+  - "hc-key*"
+  - "*/hc-key*"
 watchdog: tcp://[HOST]:[PORT:8097]
 timeout: 20
 # watch: the App slugs it watches. health: each watched App's health address on the internal network
@@ -38,11 +46,12 @@ timeout: 20
 # changed key here is refused until confirmed at the device (key-confirm <fingerprint>, DOCS.md). health_grace_s: after a watched App first starts, failed
 # liveness polls count only after this many seconds. The keeper reads its options through the Supervisor
 # each poll, never writes them, and keeps no copy of them. No registration is ever written here (0.1.3).
-# 0.1.5: a first pin accepts no registration either until key-confirm. hc_api_key (0.1.5): the Healthchecks
-# project's read-only API key, and only that (0.1.6: a key that can write, seen by the ping URLs in its
-# answer, is refused for arming and paged; a key that can write could pause checks or reroute channels).
-# With it the keeper reads every check's period, grace, status and channels before it can arm; no key, not
-# armable. A backup of this App carries these options, the key among them: one more reason it is read-only.
+# 0.1.5: a first pin accepts no registration either until key-confirm. 0.1.7: hc_api_key is gone from the options:
+# the Healthchecks project's read-only API key, and only that, is entered once at the device (hc-key <code>, the key
+# on standard input), checked read-only and seeing every check below, and kept root-only in /data/hc-key, which the
+# backup_exclude above leaves out of this App's backups. A key that can write is refused at entry and never kept.
+# hc_unique_keys (0.1.7): optional, "role=<40 hex>" with role done, deadman or an App slug: the check's unique key
+# as the read-only API shows it, used in place of the one derived from the ping URL when that doesn't match.
 options:
   watch:
     - 0fcc2575_cain
@@ -54,7 +63,7 @@ options:
   hc_failed: []
   health_grace_s: 180
   ship_public_key: ""
-  hc_api_key: ""
+  hc_unique_keys: []
 schema:
   watch:
     - match(^[a-z0-9_]{1,64}$)
@@ -68,4 +77,5 @@ schema:
     - password
   health_grace_s: int(0,900)
   ship_public_key: match(^[A-Za-z0-9+/=]{0,200}$)?
-  hc_api_key: password?
+  hc_unique_keys:
+    - match(^(done|deadman|[a-z0-9_]{1,64})=[0-9a-fA-F]{40}$)

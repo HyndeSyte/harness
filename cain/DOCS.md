@@ -566,6 +566,21 @@ bad one back from the backup taken just before it. Cain's part:
     minute-by-minute `/armed` read as well as from a Ship pass, and a pass needs the Keeper's state creation
     and confirm times to equal the recorded ones (an older or newer state is refused until the owner
     confirms again at the Keeper).
+- With Keeper 0.1.7:
+  - The enrollment id and counter: every Keeper answer carries the owner's confirm's own enrollment id and a
+    counter that only goes up. The link records both and refuses a lower counter (an older Keeper state, from
+    a restore) and an earlier enrollment id it has seen replaced (a replayed confirm). Each answer is judged
+    against the record as it stood before the request was sent. The way back after a restore of the Keeper or a
+    clock correction is the owner's `key-confirm` at the Keeper with the fresh code from its latest start: a new
+    enrollment id, which the link records.
+  - The claim's request id: the link's claim carries one, and a claim that got no answer is asked once more with
+    it; the Keeper answers that retry with the claim it recorded, never a second claim. A cancel the Keeper
+    already recorded is answered the same way, and the Keeper's own expiry of an unused claim deletes its
+    backup, so a lost cancel leaves nothing behind.
+  - The Keeper is unarmed and refuses registrations while one of its drills runs, so a Ship pass during a drill
+    is refused (the drill is then void, and is run again).
+  - Two limits of the design are recorded in the Keeper's DOCS ("Accepted limits") and accepted by the owner at
+    the Keeper; the rollback reads as armed only once they are.
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

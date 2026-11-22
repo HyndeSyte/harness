@@ -323,10 +323,11 @@ const keeperReplies: Record<string, KeeperReply | undefined> = {};
 async function askKeeper(): Promise<void> {
   for (const [app, slug] of Object.entries(KEEPER_SLUGS)) {
     if (!KEEPER_TOKEN) { keeperReplies[app] = { error: "no keeper_token set" }; continue; }
+    const before = enrollment.load();                     // Keeper 0.1.7: the record before the read was sent
     const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/armed?app=${slug}`);
     keeperReplies[app] = r ? { status: r.status, body: JSON.stringify(r.body) } : { error: "no answer" };
     // Keeper 0.1.6: the enrollment recorded from this read too, outside any Ship pass (ship-pass.ts).
-    if (r?.status === 200) { const pub = shipPub(); noteArmedEnrollment(r.body, pub ? keyFingerprint(pub) : null, enrollment, (l) => console.log(`[cain] link: ${l}`)); }
+    if (r?.status === 200) { const pub = shipPub(); noteArmedEnrollment(r.body, pub ? keyFingerprint(pub) : null, enrollment, (l) => console.log(`[cain] link: ${l}`), before); }
   }
 }
 void askKeeper();
@@ -417,7 +418,8 @@ const shipPassDeps: PassDeps = {
       .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
   },
   // 3 seconds: the hook waits on the pass (about 8 seconds a request), so the claim must answer well within it.
-  claim: (a) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup }, 3_000) : Promise.resolve(null),
+  // Keeper 0.1.7: with the claim's request id, so a retry reads the recorded claim.
+  claim: (a, request) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, request }, 3_000) : Promise.resolve(null),
   cancel: (attempt, why) => { void keeperPost(`/attempt/${attempt}/cancel`, { why }); },
   enrollment,
   log: (l) => console.log(`[cain] link: ${l}`),

@@ -1,4 +1,4 @@
-// The keeper of installs (Keeper 0.1.0; review fixes 0.1.1, 0.1.2, 0.1.3, 0.1.4, 0.1.5 and 0.1.6): a check after every
+// The keeper of installs (Keeper 0.1.0; review fixes 0.1.1, 0.1.2, 0.1.3, 0.1.4, 0.1.5, 0.1.6 and 0.1.7): a check after every
 // install of a watched App, and an automatic rollback of a bad one from the App-only backup taken just
 // before it.
 //
@@ -89,6 +89,25 @@
 //   5. Orphan backups: the backup of a registration cancelled, or of an acceptance that expired unclaimed,
 //      is deleted (logged by its slug; one that can't be deleted is named in the log, left for the owner).
 //
+// 0.1.7 (the seventh review's fixes):
+//   Accepted limits. Two limits of the design are written in DOCS.md ("Accepted limits", text version
+//      LIMITS_VERSION) and the owner accepts them at the device (accept-limits <code>); arming needs that
+//      acceptance, and it lapses when the text's version changes.
+//   1. The Healthchecks key leaves the options: entered once through hc-key <code> (the key on standard
+//      input), checked read-only and seeing the configured checks before it is kept, kept root-only (0600) in
+//      the data folder and excluded from the keeper's own backups (config.yaml backup_exclude). A refused key
+//      is never kept; an old hc_api_key option still present gets a line at every start.
+//   2. The claim record: claim, cancel and consume serialized under one lock (record()), idempotent (a retry
+//      with the same request reads the recorded outcome). A claim that expires with no version change is
+//      unused: its backup is deleted after the jobs list shows no active install or update of the App.
+//      A cancel after the claim was handed to a started run (a version change seen) is refused.
+//   Follow-ups: one drill at a time (unarmed, registrations refused; a restart or a registration interrupts
+//   it); each one-time code bound to its challenge and consumed at once; the phone test confirmed whole, in
+//   one call; an enrollment id and a monotonic counter in every enrollment; the missed-heartbeat drill polls
+//   Healthchecks until it shows the check down (capped) and refuses a schedule check; an attempt-specific
+//   backup name kept before the backup call, reconciled after a restart; explicit unique keys per check
+//   (option hc_unique_keys) when the derived one doesn't match.
+//
 // The life of an attempt (one install of one App, registered just before the install):
 //   verifying    the registration was taken (answered 202); its backup is being made and checked
 //   unprotected  the backup (or the registration) failed a check, or the install was seen outside a
@@ -137,8 +156,10 @@ export const DELIVERY_MS = 10 * 60_000;          // armed only while the heartbe
 export const STUCK_FAIL_MS = 2 * 60_000;         // a fail ping undelivered for longer than this disarms
 export const PHONE_WINDOW_MS = 60 * 60_000;      // (0.1.3) a phone test is confirmed within an hour of its page
 export const KEY_CODE_MS = 24 * 3_600_000;       // (0.1.6) the key-confirm code lasts this long (a restart prints a new one)
-export const MHB_MARGIN_MS = 2 * 60_000;         // (0.1.6) the missed-heartbeat drill's silence: period + grace + this
 export const MHB_MAX_MS = 14 * 86_400_000;       // (0.1.6) arming needs a missed-heartbeat drill confirmed within this
+export const MHB_CAP_MS = 30 * 60_000;           // (0.1.7) the missed-heartbeat drill's silence ends here at the latest
+export const LIMITS_VERSION = 1;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts
+export const HC_KEY_CODE_MS = 24 * 3_600_000;    // (0.1.7) the hc-key and accept-limits codes last this long
 export const DROP_TRIES = 3;                     // (0.1.6) an orphan backup's delete is tried this often
 export const RESTARTS_MAX = 2;                   // more stops than this after a restore, in the confirm window: gave up
 export const SHIP_TTL_S = 2 * 3600;              // a Ship token lasts 2 hours after the tap (cain/rootfs/opt/cain/ship-token.ts)
@@ -156,7 +177,8 @@ export interface Options {
   hc_failed: Record<string, string>;             // slug -> alert check URL; "*" for every App (a single URL)
   health_grace_s: number;
   ship_public_key: string;                       // (0.1.3) the link's Ship key, public half (SPKI DER, base64)
-  hc_api_key: string;                            // (0.1.5) a Healthchecks API key, for the settings read (0.1.6: read-only only)
+  // (0.1.7) hc_api_key is gone from the options: the key is entered with hc-key and kept in the data folder.
+  hc_unique_keys: Record<string, string>;        // (0.1.7) role (done, deadman, or an App slug) -> the check's unique key
 }
 const s = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 const pairs = (v: unknown): Record<string, string> => {
@@ -189,21 +211,23 @@ export function parseOptions(raw: unknown): Options {
   return {
     watch, health: pairs(o.health), tokens: pairs(o.tokens), hc_done: s(o.hc_done), hc_deadman: s(o.hc_deadman), hc_failed: parseAlerts(o.hc_failed),
     health_grace_s: Number.isFinite(grace) && grace >= 0 && grace <= 900 ? Math.floor(grace) : DEFAULT_HEALTH_GRACE_S,
-    ship_public_key: s(o.ship_public_key).replace(/\s+/g, ""), hc_api_key: s(o.hc_api_key),
+    ship_public_key: s(o.ship_public_key).replace(/\s+/g, ""),
+    hc_unique_keys: Object.fromEntries(Object.entries(pairs(o.hc_unique_keys)).map(([k, v]) => [k, v.toLowerCase()]).filter(([k, v]) => (k === "done" || k === "deadman" || SLUG.test(k)) && /^[0-9a-f]{40}$/.test(v))),
   };
 }
 const sortedRec = (r: Record<string, string>) => Object.fromEntries(Object.keys(r).sort().map((k) => [k, r[k]]));
 // The options' hash, canonical, so an options change re-binds (and drops) the drill records.
-export function optionsHash(o: Options): string {
+// (0.1.7) The kept Healthchecks key counts as an option here (its hash), though it isn't one any more.
+export function optionsHash(o: Options, hcKey = ""): string {
   const canon = JSON.stringify({ watch: [...o.watch].sort(), health: sortedRec(o.health), tokens: sortedRec(o.tokens),
     hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed), health_grace_s: o.health_grace_s, ship_public_key: o.ship_public_key,
-    hc_api_key: o.hc_api_key ? sha(o.hc_api_key).slice(0, 16) : "" });
+    hc_api_key: hcKey ? sha(hcKey).slice(0, 16) : "", hc_unique_keys: sortedRec(o.hc_unique_keys) });
   return sha(canon).slice(0, 16);
 }
 export const sha = (t: string) => createHash("sha256").update(t).digest("hex");
 const HTTPS = /^https:\/\/\S+$/;
 // (0.1.4) The Healthchecks options' hash: a phone test counts only under the options it was made with.
-export const hcHash = (o: Options) => sha(JSON.stringify({ hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed), hc_api_key: o.hc_api_key ? sha(o.hc_api_key) : "" })).slice(0, 16);
+export const hcHash = (o: Options, hcKey = "") => sha(JSON.stringify({ hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed), hc_api_key: hcKey ? sha(hcKey) : "", hc_unique_keys: sortedRec(o.hc_unique_keys) })).slice(0, 16);
 // (0.1.4) A check's identity: the check id in its ping URL's path, the Healthchecks uuid
 // (https://hc-ping.com/<uuid>) or slug (https://hc-ping.com/<ping key>/<slug>), lower case. Two URLs naming
 // the same check (a trailing slash, a query, another host spelling) are the same check. "" when the path
@@ -226,31 +250,40 @@ export function checkId(url: string): string {
 // the read-only key hides is listed in hidden (hand-confirmed at the phone test and the missed-heartbeat
 // drill); a slug that matches more than one check refuses. done: the heartbeat check's period, grace and
 // status (the missed-heartbeat drill reads them).
-export interface HcJudged { ok: boolean; why: string; hash: string; rw?: boolean; hidden?: string[]; done?: { period: number; grace: number; status: string } }
-export const HC_RW_WHY = "hc_api_key can write (the Healthchecks API answered it with ping URLs, which only a read-write key sees): swap it for the project's read-only API key";
-export function judgeHc(o: Options, list: HcCheck[]): HcJudged {
-  if (list.some((c) => typeof c.ping_url === "string" && c.ping_url)) return { ok: false, why: HC_RW_WHY, hash: "", rw: true };
-  const find = (url: string): HcCheck | string | undefined => {
-    const id = checkId(url);
-    if (!id) return undefined;
-    if (UUID.test(id)) {
+export interface HcJudged { ok: boolean; why: string; hash: string; rw?: boolean; hidden?: string[]; done?: { period: number; grace: number; status: string; schedule?: string } }
+export const HC_RW_WHY = "the kept Healthchecks key can write (the Healthchecks API answered it with ping URLs, which only a read-write key sees): enter the project's read-only API key with hc-key";
+export const hcCanWrite = (list: HcCheck[]) => list.some((c) => typeof c.ping_url === "string" && c.ping_url);
+// (0.1.7) The checks the options name, by role: the heartbeat check (done), the dead-man check (deadman) and
+// each watched App's alert check (its slug), each with the unique key the owner set for it, if any.
+export function hcRoles(o: Options): [string, string, "done" | "deadman" | "alert", string][] {
+  return [["hc_done (the heartbeat check)", o.hc_done, "done", "done"], ["hc_deadman (the dead-man check)", o.hc_deadman, "deadman", "deadman"],
+    ...o.watch.map((a) => [`${appName(a)}'s alert check`, o.hc_failed[a] ?? o.hc_failed["*"] ?? "", "alert", a] as [string, string, "alert", string])];
+}
+// (0.1.7) A check found in the API's list: by the unique key the owner set for its role (hc_unique_keys) when
+// there is one, else by the id in its ping URL (a uuid's unique key, or the slug). A string says why not.
+export function hcFind(o: Options, list: HcCheck[], url: string, role: string): HcCheck | string | undefined {
+  const explicit = o.hc_unique_keys[role];
+  if (explicit) return list.find((c) => typeof c.unique_key === "string" && c.unique_key.toLowerCase() === explicit);
+  const id = checkId(url);
+  if (!id) return undefined;
+  if (UUID.test(id)) {
       const keys = [sha1(id), sha1(id.replace(/-/g, ""))];
-      return list.find((c) => typeof c.unique_key === "string" && keys.includes(c.unique_key.toLowerCase()));
-    }
-    const hits = list.filter((c) => typeof c.slug === "string" && c.slug.toLowerCase() === id);
-    return hits.length > 1 ? `its slug ${id} matches ${hits.length} checks the key can read (give each check its own slug, or use its uuid ping URL)` : hits[0];
-  };
-  const roles: [string, string, "done" | "deadman" | "alert"][] = [["hc_done (the heartbeat check)", o.hc_done, "done"], ["hc_deadman (the dead-man check)", o.hc_deadman, "deadman"],
-    ...o.watch.map((a) => [`${appName(a)}'s alert check`, o.hc_failed[a] ?? o.hc_failed["*"] ?? "", "alert"] as [string, string, "alert"])];
+    return list.find((c) => typeof c.unique_key === "string" && keys.includes(c.unique_key.toLowerCase()));
+  }
+  const hits = list.filter((c) => typeof c.slug === "string" && c.slug.toLowerCase() === id);
+  return hits.length > 1 ? `its slug ${id} matches ${hits.length} checks the key can read (give each check its own slug, use its uuid ping URL, or set its unique key in hc_unique_keys)` : hits[0];
+}
+export function judgeHc(o: Options, list: HcCheck[]): HcJudged {
+  if (hcCanWrite(list)) return { ok: false, why: HC_RW_WHY, hash: "", rw: true };
   const seen: unknown[] = [];
   const hidden: string[] = [];
   let done: HcJudged["done"];
-  for (const [name, url, role] of roles) {
-    const c = find(url);
+  for (const [name, url, role, key] of hcRoles(o)) {
+    const c = hcFind(o, list, url, key);
     if (typeof c === "string") return { ok: false, why: `${name}: ${c}`, hash: "" };
-    if (!c) return { ok: false, why: `${name} isn't among the checks hc_api_key can read`, hash: "" };
+    if (!c) return { ok: false, why: `${name} isn't among the checks the kept Healthchecks key can read${o.hc_unique_keys[key] ? " (by the unique key set in hc_unique_keys)" : ""}`, hash: "" };
     const period = typeof c.timeout === "number" ? c.timeout : NaN, grace = typeof c.grace === "number" ? c.grace : NaN;
-    if (role === "done") done = { period, grace, status: String(c.status ?? "") };
+    if (role === "done") done = { period, grace, status: String(c.status ?? ""), ...(c.schedule ? { schedule: c.schedule } : {}) };
     const shown = typeof c.channels === "string";
     if (!shown) hidden.push(checkId(url));
     else if (!c.channels!.split(",").map((x) => x.trim()).filter(Boolean).length) return { ok: false, why: `${name} has no notification channel assigned`, hash: "", done };
@@ -328,7 +361,9 @@ export interface Attempt {
   issuedAt?: number;                             // (0.1.4) the token's issue (ms): the backup must be made after it
   acceptedAt?: number; consumedAt?: number;      // (0.1.4) the acceptance, and its single use
   acceptUntil?: number;                          // (0.1.5) the acceptance must be claimed before this
-  claim?: { id: string; at: number; until: number };   // (0.1.5) the link's claim, made as the Ship run started
+  claim?: { id: string; at: number; until: number; request?: string };   // (0.1.5) the link's claim, made as the Ship run started (0.1.7: its request id)
+  cancel?: { at: number; request?: string; why: string };   // (0.1.7) the link's cancel, as recorded (a retry reads it)
+  backupName?: string;                           // (0.1.7) the attempt-specific backup name, kept before the backup call
   chatPolls?: number; chatDown?: number;         // (0.1.4) readiness polls in the watch, and how many were down
   firstSeenTo?: number; firstStartedTo?: number; watchEnd?: number;
   notStarted: number; healthFails: number; startedEveryPoll: boolean;
@@ -345,6 +380,8 @@ export interface Attempt {
     job?: string | null; sentAt?: number; pending?: boolean; said?: string; lastState?: string; restarts?: number; down?: boolean };
   endedAt?: number; lineDelivered?: boolean; drillRecorded?: boolean;
   dropBackup?: boolean; backupDropped?: boolean; dropTries?: number;   // (0.1.6) an orphan backup to delete, deleted, tries
+  dropCheck?: boolean;                           // (0.1.7) a claim expired unused: the jobs list is read before the delete
+  dropKept?: string;                             // (0.1.7) kept, not deleted, and why
 }
 export interface Binding { protocol: number; probe_hash: string; keeper_version: string; options_hash: string; backup_scope: string }
 export interface DrillRec { attempt: string; kind: "fail-verdict" | "exits-on-start"; trigger: string; restoredAt: number; lineDeliveredAt: number; binding: Binding; at: number }
@@ -358,11 +395,15 @@ export interface Spent { id: string; auth: string; app: string; at: number }
 // (0.1.4) The pinned Ship key (0.1.5: confirmed, the owner's key-confirm, before any registration counts),
 // and (0.1.5) what a device drill's own restore job showed: its name, its reference as reported, and how
 // long it stayed in the jobs list after it finished. Recorded for a later version; nothing acts on it.
-export interface Pinned { key: string; fp: string; at: number; confirmed?: number }
+export interface Pinned { key: string; fp: string; at: number; confirmed?: number; enrollId?: string }   // (0.1.7) each confirm's own id
 // (0.1.6) A one-time code the keeper printed in its log (kept as a hash), and the missed-heartbeat drill:
 // running or ended awaiting the owner's confirm (mhb), and its confirmed record (mhbRec).
-export interface CodeRec { hash: string; at: number; until: number }
-export interface MhbRun { startedAt: number; until: number; period: number; grace: number; api: string; sawDown?: number; resumedAt?: number }
+// (0.1.7) bound to its challenge (the fingerprint, the phone test's id, the drill's id, the limits' version).
+export type CodeKind = "key" | "phone" | "heartbeat" | "limits" | "hckey";
+export interface CodeRec { hash: string; at: number; until: number; challenge?: string }
+// (0.1.7) The drill's silence lasts until Healthchecks shows the heartbeat check down (sawDown), capped at
+// cap; then the ping resumes and the check must be seen up again (sawUp): one down-to-up cycle.
+export interface MhbRun { id: string; startedAt: number; cap: number; api: string; sawDown?: number; resumedAt?: number; sawUp?: number }
 export interface MhbRec { confirmedAt: number; hc: string; api: string }
 export interface RestoreJobRec { name: string; attempt: string; at: number; job?: string; reference?: string; doneSeenAt?: number; goneAt?: number; listedMs?: number }
 // (0.1.5) A check as the Healthchecks management API lists it (GET /api/v3/checks/). A read-only key gives
@@ -386,7 +427,10 @@ export interface State {
   restoreJob?: RestoreJobRec;                    // (0.1.4) the restore job's name, recorded by a device drill
   phoneHcApi?: string;                           // (0.1.5) the checks' settings (period, grace, channels) at the phone test
   deadmanFailSince?: number;                     // (0.1.5) the dead-man /fail ping undelivered since
-  codes?: Partial<Record<"key" | "phone" | "heartbeat", CodeRec>>;   // (0.1.6) the one-time codes, hashed
+  codes?: Partial<Record<CodeKind, CodeRec>>;    // (0.1.6) the one-time codes, hashed
+  phoneRun?: { id: string; at: number };          // (0.1.7) the phone test that runs, awaiting its confirm
+  limits?: { version: number; at: number };       // (0.1.7) the owner's acceptance of DOCS.md's "Accepted limits"
+  counter: number;                                // (0.1.7) bumped on each armed read and state write, never down
   mhb?: MhbRun;                                  // (0.1.6) the missed-heartbeat drill, running or awaiting its confirm
   mhbRec?: MhbRec;                               // (0.1.6) the missed-heartbeat drill, confirmed
   hcRwSaid?: string;                             // (0.1.6) the read-write key already paged (its hash)
@@ -399,7 +443,7 @@ export interface State {
   lines: number;                                 // a counter for line ids
 }
 export const emptyState = (): State => ({ format: 1, createdAt: 0, heartbeat: 0, lastSeen: {}, attempts: {}, spent: [], probeHash: {}, outstanding: {}, last: {},
-  drills: {}, phone: {}, queue: [], hcPinged: 0, hcDelivered: 0, deadmanDelivered: 0, logPinged: {}, logDelivered: {}, lines: 0 });
+  drills: {}, phone: {}, queue: [], hcPinged: 0, hcDelivered: 0, deadmanDelivered: 0, logPinged: {}, logDelivered: {}, lines: 0, counter: 0 });
 // Loads a saved state. Anything an earlier version kept that 0.1.3 no longer uses (the kept tokens and
 // URLs, the settings hold) is dropped here, never read.
 export function loadState(raw: unknown): State {
@@ -408,7 +452,7 @@ export function loadState(raw: unknown): State {
   const r = raw as any;
   const obj = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
   const pin = r.pinnedKey && typeof r.pinnedKey.key === "string" && typeof r.pinnedKey.fp === "string" ? { key: r.pinnedKey.key, fp: r.pinnedKey.fp, at: Number(r.pinnedKey.at) || 0,
-    ...(Number(r.pinnedKey.confirmed) > 0 ? { confirmed: Number(r.pinnedKey.confirmed) } : {}) } : undefined;
+    ...(Number(r.pinnedKey.confirmed) > 0 ? { confirmed: Number(r.pinnedKey.confirmed) } : {}), ...(typeof r.pinnedKey.enrollId === "string" ? { enrollId: r.pinnedKey.enrollId } : {}) } : undefined;
   const num = (v: unknown) => (Number(v) > 0 ? Number(v) : undefined);
   const rj = r.restoreJob && typeof r.restoreJob.name === "string" && r.restoreJob.name ? JSON.parse(JSON.stringify({ name: r.restoreJob.name, attempt: s(r.restoreJob.attempt), at: Number(r.restoreJob.at) || 0,
     job: s(r.restoreJob.job) || undefined, reference: s(r.restoreJob.reference) || undefined, doneSeenAt: num(r.restoreJob.doneSeenAt), goneAt: num(r.restoreJob.goneAt), listedMs: num(r.restoreJob.listedMs) })) : undefined;
@@ -416,7 +460,9 @@ export function loadState(raw: unknown): State {
     ...(pin ? { pinnedKey: pin } : {}), ...(rj ? { restoreJob: rj } : {}),
     ...(typeof r.phoneHc === "string" ? { phoneHc: r.phoneHc } : {}), ...(typeof r.phoneHcApi === "string" ? { phoneHcApi: r.phoneHcApi } : {}),
     ...(Number(r.deadmanFailSince) > 0 ? { deadmanFailSince: Number(r.deadmanFailSince) } : {}),
-    ...(r.codes && typeof r.codes === "object" ? { codes: obj(r.codes) as any } : {}), ...(r.mhb && Number(r.mhb.until) > 0 ? { mhb: r.mhb } : {}),
+    ...(r.codes && typeof r.codes === "object" ? { codes: obj(r.codes) as any } : {}), ...(r.mhb && Number(r.mhb.cap) > 0 && typeof r.mhb.id === "string" ? { mhb: r.mhb } : {}),
+    ...(r.phoneRun && typeof r.phoneRun.id === "string" ? { phoneRun: { id: r.phoneRun.id, at: Number(r.phoneRun.at) || 0 } } : {}),
+    ...(r.limits && Number(r.limits.version) > 0 ? { limits: { version: Number(r.limits.version), at: Number(r.limits.at) || 0 } } : {}), counter: Number(r.counter) > 0 ? Math.floor(Number(r.counter)) : 0,
     ...(r.mhbRec && Number(r.mhbRec.confirmedAt) > 0 ? { mhbRec: r.mhbRec } : {}), ...(typeof r.hcRwSaid === "string" ? { hcRwSaid: r.hcRwSaid } : {}), ...(typeof r.keyChangeSaid === "string" ? { keyChangeSaid: r.keyChangeSaid } : {}), lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any, probeHash: obj(r.probeHash) as any,
     outstanding: obj(r.outstanding) as any, last: obj(r.last) as any, drills: obj(r.drills) as any, phone: obj(r.phone) as any,
     queue: Array.isArray(r.queue) ? r.queue.map((q: any) => ({ ...q, at: Number(q?.at) || 0 })) : [], hcPinged: Number(r.hcPinged) || 0, lines: Number(r.lines) || 0,
@@ -446,6 +492,9 @@ export interface Deps {
   makeBackup: (app: string, name: string) => Promise<{ slug: string } | { why: string }>;   // (0.1.3) that App alone, no password
   restore: (backup: string, app: string) => Promise<RestoreResult>;
   deleteBackup?: (backup: string) => Promise<boolean>;     // (0.1.6) an orphan backup's delete; false: not deleted
+  backups?: () => Promise<{ slug: string; name: string }[] | null>;   // (0.1.7) the Supervisor's backups list; null: unreadable
+  activeJobs?: (app: string) => Promise<string[] | null>;  // (0.1.7) active install or update jobs of that App (their names); null: unreadable
+  hcKeyStore?: { load: () => string; store: (key: string) => boolean };   // (0.1.7) the kept Healthchecks key (a 0600 file)
   job: (uuid: string) => Promise<JobState | null>;          // by its id only; null: the jobs list can't be read
   hcChecks?: (apiKey: string) => Promise<HcCheck[] | null>;   // (0.1.5) the Healthchecks checks; null: unreadable
   live: (hostPort: string) => Promise<boolean>;             // the App's liveness, the host's /health
@@ -473,23 +522,37 @@ export class Keeper {
   private settling = new Map<string, Promise<void>>(); // (0.1.5) registrations whose backup is being made in the background
   hcSeen: ({ at: number } & HcJudged) | null = null;  // (0.1.5) the last Healthchecks settings read
   private hcSaid = "";
+  hcKey = "";                                          // (0.1.7) the kept Healthchecks read-only key (never logged)
+  private oldKeyOption = false;                        // (0.1.7) the old hc_api_key option seen in the options
+  private lock: Promise<unknown> = Promise.resolve();  // (0.1.7) the claim record's lock
   constructor(private d: Deps, saved: unknown) {
     this.st = loadState(saved);
     if (!this.st.createdAt) { this.st.createdAt = d.now(); d.log(`state created at ${new Date(this.st.createdAt).toISOString()}: Ship tokens issued before it are refused`); }
+    try { this.hcKey = s(d.hcKeyStore?.load() ?? ""); } catch { this.hcKey = ""; }
   }
 
-  save(): void { this.d.save(this.st); }
+  // (0.1.7) Every state write moves the enrollment counter on.
+  save(): boolean { this.st.counter++; return this.d.save(this.st) !== false; }
+  // (0.1.7) The claim record's lock: claim, cancel and consume (and expiry) run one at a time, in order.
+  record<T>(fn: () => T | Promise<T>): Promise<T> {
+    const run = this.lock.then(fn, fn);
+    this.lock = run.catch(() => undefined);
+    return run;
+  }
   private now(): number { return this.d.now(); }
 
   // The options in force. 0.1.3: taken as they are, never filled in from a kept copy; a poll whose
   // options can't be read keeps the last ones read in this process.
   useOptions(raw: unknown): void {
     this.opts = parseOptions(raw);
+    if (raw && typeof raw === "object" && "hc_api_key" in (raw as object)) this.oldKeyOption = true;
     const why = this.armableWhy();
     if (why !== this.armableSaid) { if (why) this.d.log(`not armable: ${why}`); this.armableSaid = why; }
-    if (this.st.phoneHc && this.st.phoneHc !== hcHash(this.opts)) this.phoneLapse("a Healthchecks option changed");
+    if (this.st.phoneHc && this.st.phoneHc !== this.hcH()) this.phoneLapse("a Healthchecks option changed");
     this.pinKey();
   }
+  // (0.1.7) The Healthchecks options' hash, the kept key's hash included.
+  private hcH(): string { return hcHash(this.opts, this.hcKey); }
   // (0.1.4) The Ship key, pinned on first use: the first valid key seen in the options is kept in the
   // state, logged and paged with its fingerprint. A different key in the options is never used: it is
   // logged and paged once, and registrations are refused until the owner confirms it (keyConfirm).
@@ -501,7 +564,7 @@ export class Keeper {
       const fp = keyFp(o);
       this.st.pinnedKey = { key: o, fp, at: this.now() };
       this.d.log(`pinned the Ship public key, fingerprint ${fp}, unconfirmed (0.1.5): no registration is accepted until the owner confirms it at the device with key-confirm ${fp} <code>`);
-      this.issueCode("key", KEY_CODE_MS);
+      this.issueCode("key", KEY_CODE_MS, fp);
       this.notice(this.d.self, "key pinned", `Keeper pinned Cain's link's Ship key, fingerprint ${fp}. It accepts no install until you confirm that fingerprint at the device (key-confirm), checked against cain/SHIP_KEY_FINGERPRINT in the repository.`,
         "Keeper's Ship key notice done.");
       this.save();
@@ -512,7 +575,7 @@ export class Keeper {
     if (this.st.keyChangeSaid === fp) return;
     this.st.keyChangeSaid = fp;
     this.d.log(`ship_public_key changed to a key with fingerprint ${fp}; Keeper keeps the pinned key (fingerprint ${pin.fp}) and refuses every registration until the new one is confirmed: key-confirm ${fp} <code>`);
-    this.issueCode("key", KEY_CODE_MS);
+    this.issueCode("key", KEY_CODE_MS, fp);
     this.notice(this.d.self, "key changed", `Keeper's Ship key option changed (new fingerprint ${fp}, pinned ${pin.fp}). Keeper refuses every install registration until you confirm the new key at the device. If you didn't change it, put the old one back.`,
       "Keeper's Ship key notice done.");
     this.save();
@@ -522,45 +585,100 @@ export class Keeper {
   // too (enrollment), and so does a state rewound or created anew; a rotation is the same command.
   // 0.1.6: with the one-time code Keeper printed in its log at the pin (or at a start while the pin waits
   // for its confirm); a wrong or stale code is refused, and a code is used once.
+  // 0.1.7: a key already confirmed is confirmed again with a fresh code (the re-enrollment after a restore or a
+  // clock correction): each confirm gets its own enrollment id, which the link records; an earlier one it saw
+  // replayed is refused there. The code is bound to the fingerprint it was printed for.
   keyConfirm(fp: string, code: string): { ok: boolean; why: string } {
     const o = this.opts.ship_public_key;
     if (!shipKey(o)) return { ok: false, why: "ship_public_key in the options isn't an Ed25519 public key" };
     const cur = keyFp(o);
     if (s(fp).toLowerCase() !== cur) return { ok: false, why: `that fingerprint isn't the options' key's (${cur})` };
-    if (this.st.pinnedKey?.key === o && this.st.pinnedKey.confirmed) return { ok: true, why: "" };
-    const bad = this.useCode("key", code, true);
+    const bad = this.useCode("key", code, cur);
     if (bad) return { ok: false, why: bad };
-    const was = this.st.pinnedKey?.key === o ? "its unconfirmed pin" : this.st.pinnedKey?.fp ?? "none";
+    const p = this.st.pinnedKey;
+    const was = p?.key === o ? (p.confirmed ? "its earlier confirm (a re-enrollment)" : "its unconfirmed pin") : p?.fp ?? "none";
     const now = this.now();
-    this.st.pinnedKey = { key: o, fp: cur, at: this.st.pinnedKey?.key === o ? this.st.pinnedKey.at : now, confirmed: now };
+    this.st.pinnedKey = { key: o, fp: cur, at: p?.key === o ? p.at : now, confirmed: now, enrollId: randomBytes(8).toString("hex") };
     delete this.st.keyChangeSaid;
-    this.d.log(`the owner confirmed the Ship key with fingerprint ${cur} at the device (it replaces ${was}); state created ${new Date(this.st.createdAt).toISOString()}`);
+    this.d.log(`the owner confirmed the Ship key with fingerprint ${cur} at the device (it replaces ${was}); enrollment ${this.st.pinnedKey.enrollId}, state created ${new Date(this.st.createdAt).toISOString()}`);
     this.save();
     return { ok: true, why: "" };
   }
   // (0.1.6) One-time codes: printed once in Keeper's log, kept only as a hash, good until `until`. Each new
-  // code of a kind replaces the last one. useCode answers "" when the code is good (once: spent when once).
-  issueCode(kind: "key" | "phone" | "heartbeat", ms: number): void {
+  // code of a kind replaces the last one. useCode answers "" when the code is good.
+  // 0.1.7: each code is bound to its exact challenge (hashed with it, and the challenge kept beside it), and is
+  // spent by its first good use, checked and deleted with no await between (so two uses can't both pass).
+  static CMD: Record<CodeKind, string> = { key: "key-confirm", phone: "phone-confirm", heartbeat: "missed-heartbeat-confirm", limits: "accept-limits", hckey: "hc-key" };
+  issueCode(kind: CodeKind, ms: number, challenge: string): void {
     const code = randomBytes(5).toString("hex");
     const now = this.now();
-    (this.st.codes ??= {})[kind] = { hash: sha(`keeper-code-v1\n${kind}\n${code}`), at: now, until: now + ms };
-    this.d.log(`one-time code for ${kind === "key" ? "key-confirm" : kind === "phone" ? "phone-confirm" : "missed-heartbeat-confirm"}: ${code} (good until ${new Date(now + ms).toISOString()}; a newer code replaces it)`);
+    (this.st.codes ??= {})[kind] = { hash: sha(`keeper-code-v2\n${kind}\n${challenge}\n${code}`), at: now, until: now + ms, challenge };
+    this.d.log(`one-time code for ${Keeper.CMD[kind]}: ${code} (good until ${new Date(now + ms).toISOString()}; a newer code replaces it)`);
     this.save();
   }
-  private useCode(kind: "key" | "phone" | "heartbeat", code: string, once: boolean): string {
+  private useCode(kind: CodeKind, code: string, challenge: string): string {
     const c = this.st.codes?.[kind];
-    const given = sha(`keeper-code-v1\n${kind}\n${s(code).toLowerCase()}`);
     if (!c || !s(code)) return "no one-time code given, or none issued: use the code Keeper printed in its log";
-    if (!timingSafeEqual(Buffer.from(c.hash), Buffer.from(given))) { this.d.log(`refused a ${kind} confirm: a wrong one-time code`); return "that one-time code is wrong: use the newest code Keeper printed in its log"; }
-    if (this.now() > c.until) { this.d.log(`refused a ${kind} confirm: a stale one-time code`); return "that one-time code is stale: get a new one (a restart prints a new key code; a new phone test or drill prints its own)"; }
-    if (once) delete this.st.codes![kind];
+    const given = sha(`keeper-code-v2\n${kind}\n${challenge}\n${s(code).toLowerCase()}`);
+    if (c.challenge !== challenge) { this.d.log(`refused a ${Keeper.CMD[kind]}: its one-time code was printed for another challenge`); return "that one-time code was printed for another challenge (another key, test or drill): use the code Keeper printed for this one"; }
+    if (!timingSafeEqual(Buffer.from(c.hash), Buffer.from(given))) { this.d.log(`refused a ${Keeper.CMD[kind]}: a wrong one-time code`); return "that one-time code is wrong: use the newest code Keeper printed in its log"; }
+    if (this.now() > c.until) { this.d.log(`refused a ${Keeper.CMD[kind]}: a stale one-time code`); return "that one-time code is stale: get a new one (a restart prints new key, hc-key and limits codes; a new phone test or drill prints its own)"; }
+    delete this.st.codes![kind];
     return "";
   }
   // (0.1.5) What the link checks in every acceptance and claim answer: the pinned fingerprint, when the
-  // owner confirmed it, and when this state was created.
-  enrollment(): { key_fp: string; key_confirmed_at: string | null; state_created: string } {
+  // owner confirmed it, and when this state was created. 0.1.7: the confirm's own enrollment id and the
+  // state's counter, which only goes up (the link refuses a lower one: an older state).
+  enrollment(): { key_fp: string; key_confirmed_at: string | null; state_created: string; enroll_id: string; counter: number } {
     const p = this.st.pinnedKey;
-    return { key_fp: p?.fp ?? "", key_confirmed_at: p?.confirmed ? new Date(p.confirmed).toISOString() : null, state_created: new Date(this.st.createdAt).toISOString() };
+    return { key_fp: p?.fp ?? "", key_confirmed_at: p?.confirmed ? new Date(p.confirmed).toISOString() : null, state_created: new Date(this.st.createdAt).toISOString(),
+      enroll_id: p?.confirmed ? p.enrollId ?? "" : "", counter: this.st.counter };
+  }
+  // (0.1.7) The owner's acceptance of the two accepted limits (DOCS.md, "Accepted limits"), with the code
+  // printed at start while it is missing or for an older text.
+  limitsOk(): boolean { return this.st.limits?.version === LIMITS_VERSION; }
+  acceptLimits(code: string): { ok: boolean; why: string } {
+    if (this.limitsOk()) return { ok: true, why: "already accepted" };
+    const bad = this.useCode("limits", code, `limits-v${LIMITS_VERSION}`);
+    if (bad) return { ok: false, why: bad };
+    this.st.limits = { version: LIMITS_VERSION, at: this.now() };
+    this.d.log(`the owner accepted the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION})`);
+    this.arm();
+    this.save();
+    return { ok: true, why: "" };
+  }
+  // (0.1.7) The Healthchecks key, entered once at the device (hc-key <code>, the key on standard input): the
+  // code is checked and spent first; then the key must read the checks (a key whose answer shows ping URLs
+  // can write: refused), and see every check the options name; only then is it kept (a 0600 file, never the
+  // options, excluded from the keeper's backups). A refused key is never kept; a new code is printed.
+  async hcKeyEnter(code: string, key: string): Promise<{ ok: boolean; why: string }> {
+    const k = s(key);
+    const bad = this.useCode("hckey", code, "hc-key");
+    if (bad) return { ok: false, why: bad };
+    const refuse = (why: string) => {
+      this.d.log(`refused the Healthchecks key entered: ${why}; nothing was kept`);
+      this.issueCode("hckey", HC_KEY_CODE_MS, "hc-key");
+      return { ok: false, why };
+    };
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(k)) return refuse("that isn't a Healthchecks API key");
+    if (!this.d.hcChecks || !this.d.hcKeyStore) return refuse("this Keeper can't read Healthchecks or keep a key");
+    const list = await this.d.hcChecks(k).catch(() => null);
+    if (!list) return refuse("the Healthchecks API couldn't be read with that key");
+    if (hcCanWrite(list)) return refuse("that key can write (its answer shows ping URLs): enter the project's read-only API key (Project Settings, API Access)");
+    const set = this.armableWhy(true);
+    if (set) return refuse(`set the checks first: ${set}`);
+    for (const [name, url, , role] of hcRoles(this.opts)) {
+      const c = hcFind(this.opts, list, url, role);
+      if (typeof c === "string") return refuse(`${name}: ${c}`);
+      if (!c) return refuse(`that key doesn't see ${name}`);
+    }
+    let kept = false;
+    try { kept = this.d.hcKeyStore.store(k); } catch { kept = false; }
+    if (!kept) return refuse("Keeper couldn't write the key to its data folder");
+    this.hcKey = k; this.hcSeen = null; this.hcSaid = ""; delete this.st.hcRwSaid;
+    this.d.log(`kept the Healthchecks read-only key (its hash ${sha(`hc-key\n${k}`).slice(0, 8)}), root-only in Keeper's data folder, never in its options or its backups`);
+    this.save();
+    return { ok: true, why: "" };
   }
 
   start(): void {
@@ -569,15 +687,29 @@ export class Keeper {
       const mins = Math.round((now - this.st.heartbeat) / 60_000);
       if (Object.keys(this.st.drills).length || Object.keys(this.st.phone).length)
         this.d.log(`the keeper's heartbeat stopped for ${mins} minutes (a rewind, a restore or a long stop): the drill records are dropped`);
-      this.st.drills = {}; this.st.phone = {}; delete this.st.phoneHc; delete this.st.phoneHcApi; delete this.st.mhb; delete this.st.mhbRec;
+      this.st.drills = {}; this.st.phone = {}; delete this.st.phoneHc; delete this.st.phoneHcApi; delete this.st.mhb; delete this.st.mhbRec; delete this.st.phoneRun;
       // (0.1.4) a rewound state may lack recently spent tokens: tokens issued before now are refused.
       this.st.createdAt = now;
       // (0.1.5) and the Ship key must be confirmed again at the device before any registration counts.
       if (this.st.pinnedKey?.confirmed) { delete this.st.pinnedKey.confirmed; this.d.log("the pinned Ship key needs the owner's key-confirm again (a rewound state)"); }
     }
-    // (0.1.6) a pin waiting for its confirm with no good code: a new code in the log
-    const kc = this.st.codes?.key;
-    if (this.st.pinnedKey && !this.st.pinnedKey.confirmed && (!kc || now > kc.until)) this.issueCode("key", KEY_CODE_MS);
+    // (0.1.7) a drill that ran when Keeper stopped is interrupted: its code no longer counts
+    const running = this.drillRunning(now);
+    if (running) this.interruptDrill(running, "Keeper restarted");
+    // (0.1.6) a pin waiting for its confirm gets a new code; 0.1.7: at every start, bound to the options' key,
+    // so a confirmed key can be confirmed again (the re-enrollment after a restore or a clock correction)
+    if (shipKey(this.opts.ship_public_key)) this.issueCode("key", KEY_CODE_MS, keyFp(this.opts.ship_public_key));
+    // (0.1.7) the Healthchecks key is entered (or replaced) with a code printed at every start
+    this.issueCode("hckey", HC_KEY_CODE_MS, "hc-key");
+    if (!this.hcKey) this.d.log("no Healthchecks read-only key is kept: enter it once with hc-key <code> (the key on standard input; DOCS, What you must set)");
+    // (0.1.7) the accepted limits: a code while they aren't accepted for this text
+    if (!this.limitsOk()) {
+      this.d.log(this.st.limits ? `the accepted limits' text changed (version ${this.st.limits.version} accepted, now ${LIMITS_VERSION}): arming needs accept-limits <code> again`
+        : `the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION}) aren't accepted yet: arming needs accept-limits <code>`);
+      this.issueCode("limits", HC_KEY_CODE_MS, `limits-v${LIMITS_VERSION}`);
+    }
+    // (0.1.7) the old option, at every start while it is there
+    if (this.oldKeyOption) this.d.log("the old option hc_api_key is still in Keeper's options: remove it (Keeper ignores it; the key is entered once with hc-key and kept outside the options)");
     for (const a of this.open()) this.d.log(`resuming ${a.id} ${a.app} (${a.status})`);
     for (const a of this.unresolvedOf()) this.d.log(`reconciling ${a.id} ${a.app} on every poll (unresolved: nothing is sent again)`);
     this.st.heartbeat = now;
@@ -586,7 +718,25 @@ export class Keeper {
   open(app?: string): Attempt[] { return Object.values(this.st.attempts).filter((a) => OPEN.includes(a.status) && (!app || a.app === app)); }
   private unresolvedOf(app?: string): Attempt[] { return Object.values(this.st.attempts).filter((a) => a.status === "unresolved" && a.restore && (!app || a.app === app)); }
   binding(app: string): Binding {
-    return { protocol: PROTOCOL, probe_hash: this.st.probeHash[app] ?? "", keeper_version: this.d.version, options_hash: optionsHash(this.opts), backup_scope: BACKUP_SCOPE };
+    return { protocol: PROTOCOL, probe_hash: this.st.probeHash[app] ?? "", keeper_version: this.d.version, options_hash: optionsHash(this.opts, this.hcKey), backup_scope: BACKUP_SCOPE };
+  }
+  // (0.1.7) One drill at a time: which runs now ("" for none). The missed-heartbeat drill runs from its start
+  // until its confirm or an hour after its ping resumed; the phone test from its pages until its confirm or
+  // its code's end.
+  drillRunning(now = this.now()): string {
+    const m = this.st.mhb;
+    if (m && now <= (m.resumedAt ?? m.cap) + PHONE_WINDOW_MS) return "the missed-heartbeat drill";
+    const p = this.st.phoneRun, c = this.st.codes?.phone;
+    if (p && c && c.challenge === p.id && now <= c.until) return "the phone test";
+    return "";
+  }
+  // (0.1.7) A drill interrupted (a restart, or a registration meanwhile): its code no longer counts, and it needs
+  // a fresh run (for the missed-heartbeat drill, a fresh down-to-up cycle).
+  private interruptDrill(which: string, why: string): void {
+    if (which === "the missed-heartbeat drill") { delete this.st.mhb; delete this.st.codes?.heartbeat; }
+    else { delete this.st.phoneRun; delete this.st.codes?.phone; }
+    this.d.log(`${which} was interrupted (${why}): its code no longer counts; run it again from the start`);
+    this.save();
   }
   // The alert check of an App: its own, else the one for every App. The keeper's own lines go to the one
   // for every App, else to the first watched App's.
@@ -606,11 +756,12 @@ export class Keeper {
   }
   // Armable: the heartbeat check, the dead-man check and an alert check of its own for every watched App,
   // (0.1.4) each a distinct check by the id in its ping URL's path.
-  armableWhy(): string {
+  // 0.1.7: checksOnly leaves out the kept key (hc-key checks the checks before any key is kept).
+  armableWhy(checksOnly = false): string {
     const o = this.opts;
     if (!HTTPS.test(o.hc_done)) return "hc_done (the heartbeat check) isn't set";
     if (!HTTPS.test(o.hc_deadman)) return "hc_deadman (the dead-man check) isn't set";
-    if (!o.hc_api_key) return "hc_api_key (a Healthchecks API key, to read each check's period, grace and channels) isn't set";
+    if (!this.hcKey && !checksOnly) return "no Healthchecks read-only key is kept (enter it once with hc-key <code>, to read each check's period, grace and channels)";
     if (!o.watch.length) return "no App is watched";
     const missing = o.watch.find((a) => !HTTPS.test(this.alertUrl(a)));
     if (missing) return `${appName(missing)} has no alert check (hc_failed)`;
@@ -692,6 +843,9 @@ export class Keeper {
     const issued = (c.exp - SHIP_TTL_S) * 1000;
     if (issued + 1000 <= this.st.createdAt) return refuse("its token was issued before Keeper's state was created (a fresh or restored state can't know which tokens were spent)");
     if (pr !== c.pr || head !== c.head) return refuse(`its pull request or head (${Number.isSafeInteger(pr) ? pr : "?"}, ${head.slice(0, 12) || "?"}) aren't the token's`);
+    // (0.1.7) one drill at a time: no registration while a drill runs, and the drill is void after it
+    const drill = this.drillRunning(now);
+    if (drill) { this.interruptDrill(drill, "a registration arrived"); return refuse(`${drill} was running, and Keeper takes no registration during a drill (that drill is void now: run it again once the install is done)`); }
     if (kind !== "ship" && kind !== "drill") return refuse("its kind isn't ship or drill");
     if (!SLUG.test(app)) return refuse("its app isn't an App slug");
     if (body?.backup_slug !== undefined) return refuse("it names a backup; Keeper always makes the backup itself");
@@ -743,21 +897,31 @@ export class Keeper {
   // no await between, so of two claimants exactly one gets it; saved before the answer (a save that fails
   // takes the claim back and refuses). Refused when already claimed, when the acceptance expired, or when
   // the pinned key isn't confirmed. The claim is valid CLAIM_MS: to_version must show within it.
+  // 0.1.7: served under the claim record's lock (claim()), and idempotent: a retry carrying the same request
+  // id as the recorded claim reads the recorded outcome (the same claim, or why it ended) and changes nothing.
   claimAttempt(caller: string | null, id: string, body: any): Answer {
     const now = this.now();
     const no = (why: string, status = 409): Answer => { this.d.log(`refused a claim of ${SLUG.test(id.replace(/-/g, "_")) ? id : "an attempt"}: ${why}`); return { status, body: { status: "refused", id, why, ...this.enrollment() } }; };
     if (caller !== REGISTRAR) return no(`only ${appName(REGISTRAR)}'s App claims an acceptance`, 403);
     const a = this.st.attempts[id];
     if (!a) return no("no such attempt", 404);
+    const req = s(body?.request);
+    const same = s(body?.app) === a.app && s(body?.from_version) === a.from && s(body?.to_version) === a.to && s(body?.backup) === a.backup;
+    if (a.claim && req && a.claim.request === req && same) {
+      this.d.log(`a retry of claim ${a.claim.id} of ${a.id}: the recorded outcome (${a.status})`);
+      if (["claimed", "watching", "restoring", "passed", "rolled back", "gave up", "unresolved"].includes(a.status))
+        return { status: 200, body: { status: "claimed", id, app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, claim: a.claim.id, until: new Date(a.claim.until).toISOString(), recorded: a.status, ...this.enrollment() } };
+      return no(`its claim ${a.claim.id} was recorded, and the attempt is ${a.status} since${a.why ? ` (${a.why})` : ""}`);
+    }
     if (a.status === "claimed" || a.claim) return no(`it is claimed already (claim ${a.claim?.id ?? "?"}); an acceptance has one claimant`);
     if (a.status !== "accepted") return no(`it is ${a.status}, not accepted`);
     if (now > (a.acceptUntil ?? 0)) { this.ended(a, "its acceptance expired unclaimed", true, true); return no("its acceptance expired"); }
     if (s(body?.app) !== a.app || s(body?.from_version) !== a.from || s(body?.to_version) !== a.to || s(body?.backup) !== a.backup)
       return no("its App, versions or backup aren't the acceptance's");
     if (!this.st.pinnedKey?.confirmed) return no("the pinned Ship key isn't confirmed");
-    const claim = { id: `claim-${randomBytes(8).toString("hex")}`, at: now, until: now + CLAIM_MS };
+    const claim = { id: `claim-${randomBytes(8).toString("hex")}`, at: now, until: now + CLAIM_MS, ...(/^[A-Za-z0-9-]{8,64}$/.test(req) ? { request: req } : {}) };
     a.claim = claim; a.status = "claimed"; a.deadline = claim.until;
-    if (this.d.save(this.st) === false) {
+    if (!this.save()) {
       delete a.claim; a.status = "accepted"; a.deadline = a.acceptUntil ?? a.deadline;
       return no("Keeper couldn't save the claim", 503);
     }
@@ -767,14 +931,27 @@ export class Keeper {
   // (0.1.5) POST /attempt/<id>/cancel, Cain's link only, when it gives up on a pass: a registration still
   // pending, accepted or claimed (no version change seen) ends at once, so no acceptance is left to use.
   // 0.1.6: its backup (one made, or one still being made) is deleted at the next poll (dropBackups).
+  // 0.1.7: under the claim record's lock (cancel()), and idempotent: a cancel already recorded answers its
+  // recorded outcome again. A claim already handed to a started run (a version change seen) can't be cancelled.
   cancelAttempt(caller: string | null, id: string, body: any): Answer {
     if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App cancels a registration` } };
     const a = this.st.attempts[id];
     if (!a) return { status: 404, body: { status: "unknown", id } };
-    if (!["verifying", "accepted", "claimed"].includes(a.status) || a.firstSeenTo) return { status: 409, body: { status: "refused", id, why: `it is ${a.status}` } };
-    this.ended(a, `cancelled by ${appName(REGISTRAR)}'s link (${s(body?.why).replace(/[^\x20-\x7e]/g, " ").slice(0, 160) || "it gave up on the Ship pass"})`, false, true);
+    if (a.cancel) { this.d.log(`a retry of the cancel of ${a.id}: the recorded outcome (ended)`); return { status: 200, body: { status: "ended", id, recorded: true } }; }
+    if (a.firstSeenTo || a.consumedAt) {
+      this.d.log(`refused a cancel of ${a.id}: its claim was handed to a started run (${appName(a.app)} ${a.to} seen)`);
+      return { status: 409, body: { status: "refused", id, why: `its claim was handed to a started run (${appName(a.app)} ${a.to} was seen): it is ${a.status}, and a cancel can't end it now` } };
+    }
+    if (!["verifying", "accepted", "claimed"].includes(a.status)) return { status: 409, body: { status: "refused", id, why: `it is ${a.status}` } };
+    const why = s(body?.why).replace(/[^\x20-\x7e]/g, " ").slice(0, 160) || "it gave up on the Ship pass";
+    const req = s(body?.request);
+    a.cancel = { at: this.now(), why, ...(/^[A-Za-z0-9-]{8,64}$/.test(req) ? { request: req } : {}) };
+    this.ended(a, `cancelled by ${appName(REGISTRAR)}'s link (${why})`, false, true);
     return { status: 200, body: { status: "ended", id } };
   }
+  // (0.1.7) The routes' entry points: claim and cancel under the claim record's lock.
+  claim(caller: string | null, id: string, body: any): Promise<Answer> { return this.record(() => this.claimAttempt(caller, id, body)); }
+  cancel(caller: string | null, id: string, body: any): Promise<Answer> { return this.record(() => this.cancelAttempt(caller, id, body)); }
   // (0.1.5) An attempt that ends with nothing restored and nothing installed: its "ended" line, and (but a
   // cancellation) a notice to the owner that leaves no incident open.
   // 0.1.6: drop, its backup (made for nothing) is deleted at the next poll.
@@ -795,10 +972,11 @@ export class Keeper {
     if (info.version !== a.from) return this.unprotected(a, `${a.app} is at ${info.version}, not ${a.from}`);
     if (a.status !== "verifying") return;                  // (0.1.5) cancelled before the backup was asked
     a.backupAsked = this.now();
+    a.backupName = `Keeper ${a.id} ${randomBytes(4).toString("hex")}`;   // (0.1.7) its own name, kept before the call
     this.backups.add(a.id);
     this.save();                                           // asked once, before the call
     const timer = this.d.timer ?? ((ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); (t as any)?.unref?.(); }));
-    const made = this.d.makeBackup(a.app, `Keeper ${a.id}`).catch((e) => ({ why: String((e as Error)?.message ?? e).slice(0, 80) }));
+    const made = this.d.makeBackup(a.app, a.backupName).catch((e) => ({ why: String((e as Error)?.message ?? e).slice(0, 80) }));
     const res = await Promise.race([made, timer(REGISTER_WAIT_MS).then(() => ({ late: true as const }))]);
     this.backups.delete(a.id);
     // (0.1.6) the slug it made is kept on the attempt at once, so a cancellation meanwhile can delete it
@@ -839,14 +1017,60 @@ export class Keeper {
   // (0.1.6) Orphan backups: each attempt cancelled, or whose acceptance expired unclaimed, has its backup
   // (the slug recorded when it was made) deleted, tried up to DROP_TRIES polls; one that can't be deleted
   // is named in the log and left for the owner.
+  // 0.1.7: a claim that expired unused (dropCheck) keeps its backup while the Supervisor's jobs list shows an
+  // install or update of that App running, or can't be read (tried again, then left and named); an attempt
+  // whose slug was lost (a restart while its backup was made) is found by its own backup name, and only a
+  // backup positively identified by that name is deleted.
   private async dropBackups(): Promise<void> {
+    if (!this.reconciled) { this.reconciled = true; await this.reconcileBackups(); }
     for (const a of Object.values(this.st.attempts)) {
-      if (!a.dropBackup || a.backupDropped || !a.backup || (a.dropTries ?? 0) >= DROP_TRIES || this.backups.has(a.id)) continue;
+      if (!a.dropBackup || a.backupDropped || a.dropKept || (a.dropTries ?? 0) >= DROP_TRIES || this.backups.has(a.id)) continue;
+      if (!a.backup) {
+        if (!a.backupName || !this.d.backups) continue;
+        const list = await this.d.backups().catch(() => null);
+        const hit = list?.find((b) => b.name === a.backupName);
+        if (hit && BACKUP.test(hit.slug)) { a.backup = hit.slug; this.d.log(`${a.id}: found its backup ${hit.slug} by its own name "${a.backupName}"`); }
+        else {
+          if (list && this.now() - (a.backupAsked ?? 0) > REGISTER_WAIT_MS + 60_000) { a.dropKept = "no backup by its name was made"; this.d.log(`${a.id}: no backup named "${a.backupName}" is listed: nothing to delete`); this.save(); }
+          continue;
+        }
+      }
+      if (a.dropCheck) {
+        const jobs = this.d.activeJobs ? await this.d.activeJobs(a.app).catch(() => null) : null;
+        if (jobs === null) {
+          a.dropTries = (a.dropTries ?? 0) + 1;
+          if (a.dropTries >= DROP_TRIES) this.d.log(`${a.id}: the Supervisor's jobs list couldn't be read, so its backup ${a.backup} is kept (an install may be running): delete backup ${a.backup} by hand (Settings, System, Backups) once you know none is`);
+          this.save();
+          continue;
+        }
+        if (jobs.length) {
+          a.dropKept = `an install or update of ${a.app} is running (${jobs.join(", ").slice(0, 120)})`;
+          this.d.log(`${a.id}: kept its backup ${a.backup}: its claim expired with no version change seen, but ${a.dropKept}`);
+          this.save();
+          continue;
+        }
+      }
       a.dropTries = (a.dropTries ?? 0) + 1;
       const ok = this.d.deleteBackup ? await this.d.deleteBackup(a.backup).catch(() => false) : false;
       if (ok) { a.backupDropped = true; this.d.log(`${a.id}: deleted its backup ${a.backup} (${a.why ?? "ended"}: never used)`); }
       else if (a.dropTries >= DROP_TRIES) this.d.log(`${a.id}: couldn't delete its backup ${a.backup} after ${DROP_TRIES} tries; it stays in Home Assistant's list, used for nothing: delete backup ${a.backup} by hand (Settings, System, Backups)`);
       this.save();
+    }
+  }
+  // (0.1.7) Once after a start: backups named as Keeper names its own ("Keeper <attempt> <nonce>") that no
+  // attempt holds by its slug are named in the log; none is deleted here (only an attempt marked to drop,
+  // cancelled or expired unused, deletes its backup, found by its exact name, in dropBackups).
+  private reconciled = false;
+  private async reconcileBackups(): Promise<void> {
+    if (!this.d.backups) return;
+    const list = await this.d.backups().catch(() => null);
+    if (!list) { this.reconciled = false; return; }
+    const held = new Set(Object.values(this.st.attempts).map((a) => a.backup).filter(Boolean));
+    for (const b of list) {
+      if (!/^Keeper /.test(b.name) || held.has(b.slug)) continue;
+      const a = Object.values(this.st.attempts).find((x) => x.backupName === b.name);
+      if (a?.dropBackup) continue;                         // dropBackups deletes it
+      this.d.log(`backup ${b.slug} ("${b.name}") is Keeper's${a ? `, of ${a.id} (${a.status})` : ", of no attempt it knows"}, and no attempt uses it: kept; delete it by hand (Settings, System, Backups) if you don't want it`);
     }
   }
   // A registration left verifying by a restart (its backup's outcome unknown) is unprotected.
@@ -874,17 +1098,21 @@ export class Keeper {
     const h = (this.appHealth[app] ??= []);
     h.push(live); if (h.length > 3) h.shift();
     if (info) this.appState[app] = info.state;
-    if (info) this.versionChange(app, info.version);
-    for (const a of this.open(app)) {
-      // (0.1.4) the install seen while its registration still waits for the backup: never accepted;
-      // (0.1.5) and seen while accepted but not claimed: outside a live claim
-      if (a.status === "verifying" && info?.version === a.to) { this.unprotected(a, "the install began before Keeper accepted it (its backup wasn't complete)"); continue; }
-      if (a.status === "accepted" && info?.version === a.to) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
-      if (a.status === "claimed" && info?.version === a.to && now > a.claim!.until) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
-      if (started) a.chat = chat;
-      if (a.status === "restoring") { this.observe(a, info); await this.restoring(a, info, live); }
-      else if (a.status === "accepted" || a.status === "claimed" || a.status === "watching") this.judge(a, info, live, now);
-    }
+    const wasRestoring = this.open(app).filter((a) => a.status === "restoring");
+    // (0.1.7) the version change, the consume and the expiries under the claim record's lock
+    await this.record(() => {
+      if (info) this.versionChange(app, info.version);
+      for (const a of this.open(app)) {
+        // (0.1.4) the install seen while its registration still waits for the backup: never accepted;
+        // (0.1.5) and seen while accepted but not claimed: outside a live claim
+        if (a.status === "verifying" && info?.version === a.to) { this.unprotected(a, "the install began before Keeper accepted it (its backup wasn't complete)"); continue; }
+        if (a.status === "accepted" && info?.version === a.to) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
+        if (a.status === "claimed" && info?.version === a.to && now > a.claim!.until) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
+        if (started) a.chat = chat;
+        if (a.status === "accepted" || a.status === "claimed" || a.status === "watching") this.judge(a, info, live, now);
+      }
+    });
+    for (const a of wasRestoring) if (a.status === "restoring") { this.observe(a, info); await this.restoring(a, info, live); }
     for (const a of this.unresolvedOf(app)) { this.observe(a, info); await this.recheck(a, info); }
     this.clearOutstanding(app);
   }
@@ -922,7 +1150,8 @@ export class Keeper {
     }
     // (0.1.5) An acceptance unclaimed by its until, or a claim with no version change by its until, ends.
     if (a.status === "accepted" && now > (a.acceptUntil ?? a.deadline)) return this.ended(a, "its acceptance expired unclaimed", true, true);
-    if (a.status === "claimed" && now > a.claim!.until) return this.ended(a, `its claim ${a.claim!.id} expired with no version change seen`);
+    // 0.1.7: unused, so its backup is deleted like an unclaimed one's, once the jobs list shows no install running
+    if (a.status === "claimed" && now > a.claim!.until) { a.dropCheck = true; return this.ended(a, `its claim ${a.claim!.id} expired with no version change seen (unused)`, true, true); }
     if (a.status !== "watching") return;
     if (!info) return;                                   // the Supervisor didn't answer: nothing judged this poll
     if (info.version !== a.to) return this.fail(a, "version-moved", `the App moved to ${info.version} during the watch`);
@@ -1166,6 +1395,7 @@ export class Keeper {
   private phoneLapse(why: string): void {
     if (!Object.keys(this.st.phone).length && !this.st.phoneHc && !this.st.phoneHcApi && !this.st.mhbRec) return;
     this.st.phone = {}; delete this.st.phoneHc; delete this.st.phoneHcApi; delete this.st.mhbRec;
+    if (this.st.phoneRun) { delete this.st.phoneRun; delete this.st.codes?.phone; }   // (0.1.7) a running test is void with it
     this.d.log(`the phone test lapsed: ${why}; arming needs a new one (phone-test, then phone-confirm) and a new missed-heartbeat drill`);
     this.save();
   }
@@ -1224,11 +1454,13 @@ export class Keeper {
   private async tickHeartbeat(now: number): Promise<void> {
     this.st.heartbeat = now;
     // (0.1.6) the missed-heartbeat drill: no heartbeat ping to hc_done until its end
+    // 0.1.7: until Healthchecks shows the check down, or the cap
     const m = this.st.mhb;
-    const silent = !!m && !m.resumedAt && now < m.until;
-    if (m && !m.resumedAt && now >= m.until) {
+    const silent = !!m && !m.resumedAt && !m.sawDown && now < m.cap;
+    if (m && !m.resumedAt && !silent) {
       m.resumedAt = now; this.st.hcPinged = 0;
-      this.d.log(`missed-heartbeat drill: the heartbeat ping resumes${m.sawDown ? "" : " (Healthchecks never showed the heartbeat check down: the drill can't be confirmed; run it again)"}; once its page reached your phone, within an hour, run missed-heartbeat-confirm <code>`);
+      this.d.log(`missed-heartbeat drill: the heartbeat ping resumes${m.sawDown ? "" : ` (Healthchecks didn't show the heartbeat check down within ${MHB_CAP_MS / 60_000} minutes: the drill can't be confirmed; run it again)`}; once its page reached your phone and Healthchecks shows the check up again, within an hour, run missed-heartbeat-confirm <code>`);
+      this.save();
     }
     if (!silent && now - this.st.hcPinged >= HC_HEARTBEAT_MS && HTTPS.test(this.opts.hc_done)) {
       const ok = await this.d.ping(this.opts.hc_done, "keeper heartbeat").catch(() => false);
@@ -1276,12 +1508,12 @@ export class Keeper {
   // channels), a paused check, a heartbeat or dead-man check that is down. Its settings' hash must equal
   // the one taken at the phone test (a change lapses the phone test).
   private async readHc(force = false): Promise<void> {
-    const key = this.opts.hc_api_key;
+    const key = this.hcKey;
     const now = this.now();
     if (!key || !this.d.hcChecks) { this.hcSeen = null; return; }
     if (!force && this.hcSeen && now - this.hcSeen.at < HC_READ_MS) return;
     const list = await this.d.hcChecks(key).catch(() => null);
-    const v: HcJudged = list ? judgeHc(this.opts, list) : { ok: false, why: "the Healthchecks API couldn't be read with hc_api_key", hash: "" };
+    const v: HcJudged = list ? judgeHc(this.opts, list) : { ok: false, why: "the Healthchecks API couldn't be read with the kept key", hash: "" };
     this.hcSeen = { at: this.now(), ...v };
     const said = `${v.why}|${(v.hidden ?? []).join(",")}`;
     if (said !== this.hcSaid) { this.hcSaid = said; this.d.log(v.ok ? `the Healthchecks checks' settings are within bounds${v.hidden?.length ? ` (the key hides the channels of ${v.hidden.join(", ")}: arming takes the owner's confirmations at the phone test and the missed-heartbeat drill in their place)` : ""}` : `the Healthchecks checks' settings refuse arming: ${v.why}`); }
@@ -1289,18 +1521,20 @@ export class Keeper {
     const kh = sha(`hc-key\n${key}`).slice(0, 16);
     if (v.rw && this.st.hcRwSaid !== kh) {
       this.st.hcRwSaid = kh;
-      this.d.log("REFUSING hc_api_key: it can write (pause checks, change their period and grace, reroute their channels). Swap it in Keeper's options for the project's read-only API key (Healthchecks, Project Settings, API Access, the read-only key)");
-      this.notice(this.d.self, "hc key", "Keeper's hc_api_key is a Healthchecks key that can write. Keeper refuses to arm with it. Swap it in Keeper's options for the project's read-only API key (Project Settings, API Access).", "Keeper's Healthchecks key notice done.");
+      this.d.log("REFUSING the kept Healthchecks key: it can write (pause checks, change their period and grace, reroute their channels). Enter the project's read-only API key with hc-key (Healthchecks, Project Settings, API Access, the read-only key)");
+      this.notice(this.d.self, "hc key", "Keeper's Healthchecks key can write. Keeper refuses to arm with it. Enter the project's read-only API key with hc-key at the device (Project Settings, API Access).", "Keeper's Healthchecks key notice done.");
       this.save();
     }
     // (0.1.6) the missed-heartbeat drill: Healthchecks seen showing the heartbeat check down during it
     const m = this.st.mhb;
-    if (m && !m.sawDown && v.done?.status === "down" && this.now() >= m.startedAt) { m.sawDown = this.now(); this.d.log("missed-heartbeat drill: Healthchecks shows the heartbeat check down"); this.save(); }
+    if (m && !m.sawDown && !m.resumedAt && v.done?.status === "down" && this.now() >= m.startedAt) { m.sawDown = this.now(); this.d.log("missed-heartbeat drill: Healthchecks shows the heartbeat check down; the heartbeat ping resumes"); this.save(); }
+    // (0.1.7) and then up again after the ping resumed: the drill's down-to-up cycle is whole
+    if (m && m.sawDown && m.resumedAt && !m.sawUp && v.done?.status === "up" && this.now() > m.resumedAt) { m.sawUp = this.now(); this.d.log("missed-heartbeat drill: Healthchecks shows the heartbeat check up again"); this.save(); }
     if (v.ok && this.st.phoneHcApi && v.hash !== this.st.phoneHcApi) this.phoneLapse("a Healthchecks check's period, grace or channels changed since the phone test");
   }
   // Why the settings read refuses arming now ("" when it doesn't).
   hcWhy(now = this.now()): string {
-    if (!this.opts.hc_api_key) return "hc_api_key isn't set, so Keeper can't read the checks' settings";
+    if (!this.hcKey) return "no Healthchecks key is kept (hc-key), so Keeper can't read the checks' settings";
     const h = this.hcSeen;
     if (!h || now - h.at > HC_READ_FRESH_MS) return "the Healthchecks checks' settings haven't been read in the last 3 minutes";
     return h.ok ? "" : h.why;
@@ -1343,9 +1577,13 @@ export class Keeper {
   phoneTest(): { ok: boolean; why: string } {
     const why = this.armableWhy() || this.hcWhy();
     if (why) return { ok: false, why: `not armable: ${why}` };
+    const drill = this.drillRunning();
+    if (drill) return { ok: false, why: `${drill} is running: one drill at a time` };
     const busy = this.opts.watch.find((a) => this.st.outstanding[a] || this.open(a).length || this.unresolvedOf(a).length || this.st.queue.some((q) => q.app === a));
     if (busy) return { ok: false, why: `${appName(busy)} has an incident or a line still going out: test the phone once it has cleared` };
-    this.st.phone = {}; this.st.phoneHc = hcHash(this.opts); this.st.phoneHcApi = this.hcSeen!.hash;
+    this.st.phone = {}; this.st.phoneHc = this.hcH(); this.st.phoneHcApi = this.hcSeen!.hash;
+    const runId = `phone-${this.now()}-${randomBytes(3).toString("hex")}`;
+    this.st.phoneRun = { id: runId, at: this.now() };
     for (const app of this.opts.watch) {
       const u = this.alertUrl(app);
       this.st.phone[checkId(u)] = { sentAt: this.now() };
@@ -1358,7 +1596,7 @@ export class Keeper {
     this.st.queue.push({ key: `phone-${n}`, to: "deadman", fail: true, body: "Keeper phone test (a drill) of its dead-man check: if this reached your phone, confirm it as Keeper's DOCS say. Nothing is wrong.", app: this.d.self, kind: "phone test", tries: 0, next: 0, at: this.now() });
     this.st.queue.push({ key: `phone-${n}-clear`, to: "deadman", fail: false, body: "keeper alive", app: this.d.self, kind: "phone test clear", tries: 0, next: 0, at: this.now() });
     this.d.log(`phone test sent to the alert check of ${this.opts.watch.join(", ")} and to the dead-man check; confirm each check whose page reached your phone: phone-confirm <code> ${[...this.opts.watch.map((a) => a.replace(/^[0-9a-f]{8}_/, "")), "deadman"].join(" ")}`);
-    this.issueCode("phone", PHONE_WINDOW_MS + 10 * 60_000);
+    this.issueCode("phone", PHONE_WINDOW_MS + 10 * 60_000, runId);
     this.save();
     return { ok: true, why: "" };
   }
@@ -1366,59 +1604,70 @@ export class Keeper {
   // page reached the phone (an App's slug or its short name for its alert check, "deadman" for the dead-man
   // check). That is also the owner's confirmation that the check's channel reaches the phone, which arming
   // takes in place of the API's channel list when a read-only key hides it.
+  // 0.1.7: whole, in one call: every check is named (every watched App's alert check and the dead-man check),
+  // every page was delivered within the hour, and only then is the code (bound to this test) spent, once. A
+  // check whose page didn't reach the phone means the test failed: run it again.
   phoneConfirm(code: string, names: string[]): { ok: boolean; why: string } {
     const now = this.now();
-    const bad = this.useCode("phone", code, false);
-    if (bad) return { ok: false, why: bad };
+    const all = [...this.opts.watch.map((a) => a.replace(/^[0-9a-f]{8}_/, "")), "deadman"];
     const want = names.map((x) => s(x).toLowerCase()).filter(Boolean);
-    if (!want.length) return { ok: false, why: `name each check whose page reached your phone: ${[...this.opts.watch.map((a) => a.replace(/^[0-9a-f]{8}_/, "")), "deadman"].join(" ")}` };
     const checks: [string, string, string[]][] = [...this.opts.watch.map((app) => [`${app}'s alert check`, this.alertUrl(app), [app, app.replace(/^[0-9a-f]{8}_/, "")]] as [string, string, string[]]),
       ["the dead-man check", this.opts.hc_deadman, ["deadman", "hc_deadman"]]];
     const unknown = want.filter((w) => !checks.some(([, , n]) => n.includes(w)));
-    if (unknown.length) return { ok: false, why: `no such check: ${unknown.join(", ")} (name ${checks.map(([, , n]) => n[n.length - 1] === "hc_deadman" ? "deadman" : n[1]).join(", ")})` };
-    const done: string[] = [], late: string[] = [];
-    for (const [name, u, n] of checks) {
-      if (!n.some((x) => want.includes(x))) continue;
-      const p = this.st.phone[checkId(u)];
-      if (p?.deliveredAt && now - p.deliveredAt <= PHONE_WINDOW_MS) { p.confirmedAt = now; done.push(name); } else late.push(name);
-    }
-    if (!done.length) return { ok: false, why: "no phone test page was delivered in the last hour to the checks named: run keeper phone-test first" };
-    this.d.log(`phone test confirmed by the owner for ${done.join(", ")} (each check's page, so its channel, reaches the phone)${late.length ? `; not for ${late.join(", ")} (no page delivered in the last hour)` : ""}`);
+    if (unknown.length) return { ok: false, why: `no such check: ${unknown.join(", ")} (name ${all.join(", ")})` };
+    const missing = checks.filter(([, , n]) => !n.some((x) => want.includes(x))).map(([name]) => name);
+    if (missing.length) return { ok: false, why: `name every check in one call (${all.join(" ")}); not named: ${missing.join(", ")}. If a check's page didn't reach your phone, the test failed: fix that check's channel and run phone-test again` };
+    const run = this.st.phoneRun;
+    if (!run) return { ok: false, why: "no phone test runs: run keeper phone-test first" };
+    const late = checks.filter(([, u]) => { const p = this.st.phone[checkId(u)]; return !(p?.deliveredAt && now - p.deliveredAt <= PHONE_WINDOW_MS); }).map(([name]) => name);
+    if (late.length) return { ok: false, why: `no phone test page was delivered in the last hour to ${late.join(", ")}: wait for the pages, or run keeper phone-test again` };
+    const bad = this.useCode("phone", code, run.id);
+    if (bad) return { ok: false, why: bad };
+    for (const [, u] of checks) this.st.phone[checkId(u)].confirmedAt = now;
+    delete this.st.phoneRun;
+    this.d.log(`phone test confirmed by the owner for ${checks.map(([n]) => n).join(", ")} (each check's page, so its channel, reaches the phone)`);
     this.arm();
     this.save();
-    return { ok: true, why: late.length ? `not confirmed: ${late.join(", ")}` : "" };
+    return { ok: true, why: "" };
   }
   // (0.1.6) The missed-heartbeat drill. With no incident open and the checks' settings read within bounds,
   // Keeper stops its heartbeat ping to hc_done for the heartbeat check's period plus grace (from the API)
   // plus 2 minutes, so Healthchecks marks it down and pages; the dead-man ping goes on. It then resumes, and
   // once the page reached the phone, within an hour, the owner confirms it with the code it printed
   // (missedHeartbeatConfirm). The confirm needs Healthchecks seen showing the heartbeat check down.
+  // 0.1.7: the silence isn't computed from the check's settings any more: the heartbeat ping stops until a read
+  // of the API shows the heartbeat check down (at most MHB_CAP_MS), then resumes, and the check must be seen
+  // up again before the confirm. A check on a schedule (cron) is refused: its page time can't be judged.
   missedHeartbeat(): { ok: boolean; why: string } {
+    const d0 = this.hcSeen?.done;
+    if (d0?.schedule) { this.d.log("refused the missed-heartbeat drill: the heartbeat check runs on a schedule, not a period"); return { ok: false, why: "the heartbeat check (hc_done) runs on a schedule (cron), and the drill needs a simple period check: change it to a period of at most 5 minutes" }; }
     const why = this.armableWhy() || this.hcWhy();
     if (why) return { ok: false, why: `not armable: ${why}` };
-    if (this.st.mhb && !this.st.mhb.resumedAt) return { ok: false, why: `a missed-heartbeat drill runs until ${new Date(this.st.mhb.until).toISOString()}` };
+    const drill = this.drillRunning();
+    if (drill) return { ok: false, why: `${drill} is running: one drill at a time` };
     const busy = this.opts.watch.find((a) => this.st.outstanding[a] || this.open(a).length || this.unresolvedOf(a).length || this.st.queue.some((q) => q.app === a));
     if (busy) return { ok: false, why: `${appName(busy)} has an incident or a line still going out: run the drill once it has cleared` };
     const d = this.hcSeen?.done;
-    if (!d || !(d.period > 0) || !(d.grace >= 0)) return { ok: false, why: "the heartbeat check's period and grace can't be read from the Healthchecks API" };
+    if (!d || !(d.period > 0)) return { ok: false, why: "the heartbeat check's period can't be read from the Healthchecks API" };
     const now = this.now();
-    const ms = (d.period + d.grace) * 1000 + MHB_MARGIN_MS;
-    this.st.mhb = { startedAt: now, until: now + ms, period: d.period, grace: d.grace, api: this.hcSeen?.hash ?? "" };
-    this.d.log(`missed-heartbeat drill: no heartbeat ping to hc_done until ${new Date(now + ms).toISOString()} (period ${d.period}s plus grace ${d.grace}s plus 2 minutes), so Healthchecks pages you; once that page reached your phone, within an hour after the ping resumes, run missed-heartbeat-confirm <code>`);
-    this.issueCode("heartbeat", ms + PHONE_WINDOW_MS);
+    const id = `mhb-${now}-${randomBytes(3).toString("hex")}`;
+    this.st.mhb = { id, startedAt: now, cap: now + MHB_CAP_MS, api: this.hcSeen?.hash ?? "" };
+    this.d.log(`missed-heartbeat drill: no heartbeat ping to hc_done until Healthchecks shows the check down (read every minute; at most until ${new Date(now + MHB_CAP_MS).toISOString()}), so Healthchecks pages you; then the ping resumes, and once the page reached your phone and the check is up again, within an hour, run missed-heartbeat-confirm <code>`);
+    this.issueCode("heartbeat", MHB_CAP_MS + PHONE_WINDOW_MS, id);
     this.arm();
     this.save();
     return { ok: true, why: "" };
   }
   missedHeartbeatConfirm(code: string): { ok: boolean; why: string } {
     const m = this.st.mhb, now = this.now();
-    if (!m) return { ok: false, why: "no missed-heartbeat drill ran: run keeper missed-heartbeat first" };
-    if (!m.resumedAt || now < m.until) return { ok: false, why: `the drill runs until ${new Date(m.until).toISOString()}: confirm once it ended and the page reached your phone` };
-    if (now - m.until > PHONE_WINDOW_MS) return { ok: false, why: "the drill ended over an hour ago: run it again" };
+    if (!m) return { ok: false, why: "no missed-heartbeat drill runs: run keeper missed-heartbeat first" };
+    if (!m.resumedAt) return { ok: false, why: `the drill runs until Healthchecks shows the heartbeat check down (at most until ${new Date(m.cap).toISOString()}): confirm once the ping resumed and the page reached your phone` };
+    if (now - m.resumedAt > PHONE_WINDOW_MS) return { ok: false, why: "the drill ended over an hour ago: run it again" };
     if (!m.sawDown) return { ok: false, why: "Healthchecks never showed the heartbeat check down during the drill, so its page can't have been the drill's: run it again" };
-    const bad = this.useCode("heartbeat", code, true);
+    if (!m.sawUp) return { ok: false, why: "Healthchecks hasn't shown the heartbeat check up again since the ping resumed: confirm once it has (a minute or two)" };
+    const bad = this.useCode("heartbeat", code, m.id);
     if (bad) return { ok: false, why: bad };
-    this.st.mhbRec = { confirmedAt: now, hc: hcHash(this.opts), api: m.api };
+    this.st.mhbRec = { confirmedAt: now, hc: this.hcH(), api: m.api };
     delete this.st.mhb;
     this.d.log("missed-heartbeat drill confirmed by the owner: a missed heartbeat pages the phone (the heartbeat check's channel reaches it); good for 14 days");
     this.arm();
@@ -1429,13 +1678,13 @@ export class Keeper {
   // checks' settings.
   private mhbOk(now: number): boolean {
     const r = this.st.mhbRec;
-    if (!r || r.hc !== hcHash(this.opts) || now - r.confirmedAt > MHB_MAX_MS) return false;
+    if (!r || r.hc !== this.hcH() || now - r.confirmedAt > MHB_MAX_MS) return false;
     return !(this.hcSeen?.ok && this.hcSeen.hash !== r.api);
   }
   // (0.1.4) Confirmed within 14 days (0.1.5), under the current Healthchecks options and checks' settings,
   // for the App's alert check and the dead-man check.
   private phoneOk(app: string, now: number): boolean {
-    if (this.st.phoneHc !== hcHash(this.opts)) return false;
+    if (this.st.phoneHc !== this.hcH()) return false;
     if (!this.st.phoneHcApi || (this.hcSeen?.ok && this.hcSeen.hash !== this.st.phoneHcApi)) return false;
     return [this.alertUrl(app), this.opts.hc_deadman].every((u) => { const p = this.st.phone[checkId(u)]; return !!p?.confirmedAt && now - p.confirmedAt <= PHONE_MAX_MS; });
   }
@@ -1474,10 +1723,12 @@ export class Keeper {
     const stuck = this.st.queue.some((q) => q.fail && now - q.at > STUCK_FAIL_MS);
     const armable = this.armableWhy();
     const hc = armable ? "" : this.hcWhy(now);
+    const drill = this.drillRunning(now);
     const why = armable ? `the keeper is not armable: ${armable}`
+      : !this.limitsOk() ? `the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION}): accept-limits <code>`
+      : drill ? `${drill} is running (one drill at a time; Keeper is unarmed during a drill)`
       : valid.length < 2 ? `no drills on record for ${app} under the current binding`
       : !this.phoneOk(app, now) ? `no phone test drill confirmed for ${app}'s alert check and the dead-man check in the last 14 days, under the current Healthchecks options and checks' settings`
-      : this.st.mhb && !this.st.mhb.resumedAt ? "the missed-heartbeat drill is running"
       : !this.mhbOk(now) ? "no missed-heartbeat drill confirmed in the last 14 days, under the current Healthchecks options and checks' settings"
       : !this.delivered(now) ? "no heartbeat ping was delivered to Healthchecks in the last 10 minutes"
       : !this.st.deadmanDelivered || now - this.st.deadmanDelivered > DELIVERY_MS ? "no dead-man ping was delivered to Healthchecks in the last 10 minutes"
@@ -1488,7 +1739,9 @@ export class Keeper {
       : "";
     return { armed: !why, why, at: valid.length === 2 ? Math.max(...valid.map((r) => r!.at)) : null };
   }
-  armedView(app: string): { app: string; armed: boolean; why: string; armed_at: string | null; binding: Binding; keeper_version: string; at: string; key_fp: string; key_confirmed_at: string | null; state_created: string } {
+  armedView(app: string): { app: string; armed: boolean; why: string; armed_at: string | null; binding: Binding; keeper_version: string; at: string; key_fp: string; key_confirmed_at: string | null; state_created: string; enroll_id: string; counter: number } {
+    // (0.1.7) each armed read moves the enrollment counter on, saved
+    this.save();
     const v = this.armedState(app);
     return { app, armed: v.armed, why: v.why, armed_at: v.armed && v.at ? new Date(v.at).toISOString() : null, binding: this.binding(app),
       keeper_version: this.d.version, at: new Date(this.st.heartbeat || this.now()).toISOString(), ...this.enrollment() };
