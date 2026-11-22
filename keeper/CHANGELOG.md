@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5
+
+- Keeper never sends a restore twice. If Home Assistant turns a rollback down, fails it or doesn't answer, Keeper pages you "unresolved", keeps checking without touching anything, and tells you once it knows.
+- An install is covered only once Cain's link claims Keeper's acceptance as the Ship run starts. An acceptance not claimed within 30 minutes, or a claim with no install within 30 minutes, ends with a line in Keeper's log. An install Keeper sees outside a live claim pages you as unprotected and is never rolled back.
+- Keeper accepts no install until you confirm its Ship key at the device with `key-confirm`, at first setup too, and again after its state is lost or restored. Cain's link also checks Keeper's key against the fingerprint kept in the repository.
+- New option `hc_api_key`: a Healthchecks API key. Keeper reads each check's timing, status and notification channels with it, and can't be armed without it, while a check's timing is outside the limits in its docs, while a check has no channel or is paused, or once the settings change after your phone test.
+- The phone test now lasts 14 days. A page that Healthchecks hasn't taken within 10 minutes closes the gate until a new phone test.
+- Registering an install answers at once and Cain's link checks back while the backup is made, so nothing waits on one long request.
+
 ## 0.1.4
 
 - A Ship install now starts only after Keeper has made and checked Cain's backup. Keeper answers the registration only once that backup is complete, and Cain's Ship run waits for that answer. If the backup fails or takes over 4 minutes, you are paged "unprotected" and nothing is installed. Each acceptance covers one install only.

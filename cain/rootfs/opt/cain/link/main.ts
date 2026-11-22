@@ -37,7 +37,8 @@
 //                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
 //     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the installs registered with the
 //                                       keeper App, "pending" until it accepted every watched one (backup made and
-//                                       verified), then "ok" once, the token spent (a second run on it is refused) (0.19.0)
+//                                       verified), then each acceptance claimed and "ok" once, the token spent (a second
+//                                       run on it is refused) (0.19.0, Keeper 0.1.5: the claim and the enrollment check)
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
@@ -77,7 +78,7 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
-import { ATTEMPT_WAIT_MS, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
+import { type EnrollmentStore, keyFingerprint, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -390,19 +391,33 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 // The Ship pass (0.19.0, with Keeper 0.1.3): one Ship run per token, and its installs registered with the
 // keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
 const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
+// Keeper 0.1.5: the last confirmed enrollment of the keeper's Ship key the link saw (ship-pass.ts enrollmentCheck).
+const KEEPER_ENROLL = process.env.CAIN_KEEPER_ENROLL ?? `${TRUST_DIR}/keeper-enrollment.json`;
+const enrollment: EnrollmentStore = {
+  load: () => { try { return parseEnrollment(readFileSync(KEEPER_ENROLL, "utf8")); } catch { return null; } },
+  store: (e) => writeSynced(KEEPER_ENROLL, JSON.stringify(e)),
+};
+const shipPub = () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } };
+const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
 const shipPassDeps: PassDeps = {
-  pub: () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } },
+  pub: shipPub,
   now: Date.now,
   load: () => { try { return readFileSync(SHIP_PASSES, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; return "unreadable"; } },
   store: (text) => writeSynced(SHIP_PASSES, text),
-  // Keeper 0.1.4: each POST /attempt answers only once the keeper's backup is complete and verified (up to
-  // about 4 minutes), so the wait is ATTEMPT_WAIT_MS; the pass stays "pending" meanwhile (ship-pass.ts).
-  register: (tok, claim, done) => {
-    void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`),
-      post: (body) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/attempt", body, ATTEMPT_WAIT_MS) : Promise.resolve(null) }, tok, claim)
+  // Keeper 0.1.5: POST /attempt answers 202 at once and the link polls GET /attempt/<id> until accepted or
+  // refused (ATTEMPT_WAIT_MS per App); the pass stays "pending" meanwhile (ship-pass.ts).
+  register: (tok, claim, done, note) => {
+    const pub = shipPub();
+    void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
+      post: (body) => keeperPost("/attempt", body),
+      get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)
       .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
   },
+  // 3 seconds: the hook waits on the pass (about 8 seconds a request), so the claim must answer well within it.
+  claim: (a) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup }, 3_000) : Promise.resolve(null),
+  cancel: (attempt, why) => { void keeperPost(`/attempt/${attempt}/cancel`, { why }); },
+  enrollment,
   log: (l) => console.log(`[cain] link: ${l}`),
 };
 const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ, shipPass: (b: any) => shipPass(shipPassDeps, b) };

@@ -6,11 +6,12 @@
 //   bun main.ts phone-test            (0.1.3) the phone test drill: pages each watched App's alert check once,
 //                                     and (0.1.4) the dead-man check
 //   bun main.ts phone-confirm         (0.1.3) once those pages reached the owner's phone: records it (30 days)
-//   bun main.ts key-confirm <fp>      (0.1.4) the owner confirms a changed ship_public_key by its fingerprint
+//   bun main.ts key-confirm <fp>      (0.1.4) the owner confirms ship_public_key by its fingerprint (0.1.5: the
+//                                     first pin, a new state and a rotation alike)
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
-import { HEARTBEAT_MS, Keeper, POLL_MS, type State } from "./core.ts";
+import { HEARTBEAT_MS, type HcCheck, Keeper, POLL_MS, type State } from "./core.ts";
 import { handle } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -44,6 +45,23 @@ async function get200(url: string | null): Promise<boolean> {
   try { const r = await fetch(url, { signal: AbortSignal.timeout(5_000), redirect: "manual" }); return r.status === 200; } catch { return false; }
 }
 const readJson = (p: string): unknown => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } };
+// (0.1.5) The Healthchecks management API's checks (GET /api/v3/checks/, the key in X-Api-Key, never
+// logged). Null when it can't be read. healthchecks.io only: a self-hosted Healthchecks isn't read.
+export const HC_API = "https://healthchecks.io/api/v3/checks/";
+export async function hcChecks(key: string, http: typeof fetch = fetch): Promise<HcCheck[] | null> {
+  try {
+    const r = await http(HC_API, { headers: { "x-api-key": key }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+    if (r.status !== 200) return null;
+    const j: any = await r.json();
+    if (!Array.isArray(j?.checks)) return null;
+    return j.checks.filter((c: any) => c && typeof c === "object").map((c: any) => {
+      const out: HcCheck = {};
+      for (const k of ["name", "slug", "ping_url", "unique_key", "status", "channels", "schedule"] as const) if (typeof c[k] === "string") (out as any)[k] = c[k];
+      for (const k of ["timeout", "grace"] as const) if (typeof c[k] === "number") out[k] = c[k];
+      return out;
+    });
+  } catch { return null; }
+}
 
 async function serve(): Promise<void> {
   const token = process.env.SUPERVISOR_TOKEN ?? "";
@@ -56,7 +74,7 @@ async function serve(): Promise<void> {
   if (me && me.version && me.version !== version) log(`the Supervisor says this is ${me.version}, the image says ${version}: the image's is bound`);
   const k = new Keeper({
     now: Date.now, version, self,
-    appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, job: sup.job, restoreJobs: sup.restoreJobs,
+    appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, job: sup.job, hcChecks: (key) => hcChecks(key),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
@@ -66,7 +84,8 @@ async function serve(): Promise<void> {
     // The options as the Supervisor holds them (the file is written only at the keeper's start); the
     // Supervisor not answering keeps the last ones read in force. The keeper never writes options.
     options: () => sup.selfOptions(),
-    save: (s: State) => { try { writeWhole(STATE, JSON.stringify(s)); } catch (e) { log(`couldn't save its state: ${String((e as Error)?.message ?? e).slice(0, 80)}`); } },
+    // 0.1.5: false when the write failed, so a claim is refused rather than answered unsaved.
+    save: (s: State) => { try { writeWhole(STATE, JSON.stringify(s)); return true; } catch (e) { log(`couldn't save its state: ${String((e as Error)?.message ?? e).slice(0, 80)}`); return false; } },
     log,
   }, readJson(STATE));
   // 0.1.3: the options as they are; nothing is filled in from a kept copy.
@@ -80,8 +99,8 @@ async function serve(): Promise<void> {
     k.save();
     process.exit(0);
   });
-  // idleTimeout 255 (Bun's most): POST /attempt answers only once the keeper's backup is done (0.1.4, up to 4 minutes).
-  Bun.serve({ port: PORT, hostname: "0.0.0.0", idleTimeout: 255, maxRequestBodySize: 4096,
+  // 0.1.5: POST /attempt answers at once (the backup runs in the background), so no request is held open.
+  Bun.serve({ port: PORT, hostname: "0.0.0.0", idleTimeout: 30, maxRequestBodySize: 4096,
     fetch: (req, server) => handle(k, req, server.requestIP(req)?.address ?? "", log) });
   const tick = async () => { try { await k.poll(); } catch (e) { log(`a poll failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`); } };
   await tick();

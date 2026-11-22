@@ -2,9 +2,12 @@
 //   GET  /attempt   the open attempt of the caller's App (its id, from and to), or none
 //   POST /attempt   (0.1.3) Cain's App only: register an install, {token, app, pr, head, from_version,
 //                   to_version, probe_hash, kind?}, the token being the owner's signed Ship token, verified
-//                   here with the pinned key (core.ts registerAttempt). 0.1.4: answered only once the
-//                   keeper's backup is complete and verified, 200 {status: "accepted", id, backup, ...}, or
-//                   refused (up to about 4 minutes: the backup)
+//                   here with the pinned, confirmed key (core.ts registerAttempt). 0.1.5: answered 202
+//                   {status: "pending", id} at once; the backup is made in the background
+//   GET  /attempt/<id>          (0.1.5) Cain's App only: pending, accepted (with its backup), claimed, or refused
+//   POST /attempt/<id>/claim    (0.1.5) Cain's App only, as the Ship run starts: {app, from_version, to_version,
+//                               backup}; one claimant, valid 30 minutes
+//   POST /attempt/<id>/cancel   (0.1.5) Cain's App only: the link gave up on the pass, {why}
 //   POST /verdict   {app, version, attempt, result: PASS|FAIL, reason}: the caller's App's probe verdict
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
 //                   version and a timestamp refreshed every minute
@@ -33,6 +36,7 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (LOCAL.has(url.pathname) && req.method === "POST") {
     if (!loopback(ip)) { log(`refused ${url.pathname} from ${ip}: only from inside the keeper`); return json({ status: "refused" }, 403); }
     const b = await body(req);
+    if (url.pathname === "/phone-test") await k.refreshHc();
     const r = url.pathname === "/drill-record" ? k.drillRecord(String(b?.attempt ?? "")) : url.pathname === "/phone-test" ? k.phoneTest()
       : url.pathname === "/key-confirm" ? k.keyConfirm(String(b?.fingerprint ?? "")) : k.phoneConfirm();
     return json(r, r.ok ? 200 : 409);
@@ -44,6 +48,14 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (req.method === "GET" && url.pathname === "/attempt") {
     const a = k.openAttempt(caller);
     return json(a ? { app: caller, attempt: a.id, from_version: a.from, to_version: a.to, status: a.status } : { app: caller, attempt: null });
+  }
+  const m = /^\/attempt\/([a-z0-9-]{1,100})(\/claim|\/cancel)?$/.exec(url.pathname);
+  if (m && req.method === "GET" && !m[2]) { const r = k.attemptView(caller, m[1]); return json(r.body, r.status); }
+  if (m && req.method === "POST" && m[2]) {
+    const b = await body(req);
+    if (b === undefined || !b || typeof b !== "object") return json({ status: "refused", why: "not JSON" }, 400);
+    const r = m[2] === "/claim" ? k.claimAttempt(caller, m[1], b) : k.cancelAttempt(caller, m[1], b);
+    return json(r.body, r.status);
   }
   if (req.method === "POST" && url.pathname === "/attempt") {
     const b = await body(req);

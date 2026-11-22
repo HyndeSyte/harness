@@ -15,7 +15,7 @@ export interface RouteDeps {
   link: Link;
   toHarness: (path: string, body: unknown) => Promise<boolean>;
   tz?: string;
-  shipPass?: (body: any) => PassAnswer;          // (0.19.0) the hook's one Ship run per token (ship-pass.ts)
+  shipPass?: (body: any) => Promise<PassAnswer>; // (0.19.0) the hook's one Ship run per token (ship-pass.ts; async since Keeper 0.1.5: the claim)
 }
 
 // One request, from a caller already proven: refused unless the route is the caller's.
@@ -55,7 +55,7 @@ export function linkRoutes(d: RouteDeps) {
         case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
         case "/guard-hold": return json(link.guardHoldFor(b, caller));
-        case "/ship-pass": return json(d.shipPass ? d.shipPass(b) : { status: "refused", said: "the link can't spend Ship tokens" });
+        case "/ship-pass": return json(d.shipPass ? await d.shipPass(b) : { status: "refused", said: "the link can't spend Ship tokens" });
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

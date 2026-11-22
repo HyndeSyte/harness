@@ -12,6 +12,8 @@
 - One Ship tap starts one Ship run: a second run on the same tap is refused, and Cain's link registers that run's install with the Keeper itself, so nothing writes the Keeper's options any more.
 - The Keeper decides on /health (Cain running and alive), not /ready: a Discord outage is reported as "chat not connected", never a reason to roll Cain back.
 - A Ship run that installs Cain starts only after the Keeper has made and checked his backup. Meanwhile Cain is told to start the run again in a minute. If the Keeper refuses, doesn't answer, or isn't set up, the Ship run doesn't start and Cain tells you why.
+- Cain's link now claims the Keeper's acceptance at the moment the Ship run starts, and logs a line the Ship run must see before it installs. If the run gives up, the Keeper's registration is cancelled.
+- Cain's link checks that the Keeper trusts the right Ship key: the key's fingerprint is kept in the repository (`cain/SHIP_KEY_FINGERPRINT`), and you confirm it at the Keeper. Until the fingerprint is filled in by a Build, Ship runs that install Cain are refused, and Cain says why.
 
 ## 0.18.0
 

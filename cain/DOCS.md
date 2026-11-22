@@ -538,6 +538,24 @@ bad one back from the backup taken just before it. Cain's part:
   the Keeper isn't installed or set up (its `ship_public_key`, its `tokens` and this App's `keeper_token`),
   no Ship run that installs Cain starts. The Ship run itself still reads the Keeper's `accepting <id> ...`
   line before it installs and stops without it (RELEASING.md, Ship).
+- With Keeper 0.1.5:
+  - Register, then poll: the Keeper answers a registration at once and makes the backup in the
+    background; the link checks back (`GET /attempt/<id>`) every 5 seconds, up to 5 minutes per watched
+    App, and the whole pass waits 5 minutes per watched App plus 1. When it gives up it cancels each
+    registration it made at the Keeper, so no acceptance is left lying around.
+  - The claim: once every watched App is accepted, at the hook's next ask, the link claims each
+    acceptance at the Keeper (single use, valid 30 minutes) and only then answers "ok", with each claim's
+    id and deadline, and writes `Ship pass ok: <attempt id> claim <claim id> until <time>` to this App's
+    log. The Ship run needs that line and the Keeper's `claimed ...` line for the same attempt before it
+    installs, and aborts once the claim's deadline has passed. A refused or unanswered claim refuses the
+    pass for good.
+  - The key's fingerprint: `cain/SHIP_KEY_FINGERPRINT` in the repository holds the fingerprint of the
+    link's Ship key (this App's log prints it, `Ship key fingerprint: ...`). The link refuses the pass
+    unless the Keeper's pinned key has that fingerprint at the pull request's head, it is the link's own
+    key's, the owner has confirmed the pin at the Keeper (`key-confirm`), and the Keeper's state is no
+    newer than the one the link recorded at the last confirmed enrollment it saw (root's
+    `/data/trust/keeper-enrollment.json`). Until a Build commits the fingerprint, every Ship run that
+    installs Cain is refused.
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

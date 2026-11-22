@@ -15,7 +15,12 @@
 //     made and verified each one's backup, then "ok" once (the token spent; a second run on it is
 //     refused). The hook asks again for a few seconds while it is pending, then refuses the run with a
 //     line telling Cain to start the same run again in a minute (../link/ship-pass.ts). A link that
-//     doesn't answer, or a refused pass, refuses the run;
+//     doesn't answer, or a refused pass, refuses the run. (Keeper 0.1.5) The link's "ok" comes only after
+//     it claimed each acceptance at the keeper (single use, valid 30 minutes) and checked the keeper's
+//     pinned key against cain/SHIP_KEY_FINGERPRINT at the head and its state against the recorded
+//     enrollment; it carries each claim id and deadline, and the link logs "Ship pass ok: <attempt> claim
+//     <claim> until <time>", the line the Ship run reads. A pass the link gives up on is cancelled at the
+//     keeper;
 //   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all;
 //   - (Cain 0.16.0) a run carries one label, core, commitment, necessary-fix or other: in its body's
 //     "label" field or on a "Label: <label>" line of its text (both, and they must agree); none is
@@ -188,7 +193,7 @@ export async function decideWithGuard(call: any, holdsText: string | null, env: 
 // (Keeper 0.1.4) "pending" (the keeper is still making the backup) is asked again every second or so
 // within budgetMs (the hook's whole limit is 15 seconds), then refuses with the link's line, which tells
 // Cain to start the same run again in a minute.
-export type Pass = { ok: true } | { ok: false; why: string; pending?: true };
+export type Pass = { ok: true; claims?: { attempt: string; claim: string; until: string }[] } | { ok: false; why: string; pending?: true };
 export const PASS_BUDGET_MS = 10_000;
 export async function postShipPass(token: string, o: { url?: string; key?: string; keyFile?: string; ms?: number; fetch?: typeof fetch; budgetMs?: number; pauseMs?: number } = {}): Promise<Pass> {
   let key = o.key ?? "";
@@ -198,9 +203,9 @@ export async function postShipPass(token: string, o: { url?: string; key?: strin
     let j: any;
     try {
       const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/ship-pass`, { method: "POST", body: JSON.stringify({ token }),
-        headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(Math.max(500, Math.min(o.ms ?? 5_000, until - Date.now()))) });
+        headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(Math.max(500, Math.min(o.ms ?? 8_000, until - Date.now()))) });
       j = await r.json().catch(() => ({}));
-      if (r.ok && j?.status === "ok") return { ok: true };
+      if (r.ok && j?.status === "ok") return Array.isArray(j.claims) ? { ok: true, claims: j.claims } : { ok: true };
       if (!(r.ok && j?.status === "pending")) return { ok: false, why: String(j?.said ?? `the link answered ${j?.status ?? r.status}`).slice(0, 300) };
     } catch (e) { return { ok: false, why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
     const pause = o.pauseMs ?? 1_500;

@@ -1,0 +1,6 @@
+# The fingerprint of Cain's link's Ship key (Keeper 0.1.5): the first 16 hex digits of the SHA-256 of
+# its public half, as the link logs it ("Ship key fingerprint: ..." in Cain's App log, next to
+# "Ship key (public): ..."). The Build Dane runs when the link's Ship key is made or rotated writes it
+# here, on the line below these comments; it is a shipped file, so that Build steps Cain one patch
+# version. Cain's link refuses every Ship pass that installs a watched App until the keeper's pinned key
+# has this fingerprint, and while this file holds none (as now) every such pass is refused.

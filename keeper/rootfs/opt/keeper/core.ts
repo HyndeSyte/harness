@@ -1,4 +1,4 @@
-// The keeper of installs (Keeper 0.1.0; review fixes 0.1.1, 0.1.2, 0.1.3 and 0.1.4): a check after every
+// The keeper of installs (Keeper 0.1.0; review fixes 0.1.1, 0.1.2, 0.1.3, 0.1.4 and 0.1.5): a check after every
 // install of a watched App, and an automatic rollback of a bad one from the App-only backup taken just
 // before it.
 //
@@ -46,20 +46,50 @@
 //   Follow-ups: a token issued before the keeper's state was created is refused; an install that passed
 //   with chat down for most of its window pages the owner (no restore) so he can roll back by hand.
 //
+// 0.1.5 (the fifth review's fixes):
+//   1. No resend, ever. A restore is called at most once per attempt; a refused (4xx), failed (5xx),
+//      timed out or unclear call is unresolved: fenced, reconciled read only by its job id, paged. A drill
+//      still records the restore job's name and how long a finished job stays listed, taken only from the
+//      job id its own restore call returned (never matched on the reference), for a later version to
+//      decide on; nothing here acts on it.
+//   2. The claim at the install. An acceptance lasts 30 minutes and covers an install only once claimed
+//      (POST /attempt/<id>/claim, Cain's link, bound to the attempt, App, versions and backup slug): atomic
+//      (checked and set with no await between), saved durably before the answer, single claimant, valid
+//      30 minutes. An acceptance that expires unclaimed, or a claim that expires with no version change,
+//      ends with an "ended" line; a version change seen outside a live claim is unprotected (paged). The
+//      link cancels a registration it gives up on (POST /attempt/<id>/cancel).
+//   3. Enrollment of the Ship key. A first pin, like a rotation, accepts no registration until the owner
+//      confirms it at the device (key-confirm); a rewound state needs it again. Acceptance and claim
+//      answers report the pinned fingerprint, the confirmation time and the state's creation time, which
+//      the link checks against the fingerprint committed in the repository (cain/SHIP_KEY_FINGERPRINT).
+//   4. The alert gate. With hc_api_key (a Healthchecks API key) the keeper reads each check's period,
+//      grace, status and channels and refuses to arm outside set bounds, with no channel, paused, or with
+//      settings changed since the phone test; no key, not armable. The phone test lasts 14 days, and a
+//      page with no acknowledgment (a 2xx) from Healthchecks within 10 minutes closes the gate until a
+//      new phone test.
+//   Follow-up: register-then-poll. POST /attempt answers 202 at once; the backup is made in the
+//   background and the link polls GET /attempt/<id> until accepted or refused.
+//
 // The life of an attempt (one install of one App, registered just before the install):
-//   verifying    the registration was taken; its backup is being made and checked (the answer waits)
-//   unprotected  the backup (or the registration) failed a check: nothing is ever restored for it
-//   accepted     the backup holds that App alone at from_version: "accepting ..." is logged and answered
-//   watching     to_version was seen in the App's info (the acceptance consumed): 15 minutes from then
+//   verifying    the registration was taken (answered 202); its backup is being made and checked
+//   unprotected  the backup (or the registration) failed a check, or the install was seen outside a
+//                live claim: nothing is ever restored for it
+//   accepted     the backup holds that App alone at from_version: "accepting ..." is logged; 30 minutes
+//                to be claimed
+//   claimed      (0.1.5) Cain's link claimed it as the Ship run started: "claimed ..." is logged; 30
+//                minutes for to_version to show
+//   ended        (0.1.5) the acceptance expired unclaimed, the claim expired with no version change, or
+//                the link cancelled it: nothing is restored for it
+//   watching     to_version was seen in the App's info within the claim (consumed): 15 minutes from then
 //   restoring    a fail: marked before the restore starts, so the version change it causes is this
 //                attempt's recovery and never a new attempt, across restarts
-//   unresolved   the restore's outcome isn't established: fenced (nothing is sent again, ever),
+//   unresolved   the restore's outcome isn't established, or it was refused: fenced (nothing is sent again, ever),
 //                reconciled read only on every poll, and moved on (one follow-up line) once known
 //   passed       the watch ended with every pass condition held
 //   rolled back  the restore job finished without errors and from_version is started and live again
 //   gave up      the restore failed, or the App didn't come back
-//   never started  the install deadline passed without to_version ever seen (nothing restored)
-import { createHash, createPublicKey, timingSafeEqual, verify as edVerify, type KeyObject } from "node:crypto";
+//   never started  (before 0.1.5) the install deadline passed without to_version ever seen
+import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify as edVerify, type KeyObject } from "node:crypto";
 
 export const PROTOCOL = 1;                       // the verdict protocol version, bound into the armed state
 export const BACKUP_SCOPE = "app-only";          // the backup scope bound into the armed state
@@ -68,14 +98,21 @@ export const POLL_MS = 30_000;
 export const WATCH_MS = 15 * 60_000;
 export const HEARTBEAT_MS = 60_000;              // the heartbeat time in /data, /armed's timestamp, the dead-man ping
 export const HC_HEARTBEAT_MS = 5 * 60_000;       // the ping to hc_done, and the log ping to each alert check
-export const REGISTER_WAIT_MS = 4 * 60_000;      // (0.1.4) the registration's answer waits this long for the backup
+export const REGISTER_WAIT_MS = 4 * 60_000;      // (0.1.4) the keeper's backup must complete within this (0.1.5: in the background)
 export const BACKUP_DATE_SKEW_MS = 60_000;       // (0.1.4) the backup's date may read this much before the token's issue
-export const INSTALL_MS = 60 * 60_000;           // (0.1.3) a registration's install deadline, from its registration
+export const ACCEPT_MS = 30 * 60_000;            // (0.1.5) an acceptance must be claimed within this
+export const CLAIM_MS = 30 * 60_000;             // (0.1.5) a claim is valid this long: to_version must show within it
 export const RESTORE_LIMIT_MS = 15 * 60_000;     // the restore's whole limit, refusals included, from the fail
 export const CONFIRM_MS = 5 * 60_000;            // after the restore job: from_version started and live within this
 export const REWIND_MS = 10 * 60_000;            // a heartbeat gap at start over this drops the drill records
 export const ARMED_MAX_MS = 60 * 86_400_000;     // drill records last 60 days
-export const PHONE_MAX_MS = 30 * 86_400_000;     // (0.1.4) the phone test lasts 30 days
+export const PHONE_MAX_MS = 14 * 86_400_000;     // (0.1.5) the phone test lasts 14 days (30 in 0.1.4)
+export const PAGE_ACK_MS = 10 * 60_000;          // (0.1.5) a page with no 2xx from Healthchecks within this closes the gate
+export const HC_READ_MS = 60_000;                // (0.1.5) the Healthchecks settings read, at most this often
+export const HC_READ_FRESH_MS = 3 * 60_000;      // (0.1.5) arming needs a settings read this recent
+export const HC_DONE_PERIOD_MAX_S = 300, HC_DONE_GRACE_MAX_S = 600;     // (0.1.5) the heartbeat check's bounds
+export const HC_DEADMAN_PERIOD_S = 60, HC_DEADMAN_GRACE_MAX_S = 300;    // (0.1.5) the dead-man check's bounds
+export const JOB_LISTING_MAX_MS = 2 * 86_400_000; // (0.1.5) a drill's restore job is watched this long for how long it stays listed
 export const LOOP_FRESH_MS = 3 * 60_000;         // (0.1.4) the dead-man ping goes only while a poll completed within this
 export const DELIVERY_MS = 10 * 60_000;          // armed only while the heartbeat, dead-man and log pings were delivered within this
 export const STUCK_FAIL_MS = 2 * 60_000;         // a fail ping undelivered for longer than this disarms
@@ -96,6 +133,7 @@ export interface Options {
   hc_failed: Record<string, string>;             // slug -> alert check URL; "*" for every App (a single URL)
   health_grace_s: number;
   ship_public_key: string;                       // (0.1.3) the link's Ship key, public half (SPKI DER, base64)
+  hc_api_key: string;                            // (0.1.5) a Healthchecks API key (read-only is meant to be enough), for the settings read
 }
 const s = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 const pairs = (v: unknown): Record<string, string> => {
@@ -128,20 +166,21 @@ export function parseOptions(raw: unknown): Options {
   return {
     watch, health: pairs(o.health), tokens: pairs(o.tokens), hc_done: s(o.hc_done), hc_deadman: s(o.hc_deadman), hc_failed: parseAlerts(o.hc_failed),
     health_grace_s: Number.isFinite(grace) && grace >= 0 && grace <= 900 ? Math.floor(grace) : DEFAULT_HEALTH_GRACE_S,
-    ship_public_key: s(o.ship_public_key).replace(/\s+/g, ""),
+    ship_public_key: s(o.ship_public_key).replace(/\s+/g, ""), hc_api_key: s(o.hc_api_key),
   };
 }
 const sortedRec = (r: Record<string, string>) => Object.fromEntries(Object.keys(r).sort().map((k) => [k, r[k]]));
 // The options' hash, canonical, so an options change re-binds (and drops) the drill records.
 export function optionsHash(o: Options): string {
   const canon = JSON.stringify({ watch: [...o.watch].sort(), health: sortedRec(o.health), tokens: sortedRec(o.tokens),
-    hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed), health_grace_s: o.health_grace_s, ship_public_key: o.ship_public_key });
+    hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed), health_grace_s: o.health_grace_s, ship_public_key: o.ship_public_key,
+    hc_api_key: o.hc_api_key ? sha(o.hc_api_key).slice(0, 16) : "" });
   return sha(canon).slice(0, 16);
 }
 export const sha = (t: string) => createHash("sha256").update(t).digest("hex");
 const HTTPS = /^https:\/\/\S+$/;
 // (0.1.4) The Healthchecks options' hash: a phone test counts only under the options it was made with.
-export const hcHash = (o: Options) => sha(JSON.stringify({ hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed) })).slice(0, 16);
+export const hcHash = (o: Options) => sha(JSON.stringify({ hc_done: o.hc_done, hc_deadman: o.hc_deadman, hc_failed: sortedRec(o.hc_failed), hc_api_key: o.hc_api_key ? sha(o.hc_api_key) : "" })).slice(0, 16);
 // (0.1.4) A check's identity: the check id in its ping URL's path, the Healthchecks uuid
 // (https://hc-ping.com/<uuid>) or slug (https://hc-ping.com/<ping key>/<slug>), lower case. Two URLs naming
 // the same check (a trailing slash, a query, another host spelling) are the same check. "" when the path
@@ -158,9 +197,43 @@ export function checkId(url: string): string {
   return uuid ?? last;
 }
 
+// (0.1.5) The Healthchecks checks' settings judged for arming (Keeper.readHc): ok, why not, and the hash
+// of the settings that count (each role's check: period, grace, channels, schedule).
+export function judgeHc(o: Options, list: HcCheck[]): { ok: boolean; why: string; hash: string } {
+  const find = (url: string): HcCheck | undefined => {
+    const id = checkId(url);
+    if (!id) return undefined;
+    if (UUID.test(id)) {
+      const keys = [sha1(id), sha1(id.replace(/-/g, ""))];
+      return list.find((c) => (typeof c.ping_url === "string" && checkId(c.ping_url) === id) || (typeof c.unique_key === "string" && keys.includes(c.unique_key.toLowerCase())));
+    }
+    return list.find((c) => typeof c.slug === "string" && c.slug.toLowerCase() === id);
+  };
+  const roles: [string, string, "done" | "deadman" | "alert"][] = [["hc_done (the heartbeat check)", o.hc_done, "done"], ["hc_deadman (the dead-man check)", o.hc_deadman, "deadman"],
+    ...o.watch.map((a) => [`${appName(a)}'s alert check`, o.hc_failed[a] ?? o.hc_failed["*"] ?? "", "alert"] as [string, string, "alert"])];
+  const seen: unknown[] = [];
+  for (const [name, url, role] of roles) {
+    const c = find(url);
+    if (!c) return { ok: false, why: `${name} isn't among the checks hc_api_key can read`, hash: "" };
+    const period = typeof c.timeout === "number" ? c.timeout : NaN, grace = typeof c.grace === "number" ? c.grace : NaN;
+    if (typeof c.channels !== "string") return { ok: false, why: `the Healthchecks API doesn't show ${name}'s channels (a read-only key may hide them; use a key that shows them)`, hash: "" };
+    if (!c.channels.split(",").map((x) => x.trim()).filter(Boolean).length) return { ok: false, why: `${name} has no notification channel assigned`, hash: "" };
+    if (c.status === "paused") return { ok: false, why: `${name} is paused`, hash: "" };
+    if (role !== "alert" && c.status === "down") return { ok: false, why: `${name} is down`, hash: "" };
+    if (role === "done" && (c.schedule || !(period > 0 && period <= HC_DONE_PERIOD_MAX_S) || !(grace >= 0 && grace <= HC_DONE_GRACE_MAX_S)))
+      return { ok: false, why: `${name} needs a simple period of at most 5 minutes and a grace of at most 10 (it has ${c.schedule ? "a schedule" : `period ${period}s, grace ${grace}s`})`, hash: "" };
+    if (role === "deadman" && (c.schedule || period !== HC_DEADMAN_PERIOD_S || !(grace >= 0 && grace <= HC_DEADMAN_GRACE_MAX_S)))
+      return { ok: false, why: `${name} needs a simple period of 1 minute and a grace of at most 5 (it has ${c.schedule ? "a schedule" : `period ${period}s, grace ${grace}s`})`, hash: "" };
+    seen.push([role, url ? checkId(url) : "", period, grace, c.channels.split(",").map((x) => x.trim()).sort().join(","), c.schedule ?? ""]);
+  }
+  return { ok: true, why: "", hash: sha(JSON.stringify(seen)).slice(0, 16) };
+}
+const sha1 = (t: string) => createHash("sha1").update(t).digest("hex");
+
 export const SLUG = /^[a-z0-9_]{1,64}$/;
+const OUTSIDE_CLAIM = "the install was seen outside a live claim (the acceptance unclaimed, its claim expired, or the attempt ended), so it is uncertain";
 // (0.1.4) Kinds of line that page and clear themselves, leaving no incident open.
-const NOTICES = new Set(["phone test", "key pinned", "key changed", "degraded"]);
+const NOTICES = new Set(["phone test", "key pinned", "key changed", "degraded", "ended"]);
 const VERSION = /^[0-9A-Za-z.+-]{1,32}$/;
 const BACKUP = /^[A-Za-z0-9_-]{1,64}$/;
 const PROBE_HASH = /^[0-9a-f]{12,64}$/;
@@ -208,8 +281,8 @@ export const keyFp = (spkiB64: string) => createHash("sha256").update(Buffer.fro
 export const appName = (slug: string) => { const b = slug.replace(/^[0-9a-f]{8}_/, ""); return b ? b[0].toUpperCase() + b.slice(1) : slug; };
 
 // -- state ----------------------------------------------------------------------------------------
-export type Status = "verifying" | "unprotected" | "accepted" | "watching" | "restoring" | "passed" | "rolled back" | "gave up" | "never started" | "unresolved";
-export const OPEN: Status[] = ["verifying", "accepted", "watching", "restoring"];
+export type Status = "verifying" | "unprotected" | "accepted" | "claimed" | "ended" | "watching" | "restoring" | "passed" | "rolled back" | "gave up" | "never started" | "unresolved";
+export const OPEN: Status[] = ["verifying", "accepted", "claimed", "watching", "restoring"];
 export type TriggerKind = "state-error" | "not-started" | "health" | "verdict" | "deadline" | "version-moved" | "watch-end";
 export interface Attempt {
   id: string; app: string; from: string; to: string; backup: string; deadline: number;
@@ -218,6 +291,8 @@ export interface Attempt {
   backupAsked?: number;                          // (0.1.3) the keeper's own backup, asked at
   issuedAt?: number;                             // (0.1.4) the token's issue (ms): the backup must be made after it
   acceptedAt?: number; consumedAt?: number;      // (0.1.4) the acceptance, and its single use
+  acceptUntil?: number;                          // (0.1.5) the acceptance must be claimed before this
+  claim?: { id: string; at: number; until: number };   // (0.1.5) the link's claim, made as the Ship run started
   chatPolls?: number; chatDown?: number;         // (0.1.4) readiness polls in the watch, and how many were down
   firstSeenTo?: number; firstStartedTo?: number; watchEnd?: number;
   notStarted: number; healthFails: number; startedEveryPoll: boolean;
@@ -228,12 +303,10 @@ export interface Attempt {
   trigger?: { kind: TriggerKind; words: string; at: number };
   // The restore: inflight while a call is out and its answer not yet kept; job the job id from the
   // Supervisor's answer (the only job whose result ever counts); pending once an answer left the outcome
-  // to reconcile; refused (0.1.3) a 4xx answer waiting for the jobs list to show no restore of the backup;
-  // resent (0.1.4) once a 4xx was sent again (at most once, and only with a drill's restore job name);
-  // down once the App was seen not started after the call; called once the job finished without errors.
+  // to reconcile (0.1.5: a refusal too; nothing is ever sent twice); down once the App was seen not
+  // started after the call; called once the job finished without errors.
   restore?: { tries: number; nextTry: number; limit: number; inflight: boolean; called: boolean; doneAt?: number; confirmUntil?: number; result?: string;
-    job?: string | null; sentAt?: number; pending?: boolean; said?: string; lastState?: string; restarts?: number; down?: boolean;
-    refused?: { status: number; why: string; at: number }; resent?: boolean };
+    job?: string | null; sentAt?: number; pending?: boolean; said?: string; lastState?: string; restarts?: number; down?: boolean };
   endedAt?: number; lineDelivered?: boolean; drillRecorded?: boolean;
 }
 export interface Binding { protocol: number; probe_hash: string; keeper_version: string; options_hash: string; backup_scope: string }
@@ -245,9 +318,14 @@ export interface LastLine { id: string; kind: string; line: string; at: number }
 export interface QueueItem { key: string; to: "done" | "failed" | "deadman"; fail: boolean; body: string; app: string; attempt?: string; kind?: string; tries: number; next: number; at: number }
 // A spent Ship token, per App: its id (a hash), the attempt it registered.
 export interface Spent { id: string; auth: string; app: string; at: number }
-// (0.1.4) The pinned Ship key, and the restore job name a device drill recorded.
-export interface Pinned { key: string; fp: string; at: number }
-export interface RestoreJobRec { name: string; attempt: string; at: number }
+// (0.1.4) The pinned Ship key (0.1.5: confirmed, the owner's key-confirm, before any registration counts),
+// and (0.1.5) what a device drill's own restore job showed: its name, its reference as reported, and how
+// long it stayed in the jobs list after it finished. Recorded for a later version; nothing acts on it.
+export interface Pinned { key: string; fp: string; at: number; confirmed?: number }
+export interface RestoreJobRec { name: string; attempt: string; at: number; job?: string; reference?: string; doneSeenAt?: number; goneAt?: number; listedMs?: number }
+// (0.1.5) A check as the Healthchecks management API lists it (GET /api/v3/checks/). A read-only key gives
+// unique_key in place of ping_url.
+export interface HcCheck { name?: string; slug?: string; ping_url?: string; unique_key?: string; timeout?: number; grace?: number; status?: string; channels?: string; schedule?: string }
 export interface State {
   format: 1;
   createdAt: number;                             // (0.1.4) when this state was created: older tokens are refused
@@ -264,6 +342,8 @@ export interface State {
   pinnedKey?: Pinned;                            // (0.1.4) the Ship key pinned on first use
   keyChangeSaid?: string;                        // (0.1.4) the fingerprint of a changed key already paged
   restoreJob?: RestoreJobRec;                    // (0.1.4) the restore job's name, recorded by a device drill
+  phoneHcApi?: string;                           // (0.1.5) the checks' settings (period, grace, channels) at the phone test
+  deadmanFailSince?: number;                     // (0.1.5) the dead-man /fail ping undelivered since
   queue: QueueItem[];
   hcPinged: number;
   hcDelivered: number;                           // the last heartbeat ping Healthchecks answered 2xx
@@ -281,11 +361,15 @@ export function loadState(raw: unknown): State {
   if (!raw || typeof raw !== "object" || (raw as any).format !== 1) return e;
   const r = raw as any;
   const obj = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v) ? v : {});
-  const pin = r.pinnedKey && typeof r.pinnedKey.key === "string" && typeof r.pinnedKey.fp === "string" ? { key: r.pinnedKey.key, fp: r.pinnedKey.fp, at: Number(r.pinnedKey.at) || 0 } : undefined;
-  const rj = r.restoreJob && typeof r.restoreJob.name === "string" && r.restoreJob.name ? { name: r.restoreJob.name, attempt: s(r.restoreJob.attempt), at: Number(r.restoreJob.at) || 0 } : undefined;
+  const pin = r.pinnedKey && typeof r.pinnedKey.key === "string" && typeof r.pinnedKey.fp === "string" ? { key: r.pinnedKey.key, fp: r.pinnedKey.fp, at: Number(r.pinnedKey.at) || 0,
+    ...(Number(r.pinnedKey.confirmed) > 0 ? { confirmed: Number(r.pinnedKey.confirmed) } : {}) } : undefined;
+  const num = (v: unknown) => (Number(v) > 0 ? Number(v) : undefined);
+  const rj = r.restoreJob && typeof r.restoreJob.name === "string" && r.restoreJob.name ? JSON.parse(JSON.stringify({ name: r.restoreJob.name, attempt: s(r.restoreJob.attempt), at: Number(r.restoreJob.at) || 0,
+    job: s(r.restoreJob.job) || undefined, reference: s(r.restoreJob.reference) || undefined, doneSeenAt: num(r.restoreJob.doneSeenAt), goneAt: num(r.restoreJob.goneAt), listedMs: num(r.restoreJob.listedMs) })) : undefined;
   return { ...e, createdAt: Number(r.createdAt) || 0, heartbeat: Number(r.heartbeat) || 0,
     ...(pin ? { pinnedKey: pin } : {}), ...(rj ? { restoreJob: rj } : {}),
-    ...(typeof r.phoneHc === "string" ? { phoneHc: r.phoneHc } : {}), ...(typeof r.keyChangeSaid === "string" ? { keyChangeSaid: r.keyChangeSaid } : {}), lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any, probeHash: obj(r.probeHash) as any,
+    ...(typeof r.phoneHc === "string" ? { phoneHc: r.phoneHc } : {}), ...(typeof r.phoneHcApi === "string" ? { phoneHcApi: r.phoneHcApi } : {}),
+    ...(Number(r.deadmanFailSince) > 0 ? { deadmanFailSince: Number(r.deadmanFailSince) } : {}), ...(typeof r.keyChangeSaid === "string" ? { keyChangeSaid: r.keyChangeSaid } : {}), lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any, probeHash: obj(r.probeHash) as any,
     outstanding: obj(r.outstanding) as any, last: obj(r.last) as any, drills: obj(r.drills) as any, phone: obj(r.phone) as any,
     queue: Array.isArray(r.queue) ? r.queue.map((q: any) => ({ ...q, at: Number(q?.at) || 0 })) : [], hcPinged: Number(r.hcPinged) || 0, lines: Number(r.lines) || 0,
     spent: Array.isArray(r.spent) ? r.spent.filter((x: any) => x && typeof x.id === "string").map((x: any) => ({ id: x.id, auth: s(x.auth), app: s(x.app), at: Number(x.at) || 0 })).slice(-500) : [],
@@ -297,17 +381,14 @@ export function loadState(raw: unknown): State {
 export interface AppInfo { version: string; state: string }
 export interface BackupInfo { homeassistant: unknown; addons: { slug: string; version: string }[]; folders: unknown[]; protected?: unknown; date?: string }
 // The restore call's answer (0.1.3): started (the Supervisor took it; its job id when it gave one),
-// refused (a 4xx: the Supervisor turned it down before running it; retry false for a missing backup or a
-// refused permission), or unknown (a 5xx, no answer, or an answer that isn't one: it may have run).
+// refused (a 4xx), or unknown (a 5xx, no answer, or an answer that isn't one: it may have run). 0.1.5:
+// refused and unknown are handled alike (unresolved, never sent again); retry is only reported.
 export type RestoreResult =
   | { kind: "started"; job: string | null }
   | { kind: "refused"; status: number; retry: boolean; why: string }
   | { kind: "unknown"; why: string };
 // A restore job, by its id, as the Supervisor's jobs list shows it.
 export type JobState = { found: false } | { found: true; uuid: string; done: boolean; errors: number; name?: string; reference?: string };
-// (0.1.4) The jobs list read for one backup against the recorded restore job name: jobs of exactly that
-// name for the backup, and jobs that look like a restore (or have no name) it can't classify.
-export interface RestoreJobsSeen { matching: number; unclassified: number }
 export interface Deps {
   now: () => number;
   version: string;                               // the keeper's own version
@@ -317,12 +398,12 @@ export interface Deps {
   makeBackup: (app: string, name: string) => Promise<{ slug: string } | { why: string }>;   // (0.1.3) that App alone, no password
   restore: (backup: string, app: string) => Promise<RestoreResult>;
   job: (uuid: string) => Promise<JobState | null>;          // by its id only; null: the jobs list can't be read
-  restoreJobs: (backup: string, name: string) => Promise<RestoreJobsSeen | null>;  // (0.1.4) null: unreadable
+  hcChecks?: (apiKey: string) => Promise<HcCheck[] | null>;   // (0.1.5) the Healthchecks checks; null: unreadable
   live: (hostPort: string) => Promise<boolean>;             // the App's liveness, the host's /health
   ready: (hostPort: string) => Promise<boolean>;            // its readiness address (Cain's /ready): reported only
   ping: (url: string, body: string) => Promise<boolean>;
   options: () => unknown | Promise<unknown>;      // the keeper's options, re-read each poll (null: unreadable)
-  save: (s: State) => void;
+  save: (s: State) => boolean | void;            // (0.1.5) false: not saved (a claim is then refused)
   log: (line: string) => void;
   timer?: (ms: number) => Promise<void>;          // (0.1.4) the registration's wait for its backup (tests: a fake)
 }
@@ -340,6 +421,9 @@ export class Keeper {
   private backups = new Set<string>();                 // attempts whose backup call is out in this process
   private busy = false;
   private loopDone = 0;                                // (0.1.4) the last poll that completed, in this process
+  private settling = new Map<string, Promise<void>>(); // (0.1.5) registrations whose backup is being made in the background
+  hcSeen: { at: number; ok: boolean; why: string; hash: string } | null = null;   // (0.1.5) the last Healthchecks settings read
+  private hcSaid = "";
   constructor(private d: Deps, saved: unknown) {
     this.st = loadState(saved);
     if (!this.st.createdAt) { this.st.createdAt = d.now(); d.log(`state created at ${new Date(this.st.createdAt).toISOString()}: Ship tokens issued before it are refused`); }
@@ -367,8 +451,8 @@ export class Keeper {
     if (!pin) {
       const fp = keyFp(o);
       this.st.pinnedKey = { key: o, fp, at: this.now() };
-      this.d.log(`pinned the Ship public key, fingerprint ${fp} (trust on first use): a different key in the options is refused until it is confirmed at the device with key-confirm`);
-      this.notice(this.d.self, "key pinned", `Keeper pinned Cain's link's Ship key, fingerprint ${fp}. A different key in its options is refused until you confirm it at the device.`,
+      this.d.log(`pinned the Ship public key, fingerprint ${fp}, unconfirmed (0.1.5): no registration is accepted until the owner confirms it at the device with key-confirm ${fp}`);
+      this.notice(this.d.self, "key pinned", `Keeper pinned Cain's link's Ship key, fingerprint ${fp}. It accepts no install until you confirm that fingerprint at the device (key-confirm), checked against cain/SHIP_KEY_FINGERPRINT in the repository.`,
         "Keeper's Ship key notice done.");
       this.save();
       return;
@@ -382,20 +466,28 @@ export class Keeper {
       "Keeper's Ship key notice done.");
     this.save();
   }
-  // (0.1.4) The owner's confirmation of a changed Ship key, from inside the keeper's container only
-  // (keeper key-confirm <fingerprint>): the fingerprint must be the options' key's.
+  // (0.1.4) The owner's confirmation of a Ship key, from inside the keeper's container only (keeper
+  // key-confirm <fingerprint>): the fingerprint must be the options' key's. 0.1.5: the first pin needs it
+  // too (enrollment), and so does a state rewound or created anew; a rotation is the same command.
   keyConfirm(fp: string): { ok: boolean; why: string } {
     const o = this.opts.ship_public_key;
     if (!shipKey(o)) return { ok: false, why: "ship_public_key in the options isn't an Ed25519 public key" };
     const cur = keyFp(o);
     if (s(fp).toLowerCase() !== cur) return { ok: false, why: `that fingerprint isn't the options' key's (${cur})` };
-    if (this.st.pinnedKey?.key === o) return { ok: true, why: "" };
-    const was = this.st.pinnedKey?.fp ?? "none";
-    this.st.pinnedKey = { key: o, fp: cur, at: this.now() };
+    if (this.st.pinnedKey?.key === o && this.st.pinnedKey.confirmed) return { ok: true, why: "" };
+    const was = this.st.pinnedKey?.key === o ? "its unconfirmed pin" : this.st.pinnedKey?.fp ?? "none";
+    const now = this.now();
+    this.st.pinnedKey = { key: o, fp: cur, at: this.st.pinnedKey?.key === o ? this.st.pinnedKey.at : now, confirmed: now };
     delete this.st.keyChangeSaid;
-    this.d.log(`the owner confirmed the Ship key with fingerprint ${cur} at the device (it replaces ${was})`);
+    this.d.log(`the owner confirmed the Ship key with fingerprint ${cur} at the device (it replaces ${was}); state created ${new Date(this.st.createdAt).toISOString()}`);
     this.save();
     return { ok: true, why: "" };
+  }
+  // (0.1.5) What the link checks in every acceptance and claim answer: the pinned fingerprint, when the
+  // owner confirmed it, and when this state was created.
+  enrollment(): { key_fp: string; key_confirmed_at: string | null; state_created: string } {
+    const p = this.st.pinnedKey;
+    return { key_fp: p?.fp ?? "", key_confirmed_at: p?.confirmed ? new Date(p.confirmed).toISOString() : null, state_created: new Date(this.st.createdAt).toISOString() };
   }
 
   start(): void {
@@ -404,9 +496,11 @@ export class Keeper {
       const mins = Math.round((now - this.st.heartbeat) / 60_000);
       if (Object.keys(this.st.drills).length || Object.keys(this.st.phone).length)
         this.d.log(`the keeper's heartbeat stopped for ${mins} minutes (a rewind, a restore or a long stop): the drill records are dropped`);
-      this.st.drills = {}; this.st.phone = {}; delete this.st.phoneHc;
+      this.st.drills = {}; this.st.phone = {}; delete this.st.phoneHc; delete this.st.phoneHcApi;
       // (0.1.4) a rewound state may lack recently spent tokens: tokens issued before now are refused.
       this.st.createdAt = now;
+      // (0.1.5) and the Ship key must be confirmed again at the device before any registration counts.
+      if (this.st.pinnedKey?.confirmed) { delete this.st.pinnedKey.confirmed; this.d.log("the pinned Ship key needs the owner's key-confirm again (a rewound state)"); }
     }
     for (const a of this.open()) this.d.log(`resuming ${a.id} ${a.app} (${a.status})`);
     for (const a of this.unresolvedOf()) this.d.log(`reconciling ${a.id} ${a.app} on every poll (unresolved: nothing is sent again)`);
@@ -440,6 +534,7 @@ export class Keeper {
     const o = this.opts;
     if (!HTTPS.test(o.hc_done)) return "hc_done (the heartbeat check) isn't set";
     if (!HTTPS.test(o.hc_deadman)) return "hc_deadman (the dead-man check) isn't set";
+    if (!o.hc_api_key) return "hc_api_key (a Healthchecks API key, to read each check's period, grace and channels) isn't set";
     if (!o.watch.length) return "no App is watched";
     const missing = o.watch.find((a) => !HTTPS.test(this.alertUrl(a)));
     if (missing) return `${appName(missing)} has no alert check (hc_failed)`;
@@ -470,6 +565,8 @@ export class Keeper {
       for (const a of this.open().filter((x) => x.status === "verifying")) this.verifyLeft(a);
       const apps = new Set([...this.opts.watch, ...this.open().map((a) => a.app), ...this.unresolvedOf().map((a) => a.app)]);
       for (const app of apps) await this.pollApp(app);
+      await this.watchJobListing();
+      await this.readHc();
       await this.tickHeartbeat(now);
       this.arm();
       this.save();
@@ -480,12 +577,14 @@ export class Keeper {
     } finally { this.busy = false; }
   }
 
-  // -- registration (0.1.3: POST /attempt, Cain's token; 0.1.4: answered only after the backup) ------
+  // -- registration (0.1.3: POST /attempt, Cain's token; 0.1.5: answered 202 at once, then polled) ------
   // The body: {token, app, pr, head, from_version, to_version, probe_hash, kind?: "ship" | "drill"}. The
-  // token is the owner's Ship token as the link signed it; it is verified here with the pinned key and
-  // never kept (only its id, a hash). The keeper always makes the App-only backup itself (0.1.4: a body
-  // naming one is refused), and the answer waits until that backup is complete and verified: 200
-  // {status: "accepted", id, backup, ...}, or a refusal (the install is then "unprotected", paged).
+  // token is the owner's Ship token as the link signed it; it is verified here with the pinned key, which
+  // the owner must have confirmed (0.1.5), and never kept (only its id, a hash). The keeper always makes
+  // the App-only backup itself (a body naming one is refused). 0.1.5: a registration that passes these
+  // checks is answered 202 {status: "pending", id} at once, the backup is made in the background, and the
+  // link polls GET /attempt/<id> (attemptView) until it is accepted or refused; no request is held open
+  // through the backup.
   async registerAttempt(caller: string | null, body: any): Promise<Answer> {
     const app = s(body?.app), token = s(body?.token), kind = s(body?.kind) || "ship";
     const pr = Number(body?.pr), head = s(body?.head).toLowerCase();
@@ -497,7 +596,7 @@ export class Keeper {
       if (page) this.owner(SLUG.test(app) && app !== this.d.self ? app : this.d.self, "unprotected",
         `Keeper refused a registration${SLUG.test(app) ? ` for ${appName(app)}` : ""}: ${why}. Nothing will be rolled back for it.`, true);
       this.save();
-      return { status, body: { status: "refused", why } };
+      return { status, body: { status: "refused", why, ...this.enrollment() } };
     };
     if (caller !== REGISTRAR) return refuse(`only ${appName(REGISTRAR)}'s App registers installs`, 403);
     const pin = this.st.pinnedKey;
@@ -506,6 +605,7 @@ export class Keeper {
       const fp = shipKey(this.opts.ship_public_key) ? keyFp(this.opts.ship_public_key) : "";
       return refuse(`ship_public_key in the options ${fp ? `(fingerprint ${fp}) ` : ""}isn't the key Keeper pinned (fingerprint ${pin.fp}); a new key counts only once confirmed at the device with key-confirm`);
     }
+    if (!pin.confirmed) return refuse(`the pinned Ship key (fingerprint ${pin.fp}) isn't confirmed yet: the owner confirms it at the device with key-confirm ${pin.fp} (a first pin and a new state need it, like a rotation)`);
     const key = shipKey(pin.key);
     if (!key) return refuse("the pinned Ship key can't be read");
     if (!token) return refuse("it carries no Ship token");
@@ -533,26 +633,88 @@ export class Keeper {
     if (why) return refuse(why, 409, why !== `${app} isn't in the keeper's watch list`);
     this.st.spent.push({ id, auth: tid, app, at: now }); if (this.st.spent.length > 500) this.st.spent.shift();
     const a: Attempt = {
-      id, app, from, to, backup: "", deadline: now + INSTALL_MS, issuedAt: issued,
+      id, app, from, to, backup: "", deadline: now + REGISTER_WAIT_MS + 60_000, issuedAt: issued,
       auth: kind as "ship" | "drill", authHash: tid, pr: c.pr, head: c.head, authExpires: c.exp * 1000,
       probeHash: probe, registeredAt: now, status: "verifying",
       notStarted: 0, healthFails: 0, startedEveryPoll: true, health: [],
     };
     this.st.attempts[id] = a;
     this.st.probeHash[app] = probe;
-    this.d.log(`registered ${id} ${app} ${from} to ${to} (pull request ${c.pr}, head ${c.head.slice(0, 12)}): making its backup; the answer waits for it`);
+    this.d.log(`registered ${id} ${app} ${from} to ${to} (pull request ${c.pr}, head ${c.head.slice(0, 12)}): making its backup in the background; poll GET /attempt/${id}`);
     this.save();
-    await this.backupFor(a);
-    if (a.status !== "accepted") return { status: 409, body: { status: "refused", id, why: a.why ?? "its backup wasn't accepted" } };
-    return { status: 200, body: { status: "accepted", id, app, from_version: from, to_version: to, backup: a.backup, until: new Date(a.deadline).toISOString() } };
+    this.settling.set(id, this.backupFor(a).catch((e) => this.unprotected(a, `the keeper's backup failed (${String((e as Error)?.message ?? e).slice(0, 80)})`)).finally(() => this.settling.delete(id)));
+    return { status: 202, body: { status: "pending", id, app, from_version: from, to_version: to, ...this.enrollment() } };
+  }
+  // (0.1.5) The background backup of a registration, for tests and the server: resolves once it settled.
+  async whenSettled(id: string): Promise<void> { await this.settling.get(id); }
+  // (0.1.5) GET /attempt/<id>, Cain's link only: where a registration stands. "pending" while its backup
+  // is made, "accepted" with its backup and until, "claimed" with its claim, else "refused" (unprotected)
+  // or its status, with why. Every answer carries the enrollment (the pinned fingerprint, its
+  // confirmation and the state's creation time).
+  attemptView(caller: string | null, id: string): Answer {
+    if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App reads registrations` } };
+    const a = this.st.attempts[id];
+    if (!a) return { status: 404, body: { status: "unknown", id } };
+    const base = { id, app: a.app, from_version: a.from, to_version: a.to, ...this.enrollment() };
+    if (a.status === "verifying") return { status: 200, body: { status: "pending", ...base } };
+    if (a.status === "accepted") return { status: 200, body: { status: "accepted", ...base, backup: a.backup, until: new Date(a.acceptUntil ?? a.deadline).toISOString() } };
+    if (a.status === "claimed") return { status: 200, body: { status: "claimed", ...base, backup: a.backup, claim: a.claim!.id, until: new Date(a.claim!.until).toISOString() } };
+    return { status: 200, body: { status: a.status === "unprotected" ? "refused" : a.status, ...base, why: a.why ?? "" } };
+  }
+  // (0.1.5) POST /attempt/<id>/claim, Cain's link only, as the RemoteTrigger hook lets the Ship run start:
+  // {app, from_version, to_version, backup}, which must be the acceptance's. Atomic: checked and set with
+  // no await between, so of two claimants exactly one gets it; saved before the answer (a save that fails
+  // takes the claim back and refuses). Refused when already claimed, when the acceptance expired, or when
+  // the pinned key isn't confirmed. The claim is valid CLAIM_MS: to_version must show within it.
+  claimAttempt(caller: string | null, id: string, body: any): Answer {
+    const now = this.now();
+    const no = (why: string, status = 409): Answer => { this.d.log(`refused a claim of ${SLUG.test(id.replace(/-/g, "_")) ? id : "an attempt"}: ${why}`); return { status, body: { status: "refused", id, why, ...this.enrollment() } }; };
+    if (caller !== REGISTRAR) return no(`only ${appName(REGISTRAR)}'s App claims an acceptance`, 403);
+    const a = this.st.attempts[id];
+    if (!a) return no("no such attempt", 404);
+    if (a.status === "claimed" || a.claim) return no(`it is claimed already (claim ${a.claim?.id ?? "?"}); an acceptance has one claimant`);
+    if (a.status !== "accepted") return no(`it is ${a.status}, not accepted`);
+    if (now > (a.acceptUntil ?? 0)) { this.ended(a, "its acceptance expired unclaimed"); return no("its acceptance expired"); }
+    if (s(body?.app) !== a.app || s(body?.from_version) !== a.from || s(body?.to_version) !== a.to || s(body?.backup) !== a.backup)
+      return no("its App, versions or backup aren't the acceptance's");
+    if (!this.st.pinnedKey?.confirmed) return no("the pinned Ship key isn't confirmed");
+    const claim = { id: `claim-${randomBytes(8).toString("hex")}`, at: now, until: now + CLAIM_MS };
+    a.claim = claim; a.status = "claimed"; a.deadline = claim.until;
+    if (this.d.save(this.st) === false) {
+      delete a.claim; a.status = "accepted"; a.deadline = a.acceptUntil ?? a.deadline;
+      return no("Keeper couldn't save the claim", 503);
+    }
+    this.d.log(`claimed ${a.id} claim ${claim.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup} until ${new Date(claim.until).toISOString()}`);
+    return { status: 200, body: { status: "claimed", id, app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, claim: claim.id, until: new Date(claim.until).toISOString(), ...this.enrollment() } };
+  }
+  // (0.1.5) POST /attempt/<id>/cancel, Cain's link only, when it gives up on a pass: a registration still
+  // pending, accepted or claimed (no version change seen) ends at once, so no acceptance is left to use.
+  // Its backup stays in Home Assistant's list, used for nothing.
+  cancelAttempt(caller: string | null, id: string, body: any): Answer {
+    if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App cancels a registration` } };
+    const a = this.st.attempts[id];
+    if (!a) return { status: 404, body: { status: "unknown", id } };
+    if (!["verifying", "accepted", "claimed"].includes(a.status) || a.firstSeenTo) return { status: 409, body: { status: "refused", id, why: `it is ${a.status}` } };
+    this.ended(a, `cancelled by ${appName(REGISTRAR)}'s link (${s(body?.why).replace(/[^\x20-\x7e]/g, " ").slice(0, 160) || "it gave up on the Ship pass"})`, false);
+    return { status: 200, body: { status: "ended", id } };
+  }
+  // (0.1.5) An attempt that ends with nothing restored and nothing installed: its "ended" line, and (but a
+  // cancellation) a notice to the owner that leaves no incident open.
+  private ended(a: Attempt, why: string, tell = true): void {
+    a.status = "ended"; a.why = why; a.endedAt = this.now();
+    this.d.log(`${a.id}: ended (${why})`);
+    if (tell) this.notice(a.app, "ended", `Keeper's acceptance of the install of ${appName(a.app)} ${a.to} ended: ${why}. Nothing was installed under it and nothing was rolled back.`,
+      `Keeper's notice for ${appName(a.app)} ${a.to} done.`, a.id);
+    this.save();
   }
   // (0.1.4) The keeper's own backup, made once and awaited (up to REGISTER_WAIT_MS), then verified. A
   // backup that fails, doesn't complete in time, or (after a restart) has an unknown outcome leaves the
-  // install unprotected: paged, and the registration's answer is a refusal.
+  // install unprotected: paged, and the link's poll reads a refusal (0.1.5: in the background).
   private async backupFor(a: Attempt): Promise<void> {
     const info = await this.d.appInfo(a.app).catch(() => null);
     if (!info) return this.unprotected(a, `the Supervisor didn't answer for ${a.app}`);
     if (info.version !== a.from) return this.unprotected(a, `${a.app} is at ${info.version}, not ${a.from}`);
+    if (a.status !== "verifying") return;                  // (0.1.5) cancelled before the backup was asked
     a.backupAsked = this.now();
     this.backups.add(a.id);
     this.save();                                           // asked once, before the call
@@ -562,8 +724,10 @@ export class Keeper {
     this.backups.delete(a.id);
     if ("late" in res) {
       void made.then((r) => this.d.log(`${a.id}: the keeper's backup ${"slug" in r ? `${r.slug} ` : ""}ended after its registration was refused; it is not used`));
+      if (a.status !== "verifying") return;
       return this.unprotected(a, `the keeper's backup of ${a.app} didn't complete within ${REGISTER_WAIT_MS / 60_000} minutes`);
     }
+    if (a.status !== "verifying") return;                  // cancelled, or seen installed, meanwhile
     if (!("slug" in res) || !BACKUP.test(res.slug)) return this.unprotected(a, `the keeper's backup of ${a.app} failed (${"why" in res ? res.why : "no backup slug in its answer"})`);
     a.backup = res.slug;
     this.d.log(`${a.id}: the keeper made backup ${res.slug} of ${a.app} alone`);
@@ -586,8 +750,9 @@ export class Keeper {
     const now_ = await this.d.appInfo(a.app).catch(() => null);
     if (!now_ || now_.version !== a.from) return this.unprotected(a, now_ ? `${a.app} moved to ${now_.version} while its backup was made` : `the Supervisor didn't answer for ${a.app} after its backup`);
     if ((a.status as Status) !== "verifying") return;
-    a.status = "accepted"; a.acceptedAt = this.now();
-    this.d.log(`accepting ${a.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup} until ${new Date(a.deadline).toISOString()}`);
+    const t = this.now();
+    a.status = "accepted"; a.acceptedAt = t; a.acceptUntil = t + ACCEPT_MS; a.deadline = a.acceptUntil;
+    this.d.log(`accepting ${a.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup} until ${new Date(a.acceptUntil).toISOString()}`);
     this.save();
   }
   // A registration left verifying by a restart (its backup's outcome unknown) is unprotected.
@@ -595,8 +760,8 @@ export class Keeper {
     if (this.backups.has(a.id)) return;
     this.unprotected(a, "the keeper restarted while it made the backup, so that backup's outcome is unknown");
   }
-  private unprotected(a: Attempt, why: string): void {
-    if (a.status === "unprotected") return;
+  private unprotected(a: Attempt, why: string, force = false): void {
+    if (a.status === "unprotected" || (a.status === "ended" && !force)) return;
     a.status = "unprotected"; a.why = why; a.endedAt = this.now();
     this.d.log(`refusing ${a.id}: ${why} (UNPROTECTED: nothing will be rolled back for this install)`);
     this.owner(a.app, "unprotected", `Keeper can't protect the install of ${appName(a.app)} ${a.to || "(no version)"}: ${why}. Nothing will be rolled back for it.`, true, a.id);
@@ -617,11 +782,14 @@ export class Keeper {
     if (info) this.appState[app] = info.state;
     if (info) this.versionChange(app, info.version);
     for (const a of this.open(app)) {
-      // (0.1.4) the install seen while its registration still waits for the backup: never accepted
+      // (0.1.4) the install seen while its registration still waits for the backup: never accepted;
+      // (0.1.5) and seen while accepted but not claimed: outside a live claim
       if (a.status === "verifying" && info?.version === a.to) { this.unprotected(a, "the install began before Keeper accepted it (its backup wasn't complete)"); continue; }
+      if (a.status === "accepted" && info?.version === a.to) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
+      if (a.status === "claimed" && info?.version === a.to && now > a.claim!.until) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
       if (started) a.chat = chat;
       if (a.status === "restoring") { this.observe(a, info); await this.restoring(a, info, live); }
-      else if (a.status === "accepted" || a.status === "watching") this.judge(a, info, live, now);
+      else if (a.status === "accepted" || a.status === "claimed" || a.status === "watching") this.judge(a, info, live, now);
     }
     for (const a of this.unresolvedOf(app)) { this.observe(a, info); await this.recheck(a, info); }
     this.clearOutstanding(app);
@@ -634,30 +802,30 @@ export class Keeper {
     this.st.lastSeen[app] = v;
     const recent = Object.values(this.st.attempts).filter((a) => a.app === app && this.now() - a.registeredAt < 86_400_000);
     // (0.1.4) An install seen before its acceptance (the backup not yet complete) is unprotected, and an
-    // acceptance covers to_version only once: while accepted, before its consumption.
+    // acceptance covers to_version only once. 0.1.5: only while claimed, within the claim; a version change
+    // seen outside a live claim (accepted but unclaimed, the claim expired, or the attempt ended or was
+    // cancelled) is uncertain: unprotected, paged, never covered.
     const early = recent.find((a) => a.status === "verifying" && a.to === v);
     if (early) { this.d.log(`${app} is at ${v} (was ${was}) before Keeper accepted ${early.id}`); return this.unprotected(early, "the install began before Keeper accepted it (its backup wasn't complete)"); }
-    const covered = recent.some((a) => (a.to === v && a.status === "accepted" && !a.consumedAt) || (a.from === v && ["restoring", "rolled back", "gave up", "unresolved"].includes(a.status)));
+    const now = this.now();
+    const live = (a: Attempt) => a.status === "claimed" && !!a.claim && now <= a.claim.until && !a.consumedAt;
+    const outside = recent.find((a) => a.to === v && !a.consumedAt && (a.status === "accepted" || (a.status === "claimed" && !live(a)) || a.status === "ended"));
+    if (outside && !recent.some((a) => a.to === v && live(a))) { this.d.log(`${app} is at ${v} (was ${was}) outside a live claim of ${outside.id}`); return this.unprotected(outside, OUTSIDE_CLAIM, true); }
+    const covered = recent.some((a) => (a.to === v && live(a)) || (a.from === v && ["restoring", "rolled back", "gave up", "unresolved"].includes(a.status)));
     if (covered) { this.d.log(`${app} is at ${v} (was ${was})`); return; }
     this.d.log(`unregistered change ${app} ${was} to ${v}: no attempt was registered for it, so nothing is restored`);
     this.owner(app, "unregistered change", `${appName(app)} changed from ${was} to ${v} with no install registered with Keeper. Nothing was rolled back.`, true);
   }
   // live: the App's liveness (/health) this poll. Readiness never enters it.
   judge(a: Attempt, info: AppInfo | null, live: boolean, now: number): void {
-    if (info && a.status === "accepted" && info.version === a.to) {
+    if (info && a.status === "claimed" && info.version === a.to && now <= a.claim!.until) {
       a.status = "watching"; a.firstSeenTo = now; a.watchEnd = now + WATCH_MS; a.consumedAt = now;
-      this.d.log(`consumed ${a.id}: ${a.app} ${a.to} seen; this acceptance is spent and covers no other install`);
+      this.d.log(`consumed ${a.id}: ${a.app} ${a.to} seen within claim ${a.claim!.id}; this acceptance is spent and covers no other install`);
       this.d.log(`watching ${a.id}: ${a.app} ${a.to} seen, 15 minutes from now`);
     }
-    if (!a.firstStartedTo && now > a.deadline) {
-      if (!a.firstSeenTo) {
-        a.status = "never started"; a.endedAt = now; a.why = "the install deadline passed without the registered version seen";
-        this.d.log(`${a.id}: install never started (${a.app} at ${info?.version ?? "unknown"}, not ${a.to})`);
-        this.owner(a.app, "install never started", `${appName(a.app)} ${a.to} never started before its install deadline. Nothing was rolled back.`, true, a.id);
-        return;
-      }
-      return this.fail(a, "deadline", `the install deadline passed with ${a.to} never started`);
-    }
+    // (0.1.5) An acceptance unclaimed by its until, or a claim with no version change by its until, ends.
+    if (a.status === "accepted" && now > (a.acceptUntil ?? a.deadline)) return this.ended(a, "its acceptance expired unclaimed");
+    if (a.status === "claimed" && now > a.claim!.until) return this.ended(a, `its claim ${a.claim!.id} expired with no version change seen`);
     if (a.status !== "watching") return;
     if (!info) return;                                   // the Supervisor didn't answer: nothing judged this poll
     if (info.version !== a.to) return this.fail(a, "version-moved", `the App moved to ${info.version} during the watch`);
@@ -706,11 +874,10 @@ export class Keeper {
     this.save();
   }
 
-  // -- the restore (0.1.3) --------------------------------------------------------------------------
-  // The in-flight fence is saved before the first call, and the job id from its answer before anything
-  // else. A second call goes out only after an answer that proves the first was never accepted: a 4xx
-  // before any job, with the Supervisor's jobs list then showing no restore of that backup. A 5xx, a
-  // timeout, an unclear answer, or a restart with a call out is unresolved: fenced, reconciled read only.
+  // -- the restore (0.1.3; 0.1.5: one call, ever) -----------------------------------------------------
+  // The in-flight fence is saved before the call, and the job id from its answer before anything else.
+  // 0.1.5: there is never a second call. A refusal (4xx), a 5xx, a timeout, an unclear answer, or a
+  // restart with the call out is unresolved: fenced, reconciled read only by the job id, paged.
   // A job that ended with errors is gave up (it may already have changed data): never sent again.
   // "Rolled back" needs the job by its id seen finished without errors, then from_version started and
   // live; the App seen stopping and coming back at from_version without that job result is unresolved.
@@ -727,22 +894,16 @@ export class Keeper {
     const r = a.restore!;
     const now = this.now();
     if (!r.called) {
-      if (r.refused) return this.afterRefusal(a, now);
-      if (r.inflight || r.pending) return this.reconcile(a, info);
+      if (r.inflight || r.pending || r.tries > 0) return this.reconcile(a, info);   // (0.1.5) one call, ever
       if (now < r.nextTry) return;
-      if (now >= r.limit) return this.gaveUp(a, "the Supervisor refused the restore until past its limit (nothing ran: its jobs list showed no restore of the backup)");
       r.inflight = true; r.tries++; r.sentAt = now; r.job = null; r.down = false; delete r.said;
       this.save();                                         // the fence, before the call
       const res: RestoreResult = await this.d.restore(a.backup, a.app).catch((e) => ({ kind: "unknown" as const, why: String((e as Error)?.message ?? e).slice(0, 120) }));
       const t = this.now();
       r.inflight = false;
-      if (res.kind === "refused") {
-        if (!res.retry) { r.pending = true; return this.gaveUp(a, `the Supervisor refused the restore (${res.why}); it is never sent again`); }
-        r.refused = { status: res.status, why: res.why, at: t };
-        this.save();
-        return this.afterRefusal(a, t);
-      }
       r.pending = true;
+      // (0.1.5) No refusal proves the call had no effect: fenced, reconciled read only, never sent again.
+      if (res.kind === "refused") { this.save(); return this.unresolved(a, `the Supervisor refused the restore (${res.why}); Keeper sends a restore once and never again, since nothing proves a refused call had no effect`); }
       if (res.kind === "unknown") { this.save(); return this.unresolved(a, `the Supervisor's answer doesn't show whether the restore ran (${res.why})`); }
       r.job = res.job;
       this.save();                                         // the job id, before anything else
@@ -768,34 +929,28 @@ export class Keeper {
     }
     return this.gaveUp(a, `the restore job finished but ${a.from} wasn't started and live 5 minutes later`);
   }
-  // A 4xx answer (0.1.4). Without a restore job name recorded by a device drill (state restoreJob), it is
-  // unresolved at once: nothing proves the refused call never ran. With one, it is sent again once, only
-  // when the jobs list shows no job of exactly that name for the backup and no restore-like job it can't
-  // classify (that counts as unreadable: nothing is sent, and it is unresolved at the limit).
-  private async afterRefusal(a: Attempt, t: number): Promise<void> {
-    const r = a.restore!;
-    const ref = r.refused!;
-    const rec = this.st.restoreJob;
-    if (!rec) { delete r.refused; r.pending = true; return this.unresolved(a, `the Supervisor refused the restore (${ref.why}); no device drill has recorded a restore job's name yet, so Keeper can't show the refused call never ran and sends nothing again`); }
-    if (r.resent) { delete r.refused; r.pending = true; return this.unresolved(a, `the Supervisor refused the restore again (${ref.why}); a refused restore is sent again only once`); }
-    const n = await this.d.restoreJobs(a.backup, rec.name).catch(() => null);
-    if (n === null || n.unclassified > 0) {
-      const what = n === null ? "its jobs list couldn't be read" : `its jobs list shows ${n.unclassified} restore-like job${n.unclassified === 1 ? "" : "s"} Keeper can't classify`;
-      if (t >= r.limit) { delete r.refused; r.pending = true; return this.unresolved(a, `the Supervisor refused the restore (${ref.why}) and ${what}, so nothing shows it never ran`); }
-      return this.say(a, `the Supervisor refused the restore (${ref.why}); ${what}: nothing is sent again until it shows no ${rec.name} job of backup ${a.backup}`);
-    }
-    delete r.refused;
-    if (n.matching > 0) { r.pending = true; return this.unresolved(a, `the Supervisor refused the restore (${ref.why}) but its jobs list shows a ${rec.name} job of backup ${a.backup}`); }
-    r.resent = true;
-    return this.again(a, `the Supervisor refused the restore before running it (${ref.why}) and its jobs list shows no ${rec.name} job of backup ${a.backup}`, t);
-  }
-  // (0.1.4) A drill's restore job seen finished without errors records the Supervisor's real restore job
-  // name (its reference must be the drill's backup): the only name a later 4xx is checked against.
+  // (0.1.5) A drill's own restore job, by the id its own restore call returned (never matched on its
+  // reference or name), seen finished without errors: its name and reference as reported are recorded,
+  // and the job is then watched (watchJobListing) for how long it stays listed. For a later version to
+  // decide on; nothing in this version acts on it.
   private noteJob(a: Attempt, j: JobState | null | undefined): void {
-    if (a.auth !== "drill" || !j?.found || !j.done || j.errors !== 0 || !j.name || j.reference !== a.backup) return;
-    if (this.st.restoreJob?.name === j.name) return;
-    this.st.restoreJob = { name: j.name, attempt: a.id, at: this.now() };
-    this.d.log(`drill ${a.id} recorded the Supervisor's restore job name "${j.name}" (reference: its backup): a refused restore may now be sent again once, checked against it`);
+    if (a.auth !== "drill" || !j?.found || !j.done || j.errors !== 0 || !j.name || j.uuid !== a.restore?.job) return;
+    if (this.st.restoreJob?.job === j.uuid) return;
+    this.st.restoreJob = { name: j.name, attempt: a.id, at: this.now(), job: j.uuid, ...(j.reference ? { reference: j.reference } : {}), doneSeenAt: this.now() };
+    this.d.log(`drill ${a.id} recorded its restore job ${j.uuid}: named "${j.name}"${j.reference ? `, reference "${j.reference}"` : ""} (recorded only; Keeper never sends a restore twice)`);
+    this.save();
+  }
+  // (0.1.5) How long the drill's finished restore job stays in the jobs list: read by its id each poll
+  // until it is gone (or for JOB_LISTING_MAX_MS), recorded as listedMs. Nothing acts on it.
+  private async watchJobListing(): Promise<void> {
+    const rj = this.st.restoreJob;
+    if (!rj?.job || !rj.doneSeenAt || rj.goneAt) return;
+    const now = this.now();
+    if (now - rj.doneSeenAt > JOB_LISTING_MAX_MS) { rj.goneAt = now; rj.listedMs = now - rj.doneSeenAt; this.d.log(`the drill's restore job ${rj.job} was still listed after ${Math.round(rj.listedMs / 3_600_000)} hours: recorded as at least that`); this.save(); return; }
+    const j = await this.d.job(rj.job).catch(() => null);
+    if (!j || j.found) return;
+    rj.goneAt = now; rj.listedMs = now - rj.doneSeenAt;
+    this.d.log(`the drill's restore job ${rj.job} left the jobs list about ${Math.round(rj.listedMs / 60_000)} minutes after it was seen finished (recorded only)`);
     this.save();
   }
   private landed(a: Attempt, t: number, words: string): void {
@@ -803,17 +958,6 @@ export class Keeper {
     r.called = true; r.pending = false; r.inflight = false; r.doneAt = t; r.confirmUntil = t + CONFIRM_MS; r.restarts = 0; delete r.lastState; delete r.said;
     this.d.log(`${a.id}: ${words}; confirming ${a.from} comes back started and live for 5 minutes`);
     this.save();
-  }
-  private again(a: Attempt, why: string, t: number): void {
-    const r = a.restore!;
-    r.pending = false; r.job = null; delete r.said;
-    if (t + this.backoff(r.tries) < r.limit) {
-      r.nextTry = t + this.backoff(r.tries);
-      this.d.log(`${a.id}: ${why}; the restore is tried again in ${Math.round(this.backoff(r.tries) / 1000)} seconds`);
-      this.save();
-      return;
-    }
-    this.gaveUp(a, `${why}, until past its limit`);
   }
   private say(a: Attempt, words: string): void {
     const r = a.restore!;
@@ -864,7 +1008,6 @@ export class Keeper {
     if (j?.found && j.done) return this.gaveUp(a, `its restore job ${j.uuid} ended with errors (found after it was unresolved)`);
     this.say(a, `still unresolved (${a.why === Keeper.cameBackWhy(a) ? a.why : why}); nothing is sent again`);
   }
-  backoff(tries: number): number { return Math.min(240_000, POLL_MS * 2 ** Math.max(0, tries - 1)); }
   private gaveUp(a: Attempt, why: string): void {
     a.status = "gave up"; a.endedAt = this.now(); a.why = why;
     if (a.restore) a.restore.result = why;
@@ -881,7 +1024,7 @@ export class Keeper {
     }
     return null;
   }
-  openAttempt(app: string): Attempt | null { return this.open(app).find((a) => a.status === "accepted" || a.status === "watching") ?? null; }
+  openAttempt(app: string): Attempt | null { return this.open(app).find((a) => a.status === "accepted" || a.status === "claimed" || a.status === "watching") ?? null; }
   verdict(caller: string, body: any): { ok: boolean; why: string } {
     const app = s(body?.app), id = s(body?.attempt), version = s(body?.version), result = s(body?.result), reason = s(body?.reason).slice(0, 300);
     const a = this.openAttempt(app);
@@ -923,8 +1066,8 @@ export class Keeper {
   }
   // (0.1.4) The phone test lapses: arming closes until a new one is confirmed.
   private phoneLapse(why: string): void {
-    if (!Object.keys(this.st.phone).length && !this.st.phoneHc) return;
-    this.st.phone = {}; delete this.st.phoneHc;
+    if (!Object.keys(this.st.phone).length && !this.st.phoneHc && !this.st.phoneHcApi) return;
+    this.st.phone = {}; delete this.st.phoneHc; delete this.st.phoneHcApi;
     this.d.log(`the phone test lapsed: ${why}; arming needs a new one (phone-test, then phone-confirm)`);
     this.save();
   }
@@ -944,11 +1087,14 @@ export class Keeper {
     const now = this.now();
     const keep: QueueItem[] = [];
     for (const q of this.st.queue) {
+      // (0.1.5) A page still unacknowledged (no 2xx from Healthchecks) PAGE_ACK_MS after it was queued
+      // closes the gate until a new phone test; before that it is retried (and disarms after 2 minutes).
+      const overdue = () => { if (q.fail && now - q.at >= PAGE_ACK_MS) this.phoneLapse(`a page (${q.kind ?? "a line"}) got no acknowledgment from Healthchecks within ${PAGE_ACK_MS / 60_000} minutes`); };
       const base = q.to === "done" ? this.opts.hc_done : q.to === "deadman" ? this.opts.hc_deadman : this.alertUrl(q.app);
       const behind = !q.fail && keep.some((k) => k.app === q.app && k.fail && k.to === q.to);
       const shared = !q.fail && q.to === "failed" && HTTPS.test(base) ? this.incidentOn(base, q.app, keep) : null;
       if (shared && q.next !== -1) { this.d.log(`a success ping for ${q.app} waits: ${shared} shares its alert check and has an incident open`); q.next = -1; }
-      if (behind || shared || (q.next > 0 && now < q.next) || !HTTPS.test(base)) { keep.push(q); continue; }
+      if (behind || shared || (q.next > 0 && now < q.next) || !HTTPS.test(base)) { overdue(); keep.push(q); continue; }
       const url = q.fail ? `${base.replace(/\/+$/, "")}/fail` : base;
       const ok = await this.d.ping(url, q.body).catch(() => false);
       const notice = NOTICES.has(String(q.kind ?? "").replace(/ clear$/, ""));
@@ -960,7 +1106,7 @@ export class Keeper {
         if (q.attempt) this.autoDrill(q.attempt);
         continue;
       }
-      if (q.fail) this.phoneLapse(`a page (${q.kind ?? "a line"}) wasn't delivered to Healthchecks`);
+      overdue();
       q.tries++; q.next = now + Math.min(600_000, 30_000 * 2 ** Math.min(q.tries, 5));
       keep.push(q);
     }
@@ -1003,15 +1149,45 @@ export class Keeper {
     if (now - this.loopDone > LOOP_FRESH_MS) {
       const mins = this.loopDone ? Math.round((now - this.loopDone) / 60_000) : null;
       const ok = await this.d.ping(`${this.opts.hc_deadman.replace(/\/+$/, "")}/fail`, `Keeper's poll loop ${mins === null ? "hasn't completed since it started" : `hasn't completed for ${mins} minutes`}: it isn't watching installs`).catch(() => false);
-      if (!ok) this.phoneLapse("a dead-man page wasn't delivered to Healthchecks");
+      // (0.1.5) the same acknowledgment deadline as every page
+      if (ok) delete this.st.deadmanFailSince;
+      else if (!this.st.deadmanFailSince) this.st.deadmanFailSince = now;
+      else if (now - this.st.deadmanFailSince >= PAGE_ACK_MS) this.phoneLapse(`a dead-man page got no acknowledgment from Healthchecks within ${PAGE_ACK_MS / 60_000} minutes`);
       return false;
     }
     const ok = await this.d.ping(this.opts.hc_deadman, "keeper alive").catch(() => false);
-    if (ok) this.st.deadmanDelivered = this.now();
+    if (ok) { this.st.deadmanDelivered = this.now(); delete this.st.deadmanFailSince; }
     return ok;
   }
   loopStalled(now = this.now()): boolean { return now - this.loopDone > LOOP_FRESH_MS; }
   delivered(now = this.now()): boolean { return this.st.hcDelivered > 0 && now - this.st.hcDelivered <= DELIVERY_MS; }
+
+  // -- the Healthchecks settings read (0.1.5) ----------------------------------------------------------
+  // With hc_api_key, at most every minute: each check's period (timeout), grace, status and channels,
+  // through the Healthchecks management API. A check is found by the id in its ping URL: the uuid in the
+  // API's ping_url, or (a read-only key) its unique_key, or the slug. Refused (not armable now): a check
+  // not found, a heartbeat check with a period over 5 minutes or a grace over 10, a dead-man check whose
+  // period isn't 1 minute or whose grace is over 5, a check with no channel (or a key that doesn't show
+  // channels), a paused check, a heartbeat or dead-man check that is down. Its settings' hash must equal
+  // the one taken at the phone test (a change lapses the phone test).
+  private async readHc(force = false): Promise<void> {
+    const key = this.opts.hc_api_key;
+    const now = this.now();
+    if (!key || !this.d.hcChecks) { this.hcSeen = null; return; }
+    if (!force && this.hcSeen && now - this.hcSeen.at < HC_READ_MS) return;
+    const list = await this.d.hcChecks(key).catch(() => null);
+    const v = list ? judgeHc(this.opts, list) : { ok: false, why: "the Healthchecks API couldn't be read with hc_api_key", hash: "" };
+    this.hcSeen = { at: this.now(), ...v };
+    if (v.why !== this.hcSaid) { this.d.log(v.ok ? "the Healthchecks checks' settings are within bounds" : `the Healthchecks checks' settings refuse arming: ${v.why}`); this.hcSaid = v.why; }
+    if (v.ok && this.st.phoneHcApi && v.hash !== this.st.phoneHcApi) this.phoneLapse("a Healthchecks check's period, grace or channels changed since the phone test");
+  }
+  // Why the settings read refuses arming now ("" when it doesn't).
+  hcWhy(now = this.now()): string {
+    if (!this.opts.hc_api_key) return "hc_api_key isn't set, so Keeper can't read the checks' settings";
+    const h = this.hcSeen;
+    if (!h || now - h.at > HC_READ_FRESH_MS) return "the Healthchecks checks' settings haven't been read in the last 3 minutes";
+    return h.ok ? "" : h.why;
+  }
 
   // -- drills and arming ----------------------------------------------------------------------------
   drillRecord(id: string): { ok: boolean; why: string } {
@@ -1048,11 +1224,11 @@ export class Keeper {
   // it lapses after 30 days, on any change of the Healthchecks options, and whenever a page isn't
   // delivered to Healthchecks.
   phoneTest(): { ok: boolean; why: string } {
-    const why = this.armableWhy();
+    const why = this.armableWhy() || this.hcWhy();
     if (why) return { ok: false, why: `not armable: ${why}` };
     const busy = this.opts.watch.find((a) => this.st.outstanding[a] || this.open(a).length || this.unresolvedOf(a).length || this.st.queue.some((q) => q.app === a));
     if (busy) return { ok: false, why: `${appName(busy)} has an incident or a line still going out: test the phone once it has cleared` };
-    this.st.phone = {}; this.st.phoneHc = hcHash(this.opts);
+    this.st.phone = {}; this.st.phoneHc = hcHash(this.opts); this.st.phoneHcApi = this.hcSeen!.hash;
     for (const app of this.opts.watch) {
       const u = this.alertUrl(app);
       this.st.phone[checkId(u)] = { sentAt: this.now() };
@@ -1082,10 +1258,11 @@ export class Keeper {
     this.save();
     return { ok: true, why: "" };
   }
-  // (0.1.4) Confirmed within 30 days, under the current Healthchecks options, for the App's alert check
-  // and the dead-man check.
+  // (0.1.4) Confirmed within 14 days (0.1.5), under the current Healthchecks options and checks' settings,
+  // for the App's alert check and the dead-man check.
   private phoneOk(app: string, now: number): boolean {
     if (this.st.phoneHc !== hcHash(this.opts)) return false;
+    if (!this.st.phoneHcApi || (this.hcSeen?.ok && this.hcSeen.hash !== this.st.phoneHcApi)) return false;
     return [this.alertUrl(app), this.opts.hc_deadman].every((u) => { const p = this.st.phone[checkId(u)]; return !!p?.confirmedAt && now - p.confirmedAt <= PHONE_MAX_MS; });
   }
   arm(): void {
@@ -1122,20 +1299,24 @@ export class Keeper {
     const stale = this.alertUrls().filter((u) => { const t = this.st.logDelivered[sha(u).slice(0, 16)] ?? 0; return !t || now - t > DELIVERY_MS; });
     const stuck = this.st.queue.some((q) => q.fail && now - q.at > STUCK_FAIL_MS);
     const armable = this.armableWhy();
+    const hc = armable ? "" : this.hcWhy(now);
     const why = armable ? `the keeper is not armable: ${armable}`
       : valid.length < 2 ? `no drills on record for ${app} under the current binding`
-      : !this.phoneOk(app, now) ? `no phone test drill confirmed for ${app}'s alert check and the dead-man check in the last 30 days, under the current Healthchecks options`
+      : !this.phoneOk(app, now) ? `no phone test drill confirmed for ${app}'s alert check and the dead-man check in the last 14 days, under the current Healthchecks options and checks' settings`
       : !this.delivered(now) ? "no heartbeat ping was delivered to Healthchecks in the last 10 minutes"
       : !this.st.deadmanDelivered || now - this.st.deadmanDelivered > DELIVERY_MS ? "no dead-man ping was delivered to Healthchecks in the last 10 minutes"
       : this.loopStalled(now) ? "Keeper's poll loop hasn't completed in the last 3 minutes"
+      : hc ? `the Healthchecks checks refuse arming: ${hc}`
       : stale.length ? "an alert check's log ping wasn't delivered to Healthchecks in the last 10 minutes"
       : stuck ? "a fail ping has waited undelivered for more than 2 minutes"
       : "";
     return { armed: !why, why, at: valid.length === 2 ? Math.max(...valid.map((r) => r!.at)) : null };
   }
-  armedView(app: string): { app: string; armed: boolean; why: string; armed_at: string | null; binding: Binding; keeper_version: string; at: string } {
+  armedView(app: string): { app: string; armed: boolean; why: string; armed_at: string | null; binding: Binding; keeper_version: string; at: string; key_fp: string; key_confirmed_at: string | null; state_created: string } {
     const v = this.armedState(app);
     return { app, armed: v.armed, why: v.why, armed_at: v.armed && v.at ? new Date(v.at).toISOString() : null, binding: this.binding(app),
-      keeper_version: this.d.version, at: new Date(this.st.heartbeat || this.now()).toISOString() };
+      keeper_version: this.d.version, at: new Date(this.st.heartbeat || this.now()).toISOString(), ...this.enrollment() };
   }
+  // (0.1.5) The phone test reads the checks' settings first (server.ts).
+  refreshHc(): Promise<void> { return this.readHc(true); }
 }

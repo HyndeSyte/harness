@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.4"
+version: "0.1.5"
 slug: keeper
 description: >-
   Checks every App install for 15 minutes and rolls a bad one back from the
@@ -38,6 +38,9 @@ timeout: 20
 # changed key here is refused until confirmed at the device (key-confirm <fingerprint>, DOCS.md). health_grace_s: after a watched App first starts, failed
 # liveness polls count only after this many seconds. The keeper reads its options through the Supervisor
 # each poll, never writes them, and keeps no copy of them. No registration is ever written here (0.1.3).
+# 0.1.5: a first pin accepts no registration either until key-confirm. hc_api_key (0.1.5): a Healthchecks
+# API key (the project's read-only key is meant to be enough; DOCS.md says what to check), with which the
+# keeper reads every check's period, grace, status and channels before it can arm; no key, not armable.
 options:
   watch:
     - 0fcc2575_cain
@@ -49,6 +52,7 @@ options:
   hc_failed: []
   health_grace_s: 180
   ship_public_key: ""
+  hc_api_key: ""
 schema:
   watch:
     - match(^[a-z0-9_]{1,64}$)
@@ -62,3 +66,4 @@ schema:
     - password
   health_grace_s: int(0,900)
   ship_public_key: match(^[A-Za-z0-9+/=]{0,200}$)?
+  hc_api_key: password?

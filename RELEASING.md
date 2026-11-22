@@ -5,7 +5,7 @@ Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
-- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.4): a check after every install of a
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.5): a check after every install of a
   watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
   `bun test keeper/tests`.
 
@@ -322,27 +322,34 @@ for 2 hours, without which Cain can't start the job.
    (`git show <sha>:cain/rootfs/opt/cain/settings.json | sha256sum`) must equal that digest.
    Otherwise install nothing and end with
    `Connector check: no passing line for this head and its settings`.
-4. The keeper's acceptance (Keeper 0.1.4; no options write). The Ship run doesn't register anything
-   and writes no Keeper options at all. Before Cain's RemoteTrigger hook let this run through, Cain's link
-   registered each watched App the tap installs with the Keeper App over the Keeper's own service
-   (`POST /attempt`, with Cain's `keeper_token`; `cain/rootfs/opt/cain/link/ship-pass.ts`), and the run
-   started only once the Keeper had accepted every one: it answers a registration only after its own
-   App-only backup is complete and verified (that App alone at the version being replaced, made after
-   Dane's tap), with the backup's slug. It goes through Cain's link because the Keeper's service is only on
-   Home Assistant's internal App network: this cloud session can't reach it, and the Home Assistant
-   connector speaks to Home Assistant, not to an App's port. Before each watched App's install (Cain),
-   step 4a:
-   - 4a. Read the Keeper App's log through the connector for the accepting line of this run's exact
-     attempt id, `accepting ship-<pr number>-<app>-<first 8 of the head sha> <slug> <from> to <to> backup
-     <backup slug> until <time>` (for Cain the id is `ship-<pr number>-cain-<first 8 of the head sha>`, and
-     `<from>` and `<to>` must be the versions this install replaces and installs). Install that App only when
-     the line is there, its `until` time hasn't passed, and no later line names that id as `consumed`,
-     `refusing`, `unprotected` or ended (`<id>: ...`): the acceptance is single use, consumed when the Keeper
-     first sees the new version. Otherwise, or if the Keeper App's log can't be read, install nothing (not
-     the other App either) and end with `Keeper: no acceptance for <id>` and the line you saw, if any. There
-     is no unwatched path for a watched App. Never install the Keeper App itself while one of its installs
-     is open or unresolved (its log says so): wait until it has ended, and an unresolved one until its log
-     says `rolled back` or `gave up`, or Dane says go. The token goes nowhere from here: not into the
+4. The keeper's acceptance and claim (Keeper 0.1.5; no options write). The Ship run doesn't register
+   anything and writes no Keeper options at all. Before Cain's RemoteTrigger hook let this run through,
+   Cain's link registered each watched App the tap installs with the Keeper App over the Keeper's own
+   service (`POST /attempt`, with Cain's `keeper_token`; `cain/rootfs/opt/cain/link/ship-pass.ts`), polled
+   it until the Keeper had made and verified its App-only backup and accepted it, checked the Keeper's
+   pinned Ship key against `cain/SHIP_KEY_FINGERPRINT` at this head, and then, as the hook let the run start,
+   claimed each acceptance (single use, valid 30 minutes). It goes through Cain's link because the Keeper's
+   service is only on Home Assistant's internal App network: this cloud session can't reach it, and the
+   Home Assistant connector speaks to Home Assistant, not to an App's port. Before each watched App's
+   install (Cain), step 4a:
+   - 4a. Read two lines for this run's exact attempt id, `ship-<pr number>-<app>-<first 8 of the head sha>`
+     (for Cain `ship-<pr number>-cain-<first 8 of the head sha>`), through the connector:
+     - in the Keeper App's log, `accepting <id> <slug> <from> to <to> backup <backup slug> until <time>`,
+       followed by `claimed <id> claim <claim id> <slug> <from> to <to> backup <backup slug> until <claim
+       deadline>`, where `<from>` and `<to>` are the versions this install replaces and installs;
+     - in Cain's App log, the link's ok line for the same attempt and claim,
+       `Ship pass ok: <id> claim <claim id> until <claim deadline>`.
+     Install that App only when both lines are there with the same id and claim id, the claim deadline
+     hasn't passed (check the time right before you start the update, and abort if it has), and no later
+     Keeper line names that id as `consumed`, `refusing`, `unprotected` or `ended` (`<id>: ...`).
+     Otherwise, or if either log can't be read, install nothing (not the other App either) and end with
+     `Keeper: no claimed acceptance for <id>` and the lines you saw, if any. There is no unwatched path for
+     a watched App: an install the Keeper sees outside a live claim is "unprotected" and is never rolled
+     back. The Keeper itself isn't gated by the Keeper: an install or update of the Keeper App goes through
+     this same Ship path with a backup taken first and no 4a (Keeper DOCS, "Keeper's own install and
+     updates"); never install it while one of its installs is open or unresolved (its log says so): wait
+     until it has ended, and an unresolved one until its log says `rolled back` or `gave up`, or Dane says
+     go. A broken Keeper is repaired by break glass (below). The token goes nowhere from here: not into the
      options, the report or any log. Never print it.
    In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. When it changed both, Cain first, then
@@ -356,12 +363,12 @@ for 2 hours, without which Cain can't start the job.
    `<id>: passed (...)`, `<id>: rolled back (...)`, `<id>: gave up (...)`, `<id>: unresolved (...)` or
    `<id>: install never started`. Report that line, with its chat word when it has one ("chat not connected
    (degraded)" is only a report: the install check and the rollback decide on the App's state, version and
-   liveness, never on Discord). A rollback runs as one Supervisor job; the Keeper sends a second call only
-   after a 4xx answer with the Supervisor's jobs list showing no restore of that backup, and counts "rolled
-   back" only from that job finished without errors (since Keeper 0.1.4 a 4xx is sent again only once a
-   device drill has recorded the restore job's name; before that it is "unresolved"). A 5xx, no answer, or the App seen coming back at the old
-   version without the job's result is "unresolved": it sends nothing more, checks again on every poll, and
-   tells Dane once it knows. On a rollback, a give-up or an unresolved attempt the Keeper has already paged
+   liveness, never on Discord). A rollback runs as one Supervisor job, sent once and never again (Keeper
+   0.1.5), and counts "rolled back" only from that job finished without errors. A refusal (4xx), a 5xx, no
+   answer, or the App seen coming back at the old version without the job's result is "unresolved": it
+   sends nothing more, checks again on every poll, and tells Dane once it knows. A rollback loses what the
+   App wrote after the Keeper's backup, the few minutes before the install included (Keeper DOCS, "What a
+   rollback loses"). On a rollback, a give-up or an unresolved attempt the Keeper has already paged
    Dane through its own alert check; the report says what was rolled back and why, and installs nothing
    more. Never restore or reinstall around an unresolved attempt: report it.
 
@@ -414,7 +421,17 @@ installed from Home Assistant's own page unless Dane says so.
 
 The link makes a new Ship key only when the old one can't be read (and on a restored
 Pi, since backups leave it out), and says so. Ship tokens from before it no longer
-count, so an install waiting on one needs a new Ship card. Nothing else to do.
+count, so an install waiting on one needs a new Ship card.
+
+Since Keeper 0.1.5 the key's fingerprint is committed in the repository: `cain/SHIP_KEY_FINGERPRINT`
+(comment lines, then the fingerprint, the first 16 hex digits of the SHA-256 of the public key, the
+value in the link's `Ship key fingerprint: ...` log line). When the key is made or remade, Dane runs a
+Build that writes the new fingerprint there (Cain goes up a patch version: the file is in his folder), and
+after it lands he pastes the new public key into the Keeper's `ship_public_key` and confirms it at the
+device with `key-confirm <fingerprint>` (Keeper DOCS). Until both are done, Cain's link refuses every Ship
+run that installs a watched App: the Keeper's pinned key must have the committed fingerprint, confirmed by
+Dane, and the committed fingerprint must be the link's own key's. A Build may write that file only on
+Dane's word, with the fingerprint read from the link's log.
 
 ## If the deploy key is remade, or GitHub loses it
 
@@ -428,6 +445,11 @@ or another OAuth app's token: GitHub deletes a key added that way when the token
 revoked. Keep exactly one deploy key with write access.
 
 ## Break glass (the link can't ship)
+
+Since Keeper 0.1.5 this is also how a broken Keeper is repaired, and how anything that installs a watched
+App ships while the Keeper is absent or refuses every registration (the link then lets no such Ship run
+start).
+
 
 If the link itself is broken (a bad release, or the Pi is lost) and a fix has to reach
 `main`, then on Dane's OK, at his PC: a laptop session makes a temporary SSH key, adds
