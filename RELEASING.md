@@ -326,12 +326,12 @@ for 2 hours, without which Cain can't start the job.
    no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 5. Confirm the new version is running from the update result and the App's log.
 
-Ship checklist for Cain 0.18.1 (the owner's checks on the Pi, all read only):
+Ship checklist for Cain 0.18.2 (the owner's checks on the Pi, all read only):
 - Before the install, run the replay on copies of the live files and read what it would do: copy
   `/data/review-rounds.json` and `/data/review-grants.json` somewhere of your own, then
   `review.sh sweep-dry-run <copy of rounds> <copy of grants>`. It prints, for each grant from
   before grants were bound, the rounds it credits (one per round past the base cap) and how many it lets
-  go, and writes nothing. The running 0.18.0 has no sweep-dry-run yet, so before the install run the
+  go, and writes nothing. The running version (0.18.1 or earlier) has no sweep-dry-run yet, so before the install run the
   same command from a checkout of this pull request on any machine with Bun, on those copies:
   `bun cain/rootfs/opt/cain/review/cli.ts sweep-dry-run <copy of rounds> <copy of grants>`.
 - Stop the runner between the dry run and the install, so it records no round the dry run didn't see.

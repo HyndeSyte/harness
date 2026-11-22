@@ -213,6 +213,32 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
+### The privacy backstop (since 0.18.1)
+
+Before anything goes to a seat, the review runner checks it in code and fails closed. Over the
+brief (its topic, question, body and id) it runs every built-in pattern (an email address, a phone
+number, an account or card number, an SSN-shaped number) and your private-terms list
+(`/data/review-private-terms.txt`); a brief that matches is blocked and nothing is sent.
+
+Over the earlier findings a fix-only round carries it runs the same email, phone and SSN-shaped
+patterns and your private-terms list. Only the account-or-card pattern is relaxed there, and only
+for an unbroken run of exactly eight digits that is a valid date written year, month, day, years 1900
+to 2099 (`20250305`), whether glued to an identifier (a letter or an underscore right before it, as in
+a web search tool's name ending in a date, `web_search_20250305`) or bare. A bare eight-digit date in
+the findings is accepted on purpose: it can't be told from a date, and it is shorter than any card
+number. Any other run of eight or more digits in the findings still blocks the round: a bare
+`12345678`, a longer or non-date run glued to an identifier (`card_4111111111111111`,
+`account_123456789012`), or a spaced card number; a Luhn-valid run of 13 to 19 digits always blocks.
+A match names its kind (or the list's line), never the text. A blocked round sends nothing and
+doesn't count toward the cap.
+
+The earlier findings come only from the runner's own record: it reads the change's previous round
+from the rounds recorded under that change's own key in its rounds file (each round by its id) and the
+queue record that round left, which must be that round of that change. A brief has no field for them,
+so a brief carrying earlier findings, or any field not in its allowlist, is refused whole and nothing
+is queued. A round id is one change's: a brief whose id is already a round of another change is
+refused and nothing is queued.
+
 ### The review-round cap (since 0.16.0)
 
 A piece of work gets at most three outside review rounds, and the review runner keeps that count
@@ -325,7 +351,7 @@ Since the second review of 0.18.0:
 - `review.sh status <id>`, `review.sh spend` and Cain's "Review done" line show the raised cap and the
   grants, for example "round 4 of 5, 2 granted by Dane on Nov 21".
 
-#### A grant is bound to what you approved (since 0.18.1)
+#### A grant is bound to what you approved (since 0.18.2)
 
 The link's lock serializes your taps, but GitHub and the review runner can still move between your
 tap's last check and the moment the grant is written: a push, or a new decision, in that gap. So each
@@ -354,14 +380,14 @@ and the cap before the grant. The runner holds every grant to that:
   request as it stood then, but the pull request has new commits since). The runner keeps it as void
   in its rounds file and Cain hears it once, so he can ask you for a fresh grant card. A brief that
   names no head can't claim a grant bound to a head and is refused without voiding it.
-- Grants written by 0.18.0 carry no binding, and 0.18.0 recorded no claims. At the runner's first tick
+- Grants written by 0.18.0 and 0.18.1 carry no binding, and those versions recorded no claims. At the runner's first tick
   after the update it replays them once (sixth review): for each change group, its rounds in time order,
   where the base cap decides whether a round needed a grant. Each round past the base cap debits exactly
-  one round from the earliest 0.18.0 grant given before it that still has rounds left (by the grant's
+  one round from the earliest unbound grant given before it that still has rounds left (by the grant's
   time, then its id), written as a claim on that round, and the grant counts for those rounds only. So a
   grant given after round two is not used up by round three, which the base cap of three allowed anyway,
   and a two-round grant followed by a fourth round has one round claimed and one left over.
-- Rounds of a 0.18.0 grant that no round needed are let go: voided once, recorded in the rounds file
+- Rounds of an unbound grant that no round needed are let go: voided once, recorded in the rounds file
   under `grants_void` with the reason "unbound" and how many rounds. You get one plain notice per change
   through the link, in its own words ("Before grants were tied to a commit, you granted extra review
   rounds for pull request 48. 1 of them was never used and is now let go. If it needs more rounds, Cain

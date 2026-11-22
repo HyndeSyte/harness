@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.18.1
+## 0.18.2
 
 - A grant of more review rounds now holds the state you approved with your tap: the pull request's newest commit, the newest decision, the rounds used and the cap before it.
 - If the pull request gets new commits, or a newer decision comes, between your tap and the next round, the grant no longer counts: that round is refused, and Cain can ask you again on a fresh card.
@@ -23,6 +23,13 @@
 - The review service never writes the file that keeps your grants: only your tap does.
 - A pull request GitHub says isn't there no longer slows other reviews' GitHub reads, and a second wait on GitHub starts its own 15 minutes.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart: nothing about those changed here.
+
+## 0.18.1
+
+- A fix-only review round is no longer blocked because the earlier round's findings hold a tool name ending in a date (or a date written as eight digits).
+- Everything else is still checked over those findings: an email address, a phone number, an SSN-shaped number, a term from your private list, and any other run of eight or more digits still blocks the round, and a blocked round still doesn't count.
+- Your brief is checked as before: an email, phone, account or card number, SSN-shaped number or private term in it still blocks it before anything is sent.
+- The earlier findings come only from the review runner's own record of the round before; a brief that tries to carry its own is refused.
 
 ## 0.18.0
 

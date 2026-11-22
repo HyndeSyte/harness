@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
-  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
+  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, checkBrief, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
   keyOfRef, newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
@@ -521,8 +521,13 @@ export class Runner {
   // (a string), a refs head or a cached read can admit only a brief whose head equals the bound head.
   // One writer per file: the runner writes the rounds file only. Claims and voids live there, keyed by grant id; the
   // grants file is the link's alone, read here and never written.
-  admitAndQueue(b: Brief, gh?: string | HostRead | HostFail | null): string | null {
-    const why = this.admitInner(b, gh);
+  admitAndQueue(given: Brief, gh?: string | HostRead | HostFail | null): string | null {
+    // Only a brief's own fields go in (Cain 0.18.1): a brief carrying anything else, earlier findings
+    // included, is refused whole, so the findings a fix-only round sends are only ever the ones the
+    // runner loads itself from its own record of the change's previous round (earlierFindings).
+    const c = checkBrief(given);
+    if (!c.brief) return `not a brief: ${c.error}. Nothing was queued.`;
+    const why = this.admitInner(c.brief, gh);
     this.deliverCain();                                // what a void owed Cain, once the rounds file has it
     return why;
   }
@@ -564,6 +569,10 @@ export class Runner {
     const toVoid = (a.stale ?? []).filter((x) => !unproven.includes(x));
     if (a.key && toVoid.length && this.voidGrants(rounds, a.key, toVoid)) writeRounds(file, rounds);
     if (!a.ok) return a.why;
+    // A round id is one change's (Cain 0.18.1): an id already kept as a round of another change is refused,
+    // so no round's record can stand for two changes and a fix-only round never reads another's findings.
+    const other = Object.entries(rounds.changes).find(([k, c]) => k !== a.key && c.rounds.some((x) => x.id === b.id));
+    if (other) return `refused: the id ${b.id} is already a round of another change, so it can't be a round of ${a.key}: give this round a new id. Nothing was queued.`;
     const label = labelOf(b.label)!;
     if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
       const g = guard(label, `review ${b.id} (${a.key}, round ${a.round})`, { settingsFile: this.cfg.settingsFile, spendFile: this.cfg.spendFile,
@@ -727,11 +736,14 @@ export class Runner {
     this.deliverCain();
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
+  // Read only from the runner's own files: the rounds recorded under this change's own key in the rounds file
+  // (each round by its id; Cain 0.18.1: not a linked change's) and the queue record that round left, which
+  // must be that round of this change. Nothing a brief or request carries reaches them.
   private earlierFindings(rounds: Rounds, key: string): string[] {
-    const done = countedRounds(rounds, key).reverse();
-    for (const x of done) {
+    const own = (rounds.changes[key]?.rounds ?? []).filter((x) => !x.blocked).sort((a, b) => a.at.localeCompare(b.at)).reverse();
+    for (const x of own) {
       const prev = loadReview(this.cfg.queueDir, x.id);
-      if (!prev || prev.status === "blocked: privacy") continue;
+      if (!prev || prev.id !== x.id || prev.change !== key || prev.status === "blocked: privacy") continue;
       const list = prev.seats.filter((s) => s.state === "done").flatMap((s) => (s.findings ?? []).map((f) =>
         `${seatName(s)}${f.severity ? ` [${f.severity}]` : ""}: ${oneLine(f.problem, 400)}`));
       if (list.length) return list.slice(0, 30);
