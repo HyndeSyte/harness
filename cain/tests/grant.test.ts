@@ -90,7 +90,9 @@ function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer> } = {}) {
     get: (id: string) => loadReview(cfg.queueDir, id)! };
 }
 async function threeRounds(t: ReturnType<typeof runnerRig>, over: Partial<Brief> = {}) {
-  for (const id of ["k-1", "k-2", "k-3"]) { expect(await t.take(brief({ id, ...over }))).toBeNull(); await t.runner.tick(); }
+  // A round id is one change's (main's Cain 0.18.1): another change's rounds get ids of their own.
+  const pre = over.pr && over.pr !== PRN(46) ? `p${/\d+$/.exec(over.pr)![0]}-` : "";
+  for (const id of ["k-1", "k-2", "k-3"].map((x) => pre + x)) { expect(await t.take(brief({ id, ...over }))).toBeNull(); await t.runner.tick(); }
 }
 
 describe("the grant raises the cap by exactly the rounds it names", () => {
