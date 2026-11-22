@@ -134,6 +134,37 @@ def test_a_move_out_of_the_app_counts_as_a_shipped_change():
                         "(0.4.6, 0.5.0, 1.0.0). It says 0.4.5."]
 
 
+def test_a_version_main_already_has_in_its_changelog_is_taken():
+    # main's config says 0.4.5, but its CHANGELOG already has a 0.4.6 section (another pull request's).
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), log("0.4.6", "0.4.5"))}
+    problems = check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.4.6", "0.4.5")))
+    assert problems == ["cain 0.4.6 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
+
+
+def test_a_version_main_has_as_a_heading_is_taken_even_with_a_different_config():
+    # main's config is behind its CHANGELOG: the heading alone makes the version taken.
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), log("0.5.0", "0.4.5"))}
+    problems = check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.5.0", "0.4.5")))
+    assert problems == ["cain 0.5.0 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
+
+
+def test_a_fresh_version_is_not_taken_and_an_unchanged_app_is_never_asked():
+    assert check_pr.check_versions(["cain/run.sh"], state(), state(cain=("0.4.6", "0.4.5"))) == []
+    assert check_pr.check_versions([], state(), state()) == []
+    assert check_pr.changelog_versions(log("0.4.6", "0.4.5")) == {(0, 4, 6), (0, 4, 5)}
+    assert check_pr.changelog_versions(None) == set()
+
+
+def test_a_taken_version_is_found_under_a_variant_heading():
+    # main's CHANGELOG writes the heading with a leading v and stray spaces: it is the same version.
+    variant = "# Changelog\n\n##   v0.4.6  \n\n- a change\n\n## 0.4.5\n\n- a change\n"
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), variant)}
+    problems = check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.4.6", "0.4.5")))
+    assert problems == ["cain 0.4.6 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
+    assert check_pr.changelog_versions(variant) == {(0, 4, 6), (0, 4, 5)}
+    assert check_pr.changelog_versions("## V1.2.3\n## 1.2.30\n## notes\n") == {(1, 2, 3), (1, 2, 30)}
+
+
 # -- versions fail closed ------------------------------------------------------------
 
 @pytest.mark.parametrize("text, why", [
