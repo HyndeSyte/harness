@@ -4,18 +4,24 @@
 //   bun main.ts drill-record <id>     a drill record from the keeper's own result for that attempt
 //                                     (asks the running service; it decides from its own state alone)
 //   bun main.ts phone-test            (0.1.3) the phone test drill: pages each watched App's alert check once,
-//                                     and (0.1.4) the dead-man check
-//   bun main.ts phone-confirm         (0.1.3) once those pages reached the owner's phone: records it (30 days)
-//   bun main.ts key-confirm <fp>      (0.1.4) the owner confirms ship_public_key by its fingerprint (0.1.5: the
-//                                     first pin, a new state and a rotation alike)
+//                                     and (0.1.4) the dead-man check; (0.1.6) prints a one-time code in the log
+//   bun main.ts phone-confirm <code> <check>...   (0.1.3) once those pages reached the owner's phone: records it
+//                                     (14 days) for each check named (0.1.6: an App's short name, or deadman)
+//   bun main.ts key-confirm <fp> <code>   (0.1.4) the owner confirms ship_public_key by its fingerprint (0.1.5: the
+//                                     first pin, a new state and a rotation alike; 0.1.6: with the code from the log)
+//   bun main.ts missed-heartbeat      (0.1.6) the missed-heartbeat drill: the heartbeat ping stops until Healthchecks
+//                                     pages; prints a one-time code
+//   bun main.ts missed-heartbeat-confirm <code>   (0.1.6) once that page reached the owner's phone
+// The owner's commands go to the loopback listener (127.0.0.1:8096), never the App network's (0.1.6).
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { HEARTBEAT_MS, type HcCheck, Keeper, POLL_MS, type State } from "./core.ts";
-import { handle } from "./server.ts";
+import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
 export const PORT = Number(process.env.KEEPER_PORT ?? 8097);
+export const LOCAL_PORT = Number(process.env.KEEPER_LOCAL_PORT ?? 8096);   // (0.1.6) the owner's commands, loopback only
 const DATA = process.env.KEEPER_DATA ?? "/data";
 const STATE = `${DATA}/state.json`;
 const OPTIONS = `${DATA}/options.json`;
@@ -74,7 +80,7 @@ async function serve(): Promise<void> {
   if (me && me.version && me.version !== version) log(`the Supervisor says this is ${me.version}, the image says ${version}: the image's is bound`);
   const k = new Keeper({
     now: Date.now, version, self,
-    appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, job: sup.job, hcChecks: (key) => hcChecks(key),
+    appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
@@ -102,6 +108,9 @@ async function serve(): Promise<void> {
   // 0.1.5: POST /attempt answers at once (the backup runs in the background), so no request is held open.
   Bun.serve({ port: PORT, hostname: "0.0.0.0", idleTimeout: 30, maxRequestBodySize: 4096,
     fetch: (req, server) => handle(k, req, server.requestIP(req)?.address ?? "", log) });
+  // 0.1.6: the owner's commands, on the container's own loopback only (the App network can't reach it).
+  Bun.serve({ port: LOCAL_PORT, hostname: "127.0.0.1", idleTimeout: 30, maxRequestBodySize: 4096,
+    fetch: (req, server) => handleLocal(k, req, server.requestIP(req)?.address ?? "", log) });
   const tick = async () => { try { await k.poll(); } catch (e) { log(`a poll failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`); } };
   await tick();
   setInterval(tick, POLL_MS);
@@ -119,26 +128,33 @@ async function serve(): Promise<void> {
   setInterval(() => { void deadman(); }, HEARTBEAT_MS);
 }
 
+// (0.1.6) The owner's commands and the body each sends to the loopback listener.
+const LOCAL_CMDS: Record<string, (a: string[]) => unknown> = {
+  "drill-record": (a) => ({ attempt: a[0] ?? "" }),
+  "phone-test": () => ({}),
+  "phone-confirm": (a) => ({ code: a[0] ?? "", checks: a.slice(1) }),
+  "key-confirm": (a) => ({ fingerprint: a[0] ?? "", code: a[1] ?? "" }),
+  "missed-heartbeat": () => ({}),
+  "missed-heartbeat-confirm": (a) => ({ code: a[0] ?? "" }),
+};
+const DONE: Record<string, string> = {
+  "drill-record": "drill recorded", "phone-test": "phone test sent: once the pages reached your phone, phone-confirm <code from the log> <each check>",
+  "phone-confirm": "phone test recorded", "key-confirm": "Ship key confirmed",
+  "missed-heartbeat": "missed-heartbeat drill started: once its page reached your phone, missed-heartbeat-confirm <code from the log>",
+  "missed-heartbeat-confirm": "missed-heartbeat drill recorded",
+};
+
 if (import.meta.main) {
-  const [cmd, arg] = process.argv.slice(2);
+  const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === "serve") await serve();
-  else if (cmd === "drill-record") {
-    const r = await fetch(`http://127.0.0.1:${PORT}/drill-record`, { method: "POST", body: JSON.stringify({ attempt: arg ?? "" }) }).catch(() => null);
+  else if (LOCAL_CMDS[cmd]) {
+    const body = LOCAL_CMDS[cmd](rest);
+    const r = await fetch(`http://127.0.0.1:${LOCAL_PORT}/${cmd}`, { method: "POST", body: JSON.stringify(body) }).catch(() => null);
     const j: any = r ? await r.json().catch(() => null) : null;
-    console.log(j?.ok ? `drill recorded: ${arg}` : `no drill record: ${j?.why ?? "the keeper's service didn't answer"}`);
-    process.exit(j?.ok ? 0 : 1);
-  } else if (cmd === "phone-test" || cmd === "phone-confirm") {
-    const r = await fetch(`http://127.0.0.1:${PORT}/${cmd}`, { method: "POST", body: "{}" }).catch(() => null);
-    const j: any = r ? await r.json().catch(() => null) : null;
-    console.log(j?.ok ? (cmd === "phone-test" ? "phone test sent: confirm with phone-confirm once it reached your phone" : "phone test recorded") : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
-    process.exit(j?.ok ? 0 : 1);
-  } else if (cmd === "key-confirm") {
-    const r = await fetch(`http://127.0.0.1:${PORT}/key-confirm`, { method: "POST", body: JSON.stringify({ fingerprint: arg ?? "" }) }).catch(() => null);
-    const j: any = r ? await r.json().catch(() => null) : null;
-    console.log(j?.ok ? `Ship key confirmed: ${arg}` : `not confirmed: ${j?.why ?? "the keeper's service didn't answer"}`);
+    console.log(j?.ok ? `${DONE[cmd]}${j.why ? ` (${j.why})` : ""}` : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
     process.exit(j?.ok ? 0 : 1);
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm | key-confirm <fingerprint> | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | selftest"); process.exit(2); }
 }

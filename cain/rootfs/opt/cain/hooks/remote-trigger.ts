@@ -20,7 +20,9 @@
 //     pinned key against cain/SHIP_KEY_FINGERPRINT at the head and its state against the recorded
 //     enrollment; it carries each claim id and deadline, and the link logs "Ship pass ok: <attempt> claim
 //     <claim> until <time>", the line the Ship run reads. A pass the link gives up on is cancelled at the
-//     keeper;
+//     keeper. (Keeper 0.1.6) Just before it lets the run start, the hook checks each claim's deadline in
+//     code: a claim with under 20 minutes left (or none it can read) refuses the run, and the hook asks the
+//     link to cancel the pass and its claims (POST /ship-pass {token, cancel});
 //   - while everything is stopped (Dane's Stop, ../stop.ts), no run starts at all;
 //   - (Cain 0.16.0) a run carries one label, core, commitment, necessary-fix or other: in its body's
 //     "label" field or on a "Label: <label>" line of its text (both, and they must agree); none is
@@ -195,6 +197,26 @@ export async function decideWithGuard(call: any, holdsText: string | null, env: 
 // Cain to start the same run again in a minute.
 export type Pass = { ok: true; claims?: { attempt: string; claim: string; until: string }[] } | { ok: false; why: string; pending?: true };
 export const PASS_BUDGET_MS = 10_000;
+export const CLAIM_START_MIN_MS = 20 * 60_000;   // (Keeper 0.1.6) the same as link/ship-pass.ts
+// (Keeper 0.1.6) Why the claims' deadlines refuse the run now ("" when they don't): any claim with under 20
+// minutes left, or a deadline that can't be read.
+export function claimDeadlineWhy(claims: { attempt: string; claim: string; until: string }[] | undefined, now: number): string {
+  for (const k of claims ?? []) {
+    const t = Date.parse(String(k?.until ?? ""));
+    if (!Number.isFinite(t)) return `the keeper's claim of ${String(k?.attempt ?? "an install").slice(0, 80)} has no deadline the hook can read`;
+    if (t - now < CLAIM_START_MIN_MS) return `the keeper's claim of ${String(k.attempt).slice(0, 80)} has ${Math.max(0, Math.floor((t - now) / 60_000))} minutes left, under the 20 a Ship run needs to start`;
+  }
+  return "";
+}
+// (Keeper 0.1.6) The hook's refusal of a passed run, sent to the link so it cancels the pass and its claims.
+export async function postShipPassCancel(token: string, why: string, o: { url?: string; key?: string; keyFile?: string; fetch?: typeof fetch } = {}): Promise<void> {
+  let key = o.key ?? "";
+  if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return; } }
+  try {
+    await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/ship-pass`, { method: "POST", body: JSON.stringify({ token, cancel: why }),
+      headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(3_000) });
+  } catch { /* the claims then run out unused: the keeper ends them by themselves */ }
+}
 export async function postShipPass(token: string, o: { url?: string; key?: string; keyFile?: string; ms?: number; fetch?: typeof fetch; budgetMs?: number; pauseMs?: number } = {}): Promise<Pass> {
   let key = o.key ?? "";
   if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { ok: false, why: "this start has no key for the link" }; } }
@@ -218,7 +240,7 @@ export async function postShipPass(token: string, o: { url?: string; key?: strin
 // link's one-run-per-token pass, last, so only a run that would otherwise start spends its token.
 export async function decideAll(call: any, holdsText: string | null, env: Env,
     reading: (label: Label, what: string) => Verdict, post: (label: Label, what: string) => Promise<{ logged: boolean; passes?: boolean }>,
-    pass: (token: string) => Promise<Pass>): Promise<string> {
+    pass: (token: string) => Promise<Pass>, cancel: (token: string, why: string) => Promise<void> = async () => {}, now: () => number = Date.now): Promise<string> {
   const first = await decideWithGuard(call, holdsText, env, reading, post);
   if (first) return first;
   const t = call?.tool_input;
@@ -227,6 +249,9 @@ export async function decideAll(call: any, holdsText: string | null, env: Env,
   const token = findToken(typeof t.body?.text === "string" ? t.body.text : "");
   if (!token) return "A Ship job carries the Ship token from his relayed Ship tap.";
   const p = await pass(token);
+  // (Keeper 0.1.6) the claims' deadlines, checked in code immediately before the run is let through
+  const late = p.ok ? claimDeadlineWhy(p.claims, now()) : "";
+  if (late) { await cancel(token, late); return `The link didn't let this Ship run start: ${late}. Nothing was installed; the claims are cancelled, so start again with a new Ship card for the same pull request and head.`; }
   return p.ok ? "" : p.pending ? `This Ship run hasn't started yet: ${p.why}.` : `The link didn't let this Ship run start: ${p.why}.`;
 }
 
@@ -239,7 +264,7 @@ if (import.meta.main) {
     const reading = (label: Label, what: string): Verdict => label !== "other" ? { ok: true }
       : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now) }), new Date(now));
     try { reason = await decideAll(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w),
-      (tok) => postShipPass(tok)); }
+      (tok) => postShipPass(tok), (tok, why) => postShipPassCancel(tok, why)); }
     catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {

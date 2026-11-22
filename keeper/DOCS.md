@@ -13,8 +13,9 @@ It watches Cain to start with (option `watch`).
   version being replaced, made without a password, after the token was issued), claimed by Cain's link as
   the Ship run started (0.1.5), and it sends one restore call per install, never a second (0.1.5, below).
 - An unregistered version change is only logged and reported, never restored.
-- It can't be armed until both drills have rolled back for real on the device and the phone test drill
-  is confirmed (the next job), so "Ship it with that risk" stays refused until then.
+- It can't be armed until both drills have rolled back for real on the device, the phone test drill is
+  confirmed and (0.1.6) the missed-heartbeat drill is confirmed (the next job), so "Ship it with that risk"
+  stays refused until then.
 
 ## What Keeper proves, and what it can't (0.1.3)
 
@@ -54,8 +55,10 @@ What Keeper checks itself, before it accepts an install:
    sees into its own state, logs it with its fingerprint (the first 16 hex digits of the SHA-256 of the
    key's bytes) and pages you once: "Keeper pinned Cain's link's Ship key, fingerprint ...". 0.1.5: that
    first pin accepts **no** registration until you confirm it at the device, the same way as a new key:
-   `bun /opt/keeper/main.ts key-confirm <fingerprint>` in Keeper's container (for example
-   `docker exec addon_0fcc2575_keeper bun /opt/keeper/main.ts key-confirm <fingerprint>` from the SSH App).
+   `bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` in Keeper's container (for example
+   `docker exec addon_0fcc2575_keeper bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` from the SSH
+   App). 0.1.6: `<code>` is the one-time code Keeper printed in its log at the pin (`one-time code for
+   key-confirm: ...`, below).
    Check the fingerprint first against `cain/SHIP_KEY_FINGERPRINT` in the repository and the
    `Ship key fingerprint: ...` line in Cain's App log: all three must agree. A state that is lost (Keeper
    reinstalled) or rewound (restored, or stopped over 10 minutes) needs the confirm again. A different key
@@ -66,6 +69,13 @@ What Keeper checks itself, before it accepts an install:
    fingerprint is the one committed at the pull request's head (`cain/SHIP_KEY_FINGERPRINT`, which must
    also be the link's own key's) and the state is no newer than the one it recorded at the last confirmed
    enrollment it saw (it records it when your confirm shows up in Keeper's answers).
+7. **The enrollment record (0.1.6).** The link keeps the last confirmed enrollment it saw (the fingerprint,
+   Keeper's state creation time and your confirm time) in root's `/data/trust/keeper-enrollment.json`, which
+   Cain's session can't write. It records it from its minute-by-minute `/armed` read of Keeper as well as from
+   a Ship pass, so your confirm is recorded even before the next Ship. A Ship pass then needs Keeper's state
+   creation time and confirm time to **equal** the recorded ones: a newer state is refused, and so is an
+   older one (a restored Keeper state), and a different state counts only once you confirm the key at the
+   device again (a confirm newer than the record moves the record to it).
 
 What it can't prove:
 
@@ -116,7 +126,7 @@ No request is held open through the backup. With the acceptance Keeper logs `acc
 <to> backup <slug> until <time>`. The pass answers Cain's hook "pending" meanwhile, so the hook refuses the
 run with a line telling Cain to start the same run again in a minute.
 
-**The claim (0.1.5).** Once every watched App is accepted, at the hook's next ask, the link claims each
+**The claim (0.1.5; its deadline, 0.1.6).** Once every watched App is accepted, at the hook's next ask, the link claims each
 acceptance (`POST /attempt/<id>/claim` with the App, both versions and the backup's slug) and only then
 answers the hook "ok", with each claim's id and deadline. Keeper logs `claimed <id> claim <claim id> <app>
 <from> to <to> backup <slug> until <time>`, and the link logs `Ship pass ok: <id> claim <claim id> until
@@ -124,7 +134,31 @@ answers the hook "ok", with each claim's id and deadline. Keeper logs `claimed <
 either is missing or the claim's `until` has passed (RELEASING.md, Ship). An acceptance never claimed ends
 after 30 minutes (`<id>: ended (its acceptance expired unclaimed)`), and a claim with no version change
 seen ends after its 30 minutes (`<id>: ended (its claim <claim id> expired with no version change seen)`),
-each with a notice to you that leaves no incident open. Why the link and not the Ship run: the Ship run is
+each with a notice to you that leaves no incident open.
+
+The deadline in code (0.1.6). The Ship run is a cloud session that reaches GitHub and Home Assistant only,
+never Keeper or the link, so the gates in code are Cain's hook at the run's start and Keeper's own fence:
+
+- the claim lasts 30 minutes from the claim; the link refuses (and cancels) a claim answered with under 20
+  minutes left, and the hook checks every claim's deadline again in code immediately before it lets the run
+  start: under 20 minutes left, or a deadline it can't read, refuses the run and asks the link to cancel the
+  pass and its claims (`POST /ship-pass {token, cancel}`); a new Ship card for the same pull request and head
+  starts again (the same tap can't: Keeper spends a Ship token once per App);
+- Keeper treats a version change seen outside a live claim as uncertain, and (0.1.6) so is one seen during a
+  live claim to a version other than the claimed one: "unprotected", paged, never restored;
+- the deadline bounds the start, not the watch: an install whose new version Keeper first sees inside the
+  claim is watched its full 15 minutes, and rolled back on a fail, even after the claim's deadline passed;
+- the Ship run's own reading of both log lines and the time (RELEASING.md, Ship 4a) stays as belt and braces.
+
+**Orphan backups (0.1.6).** Keeper records the slug of the backup it made on each attempt (as soon as the
+backup call answers, even if the registration was cancelled meanwhile). When a registration is cancelled,
+or its acceptance expires unclaimed, Keeper deletes that backup at its next poll (`DELETE /backups/<slug>`,
+within the backup role) and logs `<id>: deleted its backup <slug> (...)`. If the Supervisor refuses or doesn't
+answer three polls in a row, Keeper stops trying and logs `<id>: couldn't delete its backup <slug> after 3
+tries; it stays in Home Assistant's list, used for nothing: delete backup <slug> by hand`. A backup of an
+install that happened, or of a claim that ran out, is kept.
+
+Why the link and not the Ship run: the Ship run is
 a cloud session, and Keeper's service is only on Home Assistant's internal network, which the Home
 Assistant connector can't reach.
 
@@ -226,12 +260,24 @@ to Cain itself then also goes by break glass.
    `cain/SHIP_KEY_FINGERPRINT` in the repository and `Ship key fingerprint: ...` in Cain's log. If the
    link ever makes a new Ship key (its log says so), a Build commits its fingerprint to
    `cain/SHIP_KEY_FINGERPRINT`, you paste the new key here and confirm it the same way.
-2. **`hc_api_key` (0.1.5)**: a Healthchecks API key for the project holding the checks below (Project
-   Settings, API Access). Keeper reads every check's period, grace, status and notification channels with
-   it, at most once a minute, through `https://healthchecks.io/api/v3/checks/` (healthchecks.io only).
-   Without it Keeper is not armable, and says so. The read-only key is meant to be enough; if Keeper's log
-   says the API doesn't show a check's channels, the read-only key hides them on your account and a
-   read-write key is needed (it is kept like a password and never logged).
+2. **`hc_api_key` (0.1.5; 0.1.6: a read-only key only)**: the **read-only** API key of the Healthchecks
+   project holding the checks below (Project Settings, API Access, the read-only key). Keeper reads every
+   check's period, grace, status and notification channels with it, at most once a minute, through
+   `https://healthchecks.io/api/v3/checks/` (healthchecks.io only). Without it Keeper is not armable, and says
+   so. Keeper accepts a read-only key only: a read-write key can pause checks, change their period and grace,
+   and delete or reroute their channels, and Keeper's options can be read by anything with Supervisor option
+   access. Keeper tells a read-write key by its answer (it shows each check's ping URL, which a read-only key
+   doesn't), refuses to arm with it, logs `REFUSING hc_api_key: it can write ...` and pages you once to swap
+   it. Never upgrade the key to make arming work.
+   **Hand-confirmed channels.** If the read-only key hides a check's channels, Keeper doesn't refuse for that
+   (its log says which checks are hidden): you confirm each check yourself, by the page reaching your phone.
+   The phone test confirms each alert check and the dead-man check (`phone-confirm` names each check whose
+   page reached the phone), and the missed-heartbeat drill confirms the heartbeat check; arming takes those
+   records in place of the API's channel list. A check found by its slug must be the only check with that
+   slug the key can read (two refuse arming: give each its own slug, or use its uuid ping URL).
+   **Backups carry it.** A Home Assistant backup of the Keeper App carries Keeper's options, `hc_api_key`
+   included, which is one more reason the key is read-only. Keeper's own backups are of the watched Apps
+   (Cain), never of Keeper, so they don't hold it.
 3. **Healthchecks.io checks**, each with your phone as the recipient (a notification channel assigned),
    and repeated reminders on. 0.1.5: Keeper refuses to arm unless the heartbeat check's period is at most 5
    minutes with a grace of at most 10, the dead-man check's period is exactly 1 minute with a grace of at
@@ -276,6 +322,8 @@ every read, never stored, and says armed only while all of these hold:
 3. the **phone test drill** is confirmed for the App's alert check and the dead-man check within the
    last 14 days (0.1.5), under the current Healthchecks options and checks' settings, with no page left
    unacknowledged for 10 minutes since (below);
+3a. (0.1.6) the **missed-heartbeat drill** is confirmed within the last 14 days, under the current
+   Healthchecks options and checks' settings, and isn't running now (below);
 4. a heartbeat ping and a dead-man ping were delivered (a 2xx answer) within the last 10 minutes, and
    Keeper's poll loop completed a round within the last 3 minutes;
 5. each alert check's log ping was delivered within the last 10 minutes;
@@ -283,13 +331,20 @@ every read, never stored, and says armed only while all of these hold:
 7. (0.1.5) the checks' settings, read through `hc_api_key` within the last 3 minutes, are within the
    bounds above, each check with a channel and none paused.
 
-**The phone test (a drill, 0.1.3; 0.1.4).** With no incident open, run in the Keeper App's container
+**The phone test (a drill, 0.1.3; 0.1.4; 0.1.6).** With no incident open, run in the Keeper App's container
 `bun /opt/keeper/main.ts phone-test` (for example from the SSH App: `docker exec addon_0fcc2575_keeper bun
 /opt/keeper/main.ts phone-test`). Keeper pages each watched App's alert check once ("Keeper phone test (a
-drill) ..."), and (0.1.4) the dead-man check too, each followed by its all clear. Once the pages have
-reached your phone, within an hour, run `bun /opt/keeper/main.ts phone-confirm` the same way. It shows that
-a page from each check reaches your phone, at that moment. It doesn't show that Healthchecks will page you
-when the dead-man check goes quiet (that needs Keeper stopped, the device check below). It lapses, and
+drill) ..."), and (0.1.4) the dead-man check too, each followed by its all clear, and (0.1.6) prints a
+one-time code in its log. Once the pages have reached your phone, within an hour, run
+`bun /opt/keeper/main.ts phone-confirm <code> cain deadman` the same way, naming each check whose page
+reached your phone (an App's short name for its alert check, `deadman` for the dead-man check); a check you
+don't name isn't confirmed. It shows that a page from each check reaches your phone, at that moment, and
+stands as your confirmation that each check's channel reaches it. It doesn't show that Healthchecks will page
+you when a check goes quiet: the missed-heartbeat drill (below) shows that for the heartbeat check.
+The dead-man check after the phone test: its page is a fail ping, so Healthchecks shows it down until the
+"keeper alive" ping that follows at once, and then up again by itself. While a read of the API shows it
+down, arming is refused ("hc_deadman ... is down"); that refusal clears by itself at the next read that shows
+it up, with no new phone test (the settings' hash doesn't include a check's status). It lapses, and
 arming closes, after 14 days (0.1.5), on any change of `hc_done`, `hc_deadman`, `hc_failed` or
 `hc_api_key`, on any change of a check's period, grace or channels as the API shows them (putting the old
 one back doesn't bring it back), and (0.1.5) when any page (a fail ping, the dead-man check's included) has
@@ -297,9 +352,30 @@ no acknowledgment from Healthchecks, a 2xx answer, within 10 minutes of being se
 an undelivered page is retried, and it disarms after 2 minutes (6 above). The phone test reads the
 checks' settings first and is refused while they refuse arming.
 
-What the acknowledgment shows: that Healthchecks took the page, not that your phone rang. That a missed
-heartbeat really reaches your phone is a device check (the next job's drill stops Keeper's pings and waits
-for the page).
+What the acknowledgment shows: that Healthchecks took the page, not that your phone rang.
+
+**The missed-heartbeat drill (0.1.6).** With no incident open and the checks' settings read within bounds,
+run `bun /opt/keeper/main.ts missed-heartbeat` in Keeper's container. Keeper stops its heartbeat ping to
+`hc_done` for the heartbeat check's period plus its grace, as the API shows them, plus 2 minutes (at most 17
+minutes), so Healthchecks marks the check down and pages you; the dead-man ping goes on. Keeper prints a
+one-time code, logs when Healthchecks shows the check down, then resumes the ping (the check goes back up by
+itself, and the "is down" arming refusal clears with it). Once the page reached your phone, within an hour
+after the ping resumed, run `bun /opt/keeper/main.ts missed-heartbeat-confirm <code>`. It is refused before
+the drill ends, more than an hour after, with a wrong or stale code, or if Healthchecks never showed the
+heartbeat check down. Arming needs it within 14 days, and it lapses exactly as the phone test does: a change
+of any Healthchecks option or check settings, a page left unacknowledged, a rewound state.
+**The residual window.** A silent failure on Healthchecks' side (it stops paging and says nothing) goes
+unseen for up to 14 days, until the next drill shows it. A shorter window means running the drill (and the
+phone test) more often.
+
+**The one-time codes (0.1.6).** `key-confirm`, `phone-confirm` and `missed-heartbeat-confirm` each need a
+one-time code Keeper prints in its log (`one-time code for key-confirm: <code> (good until ...)`): at the pin
+(and at each start while the pin waits for its confirm, good 24 hours, used once), at each phone test (good
+for its hour and 10 minutes), and at each missed-heartbeat drill (good until an hour after it ends, used
+once). A newer code replaces the last one; a wrong or stale code is refused and logged. The commands reach
+Keeper only on its container's own loopback (`127.0.0.1:8096`, a listener of its own): the App network's
+listener (port 8097) refuses them from any address, so another container can't make them, and the code shows
+the confirmer read Keeper's log.
 
 The binding is the verdict protocol, the App's probe (its hash), Keeper's version, Keeper's options and the
 backup scope. The drill records are dropped when the binding changes, after 60 days, or when Keeper's
@@ -322,7 +398,7 @@ Keeper before it counts as armed).
 | `hc_failed` | The alert checks: `slug=URL` entries, one per watched App (a plain URL is fine when one App is watched). |
 | `health_grace_s` | Seconds after a watched App first starts before failed liveness polls count. Default 180. |
 | `ship_public_key` | Cain's link's public Ship key, base64 (0.1.3). Pinned on first use; the first pin and every change need `key-confirm` (0.1.4; 0.1.5). |
-| `hc_api_key` | A Healthchecks API key, to read each check's period, grace, status and channels (0.1.5). Needed to arm. |
+| `hc_api_key` | The Healthchecks project's read-only API key, to read each check's period, grace, status and channels (0.1.5). Needed to arm. 0.1.6: a read-only key only; a key that can write is refused and paged. |
 
 Options are read again every 30 seconds, through the Supervisor: a change needs no restart (and drops the
 drill records). Keeper never writes them. The `attempt` option of earlier versions is gone.
@@ -346,13 +422,14 @@ App's token (`Authorization: Bearer <token>`):
   timestamp refreshed every minute, and (0.1.5) the enrollment.
 - `GET /last`: Keeper's last line to you about the caller's App.
 
-From inside Keeper's own container only: `drill-record`, `phone-test`, `phone-confirm` and (0.1.4)
-`key-confirm <fingerprint>`.
+From inside Keeper's own container only, on its own loopback listener (0.1.6: `127.0.0.1:8096`, never the
+App network's): `drill-record`, `phone-test`, `phone-confirm <code> <check>...`, `key-confirm <fingerprint>
+<code>`, and (0.1.6) `missed-heartbeat` and `missed-heartbeat-confirm <code>`.
 
 ## Permissions
 
 The Supervisor's backup role only (App and backup info, the jobs list `/jobs/info`, App-only backups and
-restores), plus reading its own info (`/addons/self/info`), never manager, and no write of any options.
+restores, and (0.1.6) deleting the orphan backups it made), plus reading its own info (`/addons/self/info`), never manager, and no write of any options.
 No Home Assistant API, no ingress, no page, no `/share`.
 
 ## Still to check on the device
@@ -365,7 +442,8 @@ how long it stayed listed (`restoreJob`, evidence only: 0.1.5 never resends); He
 the `/log` pings; the dead-man check pages when Keeper is stopped and when its poll loop stalls; the phone
 test reaches the phone from each check; the pinned key's first page; Cain's link reaches Keeper's `POST
 /attempt` and polls it through the backup, then claims it; (0.1.5) the first pin's `key-confirm` against
-`cain/SHIP_KEY_FINGERPRINT`; the Healthchecks API read with `hc_api_key` (whether the read-only key shows
-each check's channels, and whether a read-only key's `unique_key` matches a uuid ping URL); a real missed
-heartbeat paging the phone; the break-glass exercise with Keeper absent (a fix installed with no Keeper at
+`cain/SHIP_KEY_FINGERPRINT`; the Healthchecks API read with `hc_api_key` in both modes (0.1.6: a read-write key's answer
+shows ping URLs and is refused; whether the read-only key shows each check's channels, and whether its
+`unique_key` matches a uuid ping URL); the missed-heartbeat drill paging the phone; (0.1.6) the loopback
+listener and the one-time codes; the backup role deleting an orphan backup (if it can't, the log names it); the break-glass exercise with Keeper absent (a fix installed with no Keeper at
 all); and the two drills (the next job).

@@ -5,7 +5,7 @@ Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
-- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.5): a check after every install of a
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.6): a check after every install of a
   watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
   `bun test keeper/tests`.
 
@@ -322,13 +322,20 @@ for 2 hours, without which Cain can't start the job.
    (`git show <sha>:cain/rootfs/opt/cain/settings.json | sha256sum`) must equal that digest.
    Otherwise install nothing and end with
    `Connector check: no passing line for this head and its settings`.
-4. The keeper's acceptance and claim (Keeper 0.1.5; no options write). The Ship run doesn't register
+4. The keeper's acceptance and claim (Keeper 0.1.5 and 0.1.6; no options write). The Ship run doesn't register
    anything and writes no Keeper options at all. Before Cain's RemoteTrigger hook let this run through,
    Cain's link registered each watched App the tap installs with the Keeper App over the Keeper's own
    service (`POST /attempt`, with Cain's `keeper_token`; `cain/rootfs/opt/cain/link/ship-pass.ts`), polled
    it until the Keeper had made and verified its App-only backup and accepted it, checked the Keeper's
    pinned Ship key against `cain/SHIP_KEY_FINGERPRINT` at this head, and then, as the hook let the run start,
-   claimed each acceptance (single use, valid 30 minutes). It goes through Cain's link because the Keeper's
+   claimed each acceptance (single use, valid 30 minutes from the claim). Keeper 0.1.6: the claim's deadline is
+   enforced in code where code can enforce it, since this run reaches GitHub and Home Assistant only, never
+   the Keeper or the link: the link refuses a claim with under 20 minutes left, the hook checks each claim's
+   deadline again just before it lets the run start (under 20 minutes left refuses the run and cancels the
+   claims; a new Ship card for the same pull request and head starts again), and the Keeper treats a version
+   change seen outside a live claim, or to a version other than the claimed one, as uncertain (unprotected,
+   paged, never restored). The deadline bounds the start, not the watch: an install the Keeper first sees
+   inside the claim is watched its full 15 minutes even past the deadline. It goes through Cain's link because the Keeper's
    service is only on Home Assistant's internal App network: this cloud session can't reach it, and the
    Home Assistant connector speaks to Home Assistant, not to an App's port. Before each watched App's
    install (Cain), step 4a:
@@ -343,7 +350,9 @@ for 2 hours, without which Cain can't start the job.
      hasn't passed (check the time right before you start the update, and abort if it has), and no later
      Keeper line names that id as `consumed`, `refusing`, `unprotected` or `ended` (`<id>: ...`).
      Otherwise, or if either log can't be read, install nothing (not the other App either) and end with
-     `Keeper: no claimed acceptance for <id>` and the lines you saw, if any. There is no unwatched path for
+     `Keeper: no claimed acceptance for <id>` and the lines you saw, if any. These two lines and the time
+     check stay as belt and braces (Keeper 0.1.6): the hook's deadline check and the Keeper's own fence are
+     the gates in code; this step is a second look by the run, and it never overrides either. There is no unwatched path for
      a watched App: an install the Keeper sees outside a live claim is "unprotected" and is never rolled
      back. The Keeper itself isn't gated by the Keeper: an install or update of the Keeper App goes through
      this same Ship path with a backup taken first and no 4a (Keeper DOCS, "Keeper's own install and
@@ -417,6 +426,23 @@ checks its own connector, which can lapse alone.
 One installer: no laptop session installs around a waiting Ship job, and nothing is
 installed from Home Assistant's own page unless Dane says so.
 
+## The Keeper's setup (Dane, once, and after its state is lost)
+
+At the Pi, with the SSH App, in the Keeper App's container (`docker exec addon_0fcc2575_keeper bun
+/opt/keeper/main.ts <command>`). Keeper DOCS has each step in full.
+
+1. Options: `ship_public_key`, `tokens` (and the same token in Cain's `keeper_token`), the Healthchecks
+   ping URLs (`hc_done`, `hc_deadman`, `hc_failed`), and `hc_api_key`: the project's **read-only** API key
+   only (Keeper 0.1.6 refuses a key that can write, and pages you to swap it).
+2. `key-confirm <fingerprint> <code>`, the fingerprint checked against `cain/SHIP_KEY_FINGERPRINT` and Cain's
+   log, the one-time code from the Keeper's log at the pin.
+3. `phone-test`, then once the pages reached the phone, within an hour, `phone-confirm <code> cain deadman`
+   (each check named whose page reached the phone; the code from the Keeper's log at the test).
+4. `missed-heartbeat` (Keeper 0.1.6): the heartbeat ping stops until Healthchecks pages; once that page
+   reached the phone, within an hour after the ping resumes, `missed-heartbeat-confirm <code>`. Arming needs
+   it within 14 days, like the phone test, and it lapses with it.
+5. The two drills (a FAIL verdict and an exit on start), the next job.
+
 ## If the Ship key is remade
 
 The link makes a new Ship key only when the old one can't be read (and on a restored
@@ -428,7 +454,8 @@ Since Keeper 0.1.5 the key's fingerprint is committed in the repository: `cain/S
 value in the link's `Ship key fingerprint: ...` log line). When the key is made or remade, Dane runs a
 Build that writes the new fingerprint there (Cain goes up a patch version: the file is in his folder), and
 after it lands he pastes the new public key into the Keeper's `ship_public_key` and confirms it at the
-device with `key-confirm <fingerprint>` (Keeper DOCS). Until both are done, Cain's link refuses every Ship
+device with `key-confirm <fingerprint> <code>` (Keeper DOCS; the one-time code is in the Keeper's log since
+Keeper 0.1.6). Until both are done, Cain's link refuses every Ship
 run that installs a watched App: the Keeper's pinned key must have the committed fingerprint, confirmed by
 Dane, and the committed fingerprint must be the link's own key's. A Build may write that file only on
 Dane's word, with the fingerprint read from the link's log.

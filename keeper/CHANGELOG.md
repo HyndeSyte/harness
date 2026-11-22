@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.6
+
+- Keeper now takes only a read-only Healthchecks key. A key that could change your checks is refused, Keeper won't arm with it, and you are paged once to swap it for the project's read-only key.
+- If the read-only key hides which channels a check pages, you confirm each check yourself at the phone test: `phone-confirm` now names each check whose page reached your phone, and Keeper arms on that.
+- A new drill before arming, the missed heartbeat: Keeper stops its heartbeat until Healthchecks pages you, and you confirm the page reached your phone within an hour. Arming needs it within the last 14 days, and it lapses with the phone test.
+- Confirming the Ship key, the phone test and the drill now needs a one-time code that Keeper prints in its log, and these commands work only from inside Keeper itself.
+- An install seen during its claim is watched its full 15 minutes even past the claim's deadline, and an install of a different version than the one claimed pages you as unprotected and is never rolled back.
+- A backup Keeper made for an install that was called off, or never claimed, is deleted. If it can't be deleted, Keeper's log names it so you can delete it by hand.
+
 ## 0.1.5
 
 - Keeper never sends a restore twice. If Home Assistant turns a rollback down, fails it or doesn't answer, Keeper pages you "unresolved", keeps checking without touching anything, and tells you once it knows.

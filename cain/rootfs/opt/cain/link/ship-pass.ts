@@ -23,6 +23,12 @@
 //      each claim id and deadline, recording the token as passed first, and writes the ok line to its log:
 //      "Ship pass ok: <attempt id> claim <claim id> until <time>". A claim refused, or anything that can't
 //      be read, refuses the pass for good and cancels the rest (a new Ship card makes a new token).
+//   6. (Keeper 0.1.6) refuses and cancels, rather than passes, a claim with under 20 minutes left
+//      (CLAIM_START_MIN_MS); the hook checks the same deadline again in code just before it lets the run
+//      start, and when it refuses it asks the link (POST /ship-pass {token, cancel}) to cancel the claims;
+//   7. (Keeper 0.1.6) requires the keeper's state creation and confirm times to equal the recorded ones (an
+//      older or a newer state is refused; a different state counts only through a confirm newer than the
+//      record), and records the enrollment from the minute-by-minute /armed read as well as from a pass.
 // Why the link and not the Ship run: the Ship run is a cloud session, and the keeper's service is only
 // on Home Assistant's internal App network. The Home Assistant connector can't reach it, and the link,
 // on the same network, already talks to the keeper with Cain's token. So no options are written at all.
@@ -35,7 +41,8 @@ export const ATTEMPT_WAIT_MS = 5 * 60_000;        // (0.1.5) one App's registrat
 export const passWaitMs = (apps: number) => Math.max(1, apps) * ATTEMPT_WAIT_MS + 60_000;   // (0.1.5) the whole pass
 export const PASS_WAIT_MS = passWaitMs(1);        // one watched App: 6 minutes
 export const POLL_MS = 5_000;                     // (0.1.5) GET /attempt/<id> every 5 seconds
-export const CLAIMING_STUCK_MS = 60_000;          // (0.1.5) a pass left "claiming" (a restart mid-claim) is refused after this
+export const CLAIMING_STUCK_MS = 60_000;
+export const CLAIM_START_MIN_MS = 20 * 60_000;    // (Keeper 0.1.6) a claim with less left than this never starts a run          // (0.1.5) a pass left "claiming" (a restart mid-claim) is refused after this
 export const FINGERPRINT_FILE = "cain/SHIP_KEY_FINGERPRINT";
 const FP = /^[0-9a-f]{16}$/;
 const BACKUP_SLUG = /^[A-Za-z0-9_-]{1,64}$/;
@@ -81,8 +88,18 @@ export function enrollmentCheck(ans: any, committed: string, linkFp: string | nu
   if (confirmed >= created && (!rec || confirmed > rec.confirmedAt || rec.fp !== committed)) record = { fp: committed, stateCreated: created, confirmedAt: confirmed };
   const r = record ?? rec;
   if (!r) return { ok: false, why: "the link has recorded no confirmed enrollment of the keeper" };
+  // (Keeper 0.1.6) the very state and confirm the link recorded: an older state is refused too
   if (created > r.stateCreated) return { ok: false, why: `the keeper's state was created ${new Date(created).toISOString()}, after the enrollment the link recorded (${new Date(r.stateCreated).toISOString()}): the owner confirms the key at the device again`, ...(record ? { record } : {}) };
+  if (created < r.stateCreated) return { ok: false, why: `the keeper's state was created ${new Date(created).toISOString()}, before the enrollment the link recorded (${new Date(r.stateCreated).toISOString()}): an older keeper state is refused; the owner confirms the key at the device again` };
+  if (confirmed !== r.confirmedAt) return { ok: false, why: `the keeper's key was confirmed ${new Date(confirmed).toISOString()}, not at the confirm the link recorded (${new Date(r.confirmedAt).toISOString()}): the owner confirms the key at the device again` };
   return record ? { ok: true, record } : { ok: true };
+}
+// (Keeper 0.1.6) The enrollment seen in the keeper's minute-by-minute /armed answer, judged against the
+// link's own key's fingerprint: a confirm newer than the record is recorded there too, outside any pass.
+export function noteArmedEnrollment(ans: any, linkFp: string | null, e: EnrollmentStore | undefined, log: (l: string) => void): void {
+  if (!linkFp || !e) return;
+  const en = enrollmentCheck(ans, linkFp, linkFp, e.load());
+  if (en.record) noteRecord(e, en.record, log);
 }
 const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, log: (l: string) => void) => {
   if (!e || !r) return;
@@ -150,9 +167,31 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
   if (!r.ok) cancelAll(d, e.attempts ?? [], "the pass is refused");
 }
 
+// (Keeper 0.1.6) The hook refused a run the link had passed (its claim's deadline too near when it checked):
+// POST /ship-pass {token, cancel: <why>}. The pass is refused for good and each claim cancelled at the keeper,
+// so no claim is left live; a new Ship card for the same pull request and head starts again.
+export function cancelPass(d: PassDeps, token: string, why: string): PassAnswer {
+  const pub = d.pub();
+  if (!pub) return { status: "refused", said: "the link's Ship key can't be read" };
+  let c;
+  try { c = readToken(token, publicKey(pub), d.now()); } catch { return { status: "refused", said: "the link's Ship key can't be read" }; }
+  if (!c.ok) return { status: "refused", said: `that Ship token can't be used: ${c.why}` };
+  const spent = readEntries(d.load());
+  const e = spent?.find((x) => x.id === passId(token));
+  if (!spent || !e) return { status: "refused", said: "no pass for that Ship token" };
+  const ids = [...(e.claims ?? []).map((k) => k.attempt), ...(e.accepted ?? []).map((a) => a.attempt), ...(e.attempts ?? [])];
+  const said = `the hook refused the Ship run: ${String(why).replace(/[^\x20-\x7e]/g, " ").slice(0, 200)}`;
+  e.state = "refused"; e.said = said;
+  try { writeEntries(d, spent); } catch { d.log("couldn't record a cancelled pass: its claims are cancelled anyway"); }
+  d.log(`a Ship token's pass is cancelled: ${said}`);
+  cancelAll(d, ids, "the hook refused the Ship run");
+  return { status: "refused", said: `${said}. Nothing was installed; start again with a new Ship card for the same pull request and head` };
+}
+
 export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassAnswer> {
   const token = typeof body?.token === "string" ? body.token.trim() : "";
   if (!token) return { status: "refused", said: "no Ship token" };
+  if (typeof body?.cancel === "string" && body.cancel) return cancelPass(d, token, body.cancel);
   const pub = d.pub();
   if (!pub) return { status: "refused", said: "the link's Ship key can't be read" };
   let c;
@@ -215,6 +254,8 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
       return refuseFor(!r ? `the keeper didn't answer the claim of ${a.attempt}` : !okAns ? `the keeper refused the claim of ${a.attempt}: ${String(j?.why ?? r.status).slice(0, 160)}`
         : `the keeper's claim of ${a.attempt} failed the enrollment check: ${(en as any).why}`, accepted.map((x) => x.attempt));
     }
+    const left = Date.parse(String(j.until)) - d.now();
+    if (left < CLAIM_START_MIN_MS) return refuseFor(`the keeper's claim of ${a.attempt} has ${Math.max(0, Math.floor(left / 60_000))} minutes left, under the ${CLAIM_START_MIN_MS / 60_000} a Ship run needs to start`, accepted.map((x) => x.attempt));
     claims.push({ attempt: a.attempt, claim: j.claim, until: new Date(Date.parse(String(j.until))).toISOString() });
   }
   spent = readEntries(d.load()) ?? spent;

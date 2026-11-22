@@ -12,15 +12,22 @@
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
 //                   version and a timestamp refreshed every minute
 //   GET  /last      the last owner line about the caller's App
-//   POST /drill-record {attempt}   from this container only (keeper drill-record)
-//   POST /phone-test, POST /phone-confirm   (0.1.3) from this container only: the phone test drill
-//   POST /key-confirm {fingerprint}   (0.1.4) from this container only: the owner confirms a changed Ship key
-// Every request but those from this container carries an App's own token (Authorization: Bearer <token>, the
-// keeper's option tokens maps App slug to token). Anything else is refused and logged.
+// Every request carries an App's own token (Authorization: Bearer <token>, the keeper's option tokens maps App
+// slug to token). Anything else is refused and logged.
+//
+// (0.1.6) The owner's commands are served only by handleLocal, on a second listener bound to the keeper
+// container's own loopback (127.0.0.1:8096, main.ts), never on the App network's listener, which refuses
+// them whoever asks:
+//   POST /drill-record {attempt}            keeper drill-record
+//   POST /phone-test                        (0.1.3) the phone test drill; prints a one-time code in the log
+//   POST /phone-confirm {code, checks}      (0.1.6) with that code, each check whose page reached the phone
+//   POST /key-confirm {fingerprint, code}   (0.1.4; 0.1.6 with the code printed at the pin)
+//   POST /missed-heartbeat                  (0.1.6) the missed-heartbeat drill; prints its code
+//   POST /missed-heartbeat-confirm {code}   (0.1.6) the owner saw its page on the phone
 import { SLUG, type Keeper } from "./core.ts";
 
 export const MAX_BODY = 4096;
-const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm"]);
+export const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm", "/missed-heartbeat", "/missed-heartbeat-confirm"]);
 // Home Assistant's internal network (the Supervisor's hassio network): 172.30.32.0/23.
 export function internal(ip: string): boolean {
   const v4 = ip.replace(/^::ffff:/i, "");
@@ -31,16 +38,26 @@ export const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 
+// (0.1.6) The loopback listener's handler: only the owner's commands, only from 127.0.0.1 or ::1.
+export async function handleLocal(k: Keeper, req: Request, ip: string, log: (m: string) => void): Promise<Response> {
+  const url = new URL(req.url);
+  if (!loopback(ip)) { log(`refused ${url.pathname} from ${ip} on the loopback listener`); return json({ status: "refused" }, 403); }
+  if (!LOCAL.has(url.pathname) || req.method !== "POST") return json({ status: "no such route" }, 404);
+  const b = await body(req);
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  if (url.pathname === "/phone-test" || url.pathname === "/missed-heartbeat") await k.refreshHc();
+  const r = url.pathname === "/drill-record" ? k.drillRecord(str(b?.attempt)) : url.pathname === "/phone-test" ? k.phoneTest()
+    : url.pathname === "/key-confirm" ? k.keyConfirm(str(b?.fingerprint), str(b?.code))
+    : url.pathname === "/missed-heartbeat" ? k.missedHeartbeat()
+    : url.pathname === "/missed-heartbeat-confirm" ? k.missedHeartbeatConfirm(str(b?.code))
+    : k.phoneConfirm(str(b?.code), Array.isArray(b?.checks) ? b.checks.map(str) : []);
+  return json(r, r.ok ? 200 : 409);
+}
+
 export async function handle(k: Keeper, req: Request, ip: string, log: (m: string) => void, allow: (ip: string) => boolean = internal): Promise<Response> {
   const url = new URL(req.url);
-  if (LOCAL.has(url.pathname) && req.method === "POST") {
-    if (!loopback(ip)) { log(`refused ${url.pathname} from ${ip}: only from inside the keeper`); return json({ status: "refused" }, 403); }
-    const b = await body(req);
-    if (url.pathname === "/phone-test") await k.refreshHc();
-    const r = url.pathname === "/drill-record" ? k.drillRecord(String(b?.attempt ?? "")) : url.pathname === "/phone-test" ? k.phoneTest()
-      : url.pathname === "/key-confirm" ? k.keyConfirm(String(b?.fingerprint ?? "")) : k.phoneConfirm();
-    return json(r, r.ok ? 200 : 409);
-  }
+  // (0.1.6) never on the App network's listener, from any address: only the loopback listener serves them
+  if (LOCAL.has(url.pathname)) { log(`refused ${url.pathname} from ${ip}: the owner's commands are served only on the keeper's own loopback`); return json({ status: "refused" }, 403); }
   if (!allow(ip)) { log(`refused ${req.method} ${url.pathname} from ${ip}: not the internal App network`); return json({ status: "refused" }, 403); }
   const auth = req.headers.get("authorization") ?? "";
   const caller = k.appOfToken(auth.startsWith("Bearer ") ? auth.slice(7).trim() : null);

@@ -78,7 +78,7 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
-import { type EnrollmentStore, keyFingerprint, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -304,6 +304,13 @@ const link = new Link({
   writeReplay: (r) => writeReplayReport(r),
 });
 
+// Keeper 0.1.5: the last confirmed enrollment of the keeper's Ship key the link saw (ship-pass.ts enrollmentCheck).
+const KEEPER_ENROLL = process.env.CAIN_KEEPER_ENROLL ?? `${TRUST_DIR}/keeper-enrollment.json`;
+const enrollment: EnrollmentStore = {
+  load: () => { try { return parseEnrollment(readFileSync(KEEPER_ENROLL, "utf8")); } catch { return null; } },
+  store: (e) => writeSynced(KEEPER_ENROLL, JSON.stringify(e)),
+};
+const shipPub = () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } };
 // -- the keeper App's armed state (0.19.0) -------------------------------------------------------------
 // Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
 // that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
@@ -318,6 +325,8 @@ async function askKeeper(): Promise<void> {
     if (!KEEPER_TOKEN) { keeperReplies[app] = { error: "no keeper_token set" }; continue; }
     const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/armed?app=${slug}`);
     keeperReplies[app] = r ? { status: r.status, body: JSON.stringify(r.body) } : { error: "no answer" };
+    // Keeper 0.1.6: the enrollment recorded from this read too, outside any Ship pass (ship-pass.ts).
+    if (r?.status === 200) { const pub = shipPub(); noteArmedEnrollment(r.body, pub ? keyFingerprint(pub) : null, enrollment, (l) => console.log(`[cain] link: ${l}`)); }
   }
 }
 void askKeeper();
@@ -391,13 +400,6 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 // The Ship pass (0.19.0, with Keeper 0.1.3): one Ship run per token, and its installs registered with the
 // keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
 const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
-// Keeper 0.1.5: the last confirmed enrollment of the keeper's Ship key the link saw (ship-pass.ts enrollmentCheck).
-const KEEPER_ENROLL = process.env.CAIN_KEEPER_ENROLL ?? `${TRUST_DIR}/keeper-enrollment.json`;
-const enrollment: EnrollmentStore = {
-  load: () => { try { return parseEnrollment(readFileSync(KEEPER_ENROLL, "utf8")); } catch { return null; } },
-  store: (e) => writeSynced(KEEPER_ENROLL, JSON.stringify(e)),
-};
-const shipPub = () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } };
 const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
 const shipPassDeps: PassDeps = {
   pub: shipPub,

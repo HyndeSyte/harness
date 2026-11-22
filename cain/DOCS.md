@@ -556,6 +556,16 @@ bad one back from the backup taken just before it. Cain's part:
     newer than the one the link recorded at the last confirmed enrollment it saw (root's
     `/data/trust/keeper-enrollment.json`). Until a Build commits the fingerprint, every Ship run that
     installs Cain is refused.
+- With Keeper 0.1.6:
+  - The claim's deadline in code: the link refuses (and cancels) a claim the Keeper answers with under 20
+    minutes left, and the RemoteTrigger hook checks every claim's deadline again just before it lets the
+    Ship run start. Under 20 minutes left, or a deadline it can't read, refuses the run and asks the link to
+    cancel the pass and its claims (`POST /ship-pass {token, cancel}`); a new Ship card for the same pull
+    request and head starts again. The Ship run's own check of the two log lines stays, as belt and braces.
+  - The enrollment record: the link records the owner's confirm of the Keeper's key from its
+    minute-by-minute `/armed` read as well as from a Ship pass, and a pass needs the Keeper's state creation
+    and confirm times to equal the recorded ones (an older or newer state is refused until the owner
+    confirms again at the Keeper).
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 

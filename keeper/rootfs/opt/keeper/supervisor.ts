@@ -68,6 +68,11 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
         return { kind: "unknown", why: String((e as Error)?.name ?? e).slice(0, 80) };
       }
     },
+    // (0.1.6) An orphan backup's delete (DELETE /backups/<slug>, within the backup role): true only on the
+    // Supervisor's ok.
+    async deleteBackup(slug: string): Promise<boolean> {
+      try { return (await call("DELETE", `/backups/${encodeURIComponent(slug)}`)).ok; } catch { return false; }
+    },
     // The restore's job in the Supervisor's jobs list (GET /jobs/info, the backup role's info read), by
     // the id from the restore's answer and nothing else (0.1.2: no job is ever matched by its name or
     // backup). Null when the list can't be read. A finished job leaves the list after a while: not found

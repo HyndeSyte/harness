@@ -14,6 +14,8 @@
 - A Ship run that installs Cain starts only after the Keeper has made and checked his backup. Meanwhile Cain is told to start the run again in a minute. If the Keeper refuses, doesn't answer, or isn't set up, the Ship run doesn't start and Cain tells you why.
 - Cain's link now claims the Keeper's acceptance at the moment the Ship run starts, and logs a line the Ship run must see before it installs. If the run gives up, the Keeper's registration is cancelled.
 - Cain's link checks that the Keeper trusts the right Ship key: the key's fingerprint is kept in the repository (`cain/SHIP_KEY_FINGERPRINT`), and you confirm it at the Keeper. Until the fingerprint is filled in by a Build, Ship runs that install Cain are refused, and Cain says why.
+- A Ship run that installs Cain starts only while the Keeper's claim has at least 20 minutes left. If less is left, the run doesn't start, the claim is cancelled, and a new Ship card starts again.
+- Cain's link now also records your confirm of the Keeper's Ship key from its minute by minute check of the Keeper, and refuses a Keeper whose saved state is older or newer than the one you confirmed.
 
 ## 0.18.0
 

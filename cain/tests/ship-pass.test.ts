@@ -3,9 +3,9 @@
 // verified); the link keeps the ids and their state (link/ship-pass.ts, hooks/remote-trigger.ts decideAll).
 import { describe, expect, test } from "bun:test";
 import { createHash, sign as edSign } from "node:crypto";
-import { decideAll, postShipPass, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
+import { claimDeadlineWhy, decideAll, postShipPass, postShipPassCancel, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
-import { PASS_WAIT_MS, enrollmentCheck, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
+import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { SHIP_KEYS, SHIP_PUB, keeperHolds } from "./link-rig";
 import { generateKeyPairSync } from "node:crypto";
@@ -355,5 +355,67 @@ describe("Keeper 0.1.5: the claim at pass time", () => {
   test("the link logs its Ship key's fingerprint, the value cain/SHIP_KEY_FINGERPRINT holds", () => {
     const src = require("node:fs").readFileSync(require("node:path").join(import.meta.dir, "..", "rootfs", "opt", "cain", "link", "shipkey.ts"), "utf8");
     expect(src).toContain("Ship key fingerprint: ");
+  });
+});
+
+describe("Keeper 0.1.6: the claim's deadline in code, and the enrollment's exact times", () => {
+  const claimAt = (ms: number) => ({ attempt: ACC.attempt, claim: "claim-0123456789abcdef", until: T(ms) });
+  test("the hook's deadline check: a claim with under 20 minutes left, or no readable deadline, refuses the run and cancels its pass", async () => {
+    expect(CLAIM_START_MIN_MS).toBe(20 * 60_000);
+    expect(claimDeadlineWhy([claimAt(NOW + 29 * 60_000)], NOW)).toBe("");
+    expect(claimDeadlineWhy([], NOW)).toBe("");
+    expect(claimDeadlineWhy([claimAt(NOW + 19 * 60_000)], NOW)).toBe(`the keeper's claim of ${ACC.attempt} has 19 minutes left, under the 20 a Ship run needs to start`);
+    expect(claimDeadlineWhy([{ ...claimAt(NOW), until: "soon" }], NOW)).toContain("no deadline the hook can read");
+    const cancels: [string, string][] = [];
+    const run = (until: number) => decideAll(call, keeperHolds({}), ENV, () => ({ ok: true }), async () => ({ logged: true }),
+      async () => ({ ok: true as const, claims: [claimAt(until)] }), async (t, w) => { cancels.push([t, w]); }, () => NOW);
+    expect(await run(NOW + 30 * 60_000)).toBe("");
+    expect(cancels).toEqual([]);
+    const late = await run(NOW + 10 * 60_000);
+    expect(late).toContain("The link didn't let this Ship run start: the keeper's claim of");
+    expect(late).toContain("start again with a new Ship card for the same pull request and head");
+    expect(cancels).toEqual([[TOKEN, `the keeper's claim of ${ACC.attempt} has 10 minutes left, under the 20 a Ship run needs to start`]]);
+  });
+  test("the hook's cancel goes to the link as POST /ship-pass {token, cancel}, and the link refuses the pass for good and cancels each claim", async () => {
+    const seen: any[] = [];
+    await postShipPassCancel(TOKEN, "too late", { url: "http://127.0.0.1:8097", key: "cainkey", fetch: (async (u: any, i: any) => { seen.push({ u: String(u), b: JSON.parse(i.body) }); return new Response("{}"); }) as any });
+    expect(seen).toEqual([{ u: "http://127.0.0.1:8097/ship-pass", b: { token: TOKEN, cancel: "too late" } }]);
+    const l = link();
+    expect((await shipPass(l.d, { token: TOKEN })).status).toBe("ok");
+    const c = await shipPass(l.d, { token: TOKEN, cancel: "the claim's deadline was too near" });
+    expect(c.status).toBe("refused");
+    expect(l.cancelled).toContain(ACC.attempt);
+    expect((await shipPass(l.d, { token: TOKEN })).status).toBe("refused");   // never passes again
+  });
+  test("the link itself refuses and cancels a claim answered with under 20 minutes left", async () => {
+    const l = link({ claim: async () => claimAnswer({ until: T(NOW + 15 * 60_000) }) });
+    const a = await shipPass(l.d, { token: TOKEN });
+    expect(a.status).toBe("refused");
+    expect((a as any).said).toContain("has 15 minutes left, under the 20 a Ship run needs to start");
+    expect(l.cancelled).toContain(ACC.attempt);
+  });
+  test("an older keeper state, or another confirm time, is refused; a different state counts only through a newer confirm", () => {
+    const rec = { fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000 };
+    const older = { key_fp: FPR, key_confirmed_at: T(NOW - 3_600_000), state_created: T(NOW - 9_000_000) };
+    const r = enrollmentCheck(older, FPR, FPR, rec);
+    expect(r.ok).toBe(false);
+    expect((r as any).why).toContain("an older keeper state is refused");
+    const earlierConfirm = { ...ENROLLED, key_confirmed_at: T(NOW - 5_000_000) };
+    expect((enrollmentCheck(earlierConfirm, FPR, FPR, rec) as any).why).toContain("not at the confirm the link recorded");
+    // the older state with the owner's newer confirm: recorded, and it passes
+    expect(enrollmentCheck({ ...older, key_confirmed_at: T(NOW) }, FPR, FPR, rec)).toEqual({ ok: true, record: { fp: FPR, stateCreated: NOW - 9_000_000, confirmedAt: NOW } });
+  });
+  test("the enrollment is recorded from the minute-by-minute /armed read, outside any pass, in the link's record", () => {
+    let rec: any = null; const logs: string[] = [];
+    const store = { load: () => rec, store: (e: any) => { rec = e; } };
+    noteArmedEnrollment({ armed: false, ...ENROLLED }, FPR, store, (l) => logs.push(l));
+    expect(rec).toEqual({ fp: FPR, stateCreated: NOW - 7_200_000, confirmedAt: NOW - 3_600_000 });
+    expect(logs[0]).toContain("enrollment recorded");
+    // an unconfirmed or foreign pin records nothing; the same confirm again records nothing new
+    noteArmedEnrollment({ key_fp: FPR, key_confirmed_at: null, state_created: T(NOW) }, FPR, store, (l) => logs.push(l));
+    noteArmedEnrollment({ ...ENROLLED }, FPR, store, (l) => logs.push(l));
+    expect(logs).toHaveLength(1);
+    // the link then passes a claim from that very state
+    expect(enrollmentCheck(ENROLLED, FPR, FPR, rec)).toEqual({ ok: true });
   });
 });
