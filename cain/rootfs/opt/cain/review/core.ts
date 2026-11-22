@@ -224,12 +224,15 @@ export function reviewCheck(r: Review, termsText: string | null): { ok: true } |
 // record of the change's previous round (earlierFindings in runner.ts), never from a brief: a brief has no
 // field for them (BRIEF_FIELDS), so one that carries any is refused whole.
 // Over them run the email, phone and SSN-shaped patterns and the owner's private-terms list, as over a
-// brief. The account-or-card pattern is relaxed there, and only there (Cain 0.18.1): a digit run it matches
-// passes only when it is one unbroken run of digits that is glued to an identifier (a letter or an
-// underscore right before it, as in a web search tool's name ending in a date, web_search_20250305) or that
-// is a valid date written year, month, day (20250305). Any other run of eight or more digits in the
-// findings, a bare 12345678 or a spaced card number, still blocks the round. A missing or broken list
-// still fails closed, and the brief's own check (privacyCheck) is unchanged.
+// brief. The account-or-card pattern is relaxed there, and only there (Cain 0.18.1, narrowed in the second
+// review): a digit run it matches passes only when it is exactly eight unbroken digits that make a valid
+// date written year, month, day, years 1900 to 2099 (20250305), whether glued to an identifier (a letter or
+// an underscore right before it, as in a web search tool's name ending in a date, web_search_20250305) or
+// bare. A bare eight-digit date in the findings is accepted on purpose: it can't be told from a date, and
+// eight digits is shorter than any card number. Any other run of eight or more digits, longer or not a date,
+// glued to an identifier or not (a bare 12345678, card_4111111111111111, _123456789012, a spaced card number), still
+// blocks the round, and a Luhn-valid run of 13 to 19 digits always blocks. A missing or broken list still
+// fails closed, and the brief's own check (privacyCheck) is unchanged.
 const ACCOUNT = BUILT_IN.find((p) => p.what === "an account or card number")!;
 export function validYmd(d: string): boolean {
   const m = /^(\d{4})(\d{2})(\d{2})$/.exec(d);
@@ -238,11 +241,22 @@ export function validYmd(d: string): boolean {
   if (y < 1900 || y > 2099 || mo < 1 || mo > 12 || da < 1) return false;
   return da <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
 }
-// A digit run the account-or-card pattern matched in the earlier findings that may pass (see above).
-function excusedRun(text: string, at: number, run: string): boolean {
-  if (!/^\d+$/.test(run)) return false;                       // spaced digits never pass
-  if (at > 0 && /[A-Za-z_]/.test(text[at - 1])) return true;    // glued to an identifier
-  return validYmd(run);
+// A run of 13 to 19 digits whose Luhn check digit is right: the shape of a payment card number.
+export function luhnCard(run: string): boolean {
+  if (!/^\d{13,19}$/.test(run)) return false;
+  let sum = 0;
+  for (let i = 0; i < run.length; i++) {
+    let d = run.charCodeAt(run.length - 1 - i) - 48;
+    if (i % 2 === 1) { d *= 2; if (d > 9) d -= 9; }
+    sum += d;
+  }
+  return sum % 10 === 0;
+}
+// A digit run the account-or-card pattern matched in the earlier findings that may pass (see above): only
+// an unbroken eight-digit valid date, glued or bare.
+function excusedRun(run: string): boolean {
+  if (!/^\d+$/.test(run) || luhnCard(run)) return false;    // spaced digits and card numbers never pass
+  return run.length === 8 && validYmd(run);
 }
 export function earlierCheck(earlier: string[] | undefined, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
   if (!earlier?.length) return { ok: true };
@@ -255,7 +269,7 @@ export function earlierCheck(earlier: string[] | undefined, termsText: string | 
     if (p.re.test(text)) why.add(`${p.what} in the earlier findings`);
   }
   const all = new RegExp(ACCOUNT.re.source, ACCOUNT.re.flags.includes("g") ? ACCOUNT.re.flags : ACCOUNT.re.flags + "g");
-  for (const m of text.matchAll(all)) if (!excusedRun(text, m.index!, m[0])) { why.add(`${ACCOUNT.what} in the earlier findings`); break; }
+  for (const m of text.matchAll(all)) if (!excusedRun(m[0])) { why.add(`${ACCOUNT.what} in the earlier findings`); break; }
   for (const e of loaded.terms.entries) if (e.re.test(text)) why.add(`private term on line ${e.line} of the list, in the earlier findings`);
   return why.size ? { ok: false, why: [...why] } : { ok: true };
 }

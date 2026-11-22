@@ -143,10 +143,19 @@ def changelog_top(text: str | None) -> str | None:
     return None
 
 
-def changelog_headings(text: str | None) -> set[str]:
-    """Every "## " heading of a CHANGELOG, as written after the marks."""
-    return {line[3:].strip() for line in (text or "").replace("\r\n", "\n").split("\n")
-            if line.startswith("## ")}
+HEADING_VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?![\d.])", re.IGNORECASE)
+
+
+def changelog_versions(text: str | None) -> set[Version]:
+    """The version of every "## " heading of a CHANGELOG, normalised: the heading trimmed, a leading v
+    dropped, the version parsed, so "## v0.4.6 " and "## 0.4.6" are the same version."""
+    found = set()
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        if line.startswith("## "):
+            m = HEADING_VERSION.match(line[3:].strip())
+            if m:
+                found.add(tuple(int(g) for g in m.groups()))
+    return found
 
 
 def changelog_section(text: str | None) -> str | None:
@@ -320,7 +329,7 @@ def check_versions(changed: list[str], base: Snapshot, head: Snapshot) -> list[s
         if top != show(new):
             problems.append(f'{app}/CHANGELOG.md should open with "## {show(new)}"; '
                             f'its first section is "{top or "missing"}".')
-        if new != old and show(new) in changelog_headings(base.get(app, (None, None))[1]):
+        if new != old and new in changelog_versions(base.get(app, (None, None))[1]):
             problems.append(f"{app} {show(new)} is taken: main's {app}/CHANGELOG.md already has it. "
                             "Step the version again.")
     if root_changed and not bumped:
