@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LABELS as CORE_LABELS, prompt, parseBrief, resultJson, roundLine, seriousLeft, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
+import { LABELS as CORE_LABELS, earlierCheck, prompt, parseBrief, resultJson, roundLine, seriousLeft, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
 import { DEFAULTS, Runner, loadReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import { admit, countedRounds, decisionOf, emptyRounds, readRounds, type DecisionRec } from "../rootfs/opt/cain/review/rounds.ts";
 import type { SeatAnswer, SeatFn, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
@@ -99,6 +99,51 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(t.get("pv-1").status).toBe("blocked: privacy");
     expect(countedRounds(t.rounds(), "pr-40").length).toBe(0);
     expect(admit(t.rounds(), brief({ id: "pv-2" }), 3)).toMatchObject({ ok: true, round: 1, kind: "full" });
+  });
+
+  // Cain 0.18.2: the earlier findings are the service's own verdicts, so only the owner's terms list runs over
+  // them; the brief still gets every built-in pattern and the list.
+  test("earlierCheck runs only the terms list over the earlier findings, and still fails closed without one", () => {
+    expect(earlierCheck(["Claude: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Gemini: call 555-867-5309, card 4111 1111 1111 1111, ssn 123-45-6789"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Gemini: the plan names Acme Corp"], TERMS)).toEqual({ ok: false, why: ["private term on line 2 of the list, in the earlier findings"] });
+    expect(earlierCheck(["Gemini: anything"], null)).toMatchObject({ ok: false });
+    expect(earlierCheck(undefined, null)).toEqual({ ok: true });
+  });
+
+  test("a fix-only round whose earlier findings hold an eight-digit date-shaped string is admitted and sent", async () => {
+    const t = runnerRig({ seat: answerWith("The web_search_20250305 tool name is pinned; move it to settings.") });
+    t.runner.admitAndQueue(brief({ id: "dg-1" }));
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "dg-2", body: "Fix: the tool name is read from settings." }))).toBeNull();
+    await t.runner.tick();
+    const r = t.get("dg-2");
+    expect(r.round_kind).toBe("fixes");
+    expect(r.status).not.toBe("blocked: privacy");
+    expect(t.calls.length).toBe(2);
+    expect(t.calls[1].brief.earlier).toEqual(["Gemini: The web_search_20250305 tool name is pinned; move it to settings."]);
+  });
+
+  test("a fix-only round whose earlier findings hold a private term is still blocked, the line named, and doesn't count", async () => {
+    const t = runnerRig({ seat: answerWith("The note mentions Acme Corp by name.") });
+    t.runner.admitAndQueue(brief({ id: "et-1" }));
+    await t.runner.tick();
+    t.runner.admitAndQueue(brief({ id: "et-2", body: "Fix: the name is gone." }));
+    await t.runner.tick();
+    const r = t.get("et-2");
+    expect(r.status).toBe("blocked: privacy");
+    expect(r.blocked_why).toEqual(["private term on line 2 of the list, in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(1);
+  });
+
+  test("a brief holding an eight-digit run is still blocked before anything is sent", async () => {
+    const t = runnerRig();
+    t.runner.admitAndQueue(brief({ id: "bd-1", body: "Pin the web_search_20250305 tool." }));
+    await t.runner.tick();
+    expect(t.get("bd-1").status).toBe("blocked: privacy");
+    expect(JSON.stringify(t.get("bd-1"))).toContain("an account or card number");
+    expect(t.calls.length).toBe(0);
   });
 
   test("review.sh prints the refusal and leaves nothing, reading the runner's cap and rounds", () => {

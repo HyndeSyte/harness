@@ -213,6 +213,18 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
+### The privacy backstop (since 0.18.2)
+
+Before anything goes to a seat, the review runner checks it in code and fails closed. Over the
+brief (its topic, question, body and id) it runs every built-in pattern (an email address, a phone
+number, an account or card number, an SSN-shaped number) and your private-terms list
+(`/data/review-private-terms.txt`); a brief that matches is blocked and nothing is sent. Over the
+earlier findings a fix-only round carries, it runs only your private-terms list: those findings are
+the review service's own verdicts from the round before, already sent to the same seats, and they
+hold tool version strings (a web search tool's name ends in an eight-digit date) that the number
+patterns would read as an account number. A term from your list in them still blocks the round, by
+line number. A blocked round sends nothing and doesn't count toward the cap.
+
 ### The review-round cap (since 0.16.0)
 
 A piece of work gets at most three outside review rounds, and the review runner keeps that count
