@@ -17,6 +17,7 @@ import { HOLD, RISK, capStateFor } from "../rootfs/opt/cain/link/cap.ts";
 import { CAIN_ROUTES, ROOT_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth.ts";
 import { GRANT_REPLACED, GRANT_UNSAVED, grantLabel, grantRetry, REPLACED } from "../rootfs/opt/cain/link/core.ts";
 import { capFileRules } from "../rootfs/opt/cain/capfiles.ts";
+import { classify, type HostFail } from "../rootfs/opt/cain/pullnow.ts";
 import { DAY, keeperHolds, rig } from "./link-rig";
 
 const NOW = new Date("2026-11-21T17:50:00Z");          // Nov 21, 12:50 PM in New York
@@ -52,9 +53,11 @@ function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer> } = {}) {
   const logs: string[] = [];
   // Fifth review: GitHub's compare of the bound head with the head read now (null: can't tell), the runner's clock.
   // Sixth review: the owner's plain notices it asks the link for, and the compares it asked.
-  let cmp: "ahead" | "behind" | "diverged" | "identical" | null = null;
+  let cmp: "ahead" | "behind" | "diverged" | "identical" | HostFail | null = null;
   let clock = NOW.getTime();
-  const ghBy: Record<string, string | null | "hang" | { late: string; ms: number }> = {};   // per pull request, over gh
+  // Seventh review: where the head came from (the pull request API, fresh and authoritative, or the refs fallback).
+  let ghSource: "api" | "refs" = "api";
+  const ghBy: Record<string, string | null | "hang" | { late: string; ms: number } | HostFail> = {};   // per pull request, over gh
   const notices: OwedNotice[] = [];
   const compares: string[] = [];
   const deps: RunnerDeps = { seats: { gemini: async (i: SeatInput) => seat(i) }, now: () => new Date(clock), rand: () => 0.5, log: (m: string) => { logs.push(m); },
@@ -62,8 +65,9 @@ function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer> } = {}) {
     pull: async (pr: string) => {
       ghReads.push(pr);
       const v = pr in ghBy ? ghBy[pr] : gh;
-      if (v && typeof v === "object") { const late = v; return new Promise<{ head: string }>((res) => setTimeout(() => res({ head: late.late }), late.ms)); }
-      return v === "hang" ? new Promise<never>(() => {}) : v === null ? null : { head: v as string };
+      if (v && typeof v === "object" && "fail" in v) return v;
+      if (v && typeof v === "object") { const late = v as { late: string; ms: number }; return new Promise<{ head: string; source: "api" }>((res) => setTimeout(() => res({ head: late.late, source: "api" }), late.ms)); }
+      return v === "hang" ? new Promise<never>(() => {}) : v === null ? null : { head: v as string, source: ghSource };
     },
     compare: async (pr: string) => { compares.push(pr); return cmp; }, postNotice: async (n: OwedNotice) => { notices.push(n); return `n-${notices.length}`; } };
   const conf = { ...cfg, hostWaitMs: 20, hostDeadlineMs: 60, preReplayOwner: OWN };
@@ -77,7 +81,7 @@ function runnerRig(o: { seat?: (i: SeatInput) => Promise<SeatAnswer> } = {}) {
     return h === null ? "waits" : runner.admitAndQueue(b, h);
   };
   return { dir, cfg: runner.cfg, runner, posted, relays, take, logs, ghReads, setGh: (h: string | null) => { gh = h; }, setSeat: (f: typeof seat) => { seat = f; },
-    setCompare: (c: typeof cmp) => { cmp = c; }, advance: (ms: number) => { clock += ms; }, notices, compares, ghBy,
+    setCompare: (c: typeof cmp) => { cmp = c; }, setSource: (x: "api" | "refs") => { ghSource = x; }, advance: (ms: number) => { clock += ms; }, notices, compares, ghBy,
     // A restart: a new runner on the same files, its in-memory state gone.
     restart: (over: Partial<RunnerDeps> = {}) => new Runner(conf, { ...deps, ...over }),
     rounds: () => readRounds(cfg.roundsFile!)!, grants: () => readGrants(cfg.grantsFile!),
@@ -1275,7 +1279,8 @@ describe("sixth review: the code host's read has hard deadlines, one shared back
     expect(t.compares.length).toBe(c);
     t.advance(61_000); await t.runner.ingest();
     expect(t.compares.length).toBe(c + 1);
-    expect(t.rounds().host_backoff?.delay).toBe(120_000);          // the compare failed again: doubled
+    // Seventh review: the head read answered (clearing the backoff), then the compare failed again: a minute.
+    expect(t.rounds().host_backoff?.delay).toBe(60_000);
   });
 });
 
@@ -1287,7 +1292,7 @@ describe("sixth review: a grant is voided for its head only on GitHub's positive
     t.setGh(HEAD_A); t.setCompare("behind");                       // a lagging read: GitHub's compare says A is behind B
     for (const id of ["k-4", "k-4b"]) {
       const why = (await t.take(brief({ id, head: HEAD_A })))!;
-      expect(why).toContain("the pull request's head isn't proven newer than the one the grant was given for");
+      expect(why).toContain("GitHub's compare shows the pull request's head doesn't follow on from the commit the owner's grant was given for");
       expect(why).toContain("No grant was claimed or voided");
       await t.runner.tick();
     }
@@ -1305,12 +1310,14 @@ describe("sixth review: a grant is voided for its head only on GitHub's positive
       t.grant("pr-46", 1);                                         // bound to head A
       t.setGh(HEAD_B); t.setCompare(cmp);
       for (const id of ["k-4", "k-4b", "k-4c"]) {
-        expect(await t.take(brief({ id, head: HEAD_B }))).toContain("the pull request's head isn't proven newer than the one the grant was given for");
+        // Seventh review: a diverged compare is a stalled change (a fresh grant is the way out); the others are retried.
+        expect(await t.take(brief({ id, head: HEAD_B }))).toContain(cmp === "diverged" ? "doesn't follow on from the commit the owner's grant was given for"
+          : "the pull request's head isn't proven newer than the one the grant was given for");
         await t.runner.tick();
       }
       expect(t.rounds().grants_void).toBeUndefined();
       expect(t.rounds().changes["pr-46"].rounds.flatMap((x) => x.claims ?? [])).toEqual([]);
-      expect(t.notices).toEqual([]);
+      expect(t.notices.map((n) => n.kind)).toEqual(cmp === "diverged" ? ["stalled"] : []);
     }
   });
 });
@@ -1364,5 +1371,308 @@ describe("the owner's post-install checks", () => {
     const pre = cli("sweep-dry-run", join(t.dir, PRE_ROUNDS), join(t.dir, PRE_GRANTS));
     expect(pre.stdout).toContain(line);
     expect(cli("host-read", "not-a-pr").status).not.toBe(0);
+  });
+});
+
+// ---- Cain 0.18.1, seventh review ----
+const HEAD_D = "d".repeat(40);
+describe("seventh review, 1: a void for head rests on a fresh read of GitHub's pull request API", () => {
+  test("a cached descendant read after the pull request went back to the approved head leaves the grant intact", async () => {
+    const t = runnerRig();
+    t.cfg.inboxDir = join(t.dir, "inbox"); t.cfg.inboxUid = process.getuid!();
+    mkdirSync(t.cfg.inboxDir, { recursive: true });
+    await threeRounds(t);
+    t.grant("pr-46", 1);                                           // approved at head A
+    // GitHub's API answers B (a descendant of A), but slower than one tick waits: the answer is cached for the next.
+    t.ghBy[PRN(46)] = { late: HEAD_B, ms: 35 }; t.setCompare("ahead");
+    writeFileSync(join(t.cfg.inboxDir, "k-4.json"), JSON.stringify(brief({ id: "k-4", head: HEAD_B })));
+    await t.runner.ingest();
+    expect(existsSync(join(t.cfg.inboxDir, "k-4.json"))).toBe(true);
+    await Bun.sleep(60);
+    // Meanwhile the pull request was force-pushed back to A. The next tick finds the cached B: it can't void.
+    t.ghBy[PRN(46)] = HEAD_A;
+    await t.runner.ingest();
+    expect(existsSync(join(t.cfg.inboxDir, "k-4.json"))).toBe(false);
+    expect(t.relays().find((l) => l.startsWith("Review brief k-4 wasn't taken"))).toContain("wasn't read freshly from GitHub's pull request API");
+    expect(t.rounds().grants_void).toBeUndefined();
+    expect(t.notices).toEqual([]);
+    // The brief on the approved head claims the grant.
+    expect(await t.take(brief({ id: "k-4b", head: HEAD_A }))).toBeNull();
+    expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4b")?.claims).toEqual(["pr-46+11"]);
+  });
+
+  test("a head equal to the bound head claims with no compare at all, from the API or the refs", async () => {
+    for (const src of ["api", "refs"] as const) {
+      const t = runnerRig();
+      await threeRounds(t);
+      t.grant("pr-46", 1);
+      t.setSource(src); t.setCompare("ahead");
+      expect(await t.take(brief({ id: "k-4", head: HEAD_A }))).toBeNull();
+      expect(t.compares).toEqual([]);
+      expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4")?.claims).toEqual(["pr-46+11"]);
+    }
+  });
+
+  test("a refs-fallback head that differs refuses the brief, asks no compare and keeps the grant", async () => {
+    const t = runnerRig();
+    await threeRounds(t);
+    t.grant("pr-46", 1);
+    t.setGh(HEAD_B); t.setSource("refs"); t.setCompare("ahead");
+    expect(await t.take(brief({ id: "k-4", head: HEAD_B }))).toContain("wasn't read freshly from GitHub's pull request API");
+    expect(t.compares).toEqual([]);
+    expect(t.rounds().grants_void).toBeUndefined();
+    // The same head read freshly from the API, with GitHub's proof, voids it.
+    t.setSource("api");
+    expect(await t.take(brief({ id: "k-4b", head: HEAD_B }))).toContain("doesn't count");
+    expect(t.rounds().grants_void?.["pr-46+11"]).toMatchObject({ why: "head" });
+  });
+});
+
+describe("seventh review, 2: the replay reconciles existing claims and never charges a round twice", () => {
+  const withClaims = (t: ReturnType<typeof runnerRig>, claims: Record<string, string[]>, extra: GrantRec[] = []) => {
+    const r = JSON.parse(readFileSync(t.cfg.roundsFile!, "utf8"));
+    for (const x of r.changes["pr-46"].rounds) if (claims[x.id]) x.claims = claims[x.id];
+    writeFileSync(t.cfg.roundsFile!, JSON.stringify(r, null, 1));
+    const g = JSON.parse(readFileSync(t.cfg.grantsFile!, "utf8"));
+    g.grants.push(...extra);
+    writeFileSync(t.cfg.grantsFile!, JSON.stringify(g, null, 1));
+  };
+  const bound900 = (): GrantRec => grantRec("pr-46", 1, { id: "pr-46+900", at: T(13, 30), pr: PRN(46), bound: { head: HEAD_A, decision: "pr-46#3", used: 3, cap: 3 } });
+
+  test("a mixed ledger: claims already recorded are kept as they are, and only the unclaimed round past the cap is charged", async () => {
+    const t = runnerRig();
+    records018(t, [["k-1", T(10)], ["k-2", T(11)], ["k-3", T(12)], ["k-4", T(14)], ["k-5", T(15)], ["k-6", T(16)]], [["pr-46+111", 2, T(13)]]);
+    withClaims(t, { "k-4": ["pr-46+900"], "k-5": ["pr-46+111"] }, [bound900()]);
+    await t.runner.tick();
+    const r = t.rounds();
+    expect(r.replayed).toBeTruthy();
+    expect(r.changes["pr-46"].rounds.map((x) => [x.id, x.claims ?? []])).toEqual([
+      ["k-1", []], ["k-2", []], ["k-3", []], ["k-4", ["pr-46+900"]], ["k-5", ["pr-46+111"]], ["k-6", ["pr-46+111"]]]);
+    expect(r.grants_void).toBeUndefined();                          // 111's two rounds: one already claimed, one charged now
+    expect(effectiveCap(3, r, t.grants(), "pr-46", HEAD_A)).toBe(6);
+    expect(t.logs).toContain("replay plan: pr-46+111 (2 rounds for pr-46, granted by Dane on Nov 21): already claimed by k-5; credit k-6; let go 0");
+  });
+
+  test("a round past the cap with no earlier grant left to debit is recorded as unclaimed, never borrows from a later grant, and the replay refuses to commit", async () => {
+    const t = runnerRig();
+    // Round four ran before the only grant was given.
+    records018(t, [["k-1", T(10)], ["k-2", T(11)], ["k-3", T(12)], ["k-4", T(12, 30)]], [["pr-46+111", 2, T(13)]]);
+    const before = readFileSync(t.cfg.roundsFile!, "utf8");
+    await t.runner.tick(); await t.runner.tick();
+    expect(readFileSync(t.cfg.roundsFile!, "utf8")).toBe(before);  // nothing committed: no claim, no void, no marker
+    const plan = t.logs.filter((l) => l.startsWith("replay plan: ")).map((l) => l.slice("replay plan: ".length));
+    expect(plan).toEqual([
+      "pr-46+111 (2 rounds for pr-46, granted by Dane on Nov 21): credit none; let go 2",
+      "round k-4 of pr-46 is past the base cap with no earlier grant left to debit: recorded as unclaimed, nothing debited",
+      "the runner refuses to commit this replay: nothing is claimed or let go, and those grants don't count until it's sorted out"]);
+    const told = t.relays().filter((l) => l.includes("was not committed"));
+    expect(told.length).toBe(1);                                    // once a start of the runner
+    expect(told[0]).toContain("review.sh sweep-dry-run prints the same plan");
+    expect(t.notices).toEqual([]);
+    // The dry run prints the very same plan.
+    const env = { ...process.env, REVIEW_QUEUE: t.cfg.queueDir, REVIEW_SPEND: t.cfg.spendFile, REVIEW_ROUNDS: t.cfg.roundsFile, REVIEW_SETTINGS: t.cfg.settingsFile,
+      REVIEW_GRANTS: t.cfg.grantsFile, CAIN_HOME: join(t.dir, "home"), REVIEW_GUARD_LOG: join(t.dir, "guard.log"), CAIN_TEST_MODE: "1" };
+    mkdirSync(join(t.dir, "home"), { recursive: true });
+    const o = spawnSync("bun", [join(import.meta.dir, "../rootfs/opt/cain/review/cli.ts"), "sweep-dry-run"], { encoding: "utf8", env });
+    expect(o.stdout.split("\n").slice(1).filter(Boolean).map((l) => l.trim())).toEqual(plan);
+  });
+
+  test("a grant already carrying more claims than its rounds would charge a round twice: refused, nothing committed", async () => {
+    const t = runnerRig();
+    records018(t, [["k-1", T(10)], ["k-2", T(11)], ["k-3", T(12)], ["k-4", T(14)], ["k-5", T(15)]], [["pr-46+111", 1, T(13)]]);
+    withClaims(t, { "k-4": ["pr-46+111"], "k-5": ["pr-46+111"] });
+    const before = readFileSync(t.cfg.roundsFile!, "utf8");
+    await t.runner.tick();
+    expect(readFileSync(t.cfg.roundsFile!, "utf8")).toBe(before);
+    expect(t.logs).toContain("replay plan: pr-46+111 already carries 2 claims for its 1 round: it would charge a round twice");
+    expect(t.relays().filter((l) => l.includes("was not committed")).length).toBe(1);
+  });
+});
+
+describe("seventh review, 3: a notice stays owed until the link acknowledges its post", () => {
+  // The link as the runner sees it: it keeps an id as posted only after its chat post succeeded and answers a repeat
+  // with that message. mode: up, down (nothing posted), lost (posted, but the acknowledgement never comes back).
+  const fakeLink = () => {
+    const chat: string[] = [], kept = new Map<string, string>();
+    const box = { mode: "up" as "up" | "down" | "lost", calls: 0 };
+    const post = async (n: OwedNotice) => {
+      box.calls++;
+      if (kept.has(n.id)) return kept.get(n.id)!;
+      if (box.mode === "down") throw new Error("the link didn't answer");
+      chat.push(n.id); kept.set(n.id, `c-${chat.length}`);
+      if (box.mode === "lost") throw new Error("the answer was lost");
+      return kept.get(n.id)!;
+    };
+    return { chat, box, post };
+  };
+  const voided = async (t: ReturnType<typeof runnerRig>) => {
+    await threeRounds(t);
+    t.grant("pr-46", 1);
+    t.setGh(HEAD_B); t.setCompare("ahead");
+    await t.take(brief({ id: "k-4", head: HEAD_B }));
+    expect(t.rounds().notices?.["void:pr-46+11"]?.state).toBe("owed");
+  };
+
+  test("a failed post stays owed, is retried under the link's own backoff, and is delivered once; the link down then up", async () => {
+    const t = runnerRig();
+    await voided(t);
+    const l = fakeLink();
+    const run = t.restart({ postNotice: l.post });
+    l.box.mode = "down";
+    await run.postOwedNotices();
+    expect(t.rounds().notices?.["void:pr-46+11"]).toMatchObject({ state: "owed", tries: 1 });
+    expect(t.rounds().link_backoff?.delay).toBe(60_000);
+    expect(t.rounds().host_backoff).toBeUndefined();               // GitHub's backoff isn't the link's
+    await run.postOwedNotices();
+    expect(l.box.calls).toBe(1);                                    // waiting out the link's backoff
+    t.advance(61_000); await run.postOwedNotices();
+    expect(t.rounds().link_backoff?.delay).toBe(120_000);          // still down: doubled
+    l.box.mode = "up";
+    t.advance(121_000); await run.postOwedNotices(); await run.postOwedNotices();
+    expect(l.chat).toEqual(["void:pr-46+11"]);
+    expect(t.rounds().notices?.["void:pr-46+11"]).toMatchObject({ state: "sent", message: "c-1" });
+    expect(t.rounds().link_backoff).toBeUndefined();
+  });
+
+  test("a lost acknowledgement, and a restart mid-delivery, post nothing twice", async () => {
+    for (const restart of [false, true]) {
+      const t = runnerRig();
+      await voided(t);
+      const l = fakeLink();
+      const run = t.restart({ postNotice: l.post });
+      l.box.mode = "lost";
+      await run.postOwedNotices();
+      expect(t.rounds().notices?.["void:pr-46+11"]?.state).toBe("owed");
+      l.box.mode = "up";
+      t.advance(61_000);
+      await (restart ? t.restart({ postNotice: l.post }) : run).postOwedNotices();
+      expect(l.chat).toEqual(["void:pr-46+11"]);
+      expect(t.rounds().notices?.["void:pr-46+11"]).toMatchObject({ state: "sent", message: "c-1" });
+    }
+  });
+
+  test("the link keeps an id as posted only after its post, and refuses a second ask while the first is under way", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const n = { id: "void:pr-46+11", kind: "void", key: "pr-46", pr: PRN(46), rounds: 1, why: "head" };
+    const both = await Promise.allSettled([t.r.link.reviewNotice(n), t.r.link.reviewNotice(n)]);
+    expect(both.map((x) => x.status).sort()).toEqual(["fulfilled", "rejected"]);
+    const again = await t.r.link.reviewNotice(n);
+    expect(again.duplicate).toBe(true);
+    expect(again.message).toBe((both.find((x) => x.status === "fulfilled") as any).value.message);
+  });
+});
+
+describe("seventh review, 4: one writer per file", () => {
+  test("a grant the link writes between the runner's read of the grants file and its rename of the rounds file survives untouched", async () => {
+    const t = runnerRig();
+    records018(t, [["k-1", T(10)], ["k-2", T(11)], ["k-3", T(12)], ["k-4", T(14)]], [["pr-46+111", 2, T(13)]]);
+    let written = "";
+    const run = t.restart({ crashPoint: () => {
+      recordGrant(t.cfg.grantsFile!, grantRec("pr-47", 1, { id: "pr-47+5" }), { sync: () => {}, owner: OWN });
+      written = readFileSync(t.cfg.grantsFile!, "utf8");
+    } });
+    await run.tick();
+    expect(t.rounds().replayed).toBeTruthy();
+    expect(readFileSync(t.cfg.grantsFile!, "utf8")).toBe(written);
+    expect(t.grants()!.grants.map((x) => x.id)).toEqual(["pr-46+111", "pr-47+5"]);
+    const src = readFileSync(join(import.meta.dir, "../rootfs/opt/cain/review/runner.ts"), "utf8");
+    expect(src).not.toMatch(/recordGrant|writeFileSync\(this\.cfg\.grantsFile/);
+  });
+});
+
+describe("seventh review, follow-ups", () => {
+  const inboxRig = async () => {
+    const t = runnerRig();
+    t.cfg.inboxDir = join(t.dir, "inbox"); t.cfg.inboxUid = process.getuid!();
+    mkdirSync(t.cfg.inboxDir, { recursive: true });
+    await threeRounds(t);
+    await threeRounds(t, { pr: PRN(47), item: "P47" } as any);
+    t.grant("pr-46", 1); t.grant("pr-47", 1, { id: "pr-47+1" });
+    return t;
+  };
+  const put = (t: Awaited<ReturnType<typeof inboxRig>>, b: Brief) => writeFileSync(join(t.cfg.inboxDir!, `${b.id}.json`), JSON.stringify(b));
+  const inbox = (t: Awaited<ReturnType<typeof inboxRig>>, id: string) => existsSync(join(t.cfg.inboxDir!, `${id}.json`));
+
+  test("the backoff: a permanently failing compare on one change never holds up another change's brief", async () => {
+    const t = await inboxRig();
+    t.ghBy[PRN(46)] = HEAD_B; t.setCompare(classify(404));         // the compare is refused for good
+    for (const id of ["a-46", "a-46b", "a-46c"]) {
+      put(t, brief({ id, head: HEAD_B }));
+      put(t, brief({ id: `b-${id}`, pr: PRN(47), item: "P47" }));
+      await t.runner.ingest();
+      expect(inbox(t, id)).toBe(false);
+      expect(t.rounds().host_backoff).toBeUndefined();
+    }
+    expect(t.get("b-a-46")).toMatchObject({ round: 4, cap: 4 });
+    expect(t.rounds().grants_void).toBeUndefined();
+    // A definitive answer on the pull request itself refuses its brief and leaves the backoff alone; a 429 moves it.
+    t.ghBy[PRN(46)] = classify(404);
+    put(t, brief({ id: "a-46d", head: HEAD_B }));
+    await t.runner.ingest();
+    expect(t.relays().find((l) => l.startsWith("Review brief a-46d wasn't taken"))).toContain("GitHub answered for good that its pull request can't be read (not there (404))");
+    expect(t.rounds().host_backoff).toBeUndefined();
+    t.ghBy[PRN(46)] = classify(429);
+    put(t, brief({ id: "a-46e", head: HEAD_B }));
+    await t.runner.ingest();
+    expect(inbox(t, "a-46e")).toBe(true);
+    expect(t.rounds().host_backoff?.delay).toBe(60_000);
+    t.ghBy[PRN(46)] = HEAD_A; t.advance(61_000);
+    put(t, brief({ id: "a-46f" }));
+    await t.runner.ingest();
+    expect(t.rounds().host_backoff).toBeUndefined();               // reset on the read that answered
+  });
+
+  test("the wait start: two outages separated by a success each start their own wait, and a clock jump back re-anchors", async () => {
+    const t = await inboxRig();
+    const told = () => t.relays().filter((l) => l.includes("Review brief a-46 waits")).length;
+    t.ghBy[PRN(46)] = null;
+    put(t, brief({ id: "a-46", head: HEAD_B }));
+    await t.runner.ingest();
+    expect(t.rounds().host_waits?.["a-46.json"]?.since).toBe(NOW.toISOString());
+    t.advance(10 * 60_000);
+    t.ghBy[PRN(46)] = HEAD_A;                                       // the read answers: the brief names another head
+    await t.runner.ingest();
+    expect(inbox(t, "a-46")).toBe(false);
+    expect(t.rounds().host_waits?.["a-46.json"]).toBeUndefined();
+    // The brief again, and a second outage: its wait starts now, not at the first one's start.
+    t.ghBy[PRN(46)] = null;
+    put(t, brief({ id: "a-46" }));
+    t.advance(61_000); await t.runner.ingest();
+    const second = t.rounds().host_waits?.["a-46.json"]?.since;
+    expect(second).toBe(new Date(NOW.getTime() + 11 * 60_000 + 1000).toISOString());
+    t.advance(14 * 60_000); await t.runner.ingest();
+    expect(told()).toBe(0);
+    // The clock goes back an hour: elapsed time is clamped at zero and the start re-anchored to now.
+    t.advance(-60 * 60_000); await t.runner.ingest();
+    expect(Date.parse(t.rounds().host_waits!["a-46.json"].since)).toBe(NOW.getTime() + 11 * 60_000 + 1000 + 14 * 60_000 - 60 * 60_000);
+    t.advance(14 * 60_000); await t.runner.ingest();
+    expect(told()).toBe(0);
+    t.advance(2 * 60_000); await t.runner.ingest();
+    expect(told()).toBe(1);
+  });
+
+  test("a stalled change: one notice to the owner per change and head, and a new grant on the diverged head clears the refusal", async () => {
+    const t = runnerRig();
+    await threeRounds(t);
+    t.grant("pr-46", 1);                                           // approved at head A
+    t.setGh(HEAD_D); t.setCompare("diverged");                     // a rewrite: D doesn't follow on from A
+    for (const id of ["k-4", "k-4b"]) {
+      expect(await t.take(brief({ id, head: HEAD_D }))).toContain("A fresh grant for the pull request as it is now is the way");
+      await t.runner.tick();
+    }
+    expect(t.notices).toEqual([expect.objectContaining({ id: `stalled:pr-46.${HEAD_D.slice(0, 12)}`, to: "owner", kind: "stalled", key: "pr-46", rounds: 1 })]);
+    expect(t.relays().filter((l) => l.includes("can't place the pull request's head after the commit")).length).toBe(1);
+    expect(t.rounds().grants_void).toBeUndefined();
+    // His new grant on head D: the next brief runs under it; the old grant is neither claimed nor voided for its head.
+    t.grant("pr-46", 1, { id: "pr-46+fresh", bound: bindNow(t.rounds(), t.grants(), "pr-46", HEAD_D) });
+    expect(await t.take(brief({ id: "k-4c", head: HEAD_D }))).toBeNull();
+    expect(t.rounds().changes["pr-46"].rounds.find((x) => x.id === "k-4c")?.claims).toEqual(["pr-46+fresh"]);
+    expect(t.rounds().grants_void?.["pr-46+11"]).toBeUndefined();
+  });
+
+  test("the link words a stalled notice itself, facts only", async () => {
+    const t = linkRig(atCap(2), emptyGrants());
+    const a = await t.r.link.reviewNotice({ id: `stalled:pr-46.${HEAD_D.slice(0, 12)}`, kind: "stalled", key: "pr-46", pr: PRN(46), rounds: 1 });
+    expect(String(t.r.msg(a.message).content)).toBe("Your grant of 1 more review round for pull request 46 can't be used now: its newest commit doesn't follow on from the one you granted it for. A new grant for it as it is now is the way out: Cain can ask you again.");
   });
 });

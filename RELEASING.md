@@ -334,6 +334,15 @@ Ship checklist for Cain 0.18.1 (the owner's checks on the Pi, all read only):
   go, and writes nothing. The running 0.18.0 has no sweep-dry-run yet, so before the install run the
   same command from a checkout of this pull request on any machine with Bun, on those copies:
   `bun cain/rootfs/opt/cain/review/cli.ts sweep-dry-run <copy of rounds> <copy of grants>`.
+- Stop the runner between the dry run and the install, so it records no round the dry run didn't see.
+  The runner has no switch of its own: it runs inside the Cain App. So once the link has landed the pull
+  request and Cain says the Ship run started, take the two copies and stop the Cain App in Home
+  Assistant at once, then run the dry run on those copies (from a checkout, as above). The install starts
+  the App again; if the update leaves it stopped, start it. If a review round ran after the copies were
+  taken, the comparison below can differ by that round.
+- After the install, compare the replay's plan in the runner's log (its `replay plan:` lines) with the
+  dry run's lines: they are printed by the same code and must match line for line. If the runner says it
+  refused to commit the replay, nothing was changed: send the plan to Cain for a Build item.
 - Run `/opt/cain/review.sh host-read <pull request number>` against the real repository: it reads
   that pull request's head through GitHub's API and through its refs and prints both; both should
   agree on the head GitHub shows.

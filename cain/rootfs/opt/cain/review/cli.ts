@@ -22,7 +22,7 @@ import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, s
 import { configFromEnv } from "./config.ts";
 import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
 import { DEFAULT_ROUND_CAP, admit, countedRounds, decisionOf, groupOf, readRounds } from "./rounds.ts";
-import { capWords, countingGrants, grantWords, readGrants, replayUnbound, staleWords, standing } from "./grants.ts";
+import { capWords, countingGrants, grantWords, planLines, readGrants, replayUnbound, staleWords, standing } from "./grants.ts";
 import { PULL_URL, pullViaApi, pullViaRefs } from "../pullnow.ts";
 import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
@@ -216,13 +216,9 @@ switch (cmd) {
       out(`  the runner replayed these already (${rounds!.replayed}); to see what it did, run it on the copies kept before:`);
       out(`  review.sh sweep-dry-run ${join(dirname(rf), "review-rounds.pre-0.18.1.json")} ${join(dirname(gf), "review-grants.pre-0.18.1.json")}`);
     } else {
-      const done = replayUnbound(structuredClone(rounds!), structuredClone(gr!), base, new Date().toISOString());
-      if (!done.length) out("  no grant from before grants were bound");
-      for (const d of done) {
-        const n = d.rec.rounds;
-        out(`  ${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, ${grantWords([d.rec], cfg.tz).replace(/^\d+ /, "")}): `
-          + `credit ${d.credited.length ? d.credited.join(", ") : "none"}; let go ${d.unused}`);
-      }
+      // Seventh review: the very plan the runner logs and commits (or refuses to commit), line for line.
+      const plan = replayUnbound(structuredClone(rounds!), structuredClone(gr!), base, new Date().toISOString());
+      for (const l of planLines(plan, cfg.tz)) out(`  ${l}`);
     }
     for (const [id, v] of Object.entries(rounds!.grants_void ?? {})) out(`  ${id}: void already (${v.why}${v.rounds ? `, ${v.rounds} round${v.rounds === 1 ? "" : "s"} let go` : ""}, for ${v.key})`);
     break;

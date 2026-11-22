@@ -45,12 +45,13 @@ export type DecisionRec = {
 export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec; past?: DecisionRec[] };
 // grants_void (0.18.1): grants the runner found no longer bound to the change as it is (or, from before grants
 // were bound, rounds the one-time replay found unused), by grant id, kept so each is told once and never counts
-// again. rounds: the rounds let go (an unbound grant's unused ones). The grants file isn't touched.
+// again. rounds: the rounds let go (an unbound grant's unused ones). The grants file isn't touched: the runner never
+// writes it (seventh review), so claims and voids live only here, keyed by grant id.
 export type VoidRec = { why: StaleWhy; at: string; key: string; rounds?: number };
 // notices (0.18.1, sixth review): what the runner owes Cain (through the relay queue) and the owner (a plain notice
 // through the link's root socket, in the link's own words), each once, by id. Written in the same rename as what
 // they tell (a void, the replay, a wait), delivered after, and marked sent.
-export type NoticeKind = "unbound" | "void" | "waits";
+export type NoticeKind = "unbound" | "void" | "waits" | "stalled";
 export type OwedNotice = { id: string; to: "cain" | "owner"; kind: NoticeKind; key: string; pr: string | null; rounds?: number; why?: StaleWhy;
   text?: string; state: "owed" | "sent"; at: string; message?: string; tries?: number };
 // host_waits (sixth review): a brief waiting in the inbox on GitHub's head read, by inbox file name: when it first
@@ -60,8 +61,10 @@ export type OwedNotice = { id: string; to: "cain" | "owner"; kind: NoticeKind; k
 export type HostWait = { since: string; id: string; pr: string; told?: boolean };
 export type HostBackoff = { next: string; delay: number };
 // replayed (sixth review): when the one-time replay of grants from before grants were bound was committed.
+// link_backoff (seventh review): the owner's notices' own backoff for the link, apart from GitHub's.
+// One writer per file: the runner alone writes this file; the grants file is the link's alone (grants.ts).
 export type Rounds = { format: number; changes: Record<string, ChangeRec>; grants_void?: Record<string, VoidRec>;
-  notices?: Record<string, OwedNotice>; host_waits?: Record<string, HostWait>; host_backoff?: HostBackoff; replayed?: string };
+  notices?: Record<string, OwedNotice>; host_waits?: Record<string, HostWait>; host_backoff?: HostBackoff; link_backoff?: HostBackoff; replayed?: string };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
 

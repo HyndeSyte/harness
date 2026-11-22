@@ -400,10 +400,53 @@ and the cap before the grant. The runner holds every grant to that:
   card sent again never writes a second grant.
 - The rounds file has one writer again: the runner, one tick at a time, writing by temp file and atomic
   rename. The link only reads it.
+- One writer per file (seventh review). The runner never writes the grants file: it only reads it.
+  Claims and voids live only in the rounds file, keyed by grant id; the grants file is the link's alone,
+  written only on your tap. A grant the link writes while the runner is between its read of the grants
+  file and its rename of the rounds file stays exactly as the link wrote it.
+- A void needs a fresh, authoritative head (seventh review). A grant is voided for its head only when
+  that head came from a fresh read of GitHub's pull request API in the very step that admits the brief
+  (never GitHub's refs, the fallback when the API is refused for now, and never a read finished in an
+  earlier tick), and GitHub's compare says the commit you approved is a strict ancestor of it. A refs or
+  cached head can admit a brief whose head equals the commit you approved, and otherwise the brief is
+  refused ("send it again in a minute") with your grant kept as it was. A head equal to the commit you
+  approved uses the grant with no compare at all. So a cached read of a later commit, after the pull
+  request was force-pushed back to the one you approved, never voids your grant.
+- A grant kept without proof never blocks another one. When the pull request's head doesn't follow on
+  from the commit you approved (the compare says diverged or behind, or GitHub refuses the compare for
+  good), the old grant is neither claimed nor voided, and a round past the cap is refused, and you get
+  one plain notice per change and head, facts only: "Your grant of 1 more review round for pull request
+  48 can't be used now: its newest commit doesn't follow on from the one you granted it for. A new grant
+  for it as it is now is the way out: Cain can ask you again." Cain hears once. A new grant on that head
+  clears the refusal: the next round runs under it.
+- GitHub's backoff moves only for what may pass (seventh review). A definitive answer (the pull request
+  or a commit isn't there: 404, 410 or another refusal for good, or a compare that says diverged, behind
+  or identical) refuses or decides that brief and never moves the shared backoff, so one change whose
+  compare always fails never holds up another change's brief. Only a transport error, a timeout, a
+  server error, a 403 or a 429 moves it, and any answer that comes resets it.
+- The wait's start is per brief (seventh review): set at its first wait, cleared by a read that answered,
+  so a second outage starts its own 15 minutes. If the clock goes back, the time waited never counts
+  below zero: the start is set to now.
+- The replay reconciles before it charges (seventh review). Claims already in the rounds file are kept:
+  a round that carries a claim is never charged again and its claim is never replaced, and each old
+  grant's balance is its rounds less the claims it already has. Only the unclaimed rounds past the base
+  cap are then charged. A round past the cap with no earlier grant left to debit is recorded as
+  unclaimed: it debits nothing and never borrows from a grant given after it. When the replay would
+  charge a round twice (a grant already carrying more claims than its rounds, or a round carrying the
+  same grant twice) or meets an unclaimed round past the cap, it commits nothing: Cain hears the plan
+  once each time the runner starts, logged for a Build item, those old grants don't count meanwhile,
+  and `review.sh sweep-dry-run` prints the same plan, line for line, as the runner's log.
+- A notice to you stays owed until the link acknowledges it (seventh review). Each owed notice stays in
+  the rounds file until the link answers that its chat post succeeded; owed notices are tried again each
+  tick under a backoff of their own for the link (a minute, doubling to 15 minutes, reset by any
+  acknowledgement), never GitHub's. The link keeps a notice's id as posted only after its post succeeded
+  and answers a repeat with that same message, and refuses a second ask while the first is still
+  posting, so a retry after a lost acknowledgement, or after a restart mid-delivery, posts nothing twice.
 - Two checks for you, both read only:
   - `/opt/cain/review.sh sweep-dry-run [rounds file] [grants file]` runs the replay on copies of the two
-    files (the live ones by default) and prints, for each grant from before grants were bound, the rounds
-    it credits and how many it lets go. It writes nothing. Before the install, run it on copies of the
+    files (the live ones by default) and prints, for each grant from before grants were bound, the claims
+    it already has, the rounds it credits and how many it lets go, any round it can't charge, and whether
+    the runner would refuse to commit. It writes nothing. Before the install, run it on copies of the
     live files; after it, the live files say they were replayed, and pointing it at the pre-replay copies
     (`review.sh sweep-dry-run /data/review-rounds.pre-0.18.1.json /data/review-grants.pre-0.18.1.json`)
     shows what the runner did.

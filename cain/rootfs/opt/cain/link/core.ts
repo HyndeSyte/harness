@@ -2412,9 +2412,14 @@ export class Link {
   // waiting on GitHub), the change key, its pull request, the rounds and why. The words are the link's own, so
   // nothing from the runner's files reaches Discord as text. Each notice id is posted once: one already posted is
   // answered "posted" with that message, so a post whose answer was lost isn't repeated.
+  // Seventh review: the id is kept as posted only after the chat post succeeded, and a second ask for an id whose post
+  // is still under way is refused (the runner tries again later and gets the posted message), so nothing posts twice.
+  // A "stalled" notice: the change can't use his grant at the pull request's head, which GitHub's compare can't place
+  // after the commit he granted it for; a new grant is the way out.
+  private reviewNoticesInFlight = new Set<string>();
   async reviewNotice(b: any): Promise<{ status: "posted"; message: string; duplicate?: true }> {
     const id = String(b?.id ?? ""), kind = String(b?.kind ?? ""), key = String(b?.key ?? "");
-    if (!/^(unbound|void|waits):[A-Za-z0-9#+._-]{1,120}$/.test(id) || !id.startsWith(`${kind}:`)) throw new Refusal("not a review notice id");
+    if (!/^(unbound|void|waits|stalled):[A-Za-z0-9#+._-]{1,120}$/.test(id) || !id.startsWith(`${kind}:`)) throw new Refusal("not a review notice id");
     if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(key)) throw new Refusal("a review notice needs its change key");
     const pr = b?.pr && PULL.test(String(b.pr)) ? String(b.pr) : null;
     const rounds = b?.rounds === null || b?.rounds === undefined ? null : Number(b.rounds);
@@ -2433,11 +2438,17 @@ export class Link {
       text = `Your grant of ${rounds} more review round${s(rounds)} for ${what} no longer counts: ${REVIEW_VOID_WHY[why as StaleWhy]}. If it needs more rounds, Cain can ask you again.`;
     } else if (kind === "waits") {
       text = `The review of ${what} waits on GitHub: its newest commit can't be read right now. It keeps trying by itself.`;
+    } else if (kind === "stalled") {
+      if (rounds === null) throw new Refusal("a notice of a stalled grant needs its rounds");
+      text = `Your grant of ${rounds} more review round${s(rounds)} for ${what} can't be used now: its newest commit doesn't follow on from the one you granted it for. A new grant for it as it is now is the way out: Cain can ask you again.`;
     } else throw new Refusal("not a review notice");
     const had = this.d.load().reviewNotices?.[id];
     if (had) return { status: "posted", message: had.msg, duplicate: true };
+    if (this.reviewNoticesInFlight.has(id)) throw new Refusal("that notice is being posted now: ask again in a minute");
     noMachineText(text);
-    const message = await this.notice(text);
+    this.reviewNoticesInFlight.add(id);
+    let message: string;
+    try { message = await this.notice(text); } finally { this.reviewNoticesInFlight.delete(id); }
     const st = this.d.load();
     const kept = Object.entries({ ...(st.reviewNotices ?? {}), [id]: { msg: message, at: this.d.now() } }).filter(([, v]) => this.d.now() - v.at <= PC_NOTICE_RETAIN_MS)
       .sort((x, y) => y[1].at - x[1].at).slice(0, PC_NOTICE_KEEP);

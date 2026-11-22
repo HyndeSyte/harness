@@ -16,6 +16,12 @@
 - Tapping a grant card twice, or the same card coming again, never grants twice.
 - Two read-only checks: `review.sh sweep-dry-run` shows what the replay of earlier grants decides, and `review.sh host-read` shows GitHub's answer for a pull request both ways it is read.
 - Cain's review lines say when a grant no longer counts, like "1 grant no longer counts: the pull request moved on".
+- A grant is cancelled for new commits only on a fresh read of the pull request from GitHub, never an older or fallback read, so a pull request put back to the commit you approved keeps your grant.
+- When the pull request's newest commit doesn't follow on from the one you granted, you get one plain message saying a new grant is the way out, and a new grant lets the next round run.
+- The replay of earlier grants keeps every round already credited as it is and never charges a round twice. If it can't be done cleanly it changes nothing, Cain hears what it found, and `review.sh sweep-dry-run` shows the same.
+- A message for you about a grant is kept until it has really gone up, tried again later if the App's link is down, and never sent twice.
+- The review service never writes the file that keeps your grants: only your tap does.
+- A pull request GitHub says isn't there no longer slows other reviews' GitHub reads, and a second wait on GitHub starts its own 15 minutes.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart: nothing about those changed here.
 
 ## 0.18.0

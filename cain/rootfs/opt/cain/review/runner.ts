@@ -16,7 +16,8 @@ import {
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type OwedNotice, type Rounds } from "./rounds.ts";
-import { effectiveCap, grantWords, readGrants, replayUnbound, STALE_LONG, staleWords, type GrantRec, type Grants, type ReplayDecision, type StaleWhy } from "./grants.ts";
+import { effectiveCap, grantWords, planLines, readGrants, replayUnbound, STALE_LONG, staleWords, type GrantRec, type Grants, type ReplayDecision, type StaleWhy } from "./grants.ts";
+import { isFail, type Compare, type HostFail } from "../pullnow.ts";
 import { CAIN_GID, ROOT_UID } from "../capfiles.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
@@ -70,12 +71,15 @@ export type RunnerDeps = {
   // the message id, or null when it didn't go (tried again next tick). Absent: never posted.
   postDecision?: (d: DecisionRec) => Promise<string | null>;
   plan?: () => PlanReading;                        // the plan-usage reading (../plan-usage.ts), for the guard
-  // Cain 0.18.1 (fourth review): a pull request as GitHub has it now (../pullnow.ts, the link's own read), for
-  // the head a round that claims a grant is pinned to. null, or a null head: can't tell (the brief waits).
-  pull?: (pr: string) => Promise<{ head: string | null } | null>;
-  // GitHub's compare of two commits of the pull request's repository (../pullnow.ts compareHeads): "ahead" when head
-  // is a strict descendant of base. null: can't tell. The only proof a grant's bound head is superseded.
-  compare?: (pr: string, base: string, head: string) => Promise<"ahead" | "behind" | "diverged" | "identical" | null>;
+  // Cain 0.18.1 (fourth review): a pull request as GitHub has it now (../pullnow.ts pullForRunner), for the head a
+  // round that claims a grant is pinned to. null, or a null head: can't tell (the brief waits). Seventh review: source
+  // "api" is a fresh read of GitHub's pull request API, the only head that can void a grant; "refs" (the fallback, or
+  // none given) can only admit a brief whose head equals a grant's bound head. A HostFail is classified (pullnow.ts):
+  // a definitive one refuses the brief and leaves the backoff alone, a transient one moves it.
+  pull?: (pr: string) => Promise<{ head: string | null; source?: "api" | "refs" } | HostFail | null>;
+  // GitHub's compare of two commits of the pull request's repository (../pullnow.ts compareApi): "ahead" when head
+  // is a strict descendant of base. null: can't tell (transient). The only proof a grant's bound head is superseded.
+  compare?: (pr: string, base: string, head: string) => Promise<Compare | HostFail | null>;
   // Sixth review: a plain notice for the owner (a grant let go or voided, a review waiting on GitHub), posted through
   // the link in its own words (its root socket); the message id, or null when it didn't go (tried again next tick).
   postNotice?: (n: OwedNotice) => Promise<string | null>;
@@ -90,6 +94,16 @@ export type RunnerDeps = {
 export const HOST_DEADLINE_MS = 20_000;
 export const HOST_BACKOFF_MIN_MS = 60_000, HOST_BACKOFF_MAX_MS = 15 * 60_000;
 export const HOST_NOTICE_MS = 15 * 60_000, HOST_GIVE_UP_MS = 24 * 3_600_000;
+// Seventh review: the owner's notices go through the link under a backoff of their own (link_backoff in the rounds
+// file), never GitHub's: a minute, doubling to 15 minutes, cleared by any notice the link acknowledges.
+export const LINK_BACKOFF_MIN_MS = 60_000, LINK_BACKOFF_MAX_MS = 15 * 60_000;
+// One GitHub read for a brief that would claim a grant (seventh review): the head, whether it came from GitHub's pull
+// request API (api) or the refs fallback, and the compare's answer for each grant bound to another head ("unasked"
+// for a refs head: no compare is made for it; "unreadable" a definitive refusal; "transient" no answer). fresh: the
+// read started and finished in the very step that admits the brief; a read from an earlier tick is cached and never
+// voids a grant.
+export type HostVerdict = Compare | "unreadable" | "transient" | "unasked";
+export type HostRead = { head: string; api: boolean; verdicts: Map<string, HostVerdict>; fresh?: boolean };
 // The copies of the rounds and grants files kept just before the one-time replay (sixth review), beside them.
 export const PRE_ROUNDS = "review-rounds.pre-0.18.1.json", PRE_GRANTS = "review-grants.pre-0.18.1.json";
 // A copy of a file as it is, once (an existing copy is the earliest and is kept), root:cain 0640 (tests pass their
@@ -280,7 +294,10 @@ export class Runner {
   // (host_waits in the rounds file, so a restart keeps it), every tick, whether or not a read has answered: after
   // 15 minutes Cain is told once and the owner once (a plain notice through the link), after 24 hours the brief is
   // refused and no longer read for.
-  private hostReads = new Map<string, { seq: number; done: boolean; head: string | null; p: Promise<void> }>();
+  // Seventh review: the wait's start is per brief, set at its first wait and cleared by a read that answered; a clock
+  // that went back is clamped (elapsed time never below zero) and the start re-anchored to now. A definitive answer
+  // (the pull request isn't there) refuses the brief without moving the backoff.
+  private hostReads = new Map<string, { seq: number; done: boolean; got: HostRead | HostFail | null; p: Promise<void> }>();
   private hostSeq = 0;
   private latestSeq = new Map<string, number>();
   async ingest(): Promise<void> {
@@ -296,13 +313,19 @@ export class Runner {
       const got = readOwned(path, this.cfg.inboxUid ?? CAIN_UID, 256 * 1024);
       const p = got.ok ? parseBrief(got.text) : null;
       const b = p?.brief && !existsReview(this.cfg.queueDir, p.brief.id) ? p.brief : null;
-      let gh: string | undefined;
+      let gh: HostRead | undefined;
       if (b && this.claimInView(b)) {
         const h = await this.hostHead(name, b);
         if (h === "wait") continue;
         if (h === "stop") {
           try { unlinkSync(path); } catch { /* already gone */ }
           this.relay(`Review brief ${b.id} wasn't taken: its round would claim the owner's grant, and GitHub's head for its pull request couldn't be read for 24 hours, so the runner stopped trying. Send it again once GitHub answers. No grant was claimed or voided. Nothing to tell him.`);
+          continue;
+        }
+        if (isFail(h)) {
+          this.endWait(name);
+          try { unlinkSync(path); } catch { /* already gone */ }
+          this.relay(`Review brief ${b.id} wasn't taken: its round would claim the owner's grant, and GitHub answered for good that its pull request can't be read (${h.why}). Check the pull request address. No grant was claimed or voided. Nothing to tell him.`);
           continue;
         }
         gh = h;
@@ -334,14 +357,19 @@ export class Runner {
   }
   // GitHub's head for a waiting brief: the head, "wait" (not read yet, backing off, or GitHub didn't answer), or
   // "stop" (24 hours since it first waited).
-  private async hostHead(name: string, b: Brief): Promise<string | "wait" | "stop"> {
+  private async hostHead(name: string, b: Brief): Promise<HostRead | HostFail | "wait" | "stop"> {
     const file = this.cfg.roundsFile!;
     const now = this.now().getTime();
     let rounds = readRounds(file);
     if (!rounds) return "wait";
     const w = rounds.host_waits?.[name];
     if (w) {
-      const since = Date.parse(w.since);
+      let since = Date.parse(w.since);
+      if (!(since <= now)) {                               // the clock went back (or the start can't be read): re-anchor
+        w.since = new Date(now).toISOString(); since = now;
+        writeRounds(file, rounds);
+        this.log(`review brief ${b.id}'s wait started after the clock's now; its start is set to now`);
+      }
       if (now - since >= HOST_GIVE_UP_MS) { this.endWait(name); return "stop"; }
       if (!w.told && now - since >= HOST_NOTICE_MS) {
         w.told = true;
@@ -353,14 +381,20 @@ export class Runner {
       }
     }
     let r = this.hostReads.get(name);
+    let startedNow = false;
     if (!r) {
       const bo = rounds.host_backoff;
-      if (!bo || now >= Date.parse(bo.next)) r = this.startRead(name, b);
+      if (!bo || now >= Date.parse(bo.next)) { r = this.startRead(name, b); startedNow = true; }
     }
     if (r && !r.done) await Promise.race([r.p, Bun.sleep(this.cfg.hostWaitMs ?? 2000)]);
     if (r?.done) {
       this.hostReads.delete(name);
-      if (r.head) return r.head;
+      if (r.got) {
+        // A read that answered ends the wait (its start is cleared): a later outage starts its own.
+        rounds = readRounds(file);
+        if (rounds?.host_waits?.[name]) { delete rounds.host_waits[name]; writeRounds(file, rounds); }
+        return isFail(r.got) ? r.got : { ...r.got, fresh: startedNow && r.got.api };
+      }
     }
     rounds = readRounds(file);
     if (rounds && !rounds.host_waits?.[name]) {
@@ -373,10 +407,10 @@ export class Runner {
   private startRead(name: string, b: Brief) {
     const seq = ++this.hostSeq;
     this.latestSeq.set(name, seq);
-    const r = { seq, done: false, head: null as string | null, p: Promise.resolve() };
+    const r = { seq, done: false, got: null as HostRead | HostFail | null, p: Promise.resolve() };
     r.p = this.readHead(b).then((h) => {
       if (this.latestSeq.get(name) !== seq) { this.log(`a GitHub read for review brief ${b.id} answered after it was replaced; its answer was discarded`); return; }
-      r.done = true; r.head = h;
+      r.done = true; r.got = h;
     });
     this.hostReads.set(name, r);
     return r;
@@ -392,9 +426,12 @@ export class Runner {
     return a.ok && a.claims.length > 0;
   }
   // GitHub's head for the brief's pull request, read by the runner itself, when its round would claim a grant
-  // (fourth review): undefined when no claim is in view (nothing to read), null when GitHub can't be read now.
-  async githubHead(b: Brief): Promise<string | null | undefined> {
-    return this.claimInView(b) ? this.readHead(b) : undefined;
+  // (fourth review): undefined when no claim is in view (nothing to read), null when GitHub can't be read now. Read
+  // in the same step that admits the brief, so it is fresh (seventh review) when it came from the pull request API.
+  async githubHead(b: Brief): Promise<HostRead | HostFail | null | undefined> {
+    if (!this.claimInView(b)) return undefined;
+    const h = await this.readHead(b);
+    return h && !isFail(h) ? { ...h, fresh: h.api } : h;
   }
   // One GitHub request under its hard deadline: null when it doesn't answer in time (its late answer is discarded)
   // or fails.
@@ -406,15 +443,17 @@ export class Runner {
     try { return await Promise.race([call, deadline]); }
     finally { clearTimeout(timer); }
   }
-  // The shared backoff: a failed read moves it on, a whole read that answered clears it.
-  private hostFailed(): void {
+  // The shared backoff (seventh review): only a transient failure (no answer, the deadline, a 5xx, a 403 or a 429) moves
+  // it; a definitive answer (404, 410, diverged, behind, identical) decides or refuses the brief and leaves it alone;
+  // any answer that came (a head, or a compare's status) clears it.
+  private hostFailed(why = "didn't answer"): void {
     const file = this.cfg.roundsFile;
     const r = file ? readRounds(file) : null;
     if (!file || !r) return;
     const delay = Math.min(Math.max(HOST_BACKOFF_MIN_MS, (r.host_backoff?.delay ?? 0) * 2), HOST_BACKOFF_MAX_MS);
     r.host_backoff = { next: new Date(this.now().getTime() + delay).toISOString(), delay };
     writeRounds(file, r);
-    this.log(`a GitHub read didn't answer; every GitHub read waits ${Math.round(delay / 1000)} seconds`);
+    this.log(`a GitHub read ${why}; every GitHub read waits ${Math.round(delay / 1000)} seconds`);
   }
   private hostAnswered(): void {
     const file = this.cfg.roundsFile;
@@ -422,32 +461,41 @@ export class Runner {
     if (file && r?.host_backoff) { delete r.host_backoff; writeRounds(file, r); }
   }
   // Sixth review: a grant is voided for its head only on positive proof that its head is superseded: GitHub's compare
-  // says the bound head is a strict ancestor of the head read now ("ahead"). A compare that can't be read, fails, or
-  // says diverged, identical or behind proves nothing, and admitAndQueue refuses the brief, voiding nothing.
-  private headProof = new Map<string, string>();
-  private async readHead(b: Brief): Promise<string | null> {
+  // says the bound head is a strict ancestor of the head read now ("ahead"). Seventh review: and only when that head
+  // came from a fresh read of GitHub's pull request API (never the refs fallback, never a cached read): a refs head
+  // asks no compare at all. A head equal to a grant's bound head asks none either: the grant is claimable as it is.
+  private async readHead(b: Brief): Promise<HostRead | HostFail | null> {
     if (!this.deps.pull || !b.pr) return null;
     const pr = b.pr;
     const p = await this.hostCall(`the head of ${pr}`, () => this.deps.pull!(pr));
+    if (isFail(p)) {
+      if (p.fail === "transient") this.hostFailed(`was refused for now (${p.why})`);
+      else this.log(`GitHub answered for good that ${pr} can't be read (${p.why}); the backoff isn't moved`);
+      return p.fail === "transient" ? null : p;
+    }
     const head = p?.head && /^[0-9a-f]{40}$/.test(p.head) ? p.head : null;
     if (!head) { this.hostFailed(); return null; }
-    let failed = false;
+    this.hostAnswered();
+    const api = p!.source === "api";
+    const verdicts = new Map<string, HostVerdict>();
     const file = this.cfg.roundsFile;
     const rounds = file ? readRounds(file) : null;
     if (rounds) {
       const a = admit(rounds, { ...b, head }, this.roundCap, this.grants(), this.cfg.tz);
       for (const { rec, why } of a.stale ?? []) {
         if (why !== "head" || rounds.grants_void?.[rec.id] || !rec.bound?.head) continue;
+        if (!api) { verdicts.set(rec.id, "unasked"); continue; }
         const base = rec.bound.head;
         const cmp = this.deps.compare ? await this.hostCall(`the compare of two commits of ${pr}`, () => this.deps.compare!(pr, base, head)) : null;
-        if (cmp === null) failed = true;
-        const proven = cmp === "ahead";
-        if (proven) this.headProof.set(rec.id, head); else this.headProof.delete(rec.id);
-        this.log(`the owner's grant ${rec.id} is bound to another head than GitHub's now: ${proven ? "proven superseded (GitHub's compare shows the granted commit as an ancestor)" : `not proven superseded (${cmp ?? "the compare didn't answer"}), so it's left as it is`}`);
+        let v: HostVerdict;
+        if (cmp === null) { v = "transient"; this.hostFailed(); }
+        else if (isFail(cmp)) { v = cmp.fail === "definitive" ? "unreadable" : "transient"; if (cmp.fail === "transient") this.hostFailed(`was refused for now (${cmp.why})`); }
+        else { v = cmp; this.hostAnswered(); }
+        verdicts.set(rec.id, v);
+        this.log(`the owner's grant ${rec.id} is bound to another head than GitHub's now: ${v === "ahead" ? "proven superseded (GitHub's compare shows the granted commit as an ancestor)" : `not proven superseded (${v === "transient" ? "the compare didn't answer" : v === "unreadable" ? "GitHub refused the compare for good" : v}), so it's left as it is`}`);
       }
     }
-    if (failed) this.hostFailed(); else this.hostAnswered();
-    return head;
+    return { head, api, verdicts };
   }
 
   // ---- the review-round cap and the usage guard (Cain 0.16.0; rounds.ts, ../guard.ts) ----
@@ -468,16 +516,23 @@ export class Runner {
   // step that records the claim (one write of the rounds file; the runner is its only writer, one tick at a time).
   // A round that would claim a grant is pinned to GitHub's head: the brief's head must be that head, or the brief
   // is refused and no grant is claimed or voided. A grant is voided only by checks against GitHub's head and the
-  // runner's own records, never against a brief's claim.
-  admitAndQueue(b: Brief, gh?: string): string | null {
+  // runner's own records, never against a brief's claim. Seventh review: a void for head needs a fresh read of the
+  // pull request API in this step and GitHub's compare saying the bound head is a strict ancestor of it; a plain head
+  // (a string), a refs head or a cached read can admit only a brief whose head equals the bound head.
+  // One writer per file: the runner writes the rounds file only. Claims and voids live there, keyed by grant id; the
+  // grants file is the link's alone, read here and never written.
+  admitAndQueue(b: Brief, gh?: string | HostRead | HostFail | null): string | null {
     const why = this.admitInner(b, gh);
     this.deliverCain();                                // what a void owed Cain, once the rounds file has it
     return why;
   }
-  private admitInner(b: Brief, gh?: string): string | null {
+  private admitInner(b: Brief, read?: string | HostRead | HostFail | null): string | null {
     const file = this.cfg.roundsFile;
     if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
+    if (isFail(read)) return `GitHub answered for good that the pull request can't be read (${read.why}): check its address. No grant was claimed or voided. Nothing was queued.`;
+    const rd: HostRead | null = read && typeof read === "object" ? read : null;
+    const gh: string | undefined = typeof read === "string" ? read : rd?.head;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
     const grants = this.grants();
@@ -489,15 +544,25 @@ export class Runner {
     const a = admit(rounds, b, this.roundCap, grants, this.cfg.tz, gh === undefined && !headless);
     if (a.ok && a.claims.length && b.pr && gh === undefined)
       return "its round would claim the owner's grant, and the pull request's head on GitHub wasn't read for it; send it again. No grant was claimed or voided. Nothing was queued.";
-    // Sixth review: a grant is voided for its head only on GitHub's positive proof that its head is superseded
-    // (readHead); without it the brief is refused and nothing is voided or claimed.
-    const unproven = (a.stale ?? []).filter((x) => x.why === "head" && !rounds.grants_void?.[x.rec.id] && this.headProof.get(x.rec.id) !== gh);
-    if (unproven.length)
-      return "the pull request's head isn't proven newer than the one the grant was given for (GitHub's compare didn't show the granted commit as an ancestor of the head now, or didn't answer): send it again in a minute. No grant was claimed or voided. Nothing was queued.";
+    // A grant bound to another head than GitHub's is voided only on proof (above); without it the grant is kept as it
+    // is, neither claimed nor voided. The brief is refused for it only when no other grant lets the round run.
+    const proven = (id: string) => !!rd?.fresh && rd.api && rd.verdicts.get(id) === "ahead";
+    const unproven = (a.stale ?? []).filter((x) => x.why === "head" && !rounds.grants_void?.[x.rec.id] && !proven(x.rec.id));
+    if (unproven.length && !a.ok) {
+      const vs = unproven.map((x) => rd?.verdicts.get(x.rec.id));
+      const stalled = !!rd?.fresh && vs.some((v) => v === "diverged" || v === "behind" || v === "unreadable");
+      if (stalled && gh && a.key) this.oweStalled(rounds, a.key, gh, unproven.map((x) => x.rec), b.pr ?? null);
+      return stalled
+        ? "GitHub's compare shows the pull request's head doesn't follow on from the commit the owner's grant was given for (or GitHub refused the compare for good), so the grant can't be used at this head and stays as it was. A fresh grant for the pull request as it is now is the way: he's told once, in the App's own words. No grant was claimed or voided. Nothing was queued."
+        : rd && (!rd.api || !rd.fresh)
+          ? "the pull request's head wasn't read freshly from GitHub's pull request API (it came from GitHub's refs or an earlier read), and only a fresh read can show the grant's commit is superseded: send it again in a minute. No grant was claimed or voided. Nothing was queued."
+          : "the pull request's head isn't proven newer than the one the grant was given for (GitHub's compare didn't show the granted commit as an ancestor of the head now, or didn't answer): send it again in a minute. No grant was claimed or voided. Nothing was queued.";
+    }
     // 0.18.1: grants no longer bound to the change as it is are kept as void (in the rounds file, the
     // runner's own) and told to Cain and to the owner once each, whether this round is refused or runs under
-    // other grants.
-    if (a.key && a.stale?.length && this.voidGrants(rounds, a.key, a.stale)) writeRounds(file, rounds);
+    // other grants. One bound to another head without proof is never voided.
+    const toVoid = (a.stale ?? []).filter((x) => !unproven.includes(x));
+    if (a.key && toVoid.length && this.voidGrants(rounds, a.key, toVoid)) writeRounds(file, rounds);
     if (!a.ok) return a.why;
     const label = labelOf(b.label)!;
     if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
@@ -538,6 +603,19 @@ export class Runner {
     }
     return any;
   }
+  // Seventh review: a change stalled at a head GitHub's compare can't place after the granted one (diverged, behind,
+  // or the compare refused for good): one notice to the owner per change and head, facts only, and one to Cain, saying
+  // a fresh grant is the way out. Written now (the refusal writes nothing else).
+  private oweStalled(rounds: Rounds, key: string, head: string, recs: GrantRec[], pr: string | null): void {
+    const id = `${key}.${head.slice(0, 12)}`;
+    if (rounds.notices?.[`stalled:${id}`]) return;
+    const n = recs.reduce((k, x) => k + x.rounds, 0);
+    this.oweNotice(rounds, { id: `cain-stalled:${id}`, to: "cain", kind: "stalled", key, pr: pr ?? rounds.changes[key]?.pr ?? null, rounds: n,
+      text: `A round for ${key} past its cap was refused: GitHub's compare can't place the pull request's head after the commit Dane's grant of ${n} more round${n === 1 ? "" : "s"} was given for (it diverged, went back, or the compare was refused for good), so that grant can't be used at this head. It isn't voided. If the change still needs rounds, ask him for a fresh grant with keeper.sh review-grant for the pull request as it is now. He's told once, in the App's own words. Nothing else to tell him.` });
+    this.oweNotice(rounds, { id: `stalled:${id}`, to: "owner", kind: "stalled", key, pr: pr ?? rounds.changes[key]?.pr ?? null, rounds: n });
+    writeRounds(this.cfg.roundsFile!, rounds);
+    this.log(`${key} is stalled at a head GitHub's compare can't place after the granted one; the owner's notice is owed`);
+  }
   // ---- what the runner owes Cain and the owner (sixth review): rounds.notices, once each by id ----
   private oweNotice(rounds: Rounds, n: Omit<OwedNotice, "state" | "at">): void {
     const all = rounds.notices ??= {};
@@ -560,13 +638,20 @@ export class Runner {
     }
     if (changed) writeRounds(file, r);
   }
-  // The owner's owed notices, through the link (its words, its root socket); tried again each tick until posted.
+  // The owner's owed notices, through the link (its words, its root socket). Seventh review: a notice stays owed in
+  // the rounds file until the link acknowledges a successful chat post (its message id); owed ids are tried again
+  // each tick under the link's own backoff (link_backoff: a minute, doubling to 15 minutes, cleared by any
+  // acknowledgement), never GitHub's. The link keeps each id as posted only after its post succeeded and answers a
+  // repeat with that message, so a retry after a lost acknowledgement, or after a restart mid-delivery, posts nothing
+  // twice.
   async postOwedNotices(): Promise<void> {
     this.deliverCain();
     const file = this.cfg.roundsFile;
     if (!file || !this.deps.postNotice || this.capOff) return;
     const rounds = readRounds(file);
     if (!rounds?.notices) return;
+    const bo = rounds.link_backoff;
+    if (bo && this.now().getTime() < Date.parse(bo.next)) return;
     for (const [id, n] of Object.entries(rounds.notices)) {
       if (n.to !== "owner" || n.state !== "owed") continue;
       let msg: string | null = null;
@@ -574,9 +659,15 @@ export class Runner {
       const now = readRounds(file);
       const cur = now?.notices?.[id];
       if (!now || !cur || cur.state !== "owed") continue;
-      if (msg) Object.assign(cur, { state: "sent", message: msg }); else cur.tries = (cur.tries ?? 0) + 1;
+      if (msg) { Object.assign(cur, { state: "sent", message: msg }); delete now.link_backoff; }
+      else {
+        cur.tries = (cur.tries ?? 0) + 1;
+        const delay = Math.min(Math.max(LINK_BACKOFF_MIN_MS, (now.link_backoff?.delay ?? 0) * 2), LINK_BACKOFF_MAX_MS);
+        now.link_backoff = { next: new Date(this.now().getTime() + delay).toISOString(), delay };
+      }
       writeRounds(file, now);
       if (msg) this.log(`the owner's notice ${id} went up`);
+      else { this.log(`the link didn't acknowledge the notice ${id}; owed notices wait ${Math.round(now.link_backoff!.delay / 1000)} seconds`); return; }
     }
   }
   // 0.18.1 (sixth review): grants written by 0.18.0 carry no binding and 0.18.0 recorded no claims. Once, at the
@@ -587,6 +678,9 @@ export class Runner {
   // on that round, and the rounds left over are let go (grants_void, why "unbound"), owed to Cain and to the owner
   // once a change. The claims, the voids, the notices owed and the done marker (replayed) are built in memory and
   // committed in one rename: a crash before it replays from scratch, and after it a restart changes nothing.
+  // Seventh review: existing claims are reconciled first and never charged again or replaced; a plan that would charge
+  // a round twice or meets an unclaimed round past the cap isn't committed (reported to Cain instead). The grants file
+  // is only read: a grant the link writes meanwhile stays as the link wrote it.
   private replayed = false;
   replayOnce(): void {
     const file = this.cfg.roundsFile, gfile = this.cfg.grantsFile;
@@ -600,17 +694,22 @@ export class Runner {
     } catch (e) { this.log(`the copies before the replay of earlier grants couldn't be written, so it waits: ${String((e as Error)?.message ?? e).slice(0, 120)}`); return; }
     const at = this.now().toISOString();
     const next = structuredClone(rounds);
-    const done = replayUnbound(next, g, this.roundCap, at);
+    const plan = replayUnbound(next, g, this.roundCap, at);
+    // The same plan the dry run (review.sh sweep-dry-run) prints, line for line.
+    for (const l of planLines(plan, this.cfg.tz)) this.log(`replay plan: ${l}`);
+    if (plan.refused) {
+      // Seventh review: nothing is committed; reported once a start of the runner, and the dry run prints it too.
+      this.replayed = true;
+      this.relay(`The review runner's one-time replay of Dane's earlier grants (given before grants were bound to a commit) was not committed: ${planLines(plan, this.cfg.tz).join("; ")}. The rounds file is unchanged and those grants don't count until it's sorted out; review.sh sweep-dry-run prints the same plan. Log it as a Build item. Nothing to tell him.`);
+      return;
+    }
+    const done = plan.decisions;
     const byKey = new Map<string, ReplayDecision[]>();
     for (const d of done) {
-      const n = d.rec.rounds, c = d.credited.length;
-      this.log(`the owner's grant ${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, given before grants were bound): replayed: `
-        + `${c ? `credited with the round${c === 1 ? "" : "s"} past the base cap that needed it (${d.credited.join(", ")})` : "no round past the base cap needed it"}`
-        + `${d.unused ? `; ${d.unused} unused, let go` : ""}`);
       byKey.set(d.rec.key, [...(byKey.get(d.rec.key) ?? []), d]);
     }
     for (const [key, list] of byKey) {
-      const granted = list.reduce((n, d) => n + d.rec.rounds, 0), credited = list.reduce((n, d) => n + d.credited.length, 0);
+      const granted = list.reduce((n, d) => n + d.rec.rounds, 0), credited = list.reduce((n, d) => n + d.credited.length + d.claimed.length, 0);
       const unused = list.reduce((n, d) => n + d.unused, 0);
       const pr = list.find((d) => d.rec.pr)?.rec.pr ?? next.changes[key]?.pr ?? null;
       const s = (k: number) => (k === 1 ? "" : "s");

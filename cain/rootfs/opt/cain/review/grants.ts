@@ -141,17 +141,24 @@ export function standing(base: number, r: Rounds, g: Grants | null, key: string,
   }
   return s;
 }
-// The upgrade's one-time replay of grants written by 0.18.0 (sixth review). None of them carries a binding, and 0.18.0
-// recorded no claims. For each change group, its rounds are replayed in time order: the base cap decides whether a
-// round needed a grant (rounds a bound grant's claim already covers aside), and each round past it debits exactly one
-// round from the earliest pre-binding grant given before it that has rounds left (by grant time, then grant id),
-// written as a claim on that round. Whatever a pre-binding grant has left is then let go (voided, why "unbound"):
-// a fresh grant card is the way to more rounds. Changes r in place, and touches neither the grants file nor any
-// bound grant. One decision per grant, for the log, the notices and the dry run.
-export type ReplayDecision = { rec: GrantRec; credited: string[]; unused: number };
-export function replayUnbound(r: Rounds, g: Grants, base: number, at: string): ReplayDecision[] {
-  const out: ReplayDecision[] = [];
-  const todo = g.grants.filter((x) => !validBinding(x.bound) && !r.grants_void?.[x.id] && !claimCounts(r, x.key).has(x.id));
+// The upgrade's one-time replay of grants written by 0.18.0 (sixth review). None of them carries a binding. For each
+// change group, its rounds are replayed in time order. Seventh review: existing claims are reconciled first: a round
+// that already carries a claim (of any grant) is never charged again and its claim is never replaced, and each
+// pre-binding grant's balance is its rounds less the claims it already has. Then only the unclaimed rounds past the
+// base cap (the rounds a claim covers aside: a bound grant's claim covers its rounds, a pre-binding grant's one) debit
+// exactly one round each from the earliest pre-binding grant given before that round with rounds left (by grant time,
+// then grant id), written as a claim on that round. A round past the cap with no earlier grant left to debit is
+// recorded as unclaimed: it debits nothing and never borrows from a later grant. Whatever a pre-binding grant has left
+// is then let go (voided, why "unbound"): a fresh grant card is the way to more rounds. Changes r in place, and
+// touches neither the grants file nor any bound grant.
+// The plan says whether it may be committed: it may not (refused) when it would charge a round twice (a grant with
+// more claims than rounds, or a round carrying the same grant twice) or meets an unclaimed round past the cap. The
+// runner then commits nothing and reports the plan instead; review.sh sweep-dry-run prints the same lines (planLines).
+export type ReplayDecision = { rec: GrantRec; credited: string[]; unused: number; claimed: string[] };
+export type ReplayPlan = { decisions: ReplayDecision[]; unclaimed: { key: string; round: string }[]; twice: string[]; refused: boolean };
+export function replayUnbound(r: Rounds, g: Grants, base: number, at: string): ReplayPlan {
+  const decisions: ReplayDecision[] = [], unclaimed: ReplayPlan["unclaimed"] = [], twice: string[] = [];
+  const todo = g.grants.filter((x) => !validBinding(x.bound) && !r.grants_void?.[x.id]);
   const byTime = (a: GrantRec, b: GrantRec) => a.at.localeCompare(b.at) || a.id.localeCompare(b.id);
   const groups = new Map<string, GrantRec[]>();
   for (const x of [...todo].sort(byTime)) {
@@ -161,25 +168,46 @@ export function replayUnbound(r: Rounds, g: Grants, base: number, at: string): R
   for (const mine of groups.values()) {
     const key = mine[0].key;
     const byId = new Map(grantsFor(r, g, key).map((x) => [x.id, x]));
-    const left = new Map(mine.map((x) => [x.id, x.rounds]));
+    const had = claimCounts(r, key);
+    const claimedBy = new Map<string, string[]>();
+    for (const y of countedRounds(r, key)) for (const id of y.claims ?? []) claimedBy.set(id, [...(claimedBy.get(id) ?? []), y.id]);
+    const left = new Map(mine.map((x) => [x.id, x.rounds - (had.get(x.id) ?? 0)]));
+    for (const x of mine) if (left.get(x.id)! < 0) twice.push(`${x.id} already carries ${had.get(x.id)} claims for its ${x.rounds} round${x.rounds === 1 ? "" : "s"}`);
     const credited = new Map(mine.map((x) => [x.id, [] as string[]]));
-    let bound = 0;                                       // rounds already covered by bound grants' claims
+    let covered = base;                                  // the rounds the base cap and the claims seen so far cover
     countedRounds(r, key).forEach((y, i) => {
-      for (const id of y.claims ?? []) { const x = byId.get(id); if (x && validBinding(x.bound)) bound += x.rounds; }
-      if (i + 1 <= base + bound) return;                 // within the base cap (or a bound grant's rounds): no credit
+      const ids = y.claims ?? [];
+      if (new Set(ids).size !== ids.length) twice.push(`round ${y.id} of ${key} carries the same grant twice`);
+      for (const id of new Set(ids)) { const x = byId.get(id); covered += x && validBinding(x.bound) ? x.rounds : 1; }
+      if (ids.length || i + 1 <= covered) return;        // claimed already (never charged again), or within the cap
       const c = mine.find((x) => x.at < y.at && left.get(x.id)! > 0);
-      if (!c) return;
+      if (!c) { unclaimed.push({ key, round: y.id }); return; }
       left.set(c.id, left.get(c.id)! - 1);
       credited.get(c.id)!.push(y.id);
+      covered += 1;
       const rec = r.changes[y.key]?.rounds.find((z) => z.id === y.id);
-      if (rec) rec.claims = [...(rec.claims ?? []), c.id];
+      if (rec) rec.claims = [c.id];
     });
     for (const x of mine) {
-      const unused = left.get(x.id)!;
+      const unused = Math.max(0, left.get(x.id)!);
       if (unused > 0) (r.grants_void ??= {})[x.id] = { why: "unbound", at, key: x.key, rounds: unused };
-      out.push({ rec: x, credited: credited.get(x.id)!, unused });
+      decisions.push({ rec: x, credited: credited.get(x.id)!, unused, claimed: claimedBy.get(x.id) ?? [] });
     }
   }
+  return { decisions, unclaimed, twice, refused: unclaimed.length > 0 || twice.length > 0 };
+}
+// The plan in lines, the same for the runner's log and report and for review.sh sweep-dry-run.
+export function planLines(p: ReplayPlan, tz?: string): string[] {
+  const out: string[] = [];
+  if (!p.decisions.length && !p.unclaimed.length && !p.twice.length) out.push("no grant from before grants were bound");
+  for (const d of p.decisions) {
+    const n = d.rec.rounds;
+    out.push(`${d.rec.id} (${n} round${n === 1 ? "" : "s"} for ${d.rec.key}, ${grantWords([d.rec], tz).replace(/^\d+ /, "")}): `
+      + `${d.claimed.length ? `already claimed by ${d.claimed.join(", ")}; ` : ""}credit ${d.credited.length ? d.credited.join(", ") : "none"}; let go ${d.unused}`);
+  }
+  for (const u of p.unclaimed) out.push(`round ${u.round} of ${u.key} is past the base cap with no earlier grant left to debit: recorded as unclaimed, nothing debited`);
+  for (const t of p.twice) out.push(`${t}: it would charge a round twice`);
+  if (p.refused) out.push("the runner refuses to commit this replay: nothing is claimed or let go, and those grants don't count until it's sorted out");
   return out;
 }
 
