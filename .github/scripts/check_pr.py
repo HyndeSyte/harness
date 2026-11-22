@@ -7,6 +7,8 @@
 3. Each App whose shipped files changed goes up exactly one version step from
    main (patch, minor or major), and its CHANGELOG.md opens with a section for
    that version. An App whose shipped files didn't change keeps main's version.
+   A version an App goes up to must not already have a section heading in main's
+   CHANGELOG for that App: that version is taken, so step it again.
    Shipped means anything in the App's folder except its tests/ and tools/
    (neither can reach the image: tests/test_check_pr.py checks the Dockerfiles).
    A change to a repo-root release file (repository.yaml) needs at least one App
@@ -139,6 +141,21 @@ def changelog_top(text: str | None) -> str | None:
         if line.startswith("## "):
             return line[3:].strip()
     return None
+
+
+HEADING_VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?![\d.])", re.IGNORECASE)
+
+
+def changelog_versions(text: str | None) -> set[Version]:
+    """The version of every "## " heading of a CHANGELOG, normalised: the heading trimmed, a leading v
+    dropped, the version parsed, so "## v0.4.6 " and "## 0.4.6" are the same version."""
+    found = set()
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        if line.startswith("## "):
+            m = HEADING_VERSION.match(line[3:].strip())
+            if m:
+                found.add(tuple(int(g) for g in m.groups()))
+    return found
 
 
 def changelog_section(text: str | None) -> str | None:
@@ -312,6 +329,9 @@ def check_versions(changed: list[str], base: Snapshot, head: Snapshot) -> list[s
         if top != show(new):
             problems.append(f'{app}/CHANGELOG.md should open with "## {show(new)}"; '
                             f'its first section is "{top or "missing"}".')
+        if new != old and new in changelog_versions(base.get(app, (None, None))[1]):
+            problems.append(f"{app} {show(new)} is taken: main's {app}/CHANGELOG.md already has it. "
+                            "Step the version again.")
     if root_changed and not bumped:
         problems.append(f"{', '.join(root_changed)} changed, which ships from main, so at least one "
                         "App goes one version step up with a CHANGELOG section.")

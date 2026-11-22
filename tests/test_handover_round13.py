@@ -637,7 +637,16 @@ def test_cains_rules_keeper_and_docs_name_this_rounds_behaviour():
                   "writer hold"):
         assert words in docs, words
     assert "migrate-clock" in keeper
+    # Cain's side is the section that introduced the calendar specialist's restore, restart and clock
+    # behaviour, Cain 0.17.0, found by its version heading (newer Cain sections need not repeat it).
     for log in ((ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## ", 2)[1],
-                # Cain's section for these notes is 0.17.0 (pull request 23); a later Cain release may sit on top.
-                next(x for x in (ROOT / "cain" / "CHANGELOG.md").read_text().split("\n## ") if x.startswith("0.17.0\n"))):
+                cain_changelog_section("0.17.0")):
         assert "restart" in log.lower() and "clock" in log.lower()
+
+
+def cain_changelog_section(version):
+    """The Cain CHANGELOG section headed "## <version>", through the line before the next heading."""
+    text = (ROOT / "cain" / "CHANGELOG.md").read_text()
+    head = f"\n## {version}\n"
+    assert head in text, f"Cain's CHANGELOG has no {version} section"
+    return text.split(head, 1)[1].split("\n## ", 1)[0]

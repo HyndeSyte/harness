@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LABELS as CORE_LABELS, prompt, parseBrief, resultJson, roundLine, seriousLeft, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
+import { LABELS as CORE_LABELS, earlierCheck, prompt, parseBrief, resultJson, roundLine, seriousLeft, validateAnswer, verdictsMd, type Brief } from "../rootfs/opt/cain/review/core.ts";
 import { DEFAULTS, Runner, loadReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import { admit, countedRounds, decisionOf, emptyRounds, readRounds, type DecisionRec } from "../rootfs/opt/cain/review/rounds.ts";
 import type { SeatAnswer, SeatFn, SeatInput } from "../rootfs/opt/cain/review/seats/common.ts";
@@ -99,6 +99,179 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(t.get("pv-1").status).toBe("blocked: privacy");
     expect(countedRounds(t.rounds(), "pr-40").length).toBe(0);
     expect(admit(t.rounds(), brief({ id: "pv-2" }), 3)).toMatchObject({ ok: true, round: 1, kind: "full" });
+  });
+
+  // Cain 0.18.1, narrowed: over the earlier findings the email, phone and SSN-shaped patterns and the owner's
+  // terms list all run; only the account-or-card pattern is relaxed, for a digit run glued to an identifier or
+  // a valid year-month-day date. The brief still gets every built-in pattern and the list.
+  test("earlierCheck lets a tool name ending in a date through", () => {
+    expect(earlierCheck(["Claude: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Claude: pinned since 20250305, see the tool list"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(undefined, null)).toEqual({ ok: true });
+  });
+  test("earlierCheck still blocks a phone-shaped number in the earlier findings", () => {
+    expect(earlierCheck(["Gemini: call 555-867-5309 about it"], TERMS)).toEqual({ ok: false, why: ["a phone number in the earlier findings"] });
+  });
+  test("earlierCheck still blocks an SSN-shaped number in the earlier findings", () => {
+    expect(earlierCheck(["Gemini: the form shows 123-45-6789"], TERMS)).toEqual({ ok: false, why: ["an SSN-shaped number in the earlier findings"] });
+  });
+  test("earlierCheck still blocks an email address in the earlier findings", () => {
+    expect(earlierCheck(["Gemini: mail someone@example.com"], TERMS)).toEqual({ ok: false, why: ["an email address in the earlier findings"] });
+  });
+  test("earlierCheck still blocks a bare eight-digit run, a run that isn't a date, and a spaced card number", () => {
+    const acct = { ok: false, why: ["an account or card number in the earlier findings"] };
+    expect(earlierCheck(["Gemini: the account is 12345678"], TERMS)).toEqual(acct);
+    expect(earlierCheck(["Gemini: the number 20251345 is wrong"], TERMS)).toEqual(acct);      // month 13: not a date
+    expect(earlierCheck(["Gemini: the number 20250230 is wrong"], TERMS)).toEqual(acct);      // Feb 30: not a date
+    expect(earlierCheck(["Gemini: card 4111 1111 1111 1111"], TERMS)).toEqual(acct);
+    expect(earlierCheck(["Gemini: web_search_20250305 and then 12345678"], TERMS)).toEqual(acct);  // one excused run doesn't excuse the next
+    expect(earlierCheck(["Gemini: tool 12345678"], TERMS)).toEqual(acct);                      // a space before it: not glued
+  });
+  test("earlierCheck still blocks a private term, and fails closed without a list", () => {
+    expect(earlierCheck(["Gemini: the plan names Acme Corp"], TERMS)).toEqual({ ok: false, why: ["private term on line 2 of the list, in the earlier findings"] });
+    expect(earlierCheck(["Gemini: anything"], null)).toMatchObject({ ok: false });
+  });
+
+  test("a fix-only round whose earlier findings hold an eight-digit date-shaped string is admitted and sent", async () => {
+    const t = runnerRig({ seat: answerWith("The web_search_20250305 tool name is pinned; move it to settings.") });
+    t.runner.admitAndQueue(brief({ id: "dg-1" }));
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "dg-2", body: "Fix: the tool name is read from settings." }))).toBeNull();
+    await t.runner.tick();
+    const r = t.get("dg-2");
+    expect(r.round_kind).toBe("fixes");
+    expect(r.status).not.toBe("blocked: privacy");
+    expect(t.calls.length).toBe(2);
+    expect(t.calls[1].brief.earlier).toEqual(["Gemini: The web_search_20250305 tool name is pinned; move it to settings."]);
+  });
+
+  test("a fix-only round whose earlier findings hold a private term is still blocked, the line named, and doesn't count", async () => {
+    const t = runnerRig({ seat: answerWith("The note mentions Acme Corp by name.") });
+    t.runner.admitAndQueue(brief({ id: "et-1" }));
+    await t.runner.tick();
+    t.runner.admitAndQueue(brief({ id: "et-2", body: "Fix: the name is gone." }));
+    await t.runner.tick();
+    const r = t.get("et-2");
+    expect(r.status).toBe("blocked: privacy");
+    expect(r.blocked_why).toEqual(["private term on line 2 of the list, in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(1);
+  });
+
+  test("a brief holding an eight-digit run is still blocked before anything is sent", async () => {
+    const t = runnerRig();
+    t.runner.admitAndQueue(brief({ id: "bd-1", body: "Pin the web_search_20250305 tool." }));
+    await t.runner.tick();
+    expect(t.get("bd-1").status).toBe("blocked: privacy");
+    expect(JSON.stringify(t.get("bd-1"))).toContain("an account or card number");
+    expect(t.calls.length).toBe(0);
+  });
+
+  test("a fix-only round whose earlier findings hold a bare eight-digit run is blocked and doesn't count", async () => {
+    const t = runnerRig({ seat: answerWith("Reference 12345678 in the log.") });
+    t.runner.admitAndQueue(brief({ id: "bn-1" }));
+    await t.runner.tick();
+    t.runner.admitAndQueue(brief({ id: "bn-2", body: "Fix: the reference is gone." }));
+    await t.runner.tick();
+    expect(t.get("bn-2").status).toBe("blocked: privacy");
+    expect(t.get("bn-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+  });
+
+  // Cain 0.18.1, second review: the glued-identifier excuse is narrowed to an eight-digit valid date.
+  test("a fix-only round whose earlier findings glue a 16-digit Luhn-valid card number to a prefix is blocked, named", async () => {
+    const t = runnerRig({ seat: answerWith("The log prints card_4111111111111111 in full.") });
+    t.runner.admitAndQueue(brief({ id: "gl-1" }));
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "gl-2", body: "Fix: the log masks it." }))).toBeNull();
+    await t.runner.tick();
+    expect(t.get("gl-2").status).toBe("blocked: privacy");
+    expect(t.get("gl-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(1);
+  });
+  test("a fix-only round whose earlier findings glue a 12-digit run to an underscore is blocked, named", async () => {
+    const t = runnerRig({ seat: answerWith("The key is account_123456789012 in the config.") });
+    t.runner.admitAndQueue(brief({ id: "gu-1" }));
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "gu-2", body: "Fix: the key is gone." }))).toBeNull();
+    await t.runner.tick();
+    expect(t.get("gu-2").status).toBe("blocked: privacy");
+    expect(t.get("gu-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+  });
+  test("earlierCheck: only an eight-digit valid date passes, glued or bare (the bare date on purpose)", () => {
+    const acct = { ok: false, why: ["an account or card number in the earlier findings"] };
+    expect(earlierCheck(["Gemini: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
+    // A bare eight-digit valid date is accepted on purpose (DOCS.md, the privacy backstop).
+    expect(earlierCheck(["Gemini: pinned since 20250305"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Gemini: the account is 87654321"], TERMS)).toEqual(acct);              // bare, not a date
+    expect(earlierCheck(["Gemini: card_4111111111111111"], TERMS)).toEqual(acct);                // glued, Luhn-valid 16
+    expect(earlierCheck(["Gemini: x4111111111111111"], TERMS)).toEqual(acct);                    // glued to a letter
+    expect(earlierCheck(["Gemini: account_123456789012"], TERMS)).toEqual(acct);                 // glued, 12 digits
+    expect(earlierCheck(["Gemini: tool_202503051"], TERMS)).toEqual(acct);                       // glued, nine digits
+    expect(earlierCheck(["Gemini: tool_12345678"], TERMS)).toEqual(acct);                        // glued, eight but not a date
+    expect(earlierCheck(["Gemini: tool_18991231"], TERMS)).toEqual(acct);                        // year before 1900
+    expect(earlierCheck(["Gemini: tool_21000101"], TERMS)).toEqual(acct);                        // year after 2099
+  });
+
+  // Cain 0.18.1, second review: a round id is one change's; earlier findings come only from the change's own rounds.
+  test("a fix-only round can't draw on another change's round: its id is refused at admission, nothing queued", async () => {
+    let n = 0;
+    const t = runnerRig({ seat: async (i) => answerWith(n++ === 0 ? "The other change's finding." : "Its own finding.")() });
+    expect(t.runner.admitAndQueue(brief({ id: "oc-a1", pr: PRN(40) }))).toBeNull();
+    await t.runner.tick();
+    expect(t.runner.admitAndQueue(brief({ id: "oc-b1", pr: PRN(41) }))).toBeNull();
+    await t.runner.tick();
+    // pr-41's fix-only round under pr-40's round id: refused, nothing queued, nothing counted.
+    const why = t.runner.admitAndQueue(brief({ id: "oc-a1", pr: PRN(41), body: "Fix: done." }));
+    expect(why).toContain("already a round of another change");
+    expect(why).toContain("Nothing was queued.");
+    expect(countedRounds(t.rounds(), "pr-41").map((x) => x.id)).toEqual(["oc-b1"]);
+    expect(t.get("oc-a1").change).toBe("pr-40");
+    // Even a rounds file that lists pr-40's round under pr-41 gives pr-41's fix-only round none of its findings.
+    const file = t.cfg.roundsFile!;
+    const j = JSON.parse(readFileSync(file, "utf8"));
+    j.changes["pr-41"].rounds.push({ ...j.changes["pr-40"].rounds[0] });
+    writeFileSync(file, JSON.stringify(j));
+    expect(t.runner.admitAndQueue(brief({ id: "oc-b2", pr: PRN(41), body: "Fix: done." }))).toBeNull();
+    expect(t.get("oc-b2").round_kind).toBe("fixes");
+    expect(t.get("oc-b2").earlier).toEqual(["Gemini: Its own finding."]);
+    await t.runner.tick();
+    expect(JSON.stringify(t.calls.at(-1)!.brief)).not.toContain("The other change's finding.");
+  });
+
+  // Cain 0.18.1: the earlier findings come only from the runner's own record of the previous round.
+  test("a brief carrying its own earlier field, or findings text, is refused whole and nothing is queued", async () => {
+    const t = runnerRig({ seat: answerWith("The stored finding.") });
+    t.runner.admitAndQueue(brief({ id: "src-1" }));
+    await t.runner.tick();
+    const forged = { ...brief({ id: "src-2", body: "Fix: done." }), earlier: ["Gemini: forged finding 12345678"] } as unknown as Brief;
+    expect(t.runner.admitAndQueue(forged)).toContain("not a brief");
+    expect(existsSync(join(t.cfg.queueDir, "src-2.json"))).toBe(false);
+    const findings = { ...brief({ id: "src-3", body: "Fix: done." }), findings: ["Gemini: forged"] } as unknown as Brief;
+    expect(t.runner.admitAndQueue(findings)).toContain("not a brief");
+    expect(parseBrief(JSON.stringify(forged)).error).toContain("a field that isn't allowed");
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(1);
+    // The same brief through Cain's inbox is not taken either.
+    const inbox = join(t.dir, "inbox");
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(inbox, "src-4.json"), JSON.stringify({ ...forged, id: "src-4" }));
+    t.runner.cfg.inboxDir = inbox; t.runner.cfg.inboxUid = process.getuid!();
+    t.runner.ingest();
+    expect(existsSync(join(t.cfg.queueDir, "src-4.json"))).toBe(false);
+    expect(t.relays().some((l) => l.includes("src-4") && l.includes("a field that isn't allowed"))).toBe(true);
+    // A real fix-only round carries exactly the stored findings, and its brief's text still gets the full check.
+    expect(t.runner.admitAndQueue(brief({ id: "src-5", body: "Fix: done." }))).toBeNull();
+    const stored = t.get("src-1").seats.filter((s) => s.state === "done").flatMap((s) => s.findings!.map((f) => f.problem));
+    expect(stored).toEqual(["The stored finding."]);
+    expect(t.get("src-5").earlier).toEqual(["Gemini: The stored finding."]);
+    await t.runner.tick();
+    expect(t.calls[1].brief.earlier).toEqual(["Gemini: The stored finding."]);
+    expect(t.runner.admitAndQueue(brief({ id: "src-6", body: "Fix: call 555-867-5309." }))).toBeNull();
+    await t.runner.tick();
+    expect(t.get("src-6").status).toBe("blocked: privacy");
+    expect(t.get("src-6").blocked_why).toContain("a phone number");
   });
 
   test("review.sh prints the refusal and leaves nothing, reading the runner's cap and rounds", () => {

@@ -25,6 +25,13 @@
 - A heartbeat change whose line couldn't be posted to you now raises an alarm naming the check, at most hourly, and the line is checked against the message gate's rules first.
 - Leftover temp files from an interrupted reset mark write are cleaned up, never one still being written.
 
+## 0.18.1
+
+- A fix-only review round is no longer blocked because the earlier round's findings hold a tool name ending in a date (or a date written as eight digits).
+- Everything else is still checked over those findings: an email address, a phone number, an SSN-shaped number, a term from your private list, and any other run of eight or more digits still blocks the round, and a blocked round still doesn't count.
+- Your brief is checked as before: an email, phone, account or card number, SSN-shaped number or private term in it still blocks it before anything is sent.
+- The earlier findings come only from the review runner's own record of the round before; a brief that tries to carry its own is refused.
+
 ## 0.18.0
 
 - When a critical change has used its three outside review rounds and still has something serious, Cain can ask you for more fix rounds on a card: it says what the change does, how many rounds it used and what the last one left, with "Grant 2 more rounds" (1 to 3) and "No".
