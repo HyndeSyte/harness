@@ -7,6 +7,8 @@
 3. Each App whose shipped files changed goes up exactly one version step from
    main (patch, minor or major), and its CHANGELOG.md opens with a section for
    that version. An App whose shipped files didn't change keeps main's version.
+   A version an App goes up to, or its new CHANGELOG heading, must not already be a
+   heading in main's CHANGELOG for that App: that version is taken, so step it again.
    Shipped means anything in the App's folder except its tests/ and tools/
    (neither can reach the image: tests/test_check_pr.py checks the Dockerfiles).
    A change to a repo-root release file (repository.yaml) needs at least one App
@@ -139,6 +141,12 @@ def changelog_top(text: str | None) -> str | None:
         if line.startswith("## "):
             return line[3:].strip()
     return None
+
+
+def changelog_headings(text: str | None) -> set[str]:
+    """Every "## " heading of a CHANGELOG, as written after the marks."""
+    return {line[3:].strip() for line in (text or "").replace("\r\n", "\n").split("\n")
+            if line.startswith("## ")}
 
 
 def changelog_section(text: str | None) -> str | None:
@@ -312,6 +320,11 @@ def check_versions(changed: list[str], base: Snapshot, head: Snapshot) -> list[s
         if top != show(new):
             problems.append(f'{app}/CHANGELOG.md should open with "## {show(new)}"; '
                             f'its first section is "{top or "missing"}".')
+        taken = changelog_headings(base.get(app, (None, None))[1])
+        for v in dict.fromkeys(x for x in (show(new), top) if x):
+            if new != old and v in taken:
+                problems.append(f"{app} {v} is taken: main's {app}/CHANGELOG.md already has it. "
+                                "Step the version again.")
     if root_changed and not bumped:
         problems.append(f"{', '.join(root_changed)} changed, which ships from main, so at least one "
                         "App goes one version step up with a CHANGELOG section.")

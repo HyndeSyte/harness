@@ -2,11 +2,10 @@
 
 ## 0.18.1
 
-- A fix-only review round is no longer blocked because the earlier round's findings hold a long number, such as a tool name ending in a date. Those findings are the review service's own words, so only your private-terms list is checked over them.
+- A fix-only review round is no longer blocked because the earlier round's findings hold a tool name ending in a date (or a date written as eight digits).
+- Everything else is still checked over those findings: an email address, a phone number, an SSN-shaped number, a term from your private list, and any other run of eight or more digits still blocks the round, and a blocked round still doesn't count.
 - Your brief is checked as before: an email, phone, account or card number, SSN-shaped number or private term in it still blocks it before anything is sent.
-- A private term in the earlier findings still blocks the round, and a blocked round still doesn't count.
-- Pull request 48 also names 0.18.1: whichever of the two ships second steps its version again.
-- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
+- The earlier findings come only from the review runner's own record of the round before; a brief that tries to carry its own is refused.
 
 ## 0.18.0
 

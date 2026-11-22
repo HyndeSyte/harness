@@ -134,6 +134,29 @@ def test_a_move_out_of_the_app_counts_as_a_shipped_change():
                         "(0.4.6, 0.5.0, 1.0.0). It says 0.4.5."]
 
 
+def test_a_version_main_already_has_in_its_changelog_is_taken():
+    # main's config says 0.4.5, but its CHANGELOG already has a 0.4.6 section (another pull request's).
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), log("0.4.6", "0.4.5"))}
+    problems = check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.4.6", "0.4.5")))
+    assert problems == ["cain 0.4.6 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
+
+
+def test_a_changelog_heading_main_already_has_is_taken_too():
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), log("0.4.5", "0.4.4"))}
+    head = {"harness": state()["harness"], "cain": (cfg("0.4.6"), log("0.4.4", "0.4.5"))}
+    problems = check_pr.check_versions(["cain/run.sh"], base, head)
+    assert 'cain/CHANGELOG.md should open with "## 0.4.6"; its first section is "0.4.4".' in problems
+    assert "cain 0.4.4 is taken: main's cain/CHANGELOG.md already has it. Step the version again." in problems
+    assert len(problems) == 2
+
+
+def test_a_fresh_version_is_not_taken_and_an_unchanged_app_is_never_asked():
+    assert check_pr.check_versions(["cain/run.sh"], state(), state(cain=("0.4.6", "0.4.5"))) == []
+    assert check_pr.check_versions([], state(), state()) == []
+    assert check_pr.changelog_headings(log("0.4.6", "0.4.5")) == {"0.4.6", "0.4.5"}
+    assert check_pr.changelog_headings(None) == set()
+
+
 # -- versions fail closed ------------------------------------------------------------
 
 @pytest.mark.parametrize("text, why", [

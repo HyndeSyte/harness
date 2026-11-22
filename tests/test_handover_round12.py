@@ -566,5 +566,6 @@ def test_cains_rules_keeper_and_docs_name_this_rounds_behaviour():
         assert words in docs, words
     assert "migrate-restore <schema> <build>" in keeper
     for log in ((ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## ", 2)[1],
-                (ROOT / "cain" / "CHANGELOG.md").read_text().split("\n## ", 2)[1]):
+                (ROOT / "cain" / "CHANGELOG.md").read_text()):  # the whole Cain changelog: the round that
+                # introduced it may not be the newest
         assert "Unprotected" in log or "restore" in log.lower()

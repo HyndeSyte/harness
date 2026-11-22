@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
-  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
+  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, checkBrief, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
   newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
@@ -260,7 +260,13 @@ export class Runner {
   // The install-time self-check's finding (../capfiles.ts, main.ts): while set, the cap and guard are off,
   // so no brief is taken (fail closed) and no round is settled or decision card posted.
   capOff: string | null = null;
-  admitAndQueue(b: Brief): string | null {
+  admitAndQueue(given: Brief): string | null {
+    // Only a brief's own fields go in (Cain 0.18.1): a brief carrying anything else, earlier findings
+    // included, is refused whole, so the findings a fix-only round sends are only ever the ones the
+    // runner loads itself from its own record of the change's previous round (earlierFindings).
+    const c = checkBrief(given);
+    if (!c.brief) return `not a brief: ${c.error}. Nothing was queued.`;
+    const b = c.brief;
     const file = this.cfg.roundsFile;
     if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
@@ -286,6 +292,8 @@ export class Runner {
     return null;
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
+  // Read only from the runner's own files: the rounds file (keyed by change, each round by its id) and the
+  // queue record that round left. Nothing a brief or request carries reaches them.
   private earlierFindings(rounds: Rounds, key: string): string[] {
     const done = countedRounds(rounds, key).reverse();
     for (const x of done) {

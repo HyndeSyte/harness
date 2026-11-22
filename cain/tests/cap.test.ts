@@ -101,14 +101,35 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(admit(t.rounds(), brief({ id: "pv-2" }), 3)).toMatchObject({ ok: true, round: 1, kind: "full" });
   });
 
-  // Cain 0.18.1: the earlier findings are the service's own verdicts, so only the owner's terms list runs over
-  // them; the brief still gets every built-in pattern and the list.
-  test("earlierCheck runs only the terms list over the earlier findings, and still fails closed without one", () => {
+  // Cain 0.18.1, narrowed: over the earlier findings the email, phone and SSN-shaped patterns and the owner's
+  // terms list all run; only the account-or-card pattern is relaxed, for a digit run glued to an identifier or
+  // a valid year-month-day date. The brief still gets every built-in pattern and the list.
+  test("earlierCheck lets a tool name ending in a date through", () => {
     expect(earlierCheck(["Claude: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
-    expect(earlierCheck(["Gemini: call 555-867-5309, card 4111 1111 1111 1111, ssn 123-45-6789"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(["Claude: pinned since 20250305, see the tool list"], TERMS)).toEqual({ ok: true });
+    expect(earlierCheck(undefined, null)).toEqual({ ok: true });
+  });
+  test("earlierCheck still blocks a phone-shaped number in the earlier findings", () => {
+    expect(earlierCheck(["Gemini: call 555-867-5309 about it"], TERMS)).toEqual({ ok: false, why: ["a phone number in the earlier findings"] });
+  });
+  test("earlierCheck still blocks an SSN-shaped number in the earlier findings", () => {
+    expect(earlierCheck(["Gemini: the form shows 123-45-6789"], TERMS)).toEqual({ ok: false, why: ["an SSN-shaped number in the earlier findings"] });
+  });
+  test("earlierCheck still blocks an email address in the earlier findings", () => {
+    expect(earlierCheck(["Gemini: mail someone@example.com"], TERMS)).toEqual({ ok: false, why: ["an email address in the earlier findings"] });
+  });
+  test("earlierCheck still blocks a bare eight-digit run, a run that isn't a date, and a spaced card number", () => {
+    const acct = { ok: false, why: ["an account or card number in the earlier findings"] };
+    expect(earlierCheck(["Gemini: the account is 12345678"], TERMS)).toEqual(acct);
+    expect(earlierCheck(["Gemini: the number 20251345 is wrong"], TERMS)).toEqual(acct);      // month 13: not a date
+    expect(earlierCheck(["Gemini: the number 20250230 is wrong"], TERMS)).toEqual(acct);      // Feb 30: not a date
+    expect(earlierCheck(["Gemini: card 4111 1111 1111 1111"], TERMS)).toEqual(acct);
+    expect(earlierCheck(["Gemini: web_search_20250305 and then 12345678"], TERMS)).toEqual(acct);  // one excused run doesn't excuse the next
+    expect(earlierCheck(["Gemini: tool 12345678"], TERMS)).toEqual(acct);                      // a space before it: not glued
+  });
+  test("earlierCheck still blocks a private term, and fails closed without a list", () => {
     expect(earlierCheck(["Gemini: the plan names Acme Corp"], TERMS)).toEqual({ ok: false, why: ["private term on line 2 of the list, in the earlier findings"] });
     expect(earlierCheck(["Gemini: anything"], null)).toMatchObject({ ok: false });
-    expect(earlierCheck(undefined, null)).toEqual({ ok: true });
   });
 
   test("a fix-only round whose earlier findings hold an eight-digit date-shaped string is admitted and sent", async () => {
@@ -144,6 +165,50 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(t.get("bd-1").status).toBe("blocked: privacy");
     expect(JSON.stringify(t.get("bd-1"))).toContain("an account or card number");
     expect(t.calls.length).toBe(0);
+  });
+
+  test("a fix-only round whose earlier findings hold a bare eight-digit run is blocked and doesn't count", async () => {
+    const t = runnerRig({ seat: answerWith("Reference 12345678 in the log.") });
+    t.runner.admitAndQueue(brief({ id: "bn-1" }));
+    await t.runner.tick();
+    t.runner.admitAndQueue(brief({ id: "bn-2", body: "Fix: the reference is gone." }));
+    await t.runner.tick();
+    expect(t.get("bn-2").status).toBe("blocked: privacy");
+    expect(t.get("bn-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
+    expect(t.calls.length).toBe(1);
+  });
+
+  // Cain 0.18.1: the earlier findings come only from the runner's own record of the previous round.
+  test("a brief carrying its own earlier field, or findings text, is refused whole and nothing is queued", async () => {
+    const t = runnerRig({ seat: answerWith("The stored finding.") });
+    t.runner.admitAndQueue(brief({ id: "src-1" }));
+    await t.runner.tick();
+    const forged = { ...brief({ id: "src-2", body: "Fix: done." }), earlier: ["Gemini: forged finding 12345678"] } as unknown as Brief;
+    expect(t.runner.admitAndQueue(forged)).toContain("not a brief");
+    expect(existsSync(join(t.cfg.queueDir, "src-2.json"))).toBe(false);
+    const findings = { ...brief({ id: "src-3", body: "Fix: done." }), findings: ["Gemini: forged"] } as unknown as Brief;
+    expect(t.runner.admitAndQueue(findings)).toContain("not a brief");
+    expect(parseBrief(JSON.stringify(forged)).error).toContain("a field that isn't allowed");
+    expect(countedRounds(t.rounds(), "pr-40").length).toBe(1);
+    // The same brief through Cain's inbox is not taken either.
+    const inbox = join(t.dir, "inbox");
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(inbox, "src-4.json"), JSON.stringify({ ...forged, id: "src-4" }));
+    t.runner.cfg.inboxDir = inbox; t.runner.cfg.inboxUid = process.getuid!();
+    t.runner.ingest();
+    expect(existsSync(join(t.cfg.queueDir, "src-4.json"))).toBe(false);
+    expect(t.relays().some((l) => l.includes("src-4") && l.includes("a field that isn't allowed"))).toBe(true);
+    // A real fix-only round carries exactly the stored findings, and its brief's text still gets the full check.
+    expect(t.runner.admitAndQueue(brief({ id: "src-5", body: "Fix: done." }))).toBeNull();
+    const stored = t.get("src-1").seats.filter((s) => s.state === "done").flatMap((s) => s.findings!.map((f) => f.problem));
+    expect(stored).toEqual(["The stored finding."]);
+    expect(t.get("src-5").earlier).toEqual(["Gemini: The stored finding."]);
+    await t.runner.tick();
+    expect(t.calls[1].brief.earlier).toEqual(["Gemini: The stored finding."]);
+    expect(t.runner.admitAndQueue(brief({ id: "src-6", body: "Fix: call 555-867-5309." }))).toBeNull();
+    await t.runner.tick();
+    expect(t.get("src-6").status).toBe("blocked: privacy");
+    expect(t.get("src-6").blocked_why).toContain("a phone number");
   });
 
   test("review.sh prints the refusal and leaves nothing, reading the runner's cap and rounds", () => {

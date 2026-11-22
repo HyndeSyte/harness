@@ -116,7 +116,7 @@ export function checkBrief(j: any): { brief?: Brief; error?: string } {
 // only, so nothing else on a brief can reach a prompt.
 // It checks the kinds itself and throws rather than coerce.
 // fixes (Cain 0.16.0): a fix-only round, with the earlier round's findings the runner kept, which the
-// seats check the brief's fixes against (they passed the owner's private-terms list: earlierCheck).
+// seats check the brief's fixes against (they passed the privacy backstop: earlierCheck).
 export function outbound(b: Brief, fixes?: { earlier: string[] }): Outbound {
   if (!b || typeof b !== "object") throw new Error(STORED_BAD);
   for (const k of ["topic", "question", "body"] as const) if (typeof b[k] !== "string") throw new Error(STORED_BAD);
@@ -157,8 +157,8 @@ export function digest(b: Brief): string {
 // ---- Privacy gate: in code, before any dispatch, failing closed. ----
 // The list is Cain's (/data/review-private-terms.txt): one term per line (family
 // names, employer names, health words), "re:<pattern>" for a pattern, # for notes.
-// Patterns for emails, phone numbers, account numbers and SSNs are always on over a brief
-// (the earlier findings of a fix-only round get the terms list only: earlierCheck).
+// Patterns for emails, phone numbers, account numbers and SSNs are always on over a brief, and over the
+// earlier findings of a fix-only round with the account pattern narrowly relaxed there (earlierCheck).
 
 export type Terms = { entries: { line: number; re: RegExp }[] };
 const BUILT_IN: { what: string; re: RegExp }[] = [
@@ -220,19 +220,42 @@ export function reviewCheck(r: Review, termsText: string | null): { ok: true } |
   return privacyCheck(r.brief, termsText);
 }
 
-// The earlier findings a fix-only round sends (Cain 0.16.0). Over the brief, privacyCheck runs every
-// built-in pattern and the owner's private-terms list. Over the earlier findings it runs only the
-// terms list (Cain 0.18.1): they are the review service's own verdicts from the round before, already
-// sent to the same seats in the round that produced them, and they carry tool version strings (a web
-// search tool's name ends in an eight-digit date) that the built-in number patterns read as an account
-// number, which blocked every fix-only round after one. A term from the owner's list still blocks them,
-// named by line, and a missing or broken list still fails closed.
+// The earlier findings a fix-only round sends (Cain 0.16.0). The runner loads them itself from its own
+// record of the change's previous round (earlierFindings in runner.ts), never from a brief: a brief has no
+// field for them (BRIEF_FIELDS), so one that carries any is refused whole.
+// Over them run the email, phone and SSN-shaped patterns and the owner's private-terms list, as over a
+// brief. The account-or-card pattern is relaxed there, and only there (Cain 0.18.1): a digit run it matches
+// passes only when it is one unbroken run of digits that is glued to an identifier (a letter or an
+// underscore right before it, as in a web search tool's name ending in a date, web_search_20250305) or that
+// is a valid date written year, month, day (20250305). Any other run of eight or more digits in the
+// findings, a bare 12345678 or a spaced card number, still blocks the round. A missing or broken list
+// still fails closed, and the brief's own check (privacyCheck) is unchanged.
+const ACCOUNT = BUILT_IN.find((p) => p.what === "an account or card number")!;
+export function validYmd(d: string): boolean {
+  const m = /^(\d{4})(\d{2})(\d{2})$/.exec(d);
+  if (!m) return false;
+  const [y, mo, da] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (y < 1900 || y > 2099 || mo < 1 || mo > 12 || da < 1) return false;
+  return da <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
+}
+// A digit run the account-or-card pattern matched in the earlier findings that may pass (see above).
+function excusedRun(text: string, at: number, run: string): boolean {
+  if (!/^\d+$/.test(run)) return false;                       // spaced digits never pass
+  if (at > 0 && /[A-Za-z_]/.test(text[at - 1])) return true;    // glued to an identifier
+  return validYmd(run);
+}
 export function earlierCheck(earlier: string[] | undefined, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
   if (!earlier?.length) return { ok: true };
   const loaded = loadTerms(termsText);
   if (!loaded.terms) return { ok: false, why: [loaded.error!] };
   const text = normalizeText(earlier.join("\n"));
   const why = new Set<string>();
+  for (const p of BUILT_IN) {
+    if (p === ACCOUNT) continue;
+    if (p.re.test(text)) why.add(`${p.what} in the earlier findings`);
+  }
+  const all = new RegExp(ACCOUNT.re.source, ACCOUNT.re.flags.includes("g") ? ACCOUNT.re.flags : ACCOUNT.re.flags + "g");
+  for (const m of text.matchAll(all)) if (!excusedRun(text, m.index!, m[0])) { why.add(`${ACCOUNT.what} in the earlier findings`); break; }
   for (const e of loaded.terms.entries) if (e.re.test(text)) why.add(`private term on line ${e.line} of the list, in the earlier findings`);
   return why.size ? { ok: false, why: [...why] } : { ok: true };
 }

@@ -218,12 +218,20 @@ A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 Before anything goes to a seat, the review runner checks it in code and fails closed. Over the
 brief (its topic, question, body and id) it runs every built-in pattern (an email address, a phone
 number, an account or card number, an SSN-shaped number) and your private-terms list
-(`/data/review-private-terms.txt`); a brief that matches is blocked and nothing is sent. Over the
-earlier findings a fix-only round carries, it runs only your private-terms list: those findings are
-the review service's own verdicts from the round before, already sent to the same seats, and they
-hold tool version strings (a web search tool's name ends in an eight-digit date) that the number
-patterns would read as an account number. A term from your list in them still blocks the round, by
-line number. A blocked round sends nothing and doesn't count toward the cap.
+(`/data/review-private-terms.txt`); a brief that matches is blocked and nothing is sent.
+
+Over the earlier findings a fix-only round carries it runs the same email, phone and SSN-shaped
+patterns and your private-terms list. Only the account-or-card pattern is relaxed there, and only
+for an unbroken run of digits that is glued to an identifier (a letter or an underscore right before
+it, as in a web search tool's name ending in a date, `web_search_20250305`) or that is a valid date
+written year, month, day (`20250305`). Any other run of eight or more digits in the findings, a bare
+`12345678` or a spaced card number, still blocks the round. A match names its kind (or the list's
+line), never the text. A blocked round sends nothing and doesn't count toward the cap.
+
+The earlier findings come only from the runner's own record: it reads the change's previous round
+from its rounds file (keyed by change, each round by its id) and the queue record that round left.
+A brief has no field for them, so a brief carrying earlier findings, or any field not in its
+allowlist, is refused whole and nothing is queued.
 
 ### The review-round cap (since 0.16.0)
 
