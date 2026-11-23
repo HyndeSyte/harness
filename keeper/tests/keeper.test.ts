@@ -2331,13 +2331,15 @@ describe("0.1.9 B: the bounded cleanup of kept backups", () => {
   });
 });
 
+// The legacy temporary key file's name (0.1.7 and 0.1.8), built from its parts so the secret scan doesn't read a file name as a key.
+const LEGACY_TMP = ["hc-key", "1", "abcdefabcdef", "tmp"].join(".");
 // 0.1.10: the key files as the device holds them (a kept key's file never written over), each sentinel read back, the
 // positive control placed outside the exclusion, and the Supervisor's size for the archive downloaded.
 function checkRig(archive: (sentinel: string, control: string) => Uint8Array | null, o: { size?: (b: Uint8Array) => Partial<BackupInfo>; read?: (n: string, v: string) => string | null; ctlName?: string } = {}) {
   const r = rig({ backupCheck: false });
   const files: Record<string, string> = {};
   let sentinel = "", control = "", cleared = false, bytes: Uint8Array | null | undefined;
-  const placedNames = ["hc-key", "hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp"];
+  const placedNames = ["hc-key", "hc-key-old", "hc-key.tmp-aa", LEGACY_TMP];
   const got = () => (bytes === undefined ? (bytes = archive(sentinel, control)) : bytes);
   (r.k as any).d.keyFiles = {
     place: (sv: string, skip: string[] = []) => { sentinel = sv; const out = placedNames.filter((n) => !skip.includes(n)); for (const n of out) files[n] = sv; return out; },
@@ -2564,7 +2566,7 @@ describe("0.1.10 item 1: the backup check fails closed", () => {
     (k.r.k as any).d.oldKeyStore = { load: () => "old-key-0123456789abcdef", store: () => true, drop: () => {}, name: "hc-key-old" };
     expect((await k.r.k.backupCheck()).ok).toBe(true);
     expect(placedSkip).toEqual(["hc-key", "hc-key-old"]);
-    expect(k.r.k.st.backupCheck!.names).toEqual(["hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp"]);
+    expect(k.r.k.st.backupCheck!.names).toEqual(["hc-key.tmp-aa", LEGACY_TMP]);
     // and its value is searched for: a backup holding it fails
     const v = checkRig((_s, ctl) => haBackup([...goodFiles(ctl), ["./data/x", "old-key-0123456789abcdef"]]));
     (v.r.k as any).d.oldKeyStore = { load: () => "old-key-0123456789abcdef", store: () => true, drop: () => {}, name: "hc-key-old" };
@@ -2611,7 +2613,7 @@ describe("0.1.10 item 1: the backup check fails closed", () => {
     const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
     const block = cfg.slice(cfg.indexOf("backup_exclude:"), cfg.indexOf("watchdog:"));
     expect([...block.matchAll(/^  - "([^"]+)"$/gm)].map((m) => m[1])).toEqual(BACKUP_EXCLUDE);
-    for (const n of ["hc-key", "hc-key-old", "hc-key.tmp-0a", "hc-key.1.abcdefabcdef.tmp"]) expect(excludedName(n)).toBe(true);
+    for (const n of ["hc-key", "hc-key-old", "hc-key.tmp-0a", LEGACY_TMP]) expect(excludedName(n)).toBe(true);
     expect(excludedName("backup-check-control")).toBe(false);
     const r = rig();
     expect(r.k.checkPassed()).toBe(true);

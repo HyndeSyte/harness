@@ -15,7 +15,7 @@ RUN apt-get update \
     && bun --version
 
 # The keeper's version, bound into its armed record: the same as config.yaml's (keeper/tests check it).
-ENV KEEPER_VERSION=0.1.9
+ENV KEEPER_VERSION=0.1.10
 
 COPY rootfs /
 RUN chmod a+x /etc/services.d/keeper/run /etc/services.d/keeper/finish \
