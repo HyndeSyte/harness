@@ -479,5 +479,7 @@ def test_cains_rules_keeper_and_docs_name_this_rounds_behaviour():
         for words in ("Run check", "Open without protection", "Unprotected", "ready to copy"):
             assert words in text, words
     assert "posts him a card" in keeper and "migrate-override" in keeper
-    log = (ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## ", 2)[1]
+    # Harness's side is the section this round shipped in, Harness 0.24.4, found by its version heading
+    # (newer Harness sections need not repeat it).
+    log = (ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## 0.24.4\n", 1)[1].split("\n## ", 1)[0]
     assert "rehears" in log

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.24.5
+
+- **A card that takes several days off a repeating event reads as one short list**: the event's name and calendar once, the days on one line, and "each of those days only, the rest of the series stays" once. The same on the card, the *Approved* notice and the *Done* receipt. No event ids on cards.
+- **The things to check before approving are one short line**, not a line each.
+- **Ending one of two series with the same name finds the one you mean**: by its exact name (emoji included), the day of the week you named, or the id ending you gave. When nothing tells them apart, one card lists each with its days and next date, a button each. Harness never asks which days of the week when you already said.
+- **A new note on a message Harness answered "not a change" is read afresh**, so your own words get acted on without sending a new message. The same note twice is still taken once.
+- **The same "Nothing changed" answer comes once per message**, not again for every note that ends the same way.
+
 ## 0.24.4
 
 - **A tap Harness crosses off stays crossed off**, even when it can't lock its tap journal at that moment, and it never writes the journal without that lock.

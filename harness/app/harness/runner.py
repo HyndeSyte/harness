@@ -1119,6 +1119,15 @@ class Runner:
         job = self.ledger.job(data["job"])
         if job is None:
             return "Nothing changed."
+        if "picks" in data:
+            # 0.24.5: his pick of several series under one name (calendar_change._which_series_card): that
+            # series's end on a new card, read anew by its exact title and days, never applied without his tap.
+            if not 0 <= index < len(data["picks"]):
+                return "Nothing changed."
+            made = self._offer_new(job, {"changes": data["picks"][index]}, "you picked which series you meant, so "
+                                   "this is its end, read from the calendar just now.", replaced=False,
+                                   keep_versions=False, new_family=True)
+            return "Its end is on a new card, waiting for your tap." if made else "Nothing changed."
         params = {"changes": [data["change"]]}
         if index < 0:
             self._offer_new(job, params, "you said the newer note corrects none of the earlier cards, so this "

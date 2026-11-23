@@ -3306,8 +3306,13 @@ class Controller:
         if any(note in self.ledger.job_text(j) for j in family):
             return
         states = {j: (self.ledger.job(j) or {"state": ""})["state"] for j in family}
+        # 0.24.5: a request answered "not a change" (no card of it ever made) is read afresh with a new
+        # note, whoever its answer went to: the outcome isn't sticky for the message, and a note with the
+        # same words is still taken once (above). A repeated "Nothing changed" isn't sent twice
+        # (calendar_change._nothing_once).
         in_place = job["state"] == "needs_clarification" or (
-            job["state"] in ("no_action", "answered") and self._answered_to_cain(job_id))
+            job["state"] in ("no_action", "answered") and (self._answered_to_cain(job_id)
+                                                           or self._no_card_ever(family, states)))
         beside = any(st in ("proposed", "approved") for st in states.values())
         if not in_place and not beside and not self._all_closed(family):
             return                       # a card he saw (a rule, a refusal) isn't sent again
@@ -3337,6 +3342,13 @@ class Controller:
             self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
         log.info("handover: a note for job %s: it runs again%s", render.short(job_id),
                  "" if in_place else " beside its open cards")
+
+    def _no_card_ever(self, family: list[str], states: dict) -> bool:
+        """Every request of this message was answered in words, and none of it ever came on a card."""
+        marks = ",".join("?" * len(family))
+        made = self.ledger.db.execute(f"SELECT COUNT(*) FROM proposals WHERE job_id IN ({marks})",
+                                      tuple(family)).fetchone()[0]
+        return not made and all(st in ("no_action", "answered") for st in states.values())
 
     def _all_closed(self, family: list[str]) -> bool:
         """Every card of this message was declined or ran out, and nothing of it was done: a note

@@ -20,6 +20,6 @@ RUN python3 /opt/harness/harness/buildid.py /tmp/harness-build /opt/harness > /o
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.24.4" \
+    io.hass.version="0.24.5" \
     org.opencontainers.image.title="Harness" \
     org.opencontainers.image.description="Deterministic calendar specialist behind Cain on Discord"

@@ -559,12 +559,46 @@ _WEEKDAY_WORDS = {"MO": "Monday", "TU": "Tuesday", "WE": "Wednesday", "TH": "Thu
                   "SA": "Saturday", "SU": "Sunday"}
 
 
+_DAY_NAMES = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4, "saturday": 5,
+              "sunday": 6}
+_SAID_DAY = re.compile(r"\b(?:(monday|tuesday|wednesday|thursday|friday|saturday|sunday)s\b|"
+                       r"(?<!from )(?<!on )(?<!starting )(?<!after )(?<!until )(?<!next )(?<!this )(?<!last )"
+                       r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b(?!,? *(?:[0-9]|"
+                       r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)))", re.I)
+_ID_ENDING = re.compile(r"\bid ending (?:in )?([0-9A-Za-z]{4,})", re.I)
+
+
+def series_choice_words(title: str, on: set[int], nxt: date) -> str:
+    """“🏊 Swim” on Mondays, next Mon Dec 21: one series to pick, as a card lists it."""
+    names = [list(_DAY_NAMES)[d].capitalize() + "s" for d in sorted(on)]
+    days = (" and ".join(names) if len(names) < 3 else ", ".join(names[:-1]) + " and " + names[-1]) or "its days"
+    return f"“{title}” on {days}, next {nxt:%a} {_day_words(nxt)}"
+
+
+def said_weekdays(text: str) -> set[int]:
+    """The days of the week he named a series by ("the Monday swim", "on Mondays"), as 0 for Monday.
+    A day that only dates something ("from Monday", "on Monday", "Monday Dec 21") isn't one."""
+    return {_DAY_NAMES[(m.group(1) or m.group(2)).casefold()] for m in _SAID_DAY.finditer(text or "")}
+
+
 def _day_words(day: date) -> str:
     return f"{day:%b} {day.day}"
 
 
 def _list(days: list[date]) -> str:
     return ", ".join(_day_words(d) for d in sorted(days))
+
+
+def days_line(days: list[date]) -> str:
+    """Mon Dec 21, Dec 28, Jan 4 (0.24.5): the weekday once, on the first; a long list keeps its
+    first four and its last, with how many: Mon Dec 21, Dec 28, Jan 4, Jan 11 ... Mar 1 (11 days)."""
+    days = sorted(set(days))
+    if not days:
+        return ""
+    words = [f"{days[0]:%a} {_day_words(days[0])}"] + [_day_words(d) for d in days[1:]]
+    if len(words) > 6:
+        return ", ".join(words[:4]) + f" ... {words[-1]} ({len(words)} days)"
+    return ", ".join(words)
 
 
 def _dates(text: str) -> list[date]:
@@ -973,6 +1007,17 @@ class Unclear(Refuse):
         super().__init__(words, ask=ask)
 
 
+class WhichSeries(Unclear):
+    """0.24.5: several series fit an end he asked for, and nothing he said tells them apart. Before
+    a card, one card lists each (its title, days of the week and next day), a button each; anywhere
+    else it's said in words, and nothing changes."""
+
+    def __init__(self, candidates: list[tuple[str, set[int], date]]):
+        super().__init__("more than one series fits that: " + "; ".join(
+            series_choice_words(t, on, nxt) for t, on, nxt in candidates), "Which one?")
+        self.candidates = candidates
+
+
 class Stopped(Exception):
     def __init__(self, kind: str, status: int | None = None, words: str = "", undo: dict | None = None):
         super().__init__(kind)
@@ -1142,10 +1187,24 @@ class CalendarChange:
         return True
 
     def refuse_in_words(self, job, receipt: dict, why: str) -> None:
+        self._nothing_once(job, {**receipt, "reason": "calendar_change_impossible"},
+                           f"Nothing changed: {render.escape(why)}.")
+
+    def _nothing_once(self, job, receipt: dict, words: str) -> None:
+        """A "Nothing changed" answer, at most once per message for the same reason (0.24.5): a note
+        that comes to the same outcome again sends him nothing new, and Cain is told it in words, the
+        card he already has standing."""
+        root = self.ledger.get_meta(f"job_parent:{job['id']}") or job["id"]
+        key = f"nothing_said:{root}:{hashlib.sha256(words.encode()).hexdigest()[:16]}"
         with self.ledger.tx() as db:
-            self.ledger.transition(job["id"], "no_action", db=db, receipt=json.dumps(
-                {**receipt, "reason": "calendar_change_impossible"}))
-            self._say(db, job["chat_id"], job["id"], f"Nothing changed: {render.escape(why)}.")
+            again = self.ledger.get_meta(key) is not None
+            if again:
+                receipt = {**receipt, "said_to_cain": render.plain(words) + " He already has this answer for "
+                           "that message, so it wasn't sent to him again."}
+            self.ledger.transition(job["id"], "no_action", db=db, receipt=json.dumps(receipt))
+            if not again:
+                self.ledger.set_meta(key, iso(self.ledger.now()), db)
+                self._say(db, job["chat_id"], job["id"], words)
 
     # -- before anything is offered or done: is it clear? ------------------------------------
     def preview(self, job, receipt: dict, params: dict) -> Preview | None:
@@ -1157,7 +1216,13 @@ class CalendarChange:
         and None. When the read itself goes wrong here, no lines: the run reads again and says
         what it finds."""
         try:
-            parts, _ = self._plan_all(params, "preview")
+            parts, _ = self._plan_all(params, "preview", words=self.ledger.job_text(job["id"]) or "")
+        except WhichSeries as why:
+            if self._which_series_card(job, receipt, params, why):
+                return None
+            self._ask(job, receipt, f"Nothing changed: {owner_scrubbed(why)}."
+                      + (f" {owner_scrubbed(why.ask)}" if why.ask else ""))
+            return None
         except Unclear as why:
             self._ask(job, receipt, f"Nothing changed: {owner_scrubbed(why)}."
                       + (f" {owner_scrubbed(why.ask)}" if why.ask else ""))
@@ -1165,10 +1230,8 @@ class CalendarChange:
         except Refuse as why:
             # Titles in it come from a calendar anyone can invite him to: made safe, like a receipt.
             log.info("calendar change job %s: not possible, said why", render.short(job["id"]))
-            with self.ledger.tx() as db:
-                self.ledger.transition(job["id"], "no_action", db=db, receipt=json.dumps(
-                    {**receipt, "reason": "calendar_change_impossible"}))
-                self._say(db, job["chat_id"], job["id"], f"Nothing changed: {_safe(owner_scrubbed(why))}.")
+            self._nothing_once(job, {**receipt, "reason": "calendar_change_impossible"},
+                               f"Nothing changed: {_safe(owner_scrubbed(why))}.")
             return None
         except (ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant) as e:
             log.warning("calendar change job %s: couldn't preview (%s)", render.short(job["id"]),
@@ -1185,7 +1248,7 @@ class CalendarChange:
         Twentieth round: `keys`, the keys its fixed ids are made from when they're already known (a
         retry's, from its first offer), so the preview reads the very ids the write will."""
         try:
-            parts, _ = self._plan_all(params, "preview", keys=keys)
+            parts, _ = self._plan_all(params, "preview", keys=keys, words=self.ledger.job_text(job["id"]) or "")
         except (Refuse, ValueError, KeyError, TypeError, ical.Unreadable, ics_edit.Cant):
             return None
         return self._preview_of(parts, self._checks(job, parts))
@@ -1194,12 +1257,18 @@ class CalendarChange:
         """Each part's line, a removal's naming the very events it takes off (calendar, title,
         time, id), so what he approves is those events and nothing a later read finds instead."""
         lines = []
-        for p in parts:
+        for item in self._grouped(parts):
+            if isinstance(item, list):
+                # 0.24.5: several events of one title taken off, as one short list (title, calendar
+                # and scope once, the days on one line), never a line per event.
+                lines += self._group_lines(item, "will")
+                continue
+            p = item
             if p.already:
                 lines.append(p.already)
             elif p.bound and any(b.get("op", "remove") != "move" for b in p.bound):
-                # What a removal or a series's end takes off, by name and id; a move's line already
-                # says which event, and it's bound by id all the same (_drifted).
+                # What a removal or a series's end takes off, by name; a move's line already says
+                # which event, and it's bound by id all the same (_drifted). Ids stay in the ledger.
                 lines.append(p.will + ": " + "; ".join(self._bound_words(b) for b in p.bound))
             else:
                 lines.append(p.will)
@@ -1207,8 +1276,78 @@ class CalendarChange:
                 lines.append(p.loose)
         return Preview(lines, checks, [b for p in parts for b in p.bound], [p.loose for p in parts if p.loose])
 
+    @staticmethod
+    def _removal_key(p: Part) -> tuple | None:
+        """What makes removals one list on a card (0.24.5): the same name, calendars and scope."""
+        if p.already or p.loose or not p.bound or any(b.get("op", "remove") != "remove" for b in p.bound):
+            return None
+        first = p.bound[0]["calendar"]
+        cals = tuple(dict.fromkeys(b["calendar"] for b in p.bound))
+        scopes = {b.get("scope", "") for b in p.bound if b["calendar"] == first}
+        return (p.name, cals, scopes.pop() if len(scopes) == 1 else "")
+
+    def _grouped(self, parts: list[Part]) -> list:
+        """The parts in order, removals of one event's days gathered into a list where it first
+        appears; any other part as it is. A single removal of a single day stays a Part."""
+        out: list = []
+        at: dict[tuple, list[Part]] = {}
+        for p in parts:
+            key = self._removal_key(p)
+            if key is None:
+                out.append(p)
+            elif key in at:
+                at[key].append(p)
+            else:
+                at[key] = [p]
+                out.append(at[key])
+        return [g[0] if isinstance(g, list) and len(g) == 1 and len(self._group_days(g)) < 2 else g
+                for g in out]
+
+    def _group_days(self, group: list[Part]) -> list[date]:
+        """The days a list of removals takes its event off, from the bound events themselves."""
+        days = set()
+        for p in group:
+            first = p.bound[0]["calendar"]
+            for b in p.bound:
+                when = _when(b["start"]) if b.get("start") and b["calendar"] == first else None
+                if isinstance(when, datetime):
+                    days.add(when.astimezone(ZoneInfo(self.tz)).date())
+                elif isinstance(when, date):
+                    days.add(when)
+        return sorted(days)
+
+    def _group_lines(self, group: list[Part], side: str) -> list[str]:
+        """Take off “Swim”, 6:00 PM, Gmail calendar: / Wed Nov 11, Nov 18 / Each of those days only,
+        the rest of the series stays. The same for the approval card, its notice and the receipt."""
+        first = group[0]
+        cals = tuple(dict.fromkeys(b["calendar"] for p in group for b in p.bound))
+        names = ["Gmail" if c == "gmail" else "Family" for c in cals]
+        cal = (f"{names[0]} calendar" if len(names) == 1
+               else f"{names[0]} calendar and its copy on {names[1]}")
+        clocks = set()
+        for p in group:
+            for b in p.bound:
+                if b["calendar"] != p.bound[0]["calendar"] or not b.get("start"):
+                    continue
+                when = _when(b["start"])
+                clocks.add(render.clock_words(when.astimezone(ZoneInfo(self.tz)), suffix=True)
+                           if isinstance(when, datetime) else "all day")
+        clock = f", {clocks.pop()}" if len(clocks) == 1 else ""
+        verb = "Take off" if side == "will" else "Took off"
+        out = [f"{verb} “{first.name}”{clock}, {cal}:", days_line(self._group_days(group))]
+        if self._removal_key(first)[2] == "occurrence":
+            out.append("Each of those days only, the rest of the series stays.")
+        return out
+
+    def done_lines(self, done: list[Part]) -> list[str]:
+        """The receipt's lines for what went through, removals of one event gathered (0.24.5)."""
+        out = []
+        for item in self._grouped(done):
+            out += self._group_lines(item, "done") if isinstance(item, list) else [item.done]
+        return out
+
     def _bound_words(self, b: dict) -> str:
-        """the Gmail event "Busy (school drop-off)", 8:00 AM Wed Nov 11, id ending 4f2a9c"""
+        """the Gmail event "Busy (school drop-off)", 8:00 AM Wed Nov 11"""
         when = _when(b["start"]) if b.get("start") else None
         if isinstance(when, datetime):
             local = when.astimezone(ZoneInfo(self.tz))
@@ -1218,11 +1357,10 @@ class CalendarChange:
         else:
             at = ""
         cal = "Gmail" if b["calendar"] == "gmail" else "Family"
-        tail = re.sub(r"[^0-9A-Za-z]", "", b.get("id") or "")[-6:]
         scope = {"occurrence": ", this occurrence only (the rest of the series stays)",
                  "series": ", the whole series from then on"}.get(b.get("scope", ""), "")
-        return (f"the {cal} event \u201c{_safe(b['title'])}\u201d" + (f", {at}" if at else "")
-                + scope + (f", id ending {tail}" if tail else ""))
+        # 0.24.5: no id on a card; it stays bound in the ledger (calendar_change_bound) and the log.
+        return f"the {cal} event \u201c{_safe(b['title'])}\u201d" + (f", {at}" if at else "") + scope
 
     def _bound_of(self, f: "Found", op: str = "remove", scope: str = "") -> list[dict]:
         """An event and its copies, as a read found them now: which calendar, its id, the day of a
@@ -4590,7 +4728,7 @@ class CalendarChange:
             self._save_plan(pid, plan, db)
 
     def _plan_all(self, params: dict, pid: str, *, run: bool = False,
-                  keys: list[str] | None = None) -> tuple[list[Part], list[str]]:
+                  keys: list[str] | None = None, words: str | None = None) -> tuple[list[Part], list[str]]:
         """Every change he asked for, found and decided before anything is written. One event
         named twice for the same thing is one part (Nov 11: a card moved PT on Gmail and its copy
         on Family as two lines); named for two different things, it's unclear. Eighteenth round: each
@@ -4601,6 +4739,9 @@ class CalendarChange:
         notes: list[str] = []
         keys = self.keys_of(pid) if keys is None else [str(k) for k in keys]
         self._forcing = bool(self.ledger.get_meta(f"calendar_change_force:{pid}"))
+        # 0.24.5: his words (with any note on them), so a series is told apart by what he said, the
+        # same at the card and at the run (_narrow_series).
+        self._words = words if words is not None else self._words_of(pid)
         skip = self._skip_now(pid) if run else set()
         self._skipping = skip
         for index, change in enumerate(params["changes"]):
@@ -4608,7 +4749,11 @@ class CalendarChange:
                 continue                       # the calendar shows it settled, read just now (skip_found)
             # Each add's fixed id comes from the proposal it was first offered under (keys_of), so a
             # change offered again writes to the same address and never makes a second event.
-            more, said_here = self._plan(change, keys[index] if index < len(keys) else f"{pid}:{index}")
+            try:
+                more, said_here = self._plan(change, keys[index] if index < len(keys) else f"{pid}:{index}")
+            except WhichSeries as which:
+                which.index = index
+                raise
             notes += said_here
             for part in more:
                 for b in part.bound:
@@ -4621,6 +4766,50 @@ class CalendarChange:
                     raise Unclear(f"you asked for two different changes to one event: "
                                   f"{render.plain(same.will)}, and {render.plain(part.will)}", "Which one?")
         return parts, notes
+
+    def _words_of(self, pid: str) -> str:
+        """A proposal's request words, its notes included; "" when there's none to read."""
+        try:
+            row = self.ledger.db.execute("SELECT job_id FROM proposals WHERE id=?", (pid,)).fetchone()
+            return (self.ledger.job_text(row["job_id"]) or "") if row else ""
+        except (KeyError, TypeError, IndexError):
+            return ""
+
+    def _which_series_card(self, job, receipt: dict, params: dict, which: "WhichSeries") -> bool:
+        """0.24.5: one card asking which series he means, each listed with its days of the week and
+        next day, a button each. His pick puts that series's end on a new card for his tap
+        (runner._which_picked), read anew by its exact title and days. False when two can't be told
+        apart even so (the same title on the same days): then he's asked in words."""
+        index = getattr(which, "index", None)
+        cands = which.candidates[:4]
+        if index is None or len({(t, frozenset(on)) for t, on, _ in cands}) < len(cands) or len(cands) < 2:
+            return False
+        codes = list(ical.WEEKDAYS)
+        picks = []
+        for t, on, _ in cands:
+            changes = [dict(c) for c in params["changes"]]
+            changes[index] = {**changes[index], "title": t, "days": ",".join(codes[d] for d in sorted(on))}
+            picks.append(changes)
+        import secrets
+        token = secrets.token_hex(6)
+        asked = params["changes"][index]
+        lines = [f"<b>Which series do you mean?</b> More than one {_safe(asked['title'])} series fits, so "
+                 "nothing changed yet. Pick one, and its end comes on a new card for your tap."]
+        lines += [f"{i}. {_safe(series_choice_words(t, on, nxt))}" for i, (t, on, nxt) in enumerate(cands, 1)]
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(f"calendar_change_which:{token}", json.dumps(
+                {"job": job["id"], "picks": picks}), db)
+            buttons, binds = [], []
+            for i in range(len(cands)):
+                nonce = choices.mint(self.ledger, kind="calendar_change_which", target=f"{token}:{i}",
+                                     chat_id=job["chat_id"], ttl_s=UNDO_TTL_S, db=db)
+                buttons.append((f"Series {i + 1}", choices.callback_data(nonce)))
+                binds.append({"type": "choice", "nonce": nonce})
+            self.ledger.transition(job["id"], "needs_clarification", db=db, receipt=json.dumps(
+                {**receipt, "reason": "calendar_change_which_series"}))
+            self._say(db, job["chat_id"], job["id"], "\n".join(lines), buttons=[buttons], binds=binds)
+        log.info("calendar change job %s: %d series fit; asked which", render.short(job["id"]), len(cands))
+        return True
 
     def keys_of(self, pid: str) -> list[str]:
         """The key each change's fixed id is made from: the proposal and place it was first offered
@@ -4796,7 +4985,7 @@ class CalendarChange:
                         else "<b>Not confirmed.</b>" if any(s.kind in ("unconfirmed", "read_back")
                                                             for _, _, s, _ in failed)
                         else "<b>Nothing changed.</b>")
-            lines = [head] + [part.done for part in done]
+            lines = [head] + self.done_lines(done)
             retry = restart = False
             weak: list[str] = []                  # ninth round: refused on an unchanged event after an override
             for part, landed, s, at in failed:
@@ -5916,6 +6105,48 @@ class CalendarChange:
         except (ValueError, KeyError, TypeError, ical.Unreadable):
             raise Refuse(f"I couldn't read the {f.title} series") from None
 
+    def _narrow_series(self, asked: str, day: date, weekdays: str, series: dict[str, "Found"],
+                       facts: dict[str, tuple[date, set[int]]]) -> dict[str, "Found"]:
+        """Which of several series under one name he means (0.24.5). In order: the exact title,
+        emoji included, in his words or the change's; the days of the week he named ("Monday",
+        "Mondays", "the Monday series"); an id ending he gave. Each only narrows, never empties. When
+        some are still left over and ending them all from that day can't be done (one only starts
+        then), the one whose next day is the day he gave (so on that weekday) is it; failing that,
+        WhichSeries: one card asks which, each with its days of the week and next day, a button each."""
+        if len(series) < 2:
+            return series
+        text = f"{asked}\n{getattr(self, '_words', '') or ''}"
+        folded = text.casefold()
+        # The exact title: the longest titles found as written, unless one is only part of another
+        # title that isn't there ("Swim" said, with "Swim" and an emoji'd "Swim" both on the calendar).
+        named = {f.title.strip() for f in series.values() if f.title.strip()
+                 and f.title.strip().casefold() in folded}
+        top = {t for t in named if not any(t != u and t.casefold() in u.casefold() for u in named)}
+        others = {f.title.strip() for f in series.values()} - named
+        if top and not any(t.casefold() in u.casefold() for t in top for u in others):
+            narrowed = {k: f for k, f in series.items() if f.title.strip() in top}
+            if narrowed:
+                series = narrowed
+        if len(series) > 1 and not weekdays:
+            wanted = said_weekdays(text)
+            narrowed = {k: f for k, f in series.items() if wanted and facts[k][1] and facts[k][1] <= wanted}
+            if narrowed:
+                series = narrowed
+        if len(series) > 1:
+            ends = {x.casefold() for x in _ID_ENDING.findall(text)}
+            narrowed = {k: f for k, f in series.items() if ends and any(
+                re.sub(r"[^0-9A-Za-z]", "", x or "").casefold().endswith(e)
+                for e in ends for x in (f.series, f.instance))}
+            if narrowed:
+                series = narrowed
+        clash = [k for k in series if facts[k][0] >= day]
+        if len(series) < 2 or weekdays or not clash:
+            return series
+        nexts = {k: f for k, f in series.items() if f.first == day}
+        if len(nexts) == 1:
+            return nexts
+        raise WhichSeries([(f.title, facts[k][1], f.first) for k, f in series.items()])
+
     def _plan_end(self, calendar: str, asked: str, day: date, weekdays: str, found: list[Found],
                   unreadable: int) -> tuple[list[Step], list[str]]:
         """A program can be several series under one title, one for each day of the week, so
@@ -5931,6 +6162,11 @@ class CalendarChange:
             if title_words(f.title) == title_words(title):
                 series.setdefault(f.series, f)
         facts = {key: self._series_facts(calendar, f) for key, f in series.items()}
+        # 0.24.5: series of one name told apart by what he said: the exact title (emoji and all), the
+        # days of the week he named, an id ending; then the day he gave. Still several: he picks.
+        series = self._narrow_series(asked, day, weekdays, series, facts)
+        if len({f.title for f in series.values()}) == 1:
+            title = next(iter(series.values())).title
         if weekdays:
             wanted = {ical.WEEKDAYS[x] for x in weekdays.split(",")}
             for key, (_, on) in facts.items():
@@ -5941,10 +6177,10 @@ class CalendarChange:
             series = {k: f for k, f in series.items() if facts[k][1] & wanted}
             if not series:
                 raise Refuse(f"{title} doesn't repeat on those days")
-        for key in series:
-            if facts[key][0] >= day and len(series) > 1:
-                raise Refuse(f"one {title} series only starts on {_day_words(facts[key][0])}, and ending "
-                             "from then would delete it. Say which days of the week to end")
+        if len(series) > 1 and any(facts[key][0] >= day for key in series):
+            # 0.24.5: one of them only starts then, so ending them all would delete it: he picks which,
+            # never asked again for days of the week he may already have named.
+            raise WhichSeries([(f.title, facts[k][1], f.first) for k, f in series.items()])
         steps = []
         for f in series.values():
             self._guard(f)

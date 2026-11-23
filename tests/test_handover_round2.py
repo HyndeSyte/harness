@@ -83,7 +83,8 @@ def test_a_removal_card_names_the_event_it_binds_to(m):
     uid = m.blocks["drop"][1]
     line = m.seen()[-1]
     assert "the Gmail event “Busy (school drop-off)”, 8:00 AM Wed Nov 11" in line
-    assert f"id ending {uid[-6:]}" in line
+    # 0.24.5: the id stays bound in the ledger, never on the card.
+    assert "id ending" not in line and uid[-6:] not in line
 
 
 def test_a_removal_never_takes_off_another_event_than_the_card_named(m):

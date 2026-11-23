@@ -920,7 +920,10 @@ def test_ending_doesnt_delete_a_series_that_hasnt_started(r):
     r.tell(change(op="end_series", dates="2026-12-15"))
     r.approve()                                # ending a series is tapped
     assert FAMILY_PATH + "LATER.ics" in r.icloud.events and r.body() == before
-    assert "only starts on Jan 12" in r.texts()[-1]
+    # 0.24.5: never asked for days of the week; one card lists each series with its days and next day.
+    said = r.texts()[-1]
+    assert "Which series do you mean?" in said and "Say which days" not in said
+    assert "on Tuesdays, next Tue Jan 12" in said and "on Mondays and Wednesdays, next Wed Dec 16" in said
 
 
 def test_the_days_filter_goes_by_the_rule_not_the_weeks_around(r):

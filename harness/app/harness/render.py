@@ -365,6 +365,16 @@ def change_line(c: dict, tz: str, now: datetime) -> str:
     return f"Add {title} {at}{where}"
 
 
+def check_line(warnings) -> list[str]:
+    """A calendar change's warnings folded into one short line (0.24.5): the points separated by
+    semicolons, each without its own full stop, and no dash between them. [] when there are none."""
+    points = [no_dashes(str(w)).strip().rstrip(".").strip() for w in warnings]
+    points = list(dict.fromkeys(x for x in points if x))
+    if not points:
+        return []
+    return [f"\u26a0 <b>Check before approving:</b> {escape('; '.join(points))}."]
+
+
 def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime,
                   job_id: str, warnings=(), lines: list[str] | None = None,
                   now: datetime | None = None) -> str:
@@ -378,7 +388,7 @@ def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime
             lines = [change_line(c, tz, now or expires) for c in params["changes"]]
         return fit("\n".join([
             "<b>Change your calendar?</b>",
-            *[f"\u26a0 <b>Check before approving:</b> {escape(w)}" for w in warnings],
+            *check_line(warnings),
             *lines]))
     if effect.name == "calendar_hold":
         lines = [
