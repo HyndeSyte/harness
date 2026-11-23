@@ -25,6 +25,7 @@ import os
 import queue
 import re
 import sqlite3
+import threading
 import time
 from concurrent.futures import Executor
 from dataclasses import replace
@@ -48,6 +49,7 @@ from .vault import LABELS, Vault
 log = logging.getLogger("harness.controller")
 
 SETTINGS_TTL_S = 15 * 60
+NOTE_RERUNS_MAX = 2        # review round: in-place re-runs of one message for Cain's notes, at most
 FRESH_S = 120              # a handed-over message must be this new, or the handover itself
 NAMED_FRESH_S = 30 * 60    # a message Cain names, or one his suggestion rests on, this new
 DIGEST_WAIT_S = 40 * 60    # Cain has this long to fold the digest into his morning update
@@ -166,6 +168,8 @@ class Controller:
         self._discord_seen: str | None = None    # fingerprint of the token it identified with
         self._reconciled = False
         self._handover_jobs: dict[str, list] = {}
+        self._note_locks: dict[str, threading.Lock] = {}     # one per message (_note_lock)
+        self._note_locks_guard = threading.Lock()
         # The mutual watch on Cain's add-on (watch.py, set by __main__), and the last
         # thing Cain's link said about itself, for the settings page.
         self.cain_watch = None
@@ -3283,11 +3287,28 @@ class Controller:
             job_id = row["id"]
             self.ledger.set_meta(f"job_origin:{job_id}", json.dumps(origin))   # how many after it, now
             if note:
-                self._note_for_question(job_id, note, flags)
+                capped = self._note_for_question(job_id, note, flags)
+                if capped:
+                    h.job = render.short(job_id)
+                    h.finish("not a change", capped)
+                    return
         h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
 
-    def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> None:
+    def _note_lock(self, root: str):
+        """One lock per message (its root request), so two notes for it are handled one after the other
+        and can't both pass the checks below (review round)."""
+        with self._note_locks_guard:
+            return self._note_locks.setdefault(root, threading.Lock())
+
+    def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> str:
+        """Review round: handled under the message's own lock. "" once handled; the answer for Cain when
+        the note isn't read again because this message has had its in-place re-runs (NOTE_RERUNS_MAX)."""
+        root = self.ledger.get_meta(f"job_parent:{job_id}") or job_id
+        with self._note_lock(root):
+            return self._note_for_question_locked(job_id, note, flags, root) or ""
+
+    def _note_for_question_locked(self, job_id: str, note: str, flags: list[str], root: str) -> str | None:
         """A note from Cain for a request of his reaches it: one waiting on its question, one
         answered "not a change" to Cain alone, or one with a card still open or a change being done
         (one of its parts, when it was split). The note is fenced as Cain's (Nov 11: a second
@@ -3310,9 +3331,21 @@ class Controller:
         # note, whoever its answer went to: the outcome isn't sticky for the message, and a note with the
         # same words is still taken once (above). A repeated "Nothing changed" isn't sent twice
         # (calendar_change._nothing_once).
-        in_place = job["state"] == "needs_clarification" or (
+        # Review round: a message that ever had an approval or choice card (a which-one card included) is
+        # never run again in place; one answered only in words (a refusal, "Nothing changed") still may be.
+        carded = self._had_card(family, root)
+        in_place = not carded and (job["state"] == "needs_clarification" or (
             job["state"] in ("no_action", "answered") and (self._answered_to_cain(job_id)
-                                                           or self._no_card_ever(family, states)))
+                                                           or self._no_card_ever(family, states))))
+        if in_place and int(self.ledger.get_meta(f"note_reruns:{root}") or 0) >= NOTE_RERUNS_MAX:
+            # Read again twice already: the note is kept in the log as received, and Cain is told in words.
+            with self.ledger.tx() as db:
+                self.ledger.event("job_note_capped", {"job": job_id,
+                                                      "note": hashlib.sha256(note.encode()).hexdigest()[:12]}, db=db)
+            log.info("handover: a note for job %s: received; not run again (its %d re-runs are used)",
+                     render.short(job_id), NOTE_RERUNS_MAX)
+            return (f"Note received, but nothing changed: this message has already been read again for notes "
+                    f"{NOTE_RERUNS_MAX} times, the most for one message. A new message from him starts afresh.")
         beside = any(st in ("proposed", "approved") for st in states.values())
         if not in_place and not beside and not self._all_closed(family):
             return                       # a card he saw (a rule, a refusal) isn't sent again
@@ -3324,6 +3357,8 @@ class Controller:
         with self.ledger.tx() as db:
             if in_place:
                 target = job_id
+                self.ledger.set_meta(f"note_reruns:{root}",
+                                     str(int(self.ledger.get_meta(f"note_reruns:{root}") or 0) + 1), db)
                 db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, target))
                 self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
                 self.ledger.transition(target, "received", db=db)
@@ -3343,12 +3378,24 @@ class Controller:
         log.info("handover: a note for job %s: it runs again%s", render.short(job_id),
                  "" if in_place else " beside its open cards")
 
-    def _no_card_ever(self, family: list[str], states: dict) -> bool:
-        """Every request of this message was answered in words, and none of it ever came on a card."""
+    def _no_card_ever(self, family: list[str], states: dict, root: str | None = None) -> bool:
+        """Every request of this message was answered in words, and none of it ever came on a card:
+        an approval card or a choice card (a which-one card counts, review round)."""
+        return not self._had_card(family, root or family[0]) \
+            and all(st in ("no_action", "answered") for st in states.values())
+
+    def _had_card(self, family: list[str], root: str) -> bool:
+        """Whether any request of this message was ever offered on a card with buttons: a proposal, any
+        message of it that carried an approval's or a choice's buttons, or a which-one card."""
         marks = ",".join("?" * len(family))
         made = self.ledger.db.execute(f"SELECT COUNT(*) FROM proposals WHERE job_id IN ({marks})",
                                       tuple(family)).fetchone()[0]
-        return not made and all(st in ("no_action", "answered") for st in states.values())
+        if made:
+            return True
+        bound = self.ledger.db.execute(
+            f"SELECT COUNT(*) FROM outbox WHERE job_id IN ({marks}) AND binds_json IS NOT NULL"
+            " AND binds_json NOT IN ('', '[]', 'null')", tuple(family)).fetchone()[0]
+        return bool(bound) or self.ledger.get_meta(f"card_shown:{root}") is not None
 
     def _all_closed(self, family: list[str]) -> bool:
         """Every card of this message was declined or ran out, and nothing of it was done: a note

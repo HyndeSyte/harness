@@ -185,6 +185,15 @@ def rule_days(rule: str, first: date) -> set[int]:
     return set(range(7)) if parts.get("FREQ") == "DAILY" else {first.weekday()}
 
 
+def series_rule(ics: str) -> str:
+    """A series's own rule, as its master event gives it ("" when it has none): what a card binds, so
+    a rule changed since is seen at the run (calendar_change._bound_series)."""
+    lines = _unfold(ics)
+    at = _master(lines)
+    i = None if at is None else _find(lines, at, "RRULE")
+    return "" if i is None else lines[i].partition(":")[2]
+
+
 def series_facts(ics: str, tz: str) -> tuple[date, set[int]]:
     """When a series starts, and the days of the week it's on."""
     lines, default = _unfold(ics), ZoneInfo(tz)

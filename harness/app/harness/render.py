@@ -365,14 +365,28 @@ def change_line(c: dict, tz: str, now: datetime) -> str:
     return f"Add {title} {at}{where}"
 
 
+CHECK_MAX = 900          # characters of the check line's points, before it's escaped
+
+
 def check_line(warnings) -> list[str]:
     """A calendar change's warnings folded into one short line (0.24.5): the points separated by
-    semicolons, each without its own full stop, and no dash between them. [] when there are none."""
-    points = [no_dashes(str(w)).strip().rstrip(".").strip() for w in warnings]
-    points = list(dict.fromkeys(x for x in points if x))
+    semicolons, each without its own full stop. [] when there are none. Review round: only a bullet
+    dash leading a point and an em or en dash set between words come out (as a comma); a hyphen inside
+    a word, a time range (9:00-10:00) or a date (2026-12-21) stays. Escaped once, last, after any cut."""
+    points = []
+    for w in warnings:
+        text = re.sub(r"^\s*(?:[-*\u2022\u2013\u2014]\s+)+", "", str(w))       # a leading bullet
+        text = re.sub(r"\s+[\u2013\u2014]\s+|\s*\u2014\s*", ", ", text)        # a dash between points
+        text = text.strip().rstrip(".").strip()
+        if text:
+            points.append(text)
+    points = list(dict.fromkeys(points))
     if not points:
         return []
-    return [f"\u26a0 <b>Check before approving:</b> {escape('; '.join(points))}."]
+    joined = "; ".join(points)
+    if len(joined) > CHECK_MAX:
+        joined = joined[:CHECK_MAX].rsplit(" ", 1)[0].rstrip(",;") + " \u2026"
+    return [f"\u26a0 <b>Check before approving:</b> {escape(joined)}."]
 
 
 def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime,

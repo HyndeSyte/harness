@@ -1121,12 +1121,27 @@ class Runner:
             return "Nothing changed."
         if "picks" in data:
             # 0.24.5: his pick of several series under one name (calendar_change._which_series_card): that
-            # series's end on a new card, read anew by its exact title and days, never applied without his tap.
-            if not 0 <= index < len(data["picks"]):
+            # series's end on a new card, never applied without his tap. Review round: the pick is taken once
+            # (the first tap wins, in one transaction; the card's other buttons came off with it, choices.py),
+            # its index must be one of the card's, and the series it names must still be there by its id, under
+            # its title and with its rule, before the end card is made; that card reads it by its id (pins).
+            picks = data["picks"]
+            if not 0 <= index < len(picks) or not isinstance(picks[index], dict):
                 return "Nothing changed."
-            made = self._offer_new(job, {"changes": data["picks"][index]}, "you picked which series you meant, so "
+            with self.ledger.tx() as db:
+                row = db.execute("SELECT value FROM meta WHERE key=?", (f"calendar_change_which:{token}",)).fetchone()
+                live = json.loads(row[0]) if row else {}
+                if live.get("taken") is not None:
+                    return "Already done."
+                self.ledger.set_meta(f"calendar_change_which:{token}", json.dumps({**live, "taken": index}), db)
+            pick = picks[index]
+            gone = self.calendar_change.series_still(pick)
+            if gone:
+                return f"Nothing changed: {gone}, so no end card was made."
+            made = self._offer_new(job, {"changes": pick["changes"]}, "you picked which series you meant, so "
                                    "this is its end, read from the calendar just now.", replaced=False,
-                                   keep_versions=False, new_family=True)
+                                   keep_versions=False, new_family=True,
+                                   pins={str(pick["index"]): {"series": pick["series"], "calendar": pick["calendar"]}})
             return "Its end is on a new card, waiting for your tap." if made else "Nothing changed."
         params = {"changes": [data["change"]]}
         if index < 0:
@@ -1147,9 +1162,10 @@ class Runner:
         return "The correction is on a new card." + (" That card is off." if won else "")
 
     def _offer_new(self, src, params: dict, why: str, *, replaced: bool, keep_versions: bool = True,
-                   new_family: bool = False, keys: list[str] | None = None) -> str:
+                   new_family: bool = False, keys: list[str] | None = None, pins: dict | None = None) -> str:
         """A change for the same message as `src` (its quote, flags and fixed ids kept), as a new
-        request, on a card: never applied without his tap. Its request's id."""
+        request, on a card: never applied without his tap. Its request's id. Review round: `pins`, the
+        series he picked by id (calendar_change.pins_of); else any the source request had are kept."""
         root = self.ledger.get_meta(f"job_parent:{src['id']}") or src["id"]
         with self.ledger.tx() as db:
             new = self.ledger.made_job(src["chat_id"], self.ledger.job_text(src["id"]), kind="message_again",
@@ -1160,6 +1176,9 @@ class Runner:
                 self.ledger.set_meta(f"job_flags:{new}", flags, db)
             parts = json.loads(self.ledger.get_meta(f"job_parts:{root}") or "[]")
             self.ledger.set_meta(f"job_parts:{root}", json.dumps(parts + [new]), db)
+            pinned = json.dumps(pins) if pins else self.ledger.get_meta(f"calendar_change_pin:{src['id']}")
+            if pinned:
+                self.ledger.set_meta(f"calendar_change_pin:{new}", pinned, db)
         job = self.ledger.job(new)
         seen = self.calendar_change.preview_quiet(job, params, keys=keys)
         warnings = [why] + (seen.checks if seen else [])

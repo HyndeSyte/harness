@@ -2,11 +2,14 @@
 
 ## 0.24.5
 
-- **A card that takes several days off a repeating event reads as one short list**: the event's name and calendar once, the days on one line, and "each of those days only, the rest of the series stays" once. The same on the card, the *Approved* notice and the *Done* receipt. No event ids on cards.
-- **The things to check before approving are one short line**, not a line each.
-- **Ending one of two series with the same name finds the one you mean**: by its exact name (emoji included), the day of the week you named, or the id ending you gave. When nothing tells them apart, one card lists each with its days and next date, a button each. Harness never asks which days of the week when you already said.
-- **A new note on a message Harness answered "not a change" is read afresh**, so your own words get acted on without sending a new message. The same note twice is still taken once.
-- **The same "Nothing changed" answer comes once per message**, not again for every note that ends the same way.
+- **A card that takes several days off a repeating event reads as one short list**: the event's name and calendar once, every day you are approving on one line (a weekly run as "Jan 4 to Feb 22 (weekly)"), and "each of those days only, the rest of the series stays" once. The *Done* receipt shortens a long list. No event ids on cards.
+- **Two repeating events with the same name stay two lists**, each saying which days of the week it is on, so you can tell them apart.
+- **The things to check before approving are one short line**, not a line each. Times like 9:00-10:00 and dates keep their hyphens.
+- **Ending one of two series with the same name finds the one you mean**: by its exact name (emoji included), the days of the week you named ("Mondays", "every Monday", "the Monday swim"), or the id ending you gave. When nothing tells them apart, or what you said points two ways, one card lists each series with its days and next date, a button each, as many as there are. Two on the same days also show their time and calendar. Harness never picks one just because of the date you gave.
+- **A card that would take off a whole series says so**, with its days of the week and first date.
+- **What you approve is what ends**: the series on the card is the one ended, even if another one shows up before your tap. If that series changed in the meantime, nothing is ended and a fresh card follows.
+- **A new note on a message Harness answered "not a change" is read afresh**, up to two times per message. A message that already had a card is not read again that way. The same note twice is still taken once.
+- **The same "Nothing changed" answer comes once per message**, and again only if it never reached you.
 
 ## 0.24.4
 
