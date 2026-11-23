@@ -757,7 +757,9 @@ resume or the preflight starts only while what it would take fits in what is lef
 a run takes, `status` what is left). Ask him once, with that figure, before you ask for a run; never ask him to
 raise it to get past a stop. Each paid run, resume and preflight also needs his tap: run `trial.sh plan <suite>`
 (or `plan preflight`), then `/opt/cain/keeper.sh trial-approve --item <id> --suite <suite> --plan <its plan
-hash> --cap <its cap> "<what it tests, one line>"`; his "Allow this run" tap reaches you with the approval, good
+hash> --cap <its cap> "<what it tests, one line>"` (add `--new`, to both, for a new run where a stopped one would
+resume; the link works out the plan itself, shows him what it costs and sends, and refuses a hash or cap that
+differs: run `trial.sh plan` again then); his "Allow this run" tap reaches you with the approval, good
 for 2 hours and one start: pass it as `--approval <it>` to `trial.sh run` or `trial.sh preflight` at once. A
 "No" means don't start it. The trials also need keys of their own in the App's options
 (trials_anthropic_api_key, trials_gemini_api_key, trials_perplexity_api_key, never the review keys); `status`

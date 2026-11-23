@@ -92,7 +92,8 @@ import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, Decisi
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
-import { trialClaimFor, type TrialClaim } from "../trial-token";
+import { trialClaimFor, type TrialAction, type TrialClaim } from "../trial-token";
+import type { PlanView } from "../trials/plan";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
@@ -360,7 +361,7 @@ export interface Shown {
     head?: string | null; decision?: string | null };
   // Cain's trial card (0.19.0, fifth round): one paid model trial run of this exact plan (its hash) and cap, which his
   // "Allow this run" tap signs as a one-time approval (../trial-token.ts).
-  trial?: { suite: string; plan: string; cap: number };
+  trial?: { suite: string; plan: string; cap: number; action?: TrialAction };
 }
 // The values an ask quotes, in straight double quotes, as the link posts it: what a "Use it"
 // tap on it can approve for reuse in a PC job (reuseProof). Each one line of 4 to 300
@@ -706,6 +707,9 @@ export interface Deps {
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
   signTrial?: (claim: TrialClaim) => string | null;                // his "Allow this run" tap as a trial approval (0.19.0); null: no key
+  // The plan his trial card shows, computed by the link itself from the suite file and the App's options (0.19.0, sixth
+  // round; ../trials/plan.ts); absent: no trial card goes out.
+  trialPlan?: (a: { suite: string; fresh: boolean }) => PlanView | { error: string };
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
@@ -1223,9 +1227,11 @@ export class Link {
       digest: digest(msg.content ?? "", msg.components), until: now + REMEMBER_MS };
   }
 
-  private async post(text: string, comps: any[], opts: { timeoutMs?: number; replyTo?: string; nonce?: string } = {}): Promise<any> {
+  private async post(text: string, comps: any[], opts: { timeoutMs?: number; replyTo?: string; nonce?: string; files?: { name: string; content: string }[] } = {}): Promise<any> {
     const { dm } = await this.identity();
     const body: any = { content: fit(text), allowed_mentions: { parse: [] }, flags: SUPPRESS_EMBEDS };
+    // A text file sent with the message (0.19.0, sixth round: the trial card's full list of what is sent to search).
+    if (opts.files?.length) body.files = opts.files.map((f) => ({ name: f.name, content: f.content }));
     if (comps.length) body.components = comps;
     // An answer to a tap or a message is a Discord reply to it.
     if (opts.replyTo) body.message_reference = { message_id: opts.replyTo, channel_id: dm, fail_if_not_exists: false };
@@ -1239,7 +1245,7 @@ export class Link {
   // A card that must be new. Discord hands back the message already made for the same
   // nonce (a retry after a lost answer); if that one is a card already done with (the
   // same words asked again), this posts a fresh one.
-  private async postCard(text: string, comps: any[], opts: { replyTo?: string; nonce: string }): Promise<any> {
+  private async postCard(text: string, comps: any[], opts: { replyTo?: string; nonce: string; files?: { name: string; content: string }[] }): Promise<any> {
     const msg = await this.post(text, comps, opts);
     if (!this.d.load().messages[String(msg.id)]?.outcome) return msg;
     return this.post(text, comps, { ...opts, nonce: stableNonce(opts.nonce, String(this.d.now())) });
@@ -1727,13 +1733,15 @@ export class Link {
   }
 
   // -- his go for one paid model trial run (0.19.0, fifth round; ../trial-token.ts) --
-  // Cain's keeper.sh trial-approve: a card asking him to allow one paid run of a trials suite (or the preflight),
-  // bound to the exact plan `trial.sh plan` printed (its hash, kept with the card and never shown) and its cap
-  // in dollars. Two buttons, "Allow this run" and "No"; it expires with the next morning check-in like his
-  // asks. This writes nothing and signs nothing: only his Allow tap makes the approval, signed with the link's
-  // trial key, single use (the trials runner consumes its nonce) and good for 2 hours. The App option
-  // trials_run_allowance_usd stays the ceiling over every run he allows.
-  async trialApprove(a: { item?: unknown; suite?: unknown; plan?: unknown; cap?: unknown; text?: unknown; replyTo?: unknown }): Promise<AskResult> {
+  // Cain's keeper.sh trial-approve: a card asking him to allow one paid run of a trials suite (or the preflight). Sixth
+  // round: the link computes the plan itself (d.trialPlan, ../trials/plan.ts: the suite file, the research questions and
+  // notes, the App's options, the newest run) and refuses a call whose carried plan hash or cap differs from its own. The
+  // card renders, as text, what he approves: the suite, whether it is a preflight, a start or a resume, the cap in dollars,
+  // the worst case, each provider called, the total already granted from his allowance, and for research the full "Sent
+  // to third-party search" list (attached as a text file when it doesn't fit). Two buttons, "Allow this run" and "No"; it
+  // expires with the next morning check-in like his asks. Only his Allow tap signs the approval, for the hash and action
+  // computed here, with the link's trial key, single use and good for 2 hours.
+  async trialApprove(a: { item?: unknown; suite?: unknown; plan?: unknown; cap?: unknown; text?: unknown; replyTo?: unknown; fresh?: unknown }): Promise<AskResult> {
     const meta = checkMeta({ item: a.item, replyTo: a.replyTo });
     if (this.stopped().stopped) throw new Refusal("Everything is stopped: Dane tapped Stop, so no trial card until he taps Turn back on. Only he can; don't ask him to.");
     if (!this.d.signTrial) throw new Refusal("the link has no trial key, so his tap couldn't be signed: no trial card goes out. Log it as a Build item");
@@ -1748,21 +1756,49 @@ export class Link {
     if (why.length > 300) throw new Refusal("say what the run tests in one line");
     noMachineText(why);
     this.mayAsk(meta.item);
+    // The link's own reading of the plan: what he approves comes from it, never from what Cain carried.
+    if (!this.d.trialPlan) throw new Refusal("the link can't compute the trial's plan itself, so no trial card goes out. Log it as a Build item");
+    const fresh = a.fresh === true;
+    let view: PlanView | { error: string };
+    try { view = this.d.trialPlan({ suite, fresh }); } catch (e) { view = { error: `its plan couldn't be computed (${String(e).slice(0, 80)})` }; }
+    if ("error" in view) throw new Refusal(`no trial card: ${view.error}`);
+    if (view.plan !== plan) throw new Refusal("the plan hash you carried isn't the one the link computes from the suite file and the App's options: run trial.sh plan again and ask with the hash it prints now");
+    if (Math.round(view.cap * 100) !== Math.round(cap * 100)) throw new Refusal(`the cap you carried isn't the run's cap as the link computes it ($${view.cap.toFixed(2)}): run trial.sh plan again`);
     const options = [TRIAL_ALLOW, TRIAL_NO];
     const w = this.cainWords("trial", "trial card", why.replace(/[.\s]+$/, ""), { rules: CARD_RULES, buttons: options, known: this.liveLabels() });
-    const money = `$${cap.toFixed(2)}`;
-    const text = `${w.text}. Allow ${TRIAL_WHAT[suite]}, costing at most ${money} of your trial allowance? Your tap allows only this one run of this exact plan, for the next 2 hours.`;
-    const shown = this.cardGate("trial", "trial card", text, options);
+    const money = (n: number) => `$${n.toFixed(2)}`;
+    const kind = view.action === "preflight" ? "the preflight (the model checks before any trial)" : view.action === "resume" ? `a resume of the ${suite} suite's stopped run` : `a new run of the ${suite} suite`;
+    const facts = [
+      `What: ${kind}${view.tasks ? `, ${view.tasks} tasks, ${view.calls} calls` : ""}.`,
+      `Cap: ${money(view.cap)} of your trial allowance; worst case of its calls ${money(view.worst)}.`,
+      `Providers called: ${view.providers.join(", ")}.`,
+      `Granted to trial runs so far: ${view.granted === null ? "unknown (counts as all of it)" : money(view.granted)} of your ${money(view.allowance)} allowance.`,
+    ];
+    const head = `${w.text}. Allow ${TRIAL_WHAT[suite]}, costing at most ${money(view.cap)} of your trial allowance?`;
+    const tail = "Your tap allows only this one run of this exact plan, for the next 2 hours.";
+    const build = (disclosure: string) => [head, ...facts, ...(disclosure ? [disclosure] : []), tail].join("\n");
+    let files: { name: string; content: string }[] | undefined;
+    let shown: string | null = null;
+    if (view.disclosure) {
+      // The list on the card itself when it fits and passes the card gate; otherwise attached as a text file, named on the card.
+      const inline = build(view.disclosure);
+      if (inline.length <= 1_900) shown = this.cardGate("trial", "trial card", inline, options);
+      if (!shown) {
+        files = [{ name: "sent-to-third-party-search.txt", content: `${view.disclosure}\n` }];
+        shown = this.cardGate("trial", "trial card", build(`Sent to third-party search: the full list is attached (${view.tasks} questions and their answer notes).`), options);
+      }
+    } else shown = this.cardGate("trial", "trial card", build(""), options);
     if (!shown) throw new Refusal("the trial card's words didn't pass the card gate: say what the run tests in plain words, with no record codes or machine text");
     const now = this.d.now();
-    const nonce = stableNonce("trial", meta.item, suite, plan, String(cap), shown);
+    const nonce = stableNonce("trial", meta.item, suite, plan, String(cap), view.action, shown);
+    const action = view.action;
     return this.serial(async () => {
-      const msg = await this.postCard(shown, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"), { replyTo: meta.replyTo, nonce });
+      const msg = await this.postCard(shown!, rows([options.map((o, i) => [o, `q:${nonce.slice(0, 10)}:${i}`] as [string, string])], "q:"), { replyTo: meta.replyTo, nonce, ...(files ? { files } : {}) });
       const s = this.d.load();
       this.remember(s, msg, { kind: "ask", item: meta.item, question: `trial:${suite}`, posted: now, expires: this.askExpiry(now), buttons: true, labels: [...options],
-        q: { q: `Allow ${TRIAL_WHAT[suite]}, at most ${money}?`, options, used: false }, trial: { suite, plan, cap } });
+        q: { q: `Allow ${TRIAL_WHAT[suite]}, at most ${money(view.cap)}?`, options, used: false }, trial: { suite, plan: view.plan, cap: view.cap, action } });
       this.d.save(s);
-      this.log(`a trial card (${suite}, cap ${money}) went to him`);
+      this.log(`a trial card (${suite}, ${action}, cap ${money(view.cap)}) went to him`);
       return { status: "posted" as const, message: String(msg.id),
         said: "Posted. Only his Allow tap approves the run: you'll hear it with the approval to pass to trial.sh, good for 2 hours and one run of that plan." };
     });
@@ -1771,14 +1807,15 @@ export class Link {
   // signs nothing. The line for Cain.
   private trialTap(m: Shown, label: string): string {
     const t = m.trial!;
-    const cmd = t.suite === "preflight" ? "/opt/cain/trial.sh preflight" : `/opt/cain/trial.sh run ${t.suite}`;
+    const action = t.action ?? (t.suite === "preflight" ? "preflight" : "start");
+    const cmd = t.suite === "preflight" ? "/opt/cain/trial.sh preflight" : `/opt/cain/trial.sh run ${t.suite}${action === "start" ? " --new" : ""}`;
     if (label !== TRIAL_ALLOW) { this.log(`Dane turned down a trial run (${t.suite})`); return " Nothing was approved: don't start that run, and don't ask again for it today unless he raises it."; }
     if (this.stopped().stopped) return " Everything is stopped, so the link signed no approval: after he taps Turn back on, ask again with a new trial card.";
-    const claim = trialClaimFor({ suite: t.suite, plan: t.plan, capUsd: t.cap }, this.d.now());
+    const claim = trialClaimFor({ suite: t.suite, plan: t.plan, capUsd: t.cap, action }, this.d.now());
     let token: string | null = null;
     try { token = claim && this.d.signTrial ? this.d.signTrial(claim) : null; } catch (e) { this.log(`couldn't sign a trial approval: ${String(e).slice(0, 80)}`); }
     if (!token) return " The link couldn't sign an approval (no trial key), so no run can start: tell him in one line that trials are down, and log a Build item.";
-    this.log(`Dane allowed a trial run (${t.suite}, cap $${t.cap.toFixed(2)}); its approval is signed`);
+    this.log(`Dane allowed a trial run (${t.suite}, ${action}, cap $${t.cap.toFixed(2)}); its approval is signed`);
     return ` Trial approval: ${token} (one run of that exact plan, good for 2 hours): run ${cmd} --approval ${token} now. Nothing to tell him.`;
   }
 

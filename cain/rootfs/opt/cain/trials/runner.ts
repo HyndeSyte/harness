@@ -54,7 +54,7 @@ import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import { chmodSync, chownSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import type { KeyObject } from "node:crypto";
-import { centsOf, readTrialToken, trialPublicKey, type TrialTarget } from "../trial-token.ts";
+import { centsOf, readTrialToken, trialPublicKey, type TrialAction, type TrialTarget } from "../trial-token.ts";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { FINAL, SeatError, textCheck, type ErrorKind } from "../review/core.ts";
@@ -66,13 +66,14 @@ import {
   DEFAULT_BUDGET_USD, GEMINI_MODELS, PREFLIGHT_CAP_USD, modelsId, planHash, preflightCap, preflightPlanHash, runCap, GRADERS, LIMITS, PERPLEXITY_OWN_MODEL, SEAT_LIMITS, blindViolations, callShape, callsFor, ceilingOf, checkQuestions, configById, configsFor,
   familyOf, fetchAllowed, gradeCharsBound, gradePrompt, isSuite, ledgerCap, ledgerMargin, makeLabels, noteFetchUrls, notesSha, panelFor, parseGrades, pickReviewTasks, planOf, researchPrivacy, researchPrompt, reviewOutput, rubricSha,
   seatOfConfig, shuffled, taskChars, thinkingAllowance, toolViolation, tokensOf, ceilingPrice, worstOf, worstOfCeiling, trialAllowance,
-  type CallShape, type CallSpec, type Config, type GraderId, type Labelled, type Output, type OutputGrade,
+  type CallShape, type CallSpec, type CitedPage, type Config, type GraderId, type Labelled, type Output, type OutputGrade,
   type ResearchTask, type ReviewDir, type ReviewSeatName, type ReviewTask, type SeatLimit, type Suite, type SuiteName, type Task,
 } from "./core.ts";
 import { CODEX_NO_MODEL, CODEX_ROOT, CodexToolUse, CodexWebSearch, usageOf, type AskResult, type CodexProvider, type Provider, type ThinkingSeen } from "./calls.ts";
-import { Ledger, ownerAlive, readBudgetFile, type Budget, type How, type SeatWindow } from "./ledger.ts";
+import { Ledger, ownerAlive, readBudgetFile, type Budget, type How, type SeatWindow, type Spend } from "./ledger.ts";
 import { PrivacyBlock, makeWire, type Wire } from "./guard.ts";
-import { groupExec, which, type Isolation } from "./sandbox.ts";
+import { CODEX_MIN_VERSION, codexIdentity, codexVersionOf, groupExec, versionAtLeast, which, type Isolation } from "./sandbox.ts";
+import { fetchCitedPage, type PageFetch } from "./pages.ts";
 import { writeReport } from "./report.ts";
 
 export type TrialsConfig = {
@@ -97,7 +98,56 @@ export type TrialsConfig = {
   supervisorSeen?: () => boolean;   // tests only: whether SUPERVISOR_TOKEN is in this process's environment
   codexId?: string;            // tests only: the installed Codex (default: a hash of its binary)
   tallyUid?: number;           // the allowance tally's owner (default: this process's uid, root on the Pi)
+  // Sixth round:
+  privateDir?: string;         // the tally, the used approvals and the has-history marker (default <dir>-private, 0700)
+  linkKey?: string;            // the link's private trial key (default /data/link/trial.key): readable by its owner only
+  linkKeyUid?: number;         // the link's uid (root)
+  tokenFiles?: string[];       // the init's token sources (default TOKEN_FILES): none may be readable by the assistant or the runner
+  assistantUid?: number;       // the assistant's uid (Cain's user)
+  assistantGids?: number[];    // its groups (default: read from /etc/passwd and /etc/group)
+  runnerUid?: number;          // tests only: the runner's uid (default: this process's)
+  codexIdentity?: string | null;        // tests only: the trials' Codex sign-in's identity (default: from its home)
+  reviewCodexIdentity?: string | null;  // tests only: the review service's Codex sign-in's identity
+  codexHome?: string;          // the trials' own Codex home (its sign-in), apart from the review service's
+  reviewCodexHome?: string;    // the review service's Codex home (/data/codex)
+  startedAt?: number;          // when this runner started (the options-file line); default now
 };
+// The init's token sources (sixth round): s6's saved container environment and init's own environment.
+export const TOKEN_FILES = ["/run/s6/container_environment/SUPERVISOR_TOKEN", "/run/s6/container_environment/HASSIO_TOKEN", "/proc/1/environ"];
+// Whether a uid (with its groups) could read a file, by the mode bits of the file and of every folder above it. Root reads
+// anything. A file that isn't there can't be read.
+export function readableBy(path: string, uid: number, gids: number[]): boolean {
+  if (uid === 0) return existsSync(path);
+  const can = (st: { uid: number; gid: number; mode: number }, bits: { u: number; g: number; o: number }) =>
+    st.uid === uid ? !!(st.mode & bits.u) : gids.includes(st.gid) ? !!(st.mode & bits.g) : !!(st.mode & bits.o);
+  let st;
+  try { st = statSync(path); } catch { return false; }
+  if (!can(st, { u: 0o400, g: 0o040, o: 0o004 })) return false;
+  for (let d = dirname(path); ; d = dirname(d)) {
+    try { if (!can(statSync(d), { u: 0o100, g: 0o010, o: 0o001 })) return false; } catch { return false; }
+    if (d === dirname(d)) break;
+  }
+  return true;
+}
+// A user's groups from /etc/passwd and /etc/group.
+export function groupsOf(uid: number, passwd = "/etc/passwd", group = "/etc/group"): number[] {
+  const out = new Set<number>();
+  let name = "";
+  try { for (const l of readFileSync(passwd, "utf8").split("\n")) { const f = l.split(":"); if (Number(f[2]) === uid) { name = f[0]; out.add(Number(f[3])); } } } catch { /* none */ }
+  try { for (const l of readFileSync(group, "utf8").split("\n")) { const f = l.split(":"); if (name && (f[3] ?? "").split(",").includes(name)) out.add(Number(f[2])); } } catch { /* none */ }
+  return [...out].filter(Number.isInteger);
+}
+// The go/no-go lines of the preflight report (sixth round), by name.
+export const GO_LINES = {
+  bwrap: "bubblewrap starts in the container",
+  config: "the requirements file is read and honoured inside the wrapper (the effective config check)",
+  probes: "the credential, environ and network probes are refused",
+  options: "saving options rewrites the options file without a restart",
+  thinking: "each Gemini model emits thinking on its check",
+  discord: "the trial card and its tap arrive on real Discord",
+} as const;
+export type GoLineName = keyof typeof GO_LINES;
+export type GoStatus = { status: "go" | "no-go" | "not checked"; detail: string };
 // ---- the trial keys (fifth round) ----
 export type KeyName = "anthropic" | "gemini" | "perplexity";
 export type KeyCheck = Record<KeyName, "ok" | "empty" | "same">;
@@ -130,6 +180,7 @@ export type TrialDeps = {
   review: Runner;              // its ledger and caps, the guard's reserve, the private terms, Stop, relay, its queue
   providers: { claude?: Provider; gemini?: Provider; perplexity?: Provider; codex?: CodexProvider };
   fetch?: Fetch; exec?: Exec;  // what each call's Wire sends through (default: fetch, and Codex in its own process group)
+  pageFetch?: PageFetch;       // the research grader's cited pages (sixth round; default: fetch)
   now?: () => Date; rand?: () => number; log?: (m: string) => void; owner?: string;
 };
 
@@ -183,7 +234,11 @@ export const paths = (dir: string) => ({
   key: (s: string, r: string) => join(dir, s, r, "key.json"),
   report: (s: string) => join(dir, s, "report.md"),
   preflight: join(dir, "preflight.json"),
-  used: join(dir, "approvals-used"),
+  preflightReport: join(dir, "preflight.md"),
+  pages: (s: string, r: string, task: string) => join(dir, s, r, "pages", fileOf(task)),
+  // Sixth round: in the private folder, the runner's alone.
+  privateDir: `${dir.replace(/\/+$/, "")}-private`,
+  used: join(`${dir.replace(/\/+$/, "")}-private`, "approvals-used"),
 });
 
 // ---- the preflight's record (fourth round) ----
@@ -193,7 +248,7 @@ export { PREFLIGHT_CAP_USD };
 export function buildId(env = process.env): string {
   const h = createHash("sha256");
   const dir = import.meta.dir;
-  for (const f of ["core.ts", "calls.ts", "guard.ts", "ledger.ts", "runner.ts", "sandbox.ts"]) { try { h.update(f); h.update(readFileSync(join(dir, f))); } catch { h.update(`${f}:missing`); } }
+  for (const f of ["core.ts", "calls.ts", "guard.ts", "ledger.ts", "runner.ts", "sandbox.ts", "pages.ts", "plan.ts"]) { try { h.update(f); h.update(readFileSync(join(dir, f))); } catch { h.update(`${f}:missing`); } }
   return `${env.CAIN_VERSION ? `${String(env.CAIN_VERSION).replace(/[^\w.-]/g, "").slice(0, 20)}-` : ""}${h.digest("hex").slice(0, 16)}`;
 }
 export function machineId(): string {
@@ -202,12 +257,15 @@ export function machineId(): string {
 }
 export type PreflightSuite = { run: string; checked: Record<string, string>; skip: Record<string, string>; graders_off: Record<string, string>; served: Record<string, string>;
   ids: Record<string, string>; thinking: Record<string, string>; codex_isolation?: Isolation; codex_version?: string | null; codex_models?: string[] | null };
-export type PreflightKey = { code: string; machine: string; codex: string; models: string; options: string };
+export type PreflightKey = { code: string; machine: string; codex: string; models: string; options: string; codex_identity?: string };
 export type PreflightRecord = { format: 1; id: string; status: "running" | "done" | "stopped"; build: string; machine: string; started_at: string; finished_at?: string;
   cap_usd: number; suites: Partial<Record<SuiteName, PreflightSuite>>; disabled: Record<string, string>; codex_daemon?: string; stop?: string;
-  key?: PreflightKey };
+  key?: PreflightKey;
+  // Sixth round: the go/no-go lines, the installed Codex's version, what is known of key separation, and the approval.
+  golines?: Partial<Record<GoLineName, GoStatus>>; codex_version?: string | null; key_separation?: string; approved_at?: string };
+export const KEY_SEPARATION = "unverified beyond the string check: no provider the trials use exposes an organisation or workspace id per API key, so the trial keys are known only to differ from the review keys as strings";
 export const PREFLIGHT_TTL_MS = 7 * 24 * 3_600_000;
-const KEY_WHAT: Record<keyof PreflightKey, string> = { code: "the trials code", machine: "the machine", codex: "the installed Codex", models: "the configured models", options: "the trials options" };
+const KEY_WHAT: Record<keyof PreflightKey, string> = { code: "the trials code", machine: "the machine", codex: "the installed Codex", models: "the configured models", options: "the trials options", codex_identity: "the trials' Codex sign-in" };
 export function readPreflight(dir: string): PreflightRecord | null {
   const r = readJson<PreflightRecord | null>(paths(dir).preflight, null);
   return r && r.format === 1 && typeof r.build === "string" ? r : null;
@@ -275,7 +333,7 @@ export function reviewDirs(recordDir: string): ReviewDir[] {
 // counts, so an approval written as Cain's user is ignored.
 export const RESEARCH_QUESTIONS = "projects/harness/trials/research-questions.json";
 export const OPTIONS_FILE = "/data/options.json";
-export type AppOptions = { questions: string; notes: string; rubric: string; thirdParty: boolean; allowanceUsd: number };
+export type AppOptions = { questions: string; notes: string; rubric: string; thirdParty: boolean; allowanceUsd: number; budgetUsd: number };
 export function readOptions(path = OPTIONS_FILE, uid = 0): { ok: true; o: AppOptions } | { ok: false; why: string } {
   let fd: number;
   try { fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); }
@@ -290,7 +348,8 @@ export function readOptions(path = OPTIONS_FILE, uid = 0): { ok: true; o: AppOpt
     const h = (k: string) => (typeof j?.[k] === "string" && /^[0-9a-f]{64}$/.test(j[k]) ? j[k] : "");
     return { ok: true, o: { questions: h("trials_research_questions_sha256"), notes: h("trials_research_notes_sha256"), rubric: h("trials_research_rubric_sha256"),
       thirdParty: j?.trials_perplexity_third_party_routing === true,
-      allowanceUsd: typeof j?.trials_run_allowance_usd === "number" && Number.isFinite(j.trials_run_allowance_usd) && j.trials_run_allowance_usd > 0 ? j.trials_run_allowance_usd : 0 } };
+      allowanceUsd: typeof j?.trials_run_allowance_usd === "number" && Number.isFinite(j.trials_run_allowance_usd) && j.trials_run_allowance_usd > 0 ? j.trials_run_allowance_usd : 0,
+      budgetUsd: typeof j?.trials_budget_usd === "number" && Number.isFinite(j.trials_budget_usd) && j.trials_budget_usd >= 0 ? j.trials_budget_usd : DEFAULT_BUDGET_USD } };
   } catch { return { ok: false, why: "the App's options can't be read" }; }
   finally { try { closeSync(fd); } catch { /* closed */ } }
 }
@@ -376,13 +435,15 @@ type Exchange =
 export class TrialRunner {
   private now: () => Date; private rand: () => number; private log: (m: string) => void;
   private recovered = false;
+  private startedAt: number;
   readonly ledger: Ledger;
   private lastCall: Record<string, number> = {};
   constructor(public cfg: TrialsConfig, public deps: TrialDeps) {
     this.now = deps.now ?? (() => new Date());
     this.rand = deps.rand ?? Math.random;
     this.log = deps.log ?? ((m) => console.log(`[trials] ${m}`));
-    this.ledger = new Ledger(cfg.dir, deps.owner, this.now, cfg.tallyUid);
+    this.ledger = new Ledger(cfg.dir, deps.owner, this.now, cfg.tallyUid, cfg.privateDir);
+    this.startedAt = cfg.startedAt ?? Date.now();
   }
   get budget(): number { const b = this.cfg.budgetUsd; return Number.isFinite(b) && b >= 0 ? b : DEFAULT_BUDGET_USD; }
   private p = () => paths(this.cfg.dir);
@@ -401,14 +462,52 @@ export class TrialRunner {
     const k = keyProblems(this.cfg.keyCheck);
     if (k.length) return `the trials can't spend: ${k.join("; ")}. Only the owner sets the trial keys, in the App's options`;
     if ((this.cfg.supervisorSeen ?? (() => supervisorTokenSeen()))()) return "the trials can't spend: SUPERVISOR_TOKEN is in the runner's own environment, so nothing paid is dispatched until the App starts without it";
+    // Sixth round: the private folder, the link's private trial key, and the init's token files.
+    const pp = this.ledger.privateProblem();
+    if (pp) return `the trials can't spend: ${pp}`;
+    const lk = this.linkKeyProblem();
+    if (lk) return `the trials can't spend: ${lk}`;
+    const tf = this.tokenFileProblem();
+    if (tf) return `the trials can't spend: ${tf}`;
     return null;
+  }
+  // The link's private trial key must be readable by the link's uid alone (sixth round).
+  linkKeyProblem(): string | null {
+    const path = this.cfg.linkKey ?? "/data/link/trial.key";
+    let st;
+    try { st = lstatSync(path); } catch { return `the link's private trial key (${path}) can't be found, so its approvals can't be trusted`; }
+    if (!st.isFile()) return "the link's private trial key isn't a plain file";
+    if (st.uid !== (this.cfg.linkKeyUid ?? 0)) return "the link's private trial key isn't the link's";
+    if (st.mode & 0o077) return "the link's private trial key can be read by others than the link";
+    return null;
+  }
+  // The init's token sources (sixth round): none may be readable by the assistant's uid, nor by the runner's when the
+  // runner isn't root (root reads every file, so as root its check is that the file is readable by no one but root).
+  tokenFileProblem(): string | null {
+    const files = this.cfg.tokenFiles ?? TOKEN_FILES;
+    const auid = this.cfg.assistantUid ?? CAIN_UID;
+    const agids = this.cfg.assistantGids ?? (this.gidsSeen ??= groupsOf(auid));
+    const ruid = this.cfg.runnerUid ?? (process.getuid ? process.getuid() : 0);
+    for (const f of files) {
+      if (readableBy(f, auid, agids)) return `the init's token file ${f} can be read by the assistant's user, so nothing paid is dispatched (DOCS.md, the token files)`;
+      if (ruid !== 0 && readableBy(f, ruid, groupsOf(ruid))) return `the init's token file ${f} can be read by the runner's user, so nothing paid is dispatched`;
+      if (ruid === 0) { try { const st = statSync(f); if (st.uid !== 0 || (st.mode & 0o077)) return `the init's token file ${f} can be read by others than root, so nothing paid is dispatched`; } catch { /* not there: fine */ } }
+    }
+    return null;
+  }
+  private gidsSeen?: number[];
+  // The trials' and the review service's Codex sign-ins, by identity (hashed ids; never a token).
+  codexIdentities(): { trials: string | null; review: string | null } {
+    return { trials: this.cfg.codexIdentity !== undefined ? this.cfg.codexIdentity : this.cfg.codexHome ? codexIdentity(this.cfg.codexHome) : null,
+      review: this.cfg.reviewCodexIdentity !== undefined ? this.cfg.reviewCodexIdentity : this.cfg.reviewCodexHome ? codexIdentity(this.cfg.reviewCodexHome) : null };
   }
   preflightKey(): PreflightKey {
     const o = readOptions(this.cfg.optionsFile ?? OPTIONS_FILE, this.cfg.optionsUid ?? 0);
     const oo = o.ok ? (o as { o: AppOptions }).o : null;
     const options = createHash("sha256").update(JSON.stringify({ budget: this.budget, third: oo?.thirdParty ?? null, q: oo?.questions ?? null, n: oo?.notes ?? null, r: oo?.rubric ?? null,
       keys: this.cfg.keyPrint ?? null, readable: o.ok })).digest("hex").slice(0, 16);
-    return { code: this.build, machine: this.machine, codex: this.cfg.codexId ?? (this.codexSeen ??= codexInstalledId()), models: modelsId(), options };
+    return { code: this.build, machine: this.machine, codex: this.cfg.codexId ?? (this.codexSeen ??= codexInstalledId()), models: modelsId(), options,
+      codex_identity: this.codexIdentities().trials ?? "none" };
   }
   private codexSeen?: string;
   pfError(): string | null { return preflightError(readPreflight(this.cfg.dir), this.preflightKey(), this.now().getTime()); }
@@ -430,30 +529,24 @@ export class TrialRunner {
     const cap = this.runCapFor(suite!, pinned);
     return { plan: planHash(suite!, pinned, cap), cap };
   }
-  // The owner's approval checked and consumed: signed by the link's trial key, for this target, this exact plan and
-  // cap, not expired, and not used before (its nonce created exclusively, fsynced). The reason it doesn't count, or
-  // null once it is spent on this start.
-  useApproval(token: unknown, target: TrialTarget, want: { plan: string; cap: number }): { why: string } | { nonce: string; plan: string; cap_cents: number; at: string } {
+  // The owner's approval checked (sixth round: not yet spent): signed by the link's trial key, for this target, this exact
+  // plan, cap and action (a preflight, a start or a resume, as the link's card said), not expired, and not used before. It
+  // is spent by the grant it starts (ledger.ts grant), in one durable step under the ledger's lock. The reason it doesn't
+  // count, or what the grant spends.
+  verifyApproval(token: unknown, target: TrialTarget, want: { plan: string; cap: number; action: TrialAction }): { why: string } | { spend: Spend; approved: { nonce: string; plan: string; cap_cents: number; at: string; action: TrialAction } } {
     if (typeof token !== "string" || !token) return { why: NEEDS_APPROVAL };
     const key = this.trialKey();
     if (!key.ok) return { why: `${(key as { why: string }).why}.` };
     const r = readTrialToken(token, (key as { key: KeyObject }).key, this.now().getTime());
     if (!r.ok) return { why: `its approval doesn't count: ${(r as { why: string }).why}.` };
     const c = r.claim;
+    if (this.ledger.nonceUsed(c.nonce)) return { why: "its approval was already used: one tap allows one run. Ask him again with a new trial card." };
     if (c.suite !== target) return { why: `its approval is for ${c.suite}, not ${target}.` };
+    if (c.action !== want.action) return { why: `its approval is for ${c.action === "resume" ? "a resume" : c.action === "start" ? "a new run" : "the preflight"}, and this would be ${want.action === "resume" ? "a resume" : want.action === "start" ? "a new run" : "the preflight"}: ask him again with a new trial card.` };
     if (c.plan !== want.plan) return { why: "its approval is for another plan than the one this run would make (the suite, its calls, its cap or what it sends changed since trial.sh plan printed it): run trial.sh plan again and ask him again." };
     if (c.cap_cents !== centsOf(want.cap)) return { why: `its approval names a cap of $${(c.cap_cents / 100).toFixed(2)}, and this run's cap is $${want.cap.toFixed(2)}.` };
-    const dir = this.p().used;
-    try { mkdirSync(dir, { recursive: true, mode: 0o750 }); } catch { /* checked by the create */ }
-    const at = this.iso();
-    try {
-      const fd = openSync(join(dir, `${c.nonce}.json`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o640);
-      try { writeSync(fd, JSON.stringify({ suite: c.suite, plan: c.plan, cap_cents: c.cap_cents, exp: c.exp, used_at: at })); fsyncSync(fd); } finally { closeSync(fd); }
-      try { const d = openSync(dir, "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* not every platform */ }
-    } catch (e: any) {
-      return { why: e?.code === "EEXIST" ? "its approval was already used: one tap allows one run. Ask him again with a new trial card." : "its approval couldn't be recorded as used, so nothing starts." };
-    }
-    return { nonce: c.nonce, plan: c.plan, cap_cents: c.cap_cents, at };
+    if (this.ledger.nonceUsed(c.nonce)) return { why: "its approval was already used: one tap allows one run. Ask him again with a new trial card." };
+    return { spend: { nonce: c.nonce, suite: c.suite, plan: c.plan, cap_cents: c.cap_cents }, approved: { nonce: c.nonce, plan: c.plan, cap_cents: c.cap_cents, at: this.iso(), action: c.action } };
   }
   get machine(): string { return this.cfg.machine ?? (this.machineSeen ??= machineId()); }
   private builtId?: string; private machineSeen?: string;
@@ -461,9 +554,9 @@ export class TrialRunner {
   // A run's cap: its plan's worst case plus its own checks, never above the ledger's cap.
   runCapFor(suite: Suite, pinned = true): number { return runCap(this.budget, planOf(suite, pinned).total); }
   // The grant a run or the preflight goes on under, checked against the allowance as it is now.
-  private grantFor(st: { suite: string; run: string; kind?: string }, cap: number) {
+  private grantFor(st: { suite: string; run: string; kind?: string }, cap: number, spend?: Spend) {
     const key = this.grantKey(st);
-    return this.ledger.grant(key, { suite: st.kind === "preflight" ? "preflight" : st.suite, run: st.run }, cap, this.allowance());
+    return this.ledger.grant(key, { suite: st.kind === "preflight" ? "preflight" : st.suite, run: st.run }, cap, this.allowance(), spend);
   }
   // A seat's trial allowance per window (core.ts SEAT_LIMITS).
   window = (seat: ReviewSeatName): SeatWindow | null => {
@@ -540,14 +633,16 @@ export class TrialRunner {
     const last = latestRun(this.cfg.dir, suite);
     const resuming = !!(last && last.status !== "done" && mode !== "new");
     if (!resuming && last && last.status === "running") return "its newest run is still running; it can't start a new one beside it.";
-    // His one-time approval, for exactly the plan this start would run, spent before anything is frozen or sent.
+    // His one-time approval, for exactly the plan and action this start would run, spent by its grant before anything is
+    // frozen or sent.
     const pinned = resuming ? !last!.preflight?.third_party_routing : !(suite === "research" && (() => { const a = this.approval(); return a.ok && a.third_party; })());
-    const used = this.useApproval(j.approval, suite, this.approvalTarget(suite, s, pinned));
-    if ("why" in used) return used.why;
-    if (fresh) writeAtomic(this.p().suite(suite), JSON.stringify(s, null, 1));
+    const v = this.verifyApproval(j.approval, suite, { ...this.approvalTarget(suite, s, pinned), action: resuming ? "resume" : "start" });
+    if ("why" in v) return v.why;
+    const used = v.approved;
     if (resuming && last) {
-      const g = this.grantFor(last, this.runCapFor(s, !last.preflight?.third_party_routing));
-      if (!g.ok) return `the run can't resume: ${(g as { detail: string }).detail}.`;
+      const g = this.grantFor(last, this.runCapFor(s, !last.preflight?.third_party_routing), v.spend);
+      if (!g.ok) return (g as { reason: string }).reason === "used" ? (g as { detail: string }).detail : `the run can't resume: ${(g as { detail: string }).detail}.`;
+      if (fresh) writeAtomic(this.p().suite(suite), JSON.stringify(s, null, 1));
       last.status = "running"; delete last.stop; last.approved = used;
       for (const c of Object.values(last.calls)) {
         if (c.status === "held") c.status = "interrupted";
@@ -562,8 +657,9 @@ export class TrialRunner {
     const d = this.now();
     const run = `r${d.toISOString().slice(0, 10).replace(/-/g, "")}-${d.toISOString().slice(11, 19).replace(/:/g, "")}`;
     if (existsSync(this.p().run(suite, run))) return "a run started this very second; ask again.";
-    const g = this.grantFor({ suite, run }, this.runCapFor(s, pinned));
-    if (!g.ok) return `the run can't start: ${(g as { detail: string }).detail}.`;
+    const g = this.grantFor({ suite, run }, this.runCapFor(s, pinned), v.spend);
+    if (!g.ok) return (g as { reason: string }).reason === "used" ? (g as { detail: string }).detail : `the run can't start: ${(g as { detail: string }).detail}.`;
+    if (fresh) writeAtomic(this.p().suite(suite), JSON.stringify(s, null, 1));
     const st: RunState = { format: 2, suite, run, status: "running", created_at: this.iso(), updated_at: this.iso(), stops: [], calls: {},
       notes: [...s.skipped], held: {}, cool: {}, approved: used };
     // The original seats' answers kept in each review are outputs too, with no call.
@@ -630,23 +726,55 @@ export class TrialRunner {
     const d = this.now();
     const id = `p${d.toISOString().slice(0, 10).replace(/-/g, "")}-${d.toISOString().slice(11, 19).replace(/:/g, "")}`;
     if (cur?.id === id) return "a preflight started this very second; ask again.";
-    const used = this.useApproval(approval, "preflight", this.approvalTarget("preflight"));
-    if ("why" in used) return used.why;
-    const g = this.grantFor({ suite: "preflight", run: id, kind: "preflight" }, preflightCap(this.budget));
-    if (!g.ok) return `the preflight can't start: ${(g as { detail: string }).detail}.`;
+    // Sixth round: the trials' Codex sign-in must not be the review service's own.
+    const ids = this.codexIdentities();
+    if (ids.trials && ids.review && ids.trials === ids.review) return "the preflight can't start: the trials' Codex sign-in is the review service's own ChatGPT account or workspace; Codex in the trials needs a sign-in of its own (DOCS.md).";
+    const v = this.verifyApproval(approval, "preflight", { ...this.approvalTarget("preflight"), action: "preflight" });
+    if ("why" in v) return v.why;
+    const g = this.grantFor({ suite: "preflight", run: id, kind: "preflight" }, preflightCap(this.budget), v.spend);
+    if (!g.ok) return (g as { reason: string }).reason === "used" ? (g as { detail: string }).detail : `the preflight can't start: ${(g as { detail: string }).detail}.`;
     for (const suite of ["review-seats", "research"] as SuiteName[]) {
       const st: RunState = { format: 2, suite, run: id, status: "running", created_at: this.iso(), updated_at: this.iso(), stops: [], calls: {}, notes: [], held: {}, cool: {}, kind: "preflight" };
       this.save(st);
     }
     const rec: PreflightRecord = { format: 1, id, status: "running", build: this.build, machine: this.machine, started_at: this.iso(), cap_usd: (g as { cap: number }).cap, suites: {}, disabled: {},
-      key: this.preflightKey() };
+      key: this.preflightKey(), key_separation: KEY_SEPARATION, approved_at: v.approved.at };
     writeAtomic(this.p().preflight, JSON.stringify(rec, null, 1));
     return null;
+  }
+  // The preflight's named go/no-go lines (sixth round), from what its checks recorded.
+  goLines(rec: PreflightRecord): Record<GoLineName, GoStatus> {
+    const iso = rec.suites["review-seats"]?.codex_isolation ?? rec.suites.research?.codex_isolation;
+    const codexLine = (k: "bwrap" | "config" | "probes"): GoStatus => {
+      const l = iso?.lines?.[k];
+      if (l) return { status: l.ok ? "go" : "no-go", detail: l.detail };
+      return { status: "not checked", detail: iso ? `the self-test stopped before this line (${iso.detail})`.slice(0, 300) : "Codex's self-test didn't run (no sign-in or no Codex)" };
+    };
+    let options: GoStatus;
+    try {
+      const m = statSync(this.cfg.optionsFile ?? OPTIONS_FILE).mtimeMs;
+      options = m > this.startedAt ? { status: "go", detail: "the App's options file was rewritten while the runner ran, and the runner read it without a restart" }
+        : { status: "not checked", detail: "the options file hasn't changed since the runner started: save the App's options once while it runs, then run the preflight again" };
+    } catch { options = { status: "no-go", detail: "the App's options file can't be read" }; }
+    const thinking: Record<string, string> = {};
+    for (const one of Object.values(rec.suites)) Object.assign(thinking, one?.thinking ?? {});
+    const models = Object.keys(thinking);
+    const bad = models.filter((m) => thinking[m] !== "yes");
+    const think: GoStatus = !models.length ? { status: "not checked", detail: "no Gemini model was checked (no trial key for Gemini, or each was refused first)" }
+      : bad.length ? { status: "no-go", detail: `no thinking shown within the cap on its check: ${bad.join(", ")} (left disabled)` }
+      : { status: "go", detail: `each checked Gemini model thought within its cap: ${models.join(", ")}` };
+    const discord: GoStatus = rec.approved_at ? { status: "go", detail: "this preflight started on an approval the link signs only after his tap on the trial card in Discord" }
+      : { status: "not checked", detail: "this preflight carries no record of its approval" };
+    return { bwrap: codexLine("bwrap"), config: codexLine("config"), probes: codexLine("probes"), options, thinking: think, discord };
   }
   private finishPreflight(rec: PreflightRecord, status: "done" | "stopped", why?: string) {
     rec.status = status; rec.finished_at = this.iso();
     if (why) rec.stop = why.slice(0, 400);
+    rec.golines = this.goLines(rec);
+    rec.codex_version = rec.suites["review-seats"]?.codex_version ?? rec.suites.research?.codex_version ?? null;
+    rec.key_separation ??= KEY_SEPARATION;
     writeAtomic(this.p().preflight, JSON.stringify(rec, null, 1));
+    try { writeAtomic(this.p().preflightReport, preflightReport(rec)); } catch (e) { this.log(`preflight report: ${(e as Error).message}`); }
     const spent = this.committed();
     this.relay(status === "done"
       ? `The trials preflight finished on this build${Object.keys(rec.disabled).length ? `; left disabled: ${Object.entries(rec.disabled).map(([c, w]) => `${c} (${w})`).join("; ").slice(0, 600)}` : "; every configuration passed its check"}. Trials have spent $${spent.toFixed(2)} of $${this.budget.toFixed(2)}. Paid suites can run now, within the owner's run allowance. Nothing to tell him unless it needs his word.`
@@ -1043,14 +1171,14 @@ export class TrialRunner {
         ? tiny(ceilingPrice("claude-opus-5-5"), LIMITS.validateOut, 0.01, tokensOf(400) + 20_000 + LIMITS.claudeFetchTokens, 3)
         : tiny(ceilingPrice("claude-opus-5-5"), LIMITS.validateOut);
       const x = await preCall("pre|claude", "claude", worst, 0,
-        async (wire, signal) => asAsk(await claude.validate!({ wire, signal, day, model: GRADERS[0].model, search: research, maxSearches: 1, fetch: research, maxFetches: 1 })));
+        async (wire, signal) => asAsk(await claude.validate!({ wire, signal, day, model: GRADERS[0].model, search: research, maxSearches: 1, fetch: false, maxFetches: 0 })));
       if (x.kind === "denied") return denied(x, "the check of Claude's setup");
       if (x.kind === "error") {
         if (!(x.err.kind === "refused" || /^HTTP 4/.test(x.err.message))) return retryLater(`Claude answered ${x.err.message}`);
         pf.checked.claude = `disabled: Claude refused the trial's setup (a model or tool type it doesn't take: ${x.err.message})`;
         for (const c of claudeConfigs) pf.skip[c.id] = pf.checked.claude;
         pf.graders_off.claude = `the Claude grader is off: ${pf.checked.claude}`;
-      } else { pf.checked.claude = "ok"; pf.ids.claude = `${x.res.served || GRADERS[0].model}${research ? ", web_search_20260318 max_uses 1, web_fetch_20260318 max_uses 1" : ", no tools"}`; }
+      } else { pf.checked.claude = "ok"; pf.ids.claude = `${x.res.served || GRADERS[0].model}${research ? ", web_search_20260318 max_uses 1 (no fetch tool: the runner fetches the cited pages)" : ", no tools"}`; }
       this.save(st); return true;
     }
     // Perplexity: one tiny call per level, pinned.
@@ -1091,6 +1219,10 @@ export class TrialRunner {
       if (x.kind === "error") pf.codex_isolation = { ok: false, mode: "none", detail: `the self-test didn't run: ${x.err.message}`.slice(0, 300), at: this.iso() };
       const iso = pf.codex_isolation!;
       if (iso.ok && iso.mode !== "bwrap") { iso.ok = false; iso.detail = `not under bubblewrap (${iso.mode}): Codex runs only under it`; }
+      // Sixth round: Codex stays disabled until its three go/no-go lines pass (bubblewrap starts, the effective config
+      // check, the probes refused).
+      const failed = (["bwrap", "config", "probes"] as const).filter((k) => !iso.lines?.[k]?.ok);
+      if (iso.ok && failed.length) { iso.ok = false; iso.detail = `its go/no-go lines didn't all pass (${failed.map((k) => GO_LINES[k]).join("; ")})`; }
       if (!iso.ok) {
         for (const c of codexConfigs) pf.skip[c.id] = `skipped: not isolated (${iso.detail})`.slice(0, 300);
         pf.graders_off.codex = `Codex never grades: not isolated (${iso.detail})`.slice(0, 300);
@@ -1104,6 +1236,15 @@ export class TrialRunner {
         pf.codex_models = await codex.models(wire, ctl.signal);
       } catch (e) { if (e instanceof PrivacyBlock) { this.end(st, "stopped", { reason: "privacy", at: this.iso(), detail: e.message }); return false; } }
       finally { clearTimeout(t); }
+      // Sixth round: at least CODEX_MIN_VERSION, named in the preflight record.
+      const ver = codexVersionOf(pf.codex_version ?? "") ?? pf.codex_isolation?.version ?? null;
+      if (!versionAtLeast(ver, CODEX_MIN_VERSION)) {
+        const why = `skipped: the installed Codex is ${ver ?? "of an unreadable version"}; the trials need at least ${CODEX_MIN_VERSION}`;
+        for (const c of codexConfigs) pf.skip[c.id] = why;
+        pf.graders_off.codex = `Codex never grades: ${why.slice(9)}`;
+        pf.checked.codex = "too old";
+        this.save(st); return true;
+      }
       pf.checked.codex = "listed";
       pf.checked.codex_daemon = CODEX_ROOT.includes("features.daemon_auto_start=false") && CODEX_ROOT.includes('web_search="disabled"')
         ? "off: every invocation passes features.daemon_auto_start=false and web_search disabled, inside bubblewrap's own pid namespace with --die-with-parent"
@@ -1193,21 +1334,18 @@ export class TrialRunner {
       const labelled: Labelled[] = shuffled(mine.map((o) => ({ label: byCall[o.call],
         output: { call: "", config: "", verdict: o.verdict, findings: o.findings, text: o.text, urls: o.urls } as Output })), () => this.rand());
       labels = labelled.map((x) => x.label);
-      const gp = gradePrompt(task, labelled);
+      // Sixth round: the research grader reads the cited pages' text, fetched by the runner (pages.ts), and has no fetch tool.
+      const cited = task.kind !== "review" ? await this.pagesFor(st, task as ResearchTask) : [];
+      const gp = gradePrompt(task, labelled, cited);
       adoptedCount = task.kind === "review" ? (/<adopted>\n([\s\S]*?)\n<\/adopted>/.exec(gp.user)?.[1].split("\n").length ?? 0) : 0;
       const blind = blindViolations(`${gp.system}\n${gp.user}`);
       if (blind.length) return settle("blocked", `blocked: the grading prompt wasn't blind (${blind.join("; ")}); nothing was sent`);
       text = `${gp.system}\n${gp.user}`; chars = text.length;
-      // The research grader's fetch: only the exact pages cited in the answer notes, query strings stripped, HTML
-      // only (core.ts noteFetchUrls); their domains bound the tool, and any page fetched beyond them fails the call.
-      const pages = task.kind !== "review" ? noteFetchUrls(task) : [];
-      const domains = [...new Set(pages.map((u) => new URL(u).hostname))];
-      const fetching = shape.fetch && pages.length > 0;
+      // No fetch tool goes to any grader; a fetch the provider reports anyway is outside the notes, and its grades aren't kept.
       send = async (wire, signal) => {
         const a = await prov.ask({ wire, signal, day, model: shape.model, system: gp.system, user: gp.user, schema: gp.schema, maxOut: shape.maxOut,
-          thinking: shape.thinking, fetch: fetching, maxFetches: shape.maxFetches, allowedDomains: domains, codexMode });
-        const outside = wire.fetched.filter((u) => !fetching || !fetchAllowed(u, pages));
-        if (outside.length) throw new GraderFetchOutside(outside.length, a.bill?.usd ?? 0);
+          thinking: shape.thinking, fetch: false, maxFetches: 0, codexMode });
+        if (wire.fetched.length) throw new GraderFetchOutside(wire.fetched.length, a.bill?.usd ?? 0);
         return a;
       };
     }
@@ -1303,6 +1441,24 @@ export class TrialRunner {
     }
     return "settled";
   }
+  // The cited pages of a research task, fetched once per run by the runner (pages.ts) and kept beside its grades, so every
+  // grader of the task reads the same text and a resume doesn't fetch again. Each address is checked against the private
+  // terms before it is fetched.
+  async pagesFor(st: RunState, task: ResearchTask): Promise<CitedPage[]> {
+    const file = this.p().pages(st.suite, st.run, task.id);
+    const kept = readJson<CitedPage[] | null>(file, null);
+    if (Array.isArray(kept)) return kept;
+    const out: CitedPage[] = [];
+    const fetchFn = (this.deps.pageFetch ?? this.deps.fetch ?? fetch) as PageFetch;
+    for (const u of noteFetchUrls(task)) {
+      const priv = textCheck(u, this.deps.review.terms());
+      if (!priv.ok) { out.push({ url: u, why: "its address matched the private-terms list, so it wasn't fetched" }); continue; }
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 30_000 * (this.cfg.timeoutScale ?? 1));
+      try { out.push(await fetchCitedPage(u, fetchFn, ctl.signal)); } finally { clearTimeout(t); }
+    }
+    writeAtomic(file, JSON.stringify(out, null, 1));
+    return out;
+  }
   private providerFor(c: Config): Provider | undefined {
     const p = this.deps.providers;
     return c.seat === "claude" ? p.claude : c.seat === "gemini" ? p.gemini : c.seat === "perplexity" ? p.perplexity : c.seat === "codex" ? p.codex : undefined;
@@ -1336,4 +1492,18 @@ export function checkReviewTask(t: ReviewTask, terms: string | null) {
     const oc = textCheck(o.findings.map((f) => `${f.problem}\n${f.fix}`).join("\n"), terms);
     if (!oc.ok) t.notes.push(`the original answer of ${o.seat} matched the private-terms list: the task's grading is blocked`);
   }
+}
+
+// The preflight's report (sixth round): its named go/no-go lines, the installed Codex, key separation, what it disabled.
+export function preflightReport(rec: PreflightRecord): string {
+  const out = [`# Trials preflight ${rec.id}`, "", `Status: ${rec.status}${rec.stop ? ` (${rec.stop})` : ""}. Build ${rec.build}, finished ${rec.finished_at ?? "not yet"}.`, "", "## Go/no-go", ""];
+  for (const [k, name] of Object.entries(GO_LINES) as [GoLineName, string][]) {
+    const g = rec.golines?.[k];
+    out.push(`- ${name}: ${g ? `${g.status.toUpperCase()}. ${g.detail}` : "NOT CHECKED"}`);
+  }
+  out.push("", `Codex installed: ${rec.codex_version ?? "unknown"} (at least ${CODEX_MIN_VERSION} needed). Codex stays disabled until its first three lines are GO.`);
+  out.push(`Key separation: ${rec.key_separation ?? KEY_SEPARATION}.`);
+  const dis = Object.entries(rec.disabled ?? {});
+  out.push("", "## Disabled", "", ...(dis.length ? dis.map(([c, w]) => `- ${c}: ${w}`) : ["- nothing"]));
+  return `${out.join("\n")}\n`;
 }

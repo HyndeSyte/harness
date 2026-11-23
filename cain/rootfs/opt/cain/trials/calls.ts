@@ -24,7 +24,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { BWRAP_ENV, KEY_FILE, authCanaries, freshDirs, judgeSelfTest, requirementsInPlace, selfTestPrompt, which, wrap, type Dirs, type Isolation, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
+import { BWRAP_ENV, CODEX_MIN_VERSION, KEY_FILE, authCanaries, codexVersionOf, freshDirs, judgeEffectiveConfig, judgeSelfTest, requirementsInPlace, selfTestPrompt, versionAtLeast, which, wrap, type Dirs, type Isolation, type IsolationLines, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
 import { ANSWER_SCHEMA, SeatError, prompt, validateAnswer, type Answer, type ErrorKind, type Outbound } from "../review/core.ts";
 import { postJson } from "../review/seats/common.ts";
 import { classifyCodex } from "../review/seats/openai.ts";
@@ -383,16 +383,35 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
   // then every probe must be attempted and refused, with no canary or runner marker back.
   const isolation = async (wire: Wire, signal: AbortSignal): Promise<Isolation> => {
     const at = new Date().toISOString();
-    const no = (detail: string): Isolation => ({ ok: false, mode: "none", detail, at });
+    // Sixth round: three go/no-go lines, each named in the preflight report; Codex runs only once all three pass.
+    const lines: Partial<IsolationLines> = {};
+    let version: string | null = null;
+    const no = (detail: string): Isolation => ({ ok: false, mode: "none", detail, at, lines, version });
     if (!signedIn(o.home)) return no("Codex isn't signed in to ChatGPT yet");
     if (!codexBin()) return no("the Codex binary isn't installed");
-    if (!bwrapBin()) return no("bubblewrap isn't installed, and Codex runs only under it");
+    if (!bwrapBin()) { lines.bwrap = { ok: false, detail: "bubblewrap isn't installed" }; return no("bubblewrap isn't installed, and Codex runs only under it"); }
     const start = freshDirs(setup());
     try {
       const r = await run(wire, start, [...CODEX_ROOT, "--version"], signal);
-      if (r.code !== 0 || !r.stdout.trim()) return no(`bubblewrap can't start Codex in this container (exit ${r.code}${r.stderr.trim() ? `: ${r.stderr.trim().replace(/\s+/g, " ").slice(0, 120)}` : ""})`);
-    } catch (e) { return no(`bubblewrap can't start Codex in this container (${(e as Error).message.slice(0, 120)})`); }
+      if (r.code !== 0 || !r.stdout.trim()) {
+        const why = `bubblewrap can't start Codex in this container (exit ${r.code}${r.stderr.trim() ? `: ${r.stderr.trim().replace(/\s+/g, " ").slice(0, 120)}` : ""})`;
+        lines.bwrap = { ok: false, detail: why }; return no(why);
+      }
+      version = codexVersionOf(r.stdout);
+      lines.bwrap = { ok: true, detail: `bubblewrap started Codex ${version ?? "(version unreadable)"} in the container` };
+      if (!versionAtLeast(version, CODEX_MIN_VERSION)) return no(`the installed Codex is ${version ?? "of an unreadable version"}; the trials need at least ${CODEX_MIN_VERSION}`);
+    } catch (e) { const why = `bubblewrap can't start Codex in this container (${(e as Error).message.slice(0, 120)})`; lines.bwrap = { ok: false, detail: why }; return no(why); }
     finally { start.done(); }
+    // The requirements file read and honoured inside the wrapper: Codex's own effective configuration must show web search
+    // disabled-only (and the rest of the requirements), or Codex is refused.
+    const cfgDirs = freshDirs(setup());
+    try {
+      const r = await run(wire, cfgDirs, [...CODEX_ROOT, "debug", "config"], signal);
+      const why = judgeEffectiveConfig(r);
+      lines.config = why ? { ok: false, detail: why } : { ok: true, detail: "Codex's effective configuration inside the wrapper shows web search disabled-only, the sandbox modes pinned, no MCP server and no network for workspace-write" };
+      if (why) return no(`bwrap: ${why}`);
+    } catch (e) { const why = `Codex's effective configuration couldn't be read (${(e as Error).message.slice(0, 120)})`; lines.config = { ok: false, detail: why }; return no(`bwrap: ${why}`); }
+    finally { cfgDirs.done(); }
     const d = freshDirs(setup());
     try {
       const letters = (n: number) => [...randomBytes(n)].map((b) => "abcdefghijklmnop"[b % 16]).join("");
@@ -408,13 +427,14 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
       const req = requirementsInPlace(cmd);
       if (req) return no(`bwrap: ${req}`);
       const r = await run(wire, d, args, signal, envCanary);
-      if (r.stopped || CODEX_WEB_SEARCH_EVENT.test(r.stdout)) return no("Codex ran a web search during the self-test although search is off");
+      if (r.stopped || CODEX_WEB_SEARCH_EVENT.test(r.stdout)) { lines.probes = { ok: false, detail: "Codex ran a web search during the self-test" }; return no("Codex ran a web search during the self-test although search is off"); }
       const answer = existsSync(out) ? readFileSync(out, "utf8") : "";
       // The runner's environment markers: a key variable's name, the Supervisor's token name, the trials budget.
       // Fifth round: Codex's own environment (a canary set only inside the wrapper) and its sign-in file's tokens too.
       const j = judgeSelfTest({ ...r, answer }, [k1, envCanary, "REVIEW_", "SUPERVISOR_TOKEN", "TRIALS_BUDGET", ...authCanaries(join(d.codexHome, "auth.json"))], { pid: process.pid });
-      return j.ok ? { ok: true, mode: "bwrap", detail: `${j.detail}; the requirements file allowing only disabled web search was in place`, at } : no(`bwrap: ${j.detail}`);
-    } catch (e) { return no(`bwrap: ${(e as Error).message.slice(0, 160)}`); }
+      lines.probes = { ok: j.ok, detail: j.detail };
+      return j.ok ? { ok: true, mode: "bwrap", detail: `${j.detail}; the requirements file allowing only disabled web search was in place`, at, lines, version } : no(`bwrap: ${j.detail}`);
+    } catch (e) { lines.probes = { ok: false, detail: (e as Error).message.slice(0, 160) }; return no(`bwrap: ${(e as Error).message.slice(0, 160)}`); }
     finally { d.done(); }
   };
   const tool = async (wire: Wire, signal: AbortSignal, sub: string[]) => {

@@ -97,14 +97,20 @@ if (import.meta.main) {
   const ok = (k: "anthropic" | "gemini" | "perplexity") => keyCheck[k] === "ok";
   if (supervisorTokenSeen()) log("ALARM: SUPERVISOR_TOKEN is in the review runner's own environment; no paid trial call is dispatched");
   for (const p of keyProblems(keyCheck)) log(`trials: ${p}; no paid trial call is dispatched until the owner sets it`);
+  // Sixth round: Codex in the trials signs in on a home of its own (never the review service's ChatGPT account, compared by
+  // identity at the preflight); the tally and used approvals sit in the runner's private folder (root's, 0700).
+  const trialsCodexHome = env.CODEX_TRIALS_HOME ?? "/data/codex-trials";
+  try { mkdirSync(trialsCodexHome, { recursive: true, mode: 0o700 }); } catch (e) { log(`no trials Codex home: ${(e as Error).message}`); }
   const trials = new TrialRunner({ dir: env.TRIALS_DIR ?? "/data/trials", inboxDir: env.TRIALS_INBOX ?? "/data/trials-inbox",
-    recordDir: env.RECORD_DIR ?? "/data/record", budgetUsd, keyCheck, keyPrint: keyPrintOf(trialKeys) }, {
+    recordDir: env.RECORD_DIR ?? "/data/record", budgetUsd, keyCheck, keyPrint: keyPrintOf(trialKeys),
+    privateDir: env.TRIALS_PRIVATE_DIR ?? "/data/trials-private", linkKey: env.CAIN_TRIAL_KEY ?? "/data/link/trial.key", linkKeyUid: 0,
+    codexHome: trialsCodexHome, reviewCodexHome: codexHome }, {
     review: runner,
     providers: {
       claude: ok("anthropic") ? claudeProvider({ key: trialKeys.anthropic, version: env.ANTHROPIC_VERSION_HEADER || undefined }) : undefined,
       gemini: ok("gemini") ? geminiProvider({ key: trialKeys.gemini, schemaField }) : undefined,
       perplexity: ok("perplexity") ? perplexityProvider({ key: trialKeys.perplexity }) : undefined,
-      codex: codexProvider({ home: codexHome, signedIn: codexSignedIn }),
+      codex: codexProvider({ home: trialsCodexHome, signedIn: codexSignedIn }),
     },
   });
   // The budget it really uses, and what it found of the research approval in the App's options (Home Assistant
@@ -112,7 +118,7 @@ if (import.meta.main) {
   const approval = trials.approval();
   try { writeAtomic(`${trials.cfg.dir}/settings.json`, JSON.stringify({ budget_usd: trials.budget, research_approval: approval.ok ? { ok: true, third_party: approval.third_party }
     : { ok: false, why: (approval as { why: string }).why }, run_allowance_usd: trials.allowance(), build: trials.build, machine: trials.machine, preflight_key: trials.preflightKey(), trial_keys: keyProblems(keyCheck),
-    supervisor_token_seen: supervisorTokenSeen(), written_at: new Date().toISOString() }, null, 1)); }
+    supervisor_token_seen: supervisorTokenSeen(), paid_gate: trials.paidGate(), written_at: new Date().toISOString() }, null, 1)); }
   catch (e) { log(`couldn't write the trials settings: ${(e as Error).message}`); }
   (async () => {
     while (true) {

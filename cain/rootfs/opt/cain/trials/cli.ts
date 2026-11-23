@@ -26,7 +26,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { readStop } from "../stop.ts";
 import { DEFAULT_BUDGET_USD, LEDGER_MARGIN_PCT, PREFLIGHT_CAP_USD, checkQuestions, isSuite, ledgerCap, pickReviewTasks, planHash, planOf, preflightCap, preflightPlanHash, researchDisclosure, researchPrivacy, runCap, type ResearchTask, type Suite, type SuiteName } from "./core.ts";
-import { RESEARCH_QUESTIONS, checkReviewTask, latestRun, preflightError, readBudget, readPreflight, readSuite, researchHashes, reviewDirs, supervisorTokenSeen, type PreflightKey } from "./runner.ts";
+import { GO_LINES, RESEARCH_QUESTIONS, checkReviewTask, latestRun, preflightError, readBudget, readPreflight, readSuite, researchHashes, reviewDirs, supervisorTokenSeen, type PreflightKey } from "./runner.ts";
 import { committedOf, tallyGranted } from "./ledger.ts";
 import { buildReport } from "./report.ts";
 
@@ -115,7 +115,11 @@ switch (cmd) {
       break;
     }
     const name = suiteArg();
-    const { suite: s, thirdParty, approval } = suiteFor(name, a2);
+    const { suite: s, thirdParty: routed, approval } = suiteFor(name, a2);
+    // A start or a resume, as the runner (and the link's card) will judge it: a stopped run resumes unless --new.
+    const last = latestRun(dir, name);
+    const resuming = !a2 && !!(last && last.status !== "done" && !flags.has("--new"));
+    const thirdParty = resuming ? !!last!.preflight?.third_party_routing : routed;
     const p = planOf(s, !thirdParty);
     out(`Suite ${name}: ${s.tasks.length} tasks${readSuite(dir, name) && !a2 ? " (fixed at its first run)" : " (as a first run would take them)"}${approval ? `; questions ${approval}` : ""}. No call is made by this plan.`);
     out("task | who | seat | model | setting | search | ceilings in the request | worst case");
@@ -123,14 +127,17 @@ switch (cmd) {
     if (p.originals) out(`plus ${p.originals} original seat answers from the record, graded with no new call`);
     const b = readBudget(dir);
     out(`Total worst case: ${money(p.total)} over ${p.lines.length} calls. Trials budget: ${money(Number.isFinite(b.spent_usd) ? committedOf(b) : NaN)} spent or reserved of ${money(budget())}.`);
-    out(`Worst case: steps x (the context ceiling at the input price + the output cap, and a thinking allowance where it isn't covered, at the output price) + the most tool fees, at the dearest list price the model has (an unlisted model is priced high; Perplexity's fast level at the priority rate; Gemini grounding at a conservative allowance of queries). It is a soft bound: search results, Gemini's thinking level and grounding's query count have no provider cap. The ledger stops at ${money(ledgerCap(budget()))}, a fixed ${LEDGER_MARGIN_PCT}% below the budget. The hard stop is a hard spend limit, no higher than the owner's allowance, on the trials' own keys (the trials_*_api_key options, in a project or workspace of their own), never on the review service's keys. Codex runs on the ChatGPT plan: no dollars, each call counted against its trial allowance, and only under bubblewrap once its self-test passed.`);
+    out(`Worst case: steps x (the context ceiling at the input price + the output cap, and a thinking allowance where it isn't covered, at the output price) + the most tool fees, at the dearest list price the model has (an unlisted model is priced high; Perplexity's fast level at the priority rate; Gemini grounding at a conservative allowance of queries). Search results, Gemini's thinking level and grounding's query count have no provider cap, so a call can pass its own reservation. The bound is this run's cap, enforced before every dispatch: each call's worst case is reserved first, a call whose usage is missing or unresolved stays charged at its reservation, and the ledger stops at ${money(ledgerCap(budget()))}, a fixed ${LEDGER_MARGIN_PCT}% below the budget. Provider spend limits on the trials' own keys are only a backstop: they are monthly, enforced late, and can be exceeded. Codex runs on a ChatGPT sign-in of its own: no dollars, each call counted against its trial allowance, and only under bubblewrap once its go/no-go lines passed.`);
     const al = allowanceSeen(), cap = runCap(budget(), p.total), granted = tallyGranted(dir);
     out(`A run of this suite takes ${money(cap)} of the owner's run allowance (its worst case plus its checks, at most the ledger's cap); the allowance ${al === null ? "isn't known yet (the runner hasn't said)" : `is ${money(al)}, ${granted === null ? "with its tally missing or unreadable (counts as fully spent)" : `${money(granted)} granted so far`}`}.`);
     if (name === "research" && !a2) { out(""); out(researchDisclosure(s.tasks as ResearchTask[])); out(""); }
     const hash = planHash(s, !thirdParty, cap);
     out(`Plan hash: ${hash}`);
     out(`Cap: ${cap.toFixed(2)}`);
-    if (!a2) out(`For his go: keeper.sh trial-approve --suite ${name} --plan ${hash} --cap ${cap.toFixed(2)} "<what it tests, in one line>". His tap allows one run of exactly this plan${name === "research" ? ", including what is sent to third-party search above" : ""}, for 2 hours.`);
+    if (!a2) {
+      out(`This would be ${resuming ? `a resume of run ${last!.run}` : "a new run"}${!resuming && last && last.status !== "done" ? " (--new)" : ""}${resuming ? "; trial.sh plan --new shows a new run instead" : ""}.`);
+      out(`For his go: keeper.sh trial-approve --suite ${name} --plan ${hash} --cap ${cap.toFixed(2)}${flags.has("--new") ? " --new" : ""} "<what it tests, in one line>". The link computes the plan itself and puts it on his card; his tap allows one ${resuming ? "resume" : "run"} of exactly this plan${name === "research" ? ", including what is sent to third-party search above" : ""}, for 2 hours.`);
+    }
     const pfe = pfError();
     if (pfe) out(`Before any run: ${pfe}.`);
     if (name === "research") {
@@ -172,6 +179,11 @@ switch (cmd) {
     const b = readBudget(dir);
     const pr = readPreflight(dir), pfe = pfError();
     out(`Preflight: ${pfe ? pfe : `done under this key${Object.keys(pr!.disabled).length ? `; disabled: ${Object.entries(pr!.disabled).map(([c, w]) => `${c} (${w})`).join("; ")}` : "; nothing disabled"}`}.`);
+    // Sixth round: its named go/no-go lines, the installed Codex and what is known of key separation.
+    if (pr?.golines) {
+      for (const [k, name] of Object.entries(GO_LINES)) { const g = (pr.golines as any)[k]; out(`  ${g ? g.status.toUpperCase() : "NOT CHECKED"}: ${name}${g ? ` (${g.detail})` : ""}`); }
+      out(`  Codex installed: ${pr.codex_version ?? "unknown"}. Key separation: ${pr.key_separation ?? "unverified beyond the string check"}.`);
+    }
     const ks = keysSeen();
     out(`Trial keys: ${ks === null ? "not known yet (the runner hasn't said)" : ks.length ? `refused: ${ks.join("; ")}` : "each provider has its own"}.`);
     const al = allowanceSeen(), granted = tallyGranted(dir);

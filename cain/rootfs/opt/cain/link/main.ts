@@ -77,6 +77,7 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { makeTrialToken } from "../trial-token";
+import { planView } from "../trials/plan";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -146,8 +147,17 @@ else if (stateStore.lost()) console.log("[cain] link: its record of cards and me
 async function rest(method: string, path: string, body?: unknown, auth = true, timeoutMs?: number): Promise<any> {
   const headers: Record<string, string> = { "user-agent": "DiscordBot (https://github.com/HyndeSyte/harness, 1)" };
   if (auth) headers.authorization = `Bot ${token()}`;
-  if (body !== undefined) headers["content-type"] = "application/json";
-  const r = await fetch(`${API}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+  // A message with a text file (the trial card's list, 0.19.0 sixth round) goes as multipart: payload_json and files[n].
+  let payload: string | FormData | undefined = body === undefined ? undefined : JSON.stringify(body);
+  const files = (body as any)?.files;
+  if (Array.isArray(files) && files.length) {
+    const { files: _f, ...rest } = body as any;
+    const form = new FormData();
+    form.append("payload_json", JSON.stringify({ ...rest, attachments: files.map((f: any, i: number) => ({ id: i, filename: String(f.name) })) }));
+    files.forEach((f: any, i: number) => form.append(`files[${i}]`, new Blob([String(f.content)], { type: "text/plain" }), String(f.name)));
+    payload = form;
+  } else if (body !== undefined) headers["content-type"] = "application/json";
+  const r = await fetch(`${API}${path}`, { method, headers, body: payload,
     redirect: "error", signal: AbortSignal.timeout(timeoutMs ?? (path.startsWith("/interactions/") ? 3000 : 20000)) });
   if (r.status === 204) return null;
   const data = await r.json().catch(() => null);
@@ -255,6 +265,9 @@ const link = new Link({
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
   signTrial: trialPriv ? (claim) => makeTrialToken(claim, (data) => edSign(null, data, trialPriv)) : undefined,
+  // The plan on his trial card, computed here from the suite file, the record and root's App options (sixth round).
+  trialPlan: ({ suite, fresh }) => planView({ dir: process.env.TRIALS_DIR ?? "/data/trials", recordDir: RECORD, optionsFile: process.env.CAIN_OPTIONS ?? "/data/options.json", optionsUid: 0,
+    terms: (() => { try { return readFileSync(process.env.REVIEW_TERMS ?? "/data/review-private-terms.txt", "utf8"); } catch { return null; } })(), target: suite, fresh }),
   land: deployKey ? async ({ pr, head, stopped }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };

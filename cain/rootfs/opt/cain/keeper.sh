@@ -160,9 +160,11 @@
 #                                        and "No". Only his tap writes the grant; this writes nothing.
 #                                        Refused while the change has rounds left, its item is held by
 #                                        another holder, or Stop holds
-#   keeper.sh trial-approve --item P46 --suite <review-seats|research|preflight> --plan <hash> --cap <usd> "what it tests"
+#   keeper.sh trial-approve --item P46 --suite <review-seats|research|preflight> --plan <hash> --cap <usd> [--new] "what it tests"
 #                                        a card asking him to allow one paid model trial run of that exact plan
 #                                        (the hash and cap trial.sh plan prints), with "Allow this run" and "No".
+#                                        The link computes the plan itself and refuses a hash or cap that differs
+#                                        (sixth round); --new asks for a new run where a stopped one could resume.
 #                                        Only his tap signs the one-time approval (good for 2 hours, one run);
 #                                        you hear it with the approval to pass to trial.sh. Refused while Stop holds
 set -u
@@ -243,7 +245,7 @@ fi
 if { [ "$cmd" = meanings ] || [ "$cmd" = places ]; } && [ ! -r "${1:-}" ]; then
   echo '{"status":"error","said":"No table file to send."}'; exit 2
 fi
-item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke="" change="" rounds="" suite="" plan="" cap=""
+item="" question="" reply_to="" pr="" head="" edit="" review="" message="" smoke="" change="" rounds="" suite="" plan="" cap="" fresh=""
 case "$cmd" in
   handover)
     rest=()
@@ -278,6 +280,8 @@ case "$cmd" in
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           case "$1" in --suite) suite="$2" ;; --plan) plan="$2" ;; --cap) cap="$2" ;; esac
           shift 2 ;;
+        --new) [ "$cmd" = trial-approve ] || { echo '{"status":"error","said":"--new is only for trial-approve"}'; exit 2; }
+          fresh=1; shift ;;
         --change|--rounds)
           [ $# -ge 2 ] || { jq -nc --arg f "$1" '{status: "error", said: ($f + " needs a value")}'; exit 2; }
           if [ "$1" = --change ]; then change="$2"; else rounds="$2"; fi
@@ -383,8 +387,8 @@ case "$cmd" in
     [[ "$suite" =~ ^(review-seats|research|preflight)$ ]] || { echo '{"status":"error","said":"--suite takes review-seats, research or preflight"}'; exit 2; }
     [[ "$plan" =~ ^[0-9a-f]{64}$ ]] || { echo '{"status":"error","said":"--plan takes the plan hash trial.sh plan printed"}'; exit 2; }
     [[ "$cap" =~ ^[0-9]{1,3}(\.[0-9]{1,2})?$ ]] || { echo '{"status":"error","said":"--cap takes the run'"'"'s cap in dollars that trial.sh plan printed"}'; exit 2; }
-    body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg s "$suite" --arg p "$plan" --arg c "$cap" --arg r "$reply_to" \
-      '{item: $it, suite: $s, plan: $p, cap: ($c | tonumber), text: $t} + (if $r == "" then {} else {reply_to: $r} end)') ;;
+    body=$(jq -nc --arg t "${1:-}" --arg it "$item" --arg s "$suite" --arg p "$plan" --arg c "$cap" --arg r "$reply_to" --arg n "$fresh" \
+      '{item: $it, suite: $s, plan: $p, cap: ($c | tonumber), text: $t} + (if $r == "" then {} else {reply_to: $r} end) + (if $n == "" then {} else {new: true} end)') ;;
   morning)  text="${1:-}"; shift || true
             body=$(jq -nc --arg t "$text" '{text: $t, options: $ARGS.positional}' --args "$@") ;;
 esac

@@ -89,6 +89,8 @@ pc-jobs pc-jobs-queue pc-jobs-outcomes pc-jobs-reuse-used.jsonl.told.json"
   own "$D/work" cain:cain 0700
   own "$D/link" root:root 0700
   own "$D/codex" root:root 0700
+  own "$D/codex-trials" root:root 0700   # the model trials' own Codex sign-in (0.19.0, sixth round)
+  own "$D/trials-private" root:root 0700 # the trials' tally, used approvals and history marker (sixth round)
   own "$D/c1" root:root 0700
   own "$D/probe" root:root 0700
   own "$D/.claude" root:root 0700

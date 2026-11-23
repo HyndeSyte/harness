@@ -3,7 +3,7 @@
 ## 0.19.0
 
 - Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call, its limits and its most possible cost first, then the run, then a plain report.
-- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. It is a soft bound with a margin: the hard stop is a spending limit on the trials' own keys (DOCS.md says how).
+- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. The bound is each run's cap, checked before every call; a call whose cost can't be read stays counted at its most possible cost.
 - Each task's grading is set aside before its first call, so a task is never left half graded.
 - Before any spend, near-free checks catch a model or setting a provider won't take; a model not offered is skipped and the report says why.
 - Your private terms are checked on every request exactly as it is sent, and on the search queries a provider says it ran; a hit stops the run and Cain hears of it.
@@ -29,9 +29,16 @@
 - The trials have keys of their own: three new options, `trials_anthropic_api_key`, `trials_gemini_api_key` and `trials_perplexity_api_key`, empty to start. Nothing paid runs until all three are set, and never with the review keys. DOCS.md says how to make them, each with its own spending limit.
 - The Codex sandbox now holds a locked file that forbids web search, and its check also proves Codex can't read its own sign-in or its own settings.
 - The check after installing now counts only for 7 days and only while the trials code, Codex, the models and the trials options stay the same; a Gemini model whose check showed no thinking stays switched off.
-- The research grader may read only as many pages as the notes cite, each with a size cap, and that is set aside in the budget.
 - The record of what your allowance has granted is kept where only the trials runner can write it; if it goes missing, nothing more is granted until it is put right.
 - `trial.sh plan research` lists exactly what goes to outside search engines under "Sent to third-party search", and your tap covers that list.
+- The trial card now shows what you are allowing, worked out by Cain's link itself: which suite, whether it is the check after installing, a new run or a resume, the most it can cost, the worst case of its calls, each provider it calls, what your allowance has granted so far, and for research the full list of what goes to outside search (as an attached file when it is long). If what Cain asked for doesn't match what the link works out, no card goes out.
+- The record of what your allowance has granted and which taps were used now sits in a folder only the trials runner can open; nothing paid runs if that folder, or the link's signing key, could be read or changed by anyone else, and a used tap can't be used again even if its file goes missing.
+- The Codex sandbox also forbids full access, extra tools and network for its commands, and its check reads Codex's own settings and tries the internet and Cain's own local services, which must all be refused. Codex needs version 0.136.0 or newer, and it stays switched off until those checks pass on the Pi.
+- Nothing paid runs while the Supervisor's saved token could be read by Cain's user.
+- Provider spending limits are only a backstop: they are monthly, applied late, and can be exceeded, so the limit that counts is each run's cap, checked before every call. A run whose check after installing has run out stops before its next call.
+- Codex in the trials needs a ChatGPT sign-in of its own; the check after installing refuses the one real reviews use. No separate OpenAI project is needed.
+- The research grader no longer fetches pages itself: the trials runner reads the exact pages the notes cite (staying on each page's site and path, HTML only, as plain text) and hands the grader their text.
+- The check after installing now ends with a plain list of go and no-go lines (sandbox, Codex settings, the refused probes, saving options, Gemini's thinking, the card reaching you), shown by `trial.sh status`.
 
 ## 0.18.1
 

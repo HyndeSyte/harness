@@ -16,8 +16,16 @@ import { HOUR, SHIP_KEYS, rig } from "./link-rig";
 
 const TRIAL_KEYS = generateKeyPairSync("ed25519");
 const PLAN = "d".repeat(64);
-function trialRig(o: { noKey?: boolean } = {}) {
+// The link's own reading of the plan (sixth round: ../trials/plan.ts in the link); here a fixed view per suite.
+const DISCLOSURE = "Sent to third-party search:\nq01: As of 2026-11-20: What is the current release of tool number 1?\n  answer notes: must contain the version; sources https://example.com/releases (read 2026-11-19)";
+function view(suite: string, over: Record<string, unknown> = {}) {
+  if (suite === "preflight") return { target: "preflight", action: "preflight", plan: PLAN, cap: 4, worst: 4, calls: 0, providers: ["Google (Gemini)", "Anthropic (Claude)", "Perplexity", "OpenAI (Codex, on the ChatGPT plan)"], disclosure: null, granted: 2, allowance: 50, budget: 40, tasks: 0, ...over };
+  return { target: suite, action: "start", plan: PLAN, cap: 7.17, worst: 3.17, calls: 120, providers: ["Google (Gemini)", "OpenAI (Codex, on the ChatGPT plan)", "Perplexity", "Anthropic (Claude)"],
+    disclosure: suite === "research" ? DISCLOSURE : null, granted: 4, allowance: 50, budget: 40, tasks: 12, ...over };
+}
+function trialRig(o: { noKey?: boolean; view?: (suite: string, fresh: boolean) => any } = {}) {
   const r = rig();
+  (r.link as any).d.trialPlan = ({ suite, fresh }: { suite: string; fresh: boolean }) => (o.view ? o.view(suite, fresh) : view(suite));
   if (!o.noKey) (r.link as any).d.signTrial = (c: any) => makeTrialToken(c, (data) => edSign(null, data, TRIAL_KEYS.privateKey));
   else (r.link as any).d.signTrial = undefined;
   return r;
@@ -57,10 +65,11 @@ describe("the trial card", () => {
     await r.tap(r.msg(id), r.ids(id)[0]);
     const line = r.relayed.find((l) => l.includes(`Dane tapped "${TRIAL_ALLOW}"`))!;
     expect(line).toContain("Trial approval: trial1.");
-    expect(line).toContain("/opt/cain/trial.sh run review-seats --approval trial1.");
+    // A start's command says --new, so a run that stopped meanwhile isn't resumed on an approval for a new one.
+    expect(line).toContain("/opt/cain/trial.sh run review-seats --new --approval trial1.");
     const tok = findTrialToken(line)!;
     const c = readTrialToken(tok, TRIAL_KEYS.publicKey, r.t.now);
-    expect(c).toMatchObject({ ok: true, claim: { suite: "review-seats", plan: PLAN, cap_cents: 717 } });
+    expect(c).toMatchObject({ ok: true, claim: { suite: "review-seats", action: "start", plan: PLAN, cap_cents: 717 } });
     expect((c as any).claim.exp * 1000 - r.t.now).toBeLessThanOrEqual(2 * HOUR);
     // Never a Ship token: the Ship key doesn't verify it, and its shape isn't one.
     expect(readToken(tok, SHIP_KEYS.publicKey, r.t.now).ok).toBe(false);
@@ -75,6 +84,7 @@ describe("the trial card", () => {
   test("the preflight's card names the preflight command; No signs nothing; Stop after the card signs nothing", async () => {
     const r = trialRig();
     const id = ((await ask(r, { suite: "preflight", cap: 4, text: "The model checks after installing" })) as any).message;
+    expect(String(r.msg(id).content)).toContain("What: the preflight");
     await r.tap(r.msg(id), r.ids(id)[0]);
     expect(r.relayed.join("\n")).toContain("/opt/cain/trial.sh preflight --approval trial1.");
     const n = trialRig();
@@ -98,6 +108,47 @@ describe("the trial card", () => {
     expect(readTrialToken("ship1.abc.def", TRIAL_KEYS.publicKey, now).ok).toBe(false);
     expect(trialClaimFor({ suite: "research", plan: PLAN, capUsd: 501 }, now)).toBeNull();
     expect(trialClaimFor({ suite: "research", plan: "x", capUsd: 1 }, now)).toBeNull();
+  });
+
+  test("sixth round: the link computes the plan itself; a carried hash or cap that differs from its own is refused, nothing posted", async () => {
+    const r = trialRig();
+    const before = r.posts();
+    await expect(ask(r, { plan: "e".repeat(64) })).rejects.toThrow("isn't the one the link computes");
+    await expect(ask(r, { cap: 9.5 })).rejects.toThrow("isn't the run's cap as the link computes it ($7.17)");
+    expect(r.posts()).toBe(before);
+    // The link can't compute it (no suite, no approval, unreadable options): no card, with its reason.
+    const n = trialRig({ view: () => ({ error: "the research suite can't run: the owner hasn't approved the questions" }) });
+    await expect(ask(n, { suite: "research" })).rejects.toThrow("no trial card: the research suite can't run");
+    const none = trialRig(); (none.link as any).d.trialPlan = undefined;
+    await expect(ask(none)).rejects.toThrow("can't compute the trial's plan");
+  });
+
+  test("sixth round: the card shows what he approves as text: suite, start or resume, cap, worst case, providers, granted, and the disclosure", async () => {
+    const r = trialRig();
+    const id = ((await ask(r, { suite: "research" })) as any).message;
+    const text = String(r.msg(id).content);
+    expect(text).toContain("What: a new run of the research suite, 12 tasks, 120 calls.");
+    expect(text).toContain("Cap: $7.17 of your trial allowance; worst case of its calls $3.17.");
+    expect(text).toContain("Providers called: Google (Gemini), OpenAI (Codex, on the ChatGPT plan), Perplexity, Anthropic (Claude).");
+    expect(text).toContain("Granted to trial runs so far: $4.00 of your $50.00 allowance.");
+    expect(text).toContain("Sent to third-party search:");
+    expect(text).toContain("What is the current release of tool number 1?");
+    expect(text).not.toContain(PLAN);
+    // A resume says so, and the tap's approval is for a resume (and its command has no --new).
+    const res = trialRig({ view: (s) => view(s, { action: "resume" }) });
+    const id2 = ((await ask(res)) as any).message;
+    expect(String(res.msg(id2).content)).toContain("What: a resume of the review-seats suite's stopped run");
+    await res.tap(res.msg(id2), res.ids(id2)[0]);
+    const line = res.relayed.find((l) => l.includes("Trial approval:"))!;
+    expect(line).toContain("/opt/cain/trial.sh run review-seats --approval trial1.");
+    expect(readTrialToken(findTrialToken(line)!, TRIAL_KEYS.publicKey, res.t.now)).toMatchObject({ ok: true, claim: { action: "resume", plan: PLAN } });
+    // A list too long for the card is attached as a text file, named on the card.
+    const long = "Sent to third-party search:\n" + Array.from({ length: 30 }, (_, i) => `q${i}: As of 2026-11-20: What is the current release of tool number ${i}? answer notes: must contain the version`).join("\n");
+    const big = trialRig({ view: (s) => view(s, { disclosure: long }) });
+    const id3 = ((await ask(big, { suite: "research" })) as any).message;
+    expect(String(big.msg(id3).content)).toContain("the full list is attached (12 questions and their answer notes)");
+    const post = big.calls.filter((c: any) => c.method === "POST" && c.path.endsWith("/messages")).at(-1)!;
+    expect(post.body.files).toEqual([{ name: "sent-to-third-party-search.txt", content: `${long}\n` }]);
   });
 
   test("the route is Cain's, and keeper.sh trial-approve checks its arguments before it asks", () => {

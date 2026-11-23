@@ -39,7 +39,14 @@
 // runner's uid that no one else can write. A tally that is missing or can't be read counts as fully spent: no grant is
 // made until it is put right. The one exception is a trials folder with no history at all (no budget.json, no
 // preflight.json): its first grant starts an empty tally.
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, chownSync, chmodSync } from "node:fs";
+// Sixth round (Cain 0.19.0): the tally, the used approvals (approvals-used/) and the has-history marker live in one
+// folder of their own, /data/trials-private, owned by the runner's uid with mode 0700, apart from /data/trials (which
+// Cain's group reads). Every grant checks that folder and its parent first: writable by anyone else, or the folder not the
+// runner's 0700, and nothing is granted. A consumed nonce is also logged inside the tally, so a nonce file that is
+// deleted can't replay its approval. The approval's check, its use and the grant happen in one step under the ledger's
+// lock, written durably (fsynced, renamed, folder fsynced) before anything is dispatched. The total granted is mirrored
+// into /data/trials/allowance-granted.json (root's, read by trial.sh plan and status and by the link's trial card).
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, chownSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { ReviewSeatName } from "./core.ts";
@@ -53,8 +60,32 @@ export type Reservation = {
 export type Hold = { suite: string; run: string; task: string; usd: number; owner: string; at: string };
 export type Grant = { suite: string; run: string; cap_usd: number; at: string; allowance_usd: number };
 export type Budget = { format: 2; spent_usd: number; entries: BudgetEntry[]; reservations: Record<string, Reservation>; holds: Record<string, Hold>; grants?: Record<string, Grant> };
-export type Tally = { format: 1; grants: Record<string, Grant> };
+export type UsedNonce = { suite: string; plan: string; cap_cents: number; used_at: string };
+export type Tally = { format: 1; grants: Record<string, Grant>; used?: Record<string, UsedNonce> };
 export const TALLY_FILE = "allowance.json";
+export const HISTORY_FILE = "has-history";
+export const USED_DIR = "approvals-used";
+export const MIRROR_FILE = "allowance-granted.json";
+// What an approval brings to a grant: its nonce and what it was for (checked by the runner before).
+export type Spend = { nonce: string; suite: string; plan: string; cap_cents: number };
+// The private folder's trust (sixth round): the folder itself the runner's (uid), a real folder, mode 0700, and its parent
+// not writable by anyone but its owner (root's sticky folders aside, none here). The reason it can't be trusted, or null.
+export function privateDirProblem(dir: string, uid: number): string | null {
+  let st;
+  try { st = lstatSync(dir); } catch { return `the trials' private folder (${dir}) is missing`; }
+  if (!st.isDirectory()) return `the trials' private folder (${dir}) isn't a folder`;
+  if (st.uid !== uid) return `the trials' private folder (${dir}) isn't the runner's`;
+  if (st.mode & 0o077) return `the trials' private folder (${dir}) can be read or written by others (it must be mode 0700)`;
+  let ps;
+  try { ps = statSync(dirname(dir)); } catch { return "the trials' private folder's parent can't be read"; }
+  if (ps.mode & 0o022) return `the trials' private folder's parent (${dirname(dir)}) can be written by others`;
+  if (ps.uid !== uid && ps.uid !== 0) return `the trials' private folder's parent (${dirname(dir)}) isn't the runner's or root's`;
+  return null;
+}
+// The private folder, made once (0700, the runner's) when it isn't there yet.
+export function ensurePrivateDir(dir: string): void {
+  try { if (!existsSync(dir)) mkdirSync(dir, { mode: 0o700 }); } catch { /* checked by privateDirProblem */ }
+}
 export const TALLY_SPENT = "the allowance tally is missing or can't be read, so the owner's allowance counts as fully spent";
 // The tally as the runner reads it: a plain file owned by uid, writable by its owner alone, opened without following a
 // link. missing: there is no file at all.
@@ -69,13 +100,15 @@ export function readTally(path: string, uid: number): { ok: true; t: Tally } | {
     const j = JSON.parse(readFileSync(fd, "utf8"));
     if (j?.format !== 1 || !j.grants || typeof j.grants !== "object" || Array.isArray(j.grants)) return { ok: false, missing: false, why: "the allowance tally is in a format this runner doesn't know" };
     for (const g of Object.values<any>(j.grants)) if (!Number.isFinite(g?.cap_usd) || g.cap_usd < 0) return { ok: false, missing: false, why: "the allowance tally holds a grant that can't be read" };
+    if (j.used !== undefined && (!j.used || typeof j.used !== "object" || Array.isArray(j.used))) return { ok: false, missing: false, why: "the allowance tally's log of used approvals can't be read" };
     return { ok: true, t: j as Tally };
   } catch { return { ok: false, missing: false, why: "the allowance tally can't be read" }; }
   finally { try { closeSync(fd); } catch { /* closed */ } }
 }
-// What has been granted, as anyone may read it (trial.sh): null when the tally can't be read (counts as fully spent).
+// What has been granted, as anyone may read it (trial.sh, the link's card): the mirror the runner writes in /data/trials
+// after every grant; null when it can't be read (then it counts as fully spent).
 export function tallyGranted(dir: string): number | null {
-  try { const j = JSON.parse(readFileSync(join(dir, TALLY_FILE), "utf8")); if (j?.format !== 1 || !j.grants) return null; return round6(Object.values<any>(j.grants).reduce((a, g) => a + Number(g.cap_usd), 0)); }
+  try { const j = JSON.parse(readFileSync(join(dir, MIRROR_FILE), "utf8")); return j?.format === 1 && Number.isFinite(j.granted_usd) ? round6(j.granted_usd) : null; }
   catch { return null; }
 }
 
@@ -112,10 +145,11 @@ export function readBudgetFile(path: string): Budget {
 }
 
 // Written whole, fsynced, renamed, and the folder fsynced, so a reservation is on disk before the call goes.
-export function writeDurable(path: string, text: string) {
+export function fsyncDir(dir: string) { try { const d = openSync(dir, "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* not every platform fsyncs a folder */ } }
+export function writeDurable(path: string, text: string, mode = 0o640) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = join(dirname(path), `.${Date.now()}-${randomBytes(4).toString("hex")}.tmp`);
-  const fd = openSync(tmp, "w", 0o640);
+  const fd = openSync(tmp, "w", mode);
   try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
   try { const s = statSync(path); chownSync(tmp, s.uid, s.gid); chmodSync(tmp, s.mode & 0o777); } catch { /* a new file */ }
   renameSync(tmp, path);
@@ -131,7 +165,7 @@ export type SeatWindow = { ms: number; allowance: number };
 export type ReserveReq = { suite: string; run: string; call: string; attempt: number; seat: ReviewSeatName | null; usd: number; runs: number; hold?: string };
 export type ReserveOpts = { marginUsd?: number; window?: (seat: ReviewSeatName) => SeatWindow | null; runCapUsd?: number };
 export type ReserveResult = { ok: true; id: string } | { ok: false; reason: "budget" | "seat" | "busy" | "window" | "allowance"; detail: string; committed?: number; retryAt?: string };
-export type GrantResult = { ok: true; cap: number; granted: number; fresh: boolean } | { ok: false; reason: "allowance" | "busy"; detail: string };
+export type GrantResult = { ok: true; cap: number; granted: number; fresh: boolean } | { ok: false; reason: "allowance" | "busy" | "used"; detail: string };
 const money = (n: number) => `$${n.toFixed(2)}`;
 
 // Calls a seat has made or has out within its window: settled entries and live reservations.
@@ -144,19 +178,24 @@ export function windowUse(b: Budget, seat: ReviewSeatName, sinceIso: string): { 
 }
 
 export class Ledger {
-  readonly path: string; readonly lockPath: string; readonly owner: string; readonly tallyPath: string; readonly tallyUid: number;
-  constructor(public dir: string, owner?: string, private now: () => Date = () => new Date(), tallyUid?: number) {
+  readonly path: string; readonly lockPath: string; readonly owner: string; readonly tallyPath: string; readonly tallyUid: number; readonly privateDir: string;
+  constructor(public dir: string, owner?: string, private now: () => Date = () => new Date(), tallyUid?: number, privateDir?: string) {
     this.path = join(dir, "budget.json");
     this.lockPath = join(dir, "budget.lock");
-    this.tallyPath = join(dir, TALLY_FILE);
+    this.privateDir = privateDir ?? `${dir.replace(/\/+$/, "")}-private`;
+    this.tallyPath = join(this.privateDir, TALLY_FILE);
     this.owner = owner ?? ownerToken();
     this.tallyUid = tallyUid ?? (process.getuid ? process.getuid() : 0);
   }
-  // The tally, or why it counts as fully spent. A folder with no history at all starts an empty one.
+  // Why the private folder can't be trusted now, or null.
+  privateProblem(): string | null { ensurePrivateDir(this.privateDir); return privateDirProblem(this.privateDir, this.tallyUid); }
+  // The tally, or why it counts as fully spent. Only a trials folder with no history at all (no marker in the private
+  // folder, no budget.json, no preflight.json) starts an empty one.
   private tally(): { ok: true; t: Tally } | { ok: false; why: string } {
     const r = readTally(this.tallyPath, this.tallyUid);
     if (r.ok) return r;
-    if ((r as { missing: boolean }).missing && !existsSync(this.path) && !existsSync(join(this.dir, "preflight.json"))) return { ok: true, t: { format: 1, grants: {} } };
+    if ((r as { missing: boolean }).missing && !existsSync(join(this.privateDir, HISTORY_FILE)) && !existsSync(this.path) && !existsSync(join(this.dir, "preflight.json")))
+      return { ok: true, t: { format: 1, grants: {}, used: {} } };
     return { ok: false, why: (r as { why: string }).why };
   }
   read(): Budget { return readBudgetFile(this.path); }
@@ -289,15 +328,23 @@ export class Ledger {
   // The owner's allowance: a run's grant, made once (its cap fixed then), while the allowance covers every grant
   // so far plus this one. An existing grant (a resume) stands only while the allowance still covers all grants:
   // an allowance the owner lowered stops resumes until he raises it again.
-  grant(key: string, info: { suite: string; run: string }, capUsd: number, allowanceUsd: number): GrantResult {
+  // Sixth round: with an approval (spend), its nonce is checked against the tally's log and the used folder, and spent in
+  // the same durable write as the grant, under the ledger's lock: one approval, one grant, even across processes.
+  grant(key: string, info: { suite: string; run: string }, capUsd: number, allowanceUsd: number, spend?: Spend): GrantResult {
     const allowance = Number.isFinite(allowanceUsd) && allowanceUsd > 0 ? allowanceUsd : 0;
     const r = this.with<GrantResult>(() => {
+      const pp = this.privateProblem();
+      if (pp) return { value: { ok: false, reason: "allowance", detail: `${pp}, so nothing is granted (DOCS.md, the trials' private folder)` }, write: false };
       const tr = this.tally();
       if (!tr.ok) return { value: { ok: false, reason: "allowance", detail: `${(tr as { why: string }).why}, so it counts as fully spent: no run is granted until it is put right (DOCS.md, the allowance tally)` }, write: false };
       const b = (tr as { t: Tally }).t;
-      const save = () => writeDurable(this.tallyPath, JSON.stringify(b, null, 1));
+      b.used ??= {};
       const granted = grantedOf(b);
       const have = b.grants[key];
+      // The approval first: never used before, by the tally's log or by a nonce file.
+      const usedPath = spend ? join(this.privateDir, USED_DIR, `${spend.nonce}.json`) : "";
+      if (spend && (b.used[spend.nonce] || existsSync(usedPath))) return { value: { ok: false, reason: "used", detail: "its approval was already used: one tap allows one run. Ask him again with a new trial card." }, write: false };
+      let result: GrantResult;
       if (have) {
         if (granted > allowance + 1e-9) return { value: { ok: false, reason: "allowance", detail: `the owner's run allowance is ${money(allowance)} and the runs granted so far take ${money(granted)}, so this run can't go on until he raises it in the App's options` }, write: false };
         // A larger cap (the owner raised the budget since) is granted only when the allowance covers it too.
@@ -305,19 +352,43 @@ export class Ledger {
         if (want > have.cap_usd + 1e-9 && granted - have.cap_usd + want <= allowance + 1e-9) {
           const total = round6(granted - have.cap_usd + want);
           have.cap_usd = want; have.allowance_usd = allowance; have.at = this.iso();
-          save();
-          return { value: { ok: true, cap: want, granted: total, fresh: false }, write: false };
+          result = { ok: true, cap: want, granted: total, fresh: false };
+        } else {
+          if (!spend) return { value: { ok: true, cap: have.cap_usd, granted, fresh: false }, write: false };
+          result = { ok: true, cap: have.cap_usd, granted, fresh: false };
         }
-        return { value: { ok: true, cap: have.cap_usd, granted, fresh: false }, write: false };
+      } else {
+        const cap = round6(Math.max(0, capUsd));
+        if (granted + cap > allowance + 1e-9) return { value: { ok: false, reason: "allowance",
+          detail: `its cap is ${money(cap)}, and the owner's run allowance is ${money(allowance)} with ${money(granted)} already granted to earlier runs; only he raises it, in the App's options (trials_run_allowance_usd)` }, write: false };
+        b.grants[key] = { ...info, cap_usd: cap, at: this.iso(), allowance_usd: allowance };
+        result = { ok: true, cap, granted: round6(granted + cap), fresh: true };
       }
-      const cap = round6(Math.max(0, capUsd));
-      if (granted + cap > allowance + 1e-9) return { value: { ok: false, reason: "allowance",
-        detail: `its cap is ${money(cap)}, and the owner's run allowance is ${money(allowance)} with ${money(granted)} already granted to earlier runs; only he raises it, in the App's options (trials_run_allowance_usd)` }, write: false };
-      b.grants[key] = { ...info, cap_usd: cap, at: this.iso(), allowance_usd: allowance };
-      save();
-      return { value: { ok: true, cap, granted: round6(granted + cap), fresh: true }, write: false };
+      // Spent and granted in one go: the nonce file (an exclusive create), then the tally with the nonce in its log, both
+      // fsynced, before the grant is answered.
+      if (spend) {
+        try {
+          mkdirSync(join(this.privateDir, USED_DIR), { recursive: true, mode: 0o700 });
+          const fd = openSync(usedPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+          try { writeSync(fd, JSON.stringify({ suite: spend.suite, plan: spend.plan, cap_cents: spend.cap_cents, used_at: this.iso() })); fsyncSync(fd); } finally { closeSync(fd); }
+          fsyncDir(join(this.privateDir, USED_DIR));
+        } catch (e: any) {
+          return { value: e?.code === "EEXIST" ? { ok: false, reason: "used", detail: "its approval was already used: one tap allows one run. Ask him again with a new trial card." }
+            : { ok: false, reason: "allowance", detail: "its approval couldn't be recorded as used, so nothing starts" }, write: false };
+        }
+        b.used[spend.nonce] = { suite: spend.suite, plan: spend.plan, cap_cents: spend.cap_cents, used_at: this.iso() };
+      }
+      writeDurable(this.tallyPath, JSON.stringify(b, null, 1), 0o600);
+      try { if (!existsSync(join(this.privateDir, HISTORY_FILE))) writeDurable(join(this.privateDir, HISTORY_FILE), this.iso(), 0o600); } catch { /* the tally stands */ }
+      try { writeDurable(join(this.dir, MIRROR_FILE), JSON.stringify({ format: 1, granted_usd: result.granted, grants: Object.keys(b.grants).length, at: this.iso() }), 0o640); } catch { /* the tally stands */ }
+      return { value: result, write: false };
     });
     return "busy" in r ? { ok: false, reason: "busy", detail: "the trials budget is locked by another process" } : r;
+  }
+  // Whether a nonce was used: in the tally's log or in the used folder.
+  nonceUsed(nonce: string): boolean {
+    const r = readTally(this.tallyPath, this.tallyUid);
+    return (r.ok && !!(r as { t: Tally }).t.used?.[nonce]) || existsSync(join(this.privateDir, USED_DIR, `${nonce}.json`));
   }
   // A run's grant, read from the tally (none when it can't be read: nothing more is sent).
   grantOf(key: string): Grant | null { const r = readTally(this.tallyPath, this.tallyUid); return r.ok ? (r as { t: Tally }).t.grants[key] ?? null : null; }

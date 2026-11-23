@@ -5,7 +5,7 @@
 // No live provider call: every provider is a fake, or a real adapter over a fake fetch or exec.
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
@@ -42,13 +42,16 @@ function writePreflightRecord(tdir: string, over: any = {}) {
   mkdirSync(tdir, { recursive: true });
   writeFileSync(join(tdir, "preflight.json"), JSON.stringify({ format: 1, id: "p20261122-140000", status: "done", build: BUILD, machine: MACHINE,
     started_at: "2026-11-22T14:00:00Z", finished_at: "2026-11-22T14:05:00Z", cap_usd: 4, suites: {}, disabled: {}, key: KEYS.get(tdir)?.(), ...over }));
-  // A finished preflight leaves the allowance tally behind it (its own grant spent; here none counted).
-  if (!existsSync(join(tdir, "allowance.json"))) writeFileSync(join(tdir, "allowance.json"), JSON.stringify({ format: 1, grants: {} }), { mode: 0o644 });
+  // A finished preflight leaves the allowance tally behind it (its own grant spent; here none counted), in the runner's
+  // private folder (sixth round: 0700, the runner's).
+  const priv = `${tdir}-private`;
+  mkdirSync(priv, { recursive: true, mode: 0o700 }); chmodSync(priv, 0o700);
+  if (!existsSync(join(priv, "allowance.json"))) writeFileSync(join(priv, "allowance.json"), JSON.stringify({ format: 1, grants: {}, used: {} }), { mode: 0o600 });
 }
 // The link's trial key, as the link makes it, and the rig's approvals signed with it (the owner's tap).
 const TRIAL_KEYPAIR = generateKeyPairSync("ed25519");
-const signTrial = (suite: string, plan: string, capUsd: number, nowMs: number) =>
-  makeTrialToken(trialClaimFor({ suite, plan, capUsd }, nowMs)!, (d) => edSign(null, d, TRIAL_KEYPAIR.privateKey));
+const signTrial = (suite: string, plan: string, capUsd: number, nowMs: number, action?: string) =>
+  makeTrialToken(trialClaimFor({ suite, plan, capUsd, action }, nowMs)!, (d) => edSign(null, d, TRIAL_KEYPAIR.privateKey));
 const OK_KEYS = { anthropic: "ok", gemini: "ok", perplexity: "ok" } as const;
 const sig = () => new AbortController().signal;
 
@@ -95,9 +98,13 @@ function bwrapHost(cmd: string[], p: string): string {
 const outOf = (cmd: string[]) => bwrapHost(cmd, cmd[cmd.indexOf("-o") + 1]);
 // A Codex self-test's JSONL: one refused attempt per probe (or the commands given).
 const refusedProbes = (pid = process.pid, cmds?: string[]) => (cmds ?? ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${pid}/environ`,
-  "cat /trial/codex-home/auth.json", "cat /proc/$PPID/environ"])
+  "cat /trial/codex-home/auth.json", "cat /proc/$PPID/environ", "exec 3<>/dev/tcp/1.1.1.1/443 && echo open", "exec 3<>/dev/tcp/127.0.0.1/8097 && echo open", "socat - UNIX-CONNECT:/run/cain-web/upstream/codex.sock"])
   .map((c) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: c, status: "failed", exit_code: 127, aggregated_output: "bwrap: execvp bash: No such file or directory" } })).join("\n");
 
+// Codex's effective configuration inside the wrapper, as a Codex that read the requirements file prints it (sixth round).
+const GOOD_CONFIG = JSON.stringify({ web_search: "disabled", requirements: { allowed_web_search_modes: [], allowed_sandbox_modes: ["read-only", "workspace-write"], mcp_servers: {} },
+  sandbox_mode: "read-only", sandbox_workspace_write: { network_access: false } }, null, 1);
+const isConfig = (cmd: string[]) => cmd.includes("debug") && cmd.includes("config");
 // ---- fakes ----
 type Spy = Provider & { calls: AskInput[] };
 type FakeOpts = { seat: string; cost?: number | null; how?: "billed" | "estimated"; served?: (i: AskInput) => string;
@@ -131,14 +138,15 @@ function fake(o: FakeOpts): Spy {
 }
 function fakeCodex(o: Partial<FakeOpts> & { models?: string[] | null; version?: string; isolated?: boolean } = {}): Spy & CodexProvider {
   const f = fake({ seat: "codex", cost: 0, how: "billed", ...o });
-  return Object.assign(f, { validate: undefined, version: async () => o.version ?? "codex-cli 0.130.0", models: async () => (o.models === undefined ? ["gpt-6.2-sol", "gpt-6.2-astra"] : o.models),
-    isolation: async () => (o.isolated === false ? { ok: false, mode: "none" as const, detail: "a sandboxed command ran and gave output", at: "2026-11-22T15:00:00Z" } : { ok: true, mode: "bwrap" as const, detail: "fake", at: "2026-11-22T15:00:00Z" }) }) as any;
+  return Object.assign(f, { validate: undefined, version: async () => o.version ?? "codex-cli 0.136.0", models: async () => (o.models === undefined ? ["gpt-6.2-sol", "gpt-6.2-astra"] : o.models),
+    isolation: async () => (o.isolated === false ? { ok: false, mode: "none" as const, detail: "a sandboxed command ran and gave output", at: "2026-11-22T15:00:00Z" } : { ok: true, mode: "bwrap" as const, detail: "fake", at: "2026-11-22T15:00:00Z", version: "0.136.0",
+      lines: { bwrap: { ok: true, detail: "fake" }, config: { ok: true, detail: "fake" }, probes: { ok: true, detail: "fake" } } }) }) as any;
 }
 
 function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Partial<RunnerConfig["caps"]>; record?: (i: number) => any;
   providers?: Partial<TrialDeps["providers"]>; stopped?: () => boolean; fetchBody?: any; fetch?: TrialDeps["fetch"]; exec?: TrialDeps["exec"];
   questions?: boolean | object; reviewSeats?: Partial<Record<string, SeatFn>>; inbox?: boolean; timeoutScale?: number; seatLimits?: any;
-  allowance?: number; noPreflight?: boolean } = {}) {
+  allowance?: number; noPreflight?: boolean; tokenFiles?: string[] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "trials-"));
   const cfg: RunnerConfig = { ...DEFAULTS, caps: { ...DEFAULTS.caps, ...(o.caps ?? {}) }, queueDir: join(dir, "q"), spendFile: join(dir, "spend.json"), healthFile: join(dir, "health.json"),
     termsFile: join(dir, "terms.txt"), recordQueue: join(dir, "record-queue"), relayFile: join(dir, "relay.queue"), reservePercent: 25 };
@@ -164,9 +172,13 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
   const inboxDir = join(dir, "inbox");
   const approvalPub = join(dir, "trial.pub");
   writeFileSync(approvalPub, `${publicOf(TRIAL_KEYPAIR.privateKey)}\n`, { mode: 0o644 });
+  // The link's private trial key stands in as a file of the runner's uid that only its owner reads (sixth round).
+  const linkKey = join(dir, "trial.key");
+  writeFileSync(linkKey, "private key stand-in\n", { mode: 0o600 });
   const trials = new TrialRunner({ dir: tdir, recordDir, budgetUsd: o.budget ?? 40, seatGapMs: 0, timeoutScale: o.timeoutScale, inboxDir, inboxUids: [process.getuid!()],
     optionsFile, optionsUid: process.getuid!(), build: BUILD, machine: MACHINE, ...(o.seatLimits ? { seatLimits: o.seatLimits } : {}),
-    approvalPub, approvalPubUid: process.getuid!(), keyCheck: { ...OK_KEYS }, codexId: "test-codex", supervisorSeen: () => false }, deps);
+    approvalPub, approvalPubUid: process.getuid!(), keyCheck: { ...OK_KEYS }, codexId: "test-codex", supervisorSeen: () => false,
+    linkKey, linkKeyUid: process.getuid!(), tokenFiles: o.tokenFiles ?? [], assistantUid: 54321, assistantGids: [54321], codexIdentity: null, reviewCodexIdentity: null }, deps);
   KEYS.set(tdir, () => trials.preflightKey());
   if (!o.noPreflight) writePreflightRecord(tdir);
   const runAll = async (suite: "review-seats" | "research" = "review-seats", max = 3000) => {
@@ -178,7 +190,7 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
     }
   };
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
-  return { dir, tdir, cfg, recordDir, review, trials, deps, providers, fetched, runAll, relays, inboxDir, optionsFile, approvalPub,
+  return { dir, tdir, cfg, recordDir, review, trials, deps, providers, fetched, runAll, relays, inboxDir, optionsFile, approvalPub, linkKey, priv: `${tdir}-private`,
     advance: (ms: number) => { clock = new Date(clock.getTime() + ms); }, now: () => clock };
 }
 const outputCalls = (t: ReturnType<typeof rig>) => ["gemini", "codex", "perplexity"].reduce((a, s) => a + t.providers[s].calls.filter((c: AskInput) => !c.schema && c.user !== "ready?").length, 0);
@@ -188,13 +200,13 @@ let inboxSeq = 0;
 // A paid request with no approval of its own gets the owner's tap for exactly what the runner would start (approvalFor);
 // pass approval: null to send none.
 function approvalFor(trials: TrialRunner, req: any): string {
-  if (req.kind === "preflight") { const tg = trials.approvalTarget("preflight"); return signTrial("preflight", tg.plan, tg.cap, trials.deps.now!().getTime()); }
+  if (req.kind === "preflight") { const tg = trials.approvalTarget("preflight"); return signTrial("preflight", tg.plan, tg.cap, trials.deps.now!().getTime(), "preflight"); }
   const s = readSuite(trials.cfg.dir, req.suite) ?? trials.buildSuite(req.suite).suite!;
   const last = latestRun(trials.cfg.dir, req.suite);
   const resuming = !!(last && last.status !== "done" && req.mode !== "new");
   const pinned = resuming ? !last!.preflight?.third_party_routing : !(req.suite === "research" && (() => { const a = trials.approval(); return a.ok && a.third_party; })());
   const tg = trials.approvalTarget(req.suite, s, pinned);
-  return signTrial(req.suite, tg.plan, tg.cap, trials.deps.now!().getTime());
+  return signTrial(req.suite, tg.plan, tg.cap, trials.deps.now!().getTime(), resuming ? "resume" : "start");
 }
 function submit(t: { inboxDir: string; trials: TrialRunner }, req: any): string | null {
   if ((req?.kind === "run" || req?.kind === "preflight") && !("approval" in req)) { try { req = { ...req, approval: approvalFor(t.trials, req) }; } catch { /* the runner says why */ } }
@@ -635,6 +647,7 @@ describe("Codex isolation", () => {
       const work = cmd.includes("-C") ? bwrapHost(cmd, cmd[cmd.indexOf("-C") + 1]) : "";
       seen.push({ cmd, env: o.env, workEntries: work ? readdirSync(work) : [], files });
       if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" };
+      if (isConfig(cmd)) return { code: 0, stdout: GOOD_CONFIG, stderr: "" };
       if (cmd.includes("debug")) return { code: 0, stdout: JSON.stringify({ models: [{ slug: "gpt-6.2-sol" }, { slug: "gpt-6.2-astra" }] }), stderr: "" };
       const out = outOf(cmd);
       if (cmd[cmd.length - 1].startsWith("This is a sandbox check")) {
@@ -759,10 +772,10 @@ describe("Codex model discovery", () => {
     submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
     const st = latestRun(t.tdir, "review-seats")!;
-    expect(st.preflight!.codex_version).toBe("codex-cli 0.130.0");
+    expect(st.preflight!.codex_version).toBe("codex-cli 0.136.0");
     expect(st.preflight!.skip["codex:gpt-6.2-astra"]).toContain("not listed");
     expect(Object.entries(st.calls).find(([id]) => id.endsWith("codex:gpt-6.2-astra"))![1].error).toContain("not listed");
-    expect(buildReport(t.tdir, "review-seats", 40)).toContain("codex-cli 0.130.0");
+    expect(buildReport(t.tdir, "review-seats", 40)).toContain("codex-cli 0.136.0");
 
     const probe = fakeCodex({ models: null, impl: async (i) => { if (i.model === "gpt-6.2-astra") throw new SeatError("refused", "Codex: error: model 'gpt-6.2-astra' is not supported"); } });
     const t2 = rig({ reviews: 1, providers: { codex: probe } });
@@ -1044,8 +1057,9 @@ describe("the research suite's design", () => {
     expect(g.system).toContain("as of 2026-11-20");
     expect(g.system).toContain("right_abstention");
     expect(g.system).toContain("confident_wrong");
-    expect(g.fetch).toBe(true);
-    expect(g.allowedDomains).toEqual(["example.com"]);
+    // Sixth round: no fetch tool; the cited page's text (or why it wasn't read) is in the prompt, fetched by the runner.
+    expect(g.fetch).toBe(false);
+    expect(g.user).toContain('<page url="https://example.com/releases">');
     const report = buildReport(t.tdir, "research", 40);
     expect(report).toContain("OpenAI and Google: 30 tasks");
     expect(report).toContain("Claude and OpenAI: 30 tasks");
@@ -1171,7 +1185,7 @@ describe("Codex isolation before launch", () => {
     expect(judgeSelfTest({ code: 0, stdout: "", stderr: "", answer: "I won't run commands." }, ["K1"]).detail).toContain("proves nothing");
     expect(judgeSelfTest({ code: 1, stdout: "", stderr: "not signed in", answer: "" }, ["K1"]).ok).toBe(false);
     // With the probes named: each of the four must have been attempted (and refused).
-    expect(PROBES.map((p) => p.id)).toEqual(["read", "absolute", "builtin", "environ", "credential", "codex-environ"]);
+    expect(PROBES.map((p) => p.id)).toEqual(["read", "absolute", "builtin", "environ", "credential", "codex-environ", "network", "link-port", "runner-port"]);
     expect(judgeSelfTest({ code: 0, stdout: refusedProbes(4242), stderr: "", answer: "" }, ["K1"], { pid: 4242 }).ok).toBe(true);
     for (let skip = 0; skip < 4; skip++) {
       const cmds = ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo $line", "cat /proc/4242/environ"].filter((_, i) => i !== skip);
@@ -1206,6 +1220,8 @@ describe("Codex isolation before launch", () => {
     const prompts: string[] = [];
     const leak = async (cmd: string[]) => {
       if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" };
+      if (isConfig(cmd)) return { code: 0, stdout: GOOD_CONFIG, stderr: "" };
+      if (isConfig(cmd)) return { code: 0, stdout: GOOD_CONFIG, stderr: "" };
       const p = cmd[cmd.length - 1]; prompts.push(p);
       return { code: 0, stdout: [refusedProbes(), JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "/bin/cat /trial/planted-key.txt", status: "completed", exit_code: 0, aggregated_output: "REVIEW_GEMINI_KEY=x" } })].join("\n"), stderr: "" };
     };
@@ -1213,14 +1229,14 @@ describe("Codex isolation before launch", () => {
     expect(iso2.ok).toBe(false);
     for (const want of ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt", `cat /proc/${process.pid}/environ`]) expect(prompts[0]).toContain(want);
     // A probe Codex didn't attempt: not isolated.
-    const skip = async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" }
+    const skip = async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" } : isConfig(cmd) ? { code: 0, stdout: GOOD_CONFIG, stderr: "" }
       : { code: 0, stdout: refusedProbes(process.pid, ["cat /trial/planted-key.txt", `cat /proc/${process.pid}/environ`]), stderr: "" };
     const iso3 = await codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: skip as any }), sig());
     expect(iso3.ok).toBe(false);
     expect(iso3.detail).toContain("absolute-path");
     // Every probe tried and refused, under bubblewrap: isolated.
     const seen: string[][] = [];
-    const refuse = async (cmd: string[]) => { seen.push(cmd); return cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" } : { code: 0, stdout: refusedProbes(), stderr: "" }; };
+    const refuse = async (cmd: string[]) => { seen.push(cmd); return cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.167.0\n", stderr: "" } : isConfig(cmd) ? { code: 0, stdout: GOOD_CONFIG, stderr: "" } : { code: 0, stdout: refusedProbes(), stderr: "" }; };
     const iso4 = await codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: refuse as any }), sig());
     expect(iso4).toMatchObject({ ok: true, mode: "bwrap" });
     expect(seen.every((c) => c[0] === bw && c.includes("--clearenv"))).toBe(true);
@@ -1268,19 +1284,19 @@ describe("Codex isolation before launch", () => {
 });
 
 describe("a true spend bound", () => {
-  test("Claude: answerers don't fetch; the grader's fetch carries max_content_tokens and the worst case counts uses x content plus search allowances, per step", () => {
+  test("Claude: answerers don't fetch; no grader has a fetch tool, and the cited pages' text is in the grading bound", () => {
     const ans = callShape("research", { id: "o", kind: "output", task: "q", config: "claude:claude-opus-5-5+search" }, qt);
     expect(ans.fetch).toBe(false);
-    // Fifth round: no cited page, no fetch tool; max_uses is the number of pages cited, and that many fetches are reserved.
-    expect(callShape("research", { id: "g", kind: "grade", task: "q", grader: "claude" }, qt).fetch).toBe(false);
+    // Sixth round: the runner fetches the cited pages; the grader gets their text, so its bound grows by the pages' cut.
     const cited = { ...qt, sources: [{ url: "https://a.example/one", read_on: DAY }, { url: "https://b.example/two?utm=x", read_on: DAY }, { url: "https://c.example/three.pdf", read_on: DAY }] };
     const g = callShape("research", { id: "g", kind: "grade", task: "q", grader: "claude" }, cited);
-    expect(g.fetch).toBe(true);
-    expect(g.maxFetches).toBe(2);   // the PDF is left out before the fetch
-    const c = ceilingOf(g, 3_000)!;
-    expect(c.steps).toBe(2 + 1);
-    expect(c.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + 2 * LIMITS.claudeFetchTokens);
-    expect(limitsText(g)).toContain(`web_fetch max_uses 2 (the cited pages) max_content_tokens ${LIMITS.claudeFetchTokens}`);
+    expect(g.fetch).toBe(false);
+    expect(g.maxFetches).toBe(0);
+    expect(ceilingOf(g, 3_000)!.steps).toBe(1);
+    expect(limitsText(g)).not.toContain("web_fetch");
+    const suite = { format: 2, name: "research", created_at: "", tasks: [cited], skipped: [] } as any;
+    const none = { ...suite, tasks: [{ ...cited, sources: [{ url: "https://c.example/three.pdf", read_on: DAY }] }] };
+    expect(gradeCharsBound(suite, cited as any) - gradeCharsBound(none, none.tasks[0])).toBe(2 * (PAGE_TEXT_CHARS + 300));
     const ca = ceilingOf(ans, 3_000)!;
     expect(ca.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + LIMITS.claudeAnswerSearches * SEARCH_RESULT_TOKENS);
   });
@@ -1426,7 +1442,7 @@ describe("provider tools only on checked text", () => {
     expect(t.providers.gemini.calls.length).toBe(before);
     // The research suite: answerers search; the grader may fetch only cited domains.
     expect(toolViolation("research", { id: "o", kind: "output", task: "q", config: "perplexity:low" }, callShape("research", { id: "o", kind: "output", task: "q", config: "perplexity:low" }, qt))).toBeNull();
-    expect(toolViolation("review-seats", { id: "g", kind: "grade", task: "r1", grader: "claude" }, { ...callShape("review-seats", { id: "g", kind: "grade", task: "r1", grader: "claude" }, rt()), fetch: true })).toContain("only in the research suite");
+    expect(toolViolation("review-seats", { id: "g", kind: "grade", task: "r1", grader: "claude" }, { ...callShape("review-seats", { id: "g", kind: "grade", task: "r1", grader: "claude" }, rt()), fetch: true })).toContain("no search or fetch tool");
   });
 
   test("an unpinned Perplexity call without the owner's approval in the App's options is refused", async () => {
@@ -1565,7 +1581,8 @@ describe("cost reporting", () => {
 
 // ---- The fourth round's fixes ----
 import { PREFLIGHT_CAP_USD, preflightError, readPreflight, thinkingCover } from "../rootfs/opt/cain/trials/runner.ts";
-import { GROUNDING_USD, fetchAllowed, fetchableUrl, noteFetchUrls, researchPrivacy, stripQuery } from "../rootfs/opt/cain/trials/core.ts";
+import { GROUNDING_USD, PAGE_TEXT_CHARS, fetchAllowed, fetchableUrl, gradeCharsBound, noteFetchUrls, researchPrivacy, stripQuery } from "../rootfs/opt/cain/trials/core.ts";
+import { fetchCitedPage, hopAllowed, htmlToText } from "../rootfs/opt/cain/trials/pages.ts";
 import { groundingQueryCount } from "../rootfs/opt/cain/trials/calls.ts";
 
 const runReq = { kind: "run", suite: "review-seats" };
@@ -1588,17 +1605,18 @@ describe("paid runs need the owner's say: the run allowance in the App's options
 
   test("a run starts only while the allowance covers its cap; a second run beyond it is refused", async () => {
     const t = rig({ reviews: 1 });
-    // A first request freezes the suite so its cap can be read; the grant is what the allowance counts.
+    // A refused request freezes nothing (sixth round): the cap is read from the suite as a first run would build it.
     setAllowance(t, 0);
     expect(submit(t, runReq)).toContain("can't start");
-    const cap = t.trials.runCapFor(suiteOf(t));
+    expect(existsSync(paths(t.tdir).suite("review-seats"))).toBe(false);
+    const cap = t.trials.runCapFor(t.trials.buildSuite("review-seats").suite!);
     expect(cap).toBeGreaterThan(PREFLIGHT_CAP_USD);
     expect(cap).toBeLessThanOrEqual(36);
     setAllowance(t, cap + 1);
     expect(submit(t, runReq)).toBeNull();
     await t.runAll();
     expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
-    const tally = JSON.parse(readFileSync(join(t.tdir, "allowance.json"), "utf8"));
+    const tally = JSON.parse(readFileSync(join(t.priv, "allowance.json"), "utf8"));
     expect(Object.values<any>(tally.grants).map((g) => g.cap_usd)).toEqual([cap]);
     const b = readBudget(t.tdir);
     // The run spent far less than its cap, but the allowance counts caps: a second run is refused.
@@ -1642,7 +1660,7 @@ describe("paid runs need the owner's say: the run allowance in the App's options
   });
 
   test("a run's reservations and task holds never pass its granted cap", () => {
-    const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+    const dir = join(mkdtempSync(join(tmpdir(), "ledger-")), "trials");
     const l = new Ledger(dir);
     expect(l.grant("s|r", { suite: "s", run: "r" }, 1.0, 1.5)).toMatchObject({ ok: true, cap: 1, fresh: true });
     expect(l.grant("s|r2", { suite: "s", run: "r2" }, 1.0, 1.5)).toMatchObject({ ok: false, reason: "allowance" });
@@ -1704,45 +1722,70 @@ describe("the spend stop is a soft bound with a fixed margin", () => {
     expect(r.bill!.usd).toBeCloseTo(tokens + 4 * GROUNDING_USD, 9);
   });
 
-  test("the research grader fetches only the exact HTML pages of the answer notes, query strings stripped", () => {
+  test("sixth round: the runner fetches the exact cited pages, each hop on the cited host and path, query stripped, HTML only, as text", async () => {
     expect(fetchableUrl("https://example.com/a/b?utm=1&id=2#top")).toBe("https://example.com/a/b");
     expect(fetchableUrl("https://example.com/report.pdf")).toBeNull();
     expect(fetchableUrl("https://example.com/sheet.XLSX?x=1")).toBeNull();
     expect(fetchableUrl("ftp://example.com/a")).toBeNull();
     expect(fetchableUrl("https://user:pw@example.com/a")).toBeNull();
     expect(stripQuery("https://example.com/p?q=private")).toBe("https://example.com/p");
+    const asked: string[] = [];
+    const site = (routes: Record<string, () => Response>) => (async (url: string, init: any) => {
+      asked.push(url); expect(init.redirect).toBe("manual");
+      return (routes[url] ?? (() => new Response("no", { status: 404 })))();
+    }) as any;
+    const html = (b: string) => () => new Response(`<html><head><title>x</title><script>steal()</script><style>p{}</style></head><body><p>Version 4.2 &amp; notes</p><!-- hid --></body></html>${b}`, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+    const go = (to: string) => () => new Response(null, { status: 301, headers: { location: to } });
+    // Followed: a hop below the cited path, its query stripped.
+    let p = await fetchCitedPage("https://example.com/releases?ref=mine", site({ "https://example.com/releases": go("/releases/latest?utm=1"), "https://example.com/releases/latest": html("") }));
+    expect(p).toEqual({ url: "https://example.com/releases", text: "Version 4.2 & notes" });
+    expect(asked).toEqual(["https://example.com/releases", "https://example.com/releases/latest"]);
+    // Refused: off the cited host, off the cited path, or to http.
+    expect((await fetchCitedPage("https://example.com/releases", site({ "https://example.com/releases": go("https://evil.example/releases") }))).why).toContain("off the cited host or path");
+    expect((await fetchCitedPage("https://example.com/releases", site({ "https://example.com/releases": go("/login") }))).why).toContain("off the cited host or path");
+    expect((await fetchCitedPage("https://example.com/releases", site({ "https://example.com/releases": go("http://example.com/releases/x") }))).why).toContain("off the cited host or path");
+    expect(hopAllowed(new URL("https://example.com/releases"), new URL("https://example.com/releasesX"))).toBe(false);
+    // Not HTML: skipped, never read into the prompt.
+    expect((await fetchCitedPage("https://example.com/data", site({ "https://example.com/data": () => new Response("{}", { status: 200, headers: { "content-type": "application/json" } }) }))).why).toContain("not HTML");
+    expect((await fetchCitedPage("https://example.com/a.pdf", site({}))).why).toContain("not an HTML page");
+    // Cut to the page cap.
+    const big = await fetchCitedPage("https://example.com/big", site({ "https://example.com/big": html(`<p>${"word ".repeat(10_000)}</p>`) }));
+    expect(big.text!.length).toBe(PAGE_TEXT_CHARS);
+    expect(htmlToText("<p>a</p><p>b &#x41;</p>")).toBe("a\nb A");
+    // The prompt carries the text, scrubbed, and tells the grader it has no fetch tool.
     const task: any = { kind: "research", id: "q1", sent_text: "What is the release?", as_of: "2026-11-20", must_contain: "the version", no_reliable_answer: false,
       sources: [{ url: "https://example.com/releases?ref=mine", read_on: "2026-11-19" }, { url: "https://docs.example.org/notes.pdf", read_on: "2026-11-19" }] };
     expect(noteFetchUrls(task)).toEqual(["https://example.com/releases"]);
-    const gp = gradePrompt(task, [{ label: "A10", output: { call: "", config: "", text: "See https://other.example/x?y=1", urls: ["https://other.example/x?y=1"] } as any }]);
-    expect(gp.user).toContain("<pages>\nhttps://example.com/releases\n</pages>");
+    const gp = gradePrompt(task, [{ label: "A10", output: { call: "", config: "", text: "See https://other.example/x?y=1", urls: ["https://other.example/x?y=1"] } as any }],
+      [{ url: "https://example.com/releases", text: "Version 4.2, by Google" }]);
+    expect(gp.user).toContain('<page url="https://example.com/releases">\nVersion 4.2, by [name]\n</page>');
     expect(gp.user).not.toContain("ref=mine");
-    expect(gp.system).toContain("fetch only the pages listed under <pages>");
-    expect(fetchAllowed("https://example.com/releases?x=1", noteFetchUrls(task))).toBe(true);
-    expect(fetchAllowed("https://example.com/releases/", noteFetchUrls(task))).toBe(true);
-    expect(fetchAllowed("https://example.com/other", noteFetchUrls(task))).toBe(false);
-    expect(fetchAllowed("https://other.example/x", noteFetchUrls(task))).toBe(false);
+    expect(gp.system).toContain("you have no fetch or search tool");
+    expect(gradePrompt(task, [], []).user).toContain("(not read: not fetched)");
+    expect(toolViolation("research", { id: "g", kind: "grade", task: "q1", grader: "claude" }, { ...callShape("research", { id: "g", kind: "grade", task: "q1", grader: "claude" }, task), fetch: true })).toContain("no search or fetch tool");
   });
 
-  test("in a run, the Claude grader's fetch is bound to the notes' pages, and a fetch beyond them blocks its grades with an alarm", async () => {
+  test("sixth round: in a run, graders read the runner's fetch of the cited page, have no fetch tool, and a reported fetch blocks grades with an alarm", async () => {
     let fetchedOutside = false;
     const claude = fake({ seat: "claude", cost: 0.05, impl: async (i) => {
-      if (i.schema && i.fetch && !fetchedOutside) { fetchedOutside = true; i.wire.fetched.push("https://evil.example/collect?d=1"); }
-      else if (i.schema && i.fetch) i.wire.fetched.push("https://example.com/releases?utm=x");
+      if (i.schema && !fetchedOutside) { fetchedOutside = true; i.wire.fetched.push("https://evil.example/collect?d=1"); }
     } });
     const t = rig({ questions: true, providers: { claude } });
+    const pageHits: string[] = [];
+    t.deps.pageFetch = (async (url: string) => { pageHits.push(url); return new Response("<p>Release 9 is current</p>", { status: 200, headers: { "content-type": "text/html" } }); }) as any;
     submit(t, { kind: "run", suite: "research" });
     await t.runAll("research");
     const graded = claude.calls.filter((c) => c.schema);
     expect(graded.length).toBeGreaterThan(0);
-    for (const c of graded) { expect(c.fetch).toBe(true); expect(c.allowedDomains).toEqual(["example.com"]); expect(c.user).toContain("<pages>\nhttps://example.com/releases\n</pages>"); }
+    for (const c of graded) { expect(c.fetch).toBe(false); expect(c.user).toContain("Release 9 is current"); }
+    // Fetched once per task, whatever the number of graders.
+    expect(pageHits.length).toBe(30);
+    expect(new Set(pageHits)).toEqual(new Set(["https://example.com/releases"]));
     const st = latestRun(t.tdir, "research")!;
     const blocked = Object.entries(st.calls).filter(([id, c]) => id.startsWith("grade|") && id.endsWith("|claude") && c.status === "blocked");
     expect(blocked.length).toBe(1);
     expect(blocked[0][1].error).toContain("not cited in the answer notes");
     expect(t.relays().some((r) => /a grader fetched 1 page outside the answer notes/.test(r))).toBe(true);
-    // The others, whose only fetch was a note's page, were kept.
-    expect(Object.entries(st.calls).filter(([id, c]) => id.startsWith("grade|") && id.endsWith("|claude") && c.status === "done").length).toBe(graded.length - 1);
   });
 });
 
@@ -1794,7 +1837,7 @@ describe("the first install is preflight-only", () => {
     expect(preflightError(rec, t.trials.preflightKey(), t.now().getTime())).toBeNull();
     // Its own grant from the allowance, a few dollars, and every check within it.
     const b = readBudget(t.tdir);
-    expect(JSON.parse(readFileSync(join(t.tdir, "allowance.json"), "utf8")).grants[`preflight|${rec.id}`].cap_usd).toBe(PREFLIGHT_CAP_USD);
+    expect(JSON.parse(readFileSync(join(t.priv, "allowance.json"), "utf8")).grants[`preflight|${rec.id}`].cap_usd).toBe(PREFLIGHT_CAP_USD);
     expect(b.entries.every((e) => e.suite === "preflight" && e.run === rec.id)).toBe(true);
     expect(b.spent_usd).toBeLessThanOrEqual(PREFLIGHT_CAP_USD);
     // No owner text left: no question, no brief, no record of his.
@@ -1805,7 +1848,7 @@ describe("the first install is preflight-only", () => {
     expect(ppChecks.length).toBe(4);   // the review suite's pinned model, and the research suite's three levels
     expect(ppChecks.every((m) => m === "perplexity/sonar")).toBe(true);
     // Claude: the research tool path (search and the grader's fetch, direct callers) was checked.
-    expect(rec.suites.research!.ids.claude).toContain("web_fetch_20260318 max_uses 1");
+    expect(rec.suites.research!.ids.claude).toContain("no fetch tool: the runner fetches the cited pages");
     // Gemini: each model's thinking field taken; Argon's cap didn't cover its thinking, so it is disabled, named;
     // Neon isn't served. Both stay disabled.
     expect(rec.suites["review-seats"]!.thinking["gemini-4-argon"]).toBe("no");
@@ -1882,7 +1925,7 @@ describe("the preflight's verdicts in a run", () => {
 // ---- Fifth round (Cain 0.19.0): the outside review of round 4 ----
 import { authCanaries, freshDirs, requirementsInPlace, wrap, REQUIREMENTS_PATH, REQUIREMENTS_TOML } from "../rootfs/opt/cain/trials/sandbox.ts";
 import { keyProblems, supervisorTokenSeen, trialKeyCheck } from "../rootfs/opt/cain/trials/runner.ts";
-import { readTally } from "../rootfs/opt/cain/trials/ledger.ts";
+import { readTally, tallyGranted } from "../rootfs/opt/cain/trials/ledger.ts";
 
 describe("fifth round: his go per paid run", () => {
   const target = (t: ReturnType<typeof rig>) => { const s = t.trials.buildSuite("review-seats").suite!; return t.trials.approvalTarget("review-seats", s, true); };
@@ -2029,28 +2072,97 @@ describe("fifth round: the preflight record keyed and expiring", () => {
   });
 });
 
-describe("fifth round: the allowance tally", () => {
-  test("kept apart, the runner's alone; missing (with history) or unreadable counts as fully spent", () => {
+describe("sixth round: the signing key, used nonces and the tally out of the assistant's reach", () => {
+  test("kept in the runner's 0700 folder; missing (with history), garbled or replaced counts as fully spent; the mirror shows the total", async () => {
     const t = rig({ reviews: 1 });
     expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
-    const f = join(t.tdir, "allowance.json");
+    const f = join(t.priv, "allowance.json");
     expect(readTally(f, process.getuid!())).toMatchObject({ ok: true });
-    expect(Object.keys(JSON.parse(readFileSync(f, "utf8")).grants).length).toBe(1);
-    // Others can write it: it doesn't count.
+    const tally = JSON.parse(readFileSync(f, "utf8"));
+    expect(Object.keys(tally.grants).length).toBe(1);
+    expect(Object.keys(tally.used).length).toBe(1);                       // the nonce is logged in the tally too
+    expect(statSync(t.priv).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(t.priv, "has-history"))).toBe(true);
+    // The mirror in the readable folder carries the total for trial.sh and the card.
+    const cap = Object.values<any>(tally.grants)[0].cap_usd;
+    expect(tallyGranted(t.tdir)).toBe(cap);
+    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json") };
+    expect(spawnSync("bun", [CLI, "status"], { encoding: "utf8", env }).stdout).toContain(`granted to runs so far: $${cap.toFixed(2)}`);
+    // Replaced by a file others can write: it doesn't count.
     const u = rig({ reviews: 1 });
-    chmodSync(join(u.tdir, "allowance.json"), 0o666);
+    chmodSync(join(u.priv, "allowance.json"), 0o666);
     expect(submit(u, { kind: "run", suite: "review-seats" })).toContain("fully spent");
-    // Gone, while the trials folder has history: fully spent too.
+    // Taken away, with the history marker there: fully spent.
     const v = rig({ reviews: 1 });
-    spawnSync("rm", ["-f", join(v.tdir, "allowance.json")]);
-    expect(submit(v, { kind: "run", suite: "review-seats" })).toContain("fully spent");
+    expect(submit(v, { kind: "run", suite: "review-seats" })).toBeNull();
+    await v.runAll();
+    renameSync(join(v.priv, "allowance.json"), join(v.dir, "tally-moved-out.json"));
+    v.advance(2_000);
+    expect(submit(v, { kind: "run", suite: "review-seats", mode: "new" })).toContain("fully spent");
     // Garbled: the same.
     const w = rig({ reviews: 1 });
-    writeFileSync(join(w.tdir, "allowance.json"), "{not json");
+    writeFileSync(join(w.priv, "allowance.json"), "{not json");
     expect(submit(w, { kind: "run", suite: "review-seats" })).toContain("fully spent");
-    // trial.sh status says so.
-    const env = { ...process.env, TRIALS_DIR: w.tdir, TRIALS_INBOX: join(w.dir, "inbox"), RECORD_DIR: w.recordDir, CAIN_STOP_FILE: join(w.dir, "stop.json") };
-    expect(spawnSync("bun", [CLI, "status"], { encoding: "utf8", env }).stdout).toContain("counts as fully spent");
+    // Owned by another uid (what the assistant could write would be its own): never read.
+    expect(readTally(f, process.getuid!() + 1)).toMatchObject({ ok: false });
+  });
+
+  test("the folder or its parent writable by others, or the link's private trial key readable by others: no paid step", async () => {
+    const t = rig({ reviews: 1 });
+    chmodSync(t.priv, 0o770);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("private folder");
+    chmodSync(t.priv, 0o700);
+    chmodSync(t.dir, 0o777);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("parent");
+    chmodSync(t.dir, 0o700);
+    chmodSync(t.linkKey, 0o640);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("private trial key can be read by others");
+    chmodSync(t.linkKey, 0o600);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    // A run under way stops at its next paid step once the folder is opened up.
+    await t.trials.tick();
+    chmodSync(t.priv, 0o755);
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("stopped");
+    expect(st.stop!.detail).toContain("private folder");
+  });
+
+  test("a used nonce file taken away can't replay its approval: the tally's log still has it", async () => {
+    const t = rig({ reviews: 1, budget: 0.3 });
+    const s = t.trials.buildSuite("review-seats").suite!;
+    const tg = t.trials.approvalTarget("review-seats", s, true);
+    const tok = signTrial("review-seats", tg.plan, tg.cap, t.now().getTime(), "start");
+    expect(submit(t, { kind: "run", suite: "review-seats", mode: "new", approval: tok })).toBeNull();
+    await t.runAll();
+    const aside = join(t.dir, "nonces-aside");
+    renameSync(paths(t.tdir).used, aside);
+    t.advance(2_000);
+    expect(submit(t, { kind: "run", suite: "review-seats", mode: "new", approval: tok })).toContain("already used");
+  });
+
+  test("simultaneous grants from two processes: one approval, one grant; and the allowance holds across them", async () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "grants-")), "trials");
+    mkdirSync(dir, { recursive: true });
+    const script = join(dir, "..", "grant.ts");
+    writeFileSync(script, `import { existsSync } from "node:fs";\nimport { Ledger } from ${JSON.stringify(LEDGER)};\nconst [d, go, who, nonce] = process.argv.slice(2);\nwhile (!existsSync(go)) await Bun.sleep(1);\nconst r = new Ledger(d).grant("s|" + who, { suite: "s", run: who }, 1.0, 1.5, { nonce, suite: "review-seats", plan: "p", cap_cents: 100 });\nconsole.log(JSON.stringify(r));\n`);
+    let round = 0;
+    const race = async (nonces: string[]) => {
+      const go = join(dir, "..", `go-${++round}`);
+      const ps = nonces.map((n, i) => Bun.spawn(["bun", script, dir, go, `r${round}-${i}`, n], { stdout: "pipe" }));
+      await Bun.sleep(400); writeFileSync(go, "");
+      return Promise.all(ps.map(async (p) => JSON.parse((await new Response(p.stdout).text()).trim())));
+    };
+    // The same approval in two processes at once: exactly one grant.
+    const same = await race(["a".repeat(32), "a".repeat(32)]);
+    expect(same.filter((r) => r.ok).length).toBe(1);
+    expect(same.find((r) => !r.ok).reason).toBe("used");
+    // Two approvals at once with room for none (1.0 of 1.5 granted, each asks 1.0): neither is granted, neither nonce spent.
+    const two = await race(["b".repeat(32), "c".repeat(32)]);
+    expect(two.filter((r) => r.ok).length).toBe(0);
+    const tally = JSON.parse(readFileSync(join(`${dir}-private`, "allowance.json"), "utf8"));
+    expect(Object.keys(tally.grants).length).toBe(1);
+    expect(Object.keys(tally.used)).toEqual(["a".repeat(32)]);
   });
 });
 
@@ -2085,7 +2197,8 @@ describe("fifth round: the Codex boundary", () => {
     const bw = join(real, "bwrap"); writeFileSync(bw, "#!/bin/sh\n", { mode: 0o755 });
     const run = async (leak: (cmd: string[]) => string) => {
       const exec = (async (cmd: string[]) => {
-        if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.130.0\n", stderr: "" };
+        if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.136.0\n", stderr: "" };
+        if (isConfig(cmd)) return { code: 0, stdout: GOOD_CONFIG, stderr: "" };
         const out = bwrapHost(cmd, cmd[cmd.indexOf("-o") + 1]);
         writeFileSync(out, `done ${leak(cmd)}`);
         return { code: 0, stdout: refusedProbes(), stderr: "" };
@@ -2097,9 +2210,226 @@ describe("fifth round: the Codex boundary", () => {
     expect((await run(() => "canary-aaaaaaaaaaaaaaaa")).detail).toContain("came back");
     expect((await run((cmd) => cmd[cmd.indexOf("TRIAL_ENV_CANARY") + 1])).detail).toContain("came back");
     // Codex didn't try its credential file: the test proves nothing.
-    const exec2 = (async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex 1\n", stderr: "" }
+    const exec2 = (async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.136.0\n", stderr: "" } : isConfig(cmd) ? { code: 0, stdout: GOOD_CONFIG, stderr: "" }
       : { code: 0, stdout: refusedProbes(process.pid, ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${process.pid}/environ`, "cat /proc/$PPID/environ"]), stderr: "" }) as any;
     const r = await codexProvider({ home: real, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: exec2 }), sig());
     expect(r.detail).toContain("Codex's own credential file");
   });
 });
+
+describe("sixth round: the card's plan is the link's own", () => {
+  test("planView, as the link computes it from the suite file and root's options, gives the runner's own hash, cap and action", async () => {
+    const t = rig({ reviews: 2, questions: true });
+    const pv = (target: string, fresh = false) => planView({ dir: t.tdir, recordDir: t.recordDir, terms: TERMS, optionsFile: t.optionsFile, optionsUid: process.getuid!(), target, fresh }) as any;
+    const s = t.trials.buildSuite("review-seats").suite!;
+    const tg = t.trials.approvalTarget("review-seats", s, true);
+    expect(pv("review-seats")).toMatchObject({ action: "start", plan: tg.plan, cap: tg.cap, disclosure: null });
+    const rs = t.trials.buildSuite("research").suite!;
+    const rt = t.trials.approvalTarget("research", rs, true);
+    const r = pv("research");
+    expect(r).toMatchObject({ action: "start", plan: rt.plan, cap: rt.cap });
+    expect(r.disclosure.split("\n")[0]).toBe("Sent to third-party search:");
+    expect(r.providers).toContain("Perplexity");
+    expect(pv("preflight")).toMatchObject({ action: "preflight", plan: t.trials.approvalTarget("preflight").plan });
+    // An approval signed for the link's hash and action starts the run; after a stop, the link says resume, and so does the runner.
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", tg.plan, tg.cap, t.now().getTime(), "start") })).toBeNull();
+    const st = latestRun(t.tdir, "review-seats")!;
+    st.status = "stopped"; writeFileSync(paths(t.tdir).state("review-seats", st.run), JSON.stringify(st));
+    const again = pv("review-seats");
+    expect(again.action).toBe("resume");
+    expect(pv("review-seats", true).action).toBe("start");
+    // An approval for a new run doesn't resume, and one for a resume doesn't start a new run.
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", again.plan, again.cap, t.now().getTime(), "start") })).toContain("this would be a resume");
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", again.plan, again.cap, t.now().getTime(), "resume") })).toBeNull();
+    // Options it can't read: no plan, so no card.
+    chmodSync(t.optionsFile, 0o666);
+    expect(pv("review-seats").error).toContain("can't compute the plan");
+  });
+});
+
+describe("sixth round: the Codex boundary beyond web search", () => {
+  test("the requirements file pins the sandbox modes, no MCP servers, no network for workspace-write", () => {
+    expect(REQUIREMENTS_TOML).toContain("allowed_web_search_modes = []");
+    expect(REQUIREMENTS_TOML).toContain('allowed_sandbox_modes = ["read-only", "workspace-write"]');
+    expect(REQUIREMENTS_TOML).not.toMatch(/allowed_sandbox_modes[^\n]*danger-full-access/);
+    expect(REQUIREMENTS_TOML).toMatch(/\[mcp_servers\]\n\n/);
+    expect(REQUIREMENTS_TOML).toMatch(/\[sandbox_workspace_write\]\nnetwork_access = false/);
+  });
+
+  test("the effective configuration must show web search disabled-only, read from the requirements; anything else refuses Codex", () => {
+    expect(judgeEffectiveConfig({ code: 0, stdout: GOOD_CONFIG })).toBeNull();
+    expect(judgeEffectiveConfig({ code: 1, stdout: "" })).toContain("couldn't be read");
+    expect(judgeEffectiveConfig({ code: 0, stdout: "" })).toContain("empty");
+    expect(judgeEffectiveConfig({ code: 0, stdout: GOOD_CONFIG.replace('"disabled"', '"live"') })).toContain("web search");
+    expect(judgeEffectiveConfig({ code: 0, stdout: JSON.stringify({ web_search: "disabled" }) })).toContain("wasn't read");
+    const base = JSON.parse(GOOD_CONFIG);
+    const variant = (f: (c: any) => void) => { const c = structuredClone(base); f(c); return judgeEffectiveConfig({ code: 0, stdout: JSON.stringify(c) }); };
+    expect(variant((c) => { c.requirements.allowed_web_search_modes = ["cached"]; })).toContain("other than disabled");
+    expect(variant((c) => { c.requirements.allowed_sandbox_modes.push("danger-full-access"); })).toContain("danger-full-access");
+    expect(variant((c) => { c.sandbox_mode = "danger-full-access"; })).toContain("danger-full-access");
+    expect(variant((c) => { c.sandbox_workspace_write.network_access = true; })).toContain("network");
+    expect(variant((c) => { c.requirements.mcp_servers = { x: { command: "y" } }; })).toContain("MCP server");
+    // TOML-like output reads too.
+    expect(judgeEffectiveConfig({ code: 0, stdout: 'web_search = "disabled"\nallowed_web_search_modes = []\nsandbox_mode = "read-only"\n' })).toBeNull();
+  });
+
+  test("the real self-test: the version must be at least 0.136.0, the effective config check passes, and the network and local-port probes are refused", async () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-home-")); writeFileSync(join(home, "auth.json"), "{}");
+    const bin = join(home, "fake-codex"); writeFileSync(bin, "");
+    const bw = join(home, "fake-bwrap"); writeFileSync(bw, "");
+    const run = (exec: any) => codexProvider({ home, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec }), sig());
+    const ok = async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.136.0\n", stderr: "" } : isConfig(cmd) ? { code: 0, stdout: GOOD_CONFIG, stderr: "" } : { code: 0, stdout: refusedProbes(), stderr: "" };
+    const good = await run(ok);
+    expect(good).toMatchObject({ ok: true, mode: "bwrap", version: "0.136.0", lines: { bwrap: { ok: true }, config: { ok: true }, probes: { ok: true } } });
+    // Too old.
+    const old = await run(async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex-cli 0.135.9\n", stderr: "" } : ok(cmd));
+    expect(old.ok).toBe(false); expect(old.detail).toContain("at least 0.136.0");
+    expect(versionAtLeast("0.140.1", CODEX_MIN_VERSION)).toBe(true); expect(versionAtLeast(null, CODEX_MIN_VERSION)).toBe(false);
+    // The effective config doesn't show the requirements: refused, and the probes never run.
+    const ran: string[][] = [];
+    const nocfg = await run(async (cmd: string[]) => { ran.push(cmd); return isConfig(cmd) ? { code: 0, stdout: JSON.stringify({ web_search: "live" }), stderr: "" } : ok(cmd); });
+    expect(nocfg).toMatchObject({ ok: false, lines: { config: { ok: false } } });
+    expect(ran.length).toBe(2);
+    // The prompt asks for the network and both local endpoints; one that connected fails the test.
+    const prompts: string[] = [];
+    const net = await run(async (cmd: string[]) => {
+      if (cmd.includes("--version") || isConfig(cmd)) return ok(cmd);
+      prompts.push(cmd[cmd.length - 1]);
+      return { code: 0, stdout: [refusedProbes(), JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "exec 3<>/dev/tcp/1.1.1.1/443 && echo open", status: "completed", exit_code: 0, aggregated_output: "open" } })].join("\n"), stderr: "" };
+    });
+    expect(net.ok).toBe(false); expect(net.lines!.probes!.ok).toBe(false);
+    for (const want of ["/dev/tcp/1.1.1.1/443", "/dev/tcp/127.0.0.1/8097", "UNIX-CONNECT:/run/cain-web/upstream/codex.sock"]) expect(prompts[0]).toContain(want);
+    // A probe not tried proves nothing.
+    const skipped = await run(async (cmd: string[]) => cmd.includes("--version") || isConfig(cmd) ? ok(cmd) : { code: 0, stdout: refusedProbes(process.pid, ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${process.pid}/environ`, "cat /trial/codex-home/auth.json", "cat /proc/$PPID/environ"]), stderr: "" });
+    expect(skipped.detail).toContain("an outbound connection from a Codex command");
+  });
+
+  test("in a run, Codex stays disabled until its three go/no-go lines pass, and an installed Codex below 0.136.0 is skipped", async () => {
+    const half = fakeCodex();
+    (half as any).isolation = async () => ({ ok: true, mode: "bwrap", detail: "fake", at: "x", lines: { bwrap: { ok: true, detail: "" }, config: { ok: false, detail: "no" }, probes: { ok: true, detail: "" } } });
+    const t = rig({ reviews: 1, providers: { codex: half } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    let st = latestRun(t.tdir, "review-seats")!;
+    expect(st.preflight!.graders_off!.codex).toContain("go/no-go lines didn't all pass");
+    expect(half.calls.length).toBe(0);
+    const old = fakeCodex({ version: "codex-cli 0.120.0" });
+    const u = rig({ reviews: 1, providers: { codex: old } });
+    submit(u, { kind: "run", suite: "review-seats" });
+    await u.runAll();
+    st = latestRun(u.tdir, "review-seats")!;
+    expect(st.preflight!.skip["codex:default"]).toContain("at least 0.136.0");
+    expect(old.calls.length).toBe(0);
+  });
+});
+
+describe("sixth round: the init's token files", () => {
+  test("a token file the assistant's uid can read means no paid dispatch, at the start and at every paid step", async () => {
+    const t = rig({ reviews: 1 });
+    const tok = join(t.dir, "SUPERVISOR_TOKEN");
+    writeFileSync(tok, "x", { mode: 0o600 });
+    t.trials.cfg.tokenFiles = [tok];
+    expect(t.trials.paidGate()).toBeNull();
+    chmodSync(t.dir, 0o755);
+    chmodSync(tok, 0o644);   // readable by others: the assistant's uid (another uid) could read it
+    expect(t.trials.paidGate()).toContain("can be read by the assistant's user");
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("token file");
+    chmodSync(tok, 0o600);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    await t.trials.tick();
+    chmodSync(tok, 0o604);
+    await t.runAll();
+    expect(latestRun(t.tdir, "review-seats")!.stop!.detail).toContain("token file");
+    // By the mode bits of the file and every folder above it, with the uid's groups.
+    expect(readableBy(tok, 54321, [54321])).toBe(true);
+    chmodSync(t.dir, 0o700);
+    expect(readableBy(tok, 54321, [54321])).toBe(false);   // its folder can't be passed through
+    expect(readableBy(join(t.dir, "missing"), 54321, [])).toBe(false);
+    expect(TOKEN_FILES).toContain("/run/s6/container_environment/SUPERVISOR_TOKEN");
+  });
+});
+
+describe("sixth round: provider limits are a backstop; the run's ceiling is the bound", () => {
+  test("a run whose preflight record expires stops at its next paid step, nothing more sent", async () => {
+    const t = rig({ reviews: 2 });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.trials.tick(); await t.trials.tick();
+    const sent = outputCalls(t) + graderCalls(t);
+    t.advance(8 * 24 * 3_600_000);
+    await t.trials.tick();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.status).toBe("stopped");
+    expect(st.stop!.reason).toBe("preflight");
+    expect(st.stop!.detail).toContain("more than 7 days old");
+    expect(outputCalls(t) + graderCalls(t)).toBe(sent);
+  });
+
+  test("DOCS.md and the CHANGELOG say provider limits are monthly, late and can be exceeded; no separate OpenAI project for Codex", () => {
+    const docs = readFileSync(join(import.meta.dir, "../DOCS.md"), "utf8");
+    const log = readFileSync(join(import.meta.dir, "../CHANGELOG.md"), "utf8");
+    const start = log.indexOf("## 0.19.0");
+    const top = log.slice(start, log.indexOf("\n## ", start + 5));
+    for (const t of [docs, top]) { expect(t).toMatch(/monthly/); expect(t).toMatch(/can be exceeded/); expect(t).toMatch(/backstop/); }
+    expect(docs).not.toMatch(/separate OpenAI project/i);
+    expect(docs).toContain("/run/s6/container_environment/SUPERVISOR_TOKEN");
+  });
+});
+
+describe("sixth round: the Codex identity in the preflight key", () => {
+  test("the sign-in's account or workspace id, hashed (never a token), keys the preflight; the review service's own sign-in is refused", () => {
+    const a = mkdtempSync(join(tmpdir(), "codex-a-"));
+    const claims = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acct-123" } })).toString("base64url");
+    writeFileSync(join(a, "auth.json"), JSON.stringify({ tokens: { id_token: `h.${claims}.s`, access_token: "secret-access-aaaaaaaaaaaa", refresh_token: "secret-refresh-bbbbbbbbbbbb" } }));
+    const id = codexIdentity(a)!;
+    expect(id).toMatch(/^[0-9a-f]{16}$/);
+    expect(id).not.toContain("acct-123");
+    const b = mkdtempSync(join(tmpdir(), "codex-b-"));
+    writeFileSync(join(b, "auth.json"), JSON.stringify({ tokens: { account_id: "acct-123", access_token: "other" } }));
+    expect(codexIdentity(b)).toBe(id);                       // the same account, however its file names it
+    expect(codexIdentity(mkdtempSync(join(tmpdir(), "codex-none-")))).toBeNull();
+    const t = rig({ reviews: 1, noPreflight: true });
+    t.trials.cfg.codexIdentity = id;
+    expect(t.trials.preflightKey().codex_identity).toBe(id);
+    t.trials.cfg.reviewCodexIdentity = id;
+    expect(submit(t, { kind: "preflight" })).toContain("the review service's own ChatGPT account");
+    expect(readPreflight(t.tdir)).toBeNull();
+    // A preflight under one sign-in doesn't count for another.
+    t.trials.cfg.reviewCodexIdentity = "f".repeat(16);
+    expect(submit(t, { kind: "preflight" })).toBeNull();
+    t.trials.cfg.codexIdentity = "e".repeat(16);
+    expect(t.trials.pfError()).toContain("the trials' Codex sign-in");
+  });
+});
+
+describe("sixth round: named go/no-go lines in the preflight report", () => {
+  test("each line is named with its status and detail, in the record, preflight.md and trial.sh status", async () => {
+    const t = rig({ reviews: 1, noPreflight: true });
+    expect(submit(t, { kind: "preflight" })).toBeNull();
+    for (let i = 0; i < 80 && readPreflight(t.tdir)?.status === "running"; i++) { if (!(await t.trials.tick())) t.advance(16 * 60_000); }
+    const rec = readPreflight(t.tdir)!;
+    expect(rec.status).toBe("done");
+    expect(rec.golines).toMatchObject({ bwrap: { status: "go" }, config: { status: "go" }, probes: { status: "go" }, discord: { status: "go" }, thinking: { status: "go" } });
+    expect(rec.golines!.options!.status).toBe("not checked");     // the options file wasn't saved while the runner ran
+    expect(rec.codex_version).toBe("codex-cli 0.136.0");
+    expect(rec.key_separation).toContain("unverified beyond the string check");
+    const md = readFileSync(paths(t.tdir).preflightReport, "utf8");
+    for (const name of Object.values(GO_LINES)) expect(md).toContain(name);
+    expect(md).toContain("Codex stays disabled until its first three lines are GO");
+    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json") };
+    const out = spawnSync("bun", [CLI, "status"], { encoding: "utf8", env }).stdout;
+    expect(out).toContain("GO: bubblewrap starts in the container");
+    expect(out).toContain("NOT CHECKED: saving options rewrites the options file without a restart");
+    // Options saved while the runner runs: that line goes GO at the next preflight; a Gemini check with no thinking is NO-GO.
+    const u = rig({ reviews: 1, noPreflight: true, providers: { gemini: Object.assign(fake({ seat: "gemini", cost: 0.01 }), { validate: async (i: any) => { await i.wire.fetch("https://fake-gemini.example/validate", { method: "POST", body: "{}" }); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; } }) } });
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(u.optionsFile, later, later);
+    submit(u, { kind: "preflight" });
+    for (let i = 0; i < 80 && readPreflight(u.tdir)?.status === "running"; i++) { if (!(await u.trials.tick())) u.advance(16 * 60_000); }
+    const r2 = readPreflight(u.tdir)!;
+    expect(r2.golines!.options!.status).toBe("go");
+    expect(r2.golines!.thinking!.status).toBe("no-go");
+  });
+});
+import { planView } from "../rootfs/opt/cain/trials/plan.ts";
+import { CODEX_MIN_VERSION, codexIdentity, judgeEffectiveConfig, versionAtLeast } from "../rootfs/opt/cain/trials/sandbox.ts";
+import { GO_LINES, TOKEN_FILES, readableBy } from "../rootfs/opt/cain/trials/runner.ts";
