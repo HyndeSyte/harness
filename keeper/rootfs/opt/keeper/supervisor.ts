@@ -39,7 +39,7 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
     async backupInfo(slug: string): Promise<BackupInfo | null> {
       const r = await call("GET", `/backups/${encodeURIComponent(slug)}/info`);
       if (!r.ok || !r.data) return null;
-      return { homeassistant: r.data.homeassistant ?? null, addons: Array.isArray(r.data.addons) ? r.data.addons.map((a: any) => ({ slug: String(a?.slug ?? ""), version: String(a?.version ?? "") })) : [],
+      return { ...(Number(r.data.size) > 0 ? { size: Number(r.data.size) } : {}), homeassistant: r.data.homeassistant ?? null, addons: Array.isArray(r.data.addons) ? r.data.addons.map((a: any) => ({ slug: String(a?.slug ?? ""), version: String(a?.version ?? "") })) : [],
         folders: Array.isArray(r.data.folders) ? r.data.folders : [], protected: r.data.protected, ...(typeof r.data.date === "string" ? { date: r.data.date } : {}) };
     },
     // (0.1.3) The keeper's own backup of one App: partial, that App alone, no Home Assistant, no folders,
@@ -67,6 +67,21 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       } catch (e) {
         return { kind: "unknown", why: String((e as Error)?.name ?? e).slice(0, 80) };
       }
+    },
+    // (0.1.9) The free space where backups go: /host/info's disk_free (GB), an info read; null when it can't be read.
+    async diskFree(): Promise<number | null> {
+      const r = await call("GET", "/host/info").catch(() => null);
+      const gb = Number(r?.ok ? r.data?.disk_free : NaN);
+      return Number.isFinite(gb) && gb >= 0 ? Math.floor(gb * 1024 ** 3) : null;
+    },
+    // (0.1.9) A backup's archive (GET /backups/<slug>/download, the backup role): the backup check's scan reads it.
+    async download(slug: string): Promise<Uint8Array | null> {
+      try {
+        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(120_000) });
+        if (r.status !== 200) return null;
+        const b = new Uint8Array(await r.arrayBuffer());
+        return b.length > 200 * 1024 * 1024 ? null : b;
+      } catch { return null; }
     },
     // (0.1.6) An orphan backup's delete (DELETE /backups/<slug>, within the backup role): true only on the
     // Supervisor's ok.

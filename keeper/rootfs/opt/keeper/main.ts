@@ -15,14 +15,15 @@
 //   bun main.ts accept-limits <code>  (0.1.7) the owner accepts DOCS.md's "Accepted limits" (code printed at start)
 //   bun main.ts hc-key <code>         (0.1.7) the Healthchecks read-only key, read from standard input (never the
 //                                     command line), checked and kept in /data/hc-key (0600); prints nothing of it
-//   bun main.ts key-code              (0.1.8) a fresh key-confirm code in the log (a re-enrollment while enrolled)
+//   bun main.ts key-code              (0.1.8) a fresh key-confirm code in the log (0.1.9: the only way one is printed)
+//   bun main.ts backup-check          (0.1.9) a test backup of Keeper, downloaded and scanned for key files and keys
 // The owner's commands go to the loopback listener (127.0.0.1:8096), never the App network's (0.1.6).
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
-import { closeSync, constants as FS, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants as FS, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { dirname } from "node:path";
-import { HEARTBEAT_MS, type HcCheck, Keeper, POLL_MS, type State } from "./core.ts";
+import { dirname, join } from "node:path";
+import { HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -37,10 +38,46 @@ export const HC_KEY_FILE = `${DATA}/hc-key`;
 // 0.1.8: written 0600 from its first byte (writeWhole: an exclusive temporary file opened 0600 in the data folder, the
 // key written and fsynced, then renamed into place), never a write followed by a chmod. onTemp: tests only, called
 // with the temporary file's path once the key is in it, before the rename.
+// 0.1.9: its temporary file has the fixed prefix hc-key.tmp- (KEY_TMP_PREFIX), which backup_exclude's "hc-key*" covers,
+// so a crash between the write and the rename leaves nothing outside the exclusion; leftovers are swept at every start.
 export function hcKeyStore(path = HC_KEY_FILE, onTemp?: (tmp: string) => void) {
   return {
-    load: (): string => { try { return readFileSync(path, "utf8").trim(); } catch { return ""; } },
-    store: (key: string): boolean => { try { writeWhole(path, `${key}\n`, onTemp); return true; } catch { return false; } },
+    load: (): string => { try { const k = readFileSync(path, "utf8").trim(); return k.startsWith(SENTINEL) ? "" : k; } catch { return ""; } },
+    store: (key: string): boolean => { try { writeWhole(path, `${key}\n`, onTemp, keyTmp(path)); return true; } catch { return false; } },
+  };
+}
+// (0.1.9) The old hc_api_key, kept only to try it once at the rotation's attestation, then dropped.
+export const OLD_KEY_PATH = `${DATA}/${OLD_KEY_FILE}`;
+export function oldKeyStore(path = OLD_KEY_PATH) {
+  return { ...hcKeyStore(path), drop: () => { rmSync(path, { force: true }); } };
+}
+const SENTINEL = "keeper-sentinel-";
+export const keyTmp = (path: string) => join(dirname(path), `${KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`);
+// (0.1.9) The key files' names in the data folder, for the backup check and the start's sweep: place a sentinel in every
+// name (current and legacy, never over a real key), clear what was placed, and sweep leftovers (temporary files of both
+// spellings, and a sentinel left by an interrupted check).
+export function keyFiles(dir = DATA) {
+  let placed: string[] = [];
+  const put = (name: string, body: string) => { const p = join(dir, name); if (existsSync(p)) return; const fd = openSync(p, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600); try { writeSync(fd, body); } finally { closeSync(fd); } placed.push(name); };
+  return {
+    place: (sentinel: string): string[] => {
+      placed = [];
+      put(KEY_FILE, `${sentinel}\n`); put(OLD_KEY_FILE, `${sentinel}\n`);
+      put(`${KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`, `${sentinel}\n`);
+      put(`${KEY_FILE}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`, `${sentinel}\n`);   // the 0.1.7 and 0.1.8 temporary name
+      return [...placed];
+    },
+    clear: (): void => { for (const n of placed) rmSync(join(dir, n), { force: true }); placed = []; },
+    sweep: (): string[] => {
+      const out: string[] = [];
+      for (const n of readdirSync(dir)) {
+        const p = join(dir, n);
+        let gone = n.startsWith(KEY_TMP_PREFIX) || LEGACY_KEY_TMP.test(n);
+        if (!gone && (n === KEY_FILE || n === OLD_KEY_FILE)) { try { gone = readFileSync(p, "utf8").startsWith(SENTINEL); } catch { gone = false; } }
+        if (gone) { rmSync(p, { force: true }); out.push(n); }
+      }
+      return out;
+    },
   };
 }
 export const VERSION = process.env.KEEPER_VERSION ?? "0.0.0";
@@ -49,8 +86,8 @@ const log = (m: string) => console.log(`[keeper] ${m}`);
 // A file written whole: a temporary file beside it, created exclusively (O_EXCL, so never one that already exists)
 // with mode 0600 from its first byte, the body written and fsynced, then renamed into place and the folder fsynced
 // (0.1.8), so the state's counter is on disk before /armed answers with it.
-export function writeWhole(path: string, body: string, onTemp?: (tmp: string) => void): void {
-  const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+export function writeWhole(path: string, body: string, onTemp?: (tmp: string) => void, tmpPath?: string): void {
+  const tmp = tmpPath ?? `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   const fd = openSync(tmp, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600);
   try {
     try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
@@ -94,6 +131,14 @@ export async function hcChecks(key: string, http: typeof fetch = fetch): Promise
   } catch { return null; }
 }
 
+// (0.1.9) The old key tried once at the Healthchecks API: accepted (200), rejected (401 or 403), else no answer (null).
+export async function hcTry(key: string, http: typeof fetch = fetch): Promise<"accepted" | "rejected" | null> {
+  try {
+    const r = await http(HC_API, { headers: { "x-api-key": key }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+    return r.status === 200 ? "accepted" : r.status === 401 || r.status === 403 ? "rejected" : null;
+  } catch { return null; }
+}
+
 async function serve(): Promise<void> {
   const token = process.env.SUPERVISOR_TOKEN ?? "";
   delete process.env.SUPERVISOR_TOKEN;
@@ -107,6 +152,7 @@ async function serve(): Promise<void> {
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
     backups: sup.backups, activeJobs: sup.activeJobs, hcKeyStore: hcKeyStore(),
+    diskFree: sup.diskFree, download: sup.download, keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), hcTry: (key) => hcTry(key),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
@@ -125,6 +171,7 @@ async function serve(): Promise<void> {
   // (0.1.7) and as the Supervisor holds them, where an option the schema dropped (hc_api_key) still shows
   const held = await sup.selfOptions().catch(() => null);
   if (held) k.useOptions(held);
+  else k.optionsUnreadable();                     // (0.1.9) counts as the old option present until a read answers
   k.start();
   const o = k.opts;
   log(`Keeper ${version} watching ${o.watch.join(", ") || "nothing"}; Healthchecks ${k.armable() ? "set" : "not all set, so the keeper is not armable"}`);
@@ -168,6 +215,7 @@ const LOCAL_CMDS: Record<string, (a: string[]) => unknown> = {
   "accept-limits": (a) => ({ code: a[0] ?? "" }),
   "hc-key": (a) => ({ code: a[0] ?? "" }),          // (0.1.7) the key itself is added from standard input
   "key-code": () => ({}),                            // (0.1.8)
+  "backup-check": () => ({}),                        // (0.1.9)
 };
 const DONE: Record<string, string> = {
   "drill-record": "drill recorded", "phone-test": "phone test sent: once the pages reached your phone, phone-confirm <code from the log> <each check>",
@@ -176,6 +224,7 @@ const DONE: Record<string, string> = {
   "missed-heartbeat-confirm": "missed-heartbeat drill recorded",
   "accept-limits": "the accepted limits are recorded", "hc-key": "the Healthchecks read-only key is checked and kept",
   "key-code": "a fresh key-confirm code is printed in Keeper's log",
+  "backup-check": "the backup check passed: a test backup of Keeper leaves out every key file and holds no key",
 };
 // (0.1.7) The key from standard input, first line, trimmed; never echoed.
 async function readStdinKey(): Promise<string> {
@@ -198,5 +247,5 @@ if (import.meta.main) {
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | key-code | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | key-code | backup-check | selftest"); process.exit(2); }
 }

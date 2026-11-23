@@ -427,7 +427,11 @@ checks its own connector, which can lapse alone.
   goes out only once Home Assistant answers again.
 
 One installer: no laptop session installs around a waiting Ship job, and nothing is
-installed from Home Assistant's own page unless Dane says so. Keeper 0.1.8 (Accepted limits, text version 2): a
+installed from Home Assistant's own page unless Dane says so. (Keeper 0.1.9) The rule holds at every entry point (a Ship
+card, Home Assistant's page, a laptop session, break glass): one install of an App at a time, none beside a live
+claim, and when an install's outcome is uncertain, wait for the recorded claim end in Keeper's log first. A claim
+authorizes nothing: an install needs Dane's Ship tap and the link's token for that pull request and head, good for 2
+hours. Keeper 0.1.8 (Accepted limits, text version 2): a
 Ship run the link refused or that failed can leave a live claim on the Keeper for up to 30 minutes, so nothing is
 installed from Home Assistant's page while a Ship run is live, or until the Keeper's log shows no live claim (each
 claim's start and end is logged there with its deadline).

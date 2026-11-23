@@ -1,7 +1,8 @@
 # Keeper
 
 Keeper checks every install of a watched App for 15 minutes, and if the install is bad it puts the
-App back by itself, from the App-only backup taken just before the install. It tells you without
+App back by itself, from the App-only backup taken just before the install. (0.1.9) It covers only the first 15
+minutes after an install: a fault that shows later is yours to roll back by hand. It tells you without
 going through Cain, through Healthchecks.io checks that reach your phone.
 
 It watches Cain to start with (option `watch`).
@@ -172,31 +173,45 @@ the attempt ended since) and changes nothing; a cancel already recorded answers 
 (`a retry of the cancel of <id>: the recorded outcome (ended)`). A cancel is refused once the claim was handed
 to a started run, that is once Keeper saw the new version (`its claim was handed to a started run ...`): the
 install is then watched, and rolled back on a fail, as any other. (0.1.8) The cancel also reads the Supervisor's
-jobs list under the lock and is refused while it shows an install or a job Keeper doesn't recognize on the App, or
-can't be read; see "The claim record: the cancel, the lock, the counter and re-enrollment" below.
+jobs list under the lock; (0.1.9) it no longer refuses for what it shows, it ends the claim and keeps the backup;
+see "The claim record: the cancel, the lock, the counter and re-enrollment" below.
 
-**A lost cancel (0.1.7).** If the link's cancel never reaches Keeper, the claim simply runs out. A claim that
-expires with no version change seen is unused: it ends (`<id>: ended (its claim <claim id> expired with no
-version change seen (unused))`) and its backup is deleted like an unclaimed one's, after Keeper reads the
-Supervisor's jobs list: while it shows an install, update, rebuild or restore of that App still running, the
-backup is kept and logged (`<id>: kept its backup <slug>: ... an install or update of <app> is running
-(...)`); a jobs list that can't be read three polls in a row keeps it too, named in the log for you. (0.1.8) The
-delete waits one more poll after the deadline that reads the App with no version change, and a job on the App
-Keeper doesn't recognize keeps the backup as an install does.
+**A lost cancel, a cancel and an unused expiry (0.1.7; 0.1.9).** If the link's cancel never reaches Keeper, the
+claim simply runs out: it ends unused (`<id>: ended (its claim <claim id> expired with no version change seen
+(unused))`, with the claim's own end line `claim <claim id> of <id> ended (...); its deadline was <time>`). Since
+0.1.9 neither a cancel nor an unused expiry ever deletes the backup: the Supervisor may be starting an install at
+that very moment, and that backup would be its only way back. The claim ends, and the backup is kept, bound to the
+attempt and its generation, with the line `<id>: ended; backup kept: <reason> (backup <slug> "<its name>",
+generation <n>; only the bounded cleanup may delete it)`. The cancel still reads the Supervisor's jobs list, but
+only to say why in that line (an install running, a job Keeper doesn't recognize, a list it couldn't read); it is
+no longer refused for it.
 
-**Orphan backups (0.1.6; 0.1.7).** Keeper records the slug of the backup it made on each attempt (as soon as the
-backup call answers, even if the registration was cancelled meanwhile). 0.1.7: before the backup call it also
-keeps the backup's own name, `Keeper <attempt id> <8 hex digits>`, unique to that attempt. When a registration
-is cancelled, its acceptance expires unclaimed, or (0.1.7) its claim expires unused, Keeper deletes that backup
-at its next poll (`DELETE /backups/<slug>`, within the backup role) and logs `<id>: deleted its backup <slug>
-(...)`. If a restart lost the slug (the call was out when Keeper stopped), Keeper finds the backup in the
-Supervisor's backups list by that exact name and deletes it only then; no backup by that name within 5
-minutes of the call means none was made, and nothing is deleted. Once after every start, Keeper names in its
-log every backup named as its own that no attempt holds (an attempt left "unprotected" by the restart, or one
-it doesn't know), and keeps it: delete it by hand if you don't want it. Nothing is deleted on a guess. If the
-Supervisor refuses or doesn't answer a delete three polls in a row, Keeper stops trying and logs `<id>:
-couldn't delete its backup <slug> after 3 tries; it stays in Home Assistant's list, used for nothing: delete
-backup <slug> by hand`. A backup of an install that happened is kept.
+**Kept backups and the bounded cleanup (0.1.9).** Keeper records the slug of the backup it made on each attempt
+(as soon as the backup call answers, even if the registration was cancelled meanwhile), and before the call its
+own name, `Keeper <attempt id> <8 hex digits>`, and the attempt's generation (a counter in its state that never
+goes down). A kept backup is deleted only by the cleanup, and the cleanup touches only Keeper's own: a backup whose
+name is the one Keeper gave and which has a generation record in Keeper's state, never your backups, never a
+drill's, never a Keeper-named backup it has no record of (that one is named in the log once at start, for you to
+delete by hand if you like). It runs only at Keeper's start, before a new backup, and on a daily tick, always
+under the claim record's lock; never while any other attempt is open (a live or expiring claim); only when the
+Supervisor's jobs list shows no install job on a watched App (a list it can't read stops it); never within 2
+hours of a claim's end. It deletes a kept backup 48 hours after its claim ended (so at most 48 hours plus one
+daily tick), and the oldest past the 2-hour grace while more than two are kept. Right before each delete it reads
+the attempt and its generation again. Every deletion is logged (`the cleanup deleted kept backup <slug> ("<name>")
+of <id>, generation <n>, <hours> hours after its claim ended (...)`), and so is every run that didn't happen and
+why (`the cleanup of kept backups (<when>) didn't run: ...`). If a restart lost a slug, the backup is found in the
+backups list by its exact own name and bound then.
+
+**The free-space reserve (0.1.9).** Before every new backup Keeper reads the free space where backups go
+(`/host/info`) and needs the projected backup (the last backup's size and a half, 256 MB when none is known yet)
+plus a 1 GB reserve. A backup that can't fit is refused: the registration is "unprotected", logged (`refused a new
+backup for <id>: ...`, naming the kept backups the cleanup couldn't free yet) and paged. A free space it can't read
+refuses too. Delete old backups in Home Assistant (Settings, System, Backups) to make room.
+
+**A Ship install's own backup (0.1.9).** Each registration begins under the claim record's lock: the cleanup, the
+reserve, then the attempt's own generation and backup name, saved before the backup call. Its acceptance commits
+under the lock too, bound to the slug its own call returned. So an older kept backup is never that install's
+rollback.
 
 Why the link and not the Ship run: the Ship run is
 a cloud session, and Keeper's service is only on Home Assistant's internal network, which the Home
@@ -314,7 +329,11 @@ to Cain itself then also goes by break glass.
    refused key is never kept, and a new code is printed. The key is kept root-only (0600) in Keeper's data
    folder (`/data/hc-key`), never in its options and never in its log. (0.1.8) The file is 0600 from its first
    byte: Keeper writes the key into an exclusive temporary file it creates with mode 0600 in the data folder,
-   fsyncs it, then renames it into place; it never writes a file and changes its mode after.
+   fsyncs it, then renames it into place; it never writes a file and changes its mode after. (0.1.9) That
+   temporary file's name has a fixed prefix, `hc-key.tmp-`, which the backup exclusion covers, so a crash between
+   the write and the rename leaves no key outside it; at every start Keeper removes and logs any leftover, the
+   earlier builds' temporary names (`hc-key.<pid>.<hex>.tmp`) included (`removed a leftover key file ...`).
+   (0.1.9) `hc-key` is refused until the backup check (below) has passed on the device.
    **Backups leave it out.** Keeper's `config.yaml` lists the file under `backup_exclude`, so the Supervisor
    leaves it out of any backup it makes of the Keeper App (a device check confirms it). After a restore of
    Keeper the key is missing: Keeper says so at start and isn't armable until you enter it again. Keeper's own
@@ -378,21 +397,27 @@ to Cain itself then also goes by break glass.
    start while they aren't accepted for the current text (`one-time code for accept-limits: ...`). Arming needs it.
    An acceptance of version 1 (0.1.7) lapsed with 0.1.8: accept again.
 
-**Device checks before arming (0.1.8).** Before you rely on arming, check these on the live account and the Pi,
-once, and again after any change to them:
-- **Both key roles.** The Healthchecks project has a read-write API key and a read-only one (Project Settings, API
-  Access). Only the read-only key goes to Keeper, through `hc-key`; the read-write key never does, and Keeper
-  refuses one at entry. Check the key Keeper kept is the read-only one (`kept the Healthchecks read-only key (its
-  hash ...)` in its log, with no `REFUSING` line after), and that the old `hc_api_key` option is gone and that key
-  rotated.
-- **The check identities, verified against the live service.** Each role (`done`, `deadman`, and each watched App's
-  alert check, `0fcc2575_cain`) must map to the check you meant on the live account: read each check's unique key in
-  the read-only API (or the check's page) and set it explicitly in `hc_unique_keys` for every production check, one
-  `role=<unique key>` entry each, so no derived match decides. Keeper's log then shows `the Healthchecks checks'
-  settings are within bounds`.
-- **The Supervisor's backup omits the key file.** Make a backup of the Keeper App and check `/data/hc-key` isn't in
-  it (`backup_exclude`).
-- The phone test and the missed-heartbeat drill reach your phone from each check, and you confirm them yourself.
+**The checks before arming, refusals in code (0.1.9).** What 0.1.8 listed as device checks are now refusals:
+Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
+- **The backup check.** Run `bun /opt/keeper/main.ts backup-check` in Keeper's container. Keeper writes a sentinel
+  into every key file name it uses or used (the key file `hc-key` when none is kept yet, the old key's file
+  `hc-key-old`, a temporary file with the current prefix `hc-key.tmp-`, and one with the legacy temporary name
+  `hc-key.<pid>.<hex>.tmp` from 0.1.7 and 0.1.8), makes a test backup of the Keeper App, downloads it and reads every
+  file in it: the backup must leave out every one of those names, and no file in it may hold a sentinel, a kept key's
+  value or a key's fingerprint. Then it removes the sentinels and deletes the test backup. `hc-key` and arming are
+  refused until it passes (`the backup check hasn't passed on the device ...`).
+- **Both key roles.** Keeper keeps only a read-only key (a key that can write is refused at entry and for arming).
+  The old `hc_api_key` option must be gone, and the old key's rotation attested: while Keeper has seen an old key in
+  its options (it keeps only its id, a hash, and the key itself root-only in `hc-key-old` to try it once), arming is
+  refused until you tap the card Cain's link posts naming that id, once you revoked the key in Healthchecks. The
+  link signs your tap with its Ship key and Keeper checks that signature, so nothing Cain writes himself counts;
+  where Keeper kept the old key it first tries it at Healthchecks and needs it rejected (`the alert service still
+  accepts the old key ...` otherwise). An options read that fails or doesn't answer within 10 seconds counts as the
+  old option still present: not armable, and `hc-key` refused, until a read answers.
+- **The check identities.** Every role (`done`, `deadman`, and each watched App's alert check, `0fcc2575_cain`) needs
+  its check's unique key set in `hc_unique_keys`, read from the read-only API or the check's page, so no derived
+  match decides; a role without one refuses arming.
+- Still yours, by hand: the phone test and the missed-heartbeat drill reach your phone from each check.
 
 ## Arming
 
@@ -473,9 +498,9 @@ missed-heartbeat drill a fresh down-to-up cycle.
 
 **The one-time codes (0.1.6; 0.1.7).** `key-confirm`, `phone-confirm`, `missed-heartbeat-confirm`, and since
 0.1.7 `accept-limits` and `hc-key`, each need a one-time code Keeper prints in its log (`one-time code for
-key-confirm: <code> (good until ...)`): for `key-confirm` at the pin and (0.1.8) at a start only while the key
-isn't enrolled (no confirm, or another key in the options) or after the link refused the enrollment, otherwise on
-demand with `bun /opt/keeper/main.ts key-code` (good 24 hours); for
+key-confirm: <code> (good until ...)`): for `key-confirm` (0.1.9) only on demand, with `bun /opt/keeper/main.ts
+key-code` (good 24 hours), never at start or at a pin, and codes printed by an earlier build are void at this
+build's first start; for
 `hc-key` at every start (24 hours); for `accept-limits` at every start while the limits aren't accepted for the
 current text (24 hours); at each phone test (its hour and 10 minutes); and at each missed-heartbeat drill (until
 an hour after its 30 minute cap). 0.1.7: each code is bound to its exact challenge (the key's fingerprint, that
@@ -501,34 +526,41 @@ Keeper before it counts as armed).
 
 ## Accepted limits
 
-Text version 2 (0.1.8). Version 1 was 0.1.7's, and its acceptance lapsed with 0.1.8. Two limits of Keeper's design are
-recorded here rather than built around, and you accept them at the device: `bun /opt/keeper/main.ts accept-limits
-<code>` in Keeper's container, with the code Keeper prints at each start while they aren't accepted for this text
-version (`one-time code for accept-limits: ...`). Keeper records your acceptance with the text version in its
-state; arming needs it, and it lapses when this text changes (a new text version). Keeper's log says so at start.
+Text version 3 (0.1.9). Version 2 was 0.1.8's and version 1 0.1.7's; an acceptance of either lapsed with 0.1.9. Two
+limits of Keeper's design are recorded here rather than built around, and you accept them at the device: `bun
+/opt/keeper/main.ts accept-limits <code>` in Keeper's container, with the code Keeper prints at each start while they
+aren't accepted for this text version (`one-time code for accept-limits: ...`). Keeper records your acceptance with the
+text version in its state; arming needs it, and it lapses when this text changes (a new text version). Keeper's log
+says so at start. Keeper covers only the first 15 minutes after an install.
 
-**1. The installer: a live claim with no Ship run, and a same-version install from another path.** The Ship run is
-a cloud session that reaches GitHub and Home Assistant only. It can't call Keeper or Cain's link, so nothing at
-the moment the installer asks the Supervisor to install can spend an authorization. The gates in code are two:
-Cain's hook at the run's start (the claim, and its deadline checked again just before the run starts), and
-Keeper's own fence (a version change seen outside a live claim, or to another version than the claimed one, is
-"unprotected", paged, and never restored). What is left:
+**1. The installer: a claim authorizes nothing, and one installer at a time.** A claim is not a single-use installer
+authorization. An install needs your Ship tap and the link's Ship token for that pull request and head, good for 2
+hours after your tap; a claim authorizes nothing. A claim is single use only in this sense: one claimant, consumed by
+the one install it covers, and it covers no other install. The Ship run is a cloud session that reaches GitHub and
+Home Assistant only. It can't call Keeper or Cain's link, so nothing at the moment the installer asks the Supervisor
+to install can spend an authorization. The gates in code are two: Cain's hook at the run's start (the claim, and its
+deadline checked again just before the run starts), and Keeper's own fence (a version change seen outside a live
+claim, or to another version than the claimed one, is "unprotected", paged, and never restored). What is left:
 - A pass the link refuses after two silences, or whose cancel is lost, leaves a live claim on the keeper for up to
   30 minutes with no Ship run live. The link asks a claim once more when the keeper doesn't answer; after a second
   silence it refuses the pass and cancels, but the keeper may have recorded the claim, and a cancel is sent once and
-  may be lost (or, since 0.1.8, refused while the Supervisor shows an install, an unrecognized job on the App, or a
-  jobs list it can't read). That claim then stands until its deadline, and the backup Keeper took for it is kept
-  until one more poll after the deadline shows no version change.
+  may be lost. That claim then stands until its deadline. When it runs out unused, Keeper logs the expiry's end line,
+  `claim <claim id> of <attempt> ended (ended: its claim <claim id> expired with no version change seen (unused));
+  its deadline was <time>`, and `<attempt>: ended; backup kept: its claim <claim id> expired unused (backup <slug>
+  "<name>", ...)`: the backup is never deleted with the claim, only by the bounded cleanup.
 - While a claim is live (at most 30 minutes from the link's claim), an install of exactly the claimed version made
   some other way is taken for the Ship run's, watched and, on a fail, rolled back from the backup Keeper took for the
   Ship run. Only you can start such an install, from Home Assistant's own page.
 
-What Keeper and the link do about it: Keeper logs every claim's start and end with its deadline, one line each
-(`claimed <attempt> claim <id> ... until <time>`, and `claim <id> of <attempt> ended (<how>); its deadline was
-<time>`). The hook allows one pending Ship run per attempt: one Ship tap starts one run, and a second run on a token
-whose attempt has a live claim is refused with the claim's latest expiry named. Your guard: never install from Home
-Assistant's page while a Ship run is live, or until the keeper's log shows no live claim (up to 30 minutes after a
-refused or failed run). Install only through Ship cards.
+The one-installer rule applies to every entry point: a Ship card, Home Assistant's own page, a laptop session, and
+break glass alike. One install of an App at a time, and none beside a live claim. When an install's outcome is
+uncertain (a run that stopped without saying, a claim you can't see ended), wait for the recorded claim end in
+Keeper's log (`claim <id> of <attempt> ended (...)`) before any other install. Keeper logs every claim's start and
+end with its deadline, one line each (`claimed <attempt> claim <id> ... until <time>`, and `claim <id> of <attempt>
+ended (<how>); its deadline was <time>`). The hook allows one pending Ship run per attempt: one Ship tap starts one
+run, and a second run on a token whose attempt has a live claim is refused with the claim's latest expiry named.
+Your guard: never install from Home Assistant's page while a Ship run is live, or until the keeper's log shows no
+live claim (up to 30 minutes after a refused or failed run). Install only through Ship cards.
 
 **2. Delivery: no code can prove a page reached your phone.** Keeper sees only that Healthchecks took a page (a 2xx
 answer), never that your phone rang, and the read-only key cannot see notification channels, so unassigning or breaking
@@ -536,13 +568,16 @@ the phone channel in the alert service is invisible until the next phone test or
 settings, but with that key a channel's change shows nowhere it can read. The phone test and the missed-heartbeat
 drill prove delivery only at the moment you confirm them, and each confirm is the owner's own attestation that the
 alert appeared on the phone: Keeper takes your word, with the one-time code showing you read its log for that very
-drill. A failure on the provider's side afterwards (Healthchecks or its channel silently stops delivering) goes
-unseen until the next drill: arming lapses when the next drill is missed or fails, at the 14-day mark (the longest
-a drill counts), or sooner with option `drill_days` (1 to 14, default 14): set it lower and Keeper counts each
-drill for that many days and logs a reminder a day before each is due (`drill due: run ... again before <time>`);
-the drills themselves are still run by hand. What you can do: set `drill_days` to 7 (weekly halves the window) and
-run the drills when reminded; keep Healthchecks' repeated reminders on; and treat a quiet phone during an install
-you are watching as a reason to look at Keeper's log.
+drill. Arming expires at the configured interval: option `drill_days`, 14 days by default and at most, so arming
+lapses when the next drill is missed or fails, at the 14-day mark (the longest a drill counts), or sooner when you
+set `drill_days` lower; Keeper logs a reminder a day before each is due (`drill due: run ... again before <time>`), and
+the drills themselves are still run by hand. A failed drill: a phone test whose page didn't reach your phone can't be
+confirmed, and since starting a phone test drops the earlier confirmations, Keeper stays unarmed until a new one is
+confirmed; a missed-heartbeat drill that isn't confirmed within its hour counts for nothing (the last confirmed one
+counts only until its own interval ends); and Keeper is unarmed while any drill runs. A failure on the provider's side
+afterwards (Healthchecks or its channel silently stops delivering) goes unseen until the next drill. What you can do:
+set `drill_days` to 7 (weekly halves the window) and run the drills when reminded; keep Healthchecks' repeated
+reminders on; and treat a quiet phone during an install you are watching as a reason to look at Keeper's log.
 
 ## Options
 
@@ -585,30 +620,36 @@ App's token (`Authorization: Bearer <token>`):
   timestamp refreshed every minute, and (0.1.5) the enrollment (0.1.7: with the enrollment id and the counter,
   which each read moves on; 0.1.8: answered under the claim record's lock, only once that counter is on disk).
 - `GET /last`: Keeper's last line to you about the caller's App.
+- `GET /rotation` (Cain's token only, 0.1.9): whether the old Healthchecks key's rotation still needs your tap, and
+  that key's id (a hash, never the key).
+- `POST /rotation/attest` (Cain's token only, 0.1.9): `{attestation}`, your tap on the link's card, signed by the
+  link's Ship key and checked against the pinned, confirmed key.
 
 From inside Keeper's own container only, on its own loopback listener (0.1.6: `127.0.0.1:8096`, never the
 App network's): `drill-record`, `phone-test`, `phone-confirm <code> <check>...`, `key-confirm <fingerprint>
 <code>`, (0.1.6) `missed-heartbeat` and `missed-heartbeat-confirm <code>`, (0.1.7) `accept-limits <code>`
-and `hc-key <code>` (the key on standard input), and (0.1.8) `key-code`.
+and `hc-key <code>` (the key on standard input), (0.1.8) `key-code`, and (0.1.9) `backup-check`.
 
 ## The claim record: the cancel, the lock, the counter and re-enrollment (0.1.8)
 
 **The cancel.** The link's cancel (`POST /attempt/<id>/cancel`) is served under the claim record's lock, and there
-Keeper reads the Supervisor's jobs list for the App, as the expiry does. With an active install, update, rebuild or
-restore of that App, with any active job on it whose name Keeper doesn't recognize (only a backup's is recognized),
-or with a list that can't be read, the cancel is refused: the claim and its backup are kept, and the refusal is
-logged with why (`refused a cancel of <attempt> (<status>): ...`). Such a claim then runs out by itself.
+Keeper reads the Supervisor's jobs list for the App. (0.1.9) The cancel ends the claim whatever the list shows, and
+never deletes the backup: it is kept, bound to its generation, with the line `<id>: ended; backup kept: <reason>`,
+the reason naming what the list showed (an install running, a job Keeper doesn't recognize, a list it couldn't read).
+A cancel is refused only once the claim was handed to a started run.
 
-**The unused expiry.** A claim that runs out with no version change seen ends "unused". Its backup is deleted only
-after one more poll after the deadline reads the App with no version change (`a poll after its claim's deadline saw
-...`), and then only while the jobs list shows nothing in the way. An install seen at that poll instead is
-unprotected, and its backup is kept for a rollback by hand.
+**The unused expiry.** A claim that runs out with no version change seen ends "unused", and (0.1.9) its backup is
+kept the same way, for the bounded cleanup only. An install seen after it instead is unprotected, and its backup's
+kept reason says a rollback by hand may need it.
 
 **The lock's bounds.** Claim, cancel, consume, the expiries and `/armed` run one at a time under one lock. Each
 external call inside it is bounded (10 seconds; one that doesn't answer or throws counts as unreadable, logged), a
 step that throws or runs past 30 seconds is logged (`a step under the claim record's lock failed ...`) and the lock
 released for the next one, and the deadline is read again under the lock right before a claim or a consume commits,
-so a request that waited in the queue past its deadline is refused.
+so a request that waited in the queue past its deadline is refused. (0.1.9) Each step under the lock has its own
+generation: every commit, delete or state write checks it in the same moment as the write, so a step that ran past
+its 30 seconds and resumes later changes nothing; a delete already in flight when the step runs out keeps the lock
+until it ends (`... with a write in flight: the lock is held until that write ends`).
 
 **The counter.** Every state write moves the enrollment counter on, and each `/armed` read is one: the state is
 written whole (a temporary file, fsynced, renamed, the folder fsynced) before the answer leaves, and an answer whose
@@ -633,6 +674,13 @@ and held by a test: the container keeps its own network namespace, which is what
 confirm commands on it, to processes inside the container. `backup_exclude` leaves the kept Healthchecks key
 (`/data/hc-key`) out of backups of the App.
 
+## Restoring
+
+(0.1.9) A partial restore through Home Assistant's backup page (Settings, System, Backups, one App's backup) is the
+exercised path, and the one Keeper itself uses. A full restore of the whole Pi from a fresh Home Assistant is
+untested: none has been run with Keeper installed. After any restore of Keeper itself, its kept key and the old key's
+file are missing (backups leave them out), so enter the key again with `hc-key`.
+
 ## Still to check on the device
 
 None of this has run on the Pi yet. Owed there: the backup role makes a partial backup (with
@@ -656,4 +704,7 @@ recording the enrollment id and counter from `/armed`; (0.1.8) the device checks
 each role's check identity by an explicit `hc_unique_keys` entry, the backup leaving out the key file), the jobs list's
 names for anything else that runs on Cain (a name Keeper doesn't recognize refuses a cancel), the key file's mode at the
 Pi, and the old key rotated in Healthchecks; the break-glass exercise with Keeper absent (a fix installed with no Keeper at
-all); and the two drills (the next job).
+all); (0.1.9) the backup check on the Pi (the backup role makes and downloads a backup of Keeper itself, and the
+download is a tar Keeper can read), `/host/info`'s `disk_free` and the backup info's `size` for the free-space
+reserve, the old key's try at Healthchecks answering 401 or 403 once revoked, the rotation card's tap reaching Keeper,
+and a full-Pi restore from a fresh Home Assistant (untested); and the two drills (the next job).

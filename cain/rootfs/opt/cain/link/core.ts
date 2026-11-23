@@ -92,6 +92,7 @@ import { DECISION_OPTIONS, RISK, armedFor, decisionSummary, decisionText, Decisi
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
+import { ROTATION_ID } from "./rotation";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
@@ -103,6 +104,9 @@ export const DECISION_UNSAVED = "Your answer couldn't be saved, so nothing was d
 // His grant tap that couldn't be kept (0.18.0): to him alone, the card stays up.
 export const GRANT_UNSAVED = "Your grant couldn't be saved, so no rounds were added yet. The card is still up: tap it again.";
 export const GRANT_NO = "No";
+// Keeper 0.1.9: the rotation card's one button (rotation.ts).
+export const ROTATION_LABEL = "Old key replaced";
+export const ROTATION_PREFIX = "k:rot:";
 export const grantLabel = (n: number) => `Grant ${n} more round${n === 1 ? "" : "s"}`;
 // First review of 0.18.0: an open grant card loses its buttons when another card's grant for the same
 // change is written, and a grant tap whose checks no longer hold writes nothing; its card says why.
@@ -347,6 +351,7 @@ export interface Shown {
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
+  rotation?: { id: string };        // the link's card for the keeper's old Healthchecks key (Keeper 0.1.9, rotation.ts)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
   grant?: { key: string; rounds: number; pr: string | null; reason: string;       // Cain's grant card for extra review rounds (0.18.0, ../review/grants.ts)
     used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
@@ -697,6 +702,8 @@ export interface Deps {
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
+  // Keeper 0.1.9: his tap on the rotation card, signed by the link's Ship key and sent to the keeper (rotation.ts)
+  attestRotation?: (id: string) => Promise<{ ok: boolean; why: string }>;
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
@@ -1635,6 +1642,55 @@ export class Link {
       said: `Posted.${w.fixed.length ? ` ${fixedSaid(w.fixed)}` : ""} Write /data/jobs/connector-<item> as the Cloud jobs section says, and check Home Assistant again at each cloud job check.` };
   }
 
+  // -- the keeper's old Healthchecks key, attested as rotated by his tap (Keeper 0.1.9, rotation.ts) --
+  // One card per old key id, the link's own words only, naming that id, with one button. Not while stopped; not again
+  // once one for that id is up or was answered. Only his tap makes the attestation (the link signs it); nothing else.
+  async rotationCard(id: string): Promise<{ status: "posted" | "open" | "done" | "stopped"; message?: string }> {
+    if (!ROTATION_ID.test(id)) throw new Refusal("that isn't an old key's id");
+    if (this.stopped().stopped) return { status: "stopped" };
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.rotation?.id === id && (!m.outcome || m.outcome === "answered"));
+    if (prior) return { status: prior[1].outcome ? "done" : "open", message: prior[0] };
+    const text = `Keeper still knows an old Healthchecks key, id ${id}, and won't arm until you say it is replaced. `
+      + "Revoke that key in Healthchecks first (Project Settings, API Access), then tap below. "
+      + "If Keeper still has the old key, it checks Healthchecks turns it down before it takes your word.";
+    const msg = await this.post(text, rows([[[ROTATION_LABEL, `${ROTATION_PREFIX}${id}`]]], "k:"), { nonce: stableNonce("rotation", id) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `rotation:${id}`, posted: this.d.now(), expires: null, buttons: true,
+      labels: [ROTATION_LABEL], rotation: { id } });
+    this.d.save(s);
+    this.log(`a rotation card for the keeper's old key ${id} went to him`);
+    return { status: "posted", message: String(msg.id) };
+  }
+  // His tap: answered at once (Discord's 3 seconds), then the signed attestation goes to the keeper, which may first try
+  // the old key at the alert service. Taken: the card says so and loses its button. Refused: the card stays up, and he
+  // is told why, to him alone.
+  private async rotationTap(it: any, msgId: string): Promise<string> {
+    const rec = this.d.load().messages[msgId];
+    if (!rec?.rotation || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    const id = rec.rotation.id;
+    await this.answer(it, ACK);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so Keeper wasn't told. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    let r: { ok: boolean; why: string };
+    try { r = this.d.attestRotation ? await this.d.attestRotation(id) : { ok: false, why: "the link has no Ship key to sign your tap with" }; }
+    catch (e) { r = { ok: false, why: `the keeper didn't answer (${String(e).slice(0, 60)})` }; }
+    if (!r.ok) {
+      this.log(`his rotation tap for the old key ${id} wasn't taken: ${r.why}`);
+      await this.ephemeral(it, `Keeper didn't take it: ${r.why.replace(/[^\x20-\x7e]/g, " ").slice(0, 200)}. The card is still up: tap it again once that's fixed.`);
+      return "refused";
+    }
+    const line = "Done: Keeper has your word the old key is replaced.";
+    const content = withLine(String(it.message?.content ?? ""), line);
+    let edited = false;
+    try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
+    catch (e) { this.log(`couldn't mark the rotation card done: ${String(e).slice(0, 80)}`); }
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = ROTATION_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    this.d.save(s);
+    this.log(`his rotation tap for the keeper's old key ${id} was taken by the keeper`);
+    return "rotation attested";
+  }
+
   // -- extra review rounds for a change, granted by his tap (0.18.0, ../review/grants.ts) --
   // Cain's keeper.sh review-grant: a card asking him whether to grant a change at its cap 1 to 3 more
   // fix rounds. What it says about the change's rounds comes from the runner's record (how many it used,
@@ -2561,6 +2617,8 @@ export class Link {
     // run under one lock for its change key, so a second delivery of the tap, or a second tap, waits and then
     // finds the card used: a dead tap, nothing written.
     if (rec.grant && cid.startsWith("q:")) return this.underKey(`grant:${rec.grant.key}`, () => this.grantTapLocked(it, cid, msgId));
+    // Keeper 0.1.9: his tap on the rotation card, under that card's own lock
+    if (rec.rotation && cid === `${ROTATION_PREFIX}${rec.rotation.id}`) return this.underKey(`rotation:${rec.rotation.id}`, () => this.rotationTap(it, msgId));
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
       if (why) {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.9
+
+- Keeper covers only the first 15 minutes after an install, and now says so on its card and in its docs.
+- Cancelling a Ship pass, or a claim running out unused, no longer deletes the backup taken for it, since Home Assistant may be starting an install at that moment. Keeper logs "ended; backup kept" with the backup's name.
+- Kept backups are tidied up by Keeper itself, and only its own: never within 2 hours of a claim ending, never while an install runs, at most two kept, none older than about 3 days. Your own backups are never touched.
+- Before each new backup Keeper checks there is room for it. If there isn't, the install is refused and you are paged.
+- New command `backup-check`: Keeper makes a test backup of itself and checks no key file or key is in it. Entering the Healthchecks key with `hc-key` waits until it has passed.
+- Keeper won't arm until you confirm the old Healthchecks key was replaced, by tapping the card Cain posts naming it. Where Keeper still has the old key, it first checks Healthchecks turns it down. Each Healthchecks check now needs its unique key in `hc_unique_keys`.
+- The code for confirming the Ship key is only printed when you ask for it with `key-code`, and codes from earlier versions no longer work.
+- The "Accepted limits" text is now version 3, so you accept it again with `accept-limits`.
+
 ## 0.1.8
 
 - The "Accepted limits" text is now version 2, so you accept it again with `accept-limits`. It says plainly that a refused or failed Ship run can leave a live claim for up to 30 minutes, so never install Cain from Home Assistant's page while a Ship run is live or until Keeper's log shows no live claim, and that a broken phone channel in Healthchecks goes unseen until your next phone test or drill.

@@ -78,6 +78,7 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { makeRotation, rotationNeeded } from "./rotation";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
@@ -252,6 +253,13 @@ const link = new Link({
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
+  // Keeper 0.1.9: his tap on the rotation card, signed with the Ship key here and sent to the keeper (rotation.ts)
+  attestRotation: shipPriv ? async (id) => {
+    if (!KEEPER_TOKEN) return { ok: false, why: "no keeper_token is set" };
+    const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/rotation/attest", { attestation: makeRotation(id, Date.now(), (data) => edSign(null, data, shipPriv)) }, 20_000);
+    if (!r) return { ok: false, why: "the keeper didn't answer" };
+    return r.status === 200 ? { ok: true, why: "" } : { ok: false, why: typeof r.body?.why === "string" ? r.body.why : `the keeper answered ${r.status}` };
+  } : undefined,
   land: deployKey ? async ({ pr, head, stopped }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
@@ -328,6 +336,12 @@ async function askKeeper(): Promise<void> {
     keeperReplies[app] = r ? { status: r.status, body: JSON.stringify(r.body) } : { error: "no answer" };
     // Keeper 0.1.6: the enrollment recorded from this read too, outside any Ship pass (ship-pass.ts).
     if (r?.status === 200) { const pub = shipPub(); noteArmedEnrollment(r.body, pub ? keyFingerprint(pub) : null, enrollment, (l) => console.log(`[cain] link: ${l}`), before); }
+  }
+  // Keeper 0.1.9: the old Healthchecks key's rotation: one card naming its id while the keeper says a tap is needed
+  if (KEEPER_TOKEN) {
+    const rot = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/rotation");
+    const id = rot?.status === 200 ? rotationNeeded(rot.body) : null;
+    if (id) await link.rotationCard(id).catch((e) => console.log(`[cain] link: couldn't post the rotation card: ${String(e).slice(0, 80)}`));
   }
 }
 void askKeeper();

@@ -10,9 +10,9 @@ import { generateKeyPairSync, sign as edSign, type KeyObject } from "node:crypto
 import { join } from "node:path";
 import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMIT_MS, REWIND_MS, WATCH_MS, ARMED_MAX_MS, PHONE_MAX_MS, LOOP_FRESH_MS, checkId, keyFp, optionsHash, parseOptions, readShipToken, shipKey,
   ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, MHB_CAP_MS, LIMITS_VERSION, PHONE_WINDOW_MS, DROP_TRIES,
-  OLD_KEY_WHY, ENROLL_BEHIND, ENROLL_REFUSED, jobsWhy,
+  OLD_KEY_WHY, ENROLL_BEHIND, ENROLL_REFUSED, jobsWhy, CLEANUP_TICK_MS, KEPT_GRACE_MS, KEPT_MAX_MS, BACKUP_CHECK_WHY, OPTIONS_UNKNOWN_WHY, CODE_EPOCH,
   type AppInfo, type BackupInfo, type HcCheck, type JobState, type RestoreResult, type State } from "../rootfs/opt/keeper/core.ts";
-import { hcChecks, hcKeyStore, healthUrl, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
+import { hcChecks, hcKeyStore, healthUrl, keyFiles, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
 import { handle, handleLocal, internal } from "../rootfs/opt/keeper/server.ts";
 
@@ -49,7 +49,7 @@ function hcList(opts: any, over: Record<string, Partial<HcCheck> | null>): HcChe
     const key = uuid ? new Bun.CryptoHasher("sha1").update(id).digest("hex") : "";
     if (!id || out.some((x) => x.slug === id || (uuid && x.unique_key === key))) return;
     if (over[id] === null) return;
-    out.push({ ...(uuid ? { unique_key: key } : { slug: id }), status: "up", channels: "ch-phone", ...c, ...(over[id] ?? {}) });
+    out.push({ ...(uuid ? { unique_key: key } : { slug: id, unique_key: slugKey(id) }), status: "up", channels: "ch-phone", ...c, ...(over[id] ?? {}) });
   };
   add(o.hc_done, { timeout: 300, grace: 600 });
   add(o.hc_deadman, { timeout: 60, grace: 300 });
@@ -57,7 +57,23 @@ function hcList(opts: any, over: Record<string, Partial<HcCheck> | null>): HcChe
   return out;
 }
 
-function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean; hcKey?: string; limits?: boolean } = {}) {
+// (0.1.9) A check's unique key as the read-only API shows it, and the options with hc_unique_keys filled in for every role
+// not set explicitly (arming refuses a role without one): a uuid's key, or a slug check's own key in this fake.
+const slugKey = (id: string) => new Bun.CryptoHasher("sha1").update(`slug-${id}`).digest("hex");
+function withKeys(opts: any): any {
+  const o = parseOptions(opts);
+  const set = new Set((Array.isArray(opts.hc_unique_keys) ? opts.hc_unique_keys : []).map((x: string) => String(x).split("=")[0]));
+  const keys = [...(Array.isArray(opts.hc_unique_keys) ? opts.hc_unique_keys : [])];
+  const roles: [string, string][] = [["done", o.hc_done], ["deadman", o.hc_deadman], ...o.watch.map((a) => [a, o.hc_failed[a] ?? o.hc_failed["*"] ?? ""] as [string, string])];
+  for (const [role, url] of roles) {
+    const id = checkId(url);
+    if (!id || set.has(role)) continue;
+    keys.push(`${role}=${/^[0-9a-f-]{36}$/.test(id) ? new Bun.CryptoHasher("sha1").update(id).digest("hex") : slugKey(id)}`);
+  }
+  return { ...opts, hc_unique_keys: keys };
+}
+
+function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean; hcKey?: string; limits?: boolean; uniq?: boolean; backupCheck?: boolean } = {}) {
   let now = T0;
   const logs: string[] = [];
   const pings: { url: string; body: string }[] = [];
@@ -68,7 +84,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   let saved: State | null = null;
   const app: AppInfo = { version: "0.16.0", state: "started" };
   const f = {
-    saveFails: false, deleteOk: true,
+    saveFails: false, deleteOk: true, free: 10 * 1024 ** 3 as number | null,
     // (0.1.7) the kept Healthchecks key (a file on the device), the backups list and the active install jobs
     hcKey: o.hcKey ?? "hc-read-key-0123456789", hcKeyWrites: 0, hcKeyWriteOk: true,
     backupsList: [] as { slug: string; name: string }[] | null, activeJobs: [] as string[] | null,
@@ -104,6 +120,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     deleteBackup: async (b) => { deleted.push(b); return f.deleteOk; },
     backups: async () => f.backupsList,
     activeJobs: async () => f.activeJobs,
+    diskFree: async () => f.free,
     hcKeyStore: { load: () => f.hcKey, store: (key) => { f.hcKeyWrites++; if (!f.hcKeyWriteOk) return false; f.hcKey = key; return true; } },
     job: async (uuid) => { jobCalls.push(uuid); return f.jobsUp ? f.jobs[uuid] ?? { found: false } : null; },
     hcChecks: async () => { f.hcReads++; return f.hcUp ? hcList(f.options, f.hcOver) : null; },
@@ -112,14 +129,16 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     live: async () => f.alive,
     ready: async () => f.ready,
     ping: async (url, body) => { pings.push({ url, body }); return !f.pingFails(url); },
-    options: () => JSON.parse(JSON.stringify(f.options)),
+    options: () => JSON.parse(JSON.stringify(o.uniq === false ? f.options : withKeys(f.options))),
     save: (s) => { if (f.saveFails) return false; saved = JSON.parse(JSON.stringify(s)); return true; },
     log: (l) => logs.push(l),
   }, o.saved ?? null);
-  k.useOptions(f.options);
+  k.useOptions(o.uniq === false ? f.options : withKeys(f.options));
   k.start();
-  // (0.1.5) the owner's enrollment of the pinned key at the device, as at first setup
-  if (o.confirm !== false && shipKey(k.opts.ship_public_key)) k.keyConfirm(keyFp(k.opts.ship_public_key), codeIn(logs, "key-confirm"));
+  // (0.1.9) the backup check passed on the device, as at first setup
+  if (o.backupCheck !== false && !k.st.backupCheck) k.st.backupCheck = { at: T0, names: ["hc-key"], slug: "bc-1" };
+  // (0.1.5) the owner's enrollment of the pinned key at the device, as at first setup (0.1.9: its code on demand, key-code)
+  if (o.confirm !== false && shipKey(k.opts.ship_public_key)) { k.keyCode(); k.keyConfirm(keyFp(k.opts.ship_public_key), codeIn(logs, "key-confirm")); }
   // (0.1.7) the owner's acceptance of the accepted limits, as at first setup
   if (o.limits !== false) k.acceptLimits(codeIn(logs, "accept-limits"));
   const r = {
@@ -171,6 +190,11 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     },
   };
   return r;
+}
+// (0.1.9) The link's rotation attestation, signed with its Ship key, as cain link/rotation.ts makes it.
+function rotationToken(id: string, now: number, o: { key?: KeyObject; kind?: string; ttl?: number } = {}): string {
+  const payload = b64url(Buffer.from(JSON.stringify({ v: 1, kind: o.kind ?? "hc-key-rotated", id, exp: Math.floor(now / 1000) + (o.ttl ?? 3600) })));
+  return `rot1.${payload}.${b64url(edSign(null, Buffer.from(`rot1.${payload}`), o.key ?? LINK))}`;
 }
 function codeIn(logs: string[], cmd: string): string {
   for (let i = logs.length - 1; i >= 0; i--) { const m = new RegExp(`^one-time code for ${cmd}: ([0-9a-f]+) `).exec(logs[i]); if (m) return m[1]; }
@@ -403,15 +427,16 @@ describe("fix 4: registration over the keeper's own service, never an options wr
       if (path === "/backups/kb1/info") return ok({ homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: false, date: new Date(now).toISOString() });
       if (path === "/backups/kb1/restore/partial") { job = { name: "backup_manager_partial_restore", reference: "kb1", uuid: "j1", done: true, errors: [], child_jobs: [] }; app.version = "0.16.0"; app.state = "started"; return ok({ job_id: "j1" }); }
       if (path === "/jobs/info") return ok({ jobs: job ? [job] : [] });
+      if (path === "/host/info") return ok({ disk_free: 20.5 });   // (0.1.9) the free-space reserve's read
       return new Response(JSON.stringify({ result: "error" }), { status: 404 });
     };
     const sup = supervisor("t", "http://supervisor", http);
     let now = T0;
     const klogs: string[] = [];
     const k = new Keeper({ now: () => now, version: "0.1.3", self: "0fcc2575_keeper", appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup,
-      restore: sup.restore, job: sup.job, live: async () => true, ready: async () => true, ping: async () => true,
+      restore: sup.restore, job: sup.job, live: async () => true, ready: async () => true, ping: async () => true, diskFree: sup.diskFree,
       options: () => sup.selfOptions(), save: () => {}, log: (l) => klogs.push(l) }, null);
-    k.useOptions(options); k.start(); k.keyConfirm(keyFp(PUB), codeIn(klogs, "key-confirm"));
+    k.useOptions(options); k.start(); k.keyCode(); k.keyConfirm(keyFp(PUB), codeIn(klogs, "key-confirm"));
     const poll = async (n: number) => { for (let i = 0; i < n; i++) { await k.poll(); now += POLL_MS; } };
     await k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
     await k.whenSettled(ID);
@@ -423,6 +448,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     expect(k.st.attempts[ID].status).toBe("rolled back");
     const writes = calls.filter((c) => c.method !== "GET");
     expect(writes.map((c) => `${c.method} ${c.path}`)).toEqual(["POST /backups/new/partial", "POST /backups/kb1/restore/partial"]);
+    expect(calls.some((c) => c.path === "/host/info")).toBe(true);   // (0.1.9) free space read before the backup
     expect(writes[0].body).toEqual({ name: k.st.attempts[ID].backupName, addons: [CAIN], homeassistant: false, folders: [], background: false });
     expect(k.st.attempts[ID].backupName).toMatch(new RegExp(`^Keeper ${ID} [0-9a-f]{8}$`));   // (0.1.7) attempt-specific
     expect(writes[1].body).toEqual({ homeassistant: false, addons: [CAIN], folders: [], background: true });
@@ -759,7 +785,7 @@ describe("drills and the armed record", () => {
     const r = await armedRig();
     const v = r.k.armedView(CAIN);
     expect(v.armed).toBe(true);
-    expect(v.binding).toEqual({ protocol: 1, probe_hash: HASH, keeper_version: "0.1.0", options_hash: optionsHash(parseOptions(r.f.options), r.f.hcKey), backup_scope: "app-only" });
+    expect(v.binding).toEqual({ protocol: 1, probe_hash: HASH, keeper_version: "0.1.0", options_hash: optionsHash(parseOptions(withKeys(r.f.options)), r.f.hcKey), backup_scope: "app-only" });
   });
   test("an undelivered owner line records no drill; a ship attempt never does", async () => {
     const r = rig(); r.f.pingOk = false;
@@ -951,6 +977,8 @@ describe("0.1.4: the Ship key is pinned on first use", () => {
     expect(signedNew.status).toBe(409);
     expect(String(signedNew.body.why)).toContain(`isn't the key Keeper pinned (fingerprint ${keyFp(PUB)})`);
     expect((await r.register({ head: headN(3) })).status).toBe(409);
+    expect(r.code("key-confirm")).toBe(r.code("key-confirm"));
+    r.k.keyCode();                                         // (0.1.9) the code on demand only
     expect(r.k.keyConfirm("0000000000000000", r.code("key-confirm"))).toEqual({ ok: false, why: `that fingerprint isn't the options' key's (${keyFp(NPUB)})` });
     expect(r.k.keyConfirm(keyFp(NPUB), r.code("key-confirm")).ok).toBe(true);
     expect(r.k.st.pinnedKey?.fp).toBe(keyFp(NPUB));
@@ -959,6 +987,8 @@ describe("0.1.4: the Ship key is pinned on first use", () => {
   test("(0.1.6) key-confirm only on the container's own loopback, with the one-time code from the log", async () => {
     const r = rig({ confirm: false });
     const log: string[] = [];
+    expect(r.code("key-confirm")).toBe("");               // (0.1.9) never printed at start
+    r.k.keyCode();
     const code = r.code("key-confirm");
     expect(code).toMatch(/^[0-9a-f]{10}$/);
     const req = (c: string) => new Request("http://127.0.0.1:8096/key-confirm", { method: "POST", body: JSON.stringify({ fingerprint: keyFp(PUB), code: c }) });
@@ -973,8 +1003,10 @@ describe("0.1.4: the Ship key is pinned on first use", () => {
     r.advance(KEY_CODE_MS + 60_000);
     expect(((await (await handleLocal(r.k, req(code), "127.0.0.1", (m) => log.push(m))).json()) as any).why).toContain("stale");
     expect(r.k.st.pinnedKey?.confirmed).toBeUndefined();
-    // a restart prints a new code, which confirms once
+    // (0.1.9) a restart prints no code; key-code prints a new one, which confirms once
     r.k.start();
+    expect(r.code("key-confirm")).toBe(code);
+    r.k.keyCode();
     const fresh = r.code("key-confirm");
     expect(fresh).not.toBe(code);
     expect((await handleLocal(r.k, req(fresh), "127.0.0.1", (m) => log.push(m))).status).toBe(200);
@@ -1177,6 +1209,7 @@ describe("0.1.5: enrollment of the Ship key", () => {
     const r = rig({ confirm: false });
     expect((await r.register()).status).toBe(409);
     r.advance(60_000);
+    r.k.keyCode();
     expect(r.k.keyConfirm(keyFp(PUB), r.code("key-confirm")).ok).toBe(true);
     const ans = await r.register({ head: headN(1) });
     expect(ans.status).toBe(200);
@@ -1442,40 +1475,40 @@ describe("0.1.6: the claim's deadline bounds the start, not the watch", () => {
 });
 
 describe("0.1.6: orphan backups", () => {
-  test("a cancelled registration's backup is deleted, by its recorded slug", async () => {
+  test("(0.1.9) a cancelled registration's backup is kept, bound to its generation, never deleted with the claim", async () => {
     const r = rig();
     await r.register(); await r.poll();
     const slug = r.a().backup;
     expect((await r.k.cancel(CAIN, ID, { why: "gave up" })).status).toBe(200);
-    await r.poll();
-    expect(r.deleted).toEqual([slug]);
-    expect(r.a().backupDropped).toBe(true);
-    expect(r.logs).toContain(`${ID}: deleted its backup ${slug} (cancelled by Cain's link (gave up): never used)`);
-    await r.poll(3); expect(r.deleted).toHaveLength(1);
+    await r.poll(3);
+    expect(r.deleted).toEqual([]);
+    expect(r.k.st.keptBackups![slug]).toMatchObject({ slug, attempt: ID, gen: r.a().gen, name: r.a().backupName });
+    expect(r.a().gen).toBeGreaterThan(0);
+    expect(r.logs.some((l) => l.startsWith(`${ID}: ended; backup kept: cancelled;`) && l.includes(`backup ${slug} "${r.a().backupName}"`))).toBe(true);
   });
-  test("a backup still being made when the registration is cancelled is deleted once it is made", async () => {
+  test("(0.1.9) a backup still being made when the registration is cancelled is kept and bound once it is made", async () => {
     const r = rig();
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
     for (let i = 0; i < 5; i++) await Bun.sleep(0);
+    for (let i = 0; i < 20 && !r.backupsMade.length; i++) await Bun.sleep(1);
+    expect(r.backupsMade).toEqual([CAIN]);
     (await r.k.cancel(CAIN, ID, {}));
+    r.f.backupsList = [{ slug: "kb-late", name: r.a().backupName! }];
     finish({ slug: "kb-late" }); await r.k.whenSettled(ID);
     await r.poll();
-    expect(r.deleted).toEqual(["kb-late"]);
+    expect(r.deleted).toEqual([]);
+    expect(r.k.st.keptBackups!["kb-late"]).toMatchObject({ attempt: ID, gen: r.a().gen });
   });
-  test("an acceptance that expires unclaimed has its backup deleted; one that can't be deleted is named in the log and left", async () => {
+  test("(0.1.9) an acceptance that expires unclaimed keeps its backup for the bounded cleanup", async () => {
     const r = rig();
     await r.register(); await r.poll();
     const slug = r.a().backup;
-    r.f.deleteOk = false;
-    r.advance(ACCEPT_MS + 60_000); await r.poll(DROP_TRIES + 2);
+    r.advance(ACCEPT_MS + 60_000); await r.poll(3);
     expect(r.a().status).toBe("ended");
-    expect(r.deleted).toEqual(Array(DROP_TRIES).fill(slug));
-    expect(r.logs).toContain(`${ID}: couldn't delete its backup ${slug} after ${DROP_TRIES} tries; it stays in Home Assistant's list, used for nothing: delete backup ${slug} by hand (Settings, System, Backups)`);
-    const ok = rig();
-    await ok.register(); await ok.poll(); ok.advance(ACCEPT_MS + 60_000); await ok.poll(2);
-    expect(ok.deleted).toEqual([ok.a().backup]);
+    expect(r.deleted).toEqual([]);
+    expect(r.logs.some((l) => l.startsWith(`${ID}: ended; backup kept: its acceptance expired unclaimed`) && l.includes(slug))).toBe(true);
   });
   test("a claim that expires with no version change, or an install, keeps its backup", async () => {
     const r = rig();
@@ -1522,7 +1555,7 @@ describe("0.1.7: the accepted limits", () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits")).replace(/\s+/g, " ");
     expect(sec.length).toBeGreaterThan(100);
-    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.8`);   // 0.1.8: version 2
+    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.9`);   // 0.1.8: version 2; 0.1.9: version 3
     expect(sec).toContain("an install of exactly the claimed version made");
     expect(sec).toContain("at the 14-day mark");
     expect(sec).toContain("never install from Home Assistant's page while a Ship run is live");
@@ -1601,28 +1634,26 @@ describe("0.1.7: the Healthchecks key leaves the options (hc-key)", () => {
 });
 
 describe("0.1.7: the claim record (claim, cancel, consume)", () => {
-  test("a lost cancel, then the claim's expiry: the claim is unused and its backup deleted, after the jobs list shows no install", async () => {
+  test("a lost cancel, then the claim's expiry: the claim is unused, and (0.1.9) its backup kept for the bounded cleanup", async () => {
     const r = rig();
     await r.register(); await r.poll(); r.claim();
     const slug = r.a().backup;
-    // the link's cancel never reaches the keeper; the claim expires with no version change seen
     r.advance(CLAIM_MS + 60_000); await r.poll(2);
     expect(r.a().status).toBe("ended");
-    expect(r.deleted).toEqual([slug]);
+    expect(r.deleted).toEqual([]);
+    expect(r.k.st.keptBackups![slug].reason).toContain("expired unused");
   });
-  test("an active install or update of the App in the jobs list keeps the backup, logged; an unreadable list keeps it too", async () => {
+  test("(0.1.9) the expiry while an install job runs: the claim ends, the backup is kept and bound, and the cleanup doesn't run beside the install", async () => {
     const r = rig();
     await r.register(); await r.poll(); r.claim();
     r.f.activeJobs = ["addon_manager_update"];
-    r.advance(CLAIM_MS + 60_000); await r.poll(3);
+    r.f.backupsList = [{ slug: r.a().backup, name: r.a().backupName! }];
+    r.advance(CLAIM_MS + 60_000); await r.poll();
+    expect(r.a().status).toBe("ended");
+    expect(r.k.st.keptBackups![r.a().backup]).toMatchObject({ gen: r.a().gen });
+    r.advance(3 * 86_400_000); await r.poll(2);
     expect(r.deleted).toEqual([]);
-    expect(r.logs).toContain(`${ID}: kept its backup ${r.a().backup}: its claim expired with no version change seen, but an install or update of ${CAIN} is running (addon_manager_update)`);
-    const u = rig();
-    await u.register(); await u.poll(); u.claim();
-    u.f.activeJobs = null;
-    u.advance(CLAIM_MS + 60_000); await u.poll(DROP_TRIES + 2);
-    expect(u.deleted).toEqual([]);
-    expect(u.logs.some((l) => l.includes("the Supervisor's jobs list couldn't be read, so its backup") && l.includes("is kept"))).toBe(true);
+    expect(r.logs).toContain(`the cleanup of kept backups (the daily tick) didn't run: an install or update of ${CAIN} is running`);
   });
   test("a cancel after the claim was handed to a started run (a version change seen) is refused", async () => {
     const r = rig();
@@ -1695,6 +1726,8 @@ describe("0.1.7: codes bound to their challenge, and the enrollment counter", ()
     const pub2 = generateKeyPairSync("ed25519").publicKey.export({ format: "der", type: "spki" }).toString("base64");
     const before = codeIn(r.logs, "key-confirm");
     r.f.options.ship_public_key = pub2; await r.poll();
+    expect(codeIn(r.logs, "key-confirm")).toBe(before);   // (0.1.9) a changed key prints no code by itself
+    r.k.keyCode();
     const now2 = codeIn(r.logs, "key-confirm");
     expect(now2).not.toBe(before);
     // forge: the new code checked against the old fingerprint's challenge is refused; the right one works once
@@ -1730,7 +1763,7 @@ describe("0.1.7: codes bound to their challenge, and the enrollment counter", ()
 });
 
 describe("0.1.7: orphan backups by their own name, and the network mode", () => {
-  test("the backup's name is kept before the call; after a restart lost its slug, a cancelled attempt's backup is found by that exact name and deleted", async () => {
+  test("the backup's name is kept before the call; after a restart lost its slug, a cancelled attempt's backup is found by that exact name and (0.1.9) bound, not deleted", async () => {
     const r = rig();
     r.f.makeBackup = () => new Promise(() => {});         // the backup call never answers in this process
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
@@ -1741,10 +1774,12 @@ describe("0.1.7: orphan backups by their own name, and the network mode", () => 
     const again = rig({ saved: r.saved });
     again.f.backupsList = [{ slug: "kb-other", name: `Keeper ${ID} 00000000` }, { slug: "kb-mine", name }];
     await again.poll();
-    expect(again.deleted).toEqual(["kb-mine"]);
-    expect(again.logs.some((l) => l.startsWith(`backup kb-other ("Keeper ${ID} 00000000") is Keeper's, of no attempt it knows, and no attempt uses it: kept`))).toBe(true);
+    expect(again.deleted).toEqual([]);
+    expect(again.k.st.keptBackups!["kb-mine"]).toMatchObject({ attempt: ID, name });
+    expect(again.logs).toContain(`${ID}: found its backup kb-mine by its own name "${name}"`);
+    expect(again.logs.some((l) => l.startsWith(`backup kb-other ("Keeper ${ID} 00000000") is named like Keeper's but has no generation record here: never deleted by Keeper`))).toBe(true);
   });
-  test("an attempt left unprotected by a restart keeps its backup, named in the log; no backup made means nothing to delete", async () => {
+  test("an attempt left unprotected by a restart keeps its backup; nothing is deleted", async () => {
     const r = rig();
     r.f.makeBackup = () => new Promise(() => {});
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
@@ -1754,8 +1789,8 @@ describe("0.1.7: orphan backups by their own name, and the network mode", () => 
     again.f.backupsList = [{ slug: "kb-mine", name }];
     await again.poll(2);
     expect(again.a().status).toBe("unprotected");
+    again.advance(3 * 86_400_000); await again.poll(2);
     expect(again.deleted).toEqual([]);
-    expect(again.logs.some((l) => l.startsWith(`backup kb-mine ("${name}") is Keeper's, of ${ID} (`))).toBe(true);
   });
   test("host_network is false in config.yaml, and the docs say the network mode is the real gate on the confirm commands", () => {
     const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
@@ -1769,24 +1804,24 @@ describe("0.1.7: orphan backups by their own name, and the network mode", () => 
 // -- 0.1.8 (the eighth review's fixes) -------------------------------------------------------------------
 const localCall = (r: ReturnType<typeof rig>, path: string, body: any = {}) =>
   handleLocal(r.k, new Request(`http://127.0.0.1:8096${path}`, { method: "POST", body: JSON.stringify(body) }), "127.0.0.1", () => {});
-describe("0.1.8: the accepted limits at text version 2", () => {
-  test("the text is version 2, and an acceptance of version 1 lapses: a new code at start, not armed until accepted again", async () => {
-    expect(LIMITS_VERSION).toBe(2);
+describe("0.1.8: the accepted limits (text version 3 since 0.1.9)", () => {
+  test("the text is version 3, and an acceptance of version 2 lapses: a new code at start, not armed until accepted again", async () => {
+    expect(LIMITS_VERSION).toBe(3);
     const r = await armedRig();
     const saved = JSON.parse(JSON.stringify(r.saved));
-    saved.limits = { version: 1, at: T0 };
+    saved.limits = { version: 2, at: T0 };
     const again = rig({ saved, limits: false });
-    expect(again.logs.some((l) => l.startsWith("the accepted limits' text changed (version 1 accepted, now 2)"))).toBe(true);
+    expect(again.logs.some((l) => l.startsWith("the accepted limits' text changed (version 2 accepted, now 3)"))).toBe(true);
     expect(again.k.limitsOk()).toBe(false);
-    expect(again.k.armedState(CAIN).why).toBe("the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version 2): accept-limits <code>");
+    expect(again.k.armedState(CAIN).why).toBe("the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version 3): accept-limits <code>");
     expect(again.k.acceptLimits(again.code("accept-limits" as any)).ok).toBe(true);
-    expect(again.k.st.limits!.version).toBe(2);
+    expect(again.k.st.limits!.version).toBe(3);
   });
-  test("the DOCS' text at version 2 carries each statement of both limits", () => {
+  test("the DOCS' text carries each statement of both limits", () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options")).replace(/\s+/g, " ");
     for (const t of [
-      "Text version 2 (0.1.8)",
+      "Text version 3 (0.1.9)",
       // the installer limit
       "refuses after two silences, or whose cancel is lost, leaves a live claim on the keeper for up to 30 minutes with no Ship run live",
       "never install from Home Assistant's page while a Ship run is live, or until the keeper's log shows no live claim (up to 30 minutes after a refused or failed run)",
@@ -1860,6 +1895,9 @@ describe("0.1.8: the old key option gated, the key file 0600 from its first byte
     expect(r.k.armableWhy()).not.toBe(OLD_KEY_WHY);
     const ok = await localCall(r, "/hc-key", { code, key: "hc-read-key-0123456789" });
     expect(ok.status).toBe(200);
+    // (0.1.9) and arming waits for the old key's rotation, attested by the owner's tap (the link's signed attestation)
+    expect(r.k.armableWhy()).toContain("isn't attested as rotated");
+    expect((await r.k.attestRotation(CAIN, { attestation: rotationToken(r.k.st.oldKey!.id, r.now) })).status).toBe(200);
     expect(r.k.armableWhy()).toBe("");
   });
   test("the key file through the real store: an exclusive temporary file opened 0600, the key fsynced, then renamed; never a wider mode", async () => {
@@ -1886,78 +1924,66 @@ describe("0.1.8: the old key option gated, the key file 0600 from its first byte
     const rel = readFileSync(join(import.meta.dir, "..", "..", "RELEASING.md"), "utf8").replace(/\s+/g, " ");
     for (const t of [docs, rel]) { expect(t).toContain("rotate"); expect(t).toContain("earlier backups may hold it"); }
     expect(docs).toContain("0600 from its first byte");
-    const checks = docs.slice(docs.indexOf("**Device checks before arming"));
-    expect(checks).toContain("The Supervisor's backup omits the key file");
-    expect(checks).toContain("read-write key");
+    const checks = docs.slice(docs.indexOf("**The checks before arming, refusals in code (0.1.9)"));   // 0.1.9: refusals now
+    expect(checks).toContain("**The backup check.**");
+    expect(checks).toContain("a key that can write is refused");
     expect(checks).toContain("hc_unique_keys");
   });
 });
 
 describe("0.1.8: the cancel path reads the jobs list; the unused expiry's extra poll", () => {
   const claimed = async () => { const r = rig(); await r.register(); await r.poll(); r.claim(); return r; };
-  test("a cancel during an active install or update of the App is refused; the claim and its backup are kept, logged with why", async () => {
+  test("(0.1.9) a cancel during an active install or update of the App ends the claim and keeps its backup, bound, logged with why", async () => {
     const r = await claimed();
     r.f.activeJobs = ["addon_manager_update"];
     const c = await r.k.cancel(CAIN, ID, { why: "the pass gave up" });
-    expect(c.status).toBe(409);
-    expect(c.body.why).toBe(`an install or update of ${CAIN} is running (addon_manager_update): the cancel is refused, and the claim and its backup are kept`);
-    expect(r.a().status).toBe("claimed");
-    expect(r.logs).toContain(`refused a cancel of ${ID} (claimed): an install or update of ${CAIN} is running (addon_manager_update); its claim ${r.a().claim!.id} and backup ${r.a().backup} are kept`);
+    expect(c.status).toBe(200);
+    expect(c.body.backup_kept).toBe(r.a().backup);
+    expect(r.a().status).toBe("ended");
+    expect(r.logs.some((l) => l.startsWith(`${ID}: ended; backup kept: cancelled while an install or update of ${CAIN} is running (addon_manager_update)`) && l.includes(r.a().backupName!))).toBe(true);
+    expect(r.k.st.keptBackups![r.a().backup]).toMatchObject({ attempt: ID, gen: r.a().gen });
     await r.poll(2);
     expect(r.deleted).toEqual([]);
   });
-  test("an active job on the App whose name isn't recognized refuses the cancel; a backup job doesn't", async () => {
+  test("an active job on the App whose name isn't recognized is named in the kept reason; a backup job isn't in the way", async () => {
     const r = await claimed();
     r.f.activeJobs = ["addon_something_new"];
     const c = await r.k.cancel(CAIN, ID, { why: "x" });
-    expect(c.status).toBe(409);
-    expect(c.body.why).toContain(`an active job on ${CAIN} that Keeper doesn't recognize is running (addon_something_new)`);
+    expect(c.status).toBe(200);
+    expect(r.k.st.keptBackups![r.a().backup].reason).toContain(`an active job on ${CAIN} that Keeper doesn't recognize is running (addon_something_new)`);
     expect(jobsWhy(CAIN, ["backup_manager_partial_backup"])).toBe("");
     expect(jobsWhy(CAIN, ["backup_manager_partial_restore"])).toContain("an install or update");
-    r.f.activeJobs = ["backup_manager_partial_backup"];
-    expect((await r.k.cancel(CAIN, ID, { why: "x" })).status).toBe(200);
   });
-  test("a jobs list that can't be read, a thrown call or a hung one refuses the cancel", async () => {
-    const r = await claimed();
-    r.f.activeJobs = null;
-    const c = await r.k.cancel(CAIN, ID, { why: "x" });
-    expect(c.status).toBe(409);
-    expect(c.body.why).toContain("the Supervisor's jobs list couldn't be read (an install may be running)");
-    expect(r.a().status).toBe("claimed");
-    (r.k as any).d.activeJobs = async () => { throw new Error("boom"); };
-    expect((await r.k.cancel(CAIN, ID, { why: "x" })).status).toBe(409);
-    expect(r.logs).toContain("the Supervisor's jobs list failed (boom): taken as unreadable");
-    (r.k as any).d.activeJobs = () => new Promise(() => {});
-    const t = Date.now();
-    expect((await r.k.cancel(CAIN, ID, { why: "x" })).status).toBe(409);
-    expect(Date.now() - t).toBeLessThan(1_000);
-    expect(r.logs).toContain("the Supervisor's jobs list didn't answer within 0.05 seconds: taken as unreadable");
-    expect(r.a().status).toBe("claimed");
+  test("a jobs list that can't be read, a thrown call or a hung one: the cancel still ends the claim, and the backup is kept", async () => {
+    for (const jobs of ["null", "throw", "hang"]) {
+      const r = await claimed();
+      (r.k as any).d.activeJobs = jobs === "null" ? async () => null : jobs === "throw" ? async () => { throw new Error("boom"); } : () => new Promise(() => {});
+      const t = Date.now();
+      expect((await r.k.cancel(CAIN, ID, { why: "x" })).status).toBe(200);
+      expect(Date.now() - t).toBeLessThan(1_000);
+      expect(r.a().status).toBe("ended");
+      expect(r.k.st.keptBackups![r.a().backup].reason).toContain("the Supervisor's jobs list couldn't be read");
+      await r.poll(); expect(r.deleted).toEqual([]);
+    }
   });
-  test("a clean cancel still ends the claim and deletes its backup", async () => {
+  test("(0.1.9) a clean cancel ends the claim and keeps its backup too", async () => {
     const r = await claimed();
-    const slug = r.a().backup;
     expect((await r.k.cancel(CAIN, ID, { why: "gave up" })).status).toBe(200);
     expect(r.a().status).toBe("ended");
     await r.poll();
-    expect(r.deleted).toEqual([slug]);
+    expect(r.deleted).toEqual([]);
   });
-  test("the unused expiry waits one more poll with no version change seen after the deadline before deleting the backup", async () => {
+  test("(0.1.9) the unused expiry keeps the backup; an install seen after it is unprotected and its backup kept for a rollback by hand", async () => {
     const r = await claimed();
-    const slug = r.a().backup;
-    r.advance(CLAIM_MS + 60_000); await r.poll();
+    r.advance(CLAIM_MS + 60_000); await r.poll(3);
     expect(r.a().status).toBe("ended");
-    expect(r.deleted).toEqual([]);                          // the poll that ended it deletes nothing
-    await r.poll();
-    expect(r.a().quietAt).toBeGreaterThan(0);
-    expect(r.deleted).toEqual([slug]);
-    // the install seen at that next poll instead: unprotected, and the backup kept for a rollback by hand
+    expect(r.deleted).toEqual([]);
     const v = await claimed();
     v.advance(CLAIM_MS + 60_000); await v.poll();
     v.f.app.version = "0.17.0"; await v.poll(3);
     expect(v.a().status).toBe("unprotected");
     expect(v.deleted).toEqual([]);
-    expect(v.logs).toContain(`${ID}: kept its backup ${v.a().backup}: ${CAIN} moved to 0.17.0 after it ended`);
+    expect(v.logs).toContain(`${ID}: kept its backup ${v.a().backup}: ${CAIN} moved to 0.17.0 after it ended: a rollback by hand may need it`);
   });
 });
 
@@ -1965,7 +1991,7 @@ describe("0.1.8: the lock's bounds", () => {
   test("a step that throws is caught, logged, and the lock released for the next one", async () => {
     const r = rig();
     await expect(r.k.record(() => { throw new Error("a broken step"); })).rejects.toThrow("a broken step");
-    expect(r.logs).toContain("a step under the claim record's lock failed (a broken step): the lock is released for the next one");
+    expect(r.logs.some((l) => l.startsWith("a step under the claim record's lock failed (a broken step): the lock is released for the next one"))).toBe(true);
     expect(await r.k.record(() => "next")).toBe("next");
     expect(await r.k.record(() => { throw new Error("x"); }, (why) => `fallback: ${why}`)).toBe("fallback: x");
   });
@@ -1980,11 +2006,10 @@ describe("0.1.8: the lock's bounds", () => {
     const r = rig();
     await r.register(); await r.poll();
     const a = r.a();
-    (r.k as any).d.activeJobs = () => new Promise(() => {});   // the cancel ahead of it waits on a hung Supervisor
-    const cancel = r.k.cancel(CAIN, ID, { why: "x" });
+    const slow = r.k.record(() => new Promise<string>(() => {}), () => "fallback");   // a step ahead of it hangs (0.1.9: the cancel no longer refuses)
     const claim = r.k.claim(CAIN, ID, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup });
     r.advance(ACCEPT_MS + 1_000);                             // the acceptance runs out while the claim waits
-    expect((await cancel).status).toBe(409);
+    expect(await slow).toBe("fallback");
     const c = await claim;
     expect(c.status).toBe(409);
     expect(c.body.why).toBe("its acceptance expired");
@@ -2029,12 +2054,13 @@ describe("0.1.8: the counter, re-enrollment and key-code", () => {
     await r.register(); await r.poll();
     const before = r.code("key-confirm");
     await r.k.cancel(CAIN, ID, { why: `${ENROLL_BEHIND}: the keeper's counter (9) is lower than the 10 the link recorded` });
-    expect(r.logs).toContain("enrollment counter behind the link: re-enroll with key-confirm");
-    const now1 = r.code("key-confirm");
-    expect(now1).not.toBe(before);
+    expect(r.logs).toContain("enrollment counter behind the link: re-enroll with key-confirm (key-code prints a code)");
+    expect(r.code("key-confirm")).toBe(before);            // (0.1.9) no code printed by itself
     expect(r.k.st.enrollRefused).toBe(r.now);
     const again = rig({ saved: r.saved, confirm: false });
     expect(again.logs.some((l) => l.startsWith("the link refused Keeper's enrollment at "))).toBe(true);
+    expect(again.code("key-confirm")).toBe("");            // (0.1.9) never at start
+    again.k.keyCode();
     const code = again.code("key-confirm");
     expect(code).toMatch(/^[0-9a-f]{10}$/);
     expect(again.k.keyConfirm(keyFp(PUB), code).ok).toBe(true);
@@ -2044,7 +2070,7 @@ describe("0.1.8: the counter, re-enrollment and key-code", () => {
     const other = rig();
     await other.register(); await other.poll();
     await other.k.cancel(CAIN, ID, { why: `${ENROLL_REFUSED}: the keeper's key was confirmed at another time` });
-    expect(other.logs).toContain("the link refused Keeper's enrollment: re-enroll with key-confirm");
+    expect(other.logs).toContain("the link refused Keeper's enrollment: re-enroll with key-confirm (key-code prints a code)");
   });
   test("key-code over the loopback listener prints a fresh code; the App network's listener refuses it", async () => {
     const r = rig();
@@ -2055,7 +2081,404 @@ describe("0.1.8: the counter, re-enrollment and key-code", () => {
     expect(r.k.keyConfirm(keyFp(PUB), r.code("key-confirm")).ok).toBe(true);
     const net = await handle(r.k, new Request("http://keeper:8097/key-code", { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } }), "172.30.32.5", () => {});
     expect(net.status).toBe(403);
-    const fresh = rig({ confirm: false });                  // unenrolled: the pin's code is printed by itself
-    expect(fresh.code("key-confirm")).toMatch(/^[0-9a-f]{10}$/);
+    const fresh = rig({ confirm: false });                  // (0.1.9) unenrolled: still no code until key-code
+    expect(fresh.code("key-confirm")).toBe("");
+    expect(fresh.logs).toContain("the Ship key isn't enrolled: key-code prints a code on demand, then key-confirm <fingerprint> <code>");
+  });
+});
+
+// -- 0.1.9 (the ninth review's fixes, a scoped round) -----------------------------------------------------
+// A tar archive as the Supervisor's backups hold them (ustar headers), for the backup check's scan.
+function tarOf(entries: [string, string | Uint8Array][]): Uint8Array {
+  const parts: Uint8Array[] = [];
+  for (const [name, body] of entries) {
+    const data = typeof body === "string" ? new TextEncoder().encode(body) : body;
+    const h = new Uint8Array(512);
+    const put = (s: string, off: number) => h.set(new TextEncoder().encode(s), off);
+    put(name, 0); put("0000600\0", 100); put("0000000\0", 108); put("0000000\0", 116);
+    put(data.length.toString(8).padStart(11, "0") + "\0", 124); put("00000000000\0", 136); put("        ", 148); put("0", 156); put("ustar\0", 257); put("00", 263);
+    const sum = h.reduce((a, b) => a + b, 0);
+    put(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+    parts.push(h, data, new Uint8Array((512 - (data.length % 512)) % 512));
+  }
+  parts.push(new Uint8Array(1024));
+  const out = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+// A Home Assistant backup of Keeper: the outer tar with backup.json and the App's own tar.gz holding its data folder.
+const { gzipSync } = await import("node:zlib");
+const haBackup = (files: [string, string][]) => tarOf([["./backup.json", "{}"], ["./0fcc2575_keeper.tar.gz", gzipSync(tarOf(files))]]);
+
+describe("0.1.9 A1: the lock's generation fences a timed-out step", () => {
+  test("a hung step resuming after the lock's release changes nothing (a cancel whose jobs read hangs past the step's bound)", async () => {
+    const r = rig();
+    await r.register(); await r.poll(); r.claim();
+    (r.k as any).d.lockCallMs = 10_000;                    // the call's own bound longer than the step's
+    let release: (v: string[]) => void = () => {};
+    (r.k as any).d.activeJobs = () => new Promise<string[]>((res) => { release = res; });
+    const cancel = r.k.cancel(CAIN, ID, { why: "x" });
+    const c = await cancel;
+    expect(c.status).toBe(503);
+    expect(r.a().status).toBe("claimed");
+    const next = await r.k.armed(CAIN);                    // the next step ran under the lock
+    expect(next.app).toBe(CAIN);
+    release([]);                                           // the hung step resumes now
+    for (let i = 0; i < 5; i++) await Bun.sleep(1);
+    expect(r.a().status).toBe("claimed");
+    expect(r.a().cancel).toBeUndefined();
+    expect(r.k.st.keptBackups ?? {}).toEqual({});
+  });
+  test("expiry between the check and the write: a write after the step's time ran out is refused, and logged", async () => {
+    const r = rig();
+    let checked = false, wrote = false;
+    const step = r.k.record(async (f) => {
+      checked = f.live();
+      await Bun.sleep(400);                                 // past the step's 300 ms bound
+      await f.write("a test delete", async () => { wrote = true; return true; });
+      if (f.live()) r.k.st.lastSeen.x = "changed";
+      return "done";
+    }, () => "timed out");
+    expect(await step).toBe("timed out");
+    await Bun.sleep(150);
+    expect(checked).toBe(true);
+    expect(wrote).toBe(false);
+    expect(r.k.st.lastSeen.x).toBeUndefined();
+    expect(r.logs.some((l) => l.startsWith("a test delete not done: its step's generation"))).toBe(true);
+  });
+  test("expiry during a write: a delete in flight when the step runs out keeps the lock until it ends", async () => {
+    const r = rig();
+    const order: string[] = [];
+    let finish: (v: boolean) => void = () => {};
+    const step = r.k.record(async (f) => {
+      await f.write("a slow delete", () => new Promise<boolean>((res) => { finish = res; }), () => order.push("delete recorded"));
+      return "done";
+    }, () => "timed out");
+    const next = r.k.record(() => { order.push("next step"); return "next"; });
+    await Bun.sleep(400);                                   // the step's bound passed with the delete in flight
+    expect(order).toEqual([]);
+    finish(true);
+    expect(await step).toBe("timed out");
+    expect(await next).toBe("next");
+    expect(order).toEqual(["delete recorded", "next step"]);
+    expect(r.logs.some((l) => l.includes("with a write in flight: the lock is held until that write ends"))).toBe(true);
+  });
+  test("a competing generation: the next step's generation is live, the timed-out one's never again", async () => {
+    const r = rig();
+    let first: any = null, second: any = null;
+    let go: () => void = () => {};
+    const s1 = r.k.record(async (f) => { first = f; await new Promise<void>((res) => { go = res; }); return f.live(); }, () => false);
+    expect(await s1).toBe(false);
+    const s2 = r.k.record(async (f) => { second = f; expect(first.live()).toBe(false); return f.live(); });
+    expect(await s2).toBe(true);
+    expect(second.gen).toBeGreaterThan(first.gen);
+    expect(await first.write("a late write", async () => true)).toBeNull();
+    go();
+  });
+});
+
+describe("0.1.9 A2: the key file's temporary file inside the backup exclusion", () => {
+  test("the temporary file has the fixed prefix hc-key.tmp-, which backup_exclude covers; the old spelling is legacy", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "keeper-tmp-"));
+    let seen = "";
+    expect(hcKeyStore(join(dir, "hc-key"), (t) => { seen = t; }).store("hc-read-key-0123456789")).toBe(true);
+    const base = seen.split("/").pop()!;
+    expect(base.startsWith("hc-key.tmp-")).toBe(true);
+    const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
+    const globs = [...cfg.matchAll(/^  - "([^"]+)"$/gm)].map((m) => m[1]);
+    expect(globs).toContain("hc-key*");
+    expect(new Bun.Glob("hc-key*").match(base)).toBe(true);
+    expect(new Bun.Glob("hc-key*").match("hc-key.4242.abcdefabcdef.tmp")).toBe(true);
+  });
+  test("a crash between write and rename: every start removes and logs the leftovers, the legacy temporary names included", async () => {
+    const { mkdtempSync, writeFileSync, readdirSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "keeper-sweep-"));
+    writeFileSync(join(dir, "hc-key"), "real-key-0123456789\n");
+    writeFileSync(join(dir, "hc-key.tmp-0a1b2c3d4e5f"), "half-written\n");
+    writeFileSync(join(dir, "hc-key.4242.abcdefabcdef.tmp"), "from 0.1.8\n");
+    writeFileSync(join(dir, "hc-key-old"), "keeper-sentinel-abc\n");
+    writeFileSync(join(dir, "state.json"), "{}");
+    const files = keyFiles(dir);
+    expect(files.sweep().sort()).toEqual(["hc-key-old", "hc-key.4242.abcdefabcdef.tmp", "hc-key.tmp-0a1b2c3d4e5f"]);
+    expect(readdirSync(dir).sort()).toEqual(["hc-key", "state.json"]);
+    // at start, through the keeper
+    const r = rig({ saved: null });
+    (r.k as any).d.keyFiles = { place: () => [], clear: () => {}, sweep: () => ["hc-key.tmp-0a1b2c3d4e5f", "hc-key.4242.abcdefabcdef.tmp"] };
+    r.k.start();
+    expect(r.logs).toContain("removed a leftover key file hc-key.tmp-0a1b2c3d4e5f (a temporary file from an interrupted write)");
+    expect(r.logs).toContain("removed a leftover key file hc-key.4242.abcdefabcdef.tmp (a temporary file from an interrupted write)");
+  });
+});
+
+describe("0.1.9 B: the bounded cleanup of kept backups", () => {
+  // A kept backup of an ended attempt, as a cancel leaves it; the list holds it under its own name.
+  async function keptOne(r: ReturnType<typeof rig>, head = HEAD) {
+    const id = idOf(head);
+    r.f.makeBackup = async () => ({ slug: `kb-${r.backupsMade.length}` });   // a slug of its own for each backup
+    await r.register({ head }); await r.poll();
+    await r.k.cancel(CAIN, id, { why: "gave up" });
+    const a = r.k.st.attempts[id];
+    r.f.backupsList = [...(r.f.backupsList ?? []), { slug: a.backup, name: a.backupName! }];
+    return a;
+  }
+  test("only Keeper's own kept backups are deleted: an owner backup older than 48 hours, an unrecorded Keeper name and a drill's survive", async () => {
+    const r = rig();
+    const a = await keptOne(r);
+    r.f.backupsList!.push({ slug: "owner1", name: "Automatic backup 2026.11.1" }, { slug: "kb-x", name: `Keeper ${idOf(headN(9))} 0a0b0c0d` });
+    r.advance(49 * 3_600_000);
+    r.k.st.cleanupAt = r.now - CLEANUP_TICK_MS;            // the daily tick is due
+    await r.poll();
+    expect(r.deleted).toEqual([a.backup]);
+    expect(r.logs.some((l) => l.startsWith(`the cleanup deleted kept backup ${a.backup} ("${a.backupName}") of ${a.id}, generation ${a.gen}, 49 hours after its claim ended`))).toBe(true);
+    expect(r.k.st.keptBackups).toEqual({});
+  });
+  test("the grace: nothing within 2 hours of a claim's end; past it at most two kept, the oldest deleted first", async () => {
+    const r = rig();
+    const a1 = await keptOne(r, headN(1)); r.advance(60_000);
+    const a2 = await keptOne(r, headN(2)); r.advance(60_000);
+    const a3 = await keptOne(r, headN(3));
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    expect(r.deleted).toEqual([]);                          // all three inside the 2-hour grace
+    r.advance(KEPT_GRACE_MS);
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    expect(r.deleted).toEqual([a1.backup]);
+    expect(Object.keys(r.k.st.keptBackups!).sort()).toEqual([a2.backup, a3.backup].sort());
+  });
+  test("never beside a live claim, never while an install job runs, never with a jobs list it can't read", async () => {
+    const r = rig();
+    const a = await keptOne(r, headN(1));
+    await r.register({ head: headN(2) }); await r.poll(); r.claim(idOf(headN(2)));
+    r.advance(49 * 3_600_000);                              // the claim is past its deadline but not yet ended: expiring
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    expect(r.deleted).toEqual([]);
+    expect(r.logs).toContain(`the cleanup of kept backups (the daily tick) didn't run: ${idOf(headN(2))} is claimed (never beside a live or expiring claim)`);
+    await r.k.cancel(CAIN, idOf(headN(2)), {});
+    r.f.activeJobs = ["addon_manager_install"];
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    r.f.activeJobs = null;
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    expect(r.deleted).toEqual([]);
+    r.f.activeJobs = [];
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    expect(r.deleted).toEqual([a.backup]);
+  });
+  test("the claim and generation are read again right before each delete: a changed generation leaves the backup", async () => {
+    const r = rig();
+    const a = await keptOne(r);
+    r.advance(49 * 3_600_000);
+    r.k.st.keptBackups![a.backup].gen = a.gen! + 7;        // a record bound to another generation
+    await r.k.record((f) => r.k.cleanup("the daily tick", f));
+    expect(r.deleted).toEqual([]);
+  });
+  test("the daily tick holds the bound: kept at most 48 hours plus one tick", async () => {
+    const r = rig();
+    const a = await keptOne(r);
+    for (let h = 0; h < 72 && !r.deleted.length; h++) { r.advance(3_600_000); await r.poll(); }
+    expect(r.deleted).toEqual([a.backup]);
+    const age = r.now - r.k.st.attempts[a.id].endedAt!;
+    expect(age).toBeLessThanOrEqual(KEPT_MAX_MS + CLEANUP_TICK_MS + 3_600_000);
+    expect(age).toBeGreaterThanOrEqual(KEPT_MAX_MS);
+  });
+  test("an install starting while the cleanup holds the lock waits, and its own backup survives", async () => {
+    const r = rig();
+    const old = await keptOne(r, headN(1));
+    r.advance(49 * 3_600_000);
+    let finish: (v: boolean) => void = () => {};
+    (r.k as any).d.lockCallMs = 10_000; (r.k as any).d.lockStepMs = 10_000;
+    (r.k as any).d.deleteBackup = (b: string) => { r.deleted.push(b); return new Promise<boolean>((res) => { finish = res; }); };
+    const cleaning = r.k.record((f) => r.k.cleanup("the daily tick", f));
+    await Bun.sleep(5);
+    expect(r.deleted).toEqual([old.backup]);                // the delete is in flight, the lock held
+    r.f.makeBackup = async () => ({ slug: `kb-new-${r.backupsMade.length}` });
+    const reg = r.register({ head: headN(2) });
+    await Bun.sleep(20);
+    expect(r.backupsMade).toHaveLength(1);                  // the new install's backup waits for the lock
+    finish(true); await cleaning;
+    const ans = await reg;
+    expect(ans.status).toBe(200);
+    const mine = r.k.st.attempts[idOf(headN(2))];
+    expect(mine.backup).not.toBe(old.backup);
+    expect(mine.gen).toBeGreaterThan(old.gen!);
+    r.advance(3 * 86_400_000); await r.poll(2);
+    expect(r.deleted).toEqual([old.backup]);                // its own backup is never the cleanup's
+  });
+  test("a new backup needs the free-space reserve (the last size and a half): one that can't fit is refused, logged and paged", async () => {
+    const r = rig();
+    r.f.backup = { ...r.f.backup!, size: 600 } as any;      // 600 MB
+    await r.register({ head: headN(1) }); await r.poll();
+    expect(r.k.st.lastBackupBytes).toBe(600 * 1024 * 1024);
+    await r.k.cancel(CAIN, idOf(headN(1)), {});
+    r.f.backupsList = [{ slug: r.k.st.attempts[idOf(headN(1))].backup, name: r.k.st.attempts[idOf(headN(1))].backupName! }];
+    r.f.free = 1024 ** 3 + 800 * 1024 * 1024;               // under 900 MB plus the 1 GB reserve
+    const ans = await r.register({ head: headN(2) });
+    expect(ans.status).toBe(409);
+    expect(String(ans.body.why)).toContain("no room for its backup: only 1824 MB is free for backups, and its backup needs about 900 MB plus a reserve of 1024 MB");
+    expect(r.logs.some((l) => l.startsWith(`refused a new backup for ${idOf(headN(2))}`) && l.includes("the cleanup couldn't free enough"))).toBe(true);
+    expect(r.logs.some((l) => l.startsWith("owner: Keeper can't protect the install") && l.includes("no room for its backup"))).toBe(true);
+    expect(r.backupsMade).toHaveLength(1);
+    r.f.free = null;
+    expect(String((await r.register({ head: headN(3) })).body.why)).toContain("the free space for backups couldn't be read");
+  });
+});
+
+describe("0.1.9 C: the guards as hard refusals", () => {
+  test("hc-key is refused until the backup check passed on the device", async () => {
+    const r = rig({ backupCheck: false });
+    const res = await r.k.hcKeyEnter(codeIn(r.logs, "hc-key"), "hc-read-key-0123456789");
+    expect(res.ok).toBe(false);
+    expect(res.why).toContain("the backup check hasn't passed on the device");
+    expect(r.k.armableWhy()).toBe(BACKUP_CHECK_WHY);
+  });
+  function checkRig(archive: (sentinel: string) => Uint8Array | null) {
+    const r = rig({ backupCheck: false });
+    const placed: string[] = [];
+    let sentinel = "", cleared = false;
+    (r.k as any).d.keyFiles = { place: (s: string) => { sentinel = s; placed.push("hc-key", "hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp"); return [...placed]; }, clear: () => { cleared = true; }, sweep: () => [] };
+    (r.k as any).d.download = async () => archive(sentinel);
+    return { r, get cleared() { return cleared; } };
+  }
+  test("the backup check passes on a backup that leaves out every key file and holds no key; its test backup and sentinels are removed", async () => {
+    const c = checkRig(() => haBackup([["./addon.json", "{}"], ["./data/state.json", "{\"format\":1}"], ["./data/options.json", "{}"]]));
+    expect(await c.r.k.backupCheck()).toEqual({ ok: true, why: "" });
+    expect(c.r.k.st.backupCheck?.names).toEqual(["hc-key", "hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp"]);
+    expect(c.cleared).toBe(true);
+    expect(c.r.backupsMade).toEqual(["0fcc2575_keeper"]);
+    expect(c.r.deleted).toHaveLength(1);
+  });
+  test("the backup check fails on a key file's name, current or legacy, on the sentinel or a key's value anywhere, and on an unreadable archive", async () => {
+    for (const files of [[["./data/hc-key", "x"]], [["./data/hc-key.1.abcdefabcdef.tmp", "x"]], [["./data/hc-key.tmp-aa", "x"]]] as [string, string][][]) {
+      const c = checkRig(() => haBackup(files));
+      const res = await c.r.k.backupCheck();
+      expect(res.ok).toBe(false);
+      expect(res.why).toContain("is a key file's name");
+      expect(c.r.k.st.backupCheck).toBeUndefined();
+      expect(c.cleared).toBe(true);
+    }
+    const s = checkRig((sent) => haBackup([["./data/options.json", `{"note":"${sent}"}`]]));
+    expect((await s.r.k.backupCheck()).why).toContain("holds a key value, a key's fingerprint or the sentinel");
+    const k = checkRig(() => haBackup([["./data/options.json", "{\"hc_api_key\":\"hc-read-key-0123456789\"}"]]));
+    expect((await k.r.k.backupCheck()).why).toContain("holds key material");
+    const u = checkRig(() => null);
+    expect((await u.r.k.backupCheck()).why).toContain("couldn't be downloaded");
+    const g = checkRig(() => new Uint8Array([1, 2, 3]));
+    expect((await g.r.k.backupCheck()).ok).toBe(false);
+  });
+  test("arming is refused until the old key's rotation is attested by the owner's tap; Cain's own note never satisfies it", async () => {
+    const r = rig({ opts: { hc_api_key: "old-key-0123456789abcdef" } });
+    const id = r.k.st.oldKey!.id;
+    expect(id).toMatch(/^[0-9a-f]{12}$/);
+    expect(JSON.stringify(r.k.st)).not.toContain("old-key-0123456789abcdef");
+    delete r.f.options.hc_api_key; await r.poll();
+    expect(r.k.armableWhy()).toContain(`the old Healthchecks key (id ${id}) isn't attested as rotated`);
+    expect(r.k.rotationView(CAIN).body).toMatchObject({ needed: true, old_key_id: id });
+    for (const bad of ["I rotated it", rotationToken(id, r.now, { key: OTHER }), rotationToken("000000000000", r.now), rotationToken(id, r.now, { kind: "other" }), rotationToken(id, r.now, { ttl: -10 })]) {
+      expect((await r.k.attestRotation(CAIN, { attestation: bad })).status).toBe(409);
+    }
+    expect((await r.k.attestRotation(HARNESS, { attestation: rotationToken(id, r.now) })).status).toBe(403);
+    expect(r.k.armableWhy()).toContain("isn't attested as rotated");
+    expect((await r.k.attestRotation(CAIN, { attestation: rotationToken(id, r.now) })).status).toBe(200);
+    expect(r.k.armableWhy()).toBe("");
+    expect(r.k.rotationView(CAIN).body).toMatchObject({ needed: false, old_key_id: id });
+  });
+  test("where the old key was kept, it is tried first: the alert service must reject it", async () => {
+    const r = rig();
+    let kept = "", dropped = false, answer: "accepted" | "rejected" | null = "accepted";
+    (r.k as any).d.oldKeyStore = { load: () => kept, store: (k: string) => { kept = k; return true; }, drop: () => { dropped = true; kept = ""; } };
+    (r.k as any).d.hcTry = async () => answer;
+    r.f.options.hc_api_key = "old-key-0123456789abcdef"; await r.poll();
+    // while the option is still there, no attestation counts
+    expect(String((await r.k.attestRotation(CAIN, { attestation: rotationToken(r.k.st.oldKey!.id, r.now) })).body.why)).toBe(OLD_KEY_WHY);
+    delete r.f.options.hc_api_key; await r.poll();
+    const tok = () => rotationToken(r.k.st.oldKey!.id, r.now);
+    expect(String((await r.k.attestRotation(CAIN, { attestation: tok() })).body.why)).toContain("still accepts the old key");
+    answer = null;
+    expect(String((await r.k.attestRotation(CAIN, { attestation: tok() })).body.why)).toContain("didn't answer the old key's try");
+    answer = "rejected";
+    expect((await r.k.attestRotation(CAIN, { attestation: tok() })).status).toBe(200);
+    expect(dropped).toBe(true);
+    expect(r.k.st.rotation!.tried).toBe("rejected by the alert service");
+  });
+  test("an options read that fails or times out counts as the old option present: not armable, hc-key refused", async () => {
+    const r = rig();
+    expect(r.k.armableWhy()).toBe("");
+    (r.k as any).d.options = () => new Promise(() => {});
+    await r.poll();
+    expect(r.k.armableWhy()).toBe(OPTIONS_UNKNOWN_WHY);
+    expect((await r.k.hcKeyEnter(codeIn(r.logs, "hc-key"), "hc-read-key-0123456789")).why).toBe(OPTIONS_UNKNOWN_WHY);
+    (r.k as any).d.options = () => { throw new Error("down"); };
+    await r.poll();
+    expect(r.k.armableWhy()).toBe(OPTIONS_UNKNOWN_WHY);
+    (r.k as any).d.options = () => JSON.parse(JSON.stringify(withKeys(r.f.options)));
+    await r.poll();
+    expect(r.k.armableWhy()).toBe("");
+  });
+  test("every check's identity must be set by its unique key: a role without one refuses arming", () => {
+    const r = rig({ uniq: false });
+    expect(r.k.armableWhy()).toContain("every check's identity must be set by its unique key in hc_unique_keys");
+    expect(r.k.armableWhy()).toContain("hc_done (the heartbeat check) (done)");
+  });
+});
+
+describe("0.1.9 D: the enrollment code only on demand", () => {
+  test("no key-confirm code at start, unenrolled or not; key-code prints one", async () => {
+    const r = rig({ confirm: false });
+    expect(codeIn(r.logs, "key-confirm")).toBe("");
+    r.k.start();
+    expect(codeIn(r.logs, "key-confirm")).toBe("");
+    expect(r.k.keyCode().ok).toBe(true);
+    expect(codeIn(r.logs, "key-confirm")).toMatch(/^[0-9a-f]{10}$/);
+  });
+  test("codes printed by an earlier build are void at this build's first start", async () => {
+    const r = rig({ confirm: false });
+    r.k.keyCode();
+    const old = codeIn(r.logs, "key-confirm");
+    const saved: any = JSON.parse(JSON.stringify(r.saved));
+    delete saved.codeEpoch;                                // a state an earlier build wrote
+    const again = rig({ saved, confirm: false });
+    expect(again.logs.some((l) => /^the one-time codes printed by an earlier build are void \(.*\bkey\b/.test(l))).toBe(true);
+    expect(again.k.keyConfirm(keyFp(PUB), old).ok).toBe(false);
+    expect(again.k.st.codeEpoch).toBe(CODE_EPOCH);
+    const third = rig({ saved: again.saved, confirm: false });   // this build's own codes survive its restarts
+    expect(third.logs.some((l) => l.startsWith("the one-time codes printed by an earlier build are void"))).toBe(false);
+  });
+});
+
+describe("0.1.9 E: the text and the docs", () => {
+  const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8").replace(/\s+/g, " ");
+  const limits = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options"));
+  test("the installer limit: a claim is not a single-use installer authorization, and the one-installer rule covers every entry point", () => {
+    for (const t of [
+      "A claim is not a single-use installer authorization.",
+      "An install needs your Ship tap and the link's Ship token for that pull request and head, good for 2 hours after your tap; a claim authorizes nothing.",
+      "A claim is single use only in this sense: one claimant, consumed by the one install it covers, and it covers no other install.",
+      "The one-installer rule applies to every entry point: a Ship card, Home Assistant's own page, a laptop session, and break glass alike.",
+      "wait for the recorded claim end in Keeper's log",
+      // the expiry's end line
+      "its deadline was <time>`, and `<attempt>: ended; backup kept: its claim <claim id> expired unused",
+    ]) expect(limits).toContain(t);
+  });
+  test("the delivery text: arming expires at the configured interval (14 days default and maximum), and what a failed drill does", () => {
+    expect(limits).toContain("Arming expires at the configured interval: option `drill_days`, 14 days by default and at most");
+    expect(limits).toContain("A failed drill: a phone test whose page didn't reach your phone can't be confirmed");
+    expect(limits).toContain("Keeper stays unarmed until a new one is confirmed");
+  });
+  test("the card and the docs say Keeper covers only the first 15 minutes after an install", () => {
+    const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
+    expect(cfg).toContain("Covers only the first 15 minutes after each App install");
+    expect(docs).toContain("It covers only the first 15 minutes after an install");
+    expect(limits).toContain("Keeper covers only the first 15 minutes after an install.");
+  });
+  test("the full-Pi restore from a fresh Home Assistant is named untested; the partial restore is the exercised path", () => {
+    expect(docs).toContain("A partial restore through Home Assistant's backup page (Settings, System, Backups, one App's backup) is the exercised path");
+    expect(docs).toContain("A full restore of the whole Pi from a fresh Home Assistant is untested");
+  });
+  test("the checks before arming name both temporary names the backup must omit, current and legacy", () => {
+    const sec = docs.slice(docs.indexOf("**The checks before arming, refusals in code (0.1.9).**"), docs.indexOf("## Arming"));
+    expect(sec).toContain("`hc-key.tmp-`");
+    expect(sec).toContain("`hc-key.<pid>.<hex>.tmp`");
+    expect(sec).toContain("the backup must leave out every one of those names");
   });
 });
