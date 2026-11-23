@@ -39,7 +39,9 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
     async backupInfo(slug: string): Promise<BackupInfo | null> {
       const r = await call("GET", `/backups/${encodeURIComponent(slug)}/info`);
       if (!r.ok || !r.data) return null;
-      return { ...(Number(r.data.size) > 0 ? { size: Number(r.data.size) } : {}), homeassistant: r.data.homeassistant ?? null, addons: Array.isArray(r.data.addons) ? r.data.addons.map((a: any) => ({ slug: String(a?.slug ?? ""), version: String(a?.version ?? "") })) : [],
+      // 0.1.10: the size as reported, zero included (sizeMb), and in bytes where the Supervisor gives it (size_bytes)
+      return { ...(Number(r.data.size) > 0 ? { size: Number(r.data.size) } : {}), ...(Number.isFinite(Number(r.data.size)) && r.data.size !== null ? { sizeMb: Number(r.data.size) } : {}),
+        ...(Number.isSafeInteger(r.data.size_bytes) ? { sizeBytes: r.data.size_bytes } : {}), homeassistant: r.data.homeassistant ?? null, addons: Array.isArray(r.data.addons) ? r.data.addons.map((a: any) => ({ slug: String(a?.slug ?? ""), version: String(a?.version ?? "") })) : [],
         folders: Array.isArray(r.data.folders) ? r.data.folders : [], protected: r.data.protected, ...(typeof r.data.date === "string" ? { date: r.data.date } : {}) };
     },
     // (0.1.3) The keeper's own backup of one App: partial, that App alone, no Home Assistant, no folders,
@@ -82,6 +84,19 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
         const b = new Uint8Array(await r.arrayBuffer());
         return b.length > 200 * 1024 * 1024 ? null : b;
       } catch { return null; }
+    },
+    // (0.1.10) The same download, written to a file (the backup check's own folder), so an interrupted check leaves a file
+    // the next start removes rather than nothing it can name. True once the whole body is written.
+    async downloadTo(slug: string, path: string): Promise<boolean> {
+      try {
+        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(120_000) });
+        if (r.status !== 200) return false;
+        const b = new Uint8Array(await r.arrayBuffer());
+        if (b.length > 200 * 1024 * 1024) return false;
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(path, b, { mode: 0o600 });
+        return true;
+      } catch { return false; }
     },
     // (0.1.6) An orphan backup's delete (DELETE /backups/<slug>, within the backup role): true only on the
     // Supervisor's ok.

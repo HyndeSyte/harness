@@ -196,17 +196,41 @@ export const PHONE_WINDOW_MS = 60 * 60_000;      // (0.1.3) a phone test is conf
 export const KEY_CODE_MS = 24 * 3_600_000;       // (0.1.6) the key-confirm code lasts this long (a restart prints a new one)
 export const MHB_MAX_MS = 14 * 86_400_000;       // (0.1.6) arming needs a missed-heartbeat drill confirmed within this
 export const MHB_CAP_MS = 30 * 60_000;           // (0.1.7) the missed-heartbeat drill's silence ends here at the latest
-export const LIMITS_VERSION = 3;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2; 0.1.9: 3)
+export const LIMITS_VERSION = 4;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2; 0.1.9: 3; 0.1.10: 4)
 export const LOCK_CALL_MS = 10_000;              // (0.1.8) each external call under the claim record's lock is bounded by this
 export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the lock that runs past this is logged and the lock released
-export const KEPT_GRACE_MS = 2 * 3_600_000;       // (0.1.9) a kept backup is never touched within this of its claim's end
+// (0.1.10) The hook's bound: its 10-second pass budget and a pending pass started again a minute apart, up to 6 times, rounded
+// up. The kept backups' grace is strictly longer than the Ship token's life plus this, so no backup a still-valid token's run
+// could reach is ever deleted.
+export const HOOK_BOUND_MS = 10 * 60_000;
+export const KEPT_GRACE_MS = 150 * 60_000;       // (0.1.9) a kept backup is never touched within this of its claim's end (0.1.10: 2 hours 30 minutes)
 export const KEPT_MAX_MS = 48 * 3_600_000;       // (0.1.9) and kept at most this long (plus one cleanup tick)
 export const CLEANUP_TICK_MS = 24 * 3_600_000;   // (0.1.9) the cleanup's daily tick
 export const KEPT_MAX_COUNT = 2;                 // (0.1.9) at most this many unclaimed backups kept
 export const SPACE_RESERVE_BYTES = 1024 ** 3;    // (0.1.9) free space kept beyond the projected backup
-export const DEFAULT_BACKUP_BYTES = 256 * 1024 ** 2;   // (0.1.9) the projected backup when no earlier size is known
+export const FIRST_BACKUP_BYTES = 2 * 1024 ** 3;   // (0.1.10) the reserve floor for a first backup (no last size) when the App's image size isn't known
+export const ROTATION_CHALLENGE_MS = 10 * 60_000; // (0.1.10) a rotation challenge is good this long, and used once
+// (0.1.10) The backup exclusion as this build ships it (config.yaml backup_exclude, checked equal by the tests): a backup
+// check's pass is tied to its hash, so a change of the exclusion voids the pass.
+export const BACKUP_EXCLUDE = ["hc-key*", "*/hc-key*"];
+const globRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")}$`);
+export const excludedName = (name: string) => BACKUP_EXCLUDE.some((g) => globRe(g).test(name));
+export const EXCLUDE_HASH = createHash("sha256").update(JSON.stringify(BACKUP_EXCLUDE)).digest("hex").slice(0, 12);
+export const CHECK_CONTROL_FILE = "backup-check-control";   // (0.1.10) the positive control's file: NOT in the exclusion
 export const CODE_EPOCH = 9;                     // (0.1.9) codes printed by builds before this one are void
 export const ROTATION_TTL_S = 3600;              // (0.1.9) a rotation attestation is good this long after the tap
+export const ROTATION_PROOF_TAP = "attested by your tap only";   // (0.1.10) no old key was kept, so nothing was tried
+export const ROTATION_PROOF_TRIED = "your tap, and the alert service turning the old key down";
+// (0.1.10) The old key's try judged: revoked only on a 401, or the alert service's documented invalid-key answer
+// ({"error": "wrong api key"}, Healthchecks' API docs); valid on a 200; anything else, a bare 403 included, proves nothing.
+export function revocation(r: { status: number; error?: string } | null): { state: "revoked" | "valid" | "unknown"; why: string } {
+  if (!r) return { state: "unknown", why: "no answer" };
+  if (r.status === 401) return { state: "revoked", why: "401" };
+  if (r.status >= 400 && r.status < 500 && /^wrong api key$/i.test(s(r.error))) return { state: "revoked", why: `${r.status} wrong api key` };
+  if (r.status === 200) return { state: "valid", why: "200" };
+  if (r.status === 403) return { state: "unknown", why: "a bare 403, which doesn't prove the key revoked" };
+  return { state: "unknown", why: `an answer of ${r.status}` };
+}
 // (0.1.9) The key file's names: the kept key, the old key (kept only to try it once), the temporary files' fixed prefix,
 // and the earlier builds' temporary names. config.yaml's backup_exclude covers every one ("hc-key*").
 export const KEY_FILE = "hc-key", OLD_KEY_FILE = "hc-key-old", KEY_TMP_PREFIX = "hc-key.tmp-";
@@ -453,6 +477,8 @@ export interface Attempt {
   claimEndSaid?: boolean;                        // (0.1.8) the claim's end logged (one line)
   quietAt?: number;                              // (0.1.8) a poll after an unused claim's deadline saw no version change
   gen?: number;                                  // (0.1.9) the generation its backup is bound to (State.gen, never reused)
+  code?: "no_space";                             // (0.1.10) why it was refused, as a code the link reads (no room for its backup)
+  lateBackup?: number;                           // (0.1.10) its backup's create outran its bound: looked up by its name under the lock
 }
 // (0.1.9) A backup kept after its attempt ended unused (a cancel, an expiry): bound to the attempt and its generation,
 // left for the bounded cleanup only.
@@ -511,9 +537,11 @@ export interface State {
   keptBackups?: Record<string, KeptRec>;                 // (0.1.9) kept backups by slug, for the bounded cleanup
   cleanupAt?: number;                             // (0.1.9) the cleanup's last run (the daily tick)
   lastBackupBytes?: number;                       // (0.1.9) the last backup's size: the projection for the next
-  backupCheck?: { at: number; names: string[]; slug: string };   // (0.1.9) the backup check that passed on the device
+  backupCheck?: { at: number; names: string[]; slug: string; exclude?: string };   // (0.1.9) the backup check that passed on the device (0.1.10: tied to the exclusion's hash)
+  backupCheckRun?: { name: string; at: number; slug?: string };   // (0.1.10) a backup check's test backup, its name recorded before it is made
+  rotationChallenge?: { value: string; at: number; until: number; enroll: string; id: string };   // (0.1.10) the single-use challenge a rotation attestation must carry
   oldKey?: { id: string; seenAt: number };        // (0.1.9) the old hc_api_key option's id (a hash), once seen
-  rotation?: { id: string; attestedAt: number; tried: string; tok: string };   // (0.1.9) its rotation, attested by the owner's tap
+  rotation?: { id: string; attestedAt: number; tried: string; tok: string; proof?: string };   // (0.1.9) its rotation, attested by the owner's tap (0.1.10: proof)
   codeEpoch?: number;                             // (0.1.9) the build epoch the kept codes were printed under
   mhb?: MhbRun;                                  // (0.1.6) the missed-heartbeat drill, running or awaiting its confirm
   mhbRec?: MhbRec;                               // (0.1.6) the missed-heartbeat drill, confirmed
@@ -550,7 +578,9 @@ export function loadState(raw: unknown): State {
     ...(Number(r.enrollRefused) > 0 ? { enrollRefused: Number(r.enrollRefused) } : {}), ...(r.drillDue && typeof r.drillDue === "object" ? { drillDue: obj(r.drillDue) as any } : {}),
     ...(Number(r.gen) > 0 ? { gen: Math.floor(Number(r.gen)) } : {}), ...(r.keptBackups && typeof r.keptBackups === "object" ? { keptBackups: obj(r.keptBackups) as any } : {}),
     ...(Number(r.cleanupAt) > 0 ? { cleanupAt: Number(r.cleanupAt) } : {}), ...(Number(r.lastBackupBytes) > 0 ? { lastBackupBytes: Number(r.lastBackupBytes) } : {}),
-    ...(r.backupCheck && Number(r.backupCheck.at) > 0 ? { backupCheck: r.backupCheck } : {}), ...(r.oldKey && typeof r.oldKey.id === "string" ? { oldKey: r.oldKey } : {}),
+    ...(r.backupCheck && Number(r.backupCheck.at) > 0 ? { backupCheck: r.backupCheck } : {}),
+    ...(r.backupCheckRun && typeof r.backupCheckRun.name === "string" ? { backupCheckRun: r.backupCheckRun } : {}),
+    ...(r.rotationChallenge && typeof r.rotationChallenge.value === "string" ? { rotationChallenge: r.rotationChallenge } : {}), ...(r.oldKey && typeof r.oldKey.id === "string" ? { oldKey: r.oldKey } : {}),
     ...(r.rotation && typeof r.rotation.id === "string" ? { rotation: r.rotation } : {}), ...(Number(r.codeEpoch) > 0 ? { codeEpoch: Number(r.codeEpoch) } : {}),
     ...(r.mhbRec && Number(r.mhbRec.confirmedAt) > 0 ? { mhbRec: r.mhbRec } : {}), ...(typeof r.hcRwSaid === "string" ? { hcRwSaid: r.hcRwSaid } : {}), ...(typeof r.keyChangeSaid === "string" ? { keyChangeSaid: r.keyChangeSaid } : {}), lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any, probeHash: obj(r.probeHash) as any,
     outstanding: obj(r.outstanding) as any, last: obj(r.last) as any, drills: obj(r.drills) as any, phone: obj(r.phone) as any,
@@ -562,7 +592,8 @@ export function loadState(raw: unknown): State {
 
 // -- the parts it is given ------------------------------------------------------------------------
 export interface AppInfo { version: string; state: string }
-export interface BackupInfo { homeassistant: unknown; addons: { slug: string; version: string }[]; folders: unknown[]; protected?: unknown; date?: string; size?: number }
+export interface BackupInfo { homeassistant: unknown; addons: { slug: string; version: string }[]; folders: unknown[]; protected?: unknown; date?: string; size?: number;
+  sizeMb?: number; sizeBytes?: number }   // (0.1.10) the size as reported (MB, two decimals), and in bytes where the Supervisor gives it
 // The restore call's answer (0.1.3): started (the Supervisor took it; its job id when it gave one),
 // refused (a 4xx), or unknown (a 5xx, no answer, or an answer that isn't one: it may have run). 0.1.5:
 // refused and unknown are handled alike (unresolved, never sent again); retry is only reported.
@@ -609,10 +640,17 @@ export interface Deps {
   diskFree?: () => Promise<number | null>;        // (0.1.9) free bytes where backups go; null: unreadable
   // (0.1.9) the backup check: place a sentinel in every key file name (current and legacy, the real key's files left as
   // they are), clear them again, and download a backup's archive (null: unreadable)
-  keyFiles?: { place: (sentinel: string) => string[]; clear: () => void; sweep: () => string[] };
+  // 0.1.10: place never writes over a name in skip (a kept key's file); read reads a placed file back; control writes the
+  // positive control in a file outside the exclusion and answers its name; clear removes it too.
+  keyFiles?: { place: (sentinel: string, skip?: string[]) => string[]; read?: (name: string) => string | null; control?: (value: string) => string | null; clear: () => void; sweep: () => string[] };
   download?: (slug: string) => Promise<Uint8Array | null>;
-  oldKeyStore?: { load: () => string; store: (key: string) => boolean; drop: () => void };   // (0.1.9) the old key, to try it once
-  hcTry?: (key: string) => Promise<"accepted" | "rejected" | null>;   // (0.1.9) the Healthchecks API with that key; null: no answer
+  archives?: { sweep: () => string[] };            // (0.1.10) downloaded archives left behind by an interrupted check: removed, named
+  // (0.1.9) the old key, to try it once; 0.1.10: name, its file's name in the data folder (checked inside the exclusion first)
+  oldKeyStore?: { load: () => string; store: (key: string) => boolean; drop: () => void; name?: string };
+  // (0.1.9) the Healthchecks API with that key, a read-only GET of the checks list; 0.1.10: its status and its error text, judged
+  // by revocation() (null: no answer)
+  hcTry?: (key: string) => Promise<{ status: number; error?: string } | null>;
+  imageBytes?: (app: string) => Promise<number | null>;   // (0.1.10) the App's image size, when known: the first backup's reserve
   lockCallMs?: number; lockStepMs?: number;       // (0.1.8) the lock's bounds (LOCK_CALL_MS, LOCK_STEP_MS; tests: shorter)
 }
 export type Answer = { status: number; body: Record<string, unknown> };
@@ -641,6 +679,8 @@ export class Keeper {
   private lockGen = 0;                                 // (0.1.9) the lock's step generation (Fence)
   private optionsUnknown = false;                      // (0.1.9) the last options read failed or timed out
   private cleanupDue = true;                           // (0.1.9) the cleanup at start (the first poll)
+  private pendingOps = new Map<string, Promise<unknown>>();   // (0.1.10) operations whose write outlived their step
+  private checking = false;                            // (0.1.10) a backup check runs
   constructor(private d: Deps, saved: unknown) {
     this.st = loadState(saved);
     if (!this.st.createdAt) { this.st.createdAt = d.now(); d.log(`state created at ${new Date(this.st.createdAt).toISOString()}: Ship tokens issued before it are refused`); }
@@ -655,8 +695,17 @@ export class Keeper {
   // 0.1.9: each step gets its own generation (Fence). Its commits check fence.live() first, in the same tick as the
   // write; an external write goes through fence.write(), and one in flight when the step runs out keeps the lock until
   // it ends (its own bookkeeping included); after that the step's generation is over and it changes nothing.
-  record<T>(fn: (f: Fence) => T | Promise<T>, fallback?: (why: string) => T): Promise<T> {
+  // 0.1.10: a step that runs out with an external write still in flight answers at once through fallback with pending true
+  // (a route says "pending"), while the lock stays held until that write's outcome is known; op names the operation, and a
+  // retry of the same op meanwhile answers pending again without starting it twice; once the write ended, a retry runs the
+  // step afresh, which reads the recorded outcome (reconciles the same operation).
+  record<T>(fn: (f: Fence) => T | Promise<T>, fallback?: (why: string, pending: boolean) => T, op?: string): Promise<T> {
     const stepMs = this.d.lockStepMs ?? LOCK_STEP_MS;
+    if (op && this.pendingOps.has(op) && fallback) {
+      this.d.log(`a retry of ${op} while its write is still in flight: answered pending, nothing started again`);
+      return Promise.resolve(fallback("its write is still in flight", true));
+    }
+    let hold: Promise<unknown> | null = null;
     const step = async (): Promise<T> => {
       const gen = ++this.lockGen;
       let expired = false;
@@ -679,16 +728,20 @@ export class Keeper {
         expired = true;
         const why = String((e as Error)?.message ?? e).slice(0, 120);
         if (inflight.size) {
-          this.d.log(`a step under the claim record's lock failed (${why}) with a write in flight: the lock is held until that write ends`);
-          await Promise.allSettled([...inflight]);
+          this.d.log(`a step under the claim record's lock failed (${why}) with a write in flight: the lock is held until that write ends${op ? `, and ${op} answers pending meanwhile` : ""}`);
+          const all = Promise.allSettled([...inflight]).then(() => { if (op) { this.pendingOps.delete(op); this.d.log(`${op}: its write in flight ended; the lock is released, and a retry reconciles it`); } });
+          hold = all;
+          if (op) this.pendingOps.set(op, all);
+          if (fallback) return fallback(why, true);
+          throw e;
         }
         this.d.log(`a step under the claim record's lock failed (${why}): the lock is released for the next one, and that step's generation ${gen} changes nothing more`);
-        if (fallback) return fallback(why);
+        if (fallback) return fallback(why, false);
         throw e;
       } finally { if (t) clearTimeout(t); }
     };
     const run = this.lock.then(step, step);
-    this.lock = run.catch(() => undefined);
+    this.lock = run.catch(() => undefined).then(() => hold ?? undefined);
     return run;
   }
   // (0.1.8) An external call under the lock, bounded: null when it throws or doesn't answer within LOCK_CALL_MS.
@@ -720,7 +773,10 @@ export class Keeper {
       if (this.st.oldKey?.id !== id) {
         this.st.oldKey = { id, seenAt: this.now() };
         let kept = false;
-        try { kept = this.d.oldKeyStore?.store(old) ?? false; } catch { kept = false; }
+        // (0.1.10) written only once its file's name is checked inside the backup exclusion
+        const file = this.d.oldKeyStore?.name ?? OLD_KEY_FILE;
+        if (this.d.oldKeyStore && !excludedName(file)) this.d.log(`the old key isn't kept: its file ${file} isn't inside the backup exclusion (${BACKUP_EXCLUDE.join(", ")}), so its rotation is attested by your tap only`);
+        else { try { kept = this.d.oldKeyStore?.store(old) ?? false; } catch { kept = false; } }
         this.d.log(`the old option hc_api_key holds a key with id ${id}: arming waits until its rotation is attested by the owner's tap on the card Cain's link posts naming that id${kept ? " (the old key is kept root-only to try it once then, and the alert service must reject it)" : ""}`);
         this.save();
       }
@@ -849,7 +905,7 @@ export class Keeper {
     if (this.oldKeyOption) { this.d.log(`refused the Healthchecks key entered: ${OLD_KEY_WHY}; nothing was kept`); return { ok: false, why: OLD_KEY_WHY }; }
     // (0.1.9) refused while the options can't be read, and until the backup check passed on the device
     if (this.optionsUnknown) { this.d.log(`refused the Healthchecks key entered: ${OPTIONS_UNKNOWN_WHY}; nothing was kept`); return { ok: false, why: OPTIONS_UNKNOWN_WHY }; }
-    if (!this.st.backupCheck) { this.d.log(`refused the Healthchecks key entered: ${BACKUP_CHECK_WHY}; nothing was kept`); return { ok: false, why: `${BACKUP_CHECK_WHY}: run backup-check first` }; }
+    if (!this.checkPassed()) { const w = this.checkWhy(); this.d.log(`refused the Healthchecks key entered: ${w}; nothing was kept`); return { ok: false, why: `${w}: run backup-check first` }; }
     const bad = this.useCode("hckey", code, "hc-key");
     if (bad) return { ok: false, why: bad };
     const refuse = (why: string) => {
@@ -882,35 +938,117 @@ export class Keeper {
   // current and legacy (the real key's own files left as they are), a test backup of Keeper itself made, downloaded and
   // scanned: it must leave out every key file name and hold no key value, no key's fingerprint and no sentinel. The
   // sentinels and the test backup are removed whatever happens. hc-key is refused, and arming too, until it passes.
+  // 0.1.10: it fails closed. Before the test backup every sentinel is read back where it was meant to go (the current key
+  // name, the temporary prefix, the legacy temporary name, the old key's file), each inside the exclusion, a kept key's file
+  // never written over (its value and fingerprint are searched for instead), and a positive control is placed in a file
+  // the exclusion doesn't cover. The test backup's name is recorded before it is made. After the download the archive's
+  // size must match the Supervisor's, every entry and nested archive is read (scan.ts fails on anything it can't read),
+  // and the control must be found exactly once. Any error fails it; an interrupted check counts as failed, and its test
+  // backup is deleted at the next start. A pass is tied to the exclusion's hash (EXCLUDE_HASH).
   async backupCheck(): Promise<{ ok: boolean; why: string }> {
     const kf = this.d.keyFiles, dl = this.d.download;
-    if (!kf || !dl || !this.d.deleteBackup) return { ok: false, why: "this Keeper can't place key files, download or delete a backup" };
+    if (!kf || !dl || !this.d.deleteBackup || !kf.read || !kf.control || !this.d.backups) return { ok: false, why: "this Keeper can't place key files, download, list or delete a backup" };
+    if (this.checking) return { ok: false, why: "a backup check is already running" };
     const open = this.open();
     if (open.length) return { ok: false, why: `${open[0].id} is ${open[0].status}: run the backup check once no install is open` };
+    this.checking = true;
     const sentinel = `keeper-sentinel-${randomBytes(12).toString("hex")}`;
+    const control = `keeper-control-${randomBytes(12).toString("hex")}`;
     const needles = [sentinel, sha(sentinel).slice(0, 16)];
-    for (const k of [this.hcKey, this.d.oldKeyStore?.load() ?? ""].filter(Boolean)) needles.push(k, sha(`hc-key\n${k}`).slice(0, 8), sha(`hc-key\n${k}`).slice(0, 16), sha(`hc-old-key\n${k}`).slice(0, 12));
+    let oldKept = "";
+    try { oldKept = s(this.d.oldKeyStore?.load() ?? ""); } catch { oldKept = ""; }
+    for (const k of [this.hcKey, oldKept].filter(Boolean)) needles.push(k, sha(`hc-key\n${k}`).slice(0, 8), sha(`hc-key\n${k}`).slice(0, 16), sha(`hc-old-key\n${k}`).slice(0, 12));
     let placed: string[] = [];
     let slug = "";
     const name = `Keeper backup check ${randomBytes(4).toString("hex")}`;
     try {
-      placed = kf.place(sentinel);
-      this.d.log(`backup check: a sentinel placed in ${placed.join(", ")}; making a test backup of Keeper ("${name}")`);
+      const left = await this.leftoverCheck("before a new backup check");
+      if (left) return this.backupCheckFailed(left);
+      // never over a kept key: its file is skipped, and its value searched for
+      const skip = [...(this.hcKey ? [KEY_FILE] : []), ...(oldKept ? [this.d.oldKeyStore?.name ?? OLD_KEY_FILE] : [])];
+      placed = kf.place(sentinel, skip);
+      const roles: [string, (n: string) => boolean, boolean][] = [
+        ["the key file", (n) => n === KEY_FILE, !!this.hcKey], ["the old key's file", (n) => n === OLD_KEY_FILE, !!oldKept],
+        ["a temporary file with the current prefix", (n) => n.startsWith(KEY_TMP_PREFIX), false], ["a temporary file with the legacy name", (n) => LEGACY_KEY_TMP.test(n), false]];
+      for (const [what, is, keptKey] of roles) {
+        const n = placed.find(is);
+        if (!n) { if (keptKey) continue; return this.backupCheckFailed(`the sentinel for ${what} wasn't written (nothing was placed under that name)`); }
+        if (keptKey && n) return this.backupCheckFailed(`a sentinel was written over ${what}, which holds a kept key`);
+        if (!excludedName(n)) return this.backupCheckFailed(`${what} (${n}) isn't inside the backup exclusion (${BACKUP_EXCLUDE.join(", ")})`);
+        let back: string | null = null; try { back = kf.read(n); } catch { back = null; }
+        if (s(back ?? "") !== sentinel) return this.backupCheckFailed(`the sentinel for ${what} (${n}) didn't read back where it was written`);
+      }
+      const ctl = kf.control(control);
+      if (!ctl) return this.backupCheckFailed("the positive control couldn't be placed");
+      if (excludedName(ctl)) return this.backupCheckFailed(`the positive control's file (${ctl}) is inside the backup exclusion, so it proves nothing`);
+      let ctlBack: string | null = null; try { ctlBack = kf.read(ctl); } catch { ctlBack = null; }
+      if (s(ctlBack ?? "") !== control) return this.backupCheckFailed(`the positive control (${ctl}) didn't read back where it was written`);
+      // the test backup's name, recorded before it is made: an interrupted check's backup is found and deleted at the next start
+      this.st.backupCheckRun = { name, at: this.now() };
+      if (!this.save()) return this.backupCheckFailed("Keeper couldn't record the test backup's name before making it");
+      this.d.log(`backup check: a sentinel placed in ${placed.join(", ")}${skip.length ? ` (not over ${skip.join(", ")}, which hold a kept key: its value is searched for)` : ""}, the positive control in ${ctl}; making a test backup of Keeper ("${name}")`);
       const made = await this.d.makeBackup(this.d.self, name).catch((e) => ({ why: String(e).slice(0, 80) }));
       if (!("slug" in made)) return this.backupCheckFailed(`the test backup couldn't be made (${made.why})`);
       slug = made.slug;
+      this.st.backupCheckRun.slug = slug; this.save();
+      const info = await this.d.backupInfo(slug).catch(() => null);
       const bytes = await dl(slug).catch(() => null);
       if (!bytes) return this.backupCheckFailed(`the test backup ${slug} couldn't be downloaded`);
-      const r = scanBackup(bytes, KEY_NAME, needles);
+      const size = Keeper.sizeWhy(bytes.length, info);
+      if (size) return this.backupCheckFailed(`the test backup ${slug}'s download ${size}`);
+      const r = scanBackup(bytes, KEY_NAME, needles, { control });
       if (!r.ok) return this.backupCheckFailed(r.why);
-      this.st.backupCheck = { at: this.now(), names: placed, slug };
-      this.d.log(`backup check passed: test backup ${slug} (${r.members} files read) leaves out every key file (${placed.join(", ")}) and holds no key value, fingerprint or sentinel`);
+      this.st.backupCheck = { at: this.now(), names: placed, slug, exclude: EXCLUDE_HASH };
+      this.d.log(`backup check passed: test backup ${slug} (${r.members} files read, ${bytes.length} bytes as the Supervisor reported) leaves out every key file (${placed.join(", ")}), holds no key value, fingerprint or sentinel, and holds the positive control exactly once; tied to the backup exclusion ${EXCLUDE_HASH}`);
       this.save();
       return { ok: true, why: "" };
     } finally {
       try { kf.clear(); } catch (e) { this.d.log(`backup check: couldn't remove the sentinels (${String(e).slice(0, 80)}); they are removed at the next start`); }
-      if (slug) { const gone = await this.d.deleteBackup(slug).catch(() => false); this.d.log(gone ? `backup check: test backup ${slug} deleted` : `backup check: couldn't delete test backup ${slug}: delete "${name}" by hand (Settings, System, Backups)`); }
+      if (slug) {
+        const gone = await this.d.deleteBackup(slug).catch(() => false);
+        this.d.log(gone ? `backup check: test backup ${slug} deleted` : `backup check: couldn't delete test backup ${slug} ("${name}"): it is deleted at the next start`);
+        if (gone) { delete this.st.backupCheckRun; this.save(); }
+      } else if (this.st.backupCheckRun?.name === name) {
+        // never made, or its answer lost: it is looked up by its name at the next start
+        this.save();
+      }
+      this.checking = false;
     }
+  }
+  // (0.1.10) The archive's size against the Supervisor's: exact in bytes where given, else within the MB figure's rounding.
+  static sizeWhy(got: number, info: BackupInfo | null): string {
+    if (!info) return "can't be checked: the Supervisor didn't answer for its size";
+    if (Number.isSafeInteger(info.sizeBytes)) return info.sizeBytes === got ? "" : `is ${got} bytes, but the Supervisor reports ${info.sizeBytes}`;
+    const mb = Number(info.sizeMb ?? info.size);
+    if (!Number.isFinite(mb) || mb < 0) return "can't be checked: the Supervisor didn't report its size";
+    return Math.abs(got / 1024 ** 2 - mb) <= 0.005 + 1e-9 ? "" : `is ${(got / 1024 ** 2).toFixed(3)} MB, but the Supervisor reports ${mb} MB`;
+  }
+  // (0.1.10) An interrupted backup check: it counts as failed, and its test backup (by its recorded name or slug) is deleted
+  // and logged. "" once nothing is left, else why it couldn't be.
+  async leftoverCheck(when: string): Promise<string> {
+    const run = this.st.backupCheckRun;
+    if (!run) return "";
+    if (this.st.backupCheck) { delete this.st.backupCheck; this.d.log("the backup check's earlier pass no longer counts: a later check was interrupted"); }
+    const list = this.d.backups ? await this.bounded(() => this.d.backups!(), "the Supervisor's backups list") : null;
+    if (!list) { this.save(); return `the interrupted backup check's test backup "${run.name}" can't be looked up (the backups list couldn't be read)`; }
+    const hits = list.filter((b) => b.name === run.name || (!!run.slug && b.slug === run.slug));
+    let all = true;
+    for (const b of hits) {
+      const gone = this.d.deleteBackup ? await this.bounded(() => this.d.deleteBackup!(b.slug), `the delete of backup ${b.slug}`) : false;
+      this.d.log(gone ? `${when}: deleted the test backup ${b.slug} ("${b.name}") an interrupted backup check left behind` : `${when}: couldn't delete the test backup ${b.slug} ("${b.name}") an interrupted backup check left behind: tried again at the next start`);
+      if (!gone) all = false;
+    }
+    if (!hits.length) this.d.log(`${when}: the interrupted backup check's test backup "${run.name}" isn't in the backups list (never made, or deleted)`);
+    if (all) delete this.st.backupCheckRun;
+    this.save();
+    return all ? "" : `the interrupted backup check's test backup "${run.name}" couldn't be deleted`;
+  }
+  // (0.1.10) The backup check's pass, as it counts now: tied to this build's exclusion.
+  checkPassed(): boolean { return !!this.st.backupCheck && this.st.backupCheck.exclude === EXCLUDE_HASH && !this.st.backupCheckRun; }
+  private checkWhy(): string {
+    if (this.st.backupCheckRun) return `${BACKUP_CHECK_WHY}: a backup check was interrupted and counts as failed (its test backup "${this.st.backupCheckRun.name}" is deleted at the next start)`;
+    if (this.st.backupCheck && this.st.backupCheck.exclude !== EXCLUDE_HASH) return `${BACKUP_CHECK_WHY}: the backup exclusion changed since it passed (now ${EXCLUDE_HASH}), so run it again`;
+    return BACKUP_CHECK_WHY;
   }
   private backupCheckFailed(why: string): { ok: boolean; why: string } {
     delete this.st.backupCheck;
@@ -919,24 +1057,44 @@ export class Keeper {
     return { ok: false, why };
   }
   // (0.1.9) The old key's rotation, for Cain's link (GET /rotation): whether a tap is needed, and the old key's id.
+  // 0.1.10: with what the tap proves (old_key_kept false: "attested by your tap only"), the enrollment it must be bound to,
+  // and a single-use challenge Keeper issues (kept until used or 10 minutes old), which the link's signed attestation carries.
   rotationView(caller: string | null): Answer {
     if (caller !== REGISTRAR) return { status: 403, body: { status: "refused" } };
     const o = this.st.oldKey, r = this.st.rotation;
     const attested = !!o && r?.id === o.id;
-    return { status: 200, body: { needed: !!o && !attested, old_key_id: o?.id ?? null, attested_at: attested ? new Date(r!.attestedAt).toISOString() : null, old_option_present: this.oldKeyOption || this.optionsUnknown } };
+    const kept = this.oldKeyKept();
+    const pin = this.st.pinnedKey;
+    const needed = !!o && !attested;
+    let challenge: string | null = null;
+    if (needed && pin?.confirmed && pin.enrollId) {
+      const now = this.now(), c = this.st.rotationChallenge;
+      if (!c || now > c.until || c.enroll !== pin.enrollId || c.id !== o!.id) {
+        this.st.rotationChallenge = { value: randomBytes(12).toString("hex"), at: now, until: now + ROTATION_CHALLENGE_MS, enroll: pin.enrollId, id: o!.id };
+        this.save();
+      }
+      challenge = this.st.rotationChallenge!.value;
+    }
+    return { status: 200, body: { needed, old_key_id: o?.id ?? null, attested_at: attested ? new Date(r!.attestedAt).toISOString() : null, old_option_present: this.oldKeyOption || this.optionsUnknown,
+      old_key_kept: kept, proof: needed ? (kept ? ROTATION_PROOF_TRIED : ROTATION_PROOF_TAP) : attested ? r!.proof ?? r!.tried : null,
+      enroll_id: needed ? pin?.enrollId ?? null : null, challenge } };
   }
+  private oldKeyKept(): boolean { try { return !!s(this.d.oldKeyStore?.load() ?? ""); } catch { return false; } }
   // (0.1.9) POST /rotation/attest, Cain's link: the owner's tap on the card naming the old key's id, as an attestation
-  // the link signs with its Ship key ("rot1.<payload>.<signature>", payload {v: 1, kind: "hc-key-rotated", id, exp}),
-  // verified here with the pinned, confirmed key, so nothing Cain writes himself satisfies it. The old option must be
-  // gone from the options; where the old key was kept, Keeper tries it once first and needs the alert service to reject
-  // it. Under the claim record's lock.
+  // the link signs with its Ship key ("rot1.<payload>.<signature>"), verified here with the pinned, confirmed key, so
+  // nothing Cain writes himself satisfies it. The old option must be gone from the options. Under the claim record's lock.
+  // 0.1.10: the payload is {v: 2, kind: "hc-key-rotated", id, enroll, challenge, exp}: bound to the current enrollment, the
+  // old key's id and the single-use challenge from GET /rotation (spent by this call, whatever its outcome). Where the old
+  // key was kept, it is tried once at a read-only endpoint it was allowed to use (the checks list), and only a 401 or the
+  // alert service's documented invalid-key answer proves it revoked (never a bare 403); the kept key is deleted as soon as
+  // that passes. Where none was kept, the rotation is "attested by your tap only", and the state says so.
   attestRotation(caller: string | null, body: any): Promise<Answer> {
     return this.record(async (f) => {
       const no = (why: string, status = 409): Answer => { this.d.log(`refused a rotation attestation: ${why}`); return { status, body: { status: "refused", why } }; };
       if (caller !== REGISTRAR) return no(`only ${appName(REGISTRAR)}'s link attests a rotation`, 403);
       const o = this.st.oldKey;
       if (!o) return no("no old key was ever seen, so no rotation is needed");
-      if (this.st.rotation?.id === o.id) return { status: 200, body: { status: "attested", id: o.id, recorded: true } };
+      if (this.st.rotation?.id === o.id) return { status: 200, body: { status: "attested", id: o.id, recorded: true, proof: this.st.rotation.proof ?? this.st.rotation.tried } };
       if (this.oldKeyOption || this.optionsUnknown) return no(this.optionsUnknown ? OPTIONS_UNKNOWN_WHY : OLD_KEY_WHY);
       const pin = this.st.pinnedKey, key = pin?.confirmed ? shipKey(pin.key) : null;
       if (!key) return no("the pinned Ship key isn't confirmed, so the link's attestation can't be verified");
@@ -948,28 +1106,36 @@ export class Keeper {
       if (!ok) return no("its attestation isn't signed by the link's Ship key (Cain's own note never counts)");
       let c: any; try { c = JSON.parse(unb64url(parts[1]).toString("utf8")); } catch { c = null; }
       const now = this.now();
-      if (!c || c.v !== 1 || c.kind !== "hc-key-rotated" || typeof c.id !== "string" || !Number.isSafeInteger(c.exp)) return no("its attestation isn't a rotation attestation");
+      if (!c || c.v !== 2 || c.kind !== "hc-key-rotated" || typeof c.id !== "string" || typeof c.enroll !== "string" || typeof c.challenge !== "string" || !Number.isSafeInteger(c.exp)) return no("its attestation isn't a rotation attestation bound to an enrollment and a challenge (version 2)");
       if (c.id !== o.id) return no(`its attestation names key ${c.id}, not the old key ${o.id}`);
       if (c.exp * 1000 <= now || c.exp * 1000 > now + (ROTATION_TTL_S + SHIP_SKEW_S) * 1000) return no("its attestation has expired, or lasts longer than one does");
+      if (!pin!.enrollId || c.enroll !== pin!.enrollId) return no(`its attestation is bound to enrollment ${String(c.enroll).slice(0, 20)}, not the current one ${pin!.enrollId ?? "(none)"}`);
+      const ch = this.st.rotationChallenge;
+      if (!ch || ch.value !== c.challenge || ch.id !== o.id || ch.enroll !== pin!.enrollId) return no("its challenge isn't the one Keeper issued for this key and enrollment, or it was used already: tap again");
+      // single use: spent here, before anything is awaited
+      delete this.st.rotationChallenge;
+      if (now > ch.until) { this.save(); return no("its challenge is over 10 minutes old: tap again"); }
+      this.save();
       const tid = sha(`keeper-rotation-v1\n${tok}`).slice(0, 32);
-      // where the old key was kept, it is tried once first: the alert service must reject it
-      const old = this.d.oldKeyStore?.load() ?? "";
-      let tried = "not kept, so not tried";
+      const old = (() => { try { return s(this.d.oldKeyStore?.load() ?? ""); } catch { return ""; } })();
+      let tried = ROTATION_PROOF_TAP;
       if (old) {
         const r = this.d.hcTry ? await this.bounded(() => this.d.hcTry!(old), "the old key's try at the alert service") : null;
         if (!f.live()) return no("the attestation's step ran out of time");
-        if (r === "accepted") return no(`the alert service still accepts the old key ${o.id}: revoke it there (Project Settings, API Access), then tap again`);
-        if (r !== "rejected") return no("the alert service didn't answer the old key's try, so its rotation can't be confirmed: tap again later");
-        tried = "rejected by the alert service";
+        const v = revocation(r);
+        if (v.state === "valid") return no(`the alert service still accepts the old key ${o.id}: revoke it there (Project Settings, API Access), then tap again`);
+        if (v.state !== "revoked") return no(`the old key's try doesn't prove it revoked (${v.why}): tap again later`);
+        // the kept old key is deleted as soon as its revocation check passed
+        try { this.d.oldKeyStore?.drop(); this.d.log(`the kept old key ${o.id} is deleted: the alert service answered ${v.why}`); } catch { this.d.log(`couldn't delete the kept old key ${o.id}: it is removed at the next start`); }
+        tried = `rejected by the alert service (${v.why})`;
       }
       if (!f.live()) return no("the attestation's step ran out of time");
-      this.st.rotation = { id: o.id, attestedAt: now, tried, tok: tid };
-      try { this.d.oldKeyStore?.drop(); } catch { /* removed at the next start */ }
-      this.d.log(`the old Healthchecks key ${o.id} is attested as rotated by the owner's tap (the link's signed attestation; the old key ${tried})`);
+      this.st.rotation = { id: o.id, attestedAt: now, tried, tok: tid, proof: old ? ROTATION_PROOF_TRIED : ROTATION_PROOF_TAP };
+      this.d.log(`the old Healthchecks key ${o.id} is attested as rotated by the owner's tap (the link's signed attestation, enrollment ${pin!.enrollId}; ${old ? `the old key ${tried}` : "no old key was kept: attested by your tap only"})`);
       this.arm();
       this.save();
-      return { status: 200, body: { status: "attested", id: o.id } };
-    }, (why) => ({ status: 503, body: { status: "refused", why: `Keeper's attestation step failed (${why})` } }));
+      return { status: 200, body: { status: "attested", id: o.id, proof: this.st.rotation.proof } };
+    }, (why, pending) => pending ? Keeper.pendingAnswer("rotation", why) : ({ status: 503, body: { status: "refused", why: `Keeper's attestation step failed (${why})` } }), "rotation");
   }
 
   start(): void {
@@ -994,6 +1160,10 @@ export class Keeper {
     }
     // (0.1.9) the key file's leftovers (a crash between write and rename), the earlier builds' temporary names included
     try { for (const n of this.d.keyFiles?.sweep() ?? []) this.d.log(`removed a leftover key file ${n} (a temporary file from an interrupted write)`); } catch (e) { this.d.log(`couldn't sweep the key file's leftovers: ${String(e).slice(0, 80)}`); }
+    // (0.1.10) a backup check that was running when Keeper stopped counts as failed; its test backup is deleted at the first
+    // poll (by its recorded name), and a downloaded archive left behind is removed now
+    if (this.st.backupCheckRun) { if (this.st.backupCheck) delete this.st.backupCheck; this.d.log(`a backup check was interrupted (its test backup "${this.st.backupCheckRun.name}"): it counts as failed, and its test backup is deleted at the first poll`); }
+    try { for (const n of this.d.archives?.sweep() ?? []) this.d.log(`removed a downloaded archive an interrupted backup check left behind: ${n}`); } catch (e) { this.d.log(`couldn't sweep downloaded archives: ${String(e).slice(0, 80)}`); }
     // (0.1.6) a pin waiting for its confirm; 0.1.9: the enrollment code is printed only on demand (key-code), never here
     if (shipKey(this.opts.ship_public_key) && (!this.enrolled() || this.st.enrollRefused)) {
       if (this.st.enrollRefused) this.d.log(`the link refused Keeper's enrollment at ${new Date(this.st.enrollRefused).toISOString()}: re-enroll with key-code, then key-confirm`);
@@ -1083,7 +1253,7 @@ export class Keeper {
     const unkeyed = hcRoles(o).filter(([, , , role]) => !o.hc_unique_keys[role]).map(([name, , , role]) => `${name} (${role})`);
     if (unkeyed.length) return `every check's identity must be set by its unique key in hc_unique_keys, verified against the live service; missing: ${unkeyed.join(", ")}`;
     if (checksOnly) return "";
-    if (!this.st.backupCheck) return BACKUP_CHECK_WHY;
+    if (!this.checkPassed()) return this.checkWhy();
     const r = this.rotationWhy();
     if (r) return r;
     return "";
@@ -1109,6 +1279,11 @@ export class Keeper {
       const apps = new Set([...this.opts.watch, ...this.open().map((a) => a.app), ...this.unresolvedOf().map((a) => a.app)]);
       for (const app of apps) await this.pollApp(app);
       await this.watchJobListing();
+      // (0.1.10) an interrupted backup check's test backup, deleted (at start, and until it is gone)
+      if (this.st.backupCheckRun && !this.checking) await this.leftoverCheck(this.cleanupDue ? "at start" : "a poll");
+      // (0.1.10) a backup whose create outran its bound: looked up by its name under the next lock holder
+      if (Object.values(this.st.attempts).some((x) => x.lateBackup && !x.backup && !OPEN.includes(x.status)))
+        await this.record((f) => this.settleLate(f), () => undefined).catch(() => undefined);
       // (0.1.9) the bounded cleanup: at start (the first poll) and on its daily tick, under the lock
       if (this.cleanupDue || now - (this.st.cleanupAt ?? 0) >= CLEANUP_TICK_MS) {
         const when = this.cleanupDue ? "at start" : "the daily tick";
@@ -1211,7 +1386,7 @@ export class Keeper {
     if (a.status === "verifying") return { status: 200, body: { status: "pending", ...base } };
     if (a.status === "accepted") return { status: 200, body: { status: "accepted", ...base, backup: a.backup, until: new Date(a.acceptUntil ?? a.deadline).toISOString() } };
     if (a.status === "claimed") return { status: 200, body: { status: "claimed", ...base, backup: a.backup, claim: a.claim!.id, until: new Date(a.claim!.until).toISOString() } };
-    return { status: 200, body: { status: a.status === "unprotected" ? "refused" : a.status, ...base, why: a.why ?? "" } };
+    return { status: 200, body: { status: a.status === "unprotected" ? "refused" : a.status, ...base, why: a.why ?? "", ...(a.code ? { code: a.code } : {}) } };
   }
   // (0.1.5) POST /attempt/<id>/claim, Cain's link only, as the RemoteTrigger hook lets the Ship run start:
   // {app, from_version, to_version, backup}, which must be the acceptance's. Atomic: checked and set with
@@ -1291,7 +1466,7 @@ export class Keeper {
   // (0.1.7) The routes' entry points: claim and cancel under the claim record's lock.
   // 0.1.8: the cancel reads the App's jobs list under the lock (bounded); a step that fails answers 503.
   claim(caller: string | null, id: string, body: any): Promise<Answer> {
-    return this.record(() => this.claimAttempt(caller, id, body), (why) => ({ status: 503, body: { status: "refused", id, why: `Keeper's claim step failed (${why})` } }));
+    return this.record(() => this.claimAttempt(caller, id, body), (why, pending) => pending ? Keeper.pendingAnswer(id, why) : ({ status: 503, body: { status: "refused", id, why: `Keeper's claim step failed (${why})` } }), `claim ${id}`);
   }
   cancel(caller: string | null, id: string, body: any): Promise<Answer> {
     return this.record(async (f) => {
@@ -1300,7 +1475,12 @@ export class Keeper {
       // (0.1.9) the commit, only while this step's generation is live (checked in the same tick as the write)
       if (!f.live()) return { status: 503, body: { status: "refused", id, why: "Keeper's cancel step ran out of time; nothing was cancelled" } };
       return this.cancelAttempt(caller, id, body, jobs);
-    }, (why) => ({ status: 503, body: { status: "refused", id, why: `Keeper's cancel step failed (${why}); nothing was cancelled` } }));
+    }, (why, pending) => pending ? Keeper.pendingAnswer(id, why) : ({ status: 503, body: { status: "refused", id, why: `Keeper's cancel step failed (${why}); nothing was cancelled` } }), `cancel ${id}`);
+  }
+  // (0.1.10) A route whose external write is still in flight at its step's timeout: pending, the lock held until the outcome is
+  // known; the same call again reconciles it.
+  static pendingAnswer(id: string, why: string): Answer {
+    return { status: 202, body: { status: "pending", id, why: `Keeper's step ran out (${why}) with a write still in flight: its outcome isn't known yet; send the same request again to reconcile it` } };
   }
   // (0.1.8) The App's active jobs as the Supervisor lists them (their names), bounded; null when unreadable.
   private appJobs(app: string): Promise<string[] | null> {
@@ -1360,8 +1540,10 @@ export class Keeper {
       void made.then((r) => {
         this.d.log(`${a.id}: the keeper's backup ${"slug" in r ? `${r.slug} ` : ""}ended after its registration was refused; it is not used`);
         // (0.1.9) bound and kept, so the bounded cleanup may remove it later
-        if ("slug" in r && BACKUP.test(r.slug) && !a.backup) { a.backup = r.slug; this.keepBackup(a, "its backup completed after the registration was refused"); this.save(); }
+        if ("slug" in r && BACKUP.test(r.slug) && !a.backup) { a.backup = r.slug; delete a.lateBackup; this.keepBackup(a, "its backup completed after the registration was refused"); this.save(); }
       });
+      a.lateBackup = this.now();                           // (0.1.10) until its answer comes back, looked up by its name under the lock
+      this.save();
       if (a.status !== "verifying") return;
       return this.unprotected(a, `the keeper's backup of ${a.app} didn't complete within ${REGISTER_WAIT_MS / 60_000} minutes`);
     }
@@ -1404,11 +1586,18 @@ export class Keeper {
   // generation and backup name, saved before the backup call. "" when the backup may be made, else why not.
   private async prepareBackup(a: Attempt, f: Fence): Promise<string> {
     await this.cleanup("before a new backup", f, a.id);
-    const projected = Math.round((this.st.lastBackupBytes ?? DEFAULT_BACKUP_BYTES) * 1.5);
+    // (0.1.10) with no last size (a first backup) the reserve floor is 1 GB plus the App's image size when known, else 2 GB
+    const last = this.st.lastBackupBytes;
+    const image = !last && this.d.imageBytes ? await this.bounded(() => this.d.imageBytes!(a.app), "the App's image size") : null;
+    const projected = last ? Math.round(last * 1.5) : 0;
+    const need = last ? projected + SPACE_RESERVE_BYTES : image && image > 0 ? SPACE_RESERVE_BYTES + image : FIRST_BACKUP_BYTES;
     const free = this.d.diskFree ? await this.bounded(() => this.d.diskFree!(), "the Supervisor's free space") : null;
     if (!f.live()) return "Keeper's backup step ran out of time";
-    if (free === null || free < projected + SPACE_RESERVE_BYTES) {
-      const words = free === null ? "the free space for backups couldn't be read" : `only ${mb(free)} MB is free for backups, and its backup needs about ${mb(projected)} MB plus a reserve of ${mb(SPACE_RESERVE_BYTES)} MB`;
+    if (free === null || free < need) {
+      a.code = "no_space";
+      const words = free === null ? "the free space for backups couldn't be read"
+        : last ? `only ${mb(free)} MB is free for backups, and its backup needs about ${mb(projected)} MB plus a reserve of ${mb(SPACE_RESERVE_BYTES)} MB`
+        : `only ${mb(free)} MB is free for backups, under the first backup's reserve floor of ${mb(need)} MB (${image && image > 0 ? "1 GB plus the App's image size" : "2 GB, the App's image size not known"})`;
       const kept = Object.keys(this.st.keptBackups ?? {}).length;
       this.d.log(`refused a new backup for ${a.id}: ${words}${kept ? `; the cleanup couldn't free enough (${kept} kept backup${kept === 1 ? "" : "s"} still inside their bound)` : ""}`);
       return `no room for its backup: ${words} (delete old backups in Home Assistant, Settings, System, Backups)`;
@@ -1422,29 +1611,51 @@ export class Keeper {
   }
   // (0.1.9) The bounded cleanup of kept backups, under the lock (f): only at start, before a new backup (except: that
   // attempt) and on the daily tick. It touches only Keeper's own backups (a name Keeper gives and a kept record with its
-  // generation), never the owner's or a drill's; it runs only with no other attempt open and no install job on any
-  // watched App (a jobs list that can't be read stops it), never within 2 hours of a claim's end; it deletes a kept
-  // backup 48 hours after its claim ended, and the oldest past the grace while more than two are kept. Each delete
-  // re-checks the attempt and its generation right before it, and is logged.
+  // generation), never the owner's or a drill's. 0.1.10: its limits hold only while cleanup is eligible: it runs only with
+  // no other attempt open and no install job on any watched App (a jobs list that can't be read stops it), and while it is
+  // blocked a kept backup past a limit stays, logged. When eligible, it deletes a kept backup 48 hours after its claim's
+  // recorded end (the claim's deadline alone never counts as its end), and the oldest past the grace while more than two
+  // are kept; the grace (2 hours 30 minutes, longer than a Ship token's life plus the hook's bound) is a floor the cap never
+  // overrides: a third backup inside it is kept and logged. Right before each delete the jobs list, the attempt and its
+  // generation are read again. Every deletion is logged. A backup whose create outran its bound is looked up by its name here
+  // too (settleLate).
   async cleanup(when: string, f: Fence, except?: string): Promise<void> {
     const now = this.now();
     if (when !== "before a new backup") this.st.cleanupAt = now;
     const kept = this.st.keptBackups ?? {};
-    const skip = (why: string) => { this.d.log(`the cleanup of kept backups (${when}) didn't run: ${why}`); if (f.live()) this.save(); };
+    const limits = () => {
+      const recs = Object.values(kept);
+      const old = recs.filter((r) => now - r.endedAt >= KEPT_MAX_MS).length, over = Math.max(0, recs.length - KEPT_MAX_COUNT);
+      return old || over ? [old ? `${old} past the 48-hour limit` : "", over ? `${over} over the two-backup cap` : ""].filter(Boolean).join(", ") : "";
+    };
+    const skip = (why: string) => {
+      this.d.log(`the cleanup of kept backups (${when}) didn't run: ${why}`);
+      const lim = limits();
+      if (lim) this.d.log(`the cleanup is blocked past its limits (${lim}): those backups stay until cleanup is eligible again`);
+      if (f.live()) this.save();
+    };
     const busy = (x: Attempt) => x.id !== except && OPEN.includes(x.status);
-    if (!Object.keys(kept).length && !Object.values(this.st.attempts).some((x) => x.status === "ended" && x.dropKept && !x.backup && x.backupName)) { if (f.live()) this.save(); return; }
+    const late = Object.values(this.st.attempts).some((x) => x.lateBackup && !x.backup && x.backupName);
+    if (!Object.keys(kept).length && !late && !Object.values(this.st.attempts).some((x) => x.status === "ended" && x.dropKept && !x.backup && x.backupName)) { if (f.live()) this.save(); return; }
     const open = Object.values(this.st.attempts).find(busy);
     if (open) return skip(`${open.id} is ${open.status} (never beside a live or expiring claim)`);
     if (!this.d.backups || !this.d.deleteBackup) return skip("this Keeper can't list or delete backups");
-    for (const app of this.opts.watch) {
-      const jobs = await this.appJobs(app);
-      if (!f.live()) return;
-      const install = jobs === null ? "the Supervisor's jobs list couldn't be read" : jobs.filter((n) => INSTALL_JOB.test(n)).length ? `an install or update of ${app} is running` : "";
-      if (install) return skip(install);
-    }
+    const installWhy = async (): Promise<string> => {
+      for (const app of this.opts.watch) {
+        const jobs = await this.appJobs(app);
+        const w = jobs === null ? "the Supervisor's jobs list couldn't be read" : jobs.filter((n) => INSTALL_JOB.test(n)).length ? `an install or update of ${app} is running` : "";
+        if (w) return w;
+      }
+      return "";
+    };
+    const install = await installWhy();
+    if (!f.live()) return;
+    if (install) return skip(install);
     const list = await this.bounded(() => this.d.backups!(), "the Supervisor's backups list");
     if (!f.live()) return;
     if (!list) return skip("the Supervisor's backups list couldn't be read");
+    await this.settleLate(f, list);
+    if (!f.live()) return;
     // an ended attempt whose slug a restart lost: bound by its exact own name
     for (const x of Object.values(this.st.attempts)) if (x.status === "ended" && x.dropKept && !x.backup && x.backupName) {
       const hit = list.find((b) => b.name === x.backupName);
@@ -1452,21 +1663,33 @@ export class Keeper {
     }
     const listed = new Map(list.map((b) => [b.slug, b.name]));
     for (const r of Object.values(kept)) if (!listed.has(r.slug)) { delete kept[r.slug]; this.d.log(`kept backup ${r.slug} ("${r.name}") of ${r.attempt} is gone from the backups list: its record is dropped`); }
+    // ended: a recorded end, never a deadline: the attempt ended (or was refused) with its time kept, and a claim's end logged
+    const ended = (x: Attempt | undefined) => !!x && (x.status === "ended" || x.status === "unprotected") && Number(x.endedAt) > 0 && (!x.claim || !!x.claimEndSaid || x.status === "unprotected");
     const mine = (r: KeptRec) => {
       const x = this.st.attempts[r.attempt];
       const m = KEEPER_BACKUP.exec(r.name);
-      return !!x && x.auth !== "drill" && !!m && m[1] === r.attempt && listed.get(r.slug) === r.name && x.backup === r.slug && (x.gen ?? 0) === r.gen && r.gen > 0 && x.status === "ended";
+      return !!x && x.auth !== "drill" && !!m && m[1] === r.attempt && listed.get(r.slug) === r.name && x.backup === r.slug && (x.gen ?? 0) === r.gen && r.gen > 0 && ended(x);
     };
-    const past = Object.values(kept).filter((r) => mine(r) && now - r.endedAt >= KEPT_GRACE_MS).sort((p, q) => p.endedAt - q.endedAt);
-    const go = new Set(past.filter((r) => now - r.endedAt >= KEPT_MAX_MS).map((r) => r.slug));
+    const since = (r: KeptRec) => now - Math.max(r.endedAt, this.st.attempts[r.attempt]?.endedAt ?? Infinity);
+    for (const r of Object.values(kept)) if (!mine(r) && this.st.attempts[r.attempt] && !ended(this.st.attempts[r.attempt]) && now - r.endedAt >= KEPT_MAX_MS)
+      this.d.log(`kept backup ${r.slug} of ${r.attempt} stays past its limit: its attempt has no recorded end (a deadline alone never counts as one)`);
+    const past = Object.values(kept).filter((r) => mine(r) && since(r) >= KEPT_GRACE_MS).sort((p, q) => p.endedAt - q.endedAt);
+    const go = new Set(past.filter((r) => since(r) >= KEPT_MAX_MS).map((r) => r.slug));
     let left = Object.keys(kept).length - go.size;
     for (const r of past) { if (left <= KEPT_MAX_COUNT) break; if (!go.has(r.slug)) { go.add(r.slug); left--; } }
+    if (left > KEPT_MAX_COUNT) {
+      const inside = Object.values(kept).filter((r) => !go.has(r.slug) && since(r) < KEPT_GRACE_MS).map((r) => r.slug);
+      this.d.log(`${left} kept backups are over the two-backup cap, but ${inside.join(", ") || "none"} ${inside.length === 1 ? "is" : "are"} inside the 2 hours 30 minutes grace: kept (the grace is a floor the cap never overrides)`);
+    }
     for (const slug of go) {
       const r = kept[slug];
-      // the claim and the generation read again right before the delete, in the same tick as the call
+      // the jobs list, the attempt and the generation read again right before the delete
+      const again = await installWhy();
       const x = this.st.attempts[r.attempt];
-      if (!f.live() || !mine(r) || Object.values(this.st.attempts).some(busy)) { this.d.log(`the cleanup left backup ${slug}: its attempt, generation or claim changed`); continue; }
-      const age = Math.round((now - r.endedAt) / 3_600_000);
+      if (!f.live()) return;
+      if (again) { this.d.log(`the cleanup left backup ${slug}: ${again} (read again right before its delete)`); continue; }
+      if (!mine(r) || Object.values(this.st.attempts).some(busy)) { this.d.log(`the cleanup left backup ${slug}: its attempt, generation or claim changed`); continue; }
+      const age = Math.round(since(r) / 3_600_000);
       await f.write(`the delete of kept backup ${slug}`, () => this.bounded(() => this.d.deleteBackup!(slug), `the delete of backup ${slug}`), (ok) => {
         if (ok) { delete kept[slug]; x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); }
         else this.d.log(`the cleanup couldn't delete kept backup ${slug} ("${r.name}"): tried again at the next cleanup`);
@@ -1474,13 +1697,48 @@ export class Keeper {
       });
     }
     // Keeper-named backups with no kept record: never deleted, named once per start
-    if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug))
+    if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name)
       this.d.log(`backup ${b.slug} ("${b.name}") is named like Keeper's but has no generation record here: never deleted by Keeper; delete it by hand (Settings, System, Backups) if you don't want it`);
     if (f.live()) this.save();
+  }
+  // (0.1.10) A backup whose create outran its bound (an answer past REGISTER_WAIT_MS, or a restart while it was made) and may
+  // have completed later: under the next lock holder it is looked up by the name chosen before its call. Found with its
+  // attempt's generation, it is adopted as a kept backup (bound to that attempt and generation, for the bounded cleanup);
+  // found without one, it is deleted; both logged. Not found, it is looked for again until the 48-hour bound.
+  async settleLate(f: Fence, given?: { slug: string; name: string }[]): Promise<void> {
+    const due = Object.values(this.st.attempts).filter((x) => x.lateBackup && !x.backup && x.backupName && !OPEN.includes(x.status));
+    if (!due.length) return;
+    const list = given ?? (this.d.backups ? await this.bounded(() => this.d.backups!(), "the Supervisor's backups list") : null);
+    if (!f.live()) return;
+    if (!list) { this.d.log(`a late backup (${due.map((x) => x.id).join(", ")}) wasn't looked up: the backups list couldn't be read`); return; }
+    const now = this.now();
+    for (const x of due) {
+      const hit = list.find((b) => b.name === x.backupName);
+      if (!hit || !BACKUP.test(hit.slug)) {
+        if (now - x.lateBackup! > KEPT_MAX_MS) { delete x.lateBackup; this.d.log(`${x.id}: its late backup "${x.backupName}" never showed in the backups list in 48 hours: no longer looked for`); this.save(); }
+        continue;
+      }
+      if (!f.live()) return;
+      if ((x.gen ?? 0) > 0) {
+        x.backup = hit.slug; delete x.lateBackup;
+        if (!x.endedAt) x.endedAt = now;
+        (this.st.keptBackups ??= {})[hit.slug] = { slug: hit.slug, name: x.backupName!, attempt: x.id, gen: x.gen!, endedAt: Math.max(x.endedAt, now), reason: "its create outran its bound and completed later" };
+        x.dropKept = "its create outran its bound and completed later";
+        this.d.log(`${x.id}: its backup's create outran its bound and completed later: found by its name "${x.backupName}" as ${hit.slug}, adopted with its generation ${x.gen} (only the bounded cleanup may delete it)`);
+        this.save();
+      } else {
+        await f.write(`the delete of late backup ${hit.slug}`, () => this.bounded(() => this.d.deleteBackup?.(hit.slug) ?? false, `the delete of backup ${hit.slug}`), (ok) => {
+          if (ok) { delete x.lateBackup; this.d.log(`${x.id}: its backup's create outran its bound and completed later as ${hit.slug} ("${x.backupName}") with no generation record: deleted`); }
+          else this.d.log(`${x.id}: couldn't delete its late backup ${hit.slug} ("${x.backupName}"): tried again under the next lock holder`);
+          this.save();
+        });
+      }
+    }
   }
   // A registration left verifying by a restart (its backup's outcome unknown) is unprotected.
   private verifyLeft(a: Attempt): void {
     if (this.backups.has(a.id)) return;
+    if (a.backupAsked && a.backupName && !a.backup) a.lateBackup = this.now();   // (0.1.10) looked up by its name under the lock
     this.unprotected(a, "the keeper restarted while it made the backup, so that backup's outcome is unknown");
   }
   private unprotected(a: Attempt, why: string, force = false): void {
@@ -1558,6 +1816,10 @@ export class Keeper {
   // live: the App's liveness (/health) this poll. Readiness never enters it.
   judge(a: Attempt, info: AppInfo | null, live: boolean, now: number): void {
     if (info && a.status === "claimed" && info.version === a.to && now <= a.claim!.until) {
+      // (0.1.10) the watch takes an install only as its own attempt's: its backup bound, and its generation the App's newest
+      const newest = Math.max(0, ...Object.values(this.st.attempts).filter((x) => x.app === a.app).map((x) => x.gen ?? 0));
+      if (!a.backup || !(a.gen && a.gen > 0) || a.gen !== newest)
+        return this.unprotected(a, `the install of ${a.to} doesn't match the claimed attempt's own generation (${a.gen ?? 0}; the App's newest is ${newest}), so it isn't watched as the Ship run's`);
       this.claimEnd(a, "consumed by the install it covers");
       a.status = "watching"; a.firstSeenTo = now; a.watchEnd = now + WATCH_MS; a.consumedAt = now;
       this.d.log(`consumed ${a.id}: ${a.app} ${a.to} seen within claim ${a.claim!.id}; this acceptance is spent and covers no other install`);

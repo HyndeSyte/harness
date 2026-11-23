@@ -22,8 +22,8 @@
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
 import { closeSync, constants as FS, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { dirname, join } from "node:path";
-import { HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
+import { basename, dirname, join } from "node:path";
+import { CHECK_CONTROL_FILE, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -48,31 +48,37 @@ export function hcKeyStore(path = HC_KEY_FILE, onTemp?: (tmp: string) => void) {
 }
 // (0.1.9) The old hc_api_key, kept only to try it once at the rotation's attestation, then dropped.
 export const OLD_KEY_PATH = `${DATA}/${OLD_KEY_FILE}`;
+// 0.1.10: name, the file's name in the data folder, which core.ts checks inside the backup exclusion before it stores a key.
 export function oldKeyStore(path = OLD_KEY_PATH) {
-  return { ...hcKeyStore(path), drop: () => { rmSync(path, { force: true }); } };
+  return { ...hcKeyStore(path), drop: () => { rmSync(path, { force: true }); }, name: basename(path) };
 }
 const SENTINEL = "keeper-sentinel-";
 export const keyTmp = (path: string) => join(dirname(path), `${KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`);
 // (0.1.9) The key files' names in the data folder, for the backup check and the start's sweep: place a sentinel in every
 // name (current and legacy, never over a real key), clear what was placed, and sweep leftovers (temporary files of both
 // spellings, and a sentinel left by an interrupted check).
+// 0.1.10: skip names a kept key's file, never written over; read reads one back (the check verifies each sentinel landed);
+// control writes the positive control in a file the exclusion doesn't cover; clear removes it with the sentinels, and sweep
+// removes a control an interrupted check left.
 export function keyFiles(dir = DATA) {
   let placed: string[] = [];
-  const put = (name: string, body: string) => { const p = join(dir, name); if (existsSync(p)) return; const fd = openSync(p, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600); try { writeSync(fd, body); } finally { closeSync(fd); } placed.push(name); };
+  const put = (name: string, body: string) => { const p = join(dir, name); if (existsSync(p)) return; const fd = openSync(p, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600); try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); } placed.push(name); };
   return {
-    place: (sentinel: string): string[] => {
+    place: (sentinel: string, skip: string[] = []): string[] => {
       placed = [];
-      put(KEY_FILE, `${sentinel}\n`); put(OLD_KEY_FILE, `${sentinel}\n`);
+      for (const n of [KEY_FILE, OLD_KEY_FILE]) if (!skip.includes(n)) put(n, `${sentinel}\n`);
       put(`${KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`, `${sentinel}\n`);
       put(`${KEY_FILE}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`, `${sentinel}\n`);   // the 0.1.7 and 0.1.8 temporary name
       return [...placed];
     },
+    read: (name: string): string | null => { if (basename(name) !== name) return null; try { return readFileSync(join(dir, name), "utf8").trim(); } catch { return null; } },
+    control: (value: string): string | null => { try { rmSync(join(dir, CHECK_CONTROL_FILE), { force: true }); put(CHECK_CONTROL_FILE, `${value}\n`); return CHECK_CONTROL_FILE; } catch { return null; } },
     clear: (): void => { for (const n of placed) rmSync(join(dir, n), { force: true }); placed = []; },
     sweep: (): string[] => {
       const out: string[] = [];
       for (const n of readdirSync(dir)) {
         const p = join(dir, n);
-        let gone = n.startsWith(KEY_TMP_PREFIX) || LEGACY_KEY_TMP.test(n);
+        let gone = n.startsWith(KEY_TMP_PREFIX) || LEGACY_KEY_TMP.test(n) || n === CHECK_CONTROL_FILE;
         if (!gone && (n === KEY_FILE || n === OLD_KEY_FILE)) { try { gone = readFileSync(p, "utf8").startsWith(SENTINEL); } catch { gone = false; } }
         if (gone) { rmSync(p, { force: true }); out.push(n); }
       }
@@ -131,12 +137,30 @@ export async function hcChecks(key: string, http: typeof fetch = fetch): Promise
   } catch { return null; }
 }
 
-// (0.1.9) The old key tried once at the Healthchecks API: accepted (200), rejected (401 or 403), else no answer (null).
-export async function hcTry(key: string, http: typeof fetch = fetch): Promise<"accepted" | "rejected" | null> {
+// (0.1.9) The old key tried once at the Healthchecks API. 0.1.10: a GET of the checks list (read-only, no side effects, and
+// the endpoint the old hc_api_key option was used for from 0.1.5), answering its status and the API's error text; core.ts
+// revocation() judges it (a 401 or "wrong api key" proves it revoked, never a bare 403). Null: no answer.
+export async function hcTry(key: string, http: typeof fetch = fetch): Promise<{ status: number; error?: string } | null> {
   try {
-    const r = await http(HC_API, { headers: { "x-api-key": key }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
-    return r.status === 200 ? "accepted" : r.status === 401 || r.status === 403 ? "rejected" : null;
+    const r = await http(HC_API, { method: "GET", headers: { "x-api-key": key }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+    let error: string | undefined;
+    try { const j: any = await r.json(); if (typeof j?.error === "string") error = j.error.slice(0, 80); } catch { /* no body */ }
+    return { status: r.status, ...(error ? { error } : {}) };
   } catch { return null; }
+}
+// (0.1.10) The backup check's download, through a file in its own folder (removed after it is read): one an interrupted
+// check left behind is removed at the next start (archives().sweep).
+export const ARCHIVE_DIR = process.env.KEEPER_ARCHIVE_DIR ?? "/tmp/keeper-backup-check";
+export function archives(dir = ARCHIVE_DIR) {
+  return {
+    sweep: (): string[] => { try { return readdirSync(dir).filter((n) => n.endsWith(".tar")).map((n) => { rmSync(join(dir, n), { force: true }); return n; }); } catch { return []; } },
+    through: async (slug: string, fetchTo: (path: string) => Promise<boolean>): Promise<Uint8Array | null> => {
+      const { mkdirSync } = await import("node:fs");
+      try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return null; }
+      const path = join(dir, `${slug.replace(/[^A-Za-z0-9_-]/g, "_")}.tar`);
+      try { if (!(await fetchTo(path))) return null; return new Uint8Array(readFileSync(path)); } catch { return null; } finally { rmSync(path, { force: true }); }
+    },
+  };
 }
 
 async function serve(): Promise<void> {
@@ -152,7 +176,8 @@ async function serve(): Promise<void> {
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
     backups: sup.backups, activeJobs: sup.activeJobs, hcKeyStore: hcKeyStore(),
-    diskFree: sup.diskFree, download: sup.download, keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), hcTry: (key) => hcTry(key),
+    diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
+    keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), hcTry: (key) => hcTry(key),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {

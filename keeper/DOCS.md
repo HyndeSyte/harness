@@ -202,9 +202,30 @@ of <id>, generation <n>, <hours> hours after its claim ended (...)`), and so is 
 why (`the cleanup of kept backups (<when>) didn't run: ...`). If a restart lost a slug, the backup is found in the
 backups list by its exact own name and bound then.
 
+**The cleanup's grace and eligibility (0.1.10).** The grace is 2 hours 30 minutes, strictly longer than a Ship
+token's 2 hours plus the hook's bound (10 minutes), so no backup a still-valid token's run could reach is deleted.
+The limits hold only while cleanup is eligible: the 48 hours and the two-backup cap are applied only when no other
+attempt is open and the jobs list shows no install job; while it is blocked, kept backups past a limit stay, and
+the log says so (`the cleanup is blocked past its limits (...): those backups stay until cleanup is eligible
+again`). The grace is a floor the cap never overrides: a third backup inside it is kept and logged (`... over the
+two-backup cap, but ... inside the 2 hours 30 minutes grace: kept`). The 48 hours count from the attempt's recorded
+end (its claim's logged end); a claim's deadline alone never counts as one (`... stays past its limit: its attempt
+has no recorded end`). Right before each delete the jobs list is read again, with the attempt and its generation.
+
+**A backup create that outran its bound (0.1.10).** A backup whose create didn't answer within its bound, or whose
+answer a restart lost, may complete later. Its name was chosen and saved before the call, so under the next holder
+of the claim record's lock Keeper looks it up by that name in the backups list: found with its attempt's
+generation, it is adopted (`... completed later: found by its name ... adopted with its generation <n>`) and left
+to the bounded cleanup; found with no generation record, it is deleted, logged. **A route whose write is still in
+flight** when its step runs out answers `202 {"status": "pending"}` at once, the lock stays held until that write's
+outcome is known, and the same request sent again meanwhile answers pending without starting it twice; once the
+write ended, it runs again and reads the recorded outcome.
+
 **The free-space reserve (0.1.9).** Before every new backup Keeper reads the free space where backups go
-(`/host/info`) and needs the projected backup (the last backup's size and a half, 256 MB when none is known yet)
-plus a 1 GB reserve. A backup that can't fit is refused: the registration is "unprotected", logged (`refused a new
+(`/host/info`) and needs the projected backup (the last backup's size and a half) plus a 1 GB reserve. (0.1.10) For
+a first backup, with no last size, the floor is 1 GB plus the App's image size when Keeper knows it, else 2 GB.
+The refusal carries the code `no_space`: Cain's link then refuses the install, and posts you a card whose one
+button installs it without Keeper's rollback; only your tap overrides it, once, for that pull request and head. A backup that can't fit is refused: the registration is "unprotected", logged (`refused a new
 backup for <id>: ...`, naming the kept backups the cleanup couldn't free yet) and paged. A free space it can't read
 refuses too. Delete old backups in Home Assistant (Settings, System, Backups) to make room.
 
@@ -406,13 +427,29 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   file in it: the backup must leave out every one of those names, and no file in it may hold a sentinel, a kept key's
   value or a key's fingerprint. Then it removes the sentinels and deletes the test backup. `hc-key` and arming are
   refused until it passes (`the backup check hasn't passed on the device ...`).
+  (0.1.10) It fails closed. Before the test backup it reads every sentinel back where it was meant to go, each inside
+  the exclusion; a file holding a kept key (the current key, or the old key) is never written over: its value and
+  fingerprint are searched for instead. It places a positive control in `backup-check-control`, a file the exclusion
+  doesn't cover. It records the test backup's name before making it. After the download the archive's size must
+  match the Supervisor's (in bytes where given, else its MB figure), every entry and nested archive is read (tar and
+  gzip; a zstd, xz or other member, an archive-named member that is neither gzip nor tar, an encrypted backup, a tar
+  header whose checksum doesn't match and a truncated file all fail it), and the control must be found exactly once.
+  Any read, format, size or traversal error fails it. A check that was interrupted counts as failed: at every start
+  Keeper deletes its recorded test backup and any downloaded archive left behind, and logs it. A pass is tied to the
+  exclusion this build ships (its hash); a build with another exclusion needs the check again.
 - **Both key roles.** Keeper keeps only a read-only key (a key that can write is refused at entry and for arming).
   The old `hc_api_key` option must be gone, and the old key's rotation attested: while Keeper has seen an old key in
   its options (it keeps only its id, a hash, and the key itself root-only in `hc-key-old` to try it once), arming is
   refused until you tap the card Cain's link posts naming that id, once you revoked the key in Healthchecks. The
   link signs your tap with its Ship key and Keeper checks that signature, so nothing Cain writes himself counts;
   where Keeper kept the old key it first tries it at Healthchecks and needs it rejected (`the alert service still
-  accepts the old key ...` otherwise). An options read that fails or doesn't answer within 10 seconds counts as the
+  accepts the old key ...` otherwise). (0.1.10) The try is a read-only GET of the checks list (the endpoint the old
+  option was used for), and only a 401, or Healthchecks' documented `wrong api key` answer, proves the key revoked;
+  a bare 403 never does. The kept old key is deleted as soon as that passes, and is written in the first place only
+  once its file is checked inside the backup exclusion. Where no old key was kept, nothing can be tried: the card and
+  Keeper's state say "attested by your tap only". The link's signature is bound to the current enrollment, the old
+  key's id and a single-use challenge Keeper issues (`GET /rotation`), and the link checks the tap is yours before it
+  signs. An options read that fails or doesn't answer within 10 seconds counts as the
   old option still present: not armable, and `hc-key` refused, until a read answers.
 - **The check identities.** Every role (`done`, `deadman`, and each watched App's alert check, `0fcc2575_cain`) needs
   its check's unique key set in `hc_unique_keys`, read from the read-only API or the check's page, so no derived
@@ -526,7 +563,8 @@ Keeper before it counts as armed).
 
 ## Accepted limits
 
-Text version 3 (0.1.9). Version 2 was 0.1.8's and version 1 0.1.7's; an acceptance of either lapsed with 0.1.9. Two
+Text version 4 (0.1.10). Version 3 was 0.1.9's, version 2 0.1.8's and version 1 0.1.7's; an acceptance of any of them
+lapsed with 0.1.10. Two
 limits of Keeper's design are recorded here rather than built around, and you accept them at the device: `bun
 /opt/keeper/main.ts accept-limits <code>` in Keeper's container, with the code Keeper prints at each start while they
 aren't accepted for this text version (`one-time code for accept-limits: ...`). Keeper records your acceptance with the
@@ -536,7 +574,11 @@ says so at start. Keeper covers only the first 15 minutes after an install.
 **1. The installer: a claim authorizes nothing, and one installer at a time.** A claim is not a single-use installer
 authorization. An install needs your Ship tap and the link's Ship token for that pull request and head, good for 2
 hours after your tap; a claim authorizes nothing. A claim is single use only in this sense: one claimant, consumed by
-the one install it covers, and it covers no other install. The Ship run is a cloud session that reaches GitHub and
+the one install it covers, and it covers no other install. The Ship token stays valid by its signature for its 2 hours
+outside the hook, and only the hook marks it spent: the link's pass records it on its first use, so a second Ship run
+on it is refused there, but nothing else checks it is unspent. The watch accepts only an install matching its own
+attempt and generation: the claimed attempt's own backup bound to it, and its generation the App's newest; any other
+install is "unprotected", paged and never restored. The Ship run is a cloud session that reaches GitHub and
 Home Assistant only. It can't call Keeper or Cain's link, so nothing at the moment the installer asks the Supervisor
 to install can spend an authorization. The gates in code are two: Cain's hook at the run's start (the claim, and its
 deadline checked again just before the run starts), and Keeper's own fence (a version change seen outside a live
@@ -621,9 +663,11 @@ App's token (`Authorization: Bearer <token>`):
   which each read moves on; 0.1.8: answered under the claim record's lock, only once that counter is on disk).
 - `GET /last`: Keeper's last line to you about the caller's App.
 - `GET /rotation` (Cain's token only, 0.1.9): whether the old Healthchecks key's rotation still needs your tap, and
-  that key's id (a hash, never the key).
+  that key's id (a hash, never the key); (0.1.10) whether the old key is kept (`old_key_kept`, and `proof`: "attested
+  by your tap only" when it isn't), the enrollment id and a single-use challenge (10 minutes).
 - `POST /rotation/attest` (Cain's token only, 0.1.9): `{attestation}`, your tap on the link's card, signed by the
-  link's Ship key and checked against the pinned, confirmed key.
+  link's Ship key and checked against the pinned, confirmed key; (0.1.10) version 2, bound to that enrollment, the old
+  key's id and that challenge, which it spends.
 
 From inside Keeper's own container only, on its own loopback listener (0.1.6: `127.0.0.1:8096`, never the
 App network's): `drill-record`, `phone-test`, `phone-confirm <code> <check>...`, `key-confirm <fingerprint>
@@ -707,4 +751,8 @@ Pi, and the old key rotated in Healthchecks; the break-glass exercise with Keepe
 all); (0.1.9) the backup check on the Pi (the backup role makes and downloads a backup of Keeper itself, and the
 download is a tar Keeper can read), `/host/info`'s `disk_free` and the backup info's `size` for the free-space
 reserve, the old key's try at Healthchecks answering 401 or 403 once revoked, the rotation card's tap reaching Keeper,
-and a full-Pi restore from a fresh Home Assistant (untested); and the two drills (the next job).
+and a full-Pi restore from a fresh Home Assistant (untested); (0.1.10) the backup check's archive as the Pi's
+Supervisor makes it (its layout, whether the App's archive is gzip, `size` and `size_bytes` in the backup info
+matching the download, the positive control found once), the old key's try answering exactly 401 or `wrong api key`
+once revoked, a refused registration for free space bringing the link's override card, and the rotation card's
+challenge reaching Keeper within its 10 minutes; and the two drills (the next job).

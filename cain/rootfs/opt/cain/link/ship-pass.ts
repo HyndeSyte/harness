@@ -101,7 +101,7 @@ export function parseEnrollment(text: string | null): Enrollment | null {
 // hasn't seen, for the committed fingerprint and confirmed after the keeper's state was created, is the owner's
 // confirm seen (a first enrollment or a re-enrollment): the record moves to it (record). The same id needs the
 // same state and confirm times and a counter no lower than the record's (a higher one is recorded).
-export type EnrollmentJudged = { ok: true; record?: Enrollment } | { ok: false; why: string; record?: Enrollment; cancel?: string };
+export type EnrollmentJudged = { ok: true; record?: Enrollment; superseded?: true } | { ok: false; why: string; record?: Enrollment; cancel?: string };
 export function enrollmentCheck(ans: any, committed: string, linkFp: string | null, rec: Enrollment | null): EnrollmentJudged {
   const r = judgeEnrollment(ans, committed, linkFp, rec);
   if (r.ok) return r;
@@ -118,6 +118,10 @@ export function enrollmentCheckNow(ans: any, committed: string, linkFp: string |
   const eid = String(ans?.enroll_id ?? "");
   if (cur && cur.enrollId !== eid && cur.seen.includes(eid))
     return { ok: false, why: `the keeper's reply is for enrollment ${eid}, which the link has replaced (by ${cur.enrollId}) since the request was sent: discarded`, cancel: `${ENROLL_BEHIND}: a reply for a replaced enrollment` };
+  // (Keeper 0.1.10) Out of order within one enrollment: a reply valid against the record before its request, whose counter is
+  // below the one a later reply already recorded, is superseded: discarded, never recorded, and no refusal or re-enrollment.
+  const counter = Number(ans?.counter);
+  if (cur && cur.enrollId === eid && Number.isSafeInteger(counter) && counter < cur.counter) return { ok: true, superseded: true };
   return r;
 }
 function judgeEnrollment(ans: any, committed: string, linkFp: string | null, rec: Enrollment | null): { ok: true; record?: Enrollment } | { ok: false; why: string; record?: Enrollment } {
@@ -150,6 +154,7 @@ function judgeEnrollment(ans: any, committed: string, linkFp: string | null, rec
 export function noteArmedEnrollment(ans: any, linkFp: string | null, e: EnrollmentStore | undefined, log: (l: string) => void, before?: Enrollment | null): void {
   if (!linkFp || !e) return;
   const en = enrollmentCheckNow(ans, linkFp, linkFp, before === undefined ? e.load() : before, e);
+  if (en.ok && en.superseded) { log(`a keeper reply with counter ${ans?.counter} arrived after a newer one: superseded, discarded (the highest counter is kept)`); return; }
   if (en.record) noteRecord(e, en.record, log);
 }
 // Keeper 0.1.7: a counter is only ever raised (a concurrent read may have stored a higher one meanwhile), and the
@@ -335,6 +340,27 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   return { status: "ok", pr: c.claim.pr, head: c.claim.head, accepted, claims };
 }
 
+// (Keeper 0.1.10) The owner's free-space overrides: his tap on the link's card (core.ts spaceCard) records one for a pull
+// request, head and App; the next registration the keeper refuses for want of space (code no_space) for that same head
+// and App takes it, once, and that App installs without the keeper's rollback. Good for a day; used once.
+export const SPACE_OVERRIDE_MS = 24 * 3_600_000;
+export interface SpaceRec { pr: number; head: string; app: string; at: number; used?: number }
+export function spaceOverrides(load: () => string | null, store: (text: string) => void, now: () => number) {
+  const read = (): SpaceRec[] => { try { const j = JSON.parse(load() ?? "[]"); return Array.isArray(j) ? j.filter((x) => x && Number.isSafeInteger(x.pr) && typeof x.head === "string" && typeof x.app === "string") : []; } catch { return []; } };
+  return {
+    record: (pr: number, head: string, app: string): boolean => {
+      try { const t = now(); store(JSON.stringify([...read().filter((x) => t - x.at < 7 * SPACE_OVERRIDE_MS), { pr, head, app, at: t }].slice(-50))); return true; } catch { return false; }
+    },
+    take: (pr: number, head: string, app: string): boolean => {
+      const t = now(), all = read();
+      const x = all.find((r) => r.pr === pr && r.head === head && r.app === app && !r.used && t - r.at < SPACE_OVERRIDE_MS);
+      if (!x) return false;
+      x.used = t;
+      try { store(JSON.stringify(all)); return true; } catch { return false; }   // not recorded as used: not taken
+    },
+  };
+}
+
 export interface RegisterDeps {
   api: MergeDeps["api"];
   post: (body: unknown) => Promise<{ status: number; body: any } | null>;   // POST /attempt on the keeper, Cain's token
@@ -346,6 +372,9 @@ export interface RegisterDeps {
   enrollment?: EnrollmentStore;
   pollMs?: number; waitMs?: number;
   log: (line: string) => void;
+  // (Keeper 0.1.10) a refusal for want of space: the owner's recorded override taken (once), else the link's card posted
+  takeOverride?: (pr: number, head: string, app: string) => boolean;
+  noSpace?: (pr: number, head: string, app: string, version: string) => void;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
 // is accepted (the keeper's answer "accepted" for that App and versions, with its attempt id and backup
@@ -404,6 +433,10 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       if (!en.ok) { cancel ??= en.cancel; say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); continue; }
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
+    } else if (last?.status === 200 && j.status === "refused" && j.code === "no_space") {
+      // (Keeper 0.1.10) no room for the keeper's backup: the install is refused unless the owner overrode it on the link's card
+      if (d.takeOverride?.(c.pr, c.head, slug)) say(`the keeper had no room for ${b.app} ${b.version}'s backup; the owner's override on the link's card was taken, so ${b.app} ${b.version} installs without the keeper's rollback`, false);
+      else { say(`the keeper refused ${b.app} ${b.version}: ${String(j.why ?? "no room for its backup").slice(0, 160)}; the link posts the owner a card to install it without the rollback`); d.noSpace?.(c.pr, c.head, slug, b.version); }
     } else say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
       : last?.status === 200 ? `the keeper refused ${b.app} ${b.version}: ${String(j?.why || j?.status).slice(0, 160)}`
       : `the keeper didn't answer for ${b.app} ${b.version} (${attempt})`);

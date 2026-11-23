@@ -5,9 +5,9 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { sign as edSign } from "node:crypto";
-import { makeRotation, rotationNeeded, ROTATION_TTL_S } from "../rootfs/opt/cain/link/rotation";
-import { ROTATION_LABEL } from "../rootfs/opt/cain/link/core";
-import { rig, SHIP_KEYS, SHIP_PUB, DM } from "./link-rig";
+import { attestFlow, makeRotation, rotationNeeded, ROTATION_TTL_S } from "../rootfs/opt/cain/link/rotation";
+import { ROTATION_LABEL, SPACE_LABEL } from "../rootfs/opt/cain/link/core";
+import { rig, SHIP_KEYS, SHIP_PUB, DM, OWNER, BOT } from "./link-rig";
 import { Keeper, keyFp } from "../../keeper/rootfs/opt/keeper/core.ts";
 
 const ID = "a1b2c3d4e5f6";
@@ -52,7 +52,9 @@ describe("the rotation card (Keeper 0.1.9)", () => {
     expect(r.state().messages[out.message!].outcome).toBeUndefined();
   });
   test("the keeper's state judged: a card only when a tap is needed and the old option is gone", () => {
-    expect(rotationNeeded({ needed: true, old_key_id: ID, old_option_present: false })).toBe(ID);
+    expect(rotationNeeded({ needed: true, old_key_id: ID, old_option_present: false })).toMatchObject({ id: ID, kept: true });
+    expect(rotationNeeded({ needed: true, old_key_id: ID, old_key_kept: false, enroll_id: "0123456789abcdef", challenge: "a".repeat(24) }))
+      .toEqual({ id: ID, kept: false, enroll: "0123456789abcdef", challenge: "a".repeat(24) });
     expect(rotationNeeded({ needed: true, old_key_id: ID, old_option_present: true })).toBeNull();
     expect(rotationNeeded({ needed: false, old_key_id: ID })).toBeNull();
     expect(rotationNeeded({ needed: true, old_key_id: "x" })).toBeNull();
@@ -71,20 +73,76 @@ describe("the rotation card (Keeper 0.1.9)", () => {
     k.useOptions({ ship_public_key: SHIP_PUB });             // the owner removed the old option
     const id = k.st.oldKey!.id;
     expect((await k.attestRotation("0fcc2575_cain", { attestation: `Dane says key ${id} is rotated` })).status).toBe(409);
+    const view: any = k.rotationView("0fcc2575_cain").body;
     const { privateKey: other } = await import("node:crypto").then((c) => c.generateKeyPairSync("ed25519"));
-    expect((await k.attestRotation("0fcc2575_cain", { attestation: makeRotation(id, now, (d) => edSign(null, d, other)) })).status).toBe(409);
-    const tok = makeRotation(id, now, signer);
-    expect(JSON.parse(Buffer.from(tok.split(".")[1], "base64url").toString()).exp).toBe(Math.floor(now / 1000) + ROTATION_TTL_S);
-    expect((await k.attestRotation("0fcc2575_cain", { attestation: tok })).status).toBe(200);
+    expect((await k.attestRotation("0fcc2575_cain", { attestation: makeRotation(id, view.enroll_id, view.challenge, now, (d) => edSign(null, d, other)) })).status).toBe(409);
+    const tok = makeRotation(id, view.enroll_id, view.challenge, now, signer);
+    expect(JSON.parse(Buffer.from(tok.split(".")[1], "base64url").toString())).toMatchObject({ v: 2, id, enroll: view.enroll_id, challenge: view.challenge, exp: Math.floor(now / 1000) + ROTATION_TTL_S });
+    // Keeper 0.1.10: the link's own flow, reading /rotation fresh at the tap, is what the keeper takes
+    const keeper = { get: async (p: string) => ({ status: 200, body: p === "/rotation" ? k.rotationView("0fcc2575_cain").body : {} }),
+      post: async (_p: string, b: any) => { const a = await k.attestRotation("0fcc2575_cain", b); return { status: a.status, body: a.body }; }, sign: signer, now: () => now };
+    expect(await attestFlow(keeper, "000000000000")).toEqual({ ok: false, why: `the keeper now names old key ${id}, not the card's 000000000000` });
+    expect(await attestFlow(keeper, id)).toEqual({ ok: true, why: "" });
     expect(k.rotationWhy()).toBe("");
+    expect(k.st.rotation!.proof).toBe("attested by your tap only");
   });
   test("only main.ts signs an attestation, inside the tap's dependency: no other code of Cain's makes one", () => {
     const main = readFileSync(join(import.meta.dir, "..", "rootfs/opt/cain/link/main.ts"), "utf8");
-    expect(main.match(/makeRotation\(/g)?.length).toBe(1);
+    expect(main.match(/attestFlow\(/g)?.length).toBe(1);
+    expect(main).not.toContain("makeRotation(");
     expect(main).toContain("attestRotation: shipPriv ? async (id) => {");
+    const rot = readFileSync(join(import.meta.dir, "..", "rootfs/opt/cain/link/rotation.ts"), "utf8");
+    expect(rot.match(/makeRotation\(/g)?.length).toBe(2);     // its definition and the one call, in attestFlow
     const core = readFileSync(join(import.meta.dir, "..", "rootfs/opt/cain/link/core.ts"), "utf8");
     expect(core).not.toContain("makeRotation(");
+    expect(core).not.toContain("attestFlow(");
     expect(core).toContain("this.d.attestRotation(id)");
     expect(DM).toBeTruthy();
+  });
+  // Keeper 0.1.10
+  test("no old key kept: the card says the rotation is attested by his tap only", async () => {
+    const r = rig();
+    const out = await r.link.rotationCard(ID, { kept: false });
+    expect(r.msg(out.message!).content).toContain("this is attested by your tap only");
+    const k = rig();
+    const kept = await k.link.rotationCard(ID);
+    expect(k.msg(kept.message!).content).toContain("it checks Healthchecks turns it down before it takes your word");
+  });
+  test("a tap from another user is refused by the rotation handler itself, before anything is signed", async () => {
+    const r = rig();
+    const asked: string[] = [];
+    (r.link as any).d.attestRotation = async (id: string) => { asked.push(id); return { ok: true, why: "" }; };
+    const out = await r.link.rotationCard(ID);
+    const msg = r.msg(out.message!);
+    const it = (user: string) => ({ type: 3, id: "11", token: "t", application_id: BOT, channel_id: DM, user: { id: user }, data: { custom_id: `k:rot:${ID}` }, message: msg });
+    expect(await (r.link as any).rotationTap(it("7777"), out.message!)).toBe("refused: not the owner");
+    expect(asked).toEqual([]);
+    expect(r.state().messages[out.message!].outcome).toBeUndefined();
+    expect(r.logs.some((l) => l.includes(`a rotation tap for the old key ${ID} was refused before signing: not the owner`))).toBe(true);
+    expect(await (r.link as any).rotationTap(it(OWNER), out.message!)).toBe("rotation attested");
+    expect(asked).toEqual([ID]);
+  });
+  test("the free-space override card: one per pull request, head and App; only his tap records it, and Cain is told to show a new Ship card", async () => {
+    const r = rig();
+    const recorded: any[] = [];
+    (r.link as any).d.spaceOverride = (...a: any[]) => { recorded.push(a); return true; };
+    const HEAD = "a".repeat(40);
+    const out = await r.link.spaceCard(46, HEAD, "0fcc2575_cain", "0.19.0");
+    expect(out.status).toBe("posted");
+    expect(r.msg(out.message!).content).toContain("Keeper has no room for the backup it takes before installing Cain 0.19.0, so the install was refused and nothing was installed.");
+    expect(r.buttons(out.message!)).toEqual([SPACE_LABEL]);
+    expect((await r.link.spaceCard(46, HEAD, "0fcc2575_cain", "0.19.0")).status).toBe("open");
+    expect(r.posts()).toBe(1);
+    // another user's tap, straight at the handler: refused before anything is recorded
+    const msg = r.msg(out.message!);
+    const it = (user: string) => ({ type: 3, id: "11", token: "t", application_id: BOT, channel_id: DM, user: { id: user }, data: { custom_id: "k:space:46" }, message: msg });
+    expect(await (r.link as any).spaceTap(it("7777"), out.message!)).toBe("refused: not the owner");
+    expect(recorded).toEqual([]);
+    expect(await r.tap(msg, "k:space:46")).toBe("override recorded");
+    expect(recorded).toEqual([[46, HEAD, "0fcc2575_cain"]]);
+    expect(r.msg(out.message!).content).toContain("Done: the next Ship run for it installs without Keeper's rollback.");
+    expect(r.relayed.some((l: string) => l.includes(`Dane tapped ${SPACE_LABEL} for pull request 46`))).toBe(true);
+    const st = rig(); st.stop.stopped = true;
+    expect((await st.link.spaceCard(46, HEAD, "0fcc2575_cain", "0.19.0")).status).toBe("stopped");
   });
 });

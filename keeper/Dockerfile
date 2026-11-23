@@ -23,6 +23,6 @@ RUN chmod a+x /etc/services.d/keeper/run /etc/services.d/keeper/finish \
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.1.9" \
+    io.hass.version="0.1.10" \
     org.opencontainers.image.title="Keeper" \
     org.opencontainers.image.description="A check after every App install, with automatic rollback"

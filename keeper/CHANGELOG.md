@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.10
+
+- The backup check now fails unless it can prove what it read: every test file is read back before the test backup, a marker that must appear exactly once is placed outside the excluded files, the download must match the size Home Assistant reports, and any archive it can't fully open (cut short, encrypted, or a format it doesn't read) fails it. A check that was interrupted counts as failed, and its test backup is deleted at the next start. A pass only counts for the backup exclusion this version ships.
+- The old Healthchecks key counts as revoked only when Healthchecks answers it with "unauthorized" (or its own wrong key answer), never a bare "forbidden". The kept old key is deleted as soon as that check passes, and is only kept at all inside the backup exclusion. When Keeper never kept the old key, the card and Keeper's state say it rests on your tap only.
+- Kept backups now get 2 hours 30 minutes before any cleanup, and their limits apply only while a cleanup may run; a cleanup that is held up says so in the log.
+- A backup that finished after Keeper stopped waiting for it is found by its name and kept under the cleanup's rules, and a request whose change is still going through when its time runs out answers "pending" and finishes rather than failing.
+- For a first backup, Keeper now wants 2 GB free (or 1 GB plus the App's image size when it knows it).
+- Keeper watches an install only as the Ship run's own attempt and backup.
+- The "Accepted limits" text is now version 4, so you accept it again with `accept-limits`.
+
 ## 0.1.9
 
 - Keeper covers only the first 15 minutes after an install, and now says so on its card and in its docs.

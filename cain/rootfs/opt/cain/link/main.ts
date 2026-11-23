@@ -78,8 +78,8 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
-import { makeRotation, rotationNeeded } from "./rotation";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
+import { attestFlow, rotationNeeded } from "./rotation";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, spaceOverrides } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -254,12 +254,14 @@ const link = new Link({
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
   // Keeper 0.1.9: his tap on the rotation card, signed with the Ship key here and sent to the keeper (rotation.ts)
+  // Keeper 0.1.10: bound to the keeper's enrollment and its single-use challenge, read fresh at the tap (rotation.ts attestFlow)
   attestRotation: shipPriv ? async (id) => {
     if (!KEEPER_TOKEN) return { ok: false, why: "no keeper_token is set" };
-    const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/rotation/attest", { attestation: makeRotation(id, Date.now(), (data) => edSign(null, data, shipPriv)) }, 20_000);
-    if (!r) return { ok: false, why: "the keeper didn't answer" };
-    return r.status === 200 ? { ok: true, why: "" } : { ok: false, why: typeof r.body?.why === "string" ? r.body.why : `the keeper answered ${r.status}` };
+    return attestFlow({ get: (path) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path), post: (path, body) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body, 20_000),
+      sign: (data) => edSign(null, data, shipPriv), now: Date.now }, id);
   } : undefined,
+  // Keeper 0.1.10: his tap on the free-space override card, kept in root's /data/trust
+  spaceOverride: (pr, head, app) => spaceStore.record(pr, head, app),
   land: deployKey ? async ({ pr, head, stopped }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
@@ -312,6 +314,9 @@ const link = new Link({
   writeReplay: (r) => writeReplayReport(r),
 });
 
+// Keeper 0.1.10: the owner's free-space overrides, one per pull request, head and App (ship-pass.ts spaceOverrides).
+const SPACE_FILE = process.env.CAIN_SPACE_OVERRIDES ?? `${TRUST_DIR}/space-overrides.json`;
+const spaceStore = spaceOverrides(() => { try { return readFileSync(SPACE_FILE, "utf8"); } catch { return null; } }, (t) => writeSynced(SPACE_FILE, t), Date.now);
 // Keeper 0.1.5: the last confirmed enrollment of the keeper's Ship key the link saw (ship-pass.ts enrollmentCheck).
 const KEEPER_ENROLL = process.env.CAIN_KEEPER_ENROLL ?? `${TRUST_DIR}/keeper-enrollment.json`;
 const enrollment: EnrollmentStore = {
@@ -340,8 +345,8 @@ async function askKeeper(): Promise<void> {
   // Keeper 0.1.9: the old Healthchecks key's rotation: one card naming its id while the keeper says a tap is needed
   if (KEEPER_TOKEN) {
     const rot = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/rotation");
-    const id = rot?.status === 200 ? rotationNeeded(rot.body) : null;
-    if (id) await link.rotationCard(id).catch((e) => console.log(`[cain] link: couldn't post the rotation card: ${String(e).slice(0, 80)}`));
+    const need = rot?.status === 200 ? rotationNeeded(rot.body) : null;
+    if (need) await link.rotationCard(need.id, { kept: need.kept }).catch((e) => console.log(`[cain] link: couldn't post the rotation card: ${String(e).slice(0, 80)}`));
   }
 }
 void askKeeper();
@@ -427,6 +432,8 @@ const shipPassDeps: PassDeps = {
     const pub = shipPub();
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
       post: (body) => keeperPost("/attempt", body),
+      takeOverride: (pr, head, app) => spaceStore.take(pr, head, app),
+      noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)
       .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
