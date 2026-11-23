@@ -2329,6 +2329,8 @@ describe("sixth round: the init's token files", () => {
     const tok = join(t.dir, "SUPERVISOR_TOKEN");
     writeFileSync(tok, "x", { mode: 0o600 });
     t.trials.cfg.tokenFiles = [tok];
+    // The runner's uid stands as a third uid, so the check goes by mode bits whether the tests run as root or not.
+    t.trials.cfg.runnerUid = 54322;
     expect(t.trials.paidGate()).toBeNull();
     chmodSync(t.dir, 0o755);
     chmodSync(tok, 0o644);   // readable by others: the assistant's uid (another uid) could read it
