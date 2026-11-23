@@ -619,6 +619,9 @@ class Runner:
         # One transaction: the proposal and the card that tells him about it
         # are written together, so a crash can't leave a job with no words.
         with self.ledger.tx() as db:
+            # Round 3: a card made by a re-run for Cain's note, after the message was answered only in words,
+            # says so first (its note slot is still claimed until this transaction records the card).
+            reconsidered = self.ledger.note_slot_claimed(job["id"])
             # A rerun's card replaces any card still open for this request: its buttons come off,
             # so a tap binds only to the proposal it shows.
             gone = approvals.supersede_open(self.ledger, [job["id"]], db=db)
@@ -701,6 +704,8 @@ class Runner:
                                         expires=datetime.fromisoformat(row["expires_at"]),
                                         job_id=job["id"], warnings=warnings, lines=lines or None,
                                         now=self.ledger.now())
+            if reconsidered:
+                card = render.fit(f"{render.RECONSIDERED}\n{card}")
             self.ledger.event("proposal", {"job": job["id"], "proposal": pid,
                                            "receipt": receipt}, db=db)
             self.ledger.enqueue(chat_id=job["chat_id"], kind="card", text=card,

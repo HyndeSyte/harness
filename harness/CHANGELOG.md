@@ -2,14 +2,14 @@
 
 ## 0.24.5
 
-- **A card that takes several days off a repeating event reads as one short list**: the event's name and calendar once, every day you are approving on one line (a weekly run as "Jan 4 to Feb 22 (weekly)"), and "each of those days only, the rest of the series stays" once. The *Done* receipt shortens a long list. No event ids on cards.
+- **A card that takes several days off a repeating event reads as one short list**: the event's name and calendar once, every day you are approving on one line, and "each of those days only, the rest of the series stays" once. Every week at one time with none missing reads as "Jan 4 to Feb 22 (weekly)", a few weeks left out as that range with "except" those days, and anything else lists every day, with its time when the times differ. The *Done* receipt shortens a long list. No event ids on cards.
 - **Two repeating events with the same name stay two lists**, each saying which days of the week it is on, so you can tell them apart.
-- **The things to check before approving are one short line**, not a line each. Times like 9:00-10:00 and dates keep their hyphens.
-- **Ending one of two series with the same name finds the one you mean**: by its exact name (emoji included), the days of the week you named ("Mondays", "every Monday", "the Monday swim"), or the id ending you gave. When nothing tells them apart, or what you said points two ways, one card lists each series with its days and next date, a button each, as many as there are. Two on the same days also show their time and calendar. Harness never picks one just because of the date you gave.
+- **The things to check before approving are one short line**, not a line each. Times like 9:00-10:00 or 9:00 to 10:00 written with a dash, and dates, keep their dashes.
+- **Ending one of two series with the same name finds the one you mean**: by its exact name (emoji included), the days of the week you named ("Mondays", "every Monday", "the Monday series", matched to a series on exactly those days), or the id ending you gave. "Monday swim" means one Monday, not the schedule. When nothing you said tells them apart, or it points two ways, one card lists each series with its days and next date, a button each. Two on the same days also show their time and calendar. Harness never picks one just because of the date you gave, and never only because Cain's note named one: that one is listed first on the card instead. More than 20 to choose from: Harness asks you to narrow it down (calendar, time or name) instead.
 - **A card that would take off a whole series says so**, with its days of the week and first date.
-- **What you approve is what ends**: the series on the card is the one ended, even if another one shows up before your tap. If that series changed in the meantime, nothing is ended and a fresh card follows.
-- **A new note on a message Harness answered "not a change" is read afresh**, up to two times per message. A message that already had a card is not read again that way. The same note twice is still taken once.
-- **The same "Nothing changed" answer comes once per message**, and again only if it never reached you.
+- **What you approve is exactly what comes off**: the card holds every day it takes off, and for a series end every day from that date on. If one of them moved, was taken off, or a new one appeared before your tap, or the series was edited, nothing changes and one fresh card follows.
+- **A new note on a message Harness answered "not a change" is read afresh**, up to two times per message, even when two notes arrive at once. A card that comes from it starts with "Reconsidered after Cain's note:". A message that already had a card is not read again that way. The same note twice is still taken once.
+- **The same "Nothing changed" answer comes once per message**, again only if it never reached you or what it is about changed.
 
 ## 0.24.4
 

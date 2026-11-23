@@ -25,7 +25,6 @@ import os
 import queue
 import re
 import sqlite3
-import threading
 import time
 from concurrent.futures import Executor
 from dataclasses import replace
@@ -168,8 +167,6 @@ class Controller:
         self._discord_seen: str | None = None    # fingerprint of the token it identified with
         self._reconciled = False
         self._handover_jobs: dict[str, list] = {}
-        self._note_locks: dict[str, threading.Lock] = {}     # one per message (_note_lock)
-        self._note_locks_guard = threading.Lock()
         # The mutual watch on Cain's add-on (watch.py, set by __main__), and the last
         # thing Cain's link said about itself, for the settings page.
         self.cain_watch = None
@@ -3295,20 +3292,27 @@ class Controller:
         h.job = render.short(job_id)                       # for the log only
         self._handover_jobs.setdefault(job_id, []).append(h)
 
-    def _note_lock(self, root: str):
-        """One lock per message (its root request), so two notes for it are handled one after the other
-        and can't both pass the checks below (review round)."""
-        with self._note_locks_guard:
-            return self._note_locks.setdefault(root, threading.Lock())
-
     def _note_for_question(self, job_id: str, note: str, flags: list[str]) -> str:
-        """Review round: handled under the message's own lock. "" once handled; the answer for Cain when
-        the note isn't read again because this message has had its in-place re-runs (NOTE_RERUNS_MAX)."""
-        root = self.ledger.get_meta(f"job_parent:{job_id}") or job_id
-        with self._note_lock(root):
-            return self._note_for_question_locked(job_id, note, flags, root) or ""
+        """Round 3: the whole decision and the re-run's claim in one write transaction (BEGIN IMMEDIATE, so
+        another connection to the ledger, another process included, waits for it), never an in-process lock.
+        "" once handled; the answer for Cain when the note isn't read again because this message has had its
+        in-place re-runs (NOTE_RERUNS_MAX)."""
+        with self.ledger.tx() as db:
+            root = self.ledger.get_meta(f"job_parent:{job_id}") or job_id
+            capped = self._note_for_question_in(db, job_id, note, flags, root)
+        if capped:
+            log.info("handover: a note for job %s: received; not run again (its %d re-runs are used)",
+                     render.short(job_id), NOTE_RERUNS_MAX)
+        return capped or ""
 
-    def _note_for_question_locked(self, job_id: str, note: str, flags: list[str], root: str) -> str | None:
+    def note_reruns(self, root: str) -> int:
+        """How many times this message (its root request) was read again in place for a note: its slots in
+        the ledger, never a count kept in memory (round 3)."""
+        prefix = f"note_slot:{root}:"
+        return self.ledger.db.execute("SELECT COUNT(*) FROM meta WHERE substr(key, 1, ?)=?",
+                                      (len(prefix), prefix)).fetchone()[0]
+
+    def _note_for_question_in(self, db, job_id: str, note: str, flags: list[str], root: str) -> str | None:
         """A note from Cain for a request of his reaches it: one waiting on its question, one
         answered "not a change" to Cain alone, or one with a card still open or a change being done
         (one of its parts, when it was split). The note is fenced as Cain's (Nov 11: a second
@@ -3318,14 +3322,19 @@ class Controller:
         it addresses: the others stand, still offered (runner._address_open, 0.24.0, third round).
         While a change of that message is being done under its lease, it waits, then reads the
         result. What's already done isn't done again (runner._not_yet_done). A note it already has
-        changes nothing, and any change resting on it still gets his tap."""
+        changes nothing, and any change resting on it still gets his tap.
+
+        Round 3: called inside one write transaction (`db`), so everything read here is read under the
+        write lock. An in-place re-run takes the message's next slot (`note_slot:<root>:<n>`) with a plain
+        INSERT, which a second claim of the same slot can't make (the key is unique), and the slot is filled
+        with the answer in the transaction that records it (Ledger.transition)."""
         job = self.ledger.job(job_id)
         if job is None:
-            return
+            return None
         parts = json.loads(self.ledger.get_meta(f"job_parts:{job_id}") or "[]")
         family = [job_id] + parts
         if any(note in self.ledger.job_text(j) for j in family):
-            return
+            return None
         states = {j: (self.ledger.job(j) or {"state": ""})["state"] for j in family}
         # 0.24.5: a request answered "not a change" (no card of it ever made) is read afresh with a new
         # note, whoever its answer went to: the outcome isn't sticky for the message, and a note with the
@@ -3337,46 +3346,52 @@ class Controller:
         in_place = not carded and (job["state"] == "needs_clarification" or (
             job["state"] in ("no_action", "answered") and (self._answered_to_cain(job_id)
                                                            or self._no_card_ever(family, states))))
-        if in_place and int(self.ledger.get_meta(f"note_reruns:{root}") or 0) >= NOTE_RERUNS_MAX:
+        reruns = self.note_reruns(root) if in_place else 0
+        if in_place and reruns >= NOTE_RERUNS_MAX:
             # Read again twice already: the note is kept in the log as received, and Cain is told in words.
-            with self.ledger.tx() as db:
-                self.ledger.event("job_note_capped", {"job": job_id,
-                                                      "note": hashlib.sha256(note.encode()).hexdigest()[:12]}, db=db)
-            log.info("handover: a note for job %s: received; not run again (its %d re-runs are used)",
-                     render.short(job_id), NOTE_RERUNS_MAX)
+            self.ledger.event("job_note_capped", {"job": job_id,
+                                                  "note": hashlib.sha256(note.encode()).hexdigest()[:12]}, db=db)
             return (f"Note received, but nothing changed: this message has already been read again for notes "
                     f"{NOTE_RERUNS_MAX} times, the most for one message. A new message from him starts afresh.")
         beside = any(st in ("proposed", "approved") for st in states.values())
         if not in_place and not beside and not self._all_closed(family):
-            return                       # a card he saw (a rule, a refusal) isn't sent again
+            return None                  # a card he saw (a rule, a refusal) isn't sent again
         marks = ",".join("?" * len(family))
-        last = self.ledger.db.execute(f"SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id IN ({marks})",
-                                      tuple(family)).fetchone()[0]
+        last = db.execute(f"SELECT COALESCE(MAX(id), 0) FROM outbox WHERE job_id IN ({marks})",
+                          tuple(family)).fetchone()[0]
         text = self.ledger.job_text(job_id)
         flagged = json.loads(self.ledger.get_meta(f"job_flags:{job_id}") or "[]")
-        with self.ledger.tx() as db:
-            if in_place:
-                target = job_id
-                self.ledger.set_meta(f"note_reruns:{root}",
-                                     str(int(self.ledger.get_meta(f"note_reruns:{root}") or 0) + 1), db)
-                db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, target))
-                self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
-                self.ledger.transition(target, "received", db=db)
-                db.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"job_rerun:{job_id}", f"clarify_due:{target}"))
-            else:
-                target = self.ledger.made_job(job["chat_id"], text + note, kind="message", db=db,
-                                              reply_to=job["reply_to_message_id"], created_at=job["created_at"],
-                                              state="received")
-                self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
-                self.ledger.set_meta(f"job_parent:{target}", job_id, db)
-                self.ledger.set_meta(f"job_parts:{job_id}", json.dumps(parts + [target]), db)
-                self.ledger.set_meta(f"job_rerun:{job_id}", target, db)
-            self.ledger.event("job_note", {"job": target}, db=db)
-            db.execute("DELETE FROM meta WHERE key=?", (f"clarify_card:{target}",))
-            # Kept in the ledger, so every later answer about it, after a restart too, starts here.
-            self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
+        if in_place:
+            target = job_id
+            slot = f"note_slot:{root}:{reruns + 1}"
+            try:
+                db.execute("INSERT INTO meta(key, value) VALUES(?, ?)", (slot, json.dumps(
+                    {"job": job_id, "state": "claimed", "note": hashlib.sha256(note.encode()).hexdigest()[:12],
+                     "after": str(job["state"])})))
+            except sqlite3.IntegrityError:
+                log.info("handover: a note for job %s: its re-run slot was taken by another note",
+                         render.short(job_id))
+                return None
+            self.ledger.set_meta(f"note_slot_of:{target}", slot, db)
+            db.execute("UPDATE job_text SET text=? WHERE job_id=?", (text + note, target))
+            self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
+            self.ledger.transition(target, "received", db=db)
+            db.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"job_rerun:{job_id}", f"clarify_due:{target}"))
+        else:
+            target = self.ledger.made_job(job["chat_id"], text + note, kind="message", db=db,
+                                          reply_to=job["reply_to_message_id"], created_at=job["created_at"],
+                                          state="received")
+            self.ledger.set_meta(f"job_flags:{target}", json.dumps(sorted(set(flagged + flags))), db)
+            self.ledger.set_meta(f"job_parent:{target}", job_id, db)
+            self.ledger.set_meta(f"job_parts:{job_id}", json.dumps(parts + [target]), db)
+            self.ledger.set_meta(f"job_rerun:{job_id}", target, db)
+        self.ledger.event("job_note", {"job": target}, db=db)
+        db.execute("DELETE FROM meta WHERE key=?", (f"clarify_card:{target}",))
+        # Kept in the ledger, so every later answer about it, after a restart too, starts here.
+        self.ledger.set_meta(f"job_rerun_after:{job_id}", str(last), db)
         log.info("handover: a note for job %s: it runs again%s", render.short(job_id),
                  "" if in_place else " beside its open cards")
+        return None
 
     def _no_card_ever(self, family: list[str], states: dict, root: str | None = None) -> bool:
         """Every request of this message was answered in words, and none of it ever came on a card:

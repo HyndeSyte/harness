@@ -96,7 +96,10 @@ def test_a_removal_never_takes_off_another_event_than_the_card_named(m):
     other = dict(m.gmail.events.pop(uid), id="other0drop", etag='"9"')
     m.gmail.events["other0drop"] = other
     m.tap("Approve")
-    assert m.seen()[-1].startswith("Nothing changed: the event to take off isn't the one that card named")
+    # Harness 0.24.5, round 3: refused as changed since the card, and one fresh card follows.
+    said = next(t for t in m.seen() if t.startswith("Nothing changed: the event changed since your card"))
+    assert "the event to take off isn't the one that card named" in said and "A fresh card" in said
+    assert m.seen()[-1].startswith("Change your calendar?")
     assert m.gmail.events["other0drop"].get("status", "confirmed") == "confirmed"
 
 
