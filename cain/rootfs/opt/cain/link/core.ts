@@ -107,9 +107,11 @@ export const GRANT_NO = "No";
 // Keeper 0.1.9: the rotation card's one button (rotation.ts).
 export const ROTATION_LABEL = "Old key replaced";
 export const ROTATION_PREFIX = "k:rot:";
-// Keeper 0.1.10: the free-space override card's one button: his tap installs that pull request and head without Keeper's rollback.
-export const SPACE_LABEL = "Install without rollback";
-export const SPACE_PREFIX = "k:space:";
+// Keeper 0.1.11: the card for a keeper claim or cancel that wasn't a plain success: its one button asks Cain for the Ship card again.
+// (The free-space card of Keeper 0.1.10 has no button any more: nothing installs without Keeper's rollback.)
+export const RETRY_LABEL = "Try again";
+export const RETRY_PREFIX = "k:retry:";
+const RETRY_ATTEMPT = /^ship-(\d{1,9})-([a-z0-9_]{1,64})-[0-9a-f]{8}$/;
 export const grantLabel = (n: number) => `Grant ${n} more round${n === 1 ? "" : "s"}`;
 // First review of 0.18.0: an open grant card loses its buttons when another card's grant for the same
 // change is written, and a grant tap whose checks no longer hold writes nothing; its card says why.
@@ -355,7 +357,8 @@ export interface Shown {
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
   rotation?: { id: string };        // the link's card for the keeper's old Healthchecks key (Keeper 0.1.9, rotation.ts)
-  space?: { pr: number; head: string; app: string; version: string };   // the free-space override card (Keeper 0.1.10, ship-pass.ts)
+  space?: { pr: number; head: string; app: string; version: string };   // the free-space card (Keeper 0.1.10, ship-pass.ts; 0.1.11: no button)
+  retry?: { attempt: string; what: "claim" | "cancel" };   // the card offering a retry after a keeper answer that wasn't a plain success (Keeper 0.1.11)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
   grant?: { key: string; rounds: number; pr: string | null; reason: string;       // Cain's grant card for extra review rounds (0.18.0, ../review/grants.ts)
     used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
@@ -708,8 +711,6 @@ export interface Deps {
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
   // Keeper 0.1.9: his tap on the rotation card, signed by the link's Ship key and sent to the keeper (rotation.ts)
   attestRotation?: (id: string) => Promise<{ ok: boolean; why: string }>;
-  // Keeper 0.1.10: his tap on the free-space override card, recorded for that pull request, head and App (ship-pass.ts spaceOverrides)
-  spaceOverride?: (pr: number, head: string, app: string) => boolean;
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
@@ -1705,51 +1706,70 @@ export class Link {
 
   // -- the keeper refused a registration for want of free space (Keeper 0.1.10, ship-pass.ts) --
   // The install is refused (the pass is refused, nothing installed). One card per pull request, head and App, the link's
-  // own words, with one button: only his tap overrides it, once, and the next Ship run for that head then installs it
-  // without Keeper's rollback. Not while stopped.
+  // own words. Keeper 0.1.11: no button: nothing installs without Keeper's rollback; he clears space or chooses another path.
+  // Not while stopped.
   async spaceCard(pr: number, head: string, app: string, version: string): Promise<{ status: "posted" | "open" | "done" | "stopped"; message?: string }> {
     if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/.test(head) || !/^[a-z0-9_]{1,64}$/.test(app) || !/^[0-9A-Za-z.+-]{1,32}$/.test(version)) throw new Refusal("that isn't a pull request, head, App and version");
     if (this.stopped().stopped) return { status: "stopped" };
-    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.space && m.space.pr === pr && m.space.head === head && m.space.app === app && (!m.outcome || m.outcome === "answered"));
-    if (prior) return { status: prior[1].outcome ? "done" : "open", message: prior[0] };
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.space && m.space.pr === pr && m.space.head === head && m.space.app === app);
+    if (prior) return { status: "open", message: prior[0] };
     const name = app.replace(/^[0-9a-f]{8}_/, "").replace(/^./, (c) => c.toUpperCase());
     const text = `Keeper has no room for the backup it takes before installing ${name} ${version}, so the install was refused and nothing was installed. `
-      + "Free some space (Home Assistant, Settings, System, Backups) and Cain shows the Ship card again. "
-      + `Or tap below to install ${name} ${version} without Keeper's rollback: if it breaks, nothing rolls it back by itself.`;
-    const msg = await this.post(text, rows([[[SPACE_LABEL, `${SPACE_PREFIX}${pr}`]]], "k:"), { nonce: stableNonce("space", `${pr}:${head}:${app}`) });
+      + "Nothing installs it without Keeper's rollback. Free some space (Home Assistant, Settings, System, Backups) and Cain shows the Ship card again, or choose another way yourself.";
+    const msg = await this.post(text, [], { nonce: stableNonce("space", `${pr}:${head}:${app}`) });
     const s = this.d.load();
-    this.remember(s, msg, { kind: "notice", item: "none", question: `space:${pr}`, posted: this.d.now(), expires: null, buttons: true,
-      labels: [SPACE_LABEL], space: { pr, head, app, version } });
+    this.remember(s, msg, { kind: "notice", item: "none", question: `space:${pr}`, posted: this.d.now(), expires: null, buttons: false,
+      labels: [], space: { pr, head, app, version } });
     this.d.save(s);
-    this.log(`a free-space override card for pull request ${pr} (${name} ${version}) went to him`);
+    this.log(`a free-space card for pull request ${pr} (${name} ${version}) went to him, with no button`);
     return { status: "posted", message: String(msg.id) };
   }
-  // His tap: the sender checked first (the owner, in his DM), then the override recorded; the card says so and loses its
-  // button, and Cain is told to show a new Ship card for the same pull request and head.
-  private async spaceTap(it: any, msgId: string): Promise<string> {
+
+  // -- a keeper claim or cancel that wasn't a plain success (Keeper 0.1.11, ship-pass.ts) --
+  // Pending, spent, refused, an error or no answer: nothing was installed and nothing counts as done. One card per attempt and
+  // kind, the link's own words, with one button: his tap asks Cain to show the Ship card again. Not while stopped.
+  async retryCard(attempt: string, what: "claim" | "cancel"): Promise<{ status: "posted" | "open" | "stopped"; message?: string }> {
+    const m = RETRY_ATTEMPT.exec(attempt);
+    if (!m || (what !== "claim" && what !== "cancel")) throw new Refusal("that isn't a keeper attempt and a claim or cancel");
+    if (this.stopped().stopped) return { status: "stopped" };
+    const prior = Object.entries(this.d.load().messages).find(([, x]) => x.retry && x.retry.attempt === attempt && x.retry.what === what);
+    if (prior) return { status: "open", message: prior[0] };
+    const name = m[2].replace(/^./, (c) => c.toUpperCase());
+    const text = (what === "claim"
+      ? `Keeper didn't confirm the start of the install of ${name}, so the Ship run didn't start and nothing was installed. `
+      : `Keeper didn't confirm it called off an install of ${name} that didn't run, so nothing was installed and nothing counts as done. Keeper ends that hold by itself within 30 minutes. `)
+      + `Tap ${RETRY_LABEL} and Cain shows you the Ship card again.`;
+    const msg = await this.post(text, rows([[[RETRY_LABEL, `${RETRY_PREFIX}${attempt}`]]], "k:"), { nonce: stableNonce("retry", `${attempt}:${what}`) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `retry:${attempt}`, posted: this.d.now(), expires: null, buttons: true,
+      labels: [RETRY_LABEL], retry: { attempt, what } });
+    this.d.save(s);
+    this.log(`a retry card for the keeper's ${what} of ${attempt} went to him`);
+    return { status: "posted", message: String(msg.id) };
+  }
+  // His tap: the sender checked first (the owner, in his DM); the card loses its button, and Cain is told to show a new Ship
+  // card for the same pull request and head.
+  private async retryTap(it: any, msgId: string): Promise<string> {
     const rec = this.d.load().messages[msgId];
-    if (!rec?.space || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
-    const { pr, head, app, version } = rec.space;
+    if (!rec?.retry || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    const { attempt, what } = rec.retry;
     let who = "";
     try { who = await this.who(it); } catch { who = "check failed"; }
-    if (who) { await this.answer(it, ACK); this.log(`a free-space override tap for pull request ${pr} was refused: ${who}`); return `refused: ${who}`; }
+    if (who) { await this.answer(it, ACK); this.log(`a retry tap for ${attempt} was refused: ${who}`); return `refused: ${who}`; }
     await this.answer(it, ACK);
-    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so nothing was recorded. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
-    let ok = false;
-    try { ok = this.d.spaceOverride ? this.d.spaceOverride(pr, head, app) : false; } catch { ok = false; }
-    if (!ok) { await this.ephemeral(it, "Your tap couldn't be saved, so nothing changed. The card is still up: tap it again."); return "refused: not saved"; }
-    const line = "Done: the next Ship run for it installs without Keeper's rollback.";
-    const content = withLine(String(it.message?.content ?? ""), line);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so nothing was asked. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    const pr = RETRY_ATTEMPT.exec(attempt)?.[1] ?? "?";
+    const content = withLine(String(it.message?.content ?? ""), "Done: Cain shows you the Ship card again.");
     let edited = false;
     try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
-    catch (e) { this.log(`couldn't mark the free-space override card done: ${String(e).slice(0, 80)}`); }
+    catch (e) { this.log(`couldn't mark the retry card done: ${String(e).slice(0, 80)}`); }
     const s = this.d.load();
     const m = s.messages[msgId];
-    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = SPACE_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = RETRY_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
     this.d.save(s);
-    this.log(`his free-space override for pull request ${pr} (${app} ${version}) is recorded`);
-    this.d.relay(`Dane tapped ${SPACE_LABEL} for pull request ${pr} at its current head: show him a new Ship card for the same pull request and head; that Ship run installs ${version} without Keeper's rollback. Nothing else to tell him.`);
-    return "override recorded";
+    this.log(`his retry tap after the keeper's ${what} of ${attempt}`);
+    this.d.relay(`Dane tapped ${RETRY_LABEL} after Keeper didn't confirm its ${what} for pull request ${pr}: nothing was installed. Show him a new Ship card for the same pull request and head (after a cancel, once Keeper's log shows no live claim). Nothing else to tell him.`);
+    return "retry asked";
   }
 
   // -- extra review rounds for a change, granted by his tap (0.18.0, ../review/grants.ts) --
@@ -2680,8 +2700,8 @@ export class Link {
     if (rec.grant && cid.startsWith("q:")) return this.underKey(`grant:${rec.grant.key}`, () => this.grantTapLocked(it, cid, msgId));
     // Keeper 0.1.9: his tap on the rotation card, under that card's own lock
     if (rec.rotation && cid === `${ROTATION_PREFIX}${rec.rotation.id}`) return this.underKey(`rotation:${rec.rotation.id}`, () => this.rotationTap(it, msgId));
-    // Keeper 0.1.10: his tap on the free-space override card, under that card's own lock
-    if (rec.space && cid === `${SPACE_PREFIX}${rec.space.pr}`) return this.underKey(`space:${rec.space.pr}:${rec.space.head}`, () => this.spaceTap(it, msgId));
+    // Keeper 0.1.11: his tap on a retry card, under that card's own lock
+    if (rec.retry && cid === `${RETRY_PREFIX}${rec.retry.attempt}`) return this.underKey(`retry:${rec.retry.attempt}`, () => this.retryTap(it, msgId));
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
       if (why) {

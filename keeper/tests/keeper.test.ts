@@ -1559,7 +1559,7 @@ describe("0.1.7: the accepted limits", () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits")).replace(/\s+/g, " ");
     expect(sec.length).toBeGreaterThan(100);
-    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.10`);   // 0.1.8: version 2; 0.1.9: version 3; 0.1.10: version 4
+    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.11`);   // 0.1.8: version 2; 0.1.9: version 3; 0.1.10: version 4; 0.1.11: version 5
     expect(sec).toContain("an install of exactly the claimed version made");
     expect(sec).toContain("at the 14-day mark");
     expect(sec).toContain("never install from Home Assistant's page while a Ship run is live");
@@ -1811,24 +1811,24 @@ describe("0.1.7: orphan backups by their own name, and the network mode", () => 
 // -- 0.1.8 (the eighth review's fixes) -------------------------------------------------------------------
 const localCall = (r: ReturnType<typeof rig>, path: string, body: any = {}) =>
   handleLocal(r.k, new Request(`http://127.0.0.1:8096${path}`, { method: "POST", body: JSON.stringify(body) }), "127.0.0.1", () => {});
-describe("0.1.8: the accepted limits (text version 4 since 0.1.10)", () => {
-  test("the text is version 4, and an acceptance of version 2 lapses: a new code at start, not armed until accepted again", async () => {
-    expect(LIMITS_VERSION).toBe(4);
+describe("0.1.8: the accepted limits (text version 5 since 0.1.11)", () => {
+  test("the text is version 5, and an acceptance of version 2 lapses: a new code at start, not armed until accepted again", async () => {
+    expect(LIMITS_VERSION).toBe(5);
     const r = await armedRig();
     const saved = JSON.parse(JSON.stringify(r.saved));
     saved.limits = { version: 2, at: T0 };
     const again = rig({ saved, limits: false });
-    expect(again.logs.some((l) => l.startsWith("the accepted limits' text changed (version 2 accepted, now 4)"))).toBe(true);
+    expect(again.logs.some((l) => l.startsWith("the accepted limits' text changed (version 2 accepted, now 5)"))).toBe(true);
     expect(again.k.limitsOk()).toBe(false);
-    expect(again.k.armedState(CAIN).why).toBe("the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version 4): accept-limits <code>");
+    expect(again.k.armedState(CAIN).why).toBe("the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version 5): accept-limits <code>");
     expect(again.k.acceptLimits(again.code("accept-limits" as any)).ok).toBe(true);
-    expect(again.k.st.limits!.version).toBe(4);
+    expect(again.k.st.limits!.version).toBe(5);
   });
   test("the DOCS' text carries each statement of both limits", () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options")).replace(/\s+/g, " ");
     for (const t of [
-      "Text version 4 (0.1.10)",
+      "Text version 5 (0.1.11)",
       // the installer limit
       "refuses after two silences, or whose cancel is lost, leaves a live claim on the keeper for up to 30 minutes with no Ship run live",
       "never install from Home Assistant's page while a Ship run is live, or until the keeper's log shows no live claim (up to 30 minutes after a refused or failed run)",
@@ -2842,12 +2842,166 @@ describe("0.1.10 item 7: the watch takes only its own attempt's install, and the
     await ok.register(); await ok.poll(); ok.install(); await ok.poll();
     expect(ok.a().status).toBe("watching");
   });
-  test("the text is version 4: the Ship token's life outside the hook, and the watch's own attempt and generation", () => {
-    expect(LIMITS_VERSION).toBe(4);
+  test("the text (version 4 in 0.1.10): the Ship token's life outside the hook, and the watch's own attempt and generation", () => {
+    expect(LIMITS_VERSION).toBe(5);
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options")).replace(/\s+/g, " ");
-    expect(sec).toContain("Text version 4 (0.1.10)");
+    expect(sec).toContain("Text version 5 (0.1.11)");
     expect(sec).toContain("stays valid by its signature for its 2 hours outside the hook, and only the hook marks it spent");
     expect(sec).toContain("The watch accepts only an install matching its own attempt and generation");
+  });
+});
+
+// -- 0.1.11 (round 12) ---------------------------------------------------------------------------------------
+// The fail pings (pages) carrying a line, as the queue delivers them on the next poll.
+const pagesWith = (r: ReturnType<typeof rig>, text: string) => r.pings.filter((p) => p.url.endsWith("/fail") && p.body.includes(text)).length;
+
+describe("0.1.11 item 1: a late backup is retention-only", () => {
+  // A claimed attempt whose only backup was adopted late (as settleLate or the late answer marks it), then its install.
+  async function lateClaimed(times: { done: number | null; start: number | null }) {
+    const r = rig();
+    await r.register(); await r.poll(); r.claim();
+    r.a().retentionOnly = true;
+    (r.k as any).d.backupDoneAt = async () => times.done;
+    (r.k as any).d.installStartedAt = async () => times.start;
+    r.install(); await r.poll(); await r.poll();
+    return r;
+  }
+  test("a late backup that completed after the install job started is refused by the consume: unprotected, paged once", async () => {
+    const r = await lateClaimed({ done: T0 + 60_000, start: T0 + 30_000 });
+    expect(r.a().status).toBe("unprotected");
+    expect(r.a().consumedAt).toBeUndefined();
+    expect(String(r.a().why)).toContain("is retention-only: it completed at");
+    expect(pagesWith(r, "Keeper can't protect the install")).toBe(1);
+    await r.poll(3);
+    expect(pagesWith(r, "Keeper can't protect the install")).toBe(1);
+    expect(r.restores).toEqual([]);
+  });
+  test("one that completed before the install job started is accepted by the consume", async () => {
+    const r = await lateClaimed({ done: T0 + 10_000, start: T0 + 30_000 });
+    expect(r.a().status).toBe("watching");
+    expect(r.a().lateProof).toEqual({ backupDoneAt: T0 + 10_000, installStartedAt: T0 + 30_000 });
+  });
+  test("no completion time from the Supervisor (the default): never restorable, the install unprotected and paged", async () => {
+    const r = await lateClaimed({ done: null, start: T0 + 30_000 });
+    expect(r.a().status).toBe("unprotected");
+    expect(String(r.a().why)).toContain("the Supervisor gives no completion time for it");
+    expect(pagesWith(r, "Keeper can't protect the install")).toBe(1);
+  });
+  test("a restore never runs from a retention-only backup: a fail is unprotected, paged, nothing restored", async () => {
+    const r = rig();
+    await r.register(); await r.poll(); r.install(); await r.poll();
+    expect(r.a().status).toBe("watching");
+    r.a().retentionOnly = true;                            // as if its backup had been adopted late, with no proof
+    r.verdict("FAIL");
+    await r.poll(2);
+    expect(r.a().status).toBe("unprotected");
+    expect(r.restores).toEqual([]);
+    expect(String(r.a().why)).toContain("has no usable backup to restore");
+  });
+  test("adopting a late backup marks it retention-only", async () => {
+    const r = rig();
+    r.f.makeBackup = () => new Promise(() => {});
+    r.f.timer = () => Promise.resolve();
+    await r.register();
+    const again = rig({ saved: r.saved });
+    again.f.backupsList = [{ slug: "kb-late", name: r.a().backupName! }];
+    await again.poll();
+    expect(again.a().backup).toBe("kb-late");
+    expect(again.a().retentionOnly).toBe(true);
+    expect(again.k.unusableWhy(again.a())).toContain("retention-only");
+  });
+  test("the Supervisor's install job start: the newest install or update job's created time for that App", async () => {
+    const http = async () => new Response(JSON.stringify({ result: "ok", data: { jobs: [
+      { name: "addon_manager_update", reference: CAIN, created: "2026-11-21T15:00:00Z", child_jobs: [] },
+      { name: "backup_manager_partial_backup", reference: "kb-1", created: "2026-11-21T15:05:00Z" },
+      { name: "outer", reference: null, child_jobs: [{ name: "addon_manager_install", reference: CAIN, created: "2026-11-21T15:02:00Z" }] },
+    ] } }));
+    const sup = supervisor("t", "http://sup", http as any);
+    expect(await sup.installStartedAt(CAIN)).toBe(Date.parse("2026-11-21T15:02:00Z"));
+    expect(await sup.installStartedAt(HARNESS)).toBeNull();
+  });
+});
+
+describe("0.1.11 item 2: a pending lock has a ceiling", () => {
+  test("a write that never resolves: answered pending with an operation id, the lock released at the ceiling, the owner paged once, the next calls not wedged", async () => {
+    const r = rig();
+    (r.k as any).d.pendingCeilingMs = 400;
+    let calls = 0;
+    const step = (f: any) => f.write("the delete of kept backup kb-x", () => { calls++; return new Promise<boolean>(() => {}); }, () => { throw new Error("never recorded"); }).then(() => "done");
+    const fb = (why: string, pending: boolean, op?: any) => (pending ? Keeper.pendingAnswer("x", why, op) : { status: 503, body: { status: "refused" } });
+    const first: any = await r.k.record(step, fb, "cancel x");
+    expect(first.status).toBe(202);
+    const opId = String(first.body.operation);
+    expect(opId).toMatch(/^op-[0-9a-f]{16}$/);
+    expect(first.body.recorded).toBe("pending");
+    // a claim queued behind it runs once the ceiling passes (never wedged)
+    await r.register({ head: headN(9) }); await r.poll();
+    const queued = r.k.claim(CAIN, idOf(headN(9)), { app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: r.a(idOf(headN(9))).backup });
+    const t0 = Date.now();
+    expect((await queued).body.status).toBe("claimed");
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(r.k.st.ops!["cancel x"]).toMatchObject({ id: opId, state: "late" });
+    expect(r.logs.some((l) => l.includes(`(operation ${opId}): its write (the delete of kept backup kb-x) still has no outcome after`) && l.endsWith("the lock is released"))).toBe(true);
+    // a retry reports the recorded outcome with the same id, and the write isn't repeated
+    const again: any = await r.k.record(step, fb, "cancel x");
+    expect(again.status).toBe(202);
+    expect(again.body).toMatchObject({ operation: opId, recorded: "late" });
+    expect(calls).toBe(1);
+    // one page for it
+    await r.poll();
+    expect(pagesWith(r, "Keeper released its lock after")).toBe(1);
+    await r.poll(2);
+    expect(pagesWith(r, "Keeper released its lock after")).toBe(1);
+  });
+  test("a write that ends within the ceiling: done, the lock released then, and a retry reads the recorded outcome afresh", async () => {
+    const r = rig();
+    (r.k as any).d.pendingCeilingMs = 5_000;
+    let finish: (v: boolean) => void = () => {};
+    let runs = 0;
+    const step = (f: any) => { runs++; return runs === 1 ? f.write("a slow write", () => new Promise<boolean>((res) => { finish = res; })).then(() => "done") : "reconciled"; };
+    const fb = (why: string, pending: boolean, op?: any) => (pending ? Keeper.pendingAnswer("x", why, op) : "refused");
+    const first: any = await r.k.record(step, fb as any, "claim y");
+    const retry: any = await r.k.record(step, fb as any, "claim y");
+    expect(retry.body).toMatchObject({ operation: first.body.operation, recorded: "pending" });
+    expect(runs).toBe(1);
+    finish(true);
+    await Bun.sleep(5);
+    expect(r.k.st.ops!["claim y"].state).toBe("done");
+    expect(await r.k.record(step, fb as any, "claim y")).toBe("reconciled");
+    expect(r.k.st.ops?.["claim y"]).toBeUndefined();
+  });
+  test("an operation left pending by a restart is late at the next start, and its retry reports that", async () => {
+    const r = rig();
+    r.k.st.ops = { "rotation": { id: "op-0123456789abcdef", op: "rotation", at: T0, state: "pending", writes: ["w"] } };
+    r.k.save();
+    const again = rig({ saved: r.saved });
+    expect(again.k.st.ops!.rotation.state).toBe("late");
+    let ran = false;
+    const ans: any = await again.k.record(() => { ran = true; return "x"; }, (w, p, op) => Keeper.pendingAnswer("rotation", w, op) as any, "rotation");
+    expect(ran).toBe(false);
+    expect(ans.body).toMatchObject({ operation: "op-0123456789abcdef", recorded: "late" });
+  });
+});
+
+describe("0.1.11 item 5: an install the watch can't take as its own pages the owner", () => {
+  test("an install not matching its attempt's own generation pages once, not only a log line", async () => {
+    const r = rig();
+    await r.register(); await r.poll(); r.claim();
+    r.k.st.attempts["ship-46-cain-other"] = { ...r.a(), id: "ship-46-cain-other", status: "ended", gen: (r.a().gen ?? 0) + 1 } as any;
+    r.install();
+    await r.poll(); await r.poll(3);
+    expect(r.a().status).toBe("unprotected");
+    expect(pagesWith(r, "doesn't match the claimed attempt's own generation")).toBe(1);
+  });
+  test("an install whose attempt has no usable backup (its backup deleted) pages once as unprotected", async () => {
+    const r = rig();
+    await r.register(); await r.poll(); r.claim();
+    r.a().backupDropped = true;
+    r.install();
+    await r.poll(); await r.poll(3);
+    expect(r.a().status).toBe("unprotected");
+    expect(String(r.a().why)).toContain("has no usable backup (its backup kb-cain was deleted)");
+    expect(pagesWith(r, "has no usable backup")).toBe(1);
   });
 });

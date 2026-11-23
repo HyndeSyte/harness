@@ -182,7 +182,11 @@ export interface PassDeps {
   // the keeper registration, in the background; note(upd) keeps how many Apps and which attempts it made
   register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: { apps?: number; attempt?: string }) => void) => void;
   claim?: (a: Accepted, request: string) => Promise<{ status: number; body: any } | null>;   // (0.1.5) POST /attempt/<id>/claim (Keeper 0.1.7: with its request id)
-  cancel?: (attempt: string, why: string) => void;                         // (0.1.5) POST /attempt/<id>/cancel, fire and forget
+  // (0.1.5) POST /attempt/<id>/cancel. Keeper 0.1.11: its answer judged when given: only a plain "ended" counts; anything else
+  // (pending, refused, an error, no answer) is no success, logged, and the owner gets a card offering a retry (retry)
+  cancel?: (attempt: string, why: string) => Promise<{ status: number; body: any } | null> | void;
+  // (Keeper 0.1.11) a claim or cancel answer that isn't a plain success: the owner's card offering a retry (core.ts retryCard)
+  retry?: (attempt: string, what: "claim" | "cancel", why: string) => void;
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
   log: (line: string) => void;
 }
@@ -199,7 +203,24 @@ function readEntries(text: string | null): Entry[] | null {
   } catch { return null; }
 }
 const writeEntries = (d: PassDeps, spent: Entry[]) => d.store(JSON.stringify({ format: PASS_FORMAT, spent }));
-const cancelAll = (d: PassDeps, ids: string[], why: string) => { for (const a of new Set(ids)) { d.log(`cancelling the keeper's registration ${a}: ${why}`); d.cancel?.(a, why); } };
+const cancelAll = (d: PassDeps, ids: string[], why: string) => {
+  for (const a of new Set(ids)) {
+    d.log(`cancelling the keeper's registration ${a}: ${why}`);
+    const p = d.cancel?.(a, why);
+    if (p && typeof (p as Promise<unknown>).then === "function") void (p as Promise<{ status: number; body: any } | null>).catch(() => null).then((r) => judgeCancel(d, a, r));
+  }
+};
+// (Keeper 0.1.11) A cancel's answer: only a plain "ended" for that attempt counts as done. Pending, refused, an error or no answer
+// is no success: logged, and the owner gets a card offering a retry. Nothing installs either way (the pass is refused).
+export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; body: any } | null): boolean {
+  const ok = !!r && r.status === 200 && r.body?.status === "ended" && (r.body?.id === undefined || r.body.id === attempt);
+  if (ok) return true;
+  const why = !r ? "the keeper didn't answer" : r.status === 202 || r.body?.status === "pending" ? `the keeper's answer is pending${r.body?.operation ? ` (operation ${String(r.body.operation).slice(0, 40)})` : ""}`
+    : `the keeper answered ${String(r.body?.status ?? r.status).slice(0, 40)}${r.body?.why ? `: ${String(r.body.why).slice(0, 120)}` : ""}`;
+  d.log(`the keeper's cancel of ${attempt} isn't confirmed (${why}): no success; the owner gets a card offering a retry`);
+  d.retry?.(attempt, "cancel", why);
+  return false;
+}
 
 // (0.1.5) What the registration made so far, kept on its entry: the number of watched Apps (the pass's
 // wait scales with it) and each attempt id (cancelled if the pass gives up).
@@ -322,6 +343,9 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
     const en = okAns ? enrollmentCheckNow(j, e.fp ?? "", keyFingerprint(pub), before, d.enrollment) : null;
     if (en?.record) noteRecord(d.enrollment, en.record, d.log);
     if (!okAns || !en || !en.ok) {
+      // (Keeper 0.1.11) any claim answer that isn't a plain claim (pending, spent, refused, an error, no answer): no install, no
+      // success, and the owner gets a card offering a retry
+      d.retry?.(a.attempt, "claim", !r ? "the keeper didn't answer" : r.status === 202 || j?.status === "pending" ? "the keeper's answer is pending" : `the keeper answered ${String(j?.status ?? r.status).slice(0, 40)}`);
       return refuseFor(!r ? `the keeper didn't answer the claim of ${a.attempt}` : !okAns ? `the keeper refused the claim of ${a.attempt}: ${String(j?.why ?? r.status).slice(0, 160)}`
         : `the keeper's claim of ${a.attempt} failed the enrollment check: ${(en as any).why}`, accepted.map((x) => x.attempt), (en && !en.ok && en.cancel) || undefined);
     }
@@ -340,27 +364,6 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   return { status: "ok", pr: c.claim.pr, head: c.claim.head, accepted, claims };
 }
 
-// (Keeper 0.1.10) The owner's free-space overrides: his tap on the link's card (core.ts spaceCard) records one for a pull
-// request, head and App; the next registration the keeper refuses for want of space (code no_space) for that same head
-// and App takes it, once, and that App installs without the keeper's rollback. Good for a day; used once.
-export const SPACE_OVERRIDE_MS = 24 * 3_600_000;
-export interface SpaceRec { pr: number; head: string; app: string; at: number; used?: number }
-export function spaceOverrides(load: () => string | null, store: (text: string) => void, now: () => number) {
-  const read = (): SpaceRec[] => { try { const j = JSON.parse(load() ?? "[]"); return Array.isArray(j) ? j.filter((x) => x && Number.isSafeInteger(x.pr) && typeof x.head === "string" && typeof x.app === "string") : []; } catch { return []; } };
-  return {
-    record: (pr: number, head: string, app: string): boolean => {
-      try { const t = now(); store(JSON.stringify([...read().filter((x) => t - x.at < 7 * SPACE_OVERRIDE_MS), { pr, head, app, at: t }].slice(-50))); return true; } catch { return false; }
-    },
-    take: (pr: number, head: string, app: string): boolean => {
-      const t = now(), all = read();
-      const x = all.find((r) => r.pr === pr && r.head === head && r.app === app && !r.used && t - r.at < SPACE_OVERRIDE_MS);
-      if (!x) return false;
-      x.used = t;
-      try { store(JSON.stringify(all)); return true; } catch { return false; }   // not recorded as used: not taken
-    },
-  };
-}
-
 export interface RegisterDeps {
   api: MergeDeps["api"];
   post: (body: unknown) => Promise<{ status: number; body: any } | null>;   // POST /attempt on the keeper, Cain's token
@@ -372,8 +375,7 @@ export interface RegisterDeps {
   enrollment?: EnrollmentStore;
   pollMs?: number; waitMs?: number;
   log: (line: string) => void;
-  // (Keeper 0.1.10) a refusal for want of space: the owner's recorded override taken (once), else the link's card posted
-  takeOverride?: (pr: number, head: string, app: string) => boolean;
+  // (Keeper 0.1.10) a refusal for want of space: the link's card posted (Keeper 0.1.11: no button; nothing installs without the rollback)
   noSpace?: (pr: number, head: string, app: string, version: string) => void;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
@@ -434,9 +436,10 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
     } else if (last?.status === 200 && j.status === "refused" && j.code === "no_space") {
-      // (Keeper 0.1.10) no room for the keeper's backup: the install is refused unless the owner overrode it on the link's card
-      if (d.takeOverride?.(c.pr, c.head, slug)) say(`the keeper had no room for ${b.app} ${b.version}'s backup; the owner's override on the link's card was taken, so ${b.app} ${b.version} installs without the keeper's rollback`, false);
-      else { say(`the keeper refused ${b.app} ${b.version}: ${String(j.why ?? "no room for its backup").slice(0, 160)}; the link posts the owner a card to install it without the rollback`); d.noSpace?.(c.pr, c.head, slug, b.version); }
+      // (Keeper 0.1.10) no room for the keeper's backup: the install is refused. Keeper 0.1.11: always; the link posts one card
+      // saying so, with no button that installs without the rollback (the owner clears space or chooses another path)
+      say(`the keeper refused ${b.app} ${b.version}: ${String(j.why ?? "no room for its backup").slice(0, 160)}; nothing installs without the keeper's rollback, and the link posts the owner a card saying so`);
+      d.noSpace?.(c.pr, c.head, slug, b.version);
     } else say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
       : last?.status === 200 ? `the keeper refused ${b.app} ${b.version}: ${String(j?.why || j?.status).slice(0, 160)}`
       : `the keeper didn't answer for ${b.app} ${b.version} (${attempt})`);

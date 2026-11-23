@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { sign as edSign } from "node:crypto";
 import { attestFlow, makeRotation, rotationNeeded, ROTATION_TTL_S } from "../rootfs/opt/cain/link/rotation";
-import { ROTATION_LABEL, SPACE_LABEL } from "../rootfs/opt/cain/link/core";
+import { RETRY_LABEL, ROTATION_LABEL } from "../rootfs/opt/cain/link/core";
 import { rig, SHIP_KEYS, SHIP_PUB, DM, OWNER, BOT } from "./link-rig";
 import { Keeper, keyFp } from "../../keeper/rootfs/opt/keeper/core.ts";
 
@@ -122,27 +122,60 @@ describe("the rotation card (Keeper 0.1.9)", () => {
     expect(await (r.link as any).rotationTap(it(OWNER), out.message!)).toBe("rotation attested");
     expect(asked).toEqual([ID]);
   });
-  test("the free-space override card: one per pull request, head and App; only his tap records it, and Cain is told to show a new Ship card", async () => {
+  test("(Keeper 0.1.11) the free-space card: one per pull request, head and App, with no button: nothing installs without the rollback", async () => {
     const r = rig();
-    const recorded: any[] = [];
-    (r.link as any).d.spaceOverride = (...a: any[]) => { recorded.push(a); return true; };
     const HEAD = "a".repeat(40);
     const out = await r.link.spaceCard(46, HEAD, "0fcc2575_cain", "0.19.0");
     expect(out.status).toBe("posted");
-    expect(r.msg(out.message!).content).toContain("Keeper has no room for the backup it takes before installing Cain 0.19.0, so the install was refused and nothing was installed.");
-    expect(r.buttons(out.message!)).toEqual([SPACE_LABEL]);
+    const text = r.msg(out.message!).content;
+    expect(text).toContain("Keeper has no room for the backup it takes before installing Cain 0.19.0, so the install was refused and nothing was installed.");
+    expect(text).toContain("Nothing installs it without Keeper's rollback.");
+    expect(r.buttons(out.message!)).toEqual([]);
     expect((await r.link.spaceCard(46, HEAD, "0fcc2575_cain", "0.19.0")).status).toBe("open");
     expect(r.posts()).toBe(1);
-    // another user's tap, straight at the handler: refused before anything is recorded
-    const msg = r.msg(out.message!);
-    const it = (user: string) => ({ type: 3, id: "11", token: "t", application_id: BOT, channel_id: DM, user: { id: user }, data: { custom_id: "k:space:46" }, message: msg });
-    expect(await (r.link as any).spaceTap(it("7777"), out.message!)).toBe("refused: not the owner");
-    expect(recorded).toEqual([]);
-    expect(await r.tap(msg, "k:space:46")).toBe("override recorded");
-    expect(recorded).toEqual([[46, HEAD, "0fcc2575_cain"]]);
-    expect(r.msg(out.message!).content).toContain("Done: the next Ship run for it installs without Keeper's rollback.");
-    expect(r.relayed.some((l: string) => l.includes(`Dane tapped ${SPACE_LABEL} for pull request 46`))).toBe(true);
+    // the old override button does nothing now
+    expect(await r.tap(r.msg(out.message!), "k:space:46")).not.toBe("override recorded");
     const st = rig(); st.stop.stopped = true;
     expect((await st.link.spaceCard(46, HEAD, "0fcc2575_cain", "0.19.0")).status).toBe("stopped");
+  });
+});
+
+describe("Keeper 0.1.11 item 4: the retry card, and an attestation answer that isn't a plain attested", () => {
+  const ATT = "ship-46-cain-01234567";
+  test("a claim or cancel not confirmed: one card per attempt and kind with Try again; his tap asks Cain for the Ship card again", async () => {
+    const r = rig();
+    const out = await r.link.retryCard(ATT, "claim");
+    expect(out.status).toBe("posted");
+    expect(r.msg(out.message!).content).toContain("Keeper didn't confirm the start of the install of Cain, so the Ship run didn't start and nothing was installed.");
+    expect(r.buttons(out.message!)).toEqual([RETRY_LABEL]);
+    expect((await r.link.retryCard(ATT, "claim")).status).toBe("open");
+    const c = await r.link.retryCard(ATT, "cancel");
+    expect(r.msg(c.message!).content).toContain("Keeper didn't confirm it called off an install of Cain that didn't run");
+    expect(r.posts()).toBe(2);
+    const msg = r.msg(out.message!);
+    const it = (user: string) => ({ type: 3, id: "11", token: "t", application_id: BOT, channel_id: DM, user: { id: user }, data: { custom_id: `k:retry:${ATT}` }, message: msg });
+    expect(await (r.link as any).retryTap(it("7777"), out.message!)).toBe("refused: not the owner");
+    expect(r.relayed.length).toBe(0);
+    expect(await r.tap(msg, `k:retry:${ATT}`)).toBe("retry asked");
+    expect(r.buttons(out.message!)).toEqual([]);
+    expect(r.relayed.some((l: string) => l.includes(`Dane tapped ${RETRY_LABEL} after Keeper didn't confirm its claim for pull request 46`) && l.includes("Show him a new Ship card"))).toBe(true);
+    await expect(r.link.retryCard("not-an-attempt", "claim")).rejects.toThrow("isn't a keeper attempt");
+    const st = rig(); st.stop.stopped = true;
+    expect((await st.link.retryCard(ATT, "claim")).status).toBe("stopped");
+  });
+  test("the attestation counts only on a plain attested: pending, refused, an error or no answer is not taken, and the card keeps its button", async () => {
+    const view = { status: 200, body: { needed: true, old_key_id: ID, old_option_present: false, old_key_kept: true, enroll_id: "0123456789abcdef", challenge: "a".repeat(24) } };
+    for (const [ans, why] of [[{ status: 202, body: { status: "pending", operation: "op-0123456789abcdef" } }, "pending"], [{ status: 200, body: { status: "refused", why: "x" } }, "x"],
+      [{ status: 200, body: {} }, "the keeper answered"], [{ status: 503, body: { status: "refused" } }, "the keeper answered refused"], [null, "didn't answer"]] as const) {
+      const got = await attestFlow({ get: async () => view, post: async () => ans as any, sign: signer, now: () => Date.now() }, ID);
+      expect(got.ok).toBe(false);
+      expect(got.why).toContain(why);
+    }
+    expect((await attestFlow({ get: async () => view, post: async () => ({ status: 200, body: { status: "attested", id: ID } }), sign: signer, now: () => Date.now() }, ID)).ok).toBe(true);
+    const r = rig();
+    (r.link as any).d.attestRotation = async () => ({ ok: false, why: "the keeper's answer is pending" });
+    const out = await r.link.rotationCard(ID);
+    expect(await r.tap(r.msg(out.message!), `k:rot:${ID}`)).toBe("refused");
+    expect(r.buttons(out.message!)).toEqual([ROTATION_LABEL]);
   });
 });

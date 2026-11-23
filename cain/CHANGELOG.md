@@ -22,7 +22,8 @@
 - When the Keeper still remembers an old Healthchecks key, Cain's bot posts one card naming it. Revoke that key in Healthchecks, then tap the card: only your tap tells the Keeper the key is replaced, and the Keeper won't arm until then.
 - The Keeper's confirm code for the Ship key is now printed only when you ask for it there (`key-code`), never by itself at start.
 - Your tap on the old Healthchecks key card is now checked to be yours before Cain's link signs anything, and it is tied to the Keeper's current enrollment and a one-time challenge from the Keeper. When the Keeper no longer has the old key to try, the card says the change rests on your tap alone.
-- If the Keeper has no room for the backup before installing Cain, the install is refused and the link posts you a card. Only your tap on it lets the next Ship run for that same change install without the Keeper's rollback.
+- If the Keeper has no room for the backup before installing Cain, the install is refused and the link posts you a card saying so. Nothing installs without the Keeper's rollback: free some space, or choose another way yourself.
+- If the Keeper doesn't confirm the start of an install, or a cancel of one, nothing is installed and the link posts you a card with Try again, which brings the Ship card back.
 - Keeper answers that arrive out of order no longer look like an older Keeper: the newest one counts and the late one is set aside, with nothing for you to redo.
 
 ## 0.18.1

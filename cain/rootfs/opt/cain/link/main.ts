@@ -79,7 +79,7 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, spaceOverrides } from "./ship-pass";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -260,8 +260,6 @@ const link = new Link({
     return attestFlow({ get: (path) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path), post: (path, body) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body, 20_000),
       sign: (data) => edSign(null, data, shipPriv), now: Date.now }, id);
   } : undefined,
-  // Keeper 0.1.10: his tap on the free-space override card, kept in root's /data/trust
-  spaceOverride: (pr, head, app) => spaceStore.record(pr, head, app),
   land: deployKey ? async ({ pr, head, stopped }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
@@ -314,9 +312,6 @@ const link = new Link({
   writeReplay: (r) => writeReplayReport(r),
 });
 
-// Keeper 0.1.10: the owner's free-space overrides, one per pull request, head and App (ship-pass.ts spaceOverrides).
-const SPACE_FILE = process.env.CAIN_SPACE_OVERRIDES ?? `${TRUST_DIR}/space-overrides.json`;
-const spaceStore = spaceOverrides(() => { try { return readFileSync(SPACE_FILE, "utf8"); } catch { return null; } }, (t) => writeSynced(SPACE_FILE, t), Date.now);
 // Keeper 0.1.5: the last confirmed enrollment of the keeper's Ship key the link saw (ship-pass.ts enrollmentCheck).
 const KEEPER_ENROLL = process.env.CAIN_KEEPER_ENROLL ?? `${TRUST_DIR}/keeper-enrollment.json`;
 const enrollment: EnrollmentStore = {
@@ -432,7 +427,6 @@ const shipPassDeps: PassDeps = {
     const pub = shipPub();
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
       post: (body) => keeperPost("/attempt", body),
-      takeOverride: (pr, head, app) => spaceStore.take(pr, head, app),
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)
@@ -441,7 +435,9 @@ const shipPassDeps: PassDeps = {
   // 3 seconds: the hook waits on the pass (about 8 seconds a request), so the claim must answer well within it.
   // Keeper 0.1.7: with the claim's request id, so a retry reads the recorded claim.
   claim: (a, request) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, request }, 3_000) : Promise.resolve(null),
-  cancel: (attempt, why) => { void keeperPost(`/attempt/${attempt}/cancel`, { why }); },
+  // Keeper 0.1.11: the cancel's answer is judged (ship-pass.ts judgeCancel); anything but a plain "ended" brings the retry card
+  cancel: (attempt, why) => keeperPost(`/attempt/${attempt}/cancel`, { why }),
+  retry: (attempt, what) => { void link.retryCard(attempt, what).catch((e) => console.log(`[cain] link: couldn't post the retry card: ${String(e).slice(0, 80)}`)); },
   enrollment,
   log: (l) => console.log(`[cain] link: ${l}`),
 };

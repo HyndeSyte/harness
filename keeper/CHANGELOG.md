@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.11
+
+- A backup that finished after Keeper stopped waiting for it is now kept for safety only: Keeper never rolls back from it, and an install that has only that backup is reported to you once as not protected.
+- If a backup delete or another change Keeper started gets no answer, Keeper waits at most 3 minutes, then lets other requests through and tells you once. Asking again reports what happened instead of trying again.
+- When Keeper has no room for its backup, the install is refused and stays refused. There is no longer a way to install without Keeper's rollback: free some space, or choose another way yourself.
+- An install Keeper can't match to its own Ship run, or that has no backup it can use, now pages you once instead of only showing in the log.
+- The "Accepted limits" text is now version 5, so you accept it again with `accept-limits`.
+
 ## 0.1.10
 
 - The backup check now fails unless it can prove what it read: every test file is read back before the test backup, a marker that must appear exactly once is placed outside the excluded files, the download must match the size Home Assistant reports, and any archive it can't fully open (cut short, encrypted, or a format it doesn't read) fails it. A check that was interrupted counts as failed, and its test backup is deleted at the next start. A pass only counts for the backup exclusion this version ships.

@@ -175,7 +175,7 @@ async function serve(): Promise<void> {
   const k = new Keeper({
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
-    backups: sup.backups, activeJobs: sup.activeJobs, hcKeyStore: hcKeyStore(),
+    backups: sup.backups, activeJobs: sup.activeJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
     diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
     keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), hcTry: (key) => hcTry(key),
     ready: (hp) => get200(healthUrl(hp)),

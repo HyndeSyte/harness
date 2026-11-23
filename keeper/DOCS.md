@@ -221,11 +221,25 @@ flight** when its step runs out answers `202 {"status": "pending"}` at once, the
 outcome is known, and the same request sent again meanwhile answers pending without starting it twice; once the
 write ended, it runs again and reads the recorded outcome.
 
+**Late backups are retention-only, and a pending write has a ceiling (0.1.11).** A backup adopted late (its create
+outran its bound) is kept for retention only: a consume never takes it as the attempt's backup and a restore never
+runs from it, unless the Supervisor's recorded completion time for that backup precedes the install job's start time,
+both read from the Supervisor. The Supervisor's jobs list gives no completion time for a backup today, so in practice
+a late backup is never restorable. An install whose only backup is retention-only is "unprotected": logged and paged
+once, not covered. So is an install the watch can't match to its own attempt and generation, or whose attempt has no
+usable backup (none, or one deleted): one page, never only a log line. A write in flight under the claim record's
+lock holds it at most 3 minutes: then the write is marked late (reconciled later by its pre-chosen name or slug, as
+late backups are), the lock is released and you are paged once, so later claims, cancels and attestations are never
+stuck behind it. The pending answer (`202 {"status": "pending", "operation": "op-...", "recorded": ...}`) carries a
+stable operation id, and the same request again reports that recorded outcome (pending or late) without repeating
+the write.
+
 **The free-space reserve (0.1.9).** Before every new backup Keeper reads the free space where backups go
 (`/host/info`) and needs the projected backup (the last backup's size and a half) plus a 1 GB reserve. (0.1.10) For
 a first backup, with no last size, the floor is 1 GB plus the App's image size when Keeper knows it, else 2 GB.
-The refusal carries the code `no_space`: Cain's link then refuses the install, and posts you a card whose one
-button installs it without Keeper's rollback; only your tap overrides it, once, for that pull request and head. A backup that can't fit is refused: the registration is "unprotected", logged (`refused a new
+The refusal carries the code `no_space`: Cain's link then refuses the install and posts you one card saying so, with
+no button (0.1.11: the one-day override that installed without Keeper's rollback is gone); you clear space or choose
+another path. A backup that can't fit is refused: the registration is "unprotected", logged (`refused a new
 backup for <id>: ...`, naming the kept backups the cleanup couldn't free yet) and paged. A free space it can't read
 refuses too. Delete old backups in Home Assistant (Settings, System, Backups) to make room.
 
@@ -563,8 +577,8 @@ Keeper before it counts as armed).
 
 ## Accepted limits
 
-Text version 4 (0.1.10). Version 3 was 0.1.9's, version 2 0.1.8's and version 1 0.1.7's; an acceptance of any of them
-lapsed with 0.1.10. Two
+Text version 5 (0.1.11). Version 4 was 0.1.10's, version 3 0.1.9's, version 2 0.1.8's and version 1 0.1.7's; an
+acceptance of any of them lapsed with 0.1.11. Two
 limits of Keeper's design are recorded here rather than built around, and you accept them at the device: `bun
 /opt/keeper/main.ts accept-limits <code>` in Keeper's container, with the code Keeper prints at each start while they
 aren't accepted for this text version (`one-time code for accept-limits: ...`). Keeper records your acceptance with the
@@ -602,7 +616,9 @@ end with its deadline, one line each (`claimed <attempt> claim <id> ... until <t
 ended (<how>); its deadline was <time>`). The hook allows one pending Ship run per attempt: one Ship tap starts one
 run, and a second run on a token whose attempt has a live claim is refused with the claim's latest expiry named.
 Your guard: never install from Home Assistant's page while a Ship run is live, or until the keeper's log shows no
-live claim (up to 30 minutes after a refused or failed run). Install only through Ship cards.
+live claim (up to 30 minutes after a refused or failed run). Install only through Ship cards. A space refusal stops the install: when Keeper
+has no room for the backup it takes first, the install is refused and nothing is installed, and no button or override
+installs it without Keeper's rollback; you clear space (Settings, System, Backups) or choose another path yourself.
 
 **2. Delivery: no code can prove a page reached your phone.** Keeper sees only that Healthchecks took a page (a 2xx
 answer), never that your phone rang, and the read-only key cannot see notification channels, so unassigning or breaking
@@ -754,5 +770,5 @@ reserve, the old key's try at Healthchecks answering 401 or 403 once revoked, th
 and a full-Pi restore from a fresh Home Assistant (untested); (0.1.10) the backup check's archive as the Pi's
 Supervisor makes it (its layout, whether the App's archive is gzip, `size` and `size_bytes` in the backup info
 matching the download, the positive control found once), the old key's try answering exactly 401 or `wrong api key`
-once revoked, a refused registration for free space bringing the link's override card, and the rotation card's
+once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
 challenge reaching Keeper within its 10 minutes; and the two drills (the next job).

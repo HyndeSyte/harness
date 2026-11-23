@@ -123,6 +123,20 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       walk(r.data.jobs);
       return out;
     },
+    // (0.1.11) When the App's newest install or update job started: its "created" time in the jobs list (done or not), the
+    // newest such job's. Null when the list can't be read or names none with a time. The Supervisor's jobs list records no
+    // completion time for a backup, so no backupDoneAt is read here: a late backup stays retention-only (core.ts unusableWhy).
+    async installStartedAt(app: string): Promise<number | null> {
+      const r = await call("GET", "/jobs/info").catch(() => null);
+      if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
+      let best: number | null = null;
+      const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
+        const t = typeof x.created === "string" ? Date.parse(x.created) : NaN;
+        if (x.reference === app && typeof x.name === "string" && /install|update/i.test(x.name) && Number.isFinite(t)) best = Math.max(best ?? 0, t);
+        if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
+      walk(r.data.jobs);
+      return best;
+    },
     // The restore's job in the Supervisor's jobs list (GET /jobs/info, the backup role's info read), by
     // the id from the restore's answer and nothing else (0.1.2: no job is ever matched by its name or
     // backup). Null when the list can't be read. A finished job leaves the list after a while: not found

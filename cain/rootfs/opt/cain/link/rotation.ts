@@ -54,5 +54,8 @@ export async function attestFlow(d: AttestDeps, id: string): Promise<{ ok: boole
   if (!need.enroll || !need.challenge) return { ok: false, why: "the keeper gave no enrollment or challenge (its Ship key isn't enrolled)" };
   const r = await d.post("/rotation/attest", { attestation: makeRotation(id, need.enroll, need.challenge, d.now(), d.sign) }).catch(() => null);
   if (!r) return { ok: false, why: "the keeper didn't answer" };
-  return r.status === 200 ? { ok: true, why: "" } : { ok: false, why: typeof r.body?.why === "string" ? r.body.why : `the keeper answered ${r.status}` };
+  // Keeper 0.1.11: only a plain "attested" counts; pending (202), refused, an error or anything else is not taken, and the card
+  // stays up with its button, the retry
+  if (r.status === 200 && r.body?.status === "attested") return { ok: true, why: "" };
+  return { ok: false, why: typeof r.body?.why === "string" ? r.body.why : r.status === 202 || r.body?.status === "pending" ? "the keeper's answer is pending" : `the keeper answered ${r.body?.status ?? r.status}` };
 }

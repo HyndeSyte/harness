@@ -5,10 +5,12 @@ import { describe, expect, test } from "bun:test";
 import { createHash, sign as edSign } from "node:crypto";
 import { claimDeadlineWhy, decideAll, postShipPass, postShipPassCancel, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
-import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, spaceOverrides, SPACE_OVERRIDE_MS, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
+import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, judgeCancel, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { SHIP_KEYS, SHIP_PUB, keeperHolds } from "./link-rig";
 import { generateKeyPairSync } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";
 const BASE = "fedcba9876543210fedcba9876543210fedcba98";
@@ -205,33 +207,18 @@ describe("the registration with the keeper App (Keeper 0.1.5: register, then pol
     expect(k.enrolled).toEqual(REC);   // the owner's confirm seen
   });
   // Keeper 0.1.10
-  test("a refusal for want of free space refuses the install and posts the owner's card, unless he overrode it on that card", async () => {
+  test("(Keeper 0.1.11) a refusal for want of free space always refuses the install and posts one card; there is no override", async () => {
     const c = (claimFor(PR, SHA, NOW))!;
     const space = { status: "refused", why: "no room for its backup: only 900 MB is free", code: "no_space" };
     const cards: any[] = [];
-    let stored: string | null = null, t = NOW;
-    const ov = spaceOverrides(() => stored, (x) => { stored = x; }, () => t);
-    const k = keeper([space]);
-    const r = await registerInstalls({ ...k.deps, takeOverride: ov.take, noSpace: (...a: any[]) => cards.push(a) }, TOKEN, c);
-    expect(r.ok).toBe(false);
-    expect((r as any).said[0]).toContain("the link posts the owner a card to install it without the rollback");
-    expect(cards).toEqual([[46, SHA, "0fcc2575_cain", "0.19.0"]]);
-    // his tap on that card records the override; the next pass for the same head installs without the rollback, once
-    expect(ov.record(46, SHA, "0fcc2575_cain")).toBe(true);
-    const again = await registerInstalls({ ...keeper([space]).deps, takeOverride: ov.take, noSpace: (...a: any[]) => cards.push(a) }, TOKEN, c);
-    expect(again).toMatchObject({ ok: true, accepted: [] });
-    expect((again as any).said[0]).toContain("the owner's override on the link's card was taken, so Cain 0.19.0 installs without the keeper's rollback");
-    expect(cards).toHaveLength(1);
-    expect((await registerInstalls({ ...keeper([space]).deps, takeOverride: ov.take }, TOKEN, c)).ok).toBe(false);   // used once
-    // another head, or a day later, doesn't take it
-    expect(ov.record(46, SHA, "0fcc2575_cain")).toBe(true);
-    expect(ov.take(46, "f".repeat(40), "0fcc2575_cain")).toBe(false);
-    t += SPACE_OVERRIDE_MS + 1;
-    expect(ov.take(46, SHA, "0fcc2575_cain")).toBe(false);
-    // any other refusal never takes an override
-    expect(ov.record(46, SHA, "0fcc2575_cain")).toBe(true);
-    expect((await registerInstalls({ ...keeper([{ status: "refused", why: "its backup holds folders" }]).deps, takeOverride: ov.take }, TOKEN, c)).ok).toBe(false);
-    expect(ov.take(46, SHA, "0fcc2575_cain")).toBe(true);
+    for (let i = 0; i < 2; i++) {
+      const r = await registerInstalls({ ...keeper([space]).deps, noSpace: (...a: any[]) => cards.push(a) }, TOKEN, c);
+      expect(r.ok).toBe(false);
+      expect((r as any).said[0]).toContain("nothing installs without the keeper's rollback, and the link posts the owner a card saying so");
+    }
+    expect(cards).toEqual([[46, SHA, "0fcc2575_cain", "0.19.0"], [46, SHA, "0fcc2575_cain", "0.19.0"]]);
+    const src = readFileSync(join(import.meta.dir, "..", "rootfs/opt/cain/link/ship-pass.ts"), "utf8");
+    for (const gone of ["spaceOverrides", "takeOverride", "SPACE_OVERRIDE_MS"]) expect(src).not.toContain(gone);
   });
   test("polling stops at 5 minutes per App: still pending is not accepted", async () => {
     const k = keeper([{ status: "pending" }]);
@@ -571,5 +558,53 @@ describe("superseded keeper replies (Keeper 0.1.10)", () => {
     expect(l.whys).toEqual([]);
     // a reply below the record as it stood before its request is still an older keeper state: refused
     expect(enrollmentCheckNow({ ...ENROLLED, counter: 9 }, FPR, FPR, REC, store).ok).toBe(false);
+  });
+});
+
+describe("Keeper 0.1.11 item 4: a claim, cancel or attestation answer that isn't a plain ok", () => {
+  const retries = (l: ReturnType<typeof link>) => { const out: any[] = []; l.d.retry = (...a: any[]) => { out.push(a); }; return out; };
+  test("a claim answered pending, spent, refused, an error or not at all: no install, no success, and a retry card", async () => {
+    for (const claim of [async () => ({ status: 202, body: { status: "pending", id: ACC.attempt, operation: "op-0123456789abcdef" } }),
+      async () => ({ status: 409, body: { status: "spent" } }), async () => ({ status: 409, body: { status: "refused", why: "it is claimed already" } }),
+      async () => ({ status: 503, body: { status: "refused", why: "Keeper's claim step failed" } }), async () => { throw new Error("socket"); }, async () => null,
+      async () => ({ status: 200, body: { status: "ok" } })]) {
+      const l = link({ claim: claim as any });
+      const got = retries(l);
+      const a = await shipPass(l.d, { token: TOKEN });
+      expect(a.status).toBe("refused");
+      expect(l.logs.some((x) => x.startsWith("Ship pass ok"))).toBe(false);
+      expect(got).toHaveLength(1);
+      expect(got[0].slice(0, 2)).toEqual([ACC.attempt, "claim"]);
+    }
+    // the hook sees no ok, so no run starts
+    const l = link({ claim: async () => ({ status: 202, body: { status: "pending" } }) });
+    retries(l);
+    const why = await decideAll(call, keeperHolds({}), ENV, () => ({ ok: true }), async () => ({ logged: true }), passOf(l));
+    expect(why).toContain("The link didn't let this Ship run start");
+  });
+  test("a plain claim needs no retry card", async () => {
+    const l = link();
+    const got = retries(l);
+    expect((await shipPass(l.d, { token: TOKEN })).status).toBe("ok");
+    expect(got).toEqual([]);
+  });
+  test("a cancel counts only on a plain ended; pending, refused, an error or no answer is logged and brings a retry card", async () => {
+    const l = link();
+    const got = retries(l);
+    expect(judgeCancel(l.d, ACC.attempt, { status: 200, body: { status: "ended", id: ACC.attempt, backup_kept: "kb1" } })).toBe(true);
+    expect(got).toEqual([]);
+    for (const r of [{ status: 202, body: { status: "pending", operation: "op-0123456789abcdef" } }, { status: 409, body: { status: "refused", why: "its claim was handed to a started run" } },
+      { status: 503, body: { status: "refused" } }, { status: 200, body: { status: "ended", id: "ship-46-cain-ffffffff" } }, null]) {
+      expect(judgeCancel(l.d, ACC.attempt, r)).toBe(false);
+    }
+    expect(got.map((x) => x.slice(0, 2))).toEqual(Array(5).fill([ACC.attempt, "cancel"]));
+    expect(l.logs.some((x) => x.includes(`the keeper's cancel of ${ACC.attempt} isn't confirmed (the keeper's answer is pending (operation op-0123456789abcdef))`))).toBe(true);
+    // a cancel sent by a refused pass is judged when its answer comes back
+    const r2 = link({ reg: "refuse" });
+    const got2 = retries(r2);
+    r2.d.cancel = async () => ({ status: 202, body: { status: "pending" } });
+    await shipPass(r2.d, { token: TOKEN });
+    await Bun.sleep(5);
+    expect(got2.map((x) => x.slice(0, 2))).toEqual([[ACC.attempt, "cancel"]]);
   });
 });
