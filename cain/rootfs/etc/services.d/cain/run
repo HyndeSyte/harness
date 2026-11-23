@@ -511,9 +511,17 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   # Cain's user can't set them; the runner writes what it uses to /data/review-settings.json.
   REVIEW_ROUND_CAP="$(opt review_round_cap)"
   USAGE_RESERVE_PERCENT="$(opt usage_reserve_percent)"
+  # The model trials' one budget (0.19.0, trials/runner.ts): only in this environment, so Cain's user
+  # can't set it; the runner writes what it uses to /data/trials/settings.json.
+  TRIALS_BUDGET_USD="$(opt trials_budget_usd)"
+  # The model trials' own keys (0.19.0, fifth round): apart from the review keys, in a project or workspace of their
+  # own with a hard limit no higher than the run allowance (DOCS.md). Only in this environment, never printed.
+  TRIALS_ANTHROPIC_KEY="$(opt trials_anthropic_api_key)"
+  TRIALS_GEMINI_KEY="$(opt trials_gemini_api_key)"
+  TRIALS_PERPLEXITY_KEY="$(opt trials_perplexity_api_key)"
   export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
-    REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT
+    REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT TRIALS_BUDGET_USD TRIALS_ANTHROPIC_KEY TRIALS_GEMINI_KEY TRIALS_PERPLEXITY_KEY
   mkdir -p -m 700 /data/codex
   while true; do bun "$OPT/review/main.ts" 2>&1; sleep 10; done
 ) &

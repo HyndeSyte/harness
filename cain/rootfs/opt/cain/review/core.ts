@@ -274,6 +274,18 @@ export function earlierCheck(earlier: string[] | undefined, termsText: string | 
   return why.size ? { ok: false, why: [...why] } : { ok: true };
 }
 
+// The same backstop for any text that leaves outside a brief (Cain 0.19.0: the model trials, whose
+// tasks, outputs and grading prompts are longer than a brief may be). Kinds and line numbers only.
+export function textCheck(text: string, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
+  const loaded = loadTerms(termsText);
+  if (!loaded.terms) return { ok: false, why: [loaded.error!] };
+  const t = normalizeText(text);
+  const why = new Set<string>();
+  for (const p of BUILT_IN) if (p.re.test(t)) why.add(p.what);
+  for (const e of loaded.terms.entries) if (e.re.test(t)) why.add(`private term on line ${e.line} of the list`);
+  return why.size ? { ok: false, why: [...why] } : { ok: true };
+}
+
 export const ID_PRIVATE = "the id itself matched";
 export const HIDDEN_ID = "(id withheld)";
 // The id as it may be shown in a log, a relay line or a status: never one that

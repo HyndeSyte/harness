@@ -395,6 +395,598 @@ and each open change's round count.
 The sign-in, token and allowlist live in this add-on's private storage (`/data`),
 which is included in Home Assistant backups.
 
+## Model trials (since 0.19.0)
+
+Which models suit which of your tasks, tested on real tasks with keys of their own (never the review
+service's), under one spend stop and your tap for every paid run. Cain runs them with `/opt/cain/trial.sh`;
+the calls are made by the review runner's process (it holds the keys), in a loop of its own, so a trial never
+holds up a real review.
+
+### Fifth round, in short
+
+- **Trial keys of their own.** Three new options, `trials_anthropic_api_key`, `trials_gemini_api_key` and
+  `trials_perplexity_api_key`, empty by default. The preflight and every run refuse while any of them is empty
+  or equals the review service's key for that provider, and the refusal names the provider. Codex uses its own
+  ChatGPT sign-in, as the review seat does.
+- **Your go per paid run.** A run, a resume and the preflight start only with a one-time approval from your tap
+  on Cain's trial card ("Allow this run"). The link signs it with a key of its own (the trial key, never the
+  Ship key), bound to that exact plan (its hash, which `trial.sh plan` prints and the card carries) and its cap,
+  good for 2 hours, used once: the runner checks it and records it as used before anything is sent. The
+  allowance option stays the ceiling over every run you allow. Cain's inbox only submits.
+- **The Codex boundary.** A read-only requirements file allowing only disabled web search is mounted in the
+  wrapper and checked by the self-test; the self-test also proves Codex's own sign-in file and Codex's own
+  environment can't be read; and the runner and Cain's session check at start that the Supervisor's token is
+  not in their own environment (no paid dispatch if it is).
+- **The preflight record is keyed and expires.** It counts only for the same trials code, installed Codex,
+  configured models and trials options, and for 7 days. A Gemini check that showed no thinking leaves that
+  model disabled.
+- **The research grader's fetch** took `max_uses` equal to the pages cited (replaced in the sixth round: the
+  runner fetches the pages itself).
+- **The allowance tally** is a file of its own that only the runner writes; missing or unreadable counts as
+  fully spent (since the sixth round in `/data/trials-private`).
+- **What leaves for search** is printed by `trial.sh plan research` under "Sent to third-party search", and
+  your approval's hash covers it.
+
+### Sixth round, in short
+
+- **The card shows what you approve, computed by the link.** The link reads the suite file (or, before a
+  suite's first run, the past reviews or the research questions and notes it would be built from), the App's
+  options and the newest run, and computes the plan hash itself. The trial card renders, as text: the suite,
+  whether it is the preflight, a new run or a resume, the cap in dollars, the worst case of its calls, each
+  provider called, what has been granted from your allowance so far, and for research the full "Sent to
+  third-party search" list (attached as a text file when it doesn't fit on the card). Your tap signs the hash
+  and the action the link computed. A `keeper.sh trial-approve` whose carried hash or cap differs from the
+  link's own is refused, and no card goes out.
+- **The signing key, the used approvals and the tally are out of Cain's reach.** The tally, the used approvals
+  and a has-history marker live in `/data/trials-private`, owned by root, mode 0700. The runner refuses every
+  paid step if that folder or its parent can be written by anyone else, or if the link's private trial key
+  (`/data/link/trial.key`) can be read by anyone but the link. Each used approval is also logged inside the
+  tally, so a used-approval file that goes missing can't replay its approval. The check, the use of the
+  approval and the grant happen in one step under the ledger's lock, written to disk (fsynced) before anything
+  is sent. The total granted is mirrored into `/data/trials/allowance-granted.json`, shown on the card and in
+  `trial.sh plan` and `status`.
+- **The Codex boundary beyond web search.** The read-only requirements file also pins the sandbox modes to
+  read-only and workspace-write (so never danger-full-access), holds an empty `mcp_servers` table and sets
+  `network_access = false` for workspace-write. The self-test reads Codex's own effective configuration inside
+  the wrapper (`codex debug config`) and refuses Codex unless it shows web search disabled-only and the rest of
+  the requirements; it also asks Codex for an outbound connection and for connections to the link's port and the
+  runner's socket, each of which must be refused. Codex must be at least 0.136.0, and the preflight names the
+  installed version. The web search kill stays as the backstop.
+- **The init's token files.** At start and before each paid step the runner checks that s6's saved
+  `SUPERVISOR_TOKEN` and `HASSIO_TOKEN` and init's own environment (`/proc/1/environ`) can't be read by Cain's
+  user (by the mode bits of each file and every folder above it, with his groups). A readable one means no paid
+  dispatch. The runner itself is root, and root reads every file, so for the runner the check is that each file
+  can be read by no one but root.
+- **Provider limits are a backstop, not the bound.** See the spend stop, below.
+- **Codex's identity in the preflight key.** The trials' Codex signs in on a home of its own
+  (`/data/codex-trials`), never the review service's ChatGPT account: the account or workspace id its sign-in
+  file names is hashed (never a token, never the id itself) into the preflight key, and the preflight is refused
+  if it matches the review service's sign-in. No provider the trials use exposes an organisation or workspace id
+  per API key, so for the three API keys, separation is unverified beyond the string check, and the preflight
+  record says so.
+- **The research grader no longer fetches.** The runner fetches the exact cited pages itself and puts their text
+  in the grading prompt; no grader has a provider-side fetch tool (below).
+- **Named go/no-go lines in the preflight report** (`/data/trials/preflight.md`, and `trial.sh status`): bubblewrap
+  starts in the container; the requirements file is read and honoured inside the wrapper (the effective config
+  check); the credential, environ and network probes are refused; saving options rewrites the options file without
+  a restart; each Gemini model emits thinking on its check; the trial card and its tap arrive on real Discord.
+  Codex stays disabled until its three lines are GO.
+
+### The spend stop
+
+The budget: `trials_budget_usd` in this App's options (default 40, in dollars of API spend) covers every
+suite, every grading call, every probe and every retry together. Only the App option sets it: a request to
+the trials runner can't carry a budget, a list of configurations or a run id.
+
+It is a soft bound, with a margin, not a hard one (fourth round). Some of what a call can cost has no
+provider cap:
+
+- Anthropic documents no size cap on web search results (they count as input tokens);
+- Gemini's `thinkingLevel` is a level, not a token cap, so on a model whose `maxOutputTokens` doesn't cover
+  thinking, the thinking it does is bounded only by the trials' own allowance;
+- Gemini grounding is billed per search query executed, with no documented cap on how many queries one call
+  runs.
+
+So the ledger stops a fixed 10 percent below the budget option (at $36 of the default $40), and a call billed
+above its reservation stops the run with an alarm. **The bound is each run's cap, enforced before every
+dispatch** (sixth round): every call's worst case is reserved on disk first, never past the run's cap from your
+allowance; a call whose usage is missing or can't be resolved stays charged at its whole reservation; and a run
+whose preflight record expires (7 days) stops at its next paid step. Provider spend limits on the trials' own keys
+(`trials_*_api_key`) are only a backstop: they are monthly, enforced late, and can be exceeded (OpenAI documents
+that its project limits can be exceeded, and the others reconcile spend after the fact), so they can't be the
+bound. A limit on keys shared with real reviews would also cut off real reviews when it tripped, which is why the
+trials no longer use them.
+
+- Every request carries hard ceilings the provider enforces:
+  - Claude: `max_tokens` (thinking included) and `max_uses` on web search; research answerers get web
+    search only (no fetch); since the sixth round no grader has a fetch tool: the runner fetches the cited
+    pages and their text is part of the grading prompt, bounded by its size. A paused turn isn't continued.
+  - Gemini: `maxOutputTokens`, and only the thinking field the docs say each model takes (below).
+  - Perplexity: `max_steps`, `max_output_tokens`, the search tool's `max_tokens`, no page fetching.
+  - Codex: one turn (`codex exec`), no tools, `model_context_window` set.
+- A call's worst case is its steps times (its context ceiling at the input price plus its output cap at the
+  output price) plus its most tool fees, at the dearest list price the model has (Gemini 4 Argon and Carbon
+  at their December price even in November; a model with no list price at $10 and $50 per million tokens).
+  - Claude: the context ceiling counts each search use's allowance and each fetch use's
+    `max_content_tokens`, at every step.
+  - Perplexity: each search call's `max_tokens` at every step, and the fast level at the priority rate (2x
+    the token rates).
+  - Gemini: the enforced output ceiling, plus a thinking allowance only where the docs don't say
+    `maxOutputTokens` covers thinking, and, with grounding on, a conservative fee allowance of 24 search
+    queries at the per-query price. The bill is then reconciled from the queries each candidate's
+    `groundingMetadata` says were executed.
+  - A configuration that can't be given a ceiling is refused, not run.
+- One cap across every seat, probe, grader and retry: the ledger's cap sits a fixed 10 percent below the
+  budget option, not a margin worked out from the same worst-case guesses it guards. A bill above a call's
+  reserved worst case stops the run and raises an alarm to Cain.
+- The worst case is reserved in `/data/trials/budget.json` before the call is sent, in one locked
+  check-and-reserve shared by every suite, grader, resume and process. It is checked together with the
+  review seat's room this month (its cap, less the share `usage_reserve_percent` keeps for real reviews,
+  less every trial reservation already out on that seat). The file is fsynced.
+- Sending: the call is marked sent under the same lock, just before it leaves. If its reservation is gone by
+  then (a restart judged its process gone and took it back), nothing is sent.
+- Ownership: each reservation names its owner by pid, boot id and the process's start time. After a
+  restart, only reservations whose owner is gone (another boot, a pid that isn't running, or a pid now
+  running something that started at another time) are settled: never sent means released, sent means
+  counted at its worst case, once, and run again.
+- A task is one unit, and tasks run one at a time: its graders' worst case is held before its first call. If
+  its outputs then run short, the rest of them are skipped and the task is still graded; the next task
+  doesn't start.
+- Settling: from the provider's bill where it gives one (Perplexity's `usage.cost.total_cost`), otherwise from
+  the tokens it reports at the list price (estimated). A reservation is released with no charge only on an
+  authoritative zero: nothing left at all (a privacy block), an HTTP 4xx answer with no usage in it, or a
+  usage block showing zero. Anything else keeps it: a missing or unclear figure, a 200 with no usage, a
+  cut-off answer, a timeout or a server error is charged at its whole worst case. A retry reserves again.
+- Codex runs on the ChatGPT plan and returns no bill: its calls are counted against a per-window call
+  allowance, never as dollars, and the report says how many there were.
+- Trial spend shows in `review.sh spend` and the security watch like review spend. Real reviews don't see
+  trial reservations; trials keep out of the reserved share instead.
+
+### Your say on paid runs: the run allowance (App option)
+
+`trials_run_allowance_usd` (default 0) is your say on paid trial runs, a total in dollars, read only from
+this App's options (root's file), under the same rules as the research approval. A run, a resume and the
+preflight start only while what they would take, their cap, fits in what is left of it:
+
+- a run's cap is its plan's worst case plus its own checks, never above the ledger's cap; the preflight's is
+  $4;
+- the cap is granted once, when the run starts, and counted against the allowance whether the run spends it
+  or not, so a second run beyond the allowance is refused even if the first spent little;
+- a run's calls and task holds never pass its own cap;
+- lowering the allowance below what was granted stops a running run before its next call, and a resume waits
+  until you raise it again.
+
+With the default 0, nothing paid runs. Cain's inbox stays a submission channel only: a request asks, and only
+your allowance decides. `trial.sh plan` says what a run of a suite would take; `trial.sh status` shows the
+allowance the runner read and what is granted.
+
+### The Supervisor's token
+
+The App's start unsets `SUPERVISOR_TOKEN` (and `HASSIO_TOKEN`) before it starts anything, so neither Cain's
+processes nor the review and trials runner hold it. Cain's processes run as his own user, and his session's
+own check refuses to start unless every root process's `/proc/<pid>/environ`, s6's saved copy of the token and
+`/data/options.json` are unreadable to him. So a change of the App's options through the Supervisor's API (a
+raised allowance, an approval) isn't open to Cain. The tests check the start script's order and that a process
+of another user can't read a root process's environment; the live check is Cain's own session check on the Pi.
+
+### Real reviews first, and quota headroom
+
+While a real review is queued, running or waiting in the review inbox, no trial call starts. After a 429 or
+usage-limit answer on a seat (a trial's or a real review's), that seat cools for 15 minutes, and trial calls
+on one seat are spaced at least 10 seconds apart. Every trial call has a hard wall-clock limit and is aborted
+at it; Codex's whole process group is killed.
+
+Each seat also has a trial allowance per window that leaves headroom for real reviews: half of a
+conservative reading of the seat's limits.
+
+| Seat | Trial calls allowed |
+| --- | --- |
+| Codex | 20 per 5 hours |
+| Claude | 25 per hour |
+| Gemini | 30 per hour |
+| Perplexity | 25 per hour |
+
+When a seat's allowance is used, its trial calls wait for the window before any 429, and the rest go on.
+
+### What leaves, and the private-terms check
+
+Every call goes out through its own wire: immediately before it is sent, the final serialized request (the
+system prompt, the rubric, answer notes, every candidate, tool arguments, filenames, grader requests,
+retries) is checked against `/data/review-private-terms.txt` and its built-in patterns. A hit stops it
+before anything leaves (fail closed). Stored briefs, adopted notes, kept diffs and the research questions
+are checked when the suite is built too. A brief with a hit keeps its task but blocks its every call;
+adopted notes or a diff with a hit are left out (then recall isn't graded).
+
+Provider tools only on checked text: provider-managed search, fetch and grounding are on only for the
+research suite, whose every outbound field is the checked research text. The review-seats suite is built
+from the record (briefs, notes, diffs), so every call in it goes with no tools at all; one with search on is
+refused before it is sent.
+
+The research grader's pages (sixth round): the runner itself fetches the exact pages cited in the answer notes,
+once per question per run (kept beside the run's grades, so every grader reads the same text and a resume doesn't
+fetch again). Each address has its query string and fragment stripped and is checked against the private-terms
+list first; only HTML paths are tried (a PDF, an office file, an archive, an image or a data file is left out).
+Redirects are handled by the runner, never followed blindly: each hop must stay on the cited host, over the same
+scheme, inside the cited path (the path itself or below it), with its own query string stripped, at most 5 hops.
+Only an answer whose Content-Type is HTML is read, at most 2 MB of it, stripped to text (scripts, styles and tags
+out) and cut to 12,000 characters; anything else reaches the grader as "not read", with the reason. The grader's
+provider-side fetch tool is off, and a grading call whose answer shows a fetch anyway is thrown away, counted at
+its cost, with an alarm to Cain. The pages' text is part of the grading prompt, so the ledger's bound on it is the
+prompt's own size.
+
+The plan step (`trial.sh plan research`) refuses questions or answer notes (what a right answer must contain,
+the sources) that match the private-terms list, naming them, and shows no plan; with no list at all it shows
+none either. The private-terms list catches only the terms listed in it (and the built-in patterns: emails,
+phone, card and account numbers): something private that isn't on the list goes through. So the plan prints
+every approved question as it is sent, and its answer notes, under the heading "Sent to third-party search",
+and the plan hash your approval is bound to covers that statement: read it before you tap.
+
+The search queries a provider says it ran (Gemini's grounding queries, Claude's searches and fetched
+addresses, Perplexity's search results) are logged with each output and checked afterwards; a hit raises an
+alarm to Cain and stops the run. What the check can't cover: text a provider generates itself, such as a
+search query it writes from the question, is only checked after it was sent.
+
+### Codex isolation, before launch
+
+Codex runs only under bubblewrap (fourth round: the earlier fallback to Codex's own rules file is gone). A
+Codex trial or grading call runs only when the run's sandbox self-test passed under that same wrapper. Every
+Codex invocation (the self-test, its version and model list, each call) is launched through bubblewrap with:
+
+- new mount, pid, ipc and uts namespaces; a fresh `/proc` (the runner's own environment file isn't there);
+  an empty `/tmp`; no shell, no `/bin`, no `/data`; a cleared environment;
+- read-only: the Codex binary (a static build, so no libraries) and the few files a TLS connection needs
+  (`resolv.conf`, `hosts`, the CA certificates); the network stays, so Codex can reach OpenAI;
+- read-only (fifth round): a requirements file at `/etc/codex/requirements.toml` holding
+  `allowed_web_search_modes = []`, which per the Codex configuration reference allows only `disabled`, and (sixth
+  round) `allowed_sandbox_modes = ["read-only", "workspace-write"]`, an empty `[mcp_servers]` table and
+  `[sandbox_workspace_write] network_access = false`. It sits
+  in the invocation's temp folder outside every folder bound writable; the wrapper isn't started without it,
+  and the self-test checks it is in place, with exactly that content, on the very command line it runs;
+- an empty temp folder for the work, an empty home, and an isolated `CODEX_HOME` holding a copy of only its
+  sign-in file, `auth.json` (a sign-in Codex refreshed during the call is copied back; nothing else comes
+  back).
+
+The wrapper's exact mounts and settings (fifth round), as `trials/sandbox.ts wrap` builds them:
+
+| Inside | From | How |
+|---|---|---|
+| `/opt/codex/codex` | the Codex binary | read-only |
+| `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/ssl/certs`, `/etc/ssl/cert.pem`, `/etc/ca-certificates`, `/usr/share/ca-certificates` | the same paths, where present | read-only |
+| `/etc/codex/requirements.toml` | the invocation's own requirements file | read-only |
+| `/proc` | a fresh proc for the new pid namespace | |
+| `/dev` | a minimal dev | |
+| `/tmp` | an empty tmpfs | |
+| `/trial/work`, `/trial/io`, `/trial/home`, `/trial/codex-home` | the invocation's empty work folder, its answer folder, an empty home, the isolated `CODEX_HOME` (a copy of `auth.json` only) | read-write |
+
+Namespaces unshared: pid, ipc, uts and cgroup (where it can), with `--die-with-parent` and `--new-session`. The
+network namespace is **not** unshared: Codex must reach OpenAI's API, so the sandboxed Codex can open network
+connections like any process on the Pi. The environment is cleared and set to `PATH=/opt/codex`,
+`HOME=/trial/home`, `CODEX_HOME=/trial/codex-home` and `LANG=C.UTF-8` (plus a random canary during the
+self-test).
+
+The self-test runs the real binary on the Pi, once per run (and again on a resume, and in the preflight):
+
+1. bubblewrap must start at all: `codex --version` inside it;
+2. the requirements file is in place (above);
+3. (sixth round) the installed Codex is at least 0.136.0, and its own effective configuration inside the
+   wrapper (`codex debug config`) shows web search disabled-only, read from the requirements file, with the
+   sandbox modes pinned, no MCP server and no network for workspace-write; anything it can't read refuses Codex;
+4. Codex is asked to run nine probes, and each must be attempted and refused (or find nothing to run): a
+   plain read of a planted key file, the same read by an absolute-path binary (`/bin/cat`), a
+   shell-builtin-only read (a redirection, no program), the runner's own environment under `/proc`, (fifth
+   round) Codex's own credential file (`/trial/codex-home/auth.json`) and Codex's own environment
+   (`/proc/$PPID/environ`, the sandboxed shell's parent), and (sixth round) an outbound connection from a Codex
+   command, a connection to the link's port (8097) and one to the runner's socket;
+5. no canary or marker may appear anywhere in what came back: the planted key, the runner's environment
+   markers, a random canary set only in Codex's own environment, and every token in Codex's sign-in file.
+
+Steps 1, 3 and 4 are the preflight's first three go/no-go lines; Codex stays disabled until all three are GO.
+
+The Supervisor's token (fifth round). The App's start script unsets `SUPERVISOR_TOKEN` before any child starts.
+The trials runner checks at start and before every paid step that it isn't in its own environment (its `env`
+or `/proc/self/environ`): if it is, nothing paid is dispatched. Cain's session start (`session.sh`) checks the
+same and logs an alarm to `/data/session.log`, and `trial.sh`, which runs in his session with its environment,
+refuses every paid start while the token is there.
+
+If bubblewrap isn't installed or can't start in the container, or any probe isn't refused, Codex is "not
+isolated": every Codex configuration is skipped, Codex never grades, and the report says the panel was
+reduced; a ranking that would rest on one grader is left out. The self-test counts as one Codex call.
+
+Every invocation passes `-c features.daemon_auto_start=false` and `-c web_search="disabled"` before the
+subcommand, and the call's own `exec` line carries `web_search="disabled"` again. Codex has no `--no-daemon`
+on `codex exec` (it runs its own in-process server); the shared daemon's switch is that feature flag, and
+inside bubblewrap's own pid namespace with `--die-with-parent` nothing it started outlives it. Each invocation
+also has `--ignore-user-config` (no config file, so no MCP servers). It starts in its own process group, and
+the whole group is killed on abort, at once when a web search event shows in its output, and when it ends.
+A call that searched the web is stopped, its answer isn't kept, it counts at its worst case (one call of the
+plan's allowance), and Cain hears an alarm. An answer whose event stream shows any other tool use is thrown
+away.
+
+The fake-exec tests show what is handed in (command line, environment, files, working folder) and how the
+self-test is judged. They say nothing about what a real Codex could read: that is what the self-test on the
+Pi decides.
+
+### Blind grading
+
+Each output gets a random label; the key from labels to configurations is written apart (`key.json`) and
+never sent. Before a grader reads a candidate it is normalized:
+
+- provider envelopes, citation markers and grounding metadata come out (a grounding redirect gives way to
+  its page's domain);
+- tool traces and CLI headers and footers come out;
+- the names models and vendors call themselves (Claude, Opus, Anthropic, Gemini, Google, GPT, OpenAI, Codex,
+  Perplexity, Sonar and the like) come out.
+
+The brief, question and notes a grader reads get the same scrub, and a grading prompt that still holds a
+name or a marker isn't sent. Candidates go in as untrusted data the grader is told to ignore instructions in,
+each cut to a fixed length, in an order shuffled for each grader call on its own.
+
+Three graders, one per family: Claude Opus 5.5, OpenAI through Codex (no tools, so it grades on content
+only) and Google's Gemini 4 Argon (no tools). Each output's panel is the first two of those the run can use
+whose family isn't its own, so every candidate gets two graders from outside its family. With Codex not
+isolated (or any grader's check failed), the report says "Panel reduced" and why, and Google's outputs get
+Claude alone: a ranking that rests on one grader is left out. The report shows each grader's scores beside
+the combined score, ranks only configurations at least two graders of the same panel scored (each panel on
+its own matched set), and flags the combined ranking across panels as not like for like.
+
+### The suites
+
+- `review-seats`: the 12 most recent past reviews in the record with `result.json` and `adopted.md` (full
+  rounds only, none about this trial). Each is sent, with the review service's own prompt and answer schema
+  and no tools, to:
+  - Gemini 4 Argon (the review service's model for its consequential reviews), 4 Neon, 4 Carbon (which
+    Google lists as its strongest reasoning model), 4 Hydrogen and 3.8 Flash (today's default);
+  - Codex with its default model, with gpt-6.2-sol and with gpt-6.2-astra;
+  - Perplexity Sonar, pinned, with no search.
+
+  The seats' answers kept in each review are graded too, with no new call. Findings are graded against the
+  brief (and the diff, when the review kept one as `diff.patch`); the owner's adopted notes count only for
+  recall, never for a score.
+- `research`: Cain's 30 questions (15 facts, 15 listing or product searches, at least 3 with no reliable
+  answer), sent to:
+  - Claude Opus 5.5 with web search (no fetching);
+  - Perplexity's `fast`, `low` and `medium` levels, pinned to `perplexity/sonar`;
+  - Gemini 4 Hydrogen and 3.8 Flash with Google Search grounding.
+
+  Each question is in `projects/harness/trials/research-questions.json` in the record, with:
+  - `sent_text`: the question rewritten for a stranger; nothing else of it leaves;
+  - `as_of`: the date it is asked as of;
+  - `must_contain`: what a right answer needs;
+  - dated `sources` for that note.
+
+  Grading uses an explicit abstention rubric: a right "no reliable answer" earns full credit, a confidently
+  wrong answer a penalty.
+
+### Your approval of the research suite (App options)
+
+The research suite runs only with your approval, and the approval is read only from this App's options (the
+options file Home Assistant keeps as root's, set on the Configuration tab), never from a file Cain's user or
+the inbox group can write: an approval file in the record is ignored. `trial.sh plan research` prints three
+hashes for you to enter:
+
+- `trials_research_questions_sha256`: the questions file as it is;
+- `trials_research_notes_sha256`: its answer notes (what a right answer must contain, the dated sources,
+  and which questions have no reliable answer);
+- `trials_research_rubric_sha256`: the rubric (the outcomes, their points and the grading schema).
+
+If any of them stops matching (a question, a note or the rubric changed), the suite is refused, and a
+running research run stops. Leave them empty until you have read Cain's questions and notes. Home Assistant
+restarts the App when its options change, and the runner reads them again then.
+
+`trials_perplexity_third_party_routing` (off by default) lets Perplexity's levels route to another lab's
+model. While it is off, or the research approval doesn't stand, every Perplexity call is pinned to
+Perplexity's own model, and an unpinned call is refused before it is sent. The model that actually answered
+is stored for every call:
+
+- an output served by another lab's model is reported as that lab's, and that lab's grader never reads it;
+- a pinned level's rows read "perplexity/sonar at effort low", so they aren't taken for the default presets.
+
+### The checks before any spend: `trial.sh preflight` first
+
+The first install is preflight-only (fourth round). `trial.sh run` refuses every paid suite until a preflight
+record stands (`/data/trials/preflight.json`, kept by the runner). Fifth round: the record is keyed on the
+trials' own code, the machine, the installed Codex (a hash of its binary), the configured models (every
+configuration, the graders and the Gemini table) and the trials options (the budget, the research approval,
+third-party routing and the trial keys, taken together as one hash, never a key itself). Any of those changing
+refuses every paid suite, naming what changed, until the preflight runs again; so does a record more than 7
+days old when a run or a resume starts (a run already going keeps the preflight it started on, but stops if
+the key changes under it). `trial.sh preflight` runs the checks below for every configuration of both suites,
+with no text of yours, under a cap of $4 from your run allowance and on your tap, and writes the record:
+
+- Claude: one call with a tiny output cap; on research with web search `max_uses` 1 and the grader's fetch
+  `max_uses` 1, both for direct callers only; on review-seats, no tools.
+- Gemini: one tiny call per model (every configuration's, and the Gemini grader's) with the model's own
+  thinking field. A model that refuses the field (a 400) or isn't served is disabled. The check also records
+  whether the model's output cap covered its thinking (thought and answer tokens within the cap); a model the
+  docs list as covered whose check shows otherwise is disabled, since its worst case can't be bounded. Fifth
+  round: a check in which the model produced no thinking at all is inconclusive, and that model stays
+  disabled (never estimated) until a later preflight shows it.
+- Perplexity: one tiny call per level with the pinned model (pinned in the preflight even when third-party
+  routing is allowed). `response.model` must equal the pinned model; a level served by another model is
+  disabled.
+- Codex: the sandbox self-test under bubblewrap, that the daemon is off and web search off on every
+  invocation, then its version and model list (a tiny probe per model the list can't answer for).
+
+A configuration whose check fails stays disabled and is named, in the record, in `trial.sh status` and in
+every run's report. A run on that build takes the record's verdicts without paying for them again; only the
+Codex self-test runs again for each run (and Perplexity's levels are checked again when third-party routing
+is on). A run whose build or machine has no finished record stops before its next call. The exact model and
+tool ids each check used are kept (`preflight.ids`). The run still stops if today's default Gemini model, 3.8
+Flash, isn't usable.
+
+### Running one (as Cain)
+
+0. After each install, and whenever the preflight's key changes or it is 7 days old: `trial.sh plan
+   preflight`, your tap on the card, then `trial.sh preflight --approval <the approval>` (above).
+1. `trial.sh plan review-seats` (or `research`) prints every call the suite would make, its ceilings and
+   its worst-case cost, the ledger's cap, the total, what a run would take of your allowance (its cap), and the
+   plan hash (research: also everything sent to third-party search). No call is made.
+2. Cain asks you with `keeper.sh trial-approve --item <id> --suite <suite> --plan <hash> --cap <cap> "<what it
+   tests>"`. The card says what the run tests and its cap, with "Allow this run" and "No"; it expires at the
+   next morning check-in like his asks, and while you have everything stopped it isn't posted and a tap signs
+   nothing. Your Allow tap gives Cain a one-time approval, good for 2 hours.
+3. `trial.sh run review-seats --approval <the approval>` (or `research`, once approved) leaves a request in the
+   trials inbox. The runner checks the approval against its own trial key (`/data/trust/trial.pub`, root's), the
+   suite, the plan hash it computes itself from the suite it would run, and the cap, records it as used
+   (`/data/trials/approvals-used/`, an exclusive create, fsynced), and only then grants the run from your
+   allowance and starts it, task by task. A plan that changed since `trial.sh plan` (another task, call, cap or
+   question) needs a new plan and a new tap. An approval spent on a start the allowance then refuses stays spent.
+   - The inbox: a request file is opened without following a link (and without blocking, so a FIFO can't
+     hang the runner), taken only if it is a regular file of at most 4 KB, with one link, owned by Cain's
+     user. It is moved into a folder only the runner writes (`/data/trials/inbox-taken`), checked to be the
+     very file opened, and parsed from that same descriptor.
+   - Anything else is removed untaken. A paid run, a resume or the preflight starts only from such a file,
+     with your one-time approval, and only while your run allowance covers it.
+4. `trial.sh status` shows each suite's newest run, the budget, what is reserved and held;
+   `trial.sh result <suite>` every call's state, cost (billed or estimated), tokens and time.
+5. `trial.sh run <suite> --approval <a new approval>` again resumes a stopped run where it stopped
+   (`--retry` also tries again calls that failed for good; `--new` starts a fresh run). Every resume needs its
+   own tap. The checks before any spend run again on a resume.
+6. `trial.sh report <suite>` prints the report and the runner writes it to `/data/trials/<suite>/report.md`
+   (also when a run ends or stops); Cain files it in the record under `projects/harness/trials/`.
+
+The report:
+
+- labels each configuration by the model that served it;
+- shows each grader's scores beside the combined one, each configuration's panel, coverage and missing
+  grades, the installed Codex version and its isolation;
+- makes headline comparisons per panel, on the matched set of tasks every configuration of that panel
+  answered and had graded; a gap within twice the combined standard error is reported as no clear
+  difference;
+- counts every attempt in the cost (failed, retried and ungraded ones too), billed and estimated, with
+  estimates marked;
+- reports unresolved billing (charged at its worst case for want of a bill) in its own column, left out of
+  the cost per acceptable answer, which comes with its denominators.
+
+What it keeps, all readable by Cain and written only by the runner: `/data/trials/budget.json`,
+`/data/trials/allowance.json` (the tally of caps granted from your allowance, fifth round), the approvals used
+(`/data/trials/approvals-used/`), `/data/trials/preflight.json`, and per
+suite `suite.json` (the tasks) and per run `<run>/state.json`, `outputs/` (with the served model and search
+queries), `grades/` and `key.json`.
+
+### Provider contracts, and where they were read (Nov 22, 2026)
+
+- **Claude** (platform.claude.com: the web search, web fetch, extended thinking and pricing pages, read
+  directly):
+  - `web_search_20260318` with `max_uses` and `allowed_callers: ["direct"]`; $10 per 1,000 searches;
+    results count as input tokens.
+  - `web_fetch_20260318` with `max_uses`, `max_content_tokens` and `allowed_domains`; no charge beyond
+    tokens.
+  - `max_tokens` covers thinking.
+  - Opus 5.5 at $4 and $20 per million tokens.
+  - Where the docs and the job differ: Anthropic documents no ceiling on search result content, so the
+    "bounded snippet ceiling" per search use is the trials' own allowance (20,000 tokens), not a provider
+    bound; the overrun margin covers a miss. The fetch page doesn't itself list `allowed_callers` (it points
+    to the server tools page), so the check before any spend is what confirms the fetch tool takes it.
+- **Gemini** (ai.google.dev, thinking, model and pricing pages; not reachable from the build, read through
+  search results limited to that site):
+  - Gemini 4 Argon takes `thinkingLevel` (low, medium, high), and its `maxOutputTokens` counts thought
+    tokens. `thinkingBudget` is deprecated on Gemini 4 and a 400 beside `thinkingLevel`.
+  - Gemini 3.8 Flash takes `thinkingLevel` (minimal is an error).
+  - Grounding on Gemini 3 and newer is $14 per 1,000 search queries.
+  - Neon, Carbon and Hydrogen weren't found. They get `thinkingLevel` low and the thinking allowance, and a
+    refusal at the check skips them.
+  - Not confirmed for 3.8 Flash: whether `maxOutputTokens` covers thinking (the allowance is added).
+- **Perplexity** (docs.perplexity.ai, Agent API effort, presets, web search tool, pricing and models pages;
+  not reachable from the build, read through search results limited to that site):
+  - The level goes in `effort`, with `preset` read back as an alias.
+  - `model` overrides the level's model, and `max_steps` and `max_output_tokens` cap a run.
+  - The web search tool's `max_tokens` caps the search context of each call.
+  - Search calls cost $2.50 per 1,000, and the priority tier is 2x the token rates.
+  - `usage.cost.total_cost` is the bill (the docs call it an estimate), with
+    `usage.tool_calls_details.search_web`.
+  - Not confirmed: that the fast level is billed at the priority rate (it is priced so, as the job asks),
+    and whether the response echoes `effort` or `preset`.
+- **Codex** (github.com/openai/codex at its head on Nov 22: the exec CLI, config, exec policy and sandbox
+  source and READMEs; developers.openai.com wasn't reachable):
+  - `codex exec` takes `--ignore-user-config`, `--ephemeral`, `--json`, `-o`, `--output-schema`,
+    `--skip-git-repo-check`, `-m`, and `-c` overrides.
+  - `web_search = "disabled"`.
+  - `default_permissions = ":read-only"`, which can't be set beside `--sandbox`.
+  - `[features] daemon_auto_start` (no `--no-daemon` on `exec`).
+  - `auth.json` in `CODEX_HOME`.
+  - Codex's own Linux sandbox uses bubblewrap.
+  - Fifth round (the managed configuration and configuration reference pages, read through search results;
+    developers.openai.com wasn't reachable from the build): the system requirements file is
+    `/etc/codex/requirements.toml` on Unix, and `allowed_web_search_modes = []` allows only `"disabled"`
+    ("disabled" stays implicitly allowed).
+- **Claude, fifth round** (as read Nov 22): `max_content_tokens` on web fetch is approximate and isn't applied
+  to PDFs. The trials leave PDFs out before the fetch and reserve every fetch at that cap.
+
+Where the provider docs and the fourth round's list differ (the docs win):
+
+- Sixth round: the Codex configuration reference couldn't be read from the build session (its host was outside
+  the session's network), so the new requirements keys (`allowed_sandbox_modes`, `[mcp_servers]`,
+  `[sandbox_workspace_write] network_access`) and the effective configuration command (`codex debug config`) are
+  as the job listed them, unverified against the docs. That is why the effective configuration check refuses
+  Codex whenever the output can't be read or doesn't show the requirements: if a key name or the command differs,
+  Codex stays disabled and the preflight's line says why, rather than running on an unproven boundary.
+- Sixth round, "compare trial and review organisation or workspace ids per key": none of Anthropic, Google AI
+  Studio or Perplexity exposes an organisation or workspace id for an API key that a key can read about itself,
+  so separation of the three API keys is unverified beyond the string check (the preflight record says so). For
+  Codex, the sign-in file's account or workspace id is compared.
+- The research grader's fetch "takes only the exact URLs" in the answer notes: since the sixth round the runner
+  fetches them itself and the grader has no fetch tool (above); the fifth round's bound by `max_uses` and
+  `allowed_domains` is gone.
+- Fifth round, "unshare the network namespace unless Codex needs it": Codex needs it to reach OpenAI's API,
+  so it stays shared (the mounts are listed above).
+- Fifth round, "a Gemini model that produced no thinking during its check": recorded as inconclusive and the
+  model disabled, as the list asks (before this round it stayed on with the thinking allowance).
+- "Codex honouring daemon off": Codex documents the `daemon_auto_start` feature flag but no way to observe
+  that no daemon started. The preflight records the flag on every invocation, and bubblewrap's own pid
+  namespace with `--die-with-parent` ends anything it started; nothing more can be checked from outside.
+- "Each Gemini model's thinking field and whether its output cap covers thinking": for the models the docs
+  don't cover (Neon, Carbon, Hydrogen), the check can only show it when the model thinks during the check; an
+  answer with no thought tokens is recorded as unknown, and the thinking allowance stays on their worst case.
+
+### Your setup for the trials
+
+1. Make keys just for the trials (fifth round), each in a place of its own with its own spend limit no
+   higher than your run allowance, as a backstop:
+   - Codex runs on a ChatGPT sign-in, not an API key, so no OpenAI project or key is involved. Since the sixth
+     round the trials' Codex has a sign-in of its own (`/data/codex-trials`), and the preflight refuses it if it
+     is the review service's ChatGPT account. A ChatGPT sign-in shares that account's plan: its usage limits
+     (the 5-hour and weekly windows), its model access and its settings, with every other Codex or ChatGPT use
+     on the same account. There is no sign-in page for that home yet, so until one is added Codex stays out of
+     the trials (its preflight lines say it wasn't checked).
+   - Anthropic: a separate workspace in the Claude Console, with its own spend limit, and a key from it in
+     `trials_anthropic_api_key`.
+   - Google: a separate Google AI Studio project, with a budget cap on its billing, and a key from it in
+     `trials_gemini_api_key`.
+   - Perplexity: a separate API group, with its own limit or prepaid credit, and a key from it in
+     `trials_perplexity_api_key`.
+
+   Never reuse the review keys: the trials refuse a key that equals the review key for its provider. Provider
+   limits are monthly, enforced late, and can be exceeded (a call can pass a limit before it trips, and a limit
+   resets monthly), so they are a backstop only; the bound is each run's cap, enforced before every dispatch.
+   Set each no higher than the allowance anyway; a limit on shared keys would also cut off real reviews when it
+   trips.
+2. Set `trials_run_allowance_usd` on the Configuration tab: at least $4 for the preflight, plus what
+   `trial.sh plan` says each run takes. It is the ceiling over every run you allow. Cain can't set it.
+3. Tap "Allow this run" on Cain's trial card for each paid run, resume and preflight you want. Nothing paid
+   starts without that tap.
+
+On the Pi, before relying on this (questions for its preflight, not checked by any test here):
+
+- Does saving the App's options in Home Assistant rewrite `/data/options.json` without restarting the App? The
+  runner reads the run allowance, the research approval and routing from that file at each start and step, and
+  the trial keys and the budget only at start; if a save rewrites the file with no restart, a lowered allowance
+  still stops a run before its next call, but new keys or a new budget take effect only at the next restart.
+- The allowance tally (`/data/trials-private/allowance.json`, sixth round): if it is ever missing while the trials
+  have history (the `has-history` marker beside it, or a budget or preflight file), or can't be read, every grant is
+  refused as "fully spent". Putting it right is yours, at the Pi as root: restore it from a backup, or (accepting that
+  the count and the log of used approvals start again) write `{"format": 1, "grants": {}, "used": {}}` to it, owned by
+  root, mode 0600. The folder must stay root's, mode 0700 (the App's start sets it so).
+- The token files (sixth round), live check on the Pi, in the App's terminal as root:
+  `stat -c '%U %a %n' /run/s6/container_environment /run/s6/container_environment/SUPERVISOR_TOKEN /run/s6/container_environment/HASSIO_TOKEN /proc/1/environ`
+  must show root for each, mode 700 for the folder and 400 (or 600) for the files; then
+  `su -s /bin/sh cain -c 'cat /run/s6/container_environment/SUPERVISOR_TOKEN; cat /proc/1/environ' ; echo $?` must
+  print only "Permission denied" errors, never a token. `trial.sh status` names any token file the runner found
+  readable, and then nothing paid is dispatched.
+- The go/no-go lines: run the preflight once after installing, then read `/data/trials/preflight.md` (or
+  `trial.sh status`). The options line goes GO only if the App's options were saved while the runner ran: save them
+  once (with no change), then run the preflight again. The card line is GO once a preflight starts on your tap.
+
 ## Cain's own user (since 0.12.0)
 
 Cain's Claude Code session runs as its own user, `cain`, not as root. The App's keys, the

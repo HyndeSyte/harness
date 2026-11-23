@@ -125,18 +125,26 @@ def test_cain_config_denies_every_api_and_mapping():
     # Assistant user id, not a key), the alarms' webhook id, hidden like a key (C1
     # second review: the App's alarms reach Home Assistant without its API), the PC
     # job keeper's token and repo name, the security watch's and the probe's heartbeat URLs
-    # (secrets like keys: password fields). Nothing else.
+    # (secrets like keys: password fields), and (0.19.0) the model trials' budget, the owner's research
+    # approval hashes, Perplexity's third-party routing switch, the owner's run allowance and (fifth round) the
+    # trials' own keys, hidden like keys. Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
         "  review_limit_usd: 1.5\n  gemini_monthly_usd: 8\n  perplexity_monthly_usd: 4\n"
-        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n'
+        '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n  trials_budget_usd: 40\n'
+        '  trials_research_questions_sha256: ""\n  trials_research_notes_sha256: ""\n  trials_research_rubric_sha256: ""\n'
+        '  trials_perplexity_third_party_routing: false\n  trials_run_allowance_usd: 0\n'
+        '  trials_anthropic_api_key: ""\n  trials_gemini_api_key: ""\n  trials_perplexity_api_key: ""\n'
         '  owner_user_id: ""\n  notice_hook: ""\n'
         '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
-        "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n"
+        "  codex_monthly_runs: int(0,5000)\n  review_round_cap: int(1,10)\n  usage_reserve_percent: int(0,90)\n  trials_budget_usd: float(0,500)\n"
+        "  trials_research_questions_sha256: match(^([0-9a-f]{64})?$)?\n  trials_research_notes_sha256: match(^([0-9a-f]{64})?$)?\n"
+        "  trials_research_rubric_sha256: match(^([0-9a-f]{64})?$)?\n  trials_perplexity_third_party_routing: bool\n  trials_run_allowance_usd: float(0,500)\n"
+        "  trials_anthropic_api_key: password?\n  trials_gemini_api_key: password?\n  trials_perplexity_api_key: password?\n"
         "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
         "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n")
@@ -2656,7 +2664,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant"])'
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/trial-approve"])'
             in auth.replace("\r\n", "\n"))
     # Cain 0.18.0: /review-grant is Cain's card asking Dane for extra review rounds; only his tap writes one.
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and

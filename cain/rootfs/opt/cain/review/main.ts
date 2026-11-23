@@ -14,6 +14,9 @@ import { geminiSeat } from "./seats/gemini.ts";
 import { codexSeat, codexSignedIn } from "./seats/openai.ts";
 import { perplexitySeat } from "./seats/perplexity.ts";
 import { CodexLogin, handle } from "./signin.ts";
+import { TrialRunner, keyPrintOf, keyProblems, supervisorTokenSeen, trialKeyCheck, writeAtomic } from "../trials/runner.ts";
+import { claudeProvider, codexProvider, geminiProvider, perplexityProvider } from "../trials/calls.ts";
+import { DEFAULT_BUDGET_USD } from "../trials/core.ts";
 
 const log = (m: string) => console.log(`[review] ${m}`);
 
@@ -36,7 +39,9 @@ export function decisionPoster(linkSock: string, log: (m: string) => void) {
 if (import.meta.main) {
   const env = process.env;
   const keys = { gemini: env.REVIEW_GEMINI_KEY || "", perplexity: env.REVIEW_PERPLEXITY_KEY || "", anthropic: env.REVIEW_ANTHROPIC_KEY || "" };
-  for (const k of ["REVIEW_GEMINI_KEY", "REVIEW_PERPLEXITY_KEY", "REVIEW_ANTHROPIC_KEY"]) delete env[k];
+  // The model trials' keys of their own (Cain 0.19.0, fifth round): App options apart from the review keys.
+  const trialKeys = { gemini: env.TRIALS_GEMINI_KEY || "", perplexity: env.TRIALS_PERPLEXITY_KEY || "", anthropic: env.TRIALS_ANTHROPIC_KEY || "" };
+  for (const k of ["REVIEW_GEMINI_KEY", "REVIEW_PERPLEXITY_KEY", "REVIEW_ANTHROPIC_KEY", "TRIALS_GEMINI_KEY", "TRIALS_PERPLEXITY_KEY", "TRIALS_ANTHROPIC_KEY"]) delete env[k];
   const cfg = configFromEnv();
   const codexHome = env.CODEX_HOME_DIR ?? "/data/codex";
   mkdirSync(codexHome, { recursive: true, mode: 0o700 });
@@ -78,6 +83,50 @@ if (import.meta.main) {
       pinSocket(sock);                                 // root:nogroup 0770, as ttyd's (../pinned.ts)
     }
   } catch (e) { log(`sign-in page didn't start: ${(e as Error).message}`); }
+
+  // The model trials (Cain 0.19.0, ../trials/runner.ts): in a loop of their own so a long trial never holds up a real
+  // review, under one budget (the App option trials_budget_usd). Fifth round: on keys of their own (the trials_*_api_key
+  // options), never the review keys; while any is empty or equals the review key for its provider, nothing paid goes
+  // out. And SUPERVISOR_TOKEN in this process's own environment stops every paid dispatch (checked at start and at
+  // every paid step). Codex runs on its own ChatGPT sign-in, as the review seat does.
+  const schemaField = env.GEMINI_SCHEMA_FIELD === "responseJsonSchema" ? "responseJsonSchema" as const : "responseFormat" as const;
+  const budgetUsd = (() => { const n = Number(env.TRIALS_BUDGET_USD); return env.TRIALS_BUDGET_USD && Number.isFinite(n) && n >= 0 ? n : DEFAULT_BUDGET_USD; })();
+  // Every trial call goes out through its own wire (../trials/guard.ts), which checks the final request
+  // against the private terms; Codex runs only after its sandbox self-test passed (../trials/sandbox.ts).
+  const keyCheck = trialKeyCheck(trialKeys, keys);
+  const ok = (k: "anthropic" | "gemini" | "perplexity") => keyCheck[k] === "ok";
+  if (supervisorTokenSeen()) log("ALARM: SUPERVISOR_TOKEN is in the review runner's own environment; no paid trial call is dispatched");
+  for (const p of keyProblems(keyCheck)) log(`trials: ${p}; no paid trial call is dispatched until the owner sets it`);
+  // Sixth round: Codex in the trials signs in on a home of its own (never the review service's ChatGPT account, compared by
+  // identity at the preflight); the tally and used approvals sit in the runner's private folder (root's, 0700).
+  const trialsCodexHome = env.CODEX_TRIALS_HOME ?? "/data/codex-trials";
+  try { mkdirSync(trialsCodexHome, { recursive: true, mode: 0o700 }); } catch (e) { log(`no trials Codex home: ${(e as Error).message}`); }
+  const trials = new TrialRunner({ dir: env.TRIALS_DIR ?? "/data/trials", inboxDir: env.TRIALS_INBOX ?? "/data/trials-inbox",
+    recordDir: env.RECORD_DIR ?? "/data/record", budgetUsd, keyCheck, keyPrint: keyPrintOf(trialKeys),
+    privateDir: env.TRIALS_PRIVATE_DIR ?? "/data/trials-private", linkKey: env.CAIN_TRIAL_KEY ?? "/data/link/trial.key", linkKeyUid: 0,
+    codexHome: trialsCodexHome, reviewCodexHome: codexHome }, {
+    review: runner,
+    providers: {
+      claude: ok("anthropic") ? claudeProvider({ key: trialKeys.anthropic, version: env.ANTHROPIC_VERSION_HEADER || undefined }) : undefined,
+      gemini: ok("gemini") ? geminiProvider({ key: trialKeys.gemini, schemaField }) : undefined,
+      perplexity: ok("perplexity") ? perplexityProvider({ key: trialKeys.perplexity }) : undefined,
+      codex: codexProvider({ home: trialsCodexHome, signedIn: codexSignedIn }),
+    },
+  });
+  // The budget it really uses, and what it found of the research approval in the App's options (Home Assistant
+  // restarts the App when they change), for trial.sh (run as Cain, who can't read the App's options).
+  const approval = trials.approval();
+  try { writeAtomic(`${trials.cfg.dir}/settings.json`, JSON.stringify({ budget_usd: trials.budget, research_approval: approval.ok ? { ok: true, third_party: approval.third_party }
+    : { ok: false, why: (approval as { why: string }).why }, run_allowance_usd: trials.allowance(), build: trials.build, machine: trials.machine, preflight_key: trials.preflightKey(), trial_keys: keyProblems(keyCheck),
+    supervisor_token_seen: supervisorTokenSeen(), paid_gate: trials.paidGate(), written_at: new Date().toISOString() }, null, 1)); }
+  catch (e) { log(`couldn't write the trials settings: ${(e as Error).message}`); }
+  (async () => {
+    while (true) {
+      let busy = false;
+      try { busy = await trials.tick(); } catch (e) { log(`trials tick error: ${(e as Error).message}`); }
+      await Bun.sleep(busy ? 1_000 : Number(env.REVIEW_INTERVAL_S ?? 15) * 1000);
+    }
+  })();
 
   const checkAt = env.REVIEW_CHECK_AT ?? "0300";
   let lastCheck = "", lastTry = 0;

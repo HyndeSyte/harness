@@ -738,6 +738,43 @@ second view adds value; skip it for small, obvious things.
   ChatGPT on the Cain page, topping up a prepaid balance, a new key in the add-on's
   options), as one line with the fix ready.
 
+## Model trials
+Which models suit which of his tasks, tested on real tasks under one hard budget (the App option
+trials_budget_usd, his alone to raise). `/opt/cain/trial.sh plan <suite>` lists every call, its limits and
+its worst-case cost and makes none; `run <suite>` starts it, or resumes a stopped run without paying twice;
+`status`, `result <suite>` and `report <suite>` read back. Real reviews always go first. Suites:
+`review-seats` (tasks from the record's past reviews, sent with no search or fetch) and `research` (your 30
+questions in the record at projects/harness/trials/research-questions.json: 15 facts, 15 listing or product
+searches, at least 3 with no reliable answer marked `no_reliable_answer`, each with `sent_text` (the question
+for a stranger, the only part that leaves), `as_of`, `must_contain` and dated `sources`). The research suite
+runs only once he has approved those questions, their notes and the rubric in the App's options: show him the
+questions and notes, and give him the three values `trial.sh plan research` prints, to enter on the App's
+Configuration tab himself (trials_research_questions_sha256, trials_research_notes_sha256,
+trials_research_rubric_sha256, and trials_perplexity_third_party_routing only if he wants Perplexity to use
+another lab's model). Nothing you write counts as his approval, and you can't enter it for him. Paid runs
+need his say too: the App option trials_run_allowance_usd (default 0) is the total he allows, and a run, a
+resume or the preflight starts only while what it would take fits in what is left (`trial.sh plan` says what
+a run takes, `status` what is left). Ask him once, with that figure, before you ask for a run; never ask him to
+raise it to get past a stop. Each paid run, resume and preflight also needs his tap: run `trial.sh plan <suite>`
+(or `plan preflight`), then `/opt/cain/keeper.sh trial-approve --item <id> --suite <suite> --plan <its plan
+hash> --cap <its cap> "<what it tests, one line>"` (add `--new`, to both, for a new run where a stopped one would
+resume; the link works out the plan itself, shows him what it costs and sends, and refuses a hash or cap that
+differs: run `trial.sh plan` again then); his "Allow this run" tap reaches you with the approval, good
+for 2 hours and one start: pass it as `--approval <it>` to `trial.sh run` or `trial.sh preflight` at once. A
+"No" means don't start it. The trials also need keys of their own in the App's options
+(trials_anthropic_api_key, trials_gemini_api_key, trials_perplexity_api_key, never the review keys); `status`
+names a missing one: tell him once, with DOCS.md's setup steps. After each install, and when `status` says the
+preflight is stale or 7 days old, run the preflight (on his tap) before any run: no paid suite runs until it
+has finished, and what it disables stays disabled. Codex takes part only under bubblewrap, when its sandbox check passes at the start of a run;
+"not isolated" or "panel reduced" in the report means it was left out, nothing to fix by you. A Codex web
+search alarm or a grader that fetched a page outside the answer notes is the runner's to stop; read it. A
+stop for the budget or a seat's cap is told to you: a budget stop needs
+his word to go on, so ask him once with the spend so far. A trials alarm (a provider's search queries
+matched a private term, or a call cost more than its ceiling) or a stop because Perplexity answered with
+another model stops the run: read it and fix the cause before resuming. When a run ends, file its report
+under projects/harness/trials/ through the record keeper. Switching any production model is a separate
+change, on his word, after the reports.
+
 ## Cloud jobs (building, without his laptop)
 Build work on the Apps (HyndeSyte/harness) runs as a cloud session you start, never
 as a laptop session he has to book. Two routines, fired with the RemoteTrigger tool:

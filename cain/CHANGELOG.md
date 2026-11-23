@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.19.0
+
+- Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call, its limits and its most possible cost first, then the run, then a plain report.
+- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. The bound is each run's cap, checked before every call; a call whose cost can't be read stays counted at its most possible cost.
+- Each task's grading is set aside before its first call, so a task is never left half graded.
+- Before any spend, near-free checks catch a model or setting a provider won't take; a model not offered is skipped and the report says why.
+- Your private terms are checked on every request exactly as it is sent, and on the search queries a provider says it ran; a hit stops the run and Cain hears of it.
+- Codex runs each trial call in an empty folder with no tools and nothing of yours (it keeps its internet connection, which it needs to reach OpenAI).
+- Grading is blind: names and markers are taken out of every answer, two graders from different families score each answer, and neither grades its own family's answers.
+- Real reviews always go first: trials pause while one is waiting or running, and back off a seat that hit a rate limit.
+- The research questions run only once you have approved them and their answer notes, and Perplexity stays on its own model unless you approve otherwise.
+- Codex takes part only under bubblewrap, once a sandbox check on the Pi proves it can't read anything of yours; otherwise it is left out of the trial and never grades, and the report says so.
+- The spend stop keeps a fixed 10 percent of the budget back as a margin, gives money back only when a provider clearly charged nothing, counts Codex in calls rather than dollars, and keeps each seat's trial calls well inside its limits so real reviews always have room.
+- Your approval of the research questions, their answer notes and the grading rules is now three entries in this App's options (Cain gives you the values), and so is letting Perplexity use another lab's model. Nothing Cain can write counts as your approval.
+- Search and page fetching are off for trials built from your record; only the research questions you approved go out with search.
+- Every provider, model and level is checked once before any spend; one that fails is left out and named in the report.
+- A third grader, Google's, so every answer is graded by two graders from outside its own company; the report ranks only answers graded by the same pair.
+- The cost per good answer now counts failed and retried attempts too, and costs without a bill are shown apart.
+- Paid trial runs need your say: a new option, `trials_run_allowance_usd` (default 0), is the total you allow for them. A run starts only while what it could take fits in what is left, a second run beyond it is refused, and lowering it stops a run before its next call. Cain can't change it.
+- After installing, nothing paid runs until a short check of every model and setting has run on this version (`trial.sh preflight`, a few dollars, none of your text). Anything that fails it stays switched off and is named.
+- Codex runs only inside its locked-down sandbox, with web search off on every call; one that searches anyway is stopped, its answer thrown away, and Cain hears of it.
+- When a grader is left out, the report says the panel was reduced, and no ranking rests on a single grader.
+- The research questions and their notes are checked against your private list before Cain can even plan them, and the research grader only reads the exact pages named in the notes, with any tracking part of the address removed and PDFs left out.
+- Gemini's searches are allowed for generously in what a call could cost, then counted as Google reports them.
+- Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
+- Every paid trial run, resume and preflight now needs your tap: Cain shows a card with what the run tests and the most it can cost, and only your "Allow this run" lets that one run of that exact plan start, within 2 hours. Your run allowance stays the ceiling over them all.
+- The trials have keys of their own: three new options, `trials_anthropic_api_key`, `trials_gemini_api_key` and `trials_perplexity_api_key`, empty to start. Nothing paid runs until all three are set, and never with the review keys. DOCS.md says how to make them, each with its own spending limit.
+- The Codex sandbox now holds a locked file that forbids web search, and its check also proves Codex can't read its own sign-in or its own settings.
+- The check after installing now counts only for 7 days and only while the trials code, Codex, the models and the trials options stay the same; a Gemini model whose check showed no thinking stays switched off.
+- The record of what your allowance has granted is kept where only the trials runner can write it; if it goes missing, nothing more is granted until it is put right.
+- `trial.sh plan research` lists exactly what goes to outside search engines under "Sent to third-party search", and your tap covers that list.
+- The trial card now shows what you are allowing, worked out by Cain's link itself: which suite, whether it is the check after installing, a new run or a resume, the most it can cost, the worst case of its calls, each provider it calls, what your allowance has granted so far, and for research the full list of what goes to outside search (as an attached file when it is long). If what Cain asked for doesn't match what the link works out, no card goes out.
+- The record of what your allowance has granted and which taps were used now sits in a folder only the trials runner can open; nothing paid runs if that folder, or the link's signing key, could be read or changed by anyone else, and a used tap can't be used again even if its file goes missing.
+- The Codex sandbox also forbids full access, extra tools and network for its commands, and its check reads Codex's own settings and tries the internet and Cain's own local services, which must all be refused. Codex needs version 0.136.0 or newer, and it stays switched off until those checks pass on the Pi.
+- Nothing paid runs while the Supervisor's saved token could be read by Cain's user.
+- Provider spending limits are only a backstop: they are monthly, applied late, and can be exceeded, so the limit that counts is each run's cap, checked before every call. A run whose check after installing has run out stops before its next call.
+- Codex in the trials needs a ChatGPT sign-in of its own; the check after installing refuses the one real reviews use. No separate OpenAI project is needed.
+- The research grader no longer fetches pages itself: the trials runner reads the exact pages the notes cite (staying on each page's site and path, HTML only, as plain text) and hands the grader their text.
+- The check after installing now ends with a plain list of go and no-go lines (sandbox, Codex settings, the refused probes, saving options, Gemini's thinking, the card reaching you), shown by `trial.sh status`.
+
 ## 0.18.1
 
 - A fix-only review round is no longer blocked because the earlier round's findings hold a tool name ending in a date (or a date written as eight digits).
@@ -20,6 +60,13 @@
 - A grant card holds the pull request's newest commit and the newest decision from when it went up; if either changed by your tap, nothing is granted and you see why.
 - A grant card that went out of date, or whose message is gone, no longer blocks a new one: it loses its buttons ("Replaced by a newer card") and the new card goes up.
 - If the records can't be read for a moment when you tap Grant, the card stays up and asks you to try again in a minute.
+- Codex takes part only once a sandbox check on the Pi proves it can't read anything of yours; otherwise it is left out of the trial and never grades, and the report says so.
+- The spend stop now keeps a safety margin under the budget, gives money back only when a provider clearly charged nothing, counts Codex in calls rather than dollars, and keeps each seat's trial calls well inside its limits so real reviews always have room.
+- Your approval of the research questions, their answer notes and the grading rules is now three entries in this App's options (Cain gives you the values), and so is letting Perplexity use another lab's model. Nothing Cain can write counts as your approval.
+- Search and page fetching are off for trials built from your record; only the research questions you approved go out with search.
+- Every provider, model and level is checked once before any spend; one that fails is left out and named in the report.
+- A third grader, Google's, so every answer is graded by two graders from outside its own company; the report ranks only answers graded by the same pair.
+- The cost per good answer now counts failed and retried attempts too, and costs without a bill are shown apart.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
 
 ## 0.17.0
