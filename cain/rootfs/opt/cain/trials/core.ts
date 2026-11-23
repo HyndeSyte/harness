@@ -362,7 +362,10 @@ export function callShape(suite: SuiteName, spec: CallSpec, task: Task, perplexi
     if (g.id === "codex") return { ...base, seat: "codex", reviewSeat: "openai", model: "", maxOut: 0, timeoutS: 900, label: "grader OpenAI (Codex, default model, no tools)" };
     if (g.id === "gemini") return { ...base, seat: "gemini", reviewSeat: "gemini", model: g.model, maxOut: LIMITS.geminiGradeOut, thinking: thinkingAllowance(g.model),
       timeoutS: 600, label: `grader Google (${g.model}, no tools)` };
-    return { ...base, seat: "claude", reviewSeat: "claude", model: g.model, fetch: research, maxFetches: research ? LIMITS.claudeGradeFetches : 0,
+    // Fifth round: the research grader's fetch takes max_uses equal to the pages cited in the task's answer notes (none
+    // cited: no fetch tool at all), each fetch capped by max_content_tokens; the ceiling reserves exactly that.
+    const pages = research && task.kind !== "review" ? noteFetchUrls(task).length : 0;
+    return { ...base, seat: "claude", reviewSeat: "claude", model: g.model, fetch: pages > 0, maxFetches: pages,
       maxOut: research ? LIMITS.claudeResearchGradeOut : LIMITS.claudeGradeOut, timeoutS: 600, label: `grader Claude (${g.model})` };
   }
   const c = configById(suite, spec.config)!;
@@ -652,7 +655,7 @@ export type PlanLine = { call: string; task: string; who: string; seat: TrialSea
   limits: string; worst_usd: number | null; note?: string };
 export function limitsText(s: CallShape): string {
   switch (s.seat) {
-    case "claude": return `max_tokens ${s.maxOut} (thinking included)${s.maxSearches ? `, web_search max_uses ${s.maxSearches}` : ""}${s.maxFetches ? `, web_fetch max_uses ${s.maxFetches}` : ""}`;
+    case "claude": return `max_tokens ${s.maxOut} (thinking included)${s.maxSearches ? `, web_search max_uses ${s.maxSearches}` : ""}${s.maxFetches ? `, web_fetch max_uses ${s.maxFetches} (the cited pages) max_content_tokens ${LIMITS.claudeFetchTokens}` : ""}`;
     case "gemini": { const g = geminiModel(s.model); return `maxOutputTokens ${s.maxOut}, ${"level" in g.thinking ? `thinkingLevel ${g.thinking.level}` : `thinkingBudget ${g.thinking.budget}`}${s.thinking ? ` (+${s.thinking} thinking allowance)` : " (thinking included)"}${s.search ? `, grounding (up to ${LIMITS.geminiGroundingQueries} queries allowed for)` : ""}`; }
     case "perplexity": return `max_steps ${s.maxSteps}, max_output_tokens ${s.maxOut}${s.setting ? `, effort ${s.setting}${s.setting === "fast" ? " (priority rate)" : ""}` : ""}${s.search ? `, web_search max_tokens ${LIMITS.perplexitySearchTokens}` : ", no tools"}, no fetch_url`;
     case "codex": return "one turn, isolated (its run's sandbox self-test), no tools, one call of the plan's allowance";
@@ -681,9 +684,45 @@ export function planOf(suite: Suite, perplexityPinned = true): { lines: PlanLine
 // a margin derived from the same worst-case guesses it guards. It is a soft bound: Anthropic documents no size
 // cap on search results, Gemini's thinkingLevel is a level and not a token cap, and grounding has no cap on its
 // query count, so a call can pass its own reservation; the margin absorbs that, and a call that cost more than
-// its reservation stops the run with an alarm. The hard stop is a prepaid balance or workspace limit on the
-// API keys in the App's options, which the trials share with reviews (DOCS.md), not this code.
+// its reservation stops the run with an alarm. The hard stop is a spend limit on the trials' own keys (the
+// trials_*_api_key options, fifth round; never the review keys) (DOCS.md), not this code.
 export const LEDGER_MARGIN_PCT = 10;
+// What a run of a suite takes of the owner's allowance (and what his approval names): its plan's worst case plus its
+// own checks, never above the ledger's cap. The same figure trial.sh plan prints and the runner grants.
+export const PREFLIGHT_CAP_USD = 4;
+export const runCap = (budgetUsd: number, planTotal: number) => Number(Math.min(ledgerCap(budgetUsd), planTotal + PREFLIGHT_CAP_USD).toFixed(2));
+export const preflightCap = (budgetUsd: number) => Number(Math.min(PREFLIGHT_CAP_USD, ledgerCap(budgetUsd)).toFixed(2));
+
+// ---- What his one-time approval is bound to (fifth round; ../trial-token.ts) ----
+// The research suite's statement of what leaves for third-party search: every approved question as it is sent, and
+// its answer notes. Printed by trial.sh plan research under its heading, and covered by the plan hash.
+export const DISCLOSURE_HEADING = "Sent to third-party search";
+export function researchDisclosure(tasks: ResearchTask[]): string {
+  const lines = [`${DISCLOSURE_HEADING}:`];
+  for (const t of tasks) {
+    lines.push(`${t.id}: ${researchSentText(t)}`);
+    lines.push(`  answer notes: must contain ${t.must_contain}; sources ${t.sources.map((x) => `${x.url} (read ${x.read_on})`).join(", ")}${t.no_reliable_answer ? "; no reliable answer" : ""}`);
+  }
+  return lines.join("\n");
+}
+// The plan hash: every call the plan makes (task, who, seat, model, setting, search, its limits and worst case), what
+// each task sends, the run's cap, and for research the disclosure statement. trial.sh plan prints it; Cain's trial
+// card carries it; the runner computes it again from the suite it would run and refuses an approval for another.
+export function planHash(suite: Suite, pinned: boolean, capUsd: number): string {
+  const p = planOf(suite, pinned);
+  const sent = suite.tasks.map((t) => t.kind === "review" ? [t.id, t.brief.topic, t.brief.question, t.brief.body] : [t.id, researchSentText(t as ResearchTask)]);
+  return sha256(JSON.stringify({ format: 1, suite: suite.name, pinned, cap_cents: Math.round(capUsd * 100), total: Number(p.total.toFixed(6)),
+    calls: p.lines.map((l) => [l.call, l.who, l.seat, l.model, l.setting, l.search, l.limits, l.worst_usd]), sent,
+    disclosure: suite.name === "research" ? researchDisclosure(suite.tasks as ResearchTask[]) : null }));
+}
+// The preflight's plan: every configuration it checks (both suites and the graders, no owner text) and its cap.
+export function preflightPlanHash(capUsd: number): string {
+  return sha256(JSON.stringify({ format: 1, kind: "preflight", cap_cents: Math.round(capUsd * 100), models: modelsId() }));
+}
+// The configured models: every configuration of both suites, the graders and the Gemini table.
+export function modelsId(): string {
+  return sha256(JSON.stringify({ review: configsFor("review-seats"), research: configsFor("research"), graders: GRADERS, gemini: GEMINI_MODELS, perplexity: PERPLEXITY_OWN_MODEL })).slice(0, 16);
+}
 export const ledgerMargin = (budgetUsd: number) => Number((Math.max(0, budgetUsd) * LEDGER_MARGIN_PCT / 100).toFixed(6));
 export const ledgerCap = (budgetUsd: number) => Number((Math.max(0, budgetUsd) - ledgerMargin(budgetUsd)).toFixed(6));
 

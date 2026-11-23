@@ -59,7 +59,8 @@ export const KEEP_MS = 8 * 24 * 3_600_000;
 
 export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"]);
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
-  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant"]);
+  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/trial-approve"]);
+// /trial-approve (0.19.0, fifth round): Cain's card asking Dane to allow one paid model trial run; it signs nothing (his tap does).
 // /review-grant (0.18.0): Cain's card asking Dane for extra review rounds; it writes nothing (his tap does).
 // /guard-hold (0.16.0, round 2): the Build hook and review.sh run as Cain and can't open root's socket,
 // so they send a usage-guard hold with his key; the link decides it again from its own readings and

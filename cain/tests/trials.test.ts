@@ -8,16 +8,18 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign as edSign } from "node:crypto";
+import { makeTrialToken, trialClaimFor } from "../rootfs/opt/cain/trial-token.ts";
+import { publicOf } from "../rootfs/opt/cain/link/shipkey.ts";
 import { FINAL, SeatError, newReview, type Brief } from "../rootfs/opt/cain/review/core.ts";
 import { DEFAULTS, Runner, loadReview, saveReview, type RunnerConfig } from "../rootfs/opt/cain/review/runner.ts";
 import type { SeatFn } from "../rootfs/opt/cain/review/seats/common.ts";
 import {
   GRADERS, LIMITS, REVIEW_CONFIGS, RESEARCH_CONFIGS, SELF_NAMES, TRIAL_PRICES, blindViolations, callShape, callsFor, ceilingOf, ceilingPrice, checkQuestions,
-  datedPrice, disagreements, gradePrompt, makeLabels, normalizeCandidate, parseBriefTxt, parseGrades, pickReviewTasks, planOf, worstOf, worstOfCeiling,
+  datedPrice, disagreements, gradePrompt, limitsText, planHash, researchDisclosure, makeLabels, normalizeCandidate, parseBriefTxt, parseGrades, pickReviewTasks, planOf, worstOf, worstOfCeiling,
   type ReviewDir, type Suite,
 } from "../rootfs/opt/cain/trials/core.ts";
-import { RESEARCH_QUESTIONS, TrialRunner, latestRun, paths, readBudget, requestError, researchHashes, reviewDirs, takeInboxFile, type TrialDeps } from "../rootfs/opt/cain/trials/runner.ts";
+import { RESEARCH_QUESTIONS, TrialRunner, latestRun, paths, readBudget, readSuite, requestError, researchHashes, reviewDirs, takeInboxFile, type TrialDeps } from "../rootfs/opt/cain/trials/runner.ts";
 import { buildReport } from "../rootfs/opt/cain/trials/report.ts";
 import {
   CLAUDE_FETCH_TOOL, CLAUDE_SEARCH_TOOL, CODEX_NO_MODEL, CODEX_WEB_SEARCH_EVENT, claudeProvider, codexProvider, geminiProvider, modelsFromCatalog, perplexityProvider,
@@ -34,11 +36,20 @@ const DAY = "2026-11-22";
 const ALLOWANCE = 1000;
 const BUILD = "test-build", MACHINE = "test-machine";
 // The build's preflight record, as a finished `trial.sh preflight` leaves it (no checks seeded: each run checks).
+// Its key is the rig's runner's own (keyOf), unless a test gives another.
+const KEYS = new Map<string, () => any>();
 function writePreflightRecord(tdir: string, over: any = {}) {
   mkdirSync(tdir, { recursive: true });
   writeFileSync(join(tdir, "preflight.json"), JSON.stringify({ format: 1, id: "p20261122-140000", status: "done", build: BUILD, machine: MACHINE,
-    started_at: "2026-11-22T14:00:00Z", finished_at: "2026-11-22T14:05:00Z", cap_usd: 4, suites: {}, disabled: {}, ...over }));
+    started_at: "2026-11-22T14:00:00Z", finished_at: "2026-11-22T14:05:00Z", cap_usd: 4, suites: {}, disabled: {}, key: KEYS.get(tdir)?.(), ...over }));
+  // A finished preflight leaves the allowance tally behind it (its own grant spent; here none counted).
+  if (!existsSync(join(tdir, "allowance.json"))) writeFileSync(join(tdir, "allowance.json"), JSON.stringify({ format: 1, grants: {} }), { mode: 0o644 });
 }
+// The link's trial key, as the link makes it, and the rig's approvals signed with it (the owner's tap).
+const TRIAL_KEYPAIR = generateKeyPairSync("ed25519");
+const signTrial = (suite: string, plan: string, capUsd: number, nowMs: number) =>
+  makeTrialToken(trialClaimFor({ suite, plan, capUsd }, nowMs)!, (d) => edSign(null, d, TRIAL_KEYPAIR.privateKey));
+const OK_KEYS = { anthropic: "ok", gemini: "ok", perplexity: "ok" } as const;
 const sig = () => new AbortController().signal;
 
 const briefTxt = (topic: string, body: string, facts = false) =>
@@ -83,7 +94,8 @@ function bwrapHost(cmd: string[], p: string): string {
 }
 const outOf = (cmd: string[]) => bwrapHost(cmd, cmd[cmd.indexOf("-o") + 1]);
 // A Codex self-test's JSONL: one refused attempt per probe (or the commands given).
-const refusedProbes = (pid = process.pid, cmds?: string[]) => (cmds ?? ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${pid}/environ`])
+const refusedProbes = (pid = process.pid, cmds?: string[]) => (cmds ?? ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${pid}/environ`,
+  "cat /trial/codex-home/auth.json", "cat /proc/$PPID/environ"])
   .map((c) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: c, status: "failed", exit_code: 127, aggregated_output: "bwrap: execvp bash: No such file or directory" } })).join("\n");
 
 // ---- fakes ----
@@ -112,7 +124,9 @@ function fake(o: FakeOpts): Spy {
     }
     return { ...base, text: o.text?.(input) ?? "The answer is 42. https://example.com/a", urls: ["https://example.com/a"] };
   };
-  const validate = async (input: any) => { await input.wire.fetch(`https://fake-${o.seat}.example/validate`, { method: "POST", body: JSON.stringify({ model: input.model }) }); return { bill: { usd: 0.0001, how: "estimated" as const }, served: o.served?.(input) ?? input.model }; };
+  const validate = async (input: any) => { await input.wire.fetch(`https://fake-${o.seat}.example/validate`, { method: "POST", body: JSON.stringify({ model: input.model }) }); return { bill: { usd: 0.0001, how: "estimated" as const }, served: o.served?.(input) ?? input.model,
+    // A Gemini check that thought a little within its cap (a check that shows no thinking leaves its model disabled).
+    ...(o.seat === "gemini" ? { thinking: { thoughts: 6, answer: 2, maxOut: 16 } } : {}) }; };
   return { ask, validate, calls };
 }
 function fakeCodex(o: Partial<FakeOpts> & { models?: string[] | null; version?: string; isolated?: boolean } = {}): Spy & CodexProvider {
@@ -148,9 +162,13 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
   };
   const tdir = join(dir, "trials");
   const inboxDir = join(dir, "inbox");
-  if (!o.noPreflight) writePreflightRecord(tdir);
+  const approvalPub = join(dir, "trial.pub");
+  writeFileSync(approvalPub, `${publicOf(TRIAL_KEYPAIR.privateKey)}\n`, { mode: 0o644 });
   const trials = new TrialRunner({ dir: tdir, recordDir, budgetUsd: o.budget ?? 40, seatGapMs: 0, timeoutScale: o.timeoutScale, inboxDir, inboxUids: [process.getuid!()],
-    optionsFile, optionsUid: process.getuid!(), build: BUILD, machine: MACHINE, ...(o.seatLimits ? { seatLimits: o.seatLimits } : {}) }, deps);
+    optionsFile, optionsUid: process.getuid!(), build: BUILD, machine: MACHINE, ...(o.seatLimits ? { seatLimits: o.seatLimits } : {}),
+    approvalPub, approvalPubUid: process.getuid!(), keyCheck: { ...OK_KEYS }, codexId: "test-codex", supervisorSeen: () => false }, deps);
+  KEYS.set(tdir, () => trials.preflightKey());
+  if (!o.noPreflight) writePreflightRecord(tdir);
   const runAll = async (suite: "review-seats" | "research" = "review-seats", max = 3000) => {
     for (let i = 0; i < max; i++) {
       const ticked = await trials.tick();
@@ -160,14 +178,27 @@ function rig(o: { budget?: number; reviews?: number; terms?: string; caps?: Part
     }
   };
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
-  return { dir, tdir, cfg, recordDir, review, trials, deps, providers, fetched, runAll, relays, inboxDir, optionsFile,
+  return { dir, tdir, cfg, recordDir, review, trials, deps, providers, fetched, runAll, relays, inboxDir, optionsFile, approvalPub,
     advance: (ms: number) => { clock = new Date(clock.getTime() + ms); }, now: () => clock };
 }
 const outputCalls = (t: ReturnType<typeof rig>) => ["gemini", "codex", "perplexity"].reduce((a, s) => a + t.providers[s].calls.filter((c: AskInput) => !c.schema && c.user !== "ready?").length, 0);
 const graderCalls = (t: ReturnType<typeof rig>) => ["claude", "codex", "gemini"].reduce((a, s) => a + t.providers[s].calls.filter((c: AskInput) => c.schema).length, 0);
 // A request as Cain leaves it: a file in the inbox, taken on the next ingest. What the runner said of it.
 let inboxSeq = 0;
+// A paid request with no approval of its own gets the owner's tap for exactly what the runner would start (approvalFor);
+// pass approval: null to send none.
+function approvalFor(trials: TrialRunner, req: any): string {
+  if (req.kind === "preflight") { const tg = trials.approvalTarget("preflight"); return signTrial("preflight", tg.plan, tg.cap, trials.deps.now!().getTime()); }
+  const s = readSuite(trials.cfg.dir, req.suite) ?? trials.buildSuite(req.suite).suite!;
+  const last = latestRun(trials.cfg.dir, req.suite);
+  const resuming = !!(last && last.status !== "done" && req.mode !== "new");
+  const pinned = resuming ? !last!.preflight?.third_party_routing : !(req.suite === "research" && (() => { const a = trials.approval(); return a.ok && a.third_party; })());
+  const tg = trials.approvalTarget(req.suite, s, pinned);
+  return signTrial(req.suite, tg.plan, tg.cap, trials.deps.now!().getTime());
+}
 function submit(t: { inboxDir: string; trials: TrialRunner }, req: any): string | null {
+  if ((req?.kind === "run" || req?.kind === "preflight") && !("approval" in req)) { try { req = { ...req, approval: approvalFor(t.trials, req) }; } catch { /* the runner says why */ } }
+  if (req?.approval === null) { req = { ...req }; delete req.approval; }
   mkdirSync(t.inboxDir, { recursive: true });
   const name = `${Date.now()}-${++inboxSeq}.json`;
   writeFileSync(join(t.inboxDir, name), JSON.stringify(req));
@@ -561,6 +592,7 @@ describe("the private-terms check on the final request", () => {
     for (const f of t.fetched) expect(f.body).not.toContain("SECRET-CONTEXT");
     const t2 = rig();
     writeQuestions(t2.recordDir, { questions: QUESTIONS.map((q, i) => (i === 7 ? { ...q, sent_text: "What does Acme Corp charge?" } : q)) }, true, t2.optionsFile);
+    writePreflightRecord(t2.tdir);   // the approval is one of the trials options the preflight is keyed on
     expect(submit(t2, { kind: "run", suite: "research" })).toContain("blocked: privacy");
     expect(existsSync(paths(t2.tdir).suite("research"))).toBe(false);
   });
@@ -913,7 +945,7 @@ describe("prices and the checks before any spend", () => {
 
   test("a Gemini model not served is skipped; today's default not served stops the run before any spend", async () => {
     const gem = fake({ seat: "gemini" });
-    gem.validate = async (i: any) => { if (i.model === "gemini-4-neon") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; };
+    gem.validate = async (i: any) => { if (i.model === "gemini-4-neon") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model, thinking: { thoughts: 6, answer: 2, maxOut: 16 } }; };
     const t = rig({ reviews: 1, providers: { gemini: gem } });
     submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
@@ -923,7 +955,7 @@ describe("prices and the checks before any spend", () => {
     expect(gem.calls.some((c) => c.model === "gemini-4-neon")).toBe(false);
 
     const gem2 = fake({ seat: "gemini" });
-    gem2.validate = async (i: any) => { if (i.model === "gemini-3.8-flash") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; };
+    gem2.validate = async (i: any) => { if (i.model === "gemini-3.8-flash") throw new SeatError("refused", "HTTP 404: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model, thinking: { thoughts: 6, answer: 2, maxOut: 16 } }; };
     const t2 = rig({ reviews: 1, providers: { gemini: gem2 } });
     submit(t2, { kind: "run", suite: "review-seats" });
     await t2.runAll();
@@ -989,6 +1021,7 @@ describe("the research suite's design", () => {
     writeFileSync(t.optionsFile, JSON.stringify({ trials_research_questions_sha256: h.questions, trials_research_notes_sha256: h.notes, trials_research_rubric_sha256: "0".repeat(64) }), { mode: 0o600 });
     expect(submit(t, { kind: "run", suite: "research" })).toContain("the rubric changed");
     approveInOptions(t.recordDir, t.optionsFile);
+    writePreflightRecord(t.tdir);   // a new approval changes the trials options the preflight is keyed on
     expect(submit(t, { kind: "run", suite: "research" })).toBeNull();
     // The questions change after the suite is frozen: nothing is sent.
     writeFileSync(join(t.recordDir, RESEARCH_QUESTIONS), JSON.stringify({ questions: QUESTIONS.slice().reverse() }));
@@ -1052,6 +1085,8 @@ describe("the plan and trial.sh", () => {
     expect(r.stdout).toContain("max_tokens 16000 (thinking included)");
     expect(r.stdout).toContain("Total worst case");
     expect(existsSync(join(t.dir, "inbox"))).toBe(false);
+    // trial.sh reads the preflight's age against the real clock: a record finished just now.
+    writePreflightRecord(t.tdir, { finished_at: new Date().toISOString() });
     const r2 = spawnSync("bun", [CLI, "run", "research"], { encoding: "utf8", env });
     expect(r2.status).not.toBe(0);
     expect(r2.stderr).toContain("can't run");
@@ -1066,11 +1101,21 @@ describe("the plan and trial.sh", () => {
     expect(r3.stdout).toContain(`trials_research_questions_sha256 ${hh.questions}`);
     expect(r3.stdout).toContain(`trials_research_rubric_sha256 ${hh.rubric}`);
     expect(r3.stdout).toContain("perplexity/sonar at effort fast");
-    const r4 = spawnSync("bun", [CLI, "run", "review-seats", "--retry"], { encoding: "utf8", env });
+    // Fifth round: a run needs his approval; trial.sh only passes it on (the runner checks it).
+    const r4a = spawnSync("bun", [CLI, "run", "review-seats", "--retry"], { encoding: "utf8", env });
+    expect(r4a.status).not.toBe(0);
+    expect(r4a.stderr).toContain("one-time approval");
+    expect(existsSync(join(t.dir, "inbox"))).toBe(false);
+    const tok = signTrial("review-seats", "a".repeat(64), 5, Date.now());
+    const r4 = spawnSync("bun", [CLI, "run", "review-seats", "--retry", "--approval", tok], { encoding: "utf8", env });
     expect(r4.status).toBe(0);
     const files = readdirSync(join(t.dir, "inbox"));
     expect(files.length).toBe(1);
-    expect(JSON.parse(readFileSync(join(t.dir, "inbox", files[0]), "utf8"))).toEqual({ kind: "run", suite: "review-seats", mode: "retry" });
+    expect(JSON.parse(readFileSync(join(t.dir, "inbox", files[0]), "utf8"))).toEqual({ kind: "run", suite: "review-seats", mode: "retry", approval: tok });
+    // And with SUPERVISOR_TOKEN in the session's environment, it asks for nothing.
+    const r5 = spawnSync("bun", [CLI, "run", "review-seats", "--approval", tok], { encoding: "utf8", env: { ...env, SUPERVISOR_TOKEN: "x" } });
+    expect(r5.status).not.toBe(0);
+    expect(r5.stderr).toContain("SUPERVISOR_TOKEN");
   });
 });
 
@@ -1088,7 +1133,10 @@ describe("resumption", () => {
     expect(st1.stop!.reason).toBe("budget");
     const made1 = outputCalls(t);
     t.trials.cfg.budgetUsd = 40;
-    submit(t, { kind: "run", suite: "review-seats" });
+    // The budget is one of the trials options the preflight is keyed on: a new budget needs the preflight again.
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("the trials options changed");
+    writePreflightRecord(t.tdir);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
     await t.runAll();
     const st2 = latestRun(t.tdir, "review-seats")!;
     expect(st2.run).toBe(st1.run);
@@ -1123,7 +1171,7 @@ describe("Codex isolation before launch", () => {
     expect(judgeSelfTest({ code: 0, stdout: "", stderr: "", answer: "I won't run commands." }, ["K1"]).detail).toContain("proves nothing");
     expect(judgeSelfTest({ code: 1, stdout: "", stderr: "not signed in", answer: "" }, ["K1"]).ok).toBe(false);
     // With the probes named: each of the four must have been attempted (and refused).
-    expect(PROBES.map((p) => p.id)).toEqual(["read", "absolute", "builtin", "environ"]);
+    expect(PROBES.map((p) => p.id)).toEqual(["read", "absolute", "builtin", "environ", "credential", "codex-environ"]);
     expect(judgeSelfTest({ code: 0, stdout: refusedProbes(4242), stderr: "", answer: "" }, ["K1"], { pid: 4242 }).ok).toBe(true);
     for (let skip = 0; skip < 4; skip++) {
       const cmds = ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo $line", "cat /proc/4242/environ"].filter((_, i) => i !== skip);
@@ -1223,11 +1271,16 @@ describe("a true spend bound", () => {
   test("Claude: answerers don't fetch; the grader's fetch carries max_content_tokens and the worst case counts uses x content plus search allowances, per step", () => {
     const ans = callShape("research", { id: "o", kind: "output", task: "q", config: "claude:claude-opus-5-5+search" }, qt);
     expect(ans.fetch).toBe(false);
-    const g = callShape("research", { id: "g", kind: "grade", task: "q", grader: "claude" }, qt);
+    // Fifth round: no cited page, no fetch tool; max_uses is the number of pages cited, and that many fetches are reserved.
+    expect(callShape("research", { id: "g", kind: "grade", task: "q", grader: "claude" }, qt).fetch).toBe(false);
+    const cited = { ...qt, sources: [{ url: "https://a.example/one", read_on: DAY }, { url: "https://b.example/two?utm=x", read_on: DAY }, { url: "https://c.example/three.pdf", read_on: DAY }] };
+    const g = callShape("research", { id: "g", kind: "grade", task: "q", grader: "claude" }, cited);
     expect(g.fetch).toBe(true);
+    expect(g.maxFetches).toBe(2);   // the PDF is left out before the fetch
     const c = ceilingOf(g, 3_000)!;
-    expect(c.steps).toBe(LIMITS.claudeGradeFetches + 1);
-    expect(c.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + LIMITS.claudeGradeFetches * LIMITS.claudeFetchTokens);
+    expect(c.steps).toBe(2 + 1);
+    expect(c.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + 2 * LIMITS.claudeFetchTokens);
+    expect(limitsText(g)).toContain(`web_fetch max_uses 2 (the cited pages) max_content_tokens ${LIMITS.claudeFetchTokens}`);
     const ca = ceilingOf(ans, 3_000)!;
     expect(ca.contextTokens).toBe(Math.ceil(3_000 / 3) + 500 + LIMITS.claudeAnswerSearches * SEARCH_RESULT_TOKENS);
   });
@@ -1249,7 +1302,7 @@ describe("a true spend bound", () => {
   test("Gemini: only the field each model takes; Argon refusing at the check is skipped (its grader too) and the run goes on", async () => {
     expect(Object.values(GEMINI_MODELS).every((m) => "level" in m.thinking)).toBe(true);
     const gem = fake({ seat: "gemini" });
-    gem.validate = async (i: any) => { if (i.model === "gemini-4-argon") throw new SeatError("refused", "HTTP 400: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model }; };
+    gem.validate = async (i: any) => { if (i.model === "gemini-4-argon") throw new SeatError("refused", "HTTP 400: the service refused the request"); return { bill: { usd: 0.0001, how: "estimated" as const }, served: i.model, thinking: { thoughts: 6, answer: 2, maxOut: 16 } }; };
     const t = rig({ reviews: 1, providers: { gemini: gem } });
     submit(t, { kind: "run", suite: "review-seats" });
     await t.runAll();
@@ -1545,8 +1598,9 @@ describe("paid runs need the owner's say: the run allowance in the App's options
     expect(submit(t, runReq)).toBeNull();
     await t.runAll();
     expect(latestRun(t.tdir, "review-seats")!.status).toBe("done");
+    const tally = JSON.parse(readFileSync(join(t.tdir, "allowance.json"), "utf8"));
+    expect(Object.values<any>(tally.grants).map((g) => g.cap_usd)).toEqual([cap]);
     const b = readBudget(t.tdir);
-    expect(Object.values(b.grants!).map((g) => g.cap_usd)).toEqual([cap]);
     // The run spent far less than its cap, but the allowance counts caps: a second run is refused.
     expect(b.spent_usd).toBeLessThan(cap);
     t.advance(2_000);
@@ -1698,10 +1752,10 @@ describe("the first install is preflight-only", () => {
     expect(submit(t, runReq)).toContain("no preflight has run on this build");
     expect(latestRun(t.tdir, "review-seats")).toBeNull();
     // A record from another build, or another machine, doesn't count.
-    writePreflightRecord(t.tdir, { build: "older-build" });
-    expect(submit(t, runReq)).toContain("another build");
-    writePreflightRecord(t.tdir, { machine: "another-pi" });
-    expect(submit(t, runReq)).toContain("another machine");
+    writePreflightRecord(t.tdir, { key: { ...t.trials.preflightKey(), code: "older-build" } });
+    expect(submit(t, runReq)).toContain("the trials code changed");
+    writePreflightRecord(t.tdir, { key: { ...t.trials.preflightKey(), machine: "another-pi" } });
+    expect(submit(t, runReq)).toContain("the machine changed");
     writePreflightRecord(t.tdir, { status: "stopped", stop: "Claude didn't answer" });
     expect(submit(t, runReq)).toContain("didn't finish");
     // trial.sh run says the same before it leaves anything.
@@ -1711,10 +1765,14 @@ describe("the first install is preflight-only", () => {
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain("didn't finish");
     expect(existsSync(join(t.dir, "inbox2"))).toBe(false);
-    const p = spawnSync("bun", [CLI, "preflight"], { encoding: "utf8", env });
+    const p0 = spawnSync("bun", [CLI, "preflight"], { encoding: "utf8", env });
+    expect(p0.status).not.toBe(0);
+    expect(p0.stderr).toContain("one-time approval");
+    const tok = signTrial("preflight", "b".repeat(64), 4, Date.now());
+    const p = spawnSync("bun", [CLI, "preflight", "--approval", tok], { encoding: "utf8", env });
     expect(p.status).toBe(0);
     const files = readdirSync(join(t.dir, "inbox2"));
-    expect(JSON.parse(readFileSync(join(t.dir, "inbox2", files[0]), "utf8"))).toEqual({ kind: "preflight" });
+    expect(JSON.parse(readFileSync(join(t.dir, "inbox2", files[0]), "utf8"))).toEqual({ kind: "preflight", approval: tok });
   });
 
   test("trial.sh preflight runs every check with no owner text, under its cap, pins Perplexity, and writes its record; a failed check stays disabled, named", async () => {
@@ -1733,10 +1791,10 @@ describe("the first install is preflight-only", () => {
     const rec = readPreflight(t.tdir)!;
     expect(rec.status).toBe("done");
     expect(rec.build).toBe(BUILD); expect(rec.machine).toBe(MACHINE);
-    expect(preflightError(rec, BUILD, MACHINE)).toBeNull();
+    expect(preflightError(rec, t.trials.preflightKey(), t.now().getTime())).toBeNull();
     // Its own grant from the allowance, a few dollars, and every check within it.
     const b = readBudget(t.tdir);
-    expect(b.grants![`preflight|${rec.id}`].cap_usd).toBe(PREFLIGHT_CAP_USD);
+    expect(JSON.parse(readFileSync(join(t.tdir, "allowance.json"), "utf8")).grants[`preflight|${rec.id}`].cap_usd).toBe(PREFLIGHT_CAP_USD);
     expect(b.entries.every((e) => e.suite === "preflight" && e.run === rec.id)).toBe(true);
     expect(b.spent_usd).toBeLessThanOrEqual(PREFLIGHT_CAP_USD);
     // No owner text left: no question, no brief, no record of his.
@@ -1818,5 +1876,230 @@ describe("the preflight's verdicts in a run", () => {
     expect(st.stop!.reason).toBe("unavailable");
     expect(st.stop!.detail).toContain("at the build's preflight");
     expect(outputCalls(t) + graderCalls(t)).toBe(0);
+  });
+});
+
+// ---- Fifth round (Cain 0.19.0): the outside review of round 4 ----
+import { authCanaries, freshDirs, requirementsInPlace, wrap, REQUIREMENTS_PATH, REQUIREMENTS_TOML } from "../rootfs/opt/cain/trials/sandbox.ts";
+import { keyProblems, supervisorTokenSeen, trialKeyCheck } from "../rootfs/opt/cain/trials/runner.ts";
+import { readTally } from "../rootfs/opt/cain/trials/ledger.ts";
+
+describe("fifth round: his go per paid run", () => {
+  const target = (t: ReturnType<typeof rig>) => { const s = t.trials.buildSuite("review-seats").suite!; return t.trials.approvalTarget("review-seats", s, true); };
+  test("a run or the preflight with no approval starts nothing, after its other checks have spoken", async () => {
+    const t = rig({ reviews: 1 });
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: null })).toContain("one-time approval");
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    expect(existsSync(paths(t.tdir).suite("review-seats"))).toBe(false);   // nothing frozen either
+    const u = rig({ reviews: 1, noPreflight: true });
+    expect(submit(u, { kind: "preflight", approval: null })).toContain("one-time approval");
+    expect(readPreflight(u.tdir)).toBeNull();
+    expect(requestError({ kind: "run", suite: "review-seats", approval: "not-a-token" })).toContain("isn't a trial approval");
+    expect(requestError({ kind: "report", suite: "review-seats", approval: signTrial("review-seats", "a".repeat(64), 1, Date.now()) })).toContain("no approval");
+  });
+
+  test("an approval counts only for its suite, its exact plan and cap, signed by the link's trial key, within 2 hours", () => {
+    const t = rig({ reviews: 1 });
+    const tg = target(t), now = t.now().getTime();
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("research", tg.plan, tg.cap, now) })).toContain("is for research, not review-seats");
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", "c".repeat(64), tg.cap, now) })).toContain("another plan");
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", tg.plan, tg.cap + 1, now) })).toContain("names a cap of");
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", tg.plan, tg.cap, now - 3 * 3_600_000) })).toContain("expired");
+    const other = generateKeyPairSync("ed25519");
+    const forged = makeTrialToken(trialClaimFor({ suite: "review-seats", plan: tg.plan, capUsd: tg.cap }, now)!, (d) => edSign(null, d, other.privateKey));
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: forged })).toContain("signature doesn't match");
+    // The trial key's public half must be root's alone (here the runner's uid): one others can write counts for nothing.
+    chmodSync(t.approvalPub, 0o666);
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", tg.plan, tg.cap, now) })).toContain("isn't root's alone");
+    chmodSync(t.approvalPub, 0o644);
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: signTrial("review-seats", tg.plan, tg.cap, now) })).toBeNull();
+    expect(latestRun(t.tdir, "review-seats")!.approved).toMatchObject({ plan: tg.plan, cap_cents: Math.round(tg.cap * 100) });
+  });
+
+  test("one tap allows one run: an approval is spent before anything is sent, and a resume needs a new one", async () => {
+    const t = rig({ reviews: 1, budget: 0.3 });
+    const tg = target(t);
+    const tok = signTrial("review-seats", tg.plan, tg.cap, t.now().getTime());
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: tok })).toBeNull();
+    expect(readdirSync(paths(t.tdir).used).length).toBe(1);
+    await t.runAll();
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("stopped");
+    expect(submit(t, { kind: "run", suite: "review-seats", approval: tok })).toContain("already used");
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("stopped");
+    // A fresh tap for the resume (the same plan, as frozen) counts once.
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    expect(latestRun(t.tdir, "review-seats")!.status).toBe("running");
+  });
+
+  test("trial.sh plan prints the very plan hash and cap the runner checks; research shows what is sent to third-party search", () => {
+    const t = rig({ reviews: 2, questions: true });
+    const env = { ...process.env, TRIALS_DIR: t.tdir, TRIALS_INBOX: join(t.dir, "inbox"), RECORD_DIR: t.recordDir, CAIN_STOP_FILE: join(t.dir, "stop.json"), REVIEW_TERMS: t.cfg.termsFile };
+    writeFileSync(join(t.tdir, "settings.json"), JSON.stringify({ budget_usd: 40, run_allowance_usd: 50, research_approval: { ok: true, third_party: false } }));
+    const r = spawnSync("bun", [CLI, "plan", "review-seats"], { encoding: "utf8", env });
+    expect(r.status).toBe(0);
+    const tg = target(t);
+    expect(r.stdout).toContain(`Plan hash: ${tg.plan}`);
+    expect(r.stdout).toContain(`Cap: ${tg.cap.toFixed(2)}`);
+    expect(r.stdout).toContain(`keeper.sh trial-approve --suite review-seats --plan ${tg.plan} --cap ${tg.cap.toFixed(2)}`);
+    const rr = spawnSync("bun", [CLI, "plan", "research"], { encoding: "utf8", env });
+    const rs = t.trials.buildSuite("research").suite!;
+    const rt = t.trials.approvalTarget("research", rs, true);
+    expect(rr.stdout).toContain(`Plan hash: ${rt.plan}`);
+    expect(rr.stdout).toContain("Sent to third-party search:");
+    expect(rr.stdout).toContain("What is the current release of tool number 7?");
+    expect(rr.stdout).toContain("answer notes: must contain the current version and its source; sources https://example.com/releases");
+    // The hash covers the statement: other questions or notes, another hash.
+    const changed = { ...rs, tasks: rs.tasks.map((x: any, i: number) => (i === 0 ? { ...x, must_contain: "something else" } : x)) };
+    expect(planHash(changed as any, true, rt.cap)).not.toBe(rt.plan);
+    expect(researchDisclosure(rs.tasks as any).split("\n")[0]).toBe("Sent to third-party search:");
+    const pf = spawnSync("bun", [CLI, "plan", "preflight"], { encoding: "utf8", env });
+    expect(pf.stdout).toContain(`Plan hash: ${t.trials.approvalTarget("preflight").plan}`);
+  });
+});
+
+describe("fifth round: trial keys of their own", () => {
+  test("empty or the review key: every paid start refuses, naming the provider; a run going stops before its next call", async () => {
+    expect(trialKeyCheck({ anthropic: "a1", gemini: "", perplexity: "p1" }, { anthropic: "a1", gemini: "g", perplexity: "p2" })).toEqual({ anthropic: "same", gemini: "empty", perplexity: "ok" });
+    expect(keyProblems(undefined).length).toBe(3);
+    const t = rig({ reviews: 1 });
+    t.trials.cfg.keyCheck = { anthropic: "same", gemini: "ok", perplexity: "empty" };
+    const why = submit(t, { kind: "run", suite: "review-seats" })!;
+    expect(why).toContain("Anthropic's trial key (trials_anthropic_api_key) is the review service's own key");
+    expect(why).toContain("Perplexity has no trial key of its own (trials_perplexity_api_key is empty)");
+    expect(submit(t, { kind: "preflight" })).toContain("Anthropic's trial key");
+    t.trials.cfg.keyCheck = { anthropic: "ok", gemini: "ok", perplexity: "ok" };
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    await t.trials.tick();
+    t.trials.cfg.keyCheck = { anthropic: "ok", gemini: "empty", perplexity: "ok" };
+    const before = t.fetched.length;
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.stop).toMatchObject({ reason: "keys" });
+    expect(st.stop!.detail).toContain("Google (Gemini) has no trial key");
+    expect(t.fetched.length).toBe(before);
+  });
+
+  test("SUPERVISOR_TOKEN in the runner's own environment: no paid dispatch", async () => {
+    expect(supervisorTokenSeen({ SUPERVISOR_TOKEN: "x" }, "/nonexistent")).toBe(true);
+    const dir = mkdtempSync(join(tmpdir(), "environ-"));
+    writeFileSync(join(dir, "environ"), "PATH=/bin\0SUPERVISOR_TOKEN=abc\0");
+    expect(supervisorTokenSeen({}, join(dir, "environ"))).toBe(true);
+    writeFileSync(join(dir, "environ"), "PATH=/bin\0HOME=/x\0");
+    expect(supervisorTokenSeen({}, join(dir, "environ"))).toBe(false);
+    const t = rig({ reviews: 1 });
+    t.trials.cfg.supervisorSeen = () => true;
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("SUPERVISOR_TOKEN");
+    expect(latestRun(t.tdir, "review-seats")).toBeNull();
+    // The session's start says so too (session.sh), and trial.sh refuses in it (the CLI test above).
+    expect(readFileSync(join(import.meta.dir, "../rootfs/opt/cain/session.sh"), "utf8")).toContain("ALARM: SUPERVISOR_TOKEN is in the session's environment");
+  });
+});
+
+describe("fifth round: the preflight record keyed and expiring", () => {
+  test("another Codex, other models or options, or a record over 7 days old refuses every paid suite", async () => {
+    const t = rig({ reviews: 1 });
+    const key = t.trials.preflightKey();
+    for (const [k, words] of [["codex", "the installed Codex"], ["models", "the configured models"], ["options", "the trials options"]] as const) {
+      writePreflightRecord(t.tdir, { key: { ...key, [k]: "something-else" } });
+      expect(submit(t, { kind: "run", suite: "review-seats" })).toContain(`${words} changed`);
+    }
+    writePreflightRecord(t.tdir, { key: undefined });
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("has no key");
+    writePreflightRecord(t.tdir, { finished_at: new Date(t.now().getTime() - 8 * 86_400_000).toISOString() });
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toContain("more than 7 days old");
+    writePreflightRecord(t.tdir);
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    // The installed Codex changes under a run (a new image): it stops before its next call.
+    t.trials.cfg.codexId = "another-codex";
+    await t.runAll();
+    expect(latestRun(t.tdir, "review-seats")!.stop).toMatchObject({ reason: "preflight" });
+  });
+
+  test("a Gemini check that shows no thinking is inconclusive: that configuration stays disabled, never estimated", async () => {
+    const gem = fake({ seat: "gemini", cost: 0.01 });
+    gem.validate = async (i: any) => ({ bill: { usd: 0.0001, how: "estimated" as const }, served: i.model, thinking: i.model === "gemini-4-neon" ? { thoughts: 0, answer: 2, maxOut: 16 } : { thoughts: 6, answer: 2, maxOut: 16 } });
+    const t = rig({ reviews: 1, providers: { gemini: gem } });
+    submit(t, { kind: "run", suite: "review-seats" });
+    await t.runAll();
+    const st = latestRun(t.tdir, "review-seats")!;
+    expect(st.preflight!.checked["gemini:gemini-4-neon"]).toContain("inconclusive");
+    for (const [id, why] of Object.entries(st.preflight!.skip)) if (id.includes("gemini-4-neon")) expect(why).toContain("inconclusive");
+    expect(gem.calls.filter((c: AskInput) => c.model === "gemini-4-neon").length).toBe(0);
+  });
+});
+
+describe("fifth round: the allowance tally", () => {
+  test("kept apart, the runner's alone; missing (with history) or unreadable counts as fully spent", () => {
+    const t = rig({ reviews: 1 });
+    expect(submit(t, { kind: "run", suite: "review-seats" })).toBeNull();
+    const f = join(t.tdir, "allowance.json");
+    expect(readTally(f, process.getuid!())).toMatchObject({ ok: true });
+    expect(Object.keys(JSON.parse(readFileSync(f, "utf8")).grants).length).toBe(1);
+    // Others can write it: it doesn't count.
+    const u = rig({ reviews: 1 });
+    chmodSync(join(u.tdir, "allowance.json"), 0o666);
+    expect(submit(u, { kind: "run", suite: "review-seats" })).toContain("fully spent");
+    // Gone, while the trials folder has history: fully spent too.
+    const v = rig({ reviews: 1 });
+    spawnSync("rm", ["-f", join(v.tdir, "allowance.json")]);
+    expect(submit(v, { kind: "run", suite: "review-seats" })).toContain("fully spent");
+    // Garbled: the same.
+    const w = rig({ reviews: 1 });
+    writeFileSync(join(w.tdir, "allowance.json"), "{not json");
+    expect(submit(w, { kind: "run", suite: "review-seats" })).toContain("fully spent");
+    // trial.sh status says so.
+    const env = { ...process.env, TRIALS_DIR: w.tdir, TRIALS_INBOX: join(w.dir, "inbox"), RECORD_DIR: w.recordDir, CAIN_STOP_FILE: join(w.dir, "stop.json") };
+    expect(spawnSync("bun", [CLI, "status"], { encoding: "utf8", env }).stdout).toContain("counts as fully spent");
+  });
+});
+
+describe("fifth round: the Codex boundary", () => {
+  test("a read-only requirements file allowing only disabled web search is bound in every wrapper, and checked", () => {
+    const real = mkdtempSync(join(tmpdir(), "codex-real-"));
+    writeFileSync(join(real, "auth.json"), JSON.stringify({ tokens: { access_token: "canary-aaaaaaaaaaaaaaaa", refresh_token: "canary-bbbbbbbbbbbbbbbb" } }));
+    const d = freshDirs({ realHome: real });
+    expect(readFileSync(d.requirements, "utf8")).toBe(REQUIREMENTS_TOML);
+    expect(REQUIREMENTS_TOML).toContain("allowed_web_search_modes = []");
+    const cmd = wrap({ ...d, bwrap: "/usr/bin/bwrap", codexBin: "/usr/bin/codex" }, ["exec"]);
+    const i = cmd.indexOf(REQUIREMENTS_PATH);
+    expect(cmd.slice(i - 2, i + 1)).toEqual(["--ro-bind", d.requirements, "/etc/codex/requirements.toml"]);
+    expect(requirementsInPlace(cmd)).toBeNull();
+    // The network namespace is not unshared (Codex must reach OpenAI): DOCS.md says so.
+    expect(cmd).not.toContain("--unshare-net");
+    // Missing, changed, or inside a writable bind: refused.
+    expect(requirementsInPlace(cmd.filter((x, k) => !(k >= i - 2 && k <= i)))).toContain("doesn't bind");
+    writeFileSync(join(d.tmp, "other.toml"), "allowed_web_search_modes = [\"live\"]\n");
+    expect(requirementsInPlace(cmd.map((x) => (x === d.requirements ? join(d.tmp, "other.toml") : x)))).toContain("doesn't hold");
+    expect(requirementsInPlace([...cmd.slice(0, i - 2), "--ro-bind", join(d.work, "r.toml"), REQUIREMENTS_PATH, ...cmd.slice(i + 1)])).toContain("folder bound writable");
+    // The sign-in file's tokens are canaries: none may come back from a self-test.
+    expect(authCanaries(join(d.codexHome, "auth.json"))).toEqual(["canary-aaaaaaaaaaaaaaaa", "canary-bbbbbbbbbbbbbbbb"]);
+    expect(wrap({ ...d, bwrap: "b", codexBin: "c", envCanary: "trialenvcanaryxyz" }, [])).toContain("trialenvcanaryxyz");
+    d.done();
+  });
+
+  test("the self-test fails if Codex's own credential file or environment came back", async () => {
+    const real = mkdtempSync(join(tmpdir(), "codex-real-"));
+    writeFileSync(join(real, "auth.json"), JSON.stringify({ tokens: { access_token: "canary-aaaaaaaaaaaaaaaa" } }));
+    const bin = join(real, "codex"); writeFileSync(bin, "#!/bin/sh\n", { mode: 0o755 });
+    const bw = join(real, "bwrap"); writeFileSync(bw, "#!/bin/sh\n", { mode: 0o755 });
+    const run = async (leak: (cmd: string[]) => string) => {
+      const exec = (async (cmd: string[]) => {
+        if (cmd.includes("--version")) return { code: 0, stdout: "codex-cli 0.130.0\n", stderr: "" };
+        const out = bwrapHost(cmd, cmd[cmd.indexOf("-o") + 1]);
+        writeFileSync(out, `done ${leak(cmd)}`);
+        return { code: 0, stdout: refusedProbes(), stderr: "" };
+      }) as any;
+      const p = codexProvider({ home: real, bin, bwrap: bw });
+      return p.isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec }), sig());
+    };
+    expect(await run(() => "")).toMatchObject({ ok: true });
+    expect((await run(() => "canary-aaaaaaaaaaaaaaaa")).detail).toContain("came back");
+    expect((await run((cmd) => cmd[cmd.indexOf("TRIAL_ENV_CANARY") + 1])).detail).toContain("came back");
+    // Codex didn't try its credential file: the test proves nothing.
+    const exec2 = (async (cmd: string[]) => cmd.includes("--version") ? { code: 0, stdout: "codex 1\n", stderr: "" }
+      : { code: 0, stdout: refusedProbes(process.pid, ["cat /trial/planted-key.txt", "/bin/cat /trial/planted-key.txt", "read -r line < /trial/planted-key.txt; echo \"$line\"", `cat /proc/${process.pid}/environ`, "cat /proc/$PPID/environ"]), stderr: "" }) as any;
+    const r = await codexProvider({ home: real, bin, bwrap: bw }).isolation(makeWire({ terms: () => TERMS, fetch: null as any, exec: exec2 }), sig());
+    expect(r.detail).toContain("Codex's own credential file");
   });
 });

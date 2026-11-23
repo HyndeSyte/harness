@@ -24,7 +24,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { BWRAP_ENV, KEY_FILE, freshDirs, judgeSelfTest, selfTestPrompt, which, wrap, type Dirs, type Isolation, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
+import { BWRAP_ENV, KEY_FILE, authCanaries, freshDirs, judgeSelfTest, requirementsInPlace, selfTestPrompt, which, wrap, type Dirs, type Isolation, type IsolationMode, type SandboxSetup } from "./sandbox.ts";
 import { ANSWER_SCHEMA, SeatError, prompt, validateAnswer, type Answer, type ErrorKind, type Outbound } from "../review/core.ts";
 import { postJson } from "../review/seats/common.ts";
 import { classifyCodex } from "../review/seats/openai.ts";
@@ -323,15 +323,19 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
   const setup = (): SandboxSetup => ({ realHome: o.home, scratch: o.scratch });
   const codexBin = () => which(bin);
   const bwrapBin = () => (o.bwrap === null ? null : which(o.bwrap ?? "bwrap"));
-  const launch = (d: Dirs, args: string[]) => {
+  const launch = (d: Dirs, args: string[], envCanary?: string) => {
     const cb = codexBin();
     if (!cb) throw new SeatError("unconfigured", "the Codex binary isn't installed");
     const bw = bwrapBin();
     if (!bw) throw new SeatError("refused", "bubblewrap isn't installed, and Codex runs only under it");
-    return wrap({ ...d, bwrap: bw, codexBin: cb }, args);
+    const cmd = wrap({ ...d, bwrap: bw, codexBin: cb, envCanary }, args);
+    // Fifth round: never launched without the read-only requirements file that allows only disabled web search.
+    const req = requirementsInPlace(cmd);
+    if (req) throw new SeatError("refused", `Codex isn't started: ${req}`);
+    return cmd;
   };
-  const run = (wire: Wire, d: Dirs, args: string[], signal: AbortSignal) =>
-    wire.exec(launch(d, args), { env: { ...BWRAP_ENV }, signal, stopOn: CODEX_WEB_SEARCH_EVENT } as any) as Promise<{ code: number; stdout: string; stderr: string; stopped?: boolean }>;
+  const run = (wire: Wire, d: Dirs, args: string[], signal: AbortSignal, envCanary?: string) =>
+    wire.exec(launch(d, args, envCanary), { env: { ...BWRAP_ENV }, signal, stopOn: CODEX_WEB_SEARCH_EVENT } as any) as Promise<{ code: number; stdout: string; stderr: string; stopped?: boolean }>;
   const ask: AskFn = async (input) => {
     if (input.codexMode !== "bwrap") throw new SeatError("refused", "Codex isn't isolated this run (its self-test under bubblewrap didn't pass), so it isn't started");
     if (!signedIn(o.home)) throw new SeatError("unconfigured", "Codex isn't signed in to ChatGPT yet");
@@ -393,16 +397,23 @@ export function codexProvider(o: { home: string; bin?: string; bwrap?: string | 
     try {
       const letters = (n: number) => [...randomBytes(n)].map((b) => "abcdefghijklmnop"[b % 16]).join("");
       const k1 = `trialcanary${letters(12)}`;
+      const envCanary = `trialenvcanary${letters(12)}`;
       const key = join(d.tmp, KEY_FILE);
       writeFileSync(key, k1, { mode: 0o644 });
       const out = join(d.io, "answer.txt");
       const args = [...codexArgs({ work: d.work, out }), selfTestPrompt(key, process.pid)];
-      const r = await run(wire, d, args, signal);
+      // The requirements file in place first (fifth round), checked on the very command line that runs.
+      let cmd: string[];
+      try { cmd = launch(d, args, envCanary); } catch (e) { return no(`bwrap: ${(e as Error).message.slice(0, 160)}`); }
+      const req = requirementsInPlace(cmd);
+      if (req) return no(`bwrap: ${req}`);
+      const r = await run(wire, d, args, signal, envCanary);
       if (r.stopped || CODEX_WEB_SEARCH_EVENT.test(r.stdout)) return no("Codex ran a web search during the self-test although search is off");
       const answer = existsSync(out) ? readFileSync(out, "utf8") : "";
       // The runner's environment markers: a key variable's name, the Supervisor's token name, the trials budget.
-      const j = judgeSelfTest({ ...r, answer }, [k1, "REVIEW_", "SUPERVISOR_TOKEN", "TRIALS_BUDGET"], { pid: process.pid });
-      return j.ok ? { ok: true, mode: "bwrap", detail: j.detail, at } : no(`bwrap: ${j.detail}`);
+      // Fifth round: Codex's own environment (a canary set only inside the wrapper) and its sign-in file's tokens too.
+      const j = judgeSelfTest({ ...r, answer }, [k1, envCanary, "REVIEW_", "SUPERVISOR_TOKEN", "TRIALS_BUDGET", ...authCanaries(join(d.codexHome, "auth.json"))], { pid: process.pid });
+      return j.ok ? { ok: true, mode: "bwrap", detail: `${j.detail}; the requirements file allowing only disabled web search was in place`, at } : no(`bwrap: ${j.detail}`);
     } catch (e) { return no(`bwrap: ${(e as Error).message.slice(0, 160)}`); }
     finally { d.done(); }
   };

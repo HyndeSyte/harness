@@ -28,10 +28,11 @@ function read(keyPath: string): KeyObject {
   return k;
 }
 
-export function loadShipKey(keyPath: string, pubPath: string, log: (line: string) => void, now = Date.now): ShipKey | null {
+// name (0.19.0, fifth round): the same loader makes the link's trial key (trial.key, trial.pub), a key of its own.
+export function loadShipKey(keyPath: string, pubPath: string, log: (line: string) => void, now = Date.now, name = "Ship key"): ShipKey | null {
   try {
     let remade = false;
-    if (!existsSync(keyPath)) { make(keyPath); log("made a new Ship key"); }
+    if (!existsSync(keyPath)) { make(keyPath); log(`made a new ${name}`); }
     let k: KeyObject;
     try { k = read(keyPath); }
     catch (e) {
@@ -40,7 +41,7 @@ export function loadShipKey(keyPath: string, pubPath: string, log: (line: string
       make(keyPath);
       k = read(keyPath);
       remade = true;
-      log(`the Ship key couldn't be read (${String(e).slice(0, 60)}), so it was moved aside and a new one made`);
+      log(`the ${name} couldn't be read (${String(e).slice(0, 60)}), so it was moved aside and a new one made`);
     }
     const pub = publicOf(k);
     let have = "";
@@ -49,10 +50,10 @@ export function loadShipKey(keyPath: string, pubPath: string, log: (line: string
       writeFileSync(`${pubPath}.tmp`, `${pub}\n`, { mode: 0o644 });
       renameSync(`${pubPath}.tmp`, pubPath);
     }
-    log(`Ship key (public): ${pub}`);
+    log(`${name} (public): ${pub}`);
     return { key: k, pub, remade };
   } catch (e) {
-    log(`no Ship key, so Ship taps carry no token: ${String(e).slice(0, 100)}`);
+    log(`no ${name}, so ${name === "Ship key" ? "Ship taps" : "its taps"} carry no token: ${String(e).slice(0, 100)}`);
     return null;
   }
 }

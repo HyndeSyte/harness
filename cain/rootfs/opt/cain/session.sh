@@ -25,6 +25,12 @@ if [ -n "${hb_xtrace}" ]; then set -x; fi
 unset hb_xtrace
 exec 2>>/data/session.log
 echo "$(date -Is) session.sh starting (${CAIN_MODE:-old})" >&2
+# The Supervisor's token is never in his session (Cain 0.19.0, fifth round, a start-time check): the run script unsets
+# it before any child starts. If it is here anyway, say so loudly; trial.sh, run in this session with this environment,
+# then refuses every paid trial start (trials/cli.ts paidChecks), and the trials runner checks its own the same way.
+if [ -n "${SUPERVISOR_TOKEN+x}" ] || tr '\0' '\n' </proc/self/environ 2>/dev/null | grep -q '^SUPERVISOR_TOKEN='; then
+  echo "$(date -Is) ALARM: SUPERVISOR_TOKEN is in the session's environment; no paid model trial can be asked for from it" >&2
+fi
 cd /data/work || { echo "no /data/work" >&2; exit 1; }
 claude --permission-mode auto --channels plugin:discord@claude-plugins-official
 rc=$?

@@ -755,9 +755,15 @@ another lab's model). Nothing you write counts as his approval, and you can't en
 need his say too: the App option trials_run_allowance_usd (default 0) is the total he allows, and a run, a
 resume or the preflight starts only while what it would take fits in what is left (`trial.sh plan` says what
 a run takes, `status` what is left). Ask him once, with that figure, before you ask for a run; never ask him to
-raise it to get past a stop. After each install, run `/opt/cain/trial.sh preflight` once (a few dollars, no
-text of his) before any run: no paid suite runs until it has finished on that build, and what it disables
-stays disabled. Codex takes part only under bubblewrap, when its sandbox check passes at the start of a run;
+raise it to get past a stop. Each paid run, resume and preflight also needs his tap: run `trial.sh plan <suite>`
+(or `plan preflight`), then `/opt/cain/keeper.sh trial-approve --item <id> --suite <suite> --plan <its plan
+hash> --cap <its cap> "<what it tests, one line>"`; his "Allow this run" tap reaches you with the approval, good
+for 2 hours and one start: pass it as `--approval <it>` to `trial.sh run` or `trial.sh preflight` at once. A
+"No" means don't start it. The trials also need keys of their own in the App's options
+(trials_anthropic_api_key, trials_gemini_api_key, trials_perplexity_api_key, never the review keys); `status`
+names a missing one: tell him once, with DOCS.md's setup steps. After each install, and when `status` says the
+preflight is stale or 7 days old, run the preflight (on his tap) before any run: no paid suite runs until it
+has finished, and what it disables stays disabled. Codex takes part only under bubblewrap, when its sandbox check passes at the start of a run;
 "not isolated" or "panel reduced" in the report means it was left out, nothing to fix by you. A Codex web
 search alarm or a grader that fetched a page outside the answer notes is the runner's to stop; read it. A
 stop for the budget or a seat's cap is told to you: a budget stop needs

@@ -19,6 +19,17 @@
 // record for this build on this machine (/data/trials/preflight.json): its checks, with no owner text, under a cap
 // of a few dollars. A configuration whose check failed there stays disabled, named.
 //
+// Fifth round:
+// - His go per paid run: a run, a resume and the preflight start only with a one-time approval from his tap on Cain's
+//   trial card (../trial-token.ts), signed by the link's trial key, bound to that exact plan (its hash: planHash, the
+//   one trial.sh plan prints) and its cap, good for 2 hours, and consumed here (an exclusive create of its nonce under
+//   /data/trials/approvals-used) before anything is dispatched. The allowance stays the ceiling over them all.
+// - Trial keys of their own: the App options trials_*_api_key, never the review service's. Every paid start and step
+//   refuses while any is empty or equals the review key for that provider, naming it (keyProblems).
+// - SUPERVISOR_TOKEN in this process's own environment (or its /proc environ) means no paid dispatch at all.
+// - The preflight record is keyed on the trials code, the installed Codex, the configured models and the trials
+//   options, and lasts 7 days (preflightError); a Gemini check that showed no thinking leaves its model disabled.
+//
 // Approvals (second review round): the research approval (the hashes of the questions file, its answer notes
 // and the rubric) and Perplexity's third-party routing are read only from the App's options
 // (/data/options.json, root's file, set in Home Assistant), never from a file Cain's user or the inbox group
@@ -41,7 +52,9 @@
 // aborted at it (Codex's whole process group is killed).
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
-import { chmodSync, chownSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import type { KeyObject } from "node:crypto";
+import { centsOf, readTrialToken, trialPublicKey, type TrialTarget } from "../trial-token.ts";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { FINAL, SeatError, textCheck, type ErrorKind } from "../review/core.ts";
@@ -50,7 +63,7 @@ import type { Fetch } from "../review/seats/common.ts";
 import type { Exec } from "../review/seats/openai.ts";
 import { CAIN_UID } from "../owned.ts";
 import {
-  DEFAULT_BUDGET_USD, GEMINI_MODELS, GRADERS, LIMITS, PERPLEXITY_OWN_MODEL, SEAT_LIMITS, blindViolations, callShape, callsFor, ceilingOf, checkQuestions, configById, configsFor,
+  DEFAULT_BUDGET_USD, GEMINI_MODELS, PREFLIGHT_CAP_USD, modelsId, planHash, preflightCap, preflightPlanHash, runCap, GRADERS, LIMITS, PERPLEXITY_OWN_MODEL, SEAT_LIMITS, blindViolations, callShape, callsFor, ceilingOf, checkQuestions, configById, configsFor,
   familyOf, fetchAllowed, gradeCharsBound, gradePrompt, isSuite, ledgerCap, ledgerMargin, makeLabels, noteFetchUrls, notesSha, panelFor, parseGrades, pickReviewTasks, planOf, researchPrivacy, researchPrompt, reviewOutput, rubricSha,
   seatOfConfig, shuffled, taskChars, thinkingAllowance, toolViolation, tokensOf, ceilingPrice, worstOf, worstOfCeiling, trialAllowance,
   type CallShape, type CallSpec, type Config, type GraderId, type Labelled, type Output, type OutputGrade,
@@ -59,7 +72,7 @@ import {
 import { CODEX_NO_MODEL, CODEX_ROOT, CodexToolUse, CodexWebSearch, usageOf, type AskResult, type CodexProvider, type Provider, type ThinkingSeen } from "./calls.ts";
 import { Ledger, ownerAlive, readBudgetFile, type Budget, type How, type SeatWindow } from "./ledger.ts";
 import { PrivacyBlock, makeWire, type Wire } from "./guard.ts";
-import { groupExec, type Isolation } from "./sandbox.ts";
+import { groupExec, which, type Isolation } from "./sandbox.ts";
 import { writeReport } from "./report.ts";
 
 export type TrialsConfig = {
@@ -76,7 +89,43 @@ export type TrialsConfig = {
   timeoutScale?: number;       // tests only: shortens every call's wall-clock limit
   coolMs?: number;             // a seat's cooling after a 429 or usage limit (default 15 minutes)
   seatGapMs?: number;          // the least time between two trial calls on one seat (default 10 seconds)
+  // Fifth round:
+  approvalPub?: string;        // the link's trial key, public half (default /data/trust/trial.pub, root's)
+  approvalPubUid?: number;     // its owner (root)
+  keyCheck?: KeyCheck;         // the trial keys against the review keys (trialKeyCheck); none: every provider refused
+  keyPrint?: string;           // a hash of the trial keys together, for the preflight's key (never a key itself)
+  supervisorSeen?: () => boolean;   // tests only: whether SUPERVISOR_TOKEN is in this process's environment
+  codexId?: string;            // tests only: the installed Codex (default: a hash of its binary)
+  tallyUid?: number;           // the allowance tally's owner (default: this process's uid, root on the Pi)
 };
+// ---- the trial keys (fifth round) ----
+export type KeyName = "anthropic" | "gemini" | "perplexity";
+export type KeyCheck = Record<KeyName, "ok" | "empty" | "same">;
+export const KEY_NAMES: Record<KeyName, string> = { anthropic: "Anthropic", gemini: "Google (Gemini)", perplexity: "Perplexity" };
+export const KEY_OPTIONS: Record<KeyName, string> = { anthropic: "trials_anthropic_api_key", gemini: "trials_gemini_api_key", perplexity: "trials_perplexity_api_key" };
+export function trialKeyCheck(trial: Partial<Record<KeyName, string>>, review: Partial<Record<KeyName, string>>): KeyCheck {
+  const one = (k: KeyName) => { const t = (trial[k] ?? "").trim(); return !t ? "empty" as const : t === (review[k] ?? "").trim() ? "same" as const : "ok" as const; };
+  return { anthropic: one("anthropic"), gemini: one("gemini"), perplexity: one("perplexity") };
+}
+// Each provider whose trial key isn't right, named. No check at all counts as every key missing.
+export function keyProblems(k?: KeyCheck | null): string[] {
+  return (Object.keys(KEY_NAMES) as KeyName[]).flatMap((n) => {
+    const v = k?.[n] ?? "empty";
+    return v === "ok" ? [] : [v === "same" ? `${KEY_NAMES[n]}'s trial key (${KEY_OPTIONS[n]}) is the review service's own key` : `${KEY_NAMES[n]} has no trial key of its own (${KEY_OPTIONS[n]} is empty)`];
+  });
+}
+export const keyPrintOf = (keys: Partial<Record<KeyName, string>>) => createHash("sha256").update(JSON.stringify([keys.anthropic ?? "", keys.gemini ?? "", keys.perplexity ?? ""])).digest("hex").slice(0, 16);
+// SUPERVISOR_TOKEN in a process's own environment: in its env, or in its /proc environ (fifth round).
+export function supervisorTokenSeen(env: Record<string, string | undefined> = process.env, environFile = "/proc/self/environ"): boolean {
+  if (Object.keys(env).some((k) => k === "SUPERVISOR_TOKEN")) return true;
+  try { return readFileSync(environFile).toString("latin1").split("\0").some((e) => e.startsWith("SUPERVISOR_TOKEN=")); } catch { return false; }
+}
+// The installed Codex: a hash of its binary (fifth round), or "none".
+export function codexInstalledId(bin = process.env.CODEX_BIN ?? "codex"): string {
+  const p = which(bin);
+  if (!p) return "none";
+  try { return createHash("sha256").update(readFileSync(p)).digest("hex").slice(0, 16); } catch { return "unreadable"; }
+}
 export type TrialDeps = {
   review: Runner;              // its ledger and caps, the guard's reserve, the private terms, Stop, relay, its queue
   providers: { claude?: Provider; gemini?: Provider; perplexity?: Provider; codex?: CodexProvider };
@@ -93,7 +142,7 @@ export type CallRec = {
   // charged at its worst case for want of a bill; plan_calls counts Codex calls (no dollars).
   spend?: { billed: number; estimated: number; unresolved: number; plan_calls: number };
 };
-export type Stop = { reason: "budget" | "caps" | "unavailable" | "privacy" | "approval" | "model" | "allowance" | "preflight"; detail: string; at: string };
+export type Stop = { reason: "budget" | "caps" | "unavailable" | "privacy" | "approval" | "model" | "allowance" | "preflight" | "keys"; detail: string; at: string };
 export type Preflight = { done: boolean; at: string; tries: number; codex_version?: string | null; codex_models?: string[] | null;
   checked: Record<string, string>; skip: Record<string, string>; third_party_routing: boolean;
   graders_off?: Record<string, string>;      // a grader whose check failed, or Codex not isolated
@@ -108,9 +157,10 @@ export type RunState = {
   created_at: string; updated_at: string; stop?: Stop; stops: Stop[]; calls: Record<string, CallRec>; notes: string[];
   preflight?: Preflight; held: Record<string, true>; cool: Record<string, string>;
   kind?: "preflight";          // one suite's half of the build's preflight, not a run
+  approved?: { nonce: string; plan: string; cap_cents: number; at: string };   // fifth round: the approval it started (or resumed) on
 };
 export type Mode = "resume" | "retry" | "new";
-export type Request = { kind: "run"; suite: SuiteName; mode?: Mode } | { kind: "report"; suite: SuiteName } | { kind: "preflight" };
+export type Request = { kind: "run"; suite: SuiteName; mode?: Mode; approval: string } | { kind: "report"; suite: SuiteName } | { kind: "preflight"; approval: string };
 
 export function writeAtomic(path: string, text: string) {
   mkdirSync(dirname(path), { recursive: true });
@@ -133,12 +183,13 @@ export const paths = (dir: string) => ({
   key: (s: string, r: string) => join(dir, s, r, "key.json"),
   report: (s: string) => join(dir, s, "report.md"),
   preflight: join(dir, "preflight.json"),
+  used: join(dir, "approvals-used"),
 });
 
 // ---- the preflight's record (fourth round) ----
 // This build: the trials' own source files (what decides every request) and the App's version when it is
 // known. This machine: its machine id, or its host name. A record counts only for both.
-export const PREFLIGHT_CAP_USD = 4;
+export { PREFLIGHT_CAP_USD };
 export function buildId(env = process.env): string {
   const h = createHash("sha256");
   const dir = import.meta.dir;
@@ -151,19 +202,30 @@ export function machineId(): string {
 }
 export type PreflightSuite = { run: string; checked: Record<string, string>; skip: Record<string, string>; graders_off: Record<string, string>; served: Record<string, string>;
   ids: Record<string, string>; thinking: Record<string, string>; codex_isolation?: Isolation; codex_version?: string | null; codex_models?: string[] | null };
+export type PreflightKey = { code: string; machine: string; codex: string; models: string; options: string };
 export type PreflightRecord = { format: 1; id: string; status: "running" | "done" | "stopped"; build: string; machine: string; started_at: string; finished_at?: string;
-  cap_usd: number; suites: Partial<Record<SuiteName, PreflightSuite>>; disabled: Record<string, string>; codex_daemon?: string; stop?: string };
+  cap_usd: number; suites: Partial<Record<SuiteName, PreflightSuite>>; disabled: Record<string, string>; codex_daemon?: string; stop?: string;
+  key?: PreflightKey };
+export const PREFLIGHT_TTL_MS = 7 * 24 * 3_600_000;
+const KEY_WHAT: Record<keyof PreflightKey, string> = { code: "the trials code", machine: "the machine", codex: "the installed Codex", models: "the configured models", options: "the trials options" };
 export function readPreflight(dir: string): PreflightRecord | null {
   const r = readJson<PreflightRecord | null>(paths(dir).preflight, null);
   return r && r.format === 1 && typeof r.build === "string" ? r : null;
 }
-// Whether a paid suite may run here: a finished preflight record for this build on this machine. The reason if not.
-export function preflightError(rec: PreflightRecord | null, build: string, machine: string): string | null {
+// Whether a paid suite may run here: a finished preflight record under the same key (the trials code, the machine, the
+// installed Codex, the configured models and the trials options), under 7 days old. The reason if not. A null key
+// (trial.sh, before the runner has said) checks only the record's own state and age.
+export function preflightError(rec: PreflightRecord | null, key: PreflightKey | null, nowMs: number): string | null {
   if (!rec) return "no preflight has run on this build: run trial.sh preflight first (a few dollars of checks, no owner text)";
-  if (rec.build !== build) return "the preflight on record is for another build: run trial.sh preflight again on this one";
-  if (rec.machine !== machine) return "the preflight on record is from another machine: run trial.sh preflight here";
+  if (key) {
+    if (!rec.key) return "the preflight on record has no key (it is from before the fifth round): run trial.sh preflight again";
+    const changed = (Object.keys(KEY_WHAT) as (keyof PreflightKey)[]).filter((k) => rec.key![k] !== key[k]).map((k) => KEY_WHAT[k]);
+    if (changed.length) return `the preflight on record doesn't match: ${changed.join(", ")} changed since it ran: run trial.sh preflight again`;
+  }
   if (rec.status === "running") return "the preflight is still running: wait for it to finish";
   if (rec.status !== "done") return `the preflight didn't finish (${rec.stop ?? "stopped"}): run trial.sh preflight again`;
+  const at = Date.parse(rec.finished_at ?? "");
+  if (!Number.isFinite(at) || nowMs - at > PREFLIGHT_TTL_MS) return "the preflight on record is more than 7 days old: run trial.sh preflight again";
   return null;
 }
 // Whether a Gemini check showed the output cap covering thinking: thought and answer tokens never above the cap.
@@ -289,15 +351,20 @@ export function takeInboxFile(path: string, takenDir: string, uids: number[], ma
 // only with it.
 const FROM_INBOX: unique symbol = Symbol("taken from the inbox");
 
-const REQUEST_KEYS = new Set(["kind", "suite", "mode"]);
+const REQUEST_KEYS = new Set(["kind", "suite", "mode", "approval"]);
+const APPROVAL = /^trial1\.[A-Za-z0-9_-]{20,800}\.[A-Za-z0-9_-]{86}$/;
+const NEEDS_APPROVAL = "a paid run, a resume or the preflight needs the owner's one-time approval from his tap on Cain's trial card (keeper.sh trial-approve), passed as --approval to trial.sh.";
 // A request from the inbox: a known suite and the command, nothing else. The reason it isn't one, or null.
 export function requestError(j: any): string | null {
   if (!j || typeof j !== "object" || Array.isArray(j)) return "not a request.";
   for (const k of Object.keys(j)) if (!REQUEST_KEYS.has(k)) return `it carries a field a request may not (${k.slice(0, 20).replace(/[^\w-]/g, "?")}); the budget is the App's option and the configurations are the runner's.`;
-  if (j.kind === "preflight") return Object.keys(j).length === 1 ? null : "a preflight request carries only its kind.";
+  if (j.approval !== undefined && (typeof j.approval !== "string" || !APPROVAL.test(j.approval))) return "its approval isn't a trial approval.";
+  // A paid request without an approval is well formed: request() refuses it once its other checks have spoken (useApproval).
+  if (j.kind === "preflight") return Object.keys(j).some((k) => k !== "kind" && k !== "approval") ? "a preflight request carries only its kind and its approval." : null;
   if (!isSuite(j.suite)) return "not a suite this runner knows (review-seats or research).";
   if (j.kind !== "run" && j.kind !== "report") return "a request is a run or a report.";
   if (j.mode !== undefined && (j.kind !== "run" || !["resume", "retry", "new"].includes(j.mode))) return "its mode isn't resume, retry or new.";
+  if (j.kind === "report" && j.approval !== undefined) return "a report carries no approval.";
   return null;
 }
 
@@ -315,7 +382,7 @@ export class TrialRunner {
     this.now = deps.now ?? (() => new Date());
     this.rand = deps.rand ?? Math.random;
     this.log = deps.log ?? ((m) => console.log(`[trials] ${m}`));
-    this.ledger = new Ledger(cfg.dir, deps.owner, this.now);
+    this.ledger = new Ledger(cfg.dir, deps.owner, this.now, cfg.tallyUid);
   }
   get budget(): number { const b = this.cfg.budgetUsd; return Number.isFinite(b) && b >= 0 ? b : DEFAULT_BUDGET_USD; }
   private p = () => paths(this.cfg.dir);
@@ -328,13 +395,71 @@ export class TrialRunner {
   // The owner's run allowance, read now from root's options file (0 when it can't be read).
   allowance(): number { const o = readOptions(this.cfg.optionsFile ?? OPTIONS_FILE, this.cfg.optionsUid ?? 0); return o.ok ? (o as { o: AppOptions }).o.allowanceUsd : 0; }
   get build(): string { return this.cfg.build ?? (this.builtId ??= buildId()); }
+  // ---- fifth round: the keys, the Supervisor token, the preflight's key, the owner's approval ----
+  // Why nothing paid may go out now (the trial keys, SUPERVISOR_TOKEN in this process's environment), or null.
+  paidGate(): string | null {
+    const k = keyProblems(this.cfg.keyCheck);
+    if (k.length) return `the trials can't spend: ${k.join("; ")}. Only the owner sets the trial keys, in the App's options`;
+    if ((this.cfg.supervisorSeen ?? (() => supervisorTokenSeen()))()) return "the trials can't spend: SUPERVISOR_TOKEN is in the runner's own environment, so nothing paid is dispatched until the App starts without it";
+    return null;
+  }
+  preflightKey(): PreflightKey {
+    const o = readOptions(this.cfg.optionsFile ?? OPTIONS_FILE, this.cfg.optionsUid ?? 0);
+    const oo = o.ok ? (o as { o: AppOptions }).o : null;
+    const options = createHash("sha256").update(JSON.stringify({ budget: this.budget, third: oo?.thirdParty ?? null, q: oo?.questions ?? null, n: oo?.notes ?? null, r: oo?.rubric ?? null,
+      keys: this.cfg.keyPrint ?? null, readable: o.ok })).digest("hex").slice(0, 16);
+    return { code: this.build, machine: this.machine, codex: this.cfg.codexId ?? (this.codexSeen ??= codexInstalledId()), models: modelsId(), options };
+  }
+  private codexSeen?: string;
+  pfError(): string | null { return preflightError(readPreflight(this.cfg.dir), this.preflightKey(), this.now().getTime()); }
+  // The link's trial key, public half: root's file, a plain file only root can write.
+  private trialKey(): { ok: true; key: KeyObject } | { ok: false; why: string } {
+    const path = this.cfg.approvalPub ?? "/data/trust/trial.pub";
+    let fd: number;
+    try { fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); } catch { return { ok: false, why: "the link's trial key can't be read, so no approval counts" }; }
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.size > 4096 || st.uid !== (this.cfg.approvalPubUid ?? 0) || (st.mode & 0o022)) return { ok: false, why: "the link's trial key file isn't root's alone, so no approval counts" };
+      return { ok: true, key: trialPublicKey(readFileSync(fd, "utf8")) };
+    } catch { return { ok: false, why: "the link's trial key can't be read, so no approval counts" }; }
+    finally { try { closeSync(fd); } catch { /* closed */ } }
+  }
+  // What an approval for this target must name: the plan hash and the cap, as trial.sh plan prints them.
+  approvalTarget(target: TrialTarget, suite?: Suite, pinned = true): { plan: string; cap: number } {
+    if (target === "preflight") { const cap = preflightCap(this.budget); return { plan: preflightPlanHash(cap), cap }; }
+    const cap = this.runCapFor(suite!, pinned);
+    return { plan: planHash(suite!, pinned, cap), cap };
+  }
+  // The owner's approval checked and consumed: signed by the link's trial key, for this target, this exact plan and
+  // cap, not expired, and not used before (its nonce created exclusively, fsynced). The reason it doesn't count, or
+  // null once it is spent on this start.
+  useApproval(token: unknown, target: TrialTarget, want: { plan: string; cap: number }): { why: string } | { nonce: string; plan: string; cap_cents: number; at: string } {
+    if (typeof token !== "string" || !token) return { why: NEEDS_APPROVAL };
+    const key = this.trialKey();
+    if (!key.ok) return { why: `${(key as { why: string }).why}.` };
+    const r = readTrialToken(token, (key as { key: KeyObject }).key, this.now().getTime());
+    if (!r.ok) return { why: `its approval doesn't count: ${(r as { why: string }).why}.` };
+    const c = r.claim;
+    if (c.suite !== target) return { why: `its approval is for ${c.suite}, not ${target}.` };
+    if (c.plan !== want.plan) return { why: "its approval is for another plan than the one this run would make (the suite, its calls, its cap or what it sends changed since trial.sh plan printed it): run trial.sh plan again and ask him again." };
+    if (c.cap_cents !== centsOf(want.cap)) return { why: `its approval names a cap of $${(c.cap_cents / 100).toFixed(2)}, and this run's cap is $${want.cap.toFixed(2)}.` };
+    const dir = this.p().used;
+    try { mkdirSync(dir, { recursive: true, mode: 0o750 }); } catch { /* checked by the create */ }
+    const at = this.iso();
+    try {
+      const fd = openSync(join(dir, `${c.nonce}.json`), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o640);
+      try { writeSync(fd, JSON.stringify({ suite: c.suite, plan: c.plan, cap_cents: c.cap_cents, exp: c.exp, used_at: at })); fsyncSync(fd); } finally { closeSync(fd); }
+      try { const d = openSync(dir, "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* not every platform */ }
+    } catch (e: any) {
+      return { why: e?.code === "EEXIST" ? "its approval was already used: one tap allows one run. Ask him again with a new trial card." : "its approval couldn't be recorded as used, so nothing starts." };
+    }
+    return { nonce: c.nonce, plan: c.plan, cap_cents: c.cap_cents, at };
+  }
   get machine(): string { return this.cfg.machine ?? (this.machineSeen ??= machineId()); }
   private builtId?: string; private machineSeen?: string;
   grantKey = (st: { suite: string; run: string; kind?: string }) => (st.kind === "preflight" ? `preflight|${st.run}` : `${st.suite}|${st.run}`);
   // A run's cap: its plan's worst case plus its own checks, never above the ledger's cap.
-  runCapFor(suite: Suite, pinned = true): number {
-    return Number(Math.min(ledgerCap(this.budget), planOf(suite, pinned).total + PREFLIGHT_CAP_USD).toFixed(2));
-  }
+  runCapFor(suite: Suite, pinned = true): number { return runCap(this.budget, planOf(suite, pinned).total); }
   // The grant a run or the preflight goes on under, checked against the allowance as it is now.
   private grantFor(st: { suite: string; run: string; kind?: string }, cap: number) {
     const key = this.grantKey(st);
@@ -393,10 +518,10 @@ export class TrialRunner {
     if (bad) return bad;
     if (j.kind === "report") { writeReport(this.cfg.dir, j.suite, this.budget); return null; }
     if (origin !== FROM_INBOX) return "a paid run, a resume or the preflight starts only from a request file taken from the trials inbox.";
-    if (j.kind === "preflight") return this.startPreflight();
+    const gate = this.paidGate();
+    if (gate) return `${gate}.`;
+    if (j.kind === "preflight") return this.startPreflight(j.approval);
     const suite: SuiteName = j.suite;
-    const pfErr = preflightError(readPreflight(this.cfg.dir), this.build, this.machine);
-    if (pfErr) return `${pfErr}.`;
     const mode: Mode = j.mode ?? "resume";
     let s = readSuite(this.cfg.dir, suite);
     if (suite === "research") {
@@ -404,17 +529,26 @@ export class TrialRunner {
       if (!a.ok) return `the research suite can't run: ${(a as { why: string }).why}.`;
       if (s && s.questions_sha256 !== a.sha) return "the research suite was frozen from other questions than the ones the owner approved.";
     }
+    const pfErr = this.pfError();
+    if (pfErr) return `${pfErr}.`;
+    let fresh = false;
     if (!s) {
       const built = this.buildSuite(suite);
       if (!built.suite) return built.error!;
-      s = built.suite;
-      writeAtomic(this.p().suite(suite), JSON.stringify(s, null, 1));
+      s = built.suite; fresh = true;
     }
     const last = latestRun(this.cfg.dir, suite);
-    if (last && last.status !== "done" && mode !== "new") {
+    const resuming = !!(last && last.status !== "done" && mode !== "new");
+    if (!resuming && last && last.status === "running") return "its newest run is still running; it can't start a new one beside it.";
+    // His one-time approval, for exactly the plan this start would run, spent before anything is frozen or sent.
+    const pinned = resuming ? !last!.preflight?.third_party_routing : !(suite === "research" && (() => { const a = this.approval(); return a.ok && a.third_party; })());
+    const used = this.useApproval(j.approval, suite, this.approvalTarget(suite, s, pinned));
+    if ("why" in used) return used.why;
+    if (fresh) writeAtomic(this.p().suite(suite), JSON.stringify(s, null, 1));
+    if (resuming && last) {
       const g = this.grantFor(last, this.runCapFor(s, !last.preflight?.third_party_routing));
       if (!g.ok) return `the run can't resume: ${(g as { detail: string }).detail}.`;
-      last.status = "running"; delete last.stop;
+      last.status = "running"; delete last.stop; last.approved = used;
       for (const c of Object.values(last.calls)) {
         if (c.status === "held") c.status = "interrupted";
         if (mode === "retry" && c.status === "failed" && c.final && !/no key|isn't signed in|isn't served|not listed|refused|not isolated/.test(c.error ?? "")) { c.final = false; c.attempts = Math.min(c.attempts, 1); }
@@ -425,15 +559,13 @@ export class TrialRunner {
       writeAtomic(this.p().state(suite, last.run), JSON.stringify(last, null, 1));
       return null;
     }
-    if (last && last.status === "running") return "its newest run is still running; it can't start a new one beside it.";
     const d = this.now();
     const run = `r${d.toISOString().slice(0, 10).replace(/-/g, "")}-${d.toISOString().slice(11, 19).replace(/:/g, "")}`;
     if (existsSync(this.p().run(suite, run))) return "a run started this very second; ask again.";
-    const pinned = !(suite === "research" && (() => { const a = this.approval(); return a.ok && a.third_party; })());
     const g = this.grantFor({ suite, run }, this.runCapFor(s, pinned));
     if (!g.ok) return `the run can't start: ${(g as { detail: string }).detail}.`;
     const st: RunState = { format: 2, suite, run, status: "running", created_at: this.iso(), updated_at: this.iso(), stops: [], calls: {},
-      notes: [...s.skipped], held: {}, cool: {} };
+      notes: [...s.skipped], held: {}, cool: {}, approved: used };
     // The original seats' answers kept in each review are outputs too, with no call.
     for (const t of s.tasks) if (t.kind === "review") for (const o of t.originals) {
       const id = `out|${t.id}|original:${o.seat}`;
@@ -492,19 +624,22 @@ export class TrialRunner {
   // `trial.sh preflight`: the checks before any spend for every configuration of both suites, with no owner text
   // and Perplexity pinned to its own model at every level, under its own cap (PREFLIGHT_CAP_USD) and a grant from
   // the owner's allowance. Its record is what lets a paid suite run on this build on this machine.
-  startPreflight(): string | null {
+  startPreflight(approval?: unknown): string | null {
     const cur = readPreflight(this.cfg.dir);
     if (cur?.status === "running") return "the preflight is already running.";
     const d = this.now();
     const id = `p${d.toISOString().slice(0, 10).replace(/-/g, "")}-${d.toISOString().slice(11, 19).replace(/:/g, "")}`;
     if (cur?.id === id) return "a preflight started this very second; ask again.";
-    const g = this.grantFor({ suite: "preflight", run: id, kind: "preflight" }, Math.min(PREFLIGHT_CAP_USD, ledgerCap(this.budget)));
+    const used = this.useApproval(approval, "preflight", this.approvalTarget("preflight"));
+    if ("why" in used) return used.why;
+    const g = this.grantFor({ suite: "preflight", run: id, kind: "preflight" }, preflightCap(this.budget));
     if (!g.ok) return `the preflight can't start: ${(g as { detail: string }).detail}.`;
     for (const suite of ["review-seats", "research"] as SuiteName[]) {
       const st: RunState = { format: 2, suite, run: id, status: "running", created_at: this.iso(), updated_at: this.iso(), stops: [], calls: {}, notes: [], held: {}, cool: {}, kind: "preflight" };
       this.save(st);
     }
-    const rec: PreflightRecord = { format: 1, id, status: "running", build: this.build, machine: this.machine, started_at: this.iso(), cap_usd: (g as { cap: number }).cap, suites: {}, disabled: {} };
+    const rec: PreflightRecord = { format: 1, id, status: "running", build: this.build, machine: this.machine, started_at: this.iso(), cap_usd: (g as { cap: number }).cap, suites: {}, disabled: {},
+      key: this.preflightKey() };
     writeAtomic(this.p().preflight, JSON.stringify(rec, null, 1));
     return null;
   }
@@ -520,6 +655,11 @@ export class TrialRunner {
   async stepPreflight(rec: PreflightRecord): Promise<boolean> {
     if (this.deps.review.isStopped()) return false;
     if (rec.build !== this.build || rec.machine !== this.machine) { this.finishPreflight(rec, "stopped", "it was started on another build or machine"); return false; }
+    const gate = this.paidGate();
+    if (gate) {
+      for (const suite of ["review-seats", "research"] as SuiteName[]) { const st = readJson<RunState | null>(this.p().state(suite, rec.id), null); if (st && st.status === "running") this.end(st, "stopped", { reason: "keys", at: this.iso(), detail: gate }); }
+      this.finishPreflight(rec, "stopped", gate); return false;
+    }
     for (const suite of ["review-seats", "research"] as SuiteName[]) {
       const st = readJson<RunState | null>(this.p().state(suite, rec.id), null);
       if (!st) { this.finishPreflight(rec, "stopped", `its ${suite} checks can't be read`); return false; }
@@ -613,7 +753,9 @@ export class TrialRunner {
     const suite = readSuite(this.cfg.dir, st.suite);
     if (!suite) { this.end(st, "stopped", { reason: "unavailable", detail: "the suite's tasks can't be read.", at: this.iso() }); return false; }
     // The owner's say, every step: the build's preflight on record, and his allowance still covering this run.
-    const pfErr = preflightError(readPreflight(this.cfg.dir), this.build, this.machine);
+    const gate = this.paidGate();
+    if (gate) { this.end(st, "stopped", { reason: "keys", at: this.iso(), detail: `${gate}; nothing more was sent.` }); return false; }
+    const pfErr = this.pfError();
     if (pfErr) { this.end(st, "stopped", { reason: "preflight", at: this.iso(), detail: `${pfErr}; nothing more was sent.` }); return false; }
     const g = this.grantFor(st, this.runCapFor(suite, !st.preflight?.third_party_routing));
     if (!g.ok) {
@@ -722,6 +864,8 @@ export class TrialRunner {
   private async exchange(st: RunState, o: { call: string; attempt: number; seat: ReviewSeatName | null; worst: number; runs: number; hold?: string; timeoutS: number; margin: number; plan?: boolean },
     fn: (wire: Wire, signal: AbortSignal) => Promise<AskResult>): Promise<Exchange> {
     // Every paid exchange goes under its run's grant from the owner's allowance, and never past that grant's cap.
+    const gate = this.paidGate();
+    if (gate) return { kind: "denied", reason: "allowance", detail: gate };
     const grant = this.ledger.grantOf(this.grantKey(st));
     if (!grant) return { kind: "denied", reason: "allowance", detail: "no grant from the owner's run allowance covers this run" };
     const who = st.kind === "preflight" ? { suite: "preflight", run: st.run } : { suite: st.suite, run: st.run };
@@ -869,6 +1013,8 @@ export class TrialRunner {
           pf.thinking![model] = cover;
           const listed = GEMINI_MODELS[model]?.outCoversThinking === true;
           if (listed && cover === "no") pf.checked[`gemini:${model}`] = `disabled: ${model}'s output cap didn't cover its thinking at the check (${seen!.thoughts} thought and ${seen!.answer} answer tokens against a cap of ${seen!.maxOut}), so its worst case can't be bounded`;
+          // Fifth round: a check that showed no thinking at all is inconclusive: the model stays disabled, never estimated.
+          else if (cover === "unknown") pf.checked[`gemini:${model}`] = `disabled: ${model}'s check was inconclusive (it produced no thinking, so whether its output cap covers thinking wasn't shown); run the preflight again to retry it`;
           else { pf.checked[`gemini:${model}`] = "ok"; pf.ids[`gemini:${model}`] = `${x.res.served || model}, thinking ${"level" in (GEMINI_MODELS[model]?.thinking ?? { level: "low" }) ? "level" : "budget"} field, output cap covers thinking: ${cover}`; }
         }
       }

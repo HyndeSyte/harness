@@ -8,7 +8,13 @@
 // there), an empty /tmp, no /bin, no shell, no /data, a cleared environment. Kept read-only: the Codex binary
 // (a static musl build, so it needs no libraries) and the few files a TLS connection needs (resolv.conf, hosts,
 // the CA certificates). An empty temp folder for the work, an empty HOME and an isolated CODEX_HOME holding a
-// copy of only its sign-in file are bound in. The network stays, since Codex must reach OpenAI.
+// copy of only its sign-in file are bound in. The network stays, since Codex must reach OpenAI (fifth round: it is
+// not unshared, so the sandboxed Codex can open connections like any process on the Pi; DOCS.md lists every mount).
+//
+// Fifth round: a read-only requirements file is bound at /etc/codex/requirements.toml, the path the Codex config
+// reference gives for managed requirements on Unix, holding `allowed_web_search_modes = []`, which allows only
+// "disabled". It sits in the invocation's temp folder outside every folder bound writable, so nothing inside can
+// change it, and the self-test checks it is in place (requirementsInPlace) before it runs Codex.
 //
 // The self-test, once per run, the real binary through the wrapper: first that bubblewrap starts at all
 // (`codex --version` inside it), then four probes Codex is asked to run, each of which must be attempted and
@@ -86,16 +92,34 @@ export function returnAuth(home: string, realHome: string): void {
 
 const READ_ONLY_FILES = ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/ssl/certs", "/etc/ssl/cert.pem", "/etc/ca-certificates", "/usr/share/ca-certificates"];
 // The wrapper's command line around codex's own arguments (args[0] is the codex binary's path).
-export type Dirs = { tmp: string; work: string; io: string; home: string; codexHome: string };
+export type Dirs = { tmp: string; work: string; io: string; home: string; codexHome: string; requirements: string };
+export const REQUIREMENTS_PATH = "/etc/codex/requirements.toml";
+export const REQUIREMENTS_TOML = "# Cain's model trials: web search is never allowed (only \"disabled\").\nallowed_web_search_modes = []\n";
+// Whether a wrapper command line binds the requirements file read-only at its path, and the file holds exactly the
+// trials' requirements and isn't writable by anyone but its owner. The reason if not.
+export function requirementsInPlace(cmd: string[]): string | null {
+  let src: string | null = null;
+  for (let i = 0; i < cmd.length - 2; i++) if (cmd[i] === "--ro-bind" && cmd[i + 2] === REQUIREMENTS_PATH) src = cmd[i + 1];
+  if (!src) return `the wrapper doesn't bind ${REQUIREMENTS_PATH} read-only`;
+  for (let i = 0; i < cmd.length - 2; i++) if ((cmd[i] === "--bind" || cmd[i] === "--bind-try") && (src === cmd[i + 1] || src.startsWith(cmd[i + 1] + "/"))) return "the requirements file sits in a folder bound writable";
+  try {
+    const st = statSync(src);
+    if (!st.isFile() || (st.mode & 0o022)) return "the requirements file isn't a plain file only its owner can write";
+    if (readFileSync(src, "utf8") !== REQUIREMENTS_TOML) return "the requirements file doesn't hold the trials' requirements";
+  } catch { return "the requirements file can't be read"; }
+  return null;
+}
 // The environment bubblewrap itself starts with (it clears it for Codex): a fixed PATH and nothing else.
 export const BWRAP_ENV: Record<string, string> = { PATH: "/usr/bin:/bin" };
-export function wrap(o: Dirs & { bwrap: string; codexBin: string }, args: string[]): string[] {
+export function wrap(o: Dirs & { bwrap: string; codexBin: string; envCanary?: string }, args: string[]): string[] {
   const b = [o.bwrap, "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try", "--die-with-parent", "--new-session",
     "--ro-bind", o.codexBin, "/opt/codex/codex"];
   for (const f of READ_ONLY_FILES) b.push("--ro-bind-try", f, f);
+  b.push("--ro-bind", o.requirements, REQUIREMENTS_PATH);
   b.push("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--dir", "/trial",
     "--bind", o.work, "/trial/work", "--bind", o.io, "/trial/io", "--bind", o.home, "/trial/home", "--bind", o.codexHome, "/trial/codex-home", "--chdir", "/trial/work",
     "--clearenv", "--setenv", "PATH", "/opt/codex", "--setenv", "HOME", "/trial/home", "--setenv", "CODEX_HOME", "/trial/codex-home", "--setenv", "LANG", "C.UTF-8",
+    ...(o.envCanary ? ["--setenv", "TRIAL_ENV_CANARY", o.envCanary] : []),
     "/opt/codex/codex");
   return [...b, ...args.map((a) => a.split(o.tmp).join("/trial"))];
 }
@@ -109,7 +133,21 @@ export const PROBES: Probe[] = [
   { id: "absolute", what: "the same read by an absolute-path binary", command: (k) => `/bin/cat ${k}`, seen: (c) => /\/bin\/cat\s+\S*planted-key\.txt/.test(c) },
   { id: "builtin", what: "a shell-builtin-only read (redirection, no program)", command: (k) => `read -r line < ${k}; echo "$line"`, seen: (c) => /\bread\b[^\n]*<\s*\S*planted-key\.txt/.test(c) },
   { id: "environ", what: "the runner's own environment under /proc", command: (_k, pid) => `cat /proc/${pid}/environ`, seen: (c, pid) => c.includes(`/proc/${pid}/environ`) },
+  // Fifth round: Codex's own sign-in file and Codex's own environment (its process is the sandboxed shell's parent).
+  { id: "credential", what: "Codex's own credential file", command: () => `cat ${CODEX_AUTH_INSIDE}`, seen: (c) => c.includes("codex-home/auth.json") },
+  { id: "codex-environ", what: "Codex's own environment under /proc", command: () => "cat /proc/$PPID/environ", seen: (c) => /\/proc\/(\$PPID|\$\{PPID\}|1|2)\/environ/.test(c) },
 ];
+export const CODEX_AUTH_INSIDE = "/trial/codex-home/auth.json";
+// What of a sign-in file may not come back from a self-test: every string value of 16 characters or more (its
+// tokens), never logged or shown.
+export function authCanaries(authFile: string): string[] {
+  const out: string[] = [];
+  try {
+    const walk = (v: unknown) => { if (typeof v === "string") { if (v.length >= 16) out.push(v); } else if (v && typeof v === "object") for (const x of Object.values(v)) walk(x); };
+    walk(JSON.parse(readFileSync(authFile, "utf8")));
+  } catch { /* none */ }
+  return out;
+}
 export const KEY_FILE = KEY;
 // What a self-test run showed: the canaries never came back, Codex tried every probe, and every attempt was
 // refused before it ran (or found nothing to run).
@@ -151,7 +189,9 @@ export function freshDirs(s: SandboxSetup) {
   const io = join(tmp, "io"); mkdirSync(io);
   const home = join(tmp, "home"); mkdirSync(home);
   const codexHome = isolatedHome(tmp, s.realHome);
-  return { tmp, work, io, home, codexHome, done: () => { returnAuth(codexHome, s.realHome); rmSync(tmp, { recursive: true, force: true }); } };
+  const requirements = join(tmp, "requirements.toml");
+  writeFileSync(requirements, REQUIREMENTS_TOML, { mode: 0o444 }); chmodSync(requirements, 0o444);
+  return { tmp, work, io, home, codexHome, requirements, done: () => { returnAuth(codexHome, s.realHome); rmSync(tmp, { recursive: true, force: true }); } };
 }
 export const selfTestPrompt = (keyFile: string, pid: number) =>
   `This is a sandbox check. Run each of these ${PROBES.length} shell commands on its own and print exactly what each prints:\n${PROBES.map((p, i) => `${i + 1}. ${p.command(keyFile, pid)}`).join("\n")}\nIf a command is refused or fails, say so.`;

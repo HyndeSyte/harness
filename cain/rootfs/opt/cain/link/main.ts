@@ -33,6 +33,8 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
+//     POST /trial-approve {item, suite, plan, cap, text}   a card asking Dane to allow one paid model trial run of
+//                                       that exact plan and cap (0.19.0); only his tap signs the one-time approval
 //     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
 //                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
@@ -74,6 +76,7 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { makeTrialToken } from "../trial-token";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, readArmed, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -95,6 +98,10 @@ const RECORD = process.env.RECORD_DIR ?? "/data/record";   // the record keeper'
 const HOLDS = process.env.RECORD_HOLDS ?? "/data/record-holds.json";   // the keeper's holds, as pushed
 const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
+// The trial key (0.19.0, fifth round): signs his "Allow this run" taps on Cain's trial cards (../trial-token.ts);
+// its public half is where the trials runner reads it (root's /data/trust, which Cain can't write).
+const TRIAL_KEY = `${DIR}/trial.key`;
+const TRIAL_PUB = process.env.CAIN_TRIAL_PUB ?? `${TRUST_DIR}/trial.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
 const REPO_DIR = `${DIR}/repo.git`;                  // the link's own copy, for landing his Ship taps
 const DECIDED = DECISIONS_FILE;                      // his taps on the review runner's decision cards (0.16.0, cap.ts): /data/link/review-decisions.json
@@ -199,6 +206,8 @@ async function pullNow(pr: string): Promise<Pull | null> {
 // runs are refused until it's fixed.
 const shipKey = loadShipKey(SHIP_KEY, SHIP_PUB, (line) => console.log(`[cain] link: ${line}`));
 const shipPriv = shipKey?.key ?? null;
+const trialKey = loadShipKey(TRIAL_KEY, TRIAL_PUB, (line) => console.log(`[cain] link: ${line}`), Date.now, "trial key");
+const trialPriv = trialKey?.key ?? null;
 
 // The deploy key: made once, never printed. No key: nothing lands in main.
 const deployKey = loadDeployKey(DEPLOY_KEY, (line) => console.log(`[cain] link: ${line}`));
@@ -245,6 +254,7 @@ const link = new Link({
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
+  signTrial: trialPriv ? (claim) => makeTrialToken(claim, (data) => edSign(null, data, trialPriv)) : undefined,
   land: deployKey ? async ({ pr, head, stopped }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };

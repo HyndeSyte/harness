@@ -38,6 +38,7 @@ backup: cold
 backup_exclude:
   - "link/deploy_key*"
   - "link/ship.key*"
+  - "link/trial.key*"
 timeout: 30
 # Keys, entered by Dane here, never shown or logged. github_token: the record
 # keeper's GitHub fine-grained token for the org repo only (Contents read and write).
@@ -75,6 +76,11 @@ timeout: 30
 # trials_run_allowance_usd (0.19.0, fourth round): the owner's say on paid trial runs, a total in dollars. A run, a
 # resume or the preflight starts only while what it would take (its cap) fits in what is left of it; a second run
 # beyond it is refused. Read only from these options (root's file). Default 0: no paid run until he sets it.
+# trials_anthropic_api_key, trials_gemini_api_key, trials_perplexity_api_key (0.19.0, fifth round): the model trials'
+# own keys, empty by default, each from a project or workspace of its own (a separate Anthropic workspace, Google AI
+# Studio project and Perplexity group) with its own hard spend limit no higher than the run allowance. Never the review
+# keys: every trial run and the preflight refuse while any is empty or equals the review key for that provider. Codex
+# uses its own ChatGPT sign-in.
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
 # "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
@@ -95,6 +101,9 @@ options:
   trials_research_rubric_sha256: ""
   trials_perplexity_third_party_routing: false
   trials_run_allowance_usd: 0
+  trials_anthropic_api_key: ""
+  trials_gemini_api_key: ""
+  trials_perplexity_api_key: ""
   owner_user_id: ""
   notice_hook: ""
   pc_jobs_token: ""
@@ -119,6 +128,9 @@ schema:
   trials_research_rubric_sha256: match(^([0-9a-f]{64})?$)?
   trials_perplexity_third_party_routing: bool
   trials_run_allowance_usd: float(0,500)
+  trials_anthropic_api_key: password?
+  trials_gemini_api_key: password?
+  trials_perplexity_api_key: password?
   owner_user_id: match(^([0-9a-f]{32})?$)?
   notice_hook: password?
   pc_jobs_token: password?

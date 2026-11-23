@@ -3,11 +3,11 @@
 ## 0.19.0
 
 - Cain can test which models suit which of your tasks, on real tasks, with `trial.sh`: a plan of every call, its limits and its most possible cost first, then the run, then a plain report.
-- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. It is a soft bound with a margin: the hard stop is a prepaid balance or a spend limit on the API keys in this App's options, which the trials share with reviews (DOCS.md says how).
+- A spend stop: one budget for every trial, its grading and its checks, the new option `trials_budget_usd` (default $40). Every request carries hard limits, and its most possible cost is set aside on disk before it is sent; a call that could pass the budget isn't made, the trial stops and says why. Only you raise it. It is a soft bound with a margin: the hard stop is a spending limit on the trials' own keys (DOCS.md says how).
 - Each task's grading is set aside before its first call, so a task is never left half graded.
 - Before any spend, near-free checks catch a model or setting a provider won't take; a model not offered is skipped and the report says why.
 - Your private terms are checked on every request exactly as it is sent, and on the search queries a provider says it ran; a hit stops the run and Cain hears of it.
-- Codex runs each trial call in an empty folder with no tools, no network and nothing of yours.
+- Codex runs each trial call in an empty folder with no tools and nothing of yours (it keeps its internet connection, which it needs to reach OpenAI).
 - Grading is blind: names and markers are taken out of every answer, two graders from different families score each answer, and neither grades its own family's answers.
 - Real reviews always go first: trials pause while one is waiting or running, and back off a seat that hit a rate limit.
 - The research questions run only once you have approved them and their answer notes, and Perplexity stays on its own model unless you approve otherwise.
@@ -25,6 +25,13 @@
 - The research questions and their notes are checked against your private list before Cain can even plan them, and the research grader only reads the exact pages named in the notes, with any tracking part of the address removed and PDFs left out.
 - Gemini's searches are allowed for generously in what a call could cost, then counted as Google reports them.
 - Cain still knows what the calendar specialist does to restore its history, and how it keeps its clock and tap journal straight across a restart, as the earlier rounds described: nothing about those changed here.
+- Every paid trial run, resume and preflight now needs your tap: Cain shows a card with what the run tests and the most it can cost, and only your "Allow this run" lets that one run of that exact plan start, within 2 hours. Your run allowance stays the ceiling over them all.
+- The trials have keys of their own: three new options, `trials_anthropic_api_key`, `trials_gemini_api_key` and `trials_perplexity_api_key`, empty to start. Nothing paid runs until all three are set, and never with the review keys. DOCS.md says how to make them, each with its own spending limit.
+- The Codex sandbox now holds a locked file that forbids web search, and its check also proves Codex can't read its own sign-in or its own settings.
+- The check after installing now counts only for 7 days and only while the trials code, Codex, the models and the trials options stay the same; a Gemini model whose check showed no thinking stays switched off.
+- The research grader may read only as many pages as the notes cite, each with a size cap, and that is set aside in the budget.
+- The record of what your allowance has granted is kept where only the trials runner can write it; if it goes missing, nothing more is granted until it is put right.
+- `trial.sh plan research` lists exactly what goes to outside search engines under "Sent to third-party search", and your tap covers that list.
 
 ## 0.18.1
 

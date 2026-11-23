@@ -34,7 +34,12 @@
 // trials_run_allowance_usd, read only from root's options file) covers every grant made so far plus this one. A
 // run's reservations and its task holds never pass its own cap. The allowance counts caps, not spend, so a second
 // run beyond it is refused even when the first spent less. Nothing the assistant's user can write adds a grant.
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, chownSync, chmodSync } from "node:fs";
+// Fifth round (Cain 0.19.0): the tally of granted caps lives in a file of its own, /data/trials/allowance.json, in the
+// runner's folder (root's, which Cain's user can only read), checked on every read to be a plain file owned by the
+// runner's uid that no one else can write. A tally that is missing or can't be read counts as fully spent: no grant is
+// made until it is put right. The one exception is a trials folder with no history at all (no budget.json, no
+// preflight.json): its first grant starts an empty tally.
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync, chownSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { ReviewSeatName } from "./core.ts";
@@ -48,10 +53,35 @@ export type Reservation = {
 export type Hold = { suite: string; run: string; task: string; usd: number; owner: string; at: string };
 export type Grant = { suite: string; run: string; cap_usd: number; at: string; allowance_usd: number };
 export type Budget = { format: 2; spent_usd: number; entries: BudgetEntry[]; reservations: Record<string, Reservation>; holds: Record<string, Hold>; grants?: Record<string, Grant> };
+export type Tally = { format: 1; grants: Record<string, Grant> };
+export const TALLY_FILE = "allowance.json";
+export const TALLY_SPENT = "the allowance tally is missing or can't be read, so the owner's allowance counts as fully spent";
+// The tally as the runner reads it: a plain file owned by uid, writable by its owner alone, opened without following a
+// link. missing: there is no file at all.
+export function readTally(path: string, uid: number): { ok: true; t: Tally } | { ok: false; missing: boolean; why: string } {
+  let fd: number;
+  try { fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)); }
+  catch (e: any) { return { ok: false, missing: e?.code === "ENOENT", why: e?.code === "ENOENT" ? "the allowance tally is missing" : "the allowance tally can't be opened" }; }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 1 << 20) return { ok: false, missing: false, why: "the allowance tally isn't a plain file" };
+    if (st.uid !== uid || (st.mode & 0o022)) return { ok: false, missing: false, why: "the allowance tally isn't the runner's alone" };
+    const j = JSON.parse(readFileSync(fd, "utf8"));
+    if (j?.format !== 1 || !j.grants || typeof j.grants !== "object" || Array.isArray(j.grants)) return { ok: false, missing: false, why: "the allowance tally is in a format this runner doesn't know" };
+    for (const g of Object.values<any>(j.grants)) if (!Number.isFinite(g?.cap_usd) || g.cap_usd < 0) return { ok: false, missing: false, why: "the allowance tally holds a grant that can't be read" };
+    return { ok: true, t: j as Tally };
+  } catch { return { ok: false, missing: false, why: "the allowance tally can't be read" }; }
+  finally { try { closeSync(fd); } catch { /* closed */ } }
+}
+// What has been granted, as anyone may read it (trial.sh): null when the tally can't be read (counts as fully spent).
+export function tallyGranted(dir: string): number | null {
+  try { const j = JSON.parse(readFileSync(join(dir, TALLY_FILE), "utf8")); if (j?.format !== 1 || !j.grants) return null; return round6(Object.values<any>(j.grants).reduce((a, g) => a + Number(g.cap_usd), 0)); }
+  catch { return null; }
+}
 
 const EMPTY = (): Budget => ({ format: 2, spent_usd: 0, entries: [], reservations: {}, holds: {}, grants: {} });
 // What the grants made so far add up to (caps, not spend).
-export const grantedOf = (b: Budget): number => round6(Object.values(b.grants ?? {}).reduce((a, g) => a + g.cap_usd, 0));
+export const grantedOf = (b: { grants?: Record<string, Grant> }): number => round6(Object.values(b.grants ?? {}).reduce((a, g) => a + g.cap_usd, 0));
 // What one run has spent, has out and holds.
 export function runCommitted(b: Budget, suite: string, run: string): number {
   return round6(b.entries.filter((e) => e.suite === suite && e.run === run).reduce((a, e) => a + e.usd, 0)
@@ -114,11 +144,20 @@ export function windowUse(b: Budget, seat: ReviewSeatName, sinceIso: string): { 
 }
 
 export class Ledger {
-  readonly path: string; readonly lockPath: string; readonly owner: string;
-  constructor(public dir: string, owner?: string, private now: () => Date = () => new Date()) {
+  readonly path: string; readonly lockPath: string; readonly owner: string; readonly tallyPath: string; readonly tallyUid: number;
+  constructor(public dir: string, owner?: string, private now: () => Date = () => new Date(), tallyUid?: number) {
     this.path = join(dir, "budget.json");
     this.lockPath = join(dir, "budget.lock");
+    this.tallyPath = join(dir, TALLY_FILE);
     this.owner = owner ?? ownerToken();
+    this.tallyUid = tallyUid ?? (process.getuid ? process.getuid() : 0);
+  }
+  // The tally, or why it counts as fully spent. A folder with no history at all starts an empty one.
+  private tally(): { ok: true; t: Tally } | { ok: false; why: string } {
+    const r = readTally(this.tallyPath, this.tallyUid);
+    if (r.ok) return r;
+    if ((r as { missing: boolean }).missing && !existsSync(this.path) && !existsSync(join(this.dir, "preflight.json"))) return { ok: true, t: { format: 1, grants: {} } };
+    return { ok: false, why: (r as { why: string }).why };
   }
   read(): Budget { return readBudgetFile(this.path); }
   private iso() { return this.now().toISOString(); }
@@ -252,8 +291,11 @@ export class Ledger {
   // an allowance the owner lowered stops resumes until he raises it again.
   grant(key: string, info: { suite: string; run: string }, capUsd: number, allowanceUsd: number): GrantResult {
     const allowance = Number.isFinite(allowanceUsd) && allowanceUsd > 0 ? allowanceUsd : 0;
-    const r = this.with<GrantResult>((b) => {
-      b.grants ??= {};
+    const r = this.with<GrantResult>(() => {
+      const tr = this.tally();
+      if (!tr.ok) return { value: { ok: false, reason: "allowance", detail: `${(tr as { why: string }).why}, so it counts as fully spent: no run is granted until it is put right (DOCS.md, the allowance tally)` }, write: false };
+      const b = (tr as { t: Tally }).t;
+      const save = () => writeDurable(this.tallyPath, JSON.stringify(b, null, 1));
       const granted = grantedOf(b);
       const have = b.grants[key];
       if (have) {
@@ -263,7 +305,8 @@ export class Ledger {
         if (want > have.cap_usd + 1e-9 && granted - have.cap_usd + want <= allowance + 1e-9) {
           const total = round6(granted - have.cap_usd + want);
           have.cap_usd = want; have.allowance_usd = allowance; have.at = this.iso();
-          return { value: { ok: true, cap: want, granted: total, fresh: false }, write: true };
+          save();
+          return { value: { ok: true, cap: want, granted: total, fresh: false }, write: false };
         }
         return { value: { ok: true, cap: have.cap_usd, granted, fresh: false }, write: false };
       }
@@ -271,11 +314,13 @@ export class Ledger {
       if (granted + cap > allowance + 1e-9) return { value: { ok: false, reason: "allowance",
         detail: `its cap is ${money(cap)}, and the owner's run allowance is ${money(allowance)} with ${money(granted)} already granted to earlier runs; only he raises it, in the App's options (trials_run_allowance_usd)` }, write: false };
       b.grants[key] = { ...info, cap_usd: cap, at: this.iso(), allowance_usd: allowance };
-      return { value: { ok: true, cap, granted: round6(granted + cap), fresh: true }, write: true };
+      save();
+      return { value: { ok: true, cap, granted: round6(granted + cap), fresh: true }, write: false };
     });
     return "busy" in r ? { ok: false, reason: "busy", detail: "the trials budget is locked by another process" } : r;
   }
-  grantOf(key: string): Grant | null { try { return this.read().grants?.[key] ?? null; } catch { return null; } }
+  // A run's grant, read from the tally (none when it can't be read: nothing more is sent).
+  grantOf(key: string): Grant | null { const r = readTally(this.tallyPath, this.tallyUid); return r.ok ? (r as { t: Tally }).t.grants[key] ?? null : null; }
   releaseHolds(pred: (key: string, h: Hold) => boolean): number {
     const r = this.with<number>((b) => {
       const keys = Object.keys(b.holds).filter((k) => pred(k, b.holds[k]));
