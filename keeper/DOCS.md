@@ -11,12 +11,12 @@ It watches Cain to start with (option `watch`).
 
 - Keeper watches and logs. It restores only for an install registered with your signed Ship token
   (below), whose backup it made and verified before it accepted the install (that App alone, at the
-  version being replaced, made without a password, after the token was issued), claimed by Cain's link as
+  version being replaced, protected with a key only Keeper holds (0.1.12), after the token was issued), claimed by Cain's link as
   the Ship run started (0.1.5), and it sends one restore call per install, never a second (0.1.5, below).
 - An unregistered version change is only logged and reported, never restored.
 - It can't be armed until both drills have rolled back for real on the device, the phone test drill is
   confirmed and (0.1.6) the missed-heartbeat drill is confirmed (the next job), and (0.1.7) you have entered
-  its Healthchecks read-only key (`hc-key`) and accepted its two accepted limits (`accept-limits`), so "Ship it
+  its Healthchecks read-only key (`hc-key`) and accepted its accepted limits (`accept-limits`, three since 0.1.12), so "Ship it
   with that risk" stays refused until then.
 
 ## What Keeper proves, and what it can't (0.1.3)
@@ -318,6 +318,30 @@ picks up an open install where it was, and judges at once a deadline that passed
 Keeper doesn't watch its own install, and an update of Keeper should wait while an install is open
 (it logs that if it is stopped meanwhile and resumes at its next start).
 
+## Keeper's backups are protected (0.1.12)
+
+Every backup Keeper makes of a watched App (Cain) is protected (encrypted) with a password only Keeper holds, as
+every other backup on the device is. The backup holds the App's `addon.json` (its options, which hold its tokens and
+keys) and its data folder, so an unprotected one would keep them in clear on the device's disk for as long as it is
+kept, where any App or sync that reads the backup folder could copy it. Keeper makes a new password for each backup
+(32 random bytes), keeps it root-only (0600) in `/data/backup-keys/<the backup's name>`, written whole through a
+temporary file with the fixed prefix `tmp-` in that folder, and never puts it in its options, its state or its log.
+It accepts the backup only when the Supervisor shows it as protected (`protected: true`), and its restore sends the
+same password. A backup whose key file is missing or unreadable is unusable, exactly like a missing backup: the install
+is "unprotected", paged once and never restored. When the cleanup deletes a backup it deletes its key file too, and at
+every start Keeper removes, and logs, a key file whose backup is gone (`removed the key file of backup "<name>" ...`);
+a key file is never deleted while its backup is kept. `backup_exclude` leaves `/data/backup-keys` and everything in
+it out of Keeper's own backups, and the backup check proves it on the device.
+
+What this means for you:
+- Home Assistant's backup page shows Keeper's backups as protected, and you can't open or restore them by hand: their
+  key is Keeper's alone. Home Assistant's own pre-install backup, protected with your key, stays your way back by hand.
+- If Keeper's data is lost (a reinstall of Keeper, or a restore of Keeper, since its backups leave the keys out),
+  Keeper can't restore from the backups it kept: each is then unusable, and an install it covered is "unprotected".
+- Keeper's own backup check test backup stays unprotected, since the check must read it: it holds Keeper's own
+  options in clear on the device's disk until it is deleted, right after the check and again at every start if the
+  check was interrupted.
+
 ## What a rollback loses
 
 The App's data written after the backup: a rollback restores the App's whole `/data` as it was in the
@@ -448,6 +472,10 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   match the Supervisor's (in bytes where given, else its MB figure), every entry and nested archive is read (tar and
   gzip; a zstd, xz or other member, an archive-named member that is neither gzip nor tar, an encrypted backup, a tar
   header whose checksum doesn't match and a truncated file all fail it), and the control must be found exactly once.
+  (0.1.12) It also writes a sentinel into the backup key store, `/data/backup-keys/backup-check-sentinel`, and into a
+  name there with its temporary prefix (`/data/backup-keys/tmp-<hex>`); both must be absent from the test backup like
+  the `hc-key` names, and no name under `backup-keys` may appear in it. The exclusion changed in 0.1.12, so an earlier
+  pass no longer counts: run the backup check again.
   Any read, format, size or traversal error fails it. A check that was interrupted counts as failed: at every start
   Keeper deletes its recorded test backup and any downloaded archive left behind, and logs it. A pass is tied to the
   exclusion this build ships (its hash); a build with another exclusion needs the check again.
@@ -577,8 +605,8 @@ Keeper before it counts as armed).
 
 ## Accepted limits
 
-Text version 5 (0.1.11). Version 4 was 0.1.10's, version 3 0.1.9's, version 2 0.1.8's and version 1 0.1.7's; an
-acceptance of any of them lapsed with 0.1.11. Two
+Text version 6 (0.1.12). Version 5 was 0.1.11's, version 4 0.1.10's, version 3 0.1.9's, version 2 0.1.8's and version 1
+0.1.7's; an acceptance of any of them lapsed with 0.1.12. Three
 limits of Keeper's design are recorded here rather than built around, and you accept them at the device: `bun
 /opt/keeper/main.ts accept-limits <code>` in Keeper's container, with the code Keeper prints at each start while they
 aren't accepted for this text version (`one-time code for accept-limits: ...`). Keeper records your acceptance with the
@@ -636,6 +664,14 @@ counts only until its own interval ends); and Keeper is unarmed while any drill 
 afterwards (Healthchecks or its channel silently stops delivering) goes unseen until the next drill. What you can do:
 set `drill_days` to 7 (weekly halves the window) and run the drills when reminded; keep Healthchecks' repeated
 reminders on; and treat a quiet phone during an install you are watching as a reason to look at Keeper's log.
+
+**3. Keeper's backups are protected with a key only Keeper holds (0.1.12).** Every backup Keeper makes of a watched App
+is protected with a password Keeper keeps in `/data/backup-keys`, left out of its own backups. Home Assistant's backup
+page shows them as protected and you can't open or restore them by hand; Home Assistant's own pre-install backup,
+protected with your key, stays your way back by hand. If Keeper's data is lost, Keeper can't restore from the backups
+it kept: each is unusable, and an install it covered is "unprotected", paged, never restored. Keeper's own backup check
+test backup stays unprotected (the check must read it), so it holds Keeper's own options in clear on the device's disk
+until it is deleted, right after the check and at every start after an interrupted one.
 
 ## Options
 
@@ -732,20 +768,24 @@ name), plus reading its own info (`/addons/self/info`), never manager, and no wr
 No Home Assistant API, no ingress, no page, no `/share`. (0.1.7) `host_network: false`, stated in `config.yaml`
 and held by a test: the container keeps its own network namespace, which is what keeps its loopback, and the
 confirm commands on it, to processes inside the container. `backup_exclude` leaves the kept Healthchecks key
-(`/data/hc-key`) out of backups of the App.
+(`/data/hc-key`) and (0.1.12) the backup key store (`/data/backup-keys`) out of backups of the App. (0.1.12) The backups
+Keeper makes of a watched App are protected with a password it passes to the Supervisor, and its restores pass it again.
 
 ## Restoring
 
 (0.1.9) A partial restore through Home Assistant's backup page (Settings, System, Backups, one App's backup) is the
 exercised path, and the one Keeper itself uses. A full restore of the whole Pi from a fresh Home Assistant is
 untested: none has been run with Keeper installed. After any restore of Keeper itself, its kept key and the old key's
-file are missing (backups leave them out), so enter the key again with `hc-key`.
+file are missing (backups leave them out), so enter the key again with `hc-key`. (0.1.12) The backup key store is
+missing too, so Keeper can't restore from any backup it kept before; Home Assistant's own pre-install backup, with your
+key, is the way back by hand.
 
 ## Still to check on the device
 
 None of this has run on the Pi yet. Owed there: the backup role makes a partial backup (with
 `background: false` its call answers once it is complete, within 4 minutes for Cain) and restores one; the
-backup info shows `protected: false` and a `date`; a restore's answer carries its job id and the jobs list
+backup info shows `protected: true` (0.1.12: Keeper's backups carry its own password) and a `date`, and a restore with
+that password works; a restore's answer carries its job id and the jobs list
 shows the restore job long enough to read its result; the drill's record of its restore job's name and
 how long it stayed listed (`restoreJob`, evidence only: 0.1.5 never resends); Healthchecks accepts
 the `/log` pings; the dead-man check pages when Keeper is stopped and when its poll loop stalls; the phone
@@ -771,4 +811,6 @@ and a full-Pi restore from a fresh Home Assistant (untested); (0.1.10) the backu
 Supervisor makes it (its layout, whether the App's archive is gzip, `size` and `size_bytes` in the backup info
 matching the download, the positive control found once), the old key's try answering exactly 401 or `wrong api key`
 once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
-challenge reaching Keeper within its 10 minutes; and the two drills (the next job).
+challenge reaching Keeper within its 10 minutes; (0.1.12) a backup made with Keeper's password shown as protected in the
+backup info and on Home Assistant's backup page, a partial restore of it with the same password, and the backup check
+passing with the backup key store's sentinels; and the two drills (the next job).

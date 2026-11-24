@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.12
+
+- Keeper's own backups of Cain are now protected with a key only Keeper holds, so his options and data are no longer kept in clear on the device's disk. Home Assistant's backup page shows them as protected, and you can't open them by hand: Home Assistant's own pre-install backup, with your key, stays your way back by hand.
+- If Keeper loses its data (a reinstall or a restore of Keeper), it can't roll back from the backups it kept, and an install it covered is reported to you once as not protected.
+- Keeper's backups leave out the folder where it keeps those keys, and the backup check now proves it. Run `backup-check` again before arming.
+- The "Accepted limits" text is now version 6, so you accept it again with `accept-limits`.
+
 ## 0.1.11
 
 - A backup that finished after Keeper stopped waiting for it is now kept for safety only: Keeper never rolls back from it, and an install that has only that backup is reported to you once as not protected.

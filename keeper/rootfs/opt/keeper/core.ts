@@ -196,7 +196,7 @@ export const PHONE_WINDOW_MS = 60 * 60_000;      // (0.1.3) a phone test is conf
 export const KEY_CODE_MS = 24 * 3_600_000;       // (0.1.6) the key-confirm code lasts this long (a restart prints a new one)
 export const MHB_MAX_MS = 14 * 86_400_000;       // (0.1.6) arming needs a missed-heartbeat drill confirmed within this
 export const MHB_CAP_MS = 30 * 60_000;           // (0.1.7) the missed-heartbeat drill's silence ends here at the latest
-export const LIMITS_VERSION = 5;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2; 0.1.9: 3; 0.1.10: 4; 0.1.11: 5)
+export const LIMITS_VERSION = 6;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2; 0.1.9: 3; 0.1.10: 4; 0.1.11: 5; 0.1.12: 6)
 export const LOCK_CALL_MS = 10_000;              // (0.1.8) each external call under the claim record's lock is bounded by this
 export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the lock that runs past this is logged and the lock released
 // (0.1.11) A step's external write whose outcome stays unknown holds the lock at most this long: then the write is marked late
@@ -215,7 +215,8 @@ export const FIRST_BACKUP_BYTES = 2 * 1024 ** 3;   // (0.1.10) the reserve floor
 export const ROTATION_CHALLENGE_MS = 10 * 60_000; // (0.1.10) a rotation challenge is good this long, and used once
 // (0.1.10) The backup exclusion as this build ships it (config.yaml backup_exclude, checked equal by the tests): a backup
 // check's pass is tied to its hash, so a change of the exclusion voids the pass.
-export const BACKUP_EXCLUDE = ["hc-key*", "*/hc-key*"];
+// 0.1.12: and the backup key store, backup-keys in the data folder, the folder and everything in it (its temporary files too).
+export const BACKUP_EXCLUDE = ["hc-key*", "*/hc-key*", "backup-keys", "*/backup-keys", "backup-keys/*", "*/backup-keys/*"];
 const globRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")}$`);
 export const excludedName = (name: string) => BACKUP_EXCLUDE.some((g) => globRe(g).test(name));
 export const EXCLUDE_HASH = createHash("sha256").update(JSON.stringify(BACKUP_EXCLUDE)).digest("hex").slice(0, 12);
@@ -238,7 +239,13 @@ export function revocation(r: { status: number; error?: string } | null): { stat
 // and the earlier builds' temporary names. config.yaml's backup_exclude covers every one ("hc-key*").
 export const KEY_FILE = "hc-key", OLD_KEY_FILE = "hc-key-old", KEY_TMP_PREFIX = "hc-key.tmp-";
 export const LEGACY_KEY_TMP = /^hc-key\.\d+\.[0-9a-f]{12}\.tmp$/;
-export const KEY_NAME = /(^|\/)hc-key/;
+// 0.1.12: a name in the backup key store is one too (the scan finds data/backup-keys and anything under it)
+export const KEY_NAME = /(^|\/)(hc-key|backup-keys(\/|$))/;
+// (0.1.12) The backup key store: one file per backup Keeper makes of a watched App, named by that backup's name, holding the
+// backup's password (BACKUP_KEY_BYTES random bytes, base64url), root-only, never in the options, the state or a log line. Its
+// temporary files have the fixed prefix BACKUP_KEY_TMP_PREFIX; the backup check's sentinel goes in BACKUP_KEY_SENTINEL there.
+export const BACKUP_KEYS_DIR = "backup-keys", BACKUP_KEY_TMP_PREFIX = "tmp-", BACKUP_KEY_SENTINEL = "backup-check-sentinel";
+export const BACKUP_KEY_BYTES = 32;
 // (0.1.9) Keeper's own backup name, bound to an attempt (with an 8 hex nonce); a backup check's own name.
 export const KEEPER_BACKUP = /^Keeper ((?:ship|drill)-\d{1,9}-[a-z0-9_]{1,64}-[0-9a-f]{8}) [0-9a-f]{8}$/;
 export const DRILL_DAYS_DEFAULT = 14;            // (0.1.8) option drill_days: how long a phone test and a missed-heartbeat drill count
@@ -634,8 +641,13 @@ export interface Deps {
   self: string;                                  // the keeper's own slug
   appInfo: (slug: string) => Promise<AppInfo | null>;
   backupInfo: (slug: string) => Promise<BackupInfo | null>;
-  makeBackup: (app: string, name: string) => Promise<{ slug: string } | { why: string }>;   // (0.1.3) that App alone, no password
-  restore: (backup: string, app: string) => Promise<RestoreResult>;
+  // (0.1.3) that App alone; 0.1.12: protected with password when one is given (every backup of a watched App; the backup
+  // check's test backup has none, so its scan can read it)
+  makeBackup: (app: string, name: string, password?: string) => Promise<{ slug: string } | { why: string }>;
+  restore: (backup: string, app: string, password?: string) => Promise<RestoreResult>;   // 0.1.12: with the backup's own password
+  // (0.1.12) the backup key store (/data/backup-keys): store writes a backup's password (0600, atomically), load reads it
+  // (null: missing or unreadable), drop removes it (true when a file was removed), list names every file there
+  backupKeys?: { store: (name: string, key: string) => boolean; load: (name: string) => string | null; drop: (name: string) => boolean; list: () => string[] };
   deleteBackup?: (backup: string) => Promise<boolean>;     // (0.1.6) an orphan backup's delete; false: not deleted
   backups?: () => Promise<{ slug: string; name: string }[] | null>;   // (0.1.7) the Supervisor's backups list; null: unreadable
   activeJobs?: (app: string) => Promise<string[] | null>;  // (0.1.7) active jobs on that App (0.1.8: every name, judged by jobsWhy); null: unreadable
@@ -1020,7 +1032,9 @@ export class Keeper {
       placed = kf.place(sentinel, skip);
       const roles: [string, (n: string) => boolean, boolean][] = [
         ["the key file", (n) => n === KEY_FILE, !!this.hcKey], ["the old key's file", (n) => n === OLD_KEY_FILE, !!oldKept],
-        ["a temporary file with the current prefix", (n) => n.startsWith(KEY_TMP_PREFIX), false], ["a temporary file with the legacy name", (n) => LEGACY_KEY_TMP.test(n), false]];
+        ["a temporary file with the current prefix", (n) => n.startsWith(KEY_TMP_PREFIX), false], ["a temporary file with the legacy name", (n) => LEGACY_KEY_TMP.test(n), false],
+        // (0.1.12) the backup key store, and a temporary file there
+        ["the backup key store", (n) => n === `${BACKUP_KEYS_DIR}/${BACKUP_KEY_SENTINEL}`, false], ["a temporary file in the backup key store", (n) => n.startsWith(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_TMP_PREFIX}`), false]];
       for (const [what, is, keptKey] of roles) {
         const n = placed.find(is);
         if (!n) { if (keptKey) continue; return this.backupCheckFailed(`the sentinel for ${what} wasn't written (nothing was placed under that name)`); }
@@ -1342,6 +1356,8 @@ export class Keeper {
         const when = this.cleanupDue ? "at start" : "the daily tick";
         this.cleanupDue = false;
         await this.record((f) => this.cleanup(when, f), () => undefined).catch(() => undefined);
+        // (0.1.12) at start: key files whose backup is gone
+        if (when === "at start") await this.record((f) => this.sweepBackupKeys(f), () => undefined).catch(() => undefined);
       }
       await this.readHc();
       await this.tickHeartbeat(now);
@@ -1585,8 +1601,13 @@ export class Keeper {
     const ready = await this.record((f) => this.prepareBackup(a, f), (why) => `Keeper's backup step failed (${why})`).catch((e) => `Keeper's backup step failed (${String(e).slice(0, 80)})`);
     if (ready) { this.backups.delete(a.id); return this.unprotected(a, ready); }
     if (a.status !== "verifying") { this.backups.delete(a.id); return; }
+    // (0.1.12) the backup's own password, kept in the backup key store before the call (never in the options, the state or a log)
+    const password = randomBytes(BACKUP_KEY_BYTES).toString("base64url");
+    let keptKey = false;
+    try { keptKey = !!this.d.backupKeys?.store(a.backupName!, password); } catch { keptKey = false; }
+    if (!keptKey) { this.backups.delete(a.id); return this.unprotected(a, `Keeper couldn't keep the key for its backup of ${a.app} (${BACKUP_KEYS_DIR}), so no backup was made`); }
     const timer = this.d.timer ?? ((ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); (t as any)?.unref?.(); }));
-    const made = Promise.resolve().then(() => this.d.makeBackup(a.app, a.backupName!)).catch((e) => ({ why: String((e as Error)?.message ?? e).slice(0, 80) }));
+    const made = Promise.resolve().then(() => this.d.makeBackup(a.app, a.backupName!, password)).catch((e) => ({ why: String((e as Error)?.message ?? e).slice(0, 80) }));
     const res = await Promise.race([made, timer(REGISTER_WAIT_MS).then(() => ({ late: true as const }))]);
     this.backups.delete(a.id);
     // (0.1.6) the slug it made is kept on the attempt at once, so a cancellation meanwhile keeps it bound
@@ -1617,7 +1638,8 @@ export class Keeper {
       : addons[0].slug !== a.app ? `its backup holds ${addons[0].slug}, not ${a.app}`
       : Array.isArray(b.folders) && b.folders.length ? "its backup holds folders"
       : addons[0].version !== a.from ? `its backup holds ${a.app} ${addons[0].version}, not ${a.from}`
-      : b.protected !== false ? "its backup isn't shown as made without a password (protected false), and the keeper restores only such a backup"
+      : b.protected !== true ? "its backup isn't shown as protected (protected true) with Keeper's own key, and the keeper restores only such a backup"
+      : !this.backupKey(a) ? `its backup's key file is missing or unreadable`
       : !Number.isFinite(made_at) ? "its backup's date can't be read"
       : made_at < (a.issuedAt ?? 0) - BACKUP_DATE_SKEW_MS || made_at < a.registeredAt - BACKUP_DATE_SKEW_MS ? "its backup is dated before the Ship token was issued"
       : null;
@@ -1746,7 +1768,7 @@ export class Keeper {
       if (!mine(r) || Object.values(this.st.attempts).some(busy)) { this.d.log(`the cleanup left backup ${slug}: its attempt, generation or claim changed`); continue; }
       const age = Math.round(since(r) / 3_600_000);
       await f.write(`the delete of kept backup ${slug}`, () => this.bounded(() => this.d.deleteBackup!(slug), `the delete of backup ${slug}`), (ok) => {
-        if (ok) { delete kept[slug]; x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); }
+        if (ok) { delete kept[slug]; x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); this.dropKey(r.name, "its backup was deleted"); }
         else this.d.log(`the cleanup couldn't delete kept backup ${slug} ("${r.name}"): tried again at the next cleanup`);
         this.save();
       });
@@ -1783,7 +1805,7 @@ export class Keeper {
         this.save();
       } else {
         await f.write(`the delete of late backup ${hit.slug}`, () => this.bounded(() => this.d.deleteBackup?.(hit.slug) ?? false, `the delete of backup ${hit.slug}`), (ok) => {
-          if (ok) { delete x.lateBackup; this.d.log(`${x.id}: its backup's create outran its bound and completed later as ${hit.slug} ("${x.backupName}") with no generation record: deleted`); }
+          if (ok) { delete x.lateBackup; this.d.log(`${x.id}: its backup's create outran its bound and completed later as ${hit.slug} ("${x.backupName}") with no generation record: deleted`); this.dropKey(x.backupName!, "its backup was deleted"); }
           else this.d.log(`${x.id}: couldn't delete its late backup ${hit.slug} ("${x.backupName}"): tried again under the next lock holder`);
           this.save();
         });
@@ -1796,6 +1818,7 @@ export class Keeper {
     if (!a.backup) return "it has none";
     if (a.backupDropped) return `its backup ${a.backup} was deleted`;
     if (a.retentionOnly && !a.lateProof) return `its only backup ${a.backup} was adopted late and is retention-only${this.lateProofs.get(a.id) ? `: ${this.lateProofs.get(a.id)}` : ""}`;
+    if (!this.backupKey(a)) return `its backup ${a.backup}'s key file is missing or unreadable`;   // (0.1.12) exactly like a missing backup
     return "";
   }
   // (0.1.11) The proof for a retention-only backup, both times read from the Supervisor (bounded): "" and lateProof set when the
@@ -1809,6 +1832,32 @@ export class Keeper {
     a.lateProof = { backupDoneAt: done!, installStartedAt: start! };
     this.d.log(`${a.id}: its late backup ${a.backup} completed at ${new Date(done!).toISOString()}, before the install job started at ${new Date(start!).toISOString()}: usable`);
     return "";
+  }
+  // (0.1.12) An attempt's backup password from the backup key store, by the backup's name; null when missing or unreadable.
+  private backupKey(a: Attempt): string | null {
+    if (!a.backupName || !this.d.backupKeys) return null;
+    try { const k = this.d.backupKeys.load(a.backupName); return typeof k === "string" && k.length >= 43 ? k : null; } catch { return null; }
+  }
+  // (0.1.12) A backup's key file removed (its backup deleted, or gone): logged by the backup's name, never the key.
+  private dropKey(name: string, why: string): void {
+    if (!name || !this.d.backupKeys) return;
+    try { if (this.d.backupKeys.drop(name)) this.d.log(`removed the key file of backup "${name}" (${why})`); }
+    catch (e) { this.d.log(`couldn't remove the key file of backup "${name}" (${String((e as Error)?.message ?? e).slice(0, 60)}): tried again at the next start`); }
+  }
+  // (0.1.12) At start, under the lock: a key file whose backup is gone from the backups list is removed and logged. Never one
+  // whose backup is listed, nor an open attempt's, a backup being made, or a late backup still looked for.
+  async sweepBackupKeys(f: Fence): Promise<void> {
+    const bk = this.d.backupKeys;
+    if (!bk) return;
+    let names: string[] = [];
+    try { names = bk.list(); } catch (e) { this.d.log(`couldn't list the backup key store: ${String((e as Error)?.message ?? e).slice(0, 60)}`); return; }
+    if (!names.length) return;
+    const list = this.d.backups ? await this.bounded(() => this.d.backups!(), "the Supervisor's backups list") : null;
+    if (!f.live()) return;
+    if (!list) { this.d.log("the backup key store wasn't swept: the backups list couldn't be read (tried again at the next start)"); return; }
+    const listed = new Set(list.map((b) => b.name));
+    const held = new Set(Object.values(this.st.attempts).filter((x) => x.backupName && (OPEN.includes(x.status) || this.backups.has(x.id) || (x.lateBackup && !x.backup))).map((x) => x.backupName!));
+    for (const n of names) if (!listed.has(n) && !held.has(n)) this.dropKey(n, "its backup is gone from the backups list");
   }
   // A registration left verifying by a restart (its backup's outcome unknown) is unprotected.
   private verifyLeft(a: Attempt): void {
@@ -1983,9 +2032,12 @@ export class Keeper {
     if (!r.called) {
       if (r.inflight || r.pending || r.tries > 0) return this.reconcile(a, info);   // (0.1.5) one call, ever
       if (now < r.nextTry) return;
+      // (0.1.12) the backup's own password; with none, the restore is never sent (exactly like a missing backup)
+      const password = this.backupKey(a);
+      if (!password) return this.unprotected(a, `its backup ${a.backup}'s key file is missing or unreadable, so it can't be restored`);
       r.inflight = true; r.tries++; r.sentAt = now; r.job = null; r.down = false; delete r.said;
       this.save();                                         // the fence, before the call
-      const res: RestoreResult = await this.d.restore(a.backup, a.app).catch((e) => ({ kind: "unknown" as const, why: String((e as Error)?.message ?? e).slice(0, 120) }));
+      const res: RestoreResult = await this.d.restore(a.backup, a.app, password).catch((e) => ({ kind: "unknown" as const, why: String((e as Error)?.message ?? e).slice(0, 120) }));
       const t = this.now();
       r.inflight = false;
       r.pending = true;

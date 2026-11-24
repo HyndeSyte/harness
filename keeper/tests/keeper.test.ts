@@ -5,16 +5,18 @@
 // only on its job's success; alert checks per App, the shared-success suppression, the dead-man check
 // and the phone test drill; no options write and no kept settings; local evidence only.
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { generateKeyPairSync, sign as edSign, type KeyObject } from "node:crypto";
 import { join } from "node:path";
 import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMIT_MS, REWIND_MS, WATCH_MS, ARMED_MAX_MS, PHONE_MAX_MS, LOOP_FRESH_MS, checkId, keyFp, optionsHash, parseOptions, readShipToken, shipKey,
   ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, MHB_CAP_MS, LIMITS_VERSION, PHONE_WINDOW_MS, DROP_TRIES,
   OLD_KEY_WHY, ENROLL_BEHIND, ENROLL_REFUSED, jobsWhy, CLEANUP_TICK_MS, KEPT_GRACE_MS, KEPT_MAX_MS, BACKUP_CHECK_WHY, OPTIONS_UNKNOWN_WHY, CODE_EPOCH,
-  EXCLUDE_HASH, BACKUP_EXCLUDE, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, excludedName,
+  EXCLUDE_HASH, BACKUP_EXCLUDE, KEY_NAME, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, excludedName,
   type AppInfo, type BackupInfo, type HcCheck, type JobState, type RestoreResult, type State } from "../rootfs/opt/keeper/core.ts";
-import { hcChecks, hcKeyStore, healthUrl, keyFiles, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
+import { backupKeys, hcChecks, hcKeyStore, healthUrl, keyFiles, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
+import { scanBackup } from "../rootfs/opt/keeper/scan.ts";
 import { handle, handleLocal, internal } from "../rootfs/opt/keeper/server.ts";
 
 const CAIN = "0fcc2575_cain";
@@ -78,14 +80,17 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   let now = T0;
   const logs: string[] = [];
   const pings: { url: string; body: string }[] = [];
-  const restores: { backup: string; app: string }[] = [];
+  const restores: { backup: string; app: string; password?: string }[] = [];
+  // (0.1.12) the backup key store (/data/backup-keys on the device): name to password, and each backup call's password
+  const keys = new Map<string, string>();
+  const passwords: (string | undefined)[] = [];
   const backupsMade: string[] = [];
   const jobCalls: string[] = [];
   const deleted: string[] = [];
   let saved: State | null = null;
   const app: AppInfo = { version: "0.16.0", state: "started" };
   const f = {
-    saveFails: false, deleteOk: true, free: 10 * 1024 ** 3 as number | null,
+    saveFails: false, deleteOk: true, keyStoreOk: true, keyLoadOk: true, free: 10 * 1024 ** 3 as number | null,
     // (0.1.7) the kept Healthchecks key (a file on the device), the backups list and the active install jobs
     hcKey: o.hcKey ?? "hc-read-key-0123456789", hcKeyWrites: 0, hcKeyWriteOk: true,
     backupsList: [] as { slug: string; name: string }[] | null, activeJobs: [] as string[] | null,
@@ -96,7 +101,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     timer: (_ms: number): Promise<void> => new Promise(() => {}),
     makeBackup: async (a: string): Promise<{ slug: string } | { why: string }> => ({ slug: `kb-${a.slice(-4)}` }),
     pingFails: (_url: string) => !f.pingOk,
-    backup: o.backup === null ? null : { homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: false, ...(o.backup ?? {}) } as BackupInfo | null,
+    backup: o.backup === null ? null : { homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: true, ...(o.backup ?? {}) } as BackupInfo | null,
     onRestore: () => { app.version = "0.16.0"; app.state = "started"; },
     options: {
       watch: [CAIN], health: [`${CAIN}=0fcc2575-cain:8098/ready`], tokens: [`${CAIN}=${TOKEN}`, `${HARNESS}=${HTOKEN}`],
@@ -108,9 +113,9 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     now: () => now, version: "0.1.0", self: "0fcc2575_keeper",
     appInfo: async (slug) => (f.infoUp && slug === CAIN ? { ...app } : null),
     backupInfo: async () => (f.backup ? { date: new Date(now).toISOString(), ...f.backup } : null),
-    makeBackup: async (a) => { backupsMade.push(a); return f.makeBackup(a); },
-    restore: async (backup, a) => {
-      restores.push({ backup, app: a });
+    makeBackup: async (a, _name, password) => { backupsMade.push(a); passwords.push(password); return f.makeBackup(a); },
+    restore: async (backup, a, password) => {
+      restores.push({ backup, app: a, ...(password === undefined ? {} : { password }) });
       const r = f.restoreQueue.shift();
       if (r) return r;
       const id = `job-${restores.length}`;
@@ -122,6 +127,8 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     backups: async () => f.backupsList,
     activeJobs: async () => f.activeJobs,
     diskFree: async () => f.free,
+    backupKeys: { store: (n, key) => { if (!f.keyStoreOk) return false; keys.set(n, key); return true; }, load: (n) => (f.keyLoadOk ? keys.get(n) ?? null : null),
+      drop: (n) => keys.delete(n), list: () => [...keys.keys()] },
     hcKeyStore: { load: () => f.hcKey, store: (key) => { f.hcKeyWrites++; if (!f.hcKeyWriteOk) return false; f.hcKey = key; return true; } },
     job: async (uuid) => { jobCalls.push(uuid); return f.jobsUp ? f.jobs[uuid] ?? { found: false } : null; },
     hcChecks: async () => { f.hcReads++; return f.hcUp ? hcList(f.options, f.hcOver) : null; },
@@ -143,7 +150,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   // (0.1.7) the owner's acceptance of the accepted limits, as at first setup
   if (o.limits !== false) k.acceptLimits(codeIn(logs, "accept-limits"));
   const r = {
-    k, f, logs, pings, restores, backupsMade, jobCalls, deleted, get saved() { return saved; },
+    k, f, logs, pings, restores, backupsMade, keys, passwords, jobCalls, deleted, get saved() { return saved; },
     get now() { return now; }, advance(ms: number) { now += ms; },
     // A registration as Cain's link sends it (POST /attempt, 202), then its poll (GET /attempt/<id>) once
     // the background backup settled (0.1.5): 200 with the acceptance, or 409 with the refusal.
@@ -406,7 +413,8 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     ["holds two Apps", { addons: [{ slug: CAIN, version: "0.16.0" }, { slug: "x", version: "1" }] }, "2 Apps"],
     ["holds folders", { folders: ["share"] }, "folders"],
     ["holds another version", { addons: [{ slug: CAIN, version: "0.15.0" }] }, "0.15.0, not 0.16.0"],
-    ["isn't shown as protected false", { protected: undefined }, "without a password"],
+    ["isn't shown as protected true", { protected: undefined }, "isn't shown as protected (protected true)"],
+    ["is shown as protected false (0.1.12: made without Keeper's key)", { protected: false }, "isn't shown as protected (protected true)"],
   ] as const) {
     test(`a backup that ${name} leaves the attempt unprotected`, async () => {
       const r = rig({ backup: backup as any }); await r.register();
@@ -428,7 +436,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
       if (path === "/addons/self/info") return ok({ slug: "0fcc2575_keeper", version: "0.1.3", options });
       if (path === `/addons/${CAIN}/info`) return ok(app);
       if (path === "/backups/new/partial") return ok({ slug: "kb1" });
-      if (path === "/backups/kb1/info") return ok({ homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: false, date: new Date(now).toISOString() });
+      if (path === "/backups/kb1/info") return ok({ homeassistant: null, addons: [{ slug: CAIN, version: "0.16.0" }], folders: [], protected: true, date: new Date(now).toISOString() });
       if (path === "/backups/kb1/restore/partial") { job = { name: "backup_manager_partial_restore", reference: "kb1", uuid: "j1", done: true, errors: [], child_jobs: [] }; app.version = "0.16.0"; app.state = "started"; return ok({ job_id: "j1" }); }
       if (path === "/jobs/info") return ok({ jobs: job ? [job] : [] });
       if (path === "/host/info") return ok({ disk_free: 20.5 });   // (0.1.9) the free-space reserve's read
@@ -437,8 +445,10 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     const sup = supervisor("t", "http://supervisor", http);
     let now = T0;
     const klogs: string[] = [];
+    // (0.1.12) the real backup key store, in a temporary data folder
+    const keyDir = join(mkdtempSync(join(tmpdir(), "keeper-bk-")), "backup-keys");
     const k = new Keeper({ now: () => now, version: "0.1.3", self: "0fcc2575_keeper", appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup,
-      restore: sup.restore, job: sup.job, live: async () => true, ready: async () => true, ping: async () => true, diskFree: sup.diskFree,
+      restore: sup.restore, job: sup.job, live: async () => true, ready: async () => true, ping: async () => true, diskFree: sup.diskFree, backupKeys: backupKeys(keyDir),
       options: () => sup.selfOptions(), save: () => {}, log: (l) => klogs.push(l) }, null);
     k.useOptions(options); k.start(); k.keyCode(); k.keyConfirm(keyFp(PUB), codeIn(klogs, "key-confirm"));
     const poll = async (n: number) => { for (let i = 0; i < n; i++) { await k.poll(); now += POLL_MS; } };
@@ -453,9 +463,15 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     const writes = calls.filter((c) => c.method !== "GET");
     expect(writes.map((c) => `${c.method} ${c.path}`)).toEqual(["POST /backups/new/partial", "POST /backups/kb1/restore/partial"]);
     expect(calls.some((c) => c.path === "/host/info")).toBe(true);   // (0.1.9) free space read before the backup
-    expect(writes[0].body).toEqual({ name: k.st.attempts[ID].backupName, addons: [CAIN], homeassistant: false, folders: [], background: false });
+    // (0.1.12) the backup is protected with a password of 32 random bytes (base64url), kept in its key file; the restore sends the same
+    const pw = String(writes[0].body.password ?? "");
+    expect(pw).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(readFileSync(join(keyDir, k.st.attempts[ID].backupName!), "utf8").trim()).toBe(pw);
+    expect(writes[0].body).toEqual({ name: k.st.attempts[ID].backupName, addons: [CAIN], homeassistant: false, folders: [], background: false, password: pw });
     expect(k.st.attempts[ID].backupName).toMatch(new RegExp(`^Keeper ${ID} [0-9a-f]{8}$`));   // (0.1.7) attempt-specific
-    expect(writes[1].body).toEqual({ homeassistant: false, addons: [CAIN], folders: [], background: true });
+    expect(writes[1].body).toEqual({ homeassistant: false, addons: [CAIN], folders: [], background: true, password: pw });
+    expect(klogs.some((l) => l.includes(pw))).toBe(false);
+    expect(JSON.stringify(k.st)).not.toContain(pw);
     expect(calls.some((c) => c.path.includes("options"))).toBe(false);
   });
   test("no code path names the options endpoint", () => {
@@ -482,7 +498,7 @@ describe("the watch", () => {
     await r.poll(WATCH_MS / POLL_MS + 2 + ROLL);
     expect(r.a().trigger?.kind).toBe("watch-end");
     expect(r.a().status).toBe("rolled back");
-    expect(r.restores).toEqual([{ backup: "kb-cain", app: CAIN }]);
+    expect(r.restores).toEqual([{ backup: "kb-cain", app: CAIN, password: r.keys.get(r.a().backupName!) }]);
   });
   test("a FAIL verdict, state error, or not started on two polls fails", async () => {
     let r = rig(); await failed(r); expect(r.a().status).toBe("restoring"); await r.poll(ROLL); expect(r.a().status).toBe("rolled back");
@@ -1559,7 +1575,7 @@ describe("0.1.7: the accepted limits", () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits")).replace(/\s+/g, " ");
     expect(sec.length).toBeGreaterThan(100);
-    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.11`);   // 0.1.8: version 2; 0.1.9: version 3; 0.1.10: version 4; 0.1.11: version 5
+    expect(sec).toContain(`Text version ${LIMITS_VERSION} (0.1.12`);   // 0.1.8: version 2; 0.1.9: version 3; 0.1.10: version 4; 0.1.11: version 5; 0.1.12: version 6
     expect(sec).toContain("an install of exactly the claimed version made");
     expect(sec).toContain("at the 14-day mark");
     expect(sec).toContain("never install from Home Assistant's page while a Ship run is live");
@@ -1811,24 +1827,24 @@ describe("0.1.7: orphan backups by their own name, and the network mode", () => 
 // -- 0.1.8 (the eighth review's fixes) -------------------------------------------------------------------
 const localCall = (r: ReturnType<typeof rig>, path: string, body: any = {}) =>
   handleLocal(r.k, new Request(`http://127.0.0.1:8096${path}`, { method: "POST", body: JSON.stringify(body) }), "127.0.0.1", () => {});
-describe("0.1.8: the accepted limits (text version 5 since 0.1.11)", () => {
-  test("the text is version 5, and an acceptance of version 2 lapses: a new code at start, not armed until accepted again", async () => {
-    expect(LIMITS_VERSION).toBe(5);
+describe("0.1.8: the accepted limits (text version 6 since 0.1.12)", () => {
+  test("the text is version 6, and an acceptance of version 2 lapses: a new code at start, not armed until accepted again", async () => {
+    expect(LIMITS_VERSION).toBe(6);
     const r = await armedRig();
     const saved = JSON.parse(JSON.stringify(r.saved));
     saved.limits = { version: 2, at: T0 };
     const again = rig({ saved, limits: false });
-    expect(again.logs.some((l) => l.startsWith("the accepted limits' text changed (version 2 accepted, now 5)"))).toBe(true);
+    expect(again.logs.some((l) => l.startsWith("the accepted limits' text changed (version 2 accepted, now 6)"))).toBe(true);
     expect(again.k.limitsOk()).toBe(false);
-    expect(again.k.armedState(CAIN).why).toBe("the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version 5): accept-limits <code>");
+    expect(again.k.armedState(CAIN).why).toBe("the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version 6): accept-limits <code>");
     expect(again.k.acceptLimits(again.code("accept-limits" as any)).ok).toBe(true);
-    expect(again.k.st.limits!.version).toBe(5);
+    expect(again.k.st.limits!.version).toBe(6);
   });
   test("the DOCS' text carries each statement of both limits", () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options")).replace(/\s+/g, " ");
     for (const t of [
-      "Text version 5 (0.1.11)",
+      "Text version 6 (0.1.12)",
       // the installer limit
       "refuses after two silences, or whose cancel is lost, leaves a live claim on the keeper for up to 30 minutes with no Ship run live",
       "never install from Home Assistant's page while a Ship run is live, or until the keeper's log shows no live claim (up to 30 minutes after a refused or failed run)",
@@ -2096,6 +2112,7 @@ describe("0.1.8: the counter, re-enrollment and key-code", () => {
 
 // -- 0.1.9 (the ninth review's fixes, a scoped round) -----------------------------------------------------
 // A tar archive as the Supervisor's backups hold them (ustar headers), for the backup check's scan.
+// (0.1.12) a name ending in "/" is a folder entry (type 5)
 function tarOf(entries: [string, string | Uint8Array][]): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const [name, body] of entries) {
@@ -2103,7 +2120,7 @@ function tarOf(entries: [string, string | Uint8Array][]): Uint8Array {
     const h = new Uint8Array(512);
     const put = (s: string, off: number) => h.set(new TextEncoder().encode(s), off);
     put(name, 0); put("0000600\0", 100); put("0000000\0", 108); put("0000000\0", 116);
-    put(data.length.toString(8).padStart(11, "0") + "\0", 124); put("00000000000\0", 136); put("        ", 148); put("0", 156); put("ustar\0", 257); put("00", 263);
+    put(data.length.toString(8).padStart(11, "0") + "\0", 124); put("00000000000\0", 136); put("        ", 148); put(name.endsWith("/") ? "5" : "0", 156); put("ustar\0", 257); put("00", 263);
     const sum = h.reduce((a, b) => a + b, 0);
     put(sum.toString(8).padStart(6, "0") + "\0 ", 148);
     parts.push(h, data, new Uint8Array((512 - (data.length % 512)) % 512));
@@ -2339,7 +2356,7 @@ function checkRig(archive: (sentinel: string, control: string) => Uint8Array | n
   const r = rig({ backupCheck: false });
   const files: Record<string, string> = {};
   let sentinel = "", control = "", cleared = false, bytes: Uint8Array | null | undefined;
-  const placedNames = ["hc-key", "hc-key-old", "hc-key.tmp-aa", LEGACY_TMP];
+  const placedNames = ["hc-key", "hc-key-old", "hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa"];
   const got = () => (bytes === undefined ? (bytes = archive(sentinel, control)) : bytes);
   (r.k as any).d.keyFiles = {
     place: (sv: string, skip: string[] = []) => { sentinel = sv; const out = placedNames.filter((n) => !skip.includes(n)); for (const n of out) files[n] = sv; return out; },
@@ -2364,7 +2381,7 @@ describe("0.1.9 C: the guards as hard refusals", () => {
     const c = checkRig((_s, ctl) => haBackup(goodFiles(ctl)));
     expect(await c.r.k.backupCheck()).toEqual({ ok: true, why: "" });
     // the kept key's own file (hc-key) is never written over: its value is searched for instead
-    expect(c.r.k.st.backupCheck?.names).toEqual(["hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp"]);
+    expect(c.r.k.st.backupCheck?.names).toEqual(["hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp", "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa"]);
     expect(c.r.k.st.backupCheck?.exclude).toBe(EXCLUDE_HASH);
     expect(c.cleared).toBe(true);
     expect(c.r.backupsMade).toEqual(["0fcc2575_keeper"]);
@@ -2566,7 +2583,7 @@ describe("0.1.10 item 1: the backup check fails closed", () => {
     (k.r.k as any).d.oldKeyStore = { load: () => "old-key-0123456789abcdef", store: () => true, drop: () => {}, name: "hc-key-old" };
     expect((await k.r.k.backupCheck()).ok).toBe(true);
     expect(placedSkip).toEqual(["hc-key", "hc-key-old"]);
-    expect(k.r.k.st.backupCheck!.names).toEqual(["hc-key.tmp-aa", LEGACY_TMP]);
+    expect(k.r.k.st.backupCheck!.names).toEqual(["hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa"]);
     // and its value is searched for: a backup holding it fails
     const v = checkRig((_s, ctl) => haBackup([...goodFiles(ctl), ["./data/x", "old-key-0123456789abcdef"]]));
     (v.r.k as any).d.oldKeyStore = { load: () => "old-key-0123456789abcdef", store: () => true, drop: () => {}, name: "hc-key-old" };
@@ -2843,10 +2860,10 @@ describe("0.1.10 item 7: the watch takes only its own attempt's install, and the
     expect(ok.a().status).toBe("watching");
   });
   test("the text (version 4 in 0.1.10): the Ship token's life outside the hook, and the watch's own attempt and generation", () => {
-    expect(LIMITS_VERSION).toBe(5);
+    expect(LIMITS_VERSION).toBe(6);
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options")).replace(/\s+/g, " ");
-    expect(sec).toContain("Text version 5 (0.1.11)");
+    expect(sec).toContain("Text version 6 (0.1.12)");
     expect(sec).toContain("stays valid by its signature for its 2 hours outside the hook, and only the hook marks it spent");
     expect(sec).toContain("The watch accepts only an install matching its own attempt and generation");
   });
@@ -3003,5 +3020,236 @@ describe("0.1.11 item 5: an install the watch can't take as its own pages the ow
     expect(r.a().status).toBe("unprotected");
     expect(String(r.a().why)).toContain("has no usable backup (its backup kb-cain was deleted)");
     expect(pagesWith(r, "has no usable backup")).toBe(1);
+  });
+});
+
+// -- 0.1.12 (round 13) ---------------------------------------------------------------------------------------
+describe("0.1.12 item 1: Keeper's backups of a watched App are protected with a key only Keeper holds", () => {
+  test("the create carries a fresh password (32 random bytes, base64url), kept under the backup's name; the info must say protected true", async () => {
+    const r = rig();
+    expect((await r.register()).status).toBe(200);
+    const pw = r.passwords[0]!;
+    expect(pw).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(Buffer.from(pw, "base64url")).toHaveLength(32);
+    expect(r.keys.get(r.a().backupName!)).toBe(pw);
+    const r2 = rig(); await r2.register({ head: headN(2) });
+    expect(r2.passwords[0]).not.toBe(pw);                  // one per backup
+    const bare = rig({ backup: { protected: false } });
+    expect((await bare.register()).status).toBe(409);
+    expect(bare.a().why).toBe("its backup isn't shown as protected (protected true) with Keeper's own key, and the keeper restores only such a backup");
+    bare.install("error"); await bare.poll(5);
+    expect(bare.restores).toEqual([]);
+  });
+  test("a key that can't be kept: no backup is made, the install is unprotected", async () => {
+    const r = rig();
+    r.f.keyStoreOk = false;
+    expect((await r.register()).status).toBe(409);
+    expect(r.backupsMade).toEqual([]);
+    expect(r.a().why).toContain("Keeper couldn't keep the key for its backup");
+  });
+  test("the restore carries the same password", async () => {
+    const r = rig();
+    await watching(r);
+    r.verdict("FAIL"); await r.poll(ROLL);
+    expect(r.a().status).toBe("rolled back");
+    expect(r.restores).toEqual([{ backup: "kb-cain", app: CAIN, password: r.passwords[0] }]);
+  });
+  test("a missing or unreadable key file makes the attempt unprotected, paged once, never restored", async () => {
+    for (const how of ["missing", "unreadable"] as const) {
+      const r = rig();
+      await r.register(); await r.poll(); r.claim();
+      if (how === "missing") r.keys.clear(); else r.f.keyLoadOk = false;
+      r.install("error"); await r.poll(); await r.poll(5);
+      expect([how, r.a().status]).toEqual([how, "unprotected"]);
+      expect(String(r.a().why)).toContain("key file is missing or unreadable");
+      expect(r.restores).toEqual([]);
+      expect(pagesWith(r, "key file is missing or unreadable")).toBe(1);
+    }
+    // lost after the restore was decided: still never sent
+    const late = rig();
+    await watching(late);
+    late.verdict("FAIL");
+    late.keys.clear();
+    await late.poll(ROLL);
+    expect(late.restores).toEqual([]);
+    expect(late.a().status).toBe("unprotected");
+    expect(pagesWith(late, "key file is missing or unreadable")).toBe(1);
+  });
+  test("the cleanup deletes a backup's key file with the backup; a kept backup's key stays", async () => {
+    const r = rig();
+    r.f.makeBackup = async () => ({ slug: `kb-${r.backupsMade.length}` });
+    await r.register(); await r.poll();
+    await r.k.cancel(CAIN, ID, { why: "gave up" });
+    const a = r.a();
+    r.f.backupsList = [{ slug: a.backup, name: a.backupName! }];
+    r.advance(3 * 3_600_000); r.k.st.cleanupAt = r.now - CLEANUP_TICK_MS; await r.poll();
+    expect(r.deleted).toEqual([]);
+    expect(r.keys.has(a.backupName!)).toBe(true);           // kept: its key stays
+    r.advance(49 * 3_600_000); r.k.st.cleanupAt = r.now - CLEANUP_TICK_MS; await r.poll();
+    expect(r.deleted).toEqual([a.backup]);
+    expect(r.keys.has(a.backupName!)).toBe(false);
+    expect(r.logs).toContain(`removed the key file of backup "${a.backupName}" (its backup was deleted)`);
+  });
+  test("at start a key file whose backup is gone is removed and logged; one whose backup is listed stays", async () => {
+    const r = rig();
+    const gone = "Keeper ship-46-cain-00000001 0a0b0c0d", listed = "Keeper ship-46-cain-00000002 0a0b0c0e";
+    r.keys.set(gone, "x".repeat(43)); r.keys.set(listed, "y".repeat(43)); r.keys.set("tmp-0a1b2c", "z".repeat(43));
+    r.f.backupsList = [{ slug: "kb-2", name: listed }];
+    await r.poll();
+    expect([...r.keys.keys()]).toEqual([listed]);
+    expect(r.logs).toContain(`removed the key file of backup "${gone}" (its backup is gone from the backups list)`);
+    expect(r.logs).toContain(`removed the key file of backup "tmp-0a1b2c" (its backup is gone from the backups list)`);
+    expect(r.logs.some((l) => l.includes("x".repeat(43)))).toBe(false);
+    // the backups list unreadable: nothing is removed
+    const u = rig();
+    u.keys.set(gone, "x".repeat(43)); u.f.backupsList = null;
+    await u.poll();
+    expect(u.keys.has(gone)).toBe(true);
+    expect(u.logs).toContain("the backup key store wasn't swept: the backups list couldn't be read (tried again at the next start)");
+    // only at start: a later poll leaves a new key file alone
+    r.keys.set(gone, "x".repeat(43)); await r.poll(3);
+    expect(r.keys.has(gone)).toBe(true);
+  });
+  test("the password never appears in a log line or a state write", async () => {
+    const r = rig();
+    const states: string[] = [];
+    const save = (r.k as any).d.save;
+    (r.k as any).d.save = (s: State) => { states.push(JSON.stringify(s)); return save(s); };
+    await watching(r);
+    r.verdict("FAIL"); await r.poll(ROLL);
+    expect(r.a().status).toBe("rolled back");
+    const pw = r.passwords[0]!;
+    expect(states.length).toBeGreaterThan(3);
+    expect(states.some((s) => s.includes(pw))).toBe(false);
+    expect(r.logs.some((l) => l.includes(pw))).toBe(false);
+    expect(r.pings.some((p) => p.body.includes(pw))).toBe(false);
+  });
+  test("the real key store: 0600 from its first byte through a tmp- file in the same folder, a 0700 folder, nothing left behind", async () => {
+    const { statSync, readdirSync } = await import("node:fs");
+    const dir = join(mkdtempSync(join(tmpdir(), "keeper-keys-")), "backup-keys");
+    const temps: string[] = [];
+    const st = backupKeys(dir, (tmp) => { temps.push(tmp); expect(statSync(tmp).mode & 0o777).toBe(0o600); });
+    const name = "Keeper ship-46-cain-7d7b5f90 0a0b0c0d";
+    expect(st.load(name)).toBeNull();
+    expect(st.store(name, "k".repeat(43))).toBe(true);
+    expect(temps).toHaveLength(1);
+    expect(temps[0].startsWith(join(dir, "tmp-"))).toBe(true);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(join(dir, name)).mode & 0o777).toBe(0o600);
+    expect(st.load(name)).toBe("k".repeat(43));
+    expect(readdirSync(dir)).toEqual([name]);
+    expect(st.list()).toEqual([name]);
+    for (const bad of ["../x", "a/b", "", "tmp-x"]) expect(st.store(bad, "k".repeat(43))).toBe(false);
+    expect(st.drop(name)).toBe(true);
+    expect(st.drop(name)).toBe(false);
+    expect(st.load(name)).toBeNull();
+  });
+});
+
+describe("0.1.12 item 2: the backup check covers the key store", () => {
+  test("the real keyFiles place a sentinel in backup-keys under its fixed name and its temporary prefix, read them back and sweep them", async () => {
+    const { readdirSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "keeper-kf-"));
+    mkdirSync(join(dir, "backup-keys"));
+    writeFileSync(join(dir, "backup-keys", "Keeper ship-46-cain-7d7b5f90 0a0b0c0d"), "real\n");
+    const kf = keyFiles(dir);
+    const placed = kf.place("keeper-sentinel-abc");
+    expect(placed).toContain("backup-keys/backup-check-sentinel");
+    expect(placed.some((n) => /^backup-keys\/tmp-[0-9a-f]{12}$/.test(n))).toBe(true);
+    for (const n of placed) expect([n, kf.read(n)]).toEqual([n, "keeper-sentinel-abc"]);
+    expect(kf.read("../etc/passwd")).toBeNull();
+    // an interrupted check's sentinels are swept at start; a backup's real key never
+    const swept = kf.sweep();
+    expect(swept).toEqual(expect.arrayContaining(placed.filter((n) => n.startsWith("backup-keys/"))));
+    expect(readdirSync(join(dir, "backup-keys"))).toEqual(["Keeper ship-46-cain-7d7b5f90 0a0b0c0d"]);
+  });
+  test("the check fails when the key store's sentinel isn't placed, or a name under backup-keys is in the test backup", async () => {
+    const c = checkRig((_s, ctl) => haBackup(goodFiles(ctl)));
+    const kf = (c.r.k as any).d.keyFiles;
+    const place = kf.place;
+    kf.place = (sv: string, skip: string[] = []) => place(sv, skip).filter((n: string) => n !== "backup-keys/backup-check-sentinel");
+    expect((await c.r.k.backupCheck()).why).toBe("the sentinel for the backup key store wasn't written (nothing was placed under that name)");
+    const t = checkRig((_s, ctl) => haBackup(goodFiles(ctl)));
+    const tk = (t.r.k as any).d.keyFiles; const tplace = tk.place;
+    tk.place = (sv: string, skip: string[] = []) => tplace(sv, skip).filter((n: string) => !n.startsWith("backup-keys/tmp-"));
+    expect((await t.r.k.backupCheck()).why).toBe("the sentinel for a temporary file in the backup key store wasn't written (nothing was placed under that name)");
+    for (const name of ["./data/backup-keys/", "./data/backup-keys/Keeper ship-46-cain-7d7b5f90 0a0b0c0d", "./data/backup-keys/tmp-0a1b2c"]) {
+      const b = checkRig((_s, ctl) => haBackup([...goodFiles(ctl), [name, name.endsWith("/") ? "" : "a-password-of-sorts"]]));
+      const res = await b.r.k.backupCheck();
+      expect([name, res.ok]).toEqual([name, false]);
+      expect(res.why).toContain("is a key file's name");
+    }
+  });
+});
+
+describe("0.1.12 item 3: the scan on the device's real backup layout", () => {
+  // A Supervisor backup of one App: an outer plain tar with ./backup.json in clear and ./<slug>.tar.gz, a gzip tar holding
+  // addon.json and data/ (the exclusion filters only inside data/ and config/, never addon.json).
+  const SLUG = "0fcc2575_keeper";
+  const backupJson = (over: any = {}) => JSON.stringify({ slug: "3c4d5e6f", name: "Keeper backup check 0a0b0c0d", date: "2026-11-23T10:00:00+00:00", type: "partial",
+    protected: false, compressed: true, homeassistant: null, folders: [], addons: [{ slug: SLUG, name: "Keeper", version: "0.1.12", size: 0.01 }], ...over });
+  const inner = (ctl: string, extra: [string, string][] = []) => gzipSync(tarOf([["./addon.json", JSON.stringify({ version: "0.1.12", options: { watch: [CAIN] }, state: "started" })],
+    ["./data/", ""], ["./data/state.json", "{\"format\":1}"], ["./data/options.json", "{\"watch\":[]}"], [`./data/${"backup-check-control"}`, `${ctl}\n`], ...extra]));
+  const outer = (ctl: string, o: { json?: any; member?: Uint8Array; extra?: [string, string][] } = {}) =>
+    tarOf([["./backup.json", backupJson(o.json)], [`./${SLUG}.tar.gz`, o.member ?? inner(ctl, o.extra)]]);
+  const CTL = "keeper-control-0123456789abcdef01234567";
+  test("a pass: the control found once, no key names, addon.json read", () => {
+    const res = scanBackup(outer(CTL), KEY_NAME, ["keeper-sentinel-0123456789abcdef"], { control: CTL });
+    expect(res).toMatchObject({ ok: true, why: "", control: 1, found: [] });
+    expect(res.names).toContain(`./${SLUG}.tar.gz:./addon.json`);
+    expect(res.names).toContain(`./${SLUG}.tar.gz:./data/backup-check-control`);
+  });
+  test("a fail when backup.json says protected true", () => {
+    expect(scanBackup(outer(CTL, { json: { protected: true } }), KEY_NAME, [], { control: CTL }).why).toContain("says the backup is protected");
+  });
+  test("a fail when the App's inner archive is neither gzip nor tar (as an encrypted SecureTar member is)", () => {
+    const secure = new Uint8Array(4096); for (let i = 0; i < secure.length; i++) secure[i] = (i * 151 + 7) % 251;
+    secure.set(new TextEncoder().encode("SecureTar"), 0);
+    expect(scanBackup(outer(CTL, { member: secure }), KEY_NAME, [], { control: CTL }).why).toContain("is named as an archive but is neither gzip nor tar");
+  });
+  test("a fail when a key name appears under data/", () => {
+    for (const n of ["./data/hc-key", "./data/backup-keys/Keeper ship-46-cain-7d7b5f90 0a0b0c0d", "./data/backup-keys/tmp-0a"]) {
+      const res = scanBackup(outer(CTL, { extra: [[n, "x"]] }), KEY_NAME, [], { control: CTL });
+      expect([n, res.ok]).toEqual([n, false]);
+      expect(res.why).toContain("is a key file's name");
+    }
+  });
+  test("the size: the Supervisor's size_bytes preferred when present, else size in MB", async () => {
+    const n = 3 * 1024 * 1024 + 17;
+    expect(Keeper.sizeWhy(n, { homeassistant: null, addons: [], folders: [], sizeBytes: n, sizeMb: 99 })).toBe("");
+    expect(Keeper.sizeWhy(n, { homeassistant: null, addons: [], folders: [], sizeBytes: n + 1, sizeMb: 3 })).toContain(`but the Supervisor reports ${n + 1}`);
+    expect(Keeper.sizeWhy(n, { homeassistant: null, addons: [], folders: [], sizeMb: 3 })).toBe("");
+    expect(Keeper.sizeWhy(n, { homeassistant: null, addons: [], folders: [], sizeMb: 3.5 })).toContain("MB, but the Supervisor reports 3.5 MB");
+    // as the Supervisor's backup info gives them
+    const info = (data: any) => supervisor("t", "http://s", async () => new Response(JSON.stringify({ result: "ok", data }), { status: 200 })).backupInfo("x");
+    const both = await info({ size: 3, size_bytes: n, protected: true, addons: [], folders: [] });
+    expect(Keeper.sizeWhy(n, both)).toBe("");
+    expect(both!.protected).toBe(true);
+    const mbOnly = await info({ size: 3, protected: false, addons: [], folders: [] });
+    expect(mbOnly!.sizeBytes).toBeUndefined();
+    expect(Keeper.sizeWhy(n, mbOnly)).toBe("");
+  });
+});
+
+describe("0.1.12 item 4: the docs and the limits", () => {
+  const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8").replace(/\s+/g, " ");
+  test("DOCS.md says Keeper's backups are protected with its own key, what that means for the owner, and the check's test backup", () => {
+    for (const t of [
+      "Every backup Keeper makes of a watched App (Cain) is protected (encrypted) with a password only Keeper holds",
+      "Home Assistant's backup page shows Keeper's backups as protected, and you can't open or restore them by hand",
+      "Home Assistant's own pre-install backup, protected with your key, stays your way back by hand",
+      "If Keeper's data is lost",
+      "Keeper can't restore from the backups it kept",
+      "it holds Keeper's own options in clear on the device's disk until it is deleted, right after the check and again at every start",
+      "`/data/backup-keys`",
+    ]) expect(docs).toContain(t);
+  });
+  test("the accepted limits are text version 6 and carry the third limit", () => {
+    expect(LIMITS_VERSION).toBe(6);
+    const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options"));
+    expect(sec).toContain("Text version 6 (0.1.12)");
+    expect(sec).toContain("**3. Keeper's backups are protected with a key only Keeper holds (0.1.12).**");
+    expect(sec).toContain("If Keeper's data is lost, Keeper can't restore from the backups it kept");
+    expect(sec).toContain("test backup stays unprotected");
   });
 });

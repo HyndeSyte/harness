@@ -45,10 +45,11 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
         folders: Array.isArray(r.data.folders) ? r.data.folders : [], protected: r.data.protected, ...(typeof r.data.date === "string" ? { date: r.data.date } : {}) };
     },
     // (0.1.3) The keeper's own backup of one App: partial, that App alone, no Home Assistant, no folders,
-    // no password, and background false, so the call answers once the backup is complete, with its slug.
-    async makeBackup(app: string, name: string): Promise<{ slug: string } | { why: string }> {
+    // and background false, so the call answers once the backup is complete, with its slug. 0.1.12: protected with password
+    // when one is given (every backup of a watched App, its key kept by Keeper alone); none only for the backup check's test backup.
+    async makeBackup(app: string, name: string, password?: string): Promise<{ slug: string } | { why: string }> {
       try {
-        const r = await call("POST", "/backups/new/partial", { name, addons: [app], homeassistant: false, folders: [], background: false }, BACKUP_CALL_MS);
+        const r = await call("POST", "/backups/new/partial", { name, addons: [app], homeassistant: false, folders: [], background: false, ...(password ? { password } : {}) }, BACKUP_CALL_MS);
         if (r.ok && typeof r.data?.slug === "string" && r.data.slug) return { slug: r.data.slug };
         return { why: `${r.status}${r.message ? ` ${r.message}` : ""}` };
       } catch (e) {
@@ -60,9 +61,10 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
     // started, with its id, which the keeper keeps before anything else. A 4xx is reported as a refusal,
     // a 5xx, no answer, or a 2xx that isn't a result as "unknown"; 0.1.5: core.ts sends neither again,
     // ever (nothing proves a refused call had no effect).
-    async restore(backup: string, app: string): Promise<RestoreResult> {
+    // 0.1.12: with the backup's own password (Keeper's backups are protected).
+    async restore(backup: string, app: string, password?: string): Promise<RestoreResult> {
       try {
-        const r = await call("POST", `/backups/${encodeURIComponent(backup)}/restore/partial`, { homeassistant: false, addons: [app], folders: [], background: true }, 120_000);
+        const r = await call("POST", `/backups/${encodeURIComponent(backup)}/restore/partial`, { homeassistant: false, addons: [app], folders: [], background: true, ...(password ? { password } : {}) }, 120_000);
         if (r.ok) return { kind: "started", job: typeof r.data?.job_id === "string" && r.data.job_id ? r.data.job_id : null };
         if (r.status >= 400 && r.status < 500) return { kind: "refused", status: r.status, retry: ![401, 403, 404].includes(r.status), why: `${r.status}${r.message ? ` ${r.message}` : ""}` };
         return { kind: "unknown", why: `${r.status}${r.status >= 500 ? " a server error, after which it may have run" : " an answer that isn't a result"}` };

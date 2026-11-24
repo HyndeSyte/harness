@@ -20,10 +20,10 @@
 // The owner's commands go to the loopback listener (127.0.0.1:8096), never the App network's (0.1.6).
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
-import { closeSync, constants as FS, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants as FS, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { CHECK_CONTROL_FILE, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
+import { BACKUP_KEY_SENTINEL, BACKUP_KEY_TMP_PREFIX, BACKUP_KEYS_DIR, CHECK_CONTROL_FILE, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -46,6 +46,27 @@ export function hcKeyStore(path = HC_KEY_FILE, onTemp?: (tmp: string) => void) {
     store: (key: string): boolean => { try { writeWhole(path, `${key}\n`, onTemp, keyTmp(path)); return true; } catch { return false; } },
   };
 }
+// (0.1.12) The backup key store: one root-only file per backup Keeper makes of a watched App, named by the backup's name, holding
+// its password, in a root-only folder (0700) the backup exclusion leaves out (config.yaml backup_exclude: backup-keys and
+// everything in it). Written whole (writeWhole: a temporary file with the fixed prefix tmp- in the same folder, 0600 from its
+// first byte, fsynced, renamed). Never in the options, the state or a log line. onTemp: tests only, as hcKeyStore's.
+export const BACKUP_KEYS_PATH = `${DATA}/${BACKUP_KEYS_DIR}`;
+export function backupKeys(dir = BACKUP_KEYS_PATH, onTemp?: (tmp: string) => void) {
+  const ok = (n: string) => typeof n === "string" && n.length > 0 && n.length <= 200 && basename(n) === n && n !== "." && n !== ".." && !n.startsWith(BACKUP_KEY_TMP_PREFIX);
+  return {
+    store: (name: string, key: string): boolean => {
+      if (!ok(name)) return false;
+      try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });   // root-only from its creation (never a chmod after)
+        writeWhole(join(dir, name), `${key}\n`, onTemp, join(dir, `${BACKUP_KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`));
+        return true;
+      } catch { return false; }
+    },
+    load: (name: string): string | null => { if (!ok(name)) return null; try { const k = readFileSync(join(dir, name), "utf8").trim(); return k && !k.startsWith(SENTINEL) ? k : null; } catch { return null; } },
+    drop: (name: string): boolean => { if (basename(name) !== name || !name) return false; const p = join(dir, name); if (!existsSync(p)) return false; rmSync(p, { force: true }); return true; },
+    list: (): string[] => { try { return readdirSync(dir); } catch { return []; } },
+  };
+}
 // (0.1.9) The old hc_api_key, kept only to try it once at the rotation's attestation, then dropped.
 export const OLD_KEY_PATH = `${DATA}/${OLD_KEY_FILE}`;
 // 0.1.10: name, the file's name in the data folder, which core.ts checks inside the backup exclusion before it stores a key.
@@ -62,6 +83,8 @@ export const keyTmp = (path: string) => join(dirname(path), `${KEY_TMP_PREFIX}${
 // removes a control an interrupted check left.
 export function keyFiles(dir = DATA) {
   let placed: string[] = [];
+  // a name in the data folder, or (0.1.12) one in the backup key store
+  const inStore = (n: string) => basename(n) === n || (dirname(n) === BACKUP_KEYS_DIR && basename(n) !== "" && !basename(n).startsWith("."));
   const put = (name: string, body: string) => { const p = join(dir, name); if (existsSync(p)) return; const fd = openSync(p, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600); try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); } placed.push(name); };
   return {
     place: (sentinel: string, skip: string[] = []): string[] => {
@@ -69,9 +92,13 @@ export function keyFiles(dir = DATA) {
       for (const n of [KEY_FILE, OLD_KEY_FILE]) if (!skip.includes(n)) put(n, `${sentinel}\n`);
       put(`${KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`, `${sentinel}\n`);
       put(`${KEY_FILE}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`, `${sentinel}\n`);   // the 0.1.7 and 0.1.8 temporary name
+      // (0.1.12) the backup key store: a sentinel under a fixed name there, and one under its temporary prefix (never a backup's name)
+      try { mkdirSync(join(dir, BACKUP_KEYS_DIR), { recursive: true, mode: 0o700 }); } catch { /* the check fails on the missing sentinel */ }
+      try { put(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_SENTINEL}`, `${sentinel}\n`); } catch { /* idem */ }
+      try { put(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`, `${sentinel}\n`); } catch { /* idem */ }
       return [...placed];
     },
-    read: (name: string): string | null => { if (basename(name) !== name) return null; try { return readFileSync(join(dir, name), "utf8").trim(); } catch { return null; } },
+    read: (name: string): string | null => { if (!inStore(name)) return null; try { return readFileSync(join(dir, name), "utf8").trim(); } catch { return null; } },
     control: (value: string): string | null => { try { rmSync(join(dir, CHECK_CONTROL_FILE), { force: true }); put(CHECK_CONTROL_FILE, `${value}\n`); return CHECK_CONTROL_FILE; } catch { return null; } },
     clear: (): void => { for (const n of placed) rmSync(join(dir, n), { force: true }); placed = []; },
     sweep: (): string[] => {
@@ -82,6 +109,14 @@ export function keyFiles(dir = DATA) {
         if (!gone && (n === KEY_FILE || n === OLD_KEY_FILE)) { try { gone = readFileSync(p, "utf8").startsWith(SENTINEL); } catch { gone = false; } }
         if (gone) { rmSync(p, { force: true }); out.push(n); }
       }
+      // (0.1.12) a sentinel an interrupted check left in the backup key store (never a backup's key: those hold no sentinel)
+      try {
+        for (const n of readdirSync(join(dir, BACKUP_KEYS_DIR))) {
+          const p = join(dir, BACKUP_KEYS_DIR, n);
+          let gone = false; try { gone = readFileSync(p, "utf8").startsWith(SENTINEL); } catch { gone = false; }
+          if (gone) { rmSync(p, { force: true }); out.push(`${BACKUP_KEYS_DIR}/${n}`); }
+        }
+      } catch { /* no store yet */ }
       return out;
     },
   };
@@ -177,7 +212,7 @@ async function serve(): Promise<void> {
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
     backups: sup.backups, activeJobs: sup.activeJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
     diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
-    keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), hcTry: (key) => hcTry(key),
+    keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), backupKeys: backupKeys(), hcTry: (key) => hcTry(key),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
     ping: async (url, body) => {
