@@ -12,7 +12,6 @@
 //   /data/review-guard.log              root:cain 0640   the runner and the link append, Cain reads
 //   /data/review-grants.json            root:cain 0640   the link writes (his grant taps, 0.18.0), the runner and Cain read
 //   /data/link/review-decisions.json    root:root 0600   the link's own (when there)
-//   /data/probe/rollback-armed.json     root, no group or other write (the probe's, when there)
 //   /data/review-plan-cache.json        root:cain 0640   the plan reader's cache (0.17.0): root's parts write
 //                                       it, Cain's only read it, and only while root owns it; never alarmed
 // (0.19.0: the rollback's armed state is no longer a file here: the link reads it from the keeper App,
