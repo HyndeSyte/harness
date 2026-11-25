@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.1
+
+- A drill release for the Keeper drills, with nothing new: the same code as 0.19.0.
+- If this install fails, that comes only from your Arm the drill tap (the drill flag and mark), never from code in this release.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.
