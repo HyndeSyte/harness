@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.14
+
+- A drill now needs proof before it counts: Cain's link must tell Keeper it wrote the drill mark for that install, and the failure Keeper sees must be the one the drill was armed for. A rollback of an install merely labeled a drill no longer counts.
+- Each drill tap can arm only one install, ever: Keeper remembers every drill tap's one-time number and refuses it a second time, even after Cain is restored from a backup.
+- Keeper tells Cain, when asked at his start, whether an install is a drill it is still watching, so a reinstall or restart of a drill version outside the drill starts normally.
+- New option `drill_followups_open`, on by default: Keeper stays not armed until you turn it off, once the drill plan's follow-up fixes have landed. Turning it off keeps the drills already recorded.
+- The drill runbook now has you check, after the first drill, what the restored backup held and that no drill flag or mark is left on Cain.
+
 ## 0.1.13
 
 - Keeper can now be drilled for real: a drill card from Cain's link, with one button, Arm the drill. Only your tap on it arms the next install of Cain as a drill, and that version then fails on purpose (it stops at start, or reports a failed check), so Keeper must roll it back and record the drill.

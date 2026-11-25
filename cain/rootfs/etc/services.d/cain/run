@@ -124,7 +124,19 @@ version="$(bashio::addon.version 2>/dev/null || true)"; [ -n "$version" ] || ver
 # very version as exit-on-start, and Keeper accepted it as a drill, root's drill mark names this version, and this start
 # exits at once, on purpose, so Keeper sees the App not started and rolls it back. The mark is written after Keeper's
 # backup, so the version a rollback restores never sees one; any other version, or no mark, starts as usual.
-drill_mode="$(timeout 10 bun "$OPT/link/drill.ts" mode "$version" 2>/dev/null || true)"
+# Keeper 0.1.14: the helper acts only on a mark signed with the link's drill key, and only once Keeper (asked with Cain's
+# token, its open attempt) names that attempt as a drill of that mode and version, its mark confirmed, still in its watch;
+# otherwise, or when Keeper doesn't answer, it drops the mark and this start goes on as usual. Its log lines go to the log.
+drill_mode=""
+if [ -e /data/trust/keeper-drill-mark.json ]; then
+  drill_mode="$(
+    { set +x; } 2>/dev/null
+    KEEPER_URL="$(bashio::config 'keeper_url' 2>/dev/null || true)"; [ "$KEEPER_URL" = "null" ] && KEEPER_URL=""
+    KEEPER_TOKEN="$(bashio::config 'keeper_token' 2>/dev/null || true)"; [ "$KEEPER_TOKEN" = "null" ] && KEEPER_TOKEN=""
+    export KEEPER_URL KEEPER_TOKEN
+    timeout 20 bun "$OPT/link/drill.ts" mode "$version" || true
+  )"
+fi
 if [ "$drill_mode" = exit-on-start ]; then
   bashio::log.warning "Keeper drill (exit-on-start, armed by Dane's tap): this start of Cain $version stops at once, on purpose, so Keeper rolls it back"
   exit 1

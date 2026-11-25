@@ -51,6 +51,13 @@ export function publicKey(spkiB64: string): KeyObject {
   return k;
 }
 
+const SHIP_CLAIM_KEYS = JSON.stringify(["exp", "head", "pr", "repo", "v"]);
+const SHIP_CLAIM_KEYS_KIND = JSON.stringify(["exp", "head", "kind", "pr", "repo", "v"]);
+export function shipClaimShape(c: any): boolean {
+  const keys = JSON.stringify(Object.keys(c ?? {}).sort());
+  return c?.kind === undefined ? keys === SHIP_CLAIM_KEYS : c.kind === "ship" && keys === SHIP_CLAIM_KEYS_KIND;
+}
+
 export type Checked = { ok: true; claim: Claim } | { ok: false; why: string };
 
 // A token, checked: signed by this key, well formed, and not expired at nowMs.
@@ -67,6 +74,9 @@ export function readToken(token: string, key: KeyObject, nowMs: number): Checked
   if (!c || c.v !== 1 || typeof c.repo !== "string" || !REPO.test(c.repo) || !Number.isSafeInteger(c.pr) || c.pr < 1
     || typeof c.head !== "string" || !SHA.test(c.head) || !Number.isSafeInteger(c.exp))
     return { ok: false, why: "its claim isn't a Ship approval" };
+  // (Keeper 0.1.14) the payload's kind, exactly: a Ship approval's keys and nothing else, with a kind (if any) of "ship". A drill
+  // flag, a drill mark or any other payload the link signs is never a Ship token, whatever its prefix (drill.ts).
+  if (!shipClaimShape(c)) return { ok: false, why: "its payload kind isn't a Ship approval" };
   if (!SHIP_REPOS.has(c.repo.toLowerCase())) return { ok: false, why: "it's for a repository Ship doesn't approve" };
   if (c.exp * 1000 <= nowMs) return { ok: false, why: "it expired (an approval lasts 2 hours after his tap)" };
   if (c.exp * 1000 > nowMs + (TTL_S + SKEW_S) * 1000) return { ok: false, why: "its expiry is further off than an approval lasts" };

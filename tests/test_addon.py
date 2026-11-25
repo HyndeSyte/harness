@@ -723,8 +723,11 @@ def test_no_stop_is_silent(tmp_path):
     # decision after the Supervisor's restart call, and from the Pi drill's root-only mark.
     # Keeper 0.1.13: the drill's exit-on-start, only for the version root's drill mark names (link/drill.ts).
     assert sorted(exits) == sorted(['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3", "  exit 1"])
-    drill = run.index('drill_mode="$(timeout 10 bun "$OPT/link/drill.ts" mode "$version" 2>/dev/null || true)"')
-    assert run.index('version="$(bashio::addon.version') < drill < run.index('if [ "$drill_mode" = exit-on-start ]; then', drill) < run.index("  exit 1\n", drill)
+    # Keeper 0.1.14: the helper runs only when a mark exists, with Cain's keeper token in its own environment (it asks Keeper
+    # whether the mark's attempt is a drill still in its watch), and its log lines reach the App's log.
+    drill = run.index('    timeout 20 bun "$OPT/link/drill.ts" mode "$version" || true')
+    assert run.index('version="$(bashio::addon.version') < run.index("if [ -e /data/trust/keeper-drill-mark.json ]; then") < drill \
+        < run.index('if [ "$drill_mode" = exit-on-start ]; then', drill) < run.index("  exit 1\n", drill)
     exit_fn = _run_fns(run, "self_exit() {", "self_tried=0")
     # Fourth round: the mark holds the time it was written (self_mark). Fifth round: the exit route writes
     # it with the word fallback, which finish and the EXIT trap need before they take a 3 for the fallback.

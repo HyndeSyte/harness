@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMIT_MS, REWIND_MS, WATCH_MS, ARMED_MAX_MS, PHONE_MAX_MS, LOOP_FRESH_MS, checkId, keyFp, optionsHash, parseOptions, readShipToken, shipKey,
   ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, MHB_CAP_MS, LIMITS_VERSION, PHONE_WINDOW_MS, DROP_TRIES,
   OLD_KEY_WHY, ENROLL_BEHIND, ENROLL_REFUSED, jobsWhy, CLEANUP_TICK_MS, KEPT_GRACE_MS, KEPT_MAX_MS, BACKUP_CHECK_WHY, OPTIONS_UNKNOWN_WHY, CODE_EPOCH,
-  EXCLUDE_HASH, BACKUP_EXCLUDE, KEY_NAME, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, excludedName,
+  EXCLUDE_HASH, BACKUP_EXCLUDE, KEY_NAME, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, excludedName, FOLLOWUPS_WHY,
   type AppInfo, type BackupInfo, type HcCheck, type JobState, type RestoreResult, type State } from "../rootfs/opt/keeper/core.ts";
 import { backupKeys, hcChecks, hcKeyStore, healthUrl, keyFiles, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
@@ -76,6 +76,7 @@ function withKeys(opts: any): any {
   return { ...opts, hc_unique_keys: keys };
 }
 
+let nonces = 0;
 function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean; hcKey?: string; limits?: boolean; uniq?: boolean; backupCheck?: boolean } = {}) {
   let now = T0;
   const logs: string[] = [];
@@ -106,7 +107,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     options: {
       watch: [CAIN], health: [`${CAIN}=0fcc2575-cain:8098/ready`], tokens: [`${CAIN}=${TOKEN}`, `${HARNESS}=${HTOKEN}`],
       hc_done: "https://hc-ping.example/done", hc_deadman: "https://hc-ping.example/deadman", hc_failed: "https://hc-ping.example/failed",
-      health_grace_s: 0, ship_public_key: PUB, ...(o.opts ?? {}),
+      health_grace_s: 0, ship_public_key: PUB, drill_followups_open: false, ...(o.opts ?? {}),
     } as any,
   };
   const k = new Keeper({
@@ -154,14 +155,20 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     get now() { return now; }, advance(ms: number) { now += ms; },
     // A registration as Cain's link sends it (POST /attempt, 202), then its poll (GET /attempt/<id>) once
     // the background backup settled (0.1.5): 200 with the acceptance, or 409 with the refusal.
+    // (0.1.14) a drill carries its mode (verdict-fail unless named) and a fresh flag nonce, and once accepted the link confirms the
+    // signed drill mark it wrote (noMark: it never does)
     async register(over: any = {}, caller: string | null = CAIN) {
       const head = over.head ?? HEAD;
+      const { noMark, ...rest } = over;
+      const drill = rest.kind === "drill" ? { drill_mode: "verdict-fail", drill_nonce: (++nonces).toString(16).padStart(16, "0") } : {};
       const body: any = { token: shipToken({ head, now }), app: CAIN, pr: 46, head, from_version: "0.16.0", to_version: "0.17.0",
-        probe_hash: HASH, kind: "ship", ...over };
+        probe_hash: HASH, kind: "ship", ...drill, ...rest };
       const ans = await k.registerAttempt(caller, body);
       if (ans.status !== 202) return ans;
       await k.whenSettled(String(ans.body.id));
       const v = k.attemptView(CAIN, String(ans.body.id));
+      if (v.body.status === "accepted" && body.kind === "drill" && !noMark)
+        expect(k.markAttempt(CAIN, String(ans.body.id), { mode: body.drill_mode, to_version: body.to_version, mark: "ab".repeat(32) }).status).toBe(200);
       return { status: v.body.status === "accepted" ? 200 : 409, body: v.body };
     },
     // (0.1.5) The link's claim of an accepted attempt, as the Ship run starts.
@@ -365,7 +372,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     finish({ slug: "kb-late" }); await r.k.whenSettled(ID);
     const v = r.k.attemptView(CAIN, ID);
     expect(v.status).toBe(200);
-    expect(v.body).toEqual({ status: "accepted", id: ID, app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: "kb-late", until: new Date(T0 + ACCEPT_MS).toISOString(),
+    expect(v.body).toEqual({ status: "accepted", id: ID, app: CAIN, from_version: "0.16.0", to_version: "0.17.0", kind: "ship", backup: "kb-late", until: new Date(T0 + ACCEPT_MS).toISOString(),
       key_fp: keyFp(PUB), key_confirmed_at: new Date(T0).toISOString(), state_created: new Date(T0).toISOString(),
       enroll_id: r.k.st.pinnedKey!.enrollId, counter: r.k.st.counter });
     expect(v.body.enroll_id).toMatch(/^[0-9a-f]{16}$/);
@@ -782,7 +789,7 @@ describe("fix 3: alert checks per App, the dead-man check, and the phone test dr
 // -- drills and the armed record ------------------------------------------------------------------
 async function drillOf(r: ReturnType<typeof rig>, head: string, how: "verdict" | "exit") {
   r.f.app.version = "0.16.0"; r.f.app.state = "started";
-  const ans = await r.register({ head, kind: "drill" });
+  const ans = await r.register({ head, kind: "drill", drill_mode: how === "exit" ? "exit-on-start" : "verdict-fail" });
   expect(ans.status).toBe(200);
   const id = idOf(head, "drill");
   await r.poll();
@@ -3305,7 +3312,7 @@ describe("0.1.13: the drill cases as the runbook runs them", () => {
   test("restart during a flagged watch (exit-on-start): Keeper restarted after it saw the drilled version still rolls it back and records the drill", async () => {
     const r = rig();
     const head = headN(3), id = idOf(head, "drill");
-    expect((await r.register({ head, kind: "drill" })).status).toBe(200);
+    expect((await r.register({ head, kind: "drill", drill_mode: "exit-on-start" })).status).toBe(200);
     // the App exited at its start: stopped, seen once (a fail needs two polls in a row), then Keeper restarts
     await r.poll(); r.install("stopped"); await r.poll();
     expect(r.a(id).status).toBe("watching");
@@ -3347,5 +3354,113 @@ describe("0.1.13: the drill cases as the runbook runs them", () => {
     const releasing = readFileSync(join(import.meta.dir, "..", "..", "RELEASING.md"), "utf8");
     const heads = new Set([...releasing.matchAll(/^#+ (.+)$/gm)].map((m) => m[1].trim()));
     for (const m of sec.matchAll(/RELEASING\.md, ([A-Z][A-Za-z' ]+?)(?:[),.;:]| \d)/g)) expect([...heads].some((h) => h.startsWith(m[1].trim()))).toBe(true);
+  });
+});
+
+// (0.1.14) Round 15: a drill record needs evidence (the link's confirmation of the signed mark, and the failure its mode names),
+// a drill flag's nonce registers once, the payload kind of a Ship token is checked exactly, and Keeper reads not armed while the
+// drill plan's follow-up items are open (option drill_followups_open).
+describe("0.1.14: drill evidence, nonces, the Ship token's kind and the follow-ups gate", () => {
+  test("a drill registration needs its mode and nonce; a ship one carries neither", async () => {
+    const r = rig();
+    for (const [over, why] of [
+      [{ kind: "drill", drill_mode: "rollback-anyway" }, "names no drill mode"],
+      [{ kind: "drill", drill_nonce: "xyz" }, "carries no drill flag nonce"],
+      [{ kind: "ship", drill_mode: "exit-on-start" }, "a ship registration carries a drill mode or nonce"],
+    ] as const) {
+      const ans = await r.register({ head: headN(9), ...over });
+      expect(ans.status).toBe(409);
+      expect(String(ans.body.why)).toContain(why);
+    }
+    expect(Object.keys(r.k.st.attempts)).toEqual([]);
+  });
+  test("fix 4 (Keeper's side): a drill flag's nonce registers once, even from a fresh Ship token after Cain's state was restored", async () => {
+    const r = rig();
+    expect((await r.register({ head: headN(1), kind: "drill", drill_nonce: "00000000000000aa" })).status).toBe(200);
+    r.k.cancel(CAIN, idOf(headN(1), "drill"), { why: "the pass is refused" });
+    await r.poll(3);
+    const again = await r.register({ head: headN(2), kind: "drill", drill_nonce: "00000000000000aa" });
+    expect(again.status).toBe(409);
+    expect(String(again.body.why)).toContain(`a replay: that drill flag's nonce was registered under ${idOf(headN(1), "drill")}`);
+    // kept across a restart
+    const r2 = rig({ saved: JSON.parse(JSON.stringify(r.k.st)) });
+    expect((r2.k.st.drillNonces ?? []).map((x) => x.nonce)).toContain("00000000000000aa");
+  });
+  test("the link's mark confirmation: Cain's App only, a drill only, its mode and version, while accepted, idempotent for the same mark", async () => {
+    const r = rig();
+    const id = idOf(headN(1), "drill");
+    expect((await r.register({ head: headN(1), kind: "drill", drill_mode: "exit-on-start", noMark: true })).status).toBe(200);
+    const mark = "cd".repeat(32);
+    expect(r.k.markAttempt(HARNESS, id, { mode: "exit-on-start", to_version: "0.17.0", mark }).status).toBe(403);
+    expect(r.k.markAttempt(CAIN, id, { mode: "verdict-fail", to_version: "0.17.0", mark }).status).toBe(409);
+    expect(r.k.markAttempt(CAIN, id, { mode: "exit-on-start", to_version: "0.18.0", mark }).status).toBe(409);
+    expect(r.k.markAttempt(CAIN, id, { mode: "exit-on-start", to_version: "0.17.0", mark: "nothex" }).status).toBe(409);
+    expect(r.k.markAttempt(CAIN, id, { mode: "exit-on-start", to_version: "0.17.0", mark })).toEqual({ status: 200, body: { status: "marked", id } });
+    expect(r.k.markAttempt(CAIN, id, { mode: "exit-on-start", to_version: "0.17.0", mark }).status).toBe(200);
+    expect(r.k.markAttempt(CAIN, id, { mode: "exit-on-start", to_version: "0.17.0", mark: "ef".repeat(32) }).status).toBe(409);
+    expect(r.k.attemptView(CAIN, id).body).toMatchObject({ kind: "drill", drill_mode: "exit-on-start", marked: true });
+    const s = rig(); await s.register();
+    expect(s.k.markAttempt(CAIN, ID, { mode: "exit-on-start", to_version: "0.17.0", mark }).body.why).toBe("it isn't a drill");
+  });
+  test("GET /attempt names the open attempt's kind, drill mode and whether its mark was confirmed (the run script's helper reads it)", async () => {
+    const r = rig();
+    expect((await r.register({ head: headN(1), kind: "drill", drill_mode: "exit-on-start" })).status).toBe(200);
+    const res = await handle(r.k, new Request("http://keeper/attempt", { headers: { authorization: `Bearer ${TOKEN}` } }), "172.30.33.4", () => {});
+    expect(await res.json()).toMatchObject({ attempt: idOf(headN(1), "drill"), kind: "drill", drill_mode: "exit-on-start", marked: true, status: "accepted", to_version: "0.17.0" });
+    const via = await handle(r.k, new Request(`http://keeper/attempt/${idOf(headN(1), "drill")}/drill-mark`, { method: "POST", body: JSON.stringify({ mode: "exit-on-start", to_version: "0.17.0", mark: "ab".repeat(32) }),
+      headers: { authorization: `Bearer ${TOKEN}` } }), "172.30.33.4", () => {});
+    expect(via.status).toBe(200);
+    const s = rig(); await s.register();
+    const shipRes = await handle(s.k, new Request("http://keeper/attempt", { headers: { authorization: `Bearer ${TOKEN}` } }), "172.30.33.4", () => {});
+    const j: any = await shipRes.json();
+    expect(j.kind).toBe("ship");
+    expect(j.drill_mode).toBeUndefined();
+  });
+  test("a drill record needs evidence the mark was written: kind drill plus a rollback alone writes none", async () => {
+    const r = rig();
+    const head = headN(1), id = idOf(head, "drill");
+    expect((await r.register({ head, kind: "drill", drill_mode: "verdict-fail", noMark: true })).status).toBe(200);
+    await r.poll(); r.install("started"); await r.poll();
+    r.k.verdict(CAIN, { app: CAIN, version: "0.17.0", attempt: id, result: "FAIL", reason: "drill" });
+    await r.poll(ROLL);
+    expect(r.a(id).status).toBe("rolled back");
+    expect(r.k.st.drills[CAIN]).toBeUndefined();
+    expect(r.k.drillRecord(id)).toEqual({ ok: false, why: "no evidence the drill mark was written (the link never confirmed it to Keeper)" });
+  });
+  test("a drill record needs the failure its mode names: a verdict-fail drill that exited at start records nothing", async () => {
+    const r = rig();
+    const head = headN(1), id = idOf(head, "drill");
+    expect((await r.register({ head, kind: "drill", drill_mode: "verdict-fail" })).status).toBe(200);
+    await r.poll(); r.install("error"); await r.poll(ROLL);
+    expect(r.a(id).status).toBe("rolled back");
+    expect(r.k.st.drills[CAIN]).toBeUndefined();
+    expect(r.k.drillRecord(id).why).toBe("the failure Keeper observed (exits-on-start) isn't the one its drill mode (verdict-fail) names");
+    // with the evidence, the record keeps it
+    const s = rig(); await drillOf(s, headN(2), "exit");
+    expect(s.k.st.drills[CAIN]?.["exits-on-start"]).toMatchObject({ mode: "exit-on-start", markHash: "ab".repeat(32), markAt: expect.any(Number) });
+  });
+  test("fix 6 (Keeper's side): a Ship token's payload kind is checked exactly", () => {
+    const tok = (claim: any) => { const p = b64url(Buffer.from(JSON.stringify(claim))); return `ship1.${p}.${b64url(edSign(null, Buffer.from(`ship1.${p}`), LINK))}`; };
+    const base = { v: 1, repo: "HyndeSyte/harness", pr: 46, head: HEAD, exp: Math.floor(T0 / 1000) + 3600 };
+    const key = shipKey(PUB)!;
+    expect(readShipToken(tok(base), key, T0).ok).toBe(true);
+    expect(readShipToken(tok({ ...base, kind: "ship" }), key, T0).ok).toBe(true);
+    for (const c of [{ ...base, kind: "keeper-drill" }, { ...base, kind: "keeper-drill", mode: "exit-on-start", nonce: "00000000000000aa" }, { ...base, extra: 1 }])
+      expect(readShipToken(tok(c), key, T0)).toEqual({ ok: false, why: "its token's payload kind isn't a Ship approval" });
+  });
+  test("while drill_followups_open is set (the default) Keeper reads not armed whatever its drills; clearing it keeps the drill records", async () => {
+    expect(parseOptions({}).drill_followups_open).toBe(true);
+    expect(parseOptions({ drill_followups_open: false }).drill_followups_open).toBe(false);
+    const r = await armedRig();
+    expect(optionsHash(parseOptions({ ...r.f.options, drill_followups_open: true }))).toBe(optionsHash(parseOptions({ ...r.f.options, drill_followups_open: false })));
+    r.f.options.drill_followups_open = true; r.k.useOptions(withKeys(r.f.options));
+    expect(r.k.armedView(CAIN)).toMatchObject({ armed: false, why: FOLLOWUPS_WHY });
+    expect((r.k.drillState().state as any).followups_open).toBe(true);
+    expect(Object.keys(r.k.st.drills[CAIN] ?? {}).sort()).toEqual(["exits-on-start", "fail-verdict"]);
+    r.f.options.drill_followups_open = false; r.k.useOptions(withKeys(r.f.options));
+    expect(r.k.armedView(CAIN).armed).toBe(true);
+    const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
+    expect(cfg).toMatch(/^  drill_followups_open: true$/m);
+    expect(cfg).toMatch(/^  drill_followups_open: bool\?$/m);
   });
 });

@@ -11,6 +11,8 @@
 //   POST /attempt/<id>/cancel   (0.1.5) Cain's App only: the link gave up on the pass, {why} (0.1.7: a retry reads
 //                               the recorded outcome; refused once the claim was handed to a started run; 0.1.8:
 //                               refused while the jobs list shows an install or an unrecognized job, or can't be read)
+//   POST /attempt/<id>/drill-mark  (0.1.14) Cain's link only: {mode, to_version, mark}, the link wrote the signed drill mark
+//                               for this accepted drill (mark: its SHA-256); a drill record needs it
 //   POST /verdict   {app, version, attempt, result: PASS|FAIL, reason}: the caller's App's probe verdict
 //   GET  /armed     ?app=<slug> (default the caller's): the armed state, its binding, the keeper's
 //                   version and a timestamp refreshed every minute (0.1.8: under the claim record's lock)
@@ -81,14 +83,18 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (!caller) { log(`refused ${req.method} ${url.pathname} from ${ip}: no App's token`); return json({ status: "refused" }, 401); }
   if (req.method === "GET" && url.pathname === "/attempt") {
     const a = k.openAttempt(caller);
-    return json(a ? { app: caller, attempt: a.id, from_version: a.from, to_version: a.to, status: a.status } : { app: caller, attempt: null });
+    // (0.1.14) its kind, and for a drill its mode and whether the link confirmed the signed mark: the run script's drill helper and
+    // the verdict probe act on a mark only while this names its attempt as a drill still in its watch
+    return json(a ? { app: caller, attempt: a.id, from_version: a.from, to_version: a.to, status: a.status, kind: a.auth,
+      ...(a.drillMode ? { drill_mode: a.drillMode, marked: !!a.markAt } : {}) } : { app: caller, attempt: null });
   }
-  const m = /^\/attempt\/([a-z0-9-]{1,100})(\/claim|\/cancel)?$/.exec(url.pathname);
+  const m = /^\/attempt\/([a-z0-9-]{1,100})(\/claim|\/cancel|\/drill-mark)?$/.exec(url.pathname);
   if (m && req.method === "GET" && !m[2]) { const r = k.attemptView(caller, m[1]); return json(r.body, r.status); }
   if (m && req.method === "POST" && m[2]) {
     const b = await body(req);
     if (b === undefined || !b || typeof b !== "object") return json({ status: "refused", why: "not JSON" }, 400);
-    const r = m[2] === "/claim" ? await k.claim(caller, m[1], b) : await k.cancel(caller, m[1], b);   // (0.1.7) under the claim record's lock
+    const r = m[2] === "/drill-mark" ? k.markAttempt(caller, m[1], b)                                     // (0.1.14)
+      : m[2] === "/claim" ? await k.claim(caller, m[1], b) : await k.cancel(caller, m[1], b);   // (0.1.7) under the claim record's lock
     return json(r.body, r.status);
   }
   if (req.method === "POST" && url.pathname === "/attempt") {

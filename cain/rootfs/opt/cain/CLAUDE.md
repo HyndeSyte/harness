@@ -866,9 +866,11 @@ create, update or run any other routine.
    goes on the card. Then show the Ship card as for a finished Build, with that review's
    id. Its branch is yours now, with the item.
 6. Keeper drills (Keeper's DOCS, "The drill runbook"): when he wants the next install of you to be a drill, run
-   `/opt/cain/keeper.sh drill-arm exit-on-start` (or `verdict-fail`) just before that drill release's Ship card. The
+   `/opt/cain/keeper.sh drill-arm exit-on-start <version>` (or `verdict-fail`), the version being the Cain version that
+   drill release carries (its config.yaml at the pull request's head), just before that release's Ship card. The
    link posts him the drill card; only his Arm the drill tap arms it, for the next install of you only. Never say a
-   drill is armed until you hear his tap, and never arm one for an install he didn't ask to be a drill.
+   drill is armed until you hear his tap, and never arm one for an install he didn't ask to be a drill. A "Keeper drill:
+   ... nothing was installed" message from the link already reached him: don't repeat it; ask him whether to arm again.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Stop

@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.13"
+version: "0.1.14"
 slug: keeper
 description: >-
   Covers only the first 15 minutes after each App install: checks it and rolls
@@ -63,6 +63,8 @@ timeout: 20
 # 0.1.8: while hc_api_key is still in the options as the Supervisor holds them, Keeper doesn't arm and refuses hc-key;
 # remove it, then rotate that key (earlier backups may hold it). drill_days (0.1.8): 1 to 14, default 14, how long the
 # phone test and the missed-heartbeat drill count for arming, with a log reminder a day before each is due.
+# drill_followups_open (0.1.14): true until the drill plan's follow-up items have landed; while true Keeper reads not
+# armed whatever its drills recorded. Set it false only once they have; it isn't in the drill records' binding.
 options:
   watch:
     - 0fcc2575_cain
@@ -76,6 +78,7 @@ options:
   ship_public_key: ""
   hc_unique_keys: []
   drill_days: 14
+  drill_followups_open: true
 schema:
   watch:
     - match(^[a-z0-9_]{1,64}$)
@@ -92,3 +95,4 @@ schema:
   hc_unique_keys:
     - match(^(done|deadman|[a-z0-9_]{1,64})=[0-9a-fA-F]{40}$)
   drill_days: int(1,14)?
+  drill_followups_open: bool?

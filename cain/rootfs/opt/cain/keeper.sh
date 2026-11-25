@@ -160,10 +160,12 @@
 #                                        and "No". Only his tap writes the grant; this writes nothing.
 #                                        Refused while the change has rounds left, its item is held by
 #                                        another holder, or Stop holds
-#   keeper.sh drill-arm <exit-on-start|verdict-fail>
+#   keeper.sh drill-arm <exit-on-start|verdict-fail> <version>
 #                                        (Keeper 0.1.13) posts Dane the drill card for the Keeper App: his tap on it,
 #                                        and only his tap, arms the next install of Cain as a drill that fails on
 #                                        purpose that way, so Keeper must roll it back. This sets nothing itself.
+#                                        (0.1.14) <version> is the Cain version the drill release carries: the card
+#                                        names it, and an install of any other version refuses the flag.
 set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
@@ -370,8 +372,9 @@ case "$cmd" in
   key-expiry|key-ack) body=$(jq -nc --arg c "$cmd" --arg n "${1:-}" --arg d "${2:-}" '{cmd: $c, name: $n, date: $d}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
   drill-arm)
-    case "${1:-}" in exit-on-start|verdict-fail) ;; *) echo '{"status":"error","said":"drill-arm takes exit-on-start or verdict-fail"}'; exit 2 ;; esac
-    body=$(jq -nc --arg m "$1" '{mode: $m}') ;;
+    case "${1:-}" in exit-on-start|verdict-fail) ;; *) echo '{"status":"error","said":"drill-arm takes exit-on-start or verdict-fail, then the Cain version"}'; exit 2 ;; esac
+    [[ "${2:-}" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]] || { echo '{"status":"error","said":"drill-arm takes the Cain version the drill release carries, like 0.19.1"}'; exit 2; }
+    body=$(jq -nc --arg m "$1" --arg v "$2" '{mode: $m, version: $v}') ;;
   review-grant)
     [[ "$rounds" =~ ^[1-3]$ ]] || { echo '{"status":"error","said":"--rounds takes 1, 2 or 3"}'; exit 2; }
     [ -n "$change" ] || { echo '{"status":"error","said":"--change takes the pull request url or the change key"}'; exit 2; }

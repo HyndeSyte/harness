@@ -93,7 +93,7 @@ import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import { ROTATION_ID } from "./rotation";
-import { type DrillMode, isDrillMode } from "./drill";
+import { type DrillMode, type DrillPage, isDrillMode, VERSION as DRILL_VERSION } from "./drill";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
@@ -361,7 +361,8 @@ export interface Shown {
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
   rotation?: { id: string };        // the link's card for the keeper's old Healthchecks key (Keeper 0.1.9, rotation.ts)
-  drill?: { mode: DrillMode };       // the link's drill card (Keeper 0.1.13, drill.ts): his tap sets the one-shot drill flag
+  drill?: { mode: DrillMode; version?: string };   // the link's drill card (Keeper 0.1.13, drill.ts): his tap sets the one-shot drill flag (0.1.14: for that version)
+  drillPage?: { key: string };       // (Keeper 0.1.14) a drill that installed nothing, told to him once per key (drill.ts)
   space?: { pr: number; head: string; app: string; version: string };   // the free-space card (Keeper 0.1.10, ship-pass.ts; 0.1.11: no button)
   retry?: { attempt: string; what: "claim" | "cancel" };   // the card offering a retry after a keeper answer that wasn't a plain success (Keeper 0.1.11)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
@@ -717,7 +718,7 @@ export interface Deps {
   // Keeper 0.1.9: his tap on the rotation card, signed by the link's Ship key and sent to the keeper (rotation.ts)
   attestRotation?: (id: string) => Promise<{ ok: boolean; why: string }>;
   // Keeper 0.1.13: his tap on the drill card, signed by the link's Ship key and kept by root as the drill flag (drill.ts armFlag)
-  armDrill?: (mode: DrillMode) => { ok: boolean; why: string };
+  armDrill?: (mode: DrillMode, version: string) => { ok: boolean; why: string };   // (Keeper 0.1.14) bound to the version the card names
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
@@ -1715,40 +1716,47 @@ export class Link {
   // Cain asks for the card (keeper.sh drill-arm <mode>, /drill-arm); it only asks. One open card per mode, the link's own
   // words, one button. Not while stopped. Only his tap sets the flag: signed with the link's Ship key, kept by root, spent by
   // the next registration of Cain, which then goes to the keeper as kind drill and fails on purpose as the mode names.
-  async drillCard(mode: unknown): Promise<{ status: "posted" | "open" | "stopped"; message?: string; said: string }> {
+  // Keeper 0.1.14: the card names the Cain version the drilled install must carry (keeper.sh drill-arm <mode> <version>), and his
+  // flag is bound to it: a registration of another version refuses and removes it. A new card for another version or mode
+  // retires an open one (its tap is dead).
+  async drillCard(mode: unknown, version?: unknown): Promise<{ status: "posted" | "open" | "stopped"; message?: string; said: string }> {
     if (!isDrillMode(mode)) throw new Refusal("a drill takes exit-on-start or verdict-fail");
+    if (typeof version !== "string" || !DRILL_VERSION.test(version)) throw new Refusal("a drill names the Cain version the drill release carries (keeper.sh drill-arm <mode> <version>)");
     if (this.stopped().stopped) return { status: "stopped", said: "Everything is stopped, so no drill card went out." };
-    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.drill?.mode === mode && !m.outcome);
+    const open = Object.entries(this.d.load().messages).filter(([, m]) => m.drill && !m.outcome);
+    const prior = open.find(([, m]) => m.drill!.mode === mode && m.drill!.version === version);
     if (prior) return { status: "open", message: prior[0], said: "That drill card is still up; nothing is armed until his tap." };
     const what = mode === "exit-on-start" ? "stops at once when it starts" : "reports a failed check after it starts";
-    const text = `Keeper drill: the next install of Cain after your tap is a drill. That version ${what}, on purpose, so Keeper `
-      + "must see it fail and put the version before it back from its backup. Arm it only when the drill release's Ship card is next. "
-      + "One tap arms one install, for a day; without it every install is a normal one.";
-    const msg = await this.post(text, rows([[[DRILL_LABEL, `${DRILL_PREFIX}${mode}`]]], "k:"), { nonce: stableNonce("drill", `${mode}:${this.d.now()}`) });
+    const text = `Keeper drill: the next install of Cain after your tap is a drill, and it must be Cain ${version}. That version ${what}, on purpose, so Keeper `
+      + "must see it fail and put the version before it back from its backup. Arm it only when that release's Ship card is next. "
+      + "One tap arms one install of that version, for a day; without it every install is a normal one.";
+    const msg = await this.post(text, rows([[[DRILL_LABEL, `${DRILL_PREFIX}${mode}`]]], "k:"), { nonce: stableNonce("drill", `${mode}:${version}:${this.d.now()}`) });
     const s = this.d.load();
+    for (const [id] of open) { const m = s.messages[id]; if (m && !m.outcome) { m.outcome = "replaced"; m.why = "replaced by a newer drill card"; } }
     this.remember(s, msg, { kind: "notice", item: "none", question: `drill:${mode}`, posted: this.d.now(), expires: null, buttons: true,
-      labels: [DRILL_LABEL], drill: { mode } });
+      labels: [DRILL_LABEL], drill: { mode, version } });
     this.d.save(s);
-    this.log(`a drill card (${mode}) went to him`);
+    this.log(`a drill card (${mode}, Cain ${version}) went to him`);
     return { status: "posted", message: String(msg.id), said: "Posted. Nothing is armed until his tap; you hear when he taps." };
   }
   // His tap: the sender checked first (the owner, in his DM), before anything is signed; then the flag is signed and kept.
   private async drillTap(it: any, msgId: string): Promise<string> {
     const rec = this.d.load().messages[msgId];
     if (!rec?.drill || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
-    const mode = rec.drill.mode;
+    const mode = rec.drill.mode, version = rec.drill.version ?? "";
     let who = "";
     try { who = await this.who(it); } catch { who = "check failed"; }
     if (who) { await this.answer(it, ACK); this.log(`a drill tap (${mode}) was refused before signing: ${who}`); return `refused: ${who}`; }
     await this.answer(it, ACK);
     if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so the drill wasn't armed. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
-    const r = this.d.armDrill ? this.d.armDrill(mode) : { ok: false, why: "the link has no Ship key to sign your tap with" };
+    const r = !DRILL_VERSION.test(version) ? { ok: false, why: "this card names no Cain version (it is from before the version was asked): ask Cain for a new one" }
+      : this.d.armDrill ? this.d.armDrill(mode, version) : { ok: false, why: "the link has no Ship key to sign your tap with" };
     if (!r.ok) {
       this.log(`his drill tap (${mode}) wasn't kept: ${r.why}`);
       await this.ephemeral(it, `The drill wasn't armed: ${r.why.replace(/[^\x20-\x7e]/g, " ").slice(0, 200)}. The card is still up: tap it again once that's fixed.`);
       return "refused";
     }
-    const content = withLine(String(it.message?.content ?? ""), "Armed: the next install of Cain is the drill.");
+    const content = withLine(String(it.message?.content ?? ""), `Armed: the next install of Cain ${version} is the drill.`);
     let edited = false;
     try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
     catch (e) { this.log(`couldn't mark the drill card done: ${String(e).slice(0, 80)}`); }
@@ -1756,9 +1764,29 @@ export class Link {
     const m = s.messages[msgId];
     if (m) { m.outcome = "answered"; m.why = "answered"; m.label = DRILL_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
     this.d.save(s);
-    this.log(`his drill tap (${mode}) armed the drill flag`);
-    this.d.relay(`Dane tapped ${DRILL_LABEL} (${mode}): the next install of Cain is registered with Keeper as a drill and fails on purpose. Show him the drill release's Ship card when it is ready. Nothing else to tell him.`);
+    this.log(`his drill tap (${mode}, Cain ${version}) armed the drill flag`);
+    this.d.relay(`Dane tapped ${DRILL_LABEL} (${mode}, Cain ${version}): the next install of Cain ${version} is registered with Keeper as a drill and fails on purpose. Show him that release's Ship card when it is ready. Nothing else to tell him.`);
     return "drill armed";
+  }
+  // (Keeper 0.1.14) A drill that installed nothing (drill.ts DrillPage), told to him once per key, in the link's own words, with
+  // no button: the flag was damaged, ran out or was spent; it named another version; Keeper didn't accept the drill with a
+  // confirmed backup; or the mark couldn't be written or confirmed, so the drill was aborted. Not while stopped.
+  async drillPage(kind: DrillPage, key: string, info: { armed?: string; version?: string } = {}): Promise<{ status: "posted" | "done" | "stopped"; message?: string }> {
+    if (!["damaged", "version", "accept", "aborted"].includes(kind) || !/^[a-z]{1,10}:[A-Za-z0-9_.:-]{1,100}$/.test(key)) throw new Refusal("that isn't a drill page");
+    const v = (x?: string) => (x && DRILL_VERSION.test(x) ? x : "");
+    if (this.stopped().stopped) return { status: "stopped" };
+    if (Object.values(this.d.load().messages).some((m) => m.drillPage?.key === key)) return { status: "done" };
+    const of = v(info.version) ? ` of Cain ${v(info.version)}` : "";
+    const text = kind === "damaged" ? "Keeper drill: the drill flag was damaged or had run out; nothing was installed; arm it again."
+      : kind === "version" ? `Keeper drill: the drill flag was armed for Cain ${v(info.armed) || "another version"}, but the install carried ${v(info.version) || "another version"}; nothing was installed; arm it again for the right version.`
+      : kind === "accept" ? `Keeper drill: Keeper didn't accept the drill install${of} with a checked backup; nothing was installed; arm it again.`
+      : `Keeper drill: the drill install${of} was stopped because its drill mark couldn't be written or confirmed; nothing was installed; arm it again.`;
+    const msg = await this.post(text, [], { nonce: stableNonce("drill-page", key) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `drill-page:${kind}`, posted: this.d.now(), expires: null, buttons: false, labels: [], drillPage: { key } });
+    this.d.save(s);
+    this.log(`a drill page (${kind}) went to him, with no button`);
+    return { status: "posted", message: String(msg.id) };
   }
 
   // -- the keeper refused a registration for want of free space (Keeper 0.1.10, ship-pass.ts) --

@@ -80,7 +80,7 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
-import { armFlag, drillDeps, fileStore } from "./drill";
+import { armFlag, drillDeps, drillKeyFrom, fileStore, storeMarkPub } from "./drill";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
@@ -245,7 +245,14 @@ const capSweep = () => {
   else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
 };
 
-const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`);
+// Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
+// the spent nonces in /data/link (0700), outside Cain's backups (config.yaml backup_exclude).
+const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`,
+  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`);
+// The drill key, derived from the Ship key under its own domain; its public half kept by root for the run script and the probe.
+const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
+const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
+if (drillKey) { try { storeMarkPub(drillKey.pub, DRILL_MARK_PUB); } catch (e) { console.log(`[cain] link: couldn't keep the drill key's public half: ${String(e).slice(0, 80)}`); } }
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
@@ -311,7 +318,7 @@ const link = new Link({
   linkHosts: () => readHosts(),
   keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
   // Keeper 0.1.13: his tap on the drill card, signed with the Ship key here and kept by root as the one-shot drill flag (drill.ts)
-  armDrill: shipPriv ? (mode) => armFlag(drillStore, mode, Date.now(), (data) => edSign(null, data, shipPriv)) : undefined,
+  armDrill: shipPriv ? (mode, version) => armFlag(drillStore, mode, version, Date.now(), (data) => edSign(null, data, shipPriv)) : undefined,
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
@@ -325,7 +332,10 @@ const enrollment: EnrollmentStore = {
 };
 const shipPub = () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } };
 // Keeper 0.1.13: the drill flag and mark, root's, beside the other trust files (drill.ts)
-const drill = drillDeps(drillStore, shipPub, Date.now, (l) => console.log(`[cain] link: ${l}`));
+const drill = drillDeps(drillStore, shipPub, Date.now, (l) => console.log(`[cain] link: ${l}`), {
+  sign: drillKey ? (data) => edSign(null, data, drillKey.priv) : undefined, markPub: () => drillKey?.pub ?? null,
+  page: (kind, key, info) => { void link.drillPage(kind, key, info).catch((e) => console.log(`[cain] link: couldn't post the drill page: ${String(e).slice(0, 80)}`)); },
+});
 // -- the keeper App's armed state (0.19.0) -------------------------------------------------------------
 // Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
 // that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
@@ -433,7 +443,7 @@ const shipPassDeps: PassDeps = {
   register: (tok, claim, done, note) => {
     const pub = shipPub();
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
-      post: (body) => keeperPost("/attempt", body), drill,
+      post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body),
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)

@@ -2,6 +2,10 @@
 
 ## 0.19.0
 
+- A drill tap is now for one Cain version, named on the card: an install of any other version refuses it and tells you to arm it again.
+- If the drill flag is damaged, ran out or was already used, nothing is installed and you get one message saying so, instead of a normal install going ahead.
+- The drill mark is signed by the link and checked at start, and Cain asks Keeper whether the install really is a drill it is watching before failing on purpose. Otherwise he starts normally and logs why.
+- If Keeper doesn't fully accept a drill, or the drill mark can't be written or confirmed, nothing is installed and you get one message.
 - Cain now works with the new Keeper App, which checks every install of Cain for 15 minutes and rolls a bad one back by itself from the backup taken just before it.
 - Right after Cain starts following an install, the App asks him its liveness line once and tells the Keeper whether he answered. No answer within 10 minutes counts as a failed install.
 - If the Keeper rolled Cain back or gave up on a rollback, Cain's bot tells you that in one line, once, after his next start.

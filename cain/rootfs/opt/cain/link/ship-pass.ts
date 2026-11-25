@@ -48,7 +48,7 @@
 import { createHash } from "node:crypto";
 import { publicKey, readToken, type Claim } from "../ship-token";
 import { bumpsAt, fileAt, type MergeDeps, versionAt } from "./merge";
-import { DRILL_APP, type DrillDeps, type DrillMode } from "./drill";
+import { DRILL_APP, markHash, type DrillDeps, type DrillMode } from "./drill";
 
 export const PASS_FORMAT = 2;                     // 0.1.4: entries carry their state (format 1 entries count as passed)
 export const ATTEMPT_WAIT_MS = 5 * 60_000;        // (0.1.5) one App's registration polled for this long
@@ -384,6 +384,8 @@ export interface RegisterDeps {
   noSpace?: (pr: number, head: string, app: string, version: string) => void;
   // (Keeper 0.1.13) the drill switch (drill.ts): the owner's flag spent by this registration, and the accepted drill's mark
   drill?: DrillDeps;
+  // (Keeper 0.1.14) POST /attempt/<id>/drill-mark on the keeper: the link's confirmation that it wrote the drill's signed mark
+  markPost?: (attempt: string, body: unknown) => Promise<{ status: number; body: any } | null>;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
 // is accepted (the keeper's answer "accepted" for that App and versions, with its attempt id and backup
@@ -409,7 +411,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   const committed = fpFile && fpFile !== "missing" ? readFingerprintFile(fpFile.toString("utf8")) : "";
   if (!committed) { say(`${FINGERPRINT_FILE} at the head ${fpFile === null ? "couldn't be read" : "holds no fingerprint"} (the Build run when the link's Ship key is made writes it), so nothing was registered`); return { ok: false, said }; }
   if (d.linkFp && committed !== d.linkFp) { say(`${FINGERPRINT_FILE} at the head (${committed}) isn't the link's own Ship key (${d.linkFp}), so nothing was registered`); return { ok: false, said }; }
-  d.drill?.clear();                                     // (Keeper 0.1.13) an earlier drill's mark never outlives a new registration
+  // (Keeper 0.1.14) no registration removes a mark it doesn't own: a competing, retried or rejected one leaves an active mark be
   for (const b of watched) {
     const slug = APP_SLUGS[b.app];
     const from = await versionAt(d, c.repo, CONFIGS[b.app], base);
@@ -417,18 +419,25 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     if (!from || from === "none" || !probe || probe === "missing") { say(`${b.app}'s version at the base or its probe at the head couldn't be read: not registered`); continue; }
     // (Keeper 0.1.13) the owner's drill flag, spent here, before the keeper is asked, so it counts once whatever follows:
     // while it was set this install goes as kind drill, and it fails on purpose as the flag names (drill.ts)
-    let drill: DrillMode | null = null;
+    // Keeper 0.1.14: fail closed (a flag file that doesn't verify, names another version or was spent refuses the install and
+    // pages); only with no flag file at all is it kind ship. A good flag's nonce is recorded before it is removed.
+    let drill: DrillMode | null = null, nonce = "";
     if (slug === DRILL_APP && d.drill) {
-      const sp = d.drill.spend();
+      const sp = d.drill.spend(b.version);
       if ("error" in sp) { say(`${sp.error}: ${b.app} ${b.version} not registered`); continue; }
       drill = sp.mode;
+      if (sp.mode) nonce = sp.nonce;
     }
+    // (Keeper 0.1.14) a drill that won't be a definitive acceptance: the install refused (by the caller's say), the owner paged once
+    const notAccepted = (why: string) => { if (drill) { d.log(`keeper registration: the spent drill flag (${drill}) installs nothing: ${why}`); d.drill!.page("accept", `accept:${nonce}`, { version: b.version }); } };
     const r = await d.post({ token, app: slug, pr: c.pr, head: c.head, from_version: from, to_version: b.version, kind: drill ? "drill" : "ship",
+      ...(drill ? { drill_mode: drill, drill_nonce: nonce } : {}),
       probe_hash: createHash("sha256").update(probe).digest("hex").slice(0, 16) }).catch(() => null);
     let j = r?.body ?? {};
     if (!r || r.status !== 202 || j.status !== "pending" || typeof j.id !== "string" || !ATTEMPT_ID.test(j.id)) {
       say(!r ? `the keeper didn't answer for ${b.app} ${b.version}` : r.status === 202 || r.status === 200 ? `the keeper's answer for ${b.app} ${b.version} isn't a registration of it`
         : `the keeper refused ${b.app} ${b.version}: ${String(j?.why ?? r.status).slice(0, 160)}`);
+      notAccepted("the keeper didn't take its registration");
       continue;
     }
     const attempt = j.id;
@@ -448,12 +457,29 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
         && typeof j.backup === "string" && BACKUP_SLUG.test(j.backup)) {
       const en = enrollmentCheckNow(j, committed, d.linkFp ?? null, before, d.enrollment);
       if (en.record) noteRecord(d.enrollment, en.record, d.log);
-      if (!en.ok) { cancel ??= en.cancel; say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); continue; }
+      if (!en.ok) { cancel ??= en.cancel; say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); notAccepted("its enrollment is refused"); continue; }
       if (drill) {
-        // (Keeper 0.1.13) the mark the drilled version reads at run time, written after the keeper's backup so no rollback restores it
-        if (!attempt.startsWith("drill-")) { say(`the keeper accepted the drill of ${b.app} ${b.version} as ${attempt}, not as a drill: not installed`); continue; }
-        try { d.drill!.mark({ v: 1, mode: drill, attempt, to_version: b.version, head: c.head, at: now() }); }
-        catch { say(`the drill mark for ${attempt} couldn't be written, so ${b.app} ${b.version} wouldn't fail as the drill needs: not installed`); continue; }
+        // (Keeper 0.1.14) a definitive acceptance of this very drill only: its kind and mode as registered
+        if (!attempt.startsWith("drill-") || j.kind !== "drill" || j.drill_mode !== drill) {
+          say(`the keeper accepted the drill of ${b.app} ${b.version} as ${attempt}, not as this drill: not installed`); notAccepted("its acceptance isn't this drill's"); continue;
+        }
+        // the signed mark the drilled version reads at run time, written after the keeper's backup so no rollback restores it, then
+        // confirmed to the keeper (its drill record needs that). Either failing aborts the drill: recorded, cancelled, paged.
+        let text: string;
+        try { text = d.drill!.mark({ version: b.version, attempt, mode: drill }); }
+        catch {
+          cancel = "the drill was aborted: its mark couldn't be written";
+          d.drill!.aborted(attempt, b.version, "its mark couldn't be written");
+          say(`the drill mark for ${attempt} couldn't be written, so ${b.app} ${b.version} wouldn't fail as the drill needs: the drill is aborted, not installed`); continue;
+        }
+        const conf = d.markPost ? await d.markPost(attempt, { mode: drill, to_version: b.version, mark: markHash(text) }).catch(() => null) : null;
+        if (!conf || conf.status !== 200 || conf.body?.status !== "marked" || conf.body?.id !== attempt) {
+          const why = !conf ? "the keeper didn't confirm its mark (no answer)" : `the keeper didn't confirm its mark (${String(conf.body?.why ?? conf.body?.status ?? conf.status).slice(0, 120)})`;
+          d.drill!.drop(attempt);
+          cancel = `the drill was aborted: ${why}`;
+          d.drill!.aborted(attempt, b.version, why);
+          say(`${why}, so ${b.app} ${b.version} is no drill Keeper can record: the drill is aborted, not installed`); continue;
+        }
         say(`${b.app} ${b.version} is a drill (${drill}): it fails on purpose so the keeper rolls it back`, false);
       }
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
@@ -463,9 +489,13 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       // saying so, with no button that installs without the rollback (the owner clears space or chooses another path)
       say(`the keeper refused ${b.app} ${b.version}: ${String(j.why ?? "no room for its backup").slice(0, 160)}; nothing installs without the keeper's rollback, and the link posts the owner a card saying so`);
       d.noSpace?.(c.pr, c.head, slug, b.version);
-    } else say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
+      notAccepted("the keeper had no room for its backup");
+    } else {
+      notAccepted(last?.status === 200 && j.status === "pending" ? "the keeper's answer was still pending when the wait ended" : "the keeper didn't accept it with a confirmed backup");
+      say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
       : last?.status === 200 ? `the keeper refused ${b.app} ${b.version}: ${String(j?.why || j?.status).slice(0, 160)}`
       : `the keeper didn't answer for ${b.app} ${b.version} (${attempt})`);
+    }
   }
   return ok ? { ok: true, accepted, said, fp: committed } : { ok: false, said, ...(cancel ? { cancel } : {}) };
 }

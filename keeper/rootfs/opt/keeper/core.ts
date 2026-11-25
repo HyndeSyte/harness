@@ -278,6 +278,10 @@ export interface Options {
   // (0.1.7) hc_api_key is gone from the options: the key is entered with hc-key and kept in the data folder.
   hc_unique_keys: Record<string, string>;        // (0.1.7) role (done, deadman, or an App slug) -> the check's unique key
   drill_days: number;                            // (0.1.8) 1 to 14: how long a phone test and a missed-heartbeat drill count
+  // (0.1.14) true (the default) while the drill plan's follow-up items are open: Keeper reads not armed whatever the drills
+  // recorded, so arming can't complete on the runbook alone. The owner sets it false once they have landed. Not in the
+  // options' hash, so clearing it never drops the drill records.
+  drill_followups_open: boolean;
 }
 const s = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 const pairs = (v: unknown): Record<string, string> => {
@@ -310,6 +314,7 @@ export function parseOptions(raw: unknown): Options {
   const days = Number(o.drill_days);
   return {
     drill_days: Number.isInteger(days) && days >= 1 && days <= 14 ? days : DRILL_DAYS_DEFAULT,
+    drill_followups_open: o.drill_followups_open !== false,
     watch, health: pairs(o.health), tokens: pairs(o.tokens), hc_done: s(o.hc_done), hc_deadman: s(o.hc_deadman), hc_failed: parseAlerts(o.hc_failed),
     health_grace_s: Number.isFinite(grace) && grace >= 0 && grace <= 900 ? Math.floor(grace) : DEFAULT_HEALTH_GRACE_S,
     ship_public_key: s(o.ship_public_key).replace(/\s+/g, ""),
@@ -428,6 +433,11 @@ export function shipKey(spkiB64: string): KeyObject | null {
     return k.asymmetricKeyType === "ed25519" ? k : null;
   } catch { return null; }
 }
+const SHIP_CLAIM_KEYS = ["exp", "head", "pr", "repo", "v"];
+export const shipClaimShape = (c: any): boolean => {
+  const keys = Object.keys(c).sort();
+  return (c.kind === undefined ? JSON.stringify(keys) === JSON.stringify(SHIP_CLAIM_KEYS) : c.kind === "ship" && JSON.stringify(keys) === JSON.stringify([...SHIP_CLAIM_KEYS, "kind"].sort()));
+};
 export function readShipToken(token: string, key: KeyObject, nowMs: number): { ok: true; claim: ShipClaim } | { ok: false; why: string } {
   const parts = token.trim().split(".");
   if (token.length > 1000 || parts.length !== 3 || parts[0] !== "ship1" || !B64URL.test(parts[1]) || !B64URL.test(parts[2])) return { ok: false, why: "its token isn't a Ship token" };
@@ -439,6 +449,9 @@ export function readShipToken(token: string, key: KeyObject, nowMs: number): { o
   try { c = JSON.parse(unb64url(parts[1]).toString("utf8")); } catch { return { ok: false, why: "its token's claim can't be read" }; }
   if (!c || c.v !== 1 || typeof c.repo !== "string" || !Number.isSafeInteger(c.pr) || c.pr < 1 || typeof c.head !== "string" || !HEAD.test(c.head) || !Number.isSafeInteger(c.exp))
     return { ok: false, why: "its token's claim isn't a Ship approval" };
+  // (0.1.14) the payload's kind, exactly: a Ship approval's keys and nothing else, and a kind (if any) of "ship"; a drill flag or
+  // any other signed payload of the link's is never a Ship token, whatever its prefix
+  if (!shipClaimShape(c)) return { ok: false, why: "its token's payload kind isn't a Ship approval" };
   if (!SHIP_REPOS.has(c.repo.toLowerCase())) return { ok: false, why: "its token is for another repository" };
   if (c.exp * 1000 <= nowMs) return { ok: false, why: "its token has expired" };
   if (c.exp * 1000 > nowMs + (SHIP_TTL_S + SHIP_SKEW_S) * 1000) return { ok: false, why: "its token's expiry is further off than a Ship token lasts" };
@@ -493,6 +506,9 @@ export interface Attempt {
   // unless lateProof holds the Supervisor's recorded completion of that backup before the install job's start.
   retentionOnly?: boolean;
   lateProof?: { backupDoneAt: number; installStartedAt: number };
+  // (0.1.14) a drill's mode as the link registered it (the owner's flag), the flag's nonce, and the link's confirmation that it
+  // wrote the signed drill mark for this attempt (its hash): the drill record needs both the mark and the failure its mode names
+  drillMode?: DrillMode; drillNonce?: string; markAt?: number; markHash?: string;
 }
 // (0.1.11) An operation whose external write outlived its step under the lock: its stable id (the 202 pending answer carries it),
 // and its recorded outcome: pending (the write is out, the lock held), done (it ended within the ceiling), late (it passed the
@@ -502,7 +518,18 @@ export interface OpRec { id: string; op: string; at: number; state: "pending" | 
 // left for the bounded cleanup only.
 export interface KeptRec { slug: string; name: string; attempt: string; gen: number; endedAt: number; reason: string }
 export interface Binding { protocol: number; probe_hash: string; keeper_version: string; options_hash: string; backup_scope: string }
-export interface DrillRec { attempt: string; kind: "fail-verdict" | "exits-on-start"; trigger: string; restoredAt: number; lineDeliveredAt: number; binding: Binding; at: number }
+export interface DrillRec { attempt: string; kind: "fail-verdict" | "exits-on-start"; trigger: string; restoredAt: number; lineDeliveredAt: number; binding: Binding; at: number;
+  mode?: DrillMode; markAt?: number; markHash?: string }   // (0.1.14) the evidence: the drill's mode and the mark the link confirmed
+// (0.1.14) The drill modes (the owner's drill flag, cain link/drill.ts) and the failure each must show for a drill record.
+export const DRILL_MODES = ["exit-on-start", "verdict-fail"] as const;
+export type DrillMode = typeof DRILL_MODES[number];
+export const DRILL_KIND_OF: Record<DrillMode, DrillRec["kind"]> = { "exit-on-start": "exits-on-start", "verdict-fail": "fail-verdict" };
+const NONCE = /^[0-9a-f]{16}$/;
+export const NONCES_MAX = 500;                   // (0.1.14) drill flag nonces kept, newest last: a nonce registers once
+// (0.1.14) Why Keeper reads not armed while option drill_followups_open is set (DOCS.md, "The drill runbook").
+export const FOLLOWUPS_WHY = "the drill plan's follow-up items are still open (the Ship token's causal link to the install, late jobs racing a backup delete, "
+  + "the secret scanner's coverage, a bare 401 taken as a revocation, the pending claim in the hook, the pending lock's bound): the owner sets "
+  + "drill_followups_open to false in Keeper's options once they have landed";
 // (0.1.3) The phone test drill, per check (0.1.4: its check id; every watched App's alert check and the
 // dead-man check): the page sent, delivered, and the owner's confirmation that it reached his phone.
 export interface PhoneRec { sentAt: number; deliveredAt?: number; confirmedAt?: number }
@@ -534,6 +561,7 @@ export interface State {
   lastSeen: Record<string, string>;              // slug -> version
   attempts: Record<string, Attempt>;
   spent: Spent[];
+  drillNonces?: { nonce: string; attempt: string; at: number }[];   // (0.1.14) every drill flag nonce registered: never twice
   probeHash: Record<string, string>;             // slug -> the probe_hash of its newest registration
   outstanding: Record<string, boolean>;          // slug -> a fail ping delivered to its alert check, its success ping owed
   last: Record<string, LastLine>;
@@ -604,6 +632,7 @@ export function loadState(raw: unknown): State {
     ...(r.mhbRec && Number(r.mhbRec.confirmedAt) > 0 ? { mhbRec: r.mhbRec } : {}), ...(typeof r.hcRwSaid === "string" ? { hcRwSaid: r.hcRwSaid } : {}), ...(typeof r.keyChangeSaid === "string" ? { keyChangeSaid: r.keyChangeSaid } : {}), lastSeen: obj(r.lastSeen) as any, attempts: obj(r.attempts) as any, probeHash: obj(r.probeHash) as any,
     outstanding: obj(r.outstanding) as any, last: obj(r.last) as any, drills: obj(r.drills) as any, phone: obj(r.phone) as any,
     queue: Array.isArray(r.queue) ? r.queue.map((q: any) => ({ ...q, at: Number(q?.at) || 0 })) : [], hcPinged: Number(r.hcPinged) || 0, lines: Number(r.lines) || 0,
+    ...(Array.isArray(r.drillNonces) ? { drillNonces: r.drillNonces.filter((x: any) => x && NONCE.test(String(x.nonce))).map((x: any) => ({ nonce: String(x.nonce), attempt: s(x.attempt), at: Number(x.at) || 0 })).slice(-NONCES_MAX) } : {}),
     spent: Array.isArray(r.spent) ? r.spent.filter((x: any) => x && typeof x.id === "string").map((x: any) => ({ id: x.id, auth: s(x.auth), app: s(x.app), at: Number(x.at) || 0 })).slice(-500) : [],
     hcDelivered: Number(r.hcDelivered) || 0, deadmanDelivered: Number(r.deadmanDelivered) || 0,
     logPinged: obj(r.logPinged) as any, logDelivered: obj(r.logDelivered) as any };
@@ -1412,6 +1441,14 @@ export class Keeper {
     const drill = this.drillRunning(now);
     if (drill) { this.interruptDrill(drill, "a registration arrived"); return refuse(`${drill} was running, and Keeper takes no registration during a drill (that drill is void now: run it again once the install is done)`); }
     if (kind !== "ship" && kind !== "drill") return refuse("its kind isn't ship or drill");
+    // (0.1.14) a drill carries the owner's flag's mode and nonce; a nonce registers once, ever (kept here, outside Cain's backups,
+    // so a restore of Cain that brings an old flag back can't register it again); a ship carries neither
+    const mode = s(body?.drill_mode), nonce = s(body?.drill_nonce);
+    if (kind === "drill" && !(DRILL_MODES as readonly string[]).includes(mode)) return refuse("a drill registration names no drill mode (exit-on-start or verdict-fail)");
+    if (kind === "drill" && !NONCE.test(nonce)) return refuse("a drill registration carries no drill flag nonce");
+    if (kind === "ship" && (mode || nonce)) return refuse("a ship registration carries a drill mode or nonce");
+    const usedNonce = kind === "drill" ? (this.st.drillNonces ?? []).find((x) => x.nonce === nonce) : undefined;
+    if (usedNonce) return refuse(`a replay: that drill flag's nonce was registered under ${usedNonce.attempt}`);
     if (!SLUG.test(app)) return refuse("its app isn't an App slug");
     if (body?.backup_slug !== undefined) return refuse("it names a backup; Keeper always makes the backup itself");
     const tid = tokenId(token);
@@ -1428,11 +1465,13 @@ export class Keeper {
       : null;
     if (why) return refuse(why, 409, why !== `${app} isn't in the keeper's watch list`);
     this.st.spent.push({ id, auth: tid, app, at: now }); if (this.st.spent.length > 500) this.st.spent.shift();
+    if (kind === "drill") { (this.st.drillNonces ??= []).push({ nonce, attempt: id, at: now }); if (this.st.drillNonces.length > NONCES_MAX) this.st.drillNonces.shift(); }
     const a: Attempt = {
       id, app, from, to, backup: "", deadline: now + REGISTER_WAIT_MS + 60_000, issuedAt: issued,
       auth: kind as "ship" | "drill", authHash: tid, pr: c.pr, head: c.head, authExpires: c.exp * 1000,
       probeHash: probe, registeredAt: now, status: "verifying",
       notStarted: 0, healthFails: 0, startedEveryPoll: true, health: [],
+      ...(kind === "drill" ? { drillMode: mode as DrillMode, drillNonce: nonce } : {}),
     };
     this.st.attempts[id] = a;
     this.st.probeHash[app] = probe;
@@ -1451,11 +1490,31 @@ export class Keeper {
     if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App reads registrations` } };
     const a = this.st.attempts[id];
     if (!a) return { status: 404, body: { status: "unknown", id } };
-    const base = { id, app: a.app, from_version: a.from, to_version: a.to, ...this.enrollment() };
+    const base = { id, app: a.app, from_version: a.from, to_version: a.to, kind: a.auth, ...(a.drillMode ? { drill_mode: a.drillMode, marked: !!a.markAt } : {}), ...this.enrollment() };
     if (a.status === "verifying") return { status: 200, body: { status: "pending", ...base } };
     if (a.status === "accepted") return { status: 200, body: { status: "accepted", ...base, backup: a.backup, until: new Date(a.acceptUntil ?? a.deadline).toISOString() } };
     if (a.status === "claimed") return { status: 200, body: { status: "claimed", ...base, backup: a.backup, claim: a.claim!.id, until: new Date(a.claim!.until).toISOString() } };
     return { status: 200, body: { status: a.status === "unprotected" ? "refused" : a.status, ...base, why: a.why ?? "", ...(a.code ? { code: a.code } : {}) } };
+  }
+  // (0.1.14) POST /attempt/<id>/drill-mark, Cain's link only: {mode, to_version, mark}, the link's confirmation that it wrote the
+  // signed drill mark (mark: its SHA-256) for this accepted drill, before any claim. It is the evidence a drill record needs that
+  // the failure came from the owner's flag. Idempotent for the same mark; refused for a ship attempt, another mode or version,
+  // or once the acceptance was claimed or ended. Saved before the answer.
+  markAttempt(caller: string | null, id: string, body: any): Answer {
+    const no = (why: string, status = 409): Answer => { this.d.log(`refused a drill mark confirmation${/^drill-[a-z0-9-]{1,90}$/.test(id) ? ` for ${id}` : ""}: ${why}`); return { status, body: { status: "refused", id, why } }; };
+    if (caller !== REGISTRAR) return no(`only ${appName(REGISTRAR)}'s App confirms a drill mark`, 403);
+    const a = this.st.attempts[id];
+    const mark = s(body?.mark).toLowerCase();
+    if (!a) return no("no such attempt", 404);
+    if (a.auth !== "drill" || !a.drillMode) return no("it isn't a drill");
+    if (s(body?.mode) !== a.drillMode || s(body?.to_version) !== a.to) return no("its mode or version isn't the drill's");
+    if (!/^[0-9a-f]{64}$/.test(mark)) return no("its mark isn't a hash");
+    if (a.markAt) return a.markHash === mark ? { status: 200, body: { status: "marked", id } } : no("another mark was confirmed for it");
+    if (a.status !== "accepted") return no(`it is ${a.status}, not accepted`);
+    a.markAt = this.now(); a.markHash = mark;
+    if (!this.save()) { delete a.markAt; delete a.markHash; return no("Keeper couldn't save its state", 503); }
+    this.d.log(`the link confirmed the drill mark of ${id} (${a.drillMode}, ${a.to}): the drill record will need it`);
+    return { status: 200, body: { status: "marked", id } };
   }
   // (0.1.5) POST /attempt/<id>/claim, Cain's link only, as the RemoteTrigger hook lets the Ship run start:
   // {app, from_version, to_version, backup}, which must be the acceptance's. Atomic: checked and set with
@@ -2360,15 +2419,20 @@ export class Keeper {
       : a?.trigger?.kind === "state-error" || a?.trigger?.kind === "not-started" ? "exits-on-start" : null;
     const why = !a ? "no such attempt"
       : a.auth !== "drill" ? "it wasn't a drill"
+      // (0.1.14) evidence, not just kind drill plus a rollback: the link confirmed it wrote the signed mark for this attempt,
+      // and the failure Keeper observed is the one the drill's mode names
+      : !a.drillMode ? "it carries no drill mode"
+      : !a.markAt || !a.markHash ? "no evidence the drill mark was written (the link never confirmed it to Keeper)"
       : a.status !== "rolled back" ? `it ended ${a.status}, not rolled back`
       : !a.restore?.called || !a.restore.doneAt ? "no restore of its backup ran"
       : !kind ? `its trigger (${a.trigger?.kind ?? "none"}) is neither a FAIL verdict nor an exit on start`
+      : DRILL_KIND_OF[a.drillMode] !== kind ? `the failure Keeper observed (${kind}) isn't the one its drill mode (${a.drillMode}) names`
       : !a.lineDelivered ? "its owner line wasn't delivered"
       : a.probeHash !== this.st.probeHash[a.app] ? "a newer registration changed the probe since"
       : null;
     if (why) return { ok: false, why };
     (this.st.drills[a!.app] ??= {})[kind!] = { attempt: a!.id, kind: kind!, trigger: a!.trigger!.words, restoredAt: a!.restore!.doneAt!,
-      lineDeliveredAt: this.now(), binding: { ...this.binding(a!.app), probe_hash: a!.probeHash }, at: this.now() };
+      lineDeliveredAt: this.now(), binding: { ...this.binding(a!.app), probe_hash: a!.probeHash }, at: this.now(), mode: a!.drillMode, markAt: a!.markAt, markHash: a!.markHash };
     a!.drillRecorded = true;
     this.d.log(`drill recorded for ${a!.app}: ${kind} (${a!.id}); it counts while Keeper's version, its options, the kept Healthchecks key and ${appName(a!.app)}'s probe stay as they are now`);
     this.arm();
@@ -2386,14 +2450,16 @@ export class Keeper {
       const cur = JSON.stringify(this.binding(app));
       const attempts = Object.values(this.st.attempts).filter((a) => a.app === app).sort((x, y) => x.registeredAt - y.registeredAt).slice(-6)
         .map((a) => ({ id: a.id, kind: a.auth, from: a.from, to: a.to, status: a.status, trigger: a.trigger?.kind ?? null,
-          restored: !!a.restore?.doneAt, drill_recorded: !!a.drillRecorded, registered: new Date(a.registeredAt).toISOString() }));
+          restored: !!a.restore?.doneAt, drill_recorded: !!a.drillRecorded, registered: new Date(a.registeredAt).toISOString(),
+          ...(a.drillMode ? { drill_mode: a.drillMode, mark_confirmed: a.markAt ? new Date(a.markAt).toISOString() : null } : {}) }));
       const d = this.st.drills[app] ?? {};
       const drills = (["exits-on-start", "fail-verdict"] as const).map((k) => d[k] ? { kind: k, attempt: d[k]!.attempt, at: new Date(d[k]!.at).toISOString(),
         counts: JSON.stringify(d[k]!.binding) === cur && now - d[k]!.at <= ARMED_MAX_MS } : { kind: k, attempt: null, at: null, counts: false });
       const v = this.armedState(app, now);
       apps[app] = { attempts, drills, armed: v.armed, why: v.why, binding: this.binding(app) };
     }
-    return { ok: true, why: "", state: { keeper_version: this.d.version, at: new Date(now).toISOString(), drill_running: this.drillRunning(now) || null, apps } };
+    return { ok: true, why: "", state: { keeper_version: this.d.version, at: new Date(now).toISOString(), drill_running: this.drillRunning(now) || null,
+      followups_open: this.opts.drill_followups_open, apps } };
   }
   private autoDrill(id: string): void {
     const a = this.st.attempts[id];
@@ -2574,6 +2640,7 @@ export class Keeper {
     const drill = this.drillRunning(now);
     const why = armable ? `the keeper is not armable: ${armable}`
       : !this.limitsOk() ? `the owner hasn't accepted the limits in Keeper's DOCS (Accepted limits, text version ${LIMITS_VERSION}): accept-limits <code>`
+      : this.opts.drill_followups_open ? FOLLOWUPS_WHY
       : drill ? `${drill} is running (one drill at a time; Keeper is unarmed during a drill)`
       : valid.length < 2 ? `no drills on record for ${app} under the current binding`
       : !this.phoneOk(app, now) ? `no phone test drill confirmed for ${app}'s alert check and the dead-man check in the last ${this.opts.drill_days} days, under the current Healthchecks options and checks' settings`
