@@ -36,3 +36,7 @@ d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api
 d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api-key:2567
 # Keeper 0.1.10's exclusion test: the same file name among the names the exclusion must cover.
 d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api-key:2614
+# Keeper 0.1.16's scan coverage test: a made-up value ("hc-live-key-" and counting digits) planted in archive locations; replaced by plain text in the next commit.
+9237ba4e71fa56507b6eb4e3623907d3c9ee5ca0:keeper/tests/keeper.test.ts:generic-api-key:3864
+# Keeper 0.1.16's scan coverage test: the made-up sentinel "keeper-sentinel-" and counting digits; replaced by plain text in the next commit.
+9237ba4e71fa56507b6eb4e3623907d3c9ee5ca0:keeper/tests/keeper.test.ts:generic-api-key:3900

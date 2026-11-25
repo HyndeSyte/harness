@@ -23,7 +23,7 @@
 import { closeSync, constants as FS, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { BACKUP_KEY_SENTINEL, BACKUP_KEY_TMP_PREFIX, BACKUP_KEYS_DIR, CHECK_CONTROL_FILE, DRILL_SPENT_DIR, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
+import { BACKUP_KEY_SENTINEL, BACKUP_KEY_TMP_PREFIX, BACKUP_KEYS_DIR, CHECK_CONTROL_FILE, DRILL_SPENT_DIR, DRILL_SPENT_SENTINEL, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -105,7 +105,8 @@ export const keyTmp = (path: string) => join(dirname(path), `${KEY_TMP_PREFIX}${
 export function keyFiles(dir = DATA) {
   let placed: string[] = [];
   // a name in the data folder, or (0.1.12) one in the backup key store
-  const inStore = (n: string) => basename(n) === n || (dirname(n) === BACKUP_KEYS_DIR && basename(n) !== "" && !basename(n).startsWith("."));
+  const inStore = (n: string) => basename(n) === n || (dirname(n) === BACKUP_KEYS_DIR && basename(n) !== "" && !basename(n).startsWith("."))
+    || n === `${DRILL_SPENT_DIR}/${DRILL_SPENT_SENTINEL}`;   // (0.1.16)
   const put = (name: string, body: string) => { const p = join(dir, name); if (existsSync(p)) return; const fd = openSync(p, FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600); try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); } placed.push(name); };
   return {
     place: (sentinel: string, skip: string[] = []): string[] => {
@@ -117,6 +118,9 @@ export function keyFiles(dir = DATA) {
       try { mkdirSync(join(dir, BACKUP_KEYS_DIR), { recursive: true, mode: 0o700 }); } catch { /* the check fails on the missing sentinel */ }
       try { put(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_SENTINEL}`, `${sentinel}\n`); } catch { /* idem */ }
       try { put(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_TMP_PREFIX}${randomBytes(6).toString("hex")}`, `${sentinel}\n`); } catch { /* idem */ }
+      // (0.1.16) the drill flags' spent list: a sentinel under a fixed name that is never a nonce (drillSpent lists only nonces)
+      try { mkdirSync(join(dir, DRILL_SPENT_DIR), { recursive: true, mode: 0o700 }); } catch { /* the check fails on the missing sentinel */ }
+      try { put(`${DRILL_SPENT_DIR}/${DRILL_SPENT_SENTINEL}`, `${sentinel}\n`); } catch { /* idem */ }
       return [...placed];
     },
     read: (name: string): string | null => { if (!inStore(name)) return null; try { return readFileSync(join(dir, name), "utf8").trim(); } catch { return null; } },
@@ -138,6 +142,12 @@ export function keyFiles(dir = DATA) {
           if (gone) { rmSync(p, { force: true }); out.push(`${BACKUP_KEYS_DIR}/${n}`); }
         }
       } catch { /* no store yet */ }
+      // (0.1.16) and the one an interrupted check left in the drill flags' spent list (a nonce's file is empty, never a sentinel)
+      try {
+        const p = join(dir, DRILL_SPENT_DIR, DRILL_SPENT_SENTINEL);
+        let gone = false; try { gone = readFileSync(p, "utf8").startsWith(SENTINEL); } catch { gone = false; }
+        if (gone) { rmSync(p, { force: true }); out.push(`${DRILL_SPENT_DIR}/${DRILL_SPENT_SENTINEL}`); }
+      } catch { /* no list yet */ }
       return out;
     },
   };
@@ -195,12 +205,38 @@ export async function hcChecks(key: string, http: typeof fetch = fetch): Promise
 
 // (0.1.9) The old key tried once at the Healthchecks API. 0.1.10: a GET of the checks list (read-only, no side effects, and
 // the endpoint the old hc_api_key option was used for from 0.1.5), answering its status and the API's error text; core.ts
-// revocation() judges it (a 401 or "wrong api key" proves it revoked, never a bare 403). Null: no answer.
-export async function hcTry(key: string, http: typeof fetch = fetch): Promise<{ status: number; error?: string } | null> {
+// revocation() judges it (0.1.16: only "wrong api key" on a 401 or 403 proves it revoked; a bare 401 or 403 never does). Null:
+// no answer. 0.1.16: the body is read bounded in time (HC_BODY_MS, the read aborted then) and size (the first HC_BODY_MAX bytes,
+// the rest never read); the documented answer is looked for in that prefix only, and a body cut short by either bound carries no
+// error text, so it proves nothing.
+export const HC_BODY_MAX = 4096, HC_BODY_MS = 3_000;
+export async function readCapped(r: Response, max = HC_BODY_MAX, ms = HC_BODY_MS): Promise<{ text: string; whole: boolean }> {
+  const reader = r.body?.getReader();
+  if (!reader) return { text: "", whole: true };
+  const parts: Uint8Array[] = [];
+  let n = 0, whole = false, t: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((res) => { t = setTimeout(() => res("timeout"), ms); (t as any)?.unref?.(); });
+  try {
+    while (n < max) {
+      const x = await Promise.race([reader.read(), timeout]);
+      if (x === "timeout") break;
+      if (x.done) { whole = true; break; }
+      parts.push(x.value); n += x.value.length;
+    }
+  } catch { whole = false; } finally {
+    if (t) clearTimeout(t);
+    if (!whole) { try { void reader.cancel().catch(() => {}); } catch { /* already closed */ } }
+  }
+  const all = new Uint8Array(Math.min(n, max)); let o = 0;
+  for (const p of parts) { const take = p.subarray(0, Math.min(p.length, all.length - o)); all.set(take, o); o += take.length; if (o >= all.length) break; }
+  return { text: new TextDecoder().decode(all), whole: whole && n <= max };
+}
+export async function hcTry(key: string, http: typeof fetch = fetch, bodyMs = HC_BODY_MS): Promise<{ status: number; error?: string } | null> {
   try {
     const r = await http(HC_API, { method: "GET", headers: { "x-api-key": key }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
     let error: string | undefined;
-    try { const j: any = await r.json(); if (typeof j?.error === "string") error = j.error.slice(0, 80); } catch { /* no body */ }
+    const body = await readCapped(r, HC_BODY_MAX, bodyMs).catch(() => ({ text: "", whole: false }));
+    if (body.whole) { try { const j: any = JSON.parse(body.text); if (typeof j?.error === "string") error = j.error.slice(0, 80); } catch { /* not the documented body */ } }
     return { status: r.status, ...(error ? { error } : {}) };
   } catch { return null; }
 }
@@ -231,7 +267,7 @@ async function serve(): Promise<void> {
   const k = new Keeper({
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
-    backups: sup.backups, activeJobs: sup.activeJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
+    backups: sup.backups, activeJobs: sup.activeJobs, backupJobs: sup.backupJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
     installJobs: sup.installJobs, drillSpent: drillSpent(),   // (0.1.15) items 2 and 10
     diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
     keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), backupKeys: backupKeys(), hcTry: (key) => hcTry(key),
