@@ -58,8 +58,10 @@ What Keeper checks itself, before it accepts an install:
    key's bytes) and pages you once: "Keeper pinned Cain's link's Ship key, fingerprint ...". 0.1.5: that
    first pin accepts **no** registration until you confirm it at the device, the same way as a new key:
    `bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` in Keeper's container (for example
-   `docker exec addon_0fcc2575_keeper bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` from the SSH
-   App). 0.1.6: `<code>` is the one-time code Keeper printed in its log at the pin (`one-time code for
+   `docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` from the SSH
+   App; the container is `addon_0fcc2575_keeper` on an older Home Assistant and `app_0fcc2575_keeper` after Home
+   Assistant's rename, so the command finds its name at run time with `docker ps --format '{{.Names}}' | grep
+   0fcc2575_keeper`, and the SSH App's user `hassio` runs it with `sudo`). 0.1.6: `<code>` is the one-time code Keeper printed in its log at the pin (`one-time code for
    key-confirm: ...`, below).
    Check the fingerprint first against `cain/SHIP_KEY_FINGERPRINT` in the repository and the
    `Ship key fingerprint: ...` line in Cain's App log: all three must agree. A state that is lost (Keeper
@@ -230,7 +232,10 @@ once, not covered. So is an install the watch can't match to its own attempt and
 usable backup (none, or one deleted): one page, never only a log line. A write in flight under the claim record's
 lock holds it at most 3 minutes: then the write is marked late (reconciled later by its pre-chosen name or slug, as
 late backups are), the lock is released and you are paged once, so later claims, cancels and attestations are never
-stuck behind it. The pending answer (`202 {"status": "pending", "operation": "op-...", "recorded": ...}`) carries a
+stuck behind it. (0.1.16) The 3 minutes bound the lock itself, counted from the moment the step took it (before, the
+step's own 30 seconds came first, so the lock could be held about three and a half minutes): one timer started with the
+step releases the lock then whatever the step or its write is doing, marks the step late and logs it (`... the lock's
+bound ... the lock is released`), and a failing save or page at that moment doesn't keep the release from happening. The pending answer (`202 {"status": "pending", "operation": "op-...", "recorded": ...}`) carries a
 stable operation id, and the same request again reports that recorded outcome (pending or late) without repeating
 the write.
 
@@ -379,7 +384,7 @@ to Cain itself then also goes by break glass.
    Settings, API Access, the read-only key). It is no longer an option: Keeper's options can be read by
    anything with Supervisor option access, and a backup of the App carries them. Set the checks (3) first, then
    in Keeper's container run `bun /opt/keeper/main.ts hc-key <code>` with the key on standard input, never on
-   the command line (for example `docker exec -i addon_0fcc2575_keeper bun /opt/keeper/main.ts hc-key <code>`,
+   the command line (for example `docker exec -i "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun /opt/keeper/main.ts hc-key <code>`,
    paste the key, then Enter and Ctrl-D). `<code>` is the one-time code Keeper prints in its log at every start
    (`one-time code for hc-key: ...`); the command prints nothing of the key. Before it keeps the key, Keeper
    checks that it is read-only (an answer showing any ping URL comes from a key that can write, and is refused
@@ -451,7 +456,7 @@ to Cain itself then also goes by break glass.
 4. **The tokens.** One random token per watched App (at least 16 characters, for example
    `openssl rand -hex 24`), in Keeper's `tokens` as `0fcc2575_cain=<token>`, and the same token in the
    Cain App's `keeper_token` option. Cain's token is also the one that registers installs.
-5. **The accepted limits (0.1.7; text version 2 since 0.1.8).** Read "Accepted limits" below, then run `bun
+5. **The accepted limits (0.1.7; text version 7 since 0.1.15).** Read "Accepted limits" below, then run `bun
    /opt/keeper/main.ts accept-limits <code>` in Keeper's container, with the one-time code Keeper prints at each
    start while they aren't accepted for the current text (`one-time code for accept-limits: ...`). Arming needs it.
    An acceptance of version 1 (0.1.7) lapsed with 0.1.8: accept again.
@@ -476,6 +481,15 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   name there with its temporary prefix (`/data/backup-keys/tmp-<hex>`); both must be absent from the test backup like
   the `hc-key` names, and no name under `backup-keys` may appear in it. The exclusion changed in 0.1.12, so an earlier
   pass no longer counts: run the backup check again.
+  (0.1.16) The scan reaches every byte of the archive. Each layer is searched whole as well as member by member, so a
+  key value, a fingerprint or a sentinel is found in the gzip header's name and comment, in any tar header field (a
+  link's target, the owner and group names, pax records, global ones included), in the padding after a member, and
+  after the end-of-archive block. Anything but zeros after a gzip stream or after a tar's end-of-archive block fails
+  the check, since nothing would read it as a member, and an old tar header with no `ustar` magic (its checksum right)
+  is read as a tar. It also writes a sentinel into the drill flags' spent list
+  (`/data/drill-spent/backup-check-sentinel`, a name that is never a nonce), and no name under `drill-spent` may appear
+  in the test backup. A pass is tied to this scan too (scan 2): a pass from before 0.1.16 no longer counts, so run the
+  backup check again.
   Any read, format, size or traversal error fails it. A check that was interrupted counts as failed: at every start
   Keeper deletes its recorded test backup and any downloaded archive left behind, and logs it. A pass is tied to the
   exclusion this build ships (its hash); a build with another exclusion needs the check again.
@@ -486,8 +500,10 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   link signs your tap with its Ship key and Keeper checks that signature, so nothing Cain writes himself counts;
   where Keeper kept the old key it first tries it at Healthchecks and needs it rejected (`the alert service still
   accepts the old key ...` otherwise). (0.1.10) The try is a read-only GET of the checks list (the endpoint the old
-  option was used for), and only a 401, or Healthchecks' documented `wrong api key` answer, proves the key revoked;
-  a bare 403 never does. The kept old key is deleted as soon as that passes, and is written in the first place only
+  option was used for). (0.1.16) Only Healthchecks' documented `wrong api key` answer on a 401 or 403 proves the key
+  revoked at once; a bare 401 proves it only when a second read at least 10 seconds later answers 401 again with the
+  current key accepted (200) in between, so an outage or a proxy's 401 never reads as a revocation; a bare 403 never
+  does. The kept old key is deleted as soon as that passes, and is written in the first place only
   once its file is checked inside the backup exclusion. Where no old key was kept, nothing can be tried: the card and
   Keeper's state say "attested by your tap only". The link's signature is bound to the current enrollment, the old
   key's id and a single-use challenge Keeper issues (`GET /rotation`), and the link checks the tap is yours before it
@@ -525,7 +541,7 @@ every read, never stored, and says armed only while all of these hold:
    bounds above, each check with a channel and none paused.
 
 **The phone test (a drill, 0.1.3; 0.1.4; 0.1.6).** With no incident open, run in the Keeper App's container
-`bun /opt/keeper/main.ts phone-test` (for example from the SSH App: `docker exec addon_0fcc2575_keeper bun
+`bun /opt/keeper/main.ts phone-test` (for example from the SSH App: `docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun
 /opt/keeper/main.ts phone-test`). Keeper pages each watched App's alert check once ("Keeper phone test (a
 drill) ..."), and (0.1.4) the dead-man check too, each followed by its all clear, and (0.1.6) prints a
 one-time code in its log. Once the pages have reached your phone, within an hour, run
@@ -593,7 +609,7 @@ The commands reach Keeper only on its container's own loopback (`127.0.0.1:8096`
 network's listener (port 8097) refuses them from any address. So the container's network mode is the real gate on
 the confirm commands: `host_network: false` is set in Keeper's `config.yaml` (a test fails if it changes), which
 keeps every other container and the host network off that loopback. Only a process inside Keeper's own container
-(`docker exec` at the Pi, as root) can make them.
+(`docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" ...` at the Pi, as root) can make them.
 
 The binding is the verdict protocol, the App's probe (its hash), Keeper's version, Keeper's options and the
 backup scope. The drill records are dropped when the binding changes, after 60 days, or when Keeper's
@@ -612,7 +628,10 @@ your tap sets it: the **drill flag**.
 
 **The switch** (0.1.14: round 15's version, fail closed throughout).
 - Cain asks for the card: `/opt/cain/keeper.sh drill-arm exit-on-start <version>` (or `verdict-fail`), the version
-  being the Cain version the drill release carries (its `config.yaml` at the pull request's head). The link posts you
+  being the Cain version the drill release carries (its `config.yaml` at the pull request's head). That version is
+  checked when the install registers, against `cain/config.yaml` at the pull request's head: a flag armed for another
+  version is refused, nothing is installed, and the refusal then blocks every install of Cain until you tap **Clear the
+  drill** on its message (or arm a new drill). The link posts you
   one card, "Keeper drill: ... it must be Cain <version> ...", with one button, **Arm the drill**. Cain's request sets
   nothing; a new card for another version or mode retires an open one (its button no longer arms anything).
 - Your tap is checked to be yours, in your DM, the same way as a Ship tap, and only then signed with the link's Ship
@@ -633,7 +652,8 @@ your tap sets it: the **drill flag**.
   `drill-<pr>-cain-<head>`. Only a definitive acceptance counts: Keeper's "accepted" for that drill, its kind, mode
   and versions, with its checked backup. A pending answer at the end of the wait, a refusal or no answer installs
   nothing, and you get one message saying so.
-- Then the link writes the **drill mark**, `/data/trust/keeper-drill-mark.json` (0600, root), signed with the drill
+- Then the link writes the **drill mark**, `/data/trust/keeper-drill-mark.json` (root's, mode 0644: readable by the
+  App, never writable by it; Keeper 0.1.15), signed with the drill
   key (an Ed25519 key derived from the Ship key under its own domain; its public half is
   `/data/trust/keeper-drill-mark.pub`, 0600), naming the version, the attempt, the mode and its expiry (90 minutes),
   and tells Keeper so (`POST /attempt/<id>/drill-mark`, the mark's hash). It is written after Keeper's backup, so the
@@ -656,9 +676,11 @@ your tap sets it: the **drill flag**.
   whatever its drills recorded, and `drill-state` says why (`followups_open: true`). Keeper 0.1.15 closed three of the
   items the drill plan filed: the Ship token's causal link to the install (now the install job binding, below), late
   jobs racing a backup delete (now the pins), and the pending claim in the hook (now the acceptance outside the hook's
-  bound). Still open: the secret scanner's coverage, a bare 401 taken as a revocation, the pending lock's bound, and
-  this round's device checks ("Still to check on the device", 0.1.15). You set the option to `false` only once those
-  are done, after the device run. It isn't in the drill records' binding, so changing it drops nothing: the drills
+  bound). Keeper 0.1.16 closed the other three: the secret scanner's coverage (the backup check's scan reads every
+  byte of the archive), a bare 401 taken as a revocation (it now needs the documented answer, or a repeat with the
+  current key accepted in between), and the pending lock's bound (released at 3 minutes from the step's start,
+  whatever the step does). Only the device checks remain ("Still to check on the device", 0.1.15 and 0.1.16): you set
+  the option to `false` once they are done, after the device run, and not before. It isn't in the drill records' binding, so changing it drops nothing: the drills
   can run before, and arming completes only after.
 
 **Round 16 (Keeper 0.1.15, Cain 0.19.0): the switch as it now is.**
@@ -718,8 +740,10 @@ your tap sets it: the **drill flag**.
   an open attempt names, or one pinned by an install job with no recorded end (or by a claim the jobs list can't
   confirm had none), reading the attempt records right before every delete; the claim reads the backup's slug again
   right before the install.
-- **Quiet hours.** The link holds the drill, rotation, retry and free-space cards from 22:00 to 07:00 (its check-in
-  zone) and sends them at 07:00; the drill pages and Keeper's own alerts are never held.
+- **Quiet hours.** From 22:00 to 07:00 (the link's check-in zone) the drill card is refused, not held: Cain is told
+  "ask again after 7:00", and nothing is sent at 07:00 unless he asks again. Only the retry and free-space cards are
+  held and sent at 07:00 (the link's `quietFlush`). The rotation card isn't posted then either; Cain's next ask after
+  07:00 posts it. The drill pages and Keeper's own alerts are never held.
 
 **The crash ordering.** Each step is durable before the next: read the flag, claim it (0.1.15: renamed aside), check
 it, record its nonce, remove the claimed flag, register at Keeper, the acceptance (within `keeper_accept_min`), write the
@@ -763,8 +787,9 @@ phone test and the missed-heartbeat drill are done; a Keeper update after the dr
 2. Keeper's options: `watch`, `health`, `tokens` (and the same token in Cain's `keeper_token`), `hc_done`,
    `hc_deadman`, `hc_failed` (Cain's alert check: a drill record needs its rollback line delivered there),
    `hc_unique_keys` for every role, `ship_public_key`, `drill_days` (What you must set, 1 to 4).
-3. In Keeper's container (for example `docker exec addon_0fcc2575_keeper bun /opt/keeper/main.ts <command>` from the
-   SSH App, as for `key-confirm` above): `key-code`, then `key-confirm <fingerprint> <code>` against
+3. In Keeper's container (for example `docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun /opt/keeper/main.ts <command>` from
+   the SSH App, as for `key-confirm` above: `addon_0fcc2575_keeper` on an older Home Assistant, `app_0fcc2575_keeper`
+   after its rename): `key-code`, then `key-confirm <fingerprint> <code>` against
    `cain/SHIP_KEY_FINGERPRINT`; `backup-check`; `hc-key <code>` (the key on standard input); `accept-limits <code>`.
 4. The state read, before and after every case below: `bun /opt/keeper/main.ts drill-state` in Keeper's container
    (read only: each watched App's newest attempts with their kind, versions, status, trigger, whether a restore ran
@@ -785,7 +810,7 @@ the healthy case), then one Ship tap. Wait for each case's last line before the 
 **The restored backup's check (the first device drill, case 1).** Once Cain is back at N, list what Keeper's backup
 held and what the restore left: in Home Assistant, Settings, System, Backups, open the backup named
 `Keeper drill-<pr>-cain-<head> ...` and note its contents (the Cain App only); then, from the SSH App,
-`docker exec addon_0fcc2575_cain ls -l /data/trust/` and confirm neither `keeper-drill.json` (the flag) nor
+`docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_cain)" ls -l /data/trust/` (Cain's container is `addon_0fcc2575_cain` or `app_0fcc2575_cain`, as above) and confirm neither `keeper-drill.json` (the flag) nor
 `keeper-drill-mark.json` (the mark) is there. Either one present means the backup or the restore held it: stop the
 drills and log it as a Build item.
 
@@ -800,11 +825,10 @@ delivered), fix the why and run `drill-record <attempt id>` in Keeper's containe
 3. the rotation tap: tap **Old key replaced** on the link's card (What you must set, "Both key roles").
 4. The phone test: `phone-test`, then `phone-confirm <code> cain deadman` once both pages reached your phone (Arming).
 5. The missed-heartbeat drill: `missed-heartbeat`, then `missed-heartbeat-confirm <code>` (Arming).
-6. Once the drill plan's remaining follow-up items have landed (their pull requests merged and installed) and this
-   round's device checks are done ("Still to check on the device", 0.1.15), set `drill_followups_open` to `false` in
-   Keeper's options.
+6. Once Keeper 0.1.16 is installed (it closes the drill plan's follow-up items) and the device checks are done
+   ("Still to check on the device", 0.1.15 and 0.1.16), set `drill_followups_open` to `false` in Keeper's options.
 Then `drill-state` (or Cain's "Ship it with that risk" card) reads armed; until step 6 it says the follow-up items
-are still open, so arming can't complete on this runbook alone. The phone test and the missed-heartbeat
+or the device checks are still open, so arming can't complete on this runbook alone. The phone test and the missed-heartbeat
 drill last `drill_days`; the drill records last 60 days or until the binding changes.
 
 ## Accepted limits
@@ -1019,8 +1043,8 @@ download is a tar Keeper can read), `/host/info`'s `disk_free` and the backup in
 reserve, the old key's try at Healthchecks answering 401 or 403 once revoked, the rotation card's tap reaching Keeper,
 and a full-Pi restore from a fresh Home Assistant (untested); (0.1.10) the backup check's archive as the Pi's
 Supervisor makes it (its layout, whether the App's archive is gzip, `size` and `size_bytes` in the backup info
-matching the download, the positive control found once), the old key's try answering exactly 401 or `wrong api key`
-once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
+matching the download, the positive control found once), the old key's try answering `wrong api key` (or a 401
+twice, 0.1.16) once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
 challenge reaching Keeper within its 10 minutes; (0.1.12) a backup made with Keeper's password shown as protected in the
 backup info and on Home Assistant's backup page, a partial restore of it with the same password, and the backup check
 passing with the backup key store's sentinels; and the two drills (the next job). (0.1.13) The drill switch itself: the link's drill card and your tap reaching the flag in `/data/trust`, the run script's exit at start and the probe's FAIL for the drilled version only, the mark missing from the backup a rollback restores, `drill-state` read in the container, and the restart case's timing on the Pi ("The drill runbook"). (0.1.14) The run script's helper reaching Keeper's `GET /attempt` with Cain's token at start, and dropping a mark when Keeper names no drill; the link's `POST /attempt/<id>/drill-mark` reaching Keeper; the drill files' modes in `/data/trust` and `/data/link` on the Pi; the spent list staying out of a Cain backup; the restored backup's contents and no flag or mark after case 1.
@@ -1044,7 +1068,14 @@ passing with the backup key store's sentinels; and the two drills (the next job)
    excluded paths on a restore), and neither the flag nor the mark is in the backup's contents.
 7. The pins: a kept backup whose attempt's install job is still listed as running isn't deleted by the cleanup
    (`it is pinned (...)` in the log).
-8. The refused-drill page's **Clear the drill** tap reaching the link, and the drill, rotation, retry and free-space
-   cards held from 22:00 to 07:00 and sent at 07:00.
+8. The refused-drill page's **Clear the drill** tap reaching the link; a drill card asked for between 22:00 and 07:00
+   refused with "ask again after 7:00" (not held, nothing sent at 07:00); the retry and free-space cards held from
+   22:00 to 07:00 and sent at 07:00.
 9. Cain's option `keeper_accept_min` read by the link (its wait for Keeper's acceptance), and the link's reconcile
    at its start (a pass a restart left open refused, in its log).
+
+(0.1.16) One device check this build needs, named here: the backup check's scan was widened (every byte of the archive,
+and a sentinel in `/data/drill-spent/`), so a pass recorded before 0.1.16 no longer counts. Run `backup-check` again
+after installing 0.1.16 (step 1 above, with the placeholder) and confirm it passes on the Pi's real archive: its log
+line names `drill-spent/backup-check-sentinel` among the sentinels placed, and the check doesn't fail on data after a
+gzip stream or a tar's end-of-archive block in the Supervisor's own archive.

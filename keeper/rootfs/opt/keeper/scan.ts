@@ -7,7 +7,15 @@
 // that is neither gzip nor tar (an encrypted SecureTar, or anything unknown), an unknown tar entry type and a
 // backup.json that says protected all fail rather than being skipped; and a positive control (a value placed in a file
 // the backup doesn't leave out) must be found exactly once, so a scan that read nothing useful can't pass.
+// 0.1.16: the scan reaches every byte of the archive. Each archive layer's own bytes are searched whole as well as member by
+// member (the gzip header's name and comment fields, each tar header's link name, owner names and pax records, the padding
+// after each member, and whatever follows the end-of-archive block), a tar without the ustar magic (an old v7 header, its
+// checksum valid) is read as a tar, and anything but zeros after a gzip stream or after a tar's end-of-archive block fails
+// the check, since nothing reads it as a member. SCAN_VERSION names this coverage: a pass recorded by an earlier scan no
+// longer counts (core.ts checkPassed).
 import { gunzipSync } from "node:zlib";
+
+export const SCAN_VERSION = 2;
 
 export interface ScanResult { ok: boolean; why: string; members: number; names: string[]; found: string[]; control: number }
 export interface ScanOpts { control?: string }
@@ -44,9 +52,31 @@ function* tarMembers(buf: Uint8Array): Generator<{ name: string; data: Uint8Arra
     yield { name, data, type };
   }
   if (!ended) throw new Error("the tar has no end-of-archive block (truncated)");
+  // (0.1.16) nothing but zeros after the end-of-archive block: a second archive appended there is never read as members
+  for (let i = off; i < buf.length; i++) if (buf[i] !== 0) throw new Error(`the tar holds data after its end-of-archive block (at byte ${i})`);
 }
 const isGzip = (b: Uint8Array) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
-const isTar = (b: Uint8Array) => b.length >= 512 && dec.decode(b.subarray(257, 262)) === "ustar";
+// (0.1.16) a ustar header, or an old v7 header (no magic) whose checksum is right and whose name is set
+const isTar = (b: Uint8Array) => {
+  if (b.length < 512) return false;
+  if (dec.decode(b.subarray(257, 262)) === "ustar") return true;
+  if (b[0] === 0) return false;
+  const f = b.subarray(148, 156); const z = f.indexOf(0);
+  const want = parseInt(dec.decode(z >= 0 ? f.subarray(0, z) : f).trim() || "x", 8);
+  let sum = 0; for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : b[i];
+  return Number.isFinite(want) && want === sum;
+};
+// (0.1.16) A gzip read whole, its members one after another; what follows the last member must be zeros (the decoder stops
+// at them silently, so bytes after them would never be read). A decoder that doesn't say how much it read fails closed.
+function gunzipWhole(b: Uint8Array, what: string): Uint8Array {
+  let r: any;
+  try { r = gunzipSync(b, { info: true } as any); } catch (e) { throw new Error(`${what} is a gzip that can't be read whole (${String((e as Error)?.message ?? e).slice(0, 40)})`); }
+  const out: Uint8Array | undefined = r?.buffer ?? (r instanceof Uint8Array ? r : undefined);
+  const used = Number(r?.engine?.bytesWritten);
+  if (!out || !Number.isFinite(used) || used <= 0 || used > b.length) throw new Error(`${what} is a gzip whose read length can't be told, so its end can't be checked`);
+  for (let i = used; i < b.length; i++) if (b[i] !== 0) throw new Error(`${what} holds data after its gzip stream (at byte ${i})`);
+  return out;
+}
 // Formats Keeper can't open: a member in one fails the check, never skipped.
 const UNREADABLE: [string, number[]][] = [["zstd", [0x28, 0xb5, 0x2f, 0xfd]], ["xz", [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]], ["bzip2", [0x42, 0x5a, 0x68]],
   ["zip", [0x50, 0x4b, 0x03, 0x04]], ["7z", [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]], ["lz4", [0x04, 0x22, 0x4d, 0x18]]];
@@ -67,9 +97,12 @@ export function scanBackup(bytes: Uint8Array, names: RegExp, needles: string[], 
     if (depth > 6) throw new Error("the archive nests too deep");
     const what = where || "the archive";
     let b = buf;
+    // (0.1.16) every layer's own bytes, searched whole: a gzip's header fields, a tar's headers, padding and tail
+    const raw = (x: Uint8Array, layer: string) => { const X = Buffer.from(x.buffer, x.byteOffset, x.length); for (const p of pats) if (X.includes(p.b)) found.push(`${what}${layer} holds a key value, a key's fingerprint or the sentinel`); };
     if (isGzip(b)) {
+      raw(b, " (its gzip bytes)");
       // a gzip that doesn't end whole throws here (unexpected end of file): a truncated member fails the check
-      try { b = gunzipSync(b); } catch (e) { throw new Error(`${what} is a gzip that can't be read whole (${String((e as Error)?.message ?? e).slice(0, 40)})`); }
+      b = gunzipWhole(b, what);
     }
     const m = magic(b);
     if (m) throw new Error(`${what} is ${m}-compressed, which Keeper can't read`);
@@ -85,6 +118,7 @@ export function scanBackup(bytes: Uint8Array, names: RegExp, needles: string[], 
       }
       return;
     }
+    raw(b, " (its tar headers, padding or tail)");
     for (const t of tarMembers(b)) {
       members++;
       const path = `${where}${where ? ":" : ""}${t.name}`;

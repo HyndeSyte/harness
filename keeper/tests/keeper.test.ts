@@ -5,18 +5,18 @@
 // only on its job's success; alert checks per App, the shared-success suppression, the dead-man check
 // and the phone test drill; no options write and no kept settings; local evidence only.
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { generateKeyPairSync, sign as edSign, type KeyObject } from "node:crypto";
 import { join } from "node:path";
 import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMIT_MS, REWIND_MS, WATCH_MS, ARMED_MAX_MS, PHONE_MAX_MS, LOOP_FRESH_MS, checkId, keyFp, optionsHash, parseOptions, readShipToken, shipKey,
   ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, MHB_CAP_MS, LIMITS_VERSION, PHONE_WINDOW_MS, DROP_TRIES,
   OLD_KEY_WHY, ENROLL_BEHIND, ENROLL_REFUSED, jobsWhy, CLEANUP_TICK_MS, KEPT_GRACE_MS, KEPT_MAX_MS, BACKUP_CHECK_WHY, OPTIONS_UNKNOWN_WHY, CODE_EPOCH,
-  EXCLUDE_HASH, BACKUP_EXCLUDE, KEY_NAME, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, excludedName, FOLLOWUPS_WHY, JOB_GRACE_MS, KEY_TMP_PREFIX,
+  EXCLUDE_HASH, BACKUP_EXCLUDE, KEY_NAME, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, REVOKE_REPEAT_MS, excludedName, FOLLOWUPS_WHY, JOB_GRACE_MS, KEY_TMP_PREFIX,
   type AppInfo, type BackupInfo, type HcCheck, type JobState, type RestoreResult, type State, type InstallJob } from "../rootfs/opt/keeper/core.ts";
 import { backupKeys, drillSpent, hcChecks, hcKeyStore, healthUrl, keyFiles, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
-import { scanBackup } from "../rootfs/opt/keeper/scan.ts";
+import { SCAN_VERSION, scanBackup } from "../rootfs/opt/keeper/scan.ts";
 import { handle, handleLocal, internal } from "../rootfs/opt/keeper/server.ts";
 
 const CAIN = "0fcc2575_cain";
@@ -144,7 +144,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     drillSpent: { list: () => { if (!f.spentListOk) throw new Error("unreadable"); return [...f.spent]; }, add: (n) => { if (!f.spentOk || f.spent.has(n)) return false; f.spent.add(n); return true; } },
     hcChecks: async () => { f.hcReads++; return f.hcUp ? hcList(f.options, f.hcOver) : null; },
     timer: (ms) => f.timer(ms),
-    lockCallMs: 50, lockStepMs: 300,                     // (0.1.8) the lock's bounds, short for the tests
+    lockCallMs: 50, lockStepMs: 300, revokeRepeatMs: 30,                     // (0.1.8) the lock's bounds, short for the tests
     live: async () => f.alive,
     ready: async () => f.ready,
     ping: async (url, body) => { pings.push({ url, body }); return !f.pingFails(url); },
@@ -155,7 +155,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   k.useOptions(o.uniq === false ? f.options : withKeys(f.options));
   k.start();
   // (0.1.9) the backup check passed on the device, as at first setup
-  if (o.backupCheck !== false && !k.st.backupCheck) k.st.backupCheck = { at: T0, names: ["hc-key"], slug: "bc-1", exclude: EXCLUDE_HASH };
+  if (o.backupCheck !== false && !k.st.backupCheck) k.st.backupCheck = { at: T0, names: ["hc-key"], slug: "bc-1", exclude: EXCLUDE_HASH, scan: SCAN_VERSION };
   // (0.1.5) the owner's enrollment of the pinned key at the device, as at first setup (0.1.9: its code on demand, key-code)
   if (o.confirm !== false && shipKey(k.opts.ship_public_key)) { k.keyCode(); k.keyConfirm(keyFp(k.opts.ship_public_key), codeIn(logs, "key-confirm")); }
   // (0.1.7) the owner's acceptance of the accepted limits, as at first setup
@@ -2381,7 +2381,7 @@ function checkRig(archive: (sentinel: string, control: string) => Uint8Array | n
   const r = rig({ backupCheck: false });
   const files: Record<string, string> = {};
   let sentinel = "", control = "", cleared = false, bytes: Uint8Array | null | undefined;
-  const placedNames = ["hc-key", "hc-key-old", "hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa"];
+  const placedNames = ["hc-key", "hc-key-old", "hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa", "drill-spent/backup-check-sentinel"];
   const got = () => (bytes === undefined ? (bytes = archive(sentinel, control)) : bytes);
   (r.k as any).d.keyFiles = {
     place: (sv: string, skip: string[] = []) => { sentinel = sv; const out = placedNames.filter((n) => !skip.includes(n)); for (const n of out) files[n] = sv; return out; },
@@ -2406,7 +2406,7 @@ describe("0.1.9 C: the guards as hard refusals", () => {
     const c = checkRig((_s, ctl) => haBackup(goodFiles(ctl)));
     expect(await c.r.k.backupCheck()).toEqual({ ok: true, why: "" });
     // the kept key's own file (hc-key) is never written over: its value is searched for instead
-    expect(c.r.k.st.backupCheck?.names).toEqual(["hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp", "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa"]);
+    expect(c.r.k.st.backupCheck?.names).toEqual(["hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp", "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa", "drill-spent/backup-check-sentinel"]);
     expect(c.r.k.st.backupCheck?.exclude).toBe(EXCLUDE_HASH);
     expect(c.cleared).toBe(true);
     expect(c.r.backupsMade).toEqual(["0fcc2575_keeper"]);
@@ -2461,10 +2461,13 @@ describe("0.1.9 C: the guards as hard refusals", () => {
     expect(String((await r.k.attestRotation(CAIN, { attestation: tok() })).body.why)).toContain("still accepts the old key");
     answer = null;
     expect(String((await r.k.attestRotation(CAIN, { attestation: tok() })).body.why)).toContain("the old key's try doesn't prove it revoked (no answer)");
+    // (0.1.16) a bare 401 alone proves nothing; the documented answer does
     answer = { status: 401 };
+    expect(String((await r.k.attestRotation(CAIN, { attestation: tok() })).body.why)).toContain("doesn't prove it revoked");
+    answer = { status: 401, error: "wrong api key" };
     expect((await r.k.attestRotation(CAIN, { attestation: tok() })).status).toBe(200);
     expect(dropped).toBe(true);
-    expect(r.k.st.rotation!.tried).toBe("rejected by the alert service (401)");
+    expect(r.k.st.rotation!.tried).toBe("rejected by the alert service (401 wrong api key)");
   });
   test("an options read that fails or times out counts as the old option present: not armable, hc-key refused", async () => {
     const r = rig();
@@ -2608,7 +2611,7 @@ describe("0.1.10 item 1: the backup check fails closed", () => {
     (k.r.k as any).d.oldKeyStore = { load: () => "old-key-0123456789abcdef", store: () => true, drop: () => {}, name: "hc-key-old" };
     expect((await k.r.k.backupCheck()).ok).toBe(true);
     expect(placedSkip).toEqual(["hc-key", "hc-key-old"]);
-    expect(k.r.k.st.backupCheck!.names).toEqual(["hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa"]);
+    expect(k.r.k.st.backupCheck!.names).toEqual(["hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa", "drill-spent/backup-check-sentinel"]);
     // and its value is searched for: a backup holding it fails
     const v = checkRig((_s, ctl) => haBackup([...goodFiles(ctl), ["./data/x", "old-key-0123456789abcdef"]]));
     (v.r.k as any).d.oldKeyStore = { load: () => "old-key-0123456789abcdef", store: () => true, drop: () => {}, name: "hc-key-old" };
@@ -2623,7 +2626,7 @@ describe("0.1.10 item 1: the backup check fails closed", () => {
     const run = c.r.saved!.backupCheckRun!;
     expect(run.name).toMatch(/^Keeper backup check [0-9a-f]{8}$/);
     // Keeper stops here; a pass from before no longer counts after the restart
-    const saved = { ...c.r.saved!, backupCheck: { at: T0, names: [], slug: "old", exclude: EXCLUDE_HASH } };
+    const saved = { ...c.r.saved!, backupCheck: { at: T0, names: [], slug: "old", exclude: EXCLUDE_HASH, scan: SCAN_VERSION } };
     const again = rig({ saved, backupCheck: false });
     expect(again.logs.some((l) => l.startsWith(`a backup check was interrupted (its test backup "${run.name}"): it counts as failed`))).toBe(true);
     expect(again.k.checkPassed()).toBe(false);
@@ -2668,7 +2671,7 @@ describe("0.1.10 item 2: the old key's try proves revocation", () => {
   async function rotRig(kept: string | null) {
     const r = rig();
     let store = "", dropped = false;
-    let answer: { status: number; error?: string } | null = { status: 401 };
+    let answer: { status: number; error?: string } | null = { status: 401, error: "wrong api key" };
     const tried: string[] = [];
     (r.k as any).d.oldKeyStore = { load: () => store, store: (k: string) => { if (kept === null) return false; store = k; return true; }, drop: () => { dropped = true; store = ""; }, name: "hc-key-old" };
     (r.k as any).d.hcTry = async (k: string) => { tried.push(k); return answer; };
@@ -2676,9 +2679,11 @@ describe("0.1.10 item 2: the old key's try proves revocation", () => {
     delete r.f.options.hc_api_key; await r.poll();
     return { r, id: r.k.st.oldKey!.id, set: (a: typeof answer) => { answer = a; }, get dropped() { return dropped; }, get store() { return store; }, tried };
   }
-  test("only a 401 or the documented invalid-key answer proves it revoked; a bare 403 never does", async () => {
-    expect(revocation({ status: 401 }).state).toBe("revoked");
-    expect(revocation({ status: 400, error: "wrong api key" }).state).toBe("revoked");
+  test("only the documented invalid-key answer proves it revoked at once (0.1.16: a bare 401 needs its repeat); a bare 403 never does", async () => {
+    expect(revocation({ status: 401 }).state).toBe("repeat");
+    expect(revocation({ status: 401, error: "wrong api key" }).state).toBe("revoked");
+    expect(revocation({ status: 403, error: "wrong api key" }).state).toBe("revoked");
+    expect(revocation({ status: 400, error: "wrong api key" }).state).toBe("unknown");
     expect(revocation({ status: 403 }).state).toBe("unknown");
     expect(revocation({ status: 403, error: "forbidden" }).state).toBe("unknown");
     expect(revocation({ status: 200 }).state).toBe("valid");
@@ -2689,7 +2694,7 @@ describe("0.1.10 item 2: the old key's try proves revocation", () => {
     expect(res.status).toBe(409);
     expect(String(res.body.why)).toContain("a bare 403, which doesn't prove the key revoked");
     expect(t.dropped).toBe(false);
-    t.set({ status: 401 });
+    t.set({ status: 401, error: "wrong api key" });
     expect((await t.r.k.attestRotation(CAIN, { attestation: rotationToken(t.id, t.r.now, { k: t.r.k }) })).status).toBe(200);
     // deleted as soon as the revocation check passed
     expect(t.dropped).toBe(true);
@@ -2724,7 +2729,7 @@ describe("0.1.10 item 2: the old key's try proves revocation", () => {
     t.set({ status: 200 });
     const tok = rotationToken(t.id, t.r.now, { k: t.r.k });
     expect(String((await t.r.k.attestRotation(CAIN, { attestation: tok })).body.why)).toContain("still accepts the old key");
-    t.set({ status: 401 });
+    t.set({ status: 401, error: "wrong api key" });
     expect(String((await t.r.k.attestRotation(CAIN, { attestation: tok })).body.why)).toContain("or it was used already");
     expect((await att({})).status).toBe(200);
   });
@@ -3851,5 +3856,216 @@ describe("0.1.15 item 22: the device list's order", () => {
     const dev = docs.slice(docs.indexOf("(0.1.15) This round's device checks"));
     const a = dev.indexOf("placeholder"), b = dev.indexOf("live key"), c = dev.indexOf("rotation attestation"), d = dev.indexOf("before arming");
     expect(a).toBeGreaterThan(0); expect(b).toBeGreaterThan(a); expect(c).toBeGreaterThan(b); expect(d).toBeGreaterThan(c);
+  });
+});
+
+// -- 0.1.16 (the three items that gate arming) -------------------------------------------------------------
+describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
+  const KEY = "hc-live-key-0123456789abcdefABCDEF";   // a kept key's value, planted where the scan used to look past
+  const CTL = "keeper-control-0123456789abcdef01234567";
+  const enc = (x: string) => new TextEncoder().encode(x);
+  // one tar header, any field set by hand
+  const hdr = (o: { name: string; size?: number; type?: string; linkname?: string; uname?: string; gname?: string; magic?: boolean }) => {
+    const h = new Uint8Array(512);
+    const put = (x: string, off: number) => h.set(enc(x), off);
+    put(o.name, 0); put("0000600\0", 100); put("0000000\0", 108); put("0000000\0", 116);
+    put((o.size ?? 0).toString(8).padStart(11, "0") + "\0", 124); put("00000000000\0", 136); put("        ", 148); put(o.type ?? "0", 156);
+    if (o.linkname) put(o.linkname, 157);
+    if (o.magic !== false) { put("ustar\0", 257); put("00", 263); }
+    if (o.uname) put(o.uname, 265);
+    if (o.gname) put(o.gname, 297);
+    put(h.reduce((a, b) => a + b, 0).toString(8).padStart(6, "0") + "\0 ", 148);
+    return h;
+  };
+  const cat = (...p: Uint8Array[]) => { const out = new Uint8Array(p.reduce((a, x) => a + x.length, 0)); let o = 0; for (const x of p) { out.set(x, o); o += x.length; } return out; };
+  const pad = (n: number) => new Uint8Array((512 - (n % 512)) % 512);
+  // a member: header, data, padding (pad: what fills the padding, zeros by default)
+  const member = (name: string, body: string | Uint8Array, o: { type?: string; linkname?: string; uname?: string; gname?: string; magic?: boolean; fill?: string } = {}) => {
+    const data = typeof body === "string" ? enc(body) : body;
+    const p = pad(data.length); if (o.fill) p.set(enc(o.fill).subarray(0, p.length));
+    return cat(hdr({ name, size: data.length, ...o }), data, p);
+  };
+  const pax = (type: "x" | "g", rec: string) => { const line = (k: string) => { let n = k.length + 3; while (`${n} ${k}\n`.length !== n) n++; return `${n} ${k}\n`; }; return member(type === "x" ? "./PaxHeaders/x" : "./GlobalHead", line(rec), { type }); };
+  const END = new Uint8Array(1024);
+  const good = () => [member("./addon.json", "{}"), member("./data/state.json", "{\"format\":1}"), member("./data/backup-check-control", `${CTL}\n`)];
+  // the gzip with optional header fields (FNAME 0x08, FCOMMENT 0x10), written in clear before the compressed data
+  const gz = (b: Uint8Array, o: { fname?: string; comment?: string } = {}) => {
+    const z = gzipSync(b); let flags = z[3]; const extra: Uint8Array[] = [];
+    if (o.fname !== undefined) { flags |= 0x08; extra.push(enc(`${o.fname}\0`)); }
+    if (o.comment !== undefined) { flags |= 0x10; extra.push(enc(`${o.comment}\0`)); }
+    const head = z.slice(0, 10); head[3] = flags;
+    return cat(head, ...extra, z.subarray(10));
+  };
+  const outer = (inner: Uint8Array) => tarOf([["./backup.json", JSON.stringify({ protected: false })], ["./0fcc2575_keeper.tar.gz", inner]]);
+  const scan = (inner: Uint8Array) => scanBackup(outer(inner), KEY_NAME, [KEY, "keeper-sentinel-0123456789abcdef"], { control: CTL });
+
+  test("the baseline: a clean archive passes, with the same builder", () => {
+    expect(scan(gz(cat(...good(), END)))).toMatchObject({ ok: true, control: 1 });
+    // a clean pax header, a clean global header, a symlink and zeros after the gzip stream and after the end block are fine
+    expect(scan(cat(gz(cat(pax("g", "comment=nothing here"), pax("x", "path=./data/long-name.json"), member("./data/long-name.json", "{}"),
+      member("./data/link", "", { type: "2", linkname: "state.json" }), ...good(), END, new Uint8Array(512)), { fname: "keeper.tar" }), new Uint8Array(16)))).toMatchObject({ ok: true, control: 1 });
+  });
+  test("a key value planted in each place the scan didn't reach before is found, or the archive fails closed", () => {
+    const places: [string, Uint8Array][] = [
+      ["the gzip header's file name", gz(cat(...good(), END), { fname: KEY })],
+      ["the gzip header's comment", gz(cat(...good(), END), { comment: KEY })],
+      ["data after the gzip stream, past zero padding", cat(gz(cat(...good(), END)), new Uint8Array(8), enc(KEY))],
+      ["a pax extended header's attribute", gz(cat(pax("x", `SCHILY.xattr.user.note=${KEY}`), member("./data/notes", "x"), ...good(), END))],
+      ["a pax global header", gz(cat(pax("g", `comment=${KEY}`), ...good(), END))],
+      ["a symlink's target", gz(cat(member("./data/link", "", { type: "2", linkname: KEY }), ...good(), END))],
+      ["a hard link's target", gz(cat(member("./data/hard", "", { type: "1", linkname: KEY }), ...good(), END))],
+      ["a header's owner name", gz(cat(member("./data/owned", "x", { uname: KEY }), ...good(), END))],
+      ["a header's group name", gz(cat(member("./data/grouped", "x", { gname: KEY }), ...good(), END))],
+      ["a member's padding", gz(cat(member("./data/short", "x", { fill: KEY }), ...good(), END))],
+      ["after the tar's end-of-archive block", gz(cat(...good(), END, enc(KEY), new Uint8Array(512 - KEY.length)))],
+      ["a second tar appended after the end-of-archive block", gz(cat(...good(), END, member("./data/hc-key", KEY), END))],
+      ["a v7 tar member with no ustar magic", gz(cat(member("./data/notes-v7", KEY, { magic: false }), END))],
+    ];
+    for (const [where, inner] of places) {
+      const res = scan(inner);
+      expect([where, res.ok]).toEqual([where, false]);
+      expect([where, /key value|data after|can't be read/.test(res.why)]).toEqual([where, true]);
+    }
+    // the same planted in the backup's outer tar (its own headers and tail), not only the App's archive
+    const o = outer(gz(cat(...good(), END)));
+    const tail = cat(o, enc(KEY), new Uint8Array(512 - KEY.length));
+    expect(scanBackup(tail, KEY_NAME, [KEY], { control: CTL }).ok).toBe(false);
+    const linked = cat(member("./link", "", { type: "2", linkname: KEY }), o);
+    expect(scanBackup(linked, KEY_NAME, [KEY], { control: CTL }).why).toContain("holds a key value");
+  });
+  test("a v7 tar is read as a tar: a key file's name in it is found", () => {
+    const res = scan(gz(cat(member("./data/hc-key", "x", { magic: false }), member("./data/backup-check-control", `${CTL}\n`, { magic: false }), END)));
+    expect(res.ok).toBe(false);
+    expect(res.why).toContain("is a key file's name");
+  });
+  test("the drill flags' spent list is a key name, its sentinel is placed and read back, and the pass is tied to the scan", async () => {
+    for (const n of ["./data/drill-spent/", "./data/drill-spent/0123456789abcdef", "./data/drill-spent/backup-check-sentinel"]) {
+      const res = scan(gz(cat(member(n, "", n.endsWith("/") ? { type: "5" } : {}), ...good(), END)));
+      expect([n, res.why]).toEqual([n, expect.stringContaining("is a key file's name")]);
+    }
+    const dir = mkdtempSync(join(tmpdir(), "keeper-kf-"));
+    const kf = keyFiles(dir);
+    const placed = kf.place("keeper-sentinel-abc");
+    expect(placed).toContain("drill-spent/backup-check-sentinel");
+    expect(kf.read("drill-spent/backup-check-sentinel")).toBe("keeper-sentinel-abc");
+    // never taken for a nonce
+    expect(drillSpent(join(dir, "drill-spent")).list()).toEqual([]);
+    expect(excludedName("drill-spent/backup-check-sentinel")).toBe(true);
+    kf.clear();
+    expect(existsSync(join(dir, "drill-spent", "backup-check-sentinel"))).toBe(false);
+    // an interrupted check's sentinel is swept at start
+    writeFileSync(join(dir, "drill-spent", "backup-check-sentinel"), "keeper-sentinel-left\n");
+    expect(kf.sweep()).toContain("drill-spent/backup-check-sentinel");
+    // a pass from the narrower scan no longer counts
+    const r = rig();
+    r.k.st.backupCheck = { at: T0, names: [], slug: "old", exclude: EXCLUDE_HASH };
+    expect(r.k.checkPassed()).toBe(false);
+    r.k.st.backupCheck.scan = SCAN_VERSION;
+    expect(r.k.checkPassed()).toBe(true);
+    expect(SCAN_VERSION).toBe(2);
+  });
+});
+
+describe("0.1.16 item 2: a bare 401 is no longer proof of revocation", () => {
+  const OLD = "old-key-0123456789abcdef", CUR = "cur-key-0123456789abcdef";
+  // the old key's answers in order, and the current key's
+  async function rot(oldAnswers: ({ status: number; error?: string } | null)[], cur: { status: number; error?: string } | null) {
+    const r = rig();
+    let store = "", dropped = false;
+    const tried: { key: string; at: number }[] = [];
+    (r.k as any).d.oldKeyStore = { load: () => store, store: (k: string) => { store = k; return true; }, drop: () => { dropped = true; store = ""; }, name: "hc-key-old" };
+    (r.k as any).hcKey = CUR;
+    (r.k as any).d.revokeRepeatMs = 60;
+    let n = 0;
+    (r.k as any).d.hcTry = async (k: string) => { tried.push({ key: k === OLD ? "old" : k === CUR ? "cur" : "?", at: Date.now() }); return k === OLD ? oldAnswers[Math.min(n++, oldAnswers.length - 1)] : cur; };
+    r.f.options.hc_api_key = OLD; await r.poll();
+    delete r.f.options.hc_api_key; await r.poll();
+    const res = await r.k.attestRotation(CAIN, { attestation: rotationToken(r.k.st.oldKey!.id, r.now, { k: r.k }) });
+    return { r, res, tried, get dropped() { return dropped; } };
+  }
+  test("the production gap is 10 seconds", () => { expect(REVOKE_REPEAT_MS).toBe(10_000); });
+  test("a single 401: not proven", async () => {
+    const t = await rot([{ status: 401 }, { status: 200 }], { status: 200 });
+    expect(t.res.status).toBe(409);
+    expect(t.dropped).toBe(false);
+    const t2 = await rot([{ status: 401 }, null], { status: 200 });
+    expect(String(t2.res.body.why)).toContain("doesn't prove it revoked");
+    expect(t2.r.k.st.rotation).toBeUndefined();
+  });
+  test("401 twice, at least the gap apart, with the current key accepted in between: proven", async () => {
+    const t = await rot([{ status: 401 }, { status: 401 }], { status: 200 });
+    expect(t.res.status).toBe(200);
+    expect(t.tried.map((x) => x.key)).toEqual(["old", "cur", "old"]);
+    expect(t.tried[2].at - t.tried[0].at).toBeGreaterThanOrEqual(60);
+    expect(t.dropped).toBe(true);
+    expect(t.r.k.st.rotation!.tried).toContain("401 twice");
+  });
+  test("the documented answer: proven at once, on a 401 or a 403", async () => {
+    for (const status of [401, 403]) {
+      const t = await rot([{ status, error: "wrong api key" }], { status: 200 });
+      expect([status, t.res.status]).toEqual([status, 200]);
+      expect(t.tried.map((x) => x.key)).toEqual(["old"]);
+    }
+  });
+  test("a bare 403: not proven, whatever follows", async () => {
+    const t = await rot([{ status: 403 }, { status: 403 }], { status: 200 });
+    expect(t.res.status).toBe(409);
+    expect(String(t.res.body.why)).toContain("a bare 403");
+    expect(t.tried.map((x) => x.key)).toEqual(["old"]);
+  });
+  test("an outage: 401 for every key, or no answer for the current key, is not proven", async () => {
+    for (const cur of [{ status: 401 }, { status: 503 }, null]) {
+      const t = await rot([{ status: 401 }, { status: 401 }], cur);
+      expect([cur, t.res.status]).toEqual([cur, 409]);
+      expect(String(t.res.body.why)).toContain("the current key wasn't accepted in between");
+      expect(t.tried.map((x) => x.key)).toEqual(["old", "cur"]);
+      expect(t.dropped).toBe(false);
+    }
+    // no current key kept: nothing shows the service was answering
+    const r = rig();
+    (r.k as any).hcKey = "";
+    (r.k as any).d.hcTry = async () => ({ status: 401 });
+    expect((await r.k.oldKeyRevoked(OLD)).state).toBe("unknown");
+  });
+});
+
+describe("0.1.16 item 3: the pending lock's bound", () => {
+  const fb = (why: string, pending: boolean, op?: any) => (pending ? Keeper.pendingAnswer("x", why, op) : { status: 503, body: { status: "refused", why } });
+  test("a step whose write never answers releases the lock at the bound from the step's start, marked late, and a second attempt proceeds", async () => {
+    const r = rig();
+    (r.k as any).d.lockStepMs = 300; (r.k as any).d.pendingCeilingMs = 600;
+    const t0 = Date.now();
+    const first: any = await r.k.record((f: any) => f.write("the backup of Cain", () => new Promise<boolean>(() => {})).then(() => "done"), fb, "claim x");
+    expect(first.status).toBe(202);
+    const second = await r.k.record(() => "second ran", fb, "claim y");
+    const took = Date.now() - t0;
+    expect(second).toBe("second ran");
+    // released at the bound from the step's start (600 ms), not the step's 300 plus a fresh 600
+    expect(took).toBeGreaterThanOrEqual(550);
+    expect(took).toBeLessThan(850);
+    expect(r.k.st.ops!["claim x"]).toMatchObject({ state: "late" });
+    expect(r.logs.some((l) => l.includes("still has no outcome after") && l.includes("the lock's bound") && l.endsWith("the lock is released"))).toBe(true);
+  });
+  test("a step that never answers at all, even under a longer step bound, releases the lock at the bound", async () => {
+    const r = rig();
+    (r.k as any).d.pendingCeilingMs = 300;
+    const t0 = Date.now();
+    const hung = r.k.record(() => new Promise<string>(() => {}), fb, "rotation", 1_200);
+    const second = await r.k.record(() => "second ran", fb, "claim y");
+    expect(second).toBe("second ran");
+    expect(Date.now() - t0).toBeLessThan(600);
+    expect(r.logs.some((l) => l.includes("still running after") && l.includes("the lock's bound"))).toBe(true);
+    // the hung step's own bound answers it later; its generation changes nothing
+    expect(((await hung) as any).status).toBe(202);
+  });
+  test("a failing save or page at the bound still releases the lock", async () => {
+    const r = rig();
+    (r.k as any).d.lockStepMs = 100; (r.k as any).d.pendingCeilingMs = 300;
+    await r.k.record((f: any) => f.write("the delete of kept backup kb-x", () => new Promise<boolean>(() => {})).then(() => "done"), fb, "cancel x");
+    (r.k as any).d.save = () => { throw new Error("disk stalled"); };
+    const t0 = Date.now();
+    expect(await r.k.record(() => "second ran", fb)).toBe("second ran");
+    expect(Date.now() - t0).toBeLessThan(600);
+    expect(r.logs.some((l) => l.includes("its late bookkeeping failed") && l.includes("released all the same"))).toBe(true);
   });
 });
