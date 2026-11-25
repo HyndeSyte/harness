@@ -93,6 +93,7 @@ import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import { ROTATION_ID } from "./rotation";
+import { type DrillMode, isDrillMode } from "./drill";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
@@ -107,11 +108,14 @@ export const GRANT_NO = "No";
 // Keeper 0.1.9: the rotation card's one button (rotation.ts).
 export const ROTATION_LABEL = "Old key replaced";
 export const ROTATION_PREFIX = "k:rot:";
+// Keeper 0.1.13: the drill card's one button (drill.ts). Only his tap on it sets the drill flag.
+export const DRILL_LABEL = "Arm the drill";
+export const DRILL_PREFIX = "k:drill:";
 // Keeper 0.1.11: the card for a keeper claim or cancel that wasn't a plain success: its one button asks Cain for the Ship card again.
 // (The free-space card of Keeper 0.1.10 has no button any more: nothing installs without Keeper's rollback.)
 export const RETRY_LABEL = "Try again";
 export const RETRY_PREFIX = "k:retry:";
-const RETRY_ATTEMPT = /^ship-(\d{1,9})-([a-z0-9_]{1,64})-[0-9a-f]{8}$/;
+const RETRY_ATTEMPT = /^(?:ship|drill)-(\d{1,9})-([a-z0-9_]{1,64})-[0-9a-f]{8}$/;
 export const grantLabel = (n: number) => `Grant ${n} more round${n === 1 ? "" : "s"}`;
 // First review of 0.18.0: an open grant card loses its buttons when another card's grant for the same
 // change is written, and a grant tap whose checks no longer hold writes nothing; its card says why.
@@ -357,6 +361,7 @@ export interface Shown {
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
   rotation?: { id: string };        // the link's card for the keeper's old Healthchecks key (Keeper 0.1.9, rotation.ts)
+  drill?: { mode: DrillMode };       // the link's drill card (Keeper 0.1.13, drill.ts): his tap sets the one-shot drill flag
   space?: { pr: number; head: string; app: string; version: string };   // the free-space card (Keeper 0.1.10, ship-pass.ts; 0.1.11: no button)
   retry?: { attempt: string; what: "claim" | "cancel" };   // the card offering a retry after a keeper answer that wasn't a plain success (Keeper 0.1.11)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
@@ -711,6 +716,8 @@ export interface Deps {
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
   // Keeper 0.1.9: his tap on the rotation card, signed by the link's Ship key and sent to the keeper (rotation.ts)
   attestRotation?: (id: string) => Promise<{ ok: boolean; why: string }>;
+  // Keeper 0.1.13: his tap on the drill card, signed by the link's Ship key and kept by root as the drill flag (drill.ts armFlag)
+  armDrill?: (mode: DrillMode) => { ok: boolean; why: string };
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
@@ -1702,6 +1709,56 @@ export class Link {
     this.d.save(s);
     this.log(`his rotation tap for the keeper's old key ${id} was taken by the keeper`);
     return "rotation attested";
+  }
+
+  // -- the drill switch (Keeper 0.1.13, drill.ts) --
+  // Cain asks for the card (keeper.sh drill-arm <mode>, /drill-arm); it only asks. One open card per mode, the link's own
+  // words, one button. Not while stopped. Only his tap sets the flag: signed with the link's Ship key, kept by root, spent by
+  // the next registration of Cain, which then goes to the keeper as kind drill and fails on purpose as the mode names.
+  async drillCard(mode: unknown): Promise<{ status: "posted" | "open" | "stopped"; message?: string; said: string }> {
+    if (!isDrillMode(mode)) throw new Refusal("a drill takes exit-on-start or verdict-fail");
+    if (this.stopped().stopped) return { status: "stopped", said: "Everything is stopped, so no drill card went out." };
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.drill?.mode === mode && !m.outcome);
+    if (prior) return { status: "open", message: prior[0], said: "That drill card is still up; nothing is armed until his tap." };
+    const what = mode === "exit-on-start" ? "stops at once when it starts" : "reports a failed check after it starts";
+    const text = `Keeper drill: the next install of Cain after your tap is a drill. That version ${what}, on purpose, so Keeper `
+      + "must see it fail and put the version before it back from its backup. Arm it only when the drill release's Ship card is next. "
+      + "One tap arms one install, for a day; without it every install is a normal one.";
+    const msg = await this.post(text, rows([[[DRILL_LABEL, `${DRILL_PREFIX}${mode}`]]], "k:"), { nonce: stableNonce("drill", `${mode}:${this.d.now()}`) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `drill:${mode}`, posted: this.d.now(), expires: null, buttons: true,
+      labels: [DRILL_LABEL], drill: { mode } });
+    this.d.save(s);
+    this.log(`a drill card (${mode}) went to him`);
+    return { status: "posted", message: String(msg.id), said: "Posted. Nothing is armed until his tap; you hear when he taps." };
+  }
+  // His tap: the sender checked first (the owner, in his DM), before anything is signed; then the flag is signed and kept.
+  private async drillTap(it: any, msgId: string): Promise<string> {
+    const rec = this.d.load().messages[msgId];
+    if (!rec?.drill || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    const mode = rec.drill.mode;
+    let who = "";
+    try { who = await this.who(it); } catch { who = "check failed"; }
+    if (who) { await this.answer(it, ACK); this.log(`a drill tap (${mode}) was refused before signing: ${who}`); return `refused: ${who}`; }
+    await this.answer(it, ACK);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so the drill wasn't armed. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    const r = this.d.armDrill ? this.d.armDrill(mode) : { ok: false, why: "the link has no Ship key to sign your tap with" };
+    if (!r.ok) {
+      this.log(`his drill tap (${mode}) wasn't kept: ${r.why}`);
+      await this.ephemeral(it, `The drill wasn't armed: ${r.why.replace(/[^\x20-\x7e]/g, " ").slice(0, 200)}. The card is still up: tap it again once that's fixed.`);
+      return "refused";
+    }
+    const content = withLine(String(it.message?.content ?? ""), "Armed: the next install of Cain is the drill.");
+    let edited = false;
+    try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
+    catch (e) { this.log(`couldn't mark the drill card done: ${String(e).slice(0, 80)}`); }
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = DRILL_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    this.d.save(s);
+    this.log(`his drill tap (${mode}) armed the drill flag`);
+    this.d.relay(`Dane tapped ${DRILL_LABEL} (${mode}): the next install of Cain is registered with Keeper as a drill and fails on purpose. Show him the drill release's Ship card when it is ready. Nothing else to tell him.`);
+    return "drill armed";
   }
 
   // -- the keeper refused a registration for want of free space (Keeper 0.1.10, ship-pass.ts) --
@@ -2700,6 +2757,8 @@ export class Link {
     if (rec.grant && cid.startsWith("q:")) return this.underKey(`grant:${rec.grant.key}`, () => this.grantTapLocked(it, cid, msgId));
     // Keeper 0.1.9: his tap on the rotation card, under that card's own lock
     if (rec.rotation && cid === `${ROTATION_PREFIX}${rec.rotation.id}`) return this.underKey(`rotation:${rec.rotation.id}`, () => this.rotationTap(it, msgId));
+    // Keeper 0.1.13: his tap on a drill card, under that card's own lock
+    if (rec.drill && cid === `${DRILL_PREFIX}${rec.drill.mode}`) return this.underKey(`drill:${rec.drill.mode}`, () => this.drillTap(it, msgId));
     // Keeper 0.1.11: his tap on a retry card, under that card's own lock
     if (rec.retry && cid === `${RETRY_PREFIX}${rec.retry.attempt}`) return this.underKey(`retry:${rec.retry.attempt}`, () => this.retryTap(it, msgId));
     if (cid !== RESUME) {

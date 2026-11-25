@@ -48,6 +48,7 @@
 import { createHash } from "node:crypto";
 import { publicKey, readToken, type Claim } from "../ship-token";
 import { bumpsAt, fileAt, type MergeDeps, versionAt } from "./merge";
+import { DRILL_APP, type DrillDeps, type DrillMode } from "./drill";
 
 export const PASS_FORMAT = 2;                     // 0.1.4: entries carry their state (format 1 entries count as passed)
 export const ATTEMPT_WAIT_MS = 5 * 60_000;        // (0.1.5) one App's registration polled for this long
@@ -59,7 +60,8 @@ export const CLAIM_START_MIN_MS = 20 * 60_000;    // (Keeper 0.1.6) a claim with
 export const FINGERPRINT_FILE = "cain/SHIP_KEY_FINGERPRINT";
 const FP = /^[0-9a-f]{16}$/;
 const BACKUP_SLUG = /^[A-Za-z0-9_-]{1,64}$/;
-const ATTEMPT_ID = /^ship-\d{1,9}-[a-z0-9_]{1,64}-[0-9a-f]{8}$/;
+// (Keeper 0.1.13) a drill registration's attempt is "drill-...", the same shape (drill.ts)
+const ATTEMPT_ID = /^(?:ship|drill)-\d{1,9}-[a-z0-9_]{1,64}-[0-9a-f]{8}$/;
 const CLAIM_ID = /^claim-[0-9a-f]{16}$/;
 export const PROBE_FILES: Record<string, string> = { Cain: "cain/rootfs/opt/cain/probe/keeper.ts" };
 export const APP_SLUGS: Record<string, string> = { Cain: "0fcc2575_cain", Harness: "0fcc2575_harness" };
@@ -187,6 +189,8 @@ export interface PassDeps {
   cancel?: (attempt: string, why: string) => Promise<{ status: number; body: any } | null> | void;
   // (Keeper 0.1.11) a claim or cancel answer that isn't a plain success: the owner's card offering a retry (core.ts retryCard)
   retry?: (attempt: string, what: "claim" | "cancel", why: string) => void;
+  // (Keeper 0.1.13) a cancelled attempt's drill mark removed, so the version it named starts as usual (drill.ts)
+  dropMark?: (attempt: string) => void;
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
   log: (line: string) => void;
 }
@@ -206,6 +210,7 @@ const writeEntries = (d: PassDeps, spent: Entry[]) => d.store(JSON.stringify({ f
 const cancelAll = (d: PassDeps, ids: string[], why: string) => {
   for (const a of new Set(ids)) {
     d.log(`cancelling the keeper's registration ${a}: ${why}`);
+    try { d.dropMark?.(a); } catch { /* the mark lapses by itself */ }
     const p = d.cancel?.(a, why);
     if (p && typeof (p as Promise<unknown>).then === "function") void (p as Promise<{ status: number; body: any } | null>).catch(() => null).then((r) => judgeCancel(d, a, r));
   }
@@ -377,6 +382,8 @@ export interface RegisterDeps {
   log: (line: string) => void;
   // (Keeper 0.1.10) a refusal for want of space: the link's card posted (Keeper 0.1.11: no button; nothing installs without the rollback)
   noSpace?: (pr: number, head: string, app: string, version: string) => void;
+  // (Keeper 0.1.13) the drill switch (drill.ts): the owner's flag spent by this registration, and the accepted drill's mark
+  drill?: DrillDeps;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
 // is accepted (the keeper's answer "accepted" for that App and versions, with its attempt id and backup
@@ -402,12 +409,21 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   const committed = fpFile && fpFile !== "missing" ? readFingerprintFile(fpFile.toString("utf8")) : "";
   if (!committed) { say(`${FINGERPRINT_FILE} at the head ${fpFile === null ? "couldn't be read" : "holds no fingerprint"} (the Build run when the link's Ship key is made writes it), so nothing was registered`); return { ok: false, said }; }
   if (d.linkFp && committed !== d.linkFp) { say(`${FINGERPRINT_FILE} at the head (${committed}) isn't the link's own Ship key (${d.linkFp}), so nothing was registered`); return { ok: false, said }; }
+  d.drill?.clear();                                     // (Keeper 0.1.13) an earlier drill's mark never outlives a new registration
   for (const b of watched) {
     const slug = APP_SLUGS[b.app];
     const from = await versionAt(d, c.repo, CONFIGS[b.app], base);
     const probe = await fileAt(d, c.repo, PROBE_FILES[b.app] ?? CONFIGS[b.app], c.head);
     if (!from || from === "none" || !probe || probe === "missing") { say(`${b.app}'s version at the base or its probe at the head couldn't be read: not registered`); continue; }
-    const r = await d.post({ token, app: slug, pr: c.pr, head: c.head, from_version: from, to_version: b.version, kind: "ship",
+    // (Keeper 0.1.13) the owner's drill flag, spent here, before the keeper is asked, so it counts once whatever follows:
+    // while it was set this install goes as kind drill, and it fails on purpose as the flag names (drill.ts)
+    let drill: DrillMode | null = null;
+    if (slug === DRILL_APP && d.drill) {
+      const sp = d.drill.spend();
+      if ("error" in sp) { say(`${sp.error}: ${b.app} ${b.version} not registered`); continue; }
+      drill = sp.mode;
+    }
+    const r = await d.post({ token, app: slug, pr: c.pr, head: c.head, from_version: from, to_version: b.version, kind: drill ? "drill" : "ship",
       probe_hash: createHash("sha256").update(probe).digest("hex").slice(0, 16) }).catch(() => null);
     let j = r?.body ?? {};
     if (!r || r.status !== 202 || j.status !== "pending" || typeof j.id !== "string" || !ATTEMPT_ID.test(j.id)) {
@@ -433,6 +449,13 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       const en = enrollmentCheckNow(j, committed, d.linkFp ?? null, before, d.enrollment);
       if (en.record) noteRecord(d.enrollment, en.record, d.log);
       if (!en.ok) { cancel ??= en.cancel; say(`the keeper accepted ${b.app} ${b.version} as ${attempt}, but its enrollment is refused: ${en.why}`); continue; }
+      if (drill) {
+        // (Keeper 0.1.13) the mark the drilled version reads at run time, written after the keeper's backup so no rollback restores it
+        if (!attempt.startsWith("drill-")) { say(`the keeper accepted the drill of ${b.app} ${b.version} as ${attempt}, not as a drill: not installed`); continue; }
+        try { d.drill!.mark({ v: 1, mode: drill, attempt, to_version: b.version, head: c.head, at: now() }); }
+        catch { say(`the drill mark for ${attempt} couldn't be written, so ${b.app} ${b.version} wouldn't fail as the drill needs: not installed`); continue; }
+        say(`${b.app} ${b.version} is a drill (${drill}): it fails on purpose so the keeper rolls it back`, false);
+      }
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
     } else if (last?.status === 200 && j.status === "refused" && j.code === "no_space") {

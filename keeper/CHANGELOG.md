@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.13
+
+- Keeper can now be drilled for real: a drill card from Cain's link, with one button, Arm the drill. Only your tap on it arms the next install of Cain as a drill, and that version then fails on purpose (it stops at start, or reports a failed check), so Keeper must roll it back and record the drill.
+- With no tap nothing changes: every install is a normal one.
+- Keeper's DOCS now carry the whole drill runbook: the order of installs, each release and tap, what Keeper must show for each case (stops at start, failed check, a restart of Keeper during the watch, and a healthy install), and your setup steps after the drills.
+- A new read-only command in Keeper's container, `drill-state`, shows each install Keeper watched, its two drill records and why it isn't armed yet, for the reads before and after each drill.
+- When a drill is recorded, Keeper's log now says what it stays bound to: Keeper's version, its options, the kept Healthchecks key and Cain's verdict probe.
+
 ## 0.1.12
 
 - Keeper's own backups of Cain are now protected with a key only Keeper holds, so his options and data are no longer kept in clear on the device's disk. Home Assistant's backup page shows them as protected, and you can't open them by hand: Home Assistant's own pre-install backup, with your key, stays your way back by hand.

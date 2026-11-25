@@ -2370,10 +2370,30 @@ export class Keeper {
     (this.st.drills[a!.app] ??= {})[kind!] = { attempt: a!.id, kind: kind!, trigger: a!.trigger!.words, restoredAt: a!.restore!.doneAt!,
       lineDeliveredAt: this.now(), binding: { ...this.binding(a!.app), probe_hash: a!.probeHash }, at: this.now() };
     a!.drillRecorded = true;
-    this.d.log(`drill recorded for ${a!.app}: ${kind} (${a!.id})`);
+    this.d.log(`drill recorded for ${a!.app}: ${kind} (${a!.id}); it counts while Keeper's version, its options, the kept Healthchecks key and ${appName(a!.app)}'s probe stay as they are now`);
     this.arm();
     this.save();
     return { ok: true, why: "" };
+  }
+  // (0.1.13) The drill runbook's state read (DOCS.md, "The drill runbook"): for each watched App, its newest attempts (kind,
+  // versions, status, trigger, whether a restore ran and whether a drill record was written), its drill records and whether
+  // each still counts under the current binding, the binding itself and why it isn't armed. Read only: nothing is saved,
+  // and the enrollment counter doesn't move (the local drill-state command; /armed stays the link's read).
+  drillState(): { ok: true; why: string; state: Record<string, unknown> } {
+    const now = this.now();
+    const apps: Record<string, unknown> = {};
+    for (const app of this.opts.watch) {
+      const cur = JSON.stringify(this.binding(app));
+      const attempts = Object.values(this.st.attempts).filter((a) => a.app === app).sort((x, y) => x.registeredAt - y.registeredAt).slice(-6)
+        .map((a) => ({ id: a.id, kind: a.auth, from: a.from, to: a.to, status: a.status, trigger: a.trigger?.kind ?? null,
+          restored: !!a.restore?.doneAt, drill_recorded: !!a.drillRecorded, registered: new Date(a.registeredAt).toISOString() }));
+      const d = this.st.drills[app] ?? {};
+      const drills = (["exits-on-start", "fail-verdict"] as const).map((k) => d[k] ? { kind: k, attempt: d[k]!.attempt, at: new Date(d[k]!.at).toISOString(),
+        counts: JSON.stringify(d[k]!.binding) === cur && now - d[k]!.at <= ARMED_MAX_MS } : { kind: k, attempt: null, at: null, counts: false });
+      const v = this.armedState(app, now);
+      apps[app] = { attempts, drills, armed: v.armed, why: v.why, binding: this.binding(app) };
+    }
+    return { ok: true, why: "", state: { keeper_version: this.d.version, at: new Date(now).toISOString(), drill_running: this.drillRunning(now) || null, apps } };
   }
   private autoDrill(id: string): void {
     const a = this.st.attempts[id];

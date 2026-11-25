@@ -25,6 +25,7 @@
 - If the Keeper has no room for the backup before installing Cain, the install is refused and the link posts you a card saying so. Nothing installs without the Keeper's rollback: free some space, or choose another way yourself.
 - If the Keeper doesn't confirm the start of an install, or a cancel of one, nothing is installed and the link posts you a card with Try again, which brings the Ship card back.
 - Keeper answers that arrive out of order no longer look like an older Keeper: the newest one counts and the late one is set aside, with nothing for you to redo.
+- Keeper drills: when Cain asks, his link posts you a drill card with Arm the drill. Only your tap arms it, and only for the next install of Cain, which then stops at start or reports a failed check on purpose so the Keeper rolls it back and records the drill. Without your tap every install is a normal one.
 
 ## 0.18.1
 

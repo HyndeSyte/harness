@@ -160,6 +160,10 @@
 #                                        and "No". Only his tap writes the grant; this writes nothing.
 #                                        Refused while the change has rounds left, its item is held by
 #                                        another holder, or Stop holds
+#   keeper.sh drill-arm <exit-on-start|verdict-fail>
+#                                        (Keeper 0.1.13) posts Dane the drill card for the Keeper App: his tap on it,
+#                                        and only his tap, arms the next install of Cain as a drill that fails on
+#                                        purpose that way, so Keeper must roll it back. This sets nothing itself.
 set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
@@ -198,7 +202,7 @@ if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts
 case "$cmd" in
   handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;
   fastpath) url="$harness/fastpath"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant|drill-arm) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   key-expiry|key-ack) url="$link/key-note"; ctx=harness-relay-v1 ;;
   *) echo '{"status":"error","said":"unknown command"}'; exit 2 ;;
@@ -365,6 +369,9 @@ case "$cmd" in
   replay)   body=$(jq -nc --arg d "${1:-}" '{days: ($d | tonumber? // 14)}') ;;
   key-expiry|key-ack) body=$(jq -nc --arg c "$cmd" --arg n "${1:-}" --arg d "${2:-}" '{cmd: $c, name: $n, date: $d}') ;;
   connector) body=$(jq -nc --arg t "${1:-}" --arg it "$item" '{item: $it, text: $t}') ;;
+  drill-arm)
+    case "${1:-}" in exit-on-start|verdict-fail) ;; *) echo '{"status":"error","said":"drill-arm takes exit-on-start or verdict-fail"}'; exit 2 ;; esac
+    body=$(jq -nc --arg m "$1" '{mode: $m}') ;;
   review-grant)
     [[ "$rounds" =~ ^[1-3]$ ]] || { echo '{"status":"error","said":"--rounds takes 1, 2 or 3"}'; exit 2; }
     [ -n "$change" ] || { echo '{"status":"error","said":"--change takes the pull request url or the change key"}'; exit 2; }

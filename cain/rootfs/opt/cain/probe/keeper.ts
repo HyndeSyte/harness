@@ -43,6 +43,8 @@ export interface VerdictDeps {
   ask: () => Promise<boolean>;                          // the liveness line asked once: answered in time
   version: string;
   log: (m: string) => void;
+  // (Keeper 0.1.13) the drill mark's mode for this version and attempt, or null (link/drill.ts drillModeFor)
+  drill?: (attempt: string) => string | null;
 }
 // The verdict for an open attempt: only one bound to it (its id), at the version this start runs.
 export async function verdictRun(d: VerdictDeps): Promise<string> {
@@ -51,9 +53,13 @@ export async function verdictRun(d: VerdictDeps): Promise<string> {
   const id = typeof r.body?.attempt === "string" ? r.body.attempt : null;
   if (!id) return "no attempt";
   if (r.body.to_version !== d.version) { d.log(`the keeper watches an install of ${String(r.body.to_version).slice(0, 32)}, but this start runs ${d.version}: no verdict`); return "other version"; }
-  d.log(`an install of Cain ${d.version} is being watched: asking his session the liveness line`);
-  const answered = await d.ask();
-  const verdict = answered ? { result: "PASS", reason: "" } : { result: "FAIL", reason: `his session didn't answer the liveness line within ${ASK_WAIT_S / 60} minutes` };
+  // (Keeper 0.1.13) a drill the owner's tap armed as verdict-fail: FAIL for that attempt, on purpose, without asking
+  const drilled = d.drill?.(id) === "verdict-fail";
+  if (!drilled) d.log(`an install of Cain ${d.version} is being watched: asking his session the liveness line`);
+  else d.log(`an install of Cain ${d.version} is being watched, and it is a drill (verdict-fail, armed by the owner's tap): reporting FAIL on purpose`);
+  const answered = drilled ? false : await d.ask();
+  const verdict = drilled ? { result: "FAIL", reason: "a Keeper drill: the owner's tap armed this install to report FAIL (verdict-fail)" }
+    : answered ? { result: "PASS", reason: "" } : { result: "FAIL", reason: `his session didn't answer the liveness line within ${ASK_WAIT_S / 60} minutes` };
   const p = await d.post("/verdict", { app: CAIN_SLUG, version: d.version, attempt: id, ...verdict });
   d.log(`verdict ${verdict.result} for the watched install: the keeper ${p?.status === 200 ? "took it" : `didn't take it (${p ? p.status : "no answer"})`}`);
   return verdict.result;
@@ -94,8 +100,10 @@ if (import.meta.main) {
   const said = join(p.dir, "keeper-said");
   const readNum = (f: string) => { try { checkFolder(p.run); const n = Number(readFileSync(f, "utf8").trim().split(/\s+/)[0]); return Number.isFinite(n) ? n : 0; } catch { return 0; } };
   const get = (path: string) => keeperCall(base, token, path);
+  const { drillModeFor, MARK_FILE } = await import("../link/drill.ts");
   await verdictRun({
     get, post: (path, body) => keeperCall(base, token, path, body), version, log,
+    drill: (attempt) => { try { return drillModeFor(readFileSync(env.CAIN_DRILL_MARK ?? MARK_FILE, "utf8"), version, Date.now(), attempt); } catch { return null; } },
     ask: async () => {
       const at = Math.floor(Date.now() / 1000);
       try { writeWhole(p.ask, `${at} ${PROBE_LINE.length}\n`); } catch (e) { log(`couldn't ask the liveness line: ${String(e).slice(0, 80)}`); return false; }

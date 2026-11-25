@@ -35,6 +35,7 @@
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
 //     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
 //                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
+//     POST /drill-arm {mode}                         (Keeper 0.1.13) the drill card; only Dane's tap on it sets the drill flag
 //     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the installs registered with the
 //                                       keeper App, "pending" until it accepted every watched one (backup made and
 //                                       verified), then each acceptance claimed and "ok" once, the token spent (a second
@@ -79,6 +80,7 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
+import { armFlag, drillDeps, fileStore } from "./drill";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
@@ -243,6 +245,7 @@ const capSweep = () => {
   else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
 };
 
+const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`);
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
@@ -307,6 +310,8 @@ const link = new Link({
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   linkHosts: () => readHosts(),
   keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
+  // Keeper 0.1.13: his tap on the drill card, signed with the Ship key here and kept by root as the one-shot drill flag (drill.ts)
+  armDrill: shipPriv ? (mode) => armFlag(drillStore, mode, Date.now(), (data) => edSign(null, data, shipPriv)) : undefined,
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
@@ -319,6 +324,8 @@ const enrollment: EnrollmentStore = {
   store: (e) => writeSynced(KEEPER_ENROLL, JSON.stringify(e)),
 };
 const shipPub = () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } };
+// Keeper 0.1.13: the drill flag and mark, root's, beside the other trust files (drill.ts)
+const drill = drillDeps(drillStore, shipPub, Date.now, (l) => console.log(`[cain] link: ${l}`));
 // -- the keeper App's armed state (0.19.0) -------------------------------------------------------------
 // Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
 // that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
@@ -426,7 +433,7 @@ const shipPassDeps: PassDeps = {
   register: (tok, claim, done, note) => {
     const pub = shipPub();
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
-      post: (body) => keeperPost("/attempt", body),
+      post: (body) => keeperPost("/attempt", body), drill,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)
@@ -437,6 +444,7 @@ const shipPassDeps: PassDeps = {
   claim: (a, request) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, request }, 3_000) : Promise.resolve(null),
   // Keeper 0.1.11: the cancel's answer is judged (ship-pass.ts judgeCancel); anything but a plain "ended" brings the retry card
   cancel: (attempt, why) => keeperPost(`/attempt/${attempt}/cancel`, { why }),
+  dropMark: (attempt) => drill.drop(attempt),
   retry: (attempt, what) => { void link.retryCard(attempt, what).catch((e) => console.log(`[cain] link: couldn't post the retry card: ${String(e).slice(0, 80)}`)); },
   enrollment,
   log: (l) => console.log(`[cain] link: ${l}`),

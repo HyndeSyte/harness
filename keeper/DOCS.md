@@ -511,6 +511,7 @@ every read, never stored, and says armed only while all of these hold:
 2. both drill records of the App are valid under the current binding: two drills each rolled back by
    an actual restore of their backup (the restore job finished without errors), with their trigger and a
    delivered line to you, one where the App's probe said FAIL and one where the App exits on start;
+   (0.1.13) such drills are installs your tap on the link's drill card armed (below, "The drill runbook");
 3. the **phone test drill** is confirmed for the App's alert check and the dead-man check within the
    last 14 days (0.1.5; 0.1.8: `drill_days`, 1 to 14), under the current Healthchecks options and checks' settings, with no page left
    unacknowledged for 10 minutes since (below);
@@ -602,6 +603,81 @@ The restore job name a drill recorded is kept apart from them and isn't dropped.
 
 A later item, not in this version: an independent verifier lease (a second watcher that must vouch for
 Keeper before it counts as armed).
+
+## The drill runbook (0.1.13)
+
+Keeper arms only after two drill records (Arming, 2), and it writes a drill record only for an install registered
+as kind `drill` that it rolled back. Since Cain 0.19.0 with Keeper 0.1.13 one switch makes such an install, and only
+your tap sets it: the **drill flag**.
+
+**The switch.**
+- Cain asks for the card: `/opt/cain/keeper.sh drill-arm exit-on-start` (or `verdict-fail`). The link posts you one
+  card, "Keeper drill: ...", with one button, **Arm the drill**. Cain's request sets nothing.
+- Your tap is checked to be yours, in your DM, the same way as a Ship tap, and only then signed with the link's Ship
+  key (which Cain can't read) and kept by root as the flag, `/data/trust/keeper-drill.json`, good for a day. A flag
+  that isn't signed by the link, or ran out, never counts: it is removed, and that install goes as a normal one.
+- The next registration of Cain spends it, whatever happens next (it is removed before Keeper is asked), and goes
+  to Keeper as kind `drill`: Keeper names the attempt `drill-<pr>-cain-<head>`. Once Keeper accepts it, the link
+  writes the drill mark, `/data/trust/keeper-drill-mark.json`, naming the mode, that attempt and the version being
+  installed. It is written after Keeper's backup, so the backup a rollback restores never holds the mark or the flag.
+- The version installed fails on purpose, at run time, as the flag names: `exit-on-start`, the Cain App stops at
+  once when it starts (its run script reads the mark; the App's own "exited" alarm comes too, expected here); or
+  `verdict-fail`, the verdict probe reports FAIL for that attempt without asking his session. A mark counts only for
+  the version it names, for 90 minutes; the version a rollback restores, and every later one, starts as usual, and
+  every new registration removes an old mark. With no flag nothing changes: kind `ship`, a healthy start.
+
+**The drill releases.** Each is healthy code: a Cain patch release whose only change is its version (a CHANGELOG
+section that says it is a drill release with nothing new), built by a Build job (RELEASING.md, Build) and landed by the usual
+Ship tap (RELEASING.md, Ship). Nothing in `main` ever fails on purpose; the failure comes only from the flag.
+Keeper names an attempt by its kind, pull request and head, and takes each name once, so each drilled install needs a
+release of its own; the healthy case is the same release shipped again with no flag (a new Ship card for the same
+pull request and head: "Already in main, so Ship only installs it."). None of them may change Cain's verdict probe
+(`cain/rootfs/opt/cain/probe/keeper.ts`): the drill records are bound to its hash.
+
+**What must hold before the first case, and stay as it is until arming.** A drill record counts only under the
+binding it was made with: Keeper's version, its options (including `hc_unique_keys`), the kept Healthchecks key and
+Cain's probe hash (Arming, the binding). So everything in the binding is set first, and none of it changes until the
+phone test and the missed-heartbeat drill are done; a Keeper update after the drills drops them and they run again.
+
+1. **The order of installs.** The Keeper App first, then the current Cain App (0.19.0) unwatched. The pull request
+   that brings them installs both; the Ship job installs Keeper first. Cain's install is unwatched: the Cain that
+   runs then has no Ship pass and registers nothing, and the link must be installed before it can register anything.
+   Keeper logs it as an "unregistered change", never restored.
+2. Keeper's options: `watch`, `health`, `tokens` (and the same token in Cain's `keeper_token`), `hc_done`,
+   `hc_deadman`, `hc_failed` (Cain's alert check: a drill record needs its rollback line delivered there),
+   `hc_unique_keys` for every role, `ship_public_key`, `drill_days` (What you must set, 1 to 4).
+3. In Keeper's container (for example `docker exec addon_0fcc2575_keeper bun /opt/keeper/main.ts <command>` from the
+   SSH App, as for `key-confirm` above): `key-code`, then `key-confirm <fingerprint> <code>` against
+   `cain/SHIP_KEY_FINGERPRINT`; `backup-check`; `hc-key <code>` (the key on standard input); `accept-limits <code>`.
+4. The state read, before and after every case below: `bun /opt/keeper/main.ts drill-state` in Keeper's container
+   (read only: each watched App's newest attempts with their kind, versions, status, trigger, whether a restore ran
+   and whether a drill record was written; its two drill records and whether each counts under the current binding;
+   and why it isn't armed), and the Cain App's version on its Home Assistant page.
+
+**The cases.** Cain is at the release before each case (call it N). Each case is one Arm the drill tap (none for
+the healthy case), then one Ship tap. Wait for each case's last line before the next.
+
+| Case | Version and taps | What Keeper must show | Proves on the Pi |
+| --- | --- | --- | --- |
+| 1. exit-on-start | Drill release 1 (N+1). `drill-arm exit-on-start`, your Arm the drill tap, then its Ship tap. | `accepting drill-<pr>-cain-<head> ...`, `claimed ...`, the App not started on two polls, `<id>: fail (...); restoring 0fcc2575_cain from backup ...`, `drill recorded for 0fcc2575_cain: exits-on-start (...)`; Cain back at N; your phone gets the rollback line. drill-state: that attempt `rolled back`, `restored` and `drill_recorded` true, the exits-on-start record counting. | A release that won't start is put back by itself from Keeper's own backup, through the Supervisor's real restore, and the line reaches you. |
+| 2. healthy | The same release again, no tap but Ship: a new Ship card for the same pull request and head. | `accepting ship-<pr>-cain-<head> ...`, the watch's 15 minutes, `passed`; no restore, no drill record; Cain at N+1. | With no flag the same release is a normal install: kind ship, a healthy start, nothing rolled back. |
+| 3. verdict-fail | Drill release 2 (N+2). `drill-arm verdict-fail`, your tap, then its Ship tap. | Cain's log: `verdict FAIL for the watched install`; Keeper: `its probe said FAIL: a Keeper drill ...`, the restore, `drill recorded for 0fcc2575_cain: fail-verdict (...)`; Cain back at N+1. drill-state: both records counting. | A release that starts but fails its own check is put back too, on the probe's word. |
+| 4. Restart during a watch | Ship release 2 again with no flag first (Cain at N+2). Then drill release 3 (N+3): `drill-arm exit-on-start`, your tap, its Ship tap, and Restart the Keeper App (its Home Assistant page) the moment its log shows `consumed drill-...` (the drilled version seen), before any `<id>: fail (...); restoring ...` line. Keep it a Restart, back within a minute: a stop over 10 minutes drops the drill records (Arming, the binding). | After Keeper's restart, the same attempt still ends `rolled back` with one restore call, never a second, and its drill record written again; Cain back at N+2. | A watch survives Keeper restarting in the middle of it: its state on disk carries the watch to the rollback. A restart after the restore call went out proves something else (Keeper never sends a restore twice, so that attempt ends unresolved and pages you): run the case again with drill release 4. |
+| 5. healthy again | Ship release 3 again with no flag. | `passed`; Cain at N+3. | Cain ends on the newest release, as before the drills. |
+
+After case 3 `drill-state` shows both records counting, and the reason it isn't armed moves on from "no drills on
+record" to the phone test. If a record isn't written (`no drill record for <id>: <why>`, for example its line wasn't
+delivered), fix the why and run `drill-record <attempt id>` in Keeper's container once.
+
+**After the cases: your setup steps.** These don't touch the binding, so they come once the cases have run:
+1. The SSH route: the container commands above go through the SSH App; once the drills are done, close or lock down
+   whatever access you opened for them.
+2. The old Healthchecks key: revoke it in Healthchecks (Project Settings, API Access), then
+3. the rotation tap: tap **Old key replaced** on the link's card (What you must set, "Both key roles").
+4. The phone test: `phone-test`, then `phone-confirm <code> cain deadman` once both pages reached your phone (Arming).
+5. The missed-heartbeat drill: `missed-heartbeat`, then `missed-heartbeat-confirm <code>` (Arming).
+Then `drill-state` (or Cain's "Ship it with that risk" card) reads armed. The phone test and the missed-heartbeat
+drill last `drill_days`; the drill records last 60 days or until the binding changes.
 
 ## Accepted limits
 
@@ -813,4 +889,4 @@ matching the download, the positive control found once), the old key's try answe
 once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
 challenge reaching Keeper within its 10 minutes; (0.1.12) a backup made with Keeper's password shown as protected in the
 backup info and on Home Assistant's backup page, a partial restore of it with the same password, and the backup check
-passing with the backup key store's sentinels; and the two drills (the next job).
+passing with the backup key store's sentinels; and the two drills (the next job). (0.1.13) The drill switch itself: the link's drill card and your tap reaching the flag in `/data/trust`, the run script's exit at start and the probe's FAIL for the drilled version only, the mark missing from the backup a rollback restores, `drill-state` read in the container, and the restart case's timing on the Pi ("The drill runbook").

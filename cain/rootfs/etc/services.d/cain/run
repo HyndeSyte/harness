@@ -120,6 +120,15 @@ stopped_why=""; stop_kind=""; stop_cause=""; switch_stopped=""; restart_first=""
 # This App's version, for a failed check of his own user (c1/check.sh): it keeps him stopped only
 # on the version it failed on. bashio asks the Supervisor; "unknown" if it can't say.
 version="$(bashio::addon.version 2>/dev/null || true)"; [ -n "$version" ] || version=unknown
+# A Keeper drill (Keeper 0.1.13, link/drill.ts): only when Dane's tap on the link's drill card armed the install of this
+# very version as exit-on-start, and Keeper accepted it as a drill, root's drill mark names this version, and this start
+# exits at once, on purpose, so Keeper sees the App not started and rolls it back. The mark is written after Keeper's
+# backup, so the version a rollback restores never sees one; any other version, or no mark, starts as usual.
+drill_mode="$(timeout 10 bun "$OPT/link/drill.ts" mode "$version" 2>/dev/null || true)"
+if [ "$drill_mode" = exit-on-start ]; then
+  bashio::log.warning "Keeper drill (exit-on-start, armed by Dane's tap): this start of Cain $version stops at once, on purpose, so Keeper rolls it back"
+  exit 1
+fi
 if ! "$OPT/c1/lock.sh" run; then
   bashio::log.error "Couldn't set up /run/cain; Cain doesn't start until that's fixed"
   mode=none; stop_kind=setup; stopped_why="the App couldn't set up /run/cain"

@@ -52,6 +52,8 @@ export function linkRoutes(d: RouteDeps) {
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/decision": return json(await link.decision(b));
+        // Keeper 0.1.13: Cain asks for the drill card (keeper.sh drill-arm); only the owner's tap on it sets the flag
+        case "/drill-arm": return json(await link.drillCard(b.mode));
         case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
         case "/guard-hold": return json(link.guardHoldFor(b, caller));

@@ -3253,3 +3253,99 @@ describe("0.1.12 item 4: the docs and the limits", () => {
     expect(sec).toContain("test backup stays unprotected");
   });
 });
+
+// (0.1.13) The drill switch: Cain's link registers an install as kind drill only while the owner's tap set the drill flag
+// (cain/rootfs/opt/cain/link/drill.ts), and the drilled version fails on purpose as the flag names. Here, the Keeper's side
+// of the runbook's cases (DOCS.md, "The drill runbook").
+describe("0.1.13: the drill cases as the runbook runs them", () => {
+  // Keeper restarted (its state saved and loaded again, its backup keys kept) while it watches a drilled install
+  async function restartMidWatch(r: ReturnType<typeof rig>, version: string, state: string) {
+    const r2 = rig({ saved: JSON.parse(JSON.stringify(r.k.st)) });
+    for (const [n, v] of r.keys) r2.keys.set(n, v);
+    r2.f.app.version = version; r2.f.app.state = state;
+    return r2;
+  }
+  test("exit-on-start: the App not started, rolled back, and the exits-on-start record written for that drill attempt", async () => {
+    const r = rig();
+    await drillOf(r, headN(1), "exit");
+    const id = idOf(headN(1), "drill");
+    expect(r.a(id).auth).toBe("drill");
+    expect(r.a(id).trigger?.kind === "state-error" || r.a(id).trigger?.kind === "not-started").toBe(true);
+    expect(r.k.st.drills[CAIN]?.["exits-on-start"]?.attempt).toBe(id);
+    // the runbook's state read (drill-state, the loopback listener only), read only: the counter doesn't move
+    const counter = r.k.st.counter;
+    const res = await handleLocal(r.k, new Request("http://127.0.0.1:8096/drill-state", { method: "POST", body: "{}" }), "127.0.0.1", () => {});
+    expect(res.status).toBe(200);
+    const st: any = (await res.json()).state.apps[CAIN];
+    expect(st.attempts.at(-1)).toMatchObject({ id, kind: "drill", status: "rolled back", restored: true, drill_recorded: true });
+    expect(st.drills).toEqual([{ kind: "exits-on-start", attempt: id, at: expect.any(String), counts: true }, { kind: "fail-verdict", attempt: null, at: null, counts: false }]);
+    expect(st.why).toBe(`no drills on record for ${CAIN} under the current binding`);
+    expect(r.k.st.counter).toBe(counter);
+    expect((await handle(r.k, new Request("http://keeper/drill-state", { method: "POST", body: "{}", headers: { authorization: `Bearer ${TOKEN}` } }), "172.30.33.4", () => {})).status).toBe(403);
+    expect(r.logs.some((l) => l.startsWith(`drill recorded for ${CAIN}: exits-on-start (${id}); it counts while Keeper's version`))).toBe(true);
+  });
+  test("verdict-fail: the probe's FAIL rolls it back, and the fail-verdict record is written for that drill attempt", async () => {
+    const r = rig();
+    await drillOf(r, headN(2), "verdict");
+    const id = idOf(headN(2), "drill");
+    expect(r.a(id).trigger?.kind).toBe("verdict");
+    expect(r.k.st.drills[CAIN]?.["fail-verdict"]?.attempt).toBe(id);
+  });
+  test("two drill records, one of each, are what the drills part of arming needs; a ship attempt that rolls back never writes one", async () => {
+    const r = rig();
+    await drillOf(r, headN(1), "exit");
+    expect(r.k.armedView(CAIN).why).toBe(`no drills on record for ${CAIN} under the current binding`);
+    await drillOf(r, headN(2), "verdict");
+    expect(Object.keys(r.k.st.drills[CAIN] ?? {}).sort()).toEqual(["exits-on-start", "fail-verdict"]);
+    expect(r.k.armedView(CAIN).why).not.toContain("no drills on record");
+    const s = rig(); await failed(s); await s.poll(ROLL);
+    expect(s.a().status).toBe("rolled back");
+    expect(s.k.st.drills[CAIN]).toBeUndefined();
+  });
+  test("restart during a flagged watch (exit-on-start): Keeper restarted after it saw the drilled version still rolls it back and records the drill", async () => {
+    const r = rig();
+    const head = headN(3), id = idOf(head, "drill");
+    expect((await r.register({ head, kind: "drill" })).status).toBe(200);
+    // the App exited at its start: stopped, seen once (a fail needs two polls in a row), then Keeper restarts
+    await r.poll(); r.install("stopped"); await r.poll();
+    expect(r.a(id).status).toBe("watching");
+    const r2 = await restartMidWatch(r, "0.17.0", "stopped");
+    await r2.poll(ROLL);
+    expect(r2.a(id).status).toBe("rolled back");
+    expect(r2.restores.length + r.restores.length).toBe(1);   // one restore call, never a second
+    expect(r2.k.st.drills[CAIN]?.["exits-on-start"]?.attempt).toBe(id);
+  });
+  test("restart during a flagged watch (verdict-fail): the FAIL that came before the restart still rolls it back", async () => {
+    const r = rig();
+    const head = headN(4), id = idOf(head, "drill");
+    expect((await r.register({ head, kind: "drill" })).status).toBe(200);
+    await r.poll(); r.install("started"); await r.poll();
+    r.k.verdict(CAIN, { app: CAIN, version: "0.17.0", attempt: id, result: "FAIL", reason: "a Keeper drill" });
+    const r2 = await restartMidWatch(r, "0.17.0", "started");
+    await r2.poll(ROLL);
+    expect(r2.a(id).status).toBe("rolled back");
+    expect(r2.restores.length + r.restores.length).toBe(1);
+    expect(r2.k.st.drills[CAIN]?.["fail-verdict"]?.attempt).toBe(id);
+  });
+  test("the healthy case: the same release registered as kind ship with no flag passes, and writes no drill record", async () => {
+    const r = rig();
+    expect((await r.register({ head: HEAD })).status).toBe(200);
+    await r.poll(); r.install("started"); await r.poll();
+    r.verdict("PASS");
+    await r.poll(WATCH_MS / POLL_MS + 4);
+    expect(r.a().auth).toBe("ship");
+    expect(r.a().status).toBe("passed");
+    expect(r.restores).toEqual([]);
+    expect(r.k.st.drills[CAIN]).toBeUndefined();
+  });
+  test("the DOCS carry the runbook: each case, the order of installs, and no RELEASING.md section that doesn't exist", () => {
+    const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
+    const sec = docs.slice(docs.indexOf("## The drill runbook (0.1.13)"));
+    expect(sec.length).toBeGreaterThan(1000);
+    for (const s of ["exit-on-start", "verdict-fail", "Restart during a watch", "healthy", "keeper.sh drill-arm", "Arm the drill",
+      "Keeper App first", "unwatched"]) expect(sec).toContain(s);
+    const releasing = readFileSync(join(import.meta.dir, "..", "..", "RELEASING.md"), "utf8");
+    const heads = new Set([...releasing.matchAll(/^#+ (.+)$/gm)].map((m) => m[1].trim()));
+    for (const m of sec.matchAll(/RELEASING\.md, ([A-Z][A-Za-z' ]+?)(?:[),.;:]| \d)/g)) expect([...heads].some((h) => h.startsWith(m[1].trim()))).toBe(true);
+  });
+});

@@ -39,7 +39,7 @@
 import { SLUG, type Keeper } from "./core.ts";
 
 export const MAX_BODY = 4096;
-export const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm", "/missed-heartbeat", "/missed-heartbeat-confirm", "/accept-limits", "/hc-key", "/key-code", "/backup-check"]);
+export const LOCAL = new Set(["/drill-record", "/phone-test", "/phone-confirm", "/key-confirm", "/missed-heartbeat", "/missed-heartbeat-confirm", "/accept-limits", "/hc-key", "/key-code", "/backup-check", "/drill-state"]);
 // Home Assistant's internal network (the Supervisor's hassio network): 172.30.32.0/23.
 export function internal(ip: string): boolean {
   const v4 = ip.replace(/^::ffff:/i, "");
@@ -62,6 +62,7 @@ export async function handleLocal(k: Keeper, req: Request, ip: string, log: (m: 
     : url.pathname === "/accept-limits" ? k.acceptLimits(str(b?.code))
     : url.pathname === "/key-code" ? k.keyCode()
     : url.pathname === "/backup-check" ? await k.backupCheck()
+    : url.pathname === "/drill-state" ? k.drillState()                      // (0.1.13) read only
     : url.pathname === "/drill-record" ? k.drillRecord(str(b?.attempt)) : url.pathname === "/phone-test" ? k.phoneTest()
     : url.pathname === "/key-confirm" ? k.keyConfirm(str(b?.fingerprint), str(b?.code))
     : url.pathname === "/missed-heartbeat" ? k.missedHeartbeat()

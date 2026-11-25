@@ -721,7 +721,10 @@ def test_no_stop_is_silent(tmp_path):
     # "restart" (the switch on, marks kept) and his session was ended; told, so the EXIT trap stays quiet.
     # Second round: exit 3 lives in self_exit (the exit route), reached from self_restart's restart
     # decision after the Supervisor's restart call, and from the Pi drill's root-only mark.
-    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3"]
+    # Keeper 0.1.13: the drill's exit-on-start, only for the version root's drill mark names (link/drill.ts).
+    assert sorted(exits) == sorted(['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3", "  exit 1"])
+    drill = run.index('drill_mode="$(timeout 10 bun "$OPT/link/drill.ts" mode "$version" 2>/dev/null || true)"')
+    assert run.index('version="$(bashio::addon.version') < drill < run.index('if [ "$drill_mode" = exit-on-start ]; then', drill) < run.index("  exit 1\n", drill)
     exit_fn = _run_fns(run, "self_exit() {", "self_tried=0")
     # Fourth round: the mark holds the time it was written (self_mark). Fifth round: the exit route writes
     # it with the word fallback, which finish and the EXIT trap need before they take a 3 for the fallback.
@@ -2666,7 +2669,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/ship-pass"])'
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/ship-pass", "/drill-arm"])'
             in auth.replace("\r\n", "\n"))
     # Cain 0.18.0: /review-grant is Cain's card asking Dane for extra review rounds; only his tap writes one.
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and

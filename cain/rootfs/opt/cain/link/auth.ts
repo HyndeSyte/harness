@@ -59,7 +59,8 @@ export const KEEP_MS = 8 * 24 * 3_600_000;
 
 export const SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"]);
 export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",
-  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/ship-pass"]);
+  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/review-grant", "/ship-pass", "/drill-arm"]);
+// /drill-arm (Keeper 0.1.13): Cain's request for the drill card; it sets nothing (the owner's tap on the card does, drill.ts).
 // /ship-pass (0.19.0, with Keeper 0.1.3): the RemoteTrigger hook spends a Ship token once and the link registers
 // the installs with the keeper App (ship-pass.ts).
 // /review-grant (0.18.0): Cain's card asking Dane for extra review rounds; it writes nothing (his tap does).

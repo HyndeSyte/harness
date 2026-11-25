@@ -276,6 +276,7 @@ const LOCAL_CMDS: Record<string, (a: string[]) => unknown> = {
   "hc-key": (a) => ({ code: a[0] ?? "" }),          // (0.1.7) the key itself is added from standard input
   "key-code": () => ({}),                            // (0.1.8)
   "backup-check": () => ({}),                        // (0.1.9)
+  "drill-state": () => ({}),                         // (0.1.13) the drill runbook's state read, read only
 };
 const DONE: Record<string, string> = {
   "drill-record": "drill recorded", "phone-test": "phone test sent: once the pages reached your phone, phone-confirm <code from the log> <each check>",
@@ -285,6 +286,7 @@ const DONE: Record<string, string> = {
   "accept-limits": "the accepted limits are recorded", "hc-key": "the Healthchecks read-only key is checked and kept",
   "key-code": "a fresh key-confirm code is printed in Keeper's log",
   "backup-check": "the backup check passed: a test backup of Keeper leaves out every key file and holds no key",
+  "drill-state": "Keeper's drill state",
 };
 // (0.1.7) The key from standard input, first line, trimmed; never echoed.
 async function readStdinKey(): Promise<string> {
@@ -302,10 +304,11 @@ if (import.meta.main) {
     }
     const r = await fetch(`http://127.0.0.1:${LOCAL_PORT}/${cmd}`, { method: "POST", body: JSON.stringify(body) }).catch(() => null);
     const j: any = r ? await r.json().catch(() => null) : null;
-    console.log(j?.ok ? `${DONE[cmd]}${j.why ? ` (${j.why})` : ""}` : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
+    if (cmd === "drill-state" && j?.ok) console.log(JSON.stringify(j.state, null, 2));
+    else console.log(j?.ok ? `${DONE[cmd]}${j.why ? ` (${j.why})` : ""}` : `not done: ${j?.why ?? "the keeper's service didn't answer"}`);
     process.exit(j?.ok ? 0 : 1);
   } else if (cmd === "selftest") {
     if (!/^\d+\.\d+\.\d+$/.test(VERSION)) { console.error(`the image's KEEPER_VERSION isn't a version: ${VERSION}`); process.exit(1); }
     console.log(`keeper ${VERSION}: the code loads`);
-  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | key-code | backup-check | selftest"); process.exit(2); }
+  } else { console.error("usage: main.ts serve | drill-record <attempt id> | phone-test | phone-confirm <code> <check>... | key-confirm <fingerprint> <code> | missed-heartbeat | missed-heartbeat-confirm <code> | accept-limits <code> | hc-key <code> (key on stdin) | key-code | backup-check | drill-state | selftest"); process.exit(2); }
 }
