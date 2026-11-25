@@ -59,9 +59,9 @@ What Keeper checks itself, before it accepts an install:
    first pin accepts **no** registration until you confirm it at the device, the same way as a new key:
    `bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` in Keeper's container (for example
    `docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun /opt/keeper/main.ts key-confirm <fingerprint> <code>` from the SSH
-   App; the container is `addon_0fcc2575_keeper` on an older Home Assistant and `app_0fcc2575_keeper` after Home
-   Assistant's rename, so the command finds its name at run time with `docker ps --format '{{.Names}}' | grep
-   0fcc2575_keeper`, and the SSH App's user `hassio` runs it with `sudo`). 0.1.6: `<code>` is the one-time code Keeper printed in its log at the pin (`one-time code for
+   App; the container is `app_0fcc2575_keeper` on the device (0.1.17: seen there; `addon_0fcc2575_keeper` only on an
+   older Home Assistant, before its rename), so the command finds its name at run time with `docker ps --format
+   '{{.Names}}' | grep 0fcc2575_keeper`, and the SSH user is `hassio`, who runs it with `sudo`). 0.1.6: `<code>` is the one-time code Keeper printed in its log at the pin (`one-time code for
    key-confirm: ...`, below).
    Check the fingerprint first against `cain/SHIP_KEY_FINGERPRINT` in the repository and the
    `Ship key fingerprint: ...` line in Cain's App log: all three must agree. A state that is lost (Keeper
@@ -513,6 +513,36 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   still fail. Every value searched for is at least 16 bytes: the 8 and 12 hex digit ids are left out (they could match
   random bytes by chance) and each key's 16 digit fingerprint stands for them. Every failure names the layer, the byte
   offset and what matched (the sentinel, a key value, a key's fingerprint).
+  (0.1.17) The scan streams, in bounded memory. On the device the 0.1.16 scan of a 100 MB test backup held the whole
+  archive and each inflated layer several times over, and the kernel's out-of-memory killer stopped Keeper's service.
+  Now the downloaded archive is written to a file and read from it by offsets, a chunk at a time; each gzip member is
+  inflated once, through a streaming inflater, into a streaming tar reader, its CRC32 and length computed as it streams
+  and checked against its trailer (the inflater's own end of the stream, with that trailer check, takes the place of
+  0.1.16's two confirming re-inflations); every value is searched for across chunk boundaries, so one split between two
+  chunks is still found; and a tar layer's own bytes (headers, records, padding, the tail) are searched by offset
+  ranges as it streams. A hard budget fails the check, naming itself: 4 GB decoded in all (the expanded-bytes budget),
+  6 layers of nesting (the nesting budget), and 1 MB for any record Keeper must hold to read (the record budget).
+  Nothing it looks for changed. The scan runs in a child process of Keeper's service, with a memory limit of its own
+  (384 MB resident, and Bun's smaller heap): if it is killed, the service lives on, counts the check failed, removes
+  the sentinels, deletes the test backup and says so, with the archive's size ("the scan was killed (out of memory)
+  ..."). A pass is tied to this scan (scan 3): a pass from before 0.1.17 no longer counts, so run the backup check again.
+
+  **What `backup-check` says (0.1.17).** It waits at most 10 minutes and says what happened in plain words. At the start:
+  "backup check running: Keeper makes a test backup of itself, downloads it and scans it in a separate process; this
+  can take several minutes (at most 10)", then each minute "backup check still running (<n> min): the scan is reading
+  the test backup". Then one of:
+  - "the backup check passed: a test backup of Keeper leaves out every key file and holds no key";
+  - "not done: <why>", Keeper's own reason, for example "not done: the scan was killed (out of memory): it passed its
+    own limit of 384.0 MB reading the <bytes>-byte (<MB> MB) test backup", or "... the system stopped it, and Keeper's
+    service is unharmed" when the kernel killed it, or "the scan took longer than 7 minutes ... and was stopped";
+  - "not done: the keeper's service isn't answering on its loopback port (127.0.0.1:8096): is Keeper started? Nothing
+    was checked";
+  - "not done: the keeper's service stopped answering while the backup check ran (it was likely restarted while
+    scanning). Its restart counts the check failed, removes the sentinels and deletes the test backup; read Keeper's
+    log, then run backup-check again";
+  - "not done: no answer within 10 minutes; the backup check may still be running. Read Keeper's log for "backup check
+    passed" or "backup check FAILED"; if the service restarts, that counts the check failed and deletes the test
+    backup".
   Any read, format, size or traversal error fails it. A check that was interrupted counts as failed: at every start
   Keeper deletes its recorded test backup and any downloaded archive left behind, and logs it. A pass is tied to the
   exclusion this build ships (its hash); a build with another exclusion needs the check again.
@@ -702,7 +732,7 @@ your tap sets it: the **drill flag**.
   jobs racing a backup delete (now the pins), and the pending claim in the hook (now the acceptance outside the hook's
   bound). Keeper 0.1.16 closed the other three: the secret scanner's coverage (the backup check's scan reads every
   byte of the archive), a bare 401 taken as a revocation (only the documented answer counts), and the pending lock's
-  bound (released at 3 minutes from the step's start, whatever the step does). Only the device checks remain ("Still to check on the device", 0.1.15 and 0.1.16): you set
+  bound (released at 3 minutes from the step's start, whatever the step does). Only the device checks remain ("Still to check on the device", 0.1.15, 0.1.16 and 0.1.17): you set
   the option to `false` once they are done, after the device run, and not before. It isn't in the drill records' binding, so changing it drops nothing: the drills
   can run before, and arming completes only after.
 
@@ -811,8 +841,8 @@ phone test and the missed-heartbeat drill are done; a Keeper update after the dr
    `hc_deadman`, `hc_failed` (Cain's alert check: a drill record needs its rollback line delivered there),
    `hc_unique_keys` for every role, `ship_public_key`, `drill_days` (What you must set, 1 to 4).
 3. In Keeper's container (for example `docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun /opt/keeper/main.ts <command>` from
-   the SSH App, as for `key-confirm` above: `addon_0fcc2575_keeper` on an older Home Assistant, `app_0fcc2575_keeper`
-   after its rename): `key-code`, then `key-confirm <fingerprint> <code>` against
+   the SSH App, as for `key-confirm` above: `app_0fcc2575_keeper` on the device, `addon_0fcc2575_keeper` only on an
+   older Home Assistant; the SSH user `hassio` runs it with `sudo`): `key-code`, then `key-confirm <fingerprint> <code>` against
    `cain/SHIP_KEY_FINGERPRINT`; `backup-check`; `hc-key <code>` (the key on standard input); `accept-limits <code>`.
 4. The state read, before and after every case below: `bun /opt/keeper/main.ts drill-state` in Keeper's container
    (read only: each watched App's newest attempts with their kind, versions, status, trigger, whether a restore ran
@@ -833,7 +863,7 @@ the healthy case), then one Ship tap. Wait for each case's last line before the 
 **The restored backup's check (the first device drill, case 1).** Once Cain is back at N, list what Keeper's backup
 held and what the restore left: in Home Assistant, Settings, System, Backups, open the backup named
 `Keeper drill-<pr>-cain-<head> ...` and note its contents (the Cain App only); then, from the SSH App,
-`docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_cain)" ls -l /data/trust/` (Cain's container is `addon_0fcc2575_cain` or `app_0fcc2575_cain`, as above) and confirm neither `keeper-drill.json` (the flag) nor
+`docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_cain)" ls -l /data/trust/` (Cain's container is `app_0fcc2575_cain` on the device, `addon_0fcc2575_cain` only on an older Home Assistant, as above) and confirm neither `keeper-drill.json` (the flag) nor
 `keeper-drill-mark.json` (the mark) is there. Either one present means the backup or the restore held it: stop the
 drills and log it as a Build item.
 
@@ -842,14 +872,17 @@ record" to the phone test. If a record isn't written (`no drill record for <id>:
 delivered), fix the why and run `drill-record <attempt id>` in Keeper's container once.
 
 **After the cases: your setup steps.** These don't touch the binding, so they come once the cases have run:
-1. The SSH route: the container commands above go through the SSH App; once the drills are done, close or lock down
-   whatever access you opened for them.
+1. The SSH route: the container commands above go through the SSH App, as the user `hassio` with `sudo`. (0.1.17) scp
+   is closed on the device, so a script is never copied over: it is piped over ssh's standard input, for example
+   `ssh hassio@<the Pi> 'sudo bash -s' < script.sh`. Once the drills are done, close or lock down whatever access you
+   opened for them.
 2. The old Healthchecks key: revoke it in Healthchecks (Project Settings, API Access), then
 3. the rotation tap: tap **Old key replaced** on the link's card (What you must set, "Both key roles").
 4. The phone test: `phone-test`, then `phone-confirm <code> cain deadman` once both pages reached your phone (Arming).
 5. The missed-heartbeat drill: `missed-heartbeat`, then `missed-heartbeat-confirm <code>` (Arming).
-6. Once Keeper 0.1.16 is installed (it closes the drill plan's follow-up items) and the device checks are done
-   ("Still to check on the device", 0.1.15 and 0.1.16), set `drill_followups_open` to `false` in Keeper's options.
+6. Once Keeper 0.1.17 is installed (0.1.16 closed the drill plan's follow-up items; 0.1.17 lets the backup check read
+   the device's full-size backup) and the device checks are done ("Still to check on the device", 0.1.15, 0.1.16 and
+   0.1.17), set `drill_followups_open` to `false` in Keeper's options.
 Then `drill-state` (or Cain's "Ship it with that risk" card) reads armed; until step 6 it says the follow-up items
 or the device checks are still open, so arming can't complete on this runbook alone. The phone test and the missed-heartbeat
 drill last `drill_days`; the drill records last 60 days or until the binding changes.
@@ -1103,7 +1136,13 @@ passing with the backup key store's sentinels; and the two drills (the next job)
     placeholder); its log line names `drill-spent/backup-check-sentinel` among the sentinels placed.
 11. The real archive passes the wider scan: the Supervisor's own archive of Keeper has only zeros after its gzip stream
     and after each tar's end-of-archive block, one gzip member with a matching trailer, and the control once in a file.
-    A failure names the layer, the byte and what matched: copy that line into a Build item.
+    A failure names the layer, the byte and what matched: copy that line into a Build item. (0.1.17) Before this check
+    goes on a runbook, `backup-check` is run at device size (an archive of 100 MB or more) under a memory cap: the
+    0.1.16 scan of the device's 100 MB backup was killed by the kernel's out-of-memory killer, and only the tests' small
+    archives had been scanned before. `keeper/tests/scan-stream.test.ts` runs it in CI (an archive over 100 MB whose image
+    tar inflates past 300 MB, the scan's child under a 256 MB cap, its peak asserted); on the Pi, Keeper's log line
+    `backup check: the scan read <n> files, decoded <bytes> bytes, peak memory <MB> (its limit 384.0 MB)` shows the
+    device's own run.
 12. The service's real answer for a revoked key, captured as a fixture: revoke a spare read-only key in Healthchecks,
     try it once (`curl -s -o - -w '%{http_code}' -H 'X-Api-Key: <that key>' https://healthchecks.io/api/v3/checks/`),
     and record the status and body (expected: 401 with `{"error": "wrong api key"}`; the key itself never goes in the
@@ -1112,4 +1151,12 @@ passing with the backup key store's sentinels; and the two drills (the next job)
     Keeper's log shows the lock released at 3 minutes from the step's start, the operation late, `can't be reconciled
     yet` while a backup job runs, then reconciled once none does, and Supervisor writes going on after.
 14. The container name on this Home Assistant: `docker ps --format '{{.Names}}' | grep 0fcc2575_keeper` names exactly
-    one container (`addon_0fcc2575_keeper` or `app_0fcc2575_keeper`), and the commands above reach it.
+    one container, and the commands above reach it. (0.1.17) On the device it is `app_0fcc2575_keeper`, not
+    `addon_0fcc2575_keeper`; the SSH user is `hassio`, with `sudo`; scp is closed, so scripts are piped over ssh's
+    standard input.
+
+(0.1.17) This build's device check, after 14:
+15. The backup check run again on the streaming scan (scan 3): a pass recorded by 0.1.16's scan no longer counts. Run
+    `backup-check` after installing 0.1.17; it should pass on the device's full-size backup, and its log shows the
+    scan's peak memory (above, 11). If it says the scan was killed, copy its line (it names the archive's size) into a
+    Build item.

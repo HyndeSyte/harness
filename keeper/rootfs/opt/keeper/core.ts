@@ -165,7 +165,7 @@
 //   gave up      the restore failed, or the App didn't come back
 //   never started  (before 0.1.5) the install deadline passed without to_version ever seen
 import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify as edVerify, type KeyObject } from "node:crypto";
-import { type Needle, SCAN_VERSION, scanBackup } from "./scan.ts";
+import { type ArchiveFile, type Needle, SCAN_VERSION, type ScanResult, scanFile } from "./scan.ts";
 
 export const PROTOCOL = 1;                       // the verdict protocol version, bound into the armed state
 export const BACKUP_SCOPE = "app-only";          // the backup scope bound into the armed state
@@ -739,7 +739,12 @@ export interface Deps {
   // 0.1.10: place never writes over a name in skip (a kept key's file); read reads a placed file back; control writes the
   // positive control in a file outside the exclusion and answers its name; clear removes it too.
   keyFiles?: { place: (sentinel: string, skip?: string[]) => string[]; read?: (name: string) => string | null; control?: (value: string) => string | null; clear: () => void; sweep: () => string[] };
-  download?: (slug: string) => Promise<Uint8Array | null>;
+  // 0.1.17: the download is written to a file in the check's own folder and never read whole: its path, its size, and remove()
+  download?: (slug: string) => Promise<ArchiveFile | null>;
+  // (0.1.17) the scan of that file, in a child process of the service (main.ts scanChild), so a scan the kernel kills never
+  // takes the service with it: it answers why (killed, out of memory, with the archive's size). Absent (tests): scan.ts
+  // scanFile, in this process.
+  scan?: (file: ArchiveFile, names: RegExp, needles: Needle[], control: string) => Promise<ScanResult>;
   archives?: { sweep: () => string[] };            // (0.1.10) downloaded archives left behind by an interrupted check: removed, named
   // (0.1.9) the old key, to try it once; 0.1.10: name, its file's name in the data folder (checked inside the exclusion first)
   oldKeyStore?: { load: () => string; store: (key: string) => boolean; drop: () => void; name?: string };
@@ -1275,16 +1280,22 @@ export class Keeper {
       slug = made.slug;
       this.st.backupCheckRun.slug = slug; this.save();
       const info = await this.d.backupInfo(slug).catch(() => null);
-      const bytes = await dl(slug).catch(() => null);
-      if (!bytes) return this.backupCheckFailed(`the test backup ${slug} couldn't be downloaded`);
-      const size = Keeper.sizeWhy(bytes.length, info);
-      if (size) return this.backupCheckFailed(`the test backup ${slug}'s download ${size}`);
-      const r = scanBackup(bytes, KEY_NAME, needles, { control });
-      if (!r.ok) return this.backupCheckFailed(r.why);
-      this.st.backupCheck = { at: this.now(), names: placed, slug, exclude: EXCLUDE_HASH, scan: SCAN_VERSION };
-      this.d.log(`backup check passed: test backup ${slug} (${r.members} files read, ${bytes.length} bytes as the Supervisor reported) leaves out every key file (${placed.join(", ")}), holds no key value, fingerprint or sentinel, and holds the positive control exactly once; tied to the backup exclusion ${EXCLUDE_HASH}`);
-      this.save();
-      return { ok: true, why: "" };
+      // (0.1.17) the archive goes to a file and the scan reads it from there, a chunk at a time, in a child process
+      const file = await dl(slug).catch(() => null);
+      if (!file) return this.backupCheckFailed(`the test backup ${slug} couldn't be downloaded`);
+      try {
+        const size = Keeper.sizeWhy(file.size, info);
+        if (size) return this.backupCheckFailed(`the test backup ${slug}'s download ${size}`);
+        this.d.log(`backup check: scanning test backup ${slug} (${file.size} bytes)${this.d.scan ? " in a child process" : ""}`);
+        const scan = this.d.scan ?? ((f: ArchiveFile, names: RegExp, n: Needle[], c: string) => scanFile(f.path, names, n, { control: c }));
+        const r: ScanResult = await scan(file, KEY_NAME, needles, control)
+          .catch((e) => ({ ok: false, why: `the scan couldn't run (${String((e as Error)?.message ?? e).slice(0, 80)})`, members: 0, names: [], found: [], control: 0 }));
+        if (!r.ok) return this.backupCheckFailed(r.why);
+        this.st.backupCheck = { at: this.now(), names: placed, slug, exclude: EXCLUDE_HASH, scan: SCAN_VERSION };
+        this.d.log(`backup check passed: test backup ${slug} (${r.members} files read, ${file.size} bytes as the Supervisor reported) leaves out every key file (${placed.join(", ")}), holds no key value, fingerprint or sentinel, and holds the positive control exactly once; tied to the backup exclusion ${EXCLUDE_HASH} and scan ${SCAN_VERSION}`);
+        this.save();
+        return { ok: true, why: "" };
+      } finally { try { file.remove(); } catch { /* the folder is swept at the next start */ } }
     } finally {
       try { kf.clear(); } catch (e) { this.d.log(`backup check: couldn't remove the sentinels (${String(e).slice(0, 80)}); they are removed at the next start`); }
       const held = slug ? this.writesHeldWhy() : "";
@@ -1331,12 +1342,13 @@ export class Keeper {
     return all ? "" : `the interrupted backup check's test backup "${run.name}" couldn't be deleted`;
   }
   // (0.1.10) The backup check's pass, as it counts now: tied to this build's exclusion. 0.1.16: and to the scan's coverage
-  // (SCAN_VERSION): a pass recorded by a narrower scan no longer counts.
+  // (SCAN_VERSION): a pass recorded by a narrower scan no longer counts. 0.1.17: scan 3, the streaming scan (a pass recorded by
+  // scan 2 or earlier, or with no scan version, no longer counts).
   checkPassed(): boolean { return !!this.st.backupCheck && this.st.backupCheck.exclude === EXCLUDE_HASH && this.st.backupCheck.scan === SCAN_VERSION && !this.st.backupCheckRun; }
   private checkWhy(): string {
     if (this.st.backupCheckRun) return `${BACKUP_CHECK_WHY}: a backup check was interrupted and counts as failed (its test backup "${this.st.backupCheckRun.name}" is deleted at the next start)`;
     if (this.st.backupCheck && this.st.backupCheck.exclude !== EXCLUDE_HASH) return `${BACKUP_CHECK_WHY}: the backup exclusion changed since it passed (now ${EXCLUDE_HASH}), so run it again`;
-    if (this.st.backupCheck && this.st.backupCheck.scan !== SCAN_VERSION) return `${BACKUP_CHECK_WHY}: the check's scan was widened since it passed (now scan ${SCAN_VERSION}, every byte of the archive), so run it again`;
+    if (this.st.backupCheck && this.st.backupCheck.scan !== SCAN_VERSION) return `${BACKUP_CHECK_WHY}: the check's scan changed since it passed (now scan ${SCAN_VERSION}: every byte of the archive, read as a stream in bounded memory), so run it again`;
     return BACKUP_CHECK_WHY;
   }
   private backupCheckFailed(why: string): { ok: boolean; why: string } {

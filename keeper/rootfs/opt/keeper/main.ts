@@ -20,12 +20,13 @@
 // The owner's commands go to the loopback listener (127.0.0.1:8096), never the App network's (0.1.6).
 //   bun main.ts selftest              the image's own check (CI): the code loads and the version reads
 // Its state is /data/state.json, written whole (temp file, fsync, rename). Nothing of it is in /share.
-import { closeSync, constants as FS, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants as FS, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { BACKUP_KEY_SENTINEL, BACKUP_KEY_TMP_PREFIX, BACKUP_KEYS_DIR, CHECK_CONTROL_FILE, DRILL_SPENT_DIR, DRILL_SPENT_SENTINEL, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
+import { type ArchiveFile, type Needle, OVER_LIMIT_EXIT, type ScanResult } from "./scan.ts";
 
 export const PORT = Number(process.env.KEEPER_PORT ?? 8097);
 export const LOCAL_PORT = Number(process.env.KEEPER_LOCAL_PORT ?? 8096);   // (0.1.6) the owner's commands, loopback only
@@ -246,13 +247,70 @@ export const ARCHIVE_DIR = process.env.KEEPER_ARCHIVE_DIR ?? "/tmp/keeper-backup
 export function archives(dir = ARCHIVE_DIR) {
   return {
     sweep: (): string[] => { try { return readdirSync(dir).filter((n) => n.endsWith(".tar")).map((n) => { rmSync(join(dir, n), { force: true }); return n; }); } catch { return []; } },
-    through: async (slug: string, fetchTo: (path: string) => Promise<boolean>): Promise<Uint8Array | null> => {
-      const { mkdirSync } = await import("node:fs");
+    // 0.1.17: the file itself is answered (its path, its size and its removal), never its bytes read whole into memory; the scan
+    // reads it a chunk at a time, and backupCheck removes it once the scan has ended
+    through: async (slug: string, fetchTo: (path: string) => Promise<boolean>): Promise<ArchiveFile | null> => {
       try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return null; }
       const path = join(dir, `${slug.replace(/[^A-Za-z0-9_-]/g, "_")}.tar`);
-      try { if (!(await fetchTo(path))) return null; return new Uint8Array(readFileSync(path)); } catch { return null; } finally { rmSync(path, { force: true }); }
+      const remove = () => { rmSync(path, { force: true }); };
+      try {
+        if (!(await fetchTo(path))) { remove(); return null; }
+        return { path, size: statSync(path).size, remove };
+      } catch { try { remove(); } catch { /* swept at the next start */ } return null; }
     },
   };
+}
+
+// (0.1.17) The backup check's scan, in a child process of the service (scan.ts run as `bun --smol scan.ts child`): if the
+// kernel's out-of-memory killer still picks it, it takes the child and not the service, which then counts the check failed,
+// removes the sentinels, deletes the test backup and answers why, with the archive's size. The job goes to the child on its
+// standard input (the needles are key values: never on a command line), with a bare environment (no Supervisor token). Its own
+// memory limit: --smol (a smaller heap, collected sooner) and KEEPER_SCAN_RSS_MAX, its resident size sampled as it runs, over
+// which it exits at once (OVER_LIMIT_EXIT). A scan running past SCAN_CHILD_MS is stopped. Its answer is one JSON line, read to
+// at most 1 MB.
+export const SCAN_RSS_MAX = Number(process.env.KEEPER_SCAN_RSS_MAX ?? 384 * 1024 * 1024);
+export const SCAN_CHILD_MS = 7 * 60_000;
+const mb = (n: number) => `${(n / 1024 ** 2).toFixed(1)} MB`;
+export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needle[], control: string,
+  o: { rssMax?: number; timeoutMs?: number; maxExpanded?: number; script?: string; log?: (l: string) => void } = {}): Promise<ScanResult & { peakRss?: number }> {
+  const rssMax = o.rssMax ?? SCAN_RSS_MAX, timeoutMs = o.timeoutMs ?? SCAN_CHILD_MS;
+  const of = `the ${file.size}-byte (${mb(file.size)}) test backup`;
+  const fail = (why: string) => ({ ok: false, why, members: 0, names: [], found: [], control: 0 });
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = Bun.spawn([process.execPath, "--smol", o.script ?? join(import.meta.dir, "scan.ts"), "child"], {
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", KEEPER_SCAN_RSS_MAX: String(rssMax) },
+    });
+  } catch (e) { return fail(`the scan couldn't start (${String((e as Error)?.message ?? e).slice(0, 80)})`); }
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; try { child.kill("SIGKILL"); } catch { /* gone */ } }, timeoutMs);
+  try {
+    const sink = child.stdin as any;
+    sink.write(JSON.stringify({ path: file.path, names: { source: names.source, flags: names.flags }, needles, control, ...(o.maxExpanded ? { maxExpanded: o.maxExpanded } : {}) }));
+    await sink.end();
+  } catch { /* the child's end is read below */ }
+  const read = async (s: ReadableStream<Uint8Array> | undefined, max: number) => {
+    if (!s) return "";
+    const parts: Uint8Array[] = []; let n = 0;
+    try { for await (const c of s as any as AsyncIterable<Uint8Array>) { if (n < max) parts.push(c.subarray(0, max - n)); n += c.length; } } catch { /* cut short */ }
+    return Buffer.concat(parts).toString("utf8");
+  };
+  const [out, err] = await Promise.all([read(child.stdout as any, 1024 * 1024), read(child.stderr as any, 4096)]);
+  const code = await child.exited;
+  clearTimeout(timer);
+  const sig = child.signalCode;
+  if (timedOut) return fail(`the scan took longer than ${Math.round(timeoutMs / 60_000)} minutes reading ${of} and was stopped`);
+  if (code === OVER_LIMIT_EXIT) return fail(`the scan was killed (out of memory): it passed its own limit of ${mb(rssMax)} reading ${of}`);
+  if (sig === "SIGKILL" || code === 137) return fail(`the scan was killed (out of memory) reading ${of}: the system stopped it, and Keeper's service is unharmed`);
+  if (sig) return fail(`the scan was stopped by ${sig} reading ${of}`);
+  let r: any = null;
+  try { r = JSON.parse(out.trim().split("\n").pop() ?? ""); } catch { r = null; }
+  if (code !== 0 || !r || typeof r.ok !== "boolean" || typeof r.why !== "string")
+    return fail(`the scan ended without a result (exit ${code}) reading ${of}${err.trim() ? `: ${err.trim().split("\n").pop()!.slice(0, 120)}` : ""}`);
+  o.log?.(`backup check: the scan read ${Number(r.members) || 0} files, decoded ${Number(r.expanded) || 0} bytes, peak memory ${mb(Number(r.peakRss) || 0)} (its limit ${mb(rssMax)})`);
+  return { ok: r.ok, why: r.why, members: Number(r.members) || 0, names: Array.isArray(r.names) ? r.names : [], found: Array.isArray(r.found) ? r.found : [], control: Number(r.control) || 0,
+    expanded: Number(r.expanded) || 0, peakRss: Number(r.peakRss) || 0 };
 }
 
 async function serve(): Promise<void> {
@@ -270,6 +328,7 @@ async function serve(): Promise<void> {
     backups: sup.backups, activeJobs: sup.activeJobs, backupJobs: sup.backupJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
     installJobs: sup.installJobs, drillSpent: drillSpent(),   // (0.1.15) items 2 and 10
     diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
+    scan: (file, names, needles, control) => scanChild(file, names, needles, control, { log }),   // (0.1.17) in a child process
     keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), backupKeys: backupKeys(), hcTry: (key) => hcTry(key),
     ready: (hp) => get200(healthUrl(hp)),
     live: (hp) => get200(liveUrl(hp)),
@@ -304,7 +363,11 @@ async function serve(): Promise<void> {
     fetch: (req, server) => handle(k, req, server.requestIP(req)?.address ?? "", log) });
   // 0.1.6: the owner's commands, on the container's own loopback only (the App network can't reach it).
   Bun.serve({ port: LOCAL_PORT, hostname: "127.0.0.1", idleTimeout: 30, maxRequestBodySize: 4096,
-    fetch: (req, server) => handleLocal(k, req, server.requestIP(req)?.address ?? "", log) });
+    fetch: (req, server) => {
+      // (0.1.17) the backup check runs for minutes (a backup made, downloaded and scanned): its request is never cut by the idle timeout
+      if (new URL(req.url).pathname === "/backup-check") { try { server.timeout(req, 0); } catch { /* an older Bun: idleTimeout holds */ } }
+      return handleLocal(k, req, server.requestIP(req)?.address ?? "", log);
+    } });
   const tick = async () => { try { await k.poll(); } catch (e) { log(`a poll failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`); } };
   await tick();
   setInterval(tick, POLL_MS);
@@ -346,6 +409,43 @@ const DONE: Record<string, string> = {
   "backup-check": "the backup check passed: a test backup of Keeper leaves out every key file and holds no key",
   "drill-state": "Keeper's drill state",
 };
+// (0.1.17) The CLI's backup-check: it waits at most BACKUP_CHECK_CLI_MS, says while it waits that the check is running, and says in
+// plain words what happened: the result (passed, or why not: the scan killed, out of memory, among them), the service not
+// running, the service stopping while the check ran (its restart counts the check failed and deletes the test backup), or no
+// answer in time. Never only "the keeper's service didn't answer".
+export const BACKUP_CHECK_CLI_MS = 10 * 60_000;
+export const BACKUP_CHECK_SAYS = {
+  running: "backup check running: Keeper makes a test backup of itself, downloads it and scans it in a separate process; this can take several minutes (at most 10)",
+  still: (min: number) => `backup check still running (${min} min): the scan is reading the test backup`,
+  refused: "not done: the keeper's service isn't answering on its loopback port (127.0.0.1:8096): is Keeper started? Nothing was checked",
+  stopped: "not done: the keeper's service stopped answering while the backup check ran (it was likely restarted while scanning). Its restart counts the check failed, removes the sentinels and deletes the test backup; read Keeper's log, then run backup-check again",
+  timeout: "not done: no answer within 10 minutes; the backup check may still be running. Read Keeper's log for \"backup check passed\" or \"backup check FAILED\"; if the service restarts, that counts the check failed and deletes the test backup",
+  garbled: (status: number) => `not done: the keeper's service answered without a result (HTTP ${status}); read Keeper's log`,
+};
+export async function backupCheckCli(url = `http://127.0.0.1:${LOCAL_PORT}/backup-check`, o: { timeoutMs?: number; everyMs?: number; say?: (l: string) => void; http?: typeof fetch } = {}): Promise<{ ok: boolean; line: string }> {
+  const say = o.say ?? ((l: string) => console.log(l));
+  const http = o.http ?? fetch;
+  say(BACKUP_CHECK_SAYS.running);
+  const t0 = Date.now();
+  const every = setInterval(() => say(BACKUP_CHECK_SAYS.still(Math.round((Date.now() - t0) / 60_000))), o.everyMs ?? 60_000);
+  try {
+    let r: Response;
+    try { r = await http(url, { method: "POST", body: "{}", signal: AbortSignal.timeout(o.timeoutMs ?? BACKUP_CHECK_CLI_MS) }); }
+    catch (e: any) {
+      const what = `${e?.name ?? ""} ${e?.code ?? ""} ${e?.message ?? ""}`;
+      if (/TimeoutError|timed out|AbortError/i.test(what)) return { ok: false, line: BACKUP_CHECK_SAYS.timeout };
+      if (/ECONNREFUSED|ConnectionRefused|Unable to connect/i.test(what)) return { ok: false, line: BACKUP_CHECK_SAYS.refused };
+      return { ok: false, line: BACKUP_CHECK_SAYS.stopped };
+    }
+    let j: any = null;
+    try { j = await r.json(); } catch (e: any) {
+      if (/TimeoutError|AbortError/i.test(`${e?.name ?? ""}`)) return { ok: false, line: BACKUP_CHECK_SAYS.timeout };
+      return { ok: false, line: r.status ? BACKUP_CHECK_SAYS.garbled(r.status) : BACKUP_CHECK_SAYS.stopped };
+    }
+    if (!j || typeof j.ok !== "boolean") return { ok: false, line: BACKUP_CHECK_SAYS.garbled(r.status) };
+    return j.ok ? { ok: true, line: DONE["backup-check"] } : { ok: false, line: `not done: ${String(j.why ?? "no reason given")}` };
+  } finally { clearInterval(every); }
+}
 // (0.1.7) The key from standard input, first line, trimmed; never echoed.
 async function readStdinKey(): Promise<string> {
   try { return (await Bun.stdin.text()).split("\n")[0].trim(); } catch { return ""; }
@@ -354,7 +454,11 @@ async function readStdinKey(): Promise<string> {
 if (import.meta.main) {
   const [cmd, ...rest] = process.argv.slice(2);
   if (cmd === "serve") await serve();
-  else if (LOCAL_CMDS[cmd]) {
+  else if (cmd === "backup-check") {
+    const r = await backupCheckCli();
+    console.log(r.line);
+    process.exit(r.ok ? 0 : 1);
+  } else if (LOCAL_CMDS[cmd]) {
     const body: any = LOCAL_CMDS[cmd](rest);
     if (cmd === "hc-key") {
       if (rest.length > 1) { console.error("hc-key takes only the code: the key goes on standard input, never the command line"); process.exit(2); }

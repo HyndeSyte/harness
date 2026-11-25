@@ -9,6 +9,9 @@ import { type AppInfo, type BackupInfo, type InstallJob, type JobState, REGISTER
 export const BACKUP_CALL_MS = REGISTER_WAIT_MS;
 export interface Http { (url: string, init: RequestInit): Promise<Response> }
 
+// (0.1.17) the backup check's download: its largest archive, and how long the whole body may take
+export const DOWNLOAD_MAX = 200 * 1024 * 1024;
+export const DOWNLOAD_MS = 300_000;
 export function supervisor(token: string, base = "http://supervisor", http: Http = fetch) {
   const call = async (method: string, path: string, body?: unknown, ms = SUPERVISOR_CALL_MS) => {
     const r = await http(`${base}${path}`, {
@@ -78,27 +81,29 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       const gb = Number(r?.ok ? r.data?.disk_free : NaN);
       return Number.isFinite(gb) && gb >= 0 ? Math.floor(gb * 1024 ** 3) : null;
     },
-    // (0.1.9) A backup's archive (GET /backups/<slug>/download, the backup role): the backup check's scan reads it.
-    async download(slug: string): Promise<Uint8Array | null> {
-      try {
-        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(120_000) });
-        if (r.status !== 200) return null;
-        const b = new Uint8Array(await r.arrayBuffer());
-        return b.length > 200 * 1024 * 1024 ? null : b;
-      } catch { return null; }
-    },
-    // (0.1.10) The same download, written to a file (the backup check's own folder), so an interrupted check leaves a file
-    // the next start removes rather than nothing it can name. True once the whole body is written.
+    // (0.1.9) A backup's archive (GET /backups/<slug>/download, the backup role), for the backup check's scan. 0.1.10: written to a
+    // file (the backup check's own folder), so an interrupted check leaves a file the next start removes rather than nothing it
+    // can name. True once the whole body is written. 0.1.17: streamed to the file as it arrives, never held whole in memory (the
+    // 0.1.16 build read the whole body first); a body past DOWNLOAD_MAX is refused, the file removed.
     async downloadTo(slug: string, path: string): Promise<boolean> {
+      const { openSync, writeSync, fsyncSync, closeSync, rmSync } = await import("node:fs");
+      let fd = -1;
       try {
-        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(120_000) });
-        if (r.status !== 200) return false;
-        const b = new Uint8Array(await r.arrayBuffer());
-        if (b.length > 200 * 1024 * 1024) return false;
-        const { writeFileSync } = await import("node:fs");
-        writeFileSync(path, b, { mode: 0o600 });
+        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DOWNLOAD_MS) });
+        if (r.status !== 200 || !r.body) return false;
+        fd = openSync(path, "w", 0o600);
+        let n = 0;
+        for await (const chunk of r.body as any as AsyncIterable<Uint8Array>) {
+          n += chunk.length;
+          if (n > DOWNLOAD_MAX) throw new Error("too large");
+          for (let o = 0; o < chunk.length;) o += writeSync(fd, chunk, o, chunk.length - o);
+        }
+        fsyncSync(fd);
         return true;
-      } catch { return false; }
+      } catch {
+        if (fd >= 0) { try { closeSync(fd); } catch { /* closed */ } fd = -1; try { rmSync(path, { force: true }); } catch { /* swept at the next start */ } }
+        return false;
+      } finally { if (fd >= 0) { try { closeSync(fd); } catch { /* closed */ } } }
     },
     // (0.1.6) An orphan backup's delete (DELETE /backups/<slug>, within the backup role): true only on the
     // Supervisor's ok.

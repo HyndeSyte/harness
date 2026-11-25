@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.17
+
+- Fixed: `backup-check` on your Pi's full-size backup. Keeper 0.1.16 read the whole 100 MB test backup and its unpacked App image into memory at once, and the system stopped Keeper's service for using too much memory. The check now reads the backup from a file a piece at a time, unpacks it once as it goes, and stays small: about 55 MB on a test backup of 118 MB that unpacks to 330 MB.
+- It still checks exactly what it checked before, every byte of every layer, including a value split between two pieces.
+- The scan now runs in its own process with its own memory limit. If it is stopped anyway, Keeper keeps running, counts the check failed, removes its test files, deletes the test backup and tells you the scan was killed (out of memory), with the backup's size.
+- The check has hard limits: 4 GB unpacked in all and 6 layers of nesting. Past either, it fails and says which limit.
+- `backup-check` now waits up to 10 minutes, says it is running, and tells you in plain words what happened: passed, why not, Keeper not running, or Keeper stopped while scanning (that restart counts the check failed and deletes the test backup). No more bare "the keeper's service didn't answer".
+- Run `backup-check` again after installing: a pass from 0.1.16 or earlier no longer counts.
+- Keeper's DOCS: the backup check runs at full device size under a memory limit before it goes on a runbook; the container on your Pi is `app_0fcc2575_keeper`; the SSH user is `hassio` with `sudo`; scp is closed, so scripts are piped over ssh.
+
 ## 0.1.16
 
 - Closed: the secret scanner's coverage. The backup check now searches every byte of Keeper's test backup for the kept key, the old key, their fingerprints and every sentinel, including the gzip header, tar header fields, padding and anything after an archive's end. It finds the end of the gzip stream itself and checks its CRC and length: a second gzip stream, a wrong trailer or anything but zeros after it fails the check. The test value it plants must be found once, inside a file, and nowhere else. Values shorter than 16 characters are no longer searched for, so a short fingerprint can't match by chance. Every failure names the layer, the byte and what matched. It also proves the drill flags' spent list stays out of the backup.
