@@ -526,6 +526,20 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   (384 MB resident, and Bun's smaller heap): if it is killed, the service lives on, counts the check failed, removes
   the sentinels, deletes the test backup and says so, with the archive's size ("the scan was killed (out of memory)
   ..."). A pass is tied to this scan (scan 3): a pass from before 0.1.17 no longer counts, so run the backup check again.
+  (0.1.17, the review's fix round) The gzip member's end is the inflater's own end-of-stream signal, with its count of
+  bytes read taken at that moment for the trailer, so a stream that ends exactly on the last byte of a piece, a trailer
+  split across pieces and the bytes after the stream are all read exactly (the trailer's CRC32 and length, and nothing
+  but zeros after it, are still checked). A tar layer searches its whole byte stream, the files' data included, so a value
+  split between a header (or padding) and a file's data is found; a value wholly inside a file is reported once, by the
+  file. The inflater is fed 4 KB at a time and paused after each 64 KB it puts out until the layers below have taken it,
+  so an all-zero image (deflate expands up to about 1000 to 1) never builds up in memory: 2 GB of zeros scans in about
+  55 MB. The scan's memory is checked for every chunk it unpacks as well as every 20 ms, and it asks the kernel's
+  out-of-memory killer to pick it before Keeper's service (oom_score_adj 1000). The service reads the scan's output and
+  errors as they come, so a scan that writes too much or dies early never leaves the check waiting; it exits on its own
+  if the service goes. The whole check has one deadline of 8 minutes (making, downloading and scanning the test backup);
+  past it the check fails and names the phase it was in. One backup check runs at a time: a second one is answered at
+  once, "a backup check is already running". Every budget's failure names the phase, the limit, what it saw and what to
+  do, and every check logs the test backup's size ("backup check: test backup <slug> downloaded, <bytes> bytes").
 
   **What `backup-check` says (0.1.17).** It waits at most 10 minutes and says what happened in plain words. At the start:
   "backup check running: Keeper makes a test backup of itself, downloads it and scans it in a separate process; this
@@ -533,8 +547,14 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   the test backup". Then one of:
   - "the backup check passed: a test backup of Keeper leaves out every key file and holds no key";
   - "not done: <why>", Keeper's own reason, for example "not done: the scan was killed (out of memory): it passed its
-    own limit of 384.0 MB reading the <bytes>-byte (<MB> MB) test backup", or "... the system stopped it, and Keeper's
-    service is unharmed" when the kernel killed it, or "the scan took longer than 7 minutes ... and was stopped";
+    own limit of 384.0 MB reading the <bytes>-byte (<MB> MB) test backup (the scan's memory limit, in the scan phase:
+    limit ..., seen ...; what to do: ...)", or "the scan was killed (signal 9) reading ...: likely out of memory, its
+    last memory sample ... near its limit" when the kernel killed it near its limit (without "likely out of memory", and
+    saying so, when its last sample was far from it: the system, a supervisor stop or a manual kill), or "the scan took
+    longer than ... and was stopped (a timeout, not a crash)", or "the backup check ran past its deadline of 8 minutes
+    while downloading the test backup" (or making, or scanning);
+  - "not done: a backup check is already running; wait for it (Keeper's log says when it ends), then run backup-check
+    again if you need to";
   - "not done: the keeper's service isn't answering on its loopback port (127.0.0.1:8096): is Keeper started? Nothing
     was checked";
   - "not done: the keeper's service stopped answering while the backup check ran (it was likely restarted while
@@ -542,7 +562,10 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
     log, then run backup-check again";
   - "not done: no answer within 10 minutes; the backup check may still be running. Read Keeper's log for "backup check
     passed" or "backup check FAILED"; if the service restarts, that counts the check failed and deletes the test
-    backup".
+    backup";
+  - "not done: the request to Keeper's service failed (<code>); whether the check ran is unknown: read Keeper's log for
+    "backup check passed" or "backup check FAILED"", for any other failure, naming its raw code. (Fix round: the cause
+    is read from the error's code, never its message.)
   Any read, format, size or traversal error fails it. A check that was interrupted counts as failed: at every start
   Keeper deletes its recorded test backup and any downloaded archive left behind, and logs it. A pass is tied to the
   exclusion this build ships (its hash); a build with another exclusion needs the check again.
@@ -1160,3 +1183,27 @@ passing with the backup key store's sentinels; and the two drills (the next job)
     `backup-check` after installing 0.1.17; it should pass on the device's full-size backup, and its log shows the
     scan's peak memory (above, 11). If it says the scan was killed, copy its line (it names the archive's size) into a
     Build item.
+    (Fix round) Then three runs that prove the service survives and cleans up, at the Pi in Keeper's container (Pi access
+    in RELEASING.md). Record each run's peak memory and duration (the log's "backup check: the scan read ...
+    peak memory ..." line and the time from "backup check running" to the answer) in the Build item.
+    a. Under a memory hog (dd): in another shell on the Pi, start a hog that fills memory until the kernel's
+       out-of-memory killer acts (for example `sudo dd if=/dev/zero of=/dev/null bs=1G count=1 iflag=fullblock` run a few
+       times at once, or one with a bs near the free memory `free -m` shows), then run `backup-check`. Expected: the
+       kernel kills the scan's child (or the hog), never Keeper's service; `backup-check` answers (killed (signal 9),
+       likely out of memory, or a pass); the log shows the sentinels removed and the test backup deleted; Keeper's
+       service is still running (`docker ps` shows the container up and its log shows no restart).
+    b. With an all-zero high-ratio image: the scan's tests already read 2 GB of zeros in about 55 MB; on the device, place
+       a large all-zero file in Keeper's data folder outside the exclusion
+       (`docker exec ... dd if=/dev/zero of=/data/zeros.img bs=1M count=1024`), run `backup-check`, then remove it
+       (`docker exec ... rm /data/zeros.img`). Expected: a pass, the log showing the decoded size and a peak well under
+       the limit.
+    c. With the service stopped mid-scan: run `backup-check`, and while it says "still running" restart the Keeper App
+       from Home Assistant. Expected: the CLI says the service stopped answering; after the restart the log says the
+       interrupted check counts as failed and its test backup is deleted; no orphaned child, temp file or sentinel
+       remains (`docker exec ... ps aux` shows no `scan.ts child`; `/tmp/keeper-backup-check` is empty; no
+       `backup-check-sentinel` or `backup-check-control` file is left under `/data`, and the log says the sentinels were
+       removed).
+
+Follow-ups, not built in 0.1.17 (named here so they aren't lost): a cgroup memory limit for the scan's child (a hard
+ceiling the kernel enforces, rather than the child's own sampled limit; it needs a change outside Keeper's folder, in how
+the image runs); and deriving the download's cap from free disk (today a fixed 200 MB) so a check never fills the disk.

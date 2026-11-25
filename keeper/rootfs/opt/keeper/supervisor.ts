@@ -3,7 +3,8 @@
 // Home Assistant API, no manager role, and (0.1.2) no write of any options, its own included. 0.1.3: it also makes the App-only backup of an
 // install it registered (POST /backups/new/partial, within the backup role). The token
 // comes from the environment the Supervisor gives the App (SUPERVISOR_TOKEN) and is never logged.
-import { type AppInfo, type BackupInfo, type InstallJob, type JobState, REGISTER_WAIT_MS, type RestoreResult, SUPERVISOR_CALL_MS } from "./core.ts";
+import { type AppInfo, type BackupInfo, type InstallJob, inWords, type JobState, REGISTER_WAIT_MS, type RestoreResult, SUPERVISOR_CALL_MS } from "./core.ts";
+import { budgetWhy } from "./scan.ts";
 
 // (0.1.4) The backup call waits as long as the registration's answer does.
 export const BACKUP_CALL_MS = REGISTER_WAIT_MS;
@@ -84,25 +85,34 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
     // (0.1.9) A backup's archive (GET /backups/<slug>/download, the backup role), for the backup check's scan. 0.1.10: written to a
     // file (the backup check's own folder), so an interrupted check leaves a file the next start removes rather than nothing it
     // can name. True once the whole body is written. 0.1.17: streamed to the file as it arrives, never held whole in memory (the
-    // 0.1.16 build read the whole body first); a body past DOWNLOAD_MAX is refused, the file removed.
-    async downloadTo(slug: string, path: string): Promise<boolean> {
+    // 0.1.16 build read the whole body first); a body past DOWNLOAD_MAX is refused, the file removed. Fix round: the time it may
+    // take is the less of DOWNLOAD_MS and what the check's one deadline leaves (o.timeoutMs), it stops when the check aborts it
+    // (o.signal), and a failure answers why (the cap and the time limit named as budgets), never only false.
+    async downloadTo(slug: string, path: string, o: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<true | string> {
       const { openSync, writeSync, fsyncSync, closeSync, rmSync } = await import("node:fs");
-      let fd = -1;
+      const ms = Math.max(1, Math.min(DOWNLOAD_MS, o.timeoutMs ?? DOWNLOAD_MS));
+      const limit = AbortSignal.timeout(ms);
+      const signal = o.signal ? AbortSignal.any([limit, o.signal]) : limit;
+      let fd = -1, n = 0, tooBig = false;
       try {
-        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(DOWNLOAD_MS) });
-        if (r.status !== 200 || !r.body) return false;
+        const r = await http(`${base}/backups/${encodeURIComponent(slug)}/download`, { method: "GET", headers: { authorization: `Bearer ${token}` }, signal });
+        if (r.status !== 200 || !r.body) return `the Supervisor answered HTTP ${r.status}`;
         fd = openSync(path, "w", 0o600);
-        let n = 0;
         for await (const chunk of r.body as any as AsyncIterable<Uint8Array>) {
           n += chunk.length;
-          if (n > DOWNLOAD_MAX) throw new Error("too large");
-          for (let o = 0; o < chunk.length;) o += writeSync(fd, chunk, o, chunk.length - o);
+          if (n > DOWNLOAD_MAX) { tooBig = true; throw new Error("too large"); }
+          for (let w = 0; w < chunk.length;) w += writeSync(fd, chunk, w, chunk.length - w);
         }
         fsyncSync(fd);
         return true;
-      } catch {
-        if (fd >= 0) { try { closeSync(fd); } catch { /* closed */ } fd = -1; try { rmSync(path, { force: true }); } catch { /* swept at the next start */ } }
-        return false;
+      } catch (e) {
+        if (fd >= 0) { try { closeSync(fd); } catch { /* closed */ } fd = -1; }
+        try { rmSync(path, { force: true }); } catch { /* swept at the next start */ }
+        const mb = (x: number) => `${(x / 1024 ** 2).toFixed(1)} MB`;
+        if (tooBig) return `it passed Keeper's download cap ${budgetWhy({ budget: "the download cap", phase: "download", limit: mb(DOWNLOAD_MAX), seen: `over ${mb(DOWNLOAD_MAX)} (${n} bytes when it stopped)`, todo: "a test backup of Keeper itself is normally well under it: look for what fills Keeper's data folder; a larger cap needs a new Keeper release" })}`;
+        if (o.signal?.aborted) return `the backup check's deadline passed while it downloaded (${n} bytes by then)`;
+        if (limit.aborted) return `it took longer than ${inWords(ms)} ${budgetWhy({ budget: "the download's time limit", phase: "download", limit: inWords(ms), seen: `${n} bytes in ${inWords(ms)}`, todo: "run backup-check again when the device is less busy" })}`;
+        return `it failed after ${n} bytes (${String((e as any)?.code ?? (e as any)?.name ?? "error").slice(0, 40)})`;
       } finally { if (fd >= 0) { try { closeSync(fd); } catch { /* closed */ } } }
     },
     // (0.1.6) An orphan backup's delete (DELETE /backups/<slug>, within the backup role): true only on the

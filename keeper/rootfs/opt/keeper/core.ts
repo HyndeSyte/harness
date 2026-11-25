@@ -165,7 +165,7 @@
 //   gave up      the restore failed, or the App didn't come back
 //   never started  (before 0.1.5) the install deadline passed without to_version ever seen
 import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify as edVerify, type KeyObject } from "node:crypto";
-import { type ArchiveFile, type Needle, SCAN_VERSION, type ScanResult, scanFile } from "./scan.ts";
+import { type ArchiveFile, budgetWhy, type Needle, SCAN_VERSION, type ScanResult, scanFile } from "./scan.ts";
 
 export const PROTOCOL = 1;                       // the verdict protocol version, bound into the armed state
 export const BACKUP_SCOPE = "app-only";          // the backup scope bound into the armed state
@@ -209,6 +209,14 @@ export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the loc
 export const PENDING_CEILING_MS = 3 * 60_000;
 // (0.1.16) A Supervisor call's own timeout (supervisor.ts, every call but the backup create, the restore and the download).
 export const SUPERVISOR_CALL_MS = 15_000;
+// (0.1.17, fix round) The backup check's one deadline, from its start: making the test backup (its own call bounded at
+// REGISTER_WAIT_MS inside it), downloading it and scanning it all count against it. Shorter than the CLI's wait (main.ts
+// BACKUP_CHECK_CLI_MS, 10 minutes) by enough for the cleanup after it, so the owner always hears the check's own answer.
+export const CHECK_DEADLINE_MS = 8 * 60_000;
+// (0.1.17, fix round) a second backup check while one runs is answered at once with this, and starts nothing
+export const BACKUP_CHECK_BUSY = "a backup check is already running";
+// a time in words: minutes, seconds, or milliseconds under a second
+export const inWords = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)} minutes` : ms >= 1000 ? `${Math.round(ms / 1000)} seconds` : `${ms} ms`);
 // (0.1.16) Every Supervisor write that runs under the claim record's lock, with its worst case. Both are a backup's delete through
 // fence.write, bounded by LOCK_CALL_MS (bounded()) and by the call's own timeout, so the longest a step can hold the lock is its
 // own bound (LOCK_STEP_MS) plus one write still in flight when it ran out: under PENDING_CEILING_MS (checked in the tests). The
@@ -739,12 +747,13 @@ export interface Deps {
   // 0.1.10: place never writes over a name in skip (a kept key's file); read reads a placed file back; control writes the
   // positive control in a file outside the exclusion and answers its name; clear removes it too.
   keyFiles?: { place: (sentinel: string, skip?: string[]) => string[]; read?: (name: string) => string | null; control?: (value: string) => string | null; clear: () => void; sweep: () => string[] };
-  // 0.1.17: the download is written to a file in the check's own folder and never read whole: its path, its size, and remove()
-  download?: (slug: string) => Promise<ArchiveFile | null>;
+  // 0.1.17: the download is written to a file in the check's own folder and never read whole: its path, its size, and remove().
+  // Fix round: it is given what the check's deadline leaves and the check's abort signal, and a failure may say why ({ why })
+  download?: (slug: string, o?: { timeoutMs: number; signal: AbortSignal }) => Promise<ArchiveFile | { why: string } | null>;
   // (0.1.17) the scan of that file, in a child process of the service (main.ts scanChild), so a scan the kernel kills never
   // takes the service with it: it answers why (killed, out of memory, with the archive's size). Absent (tests): scan.ts
   // scanFile, in this process.
-  scan?: (file: ArchiveFile, names: RegExp, needles: Needle[], control: string) => Promise<ScanResult>;
+  scan?: (file: ArchiveFile, names: RegExp, needles: Needle[], control: string, o?: { timeoutMs: number; signal: AbortSignal }) => Promise<ScanResult>;
   archives?: { sweep: () => string[] };            // (0.1.10) downloaded archives left behind by an interrupted check: removed, named
   // (0.1.9) the old key, to try it once; 0.1.10: name, its file's name in the data folder (checked inside the exclusion first)
   oldKeyStore?: { load: () => string; store: (key: string) => boolean; drop: () => void; name?: string };
@@ -771,6 +780,28 @@ export type Answer = { status: number; body: Record<string, unknown> };
 export interface Fence { gen: number; live(): boolean; write<V>(what: string, call: () => Promise<V> | V, after?: (v: V) => void, target?: string): Promise<V | null> }
 
 // -- the keeper -----------------------------------------------------------------------------------
+// (0.1.17, fix round) The backup check's one deadline (CHECK_DEADLINE_MS from its start), as one timer: within() races a phase
+// against it (a value the phase brings after the deadline goes to late(), so a late download's file is removed); left() is what
+// remains, handed to the phase as its own limit; signal aborts the phase's work (the download, the scan's child) at the deadline.
+export const PAST: unique symbol = Symbol("past the backup check's deadline");
+export function checkDeadline(ms = CHECK_DEADLINE_MS) {
+  const t0 = Date.now(), ac = new AbortController();
+  let passed = false, timer: ReturnType<typeof setTimeout> | undefined;
+  const over = new Promise<typeof PAST>((res) => { timer = setTimeout(() => { passed = true; ac.abort(); res(PAST); }, ms); });
+  return {
+    get passed() { return passed; },
+    signal: ac.signal,
+    left: () => Math.max(1000, ms - (Date.now() - t0)),
+    within: async <T>(p: Promise<T>, late?: (v: T) => void): Promise<T | typeof PAST> => {
+      const r = await Promise.race([p, over]);
+      if (r === PAST) void p.then((v) => late?.(v), () => {});
+      return r;
+    },
+    why: (phase: string) => `the backup check ran past its deadline of ${inWords(ms)} while ${phase} the test backup ${budgetWhy({ budget: "the backup check's deadline", phase, limit: `${inWords(ms)} for the whole check`, seen: `still ${phase} after ${inWords(ms)}`, todo: "run backup-check again when the device is less busy; if it runs out of time again, report it with the backup's size from Keeper's log" })}`,
+    clear: () => clearTimeout(timer),
+  };
+}
+
 export class Keeper {
   st: State;
   opts: Options = parseOptions({});
@@ -1226,12 +1257,14 @@ export class Keeper {
   async backupCheck(): Promise<{ ok: boolean; why: string }> {
     const kf = this.d.keyFiles, dl = this.d.download;
     if (!kf || !dl || !this.d.deleteBackup || !kf.read || !kf.control || !this.d.backups) return { ok: false, why: "this Keeper can't place key files, download, list or delete a backup" };
-    if (this.checking) return { ok: false, why: "a backup check is already running" };
+    // (0.1.17, fix round) one at a time: a second call (the route has no idle timeout) starts no second child or download
+    if (this.checking) return { ok: false, why: BACKUP_CHECK_BUSY };
     const held = this.writesHeldWhy();
     if (held) return { ok: false, why: `the backup check makes and deletes a backup: ${held}` };
     const open = this.open();
     if (open.length) return { ok: false, why: `${open[0].id} is ${open[0].status}: run the backup check once no install is open` };
     this.checking = true;
+    const deadline = checkDeadline();
     const sentinel = `keeper-sentinel-${randomBytes(12).toString("hex")}`;
     const control = `keeper-control-${randomBytes(12).toString("hex")}`;
     // (0.1.16) each value with what it is, named in a failure; scan.ts searches only values of at least MIN_NEEDLE (16) bytes, so
@@ -1279,17 +1312,25 @@ export class Keeper {
       if (!("slug" in made)) return this.backupCheckFailed(`the test backup couldn't be made (${made.why})`);
       slug = made.slug;
       this.st.backupCheckRun.slug = slug; this.save();
+      if (deadline.passed) return this.backupCheckFailed(deadline.why("making"));
       const info = await this.d.backupInfo(slug).catch(() => null);
-      // (0.1.17) the archive goes to a file and the scan reads it from there, a chunk at a time, in a child process
-      const file = await dl(slug).catch(() => null);
-      if (!file) return this.backupCheckFailed(`the test backup ${slug} couldn't be downloaded`);
+      // (0.1.17) the archive goes to a file and the scan reads it from there, a chunk at a time, in a child process. Fix round:
+      // each phase gets what the deadline leaves, and is raced against it (a late download's file is removed when it comes)
+      const got = await deadline.within(dl(slug, { timeoutMs: deadline.left(), signal: deadline.signal }).catch(() => null), (f) => { if (f && "path" in f) { try { f.remove(); } catch { /* swept */ } } });
+      if (got === PAST) return this.backupCheckFailed(deadline.why("downloading"));
+      const known = Number.isSafeInteger(info?.sizeBytes) ? `${info!.sizeBytes} bytes` : Number.isFinite(Number(info?.sizeMb ?? info?.size)) ? `${Number(info!.sizeMb ?? info!.size)} MB` : "its size unknown";
+      if (!got || !("path" in got)) return this.backupCheckFailed(`the test backup ${slug} (${known}, as the Supervisor reports it) couldn't be downloaded${got && "why" in got ? `: ${got.why}` : ""}`);
+      const file = got;
       try {
+        // (0.1.17, fix round) the backup's size, on every check, so its growth shows in the log
+        this.d.log(`backup check: test backup ${slug} downloaded, ${file.size} bytes (${(file.size / 1024 ** 2).toFixed(1)} MB; the Supervisor reports ${known})`);
         const size = Keeper.sizeWhy(file.size, info);
         if (size) return this.backupCheckFailed(`the test backup ${slug}'s download ${size}`);
         this.d.log(`backup check: scanning test backup ${slug} (${file.size} bytes)${this.d.scan ? " in a child process" : ""}`);
         const scan = this.d.scan ?? ((f: ArchiveFile, names: RegExp, n: Needle[], c: string) => scanFile(f.path, names, n, { control: c }));
-        const r: ScanResult = await scan(file, KEY_NAME, needles, control)
-          .catch((e) => ({ ok: false, why: `the scan couldn't run (${String((e as Error)?.message ?? e).slice(0, 80)})`, members: 0, names: [], found: [], control: 0 }));
+        const r = await deadline.within(scan(file, KEY_NAME, needles, control, { timeoutMs: deadline.left(), signal: deadline.signal })
+          .catch((e) => ({ ok: false, why: `the scan couldn't run (${String((e as Error)?.message ?? e).slice(0, 80)})`, members: 0, names: [], found: [], control: 0 } as ScanResult)));
+        if (r === PAST) return this.backupCheckFailed(deadline.why("scanning"));
         if (!r.ok) return this.backupCheckFailed(r.why);
         this.st.backupCheck = { at: this.now(), names: placed, slug, exclude: EXCLUDE_HASH, scan: SCAN_VERSION };
         this.d.log(`backup check passed: test backup ${slug} (${r.members} files read, ${file.size} bytes as the Supervisor reported) leaves out every key file (${placed.join(", ")}), holds no key value, fingerprint or sentinel, and holds the positive control exactly once; tied to the backup exclusion ${EXCLUDE_HASH} and scan ${SCAN_VERSION}`);
@@ -1308,6 +1349,7 @@ export class Keeper {
         // never made, or its answer lost: it is looked up by its name at the next start
         this.save();
       }
+      deadline.clear();
       this.checking = false;
     }
   }

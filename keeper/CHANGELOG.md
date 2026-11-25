@@ -9,6 +9,15 @@
 - `backup-check` now waits up to 10 minutes, says it is running, and tells you in plain words what happened: passed, why not, Keeper not running, or Keeper stopped while scanning (that restart counts the check failed and deletes the test backup). No more bare "the keeper's service didn't answer".
 - Run `backup-check` again after installing: a pass from 0.1.16 or earlier no longer counts.
 - Keeper's DOCS: the backup check runs at full device size under a memory limit before it goes on a runbook; the container on your Pi is `app_0fcc2575_keeper`; the SSH user is `hassio` with `sudo`; scp is closed, so scripts are piped over ssh.
+- Review fixes: the check now knows the compressed App image has ended from the unpacker's own end signal. A valid backup whose stream ends exactly on an internal piece boundary can no longer fail by mistake.
+- A key value split between a tar header (or its padding) and a file's contents is now found.
+- The unpacker now waits until the check has read each piece it produces. A very compressible backup stays small: 2 GB of zeros scans in about 55 MB. The 4 GB limit is counted as each piece arrives, and memory is checked on every piece.
+- The scan process can no longer leave the check hanging. Too much output, an early exit or a stuck pipe ends the check at once with a plain reason. The scan exits by itself if Keeper's service goes, and the system is asked to stop the scan, not Keeper, when memory runs out.
+- A killed scan now says "killed (signal 9)", adding "likely out of memory" only when its memory was near its limit. A scan that ran out of time says so.
+- The whole check has one 8-minute deadline, inside `backup-check`'s 10-minute wait, and says which step ran out of time.
+- One check at a time: a second `backup-check` while one runs says "a backup check is already running".
+- Every limit's message names the step, the limit, what was seen and what to do. Each check logs the test backup's size. `backup-check` reads the cause of a failed request from its error code, and names the code when it can't tell.
+- Keeper's DOCS: device check 15 adds three runs (under a memory hog, with an all-zero image, with Keeper restarted mid-scan), each run's peak memory and duration recorded. The follow-ups (a cgroup memory limit, a download cap from free disk) are noted.
 
 ## 0.1.16
 

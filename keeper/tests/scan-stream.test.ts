@@ -194,20 +194,22 @@ describe("0.1.17: a scan the system kills leaves the service answering", () => {
     const b = bare(() => f, (file, n, nd, c) => scanChild(file, n, nd, c, { rssMax: 1024 }));
     const r = await b.k.backupCheck();
     expect(r.ok).toBe(false);
-    expect(r.why).toBe(`the scan was killed (out of memory): it passed its own limit of 0.0 MB reading the ${f.size}-byte (${(f.size / MB).toFixed(1)} MB) test backup`);
+    expect(r.why).toStartWith(`the scan was killed (out of memory): it passed its own limit of 0.0 MB reading the ${f.size}-byte (${(f.size / MB).toFixed(1)} MB) test backup (the scan's memory limit, in the scan phase: limit 0.0 MB resident, seen `);
+    expect(r.why).toContain("; what to do: stop other Apps or free memory on the device, then run backup-check again");
     expect(b.cleared).toBe(true);
     expect(b.deleted).toEqual(["bc-test"]);
     expect(b.k.st.backupCheckRun).toBeUndefined();
     expect(b.k.checkPassed()).toBe(false);
     expect(b.logs.some((l) => l.startsWith("backup check FAILED: the scan was killed (out of memory)"))).toBe(true);
   });
-  test("killed by the system (SIGKILL, as the kernel's out-of-memory killer does): named as such, the service unharmed", async () => {
+  test("killed by the system (SIGKILL, as the kernel's out-of-memory killer does): named signal 9, the service unharmed", async () => {
     const f = small();
     const d = scratch(); const script = join(d, "killed.ts");
     writeFileSync(script, "process.kill(process.pid, 'SIGKILL');\n");
     const b = bare(() => f, (file, n, nd, c) => scanChild(file, n, nd, c, { script }));
     const r = await b.k.backupCheck();
-    expect(r.why).toBe(`the scan was killed (out of memory) reading the ${f.size}-byte (${(f.size / MB).toFixed(1)} MB) test backup: the system stopped it, and Keeper's service is unharmed`);
+    // (fix round) no memory sample near its limit: signal 9, not "out of memory"
+    expect(r.why).toBe(`the scan was killed (signal 9) reading the ${f.size}-byte (${(f.size / MB).toFixed(1)} MB) test backup: its last memory sample was 0.0 MB, not near its limit of 384.0 MB, so something else stopped it (the system, a supervisor stop or a manual kill); Keeper's service is unharmed`);
     expect(b.deleted).toEqual(["bc-test"]);
     expect(b.cleared).toBe(true);
   });
@@ -216,7 +218,7 @@ describe("0.1.17: a scan the system kills leaves the service answering", () => {
     const d = scratch(); const script = join(d, "slow.ts");
     writeFileSync(script, "await Bun.sleep(60_000);\n");
     const slow = bare(() => f, (file, n, nd, c) => scanChild(file, n, nd, c, { script, timeoutMs: 300 }));
-    expect((await slow.k.backupCheck()).why).toContain("the scan took longer than 0 minutes reading the");
+    expect((await slow.k.backupCheck()).why).toContain("the scan took longer than 300 ms reading the");
     // a real scan in its child: the archive holds the check's own control, written as the test backup is made
     let made: { path: string; size: number } | null = null;
     const real = bare(() => made!, (file, n, nd, c) => scanChild(file, n, nd, c, { log: () => {} }));
