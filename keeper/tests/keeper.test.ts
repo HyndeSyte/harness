@@ -3861,7 +3861,7 @@ describe("0.1.15 item 22: the device list's order", () => {
 
 // -- 0.1.16 (the three items that gate arming) -------------------------------------------------------------
 describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
-  const KEY = "hc-live-key-0123456789abcdefABCDEF";   // a kept key's value, planted where the scan used to look past
+  const KEY = "planted-value-aaaaaaaaaa";   // stands in for a kept key's value (plain test text), planted where the scan used to look past
   const CTL = "keeper-control-0123456789abcdef01234567";
   const enc = (x: string) => new TextEncoder().encode(x);
   // one tar header, any field set by hand
@@ -3897,7 +3897,7 @@ describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
     return cat(head, ...extra, z.subarray(10));
   };
   const outer = (inner: Uint8Array) => tarOf([["./backup.json", JSON.stringify({ protected: false })], ["./0fcc2575_keeper.tar.gz", inner]]);
-  const scan = (inner: Uint8Array) => scanBackup(outer(inner), KEY_NAME, [KEY, "keeper-sentinel-0123456789abcdef"], { control: CTL });
+  const scan = (inner: Uint8Array) => scanBackup(outer(inner), KEY_NAME, [KEY, "keeper-sentinel-aaaaaaaa"], { control: CTL });
 
   test("the baseline: a clean archive passes, with the same builder", () => {
     expect(scan(gz(cat(...good(), END)))).toMatchObject({ ok: true, control: 1 });
@@ -3967,7 +3967,8 @@ describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
 });
 
 describe("0.1.16 item 2: a bare 401 is no longer proof of revocation", () => {
-  const OLD = "old-key-0123456789abcdef", CUR = "cur-key-0123456789abcdef";
+  const OLD = "oldvalue-aaaaaaaaaa";   // plain test text standing in for the old key
+  const CUR = "curvalue-bbbbbbbbbb";   // and for the current one
   // the old key's answers in order, and the current key's
   async function rot(oldAnswers: ({ status: number; error?: string } | null)[], cur: { status: number; error?: string } | null) {
     const r = rig();
