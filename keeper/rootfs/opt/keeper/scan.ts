@@ -46,11 +46,26 @@
 //     it never runs ahead of the layers below; the expanded-bytes budget is charged as each chunk arrives, before it is held
 //     or handed on, and the child's resident size is checked per output chunk as well as on its timer;
 //   - every budget failure names its phase, its limit, what was seen and what to do (budgetWhy).
+// 0.1.17, the last fix round (each kept fail-closed; nothing it looks for changed):
+//   - a hit wholly inside a member's data is left to the member's own layer only when a layer was made for that member and it
+//     completed; every other range is reported by the tar layer itself (GNU long-name and long-link data, pax extended and global
+//     headers, a member whose layer failed), and the tar layer's own hits (straddles included) are counted apart from the member's,
+//     so a member-internal match never hides an overlapping straddle;
+//   - the inflater's end clock runs only while the scan waits on the inflater, never while it is paused for the layers below;
+//   - the child's oom_score_adj ask is never fatal: a refusal is said as a note on standard error, which the service logs.
+// The memory bound the design gives (MEMORY_BOUND, pinned in the tests under the 256 MB cap at the deepest nesting): each gzip layer
+// is fed INFLATE_IN (4 KB) at a time, which deflate expands at most DEFLATE_MAX_RATIO (about 1032) times, so one piece's output is
+// at most about 4 MB; with backpressure a layer holds at most that much in the inflater and its output queue, and MAX_DEPTH (6)
+// layers deep that is about 25 MB in all. To it add each layer's own buffering (a record held to MAX_RECORD, 1 MB; a tar header;
+// the search's carry, under a needle's length; an output chunk or two of 64 KB) times MAX_DEPTH, and the outer read's chunk
+// (256 KB): about 33 MB on top of the runtime's own (Bun with --smol, about 30 to 50 MB). The child's resident-size limit
+// (KEEPER_SCAN_RSS_MAX) is a sampled check, not a hard one: the kernel is the hard limit until a cgroup limit lands (DOCS).
 // SCAN_VERSION names this coverage: a pass recorded by an earlier scan no longer counts (core.ts checkPassed).
 // It runs in a child process of the service (main.ts scanChild runs this file as `bun --smol scan.ts child`), so if the kernel
 // still kills it the service lives on and reports it; core.ts and the tests call scanFile or scanBackup in process.
 import { createInflateRaw, crc32 as zcrc32 } from "node:zlib";
 import { open } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 
 export const SCAN_VERSION = 3;
 // (0.1.16) the shortest value searched for in an archive's bytes: shorter ones (an 8 or 12 hex digit fingerprint) are left out
@@ -63,14 +78,21 @@ const READ_CHUNK = 256 * 1024;        // the outer file, read a chunk at a time
 // (0.1.17, fix round) the inflater fed this much at a time (at most about 4 MB of output per piece at deflate's 1032:1, handed on
 // 64 KB at a time with the inflater paused between), and its output chunk
 export const INFLATE_IN = 4 * 1024;
-const OUT_CHUNK = 64 * 1024;
-const END_DUE_MS = 10_000;           // the inflater's end signal, once due, must come within this
+export const OUT_CHUNK = 64 * 1024;
+export const DEFLATE_MAX_RATIO = 1032;
+// (last round) the bound above, in bytes: the deepest nesting's inflaters plus every layer's own buffering plus the outer read
+export const MEMORY_BOUND = INFLATE_IN * DEFLATE_MAX_RATIO * MAX_DEPTH + MAX_DEPTH * (MAX_RECORD + 512 + 2 * OUT_CHUNK) + READ_CHUNK;
+// the inflater's end signal, once due, must come within this. (last round) The clock runs only while the scan waits on the inflater
+// itself, never while the inflater is paused for the layers below: it starts afresh after every output chunk has been taken and
+// the inflater resumed, so a slow nested layer (ARM) can't trip it however long its pauses add up to.
+export const END_DUE_MS = 10_000;
 
 export interface ScanResult { ok: boolean; why: string; members: number; names: string[]; found: string[]; control: number; expanded?: number }
 // (0.1.17) the downloaded archive the scan reads: its file's path, its size in bytes, and its removal
 export interface ArchiveFile { path: string; size: number; remove: () => void }
 // tick: (0.1.17, fix round) called for every chunk read and every chunk the inflater puts out (the child checks its resident size there)
-export interface ScanOpts { control?: string; maxExpanded?: number; maxDepth?: number; tick?: () => void }
+// endDueMs: (last round) END_DUE_MS, smaller in the tests
+export interface ScanOpts { control?: string; maxExpanded?: number; maxDepth?: number; tick?: () => void; endDueMs?: number }
 // (0.1.17, fix round) a budget's failure, in the same words everywhere: the budget, its phase, its limit, what was seen, what to do
 export function budgetWhy(o: { budget: string; phase: string; limit: string; seen: string; todo: string }): string {
   return `(${o.budget}, in the ${o.phase} phase: limit ${o.limit}, seen ${o.seen}; what to do: ${o.todo})`;
@@ -151,9 +173,10 @@ class Finder {
 class Ctx {
   found: string[] = []; seen: string[] = [];
   members = 0; control = 0; expanded = 0;
-  readonly pats: Pat[]; readonly ctl: Uint8Array | null; readonly all: Pat[]; readonly tick: () => void;
+  readonly pats: Pat[]; readonly ctl: Uint8Array | null; readonly all: Pat[]; readonly tick: () => void; readonly endDueMs: number;
   constructor(readonly names: RegExp, needles: Needle[], opts: ScanOpts, readonly maxExpanded: number, readonly maxDepth: number) {
     this.tick = opts.tick ?? (() => {});
+    this.endDueMs = opts.endDueMs ?? END_DUE_MS;
     // (0.1.16) every value at least MIN_NEEDLE bytes: shorter ones are never searched for in the archive's bytes
     this.pats = needles.map((n) => (typeof n === "string" ? { value: n, kind: GENERIC } : n)).filter((n) => enc.encode(n.value).length >= MIN_NEEDLE)
       .map((n) => ({ kind: n.kind, b: enc.encode(n.value) }));
@@ -248,6 +271,9 @@ class TarLayer implements Sink {
   private region: [number, number] = [0, 0];   // the current member's data region [start, end), searched here and by its layer
   private last: [number, number, string] = [0, 0, ""];   // the member before it: its region and name, for a hit that crosses its end
   private name = "";
+  // (last round) the hits wholly inside the current member's data, by pattern (the first of each): left to the member's layer only
+  // once that layer has completed (its end() returned); a member whose layer fails reports them here first
+  private inside = new Map<number, number>();
   private readonly finder: Finder; private readonly reported = new Set<number>();
   private readonly what: string;
   constructor(private readonly ctx: Ctx, private readonly where: string, private readonly depth: number) {
@@ -255,16 +281,33 @@ class TarLayer implements Sink {
     const ctl = ctx.ctl ? ctx.all.length - 1 : -1;
     this.finder = new Finder(ctx.all, (i, at) => {
       const n = ctx.all[i].b.length, [s, e] = this.region;
-      if (this.child && e > s && at >= s && at + n <= e) return;        // wholly inside the member's data: its own layer reports it
-      const edge = (rs: number, re: number, nm: string) => (re > rs && at < re && at + n > rs ? `, across the edge of ${nm}'s data` : "");
+      // wholly inside the data of a member that has a layer of its own: held until that layer completes (memberEnd)
+      if (this.child && e > s && at >= s && at + n <= e) { if (!this.inside.has(i)) this.inside.set(i, at); return; }
+      this.own(i, at);
+    });
+  }
+  // a hit that is this layer's own: in a header, a record (pax, long name, long link), padding, the tail, across any of their edges,
+  // or in a member no layer completed. Counted apart from every member-internal match, so none of those ever hides it.
+  private own(i: number, at: number) {
+    const ctx = this.ctx, ctl = ctx.ctl ? ctx.all.length - 1 : -1;
+    {
+      const n = ctx.all[i].b.length, [s, e] = this.region;
+      const edge = (rs: number, re: number, nm: string) => (re > rs && ((at < rs && at + n > rs) || (at < re && at + n > re)) ? `, across the edge of ${nm}'s data` : "");
       const across = edge(s, e, this.name) || edge(this.last[0], this.last[1], this.last[2]);
       if (i === ctl) throw new Error(`${this.what} (its tar headers, padding or tail) holds the positive control outside any file, at byte ${at}${across}`);
       if (this.reported.has(i)) return;
       this.reported.add(i);
       ctx.found.push(`${this.what} (its tar headers, padding or tail) holds ${ctx.all[i].kind} at byte ${at}${across}`);
-    });
+    }
   }
   private fail(why: string): never { throw new Error(`${this.what}, read as a tar: ${why}`); }
+  // a member's layer that didn't complete: the hits held for it are this layer's, reported before its failure goes on
+  private childFailed(e: unknown): never {
+    this.child = null;
+    for (const [i, at] of this.inside) { try { this.own(i, at); } catch { /* the failure below is the scan's */ } }
+    this.inside.clear();
+    throw e;
+  }
   // every byte of the layer, searched in order
   private search(b: Uint8Array) { this.finder.push(b, this.at); this.at += b.length; }
   private async header() {
@@ -283,10 +326,11 @@ class TarLayer implements Sink {
     this.name = name;
     this.left = size; this.pad = Math.ceil(size / 512) * 512 - size;
     this.region = [off + 512, off + 512 + size];
-    this.child = null; this.rec = null;
-    if (type === "L" || type === "x" || type === "g") {
-      // a long-name or pax record: read by Keeper (held, to MAX_RECORD), and its bytes are the layer's own (no child reads them)
-      if (size > MAX_RECORD) this.fail(`a ${type === "L" ? "long-name" : "pax"} record of ${size} bytes at byte ${off}, more than Keeper reads ${budgetWhy({ budget: "the record budget", phase: "scan", limit: `${MAX_RECORD} bytes`, seen: `${size} bytes`, todo: BUDGET_TODO })}`);
+    this.child = null; this.rec = null; this.inside.clear();
+    if (type === "L" || type === "K" || type === "x" || type === "g") {
+      // a long-name, long-link or pax record: read by Keeper (held, to MAX_RECORD), and its bytes are the layer's own (no child
+      // reads them, so every hit in them is reported here). (last round) GNU long-link data (K) too, which 0.1.17 refused as data
+      if (size > MAX_RECORD) this.fail(`a ${type === "L" ? "long-name" : type === "K" ? "long-link" : "pax"} record of ${size} bytes at byte ${off}, more than Keeper reads ${budgetWhy({ budget: "the record budget", phase: "scan", limit: `${MAX_RECORD} bytes`, seen: `${size} bytes`, todo: BUDGET_TODO })}`);
       this.rec = []; this.recLen = 0; this.recType = type;
     } else {
       const ctx = this.ctx;
@@ -303,7 +347,12 @@ class TarLayer implements Sink {
     if (!this.left) await this.memberEnd();
   }
   private async memberEnd() {
-    if (this.child) { const c = this.child; await c.end(); }
+    if (this.child) {
+      const c = this.child;
+      // the member's layer completes, or every hit held for it is reported here before its failure goes on
+      try { await c.end(); } catch (e) { this.childFailed(e); }
+      this.inside.clear();
+    }
     if (this.rec) {
       const all = new Uint8Array(this.recLen); let o = 0; for (const p of this.rec) { all.set(p, o); o += p.length; }
       this.rec = null;
@@ -329,7 +378,7 @@ class TarLayer implements Sink {
         // searched here first (an occurrence crossing the region's edges is this layer's), then handed to the member's layer
         this.search(part);
         if (this.rec) { this.rec.push(part.slice()); this.recLen += n; }
-        else if (this.child) await this.child.write(part);
+        else if (this.child) { try { await this.child.write(part); } catch (e) { this.childFailed(e); } }
         i += n; this.left -= n;
         if (!this.left) await this.memberEnd();
       } else if (this.state === "pad") {
@@ -477,7 +526,9 @@ class GzipLayer implements Sink {
       await this.pump();
       this.check();
       if (!this.q.length && (this.ended || (done() && !this.inf.readableLength))) return;
-      if (!within) { await this.wait(); continue; }
+      // the end's clock only while the inflater runs: never while it is paused for the layers below (pump resumes it once they
+      // have taken every chunk, so after pump it is flowing; a new clock starts on every output chunk)
+      if (!within || this.inf.isPaused()) { await this.wait(); continue; }
       let t: ReturnType<typeof setTimeout> | undefined;
       const late = await Promise.race([this.wait().then(() => false), new Promise<boolean>((res) => { t = setTimeout(() => res(true), within); })]);
       clearTimeout(t);
@@ -492,7 +543,7 @@ class GzipLayer implements Sink {
     this.fed += piece.length;
     this.inf.write(piece, (e: unknown) => { written = true; if (e && !this.ended) this.infErr ??= e; this.wake(); });
     await this.drive(() => written);
-    if (!this.ended && Number(this.inf.bytesWritten) < this.fed) await this.drive(() => false, END_DUE_MS);
+    if (!this.ended && Number(this.inf.bytesWritten) < this.fed) await this.drive(() => false, this.ctx.endDueMs);
   }
   // the inflater has ended: its count says where the trailer starts, which must lie within what it was given and within this write
   private atEnd(pos: number, len: number): number {
@@ -622,12 +673,13 @@ export async function scanBackup(bytes: Uint8Array, names: RegExp, needles: Need
 // in to the layer alone. Throws, naming the offset, on any failure.
 // (0.1.17, fix round) chunk: the member written to the layer this many bytes at a time (or at these cuts); the answer's ended says
 // the next layer was told its stream is whole (at the trailer) exactly once.
-export async function gzipMember(b: Uint8Array, what: string, o: { chunk?: number; cuts?: number[]; maxExpanded?: number } = {}): Promise<Uint8Array> {
-  const ctx = ctxOf(/$^/, [], { maxExpanded: o.maxExpanded });
+// (last round) slowMs: each chunk the next layer takes held this long first (a slow nested layer); endDueMs: the end's clock
+export async function gzipMember(b: Uint8Array, what: string, o: { chunk?: number; cuts?: number[]; maxExpanded?: number; slowMs?: number; endDueMs?: number } = {}): Promise<Uint8Array> {
+  const ctx = ctxOf(/$^/, [], { maxExpanded: o.maxExpanded, endDueMs: o.endDueMs });
   const parts: Uint8Array[] = [];
   let ends = 0;
   const g = new GzipLayer(ctx, what, 1);
-  (g as any).next = { write: async (d: Uint8Array) => { if (ends) throw new Error("output after the end"); parts.push(d.slice()); }, end: async () => { ends++; } };
+  (g as any).next = { write: async (d: Uint8Array) => { if (ends) throw new Error("output after the end"); if (o.slowMs) await new Promise((r) => setTimeout(r, o.slowMs)); parts.push(d.slice()); }, end: async () => { ends++; } };
   const cuts = o.cuts ?? [];
   if (cuts.length) { let p = 0; for (const c of [...cuts, b.length]) { if (c > p) await g.write(b.subarray(p, c)); p = Math.max(p, c); } }
   else { const n = o.chunk ?? b.length; for (let i = 0; i < b.length; i += n) await g.write(b.subarray(i, i + n)); }
@@ -648,11 +700,17 @@ export async function gzipMember(b: Uint8Array, what: string, o: { chunk?: numbe
 // prefer it over the service (1000 in /proc/self/oom_score_adj, which needs no privilege; a failure is ignored). The job is the
 // first line on standard input, which the service then holds open for as long as it waits: its end, or a change of parent
 // process, means the service is gone, and the child exits (76) rather than run on as an orphan.
+// (last round) the ask to the out-of-memory killer: never fatal. A read-only /proc, a seccomp refusal or no Linux at all answers why
+// (the child says it on standard error as a note, which the service logs), and the scan goes on under its own memory limit.
+export function preferOomKill(path = "/proc/self/oom_score_adj", write: (p: string, v: string) => void = (p, v) => writeFileSync(p, v)): string {
+  try { write(path, "1000"); return ""; }
+  catch (e) { return `oom_score_adj not set (${String((e as any)?.code ?? (e as Error)?.message ?? e).slice(0, 60)}): the scan's own memory limit still holds`; }
+}
 export const OVER_LIMIT_EXIT = 75;
 export const PARENT_GONE_EXIT = 76;
 if (import.meta.main && process.argv[2] === "child") {
-  const { readFileSync, writeFileSync, writeSync } = await import("node:fs");
-  try { writeFileSync("/proc/self/oom_score_adj", "1000"); } catch { /* not Linux, or not allowed: the service's own limit still holds */ }
+  const { readFileSync, writeSync } = await import("node:fs");
+  const oomWhy = preferOomKill();
   let oomScoreAdj: number | null = null;
   try { oomScoreAdj = Number(readFileSync("/proc/self/oom_score_adj", "utf8").trim()); } catch { oomScoreAdj = null; }
   const max = Number(process.env.KEEPER_SCAN_RSS_MAX ?? 0);
@@ -666,6 +724,7 @@ if (import.meta.main && process.argv[2] === "child") {
     if (Math.abs(r - told) >= 1024 * 1024) { told = r; say(2, `rss ${r}`); }
     if (max > 0 && r > max) { say(2, `rss ${r}`); say(2, `over the scan's memory limit: ${r} bytes resident`); process.exit(OVER_LIMIT_EXIT); }
   };
+  if (oomWhy) say(2, `note ${oomWhy}`);
   const timer = setInterval(() => { rss(); if (process.ppid !== ppid) process.exit(PARENT_GONE_EXIT); }, 20);
   const answer = (r: object) => { clearInterval(timer); say(1, JSON.stringify(r)); process.exit(0); };
   try {

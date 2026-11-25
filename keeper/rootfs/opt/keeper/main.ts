@@ -334,8 +334,10 @@ export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needl
   const fail = (why: string, lastRss = 0) => ({ ok: false, why, members: 0, names: [], found: [], control: 0, lastRss });
   let child: ReturnType<typeof Bun.spawn>;
   try {
+    // (last round) in its own process group (detached: setsid), so a stop kills the group: a grandchild holding an inherited pipe
+    // goes with it
     child = Bun.spawn([process.execPath, "--smol", o.script ?? join(import.meta.dir, "scan.ts"), "child"], {
-      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+      stdin: "pipe", stdout: "pipe", stderr: "pipe", detached: true,
       env: { PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin", KEEPER_SCAN_RSS_MAX: String(rssMax) },
     });
   } catch (e) { return fail(`the scan couldn't start (${String((e as Error)?.message ?? e).slice(0, 80)})`); }
@@ -345,16 +347,23 @@ export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needl
   let stop = "" as Stop, stopDetail = "";
   let wake = () => {};
   const stopped = new Promise<void>((res) => { wake = res; });
-  const halt = (why: Exclude<Stop, "">, detail = "") => { if (stop) return; stop = why; stopDetail = detail; try { child.kill("SIGKILL"); } catch { /* gone */ } wake(); };
+  // the child's whole process group, then the child itself (a group already gone, or never made, is no error)
+  const killAll = () => { try { process.kill(-child.pid, "SIGKILL"); } catch { /* no group left */ } try { child.kill("SIGKILL"); } catch { /* gone */ } };
+  const halt = (why: Exclude<Stop, "">, detail = "") => { if (stop) return; stop = why; stopDetail = detail; killAll(); wake(); };
   const timer = setTimeout(() => halt("timeout"), timeoutMs);
   const onAbort = () => halt("aborted");
   o.signal?.addEventListener("abort", onAbort, { once: true });
   if (o.signal?.aborted) halt("aborted");
   // both pipes read from the start, before the job is written
-  let lastRss = 0, overAt = 0;
+  // (last round) every memory sample parsed as it streams, apart from stderr's capped text: the latest and the peak
+  let lastRss = 0, peakSeen = 0, overAt = 0;
   const out = drain(child.stdout as any, SCAN_OUT_MAX, { over: () => halt("overflow"), fail: (w) => halt("io", w) });
   const err = drain(child.stderr as any, SCAN_ERR_MAX, {
-    line: (l) => { let m = /^rss (\d+)$/.exec(l); if (m) { lastRss = Number(m[1]); return true; } m = /^over the scan's memory limit: (\d+) bytes resident$/.exec(l); if (m) overAt = Number(m[1]); return false; },
+    line: (l) => {
+      let m = /^rss (\d+)$/.exec(l); if (m) { lastRss = Number(m[1]); peakSeen = Math.max(peakSeen, lastRss); return true; }
+      // a note from the child (its oom_score_adj not set, say): logged, never fatal
+      if (l.startsWith("note ")) { try { o.log?.(`backup check: the scan's child says: ${l.slice(5, 200)}`); } catch { /* a test's log */ } return true; }
+      m = /^over the scan's memory limit: (\d+) bytes resident$/.exec(l); if (m) overAt = Number(m[1]); return false; },
     fail: (w) => halt("io", w),
   });
   // the job, its one line; standard input then held open while the child runs (its end tells the child the service is gone)
@@ -372,7 +381,7 @@ export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needl
   void child.exited.then(() => { grace = setTimeout(() => halt("held"), PIPE_GRACE_MS); }, () => {});
   await Promise.race([Promise.all([out.done, err.done, child.exited]), stopped]);
   if (stop) {
-    try { child.kill("SIGKILL"); } catch { /* gone */ }
+    killAll();
     await Promise.race([child.exited.catch(() => {}), Bun.sleep(2000)]);   // reaped
     out.cancel(); err.cancel();
   }
@@ -389,8 +398,10 @@ export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needl
   if (stop === "held") return fail(`the scan's output stayed open ${inWords(PIPE_GRACE_MS)} after it exited (exit ${code}) reading ${of}: something it started still holds it, so its result isn't used`, lastRss);
   if (code === OVER_LIMIT_EXIT) return fail(`the scan was killed (out of memory): it passed its own limit of ${mb(rssMax)} reading ${of} ${budgetWhy({ budget: "the scan's memory limit", phase: "scan", limit: `${mb(rssMax)} resident`, seen: `${mb(overAt || lastRss)} resident`, todo: "stop other Apps or free memory on the device, then run backup-check again; if it fails again, report it with the backup's size" })}`, lastRss);
   if (sig === "SIGKILL" || code === 137) {
-    const near = rssMax > 0 && lastRss >= NEAR_LIMIT * rssMax;
-    return fail(`the scan was killed (signal 9) reading ${of}${near ? `: likely out of memory, its last memory sample ${mb(lastRss)} near its limit of ${mb(rssMax)}` : `: its last memory sample was ${mb(lastRss)}, not near its limit of ${mb(rssMax)}, so something else stopped it (the system, a supervisor stop or a manual kill)`}; Keeper's service is unharmed`, lastRss);
+    const high = Math.max(lastRss, peakSeen);
+    const near = rssMax > 0 && high >= NEAR_LIMIT * rssMax;
+    const pk = peakSeen > lastRss ? ` (its peak ${mb(peakSeen)})` : "";
+    return fail(`the scan was killed (signal 9) reading ${of}${near ? `: likely out of memory, its last memory sample ${mb(lastRss)}${pk} near its limit of ${mb(rssMax)}` : `: its last memory sample was ${mb(lastRss)}${pk}, not near its limit of ${mb(rssMax)}, so something else stopped it (the system, a supervisor stop or a manual kill)`}; Keeper's service is unharmed`, lastRss);
   }
   if (sig) return fail(`the scan was stopped by ${sig} reading ${of}`, lastRss);
   const text = out.text();

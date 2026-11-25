@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGzip, crc32, deflateRawSync, gzipSync } from "node:zlib";
 import { randomBytes } from "node:crypto";
-import { BACKUP_CHECK_BUSY, CHECK_DEADLINE_MS, KEY_NAME, Keeper } from "../rootfs/opt/keeper/core.ts";
+import { BACKUP_CHECK_BUSY, CHECK_DEADLINE_MS, CHECK_SETTLE_MS, KEY_NAME, Keeper } from "../rootfs/opt/keeper/core.ts";
 import { BACKUP_CHECK_CLI_MARGIN_MS, BACKUP_CHECK_CLI_MS, BACKUP_CHECK_SAYS, LOCAL_IDLE_S, NEAR_LIMIT, PIPE_GRACE_MS, SCAN_OUT_MAX, archives, backupCheckCli, exemptBackupCheck, localFetch, requestCause, scanChild } from "../rootfs/opt/keeper/main.ts";
 import { DOWNLOAD_MAX, supervisor } from "../rootfs/opt/keeper/supervisor.ts";
 import { INFLATE_IN, PARENT_GONE_EXIT, gzipMember, scanBackup } from "../rootfs/opt/keeper/scan.ts";
@@ -473,7 +473,12 @@ describe("item 6: one deadline for the whole check, shorter than the CLI's wait"
       jest.advanceTimersByTime(CHECK_DEADLINE_MS - 1);
       await settle();
       jest.advanceTimersByTime(1);
+      // (last round) the cleanup waits up to CHECK_SETTLE_MS for the download, which ignores its abort here, then deletes the backup
+      for (let t = 0; t <= CHECK_SETTLE_MS; t += 1000) { await settle(); jest.advanceTimersByTime(1000); }
+      await settle();
       const r = await p;
+      // the download is still outstanding: the slot stays held until it settles
+      expect(await b.k.backupCheck()).toEqual({ ok: false, why: BACKUP_CHECK_BUSY });
       expect(r.why).toStartWith("the backup check ran past its deadline of 8 minutes while downloading the test backup (the backup check's deadline, in the downloading phase: limit 8 minutes for the whole check, seen still downloading after 8 minutes; what to do: ");
       expect(given.signal.aborted).toBe(true);
       expect(b.deleted).toEqual(["bc-test"]);
@@ -481,6 +486,8 @@ describe("item 6: one deadline for the whole check, shorter than the CLI's wait"
       late({ path: "/nonexistent", size: 1, remove: () => removed.push("late") });
       await settle();
       expect(removed).toEqual(["late"]);
+      // and with it settled, the slot is free
+      expect((b.k as any).checking).toBe(false);
     } finally { jest.useRealTimers(); }
   });
   test("a scan that never ends: the check fails at 8 minutes naming the scan phase, its child aborted and its file removed (fake timers)", async () => {
@@ -493,6 +500,10 @@ describe("item 6: one deadline for the whole check, shorter than the CLI's wait"
       await settle();
       expect(given.timeoutMs).toBeLessThanOrEqual(CHECK_DEADLINE_MS);
       jest.advanceTimersByTime(CHECK_DEADLINE_MS);
+      // (last round) the cleanup waits up to CHECK_SETTLE_MS for the scan (which never ends here), then goes on
+      await settle();
+      jest.advanceTimersByTime(CHECK_SETTLE_MS);
+      await settle();
       const r = await p;
       expect(r.why).toStartWith("the backup check ran past its deadline of 8 minutes while scanning the test backup (the backup check's deadline, in the scanning phase:");
       expect(given.signal.aborted).toBe(true);

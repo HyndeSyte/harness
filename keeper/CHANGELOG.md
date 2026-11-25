@@ -18,6 +18,12 @@
 - One check at a time: a second `backup-check` while one runs says "a backup check is already running".
 - Every limit's message names the step, the limit, what was seen and what to do. Each check logs the test backup's size. `backup-check` reads the cause of a failed request from its error code, and names the code when it can't tell.
 - Keeper's DOCS: device check 15 adds three runs (under a memory hog, with an all-zero image, with Keeper restarted mid-scan), each run's peak memory and duration recorded. The follow-ups (a cgroup memory limit, a download cap from free disk) are noted.
+- Last review fixes: a test backup that your Home Assistant finishes after the check gave up on it is now found and deleted. If it doesn't show within a minute, `backup-check` names it, Keeper keeps looking for it for an hour, and every start deletes any backup named like a test backup. A second `backup-check` stays "already running" until that cleanup is done, and the answer still comes inside the 10-minute wait.
+- A slow device can no longer fail the check by mistake while the unpacker waits for the check to catch up.
+- "likely out of memory" now reads every memory sample the scan reported, its latest and its peak, so a long scan's kill is named right.
+- A key value inside a tar's long-name, long-link or pax record is reported by the tar itself, and a value straddling a file's edge is reported even when a copy sits inside the file. Long-link records are now read instead of failing the check.
+- Stopping the scan now stops everything it started. If Keeper can't ask the system to stop the scan first when memory runs out, it says so in its log and goes on.
+- Keeper's DOCS: the scan's memory bound stated, the scan's own memory limit called a sampled check (the system is the hard limit until a cgroup limit lands), device check 15's runs named as what lets `drill_followups_open` go off, and two follow-ups noted: a cgroup limit in the tests' workflow and the tests run on ARM.
 
 ## 0.1.16
 

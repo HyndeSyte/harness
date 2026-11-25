@@ -1207,3 +1207,29 @@ passing with the backup key store's sentinels; and the two drills (the next job)
 Follow-ups, not built in 0.1.17 (named here so they aren't lost): a cgroup memory limit for the scan's child (a hard
 ceiling the kernel enforces, rather than the child's own sampled limit; it needs a change outside Keeper's folder, in how
 the image runs); and deriving the download's cap from free disk (today a fixed 200 MB) so a check never fills the disk.
+
+(0.1.17, last fix round) What the scan's memory rests on, said plainly:
+- The bound the design gives: each gzip layer is fed 4 KB at a time, so one piece's output is at most 4 KB times deflate's
+  maximum ratio (about 1032) times the deepest nesting (6), about 25 MB, held with backpressure; plus each layer's own
+  buffering (a record of at most 1 MB, a tar header, a 64 KB output chunk or two) and the 256 KB outer read, about 33 MB on top
+  of Bun's own. The tests pin it under the 256 MB cap and run the real child at the deepest nesting under that cap.
+- The child's resident-size limit (384 MB on the device) is a sampled check: the child reads its own size on every piece and
+  every 20 ms and stops itself past the limit, but between samples nothing stops it, so the kernel is the hard limit until a
+  cgroup limit lands (the follow-up above). The service names a kill "likely out of memory" from the latest and the peak of
+  every sample the child reported, read as they stream, never from stderr's capped text.
+- Device check 15's runs (the real archive, the memory hog, the all-zero image, the service stopped mid-scan, each with its
+  peak memory and duration recorded) are the conditions for setting `drill_followups_open` to false.
+- A backup the host finishes after the check gave up on it (its create timed out or was aborted) is looked for in the backups
+  list, by its name or as a backup that wasn't there before, for up to 60 seconds after the check, and deleted once it shows.
+  If it doesn't show in time, `backup-check`'s answer names it (`the test backup "Keeper backup check <id>" may still be on
+  the host`); Keeper looks for it at each poll for an hour, and every start deletes any backup named like a test backup. One
+  check runs at a time until all of that is done: a second `backup-check` meanwhile says "a backup check is already running".
+  The whole answer comes within the 8-minute deadline plus the 60-second cleanup, inside the CLI's 10-minute wait.
+- The scan's child runs in its own process group: a timeout, an abort or a pipe failure kills the group, so nothing it started
+  is left holding its pipes. Its ask to the out-of-memory killer (`/proc/self/oom_score_adj`) is never fatal: a read-only
+  `/proc` or a refusal is logged (`the scan's child says: oom_score_adj not set ...`) and the scan goes on.
+
+More follow-ups, outside Keeper's folder and not built in 0.1.17: a cgroup memory limit in the workflow (the tests' child under a
+kernel-enforced limit, not only the sampled one), and the tests run on ARM in CI: a pinned Bun build on ARM running the gzip
+boundary suite (`keeper/tests/scan-review.test.ts` item 1 and `keeper/tests/scan-last.test.ts` item 2), since the device is an
+ARM Pi and CI runs on x86.
