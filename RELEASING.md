@@ -1,10 +1,13 @@
 # Building and releasing
 
 For any session that changes this repo, including the cloud build and ship sessions
-Cain starts. Two Home Assistant Apps live here:
+Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.8): a check after every install of a
+  watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
+  `bun test keeper/tests`.
 
 Home Assistant offers an update when `version` in an App's `config.yaml` changes on
 `main`. So `main` is what gets installed: nothing reaches it without passing CI and
@@ -239,6 +242,7 @@ before Ship. A Ship card says when a change touches GitHub's workflows.
 4. Run the tests:
    - Python: `python -m pytest -q -p no:cacheprovider` from the repo root.
    - Cain: `bun test cain/tests` (install Bun if missing).
+   - Keeper: `bun test keeper/tests`.
    - A change to Cain's managed settings (`cain/rootfs/opt/cain/settings.json`) also needs
      the connector check, `cain/tools/connector-check.sh`, which CI can't run (no signed-in
      account; `cain/docs/connector-check.md`). Cain runs it himself on the live server (the
@@ -318,13 +322,67 @@ for 2 hours, without which Cain can't start the job.
    (`git show <sha>:cain/rootfs/opt/cain/settings.json | sha256sum`) must equal that digest.
    Otherwise install nothing and end with
    `Connector check: no passing line for this head and its settings`.
-4. In Home Assistant: check for App updates, then update only the App(s) the pull
+4. The keeper's acceptance and claim (Keeper 0.1.5 and 0.1.6; no options write). The Ship run doesn't register
+   anything and writes no Keeper options at all. Before Cain's RemoteTrigger hook let this run through,
+   Cain's link registered each watched App the tap installs with the Keeper App over the Keeper's own
+   service (`POST /attempt`, with Cain's `keeper_token`; `cain/rootfs/opt/cain/link/ship-pass.ts`), polled
+   it until the Keeper had made and verified its App-only backup and accepted it, checked the Keeper's
+   pinned Ship key against `cain/SHIP_KEY_FINGERPRINT` at this head, and then, as the hook let the run start,
+   claimed each acceptance (single use, valid 30 minutes from the claim). Keeper 0.1.6: the claim's deadline is
+   enforced in code where code can enforce it, since this run reaches GitHub and Home Assistant only, never
+   the Keeper or the link: the link refuses a claim with under 20 minutes left, the hook checks each claim's
+   deadline again just before it lets the run start (under 20 minutes left refuses the run and cancels the
+   claims; a new Ship card for the same pull request and head starts again), and the Keeper treats a version
+   change seen outside a live claim, or to a version other than the claimed one, as uncertain (unprotected,
+   paged, never restored). The deadline bounds the start, not the watch: an install the Keeper first sees
+   inside the claim is watched its full 15 minutes even past the deadline. It goes through Cain's link because the Keeper's
+   service is only on Home Assistant's internal App network: this cloud session can't reach it, and the
+   Home Assistant connector speaks to Home Assistant, not to an App's port. Before each watched App's
+   install (Cain), step 4a:
+   - 4a. Read two lines for this run's exact attempt id, `ship-<pr number>-<app>-<first 8 of the head sha>`
+     (for Cain `ship-<pr number>-cain-<first 8 of the head sha>`), through the connector:
+     - in the Keeper App's log, `accepting <id> <slug> <from> to <to> backup <backup slug> until <time>`,
+       followed by `claimed <id> claim <claim id> <slug> <from> to <to> backup <backup slug> until <claim
+       deadline>`, where `<from>` and `<to>` are the versions this install replaces and installs;
+     - in Cain's App log, the link's ok line for the same attempt and claim,
+       `Ship pass ok: <id> claim <claim id> until <claim deadline>`.
+     Install that App only when both lines are there with the same id and claim id, the claim deadline
+     hasn't passed (check the time right before you start the update, and abort if it has), and no later
+     Keeper line names that id as `consumed`, `refusing`, `unprotected` or `ended` (`<id>: ...`).
+     Otherwise, or if either log can't be read, install nothing (not the other App either) and end with
+     `Keeper: no claimed acceptance for <id>` and the lines you saw, if any. These two lines and the time
+     check stay as belt and braces (Keeper 0.1.6): the hook's deadline check and the Keeper's own fence are
+     the gates in code; this step is a second look by the run, and it never overrides either (Keeper 0.1.7: what
+     they leave open, a same-version install made from Home Assistant's own page inside a live claim, is an
+     accepted limit Dane accepted at the device, Keeper DOCS "Accepted limits"; so nothing else installs a
+     watched App while a Ship run is live). There is no unwatched path for
+     a watched App: an install the Keeper sees outside a live claim is "unprotected" and is never rolled
+     back. The Keeper itself isn't gated by the Keeper: an install or update of the Keeper App goes through
+     this same Ship path with a backup taken first and no 4a (Keeper DOCS, "Keeper's own install and
+     updates"); never install it while one of its installs is open or unresolved (its log says so): wait
+     until it has ended, and an unresolved one until its log says `rolled back` or `gave up`, or Dane says
+     go. A broken Keeper is repaired by break glass (below). The token goes nowhere from here: not into the
+     options, the report or any log. Never print it.
+   In Home Assistant: check for App updates, then update only the App(s) the pull
    request changed, with a backup taken first. When it changed both, Cain first, then
    Harness (since Cain 0.12.0 and Harness 0.24.0: Cain's link answers the old Harness
    with 503, so its cards wait, none lost, until Harness signs). An App already at its
    new version is skipped. Nothing else in Home Assistant: no options, no other Apps,
    no services. Never read Cain's App info (`ha_get_app`): it holds his GitHub token.
 5. Confirm the new version is running from the update result and the App's log.
+6. After each watched install, read the Keeper App's log through the connector until the attempt
+   ends (about 15 minutes after the new version first shows, about 5 more after a rollback):
+   `<id>: passed (...)`, `<id>: rolled back (...)`, `<id>: gave up (...)`, `<id>: unresolved (...)` or
+   `<id>: install never started`. Report that line, with its chat word when it has one ("chat not connected
+   (degraded)" is only a report: the install check and the rollback decide on the App's state, version and
+   liveness, never on Discord). A rollback runs as one Supervisor job, sent once and never again (Keeper
+   0.1.5), and counts "rolled back" only from that job finished without errors. A refusal (4xx), a 5xx, no
+   answer, or the App seen coming back at the old version without the job's result is "unresolved": it
+   sends nothing more, checks again on every poll, and tells Dane once it knows. A rollback loses what the
+   App wrote after the Keeper's backup, the few minutes before the install included (Keeper DOCS, "What a
+   rollback loses"). On a rollback, a give-up or an unresolved attempt the Keeper has already paged
+   Dane through its own alert check; the report says what was rolled back and why, and installs nothing
+   more. Never restore or reinstall around an unresolved attempt: report it.
 
 The job is a cloud session, not a process on the Pi: Home Assistant's Supervisor does
 each update, so replacing Cain's container doesn't stop the job before Harness. If the
@@ -369,13 +427,69 @@ checks its own connector, which can lapse alone.
   goes out only once Home Assistant answers again.
 
 One installer: no laptop session installs around a waiting Ship job, and nothing is
-installed from Home Assistant's own page unless Dane says so.
+installed from Home Assistant's own page unless Dane says so. (Keeper 0.1.9) The rule holds at every entry point (a Ship
+card, Home Assistant's page, a laptop session, break glass): one install of an App at a time, none beside a live
+claim, and when an install's outcome is uncertain, wait for the recorded claim end in Keeper's log first. A claim
+authorizes nothing: an install needs Dane's Ship tap and the link's token for that pull request and head, good for 2
+hours. Keeper 0.1.8 (Accepted limits, text version 2): a
+Ship run the link refused or that failed can leave a live claim on the Keeper for up to 30 minutes, so nothing is
+installed from Home Assistant's page while a Ship run is live, or until the Keeper's log shows no live claim (each
+claim's start and end is logged there with its deadline).
+
+## The Keeper's setup (Dane, once, and after its state is lost)
+
+At the Pi, with the SSH App, in the Keeper App's container (`docker exec addon_0fcc2575_keeper bun
+/opt/keeper/main.ts <command>`). Keeper DOCS has each step in full.
+
+1. Options: `ship_public_key`, `tokens` (and the same token in Cain's `keeper_token`), and the Healthchecks
+   ping URLs (`hc_done`, `hc_deadman`, `hc_failed`), and (Keeper 0.1.8) `hc_unique_keys` with each production
+   check's unique key, so each role is matched explicitly. Keeper 0.1.7: no `hc_api_key` option any more; if it
+   is still there from 0.1.5 or 0.1.6, remove it (Keeper's log says so at every start until it's gone). Keeper
+   0.1.8: while it is there Keeper doesn't arm and refuses `hc-key`. Then rotate that key in Healthchecks (revoke
+   it, make a new read-only key), since earlier backups may hold it. Optional: `drill_days` (1 to 14, default 14).
+1a. `hc-key <code>` (Keeper 0.1.7), with the project's **read-only** Healthchecks API key on standard input,
+   never on the command line (`docker exec -i addon_0fcc2575_keeper bun /opt/keeper/main.ts hc-key <code>`,
+   paste the key, Enter, Ctrl-D); the code is in the Keeper's log at every start. Keeper refuses a key that
+   can write, or one that doesn't see the checks, and keeps nothing then. Again after any restore of the
+   Keeper App (its backups leave the key out).
+1b. `accept-limits <code>` (Keeper 0.1.7), once you have read "Accepted limits" in Keeper DOCS; the code is in
+   the Keeper's log at each start while they aren't accepted for the current text. Arming needs it. Keeper 0.1.8
+   moved the text to version 2: accept it again.
+1c. The device checks before arming (Keeper 0.1.8, Keeper DOCS): the read-only key is the one kept and the
+   read-write key never given; each role's check identity verified on the live account and set in
+   `hc_unique_keys`; a backup of the Keeper App leaves out `/data/hc-key`.
+2. `key-confirm <fingerprint> <code>`, the fingerprint checked against `cain/SHIP_KEY_FINGERPRINT` and Cain's
+   log, the one-time code from the Keeper's log (at the pin; since 0.1.8 at a start only while the key isn't
+   enrolled or after Cain's link refused the enrollment, and otherwise from `key-code`). The same command, with a
+   fresh code, is the re-enrollment after a restore of the Keeper or a clock correction: Cain's link refuses an
+   older Keeper state (a lower counter) until then, and the Keeper logs `enrollment counter behind the link:
+   re-enroll with key-confirm` when it does.
+3. `phone-test`, then once the pages reached the phone, within an hour, `phone-confirm <code> cain deadman`
+   (every check named in one call, Keeper 0.1.7; the code from the Keeper's log at the test).
+4. `missed-heartbeat` (Keeper 0.1.6): the heartbeat ping stops until Healthchecks shows the check down (0.1.7,
+   at most 30 minutes); once that page reached the phone and the check is up again, within an hour after the
+   ping resumes, `missed-heartbeat-confirm <code>`. Each confirm is Dane's own attestation that the alert appeared
+   on his phone. Arming needs it within 14 days (or `drill_days`), like the phone test, and
+   it lapses with it. One drill at a time: no install during a drill (Keeper turns it away and the drill is
+   void).
+5. The two drills (a FAIL verdict and an exit on start), the next job.
 
 ## If the Ship key is remade
 
 The link makes a new Ship key only when the old one can't be read (and on a restored
 Pi, since backups leave it out), and says so. Ship tokens from before it no longer
-count, so an install waiting on one needs a new Ship card. Nothing else to do.
+count, so an install waiting on one needs a new Ship card.
+
+Since Keeper 0.1.5 the key's fingerprint is committed in the repository: `cain/SHIP_KEY_FINGERPRINT`
+(comment lines, then the fingerprint, the first 16 hex digits of the SHA-256 of the public key, the
+value in the link's `Ship key fingerprint: ...` log line). When the key is made or remade, Dane runs a
+Build that writes the new fingerprint there (Cain goes up a patch version: the file is in his folder), and
+after it lands he pastes the new public key into the Keeper's `ship_public_key` and confirms it at the
+device with `key-confirm <fingerprint> <code>` (Keeper DOCS; the one-time code is in the Keeper's log since
+Keeper 0.1.6). Until both are done, Cain's link refuses every Ship
+run that installs a watched App: the Keeper's pinned key must have the committed fingerprint, confirmed by
+Dane, and the committed fingerprint must be the link's own key's. A Build may write that file only on
+Dane's word, with the fingerprint read from the link's log.
 
 ## If the deploy key is remade, or GitHub loses it
 
@@ -389,6 +503,11 @@ or another OAuth app's token: GitHub deletes a key added that way when the token
 revoked. Keep exactly one deploy key with write access.
 
 ## Break glass (the link can't ship)
+
+Since Keeper 0.1.5 this is also how a broken Keeper is repaired, and how anything that installs a watched
+App ships while the Keeper is absent or refuses every registration (the link then lets no such Ship run
+start).
+
 
 If the link itself is broken (a bad release, or the Pi is lost) and a fix has to reach
 `main`, then on Dane's OK, at his PC: a laptop session makes a temporary SSH key, adds

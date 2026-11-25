@@ -1,0 +1,103 @@
+# https://developers.home-assistant.io/docs/apps/configuration
+# The keeper of installs: after every install of a watched App it checks the App for 15 minutes, and
+# rolls a bad install back from the App-only backup taken just before it (DOCS.md).
+# It reads the Supervisor's App and backup info and restores App-only backups (hassio_role backup,
+# never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
+# service (port 8097) is on Home Assistant's internal App network only, with no host port.
+name: Keeper
+version: "0.1.15"
+slug: keeper
+description: >-
+  Covers only the first 15 minutes after each App install: checks it and rolls
+  a bad one back from the backup taken just before it.
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: auto
+hassio_api: true
+hassio_role: backup
+homeassistant_api: false
+auth_api: false
+ingress: false
+# (0.1.7) Asserted, not left to the default: the owner's confirm commands are served only on the container's own
+# loopback (127.0.0.1:8096), and this network mode is what keeps every other container off it (keeper/tests).
+host_network: false
+# (0.1.7) The Healthchecks read-only key is kept in /data/hc-key (0600), never in the options; a Home Assistant
+# backup of this App leaves it out (the Supervisor matches these against each path in /data). 0.1.9: so are its temporary
+# file (the fixed prefix hc-key.tmp-), the earlier builds' temporary names (hc-key.<pid>.<hex>.tmp) and the old key's file
+# (hc-key-old); backup-check proves it on the device before hc-key is taken. 0.1.12: so is the backup key store
+# (/data/backup-keys: the password of each backup Keeper makes of a watched App), the folder and everything in it, its
+# temporary files (tmp-) included; the Supervisor matches each pattern against each path (keeper/tests). 0.1.15: and the drill
+# flags' spent list (/data/drill-spent, one file per nonce), so a restore of Keeper never rolls it back.
+backup_exclude:
+  - "hc-key*"
+  - "*/hc-key*"
+  - "backup-keys"
+  - "*/backup-keys"
+  - "backup-keys/*"
+  - "*/backup-keys/*"
+  - "drill-spent"
+  - "*/drill-spent"
+  - "drill-spent/*"
+  - "*/drill-spent/*"
+watchdog: tcp://[HOST]:[PORT:8097]
+timeout: 20
+# watch: the App slugs it watches. health: each watched App's health address on the internal network
+# ("slug=host:port/path"). 0.1.3: the install check and the rollback decide on the host's /health
+# (liveness) only; a path other than /health (Cain's /ready, his Discord gateway) is only reported, as
+# "chat connected" or "chat not connected (degraded)". tokens: each App's own token ("slug=token", at
+# least 16 characters; the same token is that App's keeper_token option); Cain's also registers installs
+# (POST /attempt). hc_done: the heartbeat check's ping URL. hc_deadman (0.1.3): the dead-man check's ping
+# URL, pinged every minute from the keeper's own timer (0.1.4: only while its poll loop completes, else its
+# /fail). Every check must be a distinct Healthchecks check, by the uuid or slug in its URL's path. hc_failed: the alert check, one plain ping URL
+# when one App is watched, or per App entries "slug=URL" (with more than one App watched each needs its
+# own: a shared one is not armable). ship_public_key (0.1.3): the public half of Cain's link's Ship key
+# (base64, the line "Ship key (public): ..." in Cain's log); public, so safe here; the keeper verifies
+# every registration's Ship token with it. 0.1.4: the first key seen is pinned in the keeper's state; a
+# changed key here is refused until confirmed at the device (key-confirm <fingerprint>, DOCS.md). health_grace_s: after a watched App first starts, failed
+# liveness polls count only after this many seconds. The keeper reads its options through the Supervisor
+# each poll, never writes them, and keeps no copy of them. No registration is ever written here (0.1.3).
+# 0.1.5: a first pin accepts no registration either until key-confirm. 0.1.7: hc_api_key is gone from the options:
+# the Healthchecks project's read-only API key, and only that, is entered once at the device (hc-key <code>, the key
+# on standard input), checked read-only and seeing every check below, and kept root-only in /data/hc-key, which the
+# backup_exclude above leaves out of this App's backups. A key that can write is refused at entry and never kept.
+# hc_unique_keys (0.1.7): optional, "role=<40 hex>" with role done, deadman or an App slug: the check's unique key
+# as the read-only API shows it, used in place of the one derived from the ping URL when that doesn't match.
+# 0.1.8: while hc_api_key is still in the options as the Supervisor holds them, Keeper doesn't arm and refuses hc-key;
+# remove it, then rotate that key (earlier backups may hold it). drill_days (0.1.8): 1 to 14, default 14, how long the
+# phone test and the missed-heartbeat drill count for arming, with a log reminder a day before each is due.
+# drill_followups_open (0.1.14): true until the drill plan's follow-up items have landed; while true Keeper reads not
+# armed whatever its drills recorded. Set it false only once they have; it isn't in the drill records' binding.
+options:
+  watch:
+    - 0fcc2575_cain
+  health:
+    - "0fcc2575_cain=0fcc2575-cain:8098/ready"
+  tokens: []
+  hc_done: ""
+  hc_deadman: ""
+  hc_failed: []
+  health_grace_s: 180
+  ship_public_key: ""
+  hc_unique_keys: []
+  drill_days: 14
+  drill_followups_open: true
+schema:
+  watch:
+    - match(^[a-z0-9_]{1,64}$)
+  health:
+    - match(^[a-z0-9_]{1,64}=[A-Za-z0-9.-]{1,253}:[0-9]{1,5}(/[A-Za-z0-9._/-]{0,64})?$)
+  tokens:
+    - password
+  hc_done: password?
+  hc_deadman: password?
+  hc_failed:
+    - password
+  health_grace_s: int(0,900)
+  ship_public_key: match(^[A-Za-z0-9+/=]{0,200}$)?
+  hc_unique_keys:
+    - match(^(done|deadman|[a-z0-9_]{1,64})=[0-9a-fA-F]{40}$)
+  drill_days: int(1,14)?
+  drill_followups_open: bool?

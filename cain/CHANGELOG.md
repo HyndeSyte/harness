@@ -1,12 +1,51 @@
 # Changelog
 
-## 0.18.2
+## 0.19.1
 
 - A fix-only review round is still let through when the earlier findings hold a tool name ending in a date, but only that: a date written as eight digits on its own, or followed by more digits, now blocks the round, and the date has to be a real one (leap days included).
 - A card number written in groups with hyphens or spaces now blocks, in your brief and in the earlier findings.
 - The earlier findings sent with a fix-only round now come only from the seats' answers as the review runner kept them when they arrived; findings from rounds answered before this version aren't sent.
 - A review id can't be used twice: not for another change, not for the same change again, and not while a review with that id is queued.
 - A brief can't name a change key that looks like a pull request's.
+
+## 0.19.0
+
+- A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.
+- A drill tap is now for one App and one version, and an install of another App leaves it alone.
+- If Cain can't reach the Keeper when a drill version starts, he keeps the drill mark and asks again for 90 seconds, then stops that start and records it, instead of starting normally. The Keeper rolls it back once it sees it.
+- Cain treats a start as the drill only when the Keeper has tied that install to the Home Assistant job that made it.
+- Every Ship tap's token now names itself as a Ship approval, and one without that is refused.
+- How long Cain's link waits for the Keeper's backup before giving up on a Ship run is a new option, `keeper_accept_min` (default 5 minutes). After a restart the link refuses any Ship run it was in the middle of, and tells the Keeper.
+- Keeper cards (the drill, old key, Try again and free space cards) no longer arrive between 10 PM and 7 AM; they come at 7 AM. Drill messages that say an install was refused still come at once.
+- A drill tap is now for one Cain version, named on the card: an install of any other version refuses it and tells you to arm it again.
+- If the drill flag is damaged, ran out or was already used, nothing is installed and you get one message saying so, instead of a normal install going ahead.
+- The drill mark is signed by the link and checked at start, and Cain asks Keeper whether the install really is a drill it is watching before failing on purpose. Otherwise he starts normally and logs why.
+- If Keeper doesn't fully accept a drill, or the drill mark can't be written or confirmed, nothing is installed and you get one message.
+- Cain now works with the new Keeper App, which checks every install of Cain for 15 minutes and rolls a bad one back by itself from the backup taken just before it.
+- Right after Cain starts following an install, the App asks him its liveness line once and tells the Keeper whether he answered. No answer within 10 minutes counts as a failed install.
+- If the Keeper rolled Cain back or gave up on a rollback, Cain's bot tells you that in one line, once, after his next start.
+- "Ship it with that risk" now reads the Keeper to see whether the rollback is armed, instead of a file nothing wrote. Until both drills have run and you have set the Keeper's two Healthchecks checks, it still reads as not armed, and the card says why.
+- Cain's health check for Home Assistant's Watchdog (/health) still only says whether the App is running, so a Discord outage doesn't make the Watchdog restart him. A new readiness check beside it (/ready) answers only while his Discord connection is up, and the Keeper reports it after an install as chat connected or not.
+- Two new options: `keeper_url` (already filled in) and `keeper_token` (the same token you give the Keeper for Cain).
+- "Ship it with that risk" reads as armed only while the Keeper's heartbeat and alert checks have answered in the last 10 minutes and none of its alerts is stuck, so a Healthchecks outage shows as not armed until it passes.
+- One Ship tap starts one Ship run: a second run on the same tap is refused, and Cain's link registers that run's install with the Keeper itself, so nothing writes the Keeper's options any more.
+- The Keeper decides on /health (Cain running and alive), not /ready: a Discord outage is reported as "chat not connected", never a reason to roll Cain back.
+- A Ship run that installs Cain starts only after the Keeper has made and checked his backup. Meanwhile Cain is told to start the run again in a minute. If the Keeper refuses, doesn't answer, or isn't set up, the Ship run doesn't start and Cain tells you why.
+- Cain's link now claims the Keeper's acceptance at the moment the Ship run starts, and logs a line the Ship run must see before it installs. If the run gives up, the Keeper's registration is cancelled.
+- Cain's link checks that the Keeper trusts the right Ship key: the key's fingerprint is kept in the repository (`cain/SHIP_KEY_FINGERPRINT`), and you confirm it at the Keeper. Until the fingerprint is filled in by a Build, Ship runs that install Cain are refused, and Cain says why.
+- The fingerprint of the link's current Ship key (e8aa4a671281b608, from the link's "Ship key (public)" line in Cain's log) is now filled in, on Dane's word (Nov 25), so normal Ship runs of Cain work once you confirm the key at the Keeper.
+- A Ship run that installs Cain starts only while the Keeper's claim has at least 20 minutes left. If less is left, the run doesn't start, the claim is cancelled, and a new Ship card starts again.
+- Cain's link now also records your confirm of the Keeper's Ship key from its minute by minute check of the Keeper, and refuses a Keeper whose saved state is older or newer than the one you confirmed.
+- If the Keeper's saved state is restored from a backup, Cain's link notices and refuses Ship runs that install Cain until you confirm the Keeper's Ship key again with a fresh code from the Keeper.
+- If the Keeper doesn't answer Cain's claim at the start of a Ship run, Cain's link asks once more, and the Keeper answers with the claim it already made, never a second one.
+- Cain's link accepts a Keeper restored from a backup once you confirm its Ship key again, ignores a Keeper answer for a confirm it has since replaced, and tells the Keeper when it turns its confirm down. A second Ship run on the same tap is refused, naming when the Keeper's claim runs out.
+- When the Keeper still remembers an old Healthchecks key, Cain's bot posts one card naming it. Revoke that key in Healthchecks, then tap the card: only your tap tells the Keeper the key is replaced, and the Keeper won't arm until then.
+- The Keeper's confirm code for the Ship key is now printed only when you ask for it there (`key-code`), never by itself at start.
+- Your tap on the old Healthchecks key card is now checked to be yours before Cain's link signs anything, and it is tied to the Keeper's current enrollment and a one-time challenge from the Keeper. When the Keeper no longer has the old key to try, the card says the change rests on your tap alone.
+- If the Keeper has no room for the backup before installing Cain, the install is refused and the link posts you a card saying so. Nothing installs without the Keeper's rollback: free some space, or choose another way yourself.
+- If the Keeper doesn't confirm the start of an install, or a cancel of one, nothing is installed and the link posts you a card with Try again, which brings the Ship card back.
+- Keeper answers that arrive out of order no longer look like an older Keeper: the newest one counts and the late one is set aside, with nothing for you to redo.
+- Keeper drills: when Cain asks, his link posts you a drill card with Arm the drill. Only your tap arms it, and only for the next install of Cain, which then stops at start or reports a failed check on purpose so the Keeper rolls it back and records the drill. Without your tap every install is a normal one.
 
 ## 0.18.1
 

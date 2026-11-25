@@ -7,7 +7,7 @@
 // Written whole or not at all. A key that can't be read is moved aside and a new one
 // made, so Ship taps are signed again at once (RELEASING.md, "If the Ship key is
 // remade"). Home Assistant's backups leave it out (config.yaml, backup_exclude).
-import { createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 export interface ShipKey { key: KeyObject; pub: string; remade: boolean }
@@ -50,6 +50,8 @@ export function loadShipKey(keyPath: string, pubPath: string, log: (line: string
       renameSync(`${pubPath}.tmp`, pubPath);
     }
     log(`Ship key (public): ${pub}`);
+    // Keeper 0.1.5: the fingerprint committed in cain/SHIP_KEY_FINGERPRINT by the Build run when a key is made.
+    log(`Ship key fingerprint: ${createHash("sha256").update(Buffer.from(pub, "base64")).digest("hex").slice(0, 16)} (cain/SHIP_KEY_FINGERPRINT must hold it)`);
     return { key: k, pub, remade };
   } catch (e) {
     log(`no Ship key, so Ship taps carry no token: ${String(e).slice(0, 100)}`);

@@ -124,12 +124,21 @@ export async function bumpsAt(d: Pick<MergeDeps, "api">, repo: string, base: str
 // An App's version in its config.yaml at one commit: the version, "none" (no such file
 // there), or null (GitHub didn't answer, or the file has no version line it can read).
 const VERSION_LINE = /^version:[ \t]*(["']?)([0-9]+(?:\.[0-9]+){1,3})\1[ \t]*(?:#.*)?$/m;
-async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, sha: string): Promise<string | "none" | null> {
+export async function versionAt(d: Pick<MergeDeps, "api">, repo: string, path: string, sha: string): Promise<string | "none" | null> {
   const r = await read(d, `/repos/${repo}/contents/${path}?ref=${sha}`);
   if (r === "missing") return "none";
   if (!r || typeof r.content !== "string" || r.encoding !== "base64") return null;
   const m = VERSION_LINE.exec(Buffer.from(r.content, "base64").toString("utf8"));
   return m ? m[2] : null;
+}
+
+// A file's bytes at one commit (Keeper 0.1.3, the Ship pass's probe hash): its content, "missing", or null.
+export async function fileAt(d: Pick<MergeDeps, "api">, repo: string, path: string, sha: string): Promise<Buffer | "missing" | null> {
+  if (!SHA.test(sha)) return null;
+  const r = await read(d, `/repos/${repo}/contents/${path}?ref=${sha}`);
+  if (r === "missing") return "missing";
+  if (!r || typeof r.content !== "string" || r.encoding !== "base64") return null;
+  return Buffer.from(r.content, "base64");
 }
 
 // A commit's check runs as GitHub has them, read one way for the landing and the Ship card

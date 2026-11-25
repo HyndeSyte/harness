@@ -22,3 +22,17 @@ cb2e92b6d9d8fb850c87efba4149d83364b16fe1:tests/test_watch.py:generic-api-key:501
 12eaacbd1300e2c8f3e581663fe669adbff5b088:tests/test_outbox_round28.py:generic-api-key:58
 # not a test file: the baseline's own comment, as first written, quoted the made-up test value above; reworded since.
 3932ecc0e4ede7a673b56bad2068fb8881080940:.gitleaksignore:generic-api-key:21
+# Keeper 0.1.9's key-file sweep test: the made-up content "keeper-sentinel-abc" written to a temp file.
+f9cbbd8b48de2c96028d22133de70c4aed4b776b:keeper/tests/keeper.test.ts:generic-api-key:2205
+# Keeper 0.1.9's key-file sweep test: the made-up content "half-written" written to a temp file.
+f9cbbd8b48de2c96028d22133de70c4aed4b776b:keeper/tests/keeper.test.ts:generic-api-key:2209
+# Keeper 0.1.9's backup check test: a fake archive member holding the one-letter content "x".
+f9cbbd8b48de2c96028d22133de70c4aed4b776b:keeper/tests/keeper.test.ts:generic-api-key:2339
+# Keeper 0.1.9's backup check test: a fake archive member holding the one-letter content "x", in a list of cases.
+f9cbbd8b48de2c96028d22133de70c4aed4b776b:keeper/tests/keeper.test.ts:generic-api-key:2346
+# Keeper 0.1.10's backup check tests: the legacy temporary key file's name "hc-key.1.abcdefabcdef.tmp", a file name, not a key (since built from its parts).
+d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api-key:2340
+# Keeper 0.1.10's backup check tests: the same file name in the names a passing check records.
+d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api-key:2567
+# Keeper 0.1.10's exclusion test: the same file name among the names the exclusion must cover.
+d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api-key:2614

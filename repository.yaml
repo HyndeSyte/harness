@@ -1,4 +1,6 @@
 # Home Assistant add-on repository: https://developers.home-assistant.io/docs/apps/repository
+# Its Apps, each found by its folder's config.yaml: harness/ (the calendar specialist), cain/ (Cain)
+# and keeper/ (the keeper of installs, since Keeper 0.1.0).
 name: Harness
 url: "https://github.com/HyndeSyte/harness"
 maintainer: Harness maintainer
