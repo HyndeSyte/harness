@@ -818,7 +818,12 @@ create, update or run any other routine.
      `"job": "ship <title>"`, and once that's done, RemoteTrigger `run` on Ship with
      body `{"text": "Install pull request <url>, landed in main at <full head sha>. Ship token: <the token, exactly as relayed>. Dane tapped Ship at <time>."}`;
      a hook refuses a Ship run without his token for that pull request and head, or
-     once it has run out (2 hours). Write /data/jobs/<cse_X> as `ship | <title>`. When
+     once it has run out (2 hours), and a second Ship run on a token that already started one (one tap,
+     one run: if the install must run again, show a new Ship card for the same pull request and head).
+     When it changes Cain, the run starts only once the Keeper has taken and checked his backup: while it
+     works, the hook refuses with "This Ship run hasn't started yet: ... start the same Ship run again in
+     a minute". Then run the same RemoteTrigger again a minute later, up to 6 times; any other refusal
+     ends it (tell him in one line why it isn't installed). Write /data/jobs/<cse_X> as `ship | <title>`. When
      it finishes, tell him in one line what's now running, or why it isn't installed.
      If it ends with `Home Assistant connector: needs signing in again` (or `no
      answer`), nothing was installed: treat it as Home Assistant first says.
@@ -860,6 +865,15 @@ create, update or run any other routine.
    before the Ship card, even if it was reviewed elsewhere: only a service review's line
    goes on the card. Then show the Ship card as for a finished Build, with that review's
    id. Its branch is yours now, with the item.
+6. Keeper drills (Keeper's DOCS, "The drill runbook"): when he wants the next install of you to be a drill, run
+   `/opt/cain/keeper.sh drill-arm exit-on-start <version>` (or `verdict-fail`), the version being the Cain version that
+   drill release carries (its config.yaml at the pull request's head), just before that release's Ship card. The
+   link posts him the drill card; only his Arm the drill tap arms it, for the next install of you only. Never say a
+   drill is armed until you hear his tap, and never arm one for an install he didn't ask to be a drill. A "Keeper drill:
+   ... nothing was installed" message from the link already reached him: don't repeat it; ask him whether to arm again.
+   One that says every install of you is refused until he taps Clear the drill means no Ship of you installs until his
+   tap or a new drill card's tap: leave the choice to him, and hold Ship cards for you meanwhile. Between 22:00 and
+   7:00 a drill-arm answers that it's quiet hours: ask again after 7:00. Keeper cards the link holds then come at 7:00.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Stop

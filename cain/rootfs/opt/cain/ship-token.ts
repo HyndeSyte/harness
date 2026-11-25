@@ -22,7 +22,9 @@ const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const SHA = /^[0-9a-f]{40}$/;
 export const PULL_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)$/;
 
-export interface Claim { v: 1; repo: string; pr: number; head: string; exp: number }
+// (Keeper 0.1.15) item 13: every Ship approval carries an explicit kind "ship"; every verifier (this one, the hook's, the
+// keeper's) rejects a payload without it.
+export interface Claim { v: 1; kind: "ship"; repo: string; pr: number; head: string; exp: number }
 
 export function b64url(b: Buffer): string {
   return b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -36,11 +38,13 @@ export function claimFor(pull: string, head: string, nowMs: number): Claim | nul
   const m = PULL_URL.exec(pull);
   const h = head.toLowerCase();
   if (!m || !SHA.test(h) || !SHIP_REPOS.has(m[1].toLowerCase())) return null;
-  return { v: 1, repo: m[1], pr: Number(m[2]), head: h, exp: Math.floor(nowMs / 1000) + TTL_S };
+  return { v: 1, kind: "ship", repo: m[1], pr: Number(m[2]), head: h, exp: Math.floor(nowMs / 1000) + TTL_S };
 }
 
-export function makeToken(claim: Claim, sign: (data: Buffer) => Buffer): string {
-  const payload = b64url(Buffer.from(JSON.stringify(claim), "utf8"));
+// The claim always goes out with its kind, whatever the caller passed (an older caller's claim without one gains it).
+export function makeToken(claim: Omit<Claim, "kind"> & { kind?: string }, sign: (data: Buffer) => Buffer): string {
+  const { v, repo, pr, head, exp } = claim;
+  const payload = b64url(Buffer.from(JSON.stringify({ v, kind: "ship", repo, pr, head, exp }), "utf8"));
   return `${PREFIX}.${payload}.${b64url(sign(Buffer.from(`${PREFIX}.${payload}`, "utf8")))}`;
 }
 
@@ -49,6 +53,12 @@ export function publicKey(spkiB64: string): KeyObject {
   const k = createPublicKey({ key: Buffer.from(spkiB64.trim(), "base64"), format: "der", type: "spki" });
   if (k.asymmetricKeyType !== "ed25519") throw new Error("not an Ed25519 key");
   return k;
+}
+
+const SHIP_CLAIM_KEYS_KIND = JSON.stringify(["exp", "head", "kind", "pr", "repo", "v"]);
+// (Keeper 0.1.15) exactly a Ship approval's keys, with a kind of exactly "ship": an absent kind is rejected.
+export function shipClaimShape(c: any): boolean {
+  return c?.kind === "ship" && JSON.stringify(Object.keys(c ?? {}).sort()) === SHIP_CLAIM_KEYS_KIND;
 }
 
 export type Checked = { ok: true; claim: Claim } | { ok: false; why: string };
@@ -67,10 +77,13 @@ export function readToken(token: string, key: KeyObject, nowMs: number): Checked
   if (!c || c.v !== 1 || typeof c.repo !== "string" || !REPO.test(c.repo) || !Number.isSafeInteger(c.pr) || c.pr < 1
     || typeof c.head !== "string" || !SHA.test(c.head) || !Number.isSafeInteger(c.exp))
     return { ok: false, why: "its claim isn't a Ship approval" };
+  // (Keeper 0.1.14) the payload's kind, exactly: a Ship approval's keys and nothing else; Keeper 0.1.15: a kind of exactly "ship",
+  // never absent. A drill flag, a drill mark or any other payload the link signs is never a Ship token, whatever its prefix.
+  if (!shipClaimShape(c)) return { ok: false, why: "its payload kind isn't a Ship approval" };
   if (!SHIP_REPOS.has(c.repo.toLowerCase())) return { ok: false, why: "it's for a repository Ship doesn't approve" };
   if (c.exp * 1000 <= nowMs) return { ok: false, why: "it expired (an approval lasts 2 hours after his tap)" };
   if (c.exp * 1000 > nowMs + (TTL_S + SKEW_S) * 1000) return { ok: false, why: "its expiry is further off than an approval lasts" };
-  return { ok: true, claim: { v: 1, repo: c.repo, pr: c.pr, head: c.head, exp: c.exp } };
+  return { ok: true, claim: { v: 1, kind: "ship", repo: c.repo, pr: c.pr, head: c.head, exp: c.exp } };
 }
 
 // The first Ship token standing on its own in a text, or null.

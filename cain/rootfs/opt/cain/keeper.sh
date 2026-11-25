@@ -165,6 +165,12 @@
 #                                        and "No". Only his tap writes the grant; this writes nothing.
 #                                        Refused while the change has rounds left, its item is held by
 #                                        another holder, or Stop holds
+#   keeper.sh drill-arm <exit-on-start|verdict-fail> <version>
+#                                        (Keeper 0.1.13) posts Dane the drill card for the Keeper App: his tap on it,
+#                                        and only his tap, arms the next install of Cain as a drill that fails on
+#                                        purpose that way, so Keeper must roll it back. This sets nothing itself.
+#                                        (0.1.14) <version> is the Cain version the drill release carries: the card
+#                                        names it, and an install of any other version refuses the flag.
 set -u
 # Moved only for the tests.
 dir="${CAIN_DISCORD_DIR:-/data/.claude/channels/discord}"
@@ -203,7 +209,7 @@ if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts
 case "$cmd" in
   handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;
   fastpath) url="$harness/fastpath"; ctx=harness-handover-v1 ;;
-  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant) url="$link/$cmd"; ctx=harness-relay-v1 ;;
+  show|ask|ship|answered|replied|morning|stopped|check|reply|replay|connector|review-grant|drill-arm) url="$link/$cmd"; ctx=harness-relay-v1 ;;
   card) url="$link/look"; ctx=harness-relay-v1 ;;   # the link's /card is the specialist's
   key-expiry|key-ack) url="$link/key-note"; ctx=harness-relay-v1 ;;
   hc-check|hc-set) url="$link/hc"; ctx=harness-relay-v1 ;;
@@ -383,6 +389,10 @@ case "$cmd" in
             done
             [ -n "$name" ] && [ -n "$grace" ] || { echo '{"status":"error","said":"usage: keeper.sh hc-set <check name> --grace <seconds> [--period <seconds>]"}'; exit 2; }
             body=$(jq -nc --arg n "$name" --arg g "$grace" --arg p "$period" '{cmd: "set", name: $n, grace: $g} + (if $p == "" then {} else {period: $p} end)') ;;
+  drill-arm)
+    case "${1:-}" in exit-on-start|verdict-fail) ;; *) echo '{"status":"error","said":"drill-arm takes exit-on-start or verdict-fail, then the Cain version"}'; exit 2 ;; esac
+    [[ "${2:-}" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]] || { echo '{"status":"error","said":"drill-arm takes the Cain version the drill release carries, like 0.19.1"}'; exit 2; }
+    body=$(jq -nc --arg m "$1" --arg v "$2" '{mode: $m, version: $v}') ;;
   review-grant)
     [[ "$rounds" =~ ^[1-3]$ ]] || { echo '{"status":"error","said":"--rounds takes 1, 2 or 3"}'; exit 2; }
     [ -n "$change" ] || { echo '{"status":"error","said":"--change takes the pull request url or the change key"}'; exit 2; }

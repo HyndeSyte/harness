@@ -23,7 +23,7 @@ describe("Ship tokens", () => {
   test("a token is his tap for one pull request and head, for 2 hours, under the link's key only", () => {
     const now = Date.UTC(2026, 10, 12, 15, 0);
     const claim = claimFor(PR, SHA1.toUpperCase(), now)!;
-    expect(claim).toEqual({ v: 1, repo: "HyndeSyte/harness", pr: 5, head: SHA1, exp: now / 1000 + TTL_S });
+    expect(claim).toEqual({ v: 1, kind: "ship", repo: "HyndeSyte/harness", pr: 5, head: SHA1, exp: now / 1000 + TTL_S });
     const token = makeToken(claim, (d) => edSign(null, d, SHIP_KEYS.privateKey));
     expect(readToken(token, KEY, now)).toEqual({ ok: true, claim });
     expect(readToken(token, KEY, now + 119 * MIN).ok).toBe(true);
@@ -287,7 +287,9 @@ describe("the RemoteTrigger hook, with Stop and signed Ship", () => {
     const good = run(job(tokenFor(PR, SHA1, Date.now())));
     expect(await hook(good, null)).toContain("Nothing runs");            // no Stop file: nothing runs
     expect(await hook(good, true)).toContain("Everything has been stopped");
-    expect(await hook(good, false)).toBe("");
+    // 0.19.0: past every check a Ship run still needs the link's one-run-per-token pass; with no key for
+    // the link here it is refused, never let through.
+    expect(await hook(good, false)).toContain("The link didn't let this Ship run start");
   });
 });
 

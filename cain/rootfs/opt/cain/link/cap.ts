@@ -27,7 +27,8 @@
 //     the three alarms of the decisions file and the guard's log, raised and cleared by the link's sweep.
 //   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
 //     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
-//     it installs, read from the probe's record (/data/probe/rollback-armed.json), never from Cain.
+//     it installs, read from the keeper App (GET /armed with Cain's token, 0.19.0: keeperArmed below),
+//     never from Cain.
 //   - 0.18.0: extra rounds granted by his tap (../review/grants.ts) raise a change's cap. The newest
 //     decision counts; a granted round after it that left nothing serious clears the way (the Ship card
 //     needs nothing more from the cap), one still running or that left something serious with rounds
@@ -47,7 +48,6 @@ export const DECISION_OPTIONS = [HOLD, RISK] as const;
 const P = capPaths();
 export const ROUNDS_FILE = P.rounds;
 export const SETTINGS_FILE = P.settings;
-export const ARMED_FILE = P.armed;
 export const DECISIONS_FILE = P.decisions;
 export const GRANTS_FILE = P.grants;
 export const GUARD_LOG = P.guardLog;
@@ -395,22 +395,60 @@ export function capState(pr: string, decidedFile: string = DECISIONS_FILE): CapS
   return capStateFor(pr, readRounds(ROUNDS_FILE), readDecided(decidedFile));
 }
 
-// Whether the probe's rollback of a bad install is armed for every App the pull request installs
-// (apps: lower-case App names; null when they can't be told: then every App must be armed). The record
-// is the probe's: {"armed": {"cain": "<when armed>", "harness": "<when armed>"}}. Missing or unreadable
-// is not armed.
+// Whether the rollback of a bad install is armed for every App the pull request installs (apps:
+// lower-case App names; null when they can't be told: then every App must be armed). The text is the
+// one keeperArmedText builds from the keeper's replies: {"armed": {"cain": "<when armed>"}, "why": {...}}.
+// Missing or unreadable is not armed.
 export function armedFor(apps: string[] | null, text: string | null): { armed: boolean; why: string } {
-  if (text === null) return { armed: false, why: "the probe has no record that its rollback of a bad install is armed (none ships before it does)" };
+  if (text === null) return { armed: false, why: "the keeper has no record that its rollback of a bad install is armed (none ships before it does)" };
   let j: any;
-  try { j = JSON.parse(text); } catch { return { armed: false, why: "the probe's rollback record can't be read" }; }
+  try { j = JSON.parse(text); } catch { return { armed: false, why: "the keeper's rollback record can't be read" }; }
   const armed = j?.armed && typeof j.armed === "object" ? j.armed : {};
   const want = apps && apps.length ? apps : ["cain", "harness"];
   const missing = want.filter((a) => typeof armed[a] !== "string" || !armed[a]);
-  if (missing.length) return { armed: false, why: `the rollback of a bad install isn't armed for ${missing.map((a) => a[0].toUpperCase() + a.slice(1)).join(" and ")}` };
+  const told = missing.map((a) => typeof j?.why?.[a] === "string" ? j.why[a].replace(/[^\x20-\x7e]/g, " ").slice(0, 120) : "").filter(Boolean);
+  if (missing.length) return { armed: false, why: `the rollback of a bad install isn't armed for ${missing.map((a) => a[0].toUpperCase() + a.slice(1)).join(" and ")}${told.length ? ` (${[...new Set(told)].join("; ")})` : ""}` };
   return { armed: true, why: "" };
 }
-export function readArmed(path = ARMED_FILE): string | null {
-  try { return readFileSync(path, "utf8"); } catch { return null; }
+
+// -- the keeper's armed state (0.19.0) ----------------------------------------------------------------
+// The link asks the keeper App every minute (GET /armed?app=<slug>, Cain's own token) for each App and
+// keeps the replies; each use judges them as they stand then. Not armed: a refused token, any error, a
+// reply that isn't for that App, a timestamp older than 2 minutes, or a binding that doesn't match (the
+// verdict protocol, the backup scope, the keeper's version as it says it, and for Cain the hash of the
+// verdict probe installed here, which must be the one the drills ran with).
+export const KEEPER_SLUGS: Record<string, string> = { cain: "0fcc2575_cain", harness: "0fcc2575_harness" };
+export const ARMED_PROTOCOL = 1;
+export const ARMED_SCOPE = "app-only";
+export const ARMED_MAX_AGE_MS = 120_000;
+export type KeeperReply = { status: number; body: string } | { error: string };
+export function keeperArmed(app: string, reply: KeeperReply | undefined, now: number, probeHash: string | null): { armed: boolean; why: string; at?: string } {
+  const slug = KEEPER_SLUGS[app] ?? app;
+  if (!reply) return { armed: false, why: "the keeper hasn't been asked yet" };
+  if ("error" in reply) return { armed: false, why: `the keeper didn't answer (${reply.error.slice(0, 60)})` };
+  if (reply.status === 401 || reply.status === 403) return { armed: false, why: "the keeper refused Cain's token" };
+  if (reply.status !== 200) return { armed: false, why: `the keeper answered ${reply.status}` };
+  let j: any;
+  try { j = JSON.parse(reply.body); } catch { return { armed: false, why: "the keeper's answer isn't JSON" }; }
+  const b = j?.binding ?? {};
+  const at = typeof j?.at === "string" ? Date.parse(j.at) : NaN;
+  if (j?.app !== slug) return { armed: false, why: "the keeper's answer is for another App" };
+  if (!Number.isFinite(at) || now - at > ARMED_MAX_AGE_MS || at - now > 60_000) return { armed: false, why: "the keeper's answer is stale (its timestamp is older than 2 minutes)" };
+  if (b.protocol !== ARMED_PROTOCOL || b.backup_scope !== ARMED_SCOPE || typeof j.keeper_version !== "string" || !j.keeper_version || b.keeper_version !== j.keeper_version
+    || typeof b.options_hash !== "string" || !b.options_hash || typeof b.probe_hash !== "string" || !b.probe_hash)
+    return { armed: false, why: "the keeper's binding doesn't match" };
+  if (app === "cain" && (!probeHash || b.probe_hash !== probeHash)) return { armed: false, why: "the keeper's drills ran with another verdict probe than the one installed" };
+  if (j.armed !== true || typeof j.armed_at !== "string") return { armed: false, why: `the keeper says it isn't armed${typeof j.why === "string" && j.why ? ` (${j.why.slice(0, 120)})` : ""}` };
+  return { armed: true, why: "", at: j.armed_at };
+}
+// The text armedFor reads, from the replies as they stand now.
+export function keeperArmedText(replies: Record<string, KeeperReply | undefined>, now: number, probeHash: string | null): string {
+  const armed: Record<string, string> = {}, why: Record<string, string> = {};
+  for (const app of Object.keys(KEEPER_SLUGS)) {
+    const a = keeperArmed(app, replies[app], now, probeHash);
+    if (a.armed) armed[app] = a.at!; else why[app] = a.why;
+  }
+  return JSON.stringify({ armed, why });
 }
 
 // As root on the Pi (round 3): `bun /opt/cain/link/cap.ts reset-mark` writes the reset mark again whole with

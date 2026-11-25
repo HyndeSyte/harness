@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# s6 restarts the service after an exit; the keeper resumes its open attempts from /data at start.
+exit 0

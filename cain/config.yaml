@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.19.0"
+version: "0.20.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -34,10 +34,15 @@ auth_api: false
 backup: cold
 # The link's two keys stay out of backups: whoever holds a backup can't sign a Ship
 # tap or update main with them. A restored Pi makes new ones (RELEASING.md, "If the
-# deploy key is remade").
+# deploy key is remade"). Keeper 0.1.14: the drill flags' spent nonces too (link/drill.ts), so a restored backup
+# never brings back a spent list that forgets a nonce spent after it was taken (Keeper keeps every drill nonce as well).
+# Keeper 0.1.15: and the drill flag (its claimed copies included) and the drill mark, so a restore never brings either back.
 backup_exclude:
   - "link/deploy_key*"
   - "link/ship.key*"
+  - "link/keeper-drill-spent*"
+  - "trust/keeper-drill.json*"
+  - "trust/keeper-drill-mark*"
 timeout: 30
 # Keys, entered by Dane here, never shown or logged. github_token: the record
 # keeper's GitHub fine-grained token for the org repo only (Contents read and write).
@@ -72,6 +77,13 @@ timeout: 30
 # owner's words; the runner writes both beside it, and review.sh guard prints them.
 # healthchecks_api_key (0.17.0): a Healthchecks.io management API key (read-write), for keeper.sh hc-check
 # and hc-set. Only the link's process has it; Cain's user never reads it. Empty: "no key set".
+# keeper_url, keeper_token (0.19.0): the keeper App (keeper/ in this repo) on Home Assistant's internal
+# network, and Cain's own token there (the same token as the keeper's tokens entry for this App, at
+# least 16 characters). The probe gives the keeper its verdict on an install of Cain with it, and the
+# link reads whether the keeper's way back from a bad install is armed. Read only by the run script's link and
+# probe subshells, never by Cain's session, never logged. Empty: no verdicts, and never armed.
+# keeper_accept_min (0.19.0, Keeper 0.1.15): how long the link waits, outside the hook's 10 seconds, for Keeper's
+# "accepted" (its backup made and checked) before it gives up on a Ship run: 1 to 15 minutes, default 5.
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
 # "If Cain stops"), a random id hidden like a key. Empty: the alarms go to Discord only.
 options:
@@ -96,6 +108,9 @@ options:
   heartbeat_url: ""
   probe_heartbeat_url: ""
   healthchecks_api_key: ""
+  keeper_url: "http://0fcc2575-keeper:8097"
+  keeper_token: ""
+  keeper_accept_min: 5
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -118,3 +133,6 @@ schema:
   heartbeat_url: password?
   probe_heartbeat_url: password?
   healthchecks_api_key: password?
+  keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?
+  keeper_token: password?
+  keeper_accept_min: int(1,15)?

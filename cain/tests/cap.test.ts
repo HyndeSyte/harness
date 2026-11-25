@@ -411,7 +411,7 @@ describe("D: shipping with the risk named needs the rollback armed", () => {
     await expect(ship(shipRig("hold", null))).rejects.toThrow("he chose to hold it");
   });
   test("with the risk named: refused while the rollback isn't armed, saying what isn't; allowed once it is", async () => {
-    await expect(ship(shipRig("risk", null))).rejects.toThrow("the probe has no record that its rollback of a bad install is armed");
+    await expect(ship(shipRig("risk", null))).rejects.toThrow("the keeper has no record that its rollback of a bad install is armed");
     await expect(ship(shipRig("risk", JSON.stringify({ armed: { harness: "2026-11-21T10:00:00Z" } })))).rejects.toThrow("isn't armed for Cain");
     expect((await ship(shipRig("risk", JSON.stringify({ armed: { cain: "2026-11-21T10:00:00Z" } })))).status).toBe("posted");
     expect((await ship(shipRig("none", null))).status).toBe("posted");             // a change not at the cap: as before
@@ -783,17 +783,18 @@ describe("round 2, fix 6: the install-time self-check, and the decision route en
   test("every file right passes; one wrong turns the features off with one alarm naming it", () => {
     const rules = capFileRules(capPaths({}));
     const good: Record<string, any> = { "/data/review-rounds.json": st(0, 1000, 0o640), "/data/review-settings.json": st(0, 1000, 0o640),
-      "/data/review-guard.log": st(0, 1000, 0o640), "/data/link/review-decisions.json": st(0, 0, 0o600), "/data/probe/rollback-armed.json": st(0, 0, 0o644) };
+      "/data/review-guard.log": st(0, 1000, 0o640), "/data/link/review-decisions.json": st(0, 0, 0o600) };
     const stat = (files: Record<string, any>) => (p: string) => { if (!files[p]) throw Object.assign(new Error("none"), { code: "ENOENT" }); return files[p]; };
     const alarms: string[] = [];
     let cleared = 0;
     const o = { rules, alarm: (c: string) => alarms.push(c), clear: () => cleared++, log: () => {}, mode: "own" };
     expect(selfCheck({ ...o, stat: stat(good) })).toBeNull();
     expect(cleared).toBe(1);
-    const { ["/data/link/review-decisions.json"]: _a, ["/data/probe/rollback-armed.json"]: _b, ...required } = good;
-    expect(selfCheck({ ...o, stat: stat(required) })).toBeNull();                         // the two optional ones may be missing
+    const { ["/data/link/review-decisions.json"]: _a, ...required } = good;
+    expect(selfCheck({ ...o, stat: stat(required) })).toBeNull();                         // the optional one may be missing
     expect(selfCheck({ ...o, stat: stat({ ...good, "/data/review-rounds.json": st(1000, 1000, 0o640) }) })).toBe("/data/review-rounds.json is owned by 1000:1000, mode 0640");
-    expect(selfCheck({ ...o, stat: stat({ ...good, "/data/probe/rollback-armed.json": st(0, 1000, 0o664) }) })).toContain("rollback-armed.json");
+    expect(capFileRules(capPaths({})).some((r) => r.path.includes("rollback-armed"))).toBe(false);   // 0.19.0: read from the keeper
+    expect(selfCheck({ ...o, stat: stat({ ...good, "/data/link/review-decisions.json": st(0, 1000, 0o664) }) })).toContain("review-decisions.json");
     expect(selfCheck({ ...o, stat: stat({ ...good, "/data/review-settings.json": st(0, 1000, 0o640, true) }) })).toBe("/data/review-settings.json is a symlink");
     const { ["/data/review-guard.log"]: _c, ...noLog } = good;
     expect(selfCheck({ ...o, stat: stat(noLog) })).toBe("/data/review-guard.log is missing");
@@ -849,11 +850,11 @@ describe("round 2, fix 6: the install-time self-check, and the decision route en
 
 describe("round 2, fix 7: paths are constants; overrides only in test mode", () => {
   test("the environment moves no path outside test mode", () => {
-    const env = { REVIEW_ROUNDS: "/tmp/x", REVIEW_SETTINGS: "/tmp/y", REVIEW_GUARD_LOG: "/tmp/z", CAIN_HOME: "/tmp/h", CAIN_ROLLBACK_ARMED: "/tmp/a" };
+    const env = { REVIEW_ROUNDS: "/tmp/x", REVIEW_SETTINGS: "/tmp/y", REVIEW_GUARD_LOG: "/tmp/z", CAIN_HOME: "/tmp/h" };
     expect(testMode(env)).toBe(false);
     expect(capPaths(env)).toMatchObject({ rounds: "/data/review-rounds.json", settings: "/data/review-settings.json",
-      guardLog: "/data/review-guard.log", home: "/data/cain", armed: "/data/probe/rollback-armed.json", decisions: "/data/link/review-decisions.json" });
-    expect(capPaths({ ...env, CAIN_TEST_MODE: "1" })).toMatchObject({ rounds: "/tmp/x", settings: "/tmp/y", guardLog: "/tmp/z", home: "/tmp/h", armed: "/tmp/a" });
+      guardLog: "/data/review-guard.log", home: "/data/cain", decisions: "/data/link/review-decisions.json" });
+    expect(capPaths({ ...env, CAIN_TEST_MODE: "1" })).toMatchObject({ rounds: "/tmp/x", settings: "/tmp/y", guardLog: "/tmp/z", home: "/tmp/h" });
     const run = readFileSync(join(import.meta.dir, "../rootfs/etc/services.d/cain/run"), "utf8");
     expect(run).not.toContain("CAIN_TEST_MODE");
   });
@@ -1096,7 +1097,7 @@ describe("round 3, fix 4: the self-check's alarm says what it stops, and the che
     const st = (uid: number) => ({ isSymbolicLink: () => false, isFile: () => true, uid, gid: uid === 0 ? 1000 : 1000, mode: 0o100640 }) as any;
     let roundsUid = 1000;
     const stat = (p: string) => {
-      if (p.endsWith("review-decisions.json") || p.endsWith("rollback-armed.json")) throw Object.assign(new Error("none"), { code: "ENOENT" });
+      if (p.endsWith("review-decisions.json")) throw Object.assign(new Error("none"), { code: "ENOENT" });
       return st(p.endsWith("review-rounds.json") ? roundsUid : 0);
     };
     const alarms: string[] = [];

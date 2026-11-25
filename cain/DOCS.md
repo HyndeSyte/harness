@@ -66,7 +66,7 @@ its own.
   one in Healthchecks.io if you ever think it leaked. Give the check a grace period of 10 to 15 minutes, so
   one late ping doesn't page you. A second check, pinged only while every liveness check of Cain passes,
   is `probe_heartbeat_url` (**What 0.14.0 does**, below).
-- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.19.0). So Cain
+- **The heartbeat checks' timing** (`healthchecks_api_key`, empty by default, since 0.20.0). So Cain
   can set those checks' grace and period himself, paste a Healthchecks.io management API key once in
   this App's Configuration (in Healthchecks.io: the project's Settings, API Access, a read-write key,
   not the read-only one), then restart the App. Only Cain's link has it; Cain's own user never reads
@@ -264,9 +264,17 @@ round is refused, with the count and the rule. If the third still leaves somethi
 runner itself sends you one card: what the piece is, the serious finding in one line, and "Hold it"
 or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
 round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
-after "Ship it with that risk" it goes only while the probe's rollback of a bad install is armed for
-that App (read from `/data/probe/rollback-armed.json`; the probe in 0.15.0 writes no such record, so
-until a release arms it, that card is refused and says what isn't armed). The cap is the option
+after "Ship it with that risk" it goes only while the rollback of a bad install is armed for that App.
+Since 0.19.0 the link reads that from the Keeper App (`GET /armed` with Cain's `keeper_token`, every
+minute): a refused token, any error, an answer for another App, a timestamp older than 2 minutes, or a
+binding that doesn't match (the verdict protocol, the backup scope, the Keeper's version, and for Cain
+the hash of the verdict probe installed in this App) all read as not armed, and the card says which.
+Until the Keeper has run both drills for the App, its Healthchecks checks are set (Keeper 0.1.3: a
+dead-man check too, and an alert check of its own for each watched App), its phone test drill is
+confirmed, and (worked out at every read) its heartbeat, its dead-man ping and a non-paging log ping to
+each of its alert checks reached Healthchecks within the last 10 minutes with no alert of it stuck for
+over 2 minutes, that card is refused and says what isn't armed (the Keeper's own documentation has the
+drills and the conditions). The cap is the option
 `review_round_cap` (default 3); the rounds are kept in `/data/review-rounds.json`, your taps on the
 card in the link's `/data/link/review-decisions.json`.
 
@@ -285,8 +293,8 @@ Since the second round of fixes in 0.16.0:
   until a release arms it, so holding is the working choice. A tap on "Ship it with that risk" then
   records the change as held, on the guard's log below, and Cain is told.
 - At each start the review runner and the link check the owner and mode of these files (the rounds
-  file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file, and the rollback
-  record when there). One that's wrong turns the cap and the guard off (no review round, no `other`
+  file, `/data/review-settings.json`, `/data/review-guard.log`, the decisions file; the rollback record
+  is no longer a file since 0.19.0). One that's wrong turns the cap and the guard off (no review round, no `other`
   Build, and Ship decisions paused for every pull request: no Ship card for any change) and raises
   one alarm naming it. Since the third round of fixes the check runs again every minute, so they come
   back on by themselves, and the alarm clears, once the file is right; no restart needed.
@@ -384,7 +392,7 @@ reads it but can't write it. The runner writes its own refusals; Cain's Build ho
 send theirs to the link, which checks the guard again itself and writes only a real refusal. If the
 link can't be reached the run is still refused, and the refusal says the hold wasn't logged. Since
 the third round of fixes that route is bounded: at most 6 holds written a minute from each caller (since
-0.19.0's second round, a check that passes doesn't count against them: checks have their own limit of 30 a
+0.20.0's second round, a check that passes doesn't count against them: checks have their own limit of 30 a
 minute, refused with their own reason and no alarm), an
 identical hold logged once in 10 minutes, its description checked like a card (one that fails is
 logged as "a build labelled" and its label), and the log rotated at 256 KB keeping one previous file
@@ -394,7 +402,7 @@ only in the tests' own mode (`CAIN_TEST_MODE`), which the App never sets, and th
 every run while that variable is set. `/opt/cain/review.sh guard` prints its reading in two lines, and the morning
 check-in hands Cain the same two lines for his daily usage row.
 
-What it reads for the plan (since 0.19.0): Cain's Claude Code transcripts under
+What it reads for the plan (since 0.20.0): Cain's Claude Code transcripts under
 `/data/cain/.claude/projects`, subagent transcripts included, and the week's allowance you set by hand,
 the option `plan_weekly_allowance_tokens` (default 4200000000; 0 means not set, and the reading is
 "unknown" as in 0.16.0). The plan's week starts Sunday 12:00 AM in the App's time zone (America/New_York),
@@ -409,14 +417,14 @@ which counts as unknown (it holds other work). Each file's count is kept in `/da
 again and a growing one is read on from where it stopped.
 
 The guard's rules don't change: an unknown reading, an incomplete one, or one older than a day counts as
-below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.19.0
+below the floor and holds `other` work; `core`, `commitment` and `necessary-fix` always run. Since 0.20.0
 the link decides every `other` Build job too, not only the ones Cain's hook would refuse: a job runs only
 when both readings let it and the link answered. `review.sh guard`'s first line says the percent of the
 week's allowance left, the tokens counted and the week's start, and how many transcript files were read
 and skipped; its second line names each seat's share left and whether other work is held. `review.sh
 spend` shows the runner's own caps and each open change's round count.
 
-Reading it without holding up Discord (0.19.0, second round of review fixes). The first reading after an
+Reading it without holding up Discord (0.20.0, second round of review fixes). The first reading after an
 install is cold: about 100 transcripts and 250 MB on the Pi's SD card. So the review runner warms the cache
 at the App's start and again whenever the week turns (and every 15 minutes between), and the link reads the
 plan in a child process of its own, waiting at most 2 seconds: a reading not ready by then counts as
@@ -447,7 +455,7 @@ fraction). Only you change the option, in the App's Configuration; Cain and the 
 also set `plan_allowance_set_on` (the date, YYYY-MM-DD) and `plan_allowance_derivation` (how you worked it out,
 in a line); the runner writes both beside the allowance, and `review.sh guard`'s first line prints them.
 
-The third round of review fixes (0.19.0):
+The third round of review fixes (0.20.0):
 
 - Alarms never hold up your taps. Each alarm the link raises or clears starts the App's notice script in
   the background, with its own 40 second limit, and the link never waits for it; a notice that fails is
@@ -599,6 +607,106 @@ or a pause that lasts, restore two backups from just before the update, Cain's f
 calendar App's (Settings, System, Backups). Either order is safe: neither App drops a card
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
+
+## What 0.19.0 does: working with the Keeper
+
+The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a
+bad one back from the backup taken just before it. Cain's part:
+
+- Right after each start of his session, the App asks the Keeper whether an install of this version is
+  being watched. If one is, it asks his session the liveness line once and gives the Keeper its
+  verdict: PASS, or FAIL when he didn't answer within 10 minutes.
+- If the Keeper's last line about Cain is a rollback or a give-up, his bot says that line to you once.
+- Two checks on port 8098, both for Home Assistant's internal network only (404 to any other address
+  and on any other path):
+  - `/health`, the Watchdog's URL, is liveness: 200 while the App runs, 503 only while a self-restart
+    is due. It doesn't depend on Discord, so a Discord outage doesn't make the Watchdog restart him.
+  - `/ready` (its `health` option names the path) is readiness: 200 only while the link's Discord
+    connection is up and Discord acknowledged it within 5 minutes, 503 otherwise. Since Keeper 0.1.3 the
+    Keeper decides an install and a rollback on `/health` alone and only reports `/ready`, as "chat
+    connected" or "chat not connected (degraded)": a Discord outage never rolls Cain back.
+- One Ship run per Ship tap, and its registration with the Keeper (with Keeper 0.1.3). When Cain starts a
+  Ship run, his RemoteTrigger hook checks the token as before, then asks the link (`POST /ship-pass`,
+  Cain's key). The link refuses a token it has already let through (a second Ship run on one tap), keeps
+  the spent ids (hashes, never the token) in root's `/data/trust/ship-passes.json`, and registers each
+  install the tap makes with the Keeper over the Keeper's own service (`POST /attempt` with Cain's
+  `keeper_token`): the token itself, the pull request, the head, the App's version before and after (each
+  `config.yaml` at the pull request's base and head) and the verdict probe's hash at the head. The Keeper
+  checks the token's signature with the link's public Ship key (its `ship_public_key` option: the line
+  `Ship key (public): ...` in this App's log; since Keeper 0.1.4 pinned on first use, a changed one needs
+  confirming at the device), spends it once per App and takes the App-only backup itself. A link that
+  doesn't answer refuses the Ship run. Nothing writes the Keeper's options. The link registers only the
+  Apps the Keeper watches by default (Cain).
+- With Keeper 0.1.4, the Ship run waits for the Keeper's acceptance. The Keeper answers a registration
+  only once its backup is complete and verified, with the backup's slug, and the link answers the hook
+  "ok" only once every watched App the run installs is accepted (a run that installs no watched App
+  passes at once). Meanwhile the link answers "pending" and the hook refuses the run with "This Ship run
+  hasn't started yet: ... start the same Ship run again in a minute"; Cain does so, up to 6 times. A
+  Keeper refusal, no answer within 5 minutes, anything the link can't read, or no acceptance within 6
+  minutes refuses the pass for good: nothing is installed, and a new Ship card makes a new token. So while
+  the Keeper isn't installed or set up (its `ship_public_key`, its `tokens` and this App's `keeper_token`),
+  no Ship run that installs Cain starts. The Ship run itself still reads the Keeper's `accepting <id> ...`
+  line before it installs and stops without it (RELEASING.md, Ship).
+- With Keeper 0.1.5:
+  - Register, then poll: the Keeper answers a registration at once and makes the backup in the
+    background; the link checks back (`GET /attempt/<id>`) every 5 seconds, up to 5 minutes per watched
+    App, and the whole pass waits 5 minutes per watched App plus 1. When it gives up it cancels each
+    registration it made at the Keeper, so no acceptance is left lying around.
+  - The claim: once every watched App is accepted, at the hook's next ask, the link claims each
+    acceptance at the Keeper (single use, valid 30 minutes) and only then answers "ok", with each claim's
+    id and deadline, and writes `Ship pass ok: <attempt id> claim <claim id> until <time>` to this App's
+    log. The Ship run needs that line and the Keeper's `claimed ...` line for the same attempt before it
+    installs, and aborts once the claim's deadline has passed. A refused or unanswered claim refuses the
+    pass for good.
+  - The key's fingerprint: `cain/SHIP_KEY_FINGERPRINT` in the repository holds the fingerprint of the
+    link's Ship key (this App's log prints it, `Ship key fingerprint: ...`). The link refuses the pass
+    unless the Keeper's pinned key has that fingerprint at the pull request's head, it is the link's own
+    key's, the owner has confirmed the pin at the Keeper (`key-confirm`), and the Keeper's state is no
+    newer than the one the link recorded at the last confirmed enrollment it saw (root's
+    `/data/trust/keeper-enrollment.json`). Until a Build commits the fingerprint, every Ship run that
+    installs Cain is refused.
+- With Keeper 0.1.6:
+  - The claim's deadline in code: the link refuses (and cancels) a claim the Keeper answers with under 20
+    minutes left, and the RemoteTrigger hook checks every claim's deadline again just before it lets the
+    Ship run start. Under 20 minutes left, or a deadline it can't read, refuses the run and asks the link to
+    cancel the pass and its claims (`POST /ship-pass {token, cancel}`); a new Ship card for the same pull
+    request and head starts again. The Ship run's own check of the two log lines stays, as belt and braces.
+  - The enrollment record: the link records the owner's confirm of the Keeper's key from its
+    minute-by-minute `/armed` read as well as from a Ship pass, and a pass needs the Keeper's state creation
+    and confirm times to equal the recorded ones (an older or newer state is refused until the owner
+    confirms again at the Keeper).
+- With Keeper 0.1.7:
+  - The enrollment id and counter: every Keeper answer carries the owner's confirm's own enrollment id and a
+    counter that only goes up. The link records both and refuses a lower counter (an older Keeper state, from
+    a restore) and an earlier enrollment id it has seen replaced (a replayed confirm). Each answer is judged
+    against the record as it stood before the request was sent. The way back after a restore of the Keeper or a
+    clock correction is the owner's `key-confirm` at the Keeper with a fresh code (Keeper 0.1.8: from `key-code`):
+    a new enrollment id, which the link records.
+  - The claim's request id: the link's claim carries one, and a claim that got no answer is asked once more with
+    it; the Keeper answers that retry with the claim it recorded, never a second claim. A cancel the Keeper
+    already recorded is answered the same way, and the Keeper's own expiry of an unused claim deletes its
+    backup, so a lost cancel leaves nothing behind.
+  - The Keeper is unarmed and refuses registrations while one of its drills runs, so a Ship pass during a drill
+    is refused (the drill is then void, and is run again).
+  - Two limits of the design are recorded in the Keeper's DOCS ("Accepted limits") and accepted by the owner at
+    the Keeper; the rollback reads as armed only once they are.
+- With Keeper 0.1.8:
+  - Enrollment after a restore: a brand-new enrollment id (one the link has never seen, the owner's `key-confirm`)
+    is recorded at the counter it carries, however far below the old record, and counters only go up within that id
+    after. A reply for an enrollment the link has replaced meanwhile (a concurrent `/armed` read recorded a newer
+    one) is discarded, even when the record before its request allowed it. The fresh code for `key-confirm` comes
+    from the Keeper's `key-code` (or its start, while it isn't enrolled or after a refusal).
+  - A pass refused on the enrollment cancels its registrations saying so: "enrollment counter behind the link" for
+    an older Keeper state, "enrollment refused by the link" otherwise. The Keeper logs `enrollment counter behind
+    the link: re-enroll with key-confirm` and prints a code.
+  - One Ship run per attempt: a second run on a token that already passed is refused naming the claims' latest
+    expiry while one is live, since a claim at the Keeper can stay live for up to 30 minutes after a refused or
+    failed run (the Keeper's first accepted limit, text version 2). The Keeper logs each claim's start and end.
+  - The Keeper's cancel is refused while Home Assistant shows an install, update, rebuild or restore of Cain, a job
+    on Cain it doesn't recognize, or a jobs list it can't read; the claim then runs out by itself, and its backup is
+    kept until one more poll after the deadline shows no version change.
+- The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
+  `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 
 ## What 0.15.0 does: Cain stays on Discord
 

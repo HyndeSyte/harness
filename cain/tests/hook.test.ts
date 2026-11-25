@@ -109,7 +109,9 @@ describe("the RemoteTrigger hook", () => {
     expect(denied.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(denied.hookSpecificOutput.permissionDecisionReason).toContain("never a pull request");
     expect(await hook(JSON.stringify(run(BUILD, `${GOOD_BUILD}\nLabel: core`)))).toBe("");
-    expect(await hook(JSON.stringify(run(SHIP, GOOD_SHIP)))).toBe("");
+    // 0.19.0: a Ship run that passes every check still needs the link's pass; with no key for the link
+    // (as here) it is refused, never let through.
+    expect(JSON.parse(await hook(JSON.stringify(run(SHIP, GOOD_SHIP)))).hookSpecificOutput.permissionDecisionReason).toContain("The link didn't let this Ship run start");
     expect(JSON.parse(await hook("not json")).hookSpecificOutput.permissionDecision).toBe("deny");
   });
 

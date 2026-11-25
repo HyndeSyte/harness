@@ -35,6 +35,11 @@
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
 //     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
 //                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
+//     POST /drill-arm {mode}                         (Keeper 0.1.13) the drill card; only Dane's tap on it sets the drill flag
+//     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the installs registered with the
+//                                       keeper App, "pending" until it accepted every watched one (backup made and
+//                                       verified), then each acceptance claimed and "ok" once, the token spent (a second
+//                                       run on it is refused) (0.19.0, Keeper 0.1.5: the claim and the enrollment check)
 //   from the PC job keeper (pcjobs/main.ts), on this machine only:
 //     POST /reuse {m, values}           whether Discord message m is his yes to reusing those values from a PC
 //                                       result: only his recorded "Use it" tap on one of Cain's asks that quoted
@@ -74,15 +79,20 @@ import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
+import { attestFlow, rotationNeeded } from "./rotation";
+import { armFlag, drillDeps, drillKeyFrom, fileStore, storeMarkPub } from "./drill";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { HcAnnounceAlarm, hcCall, takeKey } from "./healthchecks";
 import { PlanRefresher } from "../plan-read";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
-import { appendCapped, asideOf, CapAlarms, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, markHoldWritten, readArmed, readReset, recordDecision,
-  roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { appendCapped, asideOf, CapAlarms, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply,
+  markHoldWritten, readReset, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarmDetached, raiseAlarmDetached, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths, PlanCacheAlarm } from "../guard";
+import { gatewayHealthy, writeGatewayMark } from "./health-gate";
+import { KEEPER_URL, keeperCall, probeHash } from "../probe/keeper";
 import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // 0.17.0: the Healthchecks.io management key, from the App's option healthchecks_api_key, in this
@@ -263,6 +273,14 @@ const planAlarm = new PlanCacheAlarm({ log: capLog, raise: (kind, cause) => rais
 const plan = new PlanRefresher({ tz: process.env.CHECKIN_TZ ?? "America/New_York", log: capLog, onReading: (p) => planAlarm.saw(p), onAsk: () => planAlarm.asked() });
 void plan.read().catch(() => {});
 
+// Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
+// the spent nonces in /data/link (0700), outside Cain's backups (config.yaml backup_exclude).
+const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`,
+  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`, Date.now, `${DIR}/keeper-drill-refused.json`);   // Keeper 0.1.15: the refused intent, beside the spent list
+// The drill key, derived from the Ship key under its own domain; its public half kept by root for the run script and the probe.
+const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
+const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
+if (drillKey) { try { storeMarkPub(drillKey.pub, DRILL_MARK_PUB); } catch (e) { console.log(`[cain] link: couldn't keep the drill key's public half: ${String(e).slice(0, 80)}`); } }
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
@@ -273,6 +291,13 @@ const link = new Link({
   tz: process.env.CHECKIN_TZ ?? "America/New_York",
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
+  // Keeper 0.1.9: his tap on the rotation card, signed with the Ship key here and sent to the keeper (rotation.ts)
+  // Keeper 0.1.10: bound to the keeper's enrollment and its single-use challenge, read fresh at the tap (rotation.ts attestFlow)
+  attestRotation: shipPriv ? async (id) => {
+    if (!KEEPER_TOKEN) return { ok: false, why: "no keeper_token is set" };
+    return attestFlow({ get: (path) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path), post: (path, body) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body, 20_000),
+      sign: (data) => edSign(null, data, shipPriv), now: Date.now }, id);
+  } : undefined,
   land: deployKey ? async ({ pr, head, stopped }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
@@ -297,7 +322,8 @@ const link = new Link({
   // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
   // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
   capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
-  armed: () => readArmed(),
+  // 0.19.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
+  armed: () => keeperArmedText(keeperReplies, Date.now(), PROBE_HASH),
   // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
   decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm, onMarkFailed: (why) => capAlarms.markFailed(why) }),
   // 0.17.0: the hold-written flag on his decision's record, and the reset mark (paused while a copy stands).
@@ -329,10 +355,56 @@ const link = new Link({
   // Not awaited: the log is written in the background and never throws (gate/log.ts).
   linkHosts: () => readHosts(),
   keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
+  // Keeper 0.1.13: his tap on the drill card, signed with the Ship key here and kept by root as the one-shot drill flag (drill.ts)
+  armDrill: shipPriv ? (mode, version) => armFlag(drillStore, mode, version, Date.now(), (data) => edSign(null, data, shipPriv)) : undefined,
+  // Keeper 0.1.15 item 8: his Clear tap on a refused-drill page
+  clearDrill: () => { try { const was = drillStore.clearRefused(); if (was) console.log("[cain] link: the owner cleared the refused drill intent: installs go as usual again"); return was; } catch { return false; } },
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
 });
+
+// Keeper 0.1.5: the last confirmed enrollment of the keeper's Ship key the link saw (ship-pass.ts enrollmentCheck).
+const KEEPER_ENROLL = process.env.CAIN_KEEPER_ENROLL ?? `${TRUST_DIR}/keeper-enrollment.json`;
+const enrollment: EnrollmentStore = {
+  load: () => { try { return parseEnrollment(readFileSync(KEEPER_ENROLL, "utf8")); } catch { return null; } },
+  store: (e) => writeSynced(KEEPER_ENROLL, JSON.stringify(e)),
+};
+const shipPub = () => { try { return readFileSync(SHIP_PUB, "utf8").trim() || null; } catch { return null; } };
+// Keeper 0.1.13: the drill flag and mark, root's, beside the other trust files (drill.ts)
+const drill = drillDeps(drillStore, shipPub, Date.now, (l) => console.log(`[cain] link: ${l}`), {
+  sign: drillKey ? (data) => edSign(null, data, drillKey.priv) : undefined, markPub: () => drillKey?.pub ?? null,
+  page: (kind, key, info) => { void link.drillPage(kind, key, info).catch((e) => console.log(`[cain] link: couldn't post the drill page: ${String(e).slice(0, 80)}`)); },
+});
+// -- the keeper App's armed state (0.19.0) -------------------------------------------------------------
+// Asked every minute for each App; a reply older than 2 minutes, a refused token, any error or a binding
+// that doesn't match reads as not armed (cap.ts keeperArmed). The token comes from the App's options
+// (keeper_token, the run script hands it in KEEPER_TOKEN) and is never logged.
+const KEEPER_TOKEN = process.env.KEEPER_TOKEN ?? "";
+delete process.env.KEEPER_TOKEN;
+const KEEPER_BASE = (process.env.KEEPER_URL || KEEPER_URL).replace(/\/+$/, "");
+const PROBE_HASH = probeHash();
+const keeperReplies: Record<string, KeeperReply | undefined> = {};
+async function askKeeper(): Promise<void> {
+  for (const [app, slug] of Object.entries(KEEPER_SLUGS)) {
+    if (!KEEPER_TOKEN) { keeperReplies[app] = { error: "no keeper_token set" }; continue; }
+    const before = enrollment.load();                     // Keeper 0.1.7: the record before the read was sent
+    const r = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/armed?app=${slug}`);
+    keeperReplies[app] = r ? { status: r.status, body: JSON.stringify(r.body) } : { error: "no answer" };
+    // Keeper 0.1.6: the enrollment recorded from this read too, outside any Ship pass (ship-pass.ts).
+    if (r?.status === 200) { const pub = shipPub(); noteArmedEnrollment(r.body, pub ? keyFingerprint(pub) : null, enrollment, (l) => console.log(`[cain] link: ${l}`), before); }
+  }
+  // Keeper 0.1.9: the old Healthchecks key's rotation: one card naming its id while the keeper says a tap is needed
+  if (KEEPER_TOKEN) {
+    const rot = await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/rotation");
+    const need = rot?.status === 200 ? rotationNeeded(rot.body) : null;
+    if (need) await link.rotationCard(need.id, { kept: need.kept }).catch((e) => console.log(`[cain] link: couldn't post the rotation card: ${String(e).slice(0, 80)}`));
+  }
+}
+void askKeeper();
+setInterval(() => { void askKeeper(); }, 60_000);
+// Keeper 0.1.15 item 21: keeper cards held by the quiet hours go at 07:00
+setInterval(() => { void link.quietFlush().catch((e) => console.log(`[cain] link: couldn't send the cards held by the quiet hours: ${String(e).slice(0, 80)}`)); }, 60_000);
 
 // -- the gateway's health, for the Harness page ------------------------------------
 let connected = false;
@@ -405,7 +477,44 @@ const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ,
   hc: (b: unknown) => hcCall(b, { key: () => HC_KEY, log: (l) => console.log(`[cain] link: ${l}`),
     announce: async (line) => { link.relayLine(`${line} Nothing to tell him: the link posted it to him.`); await link.notice(line, NOTICE_TIMEOUT_MS); },
     // Round 3: a set line that couldn't be posted raises its own alarm (at most hourly per check).
-    announceFailed: (name, why) => hcAlarm.failed(name, why), announced: () => hcAlarm.posted() }) };
+    announceFailed: (name, why) => hcAlarm.failed(name, why), announced: () => hcAlarm.posted() }),
+  shipPass: (b: any) => shipPass(shipPassDeps, b) };
+// The Ship pass (0.19.0, with Keeper 0.1.3): one Ship run per token, and its installs registered with the
+// keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
+const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
+const ACCEPT_WAIT_MS = acceptWaitMs(process.env.KEEPER_ACCEPT_MIN);   // Keeper 0.1.15 item 6
+const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
+const shipPassDeps: PassDeps = {
+  pub: shipPub,
+  now: Date.now,
+  load: () => { try { return readFileSync(SHIP_PASSES, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; return "unreadable"; } },
+  store: (text) => writeSynced(SHIP_PASSES, text),
+  // Keeper 0.1.5: POST /attempt answers 202 at once and the link polls GET /attempt/<id> until accepted or
+  // refused (ATTEMPT_WAIT_MS per App); the pass stays "pending" meanwhile (ship-pass.ts).
+  register: (tok, claim, done, note) => {
+    const pub = shipPub();
+    void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
+      post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
+      noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
+      get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
+      .then(done)
+      .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
+  },
+  // 3 seconds: the hook waits on the pass (about 8 seconds a request), so the claim must answer well within it.
+  // Keeper 0.1.7: with the claim's request id, so a retry reads the recorded claim.
+  claim: (a, request) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${a.attempt}/claim`, { app: a.app, from_version: a.from, to_version: a.to, backup: a.backup, request }, 3_000) : Promise.resolve(null),
+  // Keeper 0.1.11: the cancel's answer is judged (ship-pass.ts judgeCancel); anything but a plain "ended" brings the retry card
+  cancel: (attempt, why) => keeperPost(`/attempt/${attempt}/cancel`, { why }),
+  dropMark: (attempt) => drill.drop(attempt),
+  retry: (attempt, what) => { void link.retryCard(attempt, what).catch((e) => console.log(`[cain] link: couldn't post the retry card: ${String(e).slice(0, 80)}`)); },
+  enrollment,
+  // Keeper 0.1.15: the wait for Keeper's acceptance (keeper_accept_min), and its reads for the reconcile at start
+  waitMs: ACCEPT_WAIT_MS,
+  view: (attempt) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${attempt}`) : Promise.resolve(null),
+  log: (l) => console.log(`[cain] link: ${l}`),
+};
+// Keeper 0.1.15 items 3 and 6: a pass a crash or restart left open is refused and its attempts cancelled; a passed one is read
+void reconcilePasses(shipPassDeps).catch((e) => console.log(`[cain] link: the reconcile at start failed: ${String(e).slice(0, 80)}`));
 const route = linkRoutes(routeDeps);
 
 // The specialist's signed requests: each id handled once (SignedOps, auth.ts), its answer kept
@@ -581,4 +690,7 @@ setInterval(() => {
     writeFileSync(`${GATEWAY_STATE}.tmp`, `${connected ? "connected" : "down"} ${Math.floor(proto.lastAck / 1000)}\n`, { mode: 0o600 });
     renameSync(`${GATEWAY_STATE}.tmp`, GATEWAY_STATE);
   } catch { /* the probe then sees an old time, and fails that layer */ }
+  // Cain's /ready (0.19.0, health-gate.ts; /health is liveness only): 200 only while the gateway is connected and acknowledged.
+  writeGatewayMark(gatewayHealthy(connected, proto.lastAck, Date.now()));
 }, 30_000);
+writeGatewayMark(false);

@@ -101,9 +101,10 @@ def test_service_runs_the_package_and_scrubs_nothing_by_shell():
 def test_repository_layout():
     repo = flat_yaml(ROOT / "repository.yaml")
     assert repo["name"] and (ADDON / "config.yaml").exists()
-    # exactly two add-ons: the harness, and Cain (which holds no harness keys)
+    # exactly three add-ons: the harness, Cain (which holds no harness keys) and, since Keeper 0.1.0,
+    # the keeper of installs (which holds no harness keys either)
     addons = sorted(p.name for p in ROOT.iterdir() if p.is_dir() and (p / "config.yaml").exists())
-    assert addons == ["cain", "harness"]
+    assert addons == ["cain", "harness", "keeper"]
 
 
 CAIN = ROOT / "cain"
@@ -125,9 +126,10 @@ def test_cain_config_denies_every_api_and_mapping():
     # Assistant user id, not a key), the alarms' webhook id, hidden like a key (C1
     # second review: the App's alarms reach Home Assistant without its API), the PC
     # job keeper's token and repo name, the security watch's and the probe's heartbeat URLs
-    # (secrets like keys: password fields), and (0.17.0) the week's plan allowance (with its date and
-    # derivation) and the
-    # Healthchecks.io management key (a password field). Nothing else.
+    # (secrets like keys: password fields), (0.17.0) the week's plan allowance (with its date and
+    # derivation) and the Healthchecks.io management key (a password field), and (0.19.0) the keeper App's
+    # address and Cain's token there (a password field), and (Keeper 0.1.15) the link's wait for Keeper's
+    # acceptance in minutes. Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
@@ -139,7 +141,7 @@ def test_cain_config_denies_every_api_and_mapping():
         ' tokens since Sunday on this device"\n'
         '  owner_user_id: ""\n  notice_hook: ""\n'
         '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\n'
-        '  healthchecks_api_key: ""\nschema:\n'
+        '  healthchecks_api_key: ""\n  keeper_url: "http://0fcc2575-keeper:8097"\n  keeper_token: ""\n  keeper_accept_min: 5\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
@@ -148,7 +150,8 @@ def test_cain_config_denies_every_api_and_mapping():
         "  plan_allowance_set_on: match(^(\\d{4}-\\d{2}-\\d{2})?$)?\n  plan_allowance_derivation: str?\n"
         "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
-        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n  healthchecks_api_key: password?\n")
+        "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n  healthchecks_api_key: password?\n"
+        "  keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?\n  keeper_token: password?\n  keeper_accept_min: int(1,15)?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():
@@ -275,6 +278,12 @@ def test_cain_terminal_is_reachable_only_through_ingress():
     assert "access_log /run/cain-web/health-miss.log cain_health_miss if=$cain_health_miss;" in loc
     assert loc.index("if ($cain_health_from != 1) { return 404;") < loc.index("health-down")
     assert "location / { return 404; }" in health and "proxy_pass" not in health and "alias" not in health
+    # Cain 0.19.0 (first review fix): /health is liveness only (no gateway mark); /ready, beside it on the same server, is
+    # readiness (the link's gateway mark), behind the same address check.
+    assert "health-gateway" not in loc.split("location = /ready {")[0]
+    ready = health.split("location = /ready {")[1].split("location / {")[0]
+    assert ready.index("if ($cain_health_from != 1) { return 404;") < ready.index("health-gateway")
+    assert "health-ok.log" not in ready
     term = (CAIN / "rootfs/etc/services.d/terminal/run").read_text()
     # C1: ttyd listens on a unix socket only nginx's workers and root can open, never a port
     # Cain's own user could take while it's down; it attaches as the session's own user.
@@ -720,7 +729,16 @@ def test_no_stop_is_silent(tmp_path):
     # "restart" (the switch on, marks kept) and his session was ended; told, so the EXIT trap stays quiet.
     # Second round: exit 3 lives in self_exit (the exit route), reached from self_restart's restart
     # decision after the Supervisor's restart call, and from the Pi drill's root-only mark.
-    assert exits == ['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3"]
+    # Keeper 0.1.13: the drill's exit-on-start, only for the version root's drill mark names (link/drill.ts).
+    # Keeper 0.1.15: and the drill's abort (Keeper couldn't confirm the start is the drill): that start stops too.
+    assert sorted(exits) == sorted(['fail_closed() { bashio::log.error "Cain couldn\'t be shown stopped, so the App stops itself"; exit 1; }', "  exit 3",
+                                    "           exit 1 ;;", "           exit 1 ;;"])
+    # Keeper 0.1.14: the helper runs only when a mark exists, with Cain's keeper token in its own environment (it asks Keeper
+    # whether the mark's attempt is a drill still in its watch), and its log lines reach the App's log. Keeper 0.1.15: it retries
+    # for 90 seconds inside a 120 second bound, and a helper killed or failed with a mark present is an abort (fail closed).
+    drill = run.index('    timeout 120 bun "$OPT/link/drill.ts" mode "$version" || echo abort')
+    assert run.index('version="$(bashio::addon.version') < run.index("if [ -e /data/trust/keeper-drill-mark.json ]; then") < drill \
+        < run.index('  *abort*) bashio::log.error', drill) < run.index("exit 1 ;;", drill) < run.index('  exit-on-start) bashio::log.warning', drill)
     exit_fn = _run_fns(run, "self_exit() {", "self_tried=0")
     # Fourth round: the mark holds the time it was written (self_mark). Fifth round: the exit route writes
     # it with the word fallback, which finish and the EXIT trap need before they take a 3 for the fallback.
@@ -2665,7 +2683,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # close Cain's questions; those are Cain's, from this machine, with his own key.
     assert ('SPECIALIST_ROUTES = new Set(["/card", "/buttons", "/answer", "/relay", "/card-of"])' in auth)
     assert ('CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answered", "/replied", "/stopped",\n'
-            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/hc", "/review-grant"])'
+            '  "/look", "/cards", "/check", "/reply", "/key-note", "/replay", "/connector", "/guard-hold", "/hc", "/review-grant", "/ship-pass", "/drill-arm"])'
             in auth.replace("\r\n", "\n"))
     # Cain 0.18.0: /review-grant is Cain's card asking Dane for extra review rounds; only his tap writes one.
     # Root's own (its unix socket): the broker's /sent, and the PC job keeper's /reuse and

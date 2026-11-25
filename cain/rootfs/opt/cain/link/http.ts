@@ -7,6 +7,7 @@ import { boundedText, type Caller, routeAllowed } from "./auth";
 import { noteKey } from "../security/main";
 import { type Link, Refusal, SAID_MAX } from "./core";
 import type { HcAnswer } from "./healthchecks";
+import type { PassAnswer } from "./ship-pass";
 
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
@@ -16,6 +17,7 @@ export interface RouteDeps {
   toHarness: (path: string, body: unknown) => Promise<boolean>;
   tz?: string;
   hc?: (b: unknown) => Promise<HcAnswer>;          // 0.17.0: keeper.sh hc-check and hc-set (healthchecks.ts)
+  shipPass?: (body: any) => Promise<PassAnswer>; // (0.19.0) the hook's one Ship run per token (ship-pass.ts; async since Keeper 0.1.5: the claim)
 }
 
 // One request, from a caller already proven: refused unless the route is the caller's.
@@ -52,11 +54,14 @@ export function linkRoutes(d: RouteDeps) {
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
         case "/decision": return json(await link.decision(b));
+        // Keeper 0.1.13: Cain asks for the drill card (keeper.sh drill-arm); only the owner's tap on it sets the flag
+        case "/drill-arm": return json(await link.drillCard(b.mode, b.version));
         case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
         case "/guard-hold": return json(await link.guardHoldFor(b, caller));
         // The heartbeat checks' grace and period at Healthchecks.io (0.17.0): the link holds the key.
         case "/hc": return json(d.hc ? await d.hc(b) : { status: "refused", said: "no key set" });
+        case "/ship-pass": return json(d.shipPass ? await d.shipPass(b) : { status: "refused", said: "the link can't spend Ship tokens" });
         case "/stopped": {
           const st = link.stopped();
           return json({ status: "ok", stopped: st.stopped, said: !st.stopped ? "Nothing is stopped."

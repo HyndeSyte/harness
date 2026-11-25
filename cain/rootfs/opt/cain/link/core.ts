@@ -93,6 +93,8 @@ import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import { NOT_READY } from "../plan-usage";
 import { countedRounds, decisionOf, type DecisionRec, type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
+import { ROTATION_ID } from "./rotation";
+import { type DrillMode, type DrillPage, isDrillMode, VERSION as DRILL_VERSION } from "./drill";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
 
@@ -113,6 +115,29 @@ export const RESET_TAP_NONE = "This card was from before your saved answers were
 // His grant tap that couldn't be kept (0.18.0): to him alone, the card stays up.
 export const GRANT_UNSAVED = "Your grant couldn't be saved, so no rounds were added yet. The card is still up: tap it again.";
 export const GRANT_NO = "No";
+// Keeper 0.1.9: the rotation card's one button (rotation.ts).
+export const ROTATION_LABEL = "Old key replaced";
+export const ROTATION_PREFIX = "k:rot:";
+// Keeper 0.1.13: the drill card's one button (drill.ts). Only his tap on it sets the drill flag.
+export const DRILL_LABEL = "Arm the drill";
+export const DRILL_PREFIX = "k:drill:";
+// Keeper 0.1.15 item 8: the refused-drill page's one button: his tap clears the refused intent, so installs go as usual again.
+export const DRILL_CLEAR_LABEL = "Clear the drill";
+export const DRILL_CLEAR = "k:drill-clear";
+// Keeper 0.1.15 item 21: quiet hours for the owner's keeper cards (the drill, rotation, retry and free-space cards): none goes out
+// from 22:00 to 07:00 local; they wait and go at 07:00. Pages (the drill pages: a drill that installed nothing) and rollbacks
+// (Keeper's own alerts, which never pass through the link) are never held.
+export const QUIET_FROM = 22, QUIET_TO = 7;
+export function quietHours(ms: number, tz = "America/New_York"): boolean {
+  let h: number;
+  try { h = zoned(ms, tz).hour; } catch { h = zoned(ms, "America/New_York").hour; }
+  return h >= QUIET_FROM || h < QUIET_TO;
+}
+// Keeper 0.1.11: the card for a keeper claim or cancel that wasn't a plain success: its one button asks Cain for the Ship card again.
+// (The free-space card of Keeper 0.1.10 has no button any more: nothing installs without Keeper's rollback.)
+export const RETRY_LABEL = "Try again";
+export const RETRY_PREFIX = "k:retry:";
+const RETRY_ATTEMPT = /^(?:ship|drill)-(\d{1,9})-([a-z0-9_]{1,64})-[0-9a-f]{8}$/;
 export const grantLabel = (n: number) => `Grant ${n} more round${n === 1 ? "" : "s"}`;
 // First review of 0.18.0: an open grant card loses its buttons when another card's grant for the same
 // change is written, and a grant tap whose checks no longer hold writes nothing; its card says why.
@@ -362,6 +387,11 @@ export interface Shown {
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
   staleDecision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // 0.17.0: a decision card from before the decisions file was reset
+  rotation?: { id: string };        // the link's card for the keeper's old Healthchecks key (Keeper 0.1.9, rotation.ts)
+  drill?: { mode: DrillMode; version?: string };   // the link's drill card (Keeper 0.1.13, drill.ts): his tap sets the one-shot drill flag (0.1.14: for that version)
+  drillPage?: { key: string; clear?: boolean };   // (Keeper 0.1.14) a drill that installed nothing, told to him once per key (drill.ts); 0.1.15: clear, its Clear button
+  space?: { pr: number; head: string; app: string; version: string };   // the free-space card (Keeper 0.1.10, ship-pass.ts; 0.1.11: no button)
+  retry?: { attempt: string; what: "claim" | "cancel" };   // the card offering a retry after a keeper answer that wasn't a plain success (Keeper 0.1.11)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
   grant?: { key: string; rounds: number; pr: string | null; reason: string;       // Cain's grant card for extra review rounds (0.18.0, ../review/grants.ts)
     used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
@@ -401,6 +431,8 @@ export interface State {
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
   pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
+  // (Keeper 0.1.15) item 21: keeper cards held by the quiet hours, sent at 07:00 (quietFlush), each once by its key
+  quietHeld?: { key: string; kind: "retry" | "space"; args: unknown[]; at: number }[];
   // The review runner's decision cards waiting while their item is held by another holder (0.16.0,
   // round 2), by decision id: one each, tried again at each sweep until the hold clears.
   decisions?: Record<string, Partial<DecisionRec> & { since: number }>;
@@ -713,6 +745,11 @@ export interface Deps {
   tz?: string;                                                     // the check-ins' zone
   stop?: { read: () => StopState; write: (stopped: boolean, at: number) => void };   // Stop everything
   signShip?: (claim: Claim) => string | null;                      // his Ship tap as a token; null: no key
+  // Keeper 0.1.9: his tap on the rotation card, signed by the link's Ship key and sent to the keeper (rotation.ts)
+  attestRotation?: (id: string) => Promise<{ ok: boolean; why: string }>;
+  // Keeper 0.1.13: his tap on the drill card, signed by the link's Ship key and kept by root as the drill flag (drill.ts armFlag)
+  armDrill?: (mode: DrillMode, version: string) => { ok: boolean; why: string };   // (Keeper 0.1.14) bound to the version the card names
+  clearDrill?: () => boolean;                                      // (Keeper 0.1.15) his Clear tap: the refused drill intent removed
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
@@ -1657,6 +1694,263 @@ export class Link {
     this.d.save(s);
     return { status: "posted", message: String(msg.id),
       said: `Posted.${w.fixed.length ? ` ${fixedSaid(w.fixed)}` : ""} Write /data/jobs/connector-<item> as the Cloud jobs section says, and check Home Assistant again at each cloud job check.` };
+  }
+
+  // -- the keeper's old Healthchecks key, attested as rotated by his tap (Keeper 0.1.9, rotation.ts) --
+  // One card per old key id, the link's own words only, naming that id, with one button. Not while stopped; not again
+  // once one for that id is up or was answered. Only his tap makes the attestation (the link signs it); nothing else.
+  // Keeper 0.1.10: kept false (the keeper kept no old key to try): the card says the rotation is attested by his tap only.
+  async rotationCard(id: string, o: { kept?: boolean } = {}): Promise<{ status: "posted" | "open" | "done" | "stopped" | "quiet"; message?: string }> {
+    if (!ROTATION_ID.test(id)) throw new Refusal("that isn't an old key's id");
+    if (this.stopped().stopped) return { status: "stopped" };
+    if (this.quiet()) return { status: "quiet" };    // (Keeper 0.1.15) asked again every minute: it goes at 07:00
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.rotation?.id === id && (!m.outcome || m.outcome === "answered"));
+    if (prior) return { status: prior[1].outcome ? "done" : "open", message: prior[0] };
+    const text = `Keeper still knows an old Healthchecks key, id ${id}, and won't arm until you say it is replaced. `
+      + "Revoke that key in Healthchecks first (Project Settings, API Access), then tap below. "
+      + (o.kept === false ? "Keeper no longer has the old key, so it can't check Healthchecks turns it down: this is attested by your tap only."
+        : "Keeper still has the old key, so it checks Healthchecks turns it down before it takes your word.");
+    const msg = await this.post(text, rows([[[ROTATION_LABEL, `${ROTATION_PREFIX}${id}`]]], "k:"), { nonce: stableNonce("rotation", id) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `rotation:${id}`, posted: this.d.now(), expires: null, buttons: true,
+      labels: [ROTATION_LABEL], rotation: { id } });
+    this.d.save(s);
+    this.log(`a rotation card for the keeper's old key ${id} went to him`);
+    return { status: "posted", message: String(msg.id) };
+  }
+  // His tap: answered at once (Discord's 3 seconds), then the signed attestation goes to the keeper, which may first try
+  // the old key at the alert service. Taken: the card says so and loses its button. Refused: the card stays up, and he
+  // is told why, to him alone.
+  private async rotationTap(it: any, msgId: string): Promise<string> {
+    const rec = this.d.load().messages[msgId];
+    if (!rec?.rotation || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    const id = rec.rotation.id;
+    // Keeper 0.1.10: the sender checked here too, before anything is signed: only the owner's tap, in his DM
+    let who = "";
+    try { who = await this.who(it); } catch { who = "check failed"; }
+    if (who) { await this.answer(it, ACK); this.log(`a rotation tap for the old key ${id} was refused before signing: ${who}`); return `refused: ${who}`; }
+    await this.answer(it, ACK);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so Keeper wasn't told. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    let r: { ok: boolean; why: string };
+    try { r = this.d.attestRotation ? await this.d.attestRotation(id) : { ok: false, why: "the link has no Ship key to sign your tap with" }; }
+    catch (e) { r = { ok: false, why: `the keeper didn't answer (${String(e).slice(0, 60)})` }; }
+    if (!r.ok) {
+      this.log(`his rotation tap for the old key ${id} wasn't taken: ${r.why}`);
+      await this.ephemeral(it, `Keeper didn't take it: ${r.why.replace(/[^\x20-\x7e]/g, " ").slice(0, 200)}. The card is still up: tap it again once that's fixed.`);
+      return "refused";
+    }
+    const line = "Done: Keeper has your word the old key is replaced.";
+    const content = withLine(String(it.message?.content ?? ""), line);
+    let edited = false;
+    try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
+    catch (e) { this.log(`couldn't mark the rotation card done: ${String(e).slice(0, 80)}`); }
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = ROTATION_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    this.d.save(s);
+    this.log(`his rotation tap for the keeper's old key ${id} was taken by the keeper`);
+    return "rotation attested";
+  }
+
+  // -- the drill switch (Keeper 0.1.13, drill.ts) --
+  // Cain asks for the card (keeper.sh drill-arm <mode>, /drill-arm); it only asks. One open card per mode, the link's own
+  // words, one button. Not while stopped. Only his tap sets the flag: signed with the link's Ship key, kept by root, spent by
+  // the next registration of Cain, which then goes to the keeper as kind drill and fails on purpose as the mode names.
+  // Keeper 0.1.14: the card names the Cain version the drilled install must carry (keeper.sh drill-arm <mode> <version>), and his
+  // flag is bound to it: a registration of another version refuses and removes it. A new card for another version or mode
+  // retires an open one (its tap is dead).
+  async drillCard(mode: unknown, version?: unknown): Promise<{ status: "posted" | "open" | "stopped" | "quiet"; message?: string; said: string }> {
+    if (!isDrillMode(mode)) throw new Refusal("a drill takes exit-on-start or verdict-fail");
+    if (typeof version !== "string" || !DRILL_VERSION.test(version)) throw new Refusal("a drill names the Cain version the drill release carries (keeper.sh drill-arm <mode> <version>)");
+    if (this.stopped().stopped) return { status: "stopped", said: "Everything is stopped, so no drill card went out." };
+    if (this.quiet()) return { status: "quiet", said: "It's quiet hours for him (22:00 to 07:00), so no drill card went out: ask again after 7:00." };   // (Keeper 0.1.15)
+    const open = Object.entries(this.d.load().messages).filter(([, m]) => m.drill && !m.outcome);
+    const prior = open.find(([, m]) => m.drill!.mode === mode && m.drill!.version === version);
+    if (prior) return { status: "open", message: prior[0], said: "That drill card is still up; nothing is armed until his tap." };
+    const what = mode === "exit-on-start" ? "stops at once when it starts" : "reports a failed check after it starts";
+    const text = `Keeper drill: the next install of Cain after your tap is a drill, and it must be Cain ${version}. That version ${what}, on purpose, so Keeper `
+      + "must see it fail and put the version before it back from its backup. Arm it only when that release's Ship card is next. "
+      + "One tap arms one install of that version, for a day; without it every install is a normal one.";
+    const msg = await this.post(text, rows([[[DRILL_LABEL, `${DRILL_PREFIX}${mode}`]]], "k:"), { nonce: stableNonce("drill", `${mode}:${version}:${this.d.now()}`) });
+    const s = this.d.load();
+    for (const [id] of open) { const m = s.messages[id]; if (m && !m.outcome) { m.outcome = "replaced"; m.why = "replaced by a newer drill card"; } }
+    this.remember(s, msg, { kind: "notice", item: "none", question: `drill:${mode}`, posted: this.d.now(), expires: null, buttons: true,
+      labels: [DRILL_LABEL], drill: { mode, version } });
+    this.d.save(s);
+    this.log(`a drill card (${mode}, Cain ${version}) went to him`);
+    return { status: "posted", message: String(msg.id), said: "Posted. Nothing is armed until his tap; you hear when he taps." };
+  }
+  // His tap: the sender checked first (the owner, in his DM), before anything is signed; then the flag is signed and kept.
+  private async drillTap(it: any, msgId: string): Promise<string> {
+    const rec = this.d.load().messages[msgId];
+    if (!rec?.drill || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    const mode = rec.drill.mode, version = rec.drill.version ?? "";
+    let who = "";
+    try { who = await this.who(it); } catch { who = "check failed"; }
+    if (who) { await this.answer(it, ACK); this.log(`a drill tap (${mode}) was refused before signing: ${who}`); return `refused: ${who}`; }
+    await this.answer(it, ACK);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so the drill wasn't armed. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    const r = !DRILL_VERSION.test(version) ? { ok: false, why: "this card names no Cain version (it is from before the version was asked): ask Cain for a new one" }
+      : this.d.armDrill ? this.d.armDrill(mode, version) : { ok: false, why: "the link has no Ship key to sign your tap with" };
+    if (!r.ok) {
+      this.log(`his drill tap (${mode}) wasn't kept: ${r.why}`);
+      await this.ephemeral(it, `The drill wasn't armed: ${r.why.replace(/[^\x20-\x7e]/g, " ").slice(0, 200)}. The card is still up: tap it again once that's fixed.`);
+      return "refused";
+    }
+    const content = withLine(String(it.message?.content ?? ""), `Armed: the next install of Cain ${version} is the drill.`);
+    let edited = false;
+    try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
+    catch (e) { this.log(`couldn't mark the drill card done: ${String(e).slice(0, 80)}`); }
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = DRILL_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    this.d.save(s);
+    this.log(`his drill tap (${mode}, Cain ${version}) armed the drill flag`);
+    this.d.relay(`Dane tapped ${DRILL_LABEL} (${mode}, Cain ${version}): the next install of Cain ${version} is registered with Keeper as a drill and fails on purpose. Show him that release's Ship card when it is ready. Nothing else to tell him.`);
+    return "drill armed";
+  }
+  // (Keeper 0.1.14) A drill that installed nothing (drill.ts DrillPage), told to him once per key, in the link's own words, with
+  // no button: the flag was damaged, ran out or was spent; it named another version; Keeper didn't accept the drill with a
+  // confirmed backup; or the mark couldn't be written or confirmed, so the drill was aborted. Not while stopped.
+  async drillPage(kind: DrillPage, key: string, info: { armed?: string; version?: string } = {}): Promise<{ status: "posted" | "done" | "stopped"; message?: string }> {
+    if (!["damaged", "version", "accept", "aborted", "refused", "spent"].includes(kind) || !/^[a-z]{1,10}:[A-Za-z0-9_.:-]{1,100}$/.test(key)) throw new Refusal("that isn't a drill page");
+    const v = (x?: string) => (x && DRILL_VERSION.test(x) ? x : "");
+    if (this.stopped().stopped) return { status: "stopped" };
+    if (Object.values(this.d.load().messages).some((m) => m.drillPage?.key === key)) return { status: "done" };
+    const of = v(info.version) ? ` of Cain ${v(info.version)}` : "";
+    const text = kind === "damaged" ? "Keeper drill: the drill flag was damaged or had run out; nothing was installed; arm it again."
+      : kind === "version" ? `Keeper drill: the drill flag was armed for Cain ${v(info.armed) || "another version"}, but the install carried ${v(info.version) || "another version"}; nothing was installed; arm it again for the right version.`
+      : kind === "accept" ? `Keeper drill: Keeper didn't accept the drill install${of} with a checked backup; nothing was installed; arm it again.`
+      // (Keeper 0.1.15) item 8: a refused drill intent stands until his Clear tap or a new drill armed from a card
+      : kind === "refused" ? `Keeper drill: a drill flag was refused${v(info.armed) ? ` (it was armed for Cain ${v(info.armed)}${v(info.version) ? `, and the install carried ${v(info.version)}` : ""})` : " (it was damaged or had run out)"}, so every install of Cain is refused until you tap ${DRILL_CLEAR_LABEL} or arm a new drill. Nothing was installed.`
+      // (Keeper 0.1.15) item 11: a flag an interrupted registration had already spent: refused once
+      : kind === "spent" ? `Keeper drill: a drill flag that was already used came back${of}, so that install was refused once; nothing was installed, and the next install goes as usual.`
+      : `Keeper drill: the drill install${of} was stopped because its drill mark couldn't be written or confirmed; nothing was installed; arm it again.`;
+    const clear = kind === "refused";
+    const msg = await this.post(text, clear ? rows([[[DRILL_CLEAR_LABEL, DRILL_CLEAR]]], "k:") : [], { nonce: stableNonce("drill-page", key) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `drill-page:${kind}`, posted: this.d.now(), expires: null, buttons: clear, labels: clear ? [DRILL_CLEAR_LABEL] : [],
+      drillPage: { key, ...(clear ? { clear: true } : {}) } });
+    this.d.save(s);
+    this.log(`a drill page (${kind}) went to him, ${clear ? `with ${DRILL_CLEAR_LABEL}` : "with no button"}`);
+    return { status: "posted", message: String(msg.id) };
+  }
+  // (Keeper 0.1.15) item 8: his Clear tap on a refused-drill page: the sender checked first (the owner, in his DM); the refused intent
+  // is removed and the page loses its button. Cain is told installs go as usual again.
+  private async drillClearTap(it: any, msgId: string): Promise<string> {
+    const rec = this.d.load().messages[msgId];
+    if (!rec?.drillPage?.clear || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    let who = "";
+    try { who = await this.who(it); } catch { who = "check failed"; }
+    if (who) { await this.answer(it, ACK); this.log(`a drill clear tap was refused: ${who}`); return `refused: ${who}`; }
+    await this.answer(it, ACK);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so nothing was cleared. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    const was = this.d.clearDrill ? this.d.clearDrill() : false;
+    const content = withLine(String(it.message?.content ?? ""), was ? "Cleared: installs of Cain go as usual again." : "Nothing was left to clear: installs of Cain go as usual.");
+    let edited = false;
+    try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
+    catch (e) { this.log(`couldn't mark the drill page cleared: ${String(e).slice(0, 80)}`); }
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = DRILL_CLEAR_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    this.d.save(s);
+    this.log(`his ${DRILL_CLEAR_LABEL} tap ${was ? "cleared the refused drill intent" : "found nothing to clear"}`);
+    this.d.relay(`Dane tapped ${DRILL_CLEAR_LABEL}: installs of Cain go as usual again (no drill is armed). Nothing else to tell him.`);
+    return "drill cleared";
+  }
+  // (Keeper 0.1.15) item 21: quiet hours, in the check-ins' zone
+  quiet(): boolean { return quietHours(this.d.now(), this.d.tz ?? "America/New_York"); }
+  private holdQuiet(key: string, kind: "retry" | "space", args: unknown[]): void {
+    const s = this.d.load();
+    const q = (s.quietHeld ??= []);
+    if (!q.some((x) => x.key === key)) { q.push({ key, kind, args, at: this.d.now() }); if (q.length > 50) q.shift(); this.d.save(s); this.log(`a ${kind} card waits for the end of quiet hours (07:00)`); }
+  }
+  // Sent once quiet hours end (main.ts calls it every minute): each held card, in order, by its own path (which checks it again).
+  async quietFlush(): Promise<number> {
+    if (this.quiet()) return 0;
+    const s = this.d.load();
+    const q = s.quietHeld ?? [];
+    if (!q.length) return 0;
+    delete s.quietHeld; this.d.save(s);
+    let n = 0;
+    for (const h of q) {
+      try {
+        if (h.kind === "retry") await this.retryCard(...(h.args as [string, "claim" | "cancel"]));
+        else await this.spaceCard(...(h.args as [number, string, string, string]));
+        n++;
+      } catch (e) { this.log(`a held ${h.kind} card couldn't go out: ${String(e).slice(0, 80)}`); }
+    }
+    return n;
+  }
+
+  // -- the keeper refused a registration for want of free space (Keeper 0.1.10, ship-pass.ts) --
+  // The install is refused (the pass is refused, nothing installed). One card per pull request, head and App, the link's
+  // own words. Keeper 0.1.11: no button: nothing installs without Keeper's rollback; he clears space or chooses another path.
+  // Not while stopped.
+  async spaceCard(pr: number, head: string, app: string, version: string): Promise<{ status: "posted" | "open" | "done" | "stopped" | "quiet"; message?: string }> {
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/.test(head) || !/^[a-z0-9_]{1,64}$/.test(app) || !/^[0-9A-Za-z.+-]{1,32}$/.test(version)) throw new Refusal("that isn't a pull request, head, App and version");
+    if (this.stopped().stopped) return { status: "stopped" };
+    if (this.quiet()) { this.holdQuiet(`space:${pr}:${head}:${app}`, "space", [pr, head, app, version]); return { status: "quiet" }; }   // (Keeper 0.1.15)
+    const prior = Object.entries(this.d.load().messages).find(([, m]) => m.space && m.space.pr === pr && m.space.head === head && m.space.app === app);
+    if (prior) return { status: "open", message: prior[0] };
+    const name = app.replace(/^[0-9a-f]{8}_/, "").replace(/^./, (c) => c.toUpperCase());
+    const text = `Keeper has no room for the backup it takes before installing ${name} ${version}, so the install was refused and nothing was installed. `
+      + "Nothing installs it without Keeper's rollback. Free some space (Home Assistant, Settings, System, Backups) and Cain shows the Ship card again, or choose another way yourself.";
+    const msg = await this.post(text, [], { nonce: stableNonce("space", `${pr}:${head}:${app}`) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `space:${pr}`, posted: this.d.now(), expires: null, buttons: false,
+      labels: [], space: { pr, head, app, version } });
+    this.d.save(s);
+    this.log(`a free-space card for pull request ${pr} (${name} ${version}) went to him, with no button`);
+    return { status: "posted", message: String(msg.id) };
+  }
+
+  // -- a keeper claim or cancel that wasn't a plain success (Keeper 0.1.11, ship-pass.ts) --
+  // Pending, spent, refused, an error or no answer: nothing was installed and nothing counts as done. One card per attempt and
+  // kind, the link's own words, with one button: his tap asks Cain to show the Ship card again. Not while stopped.
+  async retryCard(attempt: string, what: "claim" | "cancel"): Promise<{ status: "posted" | "open" | "stopped" | "quiet"; message?: string }> {
+    const m = RETRY_ATTEMPT.exec(attempt);
+    if (!m || (what !== "claim" && what !== "cancel")) throw new Refusal("that isn't a keeper attempt and a claim or cancel");
+    if (this.stopped().stopped) return { status: "stopped" };
+    if (this.quiet()) { this.holdQuiet(`retry:${attempt}:${what}`, "retry", [attempt, what]); return { status: "quiet" }; }   // (Keeper 0.1.15)
+    const prior = Object.entries(this.d.load().messages).find(([, x]) => x.retry && x.retry.attempt === attempt && x.retry.what === what);
+    if (prior) return { status: "open", message: prior[0] };
+    const name = m[2].replace(/^./, (c) => c.toUpperCase());
+    const text = (what === "claim"
+      ? `Keeper didn't confirm the start of the install of ${name}, so the Ship run didn't start and nothing was installed. `
+      : `Keeper didn't confirm it called off an install of ${name} that didn't run, so nothing was installed and nothing counts as done. Keeper ends that hold by itself within 30 minutes. `)
+      + `Tap ${RETRY_LABEL} and Cain shows you the Ship card again.`;
+    const msg = await this.post(text, rows([[[RETRY_LABEL, `${RETRY_PREFIX}${attempt}`]]], "k:"), { nonce: stableNonce("retry", `${attempt}:${what}`) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `retry:${attempt}`, posted: this.d.now(), expires: null, buttons: true,
+      labels: [RETRY_LABEL], retry: { attempt, what } });
+    this.d.save(s);
+    this.log(`a retry card for the keeper's ${what} of ${attempt} went to him`);
+    return { status: "posted", message: String(msg.id) };
+  }
+  // His tap: the sender checked first (the owner, in his DM); the card loses its button, and Cain is told to show a new Ship
+  // card for the same pull request and head.
+  private async retryTap(it: any, msgId: string): Promise<string> {
+    const rec = this.d.load().messages[msgId];
+    if (!rec?.retry || rec.outcome) return this.deadTap(it, msgId, rec?.why ?? "answered");
+    const { attempt, what } = rec.retry;
+    let who = "";
+    try { who = await this.who(it); } catch { who = "check failed"; }
+    if (who) { await this.answer(it, ACK); this.log(`a retry tap for ${attempt} was refused: ${who}`); return `refused: ${who}`; }
+    await this.answer(it, ACK);
+    if (this.stopped().stopped) { await this.ephemeral(it, "Everything is stopped, so nothing was asked. The card is still up: tap it again once you turn things back on."); return "refused: stopped"; }
+    const pr = RETRY_ATTEMPT.exec(attempt)?.[1] ?? "?";
+    const content = withLine(String(it.message?.content ?? ""), "Done: Cain shows you the Ship card again.");
+    let edited = false;
+    try { const { dm } = await this.identity(); await this.rest("PATCH", `/channels/${dm}/messages/${msgId}`, { content, components: [], allowed_mentions: { parse: [] } }); edited = true; }
+    catch (e) { this.log(`couldn't mark the retry card done: ${String(e).slice(0, 80)}`); }
+    const s = this.d.load();
+    const m = s.messages[msgId];
+    if (m) { m.outcome = "answered"; m.why = "answered"; m.label = RETRY_LABEL; m.buttons = !edited; if (edited) m.digest = digest(content, []); }
+    this.d.save(s);
+    this.log(`his retry tap after the keeper's ${what} of ${attempt}`);
+    this.d.relay(`Dane tapped ${RETRY_LABEL} after Keeper didn't confirm its ${what} for pull request ${pr}: nothing was installed. Show him a new Ship card for the same pull request and head (after a cancel, once Keeper's log shows no live claim). Nothing else to tell him.`);
+    return "retry asked";
   }
 
   // -- extra review rounds for a change, granted by his tap (0.18.0, ../review/grants.ts) --
@@ -2628,6 +2922,14 @@ export class Link {
     // run under one lock for its change key, so a second delivery of the tap, or a second tap, waits and then
     // finds the card used: a dead tap, nothing written.
     if (rec.grant && cid.startsWith("q:")) return this.underKey(`grant:${rec.grant.key}`, () => this.grantTapLocked(it, cid, msgId));
+    // Keeper 0.1.9: his tap on the rotation card, under that card's own lock
+    if (rec.rotation && cid === `${ROTATION_PREFIX}${rec.rotation.id}`) return this.underKey(`rotation:${rec.rotation.id}`, () => this.rotationTap(it, msgId));
+    // Keeper 0.1.13: his tap on a drill card, under that card's own lock
+    if (rec.drill && cid === `${DRILL_PREFIX}${rec.drill.mode}`) return this.underKey(`drill:${rec.drill.mode}`, () => this.drillTap(it, msgId));
+    // Keeper 0.1.15: his Clear tap on a refused-drill page, under the drill's own lock
+    if (rec.drillPage?.clear && cid === DRILL_CLEAR) return this.underKey("drill:clear", () => this.drillClearTap(it, msgId));
+    // Keeper 0.1.11: his tap on a retry card, under that card's own lock
+    if (rec.retry && cid === `${RETRY_PREFIX}${rec.retry.attempt}`) return this.underKey(`retry:${rec.retry.attempt}`, () => this.retryTap(it, msgId));
     if (cid !== RESUME) {
       const why = this.deadReason(rec, now);
       if (why) {
@@ -3151,7 +3453,7 @@ export class Link {
   private heldForRollback(m: Shown, kept: { existed: boolean; hold_written?: boolean } = { existed: false }): string {
     const dec = m.decision!;
     let a: { armed: boolean; why: string };
-    try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the probe's rollback record can't be read` }; }
+    try { a = armedFor(null, this.d.armed?.() ?? null); } catch (e) { a = { armed: false, why: `the keeper's rollback record can't be read` }; }
     if (a.armed) return "";
     const what = `${dec.key}${dec.pr ? ` (${dec.pr})` : ""}`;
     const why = `held: he chose to ship it with the risk named, but ${a.why}, so a Ship card is refused until a release arms it`;
