@@ -154,6 +154,9 @@ ask() {   # ask <from address> <path>: the status code nginx answers
   case "$1" in 172.30.40.*) net="$hout"; to=172.30.40.10 ;; esac
   docker run --rm --network "$net" --ip "$1" --entrypoint curl "$IMG" -s -o /dev/null -m 5 -w '%{http_code}' "http://$to:8098$2" || true
 }
+# Cain 0.19.0 (first review fix): /health is liveness (200 with no link running here), and /ready, beside it, answers
+# 503 until the link's gateway mark is there, then 200 once it is, written as the link writes it
+# (link/health-gate.ts).
 up=""
 for _ in $(seq 1 60); do
   [ "$(ask 172.30.32.2 /health)" = 200 ] && { up=1; break; }
@@ -161,6 +164,10 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 [ -n "$up" ] || die "nginx, started by the terminal service, didn't answer /health with 200: $(docker logs "$hc" 2>&1 | tail -n 15 | tr '\n' ' ')"
+[ "$(ask 172.30.32.2 /ready)" = 503 ] || die "/ready didn't answer 503 while the link's gateway mark is missing"
+docker exec "$hc" sh -c 'echo 1 > /run/cain-web/www/health-gateway && chgrp nogroup /run/cain-web/www/health-gateway && chmod 0640 /run/cain-web/www/health-gateway'
+[ "$(ask 172.30.32.2 /ready)" = 200 ] || die "nginx didn't answer /ready with 200 once the link's gateway mark was there"
+[ "$(ask 172.30.40.5 /ready)" = 404 ] || die "/ready answered an address outside the hassio network"
 docker logs "$hc" 2>&1 | grep -q "nginx did not start" && die "the terminal service says nginx did not start"
 docker exec "$hc" sh -c ': > /run/cain-web/www/health-down && chgrp nogroup /run/cain-web/www/health-down && chmod 0640 /run/cain-web/www/health-down'
 [ "$(ask 172.30.32.2 /health)" = 503 ] || die "/health didn't answer 503 with the self-restart mark there"
@@ -176,6 +183,6 @@ docker exec "$hc" grep -qx 172.30.40.5 /run/cain-web/health-miss.log \
   || die "nginx didn't note the address of the refused /health in health-miss.log"
 cleanup_health; trap - EXIT
 ran=$((ran + 1))
-echo "the Supervisor's health check: 200 to the hassio network, 503 with the mark, 404 outside it and on any other path, each 404 noted"
+echo "the Supervisor's health check: /health 200 to the hassio network, 503 with the self-restart mark; /ready 503 without the gateway mark, 200 with it; 404 outside it and on any other path, each 404 noted"
 
 echo "C1 image test: $ran cases passed"
