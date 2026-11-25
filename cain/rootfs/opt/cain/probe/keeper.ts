@@ -46,7 +46,9 @@ export interface VerdictDeps {
   // (Keeper 0.1.13) the drill mark's mode for this version and attempt, or null (link/drill.ts drillModeFor). Keeper 0.1.14:
   // given Keeper's answer for the open attempt, so a mark counts only when it is signed and Keeper names that attempt as a drill
   // of that mode, its mark confirmed, in its watch (a mark on a ship attempt changes nothing)
-  drill?: (attempt: string, open: Reply) => string | null;
+  // Keeper 0.1.15: asked about the mark's own attempt (GET /attempt/<id>, read only), tied to its install job; a lookup that fails
+  // keeps the mark and reports no FAIL
+  drill?: (attempt: string, open: Reply) => Promise<string | null> | string | null;
 }
 // The verdict for an open attempt: only one bound to it (its id), at the version this start runs.
 export async function verdictRun(d: VerdictDeps): Promise<string> {
@@ -56,7 +58,7 @@ export async function verdictRun(d: VerdictDeps): Promise<string> {
   if (!id) return "no attempt";
   if (r.body.to_version !== d.version) { d.log(`the keeper watches an install of ${String(r.body.to_version).slice(0, 32)}, but this start runs ${d.version}: no verdict`); return "other version"; }
   // (Keeper 0.1.13) a drill the owner's tap armed as verdict-fail: FAIL for that attempt, on purpose, without asking
-  const drilled = d.drill?.(id, r) === "verdict-fail";
+  const drilled = (await d.drill?.(id, r)) === "verdict-fail";
   if (!drilled) d.log(`an install of Cain ${d.version} is being watched: asking his session the liveness line`);
   else d.log(`an install of Cain ${d.version} is being watched, and it is a drill (verdict-fail, armed by the owner's tap): reporting FAIL on purpose`);
   const answered = drilled ? false : await d.ask();
@@ -102,17 +104,21 @@ if (import.meta.main) {
   const said = join(p.dir, "keeper-said");
   const readNum = (f: string) => { try { checkFolder(p.run); const n = Number(readFileSync(f, "utf8").trim().split(/\s+/)[0]); return Number.isFinite(n) ? n : 0; } catch { return 0; } };
   const get = (path: string) => keeperCall(base, token, path);
-  const { drillModeFor, MARK_FILE, MARK_PUB_FILE } = await import("../link/drill.ts");
+  const { drillModeFor, readMark, MARK_FILE, MARK_PUB_FILE } = await import("../link/drill.ts");
   const { rmSync } = await import("node:fs");
   await verdictRun({
     get, post: (path, body) => keeperCall(base, token, path, body), version, log,
-    // (Keeper 0.1.14) the signed mark, checked with the drill key's public half, and named by Keeper as this drill in its watch
-    drill: (attempt, open) => {
+    // (Keeper 0.1.14) the signed mark, checked with the drill key's public half, and named by Keeper as this drill in its watch.
+    // Keeper 0.1.15: Keeper asked about the mark's own attempt (GET /attempt/<id>), which must be tied to its install job; a definitive
+    // "no drill" drops the mark, a lookup that fails keeps it (and no FAIL is reported)
+    drill: async (attempt, _open) => {
       const markPath = env.CAIN_DRILL_MARK ?? MARK_FILE;
       let text: string | null = null, pub: string | null = null;
       try { text = readFileSync(markPath, "utf8"); } catch { return null; }
       try { pub = readFileSync(env.CAIN_DRILL_MARK_PUB ?? MARK_PUB_FILE, "utf8").trim() || null; } catch { pub = null; }
-      const r = drillModeFor(text, pub, version, Date.now(), open);
+      const pre = readMark(text, pub, Date.now());
+      const view = pre.ok && pre.mark.attempt === attempt && pre.mark.version === version ? await get(`/attempt/${encodeURIComponent(attempt)}`) : null;
+      const r = drillModeFor(text, pub, version, Date.now(), view);
       if (r.mode && r.mark?.attempt === attempt) return r.mode;
       if (r.drop) { try { rmSync(markPath, { force: true }); } catch { /* it lapses */ } }
       if (r.why && r.why !== "no mark") log(r.why);

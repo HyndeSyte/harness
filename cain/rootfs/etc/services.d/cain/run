@@ -126,7 +126,12 @@ version="$(bashio::addon.version 2>/dev/null || true)"; [ -n "$version" ] || ver
 # backup, so the version a rollback restores never sees one; any other version, or no mark, starts as usual.
 # Keeper 0.1.14: the helper acts only on a mark signed with the link's drill key, and only once Keeper (asked with Cain's
 # token, its open attempt) names that attempt as a drill of that mode and version, its mark confirmed, still in its watch;
-# otherwise, or when Keeper doesn't answer, it drops the mark and this start goes on as usual. Its log lines go to the log.
+# Keeper 0.1.15: it asks Keeper about the mark's own attempt only (GET /attempt/<id>), and the attempt must be tied to the
+# Supervisor's install job made during its claim, before this start. Keeper's definitive "no drill" drops the mark and this start
+# goes on; a lookup that keeps failing (no answer, a restart, a timeout) keeps the mark and, after 90 seconds of retries, prints
+# "abort": the abort is recorded and this start stops (never a usual start of the drill; the finish tells the outside heartbeat,
+# and Keeper rolls it back once it sees the App not started). A helper that was killed or failed with a mark present counts as
+# an abort too (fail closed). Its log lines go to the log.
 drill_mode=""
 if [ -e /data/trust/keeper-drill-mark.json ]; then
   drill_mode="$(
@@ -134,13 +139,15 @@ if [ -e /data/trust/keeper-drill-mark.json ]; then
     KEEPER_URL="$(bashio::config 'keeper_url' 2>/dev/null || true)"; [ "$KEEPER_URL" = "null" ] && KEEPER_URL=""
     KEEPER_TOKEN="$(bashio::config 'keeper_token' 2>/dev/null || true)"; [ "$KEEPER_TOKEN" = "null" ] && KEEPER_TOKEN=""
     export KEEPER_URL KEEPER_TOKEN
-    timeout 20 bun "$OPT/link/drill.ts" mode "$version" || true
+    timeout 120 bun "$OPT/link/drill.ts" mode "$version" || echo abort
   )"
 fi
-if [ "$drill_mode" = exit-on-start ]; then
-  bashio::log.warning "Keeper drill (exit-on-start, armed by Dane's tap): this start of Cain $version stops at once, on purpose, so Keeper rolls it back"
-  exit 1
-fi
+case "$drill_mode" in
+  *abort*) bashio::log.error "Keeper drill: Keeper couldn't confirm this start of Cain $version is the drill, so the drill is aborted and this start stops (recorded in /data/trust/keeper-drill-aborted.jsonl)"
+           exit 1 ;;
+  exit-on-start) bashio::log.warning "Keeper drill (exit-on-start, armed by Dane's tap): this start of Cain $version stops at once, on purpose, so Keeper rolls it back"
+           exit 1 ;;
+esac
 if ! "$OPT/c1/lock.sh" run; then
   bashio::log.error "Couldn't set up /run/cain; Cain doesn't start until that's fixed"
   mode=none; stop_kind=setup; stopped_why="the App couldn't set up /run/cain"
@@ -519,7 +526,9 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   { set +x; } 2>/dev/null
   KEEPER_URL="$(bashio::config 'keeper_url' 2>/dev/null || true)"; [ "$KEEPER_URL" = "null" ] && KEEPER_URL=""
   KEEPER_TOKEN="$(bashio::config 'keeper_token' 2>/dev/null || true)"; [ "$KEEPER_TOKEN" = "null" ] && KEEPER_TOKEN=""
-  export KEEPER_URL KEEPER_TOKEN
+  # Keeper 0.1.15: the link's wait for Keeper's acceptance, outside the hook (keeper_accept_min, 1 to 15, default 5)
+  KEEPER_ACCEPT_MIN="$(bashio::config 'keeper_accept_min' 2>/dev/null || true)"; [ "$KEEPER_ACCEPT_MIN" = "null" ] && KEEPER_ACCEPT_MIN=""
+  export KEEPER_URL KEEPER_TOKEN KEEPER_ACCEPT_MIN
   while true; do bun "$OPT/link/main.ts" 2>&1; sleep 5; done
 ) &
 # The record keeper (record/main.ts): the one writer of Cain's record. Its key comes from the

@@ -653,23 +653,95 @@ your tap sets it: the **drill flag**.
   names (`exit-on-start`: the App not started or in error, the exits-on-start record; `verdict-fail`: the probe's
   FAIL, the fail-verdict record). The record keeps the mode and the mark's hash as its evidence.
 - **The follow-ups gate.** While option `drill_followups_open` is `true` (the default), Keeper reads not armed
-  whatever its drills recorded, and `drill-state` says why (`followups_open: true`). The drill plan filed follow-up
-  items that must land first: the Ship token's causal link to the install, late jobs racing a backup delete, the
-  secret scanner's coverage, a bare 401 taken as a revocation, the pending claim in the hook, and the pending lock's
-  bound. You set the option to `false` once they have landed. It isn't in the drill records' binding, so changing it
-  drops nothing: the drills can run before, and arming completes only after.
+  whatever its drills recorded, and `drill-state` says why (`followups_open: true`). Keeper 0.1.15 closed three of the
+  items the drill plan filed: the Ship token's causal link to the install (now the install job binding, below), late
+  jobs racing a backup delete (now the pins), and the pending claim in the hook (now the acceptance outside the hook's
+  bound). Still open: the secret scanner's coverage, a bare 401 taken as a revocation, the pending lock's bound, and
+  this round's device checks ("Still to check on the device", 0.1.15). You set the option to `false` only once those
+  are done, after the device run. It isn't in the drill records' binding, so changing it drops nothing: the drills
+  can run before, and arming completes only after.
 
-**The crash ordering.** Each step is durable before the next: read the flag, check it, record its nonce, remove the
-flag, register at Keeper, the acceptance, write the mark, confirm it to Keeper.
-- Cut before the nonce is recorded: the flag stands; the next registration spends it.
-- Nonce recorded, flag not removed: the next registration finds the nonce spent, removes the flag, refuses and tells
-  you to arm again. It never counts twice.
+**Round 16 (Keeper 0.1.15, Cain 0.19.0): the switch as it now is.**
+- **Single use, and tied to its own install job.** A Ship approval starts one pass (the link records its use before
+  anything is registered) and registers once per App at Keeper; a second submission of the same token is refused by
+  both. The link doesn't submit the install itself: the Ship run installs through Home Assistant, as RELEASING.md's
+  Ship section says. So Keeper ties the install to the Supervisor's own job: while an attempt is claimed it reads the
+  jobs list (`/jobs/info`, the backup role's read) and binds the one install or update job of the App made during the
+  claim, by its id and creation time (`<id>: bound to the Supervisor's install job <uuid> ...`). Two such jobs, or one
+  made before the claim that is still running, can't be tied to one attempt: unprotected, paged, never rolled back.
+  Keeper watches, rolls back and credits a drill only for a start whose attempt has its job bound; a start of the
+  claimed version with no job made during the claim is not the attempt's install. Once its job is bound the claim
+  stays live 15 minutes past its deadline for the version to show. `GET /attempt/<id>` names the job
+  (`install_job`, `install_job_at`).
+- **The drilled start, tied to the job.** The run script's helper and the verdict probe ask Keeper about the mark's
+  own attempt only (`GET /attempt/<id>`, read only) and fail on purpose only when Keeper names it a drill in its watch
+  with its install job bound, made before this start and within an hour of it. Which: the Supervisor's job record, as
+  Keeper read it, against the App's own clock at its start. The limit: the jobs list says nothing about which
+  container a job started, so a restart of the drilled version within that hour (the watchdog's) also counts as the
+  drill's start, and when the jobs list can't be read Keeper binds nothing and the start waits (the helper's retries,
+  then its abort).
+- **A lookup that fails keeps the mark.** Keeper unreachable, restarting or slow: the helper keeps the mark and asks
+  again every 5 seconds for 90 seconds; then it records the abort (`/data/trust/keeper-drill-aborted.jsonl`, `page:
+  true`) and the start stops (exit 1): never a usual start of the drill. The App's finish pings the outside heartbeat's
+  failure check, and Keeper, once it sees the App not started, rolls it back and pages you. A later start of that
+  attempt aborts at once while its mark lasts. Only Keeper's definitive "no drill" (another attempt, a ship, another
+  mode or version, no confirmation, closed, no such attempt) drops the mark, and the start goes on.
+- **A refused flag never becomes a ship.** A flag that doesn't verify, or names another version, is refused and the
+  refusal kept (`/data/link/keeper-drill-refused.json`, root's, beside the spent list): every install of Cain is then
+  refused, with one message whose button **Clear the drill** removes the refusal; arming a new drill from a card
+  replaces it too. A registration consumes the flag by renaming that exact file aside first
+  (`keeper-drill.json.claim-<id>`), so a new flag written meanwhile is a new one, never consumed by it.
+- **A crash between the nonce and the flag's removal.** A claimed flag left behind whose nonce is spent is removed at
+  the next install, which is refused once, with one message; the install after goes as usual. One whose nonce isn't
+  spent yet is spent then.
+- **The flag is bound to the App and the version** (`app` in its payload): another App's registration leaves it be.
+- **Every Ship token carries `kind: "ship"`**; the link, the hook and Keeper refuse one without it.
+- **The mark** is root's `0644`: readable by the App, never writable by it.
+- **The clock.** The link's spent list keeps a high-water time (`.high-water` in its folder): a flag is judged against
+  the later of the clock and that time, and pruning removes only entries older than it.
+- **Restore safety.** The flag, the mark and Cain's spent list are left out of Cain's backups (`backup_exclude`), and
+  Keeper keeps its own spent list in `/data/drill-spent/` (one file per nonce, never pruned), left out of Keeper's
+  backups and read again at every start, so a Keeper state rolled back before a nonce was kept still refuses it. The
+  Supervisor keeps excluded files where they are on a restore of the App; that a full restore keeps both spent lists
+  is a device check (below).
+- **Acceptance outside the hook's bound.** The hook asks the link (10 seconds), which answers pending and waits for
+  Keeper's "accepted" on its own clock, up to Cain's option `keeper_accept_min` (1 to 15 minutes, default 5); Keeper
+  makes and checks the backup on its own clock. An acceptance the link never claims (the link crashed after it) ends
+  by itself after 30 minutes as a **terminal abort**: its backup kept, you paged. The link refuses, at its next start,
+  every pass a restart left open and cancels its attempts, and reads each passed one's attempt at Keeper, its job
+  included, into its log.
+- **Cancels.** A cancel is recorded at Keeper as asked the moment it arrives: if its step fails, times out or answers
+  pending, the attempt is never claimed or consumed after it, and the next poll ends it as a terminal abort, which
+  wins over a late backup or a late install (that install is unprotected, never rolled back).
+- **Backups.** Only the backup made for this attempt, completed and checked before the acceptance, is its rollback
+  point; one whose create timed out is disqualified for good, however it finishes. The cleanup never deletes a backup
+  an open attempt names, or one pinned by an install job with no recorded end (or by a claim the jobs list can't
+  confirm had none), reading the attempt records right before every delete; the claim reads the backup's slug again
+  right before the install.
+- **Quiet hours.** The link holds the drill, rotation, retry and free-space cards from 22:00 to 07:00 (its check-in
+  zone) and sends them at 07:00; the drill pages and Keeper's own alerts are never held.
+
+**The crash ordering.** Each step is durable before the next: read the flag, claim it (0.1.15: renamed aside), check
+it, record its nonce, remove the claimed flag, register at Keeper, the acceptance (within `keeper_accept_min`), write the
+mark, confirm it to Keeper, the claim, the Supervisor's install job bound to it, the drilled start.
+- Cut before the claim: the flag stands; the next registration claims it.
+- Claimed, nonce not recorded: the next registration finds the claimed flag and spends it then.
+- Nonce recorded, claimed flag not removed: the next registration finds it spent, removes it, refuses once and tells
+  you; the install after goes as usual. It never counts twice.
 - Flag removed, nothing registered: no attempt exists; the Ship pass times out and is refused. Arm again.
 - Registered, no mark: the pass is refused or times out and its attempts are cancelled; with no mark nothing fails on
   purpose, and Keeper writes no drill record without the mark's confirmation.
 - Mark written, not confirmed: the run-time helper finds Keeper doesn't name it confirmed and drops it; the refused
   pass's cancel drops it too.
 - Mark confirmed: the install goes on as a drill; if the pass is refused after that, its cancel drops the mark.
+- Accepted, never claimed (the link crashed): Keeper ends it after 30 minutes as a terminal abort, its backup kept,
+  and pages you; the link refuses the pass at its next start.
+- Claimed, no install job made during the claim (the install never reached the Supervisor, or its answer was lost and
+  nothing ran): the claim's deadline ends it as a terminal abort, paged; an install that shows later is unprotected.
+- Job bound, the version never shows: 15 minutes past the claim's deadline, a terminal abort; the backup stays pinned
+  until the job's end is recorded.
+- Job bound, the drilled version starts: the helper (or the probe) finds Keeper naming the drill with its job and fails
+  on purpose; Keeper unreachable then, it retries, then aborts (the start stops).
 
 **The drill releases.** Each is healthy code: a Cain patch release whose only change is its version (a CHANGELOG
 section that says it is a drill release with nothing new), built by a Build job (RELEASING.md, Build) and landed by the usual
@@ -728,16 +800,17 @@ delivered), fix the why and run `drill-record <attempt id>` in Keeper's containe
 3. the rotation tap: tap **Old key replaced** on the link's card (What you must set, "Both key roles").
 4. The phone test: `phone-test`, then `phone-confirm <code> cain deadman` once both pages reached your phone (Arming).
 5. The missed-heartbeat drill: `missed-heartbeat`, then `missed-heartbeat-confirm <code>` (Arming).
-6. Once the drill plan's follow-up items have landed (their pull requests merged and installed), set
-   `drill_followups_open` to `false` in Keeper's options.
+6. Once the drill plan's remaining follow-up items have landed (their pull requests merged and installed) and this
+   round's device checks are done ("Still to check on the device", 0.1.15), set `drill_followups_open` to `false` in
+   Keeper's options.
 Then `drill-state` (or Cain's "Ship it with that risk" card) reads armed; until step 6 it says the follow-up items
 are still open, so arming can't complete on this runbook alone. The phone test and the missed-heartbeat
 drill last `drill_days`; the drill records last 60 days or until the binding changes.
 
 ## Accepted limits
 
-Text version 6 (0.1.12). Version 5 was 0.1.11's, version 4 0.1.10's, version 3 0.1.9's, version 2 0.1.8's and version 1
-0.1.7's; an acceptance of any of them lapsed with 0.1.12. Three
+Text version 7 (0.1.15). Version 6 was 0.1.12's, version 5 0.1.11's, version 4 0.1.10's, version 3 0.1.9's, version 2
+0.1.8's and version 1 0.1.7's; an acceptance of any of them lapsed with 0.1.15. Three
 limits of Keeper's design are recorded here rather than built around, and you accept them at the device: `bun
 /opt/keeper/main.ts accept-limits <code>` in Keeper's container, with the code Keeper prints at each start while they
 aren't accepted for this text version (`one-time code for accept-limits: ...`). Keeper records your acceptance with the
@@ -745,7 +818,10 @@ text version in its state; arming needs it, and it lapses when this text changes
 says so at start. Keeper covers only the first 15 minutes after an install.
 
 **1. The installer: a claim authorizes nothing, and one installer at a time.** A claim is not a single-use installer
-authorization. An install needs your Ship tap and the link's Ship token for that pull request and head, good for 2
+authorization. Since 0.1.15 the install job binding narrows what one covers: Keeper watches an install only through
+the one Supervisor install job of the App made during the claim (a second job, or one made before the claim and still
+running, leaves it unprotected), and a new registration waits while an earlier attempt's install job has no recorded
+end. It still can't tell which installer asked the Supervisor for that job. An install needs your Ship tap and the link's Ship token for that pull request and head, good for 2
 hours after your tap; a claim authorizes nothing. A claim is single use only in this sense: one claimant, consumed by
 the one install it covers, and it covers no other install. The Ship token stays valid by its signature for its 2 hours
 outside the hook, and only the hook marks it spent: the link's pass records it on its first use, so a second Ship run
@@ -759,10 +835,12 @@ claim, or to another version than the claimed one, is "unprotected", paged, and 
 - A pass the link refuses after two silences, or whose cancel is lost, leaves a live claim on the keeper for up to
   30 minutes with no Ship run live. The link asks a claim once more when the keeper doesn't answer; after a second
   silence it refuses the pass and cancels, but the keeper may have recorded the claim, and a cancel is sent once and
-  may be lost. That claim then stands until its deadline. When it runs out unused, Keeper logs the expiry's end line,
-  `claim <claim id> of <attempt> ended (ended: its claim <claim id> expired with no version change seen (unused));
-  its deadline was <time>`, and `<attempt>: ended; backup kept: its claim <claim id> expired unused (backup <slug>
-  "<name>", ...)`: the backup is never deleted with the claim, only by the bounded cleanup.
+  may be lost (0.1.15: Keeper records the cancel as asked the moment it arrives, so a cancel that reached it ends the
+  attempt as a terminal abort at the next poll). Otherwise that claim stands until its deadline. When it runs out with
+  no install job made during it, Keeper logs `claim <claim id> of <attempt> ended (aborted: no Supervisor install job
+  of Cain was made during its claim <claim id>); its deadline was <time>` and `<attempt>: ended; backup kept: aborted:
+  ... (backup <slug> "<name>", ...)`, and pages you: the backup is never deleted with the claim, only by the bounded
+  cleanup, and never while an install job of it has no recorded end.
 - While a claim is live (at most 30 minutes from the link's claim), an install of exactly the claimed version made
   some other way is taken for the Ship run's, watched and, on a fail, rolled back from the backup Keeper took for the
   Ship run. Only you can start such an install, from Home Assistant's own page.
@@ -946,3 +1024,27 @@ once revoked, a refused registration for free space bringing the link's card (no
 challenge reaching Keeper within its 10 minutes; (0.1.12) a backup made with Keeper's password shown as protected in the
 backup info and on Home Assistant's backup page, a partial restore of it with the same password, and the backup check
 passing with the backup key store's sentinels; and the two drills (the next job). (0.1.13) The drill switch itself: the link's drill card and your tap reaching the flag in `/data/trust`, the run script's exit at start and the probe's FAIL for the drilled version only, the mark missing from the backup a rollback restores, `drill-state` read in the container, and the restart case's timing on the Pi ("The drill runbook"). (0.1.14) The run script's helper reaching Keeper's `GET /attempt` with Cain's token at start, and dropping a mark when Keeper names no drill; the link's `POST /attempt/<id>/drill-mark` reaching Keeper; the drill files' modes in `/data/trust` and `/data/link` on the Pi; the spent list staying out of a Cain backup; the restored backup's contents and no flag or mark after case 1.
+
+(0.1.15) This round's device checks, in this order; the follow-ups gate is cleared only once they are done:
+1. The backup exclusion first, with a placeholder: run `backup-check` (its sentinels stand in for the key) and confirm
+   it passes for this build's exclusion (the `drill-spent` folder is new in it) before you enter the live key with
+   `hc-key`.
+2. Then the live key: `hc-key <code>`, and each role's check identity against the live service (`hc_unique_keys`).
+3. The old key's rotation attestation, made explicit: revoke it in Healthchecks, then tap **Old key replaced**, before
+   arming (the gate refuses arming until that tap is recorded).
+4. The install job binding: at a real Ship of Cain, Keeper's log shows `bound to the Supervisor's install job <uuid>`
+   with the job's name (`addon_manager_update` or what the Pi's Supervisor calls it) and its creation time inside the
+   claim; `GET /attempt/<id>` names it; the jobs list shows that job finished, and its end is recorded.
+5. The drilled start tied to its job: in drill case 1 the helper exits only once Keeper names the job; stop Keeper
+   for the first 2 minutes of a drill install and the helper keeps the mark, retries, then aborts (exit 1, the abort
+   line in `/data/trust/keeper-drill-aborted.jsonl`, the outside heartbeat's failure page, then Keeper's rollback
+   once it is back).
+6. A restore keeps the excluded files: after case 1, and once after a full restore from a backup, `/data/drill-spent/`
+   in Keeper and `/data/link/keeper-drill-spent/` in Cain still hold every nonce spent since (the Supervisor keeps
+   excluded paths on a restore), and neither the flag nor the mark is in the backup's contents.
+7. The pins: a kept backup whose attempt's install job is still listed as running isn't deleted by the cleanup
+   (`it is pinned (...)` in the log).
+8. The refused-drill page's **Clear the drill** tap reaching the link, and the drill, rotation, retry and free-space
+   cards held from 22:00 to 07:00 and sent at 07:00.
+9. Cain's option `keeper_accept_min` read by the link (its wait for Keeper's acceptance), and the link's reconcile
+   at its start (a pass a restart left open refused, in its log).

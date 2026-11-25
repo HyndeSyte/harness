@@ -871,6 +871,9 @@ create, update or run any other routine.
    link posts him the drill card; only his Arm the drill tap arms it, for the next install of you only. Never say a
    drill is armed until you hear his tap, and never arm one for an install he didn't ask to be a drill. A "Keeper drill:
    ... nothing was installed" message from the link already reached him: don't repeat it; ask him whether to arm again.
+   One that says every install of you is refused until he taps Clear the drill means no Ship of you installs until his
+   tap or a new drill card's tap: leave the choice to him, and hold Ship cards for you meanwhile. Between 22:00 and
+   7:00 a drill-arm answers that it's quiet hours: ask again after 7:00. Keeper cards the link holds then come at 7:00.
 Keep PENDING.md current: a job's item says Running, Waiting on Dane (Ship) or Done.
 
 ## Stop

@@ -4,7 +4,9 @@
 //                   to_version, probe_hash, kind?}, the token being the owner's signed Ship token, verified
 //                   here with the pinned, confirmed key (core.ts registerAttempt). 0.1.5: answered 202
 //                   {status: "pending", id} at once; the backup is made in the background
-//   GET  /attempt/<id>          (0.1.5) Cain's App only: pending, accepted (with its backup), claimed, or refused
+//   GET  /attempt/<id>          (0.1.5) Cain's App only: pending, accepted (with its backup), claimed, or refused; read only, and
+//                               (0.1.15) with the install job bound to it (install_job, install_job_at) and, for a drill, its
+//                               mode and whether its mark was confirmed
 //   POST /attempt/<id>/claim    (0.1.5) Cain's App only, as the Ship run starts: {app, from_version, to_version,
 //                               backup, request?}; one claimant, valid 30 minutes (0.1.7: a retry with the same
 //                               request reads the recorded claim)
@@ -83,10 +85,9 @@ export async function handle(k: Keeper, req: Request, ip: string, log: (m: strin
   if (!caller) { log(`refused ${req.method} ${url.pathname} from ${ip}: no App's token`); return json({ status: "refused" }, 401); }
   if (req.method === "GET" && url.pathname === "/attempt") {
     const a = k.openAttempt(caller);
-    // (0.1.14) its kind, and for a drill its mode and whether the link confirmed the signed mark: the run script's drill helper and
-    // the verdict probe act on a mark only while this names its attempt as a drill still in its watch
-    return json(a ? { app: caller, attempt: a.id, from_version: a.from, to_version: a.to, status: a.status, kind: a.auth,
-      ...(a.drillMode ? { drill_mode: a.drillMode, marked: !!a.markAt } : {}) } : { app: caller, attempt: null });
+    // (0.1.14) its kind. 0.1.15 item 14: no drill fields here any more: the run script's helper and the verdict probe read a drill
+    // only by the attempt id the signed mark names (GET /attempt/<id>, read only, that attempt alone)
+    return json(a ? { app: caller, attempt: a.id, from_version: a.from, to_version: a.to, status: a.status, kind: a.auth } : { app: caller, attempt: null });
   }
   const m = /^\/attempt\/([a-z0-9-]{1,100})(\/claim|\/cancel|\/drill-mark)?$/.exec(url.pathname);
   if (m && req.method === "GET" && !m[2]) { const r = k.attemptView(caller, m[1]); return json(r.body, r.status); }

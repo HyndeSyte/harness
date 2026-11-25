@@ -48,11 +48,14 @@
 import { createHash } from "node:crypto";
 import { publicKey, readToken, type Claim } from "../ship-token";
 import { bumpsAt, fileAt, type MergeDeps, versionAt } from "./merge";
-import { DRILL_APP, markHash, type DrillDeps, type DrillMode } from "./drill";
+import { markHash, type DrillDeps, type DrillMode } from "./drill";
 
 export const PASS_FORMAT = 2;                     // 0.1.4: entries carry their state (format 1 entries count as passed)
 export const ATTEMPT_WAIT_MS = 5 * 60_000;        // (0.1.5) one App's registration polled for this long
-export const passWaitMs = (apps: number) => Math.max(1, apps) * ATTEMPT_WAIT_MS + 60_000;   // (0.1.5) the whole pass
+export const passWaitMs = (apps: number, waitMs = ATTEMPT_WAIT_MS) => Math.max(1, apps) * waitMs + 60_000;   // (0.1.5) the whole pass
+// (Keeper 0.1.15) item 6: the wait for Keeper's "accepted", outside the hook's 10 second bound, is the option keeper_accept_min
+// (1 to 15 minutes, default 5); anything else read is the default.
+export const acceptWaitMs = (v?: string | null) => { const n = Number(v); return v && Number.isInteger(n) && n >= 1 && n <= 15 ? n * 60_000 : ATTEMPT_WAIT_MS; };
 export const PASS_WAIT_MS = passWaitMs(1);        // one watched App: 6 minutes
 export const POLL_MS = 5_000;                     // (0.1.5) GET /attempt/<id> every 5 seconds
 export const CLAIMING_STUCK_MS = 60_000;
@@ -192,6 +195,8 @@ export interface PassDeps {
   // (Keeper 0.1.13) a cancelled attempt's drill mark removed, so the version it named starts as usual (drill.ts)
   dropMark?: (attempt: string) => void;
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
+  waitMs?: number;                                                          // (Keeper 0.1.15) one App's wait for acceptance (acceptWaitMs)
+  view?: (attempt: string) => Promise<{ status: number; body: any } | null>;   // (Keeper 0.1.15) GET /attempt/<id>, for the reconcile at start
   log: (line: string) => void;
 }
 export type PassAnswer = { status: "ok"; pr: number; head: string; accepted: Accepted[]; claims: Claimed[] } | { status: "pending" | "spent" | "refused"; said: string };
@@ -254,6 +259,39 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's outcome: the pass times out and is refused"); return; }
   d.log(r.ok ? `the keeper accepted every watched install for a Ship token (${r.accepted.map((a) => `${a.attempt} backup ${a.backup}`).join(", ") || "none watched"})` : `a Ship token's pass is refused: ${e.said}`);
   if (!r.ok) cancelAll(d, e.attempts ?? [], r.cancel ?? "the pass is refused");
+}
+
+// (Keeper 0.1.15) items 3 and 6: the link's reconcile at its start. A pass left registering, accepted or claiming by a crash or a
+// restart never started a Ship run (the hook needs the link's "ok"), so it is refused for good and each of its attempts cancelled
+// (Keeper ends an acceptance the link never claims by itself after its bound, as a terminal abort, with its backup kept). A pass that
+// passed is only read: each claimed attempt's state at Keeper, the Supervisor's install job Keeper tied to it included, is logged,
+// so the install the Ship run submitted (or its absence) is in the link's log before anything else happens. Nothing is installed or
+// claimed here. Answers how many passes it refused.
+export async function reconcilePasses(d: PassDeps): Promise<number> {
+  const spent = readEntries(d.load());
+  if (!spent) { d.log("the reconcile at start couldn't read the Ship passes: nothing was reconciled"); return 0; }
+  const now = d.now();
+  let refused = 0;
+  for (const e of spent) {
+    if (e.exp * 1000 <= now - 86_400_000) continue;
+    if (e.state === "registering" || e.state === "accepted" || e.state === "claiming") {
+      const ids = [...new Set([...(e.attempts ?? []), ...(e.accepted ?? []).map((a) => a.attempt)])];
+      const was = e.state;
+      e.state = "refused"; e.said = "the link restarted before its Ship run started, so the pass was refused at its next start";
+      refused++;
+      d.log(`the reconcile at start refused a pass left ${was} by a restart (${ids.join(", ") || "no attempt registered yet"}): nothing was installed`);
+      if (ids.length) cancelAll(d, ids, "the link restarted before its Ship run started");
+      continue;
+    }
+    if (e.state === "passed" && d.view) for (const k of e.claims ?? []) {
+      const v = await d.view(k.attempt).catch(() => null);
+      const b = v?.body ?? {};
+      d.log(!v ? `the reconcile at start couldn't read ${k.attempt} at Keeper` : `the reconcile at start read ${k.attempt} at Keeper: ${String(b.status ?? v.status).slice(0, 30)}, `
+        + (b.install_job ? `tied to the Supervisor's install job ${String(b.install_job).slice(0, 64)} made ${String(b.install_job_at ?? "?").slice(0, 30)}` : "no install job tied to it"));
+    }
+  }
+  if (refused) { try { writeEntries(d, spent); } catch { d.log("the reconcile at start couldn't record the refused passes: the hook's next ask refuses them on their wait"); } }
+  return refused;
 }
 
 // (Keeper 0.1.6) The hook refused a run the link had passed (its claim's deadline too near when it checked):
@@ -319,7 +357,7 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   }
   if (e.state === "refused") return { status: "refused", said: `${e.said ?? "the keeper didn't accept the install"}. ${again}` };
   if (e.state === "registering") {
-    const wait = passWaitMs(e.apps ?? 1);
+    const wait = passWaitMs(e.apps ?? 1, d.waitMs);
     if (now - e.at <= wait) return { status: "pending", said: PENDING_SAID };
     return refuseFor(`the keeper didn't accept every install within ${wait / 60_000} minutes`, e.attempts ?? []);
   }
@@ -421,9 +459,11 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     // while it was set this install goes as kind drill, and it fails on purpose as the flag names (drill.ts)
     // Keeper 0.1.14: fail closed (a flag file that doesn't verify, names another version or was spent refuses the install and
     // pages); only with no flag file at all is it kind ship. A good flag's nonce is recorded before it is removed.
+    // Keeper 0.1.15 item 12: the flag is bound to an App's slug and version: spent for its own App's registration only, and left be
+    // (not refused) by any other App's
     let drill: DrillMode | null = null, nonce = "";
-    if (slug === DRILL_APP && d.drill) {
-      const sp = d.drill.spend(b.version);
+    if (d.drill) {
+      const sp = d.drill.spend(b.version, slug);
       if ("error" in sp) { say(`${sp.error}: ${b.app} ${b.version} not registered`); continue; }
       drill = sp.mode;
       if (sp.mode) nonce = sp.nonce;

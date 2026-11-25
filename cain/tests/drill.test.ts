@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { claimFor, makeToken, readToken, publicKey, b64url } from "../rootfs/opt/cain/ship-token";
 import { keyFingerprint, passId, registerInstalls, settle, type PassDeps } from "../rootfs/opt/cain/link/ship-pass";
 import { armFlag, DRILL_TTL_S, drillDeps, drillKeyFrom, drillModeFor, fileStore, keeperNames, makeDrillFlag, makeMark, markHash, MARK_TTL_MS, readDrillFlag, readMark,
-  storeMarkPub, type DrillStore } from "../rootfs/opt/cain/link/drill";
+  storeMarkPub, type DrillStore, type RefusedIntent } from "../rootfs/opt/cain/link/drill";
 import { DRILL_LABEL } from "../rootfs/opt/cain/link/core";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { verdictRun } from "../rootfs/opt/cain/probe/keeper";
@@ -35,15 +35,22 @@ const { privateKey: OTHER } = generateKeyPairSync("ed25519");
 const ATT = `drill-46-cain-${SHA.slice(0, 8)}`;
 const ROOT = join(import.meta.dir, "..");
 
-// A drill store in memory (root's files on the Pi: fileStore)
-function mem(o: { flag?: string | null; removeFails?: boolean; markFails?: boolean; spent?: string[]; taken?: boolean } = {}) {
-  const s = { flag: o.flag ?? null as string | null, mark: null as string | null, spent: new Set(o.spent ?? []), aborted: [] as string[] };
+// A drill store in memory (root's files on the Pi: fileStore). Keeper 0.1.15: the flag consumed by a claim of its exact instance
+// (claims: instances renamed aside), the refused intent, and the high-water time.
+function mem(o: { flag?: string | null; removeFails?: boolean; markFails?: boolean; spent?: string[]; taken?: boolean; claimFails?: boolean } = {}) {
+  const s = { flag: o.flag ?? null as string | null, mark: null as string | null, spent: new Set(o.spent ?? []), aborted: [] as string[],
+    claims: [] as { id: string; text: string }[], refused: null as RefusedIntent | null, hw: 0, n: 0 };
   const store: DrillStore = {
     loadFlag: () => s.flag, removeFlag: () => { if (o.removeFails) throw new Error("EROFS"); s.flag = null; }, storeFlag: (t) => { s.flag = t; },
     loadMark: () => s.mark, storeMark: (t) => { if (o.markFails) throw new Error("ENOSPC"); s.mark = t; }, removeMark: () => { s.mark = null; },
     spent: (n) => s.spent.has(n),
     recordNonce: (n) => { if (o.taken || s.spent.has(n)) return "taken"; s.spent.add(n); return "recorded"; },
     aborted: (l) => { s.aborted.push(l); },
+    claimFlag: () => { if (o.claimFails) throw new Error("EIO"); if (s.flag === null) return null; const c = { id: (++s.n).toString(16).padStart(12, "0"), text: s.flag }; s.flag = null; s.claims.push(c); return c; },
+    claimed: () => s.claims.map((c) => ({ ...c })),
+    dropClaim: (id) => { if (o.removeFails) throw new Error("EROFS"); s.claims = s.claims.filter((c) => c.id !== id); },
+    refused: () => s.refused, storeRefused: (r) => { s.refused = r; }, clearRefused: () => { const was = !!s.refused; s.refused = null; return was; },
+    highWater: (t) => { s.hw = Math.max(s.hw, t); return s.hw; },
   };
   return { s, store };
 }
@@ -84,7 +91,9 @@ function keeper(store: DrillStore, o: { mode?: KeeperMode; markAnswer?: { status
 }
 const c = claimFor(PR, SHA, NOW)!;
 // Keeper's GET /attempt answer for a drill in its watch, with the mark confirmed (Keeper server.ts)
-const openOf = (over: any = {}) => ({ status: 200, body: { app: "0fcc2575_cain", attempt: ATT, from_version: "0.18.0", to_version: V, status: "watching", kind: "drill", drill_mode: "exit-on-start", marked: true, ...over } });
+// Keeper 0.1.15: GET /attempt/<id> (attemptView): its id, and the Supervisor's install job tied to it (attempt: the open-attempt read's field)
+const openOf = (over: any = {}) => ({ status: 200, body: { app: "0fcc2575_cain", id: ATT, attempt: ATT, from_version: "0.18.0", to_version: V, status: "watching", kind: "drill", drill_mode: "exit-on-start", marked: true,
+  install_job: "inst-1", install_job_at: T(NOW - 60_000), ...over } });
 
 describe("the registration spends the flag (ship-pass.ts registerInstalls)", () => {
   test("with no flag file the registration is kind ship, and no mark is written", async () => {
@@ -137,7 +146,9 @@ describe("fix 1: fail closed on a bad flag", () => {
       expect(m.s.mark).toBeNull();
       expect((r as any).said.join(" ")).toContain("so nothing was installed");
       expect(k.logs.some((l) => l.startsWith("a drill flag was refused and removed: didn't verify"))).toBe(true);
-      expect(k.pages.map(([kind]) => kind)).toEqual(["damaged"]);
+      // Keeper 0.1.15 item 8: the refusal is persisted, and paged with its Clear button
+      expect(k.pages.map(([kind]) => kind)).toEqual(["refused"]);
+      expect(m.s.refused).toMatchObject({ kind: "damaged" });
     });
   }
   test("the owner's page says what happened and is posted once per flag, with no button", async () => {
@@ -159,6 +170,13 @@ describe("fix 1: fail closed on a bad flag", () => {
     expect((await registerInstalls(kn.deps, TOKEN, c)).ok).toBe(false);
     expect(kn.posted).toEqual([]);
     expect(n.s.spent.has(nonceOf(flag))).toBe(true);              // it can never count again
+    // Keeper 0.1.15 item 11: left claimed, its nonce spent: the next registration removes it, refuses once, pages once, then ship
+    const k2 = keeper(n.store); (n.store as any).dropClaim = (id: string) => { n.s.claims = n.s.claims.filter((x) => x.id !== id); };
+    expect((await registerInstalls(k2.deps, TOKEN, c)).ok).toBe(false);
+    expect(k2.pages.map(([kind]) => kind)).toEqual(["spent"]);
+    expect(n.s.claims).toEqual([]);
+    expect((await registerInstalls(k2.deps, TOKEN, c)).ok).toBe(true);
+    expect(k2.posted.map((b) => b.kind)).toEqual(["ship"]);
   });
 });
 
@@ -166,11 +184,12 @@ describe("fix 2: the mark is bound to its attempt, and a stray mark is harmless"
   const mark = (mode: "exit-on-start" | "verdict-fail" = "exit-on-start", attempt = ATT, version = V) => makeMark({ version, attempt, mode }, NOW, markSigner);
   test("a mark counts only while Keeper names that attempt as a drill of that mode and version, its mark confirmed, in its watch", () => {
     expect(drillModeFor(mark(), DK.pub, V, NOW, openOf())).toMatchObject({ mode: "exit-on-start", drop: false });
+    // Keeper 0.1.15 item 7: a failed lookup keeps the mark (retry), never a drop
+    for (const open of [null, { status: 401, body: {} }, { status: 503, body: {} }]) expect(drillModeFor(mark(), DK.pub, V, NOW, open as any)).toMatchObject({ mode: null, drop: false, retry: true });
     for (const [why, open] of [
-      ["Keeper didn't answer", null],
-      ["Keeper answered 401", { status: 401, body: {} }],
-      ["Keeper has no open attempt", openOf({ attempt: null })],
-      ["not the mark's", openOf({ attempt: "drill-46-cain-ffffffff" })],
+      ["Keeper has no such attempt", { status: 404, body: { status: "unknown" } }],
+      ["names no attempt", openOf({ id: null })],
+      ["not the mark's attempt", openOf({ id: "drill-46-cain-ffffffff" })],
       ["no drill", openOf({ kind: "ship", drill_mode: undefined })],
       ["drill mode for it isn't the mark's", openOf({ drill_mode: "verdict-fail" })],
       ["version for it isn't this start's", openOf({ to_version: "0.19.1" })],
@@ -192,10 +211,12 @@ describe("fix 2: the mark is bound to its attempt, and a stray mark is harmless"
     writeFileSync(pubf, `${DK.pub}\n`);
     let open: any = openOf();
     const tok = ["test", "only", "keeper", "token", "value"].join("-");   // a made-up test value, at least 16 characters
-    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => req.headers.get("authorization") === `Bearer ${tok}` ? Response.json(open.body) : new Response("no", { status: 401 }) });
+    // Keeper 0.1.15: asked about the mark's own attempt only (GET /attempt/<id>)
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: (req) => req.headers.get("authorization") !== `Bearer ${tok}` ? new Response("no", { status: 401 })
+      : new URL(req.url).pathname === `/attempt/${ATT}` ? Response.json({ ...open.body, install_job_at: T(Date.now() - 60_000) }) : new Response("no", { status: 404 }) });
     const run = async (v: string, token = tok) => {
       const p = Bun.spawn(["bun", join(ROOT, "rootfs/opt/cain/link/drill.ts"), "mode", v], { stdout: "pipe", stderr: "pipe",
-        env: { ...process.env, CAIN_DRILL_MARK: f, CAIN_DRILL_MARK_PUB: pubf, KEEPER_URL: `http://127.0.0.1:${server.port}`, KEEPER_TOKEN: token } });
+        env: { ...process.env, CAIN_DRILL_MARK: f, CAIN_DRILL_MARK_PUB: pubf, CAIN_DRILL_ABORTED: join(dir, "aborted.jsonl"), KEEPER_URL: `http://127.0.0.1:${server.port}`, KEEPER_TOKEN: token } });
       await p.exited;
       return { out: await new Response(p.stdout).text(), err: await new Response(p.stderr).text(), code: p.exitCode };
     };
@@ -212,9 +233,11 @@ describe("fix 2: the mark is bound to its attempt, and a stray mark is harmless"
       expect(existsSync(f)).toBe(false);
       writeFileSync(f, makeMark({ version: V, attempt: ATT, mode: "exit-on-start" }, Date.now(), markSigner));
       open = openOf();
-      const t = await run(V, "");                                   // no token: Keeper can't be asked, so it is dropped
-      expect(t.out).toBe("");
-      expect(existsSync(f)).toBe(false);
+      // Keeper 0.1.15 item 7: no token, Keeper can't be asked: the mark is kept, and the start aborts (recorded), never a usual start
+      const t = await run(V, "");
+      expect(t.out).toBe("abort\n");
+      expect(t.err).toContain("no keeper_token is set");
+      expect(existsSync(f)).toBe(true);
     } finally { server.stop(true); }
   });
   test("a competing, retried or rejected registration never erases an active mark; only its attempt's cancel does", async () => {
@@ -289,7 +312,7 @@ describe("fix 4: spent nonces", () => {
     const k = keeper(store);
     expect((await registerInstalls(k.deps, TOKEN, c)).ok).toBe(true);
     expect(existsSync(join(d, "trust/keeper-drill.json"))).toBe(false);
-    expect(readdirSync(join(d, "link/keeper-drill-spent"))).toEqual([nonceOf(flag)]);
+    expect(readdirSync(join(d, "link/keeper-drill-spent")).filter((n) => !n.startsWith("."))).toEqual([nonceOf(flag)]);
     // a restore of /data/trust from a backup taken while the flag was armed: the spent list, outside the backup, stays
     writeFileSync(join(d, "trust/keeper-drill.json"), flag);
     const k2 = keeper(store);
@@ -298,7 +321,8 @@ describe("fix 4: spent nonces", () => {
     expect(k2.posted).toEqual([]);
     expect(existsSync(join(d, "trust/keeper-drill.json"))).toBe(false);
     expect(k2.logs.some((l) => l.includes("was spent before"))).toBe(true);
-    expect(k2.pages.map(([kind]) => kind)).toEqual(["damaged"]);
+    expect(k2.pages.map(([kind]) => kind)).toEqual(["spent"]);       // Keeper 0.1.15 item 11: refused once, no refused intent
+    expect((await registerInstalls(k2.deps, TOKEN, c)).ok).toBe(true);
   });
   test("the spent list is outside Cain's backups", () => {
     const cfg = readFileSync(join(ROOT, "config.yaml"), "utf8");
@@ -318,7 +342,7 @@ describe("fix 4: spent nonces", () => {
     expect(r.ok).toBe(false);
     expect(k.posted).toEqual([]);
     expect((r as any).said.join(" ")).toContain("another registration is spending the drill flag at the same moment, so this one stops");
-    expect(m.s.flag).toBe(flag);                                    // the one that recorded it removes it
+    expect(m.s.claims.map((x) => x.text)).toEqual([flag]);          // Keeper 0.1.15: its claimed instance stays for the one that recorded it
   });
   test("a nonce that can't be recorded installs nothing and leaves the flag for the next try", async () => {
     const flag = flagOf("exit-on-start");
@@ -326,7 +350,10 @@ describe("fix 4: spent nonces", () => {
     const k = keeper(m.store);
     expect((await registerInstalls(k.deps, TOKEN, c)).ok).toBe(false);
     expect(k.posted).toEqual([]);
-    expect(m.s.flag).toBe(flag);
+    expect(m.s.claims.map((x) => x.text)).toEqual([flag]);          // Keeper 0.1.15: left claimed, spent by the next try
+    m.store.recordNonce = (n) => { m.s.spent.add(n); return "recorded"; };
+    expect((await registerInstalls(k.deps, TOKEN, c)).ok).toBe(true);
+    expect(k.posted.map((b) => b.kind)).toEqual(["drill"]);
   });
 });
 
@@ -397,6 +424,11 @@ describe("fix 6: a drill flag is never a Ship token, and the drill's trust files
     expect(readShipToken(forged, publicKey(SHIP_PUB), NOW)).toEqual({ ok: false, why: "its token's payload kind isn't a Ship approval" });
     // a Ship approval's own shape passes, with or without kind "ship"
     expect(readToken(TOKEN, publicKey(SHIP_PUB), NOW).ok).toBe(true);
+    // Keeper 0.1.15 item 13: a Ship approval without its kind is refused by both
+    const bare = b64url(Buffer.from(JSON.stringify({ v: 1, repo: "HyndeSyte/harness", pr: 46, head: SHA, exp: Math.floor(NOW / 1000) + 3600 })));
+    const noKind = `ship1.${bare}.${b64url(signer(Buffer.from(`ship1.${bare}`)))}`;
+    expect(readToken(noKind, publicKey(SHIP_PUB), NOW).ok).toBe(false);
+    expect(readShipToken(noKind, publicKey(SHIP_PUB), NOW).ok).toBe(false);
     const q = b64url(Buffer.from(JSON.stringify({ v: 1, kind: "ship", repo: "HyndeSyte/harness", pr: 46, head: SHA, exp: Math.floor(NOW / 1000) + 3600 })));
     const kinded = `ship1.${q}.${b64url(signer(Buffer.from(`ship1.${q}`)))}`;
     expect(readToken(kinded, publicKey(SHIP_PUB), NOW).ok).toBe(true);
@@ -413,10 +445,11 @@ describe("fix 6: a drill flag is never a Ship token, and the drill's trust files
     store.recordNonce("0123456789abcdef", NOW + 1000);
     store.aborted("{}");
     storeMarkPub(DK.pub, join(d, "trust/mark.pub"));
-    for (const f of ["trust/flag", "trust/mark", "trust/mark.pub", "link/spent/0123456789abcdef", "trust/aborted.jsonl"]) expect(statSync(join(d, f)).mode & 0o777).toBe(0o600);
+    for (const f of ["trust/flag", "trust/mark.pub", "link/spent/0123456789abcdef", "trust/aborted.jsonl"]) expect(statSync(join(d, f)).mode & 0o777).toBe(0o600);
+    expect(statSync(join(d, "trust/mark")).mode & 0o777).toBe(0o644);   // Keeper 0.1.15 item 14: readable by the App, never writable by it
     expect(statSync(join(d, "link/spent")).mode & 0o777).toBe(0o700);
     const run = readFileSync(join(ROOT, "rootfs/etc/services.d/cain/run"), "utf8");
-    expect(run).toContain('timeout 20 bun "$OPT/link/drill.ts" mode "$version" || true');   // read as root by the run script
+    expect(run).toContain('timeout 120 bun "$OPT/link/drill.ts" mode "$version" || echo abort');   // read as root by the run script
   });
 });
 
@@ -466,7 +499,9 @@ describe("fix 7: the flag is bound to a target version at tap time", () => {
     expect(k.posted).toEqual([]);
     expect(m.s.flag).toBeNull();
     expect(k.logs.some((l) => l.includes("was armed for Cain 0.19.1, but this install carries 0.19.0"))).toBe(true);
-    expect(k.pages).toEqual([["version", expect.stringMatching(/^version:[0-9a-f]{16}$/), { armed: "0.19.1", version: "0.19.0" }]]);
+    // Keeper 0.1.15 item 8: the refusal is persisted and paged once, with its Clear button
+    expect(k.pages).toEqual([["refused", expect.stringMatching(/^refused:version:[0-9a-f]{16}$/), { armed: "0.19.1", version: "0.19.0" }]]);
+    expect(m.s.refused).toMatchObject({ kind: "version", armed: "0.19.1", version: "0.19.0" });
     const card = rig();
     const p = await card.link.drillPage("version", "version:0123456789abcdef", { armed: "0.19.1", version: "0.19.0" });
     expect(card.msg(p.message!).content).toBe("Keeper drill: the drill flag was armed for Cain 0.19.1, but the install carried 0.19.0; nothing was installed; arm it again for the right version.");
@@ -504,9 +539,9 @@ describe("the switch's wiring", () => {
     const m = readMark(makeMark({ version: V, attempt: ATT, mode: "exit-on-start" }, NOW, markSigner), DK.pub, NOW);
     expect(m.ok).toBe(true);
     if (m.ok) {
-      expect(keeperNames(m.mark, V, openOf())).toBe("");
-      for (const st of ["accepted", "claimed", "watching"]) expect(keeperNames(m.mark, V, openOf({ status: st }))).toBe("");
-      for (const st of ["verifying", "restoring", "passed", "ended"]) expect(keeperNames(m.mark, V, openOf({ status: st }))).not.toBe("");
+      expect(keeperNames(m.mark, V, openOf(), NOW).why).toBe("");
+      for (const st of ["accepted", "claimed", "watching"]) expect(keeperNames(m.mark, V, openOf({ status: st }), NOW).why).toBe("");
+      for (const st of ["verifying", "restoring", "passed", "ended", "aborted"]) expect(keeperNames(m.mark, V, openOf({ status: st }), NOW)).toMatchObject({ definitive: true });
     }
   });
 });

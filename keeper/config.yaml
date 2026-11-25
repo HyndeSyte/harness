@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.14"
+version: "0.1.15"
 slug: keeper
 description: >-
   Covers only the first 15 minutes after each App install: checks it and rolls
@@ -29,7 +29,8 @@ host_network: false
 # file (the fixed prefix hc-key.tmp-), the earlier builds' temporary names (hc-key.<pid>.<hex>.tmp) and the old key's file
 # (hc-key-old); backup-check proves it on the device before hc-key is taken. 0.1.12: so is the backup key store
 # (/data/backup-keys: the password of each backup Keeper makes of a watched App), the folder and everything in it, its
-# temporary files (tmp-) included; the Supervisor matches each pattern against each path (keeper/tests).
+# temporary files (tmp-) included; the Supervisor matches each pattern against each path (keeper/tests). 0.1.15: and the drill
+# flags' spent list (/data/drill-spent, one file per nonce), so a restore of Keeper never rolls it back.
 backup_exclude:
   - "hc-key*"
   - "*/hc-key*"
@@ -37,6 +38,10 @@ backup_exclude:
   - "*/backup-keys"
   - "backup-keys/*"
   - "*/backup-keys/*"
+  - "drill-spent"
+  - "*/drill-spent"
+  - "drill-spent/*"
+  - "*/drill-spent/*"
 watchdog: tcp://[HOST]:[PORT:8097]
 timeout: 20
 # watch: the App slugs it watches. health: each watched App's health address on the internal network

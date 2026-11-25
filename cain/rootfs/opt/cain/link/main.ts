@@ -81,7 +81,7 @@ import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, 
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, fileStore, storeMarkPub } from "./drill";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass } from "./ship-pass";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -248,7 +248,7 @@ const capSweep = () => {
 // Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
 // the spent nonces in /data/link (0700), outside Cain's backups (config.yaml backup_exclude).
 const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`,
-  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`);
+  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`, Date.now, `${DIR}/keeper-drill-refused.json`);   // Keeper 0.1.15: the refused intent, beside the spent list
 // The drill key, derived from the Ship key under its own domain; its public half kept by root for the run script and the probe.
 const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
 const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
@@ -319,6 +319,8 @@ const link = new Link({
   keeperSent: (at) => { noteAt(KEEPER_SENT, at); },
   // Keeper 0.1.13: his tap on the drill card, signed with the Ship key here and kept by root as the one-shot drill flag (drill.ts)
   armDrill: shipPriv ? (mode, version) => armFlag(drillStore, mode, version, Date.now(), (data) => edSign(null, data, shipPriv)) : undefined,
+  // Keeper 0.1.15 item 8: his Clear tap on a refused-drill page
+  clearDrill: () => { try { const was = drillStore.clearRefused(); if (was) console.log("[cain] link: the owner cleared the refused drill intent: installs go as usual again"); return was; } catch { return false; } },
   report: (r) => { void appendGate({ at: Date.now(), ...r }, GATE_LOG, GATE_LOG_MAX, (line) => console.log(`[cain] link: ${line}`)); },
   transcripts: (since) => readTranscripts(TRANSCRIPTS, since),
   writeReplay: (r) => writeReplayReport(r),
@@ -363,6 +365,8 @@ async function askKeeper(): Promise<void> {
 }
 void askKeeper();
 setInterval(() => { void askKeeper(); }, 60_000);
+// Keeper 0.1.15 item 21: keeper cards held by the quiet hours go at 07:00
+setInterval(() => { void link.quietFlush().catch((e) => console.log(`[cain] link: couldn't send the cards held by the quiet hours: ${String(e).slice(0, 80)}`)); }, 60_000);
 
 // -- the gateway's health, for the Harness page ------------------------------------
 let connected = false;
@@ -432,6 +436,7 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 // The Ship pass (0.19.0, with Keeper 0.1.3): one Ship run per token, and its installs registered with the
 // keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
 const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
+const ACCEPT_WAIT_MS = acceptWaitMs(process.env.KEEPER_ACCEPT_MIN);   // Keeper 0.1.15 item 6
 const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
 const shipPassDeps: PassDeps = {
   pub: shipPub,
@@ -443,7 +448,7 @@ const shipPassDeps: PassDeps = {
   register: (tok, claim, done, note) => {
     const pub = shipPub();
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
-      post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body),
+      post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
       .then(done)
@@ -457,8 +462,13 @@ const shipPassDeps: PassDeps = {
   dropMark: (attempt) => drill.drop(attempt),
   retry: (attempt, what) => { void link.retryCard(attempt, what).catch((e) => console.log(`[cain] link: couldn't post the retry card: ${String(e).slice(0, 80)}`)); },
   enrollment,
+  // Keeper 0.1.15: the wait for Keeper's acceptance (keeper_accept_min), and its reads for the reconcile at start
+  waitMs: ACCEPT_WAIT_MS,
+  view: (attempt) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${attempt}`) : Promise.resolve(null),
   log: (l) => console.log(`[cain] link: ${l}`),
 };
+// Keeper 0.1.15 items 3 and 6: a pass a crash or restart left open is refused and its attempts cancelled; a passed one is read
+void reconcilePasses(shipPassDeps).catch((e) => console.log(`[cain] link: the reconcile at start failed: ${String(e).slice(0, 80)}`));
 const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ, shipPass: (b: any) => shipPass(shipPassDeps, b) };
 const route = linkRoutes(routeDeps);
 

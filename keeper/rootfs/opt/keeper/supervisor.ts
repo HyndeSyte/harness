@@ -3,7 +3,7 @@
 // Home Assistant API, no manager role, and (0.1.2) no write of any options, its own included. 0.1.3: it also makes the App-only backup of an
 // install it registered (POST /backups/new/partial, within the backup role). The token
 // comes from the environment the Supervisor gives the App (SUPERVISOR_TOKEN) and is never logged.
-import { type AppInfo, type BackupInfo, type JobState, REGISTER_WAIT_MS, type RestoreResult } from "./core.ts";
+import { type AppInfo, type BackupInfo, type InstallJob, type JobState, REGISTER_WAIT_MS, type RestoreResult } from "./core.ts";
 
 // (0.1.4) The backup call waits as long as the registration's answer does.
 export const BACKUP_CALL_MS = REGISTER_WAIT_MS;
@@ -138,6 +138,25 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
         if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
       walk(r.data.jobs);
       return best;
+    },
+    // (0.1.15) item 2: the App's install and update jobs in the jobs list (GET /jobs/info, the backup role's info read), done or
+    // not: each one's id (uuid), its creation time, whether it is done, its error count and name. A job is the App's when its
+    // reference is the App's slug and its name says install or update (never a restore: Keeper's own restore job is on the
+    // backup). A job with no readable creation time is reported at time 0, so it counts as made before any claim. Null when
+    // the list can't be read.
+    async installJobs(app: string): Promise<InstallJob[] | null> {
+      const r = await call("GET", "/jobs/info").catch(() => null);
+      if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
+      const out: InstallJob[] = [];
+      const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
+        const name = typeof x.name === "string" ? x.name : "";
+        if (x.reference === app && /install|update/i.test(name) && !/restore/i.test(name) && typeof x.uuid === "string" && x.uuid) {
+          const t = typeof x.created === "string" ? Date.parse(x.created) : NaN;
+          out.push({ uuid: x.uuid.slice(0, 64), created: Number.isFinite(t) ? t : 0, done: x.done === true, errors: Array.isArray(x.errors) ? x.errors.length : 0, name: name.slice(0, 80) });
+        }
+        if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
+      walk(r.data.jobs);
+      return out;
     },
     // The restore's job in the Supervisor's jobs list (GET /jobs/info, the backup role's info read), by
     // the id from the restore's answer and nothing else (0.1.2: no job is ever matched by its name or

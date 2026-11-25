@@ -2,6 +2,13 @@
 
 ## 0.19.0
 
+- A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.
+- A drill tap is now for one App and one version, and an install of another App leaves it alone.
+- If Cain can't reach the Keeper when a drill version starts, he keeps the drill mark and asks again for 90 seconds, then stops that start and records it, instead of starting normally. The Keeper rolls it back once it sees it.
+- Cain treats a start as the drill only when the Keeper has tied that install to the Home Assistant job that made it.
+- Every Ship tap's token now names itself as a Ship approval, and one without that is refused.
+- How long Cain's link waits for the Keeper's backup before giving up on a Ship run is a new option, `keeper_accept_min` (default 5 minutes). After a restart the link refuses any Ship run it was in the middle of, and tells the Keeper.
+- Keeper cards (the drill, old key, Try again and free space cards) no longer arrive between 10 PM and 7 AM; they come at 7 AM. Drill messages that say an install was refused still come at once.
 - A drill tap is now for one Cain version, named on the card: an install of any other version refuses it and tells you to arm it again.
 - If the drill flag is damaged, ran out or was already used, nothing is installed and you get one message saying so, instead of a normal install going ahead.
 - The drill mark is signed by the link and checked at start, and Cain asks Keeper whether the install really is a drill it is watching before failing on purpose. Otherwise he starts normally and logs why.

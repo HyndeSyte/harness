@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.15
+
+- Keeper now ties each install to the Home Assistant job that made it. It watches, rolls back and counts a drill only for that install; a start of the same version with no such job is not covered, and you are paged.
+- An install that was approved but never reached Home Assistant, or an approval Cain's link never used, now ends by itself as a hard stop: you are paged, the backup is kept, and nothing installed later counts under it.
+- A cancel that Keeper couldn't confirm still stops the install from being covered, and Keeper ends it at its next check.
+- Keeper never deletes a backup while its install is still running or might still start, and it checks the backup is still there right before the install.
+- A backup that finished after Keeper stopped waiting for it is never used for a rollback, whatever it later shows.
+- A drill's one-time number is now also kept in a folder left out of Keeper's backups, so restoring Keeper can't make it usable again.
+- Keeper's backups now leave out that folder too, so run `backup-check` again before arming.
+- The "Accepted limits" text is now version 7, so you accept it again with `accept-limits`.
+- Keeper's DOCS list this round's device checks in order; keep `drill_followups_open` on until they are done.
+
 ## 0.1.14
 
 - A drill now needs proof before it counts: Cain's link must tell Keeper it wrote the drill mark for that install, and the failure Keeper sees must be the one the drill was armed for. A rollback of an install merely labeled a drill no longer counts.

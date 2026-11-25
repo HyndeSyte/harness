@@ -196,7 +196,12 @@ export const PHONE_WINDOW_MS = 60 * 60_000;      // (0.1.3) a phone test is conf
 export const KEY_CODE_MS = 24 * 3_600_000;       // (0.1.6) the key-confirm code lasts this long (a restart prints a new one)
 export const MHB_MAX_MS = 14 * 86_400_000;       // (0.1.6) arming needs a missed-heartbeat drill confirmed within this
 export const MHB_CAP_MS = 30 * 60_000;           // (0.1.7) the missed-heartbeat drill's silence ends here at the latest
-export const LIMITS_VERSION = 6;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2; 0.1.9: 3; 0.1.10: 4; 0.1.11: 5; 0.1.12: 6)
+export const LIMITS_VERSION = 7;                 // (0.1.7) the version of DOCS.md's "Accepted limits" text the owner accepts (0.1.8: 2; 0.1.9: 3; 0.1.10: 4; 0.1.11: 5; 0.1.12: 6; 0.1.15: 7)
+// (0.1.15) item 2: the Supervisor's install job of a claimed attempt. A job created within this of the claim's start counts as made
+// during it (the two clocks are the same host's); once one is bound, the claim stays live this long past its deadline for the
+// version to show, since the job, not the deadline, is what the install is tied to.
+export const JOB_SKEW_MS = 5_000;
+export const JOB_GRACE_MS = 15 * 60_000;
 export const LOCK_CALL_MS = 10_000;              // (0.1.8) each external call under the claim record's lock is bounded by this
 export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the lock that runs past this is logged and the lock released
 // (0.1.11) A step's external write whose outcome stays unknown holds the lock at most this long: then the write is marked late
@@ -216,7 +221,9 @@ export const ROTATION_CHALLENGE_MS = 10 * 60_000; // (0.1.10) a rotation challen
 // (0.1.10) The backup exclusion as this build ships it (config.yaml backup_exclude, checked equal by the tests): a backup
 // check's pass is tied to its hash, so a change of the exclusion voids the pass.
 // 0.1.12: and the backup key store, backup-keys in the data folder, the folder and everything in it (its temporary files too).
-export const BACKUP_EXCLUDE = ["hc-key*", "*/hc-key*", "backup-keys", "*/backup-keys", "backup-keys/*", "*/backup-keys/*"];
+// (0.1.15) item 10: and the drill flags' spent list (drill-spent/<nonce>), so a restore of Keeper never rolls it back.
+export const BACKUP_EXCLUDE = ["hc-key*", "*/hc-key*", "backup-keys", "*/backup-keys", "backup-keys/*", "*/backup-keys/*", "drill-spent", "*/drill-spent", "drill-spent/*", "*/drill-spent/*"];
+export const DRILL_SPENT_DIR = "drill-spent";
 const globRe = (g: string) => new RegExp(`^${g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]")}$`);
 export const excludedName = (name: string) => BACKUP_EXCLUDE.some((g) => globRe(g).test(name));
 export const EXCLUDE_HASH = createHash("sha256").update(JSON.stringify(BACKUP_EXCLUDE)).digest("hex").slice(0, 12);
@@ -433,11 +440,9 @@ export function shipKey(spkiB64: string): KeyObject | null {
     return k.asymmetricKeyType === "ed25519" ? k : null;
   } catch { return null; }
 }
-const SHIP_CLAIM_KEYS = ["exp", "head", "pr", "repo", "v"];
-export const shipClaimShape = (c: any): boolean => {
-  const keys = Object.keys(c).sort();
-  return (c.kind === undefined ? JSON.stringify(keys) === JSON.stringify(SHIP_CLAIM_KEYS) : c.kind === "ship" && JSON.stringify(keys) === JSON.stringify([...SHIP_CLAIM_KEYS, "kind"].sort()));
-};
+// (0.1.15) item 13: every Ship approval carries an explicit kind "ship"; an absent kind is rejected, like any other.
+const SHIP_CLAIM_KEYS = ["exp", "head", "kind", "pr", "repo", "v"];
+export const shipClaimShape = (c: any): boolean => c.kind === "ship" && JSON.stringify(Object.keys(c).sort()) === JSON.stringify(SHIP_CLAIM_KEYS);
 export function readShipToken(token: string, key: KeyObject, nowMs: number): { ok: true; claim: ShipClaim } | { ok: false; why: string } {
   const parts = token.trim().split(".");
   if (token.length > 1000 || parts.length !== 3 || parts[0] !== "ship1" || !B64URL.test(parts[1]) || !B64URL.test(parts[2])) return { ok: false, why: "its token isn't a Ship token" };
@@ -449,8 +454,8 @@ export function readShipToken(token: string, key: KeyObject, nowMs: number): { o
   try { c = JSON.parse(unb64url(parts[1]).toString("utf8")); } catch { return { ok: false, why: "its token's claim can't be read" }; }
   if (!c || c.v !== 1 || typeof c.repo !== "string" || !Number.isSafeInteger(c.pr) || c.pr < 1 || typeof c.head !== "string" || !HEAD.test(c.head) || !Number.isSafeInteger(c.exp))
     return { ok: false, why: "its token's claim isn't a Ship approval" };
-  // (0.1.14) the payload's kind, exactly: a Ship approval's keys and nothing else, and a kind (if any) of "ship"; a drill flag or
-  // any other signed payload of the link's is never a Ship token, whatever its prefix
+  // (0.1.14) the payload's kind, exactly: a Ship approval's keys and nothing else; 0.1.15: a kind of exactly "ship", never absent.
+  // A drill flag or any other signed payload of the link's is never a Ship token, whatever its prefix
   if (!shipClaimShape(c)) return { ok: false, why: "its token's payload kind isn't a Ship approval" };
   if (!SHIP_REPOS.has(c.repo.toLowerCase())) return { ok: false, why: "its token is for another repository" };
   if (c.exp * 1000 <= nowMs) return { ok: false, why: "its token has expired" };
@@ -465,7 +470,9 @@ export const keyFp = (spkiB64: string) => createHash("sha256").update(Buffer.fro
 export const appName = (slug: string) => { const b = slug.replace(/^[0-9a-f]{8}_/, ""); return b ? b[0].toUpperCase() + b.slice(1) : slug; };
 
 // -- state ----------------------------------------------------------------------------------------
-export type Status = "verifying" | "unprotected" | "accepted" | "claimed" | "ended" | "watching" | "restoring" | "passed" | "rolled back" | "gave up" | "never started" | "unresolved";
+// (0.1.15) aborted: a terminal abort (an acceptance the link never claimed, a claim with no install job or no version change by its
+// bound, or a cancel that failed or answered pending): its backup kept, the owner paged, and it covers nothing, ever.
+export type Status = "verifying" | "unprotected" | "accepted" | "claimed" | "ended" | "aborted" | "watching" | "restoring" | "passed" | "rolled back" | "gave up" | "never started" | "unresolved";
 export const OPEN: Status[] = ["verifying", "accepted", "claimed", "watching", "restoring"];
 export type TriggerKind = "state-error" | "not-started" | "health" | "verdict" | "deadline" | "version-moved" | "watch-end";
 export interface Attempt {
@@ -509,7 +516,15 @@ export interface Attempt {
   // (0.1.14) a drill's mode as the link registered it (the owner's flag), the flag's nonce, and the link's confirmation that it
   // wrote the signed drill mark for this attempt (its hash): the drill record needs both the mark and the failure its mode names
   drillMode?: DrillMode; drillNonce?: string; markAt?: number; markHash?: string;
+  // (0.1.15) item 2: the Supervisor's install job this attempt's install came from: the one install or update job of the App made
+  // during its claim, bound by its id (uuid) and creation time; done once the jobs list shows it finished or it left the list.
+  job?: { id: string; created: number; boundAt: number; done?: boolean; errors?: number };
+  // (0.1.15) item 9: a cancel was asked (whatever its step's outcome): the attempt can't be claimed or consumed any more, and the
+  // next poll ends it as a terminal abort unless the cancel ended it first
+  abortAsked?: { at: number; why: string };
 }
+// (0.1.15) An install or update job of an App as the Supervisor's jobs list shows it (supervisor.ts installJobs).
+export interface InstallJob { uuid: string; created: number; done: boolean; errors: number; name: string }
 // (0.1.11) An operation whose external write outlived its step under the lock: its stable id (the 202 pending answer carries it),
 // and its recorded outcome: pending (the write is out, the lock held), done (it ended within the ceiling), late (it passed the
 // ceiling: the lock was released and the write is reconciled later by its pre-chosen name or id).
@@ -527,9 +542,12 @@ export const DRILL_KIND_OF: Record<DrillMode, DrillRec["kind"]> = { "exit-on-sta
 const NONCE = /^[0-9a-f]{16}$/;
 export const NONCES_MAX = 500;                   // (0.1.14) drill flag nonces kept, newest last: a nonce registers once
 // (0.1.14) Why Keeper reads not armed while option drill_followups_open is set (DOCS.md, "The drill runbook").
-export const FOLLOWUPS_WHY = "the drill plan's follow-up items are still open (the Ship token's causal link to the install, late jobs racing a backup delete, "
-  + "the secret scanner's coverage, a bare 401 taken as a revocation, the pending claim in the hook, the pending lock's bound): the owner sets "
-  + "drill_followups_open to false in Keeper's options once they have landed";
+// 0.1.15: the items this build closed (the Ship token's causal link, now the install job binding; late jobs racing a backup delete,
+// now the pins; the pending claim in the hook, now the acceptance outside the hook's bound) are off the list; the owner still clears
+// the option only after the device run (DOCS.md, "Still to check on the device").
+export const FOLLOWUPS_WHY = "the drill plan's follow-up items are still open (the secret scanner's coverage, a bare 401 taken as a revocation, the pending "
+  + "lock's bound, and this build's device checks: the install job binding, the backup pins and the restore of the drill files): the owner sets "
+  + "drill_followups_open to false in Keeper's options once they are done";
 // (0.1.3) The phone test drill, per check (0.1.4: its check id; every watched App's alert check and the
 // dead-man check): the page sent, delivered, and the owner's confirmation that it reached his phone.
 export interface PhoneRec { sentAt: number; deliveredAt?: number; confirmedAt?: number }
@@ -707,9 +725,14 @@ export interface Deps {
   lockCallMs?: number; lockStepMs?: number;       // (0.1.8) the lock's bounds (LOCK_CALL_MS, LOCK_STEP_MS; tests: shorter)
   pendingCeilingMs?: number;                      // (0.1.11) the pending write's ceiling (PENDING_CEILING_MS; tests: shorter)
   // (0.1.11) read from the Supervisor for a retention-only backup: when that backup completed, and when the App's install job
-  // started (ms); null when the Supervisor doesn't say. Either missing keeps the backup retention-only.
+  // started (ms). 0.1.15 item 5: no longer read: a backup whose create timed out is disqualified for good, whatever these say.
   backupDoneAt?: (slug: string) => Promise<number | null>;
   installStartedAt?: (app: string) => Promise<number | null>;
+  // (0.1.15) item 2: the App's install and update jobs, done or not, with their creation times; null when the list can't be read
+  installJobs?: (app: string) => Promise<InstallJob[] | null>;
+  // (0.1.15) item 10: the drill flags' spent list, root's, one file per nonce in the data folder's drill-spent, outside Keeper's
+  // backups: authoritative over the state, re-read at every start; add is exclusive and durable (false: not recorded)
+  drillSpent?: { list: () => string[]; add: (nonce: string) => boolean };
 }
 export type Answer = { status: number; body: Record<string, unknown> };
 // (0.1.9) A step's generation under the claim record's lock: live() is checked right before every commit (in the same
@@ -737,8 +760,9 @@ export class Keeper {
   private lockGen = 0;                                 // (0.1.9) the lock's step generation (Fence)
   private optionsUnknown = false;                      // (0.1.9) the last options read failed or timed out
   private cleanupDue = true;                           // (0.1.9) the cleanup at start (the first poll)
-  private lateProofs = new Map<string, string>();     // (0.1.11) this poll's proof for a retention-only backup ("" proven, else why not)
+  private jobReads = new Map<string, InstallJob[] | null>();   // (0.1.15) this poll's jobs list read for each claimed attempt with no job bound
   private checking = false;                            // (0.1.10) a backup check runs
+  private spentUnreadable = false;                     // (0.1.15) the drill flags' spent list couldn't be read at start
   constructor(private d: Deps, saved: unknown) {
     this.st = loadState(saved);
     if (!this.st.createdAt) { this.st.createdAt = d.now(); d.log(`state created at ${new Date(this.st.createdAt).toISOString()}: Ship tokens issued before it are refused`); }
@@ -1276,6 +1300,17 @@ export class Keeper {
     }
     // (0.1.7) the old option, at every start while it is there
     if (this.oldKeyOption) this.d.log("the old option hc_api_key is still in Keeper's options: remove it (Keeper ignores it; the key is entered once with hc-key and kept outside the options), then rotate that key in the alert service, since earlier backups may hold it; until then Keeper doesn't arm and refuses hc-key");
+    // (0.1.15) item 10: the drill flags' spent list is authoritative: re-read at every start, so a state rolled back (a restore of
+    // Keeper) before a nonce was committed to it still refuses that nonce
+    try {
+      const have = new Set((this.st.drillNonces ?? []).map((x) => x.nonce));
+      const back = (this.d.drillSpent?.list() ?? []).filter((n) => NONCE.test(n) && !have.has(n));
+      if (back.length) {
+        for (const n of back) (this.st.drillNonces ??= []).push({ nonce: n, attempt: "(from the spent list)", at: now });
+        if (this.st.drillNonces!.length > NONCES_MAX) this.st.drillNonces!.splice(0, this.st.drillNonces!.length - NONCES_MAX);
+        this.d.log(`the drill flags' spent list holds ${back.length} nonce${back.length === 1 ? "" : "s"} the state didn't (a restored or rolled back state): each is refused like any spent nonce`);
+      }
+    } catch (e) { this.d.log(`couldn't read the drill flags' spent list (${String((e as Error)?.message ?? e).slice(0, 60)}): every drill registration is refused until it can be read`); this.spentUnreadable = true; }
     for (const a of this.open()) this.d.log(`resuming ${a.id} ${a.app} (${a.status})`);
     for (const a of this.unresolvedOf()) this.d.log(`reconciling ${a.id} ${a.app} on every poll (unresolved: nothing is sent again)`);
     this.st.heartbeat = now;
@@ -1449,6 +1484,7 @@ export class Keeper {
     if (kind === "ship" && (mode || nonce)) return refuse("a ship registration carries a drill mode or nonce");
     const usedNonce = kind === "drill" ? (this.st.drillNonces ?? []).find((x) => x.nonce === nonce) : undefined;
     if (usedNonce) return refuse(`a replay: that drill flag's nonce was registered under ${usedNonce.attempt}`);
+    if (kind === "drill" && (this.spentUnreadable || !this.d.drillSpent)) return refuse("the drill flags' spent list can't be read, so no drill is registered");
     if (!SLUG.test(app)) return refuse("its app isn't an App slug");
     if (body?.backup_slug !== undefined) return refuse("it names a backup; Keeper always makes the backup itself");
     const tid = tokenId(token);
@@ -1462,8 +1498,16 @@ export class Keeper {
       : from === to ? "from_version and to_version are the same"
       : !PROBE_HASH.test(probe) ? "its probe_hash isn't a hash"
       : this.open(app).length ? `another attempt for ${app} is open (${this.open(app)[0].id})`
+      // (0.1.15) item 20: one installer at every entry point: while an earlier attempt's install job has no recorded end, wait
+      : this.jobOpen(app) ? `the install job ${this.jobOpen(app)!.job!.id} of ${this.jobOpen(app)!.id} has no recorded end yet (one installer at a time: Keeper waits for it)`
       : null;
     if (why) return refuse(why, 409, why !== `${app} isn't in the keeper's watch list`);
+    // (0.1.15) item 10: a drill's nonce goes to the spent list first, durably and exclusively; one that can't be recorded is refused
+    if (kind === "drill") {
+      let added = false;
+      try { added = !!this.d.drillSpent?.add(nonce); } catch { added = false; }
+      if (!added) return refuse("its drill flag's nonce couldn't be recorded in the spent list (or is there already), so no drill is registered");
+    }
     this.st.spent.push({ id, auth: tid, app, at: now }); if (this.st.spent.length > 500) this.st.spent.shift();
     if (kind === "drill") { (this.st.drillNonces ??= []).push({ nonce, attempt: id, at: now }); if (this.st.drillNonces.length > NONCES_MAX) this.st.drillNonces.shift(); }
     const a: Attempt = {
@@ -1490,7 +1534,10 @@ export class Keeper {
     if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App reads registrations` } };
     const a = this.st.attempts[id];
     if (!a) return { status: 404, body: { status: "unknown", id } };
-    const base = { id, app: a.app, from_version: a.from, to_version: a.to, kind: a.auth, ...(a.drillMode ? { drill_mode: a.drillMode, marked: !!a.markAt } : {}), ...this.enrollment() };
+    // (0.1.15) item 14: read only (nothing saved, the counter doesn't move) and only for the attempt named; item 2: the install job
+    // bound to it, so the run script's helper and the verdict probe can tie a start to it
+    const base = { id, app: a.app, from_version: a.from, to_version: a.to, kind: a.auth, ...(a.drillMode ? { drill_mode: a.drillMode, marked: !!a.markAt } : {}),
+      install_job: a.job?.id ?? null, install_job_at: a.job ? new Date(a.job.created).toISOString() : null, ...this.enrollment() };
     if (a.status === "verifying") return { status: 200, body: { status: "pending", ...base } };
     if (a.status === "accepted") return { status: 200, body: { status: "accepted", ...base, backup: a.backup, until: new Date(a.acceptUntil ?? a.deadline).toISOString() } };
     if (a.status === "claimed") return { status: 200, body: { status: "claimed", ...base, backup: a.backup, claim: a.claim!.id, until: new Date(a.claim!.until).toISOString() } };
@@ -1538,13 +1585,14 @@ export class Keeper {
       return no(`its claim ${a.claim.id} was recorded, and the attempt is ${a.status} since${a.why ? ` (${a.why})` : ""}`);
     }
     if (a.status === "claimed" || a.claim) return no(`it is claimed already (claim ${a.claim?.id ?? "?"}); an acceptance has one claimant`);
+    if (a.abortAsked) return no(`a cancel was asked for it (${a.abortAsked.why}): it ends as a terminal abort and is never claimed`);   // (0.1.15) item 9
     if (a.status !== "accepted") return no(`it is ${a.status}, not accepted`);
-    if (now > (a.acceptUntil ?? 0)) { this.ended(a, "its acceptance expired unclaimed", true, "its acceptance expired unclaimed"); return no("its acceptance expired"); }
+    if (now > (a.acceptUntil ?? 0)) { this.abort(a, "its acceptance expired unclaimed (the link never claimed it)"); return no("its acceptance expired"); }
     if (s(body?.app) !== a.app || s(body?.from_version) !== a.from || s(body?.to_version) !== a.to || s(body?.backup) !== a.backup)
       return no("its App, versions or backup aren't the acceptance's");
     if (!this.st.pinnedKey?.confirmed) return no("the pinned Ship key isn't confirmed");
     // (0.1.8) the deadline read again right before the claim commits
-    if (this.now() > (a.acceptUntil ?? 0)) { this.ended(a, "its acceptance expired unclaimed", true, "its acceptance expired unclaimed"); return no("its acceptance expired"); }
+    if (this.now() > (a.acceptUntil ?? 0)) { this.abort(a, "its acceptance expired unclaimed (the link never claimed it)"); return no("its acceptance expired"); }
     const claim = { id: `claim-${randomBytes(8).toString("hex")}`, at: now, until: now + CLAIM_MS, ...(/^[A-Za-z0-9-]{8,64}$/.test(req) ? { request: req } : {}) };
     a.claim = claim; a.status = "claimed"; a.deadline = claim.until;
     if (!this.save()) {
@@ -1593,10 +1641,29 @@ export class Keeper {
   }
   // (0.1.7) The routes' entry points: claim and cancel under the claim record's lock.
   // 0.1.8: the cancel reads the App's jobs list under the lock (bounded); a step that fails answers 503.
+  // 0.1.15 item 4: the backup's slug is read again from the Supervisor right before the claim commits (the claim is what lets the
+  // Ship run start the install): a backup that isn't there any more refuses the claim.
   claim(caller: string | null, id: string, body: any): Promise<Answer> {
-    return this.record(() => this.claimAttempt(caller, id, body), (why, pending, op) => pending ? Keeper.pendingAnswer(id, why, op) : ({ status: 503, body: { status: "refused", id, why: `Keeper's claim step failed (${why})` } }), `claim ${id}`);
+    return this.record(async (f) => {
+      const a = caller === REGISTRAR ? this.st.attempts[id] : undefined;
+      if (a && a.status === "accepted" && !a.claim && a.backup) {
+        const b = await this.bounded(() => this.d.backupInfo(a.backup), "the Supervisor's backup info before a claim");
+        if (!f.live()) return { status: 503, body: { status: "refused", id, why: "Keeper's claim step ran out of time; nothing was claimed" } };
+        if (!b) { this.d.log(`refused a claim of ${id}: its backup ${a.backup} isn't there (or can't be read) right before the install`); return { status: 409, body: { status: "refused", id, why: `its backup ${a.backup} isn't there (or can't be read) right before the install`, ...this.enrollment() } }; }
+      }
+      return this.claimAttempt(caller, id, body);
+    }, (why, pending, op) => pending ? Keeper.pendingAnswer(id, why, op) : ({ status: 503, body: { status: "refused", id, why: `Keeper's claim step failed (${why})` } }), `claim ${id}`);
   }
+  // 0.1.15 item 9: the cancel is recorded as asked before its step runs, so a step that fails, times out or answers pending still
+  // leaves an attempt that is never claimed or consumed, and that the next poll ends as a terminal abort (it wins over a late
+  // completion: a backup or a version change after it covers nothing).
   cancel(caller: string | null, id: string, body: any): Promise<Answer> {
+    const a0 = caller === REGISTRAR ? this.st.attempts[id] : undefined;
+    if (a0 && !a0.cancel && !a0.abortAsked && !a0.firstSeenTo && !a0.consumedAt && ["verifying", "accepted", "claimed"].includes(a0.status)) {
+      a0.abortAsked = { at: this.now(), why: s(body?.why).replace(/[^\x20-\x7e]/g, " ").slice(0, 160) || "it gave up on the Ship pass" };
+      this.save();
+      this.d.log(`${id}: a cancel was asked (${a0.abortAsked.why}): it can't be claimed or consumed any more`);
+    }
     return this.record(async (f) => {
       const a = caller === REGISTRAR ? this.st.attempts[id] : undefined;
       const jobs = a ? await this.appJobs(a.app) : [];
@@ -1630,6 +1697,22 @@ export class Keeper {
       `Keeper's notice for ${appName(a.app)} ${a.to} done.`, a.id);
     this.save();
   }
+  // (0.1.15) A terminal abort: the attempt covers nothing, ever (a later install of its version is outside any claim), its backup is
+  // kept for the bounded cleanup, and the owner is paged (an alert, not a notice).
+  private abort(a: Attempt, why: string): void {
+    this.claimEnd(a, `aborted: ${why}`);
+    a.status = "aborted"; a.why = why; a.endedAt = this.now();
+    this.d.log(`${a.id}: aborted (${why}): a terminal abort, nothing installed under it is covered`);
+    this.keepBackup(a, `aborted: ${why}`.slice(0, 200));
+    this.owner(a.app, "aborted", `Keeper ended its hold on the install of ${appName(a.app)} ${a.to}: ${why}. Nothing installed under it will be covered or rolled back; its backup is kept.`, true, a.id);
+    this.save();
+  }
+  // (0.1.15) An attempt whose install job has no recorded end: one installer at a time, so a new registration waits for it.
+  jobOpen(app: string): Attempt | undefined {
+    return Object.values(this.st.attempts).find((x) => x.app === app && x.job && !x.job.done);
+  }
+  // (0.1.15) item 2: the claim is live until its deadline, or, once its install job is bound, JOB_GRACE_MS past it.
+  liveUntil(a: Attempt): number { return (a.claim?.until ?? 0) + (a.job ? JOB_GRACE_MS : 0); }
   // (0.1.9) An ended attempt's backup, kept and bound to the attempt and its generation: "ended; backup kept: <reason>"
   // with the backup's name. A backup still being made is bound when its slug comes back (backupFor).
   private keepBackup(a: Attempt, reason: string): void {
@@ -1710,12 +1793,13 @@ export class Keeper {
     // (0.1.9) the acceptance commits under the lock, bound to this attempt's own backup and generation
     const slug = a.backup;
     await this.record((f) => {
-      if (!f.live() || (a.status as Status) !== "verifying" || a.backup !== slug) return;
+      if (!f.live() || (a.status as Status) !== "verifying" || a.backup !== slug || a.abortAsked) return;   // (0.1.15) an abort wins
       const t = this.now();
       a.status = "accepted"; a.acceptedAt = t; a.acceptUntil = t + ACCEPT_MS; a.deadline = a.acceptUntil;
       this.d.log(`accepting ${a.id} ${a.app} ${a.from} to ${a.to} backup ${a.backup} until ${new Date(a.acceptUntil).toISOString()}`);
       this.save();
     }, () => undefined);
+    if ((a.status as Status) === "verifying" && a.abortAsked) return this.abort(a, `a cancel was asked while its backup was made (${a.abortAsked.why})`);
     if ((a.status as Status) === "verifying") this.unprotected(a, "Keeper couldn't commit its acceptance under the claim record's lock");
   }
   // (0.1.9) Under the lock, before a new backup: the bounded cleanup, the free-space reserve, then the attempt's own
@@ -1800,7 +1884,7 @@ export class Keeper {
     const listed = new Map(list.map((b) => [b.slug, b.name]));
     for (const r of Object.values(kept)) if (!listed.has(r.slug)) { delete kept[r.slug]; this.d.log(`kept backup ${r.slug} ("${r.name}") of ${r.attempt} is gone from the backups list: its record is dropped`); }
     // ended: a recorded end, never a deadline: the attempt ended (or was refused) with its time kept, and a claim's end logged
-    const ended = (x: Attempt | undefined) => !!x && (x.status === "ended" || x.status === "unprotected") && Number(x.endedAt) > 0 && (!x.claim || !!x.claimEndSaid || x.status === "unprotected");
+    const ended = (x: Attempt | undefined) => !!x && (x.status === "ended" || x.status === "aborted" || x.status === "unprotected") && Number(x.endedAt) > 0 && (!x.claim || !!x.claimEndSaid || x.status === "unprotected");
     const mine = (r: KeptRec) => {
       const x = this.st.attempts[r.attempt];
       const m = KEEPER_BACKUP.exec(r.name);
@@ -1825,6 +1909,11 @@ export class Keeper {
       if (!f.live()) return;
       if (again) { this.d.log(`the cleanup left backup ${slug}: ${again} (read again right before its delete)`); continue; }
       if (!mine(r) || Object.values(this.st.attempts).some(busy)) { this.d.log(`the cleanup left backup ${slug}: its attempt, generation or claim changed`); continue; }
+      // (0.1.15) item 4: never a backup an accepted or open attempt references, and never one pinned by an install job without a
+      // recorded end (or a claim the Supervisor can't confirm had none): the attempt records are read right before every delete
+      const pin = await this.pinWhy(x, slug);
+      if (!f.live()) return;
+      if (pin) { this.d.log(`the cleanup left backup ${slug}: it is pinned (${pin})`); continue; }
       const age = Math.round(since(r) / 3_600_000);
       await f.write(`the delete of kept backup ${slug}`, () => this.bounded(() => this.d.deleteBackup!(slug), `the delete of backup ${slug}`), (ok) => {
         if (ok) { delete kept[slug]; x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); this.dropKey(r.name, "its backup was deleted"); }
@@ -1836,6 +1925,27 @@ export class Keeper {
     if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name)
       this.d.log(`backup ${b.slug} ("${b.name}") is named like Keeper's but has no generation record here: never deleted by Keeper; delete it by hand (Settings, System, Backups) if you don't want it`);
     if (f.live()) this.save();
+  }
+  // (0.1.15) item 4: why a kept backup is pinned ("" when it isn't): an open attempt names it; its attempt's install job has no
+  // recorded end (running, or its state unreadable); or its attempt was claimed with no job bound and the Supervisor's jobs list
+  // can't confirm that no install job was accepted since the claim. A job seen finished, or gone from the list, releases it.
+  async pinWhy(x: Attempt, slug: string): Promise<string> {
+    const holder = Object.values(this.st.attempts).find((y) => y.backup === slug && OPEN.includes(y.status));
+    if (holder) return `${holder.id} is ${holder.status} and names it`;
+    if (x.job && !x.job.done) {
+      const j = await this.bounded(() => this.d.job(x.job!.id), "the Supervisor's install job");
+      if (!j) return `the state of its install job ${x.job.id} can't be read`;
+      if (j.found && !j.done) return `its install job ${x.job.id} is still running`;
+      x.job.done = true; if (j.found) x.job.errors = j.errors;
+      this.save();
+    }
+    if (x.claim && !x.job) {
+      const list = this.d.installJobs ? await this.bounded(() => this.d.installJobs!(x.app), "the Supervisor's install jobs") : null;
+      if (!list) return "the Supervisor's jobs list can't confirm that no install job was accepted for its claim";
+      const since = list.filter((j) => j.created >= x.claim!.at - JOB_SKEW_MS && !j.done);
+      if (since.length) return `an install job of ${x.app} made since its claim (${since[0].uuid}) is still running`;
+    }
+    return "";
   }
   // (0.1.10) A backup whose create outran its bound (an answer past REGISTER_WAIT_MS, or a restart while it was made) and may
   // have completed later: under the next lock holder it is looked up by the name chosen before its call. Found with its
@@ -1871,25 +1981,14 @@ export class Keeper {
       }
     }
   }
-  // (0.1.11) Why an attempt's backup can't be used for its consume or its restore ("" when it can). A late backup is retention-only:
-  // usable only with its proof (lateProof), the Supervisor's completion time for it before the install job's start.
+  // (0.1.11) Why an attempt's backup can't be used for its consume or its restore ("" when it can). 0.1.15 item 5: a backup whose
+  // create timed out is disqualified for good for that attempt, however it finishes later: only a backup created for the attempt,
+  // completed and verified before the acceptance, is ever its rollback point (no completion-time proof makes a late one usable).
   unusableWhy(a: Attempt): string {
     if (!a.backup) return "it has none";
     if (a.backupDropped) return `its backup ${a.backup} was deleted`;
-    if (a.retentionOnly && !a.lateProof) return `its only backup ${a.backup} was adopted late and is retention-only${this.lateProofs.get(a.id) ? `: ${this.lateProofs.get(a.id)}` : ""}`;
+    if (a.retentionOnly || a.lateBackup) return `its only backup ${a.backup} completed after its create timed out: disqualified for good as its rollback point (retention-only)`;
     if (!this.backupKey(a)) return `its backup ${a.backup}'s key file is missing or unreadable`;   // (0.1.12) exactly like a missing backup
-    return "";
-  }
-  // (0.1.11) The proof for a retention-only backup, both times read from the Supervisor (bounded): "" and lateProof set when the
-  // backup's recorded completion precedes the install job's start, else why not.
-  private async lateWhy(a: Attempt): Promise<string> {
-    const done = this.d.backupDoneAt ? await this.bounded(() => this.d.backupDoneAt!(a.backup), "the Supervisor's completion time for a late backup") : null;
-    const start = this.d.installStartedAt ? await this.bounded(() => this.d.installStartedAt!(a.app), "the Supervisor's start time for the install job") : null;
-    if (!(Number(done) > 0)) return "the Supervisor gives no completion time for it";
-    if (!(Number(start) > 0)) return "the Supervisor gives no start time for the install job";
-    if (done! >= start!) return `it completed at ${new Date(done!).toISOString()}, not before the install job started at ${new Date(start!).toISOString()}`;
-    a.lateProof = { backupDoneAt: done!, installStartedAt: start! };
-    this.d.log(`${a.id}: its late backup ${a.backup} completed at ${new Date(done!).toISOString()}, before the install job started at ${new Date(start!).toISOString()}: usable`);
     return "";
   }
   // (0.1.12) An attempt's backup password from the backup key store, by the backup's name; null when missing or unreadable.
@@ -1946,20 +2045,31 @@ export class Keeper {
     h.push(live); if (h.length > 3) h.shift();
     if (info) this.appState[app] = info.state;
     const wasRestoring = this.open(app).filter((a) => a.status === "restoring");
-    // (0.1.11) a retention-only backup's proof, read from the Supervisor before the lock (the consume decides on it)
-    this.lateProofs.clear();
-    for (const a of this.open(app)) if (a.status === "claimed" && a.retentionOnly && !a.lateProof && info?.version === a.to) this.lateProofs.set(a.id, await this.lateWhy(a));
+    // (0.1.15) item 2: the Supervisor's install jobs of the App, read before the lock for each claimed attempt with no job bound yet,
+    // and the state of every bound job with no recorded end
+    this.jobReads.clear();
+    for (const a of this.open(app)) if (a.status === "claimed" && !a.job)
+      this.jobReads.set(a.id, this.d.installJobs ? await this.bounded(() => this.d.installJobs!(app), "the Supervisor's install jobs") : null);
+    for (const a of Object.values(this.st.attempts)) if (a.app === app && a.job && !a.job.done) {
+      const j = await this.d.job(a.job.id).catch(() => null);
+      if (j && (!j.found || j.done)) { a.job.done = true; if (j.found) a.job.errors = j.errors; this.d.log(`${a.id}: its install job ${a.job.id} ${j.found ? `finished${j.errors ? ` with ${j.errors} error${j.errors === 1 ? "" : "s"}` : ""}` : "left the jobs list"}: its end is recorded`); this.save(); }
+    }
     // (0.1.7) the version change, the consume and the expiries under the claim record's lock
     await this.record(() => {
       // (0.1.8) the time read under the lock: the consume and the expiries decide on it, not on the poll's start
       const t = this.now();
+      // (0.1.15) item 9: a cancel asked whose step didn't end the attempt: a terminal abort, before anything else this poll
+      for (const a of this.open(app)) if (a.abortAsked && ["verifying", "accepted", "claimed"].includes(a.status) && !a.consumedAt)
+        this.abort(a, `a cancel was asked (${a.abortAsked.why}) and its step didn't confirm it`);
+      // (0.1.15) item 2: bind each claimed attempt to its install job
+      for (const a of this.open(app)) if (a.status === "claimed" && !a.job && this.jobReads.has(a.id)) this.bindJob(a, this.jobReads.get(a.id) ?? null);
       if (info) this.versionChange(app, info.version);
       for (const a of this.open(app)) {
         // (0.1.4) the install seen while its registration still waits for the backup: never accepted;
         // (0.1.5) and seen while accepted but not claimed: outside a live claim
         if (a.status === "verifying" && info?.version === a.to) { this.unprotected(a, "the install began before Keeper accepted it (its backup wasn't complete)"); continue; }
         if (a.status === "accepted" && info?.version === a.to) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
-        if (a.status === "claimed" && info?.version === a.to && t > a.claim!.until) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
+        if (a.status === "claimed" && info?.version === a.to && t > this.liveUntil(a)) { this.unprotected(a, OUTSIDE_CLAIM); continue; }
         if (started) a.chat = chat;
         if (a.status === "accepted" || a.status === "claimed" || a.status === "watching") this.judge(a, info, live, t);
       }
@@ -1967,6 +2077,22 @@ export class Keeper {
     for (const a of wasRestoring) if (a.status === "restoring") { this.observe(a, info); await this.restoring(a, info, live); }
     for (const a of this.unresolvedOf(app)) { this.observe(a, info); await this.recheck(a, info); }
     this.clearOutstanding(app);
+  }
+  // (0.1.15) item 2: a claimed attempt bound to the Supervisor's install job made during its claim (created from the claim's start,
+  // less JOB_SKEW_MS, to its deadline). Exactly one: bound by its id. Two or more, or an install job of the App made before the
+  // claim and still running: the install can't be tied to this attempt, so it is unprotected (paged, never watched or rolled back).
+  // A list that can't be read binds nothing this poll.
+  private bindJob(a: Attempt, list: InstallJob[] | null): void {
+    if (!list || !a.claim) return;
+    const during = list.filter((j) => j.created >= a.claim!.at - JOB_SKEW_MS && j.created <= a.claim!.until);
+    const before = list.filter((j) => j.created < a.claim!.at - JOB_SKEW_MS && !j.done);
+    if (before.length) return this.unprotected(a, `an install job of ${appName(a.app)} made before its claim (${before[0].uuid}) is still running, so the install can't be tied to this attempt`);
+    if (during.length > 1) return this.unprotected(a, `${during.length} install jobs of ${appName(a.app)} were made during its claim (${during.map((j) => j.uuid).join(", ").slice(0, 120)}), so the install can't be tied to one`);
+    if (!during.length) return;
+    const j = during[0];
+    a.job = { id: j.uuid, created: j.created, boundAt: this.now(), ...(j.done ? { done: true, errors: j.errors } : {}) };
+    this.d.log(`${a.id}: bound to the Supervisor's install job ${j.uuid} ("${j.name.slice(0, 60)}", made ${new Date(j.created).toISOString()}, during claim ${a.claim.id})`);
+    this.save();
   }
   // A version change of a watched App: an attempt's install, an attempt's recovery, or unregistered.
   private versionChange(app: string, v: string): void {
@@ -1982,8 +2108,8 @@ export class Keeper {
     const early = recent.find((a) => a.status === "verifying" && a.to === v);
     if (early) { this.d.log(`${app} is at ${v} (was ${was}) before Keeper accepted ${early.id}`); return this.unprotected(early, "the install began before Keeper accepted it (its backup wasn't complete)"); }
     const now = this.now();
-    const live = (a: Attempt) => a.status === "claimed" && !!a.claim && now <= a.claim.until && !a.consumedAt;
-    const outside = recent.find((a) => a.to === v && !a.consumedAt && (a.status === "accepted" || (a.status === "claimed" && !live(a)) || a.status === "ended"));
+    const live = (a: Attempt) => a.status === "claimed" && !!a.claim && now <= this.liveUntil(a) && !a.consumedAt;
+    const outside = recent.find((a) => a.to === v && !a.consumedAt && (a.status === "accepted" || (a.status === "claimed" && !live(a)) || a.status === "ended" || a.status === "aborted"));
     if (outside && !recent.some((a) => a.to === v && live(a))) {
       this.d.log(`${app} is at ${v} (was ${was}) outside a live claim of ${outside.id}`);
       // (0.1.8) an install happened: its backup is kept for a rollback by hand (0.1.9: under the cleanup's bound)
@@ -2001,7 +2127,13 @@ export class Keeper {
   }
   // live: the App's liveness (/health) this poll. Readiness never enters it.
   judge(a: Attempt, info: AppInfo | null, live: boolean, now: number): void {
-    if (info && a.status === "claimed" && info.version === a.to && now <= a.claim!.until) {
+    if (info && a.status === "claimed" && info.version === a.to && now <= this.liveUntil(a)) {
+      // (0.1.15) item 2: the start counts as this attempt's install only through its own install job: none bound, the version
+      // seen is no install of this attempt (an unreadable jobs list waits for the next poll, within the claim)
+      if (!a.job) {
+        if (this.jobReads.has(a.id) && this.jobReads.get(a.id) === null) { this.d.log(`${a.id}: ${a.app} is at ${a.to}, but the jobs list can't be read to tie it to an install job: judged at the next poll`); return; }
+        return this.unprotected(a, `${appName(a.app)} ${a.to} started with no Supervisor install job made during its claim, so the start isn't tied to this attempt (not watched, never rolled back, no drill)`);
+      }
       // (0.1.10) the watch takes an install only as its own attempt's: its backup bound, and its generation the App's newest
       const newest = Math.max(0, ...Object.values(this.st.attempts).filter((x) => x.app === a.app).map((x) => x.gen ?? 0));
       if (!(a.gen && a.gen > 0) || a.gen !== newest)
@@ -2015,9 +2147,11 @@ export class Keeper {
       this.d.log(`watching ${a.id}: ${a.app} ${a.to} seen, 15 minutes from now`);
     }
     // (0.1.5) An acceptance unclaimed by its until, or a claim with no version change by its until, ends.
-    if (a.status === "accepted" && now > (a.acceptUntil ?? a.deadline)) return this.ended(a, "its acceptance expired unclaimed", true, "its acceptance expired unclaimed");
-    // 0.1.9: unused, the claim ends and its backup is kept (the Supervisor may be starting an install): the bounded cleanup only
-    if (a.status === "claimed" && now > a.claim!.until) return this.ended(a, `its claim ${a.claim!.id} expired with no version change seen (unused)`, true, `its claim ${a.claim!.id} expired unused`);
+    // 0.1.15 items 3 and 6: as a terminal abort, paged, its backup kept: an acceptance the link never claimed (it crashed, or gave
+    // up without a cancel Keeper saw), a claim with no install job by its deadline, or one whose job never brought the version
+    if (a.status === "accepted" && now > (a.acceptUntil ?? a.deadline)) return this.abort(a, "its acceptance expired unclaimed (the link never claimed it)");
+    if (a.status === "claimed" && now > this.liveUntil(a)) return this.abort(a, a.job ? `its install job ${a.job.id} didn't bring ${a.to} within ${JOB_GRACE_MS / 60_000} minutes of its claim's deadline`
+      : `no Supervisor install job of ${appName(a.app)} was made during its claim ${a.claim!.id}`);
     if (a.status !== "watching") return;
     if (!info) return;                                   // the Supervisor didn't answer: nothing judged this poll
     if (info.version !== a.to) return this.fail(a, "version-moved", `the App moved to ${info.version} during the watch`);
@@ -2423,6 +2557,7 @@ export class Keeper {
       // and the failure Keeper observed is the one the drill's mode names
       : !a.drillMode ? "it carries no drill mode"
       : !a.markAt || !a.markHash ? "no evidence the drill mark was written (the link never confirmed it to Keeper)"
+      : !a.job ? "its install isn't tied to a Supervisor install job (0.1.15: a start with no matching job is not the drill)"
       : a.status !== "rolled back" ? `it ended ${a.status}, not rolled back`
       : !a.restore?.called || !a.restore.doneAt ? "no restore of its backup ran"
       : !kind ? `its trigger (${a.trigger?.kind ?? "none"}) is neither a FAIL verdict nor an exit on start`

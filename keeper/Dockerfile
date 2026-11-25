@@ -15,7 +15,7 @@ RUN apt-get update \
     && bun --version
 
 # The keeper's version, bound into its armed record: the same as config.yaml's (keeper/tests check it).
-ENV KEEPER_VERSION=0.1.14
+ENV KEEPER_VERSION=0.1.15
 
 COPY rootfs /
 RUN chmod a+x /etc/services.d/keeper/run /etc/services.d/keeper/finish \
@@ -23,6 +23,6 @@ RUN chmod a+x /etc/services.d/keeper/run /etc/services.d/keeper/finish \
 
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.1.14" \
+    io.hass.version="0.1.15" \
     org.opencontainers.image.title="Keeper" \
     org.opencontainers.image.description="A check after every App install, with automatic rollback"

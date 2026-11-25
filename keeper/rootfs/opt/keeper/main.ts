@@ -23,7 +23,7 @@
 import { closeSync, constants as FS, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { BACKUP_KEY_SENTINEL, BACKUP_KEY_TMP_PREFIX, BACKUP_KEYS_DIR, CHECK_CONTROL_FILE, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
+import { BACKUP_KEY_SENTINEL, BACKUP_KEY_TMP_PREFIX, BACKUP_KEYS_DIR, CHECK_CONTROL_FILE, DRILL_SPENT_DIR, HEARTBEAT_MS, type HcCheck, KEY_FILE, KEY_TMP_PREFIX, Keeper, LEGACY_KEY_TMP, OLD_KEY_FILE, POLL_MS, type State } from "./core.ts";
 import { handle, handleLocal } from "./server.ts";
 import { supervisor } from "./supervisor.ts";
 
@@ -65,6 +65,27 @@ export function backupKeys(dir = BACKUP_KEYS_PATH, onTemp?: (tmp: string) => voi
     load: (name: string): string | null => { if (!ok(name)) return null; try { const k = readFileSync(join(dir, name), "utf8").trim(); return k && !k.startsWith(SENTINEL) ? k : null; } catch { return null; } },
     drop: (name: string): boolean => { if (basename(name) !== name || !name) return false; const p = join(dir, name); if (!existsSync(p)) return false; rmSync(p, { force: true }); return true; },
     list: (): string[] => { try { return readdirSync(dir); } catch { return []; } },
+  };
+}
+// (0.1.15) item 10: the drill flags' spent list, root's: one empty file per nonce in a 0700 folder the backup exclusion leaves out
+// (config.yaml backup_exclude: drill-spent and everything in it), so a restore of Keeper never rolls it back (the Supervisor keeps
+// excluded paths on a restore: a device check). add creates the nonce's file exclusively and fsyncs it and the folder; a nonce
+// already there is false. Nothing is ever pruned from it (the files are empty; a nonce is 16 hex digits).
+export const DRILL_SPENT_PATH = `${DATA}/${DRILL_SPENT_DIR}`;
+export function drillSpent(dir = DRILL_SPENT_PATH) {
+  const NONCE = /^[0-9a-f]{16}$/;
+  return {
+    list: (): string[] => { try { return readdirSync(dir).filter((n) => NONCE.test(n)); } catch (e: any) { if (e?.code === "ENOENT") return []; throw e; } },
+    add: (nonce: string): boolean => {
+      if (!NONCE.test(nonce)) return false;
+      try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const fd = openSync(join(dir, nonce), FS.O_WRONLY | FS.O_CREAT | FS.O_EXCL, 0o600);
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        try { const d = openSync(dir, "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* the file itself is synced */ }
+        return true;
+      } catch { return false; }
+    },
   };
 }
 // (0.1.9) The old hc_api_key, kept only to try it once at the rotation's attestation, then dropped.
@@ -211,6 +232,7 @@ async function serve(): Promise<void> {
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
     backups: sup.backups, activeJobs: sup.activeJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
+    installJobs: sup.installJobs, drillSpent: drillSpent(),   // (0.1.15) items 2 and 10
     diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
     keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), backupKeys: backupKeys(), hcTry: (key) => hcTry(key),
     ready: (hp) => get200(healthUrl(hp)),
