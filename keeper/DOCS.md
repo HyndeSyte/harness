@@ -235,7 +235,21 @@ late backups are), the lock is released and you are paged once, so later claims,
 stuck behind it. (0.1.16) The 3 minutes bound the lock itself, counted from the moment the step took it (before, the
 step's own 30 seconds came first, so the lock could be held about three and a half minutes): one timer started with the
 step releases the lock then whatever the step or its write is doing, marks the step late and logs it (`... the lock's
-bound ... the lock is released`), and a failing save or page at that moment doesn't keep the release from happening. The pending answer (`202 {"status": "pending", "operation": "op-...", "recorded": ...}`) carries a
+bound ... the lock is released`), and a failing save or page at that moment doesn't keep the release from happening.
+(0.1.16, the fix round) The release comes first, synchronously, before anything else; the late record's save and your
+page follow, each bounded, and a failure of either is logged. Each time a step takes the lock it gets its own token, and
+a release is a no-op unless that token still holds the lock, so a step finishing in the same moment its bound fires lets
+go exactly once, and a step that lost the lock can never write over the next one's state: a write of its that answers
+late is never recorded by it, it queues a reconcile under the lock instead. If the late record can't be saved, Keeper
+keeps it in memory: the same request is refused (it reports late, and nothing reaches the Supervisor) while it stands,
+and the save is tried again at the next step. An operation's record only moves one way (pending to done or late, late
+only to reconciled), each write of it compared on its generation and id. While any operation is late, Keeper holds every
+Supervisor write: claims, cancels, restores, backups and backup deletes (reads and status go on), until a reconcile under
+the lock (at the next poll) reads the Supervisor's jobs list with no backup job running, and, for a backup delete, the
+backups list for whether it took effect. The writes that run under the lock are only two, a kept backup's delete and a
+late backup's delete, each bounded by 10 seconds (and the Supervisor call's own 15): the step's 30 seconds plus one of
+them is well under the 3 minutes, checked in a test. The backup create (up to 15 minutes), the restore (tracked by its
+Supervisor job id) and the backup check's backup and its delete run outside the lock. The pending answer (`202 {"status": "pending", "operation": "op-...", "recorded": ...}`) carries a
 stable operation id, and the same request again reports that recorded outcome (pending or late) without repeating
 the write.
 
@@ -489,7 +503,16 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   is read as a tar. It also writes a sentinel into the drill flags' spent list
   (`/data/drill-spent/backup-check-sentinel`, a name that is never a nonce), and no name under `drill-spent` may appear
   in the test backup. A pass is tied to this scan too (scan 2): a pass from before 0.1.16 no longer counts, so run the
-  backup check again.
+  backup check again. (0.1.16, the fix round) The scan finds the gzip stream's end itself: it parses the gzip header
+  (its flags, extra field, name, comment and header CRC), inflates the stream with the inflater's count of bytes read,
+  confirms that count, and checks the 8-byte trailer (CRC32 and length) against what it decoded; a trailer that doesn't
+  match, a second gzip member, or anything but zeros after the trailer fails the check. The positive control is counted
+  only inside files: a copy anywhere else in a layer (a header field, the padding, the tail, the gzip header) fails it. A
+  layer read as a tar (ustar, or an old v7 header with a valid checksum) must parse to its end-of-archive block, and a
+  layer whose magic says gzip must decode: neither is ever read as a plain file. zstd, xz, bzip2 and encrypted members
+  still fail. Every value searched for is at least 16 bytes: the 8 and 12 hex digit ids are left out (they could match
+  random bytes by chance) and each key's 16 digit fingerprint stands for them. Every failure names the layer, the byte
+  offset and what matched (the sentinel, a key value, a key's fingerprint).
   Any read, format, size or traversal error fails it. A check that was interrupted counts as failed: at every start
   Keeper deletes its recorded test backup and any downloaded archive left behind, and logs it. A pass is tied to the
   exclusion this build ships (its hash); a build with another exclusion needs the check again.
@@ -501,9 +524,10 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   where Keeper kept the old key it first tries it at Healthchecks and needs it rejected (`the alert service still
   accepts the old key ...` otherwise). (0.1.10) The try is a read-only GET of the checks list (the endpoint the old
   option was used for). (0.1.16) Only Healthchecks' documented `wrong api key` answer on a 401 or 403 proves the key
-  revoked at once; a bare 401 proves it only when a second read at least 10 seconds later answers 401 again with the
-  current key accepted (200) in between, so an outage or a proxy's 401 never reads as a revocation; a bare 403 never
-  does. The kept old key is deleted as soon as that passes, and is written in the first place only
+  revoked. A bare 401, once or repeated, stays unknown, since an outage or a proxy can answer 401: Keeper logs "the alert
+  service answered 401 with no documented body: not taken as proof; try again later", pages you once for that tap, and
+  you tap again later. A bare 403 never proves it either. The answer's body is read for at most 3 seconds and only its
+  first 4 KB; a body cut short by either proves nothing. The kept old key is deleted as soon as that passes, and is written in the first place only
   once its file is checked inside the backup exclusion. Where no old key was kept, nothing can be tried: the card and
   Keeper's state say "attested by your tap only". The link's signature is bound to the current enrollment, the old
   key's id and a single-use challenge Keeper issues (`GET /rotation`), and the link checks the tap is yours before it
@@ -677,9 +701,8 @@ your tap sets it: the **drill flag**.
   items the drill plan filed: the Ship token's causal link to the install (now the install job binding, below), late
   jobs racing a backup delete (now the pins), and the pending claim in the hook (now the acceptance outside the hook's
   bound). Keeper 0.1.16 closed the other three: the secret scanner's coverage (the backup check's scan reads every
-  byte of the archive), a bare 401 taken as a revocation (it now needs the documented answer, or a repeat with the
-  current key accepted in between), and the pending lock's bound (released at 3 minutes from the step's start,
-  whatever the step does). Only the device checks remain ("Still to check on the device", 0.1.15 and 0.1.16): you set
+  byte of the archive), a bare 401 taken as a revocation (only the documented answer counts), and the pending lock's
+  bound (released at 3 minutes from the step's start, whatever the step does). Only the device checks remain ("Still to check on the device", 0.1.15 and 0.1.16): you set
   the option to `false` once they are done, after the device run, and not before. It isn't in the drill records' binding, so changing it drops nothing: the drills
   can run before, and arming completes only after.
 
@@ -1043,8 +1066,8 @@ download is a tar Keeper can read), `/host/info`'s `disk_free` and the backup in
 reserve, the old key's try at Healthchecks answering 401 or 403 once revoked, the rotation card's tap reaching Keeper,
 and a full-Pi restore from a fresh Home Assistant (untested); (0.1.10) the backup check's archive as the Pi's
 Supervisor makes it (its layout, whether the App's archive is gzip, `size` and `size_bytes` in the backup info
-matching the download, the positive control found once), the old key's try answering `wrong api key` (or a 401
-twice, 0.1.16) once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
+matching the download, the positive control found once), the old key's try answering `wrong api key` (on a 401 or
+403, 0.1.16) once revoked, a refused registration for free space bringing the link's card (no button since 0.1.11), and the rotation card's
 challenge reaching Keeper within its 10 minutes; (0.1.12) a backup made with Keeper's password shown as protected in the
 backup info and on Home Assistant's backup page, a partial restore of it with the same password, and the backup check
 passing with the backup key store's sentinels; and the two drills (the next job). (0.1.13) The drill switch itself: the link's drill card and your tap reaching the flag in `/data/trust`, the run script's exit at start and the probe's FAIL for the drilled version only, the mark missing from the backup a rollback restores, `drill-state` read in the container, and the restart case's timing on the Pi ("The drill runbook"). (0.1.14) The run script's helper reaching Keeper's `GET /attempt` with Cain's token at start, and dropping a mark when Keeper names no drill; the link's `POST /attempt/<id>/drill-mark` reaching Keeper; the drill files' modes in `/data/trust` and `/data/link` on the Pi; the spent list staying out of a Cain backup; the restored backup's contents and no flag or mark after case 1.
@@ -1074,8 +1097,19 @@ passing with the backup key store's sentinels; and the two drills (the next job)
 9. Cain's option `keeper_accept_min` read by the link (its wait for Keeper's acceptance), and the link's reconcile
    at its start (a pass a restart left open refused, in its log).
 
-(0.1.16) One device check this build needs, named here: the backup check's scan was widened (every byte of the archive,
-and a sentinel in `/data/drill-spent/`), so a pass recorded before 0.1.16 no longer counts. Run `backup-check` again
-after installing 0.1.16 (step 1 above, with the placeholder) and confirm it passes on the Pi's real archive: its log
-line names `drill-spent/backup-check-sentinel` among the sentinels placed, and the check doesn't fail on data after a
-gzip stream or a tar's end-of-archive block in the Supervisor's own archive.
+(0.1.16) The device checks this build needs, named here. `drill_followups_open` stays `true` until each is done:
+10. The backup check run again: the scan was widened (every byte of the archive, and a sentinel in `/data/drill-spent/`),
+    so a pass recorded before 0.1.16 no longer counts. Run `backup-check` after installing 0.1.16 (step 1 above, with the
+    placeholder); its log line names `drill-spent/backup-check-sentinel` among the sentinels placed.
+11. The real archive passes the wider scan: the Supervisor's own archive of Keeper has only zeros after its gzip stream
+    and after each tar's end-of-archive block, one gzip member with a matching trailer, and the control once in a file.
+    A failure names the layer, the byte and what matched: copy that line into a Build item.
+12. The service's real answer for a revoked key, captured as a fixture: revoke a spare read-only key in Healthchecks,
+    try it once (`curl -s -o - -w '%{http_code}' -H 'X-Api-Key: <that key>' https://healthchecks.io/api/v3/checks/`),
+    and record the status and body (expected: 401 with `{"error": "wrong api key"}`; the key itself never goes in the
+    record). Anything else means the rotation tap can't prove a revocation: a Build item.
+13. The lock's bound against a real hung Supervisor step: while a cleanup's delete is slow (or the Supervisor is busy),
+    Keeper's log shows the lock released at 3 minutes from the step's start, the operation late, `can't be reconciled
+    yet` while a backup job runs, then reconciled once none does, and Supervisor writes going on after.
+14. The container name on this Home Assistant: `docker ps --format '{{.Names}}' | grep 0fcc2575_keeper` names exactly
+    one container (`addon_0fcc2575_keeper` or `app_0fcc2575_keeper`), and the commands above reach it.

@@ -205,13 +205,38 @@ export async function hcChecks(key: string, http: typeof fetch = fetch): Promise
 
 // (0.1.9) The old key tried once at the Healthchecks API. 0.1.10: a GET of the checks list (read-only, no side effects, and
 // the endpoint the old hc_api_key option was used for from 0.1.5), answering its status and the API's error text; core.ts
-// revocation() judges it ("wrong api key" on a 401 or 403 proves it revoked, 0.1.16: a bare 401 only when it repeats 10 seconds
-// later with the current key accepted in between; never a bare 403). Null: no answer.
-export async function hcTry(key: string, http: typeof fetch = fetch): Promise<{ status: number; error?: string } | null> {
+// revocation() judges it (0.1.16: only "wrong api key" on a 401 or 403 proves it revoked; a bare 401 or 403 never does). Null:
+// no answer. 0.1.16: the body is read bounded in time (HC_BODY_MS, the read aborted then) and size (the first HC_BODY_MAX bytes,
+// the rest never read); the documented answer is looked for in that prefix only, and a body cut short by either bound carries no
+// error text, so it proves nothing.
+export const HC_BODY_MAX = 4096, HC_BODY_MS = 3_000;
+export async function readCapped(r: Response, max = HC_BODY_MAX, ms = HC_BODY_MS): Promise<{ text: string; whole: boolean }> {
+  const reader = r.body?.getReader();
+  if (!reader) return { text: "", whole: true };
+  const parts: Uint8Array[] = [];
+  let n = 0, whole = false, t: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((res) => { t = setTimeout(() => res("timeout"), ms); (t as any)?.unref?.(); });
+  try {
+    while (n < max) {
+      const x = await Promise.race([reader.read(), timeout]);
+      if (x === "timeout") break;
+      if (x.done) { whole = true; break; }
+      parts.push(x.value); n += x.value.length;
+    }
+  } catch { whole = false; } finally {
+    if (t) clearTimeout(t);
+    if (!whole) { try { void reader.cancel().catch(() => {}); } catch { /* already closed */ } }
+  }
+  const all = new Uint8Array(Math.min(n, max)); let o = 0;
+  for (const p of parts) { const take = p.subarray(0, Math.min(p.length, all.length - o)); all.set(take, o); o += take.length; if (o >= all.length) break; }
+  return { text: new TextDecoder().decode(all), whole: whole && n <= max };
+}
+export async function hcTry(key: string, http: typeof fetch = fetch, bodyMs = HC_BODY_MS): Promise<{ status: number; error?: string } | null> {
   try {
     const r = await http(HC_API, { method: "GET", headers: { "x-api-key": key }, redirect: "manual", signal: AbortSignal.timeout(10_000) });
     let error: string | undefined;
-    try { const j: any = await r.json(); if (typeof j?.error === "string") error = j.error.slice(0, 80); } catch { /* no body */ }
+    const body = await readCapped(r, HC_BODY_MAX, bodyMs).catch(() => ({ text: "", whole: false }));
+    if (body.whole) { try { const j: any = JSON.parse(body.text); if (typeof j?.error === "string") error = j.error.slice(0, 80); } catch { /* not the documented body */ } }
     return { status: r.status, ...(error ? { error } : {}) };
   } catch { return null; }
 }
@@ -242,7 +267,7 @@ async function serve(): Promise<void> {
   const k = new Keeper({
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
-    backups: sup.backups, activeJobs: sup.activeJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
+    backups: sup.backups, activeJobs: sup.activeJobs, backupJobs: sup.backupJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
     installJobs: sup.installJobs, drillSpent: drillSpent(),   // (0.1.15) items 2 and 10
     diskFree: sup.diskFree, download: (slug) => archives().through(slug, (path) => sup.downloadTo(slug, path)), archives: archives(),
     keyFiles: keyFiles(), oldKeyStore: oldKeyStore(), backupKeys: backupKeys(), hcTry: (key) => hcTry(key),

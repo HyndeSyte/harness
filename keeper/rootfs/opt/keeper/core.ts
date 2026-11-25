@@ -165,7 +165,7 @@
 //   gave up      the restore failed, or the App didn't come back
 //   never started  (before 0.1.5) the install deadline passed without to_version ever seen
 import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify as edVerify, type KeyObject } from "node:crypto";
-import { SCAN_VERSION, scanBackup } from "./scan.ts";
+import { type Needle, SCAN_VERSION, scanBackup } from "./scan.ts";
 
 export const PROTOCOL = 1;                       // the verdict protocol version, bound into the armed state
 export const BACKUP_SCOPE = "app-only";          // the backup scope bound into the armed state
@@ -207,6 +207,19 @@ export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the loc
 // (0.1.11) A step's external write whose outcome stays unknown holds the lock at most this long: then the write is marked late
 // (reconciled later by its pre-chosen name or id), the lock is released, and the owner is paged once.
 export const PENDING_CEILING_MS = 3 * 60_000;
+// (0.1.16) A Supervisor call's own timeout (supervisor.ts, every call but the backup create, the restore and the download).
+export const SUPERVISOR_CALL_MS = 15_000;
+// (0.1.16) Every Supervisor write that runs under the claim record's lock, with its worst case. Both are a backup's delete through
+// fence.write, bounded by LOCK_CALL_MS (bounded()) and by the call's own timeout, so the longest a step can hold the lock is its
+// own bound (LOCK_STEP_MS) plus one write still in flight when it ran out: under PENDING_CEILING_MS (checked in the tests). The
+// writes that can run longer are kept outside the lock and tracked by name or job id: the backup create (makeBackup, up to
+// REGISTER_WAIT_MS, made after prepareBackup's step under its pre-chosen name and committed by a second step), the restore (its
+// Supervisor job id), the backup check's test backup and its delete, and an interrupted check's leftover delete.
+export const LOCK_WRITES: { what: string; worstMs: number }[] = [
+  { what: "the delete of a kept backup (cleanup)", worstMs: Math.max(LOCK_CALL_MS, SUPERVISOR_CALL_MS) },
+  { what: "the delete of a late backup (settleLate)", worstMs: Math.max(LOCK_CALL_MS, SUPERVISOR_CALL_MS) },
+];
+export const OUTSIDE_LOCK = ["the backup create", "the restore", "the backup check's test backup and its delete", "an interrupted backup check's leftover delete"];
 // (0.1.10) The hook's bound: its 10-second pass budget and a pending pass started again a minute apart, up to 6 times, rounded
 // up. The kept backups' grace is strictly longer than the Ship token's life plus this, so no backup a still-valid token's run
 // could reach is ever deleted.
@@ -234,20 +247,17 @@ export const ROTATION_PROOF_TAP = "attested by your tap only";   // (0.1.10) no 
 export const ROTATION_PROOF_TRIED = "your tap, and the alert service turning the old key down";
 // (0.1.10) The old key's try judged: revoked only on a 401, or the alert service's documented invalid-key answer
 // ({"error": "wrong api key"}, Healthchecks' API docs); valid on a 200; anything else, a bare 403 included, proves nothing.
-// 0.1.16: a bare 401 alone no longer proves it ("repeat"): only a 401 or 403 carrying the documented answer does, or a bare
-// 401 that repeats on a second read at least REVOKE_REPEAT_MS later with the current key accepted in between
-// (Keeper.oldKeyRevoked), so an outage or a proxy answering 401 never reads as a revocation.
-export const REVOKE_REPEAT_MS = 10_000;
-export function revocation(r: { status: number; error?: string } | null): { state: "revoked" | "valid" | "unknown" | "repeat"; why: string } {
+// 0.1.16: only a 401 or 403 whose body is the documented answer proves it. A bare 401, once or repeated, proves nothing (an
+// outage or a proxy can answer 401): it is unknown, logged in plain words, and the owner is paged once per rotation attempt.
+export const BARE_401_WHY = "the alert service answered 401 with no documented body: not taken as proof; try again later";
+export function revocation(r: { status: number; error?: string } | null): { state: "revoked" | "valid" | "unknown"; why: string } {
   if (!r) return { state: "unknown", why: "no answer" };
   if ((r.status === 401 || r.status === 403) && /^wrong api key$/i.test(s(r.error))) return { state: "revoked", why: `${r.status} wrong api key` };
-  if (r.status === 401) return { state: "repeat", why: "a bare 401, which proves the key revoked only if it repeats with the current key accepted in between" };
+  if (r.status === 401) return { state: "unknown", why: BARE_401_WHY };
   if (r.status === 200) return { state: "valid", why: "200" };
   if (r.status === 403) return { state: "unknown", why: "a bare 403, which doesn't prove the key revoked" };
   return { state: "unknown", why: `an answer of ${r.status}` };
 }
-// (0.1.9) The key file's names: the kept key, the old key (kept only to try it once), the temporary files' fixed prefix,
-// and the earlier builds' temporary names. config.yaml's backup_exclude covers every one ("hc-key*").
 export const KEY_FILE = "hc-key", OLD_KEY_FILE = "hc-key-old", KEY_TMP_PREFIX = "hc-key.tmp-";
 export const LEGACY_KEY_TMP = /^hc-key\.\d+\.[0-9a-f]{12}\.tmp$/;
 // 0.1.12: a name in the backup key store is one too (the scan finds data/backup-keys and anything under it)
@@ -535,7 +545,11 @@ export interface InstallJob { uuid: string; created: number; done: boolean; erro
 // (0.1.11) An operation whose external write outlived its step under the lock: its stable id (the 202 pending answer carries it),
 // and its recorded outcome: pending (the write is out, the lock held), done (it ended within the ceiling), late (it passed the
 // ceiling: the lock was released and the write is reconciled later by its pre-chosen name or id).
-export interface OpRec { id: string; op: string; at: number; state: "pending" | "done" | "late"; writes: string[]; settledAt?: number }
+// 0.1.16: a one-way machine (OP_MOVES), each record bound to the generation that made it (gen), the backups its writes named
+// (targets), and once late, only a reconcile under the lock moves it on (reconciled, with the outcome it read).
+export interface OpRec { id: string; op: string; at: number; state: "pending" | "done" | "late" | "reconciled"; writes: string[]; settledAt?: number;
+  gen?: number; targets?: string[]; outcome?: "done" | "failed" }
+export const OP_MOVES: Record<OpRec["state"], OpRec["state"][]> = { pending: ["done", "late"], late: ["reconciled"], done: [], reconciled: [] };
 // (0.1.9) A backup kept after its attempt ended unused (a cancel, an expiry): bound to the attempt and its generation,
 // left for the bounded cleanup only.
 export interface KeptRec { slug: string; name: string; attempt: string; gen: number; endedAt: number; reason: string }
@@ -554,8 +568,10 @@ export const NONCES_MAX = 500;                   // (0.1.14) drill flag nonces k
 // the option only after the device run (DOCS.md, "Still to check on the device").
 // 0.1.16: the scanner's coverage, the bare 401 and the pending lock's bound are closed in code; only the device checks remain.
 export const FOLLOWUPS_WHY = "the drill plan's device checks are still open (the follow-up items are closed in Keeper 0.1.16; the device checks remain: "
-  + "the install job binding, the backup pins, the restore of the drill files, and the backup check run again for the wider scan): the owner sets "
-  + "drill_followups_open to false in Keeper's options once they are done";
+  + "the install job binding, the backup pins, the restore of the drill files, the backup check run again, and four device facts this build relies on: "
+  + "the real Supervisor archive passing the wider scan with only zeros after its stream and end block, the alert service's real answer for a revoked "
+  + "key captured as a fixture, the lock's bound against a real hung Supervisor step, and the container name on this Home Assistant): the owner sets "
+  + "drill_followups_open to false in Keeper's options once they are done, and not before";
 // (0.1.3) The phone test drill, per check (0.1.4: its check id; every watched App's alert check and the
 // dead-man check): the page sent, delivered, and the owner's confirmation that it reached his phone.
 export interface PhoneRec { sentAt: number; deliveredAt?: number; confirmedAt?: number }
@@ -705,6 +721,7 @@ export interface Deps {
   backupKeys?: { store: (name: string, key: string) => boolean; load: (name: string) => string | null; drop: (name: string) => boolean; list: () => string[] };
   deleteBackup?: (backup: string) => Promise<boolean>;     // (0.1.6) an orphan backup's delete; false: not deleted
   backups?: () => Promise<{ slug: string; name: string }[] | null>;   // (0.1.7) the Supervisor's backups list; null: unreadable
+  backupJobs?: () => Promise<string[] | null>;             // (0.1.16) the Supervisor's running backup jobs (their names); null: unreadable
   activeJobs?: (app: string) => Promise<string[] | null>;  // (0.1.7) active jobs on that App (0.1.8: every name, judged by jobsWhy); null: unreadable
   hcKeyStore?: { load: () => string; store: (key: string) => boolean };   // (0.1.7) the kept Healthchecks key (a 0600 file)
   job: (uuid: string) => Promise<JobState | null>;          // by its id only; null: the jobs list can't be read
@@ -729,7 +746,6 @@ export interface Deps {
   // (0.1.9) the Healthchecks API with that key, a read-only GET of the checks list; 0.1.10: its status and its error text, judged
   // by revocation() (null: no answer)
   hcTry?: (key: string) => Promise<{ status: number; error?: string } | null>;
-  revokeRepeatMs?: number;                          // (0.1.16) the gap before a bare 401's second read (REVOKE_REPEAT_MS; tests: shorter)
   imageBytes?: (app: string) => Promise<number | null>;   // (0.1.10) the App's image size, when known: the first backup's reserve
   lockCallMs?: number; lockStepMs?: number;       // (0.1.8) the lock's bounds (LOCK_CALL_MS, LOCK_STEP_MS; tests: shorter)
   pendingCeilingMs?: number;                      // (0.1.11) the pending write's ceiling (PENDING_CEILING_MS; tests: shorter)
@@ -746,7 +762,8 @@ export interface Deps {
 export type Answer = { status: number; body: Record<string, unknown> };
 // (0.1.9) A step's generation under the claim record's lock: live() is checked right before every commit (in the same
 // tick as the write); write() runs an external write (a delete) only while live, and holds the lock until it ends.
-export interface Fence { gen: number; live(): boolean; write<V>(what: string, call: () => Promise<V> | V, after?: (v: V) => void): Promise<V | null> }
+// 0.1.16: target names the backup a write deletes, so a late write is reconciled from the backups list.
+export interface Fence { gen: number; live(): boolean; write<V>(what: string, call: () => Promise<V> | V, after?: (v: V) => void, target?: string): Promise<V | null> }
 
 // -- the keeper -----------------------------------------------------------------------------------
 export class Keeper {
@@ -767,6 +784,11 @@ export class Keeper {
   private oldKeyOption = false;                        // (0.1.7) the old hc_api_key option seen in the options
   private lock: Promise<unknown> = Promise.resolve();  // (0.1.7) the claim record's lock
   private lockGen = 0;                                 // (0.1.9) the lock's step generation (Fence)
+  private holder: { token: string; gen: number } | null = null;   // (0.1.16) the lock's current acquisition (its token)
+  private tombs = new Map<string, OpRec>();            // (0.1.16) late records whose save failed, by operation key (in memory)
+  lockMoves: { token: string; gen: number; by: string }[] = [];   // (0.1.16) the lock's last 50 releases (each acquisition's token once)
+  private heldSaid = "";                               // (0.1.16) the last "writes held" line logged by a poll
+  private reconcileQueued = false;                     // (0.1.16) a reconcile of late operations is queued on the lock
   private optionsUnknown = false;                      // (0.1.9) the last options read failed or timed out
   private cleanupDue = true;                           // (0.1.9) the cleanup at start (the first poll)
   private jobReads = new Map<string, InstallJob[] | null>();   // (0.1.15) this poll's jobs list read for each claimed attempt with no job bound
@@ -795,56 +817,102 @@ export class Keeper {
   // released and the owner paged once, so later claim, cancel and attestation calls are never wedged behind it. The pending
   // answer carries the operation's stable id (OpRec, kept in the state), and a retry of that operation reports its recorded
   // outcome (pending or late) without starting it again; once its write ended, a retry runs the step afresh.
-  record<T>(fn: (f: Fence) => T | Promise<T>, fallback?: (why: string, pending: boolean, op?: OpRec) => T, op?: string, stepOver?: number): Promise<T> {
-    const stepMs = stepOver ?? this.d.lockStepMs ?? LOCK_STEP_MS;
+  // 0.1.16 (the fix round): every acquisition of the lock has its own token (holder); its release is a no-op unless that token
+  // still holds the lock, so a step that finishes in the same tick its bound fires makes exactly one holder transition. The
+  // bound's timer releases first, synchronously, before anything else; the late record's save and the owner's page follow,
+  // fire-and-forget, each bounded and logged when it fails. A late record whose save fails stays as an in-memory tombstone
+  // (tombs): a step that would start that operation refuses while it stands, and the save is tried again at the next step's
+  // start. Operation records are a one-way machine (OP_MOVES: pending to done or late, late only to reconciled), every write of
+  // one compare-and-set on (generation, operation id) (opPut); a cut-off step's completion never writes its record, it queues a
+  // reconcile under the lock (reconcileOps). While any record is late, every Supervisor write is held (writesHeldWhy).
+  record<T>(fn: (f: Fence) => T | Promise<T>, fallback?: (why: string, pending: boolean, op?: OpRec) => T, op?: string): Promise<T> {
+    const stepMs = this.d.lockStepMs ?? LOCK_STEP_MS;
+    const said = (o: OpRec) => o.state === "late" ? "its write passed the ceiling and is marked late" : "its write is still in flight";
+    // a tombstone stands: refused at once, nothing started (no Supervisor call)
+    const tomb = op ? this.tombs.get(op) : undefined;
+    if (op && tomb && fallback) {
+      this.d.log(`a retry of ${op} (operation ${tomb.id}): its late record couldn't be saved and stands in memory; nothing started again`);
+      return Promise.resolve(fallback(said(tomb), true, tomb));
+    }
     const seen = op ? this.st.ops?.[op] : undefined;
     if (op && seen && fallback && (seen.state === "pending" || seen.state === "late")) {
       this.d.log(`a retry of ${op} (operation ${seen.id}): its recorded outcome is ${seen.state}; nothing started again`);
-      return Promise.resolve(fallback(seen.state === "late" ? "its write passed the ceiling and is marked late" : "its write is still in flight", true, seen));
+      return Promise.resolve(fallback(said(seen), true, seen));
     }
-    if (op && seen) { delete this.st.ops![op]; this.save(); }
     let hold: Promise<unknown> | null = null;
-    // (0.1.16) The lock's own bound: PENDING_CEILING_MS from the moment this step takes the lock, whatever the step or its
-    // writes do. One timer, started as the step starts, releases the lock then: a write still unanswered is marked late
-    // (reconciled by its name or id) and paged, a step still running is cut off (its generation over, so it changes nothing
-    // more), and it is logged. Nothing it does first can keep the release from happening (a failed save or page included).
-    let release: () => void = () => {};
-    const released = new Promise<void>((r) => { release = r; });
+    let freed: () => void = () => {};
+    const released = new Promise<void>((r) => { freed = r; });
     const step = async (): Promise<T> => {
       const gen = ++this.lockGen;
+      const token = randomBytes(8).toString("hex");
+      this.holder = { token, gen };
+      // (0.1.16) the one release of this acquisition: a no-op unless its token still holds the lock
+      const release = (by: string): boolean => {
+        if (this.holder?.token !== token) return false;
+        this.holder = null; freed();
+        this.lockMoves.push({ token, gen, by }); if (this.lockMoves.length > 50) this.lockMoves.shift();
+        return true;
+      };
       let expired = false, late = false, finished = false;
       const inflight = new Set<Promise<unknown>>();
-      const writes: string[] = [];
+      const writes: string[] = [], targets: string[] = [];
       const ceilMs = this.d.pendingCeilingMs ?? PENDING_CEILING_MS;
+      const key = op ?? `a step (generation ${gen})`;
       let rec: OpRec | undefined;
+      // one reconcile queued at a time, however many cut-off completions ask for it
+      const reconcileLater = () => {
+        if (this.reconcileQueued) return;
+        this.reconcileQueued = true;
+        void this.record((g) => { this.reconcileQueued = false; return this.reconcileOps(g); }, () => { this.reconcileQueued = false; }).catch(() => { this.reconcileQueued = false; });
+      };
+      // (0.1.16) the lock's own bound, from the moment this step took the lock
       let bound: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
         bound = undefined;
+        if (finished && !inflight.size) return;
+        late = true; expired = true;
+        // released first, synchronously, before any bookkeeping
+        release("its bound");
         try {
-          if (finished && !inflight.size) return;
-          late = true; expired = true;
-          if (rec) rec.state = "late";
           const what = rec ? `${rec.op} (operation ${rec.id})` : `a step under the claim record's lock${op ? ` (${op})` : ""}`;
           this.d.log(inflight.size
             ? `${what}: its write (${writes.join(", ") || "an external write"}) still has no outcome after ${ceilMs / 60_000} minutes, the lock's bound: marked late, reconciled by its name or id; the lock is released`
-            : `${what}: still running after ${ceilMs / 60_000} minutes, the lock's bound: marked late, and its generation changes nothing more; the lock is released`);
-          if (inflight.size) this.owner(this.d.self, "late write", `Keeper released its lock after ${ceilMs / 60_000} minutes with a write still unanswered (${(writes[0] ?? "an external write").slice(0, 80)}). It is marked late and checked again by its name; nothing is sent again.`, true);
-          this.save();
+            : `${what}: still running after ${ceilMs / 60_000} minutes, the lock's bound: its generation changes nothing more; the lock is released`);
+          if (!inflight.size) return;
+          const next: OpRec = rec ? { ...rec, state: "late" } : { id: `op-${randomBytes(8).toString("hex")}`, op: op ?? "a step", at: this.now(), state: "late", writes: [...writes], gen, ...(targets.length ? { targets: [...targets] } : {}) };
+          if (this.opPut(key, next, rec ? { gen: rec.gen ?? 0, id: rec.id } : undefined)) rec = next;
+          const r = rec ?? next;
+          void this.bounded(() => this.saveAsync(), "the late record's save").then((ok) => {
+            if (ok) { this.tombs.delete(key); return; }
+            this.tombs.set(key, r);
+            this.d.log(`${r.op} (operation ${r.id}): its late record couldn't be saved: kept in memory, every start of it refused, and the save tried again at the next step`);
+          });
+          void this.bounded(() => { this.owner(this.d.self, "late write", `Keeper released its lock after ${ceilMs / 60_000} minutes with a write still unanswered (${(writes[0] ?? "an external write").slice(0, 80)}). It is marked late and checked again by its name; nothing is sent again.`, true); return true; }, "the late write's page")
+            .then((ok) => { if (!ok) this.d.log(`${r.op} (operation ${r.id}): the owner's page for its late write couldn't be queued`); });
         } catch (e) {
           this.d.log(`the lock's bound: its late bookkeeping failed (${String((e as Error)?.message ?? e).slice(0, 80)}); the lock is released all the same`);
-        } finally { release(); }
+        }
       }, ceilMs);
       (bound as any)?.unref?.();
       const unbound = () => { if (bound) { clearTimeout(bound); bound = undefined; } };
+      // (0.1.16) a tombstone's save tried again at each step's start
+      if (this.tombs.size) {
+        let ok = false; try { ok = this.save(); } catch { ok = false; }
+        if (ok) { this.d.log(`the late record${this.tombs.size === 1 ? "" : "s"} kept in memory (${[...this.tombs.values()].map((o) => o.id).join(", ")}) saved now`); this.tombs.clear(); }
+      }
+      const mine = () => !late && this.holder?.token === token;
       const f: Fence = {
         gen,
-        live: () => !expired && this.lockGen === gen,
-        write: async <V>(what: string, call: () => Promise<V> | V, after?: (v: V) => void): Promise<V | null> => {
+        live: () => !expired && this.lockGen === gen && this.holder?.token === token,
+        write: async <V>(what: string, call: () => Promise<V> | V, after?: (v: V) => void, target?: string): Promise<V | null> => {
           if (!f.live()) { this.d.log(`${what} not done: its step's generation ${gen} under the claim record's lock is over`); return null; }
+          const held = this.writesHeldWhy();
+          if (held) { this.d.log(`${what} not done: ${held}`); return null; }
           writes.push(what);
+          if (target) targets.push(target);
           const p = (async () => {
             const v = await call();
-            // (0.1.11) past the ceiling the lock is gone: its outcome is reconciled by name or id, never written here
-            if (late) this.d.log(`${what} ended after its ceiling: not recorded here; it is reconciled by its name or id`);
+            // past the bound, or once another step holds the lock, its outcome is never written here: a reconcile is queued
+            if (!mine()) { this.d.log(`${what} ended after its step lost the lock: not recorded here; a reconcile under the lock settles it`); reconcileLater(); }
             else after?.(v);
             return v;
           })();
@@ -852,50 +920,102 @@ export class Keeper {
           try { return await p; } finally { inflight.delete(p); }
         },
       };
+      // a finished record of this operation is dropped (compare-and-set) before it runs afresh; one that stands refuses
+      if (op) {
+        const cur = this.st.ops?.[op];
+        if (cur && (cur.state === "pending" || cur.state === "late") && fallback) { unbound(); finished = true; release("its operation stands"); return fallback(said(cur), true, cur); }
+        if (cur && this.opDrop(op, { gen: cur.gen ?? 0, id: cur.id })) this.save();
+      }
       let t: ReturnType<typeof setTimeout> | undefined;
       try {
         const v = await Promise.race([Promise.resolve().then(() => fn(f)),
           new Promise<never>((_, no) => { t = setTimeout(() => { expired = true; no(new Error(`it ran past ${stepMs / 1000} seconds`)); }, stepMs); (t as any)?.unref?.(); })]);
         finished = true;
-        unbound();
+        if (!inflight.size) { unbound(); release("its end"); }
         return v;
       } catch (e) {
         expired = true;
         finished = true;
         const why = String((e as Error)?.message ?? e).slice(0, 120);
         if (inflight.size && !late) {
-          rec = { id: `op-${randomBytes(8).toString("hex")}`, op: op ?? "a step", at: this.now(), state: "pending", writes: [...writes] };
-          const r = rec;
-          if (op) { const ops = (this.st.ops ??= {}); ops[op] = r; const keys = Object.keys(ops); if (keys.length > 50) delete ops[keys[0]]; this.save(); }
+          const r: OpRec = { id: `op-${randomBytes(8).toString("hex")}`, op: op ?? "a step", at: this.now(), state: "pending", writes: [...writes], gen, ...(targets.length ? { targets: [...targets] } : {}) };
+          if (this.opPut(key, r)) { rec = r; try { this.save(); } catch { /* the bound's save follows */ } }
           this.d.log(`a step under the claim record's lock failed (${why}) with a write in flight: the lock is held until that write ends, at most ${ceilMs / 60_000} minutes from the step's start${op ? `, and ${op} answers pending meanwhile (operation ${r.id})` : ""}`);
           hold = Promise.allSettled([...inflight]).then(() => {
-            r.settledAt = this.now();
-            if (late) { this.d.log(`${r.op} (operation ${r.id}): its late write ended; its outcome is reconciled by its name or id`); return; }
+            if (late || this.holder?.token !== token) { this.d.log(`${r.op} (operation ${r.id}): its late write ended; a reconcile under the lock settles it`); reconcileLater(); return; }
             unbound();
-            r.state = "done";
-            if (op) this.save();
+            const done: OpRec = { ...r, state: "done", settledAt: this.now() };
+            if (this.opPut(key, done, { gen, id: r.id })) { rec = done; try { this.save(); } catch { /* kept in memory */ } }
             this.d.log(`${r.op}: its write in flight ended; the lock is released, and a retry reconciles it`);
-          });
+          }).finally(() => { if (!late) { unbound(); release("its write's end"); } });
           if (fallback) return fallback(why, true, op ? r : undefined);
           throw e;
         }
-        if (inflight.size && late && op) {
-          // the bound fired while the step still ran with a write out: recorded late, so a retry reports it and never starts it again
-          rec = { id: `op-${randomBytes(8).toString("hex")}`, op, at: this.now(), state: "late", writes: [...writes] };
-          const ops = (this.st.ops ??= {}); ops[op] = rec; const keys = Object.keys(ops); if (keys.length > 50) delete ops[keys[0]];
-          try { this.save(); } catch { /* logged below */ }
-        }
-        unbound();
+        if (!inflight.size || !late) { unbound(); release("its failure"); }
         if (late) this.d.log(`a step under the claim record's lock failed (${why}) after its bound: the lock was already released`);
         else this.d.log(`a step under the claim record's lock failed (${why}): the lock is released for the next one, and that step's generation ${gen} changes nothing more`);
-        if (fallback) return fallback(why, late, late && op ? rec : undefined);
+        if (fallback) return fallback(why, late && !!rec, late && op ? rec : undefined);
         throw e;
       } finally { if (t) clearTimeout(t); }
     };
     const run = this.lock.then(step, step);
-    // the next step waits for this one's end and its write's, or for the bound, whichever comes first
-    this.lock = Promise.race([run.catch(() => undefined).then(() => hold ?? undefined), released]).catch(() => undefined);
+    // the next step waits for this acquisition's release (its end, its write's end, or its bound), or for the step and its hold
+    // to settle whatever they did: a rejected step never makes the next one throw
+    this.lock = Promise.race([released, run.catch(() => undefined).then(() => hold ?? undefined).catch(() => undefined)]).then(() => undefined, () => undefined);
     return run;
+  }
+  // (0.1.16) A state save as a promise (the late record's, under bounded()): false when it reports not saved or fails.
+  private saveAsync(): Promise<boolean> { this.st.counter++; return Promise.resolve().then(() => this.d.save(this.st)).then((v) => v !== false); }
+  // (0.1.16) An operation record's write, compare-and-set on (generation, operation id): a new record only where none stands or
+  // the one there is over (done or reconciled); a move only from the very record the writer read, along OP_MOVES. Only finished
+  // records are ever dropped to keep the list at 50.
+  private opPut(key: string, next: OpRec, want?: { gen: number; id: string }): boolean {
+    const ops = (this.st.ops ??= {});
+    const cur = ops[key];
+    const ok = !want ? !cur || cur.state === "done" || cur.state === "reconciled"
+      : !!cur && cur.id === want.id && (cur.gen ?? 0) === want.gen && next.id === cur.id && OP_MOVES[cur.state].includes(next.state);
+    if (!ok) { this.d.log(`the operation record of ${key} wasn't written (${cur ? `${cur.id} is ${cur.state}` : "none stands"}; ${next.id} to ${next.state} refused: records move one way, compared on generation and id)`); return false; }
+    ops[key] = next;
+    for (const k of Object.keys(ops)) { if (Object.keys(ops).length <= 50) break; if (ops[k].state === "done" || ops[k].state === "reconciled") delete ops[k]; }
+    return true;
+  }
+  private opDrop(key: string, want: { gen: number; id: string }): boolean {
+    const cur = this.st.ops?.[key];
+    if (!cur || cur.id !== want.id || (cur.gen ?? 0) !== want.gen || !(cur.state === "done" || cur.state === "reconciled")) return false;
+    delete this.st.ops![key];
+    return true;
+  }
+  // (0.1.16) While any operation record is late (or a late record stands only in memory), every Supervisor write is held: claims,
+  // cancels, restores, backups and backup deletes. Reads and status go on. "" when none is.
+  writesHeldWhy(): string {
+    const late = [...this.tombs.values(), ...Object.values(this.st.ops ?? {}).filter((o) => o.state === "late")];
+    return late.length ? `operation ${late[0].id} (${late[0].op}) is late: Keeper holds every Supervisor write (claims, cancels, restores, backups and backup deletes) until a reconcile under the lock confirms no job of it is running` : "";
+  }
+  // (0.1.16) The late operations reconciled, under the lock: once the Supervisor's jobs list shows no backup job running, each late
+  // record moves to reconciled (compare-and-set on its generation and id), its outcome read from the backups list where its write
+  // named a backup (gone: done; still there: failed), else failed (nothing of it runs, so nothing is lost by trying again). A list
+  // that can't be read, or a backup job still running, keeps it late (and every Supervisor write held).
+  async reconcileOps(f: Fence): Promise<void> {
+    for (const [k, o] of this.tombs) if (!this.st.ops?.[k]) (this.st.ops ??= {})[k] = o;
+    const late = Object.entries(this.st.ops ?? {}).filter(([, o]) => o.state === "late");
+    if (!late.length) return;
+    const jobs = this.d.backupJobs ? await this.bounded(() => this.d.backupJobs!(), "the Supervisor's backup jobs") : null;
+    const list = late.some(([, o]) => o.targets?.length) ? (this.d.backups ? await this.bounded(() => this.d.backups!(), "the Supervisor's backups list") : null) : [];
+    if (!f.live()) return;
+    const ids = late.map(([, o]) => o.id).join(", ");
+    if (!jobs) { this.d.log(`the late operation${late.length === 1 ? "" : "s"} ${ids} can't be reconciled yet: the Supervisor's jobs list couldn't be read; Supervisor writes stay held`); return; }
+    if (jobs.length) { this.d.log(`the late operation${late.length === 1 ? "" : "s"} ${ids} can't be reconciled yet: a backup job is still running (${jobs[0]}); Supervisor writes stay held`); return; }
+    for (const [k, o] of late) {
+      if (o.targets?.length && !list) { this.d.log(`${o.op} (operation ${o.id}) can't be reconciled yet: the backups list couldn't be read`); continue; }
+      const outcome: "done" | "failed" = o.targets?.length && o.targets.every((t) => !list!.some((b) => b.slug === t)) ? "done" : "failed";
+      if (!f.live()) return;
+      if (this.opPut(k, { ...o, state: "reconciled", outcome, settledAt: this.now() }, { gen: o.gen ?? 0, id: o.id })) {
+        this.tombs.delete(k);
+        this.d.log(`${o.op} (operation ${o.id}): reconciled under the lock: no Supervisor job of it is running, and its write ${outcome === "done" ? "took effect" : "didn't take effect (a retry may send it again)"}`);
+      }
+    }
+    if (!this.writesHeldWhy()) this.d.log("no operation is late any more: Supervisor writes go on");
+    this.save();
   }
   // (0.1.8) An external call under the lock, bounded: null when it throws or doesn't answer within LOCK_CALL_MS.
   async bounded<T>(call: () => Promise<T> | T, what: string): Promise<T | null> {
@@ -1102,15 +1222,21 @@ export class Keeper {
     const kf = this.d.keyFiles, dl = this.d.download;
     if (!kf || !dl || !this.d.deleteBackup || !kf.read || !kf.control || !this.d.backups) return { ok: false, why: "this Keeper can't place key files, download, list or delete a backup" };
     if (this.checking) return { ok: false, why: "a backup check is already running" };
+    const held = this.writesHeldWhy();
+    if (held) return { ok: false, why: `the backup check makes and deletes a backup: ${held}` };
     const open = this.open();
     if (open.length) return { ok: false, why: `${open[0].id} is ${open[0].status}: run the backup check once no install is open` };
     this.checking = true;
     const sentinel = `keeper-sentinel-${randomBytes(12).toString("hex")}`;
     const control = `keeper-control-${randomBytes(12).toString("hex")}`;
-    const needles = [sentinel, sha(sentinel).slice(0, 16)];
+    // (0.1.16) each value with what it is, named in a failure; scan.ts searches only values of at least MIN_NEEDLE (16) bytes, so
+    // the 8 and 12 hex digit ids are left out of the byte search (they could match random bytes by chance) and the 16 digit
+    // fingerprint of each key stands for them
+    const needles: Needle[] = [{ value: sentinel, kind: "the sentinel" }, { value: sha(sentinel).slice(0, 16), kind: "the sentinel's fingerprint" }];
     let oldKept = "";
     try { oldKept = s(this.d.oldKeyStore?.load() ?? ""); } catch { oldKept = ""; }
-    for (const k of [this.hcKey, oldKept].filter(Boolean)) needles.push(k, sha(`hc-key\n${k}`).slice(0, 8), sha(`hc-key\n${k}`).slice(0, 16), sha(`hc-old-key\n${k}`).slice(0, 12));
+    for (const k of [this.hcKey, oldKept].filter(Boolean)) needles.push({ value: k, kind: "a key value" }, { value: sha(`hc-key\n${k}`).slice(0, 16), kind: "a key's fingerprint" },
+      { value: sha(`hc-old-key\n${k}`).slice(0, 16), kind: "a key's fingerprint" });
     let placed: string[] = [];
     let slug = "";
     const name = `Keeper backup check ${randomBytes(4).toString("hex")}`;
@@ -1161,7 +1287,9 @@ export class Keeper {
       return { ok: true, why: "" };
     } finally {
       try { kf.clear(); } catch (e) { this.d.log(`backup check: couldn't remove the sentinels (${String(e).slice(0, 80)}); they are removed at the next start`); }
-      if (slug) {
+      const held = slug ? this.writesHeldWhy() : "";
+      if (held) this.d.log(`backup check: test backup ${slug} ("${name}") isn't deleted now (${held}): it is deleted at the next start`);
+      else if (slug) {
         const gone = await this.d.deleteBackup(slug).catch(() => false);
         this.d.log(gone ? `backup check: test backup ${slug} deleted` : `backup check: couldn't delete test backup ${slug} ("${name}"): it is deleted at the next start`);
         if (gone) { delete this.st.backupCheckRun; this.save(); }
@@ -1189,6 +1317,8 @@ export class Keeper {
     const list = this.d.backups ? await this.bounded(() => this.d.backups!(), "the Supervisor's backups list") : null;
     if (!list) { this.save(); return `the interrupted backup check's test backup "${run.name}" can't be looked up (the backups list couldn't be read)`; }
     const hits = list.filter((b) => b.name === run.name || (!!run.slug && b.slug === run.slug));
+    const held = hits.length ? this.writesHeldWhy() : "";
+    if (held) { this.save(); return `the interrupted backup check's test backup "${run.name}" isn't deleted now: ${held}`; }
     let all = true;
     for (const b of hits) {
       const gone = this.d.deleteBackup ? await this.bounded(() => this.d.deleteBackup!(b.slug), `the delete of backup ${b.slug}`) : false;
@@ -1279,8 +1409,14 @@ export class Keeper {
       const old = (() => { try { return s(this.d.oldKeyStore?.load() ?? ""); } catch { return ""; } })();
       let tried = ROTATION_PROOF_TAP;
       if (old) {
-        const v = await this.oldKeyRevoked(old);
+        const v = revocation(this.d.hcTry ? await this.bounded(() => this.d.hcTry!(old), "the old key's try at the alert service") : null);
         if (!f.live()) return no("the attestation's step ran out of time");
+        // (0.1.16) a bare 401 is no proof: said in plain words, and the owner paged once for this attempt
+        if (v.why === BARE_401_WHY) {
+          this.d.log(`the old key ${o.id}: ${BARE_401_WHY}`);
+          this.owner(this.d.self, "rotation unproven", `Keeper couldn't confirm the old alert key ${o.id} is revoked: ${BARE_401_WHY}.`, true);
+          this.save();
+        }
         if (v.state === "valid") return no(`the alert service still accepts the old key ${o.id}: revoke it there (Project Settings, API Access), then tap again`);
         if (v.state !== "revoked") return no(`the old key's try doesn't prove it revoked (${v.why}): tap again later`);
         // the kept old key is deleted as soon as its revocation check passed
@@ -1293,35 +1429,13 @@ export class Keeper {
       this.arm();
       this.save();
       return { status: 200, body: { status: "attested", id: o.id, proof: this.st.rotation.proof } };
-    }, (why, pending, op) => pending ? Keeper.pendingAnswer("rotation", why, op) : ({ status: 503, body: { status: "refused", why: `Keeper's attestation step failed (${why})` } }), "rotation",
-    // the tries and the bare 401's repeat (three reads, each bounded, and the gap) get twice the usual step bound, still well
-    // inside the lock's own bound
-    2 * (this.d.lockStepMs ?? LOCK_STEP_MS));
-  }
-  // (0.1.16) The old key's try, judged: the documented answer proves it at once; a bare 401 only when a second read at least
-  // REVOKE_REPEAT_MS after the first answers 401 again and the current key, read in between, is accepted (200). Anything
-  // else (no current key, the current key refused or unanswered, the second read not a 401) proves nothing.
-  async oldKeyRevoked(old: string): Promise<{ state: "revoked" | "valid" | "unknown" | "repeat"; why: string }> {
-    const tryKey = (k: string, what: string) => this.d.hcTry ? this.bounded(() => this.d.hcTry!(k), what) : Promise.resolve(null);
-    const first = revocation(await tryKey(old, "the old key's try at the alert service"));
-    if (first.state !== "repeat") return first;
-    const at = Date.now();
-    const gap = this.d.revokeRepeatMs ?? REVOKE_REPEAT_MS;
-    if (!this.hcKey) return { state: "unknown", why: "a bare 401, and no current key is kept to show the alert service was answering" };
-    const cur = revocation(await tryKey(this.hcKey, "the current key's read at the alert service"));
-    if (cur.state !== "valid") return { state: "unknown", why: `a bare 401, and the current key wasn't accepted in between (${cur.state === "repeat" ? "401" : cur.why}): the alert service may be down` };
-    const wait = gap - (Date.now() - at);
-    if (wait > 0) await new Promise((res) => { const t = setTimeout(res, wait); (t as any)?.unref?.(); });
-    const second = revocation(await tryKey(old, "the old key's second try at the alert service"));
-    if (second.state === "revoked") return second;
-    if (second.state !== "repeat") return { state: second.state === "valid" ? "valid" : "unknown", why: second.state === "valid" ? "200" : `a bare 401, then ${second.why} on the second read` };
-    return { state: "revoked", why: `401 twice, ${Math.round(Math.max(gap, Date.now() - at) / 1000)} seconds apart, with the current key accepted in between` };
+    }, (why, pending, op) => pending ? Keeper.pendingAnswer("rotation", why, op) : ({ status: 503, body: { status: "refused", why: `Keeper's attestation step failed (${why})` } }), "rotation");
   }
 
   start(): void {
     const now = this.now();
     // (0.1.11) an operation left pending by a restart: its write's outcome is unknown, so it is late (reconciled by name or id)
-    for (const o of Object.values(this.st.ops ?? {})) if (o.state === "pending") { o.state = "late"; this.d.log(`${o.op} (operation ${o.id}): left pending by a restart: marked late, reconciled by its name or id`); }
+    for (const [k, o] of Object.entries(this.st.ops ?? {})) if (o.state === "pending" && this.opPut(k, { ...o, state: "late" }, { gen: o.gen ?? 0, id: o.id })) this.d.log(`${o.op} (operation ${o.id}): left pending by a restart: marked late, reconciled by its name or id`);
     if (this.st.heartbeat && now - this.st.heartbeat > REWIND_MS) {
       const mins = Math.round((now - this.st.heartbeat) / 60_000);
       if (Object.keys(this.st.drills).length || Object.keys(this.st.phone).length)
@@ -1469,6 +1583,8 @@ export class Keeper {
       else { this.d.log("the keeper's options can't be read this poll: the last ones read stay in force, and the old option counts as present"); this.optionsUnreadable(); }
       const now = this.now();
       for (const a of this.open().filter((x) => x.status === "verifying")) this.verifyLeft(a);
+      // (0.1.16) a late operation reconciled under the lock first, so the writes it holds (a restore among them) go on once it is
+      if (this.writesHeldWhy()) await this.record((f) => this.reconcileOps(f), () => undefined).catch(() => undefined);
       const apps = new Set([...this.opts.watch, ...this.open().map((a) => a.app), ...this.unresolvedOf().map((a) => a.app)]);
       for (const app of apps) await this.pollApp(app);
       await this.watchJobListing();
@@ -1707,6 +1823,9 @@ export class Keeper {
   // Ship run start the install): a backup that isn't there any more refuses the claim.
   claim(caller: string | null, id: string, body: any): Promise<Answer> {
     return this.record(async (f) => {
+      // (0.1.16) no claim while an operation is late
+      const held = this.writesHeldWhy();
+      if (held) { this.d.log(`refused a claim of ${id}: ${held}`); return { status: 503, body: { status: "refused", id, why: held } }; }
       const a = caller === REGISTRAR ? this.st.attempts[id] : undefined;
       if (a && a.status === "accepted" && !a.claim && a.backup) {
         const b = await this.bounded(() => this.d.backupInfo(a.backup), "the Supervisor's backup info before a claim");
@@ -1727,6 +1846,9 @@ export class Keeper {
       this.d.log(`${id}: a cancel was asked (${a0.abortAsked.why}): it can't be claimed or consumed any more`);
     }
     return this.record(async (f) => {
+      // (0.1.16) no cancel while an operation is late (the cancel asked stays recorded: nothing claims or consumes the attempt)
+      const held = this.writesHeldWhy();
+      if (held) { this.d.log(`refused a cancel of ${id}: ${held}`); return { status: 503, body: { status: "refused", id, why: `${held}; nothing was cancelled` } }; }
       const a = caller === REGISTRAR ? this.st.attempts[id] : undefined;
       const jobs = a ? await this.appJobs(a.app) : [];
       // (0.1.9) the commit, only while this step's generation is live (checked in the same tick as the write)
@@ -1867,6 +1989,9 @@ export class Keeper {
   // (0.1.9) Under the lock, before a new backup: the bounded cleanup, the free-space reserve, then the attempt's own
   // generation and backup name, saved before the backup call. "" when the backup may be made, else why not.
   private async prepareBackup(a: Attempt, f: Fence): Promise<string> {
+    // (0.1.16) no backup while an operation is late
+    const held = this.writesHeldWhy();
+    if (held) return `no backup is made now: ${held}`;
     await this.cleanup("before a new backup", f, a.id);
     // (0.1.10) with no last size (a first backup) the reserve floor is 1 GB plus the App's image size when known, else 2 GB
     const last = this.st.lastBackupBytes;
@@ -1981,7 +2106,7 @@ export class Keeper {
         if (ok) { delete kept[slug]; x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); this.dropKey(r.name, "its backup was deleted"); }
         else this.d.log(`the cleanup couldn't delete kept backup ${slug} ("${r.name}"): tried again at the next cleanup`);
         this.save();
-      });
+      }, slug);
     }
     // Keeper-named backups with no kept record: never deleted, named once per start
     if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name)
@@ -2039,7 +2164,7 @@ export class Keeper {
           if (ok) { delete x.lateBackup; this.d.log(`${x.id}: its backup's create outran its bound and completed later as ${hit.slug} ("${x.backupName}") with no generation record: deleted`); this.dropKey(x.backupName!, "its backup was deleted"); }
           else this.d.log(`${x.id}: couldn't delete its late backup ${hit.slug} ("${x.backupName}"): tried again under the next lock holder`);
           this.save();
-        });
+        }, hit.slug);
       }
     }
   }
@@ -2287,6 +2412,9 @@ export class Keeper {
     if (!r.called) {
       if (r.inflight || r.pending || r.tries > 0) return this.reconcile(a, info);   // (0.1.5) one call, ever
       if (now < r.nextTry) return;
+      // (0.1.16) never sent while an operation is late: it waits for the reconcile, checked again at every poll
+      const held = this.writesHeldWhy();
+      if (held) { if (this.heldSaid !== `${a.id} ${held}`) { this.heldSaid = `${a.id} ${held}`; this.d.log(`${a.id}: its restore waits: ${held}`); } return; }
       // (0.1.12) the backup's own password; with none, the restore is never sent (exactly like a missing backup)
       const password = this.backupKey(a);
       if (!password) return this.unprotected(a, `its backup ${a.backup}'s key file is missing or unreadable, so it can't be restored`);
