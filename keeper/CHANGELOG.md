@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.16
+
+- Closed: the secret scanner's coverage. The backup check now searches every byte of Keeper's test backup for the kept key, the old key, their fingerprints and every sentinel, including the gzip header, tar header fields, padding and anything after an archive's end. It finds the end of the gzip stream itself and checks its CRC and length: a second gzip stream, a wrong trailer or anything but zeros after it fails the check. The test value it plants must be found once, inside a file, and nowhere else. Values shorter than 16 characters are no longer searched for, so a short fingerprint can't match by chance. Every failure names the layer, the byte and what matched. It also proves the drill flags' spent list stays out of the backup.
+- Closed: a bare 401 taken as a revocation. The old key counts as revoked only on Healthchecks' "wrong api key" answer, on a 401 or a 403. A bare 401, even repeated, is not proof: Keeper says so in its log, pages you once for that tap, and you tap again later. Keeper reads at most 4 KB of the answer, for at most 3 seconds.
+- Closed: the pending lock's bound. A step that never answers now lets go of Keeper's lock 3 minutes after it took it, at once, before anything else, and the next request goes ahead. A step that lost the lock can never write over the next one. If Keeper can't save the late record, it keeps it in memory and refuses that request until it can.
+- While anything is late, Keeper holds every change it would make in Home Assistant (claims, cancels, restores, backups and their deletes) until it has checked that nothing of it is still running. Reading and status go on.
+- Run `backup-check` again after installing: a pass from before 0.1.16 no longer counts, since the scan is wider. The accepted limits (version 7) and the backup exclusion are unchanged.
+- Keeper's DOCS: the drill-plan follow-ups are closed and only the device checks remain before `drill_followups_open` goes off; the container name is found at run time (`addon_` or `app_0fcc2575_keeper`); the drill card is refused in quiet hours, not held; the drill mark is 0644; the limits text is version 7; a drill armed for the wrong version blocks Cain's installs until Clear the drill.
+- RELEASING.md: a Drill releases section and notes on reaching the Pi.
+
 ## 0.1.15
 
 - Keeper now ties each install to the Home Assistant job that made it. It watches, rolls back and counts a drill only for that install; a start of the same version with no such job is not covered, and you are paged.

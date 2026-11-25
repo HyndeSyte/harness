@@ -5,7 +5,7 @@
 # never manager), has no Home Assistant API access, no ingress, no page and no /share. Its HTTP
 # service (port 8097) is on Home Assistant's internal App network only, with no host port.
 name: Keeper
-version: "0.1.15"
+version: "0.1.16"
 slug: keeper
 description: >-
   Covers only the first 15 minutes after each App install: checks it and rolls

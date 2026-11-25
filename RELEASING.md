@@ -5,7 +5,7 @@ Cain starts. Three Home Assistant Apps live here:
 
 - `harness/` is the calendar specialist (Python). Slug `0fcc2575_harness`.
 - `cain/` is Cain, Dane's chief of staff (bash and Bun/TypeScript). Slug `0fcc2575_cain`.
-- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.8): a check after every install of a
+- `keeper/` is the keeper of installs (Bun/TypeScript, Keeper 0.1.16): a check after every install of a
   watched App, with automatic rollback (`keeper/DOCS.md`). Slug `0fcc2575_keeper`. Its tests:
   `bun test keeper/tests`.
 
@@ -438,8 +438,10 @@ claim's start and end is logged there with its deadline).
 
 ## The Keeper's setup (Dane, once, and after its state is lost)
 
-At the Pi, with the SSH App, in the Keeper App's container (`docker exec addon_0fcc2575_keeper bun
-/opt/keeper/main.ts <command>`). Keeper DOCS has each step in full.
+At the Pi, with the SSH App, in the Keeper App's container (`docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun
+/opt/keeper/main.ts <command>`). The container is `addon_0fcc2575_keeper` on an older Home Assistant and
+`app_0fcc2575_keeper` after Home Assistant's rename, so every command finds its name at run time with
+`docker ps --format '{{.Names}}' | grep 0fcc2575_keeper` (Pi access, below). Keeper DOCS has each step in full.
 
 1. Options: `ship_public_key`, `tokens` (and the same token in Cain's `keeper_token`), and the Healthchecks
    ping URLs (`hc_done`, `hc_deadman`, `hc_failed`), and (Keeper 0.1.8) `hc_unique_keys` with each production
@@ -448,7 +450,7 @@ At the Pi, with the SSH App, in the Keeper App's container (`docker exec addon_0
    0.1.8: while it is there Keeper doesn't arm and refuses `hc-key`. Then rotate that key in Healthchecks (revoke
    it, make a new read-only key), since earlier backups may hold it. Optional: `drill_days` (1 to 14, default 14).
 1a. `hc-key <code>` (Keeper 0.1.7), with the project's **read-only** Healthchecks API key on standard input,
-   never on the command line (`docker exec -i addon_0fcc2575_keeper bun /opt/keeper/main.ts hc-key <code>`,
+   never on the command line (`docker exec -i "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun /opt/keeper/main.ts hc-key <code>`,
    paste the key, Enter, Ctrl-D); the code is in the Keeper's log at every start. Keeper refuses a key that
    can write, or one that doesn't see the checks, and keeps nothing then. Again after any restore of the
    Keeper App (its backups leave the key out).
@@ -473,6 +475,28 @@ At the Pi, with the SSH App, in the Keeper App's container (`docker exec addon_0
    it lapses with it. One drill at a time: no install during a drill (Keeper turns it away and the drill is
    void).
 5. The two drills (a FAIL verdict and an exit on start), the next job.
+
+### Pi access
+
+- The SSH App's user is `hassio`, with `sudo`: `docker` runs as `sudo docker ...` there.
+- An App's container name depends on the Home Assistant version: `addon_0fcc2575_<app>` on an older one,
+  `app_0fcc2575_<app>` after Home Assistant's rename. Resolve it at run time, never type it:
+  `docker ps --format '{{.Names}}' | grep 0fcc2575_keeper` (or `0fcc2575_cain`), as in the commands above.
+- `scp` is closed on the SSH App, so a script goes over ssh's standard input:
+  `ssh <host> 'sudo bash -s' < script.sh`, or `ssh <host> 'cat > /tmp/script.sh' < script.sh` to keep a copy.
+
+## Drill releases
+
+A drill release is what the Keeper drills install (Keeper DOCS, "The drill runbook"). It is a version-only Cain patch:
+`cain/config.yaml`'s `version` one step above `main`'s, and a section at the top of `cain/CHANGELOG.md` saying it is a
+drill release with nothing new. Nothing in `main` fails on purpose: the failure comes only from Dane's Arm the drill tap
+(the drill flag and mark), never from code in the release.
+
+- It is built by the Build routine like any other change (a branch, a pull request, the checks), and landed by the
+  usual Ship tap.
+- Before its Ship card the pull request's files are checked: exactly those two files (`cain/config.yaml` and
+  `cain/CHANGELOG.md`), and the probe (`cain/rootfs/opt/cain/probe/keeper.ts`) untouched. Anything else in it means it
+  isn't a drill release: no Ship card for it as one.
 
 ## If the Ship key is remade
 

@@ -3,14 +3,14 @@
 // Home Assistant API, no manager role, and (0.1.2) no write of any options, its own included. 0.1.3: it also makes the App-only backup of an
 // install it registered (POST /backups/new/partial, within the backup role). The token
 // comes from the environment the Supervisor gives the App (SUPERVISOR_TOKEN) and is never logged.
-import { type AppInfo, type BackupInfo, type InstallJob, type JobState, REGISTER_WAIT_MS, type RestoreResult } from "./core.ts";
+import { type AppInfo, type BackupInfo, type InstallJob, type JobState, REGISTER_WAIT_MS, type RestoreResult, SUPERVISOR_CALL_MS } from "./core.ts";
 
 // (0.1.4) The backup call waits as long as the registration's answer does.
 export const BACKUP_CALL_MS = REGISTER_WAIT_MS;
 export interface Http { (url: string, init: RequestInit): Promise<Response> }
 
 export function supervisor(token: string, base = "http://supervisor", http: Http = fetch) {
-  const call = async (method: string, path: string, body?: unknown, ms = 15_000) => {
+  const call = async (method: string, path: string, body?: unknown, ms = SUPERVISOR_CALL_MS) => {
     const r = await http(`${base}${path}`, {
       method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(ms),
@@ -121,6 +121,18 @@ export function supervisor(token: string, base = "http://supervisor", http: Http
       const out: string[] = [];
       const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
         if (x.done !== true && x.reference === app) out.push(typeof x.name === "string" && x.name ? x.name.slice(0, 60) : "(a job with no name)");
+        if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
+      walk(r.data.jobs);
+      return out;
+    },
+    // (0.1.16) The Supervisor's running backup jobs (a create, a restore, a delete: names with "backup"), from the jobs list; the
+    // reconcile of a late operation waits until none runs. Null when the list can't be read.
+    async backupJobs(): Promise<string[] | null> {
+      const r = await call("GET", "/jobs/info").catch(() => null);
+      if (!r?.ok || !Array.isArray(r.data?.jobs)) return null;
+      const out: string[] = [];
+      const walk = (xs: any[]) => { for (const x of xs) { if (!x || typeof x !== "object") continue;
+        if (x.done !== true && typeof x.name === "string" && /backup/i.test(x.name)) out.push(x.name.slice(0, 60));
         if (Array.isArray(x.child_jobs)) walk(x.child_jobs); } };
       walk(r.data.jobs);
       return out;
