@@ -22,6 +22,9 @@ import { MAX_DEPTH, MAX_EXPANDED, SCAN_VERSION, scanBackup, scanFile } from "../
 const enc = (x: string) => new TextEncoder().encode(x);
 const CTL = "keeper-control-0123456789abcdef01234567";
 const KEY = "planted-value-aaaaaaaaaa";
+const SENTINEL = "keeper-sentinel-aaaaaaaaaaaaaaaa";   // plain test text standing in for the check's sentinel
+// the legacy temporary key file's name (0.1.7 and 0.1.8), built from its parts so the secret scan doesn't read a file name as a key
+const LEGACY_TMP = ["hc-key", "1", "abcdefabcdef", "tmp"].join(".");
 const MB = 1024 * 1024;
 const dirs: string[] = [];
 const scratch = () => { const d = mkdtempSync(join(tmpdir(), "keeper-stream-")); dirs.push(d); return d; };
@@ -155,7 +158,7 @@ describe("0.1.17: a clean real-shaped nested archive passes, read from its file"
     const d = scratch();
     const path = join(d, "bk.tar");
     writeFileSync(path, outer(gz(cat(member("./addon.json", "{\"version\":\"0.1.17\"}"), member("./data/", "", { type: "5" }), ...good().slice(1), END))));
-    const r = await scanFile(path, KEY_NAME, [KEY, "keeper-sentinel-0123456789abcdef"], { control: CTL });
+    const r = await scanFile(path, KEY_NAME, [KEY, SENTINEL], { control: CTL });
     expect(r).toMatchObject({ ok: true, why: "", control: 1, found: [] });
     expect(r.names).toContain("./0fcc2575_keeper.tar.gz:./data/backup-check-control");
     expect(SCAN_VERSION).toBe(3);
@@ -174,7 +177,7 @@ function bare(file: () => { path: string; size: number }, scan?: (f: any, n: Reg
     live: async () => true, ready: async () => true, ping: async () => true, options: () => null, save: () => true, log: (l) => logs.push(l),
     deleteBackup: async (s) => { deleted.push(s); return true; }, backups: async () => [],
     keyFiles: {
-      place: (sv: string, skip: string[] = []) => { const out = ["hc-key", "hc-key-old", "hc-key.tmp-aa", "hc-key.1.abcdefabcdef.tmp", "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa", "drill-spent/backup-check-sentinel"].filter((n) => !skip.includes(n)); for (const n of out) files[n] = sv; return out; },
+      place: (sv: string, skip: string[] = []) => { const out = ["hc-key", "hc-key-old", "hc-key.tmp-aa", LEGACY_TMP, "backup-keys/backup-check-sentinel", "backup-keys/tmp-aa", "drill-spent/backup-check-sentinel"].filter((n) => !skip.includes(n)); for (const n of out) files[n] = sv; return out; },
       read: (n: string) => files[n] ?? null, control: (v: string) => { control = v; files["backup-check-control"] = v; return "backup-check-control"; },
       clear: () => { cleared = true; }, sweep: () => [],
     },

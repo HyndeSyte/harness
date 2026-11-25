@@ -3246,7 +3246,7 @@ describe("0.1.12 item 3: the scan on the device's real backup layout", () => {
     tarOf([["./backup.json", backupJson(o.json)], [`./${SLUG}.tar.gz`, o.member ?? inner(ctl, o.extra)]]);
   const CTL = "keeper-control-0123456789abcdef01234567";
   test("a pass: the control found once, no key names, addon.json read", async () => {
-    const res = await scanBackup(outer(CTL), KEY_NAME, ["keeper-sentinel-0123456789abcdef"], { control: CTL });
+    const res = await scanBackup(outer(CTL), KEY_NAME, ["keeper-sentinel-aaaaaaaaaaaaaaaa"], { control: CTL });
     expect(res).toMatchObject({ ok: true, why: "", control: 1, found: [] });
     expect(res.names).toContain(`./${SLUG}.tar.gz:./addon.json`);
     expect(res.names).toContain(`./${SLUG}.tar.gz:./data/backup-check-control`);
