@@ -50,6 +50,13 @@ describe("Keeper 0.1.18: files in the App's own image that Keeper can't open", (
     expect(r.ok).toBe(true);
     expect(r.unopened).toBe(1);
   });
+  test("a gzip in the image that isn't a tar inside (a changelog.gz) is opened and searched, not counted as unopened", async () => {
+    const r = await scan(backup(image(member("usr/share/doc/x/changelog.gz", gzipSync(enc("plain text"))), member("var/log/apt/eipp.log.xz", XZ())), ...data()));
+    expect(r.ok).toBe(true);
+    expect(r.unopened).toBe(1);
+    const k = await scan(backup(image(member("usr/share/doc/x/changelog.gz", gzipSync(enc(`text ${KEY}`)))), ...data()));
+    expect(k.ok).toBe(false);
+  });
   test("past the nesting budget inside the image: read as raw bytes, not failed", async () => {
     let deep: Uint8Array = member("f.txt", "x");
     for (let i = 0; i < MAX_DEPTH + 2; i++) deep = member(`n${i}.tar`, tar(deep));

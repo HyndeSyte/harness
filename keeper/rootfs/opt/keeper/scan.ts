@@ -221,7 +221,7 @@ class Detect implements Sink {
     if (m && inImage(this.where)) return unopened();
     if (m) throw new Error(`${what} is ${m}-compressed, which Keeper can't read (at byte 0)`);
     if (isTar(b)) return new TarLayer(this.ctx, this.where, this.depth);
-    if (this.depth > 0 && ARCHIVE_NAME.test(this.where.split(":").pop() ?? "")) { if (inImage(this.where)) return unopened(); throw new Error(`${what} is named as an archive but is neither gzip nor tar (encrypted or unknown) (at byte 0)`); }
+    if (this.depth > 0 && ARCHIVE_NAME.test(this.where.split(":").pop() ?? "")) { if (inImage(this.where)) return this.afterGzip ? new Leaf(this.ctx, this.where) : unopened(); throw new Error(`${what} is named as an archive but is neither gzip nor tar (encrypted or unknown) (at byte 0)`); }
     if (this.depth === 0) throw new Error("the backup isn't a tar archive (at byte 0)");
     return new Leaf(this.ctx, this.where);
   }
