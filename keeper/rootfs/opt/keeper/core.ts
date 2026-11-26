@@ -165,7 +165,7 @@
 //   gave up      the restore failed, or the App didn't come back
 //   never started  (before 0.1.5) the install deadline passed without to_version ever seen
 import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify as edVerify, type KeyObject } from "node:crypto";
-import { type Needle, SCAN_VERSION, scanBackup } from "./scan.ts";
+import { type ArchiveFile, budgetWhy, type Needle, SCAN_VERSION, type ScanResult, scanFile } from "./scan.ts";
 
 export const PROTOCOL = 1;                       // the verdict protocol version, bound into the armed state
 export const BACKUP_SCOPE = "app-only";          // the backup scope bound into the armed state
@@ -209,6 +209,27 @@ export const LOCK_STEP_MS = 30_000;              // (0.1.8) a step under the loc
 export const PENDING_CEILING_MS = 3 * 60_000;
 // (0.1.16) A Supervisor call's own timeout (supervisor.ts, every call but the backup create, the restore and the download).
 export const SUPERVISOR_CALL_MS = 15_000;
+// (0.1.17, fix round) The backup check's one deadline, from its start: making the test backup (its own call bounded at
+// REGISTER_WAIT_MS inside it), downloading it and scanning it all count against it. Shorter than the CLI's wait (main.ts
+// BACKUP_CHECK_CLI_MS, 10 minutes) by enough for the cleanup after it, so the owner always hears the check's own answer.
+export const CHECK_DEADLINE_MS = 8 * 60_000;
+// (0.1.17, fix round) a second backup check while one runs is answered at once with this, and starts nothing
+export const BACKUP_CHECK_BUSY = "a backup check is already running";
+// (0.1.17, last round) The cleanup after the check (its outstanding work settled, the sentinels removed, the test backup deleted, a
+// test backup the host finished late looked for every LATE_POLL_MS and deleted) has its own bound, so the deadline plus the cleanup
+// stays under the CLI's wait with a margin (CHECK_DEADLINE_MS + CHECK_CLEANUP_MS + main.ts BACKUP_CHECK_CLI_MARGIN_MS <=
+// BACKUP_CHECK_CLI_MS, pinned in the tests). A late test backup not found within it stays recorded (late) and is looked for at each
+// poll for LATE_KEEP_MS, and every start deletes any backup named like a test backup (TEST_BACKUP_NAME: only the check makes those).
+export const CHECK_CLEANUP_MS = 60_000;
+export const CHECK_SETTLE_MS = 15_000;          // of the cleanup's bound: the wait for the check's outstanding work
+export const LATE_POLL_MS = 5_000;
+export const LATE_KEEP_MS = 60 * 60_000;
+export const TEST_BACKUP_NAME = /^Keeper backup check [0-9a-f]{8}$/;
+// (0.1.17, last round) one backup check's own record while it runs: its test backup's name and slug, whether it was asked for (and
+// why its create failed), the backups there before it, and the work still outstanding (the slot is held until that settles)
+interface CheckRun { name: string; slug: string; asked: boolean; makeWhy: string; before: Set<string> | null; pending: Promise<void>[]; open: number; deleted: boolean }
+// a time in words: minutes, seconds, or milliseconds under a second
+export const inWords = (ms: number) => (ms >= 60_000 ? `${Math.round(ms / 60_000)} minutes` : ms >= 1000 ? `${Math.round(ms / 1000)} seconds` : `${ms} ms`);
 // (0.1.16) Every Supervisor write that runs under the claim record's lock, with its worst case. Both are a backup's delete through
 // fence.write, bounded by LOCK_CALL_MS (bounded()) and by the call's own timeout, so the longest a step can hold the lock is its
 // own bound (LOCK_STEP_MS) plus one write still in flight when it ran out: under PENDING_CEILING_MS (checked in the tests). The
@@ -627,7 +648,7 @@ export interface State {
   cleanupAt?: number;                             // (0.1.9) the cleanup's last run (the daily tick)
   lastBackupBytes?: number;                       // (0.1.9) the last backup's size: the projection for the next
   backupCheck?: { at: number; names: string[]; slug: string; exclude?: string; scan?: number };   // (0.1.9) the backup check that passed on the device (0.1.10: tied to the exclusion's hash)
-  backupCheckRun?: { name: string; at: number; slug?: string };   // (0.1.10) a backup check's test backup, its name recorded before it is made
+  backupCheckRun?: { name: string; at: number; slug?: string; late?: boolean };   // (0.1.17, last round) late: its create gave up, it may show later   // (0.1.10) a backup check's test backup, its name recorded before it is made
   rotationChallenge?: { value: string; at: number; until: number; enroll: string; id: string };   // (0.1.10) the single-use challenge a rotation attestation must carry
   oldKey?: { id: string; seenAt: number };        // (0.1.9) the old hc_api_key option's id (a hash), once seen
   rotation?: { id: string; attestedAt: number; tried: string; tok: string; proof?: string };   // (0.1.9) its rotation, attested by the owner's tap (0.1.10: proof)
@@ -739,7 +760,13 @@ export interface Deps {
   // 0.1.10: place never writes over a name in skip (a kept key's file); read reads a placed file back; control writes the
   // positive control in a file outside the exclusion and answers its name; clear removes it too.
   keyFiles?: { place: (sentinel: string, skip?: string[]) => string[]; read?: (name: string) => string | null; control?: (value: string) => string | null; clear: () => void; sweep: () => string[] };
-  download?: (slug: string) => Promise<Uint8Array | null>;
+  // 0.1.17: the download is written to a file in the check's own folder and never read whole: its path, its size, and remove().
+  // Fix round: it is given what the check's deadline leaves and the check's abort signal, and a failure may say why ({ why })
+  download?: (slug: string, o?: { timeoutMs: number; signal: AbortSignal }) => Promise<ArchiveFile | { why: string } | null>;
+  // (0.1.17) the scan of that file, in a child process of the service (main.ts scanChild), so a scan the kernel kills never
+  // takes the service with it: it answers why (killed, out of memory, with the archive's size). Absent (tests): scan.ts
+  // scanFile, in this process.
+  scan?: (file: ArchiveFile, names: RegExp, needles: Needle[], control: string, o?: { timeoutMs: number; signal: AbortSignal }) => Promise<ScanResult>;
   archives?: { sweep: () => string[] };            // (0.1.10) downloaded archives left behind by an interrupted check: removed, named
   // (0.1.9) the old key, to try it once; 0.1.10: name, its file's name in the data folder (checked inside the exclusion first)
   oldKeyStore?: { load: () => string; store: (key: string) => boolean; drop: () => void; name?: string };
@@ -766,6 +793,28 @@ export type Answer = { status: number; body: Record<string, unknown> };
 export interface Fence { gen: number; live(): boolean; write<V>(what: string, call: () => Promise<V> | V, after?: (v: V) => void, target?: string): Promise<V | null> }
 
 // -- the keeper -----------------------------------------------------------------------------------
+// (0.1.17, fix round) The backup check's one deadline (CHECK_DEADLINE_MS from its start), as one timer: within() races a phase
+// against it (a value the phase brings after the deadline goes to late(), so a late download's file is removed); left() is what
+// remains, handed to the phase as its own limit; signal aborts the phase's work (the download, the scan's child) at the deadline.
+export const PAST: unique symbol = Symbol("past the backup check's deadline");
+export function checkDeadline(ms = CHECK_DEADLINE_MS) {
+  const t0 = Date.now(), ac = new AbortController();
+  let passed = false, timer: ReturnType<typeof setTimeout> | undefined;
+  const over = new Promise<typeof PAST>((res) => { timer = setTimeout(() => { passed = true; ac.abort(); res(PAST); }, ms); });
+  return {
+    get passed() { return passed; },
+    signal: ac.signal,
+    left: () => Math.max(1000, ms - (Date.now() - t0)),
+    within: async <T>(p: Promise<T>, late?: (v: T) => void): Promise<T | typeof PAST> => {
+      const r = await Promise.race([p, over]);
+      if (r === PAST) void p.then((v) => late?.(v), () => {});
+      return r;
+    },
+    why: (phase: string) => `the backup check ran past its deadline of ${inWords(ms)} while ${phase} the test backup ${budgetWhy({ budget: "the backup check's deadline", phase, limit: `${inWords(ms)} for the whole check`, seen: `still ${phase} after ${inWords(ms)}`, todo: "run backup-check again when the device is less busy; if it runs out of time again, report it with the backup's size from Keeper's log" })}`,
+    clear: () => clearTimeout(timer),
+  };
+}
+
 export class Keeper {
   st: State;
   opts: Options = parseOptions({});
@@ -1221,12 +1270,44 @@ export class Keeper {
   async backupCheck(): Promise<{ ok: boolean; why: string }> {
     const kf = this.d.keyFiles, dl = this.d.download;
     if (!kf || !dl || !this.d.deleteBackup || !kf.read || !kf.control || !this.d.backups) return { ok: false, why: "this Keeper can't place key files, download, list or delete a backup" };
-    if (this.checking) return { ok: false, why: "a backup check is already running" };
+    // (0.1.17, fix round) one at a time: a second call (the route has no idle timeout) starts no second child or download. Last
+    // round: the slot is held until every piece of the check's work has settled and its cleanup has ended, not only to the deadline
+    if (this.checking) return { ok: false, why: BACKUP_CHECK_BUSY };
     const held = this.writesHeldWhy();
     if (held) return { ok: false, why: `the backup check makes and deletes a backup: ${held}` };
     const open = this.open();
     if (open.length) return { ok: false, why: `${open[0].id} is ${open[0].status}: run the backup check once no install is open` };
     this.checking = true;
+    const deadline = checkDeadline();
+    const c: CheckRun = { name: `Keeper backup check ${randomBytes(4).toString("hex")}`, slug: "", asked: false, makeWhy: "", before: null, pending: [], open: 0, deleted: false };
+    // a phase's work: raced against the deadline, and kept as outstanding until it settles (the slot is held until then)
+    const phase = <T>(p: Promise<T>, late?: (v: T) => void): Promise<T | typeof PAST> => {
+      c.open++;
+      c.pending.push(p.then(() => {}, () => {}).finally(() => { c.open--; }));
+      return deadline.within(p, late);
+    };
+    let r: { ok: boolean; why: string };
+    try { r = await this.checkBody(c, deadline, phase); }
+    catch (e) { r = this.backupCheckFailed(`the backup check stopped (${String((e as Error)?.message ?? e).slice(0, 80)})`); }
+    let note = "";
+    try { note = await this.checkCleanup(c); }
+    catch (e) { this.d.log(`backup check: its cleanup stopped (${String((e as Error)?.message ?? e).slice(0, 80)}); what is left is removed at the next start`); }
+    deadline.clear();
+    if (c.open === 0) this.checking = false;
+    else {
+      // work still outstanding (each piece is bounded by its own limit): the slot stays held until it has all settled, and a
+      // test backup made after all is deleted then
+      void Promise.allSettled(c.pending).then(async () => {
+        try { if (c.slug && !c.deleted) await this.dropTestBackup(c, "after the check"); } catch { /* deleted at the next start */ }
+        this.checking = false;
+      });
+    }
+    if (note && !r.ok) return { ok: false, why: `${r.why}; ${note}` };
+    return r;
+  }
+  // (0.1.17) the check itself, up to its answer: every phase raced against the one deadline (phase())
+  private async checkBody(c: CheckRun, deadline: ReturnType<typeof checkDeadline>, phase: <T>(p: Promise<T>, late?: (v: T) => void) => Promise<T | typeof PAST>): Promise<{ ok: boolean; why: string }> {
+    const kf = this.d.keyFiles!, dl = this.d.download!;
     const sentinel = `keeper-sentinel-${randomBytes(12).toString("hex")}`;
     const control = `keeper-control-${randomBytes(12).toString("hex")}`;
     // (0.1.16) each value with what it is, named in a failure; scan.ts searches only values of at least MIN_NEEDLE (16) bytes, so
@@ -1237,68 +1318,141 @@ export class Keeper {
     try { oldKept = s(this.d.oldKeyStore?.load() ?? ""); } catch { oldKept = ""; }
     for (const k of [this.hcKey, oldKept].filter(Boolean)) needles.push({ value: k, kind: "a key value" }, { value: sha(`hc-key\n${k}`).slice(0, 16), kind: "a key's fingerprint" },
       { value: sha(`hc-old-key\n${k}`).slice(0, 16), kind: "a key's fingerprint" });
-    let placed: string[] = [];
-    let slug = "";
-    const name = `Keeper backup check ${randomBytes(4).toString("hex")}`;
+    const name = c.name;
+    const left = await phase(this.leftoverCheck("before a new backup check"));
+    if (left === PAST) return this.backupCheckFailed(deadline.why("clearing an earlier check's leftovers before making"));
+    if (left) return this.backupCheckFailed(left);
+    // never over a kept key: its file is skipped, and its value searched for
+    const skip = [...(this.hcKey ? [KEY_FILE] : []), ...(oldKept ? [this.d.oldKeyStore?.name ?? OLD_KEY_FILE] : [])];
+    const placed = kf.place(sentinel, skip);
+    const roles: [string, (n: string) => boolean, boolean][] = [
+      ["the key file", (n) => n === KEY_FILE, !!this.hcKey], ["the old key's file", (n) => n === OLD_KEY_FILE, !!oldKept],
+      ["a temporary file with the current prefix", (n) => n.startsWith(KEY_TMP_PREFIX), false], ["a temporary file with the legacy name", (n) => LEGACY_KEY_TMP.test(n), false],
+      // (0.1.12) the backup key store, and a temporary file there
+      ["the backup key store", (n) => n === `${BACKUP_KEYS_DIR}/${BACKUP_KEY_SENTINEL}`, false], ["a temporary file in the backup key store", (n) => n.startsWith(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_TMP_PREFIX}`), false],
+      // (0.1.16) the drill flags' spent list
+      ["the drill flags' spent list", (n) => n === `${DRILL_SPENT_DIR}/${DRILL_SPENT_SENTINEL}`, false]];
+    for (const [what, is, keptKey] of roles) {
+      const n = placed.find(is);
+      if (!n) { if (keptKey) continue; return this.backupCheckFailed(`the sentinel for ${what} wasn't written (nothing was placed under that name)`); }
+      if (keptKey && n) return this.backupCheckFailed(`a sentinel was written over ${what}, which holds a kept key`);
+      if (!excludedName(n)) return this.backupCheckFailed(`${what} (${n}) isn't inside the backup exclusion (${BACKUP_EXCLUDE.join(", ")})`);
+      let back: string | null = null; try { back = kf.read!(n); } catch { back = null; }
+      if (s(back ?? "") !== sentinel) return this.backupCheckFailed(`the sentinel for ${what} (${n}) didn't read back where it was written`);
+    }
+    const ctl = kf.control!(control);
+    if (!ctl) return this.backupCheckFailed("the positive control couldn't be placed");
+    if (excludedName(ctl)) return this.backupCheckFailed(`the positive control's file (${ctl}) is inside the backup exclusion, so it proves nothing`);
+    let ctlBack: string | null = null; try { ctlBack = kf.read!(ctl); } catch { ctlBack = null; }
+    if (s(ctlBack ?? "") !== control) return this.backupCheckFailed(`the positive control (${ctl}) didn't read back where it was written`);
+    // (0.1.17, last round) the backups present before the test backup is asked for, so one the host finishes after its call gave
+    // up (a timeout, an abort) is found by what is new as well as by its name, and deleted in the cleanup
+    const before = await phase(this.bounded(() => this.d.backups!(), "the Supervisor's backups list"));
+    if (before === PAST) return this.backupCheckFailed(deadline.why("listing the backups before making"));
+    if (!before) return this.backupCheckFailed("the backups list couldn't be read before the test backup was made, so a test backup the host finished late couldn't be found: nothing was made");
+    c.before = new Set(before.map((b) => b.slug));
+    // the test backup's name, recorded before it is made: an interrupted check's backup is found and deleted at the next start
+    this.st.backupCheckRun = { name, at: this.now() };
+    if (!this.save()) return this.backupCheckFailed("Keeper couldn't record the test backup's name before making it");
+    this.d.log(`backup check: a sentinel placed in ${placed.join(", ")}${skip.length ? ` (not over ${skip.join(", ")}, which hold a kept key: its value is searched for)` : ""}, the positive control in ${ctl}; making a test backup of Keeper ("${name}")`);
+    c.asked = true;
+    const asked = Promise.resolve().then(() => this.d.makeBackup(this.d.self, name)).catch((e) => ({ why: String(e).slice(0, 80) }));
+    // a slug answered at any time (after the deadline too) is the check's, so the cleanup (or the work's settling) deletes it
+    void asked.then((m) => { if ("slug" in m && m.slug && !c.slug) { c.slug = m.slug; if (this.st.backupCheckRun?.name === name) { this.st.backupCheckRun.slug = m.slug; this.save(); } } else if (!("slug" in m)) c.makeWhy = m.why; });
+    const made = await phase(asked);
+    if (made === PAST) return this.backupCheckFailed(deadline.why("making"));
+    if (!("slug" in made)) return this.backupCheckFailed(`the test backup couldn't be made (${made.why})`);
+    const slug = made.slug;
+    if (deadline.passed) return this.backupCheckFailed(deadline.why("making"));
+    const info = await phase(this.d.backupInfo(slug).catch(() => null));
+    if (info === PAST) return this.backupCheckFailed(deadline.why("reading the size of"));
+    // (0.1.17) the archive goes to a file and the scan reads it from there, a chunk at a time, in a child process. Fix round:
+    // each phase gets what the deadline leaves, and is raced against it (a late download's file is removed when it comes)
+    const got = await phase(dl(slug, { timeoutMs: deadline.left(), signal: deadline.signal }).catch(() => null), (f) => { if (f && "path" in f) { try { f.remove(); } catch { /* swept */ } } });
+    if (got === PAST) return this.backupCheckFailed(deadline.why("downloading"));
+    const known = Number.isSafeInteger(info?.sizeBytes) ? `${info!.sizeBytes} bytes` : Number.isFinite(Number(info?.sizeMb ?? info?.size)) ? `${Number(info!.sizeMb ?? info!.size)} MB` : "its size unknown";
+    if (!got || !("path" in got)) return this.backupCheckFailed(`the test backup ${slug} (${known}, as the Supervisor reports it) couldn't be downloaded${got && "why" in got ? `: ${got.why}` : ""}`);
+    const file = got;
     try {
-      const left = await this.leftoverCheck("before a new backup check");
-      if (left) return this.backupCheckFailed(left);
-      // never over a kept key: its file is skipped, and its value searched for
-      const skip = [...(this.hcKey ? [KEY_FILE] : []), ...(oldKept ? [this.d.oldKeyStore?.name ?? OLD_KEY_FILE] : [])];
-      placed = kf.place(sentinel, skip);
-      const roles: [string, (n: string) => boolean, boolean][] = [
-        ["the key file", (n) => n === KEY_FILE, !!this.hcKey], ["the old key's file", (n) => n === OLD_KEY_FILE, !!oldKept],
-        ["a temporary file with the current prefix", (n) => n.startsWith(KEY_TMP_PREFIX), false], ["a temporary file with the legacy name", (n) => LEGACY_KEY_TMP.test(n), false],
-        // (0.1.12) the backup key store, and a temporary file there
-        ["the backup key store", (n) => n === `${BACKUP_KEYS_DIR}/${BACKUP_KEY_SENTINEL}`, false], ["a temporary file in the backup key store", (n) => n.startsWith(`${BACKUP_KEYS_DIR}/${BACKUP_KEY_TMP_PREFIX}`), false],
-        // (0.1.16) the drill flags' spent list
-        ["the drill flags' spent list", (n) => n === `${DRILL_SPENT_DIR}/${DRILL_SPENT_SENTINEL}`, false]];
-      for (const [what, is, keptKey] of roles) {
-        const n = placed.find(is);
-        if (!n) { if (keptKey) continue; return this.backupCheckFailed(`the sentinel for ${what} wasn't written (nothing was placed under that name)`); }
-        if (keptKey && n) return this.backupCheckFailed(`a sentinel was written over ${what}, which holds a kept key`);
-        if (!excludedName(n)) return this.backupCheckFailed(`${what} (${n}) isn't inside the backup exclusion (${BACKUP_EXCLUDE.join(", ")})`);
-        let back: string | null = null; try { back = kf.read(n); } catch { back = null; }
-        if (s(back ?? "") !== sentinel) return this.backupCheckFailed(`the sentinel for ${what} (${n}) didn't read back where it was written`);
-      }
-      const ctl = kf.control(control);
-      if (!ctl) return this.backupCheckFailed("the positive control couldn't be placed");
-      if (excludedName(ctl)) return this.backupCheckFailed(`the positive control's file (${ctl}) is inside the backup exclusion, so it proves nothing`);
-      let ctlBack: string | null = null; try { ctlBack = kf.read(ctl); } catch { ctlBack = null; }
-      if (s(ctlBack ?? "") !== control) return this.backupCheckFailed(`the positive control (${ctl}) didn't read back where it was written`);
-      // the test backup's name, recorded before it is made: an interrupted check's backup is found and deleted at the next start
-      this.st.backupCheckRun = { name, at: this.now() };
-      if (!this.save()) return this.backupCheckFailed("Keeper couldn't record the test backup's name before making it");
-      this.d.log(`backup check: a sentinel placed in ${placed.join(", ")}${skip.length ? ` (not over ${skip.join(", ")}, which hold a kept key: its value is searched for)` : ""}, the positive control in ${ctl}; making a test backup of Keeper ("${name}")`);
-      const made = await this.d.makeBackup(this.d.self, name).catch((e) => ({ why: String(e).slice(0, 80) }));
-      if (!("slug" in made)) return this.backupCheckFailed(`the test backup couldn't be made (${made.why})`);
-      slug = made.slug;
-      this.st.backupCheckRun.slug = slug; this.save();
-      const info = await this.d.backupInfo(slug).catch(() => null);
-      const bytes = await dl(slug).catch(() => null);
-      if (!bytes) return this.backupCheckFailed(`the test backup ${slug} couldn't be downloaded`);
-      const size = Keeper.sizeWhy(bytes.length, info);
+      // (0.1.17, fix round) the backup's size, on every check, so its growth shows in the log
+      this.d.log(`backup check: test backup ${slug} downloaded, ${file.size} bytes (${(file.size / 1024 ** 2).toFixed(1)} MB; the Supervisor reports ${known})`);
+      const size = Keeper.sizeWhy(file.size, info);
       if (size) return this.backupCheckFailed(`the test backup ${slug}'s download ${size}`);
-      const r = scanBackup(bytes, KEY_NAME, needles, { control });
+      this.d.log(`backup check: scanning test backup ${slug} (${file.size} bytes)${this.d.scan ? " in a child process" : ""}`);
+      const scan = this.d.scan ?? ((f: ArchiveFile, names: RegExp, n: Needle[], cv: string) => scanFile(f.path, names, n, { control: cv }));
+      const r = await phase(Promise.resolve().then(() => scan(file, KEY_NAME, needles, control, { timeoutMs: deadline.left(), signal: deadline.signal }))
+        .catch((e) => ({ ok: false, why: `the scan couldn't run (${String((e as Error)?.message ?? e).slice(0, 80)})`, members: 0, names: [], found: [], control: 0 } as ScanResult)));
+      if (r === PAST) return this.backupCheckFailed(deadline.why("scanning"));
       if (!r.ok) return this.backupCheckFailed(r.why);
       this.st.backupCheck = { at: this.now(), names: placed, slug, exclude: EXCLUDE_HASH, scan: SCAN_VERSION };
-      this.d.log(`backup check passed: test backup ${slug} (${r.members} files read, ${bytes.length} bytes as the Supervisor reported) leaves out every key file (${placed.join(", ")}), holds no key value, fingerprint or sentinel, and holds the positive control exactly once; tied to the backup exclusion ${EXCLUDE_HASH}`);
+      this.d.log(`backup check passed: test backup ${slug} (${r.members} files read, ${file.size} bytes as the Supervisor reported) leaves out every key file (${placed.join(", ")}), holds no key value, fingerprint or sentinel, and holds the positive control exactly once; tied to the backup exclusion ${EXCLUDE_HASH} and scan ${SCAN_VERSION}`);
       this.save();
       return { ok: true, why: "" };
-    } finally {
-      try { kf.clear(); } catch (e) { this.d.log(`backup check: couldn't remove the sentinels (${String(e).slice(0, 80)}); they are removed at the next start`); }
-      const held = slug ? this.writesHeldWhy() : "";
-      if (held) this.d.log(`backup check: test backup ${slug} ("${name}") isn't deleted now (${held}): it is deleted at the next start`);
-      else if (slug) {
-        const gone = await this.d.deleteBackup(slug).catch(() => false);
-        this.d.log(gone ? `backup check: test backup ${slug} deleted` : `backup check: couldn't delete test backup ${slug} ("${name}"): it is deleted at the next start`);
-        if (gone) { delete this.st.backupCheckRun; this.save(); }
-      } else if (this.st.backupCheckRun?.name === name) {
-        // never made, or its answer lost: it is looked up by its name at the next start
-        this.save();
+    } finally { try { file.remove(); } catch { /* the folder is swept at the next start */ } }
+  }
+  // (0.1.17, last round) The check's cleanup, after its answer is known and within its own bound (CHECK_CLEANUP_MS, so the
+  // deadline plus the cleanup stays under the CLI's wait with a margin: BACKUP_CHECK_CLI_MS): the outstanding work (aborted at the
+  // deadline) awaited, the sentinels removed, and the test backup deleted. One whose create gave up without a slug (a timeout,
+  // an abort, an unknown answer: the host may finish it anyway) is looked for in the backups list (by its name, or as a backup
+  // that wasn't there before with a test backup's name) every LATE_POLL_MS and deleted once it shows; past the bound it is named
+  // in the answer, its record kept (marked late) so each poll for LATE_KEEP_MS looks for it again, and every start's sweep of
+  // test backups (leftoverCheck) deletes it. "" or a note for the answer.
+  private async checkCleanup(c: CheckRun): Promise<string> {
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const over = new Promise<typeof PAST>((res) => { t = setTimeout(() => res(PAST), CHECK_CLEANUP_MS); });
+    const bound = <T>(p: Promise<T>): Promise<T | typeof PAST> => Promise.race([p, over]);
+    try {
+      // the outstanding work (aborted at the deadline: a download stops, a scan's child is killed and reaped) gets the first part
+      // of the bound, so the delete and the late search always have the rest
+      let st: ReturnType<typeof setTimeout> | undefined;
+      await bound(Promise.race([Promise.allSettled(c.pending), new Promise<void>((res) => { st = setTimeout(res, CHECK_SETTLE_MS); })]));
+      clearTimeout(st);
+      try { this.d.keyFiles!.clear(); } catch (e) { this.d.log(`backup check: couldn't remove the sentinels (${String(e).slice(0, 80)}); they are removed at the next start`); }
+      const held = c.slug || c.asked ? this.writesHeldWhy() : "";
+      if (held) { this.d.log(`backup check: test backup ${c.slug || `"${c.name}"`} isn't deleted now (${held}): it is deleted at the next start`); return ""; }
+      if (c.slug) { await this.dropTestBackup(c, "", bound); return ""; }
+      if (!c.asked) return "";
+      // a definite refusal (a 4xx answer) made nothing; anything else may have made it after all
+      if (/^4\d\d\b/.test(c.makeWhy)) { this.save(); return ""; }
+      let seen = "";
+      for (;;) {
+        if (c.slug) { const gone = await this.dropTestBackup(c, "", bound); if (gone) return `its test backup ${c.slug}, made after the check gave up on it, was deleted`; seen = c.slug; }
+        else {
+          const list = await bound(Promise.resolve().then(() => this.d.backups!()).catch(() => null));
+          if (list === PAST) break;
+          const hit = (list ?? []).find((b) => b.name === c.name || (!!c.before && !c.before.has(b.slug) && TEST_BACKUP_NAME.test(b.name)));
+          if (hit) {
+            seen = hit.slug;
+            const gone = await bound(Promise.resolve().then(() => this.d.deleteBackup!(hit.slug)).catch(() => false));
+            if (gone === PAST) break;
+            if (gone) {
+              this.d.log(`backup check: the test backup ${hit.slug} ("${hit.name}") was made on the host after the check gave up on it: found and deleted`);
+              if (this.st.backupCheckRun?.name === c.name) { delete this.st.backupCheckRun; this.save(); }
+              c.deleted = true;
+              return `its test backup ${hit.slug}, made on the host after the check gave up on it, was found and deleted`;
+            }
+          }
+        }
+        const slept = await bound(new Promise<void>((res) => { setTimeout(res, LATE_POLL_MS); }));
+        if (slept === PAST) break;
       }
-      this.checking = false;
-    }
+      // the bound tripped: the backup named, its record kept and marked late for the polls and every start
+      if (this.st.backupCheckRun?.name === c.name) { this.st.backupCheckRun.late = true; if (seen) this.st.backupCheckRun.slug = seen; this.save(); }
+      const what = `the test backup "${c.name}"${seen ? ` (${seen})` : ""}`;
+      const secs = `${Math.round(CHECK_CLEANUP_MS / 1000)} seconds`, keep = `${Math.round(LATE_KEEP_MS / 60_000)} minutes`;
+      this.d.log(`backup check: ${what} ${seen ? "was found but couldn't be deleted" : "wasn't found"} within the cleanup's ${secs}: it may be on the host; Keeper looks for it at each poll for ${keep} and at every start, and deletes it`);
+      return `${what} may still be on the host: ${seen ? "it was found but couldn't be deleted" : "it wasn't found"} within the cleanup's bound of ${secs}; Keeper deletes it when it shows (each poll for ${keep}, and at every start), or delete it by hand in Settings, System, Backups`;
+    } finally { clearTimeout(t); }
+  }
+  // the test backup's delete, by its slug: the record cleared once it is gone
+  private async dropTestBackup(c: CheckRun, when: string, bound: <T>(p: Promise<T>) => Promise<T | typeof PAST> = (p) => p): Promise<boolean> {
+    const slug = c.slug;
+    const g = await bound(Promise.resolve().then(() => this.d.deleteBackup!(slug)).catch(() => false));
+    const gone = g === true;
+    this.d.log(gone ? `backup check: test backup ${slug} deleted${when ? ` ${when}` : ""}` : `backup check: couldn't delete test backup ${slug} ("${c.name}"): it is deleted at the next start`);
+    if (gone) { c.deleted = true; if (this.st.backupCheckRun?.name === c.name) { delete this.st.backupCheckRun; this.save(); } }
+    else if (this.st.backupCheckRun?.name === c.name) { this.st.backupCheckRun.slug = slug; this.save(); }
+    return gone;
   }
   // (0.1.10) The archive's size against the Supervisor's: exact in bytes where given, else within the MB figure's rounding.
   static sizeWhy(got: number, info: BackupInfo | null): string {
@@ -1310,13 +1464,26 @@ export class Keeper {
   }
   // (0.1.10) An interrupted backup check: it counts as failed, and its test backup (by its recorded name or slug) is deleted
   // and logged. "" once nothing is left, else why it couldn't be.
+  // (0.1.17, last round) at start (and before each new check) every backup named like a test backup (TEST_BACKUP_NAME) is deleted
+  // too, recorded or not, so a test backup the host finished after its check gave up is never left; a late run's record not yet
+  // matched is kept for LATE_KEEP_MS, so each poll looks for it again.
   async leftoverCheck(when: string): Promise<string> {
     const run = this.st.backupCheckRun;
-    if (!run) return "";
-    if (this.st.backupCheck) { delete this.st.backupCheck; this.d.log("the backup check's earlier pass no longer counts: a later check was interrupted"); }
+    const sweep = when === "at start" || when === "before a new backup check";
+    if (!run && when !== "at start") return "";
+    if (run && this.st.backupCheck) { delete this.st.backupCheck; this.d.log("the backup check's earlier pass no longer counts: a later check was interrupted"); }
     const list = this.d.backups ? await this.bounded(() => this.d.backups!(), "the Supervisor's backups list") : null;
+    if (!run) {
+      // the start's sweep alone: test backups no record names
+      for (const b of (list ?? []).filter((x) => TEST_BACKUP_NAME.test(x.name))) {
+        if (this.writesHeldWhy()) break;
+        const gone = this.d.deleteBackup ? await this.bounded(() => this.d.deleteBackup!(b.slug), `the delete of backup ${b.slug}`) : false;
+        this.d.log(gone ? `${when}: deleted the test backup ${b.slug} ("${b.name}") a backup check left behind` : `${when}: couldn't delete the test backup ${b.slug} ("${b.name}") a backup check left behind: tried again at the next start`);
+      }
+      return "";
+    }
     if (!list) { this.save(); return `the interrupted backup check's test backup "${run.name}" can't be looked up (the backups list couldn't be read)`; }
-    const hits = list.filter((b) => b.name === run.name || (!!run.slug && b.slug === run.slug));
+    const hits = list.filter((b) => b.name === run.name || (!!run.slug && b.slug === run.slug) || (sweep && TEST_BACKUP_NAME.test(b.name)));
     const held = hits.length ? this.writesHeldWhy() : "";
     if (held) { this.save(); return `the interrupted backup check's test backup "${run.name}" isn't deleted now: ${held}`; }
     let all = true;
@@ -1325,18 +1492,22 @@ export class Keeper {
       this.d.log(gone ? `${when}: deleted the test backup ${b.slug} ("${b.name}") an interrupted backup check left behind` : `${when}: couldn't delete the test backup ${b.slug} ("${b.name}") an interrupted backup check left behind: tried again at the next start`);
       if (!gone) all = false;
     }
-    if (!hits.length) this.d.log(`${when}: the interrupted backup check's test backup "${run.name}" isn't in the backups list (never made, or deleted)`);
-    if (all) delete this.st.backupCheckRun;
+    const named = hits.some((b) => b.name === run.name || (!!run.slug && b.slug === run.slug));
+    // a late run not seen yet: kept (and looked for at each poll) until LATE_KEEP_MS after it began; every start's sweep goes on after
+    const keep = !named && !!run.late && this.now() - run.at < LATE_KEEP_MS && when !== "before a new backup check";
+    if (!named && !keep) this.d.log(`${when}: the interrupted backup check's test backup "${run.name}" isn't in the backups list (never made, or deleted)${run.late ? "; any backup named like a test backup is still deleted at every start" : ""}`);
+    if (all && !keep) delete this.st.backupCheckRun;
     this.save();
     return all ? "" : `the interrupted backup check's test backup "${run.name}" couldn't be deleted`;
   }
   // (0.1.10) The backup check's pass, as it counts now: tied to this build's exclusion. 0.1.16: and to the scan's coverage
-  // (SCAN_VERSION): a pass recorded by a narrower scan no longer counts.
+  // (SCAN_VERSION): a pass recorded by a narrower scan no longer counts. 0.1.17: scan 3, the streaming scan (a pass recorded by
+  // scan 2 or earlier, or with no scan version, no longer counts).
   checkPassed(): boolean { return !!this.st.backupCheck && this.st.backupCheck.exclude === EXCLUDE_HASH && this.st.backupCheck.scan === SCAN_VERSION && !this.st.backupCheckRun; }
   private checkWhy(): string {
     if (this.st.backupCheckRun) return `${BACKUP_CHECK_WHY}: a backup check was interrupted and counts as failed (its test backup "${this.st.backupCheckRun.name}" is deleted at the next start)`;
     if (this.st.backupCheck && this.st.backupCheck.exclude !== EXCLUDE_HASH) return `${BACKUP_CHECK_WHY}: the backup exclusion changed since it passed (now ${EXCLUDE_HASH}), so run it again`;
-    if (this.st.backupCheck && this.st.backupCheck.scan !== SCAN_VERSION) return `${BACKUP_CHECK_WHY}: the check's scan was widened since it passed (now scan ${SCAN_VERSION}, every byte of the archive), so run it again`;
+    if (this.st.backupCheck && this.st.backupCheck.scan !== SCAN_VERSION) return `${BACKUP_CHECK_WHY}: the check's scan changed since it passed (now scan ${SCAN_VERSION}: every byte of the archive, read as a stream in bounded memory), so run it again`;
     return BACKUP_CHECK_WHY;
   }
   private backupCheckFailed(why: string): { ok: boolean; why: string } {
@@ -1589,7 +1760,8 @@ export class Keeper {
       for (const app of apps) await this.pollApp(app);
       await this.watchJobListing();
       // (0.1.10) an interrupted backup check's test backup, deleted (at start, and until it is gone)
-      if (this.st.backupCheckRun && !this.checking) await this.leftoverCheck(this.cleanupDue ? "at start" : "a poll");
+      // (0.1.17, last round) at start also every backup named like a test backup, recorded or not
+      if ((this.st.backupCheckRun || this.cleanupDue) && !this.checking) await this.leftoverCheck(this.cleanupDue ? "at start" : "a poll");
       // (0.1.10) a backup whose create outran its bound: looked up by its name under the next lock holder
       if (Object.values(this.st.attempts).some((x) => x.lateBackup && !x.backup && !OPEN.includes(x.status)))
         await this.record((f) => this.settleLate(f), () => undefined).catch(() => undefined);
@@ -2109,7 +2281,7 @@ export class Keeper {
       }, slug);
     }
     // Keeper-named backups with no kept record: never deleted, named once per start
-    if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name)
+    if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name && !TEST_BACKUP_NAME.test(b.name))
       this.d.log(`backup ${b.slug} ("${b.name}") is named like Keeper's but has no generation record here: never deleted by Keeper; delete it by hand (Settings, System, Backups) if you don't want it`);
     if (f.live()) this.save();
   }
