@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.17
+
+- Fixed: `backup-check` on your Pi's full-size backup. Keeper 0.1.16 read the whole 100 MB test backup and its unpacked App image into memory at once, and the system stopped Keeper's service for using too much memory. The check now reads the backup from a file a piece at a time, unpacks it once as it goes, and stays small: about 55 MB on a test backup of 118 MB that unpacks to 330 MB.
+- It still checks exactly what it checked before, every byte of every layer, including a value split between two pieces.
+- The scan now runs in its own process with its own memory limit. If it is stopped anyway, Keeper keeps running, counts the check failed, removes its test files, deletes the test backup and tells you the scan was killed (out of memory), with the backup's size.
+- The check has hard limits: 4 GB unpacked in all and 6 layers of nesting. Past either, it fails and says which limit.
+- `backup-check` now waits up to 10 minutes, says it is running, and tells you in plain words what happened: passed, why not, Keeper not running, or Keeper stopped while scanning (that restart counts the check failed and deletes the test backup). No more bare "the keeper's service didn't answer".
+- Run `backup-check` again after installing: a pass from 0.1.16 or earlier no longer counts.
+- Keeper's DOCS: the backup check runs at full device size under a memory limit before it goes on a runbook; the container on your Pi is `app_0fcc2575_keeper`; the SSH user is `hassio` with `sudo`; scp is closed, so scripts are piped over ssh.
+- Review fixes: the check now knows the compressed App image has ended from the unpacker's own end signal. A valid backup whose stream ends exactly on an internal piece boundary can no longer fail by mistake.
+- A key value split between a tar header (or its padding) and a file's contents is now found.
+- The unpacker now waits until the check has read each piece it produces. A very compressible backup stays small: 2 GB of zeros scans in about 55 MB. The 4 GB limit is counted as each piece arrives, and memory is checked on every piece.
+- The scan process can no longer leave the check hanging. Too much output, an early exit or a stuck pipe ends the check at once with a plain reason. The scan exits by itself if Keeper's service goes, and the system is asked to stop the scan, not Keeper, when memory runs out.
+- A killed scan now says "killed (signal 9)", adding "likely out of memory" only when its memory was near its limit. A scan that ran out of time says so.
+- The whole check has one 8-minute deadline, inside `backup-check`'s 10-minute wait, and says which step ran out of time.
+- One check at a time: a second `backup-check` while one runs says "a backup check is already running".
+- Every limit's message names the step, the limit, what was seen and what to do. Each check logs the test backup's size. `backup-check` reads the cause of a failed request from its error code, and names the code when it can't tell.
+- Keeper's DOCS: device check 15 adds three runs (under a memory hog, with an all-zero image, with Keeper restarted mid-scan), each run's peak memory and duration recorded. The follow-ups (a cgroup memory limit, a download cap from free disk) are noted.
+- Last review fixes: a test backup that your Home Assistant finishes after the check gave up on it is now found and deleted. If it doesn't show within a minute, `backup-check` names it, Keeper keeps looking for it for an hour, and every start deletes any backup named like a test backup. A second `backup-check` stays "already running" until that cleanup is done, and the answer still comes inside the 10-minute wait.
+- A slow device can no longer fail the check by mistake while the unpacker waits for the check to catch up.
+- "likely out of memory" now reads every memory sample the scan reported, its latest and its peak, so a long scan's kill is named right.
+- A key value inside a tar's long-name, long-link or pax record is reported by the tar itself, and a value straddling a file's edge is reported even when a copy sits inside the file. Long-link records are now read instead of failing the check.
+- Stopping the scan now stops everything it started. If Keeper can't ask the system to stop the scan first when memory runs out, it says so in its log and goes on.
+- Keeper's DOCS: the scan's memory bound stated, the scan's own memory limit called a sampled check (the system is the hard limit until a cgroup limit lands), device check 15's runs named as what lets `drill_followups_open` go off, and two follow-ups noted: a cgroup limit in the tests' workflow and the tests run on ARM.
+
 ## 0.1.16
 
 - Closed: the secret scanner's coverage. The backup check now searches every byte of Keeper's test backup for the kept key, the old key, their fingerprints and every sentinel, including the gzip header, tar header fields, padding and anything after an archive's end. It finds the end of the gzip stream itself and checks its CRC and length: a second gzip stream, a wrong trailer or anything but zeros after it fails the check. The test value it plants must be found once, inside a file, and nowhere else. Values shorter than 16 characters are no longer searched for, so a short fingerprint can't match by chance. Every failure names the layer, the byte and what matched. It also proves the drill flags' spent list stays out of the backup.
