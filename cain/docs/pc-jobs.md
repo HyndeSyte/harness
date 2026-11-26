@@ -372,9 +372,26 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     next update (Chrome 158 has no `resources` folder at all: its version folder holds
     `resources.pak`). So for a built-in id at `location` 5 only (Web Store Payments aside), a path
     that doesn't exist (`path_kind` `missing`) still counts as Chrome's own when it has the
-    install-folder shape, as written: the folder the worker's own `chrome.exe` resolves to, then a
-    `a.b.c.d` version folder, then `resources`, then a name. `location` 10 still needs the folder on
-    disk, and a profile path, an odd form or any other folder stays foreign. **Seventh pass:** Chrome's install folder is judged by whole path segments,
+    install-folder shape. What Chrome loads for a component is its own binary and `resources.pak`,
+    never the path in the preferences, so this exception adds no load path: it only stops a stale
+    path Chrome itself left from refusing setup. **Review round 1** narrowed it; every one of these
+    must hold, or the entry is foreign:
+    - the id is on a short table with its resource folder name, and the path ends in that name:
+      Chrome PDF Viewer `pdf`, Google Hangouts `hangout_services`, Google Network Speech (both ids)
+      `network_speech_synthesis` (with one subfolder allowed, such as `mv3`), Gemini in Chrome
+      `gemini`. Web Store Payments isn't on it, and no other location counts (1, 4, 6, 8, a policy
+      entry: all refuse);
+    - the path is written, exactly and case for case, under the folder the worker's own `chrome.exe`
+      resolves to, then a version folder, then `resources`, then the name: no `\\?\`, UNC or 8.3
+      form, no `.` or `..` or empty segment, no segment ending in a dot or a space, never resolved;
+    - its version folder is four numbers and strictly older than the running Chrome's version (the
+      one the worker reads for every check, `chrome.exe`'s file version or the Last Version file);
+      an equal or newer one, or a version the worker couldn't read, refuses;
+    - the path doesn't exist, the install folder's version folders can be listed, and no folder
+      `<install folder>\<another version>\resources\<name>` exists: one that does is planted, and
+      the entry refuses, its refusal naming that folder (`planted`).
+    `location` 10 still needs the folder on disk, and a profile path or any other folder stays
+    foreign. **Seventh pass:** Chrome's install folder is judged by whole path segments,
     case-insensitively, against `Program Files\Google\Chrome\Application` and
     `Program Files (x86)\Google\Chrome\Application` (as the environment names them), then a
     version folder, then `resources`, then the entry's own folder: a sibling such as
@@ -1003,9 +1020,18 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
   own native messaging host doesn't count). **Cain 0.19.1:** a Claude Code process is the
   `claude` command `install.json` pins, any other `claude.exe`, or any process whose command
   line names the Claude Code CLI entry (`@anthropic-ai/claude-code`, or a `claude-code`
-  folder's `cli.js`). The Claude desktop app's own shell (its `claude.exe` in
-  `WindowsApps\Claude_...\app` or `AnthropicClaude\app-...`, with no CLI entry on its command
-  line) is not one, so the app may stay open; a Code session it started still is. Then a short bridge check (at most 90
+  folder's `cli.js`). The Claude desktop app's own shell is not one, so the app may stay open; a
+  Code session it started still is. **Review round 1:** the shell is recognised positively and
+  narrowly: its executable is exactly the app's `claude.exe` in its install folder
+  (`...\WindowsApps\Claude_<package>\app\claude.exe` or `...\AnthropicClaude\app-<version>\claude.exe`,
+  a drive path, quoted or not, separators and case folded, no `\\?\`, UNC or 8.3 form, and the
+  same as the executable path Windows lists for the process), and its command line is the Electron
+  shell: no arguments at all, or a `--type=` child of a known kind (`gpu-process`, `renderer`,
+  `utility`, `crashpad-handler`, `zygote`, `broker`), with no CLI entry anywhere on it. Anything
+  else that names `claude.exe` refuses, an app-folder `claude.exe` with only CLI flags (`-p`,
+  `--output-format`, `mcp serve`) included; so does any `claude.exe`, `node.exe`, `bun.exe` or
+  `electron.exe` whose command line is empty (it couldn't be read), and a process list that can't
+  be read. Then a short bridge check (at most 90
   seconds: a tab-context call, a page the worker serves for it, `get_page_text` on it
   and a tab context after) must reach the extension; if it doesn't, the worker ends any
   leftover native messaging host of the extension (no session is running, so none is in
@@ -1245,7 +1271,10 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    `HKLM` in its 64-bit view and in its 32-bit view (`HKLM\Software\WOW6432Node`), and
    fails with `manifest_path_mismatch` if any registered entry isn't this one, if the
    views hold more than one distinct path, or if no view has one, after normalizing: full
-   path, case, quotes and slashes; `bind-profile` checks it too), the profile
+   path, case, quotes and slashes; `bind-profile` and (Cain 0.19.1) the probe check it too, and all
+   three also refuse a pinned manifest whose host program is in the Claude desktop app's own folder,
+   `WindowsApps\Claude_...` or `AnthropicClaude\`, as `manifest_path_mismatch` naming
+   `desktop_app_host`), the profile
    (its folder, profile directory, name **Cain jobs**, and the extension's id from
    chrome://extensions with Developer mode on), and any other Chrome folders to scan
    (`other_user_data_dirs`). Leave
@@ -1295,10 +1324,15 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     (add `--desktop <folder>` if your desktop isn't `%USERPROFILE%\Desktop`, for example a
     OneDrive desktop). It puts **Cain PC jobs** (`Cain PC jobs.cmd`) on your desktop: double-click
     it and press 1 to bind the profile, 2 for the probe, 3 to run the queued jobs, Q to quit. It
-    prints the worker's answer, and when something stops it, one plain line saying what to do
-    (for `chrome_busy`, what to close: a terminal running `claude`, or the Code session in the
-    Claude app; the app itself may stay open), then waits for a key and shows the menu again.
-    Write it again after you move the harness checkout or Bun. Then run
+    prints the worker's answer, and when something stops it, one plain line: for `chrome_busy`,
+    what to close (a terminal running `claude`, or the Code session in the Claude app; the app
+    itself may stay open), and for any other code `Stopped: <code>. Tell Cain: refusal <code>.`
+    (find the code in Troubleshooting, below), then waits for a key and shows the menu again.
+    Write it again after you move the harness checkout or Bun. The paths it holds (Bun, `worker.ts`
+    and the worker folder) must be plain ASCII with none of `" % ! ^ & | < >`; otherwise
+    `write-launcher` refuses with `untrusted_config` (move that folder; for a desktop folder with an
+    unusual name, pass `--desktop`). Each path is quoted at every use, and the file turns cmd.exe's
+    delayed expansion off. Then run
     `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts check-host --home C:/pc-worker-k7q2xz`
     (Chrome open or closed: it reads only). It passes when nothing but Claude in Chrome and
     Chrome's own is on, no policy installs another extension and every policy hive reads; its
@@ -2374,7 +2408,8 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `extension_elsewhere` with an unexpected intermediate | Task Manager, Details, with the Command line column: the extension's native host and its parent | Between the native host and the Cain jobs Chrome sat a process other than the one `cmd.exe` naming your registered host (from `native_host_manifest`), or two of them, or one whose command line Windows won't show (an elevated or another user's process). Check `native_host_manifest` points at the manifest Chrome uses; end the odd process; if your Claude in Chrome starts its host another way, the chain rule needs a code change. |
 | `slow_hook_required` (`confirm-profile`), `slow_hook` not passed (probe) | `probe-evidence.json`: `slow_hook` | With nav-guard stalled, the navigation ran anyway (`opened`) or was refused without a permission denial recorded for it, or it was seen on another `claude` version. Claude Code's `dontAsk` mode isn't refusing what the hook didn't allow on your version, and nothing runs, attended or not, until it does: rerun the probe once; if it repeats, it needs a code change. |
 | `injection` or `injection_plan` not passed (probe) | `probe-evidence.json`: `injection`, `injection_plan` | The planted token got into an accepted fact (a notes field, the account, or the plan's name), or the page was never read. `confirm-profile` refuses until it passes; the schema needs a narrower field. |
-| `manifest_path_mismatch` (`bind-profile`, `check-host`) | `check-host`'s detail (which views differ); `regedit`: `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts`, `HKEY_LOCAL_MACHINE\Software\Google\Chrome\NativeMessagingHosts` and `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts`, the entry named as the manifest's `name`; `install.json`: `native_host_manifest` | A registered manifest Chrome may use for Claude in Chrome's native host (the default value in any of the three views) isn't the file `install.json` names, after normalizing (full path, case, quotes, slashes), the views hold more than one distinct path, or no view has an entry. Set `native_host_manifest` to the registry's path (forward slashes), delete stale entries in the other views, check that file lists your extension in `allowed_origins`, then run `check-host` again. Needs a code change: no. |
+| `manifest_path_mismatch` (`bind-profile`, `check-host`, `probe`) | `check-host`'s detail (which views differ); `regedit`: `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts`, `HKEY_LOCAL_MACHINE\Software\Google\Chrome\NativeMessagingHosts` and `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts`, the entry named as the manifest's `name`; `install.json`: `native_host_manifest` | A registered manifest Chrome may use for Claude in Chrome's native host (the default value in any of the three views) isn't the file `install.json` names, after normalizing (full path, case, quotes, slashes), the views hold more than one distinct path, or no view has an entry. Set `native_host_manifest` to the registry's path (forward slashes), delete stale entries in the other views, check that file lists your extension in `allowed_origins`, then run `check-host` again. Needs a code change: no. |
+| `manifest_path_mismatch` naming `desktop_app_host`, or a view whose entry is the Claude desktop app's manifest (Cain 0.19.1) | `check-host`'s detail; the `.json` file `install.json` names (`native_host_manifest`), its `path`; `regedit` as above | The manifest Chrome would use for Claude in Chrome's host name is the Claude desktop app's (registered in `HKCU` by the app, beside Claude Code's in another view), or the pinned manifest's `path` is a program in the app's own folder (`WindowsApps\Claude_...` or `AnthropicClaude\`). The worker only drives Claude Code's host. Point `native_host_manifest` at Claude Code's manifest (the one whose `path` runs `claude --chrome-native-host`), and remove or repoint the other entry so every view names that one file, then run `check-host` again. Needs a code change: no. |
 | `manifest_path_mismatch` naming `HKLM32` (a WOW6432Node entry) | `regedit`: `HKEY_LOCAL_MACHINE\Software\WOW6432Node\Google\Chrome\NativeMessagingHosts` | An old or 32-bit install left a native host entry in the machine hive's 32-bit view that points elsewhere; Chrome consults that view too. Delete it there (or point it at the same manifest), then run `check-host` again. Needs a code change: no. |
 | `allowlist_risky_url` (`sign-allowlist`) | its detail: `entry <n>: matched "<word>" on host <host>` (the path, query, fragment and sign-in part are never printed, and nothing of the address is written anywhere) | That entry's address has a query, or its path (or a redirect or sign-in path) has a word that acts (`logout`, `signout`, `unsubscribe`, `confirm`, `delete`, `remove`, `cancel`). Open the address yourself in the Cain jobs profile: if it only shows a page, add `"reviewed": true` to the entry and sign again; otherwise pin another address. Needs a code change: no. |
 | `probe_stale` with reason `cli_version_changed` but the same `claude --version` | `confirmed.json`: `cli_sha256` | The `claude` executable's bytes changed (a reinstall, a repair, or a `cli_changed` run) since the deny-alone check was seen on it. Run the probe and `confirm-profile` again. Needs a code change: no. |

@@ -6,6 +6,11 @@
 - Having the Claude app open on your PC no longer stops bind-profile, the probe or a run. A Claude Code session that is running still does, whether it runs in a terminal or in the Claude app.
 - A new launcher on your desktop, Cain PC jobs, runs bind-profile, the probe or the queued jobs with a double click. When something is in the way it says in one line what to close, then waits for a key.
 - The setup steps say to turn Google Docs Offline off in the Cain jobs Chrome before the probe.
+- Only the Claude app's own window and its helper processes are let through now: anything else from the app, or any Claude process whose details can't be read, still stops setup with "another Claude Code is running".
+- The probe now checks Claude in Chrome's registered host like check-host and bind-profile, and all three stop when the Claude app's own host is registered in its place.
+- Chrome's own parts with their folders gone are accepted only by their exact folder name, under an older Chrome version than the one running, and never when a folder of that name turns up under another version.
+- When something other than a busy Claude stops the launcher, it says one line: "Stopped: <code>. Tell Cain: refusal <code>."
+- The launcher is only written when its folders have plain names, and it quotes each one.
 - The PC needs a new probe and confirmation after this update, as after every new PC worker.
 
 ## 0.19.0

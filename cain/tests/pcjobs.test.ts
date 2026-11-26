@@ -26,7 +26,7 @@ import {
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, DEFAULT_APP_IDS, readPolicy, parseSettingsValue, parseSettingsKey,
-  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, componentShaped, busyLine, launcherText, launcherLine, isClaudeCode, LAUNCHER_NAME, writeLauncher, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, componentShape, COMPONENT_RESOURCES, isDesktopShell, hasCliEntry, splitCmd, busyLine, launcherText, launcherLine, isClaudeCode, LAUNCHER_NAME, writeLauncher, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -3833,7 +3833,9 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     const PDF = "mhjfbmdgcfjbbpaeojofohoefgiehjai", HANGOUTS = "nkeimhogjdpnpccoofpliimaahmaaome", DOCS = "ghbmnnjooekpmoecnnnilnnbdlolhkhi";
     const X86 = "C:\\Program Files (x86)\\Google\\Chrome\\Application";
     // The disk as Chrome 158 leaves it: chrome.exe in Program Files (x86), and no 157 version folder anywhere.
-    const disk158: Disk = { real: (p) => /[\\/]157\.0\.8103\.39([\\/]|$)/.test(p) ? null : FAKE_DISK.real(p), chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV };
+    const V158 = "158.0.8127.36";
+    const disk158: Disk = { real: (p) => /[\\/]157\.0\.8103\.39([\\/]|$)/.test(p) ? null : FAKE_DISK.real(p), chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV,
+      list: (d) => d === X86 ? [V158, "SetupMetrics", "chrome.exe"] : null };
     const comp = (name: string, sub: string) => ({ creation_flags: 1, from_webstore: false, location: 5, manifest: { manifest_version: 3, name, version: "1.0" },
       path: `${X86}\\157.0.8103.39\\resources\\${sub}`, was_installed_by_default: false, was_installed_by_oem: false });
     const store = (id: string, name: string, extra: object = {}) => ({ creation_flags: 9, from_webstore: true, location: 1, manifest: { manifest_version: 3, name, version: "1.0" },
@@ -3851,41 +3853,41 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     test("the captured shape gives exactly one finding, Docs Offline on, and passes once it is off", () => withDisk(() => {
       const { q } = oneJob();
       write(q, captured());
-      const prefs = extensionPrefs(instOf(q));
+      const prefs = extensionPrefs(instOf(q), undefined, V158);
       expect(prefs.refusals).toEqual([{ id: DOCS, why: "default_app_on" }]);
       expect(prefs.others).toEqual([DOCS]);
       for (const id of [GEMINI, SPEECH, PDF, HANGOUTS]) expect([id, prefs.extensions.find((x) => x.id === id)]).toMatchObject([id, { kind: "chrome", path_kind: "missing", location: 5 }]);
       expect(prefs.extensions.find((x) => x.id === CIC)).toMatchObject({ kind: "claude", path_kind: "profile" });
       write(q, { ...captured(), [DOCS]: store(DOCS, "Google Docs Offline", { creation_flags: 137, was_installed_by_default: true, disable_reasons: [1] }) });
-      expect(extensionPrefs(instOf(q)).refusals).toEqual([]);
+      expect(extensionPrefs(instOf(q), undefined, V158).refusals).toEqual([]);
     }));
 
     test("the same shape plus a location 10 entry with its folder gone still refuses, and every other rule stands", () => withDisk(() => {
       const { q } = oneJob();
       const off = { ...captured(), [DOCS]: store(DOCS, "Google Docs Offline", { creation_flags: 137, disable_reasons: [1] }) };
       write(q, { ...off, [PDF]: { ...comp("Chrome PDF Viewer", "pdf"), location: 10 } });
-      expect(extensionPrefs(instOf(q)).refusals).toEqual([{ id: PDF, why: "on", path_kind: "missing", path: externalPath(`${X86}\\157.0.8103.39\\resources\\pdf`) }]);
+      expect(extensionPrefs(instOf(q), undefined, V158).refusals).toEqual([{ id: PDF, why: "on", path_kind: "missing", path: externalPath(`${X86}\\157.0.8103.39\\resources\\pdf`) }]);
       // Web Store Payments, as before: its folder gone is foreign, at location 5 too.
       const PAY = "nmmhkkegccagdldgiimedpiccmgmieda";
       write(q, { ...off, [PAY]: comp("Chrome Web Store Payments", "web_store_payments") });
-      expect(extensionPrefs(instOf(q)).refusals).toEqual([{ id: PAY, why: "on" }]);
+      expect(extensionPrefs(instOf(q), undefined, V158).refusals).toEqual([{ id: PAY, why: "on" }]);
       // An id that isn't built in, in the same shape: foreign.
       const OTHER = "dddddddddddddddddddddddddddddddd";
       write(q, { ...off, [OTHER]: comp("Something", "x") });
-      expect(extensionPrefs(instOf(q)).refusals).toEqual([{ id: OTHER, why: "on" }]);
+      expect(extensionPrefs(instOf(q), undefined, V158).refusals).toEqual([{ id: OTHER, why: "on" }]);
       // A built-in id in the profile, in another folder, under another Chrome, in an odd form, or with no resources: foreign.
       for (const path of [`${PDF}\\1.0_0`, join(q.udd, "Default", "Extensions", PDF, "1.0_0"), "D:\\Tools\\pdf",
         `${FAKE_APP}\\157.0.8103.39\\resources\\pdf`, `${X86}\\157.0.8103.39\\RESOUR~1\\pdf`, `\\\\?\\${X86}\\157.0.8103.39\\resources\\pdf`,
         `${X86}\\157.0.8103.39\\pdf`, `${X86}\\157.0.8103.39\\resources`, `${X86}\\157.0.8103.39\\resources\\..\\..\\x\\pdf`, `${X86}\\v157\\resources\\pdf`]) {
         write(q, { ...off, [PDF]: { ...comp("Chrome PDF Viewer", "pdf"), path } });
-        expect([path, extensionPrefs(instOf(q)).refusals.map((r) => r.id)]).toEqual([path, [PDF]]);
+        expect([path, extensionPrefs(instOf(q), undefined, V158).refusals.map((r) => r.id)]).toEqual([path, [PDF]]);
       }
       // A policy entry naming a built-in id still refuses.
       write(q, off);
-      expect(extensionPrefs(instOf(q), { entries: [{ id: PDF, hive: "HKLM", policy: "ExtensionInstallForcelist" }], unreadable: [] } as any).refusals)
+      expect(extensionPrefs(instOf(q), { entries: [{ id: PDF, hive: "HKLM", policy: "ExtensionInstallForcelist" }], unreadable: [] } as any, V158).refusals)
         .toEqual([{ id: PDF, why: "policy" }]);
-      expect(componentShaped(`${X86}\\158.0.8127.36\\resources\\pdf`, disk158)).toBe(true);
-      expect(componentShaped(`${X86}\\158.0.8127.36\\resources\\pdf`, FAKE_DISK)).toBe(false);
+      expect(componentShape(PDF, `${X86}\\157.0.8103.39\\resources\\pdf`, V158, disk158)).toEqual({ ok: true });
+      expect(componentShape(PDF, `${X86}\\157.0.8103.39\\resources\\pdf`, V158, FAKE_DISK)).toEqual({ ok: false });
     }));
   });
 
@@ -8728,6 +8730,235 @@ describe("0.12.2: the hooks seal the test symbol and run the worker's preload sc
       expect(body.indexOf("if (startRefused)")).toBeGreaterThan(check);
       expect(body.indexOf("if (startRefused)")).toBeLessThan(body.indexOf("hookBudget("));
       expect(body.indexOf("if (startRefused)")).toBeLessThan(body.indexOf("if (probe.deny)"));
+    }
+  });
+});
+
+// Cain 0.19.1, review round 1 of pull request 60: the five adopted fixes, each with the cases that fail without it.
+describe("Cain 0.19.1, review round 1: the PC worker's fixes for Chrome 158 and the Claude desktop app", () => {
+  const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+  const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+  const ASAR = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar";
+
+  test("1. the desktop shell: its plain process and its typed children, with no CLI entry, are left out", async () => {
+    const shell = [
+      { pid: 50, cmd: `"${APP}"`, name: "claude.exe", exe: APP },
+      { pid: 51, cmd: APP, name: "claude.exe" },
+      { pid: 52, cmd: `"${SQUIRREL}"` },
+      ...["gpu-process", "renderer", "utility", "crashpad-handler", "zygote", "broker"].map((t, i) =>
+        ({ pid: 60 + i, cmd: `"${i % 2 ? SQUIRREL : APP}" --type=${t} --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --app-path="${ASAR}"` })),
+      { pid: 70, cmd: `${APP} --type=renderer --lang=en-US` },
+    ];
+    for (const p of shell) expect([p.cmd, isDesktopShell(p), isClaudeCode(p)]).toEqual([p.cmd, true, false]);
+    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe")).toEqual([]);
+    const { q, id } = oneJob();
+    expect(await run(q.opts({ ...attended, procs: () => shell }))).toMatchObject({ code: "ok", job: id });
+  });
+
+  test("1. everything else that names claude.exe, or runs the CLI entry, refuses as chrome_busy", async () => {
+    const CLI = "node_modules\\@anthropic-ai\\claude-code\\cli.js";
+    const refuse: { why: string; p: { pid: number; cmd: string; name?: string; exe?: string } }[] = [
+      { why: "the app's Electron running the CLI, backslashes", p: { pid: 80, cmd: `"${APP}" "C:\\Users\\owner\\AppData\\Roaming\\npm\\${CLI}" -p` } },
+      { why: "forward slashes", p: { pid: 81, cmd: `"${APP}" C:/Users/owner/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/cli.js` } },
+      { why: "from app.asar", p: { pid: 82, cmd: `"${APP}" "${ASAR}\\${CLI}"` } },
+      { why: "from app.asar.unpacked", p: { pid: 83, cmd: `"${APP}" "${ASAR}.unpacked\\${CLI}" --output-format stream-json` } },
+      { why: "a utility child carrying the CLI path", p: { pid: 84, cmd: `"${APP}" --type=utility --utility-sub-type=node.mojom.NodeService "${ASAR}.unpacked\\${CLI}"` } },
+      { why: "a claude-code folder's cli.js", p: { pid: 85, cmd: `"C:\\Program Files\\nodejs\\node.exe" "D:\\src\\claude-code\\dist\\cli.mjs"` } },
+      { why: "a native claude.exe outside the app folder, no arguments", p: { pid: 86, cmd: '"C:\\Users\\owner\\.local\\bin\\claude.exe"' } },
+      { why: "the desktop's own Code binary outside its app folder", p: { pid: 87, cmd: '"C:\\Users\\owner\\AppData\\Roaming\\Claude\\claude-code\\2.1.0\\claude.exe"' } },
+      { why: "app-folder claude.exe with -p", p: { pid: 88, cmd: `"${APP}" -p "hello"` } },
+      { why: "app-folder claude.exe with --output-format stream-json", p: { pid: 89, cmd: `"${APP}" --output-format stream-json` } },
+      { why: "app-folder claude.exe running mcp serve", p: { pid: 90, cmd: `"${SQUIRREL}" mcp serve` } },
+      { why: "an 8.3 path", p: { pid: 91, cmd: '"C:\\PROGRA~1\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe"' } },
+      { why: "a \\\\?\\ path", p: { pid: 92, cmd: `"\\\\?\\${APP}"` } },
+      { why: "a UNC path", p: { pid: 93, cmd: '"\\\\host\\share\\WindowsApps\\Claude_1\\app\\claude.exe"' } },
+      { why: "mixed case CLI entry", p: { pid: 94, cmd: `"${APP.toUpperCase()}" "C:\\Users\\owner\\Node_Modules\\@Anthropic-AI\\Claude-Code\\CLI.JS"` } },
+      { why: "mixed case CLI entry, typed child", p: { pid: 95, cmd: `"${APP}" --type=renderer C:/X/@ANTHROPIC-AI/CLAUDE-CODE/cli.js` } },
+      { why: "an app-folder claude.exe whose command line is empty", p: { pid: 96, cmd: "", name: "claude.exe", exe: APP } },
+      { why: "a node.exe whose command line is empty", p: { pid: 97, cmd: "", name: "node.exe" } },
+      { why: "a bun.exe whose command line is empty", p: { pid: 98, cmd: "", name: "bun.exe" } },
+      { why: "an electron.exe whose command line is empty", p: { pid: 99, cmd: "  ", exe: "C:\\x\\electron.exe" } },
+      { why: "a --type value not on the known list", p: { pid: 100, cmd: `"${APP}" --type=extension` } },
+      { why: "a --type known and one not", p: { pid: 101, cmd: `"${APP}" --type=renderer --type=node` } },
+      { why: "an app path whose listed executable is elsewhere", p: { pid: 102, cmd: `"${APP}"`, name: "claude.exe", exe: "C:\\Temp\\claude.exe" } },
+      { why: "a version-less AnthropicClaude folder", p: { pid: 103, cmd: '"C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\claude.exe"' } },
+      { why: "a dot segment", p: { pid: 104, cmd: '"C:\\Program Files\\WindowsApps\\Claude_1\\app\\.\\claude.exe"' } },
+      { why: "an image named claude.exe whatever its command line says", p: { pid: 105, cmd: "C:\\tools\\agent --serve", name: "claude.exe" } },
+    ];
+    for (const { why, p } of refuse) {
+      expect([why, isClaudeCode(p)]).toEqual([why, true]);
+      const { q } = oneJob();
+      expect([why, (await run(q.opts({ ...attended, procs: () => [p] }))).code]).toEqual([why, "chrome_busy"]);
+    }
+    // A process list that can't be read still refuses.
+    const { q } = oneJob();
+    expect((await run(q.opts({ ...attended, procs: () => null }))).code).toBe("chrome_busy");
+    // A process with no name and an empty command line can't be told apart from Windows' own: left alone, as before.
+    expect(isClaudeCode({ pid: 110, cmd: "" })).toBe(false);
+    expect(hasCliEntry("C:/a/node_modules/@anthropic-ai/claude-code/cli.js")).toBe(true);
+    expect(splitCmd(`${APP} --type=renderer`)).toEqual({ exe: APP, rest: " --type=renderer" });
+  });
+
+  // 2. The native host manifest: every registry view Chrome reads for the extension's host name, and the pinned manifest.
+  test("2. a second manifest registered under HKCU by the desktop app, or a pinned one naming the app's host, refuses check-host, bind-profile and the probe", async () => {
+    const q = queueRig({ confirmed: false });
+    const desk = "C:\\Users\\owner\\AppData\\Roaming\\Claude\\ChromeNativeHost\\com.anthropic.claude_browser_extension.json";
+    const two = () => [{ view: "HKCU" as const, path: desk }, { view: "HKLM64" as const, path: q.manifest }];
+    expect(manifestViews(q.opts({ registry: two }), q.inst)).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["HKCU"], distinct: 2 });
+    expect(() => checkHost(q.opts({ registry: two }))).toThrow("manifest_path_mismatch");
+    await expect(bindProfile(q.opts({ ...attended, registry: two }))).rejects.toThrow("manifest_path_mismatch");
+    await expect(probe(q.opts({ ...attended, registry: two }))).rejects.toMatchObject({ code: "manifest_path_mismatch" });
+    expect(q.launches).toEqual([]);
+    // Each view on its own, the HKLM ones included.
+    for (const view of ["HKCU", "HKLM64", "HKLM32"] as const)
+      expect(manifestViews(q.opts({ registry: () => [{ view: "HKCU", path: q.manifest }, { view, path: desk }] }), q.inst).code).toBe("manifest_path_mismatch");
+    // The pinned manifest itself naming the desktop app's own host program.
+    const pinned = JSON.parse(readFileSync(q.manifest, "utf8"));
+    writeFileSync(q.manifest, JSON.stringify({ ...pinned, path: "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\resources\\chrome-native-host.exe" }));
+    expect(manifestViews(q.opts(), q.inst)).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["desktop_app_host"] });
+    expect(() => checkHost(q.opts())).toThrow("manifest_path_mismatch");
+    await expect(probe(q.opts(attended))).rejects.toMatchObject({ code: "manifest_path_mismatch" });
+    writeFileSync(q.manifest, JSON.stringify({ ...pinned, path: "C:\\Program Files\\WindowsApps\\Claude_1.0_x64__p\\app\\resources\\chrome-native-host.exe" }));
+    expect(manifestViews(q.opts(), q.inst).code).toBe("manifest_path_mismatch");
+    writeFileSync(q.manifest, JSON.stringify(pinned));
+    expect(manifestViews(q.opts(), q.inst).code).toBeNull();
+    expect(q.launches).toEqual([]);
+  });
+
+  // 3. The location 5 missing-path exception, narrowed.
+  describe("3. a component's missing path", () => {
+    const CIC = "fcoeoabgfenejglbffodgkkbkcdhcgfn", PDF = "mhjfbmdgcfjbbpaeojofohoefgiehjai", GEMINI = "admccjkmockfdflocgggjfgdacdodkdf";
+    const SPEECH = "fignfifoniblkonapihmkfakmlgkbkcf", SPEECH_OLD = "neajdppkdcdipfabeoofebfddakdcjhd", HANGOUTS = "nkeimhogjdpnpccoofpliimaahmaaome";
+    const PAY = "nmmhkkegccagdldgiimedpiccmgmieda";
+    const X86 = "C:\\Program Files (x86)\\Google\\Chrome\\Application";
+    const V = "158.0.8127.36", OLD = "157.0.8103.39";
+    // Only chrome.exe and what a test plants exist; the install folder lists the current version and the planted ones.
+    const diskWith = (planted: string[] = [], dirs: string[] | null = [V, ...planted.map((p) => p.slice(X86.length + 1).split("\\")[0])]): Disk => ({
+      real: (p) => p === `${X86}\\chrome.exe` || planted.includes(p) ? p : null, chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV,
+      list: (d) => d === X86 ? dirs : null });
+    const shaped = (id: string, name: string, ver = OLD) => `${X86}\\${ver}\\resources\\${name}`;
+    const comp = (path: string, location = 5) => ({ creation_flags: 1, from_webstore: false, location, manifest: { manifest_version: 3, name: "Chrome part", version: "1.0" }, path });
+    const judge = (id: string, entry: object, disk: Disk = diskWith(), version: string | null = V, policy?: any) => {
+      const { q } = oneJob();
+      writeFileSync(join(q.udd, "Default", "Secure Preferences"), JSON.stringify({ extensions: { settings: { [id]: entry,
+        [CIC]: { creation_flags: 9, from_webstore: true, location: 1, manifest: { name: "Claude", version: "1.0" }, path: `${CIC}\\1.0_0` } } } }));
+      setDiskStandIn(disk);
+      try { return extensionPrefs({ ...q.inst, profile: { ...q.inst.profile, extension_id: CIC } }, policy, version); } finally { setDiskStandIn(FAKE_DISK); }
+    };
+    const own = (id: string, entry: object, disk?: Disk, version?: string | null) => judge(id, entry, disk, version).refusals.length === 0;
+
+    test("the table, and the captured Chrome 158 shape still passes", () => {
+      expect(Object.keys(COMPONENT_RESOURCES).sort()).toEqual([PDF, GEMINI, SPEECH, SPEECH_OLD, HANGOUTS].sort());
+      expect(COMPONENT_RESOURCES[PAY]).toBeUndefined();
+      expect(own(PDF, comp(shaped(PDF, "pdf")))).toBe(true);
+      expect(own(HANGOUTS, comp(shaped(HANGOUTS, "hangout_services")))).toBe(true);
+      expect(own(GEMINI, comp(shaped(GEMINI, "gemini")))).toBe(true);
+      for (const id of [SPEECH, SPEECH_OLD]) {
+        expect(own(id, comp(shaped(id, "network_speech_synthesis\\mv3")))).toBe(true);
+        expect(own(id, comp(shaped(id, "network_speech_synthesis")))).toBe(true);
+        expect(own(id, comp(shaped(id, "network_speech_synthesis\\mv3\\x")))).toBe(false);
+      }
+      expect(own(GEMINI, comp(shaped(GEMINI, "gemini\\mv3")))).toBe(false);
+      expect(POLICY_VERSION).toBe("22");
+    });
+
+    test("every case outside the narrow rule refuses", () => {
+      const OTHER = "dddddddddddddddddddddddddddddddd";
+      const cases: [string, string, object, Disk?, (string | null)?][] = [
+        ["a non-built-in id at location 5", OTHER, comp(shaped(OTHER, "pdf"))],
+        ...[1, 4, 6, 8].map((l): [string, string, object] => [`a built-in id at location ${l}`, PDF, comp(shaped(PDF, "pdf"), l)]),
+        ["Web Store Payments missing at location 5", PAY, comp(shaped(PAY, "web_store_payments"))],
+        ["a version equal to Chrome's", PDF, comp(shaped(PDF, "pdf", V))],
+        ["a newer version", PDF, comp(shaped(PDF, "pdf", "159.0.0.1"))],
+        ["a newer minor", PDF, comp(shaped(PDF, "pdf", "158.0.8127.37"))],
+        ["a three-part version", PDF, comp(shaped(PDF, "pdf", "157.0.8103"))],
+        ["Chrome's version unknown", PDF, comp(shaped(PDF, "pdf")), diskWith(), null],
+        ["the install folder can't be listed", PDF, comp(shaped(PDF, "pdf")), diskWith([], null)],
+        ["a wrong resource name", PDF, comp(shaped(PDF, "gemini"))],
+        ["another id's name", GEMINI, comp(shaped(GEMINI, "pdf"))],
+        ["another Chrome install folder", PDF, comp(`${FAKE_APP}\\${OLD}\\resources\\pdf`)],
+        ["UNC", PDF, comp(`\\\\host\\c$\\Program Files (x86)\\Google\\Chrome\\Application\\${OLD}\\resources\\pdf`)],
+        ["\\\\?\\", PDF, comp(`\\\\?\\${shaped(PDF, "pdf")}`)],
+        ["8.3", PDF, comp(`C:\\PROGRA~2\\Google\\Chrome\\Application\\${OLD}\\resources\\pdf`)],
+        ["case variant of the install folder", PDF, comp(shaped(PDF, "pdf").replace("Program Files (x86)", "program files (x86)"))],
+        ["case variant of the drive", PDF, comp(shaped(PDF, "pdf").replace("C:", "c:"))],
+        ["case variant of resources", PDF, comp(shaped(PDF, "pdf").replace("resources", "Resources"))],
+        ["a trailing dot on the name", PDF, comp(`${shaped(PDF, "pdf")}.`)],
+        ["a trailing space on the version", PDF, comp(`${X86}\\${OLD} \\resources\\pdf`)],
+        ["a trailing dot on resources", PDF, comp(`${X86}\\${OLD}\\resources.\\pdf`)],
+        ["a trailing dot on the install folder", PDF, comp(`${X86}.\\${OLD}\\resources\\pdf`)],
+        ["a trailing separator", PDF, comp(`${shaped(PDF, "pdf")}\\`)],
+      ];
+      for (const [why, id, entry, disk, version] of cases) expect([why, own(id, entry, disk, version === undefined ? V : version)]).toEqual([why, false]);
+      // A policy entry naming a built-in id, in the shaped path.
+      expect(judge(PDF, comp(shaped(PDF, "pdf")), diskWith(), V, { entries: [{ id: PDF, hive: "HKLM", policy: "ExtensionInstallForcelist" }], unreadable: [] }).refusals)
+        .toEqual([{ id: PDF, why: "policy" }]);
+    });
+
+    test("the shaped folder existing under another old version folder is planted: refused, naming it", () => {
+      const planted = `${X86}\\156.0.1.2\\resources\\pdf`;
+      const r = judge(PDF, comp(shaped(PDF, "pdf")), diskWith([planted]));
+      expect(r.refusals).toEqual([{ id: PDF, why: "on", planted: externalPath(planted) }]);
+      expect(componentShape(PDF, shaped(PDF, "pdf"), V, diskWith([planted]))).toEqual({ ok: false, planted });
+      // The same name under the current version is Chrome's own folder, not a plant.
+      expect(componentShape(PDF, shaped(PDF, "pdf"), V, diskWith([`${X86}\\${V}\\resources\\pdf`]))).toEqual({ ok: true });
+      // A Network Speech folder planted without its subfolder counts too.
+      const sp = `${X86}\\150.0.0.1\\resources\\network_speech_synthesis`;
+      expect(componentShape(SPEECH, shaped(SPEECH, "network_speech_synthesis\\mv3"), V, diskWith([sp]))).toEqual({ ok: false, planted: sp });
+    });
+
+    test("on a real disk: a link into the install folder, or a version folder linked out, is not Chrome's own; a real old-version plant is named", () => {
+      if (WIN) return;   // symlinks need rights on Windows; the stand-in cases above cover the same rules there
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "pcw-comp-")));
+      const app = join(root, "Google", "Chrome", "Application");
+      mkdirSync(join(app, V), { recursive: true });
+      writeFileSync(join(app, "chrome.exe"), "");
+      const disk: Disk = { ...realDisk(), chromeExe: () => join(app, "chrome.exe"), env: { ProgramFiles: root } };
+      const at = (p: string) => componentShape(PDF, p, V, disk);
+      const ok = join(app, OLD, "resources", "pdf");
+      expect(at(ok)).toEqual({ ok: true });
+      expect(pathKind(ok, join(root, "udd"), "Default", disk.env, disk)).toBe("missing");
+      symlinkSync(app, join(root, "Google", "Chrome", "Link"));
+      expect(at(join(root, "Google", "Chrome", "Link", OLD, "resources", "pdf"))).toEqual({ ok: false });
+      mkdirSync(join(root, "out", "resources", "pdf"), { recursive: true });
+      symlinkSync(join(root, "out"), join(app, "155.0.0.1"));
+      expect(pathKind(join(app, "155.0.0.1", "resources", "pdf"), join(root, "udd"), "Default", disk.env, disk)).toBe("other");
+      expect(at(ok)).toEqual({ ok: false, planted: join(app, "155.0.0.1", "resources", "pdf") });
+      rmSync(join(app, "155.0.0.1"));
+      mkdirSync(join(app, "154.0.0.1", "resources", "pdf"), { recursive: true });
+      expect(at(ok)).toEqual({ ok: false, planted: join(app, "154.0.0.1", "resources", "pdf") });
+      rmSync(root, { recursive: true, force: true });
+    });
+  });
+
+  test("4. the launcher's line for every code but chrome_busy is exactly one plain line naming the code", () => {
+    const { q } = oneJob();
+    for (const code of ["extra_extension", "manifest_path_mismatch", "probe_stale", "untrusted_config", "worker_failed", "cold_sample_missing"]) {
+      const l = launcherLine(code, q.opts(), q.inst);
+      expect(l).toBe(`Stopped: ${code}. Tell Cain: refusal ${code}.`);
+      expect(l).not.toMatch(/[\\/]|\d|\r|\n|Troubleshooting|pc-jobs\.md/);
+    }
+    expect(launcherLine("../x\\y 12", q.opts(), q.inst)).toBe("Stopped: worker_failed. Tell Cain: refusal worker_failed.");
+    expect(launcherLine("chrome_busy", q.opts({ procs: () => [{ pid: 60, cmd: '"C:/Users/owner/.local/bin/claude.exe"' }] }), q.inst))
+      .toBe("Stopped: another Claude Code is running. Close every terminal running claude, then press a key to try again.");
+  });
+
+  test("5. the launcher's paths: plain ASCII only, quoted at every use, delayed expansion off, CRLF", () => {
+    const bun = "C:\\Program Files (x86)\\Bun (x64)\\bun.exe", worker = "C:\\tools (1)\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts", home = "C:\\pc worker (k7q2xz)";
+    const text = launcherText(bun, worker, home);
+    for (const p of [bun, worker, home]) {
+      let at = text.indexOf(p), n = 0;
+      expect(at).toBeGreaterThan(-1);
+      while (at >= 0) { expect([p, text[at - 1], text[at + p.length]]).toEqual([p, '"', '"']); n++; at = text.indexOf(p, at + 1); }
+      expect(n).toBe(p === home ? 4 : 3);
+    }
+    expect(text).not.toContain("%");
+    expect(/^[\x20-\x7e\r\n]*$/.test(text)).toBe(true);
+    expect(text.replace(/\r\n/g, "")).not.toMatch(/[\r\n]/);
+    expect(text.split("\r\n")).toContain("setlocal DisableDelayedExpansion");
+    for (const bad of ["C:\\Users\\Zo\u00eb\\bun.exe", "C:\\\u0420\\bun.exe", "C:\\a\u00a0b", "C:\\a\tb", "C:\\a\u2014b", " C:\\lead"]) {
+      for (const args of [[bad, worker, home], [bun, bad, home], [bun, worker, bad]] as [string, string, string][])
+        expect(() => launcherText(...args)).toThrow(expect.objectContaining({ code: "untrusted_config" }));
     }
   });
 });

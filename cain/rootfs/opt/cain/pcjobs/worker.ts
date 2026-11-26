@@ -792,7 +792,9 @@ function segKind(segs: string[], env: Record<string, string | undefined>): "chro
 // and links followed) or null when it doesn't exist or can't be resolved; chromeExe the worker's own chrome.exe as the
 // environment's install folders hold it (Program Files, either view, then LocalAppData), or null. The tests hand in a
 // stand-in (setDiskStandIn); the worker never does.
-export interface Disk { real: (p: string) => string | null; chromeExe: (env: Record<string, string | undefined>) => string | null; env: Record<string, string | undefined> }
+// list (Cain 0.19.1, review round 1): a folder's entry names, or null when it can't be read; a stand-in without it lists nothing.
+export interface Disk { real: (p: string) => string | null; chromeExe: (env: Record<string, string | undefined>) => string | null; env: Record<string, string | undefined>;
+  list?: (dir: string) => string[] | null }
 export function workerChromeExe(env: Record<string, string | undefined>): string | null {
   for (const r of [...programFilesRoots(env).slice(0, 2), env.LOCALAPPDATA ?? env.LocalAppData]) if (r) {
     const f = join(r, "Google", "Chrome", "Application", "chrome.exe");
@@ -800,7 +802,8 @@ export function workerChromeExe(env: Record<string, string | undefined>): string
   }
   return null;
 }
-export const realDisk = (): Disk => ({ real: (p) => { try { return realpathSync.native(p); } catch { return null; } }, chromeExe: workerChromeExe, env: process.env });
+export const realDisk = (): Disk => ({ real: (p) => { try { return realpathSync.native(p); } catch { return null; } }, chromeExe: workerChromeExe, env: process.env,
+  list: (d) => { try { return readdirSync(d); } catch { return null; } } });
 let diskStandIn: Disk | null = null;
 export const setDiskStandIn = (d: Disk | null) => { diskStandIn = d; };
 export const diskNow = (): Disk => diskStandIn ?? realDisk();
@@ -850,24 +853,66 @@ export function pathKind(path: unknown, userDataDir: string, _profileDirectory?:
 export const EXTERNAL_COMPONENT_LOCATION = 10;
 // Cain 0.19.1 (Chrome 158): a component (location 5) keeps the path Chrome wrote at the version it was first installed
 // under (<install folder>\<a.b.c.d>\resources\<name>), and Chrome deletes that version folder at its next update; Chrome
-// 158 has no resources folder at all (its version folder holds resources.pak). So for a built-in id at location 5 only,
-// a missing path counts as Chrome's own when it has the install-folder shape: as written (never resolved), under the
-// folder the worker's own chrome.exe resolves to, then a version folder, then resources, then a name (a name and its
-// subfolder too, as Network Speech keeps network_speech_synthesis\mv3), the same shape as chrome_install. Location 10 still
-// needs the path on disk, and so does Web Store Payments; a profile path, an odd form, a "." or ".." segment or any
-// other folder stays foreign.
-export function componentShaped(path: unknown, disk: Disk = diskNow(), env: Record<string, string | undefined> = disk.env): boolean {
-  if (typeof path !== "string" || !path || oddForm(path)) return false;
-  const segs = pathSegs(path);
-  if (!segs || segs.includes("..") || segs.includes(".")) return false;
-  const app = chromeAppSegs(disk, env);
-  if (!app || !startsWithSegs(segs, app)) return false;
-  const rest = segs.slice(app.length);
-  return rest.length >= 3 && /^\d+(\.\d+){3}$/.test(rest[0]) && rest[1] === "resources";
+// 158 has no resources folder at all (its version folder holds resources.pak). Chrome loads a component from its own
+// binary and resources.pak, never from that path, so the exception below adds no load path. Review round 1: a missing path
+// counts as Chrome's own only when every one of these holds (componentShape):
+// - the id is on COMPONENT_RESOURCES and the path ends in that id's resource folder name (Network Speech: its name and
+//   one subfolder too); Web Store Payments isn't on it;
+// - the path is written, exactly and case for case, under the folder the worker's own chrome.exe resolves to, then a
+//   version folder, then resources, then the name; no odd form (\\?\, UNC, 8.3), no ".", ".." or empty segment, and no
+//   segment ending in a dot or a space;
+// - its version parses (four numbers) and is strictly older than the running Chrome's (chromeVersionRead), which must
+//   be known;
+// - the path doesn't exist, and no folder <install folder>\<any other version>\resources\<name> exists (one that does is
+//   planted: the entry refuses, naming it), and the install folder's version folders can be listed.
+// Location 10 still needs the path on disk; a profile path or any other folder stays foreign.
+export const COMPONENT_RESOURCES: Readonly<Record<string, { name: string; sub: boolean }>> = {
+  mhjfbmdgcfjbbpaeojofohoefgiehjai: { name: "pdf", sub: false },                     // Chrome PDF Viewer
+  nkeimhogjdpnpccoofpliimaahmaaome: { name: "hangout_services", sub: false },        // Google Hangouts
+  neajdppkdcdipfabeoofebfddakdcjhd: { name: "network_speech_synthesis", sub: true }, // Google Network Speech (its older id)
+  fignfifoniblkonapihmkfakmlgkbkcf: { name: "network_speech_synthesis", sub: true }, // Google Network Speech (Chrome 158)
+  admccjkmockfdflocgggjfgdacdodkdf: { name: "gemini", sub: false },                  // Gemini in Chrome
+};
+const VERSION4 = /^\d{1,6}\.\d{1,6}\.\d{1,6}\.\d{1,6}$/;
+const verNums = (v: unknown): number[] | null => typeof v === "string" && VERSION4.test(v) ? v.split(".").map(Number) : null;
+const verOlder = (a: number[], b: number[]) => { for (let i = 0; i < 4; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
+// A path's segments as written (separators folded, case kept); the first is the root ("C:", or "" for a POSIX root).
+const rawSegs = (s: string) => s.replace(/[\\/]+/g, "/").split("/");
+// The folder the worker's own chrome.exe resolves to, as written by the disk (case kept); null when there is none.
+function chromeAppRaw(disk: Disk, env: Record<string, string | undefined>): string[] | null {
+  const exe = disk.chromeExe(env);
+  const real = exe ? disk.real(exe) : null;
+  if (!real || oddForm(real)) return null;
+  const segs = rawSegs(real);
+  return segs.length > 2 && segs.slice(1).every((x) => x && x !== "." && x !== "..") ? segs.slice(0, -1) : null;
 }
-export const chromeOwn = (id: string, location: number | null, pk: PathKind, path?: unknown) =>
+export type ComponentShape = { ok: true } | { ok: false; planted?: string };
+export function componentShape(id: string, path: unknown, chromeVersion: string | null, disk: Disk = diskNow(), env: Record<string, string | undefined> = disk.env): ComponentShape {
+  const no: ComponentShape = { ok: false };
+  const want = Object.hasOwn(COMPONENT_RESOURCES, id) ? COMPONENT_RESOURCES[id] : null;
+  if (!want || typeof path !== "string" || !path || oddForm(path)) return no;
+  const segs = rawSegs(path);
+  if (segs.slice(1).some((x) => !x || x === "." || x === ".." || /[. ]$/.test(x))) return no;
+  const app = chromeAppRaw(disk, env);
+  if (!app || app.length > segs.length || !app.every((x, i) => segs[i] === x)) return no;
+  const [ver, res, name, sub, ...more] = segs.slice(app.length);
+  if (more.length || res !== "resources" || name !== want.name || (sub !== undefined && (!want.sub || !/^[a-z0-9_]{1,40}$/.test(sub)))) return no;
+  const v = verNums(ver), cur = verNums(chromeVersion);
+  if (!v || !cur || !verOlder(v, cur)) return no;
+  if (disk.real(path) !== null) return no;
+  const sep = segs[0] === "" ? "/" : "\\";
+  const dirs = disk.list?.(app.join(sep)) ?? null;
+  if (!dirs) return no;
+  for (const d of dirs) {
+    if (d === chromeVersion || !/^\d+(\.\d+){3}$/.test(d)) continue;
+    const f = [...app, d, "resources", want.name].join(sep);
+    if (disk.real(f) !== null) return { ok: false, planted: f };
+  }
+  return { ok: true };
+}
+export const chromeOwn = (id: string, location: number | null, pk: PathKind, path?: unknown, chromeVersion: string | null = null) =>
   CHROME_BUILTIN_IDS.includes(id) && location !== null && CHROME_LOCATIONS.includes(location)
-  && (pk === "chrome_install" || (location === COMPONENT_LOCATION && pk === "missing" && id !== WEB_STORE_PAYMENTS_ID && componentShaped(path)));
+  && (pk === "chrome_install" || (location === COMPONENT_LOCATION && pk === "missing" && componentShape(id, path, chromeVersion).ok));
 // Chrome Web Store Payments is an external component (location 10) in Chrome; its rule is unchanged: Chrome's own only
 // with its folder on disk, at either location.
 export const WEB_STORE_PAYMENTS_ID = "nmmhkkegccagdldgiimedpiccmgmieda";
@@ -897,7 +942,7 @@ export type PolicyName = "ExtensionInstallForcelist" | "ExtensionSettings" | "En
 export type RegView = "64" | "32";
 export interface ExtensionLine { id: string; name: string | null; enabled: boolean; component: boolean; kind: ExtensionKind; status: ExtensionStatus;
   location: number | null; state: number | null; disable_reasons: RawReasons; path_kind: PathKind; policy: PolicyHive[]; unrecognised: string[];
-  path?: string | null }
+  path?: string | null; planted?: string | null }
 // Chrome's extension policies, as read now (0.12.2, fourth pass): each id a policy installs, with the hive and the
 // policy naming it (ExtensionSettings' installation_mode too), and each hive and policy that couldn't be read. A key
 // or value that isn't there is no entry (reg answers 1); anything else but 0, or a listing that doesn't parse, is
@@ -1125,7 +1170,7 @@ export const forcelistOf = (o: Opts): ForceList => (o.forcelist ?? (() => {
 // refusals: each reason the gate refuses, by name (the entry and the field, the policy id, or the hive).
 export interface Refusal { id?: string; why: "on" | "default_app_on" | "policy" | "unrecognised" | "policy_unreadable" | "policy_unrecognised" | "policy_enrollment"
   | "uninstalls_unrecognised" | "policy_cache";
-  field?: string; hive?: PolicyHive; view?: RegView; policy?: PolicyName; key?: string; name?: string; path_kind?: PathKind; path?: string | null }
+  field?: string; hive?: PolicyHive; view?: RegView; policy?: PolicyName; key?: string; name?: string; path_kind?: PathKind; path?: string | null; planted?: string | null }
 export interface ExtensionPrefs { files: string[]; key: string; extensions: ExtensionLine[]; others: string[]; disagree: string[]; policy: ForceList; refusals: Refusal[] }
 const num = (x: unknown) => typeof x === "number" && Number.isFinite(x) ? x : null;
 // 0.12.2, seventh pass: a disable reason is a non-negative integer, never a boolean, a fraction, a negative number or a
@@ -1209,18 +1254,21 @@ function readPrefs(inst: Install): RawPrefs {
     && (differs(seen[id][0].state, seen[id][1].state) || differs(seen[id][0].manifest?.version, seen[id][1].manifest?.version)));
   return { files, merged, views, held, disagree, uninstalls, uninstallsBad };
 }
-function classify(inst: Install, id: string, e: any, hives: PolicyHive[]): ExtensionLine {
+function classify(inst: Install, id: string, e: any, hives: PolicyHive[], chromeVersion: string | null = null): ExtensionLine {
   const p = inst.profile;
   const reasons = rawReasons(e.disable_reasons), location = num(e.location), state = num(e.state);
   const name = typeof e.manifest?.name === "string" && /^[\w .,()'&+-]{1,60}$/.test(e.manifest.name) ? e.manifest.name : null;
   const pk = pathKind(e.path, p.user_data_dir, p.profile_directory);
   const kind: ExtensionKind = id === p.extension_id ? "claude"
     : (location !== null && POLICY_LOCATIONS.includes(location)) || hives.length ? "policy"
-    : CHROME_BUILTIN_IDS.includes(id) ? (chromeOwn(id, location, pk, e.path) ? "chrome" : "foreign")
+    : CHROME_BUILTIN_IDS.includes(id) ? (chromeOwn(id, location, pk, e.path, chromeVersion) ? "chrome" : "foreign")
     : defaultAppIds(inst).includes(id) ? "default_app" : "foreign";
   const st = entryStatus(e);
   const status: ExtensionStatus = kind === "policy" ? "on" : st.status;
-  return { id, name, enabled: status !== "present, off", component: kind === "chrome", kind, status, location, state, disable_reasons: reasons, path_kind: pk,
+  // Review round 1: a component whose missing path has a folder of the same shape under another version folder names it.
+  const shape = kind === "foreign" && location === COMPONENT_LOCATION && pk === "missing" ? componentShape(id, e.path, chromeVersion) : null;
+  const planted = shape && !shape.ok && shape.planted ? { planted: externalPath(shape.planted) } : {};
+  return { ...planted, id, name, enabled: status !== "present, off", component: kind === "chrome", kind, status, location, state, disable_reasons: reasons, path_kind: pk,
     policy: hives, unrecognised: kind === "claude" ? [] : st.unrecognised,
     ...(location === EXTERNAL_COMPONENT_LOCATION && kind !== "chrome" && kind !== "claude" ? { path: externalPath(e.path) } : {}) };
 }
@@ -1236,15 +1284,17 @@ function combine(lines: ExtensionLine[]): ExtensionLine {
   const unrecognised = [...new Set(lines.flatMap((x) => x.unrecognised))];
   return { ...base, kind, status, enabled: status !== "present, off", component: kind === "chrome", unrecognised: kind === "claude" ? [] : unrecognised };
 }
-export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST): ExtensionPrefs {
+// chromeVersion (Cain 0.19.1, review round 1): the running Chrome's version, for the component rule (componentShape);
+// unknown (null), no missing component path counts as Chrome's own.
+export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST, chromeVersion: string | null = null): ExtensionPrefs {
   const p = inst.profile;
   const { files, merged, views, disagree, uninstallsBad } = readPrefs(inst);
   const hivesOf = (id: string) => [...new Set(policy.entries.filter((x) => x.id === id).map((x) => x.hive))];
   const extensions = Object.keys(merged).sort().map((id) => {
-    const lines = views[id].map((v) => classify(inst, id, v, hivesOf(id)));
+    const lines = views[id].map((v) => classify(inst, id, v, hivesOf(id), chromeVersion));
     const line = combine(lines);
     // The printed fields stay the merged entry's (Secure Preferences first), the classification the combined one.
-    const shown = classify(inst, id, merged[id], hivesOf(id));
+    const shown = classify(inst, id, merged[id], hivesOf(id), chromeVersion);
     return { ...shown, kind: line.kind, status: line.status, enabled: line.enabled, component: line.component, unrecognised: line.unrecognised };
   });
   const refusals: Refusal[] = [];
@@ -1256,7 +1306,7 @@ export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST):
       ? { path_kind: x.path_kind, path: x.path ?? externalPath(merged[x.id]?.path) } : {};
     for (const field of x.unrecognised) refusals.push({ id: x.id, why: "unrecognised", field, ...at });
     if (x.kind === "policy") refusals.push({ id: x.id, why: "policy", ...at });
-    else if (x.status === "on" && x.kind === "foreign") refusals.push({ id: x.id, why: "on", ...at });
+    else if (x.status === "on" && x.kind === "foreign") refusals.push({ id: x.id, why: "on", ...at, ...(x.planted ? { planted: x.planted } : {}) });
     else if (x.status === "on" && x.kind === "default_app") refusals.push({ id: x.id, why: "default_app_on" });
   }
   // A policy id other than Claude in Chrome that isn't in the profile yet: Chrome installs it at its next start.
@@ -1982,13 +2032,19 @@ export function manifestViews(o: Opts, inst: Install): ManifestViews {
   const mismatched = reg.filter((e) => normalPath(e.path) !== want).map((e) => e.view);
   const distinct = new Set(reg.map((e) => normalPath(e.path))).size;
   if (!reg.length) return { code: "manifest_path_mismatch", entries: reg, mismatched: ["none"], distinct };
+  // Cain 0.19.1, review round 1: the pinned manifest itself may not name the Claude desktop app's own host program.
+  const host = hostPath(inst);
+  if (host && DESKTOP_APP_DIR.test(folded(host))) mismatched.push("desktop_app_host");
   return { code: mismatched.length || distinct > 1 ? "manifest_path_mismatch" : null, entries: reg, mismatched, distinct };
 }
+// The Claude desktop app's install folders (its own native host lives there).
+const DESKTOP_APP_DIR = /\\windowsapps\\claude_[^\\]*\\|\\anthropicclaude\\/;
 // null when every registered view matches (or there's no registry to read); manifest_path_mismatch otherwise.
 export const manifestCheck = (o: Opts, inst: Install): "manifest_path_mismatch" | null => manifestViews(o, inst).code;
 const manifestDetail = (m: ManifestViews) => `the native host manifest registered for Claude in Chrome isn't the one install.json names (native_host_manifest): `
   + (m.mismatched.includes("none") ? "no registry view has an entry" : `${m.mismatched.join(", ") || "the views disagree"} differs${m.distinct > 1 ? `; ${m.distinct} distinct paths across the views` : ""}`)
-  + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "");
+  + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "")
+  + (m.mismatched.includes("desktop_app_host") ? " (the pinned manifest names the Claude desktop app's own host program, not Claude Code's: see Troubleshooting)" : "");
 
 // The extension's hosts left behind by a browser that has gone: their parent is gone, or
 // its PID now belongs to a process that started after them. The preflight fails on them
@@ -2127,8 +2183,9 @@ export function readConfirmed(o: Opts): Confirmed | null {
 // missing confirmation (and the pinned hashes it would hold) is checked. The worker
 // never starts Chrome: the dedicated one must already be open on its profile.
 // Chrome's version is read once for the whole preflight (inChromePhase, twenty-second round).
-export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false): Code | null {
-  return inChromePhase(() => preflightChecks(o, inst, bypassConfirm));
+// reuse (Cain 0.19.1): a run's preflight reuses the one reading of Chrome's version its start made for the extension notes.
+export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false, reuse = false): Code | null {
+  return inChromePhase(() => preflightChecks(o, inst, bypassConfirm), reuse);
 }
 function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code | null {
   if (inst.unattended) return "unattended_unsupported";
@@ -2138,7 +2195,8 @@ function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code |
   const contained = containmentProblem(o);
   if (contained) return contained;
   // The extension's entry in the profile's preferences, and no other extension on there (a policy one counts whatever its state).
-  const prefs = extensionPrefs(inst, forcelistOf(o));
+  // Cain 0.19.1: Chrome's version, this phase's one reading, for the component rule (componentShape).
+  const prefs = extensionPrefs(inst, forcelistOf(o), chromeVersionRead(o, inst)?.version ?? null);
   if (!prefs.files.length) return "extension_entry_missing";
   if (prefs.disagree.length) return "prefs_disagree";
   if (gateRefuses(prefs)) return "extra_extension";
@@ -2456,7 +2514,8 @@ export async function next(o: Opts): Promise<NextOut> {
     const inst = installOf(o);
     if (typeof inst === "string") return quit(inst);
     // Each extension other than Claude in Chrome and Chrome's own listed with its status (read only: nothing is written to the profile).
-    const exts = extensionNotes(extensionPrefs(inst, forcelistOf(o)));
+    // Cain 0.19.1: with Chrome's version for the component rule, read once here; the preflight below reuses this reading.
+    const exts = extensionNotes(extensionPrefs(inst, forcelistOf(o), inChromePhase(() => chromeVersionRead(o, inst))?.version ?? null));
     if (exts.length) st.warnings = [...(st.warnings ?? []), ...exts];
     // Pop-ups and redirects allowed in the dedicated profile: a warning, never a stop.
     const pw = popupWarning(inst);
@@ -2488,7 +2547,7 @@ export async function next(o: Opts): Promise<NextOut> {
     let run: Job | null = null;
     let code: Heartbeat["code"] = "idle";
     if (candidate) {
-      const pre = browserPreflight(o, inst) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o, inst) ?? await bridgeCheck(o, inst);
+      const pre = browserPreflight(o, inst, false, true) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o, inst) ?? await bridgeCheck(o, inst);
       if (pre === "probe_stale") st.reason = inChromePhase(() => staleReason(o, inst), true);     // the preflight's own reading
       if (pre === "extension_version_unknown") st.reason = "extension_version_unknown";
       if (pre) code = pre;
@@ -4058,8 +4117,9 @@ export function guardCheck(st: Stream, log: Decision[], paths: string[] = [], to
 // the worker's lock can't see it: any is chrome_busy, and so is a process list that can't
 // be read. The extension's native messaging host is not a session and doesn't count.
 // created: when the process started, in ms since the epoch (null when it can't be read);
-// cmd: its command line, "" when the system won't show it.
-export interface Proc { pid: number; cmd: string; ppid?: number; created?: number | null }
+// cmd: its command line, "" when the system won't show it. name and exe (Cain 0.19.1, review round 1): its image name
+// (claude.exe) and executable path, as Windows lists them ("" when it won't show them; absent elsewhere and in older stand-ins).
+export interface Proc { pid: number; cmd: string; ppid?: number; created?: number | null; name?: string; exe?: string }
 const CLAUDE_PROC = /(^|[\\/"\s])claude(\.exe)?("|\s|$)|@anthropic-ai[\\/]claude-code/i;
 const NATIVE_HOST = /native[-_]?host|chrome-native/i;
 
@@ -4067,35 +4127,75 @@ export function listProcs(plat = process.platform, nowMs = Date.now()): Proc[] |
   try {
     if (plat === "win32") {
       const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)|$($_.ParentProcessId)|$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') })|$($_.CommandLine)\" }"],
+        "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)|$($_.ParentProcessId)|$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') })|$($_.Name)|$($_.ExecutablePath)|$($_.CommandLine)\" }"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
-      return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
-        .map((m) => { const t = Date.parse(m[3]); return { pid: Number(m[1]), ppid: Number(m[2]), created: Number.isFinite(t) ? t : null, cmd: m[4].trim() }; });
+      return out.split(/\r?\n/).map((l) => /^\s*(\d+)\|(\d+)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
+        .map((m) => { const t = Date.parse(m[3]); return { pid: Number(m[1]), ppid: Number(m[2]), created: Number.isFinite(t) ? t : null, name: m[4].trim(), exe: m[5].trim(), cmd: m[6].trim() }; });
     }
     const out = execFileSync("ps", ["-axo", "pid=,ppid=,etimes=,args="], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 });
     return out.split(/\r?\n/).map((l) => /^\s*(\d+)\s+(\d+)\s+(\d+)\s?(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m)
       .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), created: nowMs - Number(m[3]) * 1000, cmd: m[4].trim() }));
   } catch { return null; }
 }
-// Cain 0.19.1: the Claude desktop app's own Electron processes are claude.exe too (its main process and its --type=
-// children, in its install folder: WindowsApps\Claude_<...>\app, or AnthropicClaude\app-<version>), and they are not a
-// Claude Code session. A process counts as another Claude Code when it is the claude command install.json pins, or any
-// process whose command line names the Claude Code CLI entry (@anthropic-ai/claude-code, or a claude-code folder's
-// cli.js: node, bun, or the desktop app's own Electron running it as Node), or any other claude.exe (one the desktop
-// app downloads for its Code sessions included). Only the desktop app's shell, by its folder and with no CLI entry on
-// its command line, is left out: a Claude Code session the desktop app started still refuses.
-const CLAUDE_CLI_ENTRY = /@anthropic-ai[\\/]claude-code|[\\/]claude-code[\\/](?:[^"\s]*[\\/])?cli\.(?:m?js|ts)\b/i;
-const DESKTOP_SHELL = /^\s*"?[^"]*?[\\/](?:WindowsApps[\\/]Claude_[^\\/"]*[\\/]app|AnthropicClaude[\\/]app-[^\\/"]*)[\\/]claude\.exe"?(?:\s|$)/i;
+// Cain 0.19.1: the Claude desktop app's own Electron processes are claude.exe too, and they are not a Claude Code session.
+// Review round 1: the exclusion is positive and narrow (isDesktopShell). A process is left out only when its executable is
+// exactly the desktop app's claude.exe in its install folder (...\WindowsApps\Claude_<package>\app\claude.exe, or
+// ...\AnthropicClaude\app-<version>\claude.exe; a drive path, no \\?\, UNC or 8.3 form, no "." or ".." segment), quoted
+// or not, the same as the executable path Windows lists for it when it lists one, and its command line is the Electron
+// shell: no arguments at all, or a --type= child of a known kind (DESKTOP_TYPES, every --type= on it known), with no
+// Claude Code CLI entry anywhere on it (separators and case folded). Everything else that names claude.exe refuses, and
+// so does any process named claude.exe, node.exe, bun.exe or electron.exe whose command line is empty (it couldn't be
+// read); a process list that can't be read refuses too (chromeBusy). The pinned claude command, any process whose command
+// line names the CLI entry (@anthropic-ai/claude-code, or a claude-code folder's cli.js: node, bun, or the desktop app's
+// own Electron running it as Node) and any other claude.exe is another Claude Code. The extension's native host isn't.
+const CLAUDE_CLI_ENTRY = /@anthropic-ai\\claude-code|\\claude-code\\(?:[^"\\\r\n]*\\)*cli\.(?:[cm]?js|ts)\b/;
+const folded = (x: string) => x.replace(/[\\/]+/g, "\\").toLowerCase();
+export const hasCliEntry = (cmd: string) => CLAUDE_CLI_ENTRY.test(folded(cmd));
+export const DESKTOP_TYPES: readonly string[] = ["gpu-process", "renderer", "utility", "crashpad-handler", "zygote", "broker"];
+export const RUNTIME_NAMES: readonly string[] = ["claude.exe", "node.exe", "bun.exe", "electron.exe"];
 const normExe = (x: string) => x.replace(/\//g, "\\").replace(/\\+/g, "\\").toLowerCase();
-export function isClaudeCode(p: Proc, pinned?: string): boolean {
-  if (p.pid === process.pid || NATIVE_HOST.test(p.cmd)) return false;
-  const exe = exeOf(p.cmd);
-  if (pinned && exe && normExe(exe) === normExe(pinned)) return true;
-  if (CLAUDE_CLI_ENTRY.test(p.cmd)) return true;
-  if (DESKTOP_SHELL.test(p.cmd)) return false;
-  return CLAUDE_PROC.test(p.cmd);
+// The executable a command line starts with, and what follows it: a quoted path, or an unquoted one up to the first
+// ".exe" followed by a space or the end (so an unquoted path with spaces is read whole), or else its first word.
+export function splitCmd(cmd: string): { exe: string; rest: string } | null {
+  const m = /^\s*(?:"([^"]+)"|([^"\s][^"]*?\.exe)(?=\s|$)|(\S+))(.*)$/is.exec(cmd);
+  return m ? { exe: m[1] ?? m[2] ?? m[3], rest: m[4] } : null;
 }
-export const isDesktopShell = (p: Proc) => DESKTOP_SHELL.test(p.cmd) && !CLAUDE_CLI_ENTRY.test(p.cmd) && !NATIVE_HOST.test(p.cmd);
+// The words after the executable, quotes kept out of the way of the split.
+const argWords = (rest: string) => [...rest.matchAll(/(?:"[^"]*"|[^\s"])+/g)].map((m) => m[0]);
+export function isDesktopExe(exe: string): boolean {
+  if (!exe || oddForm(exe) || !/^[a-z]:[\\/]/i.test(exe)) return false;
+  const segs = normExe(exe).split("\\");
+  if (segs.slice(1).some((x) => !x || x === "." || x === ".." || /[. ]$/.test(x))) return false;
+  const n = segs.length;
+  if (segs[n - 1] !== "claude.exe") return false;
+  return (n >= 5 && segs[n - 2] === "app" && /^claude_[a-z0-9._-]+$/.test(segs[n - 3]) && segs[n - 4] === "windowsapps")
+    || (n >= 4 && /^app-\d+(\.\d+)*$/.test(segs[n - 2]) && segs[n - 3] === "anthropicclaude");
+}
+export function isDesktopShell(p: Proc): boolean {
+  if (!p.cmd.trim() || hasCliEntry(p.cmd) || NATIVE_HOST.test(p.cmd)) return false;
+  const c = splitCmd(p.cmd);
+  if (!c || !isDesktopExe(c.exe)) return false;
+  if (p.exe && normExe(p.exe) !== normExe(c.exe)) return false;
+  const words = argWords(c.rest);
+  if (!words.length) return !c.rest.trim();
+  const types = words.filter((w) => /^--type=/i.test(w));
+  return types.length > 0 && types.every((w) => DESKTOP_TYPES.includes(w.slice("--type=".length)));
+}
+const procName = (p: Proc): string => {
+  const n = (p.name ?? "").trim() || (p.exe ?? "").trim() || (splitCmd(p.cmd)?.exe ?? "");
+  return (n.split(/[\\/]/).pop() ?? "").toLowerCase();
+};
+export function isClaudeCode(p: Proc, pinned?: string): boolean {
+  if (p.pid === process.pid) return false;
+  const name = procName(p);
+  if (!p.cmd.trim()) return RUNTIME_NAMES.includes(name) || RUNTIME_NAMES.includes(`${name}.exe`);
+  if (NATIVE_HOST.test(p.cmd)) return false;
+  const exe = splitCmd(p.cmd)?.exe ?? null;
+  if (pinned && ((exe && normExe(exe) === normExe(pinned)) || (p.exe && normExe(p.exe) === normExe(pinned)))) return true;
+  if (hasCliEntry(p.cmd)) return true;
+  if (isDesktopShell(p)) return false;
+  return CLAUDE_PROC.test(p.cmd) || name === "claude.exe";
+}
 export const claudeSessions = (ps: Proc[], pinned?: string) => ps.filter((p) => isClaudeCode(p, pinned));
 export const nativeHosts = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pid && NATIVE_HOST.test(p.cmd) && /claude/i.test(p.cmd));
 
@@ -4104,8 +4204,12 @@ export const nativeHosts = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pi
 export function busyLine(ps: Proc[] | null, pinned?: string): string {
   if (!ps) return "Stopped: the PC's process list couldn't be read. Close Claude Code wherever it is open, then press a key to try again.";
   const found = claudeSessions(ps, pinned);
-  const inApp = found.some((p) => /[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i.test(p.cmd));
-  const elsewhere = found.some((p) => !/[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i.test(p.cmd));
+  // Review round 1: one whose command line couldn't be read could be either.
+  const APP = /[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i;
+  const where = (p: Proc) => `${p.exe ?? ""} ${p.cmd}`;
+  const unread = (p: Proc) => !p.cmd.trim() && !(p.exe ?? "").trim();
+  const inApp = found.some((p) => unread(p) || APP.test(where(p)));
+  const elsewhere = found.some((p) => unread(p) || !APP.test(where(p)));
   const what = inApp && elsewhere ? "the Code session in the Claude app and every terminal running claude"
     : inApp ? "the Code session in the Claude app (the app itself can stay open)" : "every terminal running claude";
   return `Stopped: another Claude Code is running. Close ${what}, then press a key to try again.`;
@@ -4113,16 +4217,19 @@ export function busyLine(ps: Proc[] | null, pinned?: string): string {
 // The launcher (Cain 0.19.1): one file on the owner's desktop, outside the Claude app, that runs bind-profile, the probe
 // or an attended run with a double click, so he never types a command. It prints the worker's own answer, then on a
 // refusal one plain line (--launcher), and waits for a key. Every path it holds is checked: none may carry a character
-// cmd.exe would read as anything but text.
+// cmd.exe would read as anything but text. Review round 1: printable ASCII only (no character outside it, so no code page
+// can change it), none of " % ! ^ & | < >, each path quoted at every use, delayed expansion off, CRLF line ends.
 export const LAUNCHER_NAME = "Cain PC jobs.cmd";
-const CMD_SAFE = /^[^"%!^&|<>\r\n]+$/;
+const CMD_SAFE = /^[\x20-\x7e]+$/;
+const CMD_SPECIAL = /["%!^&|<>]/;
 export function launcherText(bun: string, worker: string, home: string): string {
-  for (const x of [bun, worker, home]) if (!CMD_SAFE.test(x)) throw new WorkerError("untrusted_config", "a path for the launcher holds a character cmd.exe would not read as text");
+  for (const x of [bun, worker, home]) if (typeof x !== "string" || !CMD_SAFE.test(x) || CMD_SPECIAL.test(x) || x !== x.trim())
+    throw new WorkerError("untrusted_config", "a path for the launcher (Bun, worker.ts or the worker folder) holds a character cmd.exe would not read as plain text, or one outside plain ASCII: move it to a folder whose path is plain ASCII letters, digits and spaces");
   const call = (cmd: string) => `"${bun}" "${worker}" ${cmd} --attended --launcher --home "${home}"`;
   return [
     "@echo off",
     "rem Cain PC jobs: written by worker.ts write-launcher. Double-click it; it runs only what you pick.",
-    "setlocal",
+    "setlocal DisableDelayedExpansion",
     "title Cain PC jobs",
     `cd /d "${home}"`,
     ":menu",
@@ -4162,7 +4269,9 @@ export function writeLauncher(o: Opts, desktop?: string): { written: string } {
 export function launcherLine(code: string | null, o: Opts, inst?: Install | null): string | null {
   if (!code || code === "ok" || code === "idle") return null;
   if (code === "chrome_busy") return busyLine((o.procs ?? (() => listProcs(platform(o))))(), inst?.claude);
-  return `Stopped with ${code}: find ${code} in the Troubleshooting table of cain/docs/pc-jobs.md, fix it, then press a key to try again.`;
+  // Review round 1: one plain line, the code alone: no table, no path, no process id.
+  const c = /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "worker_failed";
+  return `Stopped: ${c}. Tell Cain: refusal ${c}.`;
 }
 export function chromeBusy(o: Opts, inst?: Install): Code | null {
   const ps = (o.procs ?? (() => listProcs(platform(o))))();
@@ -6523,6 +6632,10 @@ export async function probe(o: Opts): Promise<Evidence> {
   const tools = h ? allowedTools(h.settings) : null;
   if (!h || !tools) throw new WorkerError("untrusted_config");
   const denied: string[] = h.settings.permissions.deny;
+  // Cain 0.19.1, review round 1: the registered native host manifest, in every registry view Chrome reads, as check-host
+  // and bind-profile check it (manifestViews): the probe never runs against a host Chrome might not start.
+  const reg = manifestViews(o, inst);
+  if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   const launch = o.launch ?? launchSession;
   const limit = Math.min(inst.session_minutes * 60_000, MAX_SESSION_MS);
   const l = lock(o, now, "probe");
@@ -6804,7 +6917,7 @@ export async function probe(o: Opts): Promise<Evidence> {
     const short_names = shortNameSetting(resolve(o.home), platform(o));
     const process_end = await (o.processCheck ?? processCheck)(o);
     try { appendFileSync(P.log(o), `${clock(o).toISOString()} probe process_end ${JSON.stringify(process_end)}\n`); } catch { /* never stops a probe */ }
-    const prefs = extensionPrefs(inst, forcelistOf(o));
+    const prefs = extensionPrefs(inst, forcelistOf(o), inChromePhase(() => chromeVersionRead(o, inst), true)?.version ?? null);
     const ev: Evidence = { v: 1, at: now.toISOString(), target: pin.url, stop_ok, smoke: "connected", signin, config_sweep, credential,
       extensions: prefs.extensions, extension_policy: prefs.policy, popups: popupState(inst), restart, failed_preflight, browser: r.code, canary_ok,
       reading_reports_url: readingReports(stream, ...destStreams), live_extension_version: !!smoke.init?.extension_version && !!stream.init?.extension_version,
@@ -7070,13 +7183,14 @@ export function checkHost(o: Opts): HostCheck {
   const reg = manifestViews(o, inst);
   if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   if (!hostPath(inst)) throw new WorkerError("untrusted_config", "the registered manifest can't be read, or doesn't list the extension");
-  const prefs = extensionPrefs(inst, forcelistOf(o));
+  // Sixth pass: Chrome's version as read now, in the answer and the refusal, so the acceptance run records which Chrome wrote the files.
+  // Cain 0.19.1: read first, for the component rule (componentShape).
+  const chrome = chromeVersionRead(o, inst);
+  const prefs = extensionPrefs(inst, forcelistOf(o), chrome?.version ?? null);
   if (!prefs.files.length)
     throw new WorkerError("extension_entry_missing", `neither Secure Preferences nor Preferences of the dedicated profile has ${prefs.key}: check profile_directory and extension_id in install.json`);
   if (prefs.disagree.length)
     throw new WorkerError("prefs_disagree", { ids: prefs.disagree, extensions: prefs.extensions });
-  // Sixth pass: Chrome's version as read now, in the answer and the refusal, so the acceptance run records which Chrome wrote the files.
-  const chrome = chromeVersionRead(o, inst);
   if (gateRefuses(prefs))
     throw new WorkerError("extra_extension", { other_enabled: prefs.others, by_policy: byPolicy(prefs), refusals: prefs.refusals, extension_policy: prefs.policy,
       extensions: prefs.extensions, chrome_version: chrome, fix: gateFix(prefs, chrome) });
@@ -7444,7 +7558,7 @@ if (isMain && process.argv[2] === "nav-guard") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
       const ev = readJson(P.evidence(o)) as Evidence;
       say({ confirmed: c.at, boundary_version: c.boundary_version, deny_check: c.deny_check, versions: versionsOf(c.fingerprint, (readJson(P.evidence(o)) as any)?.versions?.chrome_version_source ?? null), hook_worst: readHookWorst(o), boundary_cases: ev.boundary ?? [], ...probeCases(ev),
-        extensions: extensionPrefs(mustInstall(o), forcelistOf(o)).extensions });
+        extensions: (() => { const i = mustInstall(o); return extensionPrefs(i, forcelistOf(o), chromeVersionRead(o, i)?.version ?? null).extensions; })() });
     } else if (cmd === "check-host") say({ ...checkHost(o), cli: checkCli(o) });
     else if (cmd === "dump-extensions") { const inst = mustInstall(o); const d = dumpExtensions(inst, chromeVersionRead(o, inst), forcelistOf(o)); for (const l of dumpHead(d)) console.log(l); say(d); }
     else if (cmd === "open-chrome") say(openChrome(o));
