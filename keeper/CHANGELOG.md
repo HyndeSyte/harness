@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.18
+
+- Fixed: `backup-check` on your Pi stopped at a compressed system log inside Keeper's own software image (`eipp.log.xz`,
+  which Debian ships), since Keeper can't open xz files and refuses what it can't read. The image is built from Keeper's
+  public code before any key exists, and nothing Keeper writes ends up in it, so inside the image only, a file Keeper
+  can't open is now searched as raw bytes and counted instead of failing the check. Keeper's data, its settings and the
+  rest of the backup are checked exactly as before. Run `backup-check` again after updating (scan 4).
+
 ## 0.1.17
 
 - Fixed: `backup-check` on your Pi's full-size backup. Keeper 0.1.16 read the whole 100 MB test backup and its unpacked App image into memory at once, and the system stopped Keeper's service for using too much memory. The check now reads the backup from a file a piece at a time, unpacks it once as it goes, and stays small: about 55 MB on a test backup of 118 MB that unpacks to 330 MB.

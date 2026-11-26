@@ -1507,7 +1507,7 @@ export class Keeper {
   private checkWhy(): string {
     if (this.st.backupCheckRun) return `${BACKUP_CHECK_WHY}: a backup check was interrupted and counts as failed (its test backup "${this.st.backupCheckRun.name}" is deleted at the next start)`;
     if (this.st.backupCheck && this.st.backupCheck.exclude !== EXCLUDE_HASH) return `${BACKUP_CHECK_WHY}: the backup exclusion changed since it passed (now ${EXCLUDE_HASH}), so run it again`;
-    if (this.st.backupCheck && this.st.backupCheck.scan !== SCAN_VERSION) return `${BACKUP_CHECK_WHY}: the check's scan changed since it passed (now scan ${SCAN_VERSION}: every byte of the archive, read as a stream in bounded memory), so run it again`;
+    if (this.st.backupCheck && this.st.backupCheck.scan !== SCAN_VERSION) return `${BACKUP_CHECK_WHY}: the check's scan changed since it passed (now scan ${SCAN_VERSION}: every byte of the archive, read as a stream in bounded memory, files in the App's own image it can't open read as raw bytes), so run it again`;
     return BACKUP_CHECK_WHY;
   }
   private backupCheckFailed(why: string): { ok: boolean; why: string } {

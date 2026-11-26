@@ -60,6 +60,13 @@
 // the search's carry, under a needle's length; an output chunk or two of 64 KB) times MAX_DEPTH, and the outer read's chunk
 // (256 KB): about 33 MB on top of the runtime's own (Bun with --smol, about 30 to 50 MB). The child's resident-size limit
 // (KEEPER_SCAN_RSS_MAX) is a sampled check, not a hard one: the kernel is the hard limit until a cgroup limit lands (DOCS).
+// 0.1.18: the App's own image. A backup of a locally built App holds its container image (`./image.tar` in the App's archive,
+// written by `docker save`): the image as built from the App's public source, before any key exists. A container's writes never
+// reach it (they live in the container's layer, and /data is a volume), so no key value, fingerprint, sentinel or control can be
+// in it. Base images ship files in formats Keeper can't open (Debian's apt logs are xz), and 0.1.17 failed the check on the
+// first one. Inside the image only, such a file (a format Keeper can't open, a name that says archive with bytes that are
+// neither gzip nor tar, or a layer past the nesting budget) is searched as raw bytes and counted as not opened, never failed.
+// Everywhere else nothing changed: the App's data, its options (addon.json) and the outer archive still fail closed.
 // SCAN_VERSION names this coverage: a pass recorded by an earlier scan no longer counts (core.ts checkPassed).
 // It runs in a child process of the service (main.ts scanChild runs this file as `bun --smol scan.ts child`), so if the kernel
 // still kills it the service lives on and reports it; core.ts and the tests call scanFile or scanBackup in process.
@@ -67,7 +74,7 @@ import { createInflateRaw, crc32 as zcrc32 } from "node:zlib";
 import { open } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 
-export const SCAN_VERSION = 3;
+export const SCAN_VERSION = 4;
 // (0.1.16) the shortest value searched for in an archive's bytes: shorter ones (an 8 or 12 hex digit fingerprint) are left out
 export const MIN_NEEDLE = 16;
 // (0.1.17) the budgets: bytes decoded by every gzip layer together, the deepest nesting, and the largest record held to be read
@@ -87,7 +94,7 @@ export const MEMORY_BOUND = INFLATE_IN * DEFLATE_MAX_RATIO * MAX_DEPTH + MAX_DEP
 // the inflater resumed, so a slow nested layer (ARM) can't trip it however long its pauses add up to.
 export const END_DUE_MS = 10_000;
 
-export interface ScanResult { ok: boolean; why: string; members: number; names: string[]; found: string[]; control: number; expanded?: number }
+export interface ScanResult { ok: boolean; why: string; members: number; names: string[]; found: string[]; control: number; expanded?: number; unopened?: number }
 // (0.1.17) the downloaded archive the scan reads: its file's path, its size in bytes, and its removal
 export interface ArchiveFile { path: string; size: number; remove: () => void }
 // tick: (0.1.17, fix round) called for every chunk read and every chunk the inflater puts out (the child checks its resident size there)
@@ -112,6 +119,10 @@ const UNREADABLE: [string, number[]][] = [["zstd", [0x28, 0xb5, 0x2f, 0xfd]], ["
   ["zip", [0x50, 0x4b, 0x03, 0x04]], ["7z", [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]], ["lz4", [0x04, 0x22, 0x4d, 0x18]]];
 const magic = (b: Uint8Array) => UNREADABLE.find(([, m]) => b.length >= m.length && m.every((x, i) => b[i] === x))?.[0] ?? "";
 const ARCHIVE_NAME = /\.(tar|tgz|gz|tar\.gz|zst|tzst|xz|txz|bz2|tbz2?|zip|7z|lz4)$/i;
+// (0.1.18) inside the App's own container image: the App archive's top-level image.tar (the outer tar's "<slug>.tar.gz" member,
+// then its "./image.tar" member), and anything below it
+const IN_IMAGE = /^(\.\/)?[^:/]+\.tar\.gz:(\.\/)?image\.tar:/;
+export const inImage = (where: string) => IN_IMAGE.test(where);
 const isGzip = (b: Uint8Array) => b.length > 2 && b[0] === 0x1f && b[1] === 0x8b;
 const field = (b: Uint8Array, a: number, n: number) => { const x = b.subarray(a, a + n); const z = x.indexOf(0); return dec.decode(z >= 0 ? x.subarray(0, z) : x); };
 const headerSum = (h: Uint8Array) => { let sum = 0; for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : h[i]; return sum; };
@@ -172,7 +183,7 @@ class Finder {
 // What every layer of one scan shares: the patterns, the findings, the counts and the budgets.
 class Ctx {
   found: string[] = []; seen: string[] = [];
-  members = 0; control = 0; expanded = 0;
+  members = 0; control = 0; expanded = 0; unopened = 0;
   readonly pats: Pat[]; readonly ctl: Uint8Array | null; readonly all: Pat[]; readonly tick: () => void; readonly endDueMs: number;
   constructor(readonly names: RegExp, needles: Needle[], opts: ScanOpts, readonly maxExpanded: number, readonly maxDepth: number) {
     this.tick = opts.tick ?? (() => {});
@@ -194,16 +205,23 @@ interface Sink { write(b: Uint8Array): Promise<void>; end(): Promise<void> }
 class Detect implements Sink {
   private head = new Uint8Array(0);
   private next: Sink | null = null;
+  // (0.1.18) past the nesting budget inside the App's image: read as a leaf, not opened
+  private readonly tooDeep: boolean;
   constructor(private readonly ctx: Ctx, private readonly where: string, private readonly depth: number, private readonly afterGzip = false) {
-    if (depth > ctx.maxDepth) throw new Error(`the archive nests too deep: ${where || "the archive"} is more than ${ctx.maxDepth} layers in (at byte 0) ${budgetWhy({ budget: "the nesting budget", phase: "scan", limit: `${ctx.maxDepth} layers`, seen: `${depth} layers`, todo: BUDGET_TODO })}`);
+    this.tooDeep = depth > ctx.maxDepth && inImage(where);
+    if (depth > ctx.maxDepth && !this.tooDeep) throw new Error(`the archive nests too deep: ${where || "the archive"} is more than ${ctx.maxDepth} layers in (at byte 0) ${budgetWhy({ budget: "the nesting budget", phase: "scan", limit: `${ctx.maxDepth} layers`, seen: `${depth} layers`, todo: BUDGET_TODO })}`);
   }
   private choose(): Sink {
     const b = this.head, what = this.where || "the archive";
+    // (0.1.18) a file in the App's image Keeper doesn't open: its raw bytes are searched as a leaf, and it is counted
+    const unopened = () => { this.ctx.unopened++; return new Leaf(this.ctx, this.where); };
+    if (this.tooDeep) return unopened();
     if (!this.afterGzip && isGzip(b)) return new GzipLayer(this.ctx, this.where, this.depth);
     const m = magic(b);
+    if (m && inImage(this.where)) return unopened();
     if (m) throw new Error(`${what} is ${m}-compressed, which Keeper can't read (at byte 0)`);
     if (isTar(b)) return new TarLayer(this.ctx, this.where, this.depth);
-    if (this.depth > 0 && ARCHIVE_NAME.test(this.where.split(":").pop() ?? "")) throw new Error(`${what} is named as an archive but is neither gzip nor tar (encrypted or unknown) (at byte 0)`);
+    if (this.depth > 0 && ARCHIVE_NAME.test(this.where.split(":").pop() ?? "")) { if (inImage(this.where)) return unopened(); throw new Error(`${what} is named as an archive but is neither gzip nor tar (encrypted or unknown) (at byte 0)`); }
     if (this.depth === 0) throw new Error("the backup isn't a tar archive (at byte 0)");
     return new Leaf(this.ctx, this.where);
   }
@@ -626,7 +644,7 @@ class GzipLayer implements Sink {
 }
 
 function result(ctx: Ctx, err: unknown): ScanResult {
-  const base = { members: ctx.members, names: ctx.seen, found: ctx.found, control: ctx.control, expanded: ctx.expanded };
+  const base = { members: ctx.members, names: ctx.seen, found: ctx.found, control: ctx.control, expanded: ctx.expanded, unopened: ctx.unopened };
   if (err) return { ok: false, why: `the backup couldn't be read: ${String((err as Error)?.message ?? err).slice(0, 600)}`, ...base };
   if (!ctx.members) return { ok: false, why: "the backup holds no files Keeper could read", ...base };
   if (ctx.found.length) return { ok: false, why: `the backup holds key material: ${[...new Set(ctx.found)].slice(0, 5).join("; ")}`, ...base };
