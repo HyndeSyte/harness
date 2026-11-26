@@ -40,3 +40,7 @@ d2f0abe10986a02d14a1559d615c727ed022f463:keeper/tests/keeper.test.ts:generic-api
 9237ba4e71fa56507b6eb4e3623907d3c9ee5ca0:keeper/tests/keeper.test.ts:generic-api-key:3864
 # Keeper 0.1.16's scan coverage test: the made-up sentinel "keeper-sentinel-" and counting digits; replaced by plain text in the next commit.
 9237ba4e71fa56507b6eb4e3623907d3c9ee5ca0:keeper/tests/keeper.test.ts:generic-api-key:3900
+# Keeper 0.1.17's streaming scan test: the made-up sentinel "keeper-sentinel-" and counting digits; replaced by plain text in the next commit.
+315d49730d5d5fc528163eabb3445343c018afde:keeper/tests/scan-stream.test.ts:generic-api-key:158
+# Keeper 0.1.17's streaming scan test: the legacy temporary key file's name "hc-key.1.abcdefabcdef.tmp", a file name, not a key; built from its parts in the next commit.
+315d49730d5d5fc528163eabb3445343c018afde:keeper/tests/scan-stream.test.ts:generic-api-key:177
