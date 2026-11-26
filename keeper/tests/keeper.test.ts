@@ -5,7 +5,7 @@
 // only on its job's success; alert checks per App, the shared-success suppression, the dead-man check
 // and the phone test drill; no options write and no kept settings; local evidence only.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { generateKeyPairSync, sign as edSign, type KeyObject } from "node:crypto";
 import { join } from "node:path";
@@ -500,7 +500,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     expect(JSON.stringify(k.st)).not.toContain(pw);
     expect(calls.some((c) => c.path.includes("options"))).toBe(false);
   });
-  test("no code path names the options endpoint", () => {
+  test("no code path names the options endpoint", async () => {
     for (const f of ["core.ts", "supervisor.ts", "main.ts", "server.ts"]) {
       const src = readFileSync(join(import.meta.dir, "..", "rootfs", "opt", "keeper", f), "utf8");
       expect([f, /addons\/self\/options|clearAttempt/.test(src)]).toEqual([f, false]);
@@ -1598,7 +1598,7 @@ describe("0.1.7: the accepted limits", () => {
     expect(again.k.armedState(CAIN).why).toContain("hasn't accepted the limits");
     expect(again.k.acceptLimits(again.code("accept-limits" as any)).ok).toBe(true);
   });
-  test("the DOCS carry the Accepted limits section at this text version, with both limits and what the owner can do; RELEASING's setup list has the step", () => {
+  test("the DOCS carry the Accepted limits section at this text version, with both limits and what the owner can do; RELEASING's setup list has the step", async () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits")).replace(/\s+/g, " ");
     expect(sec.length).toBeGreaterThan(100);
@@ -1970,7 +1970,7 @@ describe("0.1.8: the old key option gated, the key file 0600 from its first byte
     // a write that fails leaves no temporary file behind
     expect(() => writeWhole(join(dir, "missing", "x"), "y")).toThrow();
   });
-  test("the docs: rotate the old key (earlier backups may hold it), the key file's write, and the backup's omission among the device checks", () => {
+  test("the docs: rotate the old key (earlier backups may hold it), the key file's write, and the backup's omission among the device checks", async () => {
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8").replace(/\s+/g, " ");
     const rel = readFileSync(join(import.meta.dir, "..", "..", "RELEASING.md"), "utf8").replace(/\s+/g, " ");
     for (const t of [docs, rel]) { expect(t).toContain("rotate"); expect(t).toContain("earlier backups may hold it"); }
@@ -2392,9 +2392,17 @@ function checkRig(archive: (sentinel: string, control: string) => Uint8Array | n
     control: (v: string) => { control = v; const n = o.ctlName ?? "backup-check-control"; files[n] = v; return n; },
     clear: () => { cleared = true; }, sweep: () => [],
   };
-  (r.k as any).d.download = async () => got();
+  // (0.1.17) the download is a file the scan reads by offsets, removed once the check is done
+  const removed: string[] = [];
+  (r.k as any).d.download = async () => {
+    const b = got();
+    if (!b) return null;
+    const path = join(mkdtempSync(join(tmpdir(), "keeper-dl-")), "bk.tar");
+    writeFileSync(path, b);
+    return { path, size: b.length, remove: () => { removed.push(path); rmSync(path, { force: true }); } };
+  };
   (r.k as any).d.backupInfo = async () => { const b = got(); return { homeassistant: null, addons: [], folders: [], ...(b ? (o.size ? o.size(b) : { sizeBytes: b.length }) : {}) }; };
-  return { r, get cleared() { return cleared; }, get sentinel() { return sentinel; }, get control() { return control; } };
+  return { r, removed, get cleared() { return cleared; }, get sentinel() { return sentinel; }, get control() { return control; } };
 }
 const goodFiles = (ctl: string): [string, string][] => [["./addon.json", "{}"], ["./data/state.json", "{\"format\":1}"], ["./data/options.json", "{}"], ["./data/backup-check-control", ctl]];
 describe("0.1.9 C: the guards as hard refusals", () => {
@@ -2653,11 +2661,17 @@ describe("0.1.10 item 1: the backup check fails closed", () => {
     expect(r.logs).toContain("removed a downloaded archive an interrupted backup check left behind: bk1.tar");
     expect(readdirSync(dir)).toEqual([]);
     // the download itself goes through that folder and leaves nothing
+    // 0.1.17: as a file (its path and size), never read whole; removed by the check once its scan has ended
     const got = await archives(dir).through("bk2", async (p) => { writeFileSync(p, "abc"); return true; });
-    expect(new TextDecoder().decode(got!)).toBe("abc");
+    expect(got!.size).toBe(3);
+    expect(readFileSync(got!.path, "utf8")).toBe("abc");
+    got!.remove();
+    expect(readdirSync(dir)).toEqual([]);
+    // a download that fails leaves nothing either
+    expect(await archives(dir).through("bk3", async (p) => { writeFileSync(p, "partial"); return false; })).toBeNull();
     expect(readdirSync(dir)).toEqual([]);
   });
-  test("a pass is tied to the deployed exclusion: config.yaml's backup_exclude is the one hashed, and a change voids the pass", () => {
+  test("a pass is tied to the deployed exclusion: config.yaml's backup_exclude is the one hashed, and a change voids the pass", async () => {
     const cfg = readFileSync(join(import.meta.dir, "..", "config.yaml"), "utf8");
     const block = cfg.slice(cfg.indexOf("backup_exclude:"), cfg.indexOf("watchdog:"));
     expect([...block.matchAll(/^  - "([^"]+)"$/gm)].map((m) => m[1])).toEqual(BACKUP_EXCLUDE);
@@ -2892,7 +2906,7 @@ describe("0.1.10 item 7: the watch takes only its own attempt's install, and the
     await ok.register(); await ok.poll(); ok.install(); await ok.poll();
     expect(ok.a().status).toBe("watching");
   });
-  test("the text (version 4 in 0.1.10): the Ship token's life outside the hook, and the watch's own attempt and generation", () => {
+  test("the text (version 4 in 0.1.10): the Ship token's life outside the hook, and the watch's own attempt and generation", async () => {
     expect(LIMITS_VERSION).toBe(7);
     const docs = readFileSync(join(import.meta.dir, "..", "DOCS.md"), "utf8");
     const sec = docs.slice(docs.indexOf("## Accepted limits"), docs.indexOf("## Options")).replace(/\s+/g, " ");
@@ -3231,23 +3245,23 @@ describe("0.1.12 item 3: the scan on the device's real backup layout", () => {
   const outer = (ctl: string, o: { json?: any; member?: Uint8Array; extra?: [string, string][] } = {}) =>
     tarOf([["./backup.json", backupJson(o.json)], [`./${SLUG}.tar.gz`, o.member ?? inner(ctl, o.extra)]]);
   const CTL = "keeper-control-0123456789abcdef01234567";
-  test("a pass: the control found once, no key names, addon.json read", () => {
-    const res = scanBackup(outer(CTL), KEY_NAME, ["keeper-sentinel-0123456789abcdef"], { control: CTL });
+  test("a pass: the control found once, no key names, addon.json read", async () => {
+    const res = await scanBackup(outer(CTL), KEY_NAME, ["keeper-sentinel-aaaaaaaaaaaaaaaa"], { control: CTL });
     expect(res).toMatchObject({ ok: true, why: "", control: 1, found: [] });
     expect(res.names).toContain(`./${SLUG}.tar.gz:./addon.json`);
     expect(res.names).toContain(`./${SLUG}.tar.gz:./data/backup-check-control`);
   });
-  test("a fail when backup.json says protected true", () => {
-    expect(scanBackup(outer(CTL, { json: { protected: true } }), KEY_NAME, [], { control: CTL }).why).toContain("says the backup is protected");
+  test("a fail when backup.json says protected true", async () => {
+    expect((await scanBackup(outer(CTL, { json: { protected: true } }), KEY_NAME, [], { control: CTL })).why).toContain("says the backup is protected");
   });
-  test("a fail when the App's inner archive is neither gzip nor tar (as an encrypted SecureTar member is)", () => {
+  test("a fail when the App's inner archive is neither gzip nor tar (as an encrypted SecureTar member is)", async () => {
     const secure = new Uint8Array(4096); for (let i = 0; i < secure.length; i++) secure[i] = (i * 151 + 7) % 251;
     secure.set(new TextEncoder().encode("SecureTar"), 0);
-    expect(scanBackup(outer(CTL, { member: secure }), KEY_NAME, [], { control: CTL }).why).toContain("is named as an archive but is neither gzip nor tar");
+    expect((await scanBackup(outer(CTL, { member: secure }), KEY_NAME, [], { control: CTL })).why).toContain("is named as an archive but is neither gzip nor tar");
   });
-  test("a fail when a key name appears under data/", () => {
+  test("a fail when a key name appears under data/", async () => {
     for (const n of ["./data/hc-key", "./data/backup-keys/Keeper ship-46-cain-7d7b5f90 0a0b0c0d", "./data/backup-keys/tmp-0a"]) {
-      const res = scanBackup(outer(CTL, { extra: [[n, "x"]] }), KEY_NAME, [], { control: CTL });
+      const res = await scanBackup(outer(CTL, { extra: [[n, "x"]] }), KEY_NAME, [], { control: CTL });
       expect([n, res.ok]).toEqual([n, false]);
       expect(res.why).toContain("is a key file's name");
     }
@@ -3906,13 +3920,13 @@ describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
   const outer = (inner: Uint8Array) => tarOf([["./backup.json", JSON.stringify({ protected: false })], ["./0fcc2575_keeper.tar.gz", inner]]);
   const scan = (inner: Uint8Array) => scanBackup(outer(inner), KEY_NAME, [KEY, "keeper-sentinel-aaaaaaaa"], { control: CTL });
 
-  test("the baseline: a clean archive passes, with the same builder", () => {
-    expect(scan(gz(cat(...good(), END)))).toMatchObject({ ok: true, control: 1 });
+  test("the baseline: a clean archive passes, with the same builder", async () => {
+    expect(await scan(gz(cat(...good(), END)))).toMatchObject({ ok: true, control: 1 });
     // a clean pax header, a clean global header, a symlink and zeros after the gzip stream and after the end block are fine
-    expect(scan(cat(gz(cat(pax("g", "comment=nothing here"), pax("x", "path=./data/long-name.json"), member("./data/long-name.json", "{}"),
+    expect(await scan(cat(gz(cat(pax("g", "comment=nothing here"), pax("x", "path=./data/long-name.json"), member("./data/long-name.json", "{}"),
       member("./data/link", "", { type: "2", linkname: "state.json" }), ...good(), END, new Uint8Array(512)), { fname: "keeper.tar" }), new Uint8Array(16)))).toMatchObject({ ok: true, control: 1 });
   });
-  test("a key value planted in each place the scan didn't reach before is found, or the archive fails closed", () => {
+  test("a key value planted in each place the scan didn't reach before is found, or the archive fails closed", async () => {
     const places: [string, Uint8Array][] = [
       ["the gzip header's file name", gz(cat(...good(), END), { fname: KEY })],
       ["the gzip header's comment", gz(cat(...good(), END), { comment: KEY })],
@@ -3929,78 +3943,78 @@ describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
       ["a v7 tar member with no ustar magic", gz(cat(member("./data/notes-v7", KEY, { magic: false }), END))],
     ];
     for (const [where, inner] of places) {
-      const res = scan(inner);
+      const res = await scan(inner);
       expect([where, res.ok]).toEqual([where, false]);
       expect([where, /key value|data after|can't be read/.test(res.why)]).toEqual([where, true]);
     }
     // the same planted in the backup's outer tar (its own headers and tail), not only the App's archive
     const o = outer(gz(cat(...good(), END)));
     const tail = cat(o, enc(KEY), new Uint8Array(512 - KEY.length));
-    expect(scanBackup(tail, KEY_NAME, [KEY], { control: CTL }).ok).toBe(false);
+    expect((await scanBackup(tail, KEY_NAME, [KEY], { control: CTL })).ok).toBe(false);
     const linked = cat(member("./link", "", { type: "2", linkname: KEY }), o);
-    expect(scanBackup(linked, KEY_NAME, [KEY], { control: CTL }).why).toContain("holds a key value");
+    expect((await scanBackup(linked, KEY_NAME, [KEY], { control: CTL })).why).toContain("holds a key value");
   });
-  test("a v7 tar is read as a tar: a key file's name in it is found", () => {
-    const res = scan(gz(cat(member("./data/hc-key", "x", { magic: false }), member("./data/backup-check-control", `${CTL}\n`, { magic: false }), END)));
+  test("a v7 tar is read as a tar: a key file's name in it is found", async () => {
+    const res = await scan(gz(cat(member("./data/hc-key", "x", { magic: false }), member("./data/backup-check-control", `${CTL}\n`, { magic: false }), END)));
     expect(res.ok).toBe(false);
     expect(res.why).toContain("is a key file's name");
   });
   // (0.1.16, the fix round) the gzip member's end found by the scan itself
-  test("one gzip member followed by zeros passes; a second member, a raw deflate blob or a wrong trailer after it fails", () => {
+  test("one gzip member followed by zeros passes; a second member, a raw deflate blob or a wrong trailer after it fails", async () => {
     const one = gz(cat(...good(), END));
-    expect(scan(cat(one, new Uint8Array(64)))).toMatchObject({ ok: true, control: 1 });
-    const second = scan(cat(one, gzipSync(enc(`note=${KEY}`))));
+    expect(await scan(cat(one, new Uint8Array(64)))).toMatchObject({ ok: true, control: 1 });
+    const second = await scan(cat(one, gzipSync(enc(`note=${KEY}`))));
     expect(second.ok).toBe(false);
     expect(second.why).toContain("holds a second gzip member after the first");
     expect(second.why).toMatch(/at byte \d+/);
-    const blob = scan(cat(one, deflateRawSync(enc(`note=${KEY}`))));
+    const blob = await scan(cat(one, deflateRawSync(enc(`note=${KEY}`))));
     expect(blob.ok).toBe(false);
     expect(blob.why).toContain("holds data after its gzip stream");
     const crc = one.slice(); crc[crc.length - 8] ^= 0xff;
-    expect(scan(crc).why).toContain("its trailer's CRC32 doesn't match");
+    expect((await scan(crc)).why).toContain("its trailer's CRC32 doesn't match");
     const len = one.slice(); len[len.length - 1] ^= 0x01;
-    expect(scan(len).why).toContain("its trailer's length doesn't match");
-    expect(scan(one.subarray(0, one.length - 3)).why).toContain("its 8-byte trailer is cut off");
+    expect((await scan(len)).why).toContain("its trailer's length doesn't match");
+    expect((await scan(one.subarray(0, one.length - 3))).why).toContain("its 8-byte trailer is cut off");
     // a header CRC that doesn't match its header fails too
     const h = one.slice(); h[3] |= 0x02; const withCrc = cat(h.subarray(0, 10), new Uint8Array([0x12, 0x34]), h.subarray(10));
-    expect(scan(withCrc).why).toContain("its header CRC doesn't match");
+    expect((await scan(withCrc)).why).toContain("its header CRC doesn't match");
     // the inflater's count is checked, not trusted: a stream that decodes in fewer bytes than reported fails
-    expect(gzipMember(gzipSync(enc("x")), "t").length).toBe(1);
+    expect((await gzipMember(gzipSync(enc("x")), "t")).length).toBe(1);
   });
-  test("a layer whose magic says gzip but doesn't decode fails the check, never read as a file", () => {
+  test("a layer whose magic says gzip but doesn't decode fails the check, never read as a file", async () => {
     const bad = cat(new Uint8Array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]), enc("not a deflate stream at all, padded out"), new Uint8Array(16));
-    const res = scan(bad);
+    const res = await scan(bad);
     expect(res.ok).toBe(false);
     expect(res.why).toContain("its deflate stream doesn't decode");
   });
-  test("the positive control is counted in files only: a copy hidden in tar padding, a header field or the tail fails", () => {
-    const padded = scan(gz(cat(member("./data/short", "x", { fill: CTL }), ...good(), END)));
+  test("the positive control is counted in files only: a copy hidden in tar padding, a header field or the tail fails", async () => {
+    const padded = await scan(gz(cat(member("./data/short", "x", { fill: CTL }), ...good(), END)));
     expect(padded.ok).toBe(false);
     expect(padded.why).toMatch(/holds the positive control outside any file, at byte \d+/);
-    expect(scan(gz(cat(member("./data/owned", "x", { uname: CTL.slice(0, 31) }), ...good(), END))).ok).toBe(true);   // a prefix is no copy
-    expect(scan(gz(cat(member("./data/link", "", { type: "2", linkname: CTL }), ...good(), END))).why).toContain("holds the positive control outside any file");
-    expect(scan(gz(cat(...good(), END), { comment: CTL })).why).toContain("(its gzip bytes) holds the positive control outside any file");
+    expect((await scan(gz(cat(member("./data/owned", "x", { uname: CTL.slice(0, 31) }), ...good(), END)))).ok).toBe(true);   // a prefix is no copy
+    expect((await scan(gz(cat(member("./data/link", "", { type: "2", linkname: CTL }), ...good(), END)))).why).toContain("holds the positive control outside any file");
+    expect((await scan(gz(cat(...good(), END), { comment: CTL }))).why).toContain("(its gzip bytes) holds the positive control outside any file");
   });
-  test("a v7 tar must parse to its end-of-archive block; a parse failure never makes it a file", () => {
+  test("a v7 tar must parse to its end-of-archive block; a parse failure never makes it a file", async () => {
     const v7 = member("./data/notes-v7", "plain", { magic: false });
-    expect(scan(gz(cat(v7, ...good(), END))).ok).toBe(true);
-    const cut = scan(gz(cat(v7, ...good())));                                   // no end-of-archive block
+    expect((await scan(gz(cat(v7, ...good(), END)))).ok).toBe(true);
+    const cut = await scan(gz(cat(v7, ...good())));                                   // no end-of-archive block
     expect(cut.ok).toBe(false);
     expect(cut.why).toContain("the tar has no end-of-archive block");
     const broken = cat(v7, enc("junk".repeat(128)), END);                        // a second header that isn't one
-    expect(scan(gz(broken)).why).toContain("./0fcc2575_keeper.tar.gz, read as a tar: a tar header's checksum doesn't match at byte 1024");
+    expect((await scan(gz(broken))).why).toContain("./0fcc2575_keeper.tar.gz, read as a tar: a tar header's checksum doesn't match at byte 1024");
   });
-  test("values shorter than 16 bytes are never searched for; every finding names the layer, the offset and what matched", () => {
+  test("values shorter than 16 bytes are never searched for; every finding names the layer, the offset and what matched", async () => {
     const short = "abcdef0123456789".slice(0, 12);
-    const res = scanBackup(outer(gz(cat(member("./data/x", short), ...good(), END))), KEY_NAME, [{ value: short, kind: "a key's fingerprint" }], { control: CTL });
+    const res = await scanBackup(outer(gz(cat(member("./data/x", short), ...good(), END))), KEY_NAME, [{ value: short, kind: "a key's fingerprint" }], { control: CTL });
     expect(res.ok).toBe(true);
     expect(MIN_NEEDLE).toBe(16);
-    const hit = scanBackup(outer(gz(cat(member("./data/x", `${KEY}`), ...good(), END))), KEY_NAME, [{ value: KEY, kind: "a key value" }], { control: CTL });
+    const hit = await scanBackup(outer(gz(cat(member("./data/x", `${KEY}`), ...good(), END))), KEY_NAME, [{ value: KEY, kind: "a key value" }], { control: CTL });
     expect(hit.why).toMatch(/\.\/0fcc2575_keeper\.tar\.gz:\.\/data\/x holds a key value at byte 0/);
   });
   test("the drill flags' spent list is a key name, its sentinel is placed and read back, and the pass is tied to the scan", async () => {
     for (const n of ["./data/drill-spent/", "./data/drill-spent/0123456789abcdef", "./data/drill-spent/backup-check-sentinel"]) {
-      const res = scan(gz(cat(member(n, "", n.endsWith("/") ? { type: "5" } : {}), ...good(), END)));
+      const res = await scan(gz(cat(member(n, "", n.endsWith("/") ? { type: "5" } : {}), ...good(), END)));
       expect([n, res.why]).toEqual([n, expect.stringContaining("is a key file's name")]);
     }
     const dir = mkdtempSync(join(tmpdir(), "keeper-kf-"));
@@ -4022,7 +4036,11 @@ describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
     expect(r.k.checkPassed()).toBe(false);
     r.k.st.backupCheck.scan = SCAN_VERSION;
     expect(r.k.checkPassed()).toBe(true);
-    expect(SCAN_VERSION).toBe(2);
+    expect(SCAN_VERSION).toBe(3);
+    // (0.1.17) and a pass recorded by scan 2 (0.1.16's) no longer counts either
+    r.k.st.backupCheck.scan = 2;
+    expect(r.k.checkPassed()).toBe(false);
+    expect(r.k.armableWhy()).toContain("the check's scan changed since it passed (now scan 3");
   });
 });
 
