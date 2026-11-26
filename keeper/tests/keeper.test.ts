@@ -4036,11 +4036,11 @@ describe("0.1.16 item 1: the scan reaches every byte of the archive", () => {
     expect(r.k.checkPassed()).toBe(false);
     r.k.st.backupCheck.scan = SCAN_VERSION;
     expect(r.k.checkPassed()).toBe(true);
-    expect(SCAN_VERSION).toBe(3);
+    expect(SCAN_VERSION).toBe(4);
     // (0.1.17) and a pass recorded by scan 2 (0.1.16's) no longer counts either
     r.k.st.backupCheck.scan = 2;
     expect(r.k.checkPassed()).toBe(false);
-    expect(r.k.armableWhy()).toContain("the check's scan changed since it passed (now scan 3");
+    expect(r.k.armableWhy()).toContain("the check's scan changed since it passed (now scan 4");
   });
 });
 

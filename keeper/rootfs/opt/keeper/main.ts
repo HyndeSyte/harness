@@ -325,7 +325,7 @@ function resultOf(line: string): (ScanResult & { peakRss?: number; oomScoreAdj?:
   if (!r || typeof r !== "object" || typeof r.ok !== "boolean" || typeof r.why !== "string" || !count(r.members) || !strs(r.names) || !strs(r.found) || !count(r.control)) return null;
   for (const k of ["expanded", "peakRss"]) if (r[k] !== undefined && !count(r[k])) return null;
   if (r.oomScoreAdj !== undefined && r.oomScoreAdj !== null && typeof r.oomScoreAdj !== "number") return null;
-  return { ok: r.ok, why: r.why, members: r.members, names: r.names, found: r.found, control: r.control, expanded: r.expanded ?? 0, peakRss: r.peakRss ?? 0, oomScoreAdj: r.oomScoreAdj ?? null };
+  return { ok: r.ok, why: r.why, members: r.members, names: r.names, found: r.found, control: r.control, expanded: r.expanded ?? 0, unopened: count(r.unopened) ? r.unopened : 0, peakRss: r.peakRss ?? 0, oomScoreAdj: r.oomScoreAdj ?? null };
 }
 export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needle[], control: string,
   o: { rssMax?: number; timeoutMs?: number; maxExpanded?: number; script?: string; log?: (l: string) => void; signal?: AbortSignal; onSpawn?: (pid: number) => void } = {}): Promise<ScanResult & { peakRss?: number; lastRss?: number; oomScoreAdj?: number | null }> {
@@ -408,7 +408,7 @@ export async function scanChild(file: ArchiveFile, names: RegExp, needles: Needl
   const lines = text.split("\n");
   const r = code === 0 && !stdinFailed && lines.length === 2 && lines[1] === "" ? resultOf(lines[0]) : null;
   if (!r) return fail(`the scan ended without a result (exit ${code}) reading ${of}${stdinFailed ? `: it didn't take its job (${stdinFailed})` : code === 0 ? ": its output wasn't one valid result line" : ""}${said ? `: ${said}` : ""}`, lastRss);
-  o.log?.(`backup check: the scan read ${r.members} files, decoded ${r.expanded ?? 0} bytes, peak memory ${mb(r.peakRss ?? 0)} (its limit ${mb(rssMax)})`);
+  o.log?.(`backup check: the scan read ${r.members} files, decoded ${r.expanded ?? 0} bytes, left ${r.unopened ?? 0} files in the App's own image unopened (searched as raw bytes), peak memory ${mb(r.peakRss ?? 0)} (its limit ${mb(rssMax)})`);
   return { ...r, lastRss };
 }
 

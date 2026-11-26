@@ -526,6 +526,14 @@ Keeper doesn't take `hc-key`, or doesn't arm, until each holds.
   (384 MB resident, and Bun's smaller heap): if it is killed, the service lives on, counts the check failed, removes
   the sentinels, deletes the test backup and says so, with the archive's size ("the scan was killed (out of memory)
   ..."). A pass is tied to this scan (scan 3): a pass from before 0.1.17 no longer counts, so run the backup check again.
+  (0.1.18) The App's own image. A backup of Keeper holds its container image (`./image.tar` inside the App's archive), the
+  image as built from Keeper's public source before any key exists; nothing the container writes reaches it. Base images
+  ship files Keeper can't open (Debian's apt logs are xz-compressed), and on the device 0.1.17 failed the check on the
+  first one. Inside the image only, such a file (a format Keeper can't open, a name that says archive over other bytes,
+  or a layer past the nesting budget) is searched as raw bytes and counted; the log says how many ("left N files in the
+  App's own image unopened"). Everywhere else nothing changed: Keeper's data, its options and the outer archive still
+  fail closed. A pass is tied to scan 4: run the backup check again after installing 0.1.18. On the device a full
+  Keeper backup (104 MB) read 5,108 files in 3 seconds, peak 62 MB, with 4 image files left unopened.
   (0.1.17, the review's fix round) The gzip member's end is the inflater's own end-of-stream signal, with its count of
   bytes read taken at that moment for the trailer, so a stream that ends exactly on the last byte of a piece, a trailer
   split across pieces and the bytes after the stream are all read exactly (the trailer's CRC32 and length, and nothing
