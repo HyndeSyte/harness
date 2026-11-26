@@ -161,7 +161,7 @@ describe("0.1.17: a clean real-shaped nested archive passes, read from its file"
     const r = await scanFile(path, KEY_NAME, [KEY, SENTINEL], { control: CTL });
     expect(r).toMatchObject({ ok: true, why: "", control: 1, found: [] });
     expect(r.names).toContain("./0fcc2575_keeper.tar.gz:./data/backup-check-control");
-    expect(SCAN_VERSION).toBe(3);
+    expect(SCAN_VERSION).toBe(4);
   });
 });
 
@@ -213,7 +213,7 @@ describe("0.1.17: a scan the system kills leaves the service answering", () => {
     expect(b.deleted).toEqual(["bc-test"]);
     expect(b.cleared).toBe(true);
   });
-  test("a child that runs past its time is stopped and named; one that answers is used, and its pass recorded at scan 3", async () => {
+  test("a child that runs past its time is stopped and named; one that answers is used, and its pass recorded at scan 4", async () => {
     const f = small();
     const d = scratch(); const script = join(d, "slow.ts");
     writeFileSync(script, "await Bun.sleep(60_000);\n");
@@ -224,7 +224,7 @@ describe("0.1.17: a scan the system kills leaves the service answering", () => {
     const real = bare(() => made!, (file, n, nd, c) => scanChild(file, n, nd, c, { log: () => {} }));
     (real.k as any).d.makeBackup = async () => { const p = join(scratch(), "bk.tar"); writeFileSync(p, outer(gz(cat(...good().slice(0, 2), member("./data/backup-check-control", `${real.control}\n`), END)))); made = { path: p, size: statSync(p).size }; return { slug: "bc-test" }; };
     expect(await real.k.backupCheck()).toEqual({ ok: true, why: "" });
-    expect(real.k.st.backupCheck).toMatchObject({ exclude: EXCLUDE_HASH, scan: 3 });
+    expect(real.k.st.backupCheck).toMatchObject({ exclude: EXCLUDE_HASH, scan: 4 });
     expect(real.k.checkPassed()).toBe(true);
     // the child is handed the needles on standard input, never its command line
     const src = readFileSync(join(import.meta.dir, "..", "rootfs", "opt", "keeper", "main.ts"), "utf8");
@@ -347,7 +347,7 @@ describe("0.1.17: a device-size backup-check in bounded memory", () => {
     expect(r).toEqual({ ok: true, why: "" });
     expect(peak).toBeGreaterThan(0);
     expect(peak).toBeLessThan(CAP);
-    expect(logs.some((l) => /^backup check: the scan read 16 files, decoded \d+ bytes, peak memory [\d.]+ MB \(its limit 256\.0 MB\)$/.test(l))).toBe(true);
+    expect(logs.some((l) => /^backup check: the scan read 16 files, decoded \d+ bytes, left 0 files in the App's own image unopened \(searched as raw bytes\), peak memory [\d.]+ MB \(its limit 256\.0 MB\)$/.test(l))).toBe(true);
     console.log(`device-size check: archive ${(built!.size / MB).toFixed(1)} MB, image tar ${(inflated / MB).toFixed(1)} MB inflated, the scan's peak ${(peak / MB).toFixed(1)} MB`);
   }, 300_000);
 });
