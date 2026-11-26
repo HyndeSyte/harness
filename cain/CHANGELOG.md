@@ -17,6 +17,12 @@
 - The extension check runs once more after Claude in Chrome connects and again just before a job starts, and stops the run if anything changed.
 - The launcher starts Windows' key prompt by its full path, so nothing of the same name elsewhere can run in its place.
 - The setup steps add a one-time check that Chrome ignores a planted copy of one of its parts.
+- A Claude in Chrome helper registered after you bound the profile, for example by a Claude app install or update, now stops the next job: every job checks the registered helpers against what bind-profile saw, before it starts and again just before its browser session.
+- If the worker can't read a registered helper or a registry view, setup and jobs stop every time, naming the registry key to check, whether or not the Claude app is open.
+- The Claude app counts as the Claude app only when its signature is from Anthropic's exact publisher name, valid, and from a trusted root. When it doesn't pass, the stop line says which check failed and the value it read, so you can send it to Cain.
+- A new setup step, the component check: press 4 on the Cain PC jobs launcher with the Cain jobs Chrome closed. It checks once that Chrome ignores a planted copy of one of its parts, cleans up after itself, and jobs wait until it has passed for the Chrome version you run.
+- A leftover or planted folder in Chrome's install is named exactly, with the one line that removes it.
+- After installing this update, run bind-profile again before the probe.
 - The PC needs a new probe and confirmation after this update, as after every new PC worker.
 
 ## 0.19.0

@@ -645,6 +645,11 @@ in the harness repo; until then the keeper says it is waiting).
   `hook_selftest_failed`, `containment_unavailable`, `helper_compiler_missing` (Windows has no
   C# compiler for the helper), `helper_blocked` (security software stopped the helper),
   `chrome_busy` (another Claude Code is open on his PC),
+  `manifest_path_mismatch` (a native messaging host other than Claude Code's is registered on
+  his PC, one changed since he bound the profile, or the PC couldn't read one: he runs check-host,
+  which names it and the fix, then binds the profile again), `component_check_missing` (the
+  component check hasn't passed for the Chrome version running: he closes the Cain jobs Chrome and
+  presses 4 on his Cain PC jobs launcher),
   `attended_only`, `untrusted_config` or `stopped` means the PC isn't taking jobs, and
   why. Those are fixed at his PC, so they
   go on his "At his PC" list, never in the morning message.
