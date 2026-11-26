@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.19.1
+
+- The PC worker's extension check works with Chrome 158: Gemini in Chrome, Google Network Speech, the PDF viewer and Google Hangouts, parts of Chrome itself that you can't turn off, no longer stop check-host, bind-profile and the probe. They stay accepted after later Chrome updates too.
+- Having the Claude app open on your PC no longer stops bind-profile, the probe or a run. A Claude Code session that is running still does, whether it runs in a terminal or in the Claude app.
+- A new launcher on your desktop, Cain PC jobs, runs bind-profile, the probe or the queued jobs with a double click. When something is in the way it says in one line what to close, then waits for a key.
+- The setup steps say to turn Google Docs Offline off in the Cain jobs Chrome before the probe.
+- The PC needs a new probe and confirmation after this update, as after every new PC worker.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.

@@ -720,13 +720,15 @@ export const CHROME_LOCATIONS: readonly number[] = [COMPONENT_LOCATION, 10];
 // Policy locations: kExternalPolicyDownload (7) and kExternalPolicy (9).
 export const POLICY_LOCATIONS: readonly number[] = [7, 9];
 // The extensions Chrome installs itself, by id: the Web Store, Web Store Payments, the PDF viewer,
-// Google Hangouts, Network Speech, CryptoToken, Feedback and the Cast media router.
+// Google Hangouts, Network Speech (both ids), Gemini in Chrome, CryptoToken, Feedback and the Cast media router.
 export const CHROME_BUILTIN_IDS: readonly string[] = [
   "ahfgeienlihckogmohjhadlkjgocpleb", // Web Store
   "nmmhkkegccagdldgiimedpiccmgmieda", // Chrome Web Store Payments
   "mhjfbmdgcfjbbpaeojofohoefgiehjai", // Chrome PDF Viewer
   "nkeimhogjdpnpccoofpliimaahmaaome", // Google Hangouts
-  "neajdppkdcdipfabeoofebfddakdcjhd", // Google Network Speech
+  "neajdppkdcdipfabeoofebfddakdcjhd", // Google Network Speech (its older id)
+  "fignfifoniblkonapihmkfakmlgkbkcf", // Google Network Speech (Cain 0.19.1: its id in Chrome 158)
+  "admccjkmockfdflocgggjfgdacdodkdf", // Gemini in Chrome (Cain 0.19.1: a component since Chrome 158)
   "kmendfapggjehodndflmmgagdbamhnfd", // CryptoToken
   "gfdkimpbcpahaombhbimeihdjnejgicl", // Feedback
   "pkedcjkdefgpdelpbcmbmeomcjbeemfm", // Chrome Media Router
@@ -846,8 +848,29 @@ export function pathKind(path: unknown, userDataDir: string, _profileDirectory?:
 // 0.12.2, fourth pass: a real path under Chrome's install folder is required; no path is foreign. Sixth pass: the same at
 // location 10 (external component); the fifth pass's user data folder branch is removed.
 export const EXTERNAL_COMPONENT_LOCATION = 10;
-export const chromeOwn = (id: string, location: number | null, pk: PathKind) =>
-  CHROME_BUILTIN_IDS.includes(id) && location !== null && CHROME_LOCATIONS.includes(location) && pk === "chrome_install";
+// Cain 0.19.1 (Chrome 158): a component (location 5) keeps the path Chrome wrote at the version it was first installed
+// under (<install folder>\<a.b.c.d>\resources\<name>), and Chrome deletes that version folder at its next update; Chrome
+// 158 has no resources folder at all (its version folder holds resources.pak). So for a built-in id at location 5 only,
+// a missing path counts as Chrome's own when it has the install-folder shape: as written (never resolved), under the
+// folder the worker's own chrome.exe resolves to, then a version folder, then resources, then a name (a name and its
+// subfolder too, as Network Speech keeps network_speech_synthesis\mv3), the same shape as chrome_install. Location 10 still
+// needs the path on disk, and so does Web Store Payments; a profile path, an odd form, a "." or ".." segment or any
+// other folder stays foreign.
+export function componentShaped(path: unknown, disk: Disk = diskNow(), env: Record<string, string | undefined> = disk.env): boolean {
+  if (typeof path !== "string" || !path || oddForm(path)) return false;
+  const segs = pathSegs(path);
+  if (!segs || segs.includes("..") || segs.includes(".")) return false;
+  const app = chromeAppSegs(disk, env);
+  if (!app || !startsWithSegs(segs, app)) return false;
+  const rest = segs.slice(app.length);
+  return rest.length >= 3 && /^\d+(\.\d+){3}$/.test(rest[0]) && rest[1] === "resources";
+}
+export const chromeOwn = (id: string, location: number | null, pk: PathKind, path?: unknown) =>
+  CHROME_BUILTIN_IDS.includes(id) && location !== null && CHROME_LOCATIONS.includes(location)
+  && (pk === "chrome_install" || (location === COMPONENT_LOCATION && pk === "missing" && id !== WEB_STORE_PAYMENTS_ID && componentShaped(path)));
+// Chrome Web Store Payments is an external component (location 10) in Chrome; its rule is unchanged: Chrome's own only
+// with its folder on disk, at either location.
+export const WEB_STORE_PAYMENTS_ID = "nmmhkkegccagdldgiimedpiccmgmieda";
 // 0.12.2, sixth pass: an entry's path as printed for an external component (location 10) that isn't Chrome's own: the
 // path as Chrome wrote it, with the user name after Users\ or /home/ (and the Windows account's name anywhere) redacted,
 // control characters dropped, at most 260 characters. null when there is no path or it isn't a string.
@@ -1193,7 +1216,7 @@ function classify(inst: Install, id: string, e: any, hives: PolicyHive[]): Exten
   const pk = pathKind(e.path, p.user_data_dir, p.profile_directory);
   const kind: ExtensionKind = id === p.extension_id ? "claude"
     : (location !== null && POLICY_LOCATIONS.includes(location)) || hives.length ? "policy"
-    : CHROME_BUILTIN_IDS.includes(id) ? (chromeOwn(id, location, pk) ? "chrome" : "foreign")
+    : CHROME_BUILTIN_IDS.includes(id) ? (chromeOwn(id, location, pk, e.path) ? "chrome" : "foreign")
     : defaultAppIds(inst).includes(id) ? "default_app" : "foreign";
   const st = entryStatus(e);
   const status: ExtensionStatus = kind === "policy" ? "on" : st.status;
@@ -2053,9 +2076,11 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // both hooks refuse at once when probe mode shows outside a bound probe session, and read-guard names
 // why a read is unplaced; 20: read-guard's address-field rule counts inside the placement-bearing answer
 // (tool_response) alone and folds keys by NFKC then ASCII lowercase; 21, 0.12.2: the worker file changed for the
-// extension check and the hook's entry points (nav-guard and read-guard themselves unchanged)). The pull request check (check_pr.py) wants it above main's whenever the
+// extension check and the hook's entry points (nav-guard and read-guard themselves unchanged); 22, Cain 0.19.1: the worker
+// file changed for Chrome 158's components, the desktop app's processes and the launcher (nav-guard and read-guard
+// themselves unchanged)). The pull request check (check_pr.py) wants it above main's whenever the
 // guard changed against main, so a rebase over another pull request that touched the guard bumps it again.
-export const POLICY_VERSION = "21";
+export const POLICY_VERSION = "22";
 // The hook bundle (the hook's own code: worker.ts, which holds nav-guard and read-guard, the format
 // it imports and the pinned Public Suffix List) plus the pinned session settings, hashed into every
 // confirmation (0.12.0, nineteenth round): the confirmation binds to what the hook is, not to the
@@ -2463,7 +2488,7 @@ export async function next(o: Opts): Promise<NextOut> {
     let run: Job | null = null;
     let code: Heartbeat["code"] = "idle";
     if (candidate) {
-      const pre = browserPreflight(o, inst) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o) ?? await bridgeCheck(o, inst);
+      const pre = browserPreflight(o, inst) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o, inst) ?? await bridgeCheck(o, inst);
       if (pre === "probe_stale") st.reason = inChromePhase(() => staleReason(o, inst), true);     // the preflight's own reading
       if (pre === "extension_version_unknown") st.reason = "extension_version_unknown";
       if (pre) code = pre;
@@ -4052,12 +4077,96 @@ export function listProcs(plat = process.platform, nowMs = Date.now()): Proc[] |
       .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), created: nowMs - Number(m[3]) * 1000, cmd: m[4].trim() }));
   } catch { return null; }
 }
-export const claudeSessions = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pid && CLAUDE_PROC.test(p.cmd) && !NATIVE_HOST.test(p.cmd));
+// Cain 0.19.1: the Claude desktop app's own Electron processes are claude.exe too (its main process and its --type=
+// children, in its install folder: WindowsApps\Claude_<...>\app, or AnthropicClaude\app-<version>), and they are not a
+// Claude Code session. A process counts as another Claude Code when it is the claude command install.json pins, or any
+// process whose command line names the Claude Code CLI entry (@anthropic-ai/claude-code, or a claude-code folder's
+// cli.js: node, bun, or the desktop app's own Electron running it as Node), or any other claude.exe (one the desktop
+// app downloads for its Code sessions included). Only the desktop app's shell, by its folder and with no CLI entry on
+// its command line, is left out: a Claude Code session the desktop app started still refuses.
+const CLAUDE_CLI_ENTRY = /@anthropic-ai[\\/]claude-code|[\\/]claude-code[\\/](?:[^"\s]*[\\/])?cli\.(?:m?js|ts)\b/i;
+const DESKTOP_SHELL = /^\s*"?[^"]*?[\\/](?:WindowsApps[\\/]Claude_[^\\/"]*[\\/]app|AnthropicClaude[\\/]app-[^\\/"]*)[\\/]claude\.exe"?(?:\s|$)/i;
+const normExe = (x: string) => x.replace(/\//g, "\\").replace(/\\+/g, "\\").toLowerCase();
+export function isClaudeCode(p: Proc, pinned?: string): boolean {
+  if (p.pid === process.pid || NATIVE_HOST.test(p.cmd)) return false;
+  const exe = exeOf(p.cmd);
+  if (pinned && exe && normExe(exe) === normExe(pinned)) return true;
+  if (CLAUDE_CLI_ENTRY.test(p.cmd)) return true;
+  if (DESKTOP_SHELL.test(p.cmd)) return false;
+  return CLAUDE_PROC.test(p.cmd);
+}
+export const isDesktopShell = (p: Proc) => DESKTOP_SHELL.test(p.cmd) && !CLAUDE_CLI_ENTRY.test(p.cmd) && !NATIVE_HOST.test(p.cmd);
+export const claudeSessions = (ps: Proc[], pinned?: string) => ps.filter((p) => isClaudeCode(p, pinned));
 export const nativeHosts = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pid && NATIVE_HOST.test(p.cmd) && /claude/i.test(p.cmd));
 
-export function chromeBusy(o: Opts): Code | null {
+// The one plain line a launcher run prints when another Claude Code blocks it (Cain 0.19.1): what to close, by kind,
+// never a path or a process id. A list that can't be read says so.
+export function busyLine(ps: Proc[] | null, pinned?: string): string {
+  if (!ps) return "Stopped: the PC's process list couldn't be read. Close Claude Code wherever it is open, then press a key to try again.";
+  const found = claudeSessions(ps, pinned);
+  const inApp = found.some((p) => /[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i.test(p.cmd));
+  const elsewhere = found.some((p) => !/[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i.test(p.cmd));
+  const what = inApp && elsewhere ? "the Code session in the Claude app and every terminal running claude"
+    : inApp ? "the Code session in the Claude app (the app itself can stay open)" : "every terminal running claude";
+  return `Stopped: another Claude Code is running. Close ${what}, then press a key to try again.`;
+}
+// The launcher (Cain 0.19.1): one file on the owner's desktop, outside the Claude app, that runs bind-profile, the probe
+// or an attended run with a double click, so he never types a command. It prints the worker's own answer, then on a
+// refusal one plain line (--launcher), and waits for a key. Every path it holds is checked: none may carry a character
+// cmd.exe would read as anything but text.
+export const LAUNCHER_NAME = "Cain PC jobs.cmd";
+const CMD_SAFE = /^[^"%!^&|<>\r\n]+$/;
+export function launcherText(bun: string, worker: string, home: string): string {
+  for (const x of [bun, worker, home]) if (!CMD_SAFE.test(x)) throw new WorkerError("untrusted_config", "a path for the launcher holds a character cmd.exe would not read as text");
+  const call = (cmd: string) => `"${bun}" "${worker}" ${cmd} --attended --launcher --home "${home}"`;
+  return [
+    "@echo off",
+    "rem Cain PC jobs: written by worker.ts write-launcher. Double-click it; it runs only what you pick.",
+    "setlocal",
+    "title Cain PC jobs",
+    `cd /d "${home}"`,
+    ":menu",
+    "echo.",
+    "echo Cain PC jobs. Keep the Cain jobs Chrome open. Close Claude Code first: any terminal running claude, and the Code session in the Claude app.",
+    "echo   1  Bind the profile (setup step 10)",
+    "echo   2  Run the probe (setup step 11)",
+    "echo   3  Run the queued jobs, while you watch",
+    "echo   Q  Quit",
+    'choice /c 123Q /n /m "Press 1, 2, 3 or Q: "',
+    "if errorlevel 4 goto :eof",
+    "if errorlevel 3 goto run",
+    "if errorlevel 2 goto probe",
+    call("bind-profile"),
+    "goto done",
+    ":probe",
+    call("probe"),
+    "goto done",
+    ":run",
+    call("run"),
+    ":done",
+    "echo.",
+    "pause",
+    "goto menu",
+    "",
+  ].join("\r\n");
+}
+export function writeLauncher(o: Opts, desktop?: string): { written: string } {
+  const env = envOf(o);
+  const dir = desktop ?? join(env.USERPROFILE ?? homedir(), "Desktop");
+  if (!existsSync(dir)) throw new WorkerError("untrusted_config", `no desktop folder at ${dir}: pass --desktop <folder>`);
+  const file = join(dir, LAUNCHER_NAME);
+  writeFileSync(file, launcherText(process.execPath, WORKER_FILE, o.home));
+  return { written: file };
+}
+// What a launcher run prints after the worker's answer: one plain line for a refusal, nothing when it went through.
+export function launcherLine(code: string | null, o: Opts, inst?: Install | null): string | null {
+  if (!code || code === "ok" || code === "idle") return null;
+  if (code === "chrome_busy") return busyLine((o.procs ?? (() => listProcs(platform(o))))(), inst?.claude);
+  return `Stopped with ${code}: find ${code} in the Troubleshooting table of cain/docs/pc-jobs.md, fix it, then press a key to try again.`;
+}
+export function chromeBusy(o: Opts, inst?: Install): Code | null {
   const ps = (o.procs ?? (() => listProcs(platform(o))))();
-  return !ps || claudeSessions(ps).length ? "chrome_busy" : null;
+  return !ps || claudeSessions(ps, inst?.claude).length ? "chrome_busy" : null;
 }
 
 // The bridge check: a short session that calls tabs_context_mcp, opens a page the worker
@@ -6736,7 +6845,7 @@ export async function bindProfile(o: Opts): Promise<{ bound: string }> {
   const reg = manifestViews(o, inst);
   if (reg.code) throw new WorkerError(reg.code, manifestDetail(reg));
   if (startSweep(o).code) throw new WorkerError("session_cleanup_failed", cleanupHint(o));
-  const pre = browserPreflight(o, inst, true) ?? chromeBusy(o);
+  const pre = browserPreflight(o, inst, true) ?? chromeBusy(o, inst);
   if (pre) throw new WorkerError(pre, pre === "worker_signin_missing" ? SIGNIN_HINT : undefined);
   const now = clock(o);
   const l = lock(o, now);
@@ -7322,9 +7431,15 @@ if (isMain && process.argv[2] === "nav-guard") {
   if (preloaded) { startRefusedBeat(o, "preload_flag_set"); say(preloaded); process.exit(1); }
   try {
     const [cmd, a1] = args;
-    if (cmd === "run") run(o).then(say, fail);
-    else if (cmd === "probe") probe(o).then((ev) => { say(ev); const t = probeTail(ev, platform(o)); if (t) say(t); }, fail);
-    else if (cmd === "bind-profile") bindProfile(o).then(say, fail);
+    // Cain 0.19.1: --launcher (the desktop launcher's calls) adds one plain line after a refusal.
+    const launched = args.includes("--launcher");
+    const plain = (code: string | null) => { if (!launched) return; let inst: Install | null = null; try { inst = loadInstall(o); } catch { inst = null; }
+      const l = launcherLine(code, o, inst); if (l) console.log(l); };
+    const failL = (e: unknown) => { plain(e instanceof WorkerError ? e.code : "worker_failed"); fail(e); };
+    if (cmd === "run") run(o).then((r) => { say(r); plain(r.code); }, failL);
+    else if (cmd === "probe") probe(o).then((ev) => { say(ev); const t = probeTail(ev, platform(o)); if (t) say(t); }, failL);
+    else if (cmd === "bind-profile") bindProfile(o).then(say, failL);
+    else if (cmd === "write-launcher") say(writeLauncher(o, flag(args, "--desktop")));
     else if (cmd === "confirm-profile") {
       const c = confirmProfile(o, { acceptBoundary: args.includes("--accept-boundary") });
       const ev = readJson(P.evidence(o)) as Evidence;
@@ -7341,6 +7456,6 @@ if (isMain && process.argv[2] === "nav-guard") {
       const text = signAllowlistFile(a1, flag(args, "--key") ?? "", process.env.PC_OWNER_PASSPHRASE ?? "", flag(args, "--kid") ?? "");
       const out = flag(args, "--out");
       if (out) { writeFileSync(out, text); say({ written: out }); } else process.stdout.write(text);
-    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | confirm-profile --accept-boundary | check-host | dump-extensions | open-chrome | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
+    } else { console.error("usage: worker.ts run [--attended] | bind-profile --attended | probe --attended | write-launcher [--desktop <folder>] | confirm-profile --accept-boundary | check-host | dump-extensions | open-chrome | check-cli | clean-probe | owner-keygen | owner-fpr <owner.pub> | sign-allowlist | nav-guard | read-guard"); process.exit(2); }
   } catch (e) { fail(e); }
 }

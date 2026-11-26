@@ -355,8 +355,8 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     redacted), and `dump-extensions` lists all three with what each held (`policy_caches`:
     `absent`, `empty`, `holds` or `unreadable`).
   - **Chrome's own** (`chrome`): an id on Chrome's built-in list (the Web Store, Web Store
-    Payments, the PDF viewer, Hangouts, Network Speech, CryptoToken, Feedback, the Cast media
-    router) **and** at an internal location, component (`location` 5) or external component
+    Payments, the PDF viewer, Hangouts, Network Speech under both its ids, Gemini in Chrome,
+    CryptoToken, Feedback, the Cast media router) **and** at an internal location, component (`location` 5) or external component
     (`location` 10, where Chrome 157 puts Web Store Payments), **and** with its `path` in
     Chrome's install folder (`...\Google\Chrome\Application\<version>\resources\...`,
     outside the user data folder), at `location` 10 as at 5. **Sixth pass:** the fifth pass's
@@ -367,7 +367,14 @@ prevents it) and whether the run's own end check caught it afterwards (`caught`)
     Chrome's own is refused with its exact `path_kind` and its `path`, the user name redacted
     (`Users\<user>\...`), in `refusals` and in the `fix`, and `dump-extensions` prints the same
     `path` for every `location` 10 entry, so the real-PC run can name the one folder to allow
-    later. **Seventh pass:** Chrome's install folder is judged by whole path segments,
+    later. **Cain 0.19.1 (Chrome 158):** a component (`location` 5) keeps the `path` Chrome wrote
+    at the version it was first installed under, and Chrome deletes that version's folder at its
+    next update (Chrome 158 has no `resources` folder at all: its version folder holds
+    `resources.pak`). So for a built-in id at `location` 5 only (Web Store Payments aside), a path
+    that doesn't exist (`path_kind` `missing`) still counts as Chrome's own when it has the
+    install-folder shape, as written: the folder the worker's own `chrome.exe` resolves to, then a
+    `a.b.c.d` version folder, then `resources`, then a name. `location` 10 still needs the folder on
+    disk, and a profile path, an odd form or any other folder stays foreign. **Seventh pass:** Chrome's install folder is judged by whole path segments,
     case-insensitively, against `Program Files\Google\Chrome\Application` and
     `Program Files (x86)\Google\Chrome\Application` (as the environment names them), then a
     version folder, then `resources`, then the entry's own folder: a sibling such as
@@ -993,7 +1000,12 @@ instruction lists them (`allowed_domains`) and the hook gets them (`PCW_NAV_DOMA
 - **One Claude Code at a time, and a live bridge.** Before a claim, any other Claude
   Code process on the PC (a session of yours, or one left over) is `chrome_busy`: the
   extension would serve it instead, and the worker's lock can't see it (the extension's
-  own native messaging host doesn't count). Then a short bridge check (at most 90
+  own native messaging host doesn't count). **Cain 0.19.1:** a Claude Code process is the
+  `claude` command `install.json` pins, any other `claude.exe`, or any process whose command
+  line names the Claude Code CLI entry (`@anthropic-ai/claude-code`, or a `claude-code`
+  folder's `cli.js`). The Claude desktop app's own shell (its `claude.exe` in
+  `WindowsApps\Claude_...\app` or `AnthropicClaude\app-...`, with no CLI entry on its command
+  line) is not one, so the app may stay open; a Code session it started still is. Then a short bridge check (at most 90
   seconds: a tab-context call, a page the worker serves for it, `get_page_text` on it
   and a tab context after) must reach the extension; if it doesn't, the worker ends any
   leftover native messaging host of the extension (no session is running, so none is in
@@ -1277,7 +1289,16 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
    or the built file no longer matches what it recorded. If that compiler is missing every
    run stops with `helper_compiler_missing`; if security software stops the build or the
    helper, `helper_blocked`; otherwise `containment_unavailable` (Troubleshooting).
-10. **Bind the profile, once.** First run
+10. **The launcher, then bind the profile, once.** Write the launcher once, from a terminal of
+    your own (not inside the Claude app):
+    `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts write-launcher --home C:/pc-worker-k7q2xz`
+    (add `--desktop <folder>` if your desktop isn't `%USERPROFILE%\Desktop`, for example a
+    OneDrive desktop). It puts **Cain PC jobs** (`Cain PC jobs.cmd`) on your desktop: double-click
+    it and press 1 to bind the profile, 2 for the probe, 3 to run the queued jobs, Q to quit. It
+    prints the worker's answer, and when something stops it, one plain line saying what to do
+    (for `chrome_busy`, what to close: a terminal running `claude`, or the Code session in the
+    Claude app; the app itself may stay open), then waits for a key and shows the menu again.
+    Write it again after you move the harness checkout or Bun. Then run
     `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts check-host --home C:/pc-worker-k7q2xz`
     (Chrome open or closed: it reads only). It passes when nothing but Claude in Chrome and
     Chrome's own is on, no policy installs another extension and every policy hive reads; its
@@ -1287,9 +1308,9 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     included (one in `by_policy` stays on until its policy stops naming it), and run it again. Nothing in the worker turns anything off or removes anything. Then run
     `worker.ts dump-extensions --home C:/pc-worker-k7q2xz` and paste its output into the
     setup record: it holds ids, numbers and folder kinds only.
-    With the Cain jobs Chrome open and no other Claude Code
-    running, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
-    bind-profile --attended --home C:/pc-worker-k7q2xz`. A short session opens a page the worker
+    With the Cain jobs Chrome open and no Claude Code session
+    running, double-click **Cain PC jobs** on your desktop and press 1 (it runs
+    `worker.ts bind-profile --attended --home C:/pc-worker-k7q2xz`). A short session opens a page the worker
     serves on `127.0.0.1`, which sets a random marker as a cookie in this profile only,
     then reads it back from the canary page. The worker keeps only its hash, in
     `C:/pc-worker-k7q2xz/profile-marker.json` (run `icacls C:\pc-worker-k7q2xz\profile-marker.json` to
@@ -1300,14 +1321,17 @@ folder at the top of a drive, like `C:/pc-worker-k7q2xz`, keeps that simple.
     after you cleared browsing data, run `bind-profile` again. It prints `{"bound": ...}`,
     or the code that stopped it.
 11. **The supervised probe: the only way to the first confirmation.** Not a queued job:
-    nothing in the queue runs, and nothing is pushed. **Run it within 5 minutes of a
+    nothing in the queue runs, and nothing is pushed. **Before it, turn Google Docs Offline
+    off** in the Cain jobs Chrome (chrome://extensions in that Chrome, its toggle): it is the
+    one extension there that is yours to switch, Chrome turns it on by default, and the probe
+    and every run refuse while it is on (`extra_extension`). **Run it within 5 minutes of a
     Restart of the PC** (Start, Power, Restart; **not Shut down**, which Windows Fast Startup
     doesn't count as a fresh start, so the uptime isn't reset; or turn Fast Startup off first):
     its first step measures the hook's cold start (`hook_timing`, below) and refuses
     (`cold_sample_missing`, printing the uptime it measured) when the PC has been up longer. With the Cain jobs Chrome open and
-    you watching, in a terminal: `bun <harness tools>/cain/rootfs/opt/cain/pcjobs/worker.ts
-    probe --attended --home C:/pc-worker-k7q2xz` (add `--diagnose` for the diagnostic capture,
-    below). In order, it:
+    you watching, double-click **Cain PC jobs** on your desktop and press 2 (it runs
+    `worker.ts probe --attended --home C:/pc-worker-k7q2xz`; for the diagnostic capture, below,
+    run that line with `--diagnose` added in a terminal of your own, outside the Claude app). In order, it:
     - checks the install config, the files' ACLs, the owner key's fingerprint and the
       allowlist's signature, and refuses to start if a `STOP` file is in place;
     - exercises STOP: puts a `STOP` file in place, checks the preflight stops on it, and
@@ -2225,7 +2249,7 @@ copy of it), in the job's result, or in what `probe` prints. Files are in `C:/pc
 | `popups_allowed` in `worker.log` | `worker.ts check-host --home C:/pc-worker-k7q2xz`: `popups`; chrome://settings/content/popups in the Cain jobs profile | Pop-ups and redirects are allowed in the dedicated profile, as its default or for a site. A warning only: runs go on, and the stated boundary covers a popup. Choose **Don't allow sites to send pop-ups or use redirects** and remove any site from the allowed list (setup step 7). Needs a code change: no. |
 | `unattended_unsupported` | `install.json`: `unattended` | This version has no unattended runs; an install file that asks for them is refused by every command that reads it (`run --attended`, `probe`, `bind-profile`, `confirm-profile`, `check-host`, `check-cli`; the key and allowlist tools don't read it). Set `"unattended": false` (and run `worker.ts run --attended` yourself). Needs a code change: no; unattended runs come with a later version that adds request-level blocking. |
 | `busy` | `worker.lock` (its `kind`); a run's refusal detail `holder` | Another run holds the lock. Wait; a lock from a dead run clears itself (`stale_lock` in the heartbeat). When the refusal names `holder` `probe` (twenty-first round), a probe is running: the run checked and swept nothing; wait for the probe to finish, then run again. |
-| `chrome_busy` (the competing-session case) | Task Manager, Details: any `claude.exe`, or `node` running `claude-code` | Close the other Claude Code session (or end a leftover one) and run again. Any other Claude Code process blocks a run, attached to Chrome or not: the worker can't tell, and the extension would serve it instead. |
+| `chrome_busy` (the competing-session case) | The launcher's plain line names what to close; Task Manager, Details: a `claude.exe` outside the Claude app's own folder, or `node`, `bun` or `claude.exe` running `claude-code`'s `cli.js` | Close the other Claude Code session: a terminal running `claude`, or the Code session in the Claude app (end a leftover one in Task Manager), then press a key in **Cain PC jobs** to try again. The Claude app itself may stay open (since Cain 0.19.1 its own shell doesn't count). Any Claude Code session blocks a run, attached to Chrome or not, wherever it runs: the worker can't tell, and the extension would serve it instead. |
 | `extension_unreachable` | `probe`'s detail, or the bridge check in `worker.log` | Open the Cain jobs Chrome on its folder, check Claude in Chrome is on and paired with the `claude` command. The worker already ended a leftover native messaging host and checked again; if it persists, restart that Chrome. |
 | `extension_unreachable` with "Claude in Chrome: not listed" (the strict-MCP-config case) | `probe`'s detail; the `tools` in `probe-evidence.json` hold no `mcp__claude-in-chrome__` names | `--strict-mcp-config` may be keeping the built-in Chrome integration out on your `claude` version. Don't edit the session's flags by hand (the settings hash fails closed): ask for a build without that flag. The inventory check already fails any MCP server but Claude in Chrome's, so dropping the flag keeps that guarantee. Untested assumption: that `--strict-mcp-config` leaves the built-in Chrome integration in. Needs a code change: yes. |
 | `extension_unreachable` with "the claude command printed no session" (Git Bash not found) | run `claude --version` in a terminal of your own; does it complain about git-bash? | `claude` on Windows needs Git Bash, and runs the hook through it. Install Git for Windows, or set `CLAUDE_CODE_GIT_BASH_PATH` to the full path of `bash.exe` (it must exist; any other value is `untrusted_config`), then probe and confirm again (the environment's hash changes). Needs a code change: no. |

@@ -26,7 +26,7 @@ import {
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, DEFAULT_APP_IDS, readPolicy, parseSettingsValue, parseSettingsKey,
-  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, componentShaped, busyLine, launcherText, launcherLine, isClaudeCode, LAUNCHER_NAME, writeLauncher, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -1753,6 +1753,77 @@ describe("where a run ends, and its tabs", () => {
       { pid: 9, cmd: "C:/Program Files/Google/Chrome/Application/chrome.exe --user-data-dir=C:/pc-worker/chrome" },
       { pid: 10, cmd: "bun C:/tools/harness/cain/rootfs/opt/cain/pcjobs/worker.ts run" }])).toEqual([]);
     expect(await run(q.opts({ ...attended, procs: () => [{ pid: 8, cmd: "claude.exe --chrome-native-host x" }] }))).toMatchObject({ code: "ok", job: id });
+  });
+
+  test("Cain 0.19.1: the Claude desktop app's own shell isn't another Claude Code; a Claude Code CLI process, the desktop app's included, is", async () => {
+    const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+    const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+    const shell = [
+      { pid: 50, cmd: `"${APP}"` },
+      { pid: 51, cmd: `"${APP}" --type=gpu-process --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --gpu-preferences=x` },
+      { pid: 52, cmd: `"${APP}" --type=renderer --app-path="C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar"` },
+      { pid: 53, cmd: `"${APP}" --type=utility --utility-sub-type=node.mojom.NodeService` },
+      { pid: 54, cmd: `"${SQUIRREL}" --type=crashpad-handler` },
+      { pid: 55, cmd: `${APP} --type=renderer` },
+    ];
+    expect(claudeSessions(shell)).toEqual([]);
+    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe")).toEqual([]);
+    {
+      const { q, id } = oneJob();
+      expect(await run(q.opts({ ...attended, procs: () => shell }))).toMatchObject({ code: "ok", job: id });
+    }
+    // A Claude Code CLI process refuses, wherever it runs: the pinned claude command, any other claude.exe (the one the
+    // desktop app downloads for its Code sessions included), and node, bun or the app's own Electron running the CLI entry.
+    const cli = [
+      { pid: 60, cmd: '"C:\\Users\\owner\\.local\\bin\\claude.exe"' },
+      { pid: 61, cmd: '"C:\\Users\\owner\\AppData\\Roaming\\Claude\\claude-code\\2.1.0\\claude.exe" --output-format stream-json' },
+      { pid: 62, cmd: '"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\owner\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"' },
+      { pid: 63, cmd: '"C:\\Users\\owner\\.bun\\bin\\bun.exe" C:/Users/owner/.bun/install/global/node_modules/@anthropic-ai/claude-code/cli.js' },
+      { pid: 64, cmd: `"${APP}" "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\claude-code\\cli.js" --print` },
+      { pid: 65, cmd: "D:/tools/claude.exe --resume" },
+    ];
+    for (const p of cli) {
+      expect([p.cmd, isClaudeCode(p)]).toEqual([p.cmd, true]);
+      const { q } = oneJob();
+      expect([p.cmd, (await run(q.opts({ ...attended, procs: () => [...shell, p] }))).code]).toEqual([p.cmd, "chrome_busy"]);
+    }
+    // The pinned path counts whatever its name.
+    expect(isClaudeCode({ pid: 66, cmd: '"C:\\Tools\\cc\\agent.exe" -p' }, "C:/Tools/cc/agent.exe")).toBe(true);
+    // The native host stays out, in the app's folder too.
+    expect(isClaudeCode({ pid: 67, cmd: `"${APP}" --chrome-native-host chrome-extension://abc/` })).toBe(false);
+    // The plain line names what to close, by kind.
+    expect(busyLine([...shell, cli[1]])).toContain("the Code session in the Claude app");
+    expect(busyLine([...shell, cli[0]])).toContain("every terminal running claude");
+    expect(busyLine([cli[0], cli[1]])).toContain("the Code session in the Claude app and every terminal running claude");
+    expect(busyLine(null)).toContain("couldn't be read");
+    for (const l of [busyLine([cli[0]]), busyLine([cli[1]]), busyLine(null)]) {
+      expect(l).toContain("press a key");
+      expect(l).not.toMatch(/\u2014|[\\/]|\d{2,}/);
+    }
+  });
+
+  test("Cain 0.19.1: the desktop launcher runs bind-profile, the probe or a run with a double click, and says one plain line on a refusal", () => {
+    const { q } = oneJob();
+    const text = launcherText("C:\\Users\\owner\\.bun\\bin\\bun.exe", "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts", "C:\\pc-worker-k7q2xz");
+    for (const c of ["bind-profile", "probe", "run"])
+      expect(text).toContain(`"C:\\Users\\owner\\.bun\\bin\\bun.exe" "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts" ${c} --attended --launcher --home "C:\\pc-worker-k7q2xz"`);
+    expect(text).toContain("pause");
+    expect(text).toContain('choice /c 123Q');
+    expect(text.split("\r\n")[0]).toBe("@echo off");
+    expect(text).not.toContain("\u2014");
+    for (const bad of ['C:\\a"b', "C:\\100%", "C:\\a&b", "C:\\a\nb", "C:\\a!b"])
+      expect(() => launcherText("bun", "worker.ts", bad)).toThrow();
+    const desk = join(q.root, "Desktop");
+    mkdirSync(desk, { recursive: true });
+    const out = writeLauncher(q.opts(), desk);
+    expect(out.written).toBe(join(desk, LAUNCHER_NAME));
+    expect(readFileSync(out.written, "utf8")).toContain(" probe --attended --launcher --home ");
+    expect(() => writeLauncher(q.opts(), join(q.root, "no-desktop"))).toThrow();
+    // The plain line after the worker's answer: none when it went through, what to close on chrome_busy, the code otherwise.
+    expect(launcherLine("ok", q.opts(), q.inst)).toBeNull();
+    expect(launcherLine("idle", q.opts(), q.inst)).toBeNull();
+    expect(launcherLine("chrome_busy", q.opts({ procs: () => [{ pid: 60, cmd: '"C:/Users/owner/.local/bin/claude.exe"' }] }), q.inst)).toContain("every terminal running claude");
+    expect(launcherLine("extra_extension", q.opts(), q.inst)).toContain("extra_extension");
   });
 
   test("the bridge check: a stuck bridge is recycled where it can be and checked again; still stuck is extension_unreachable, before any claim", async () => {
@@ -3752,6 +3823,70 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     let err: any = null;
     try { checkHost(q.opts()); } catch (e) { err = e; }
     expect(err).toMatchObject({ code: "extra_extension", detail: { other_enabled: [USER], by_policy: [] } });
+  });
+
+  // Cain 0.19.1: the shape the setup session captured on the owner's PC (ids, numbers and folder kinds only). Chrome
+  // 158.0.8127.36, machine-wide in Program Files (x86). Four of Chrome's own parts at location 5 keep the path Chrome wrote
+  // at 157 (...\157.0.8103.39\resources\<name>), gone with that version, and Chrome 158 has no resources folder at all.
+  describe("Cain 0.19.1: Chrome 158's components with their folders gone", () => {
+    const CIC = "fcoeoabgfenejglbffodgkkbkcdhcgfn", GEMINI = "admccjkmockfdflocgggjfgdacdodkdf", SPEECH = "fignfifoniblkonapihmkfakmlgkbkcf";
+    const PDF = "mhjfbmdgcfjbbpaeojofohoefgiehjai", HANGOUTS = "nkeimhogjdpnpccoofpliimaahmaaome", DOCS = "ghbmnnjooekpmoecnnnilnnbdlolhkhi";
+    const X86 = "C:\\Program Files (x86)\\Google\\Chrome\\Application";
+    // The disk as Chrome 158 leaves it: chrome.exe in Program Files (x86), and no 157 version folder anywhere.
+    const disk158: Disk = { real: (p) => /[\\/]157\.0\.8103\.39([\\/]|$)/.test(p) ? null : FAKE_DISK.real(p), chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV };
+    const comp = (name: string, sub: string) => ({ creation_flags: 1, from_webstore: false, location: 5, manifest: { manifest_version: 3, name, version: "1.0" },
+      path: `${X86}\\157.0.8103.39\\resources\\${sub}`, was_installed_by_default: false, was_installed_by_oem: false });
+    const store = (id: string, name: string, extra: object = {}) => ({ creation_flags: 9, from_webstore: true, location: 1, manifest: { manifest_version: 3, name, version: "1.0" },
+      path: `${id}\\1.0_0`, was_installed_by_default: false, was_installed_by_oem: false, ...extra });
+    const captured = () => ({
+      [GEMINI]: comp("Gemini in Chrome", "gemini"), [CIC]: store(CIC, "Claude"), [SPEECH]: comp("Google Network Speech", "network_speech_synthesis\\mv3"),
+      [DOCS]: store(DOCS, "Google Docs Offline", { creation_flags: 137, was_installed_by_default: true }), [PDF]: comp("Chrome PDF Viewer", "pdf"),
+      [HANGOUTS]: comp("Google Hangouts", "hangout_services"),
+    });
+    const sec = (q: any) => join(q.udd, "Default", "Secure Preferences");
+    const write = (q: any, settings: object) => writeFileSync(sec(q), JSON.stringify({ extensions: { settings } }));
+    const instOf = (q: any) => ({ ...q.inst, profile: { ...q.inst.profile, extension_id: CIC } });
+    const withDisk = <T>(f: () => T): T => { setDiskStandIn(disk158); try { return f(); } finally { setDiskStandIn(FAKE_DISK); } };
+
+    test("the captured shape gives exactly one finding, Docs Offline on, and passes once it is off", () => withDisk(() => {
+      const { q } = oneJob();
+      write(q, captured());
+      const prefs = extensionPrefs(instOf(q));
+      expect(prefs.refusals).toEqual([{ id: DOCS, why: "default_app_on" }]);
+      expect(prefs.others).toEqual([DOCS]);
+      for (const id of [GEMINI, SPEECH, PDF, HANGOUTS]) expect([id, prefs.extensions.find((x) => x.id === id)]).toMatchObject([id, { kind: "chrome", path_kind: "missing", location: 5 }]);
+      expect(prefs.extensions.find((x) => x.id === CIC)).toMatchObject({ kind: "claude", path_kind: "profile" });
+      write(q, { ...captured(), [DOCS]: store(DOCS, "Google Docs Offline", { creation_flags: 137, was_installed_by_default: true, disable_reasons: [1] }) });
+      expect(extensionPrefs(instOf(q)).refusals).toEqual([]);
+    }));
+
+    test("the same shape plus a location 10 entry with its folder gone still refuses, and every other rule stands", () => withDisk(() => {
+      const { q } = oneJob();
+      const off = { ...captured(), [DOCS]: store(DOCS, "Google Docs Offline", { creation_flags: 137, disable_reasons: [1] }) };
+      write(q, { ...off, [PDF]: { ...comp("Chrome PDF Viewer", "pdf"), location: 10 } });
+      expect(extensionPrefs(instOf(q)).refusals).toEqual([{ id: PDF, why: "on", path_kind: "missing", path: externalPath(`${X86}\\157.0.8103.39\\resources\\pdf`) }]);
+      // Web Store Payments, as before: its folder gone is foreign, at location 5 too.
+      const PAY = "nmmhkkegccagdldgiimedpiccmgmieda";
+      write(q, { ...off, [PAY]: comp("Chrome Web Store Payments", "web_store_payments") });
+      expect(extensionPrefs(instOf(q)).refusals).toEqual([{ id: PAY, why: "on" }]);
+      // An id that isn't built in, in the same shape: foreign.
+      const OTHER = "dddddddddddddddddddddddddddddddd";
+      write(q, { ...off, [OTHER]: comp("Something", "x") });
+      expect(extensionPrefs(instOf(q)).refusals).toEqual([{ id: OTHER, why: "on" }]);
+      // A built-in id in the profile, in another folder, under another Chrome, in an odd form, or with no resources: foreign.
+      for (const path of [`${PDF}\\1.0_0`, join(q.udd, "Default", "Extensions", PDF, "1.0_0"), "D:\\Tools\\pdf",
+        `${FAKE_APP}\\157.0.8103.39\\resources\\pdf`, `${X86}\\157.0.8103.39\\RESOUR~1\\pdf`, `\\\\?\\${X86}\\157.0.8103.39\\resources\\pdf`,
+        `${X86}\\157.0.8103.39\\pdf`, `${X86}\\157.0.8103.39\\resources`, `${X86}\\157.0.8103.39\\resources\\..\\..\\x\\pdf`, `${X86}\\v157\\resources\\pdf`]) {
+        write(q, { ...off, [PDF]: { ...comp("Chrome PDF Viewer", "pdf"), path } });
+        expect([path, extensionPrefs(instOf(q)).refusals.map((r) => r.id)]).toEqual([path, [PDF]]);
+      }
+      // A policy entry naming a built-in id still refuses.
+      write(q, off);
+      expect(extensionPrefs(instOf(q), { entries: [{ id: PDF, hive: "HKLM", policy: "ExtensionInstallForcelist" }], unreadable: [] } as any).refusals)
+        .toEqual([{ id: PDF, why: "policy" }]);
+      expect(componentShaped(`${X86}\\158.0.8127.36\\resources\\pdf`, disk158)).toBe(true);
+      expect(componentShaped(`${X86}\\158.0.8127.36\\resources\\pdf`, FAKE_DISK)).toBe(false);
+    }));
   });
 
   // 0.12.2, third pass: read only. The owner's reported profile, in the shape Chrome 157 writes it (no state field;
@@ -6861,7 +6996,7 @@ describe("eighteenth review: the hook's margin measured on the PC, a strict pars
     expect(HOOK_STALL_MS).toBeGreaterThan(HOOK_TIMEOUT_S * 1000);
     expect(PROBE_GATES).toContain("hook_timing");
     expect(PROBE_GATES).toContain("payload_replay");
-    expect(POLICY_VERSION).toBe("21");
+    expect(POLICY_VERSION).toBe("22");
   });
 
   // The step's four sessions, each a real session process (the stand-in CLI) running the real nav-guard.
