@@ -26,7 +26,7 @@ import {
   readConfirmed, reportFrom, run, sessionHashes, startCanary, untrustedWriters, ADMINS_SID, SESSION_FILES, SYSTEM_SID,
   BOUNDARY_ENDED, BOUNDARY_WITHHELD, BOUNDARY_VERSIONS, boundaryFor, probeCases, checkCli, manifestViews, activeExtensionVersion, updatePending, isDedicated, serverBound, echoVeto, toolNames,
   browserPreflight, hostChain, extensionPrefs, dumpExtensions, parseForcelist, pathKind, DEFAULT_APP_IDS, readPolicy, parseSettingsValue, parseSettingsKey,
-  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, componentShape, COMPONENT_RESOURCES, isDesktopShell, hasCliEntry, splitCmd, busyLine, launcherText, launcherLine, isClaudeCode, LAUNCHER_NAME, writeLauncher, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
+  chromeLaunchArgs, openChrome, chromeExe, entryStatus, externalPath, anyReason, runsInChrome, policyCache, cacheState, policyCacheDirs, NO_PROGRAM_FILES, REG_NOT_FOUND, regAbsent, setDiskStandIn, realDisk, componentShape, COMPONENT_RESOURCES, isDesktopShell, childShape, desktopIdentity, identityMemo, casedOnDisk, casedSegs, hostListing, desktopPresent, gateAgain, launcherChoice, LAUNCHER_BUILTINS, DESKTOP_VERSION_INFO, UTILITY_SAFE, type ExeIdentity, hasCliEntry, splitCmd, busyLine, launcherText, launcherLine, isClaudeCode, LAUNCHER_NAME, writeLauncher, chromeInstall, dumpHead, DEFAULT_VALUE, type Disk, forcelistOf, CLOUD_KEYS, DISABLE_DEFAULT_APPS, POLICY_HIVES, CHROME_POLICY_KEYS, FORCELIST_KEYS, sweepSession, signedIn, startSweep, CONFIG_KEEP,
   workerDenyRules, rulePath, mentionsWorker, judgeCredential, credentialUrl, sameStart, later, TICK_MS, popupState, workerPaths, chainTimes,
   DENIED_BUILTIN, DENY_CAPS, safeField, lastRunOf, deniedAddress, endChildThenSweep, setLiveChild, killTree,
   workerNow, canonPath, wallOf, tokenHit, HOOK_ALLOWED, CONTEXT_REFUSALS_MAX, CONTEXT_MESSAGE, contextOwed, createdTabId, registrableDomain, hookKey,
@@ -1758,19 +1758,23 @@ describe("where a run ends, and its tabs", () => {
   test("Cain 0.19.1: the Claude desktop app's own shell isn't another Claude Code; a Claude Code CLI process, the desktop app's included, is", async () => {
     const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
     const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+    // Review round 2: exempt only with the file's identity (a stand-in reader here) and a known child shape.
+    const ident = () => ({ asar: true, product: "Claude", original: "claude.exe", signer: 'CN="Anthropic, PBC", O="Anthropic, PBC"', status: "Valid", cased: true });
     const shell = [
-      { pid: 50, cmd: `"${APP}"` },
-      { pid: 51, cmd: `"${APP}" --type=gpu-process --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --gpu-preferences=x` },
-      { pid: 52, cmd: `"${APP}" --type=renderer --app-path="C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar"` },
-      { pid: 53, cmd: `"${APP}" --type=utility --utility-sub-type=node.mojom.NodeService` },
-      { pid: 54, cmd: `"${SQUIRREL}" --type=crashpad-handler` },
-      { pid: 55, cmd: `${APP} --type=renderer` },
+      { pid: 50, cmd: `"${APP}"`, exe: APP },
+      { pid: 51, cmd: `"${APP}" --type=gpu-process --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --gpu-preferences=x`, exe: APP },
+      { pid: 52, cmd: `"${APP}" --type=renderer --app-path="C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar"`, exe: APP },
+      { pid: 53, cmd: `"${APP}" --type=utility --utility-sub-type=network.mojom.NetworkService`, exe: APP },
+      { pid: 54, cmd: `"${SQUIRREL}" --type=crashpad-handler`, exe: SQUIRREL },
+      { pid: 55, cmd: `${APP} --type=renderer`, exe: APP },
     ];
-    expect(claudeSessions(shell)).toEqual([]);
-    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe")).toEqual([]);
+    expect(claudeSessions(shell, undefined, ident)).toEqual([]);
+    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe", ident)).toEqual([]);
+    // A utility child running Node is not the shell (review round 2).
+    expect(claudeSessions([{ pid: 56, cmd: `"${APP}" --type=utility --utility-sub-type=node.mojom.NodeService`, exe: APP }], undefined, ident).length).toBe(1);
     {
       const { q, id } = oneJob();
-      expect(await run(q.opts({ ...attended, procs: () => shell }))).toMatchObject({ code: "ok", job: id });
+      expect(await run(q.opts({ ...attended, procs: () => shell, exeIdentity: ident }))).toMatchObject({ code: "ok", job: id });
     }
     // A Claude Code CLI process refuses, wherever it runs: the pinned claude command, any other claude.exe (the one the
     // desktop app downloads for its Code sessions included), and node, bun or the app's own Electron running the CLI entry.
@@ -1785,15 +1789,15 @@ describe("where a run ends, and its tabs", () => {
     for (const p of cli) {
       expect([p.cmd, isClaudeCode(p)]).toEqual([p.cmd, true]);
       const { q } = oneJob();
-      expect([p.cmd, (await run(q.opts({ ...attended, procs: () => [...shell, p] }))).code]).toEqual([p.cmd, "chrome_busy"]);
+      expect([p.cmd, (await run(q.opts({ ...attended, procs: () => [...shell, p], exeIdentity: ident }))).code]).toEqual([p.cmd, "chrome_busy"]);
     }
     // The pinned path counts whatever its name.
     expect(isClaudeCode({ pid: 66, cmd: '"C:\\Tools\\cc\\agent.exe" -p' }, "C:/Tools/cc/agent.exe")).toBe(true);
     // The native host stays out, in the app's folder too.
     expect(isClaudeCode({ pid: 67, cmd: `"${APP}" --chrome-native-host chrome-extension://abc/` })).toBe(false);
     // The plain line names what to close, by kind.
-    expect(busyLine([...shell, cli[1]])).toContain("the Code session in the Claude app");
-    expect(busyLine([...shell, cli[0]])).toContain("every terminal running claude");
+    expect(busyLine([...shell, cli[1]], undefined, ident)).toContain("the Code session in the Claude app");
+    expect(busyLine([...shell, cli[0]], undefined, ident)).toContain("every terminal running claude");
     expect(busyLine([cli[0], cli[1]])).toContain("the Code session in the Claude app and every terminal running claude");
     expect(busyLine(null)).toContain("couldn't be read");
     for (const l of [busyLine([cli[0]]), busyLine([cli[1]]), busyLine(null)]) {
@@ -1808,7 +1812,7 @@ describe("where a run ends, and its tabs", () => {
     for (const c of ["bind-profile", "probe", "run"])
       expect(text).toContain(`"C:\\Users\\owner\\.bun\\bin\\bun.exe" "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts" ${c} --attended --launcher --home "C:\\pc-worker-k7q2xz"`);
     expect(text).toContain("pause");
-    expect(text).toContain('choice /c 123Q');
+    expect(text).toContain('"C:\\Windows\\System32\\choice.exe" /c 123Q');
     expect(text.split("\r\n")[0]).toBe("@echo off");
     expect(text).not.toContain("\u2014");
     for (const bad of ['C:\\a"b', "C:\\100%", "C:\\a&b", "C:\\a\nb", "C:\\a!b"])
@@ -3834,7 +3838,7 @@ describe("tenth review: the worker folder's second wall, the keep-list sweep, pr
     const X86 = "C:\\Program Files (x86)\\Google\\Chrome\\Application";
     // The disk as Chrome 158 leaves it: chrome.exe in Program Files (x86), and no 157 version folder anywhere.
     const V158 = "158.0.8127.36";
-    const disk158: Disk = { real: (p) => /[\\/]157\.0\.8103\.39([\\/]|$)/.test(p) ? null : FAKE_DISK.real(p), chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV,
+    const disk158: Disk = { real: (p) => /[\\/](157\.0\.8103\.39|158\.0\.8127\.36[\\/]resources)([\\/]|$)/.test(p) ? null : FAKE_DISK.real(p), chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV,
       list: (d) => d === X86 ? [V158, "SetupMetrics", "chrome.exe"] : null };
     const comp = (name: string, sub: string) => ({ creation_flags: 1, from_webstore: false, location: 5, manifest: { manifest_version: 3, name, version: "1.0" },
       path: `${X86}\\157.0.8103.39\\resources\\${sub}`, was_installed_by_default: false, was_installed_by_oem: false });
@@ -8741,18 +8745,23 @@ describe("Cain 0.19.1, review round 1: the PC worker's fixes for Chrome 158 and 
   const ASAR = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\resources\\app.asar";
 
   test("1. the desktop shell: its plain process and its typed children, with no CLI entry, are left out", async () => {
+    // Review round 2: with the file's identity (a stand-in reader), the listed executable path, and a known child shape.
+    const ident = () => ({ asar: true, product: "Claude", original: "claude.exe", signer: 'CN="Anthropic, PBC", O="Anthropic, PBC"', status: "Valid", cased: true });
+    const asar = (exe: string) => `${exe.slice(0, exe.lastIndexOf("\\"))}\\resources\\app.asar`;
     const shell = [
       { pid: 50, cmd: `"${APP}"`, name: "claude.exe", exe: APP },
-      { pid: 51, cmd: APP, name: "claude.exe" },
-      { pid: 52, cmd: `"${SQUIRREL}"` },
-      ...["gpu-process", "renderer", "utility", "crashpad-handler", "zygote", "broker"].map((t, i) =>
-        ({ pid: 60 + i, cmd: `"${i % 2 ? SQUIRREL : APP}" --type=${t} --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --app-path="${ASAR}"` })),
-      { pid: 70, cmd: `${APP} --type=renderer --lang=en-US` },
+      { pid: 51, cmd: APP, name: "claude.exe", exe: APP },
+      { pid: 52, cmd: `"${SQUIRREL}"`, exe: SQUIRREL },
+      ...["gpu-process", "renderer", "utility", "crashpad-handler", "zygote", "broker"].map((t, i) => {
+        const exe = i % 2 ? SQUIRREL : APP;
+        return { pid: 60 + i, exe, cmd: `"${exe}" --type=${t}${t === "utility" ? " --utility-sub-type=network.mojom.NetworkService" : ""} --user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude" --app-path="${asar(exe)}"` };
+      }),
+      { pid: 70, cmd: `${APP} --type=renderer --lang=en-US`, exe: APP },
     ];
-    for (const p of shell) expect([p.cmd, isDesktopShell(p), isClaudeCode(p)]).toEqual([p.cmd, true, false]);
-    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe")).toEqual([]);
+    for (const p of shell) expect([p.cmd, isDesktopShell(p, ident), isClaudeCode(p, undefined, ident)]).toEqual([p.cmd, true, false]);
+    expect(claudeSessions(shell, "C:\\Users\\owner\\.local\\bin\\claude.exe", ident)).toEqual([]);
     const { q, id } = oneJob();
-    expect(await run(q.opts({ ...attended, procs: () => shell }))).toMatchObject({ code: "ok", job: id });
+    expect(await run(q.opts({ ...attended, procs: () => shell, exeIdentity: ident }))).toMatchObject({ code: "ok", job: id });
   });
 
   test("1. everything else that names claude.exe, or runs the CLI entry, refuses as chrome_busy", async () => {
@@ -8900,8 +8909,8 @@ describe("Cain 0.19.1, review round 1: the PC worker's fixes for Chrome 158 and 
       const r = judge(PDF, comp(shaped(PDF, "pdf")), diskWith([planted]));
       expect(r.refusals).toEqual([{ id: PDF, why: "on", planted: externalPath(planted) }]);
       expect(componentShape(PDF, shaped(PDF, "pdf"), V, diskWith([planted]))).toEqual({ ok: false, planted });
-      // The same name under the current version is Chrome's own folder, not a plant.
-      expect(componentShape(PDF, shaped(PDF, "pdf"), V, diskWith([`${X86}\\${V}\\resources\\pdf`]))).toEqual({ ok: true });
+      // Review round 2: the same name under the current version is in the scan too, named a leftover.
+      expect(componentShape(PDF, shaped(PDF, "pdf"), V, diskWith([`${X86}\\${V}\\resources\\pdf`]))).toEqual({ ok: false, planted: `${X86}\\${V}\\resources\\pdf`, leftover: true });
       // A Network Speech folder planted without its subfolder counts too.
       const sp = `${X86}\\150.0.0.1\\resources\\network_speech_synthesis`;
       expect(componentShape(SPEECH, shaped(SPEECH, "network_speech_synthesis\\mv3"), V, diskWith([sp]))).toEqual({ ok: false, planted: sp });
@@ -8960,5 +8969,316 @@ describe("Cain 0.19.1, review round 1: the PC worker's fixes for Chrome 158 and 
       for (const args of [[bad, worker, home], [bun, bad, home], [bun, worker, bad]] as [string, string, string][])
         expect(() => launcherText(...args)).toThrow(expect.objectContaining({ code: "untrusted_config" }));
     }
+  });
+});
+
+describe("Cain 0.19.1, review round 2: file identity for the desktop shell, native hosts under any name, the component rule, the launcher's proof", () => {
+  const APP = "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app\\claude.exe";
+  const SQUIRREL = "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\claude.exe";
+  const asarOf = (exe: string) => `${exe.slice(0, exe.lastIndexOf("\\"))}\\resources\\app.asar`;
+  const SIGNER = 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US';
+  const GOOD: ExeIdentity = { asar: true, product: DESKTOP_VERSION_INFO.product, original: DESKTOP_VERSION_INFO.original, signer: SIGNER, status: "Valid", cased: true };
+  const CLI_INFO = [{ product: "Claude Code", original: "claude.exe" }, { product: "Bun", original: "bun.exe" }, { product: "", original: "" }];
+  const good = () => GOOD;
+  const shellOf = (exe: string, args = "") => ({ pid: 50, name: "claude.exe", exe, cmd: `"${exe}"${args ? ` ${args}` : ""}` });
+  const UDD = '--user-data-dir="C:\\Users\\owner\\AppData\\Roaming\\Claude"';
+
+  describe("1. the desktop shell is exempt only by file identity, and its children only with a complete known shape", () => {
+    test("the real shell and its known children pass, and a run goes through", async () => {
+      const kids = (exe: string) => [
+        shellOf(exe),
+        shellOf(exe, `--type=gpu-process ${UDD} --gpu-preferences=WAAAAAAAAADgAAAEAAAAAAAAAAAAAAAAAABgAAEAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA --field-trial-handle=1812,i,1,2,262144 --mojo-platform-channel-handle=1820 /prefetch:2`.replace(" /prefetch:2", " --prefetch=2")),
+        shellOf(exe, `--type=renderer ${UDD} --app-path="${asarOf(exe)}" --enable-sandbox --lang=en-US --device-scale-factor=1.5 --num-raster-threads=4 --renderer-client-id=5 --time-ticks-at-unix-epoch=-1764160000000000 --launch-time-ticks=123 --mojo-platform-channel-handle=2100 --field-trial-handle=1812,i,1,2,262144`),
+        shellOf(exe, `--type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none ${UDD} --mojo-platform-channel-handle=1900 --field-trial-handle=1812,i,1,2,262144`),
+        shellOf(exe, `--type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service ${UDD} --mojo-platform-channel-handle=1950`),
+        shellOf(exe, `--type=utility --utility-sub-type=audio.mojom.AudioService --lang=en-US --service-sandbox-type=audio ${UDD}`),
+        shellOf(exe, `--type=crashpad-handler ${UDD} --monitor-self-annotation=ptype=crashpad-handler --database=C:\\Users\\owner\\AppData\\Roaming\\Claude\\Crashpad --url=https://f.a.k/e --annotation=_productName=Claude --initial-client-data=0x4f0,0x4f4`),
+      ];
+      for (const exe of [APP, SQUIRREL]) for (const p of kids(exe)) expect([p.cmd, isDesktopShell(p, good), isClaudeCode(p, undefined, good)]).toEqual([p.cmd, true, false]);
+      const { q, id } = oneJob();
+      expect(await run(q.opts({ ...attended, procs: () => [...kids(APP), ...kids(SQUIRREL)], exeIdentity: good }))).toMatchObject({ code: "ok", job: id });
+    });
+
+    test("the native CLI binary at the app-<version> path, run with no arguments, refuses: same folder, listed path matching, no app.asar, the CLI's version info", async () => {
+      const p = shellOf(SQUIRREL);
+      for (const info of CLI_INFO) {
+        const r = () => ({ ...GOOD, ...info, asar: false });
+        expect([info, isDesktopShell(p, r), isClaudeCode(p, undefined, r)]).toEqual([info, false, true]);
+        const { q } = oneJob();
+        expect((await run(q.opts({ ...attended, procs: () => [p], exeIdentity: r }))).code).toBe("chrome_busy");
+      }
+    });
+
+    test("the same with app.asar planted beside it, but the CLI's version info, still refuses; so does every other identity that isn't the app's", async () => {
+      const p = shellOf(SQUIRREL);
+      const bad: [string, ExeIdentity | null][] = [
+        ...CLI_INFO.map((info): [string, ExeIdentity] => [`CLI info ${info.product}`, { ...GOOD, ...info }]),
+        ["no app.asar", { ...GOOD, asar: false }],
+        ["a ProductName of another case", { ...GOOD, product: "claude" }],
+        ["unsigned", { ...GOOD, signer: "", status: "NotSigned" }],
+        ["signed by someone else", { ...GOOD, signer: "CN=Contoso, O=Contoso" }],
+        ["Anthropic only inside another name", { ...GOOD, signer: "CN=NotAnthropic Ltd, O=NotAnthropic Ltd" }],
+        ["a signature that doesn't verify", { ...GOOD, status: "HashMismatch" }],
+        ["a path not written as the disk lists it", { ...GOOD, cased: false }],
+        ["a reader that failed", null],
+      ];
+      for (const [why, x] of bad) {
+        expect([why, desktopIdentity(x), isClaudeCode(p, undefined, () => x)]).toEqual([why, false, true]);
+        const { q } = oneJob();
+        expect([why, (await run(q.opts({ ...attended, procs: () => [p], exeIdentity: () => x }))).code]).toEqual([why, "chrome_busy"]);
+      }
+      // A reader that throws refuses too; one with no listed executable path is never asked.
+      expect(isClaudeCode(p, undefined, () => { throw new Error("powershell"); })).toBe(true);
+      let asked = 0;
+      expect(isClaudeCode({ pid: 51, cmd: `"${APP}"`, name: "claude.exe" }, undefined, () => { asked++; return GOOD; })).toBe(true);
+      expect(asked).toBe(0);
+      // Off Windows (no reader) nothing is exempt.
+      if (!WIN) expect(isDesktopShell(shellOf(APP))).toBe(false);
+    });
+
+    test("one reading per process image per listing, cached by path", () => {
+      let reads = 0;
+      const r = (exe: string) => { reads++; return exe === APP ? GOOD : null; };
+      const ps = [shellOf(APP), shellOf(APP, "--type=gpu-process"), shellOf(APP, "--type=crashpad-handler"), shellOf(SQUIRREL)];
+      expect(claudeSessions(ps, undefined, r).map((p) => p.exe)).toEqual([SQUIRREL]);
+      expect(reads).toBe(2);
+      const memo = identityMemo(r);
+      memo(APP); memo(APP.toUpperCase()); memo(APP);
+      expect(reads).toBe(3);
+    });
+
+    test("a utility child running Node, an unknown or missing sub-type, a known child with an unrecognised argument or a packaged entry point, or a CLI marker refuses", async () => {
+      const refuse: [string, string][] = [
+        ["node.mojom.NodeService", `--type=utility --utility-sub-type=node.mojom.NodeService --lang=en-US ${UDD}`],
+        ["an unknown sub-type", "--type=utility --utility-sub-type=evil.mojom.Runner"],
+        ["no sub-type", "--type=utility --lang=en-US"],
+        ["two sub-types", "--type=utility --utility-sub-type=network.mojom.NetworkService --utility-sub-type=node.mojom.NodeService"],
+        ["a sub-type on a renderer", "--type=renderer --utility-sub-type=network.mojom.NetworkService"],
+        ["--inspect on a renderer", "--type=renderer --inspect=9229"],
+        ["--js-flags", "--type=renderer --js-flags=--expose-gc"],
+        ["an unknown switch", "--type=gpu-process --remote-debugging-port=9222"],
+        ["a packaged entry point", `--type=renderer "C:\\Users\\owner\\AppData\\Local\\Temp\\main.js"`],
+        ["a bare word", "--type=renderer main.js"],
+        ["--app-path elsewhere", '--type=renderer --app-path="C:\\Users\\owner\\x\\app.asar"'],
+        ["two types", "--type=renderer --type=gpu-process"],
+        ["an unknown type", "--type=extension"],
+        ["a CLI marker on a known child", "--type=renderer --output-format stream-json"],
+        ["-p on a known child", '--type=gpu-process -p "hi"'],
+        ["the CLI entry on a utility child", "--type=utility --utility-sub-type=network.mojom.NetworkService C:/x/node_modules/@anthropic-ai/claude-code/cli.js"],
+      ];
+      for (const [why, args] of refuse) {
+        const p = shellOf(APP, args);
+        expect([why, isDesktopShell(p, good), isClaudeCode(p, undefined, good)]).toEqual([why, false, true]);
+      }
+      const { q } = oneJob();
+      expect((await run(q.opts({ ...attended, procs: () => [shellOf(APP), shellOf(APP, refuse[0][1])], exeIdentity: good }))).code).toBe("chrome_busy");
+      expect(UTILITY_SAFE).not.toContain("node.mojom.NodeService");
+      expect(childShape(["--type=utility", "--utility-sub-type=network.mojom.NetworkService"], APP)).toBe(true);
+    });
+
+    test("5. the casing on disk: the real MSIX and Squirrel installs and WMI's ExecutablePath shapes", () => {
+      // What each folder lists, case kept, as the two installs write them.
+      const tree: Record<string, string[]> = {
+        "C:\\": ["Program Files", "Users", "Windows"],
+        "C:\\Program Files": ["WindowsApps", "Google"],
+        "C:\\Program Files\\WindowsApps": ["Claude_1.0.3218.0_x64__pzs8sxrjxfjjc"],
+        "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc": ["app", "AppxManifest.xml"],
+        "C:\\Program Files\\WindowsApps\\Claude_1.0.3218.0_x64__pzs8sxrjxfjjc\\app": ["claude.exe", "resources"],
+        "C:\\Users": ["owner"], "C:\\Users\\owner": ["AppData"], "C:\\Users\\owner\\AppData": ["Local"],
+        "C:\\Users\\owner\\AppData\\Local": ["AnthropicClaude"], "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude": ["app-1.0.3218", "Update.exe", "packages"],
+        "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218": ["claude.exe", "resources"],
+      };
+      const list = (d: string) => tree[d] ?? null;
+      // WMI's ExecutablePath for each, as Windows lists it.
+      for (const wmi of [APP, SQUIRREL]) expect([wmi, casedOnDisk(wmi, list)]).toEqual([wmi, true]);
+      for (const bad of [APP.toLowerCase(), APP.replace("WindowsApps", "windowsapps"), SQUIRREL.replace("AnthropicClaude", "anthropicclaude"),
+        SQUIRREL.replace("claude.exe", "Claude.exe"), SQUIRREL.replace("app-1.0.3218", "app-1.0.3219"), `\\\\?\\${APP}`, "C:\\PROGRA~1\\WindowsApps\\x\\app\\claude.exe"])
+        expect([bad, casedOnDisk(bad, list)]).toEqual([bad, false]);
+      expect(casedSegs("C:/Program Files/WindowsApps", list)).toBe(true);
+      expect(casedSegs("C:\\program files", list)).toBe(false);
+    });
+  });
+
+  describe("2. native hosts under any name", () => {
+    const desktopProc = shellOf(APP);
+    const other = (q: any, json: object | null, name = "com.anthropic.claude_desktop_host") => {
+      const f = join(q.home, `${name}.json`);
+      if (json) writeFileSync(f, JSON.stringify(json)); else rmSync(f, { force: true });
+      return () => ({ entries: [{ view: "HKCU" as const, name, path: f }], failed: [] as string[] });
+    };
+    test("a differently named manifest under HKCU whose allowed_origins holds the extension's origin refuses check-host, bind-profile and the probe", async () => {
+      const q = queueRig({ confirmed: false });
+      const origin = `chrome-extension://${q.inst.profile.extension_id}/`;
+      const hostList = other(q, { name: "com.anthropic.claude_desktop_host", path: "C:\\Tools\\host.exe", type: "stdio", allowed_origins: [origin] });
+      expect(manifestViews(q.opts({ hostList }), q.inst)).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["other_host:com.anthropic.claude_desktop_host"] });
+      expect(() => checkHost(q.opts({ hostList }))).toThrow("manifest_path_mismatch");
+      await expect(bindProfile(q.opts({ ...attended, hostList }))).rejects.toThrow("manifest_path_mismatch");
+      await expect(probe(q.opts({ ...attended, hostList }))).rejects.toMatchObject({ code: "manifest_path_mismatch" });
+      // The origin without its slash, or in another case, counts the same.
+      expect(manifestViews(q.opts({ hostList: other(q, { allowed_origins: [origin.slice(0, -1).toUpperCase()] }) }), q.inst).code).toBe("manifest_path_mismatch");
+      // A host whose program is in the desktop app's folder refuses whatever its origins.
+      expect(manifestViews(q.opts({ hostList: other(q, { allowed_origins: ["chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/"], path: "C:\\Users\\owner\\AppData\\Local\\AnthropicClaude\\app-1.0.3218\\resources\\chrome-native-host.exe" }) }), q.inst))
+        .toMatchObject({ code: "manifest_path_mismatch", mismatched: ["desktop_host:com.anthropic.claude_desktop_host"] });
+      expect(q.launches).toEqual([]);
+    });
+    test("one that holds another origin passes", () => {
+      const q = queueRig({ confirmed: false });
+      const hostList = other(q, { name: "com.example.host", path: "C:\\Tools\\host.exe", allowed_origins: ["chrome-extension://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz/"] }, "com.example.host");
+      expect(manifestViews(q.opts({ hostList }), q.inst).code).toBeNull();
+      expect(() => checkHost(q.opts({ hostList }))).not.toThrow();
+    });
+    test("an unreadable manifest, or a view that can't be read, refuses while the desktop shell is present, and passes without it", () => {
+      const q = queueRig({ confirmed: false });
+      const hostList = other(q, null);
+      const withApp = manifestViews(q.opts({ hostList, procs: () => [desktopProc] }), q.inst);
+      expect(withApp).toMatchObject({ code: "manifest_path_mismatch", mismatched: ["host_scan_failed"] });
+      expect(() => checkHost(q.opts({ hostList, procs: () => [desktopProc] }))).toThrow("manifest_path_mismatch");
+      expect(manifestViews(q.opts({ hostList, procs: () => [] }), q.inst).code).toBeNull();
+      // A process list that can't be read counts as the app present.
+      expect(manifestViews(q.opts({ hostList, procs: () => null }), q.inst).code).toBe("manifest_path_mismatch");
+      const failed = () => ({ entries: [], failed: ["HKLM32"] });
+      expect(manifestViews(q.opts({ hostList: failed, procs: () => [desktopProc] }), q.inst).code).toBe("manifest_path_mismatch");
+      expect(manifestViews(q.opts({ hostList: failed, procs: () => [] }), q.inst).code).toBeNull();
+      expect(desktopPresent([{ pid: 1, cmd: "", exe: SQUIRREL }])).toBe(true);
+    });
+    test("the listing reads every subkey in each of the three views, and a failed read is named", () => {
+      const answers: Record<string, { status: number | null; stdout: string; stderr?: string; error: boolean }> = {
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts /reg:64": { status: 0, stdout: "\r\nHKEY_CURRENT_USER\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_code_browser_extension\r\nHKEY_CURRENT_USER\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_browser_extension\r\n", error: false },
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_code_browser_extension /ve /reg:64": { status: 0, stdout: "\r\n    (Default)    REG_SZ    C:\\Users\\owner\\.claude\\host.json\r\n", error: false },
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\com.anthropic.claude_browser_extension /ve /reg:64": { status: 0, stdout: "\r\n    (Default)    REG_SZ    C:\\Users\\owner\\AppData\\Roaming\\Claude\\host.json\r\n", error: false },
+        "HKLM\\Software\\Google\\Chrome\\NativeMessagingHosts /reg:64": { status: 1, stdout: "", stderr: REG_NOT_FOUND, error: false },
+        "HKLM\\Software\\Google\\Chrome\\NativeMessagingHosts /reg:32": { status: 1, stdout: "", stderr: "ERROR: Access is denied.", error: false },
+      };
+      const l = hostListing("win32", (a) => answers[a.join(" ")] ?? { status: null, stdout: "", error: true });
+      expect(l).toEqual({ entries: [
+        { view: "HKCU", name: "com.anthropic.claude_code_browser_extension", path: "C:\\Users\\owner\\.claude\\host.json" },
+        { view: "HKCU", name: "com.anthropic.claude_browser_extension", path: "C:\\Users\\owner\\AppData\\Roaming\\Claude\\host.json" },
+      ], failed: ["HKLM32"] });
+      expect(hostListing("linux")).toBeUndefined();
+    });
+  });
+
+  describe("3 and 5. the component rule", () => {
+    const PDF = "mhjfbmdgcfjbbpaeojofohoefgiehjai";
+    const X86 = "C:\\Program Files (x86)\\Google\\Chrome\\Application";
+    const V = "158.0.8127.36", OLD = "157.0.8103.39";
+    const path = `${X86}\\${OLD}\\resources\\pdf`;
+    const disk = (planted: string[] = [], over: Partial<Disk> = {}): Disk => ({
+      real: (p) => p === `${X86}\\chrome.exe` || planted.includes(p) || p === `${X86}\\${V}` ? p : null, chromeExe: () => `${X86}\\chrome.exe`, env: FAKE_ENV,
+      list: (d) => d === X86 ? [V, ...planted.map((p) => p.slice(X86.length + 1).split("\\")[0])] : null, ...over });
+    test("the running version's own folder is in the planted scan; one under a version Chrome's install state lists is named a leftover", () => {
+      const own = `${X86}\\${V}\\resources\\pdf`;
+      expect(componentShape(PDF, path, V, disk([own]))).toEqual({ ok: false, planted: own, leftover: true });
+      const listed = `${X86}\\156.0.1.2\\resources\\pdf`;
+      expect(componentShape(PDF, path, V, disk([listed], { installState: () => ["156.0.1.2", V] }))).toEqual({ ok: false, planted: listed, leftover: true });
+      expect(componentShape(PDF, path, V, disk([listed], { installState: () => [V] }))).toEqual({ ok: false, planted: listed });
+      expect(componentShape(PDF, path, V, disk())).toEqual({ ok: true });
+    });
+    test("the install folder must be written as its parents list it", () => {
+      expect(componentShape(PDF, path, V, disk([], { cased: () => false }))).toEqual({ ok: false });
+      expect(componentShape(PDF, path, V, disk([], { cased: (p) => p === X86 }))).toEqual({ ok: true });
+    });
+    test("a reparse point in the install, version or resources chain refuses", () => {
+      for (const at of ["C:\\Program Files (x86)\\Google", X86, `${X86}\\${V}`]) {
+        const d = disk([], { reparse: (p) => p === at });
+        expect([at, componentShape(PDF, path, V, d)]).toEqual([at, { ok: false, reparse: at }]);
+      }
+      expect(componentShape(PDF, path, V, disk([], { reparse: (p) => p === `${X86}\\${V}\\resources` }))).toEqual({ ok: false, reparse: `${X86}\\${V}\\resources` });
+      // One that can't be read refuses, a missing resources folder doesn't.
+      expect(componentShape(PDF, path, V, disk([], { reparse: (p) => p.endsWith("resources") ? null : p === "C:\\Program Files (x86)" ? null : false })).ok).toBe(false);
+      expect(componentShape(PDF, path, V, disk([], { reparse: (p) => p.endsWith("resources") ? null : false }))).toEqual({ ok: true });
+    });
+    test("on the Windows runner: a junction in the version chain refuses", () => {
+      if (!WIN) return;
+      const root = realpathSync.native(mkdtempSync(join(tmpdir(), "pcw-junc-")));
+      const app = join(root, "Google", "Chrome", "Application");
+      mkdirSync(join(app, V), { recursive: true });
+      writeFileSync(join(app, "chrome.exe"), "");
+      const d: Disk = { ...realDisk(), chromeExe: () => join(app, "chrome.exe"), env: { ProgramFiles: root } };
+      const p = join(app, OLD, "resources", "pdf");
+      expect(componentShape(PDF, p, V, d)).toEqual({ ok: true });
+      mkdirSync(join(root, "elsewhere"), { recursive: true });
+      symlinkSync(join(root, "elsewhere"), join(app, "156.0.0.1"), "junction");
+      expect(componentShape(PDF, p, V, d)).toEqual({ ok: false, reparse: join(app, "156.0.0.1") });
+      rmSync(root, { recursive: true, force: true });
+    });
+    test("the extension gate is read again after the bridge check, and a change refuses the run", async () => {
+      const { q, id } = oneJob();
+      const OTHER = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+      const prefsFile = join(q.udd, "Default", "Preferences");
+      const before = readFileSync(prefsFile, "utf8");
+      const selfTest = async () => {
+        const x = JSON.parse(before);
+        x.extensions ??= {}; x.extensions.settings ??= {};
+        x.extensions.settings[OTHER] = { state: 1, manifest: { name: "Helper" } };
+        writeFileSync(prefsFile, JSON.stringify(x));
+        return null;
+      };
+      expect((await run(q.opts({ ...attended, selfTest })))).toMatchObject({ code: "extra_extension", job: null });
+      expect(JSON.parse(q.remoteFile(`jobs/${id}.json`)).state).toBe("pending");
+      writeFileSync(prefsFile, before);
+      expect((await run(q.opts(attended)))).toMatchObject({ code: "ok", job: id });
+      // With no preflight reading for this profile, the second reading refuses.
+      expect(gateAgain(q.opts(), { ...q.inst, profile: { ...q.inst.profile, user_data_dir: join(q.home, "nope") } })).toBe("extra_extension");
+    });
+  });
+
+  describe("4. the launcher's proof", () => {
+    const bun = "C:\\Program Files\\Bun\\bun.exe", worker = "C:\\tools\\harness\\cain\\rootfs\\opt\\cain\\pcjobs\\worker.ts", home = "C:\\pc-worker-k7q2xz";
+    const choice = "C:\\Windows\\System32\\choice.exe";
+    const text = launcherText(bun, worker, home, choice);
+    const lines = text.split("\r\n").filter(Boolean);
+    test("choice /c ... /n with descending if errorlevel branches; no set /p and no %...% expansion", () => {
+      const at = lines.findIndex((l) => l.startsWith(`"${choice}" /c 123Q /n `));
+      expect(at).toBeGreaterThan(-1);
+      expect(lines.slice(at + 1, at + 4)).toEqual(["if errorlevel 4 goto :eof", "if errorlevel 3 goto run", "if errorlevel 2 goto probe"]);
+      expect(text).not.toMatch(/set\s+\/p/i);
+      expect(text).not.toMatch(/%[^%\r\n]*%/);
+      expect(text).not.toContain("%");
+      expect(text).not.toContain("!");
+    });
+    test("every bun and worker call is an absolute quoted path, and no unqualified command name appears", () => {
+      const calls = lines.filter((l) => !l.startsWith("rem ") && l.includes("worker.ts"));
+      expect(calls.length).toBe(3);
+      for (const l of calls) expect(l.startsWith(`"${bun}" "${worker}" `)).toBe(true);
+      for (const l of lines) {
+        if (l.startsWith(":")) continue;
+        const first = l.startsWith('"') ? l.slice(0, l.indexOf('"', 1) + 1) : l.split(" ")[0].toLowerCase();
+        if (first.startsWith('"')) expect([l, /^"[A-Za-z]:\\[^"]+\.(exe)"$/i.test(first)]).toEqual([l, true]);
+        else expect([l, LAUNCHER_BUILTINS.includes(first)]).toEqual([l, true]);
+      }
+      expect(text).not.toMatch(/(^|\r\n)(choice|bun|node|powershell|cmd|where)\b/i);
+      expect(launcherChoice({ SystemRoot: "C:\\Windows" })).toBe(choice);
+      for (const bad of ["choice.exe", "System32\\choice.exe", "C:\\Windows\\System32\\evil.exe"]) expect(() => launcherText(bun, worker, home, bad)).toThrow();
+      for (const rel of ["bun.exe", ".\\bun.exe", "worker.ts"]) expect(() => launcherText(rel, worker, home, choice)).toThrow();
+    });
+    test("on the Windows runner: the launcher runs the stand-in worker by its absolute path under cmd.exe, and a competing bun on PATH never runs", () => {
+      if (!WIN) return;
+      const root = realpathSync.native(mkdtempSync(join(tmpdir(), "pcwlaunch")));
+      if (/[^\x20-\x7e]|["%!^&|<>]/.test(root)) return;   // the runner's temp folder must be plain to write a launcher at all
+      const work = join(root, "home"), bin = join(root, "bin");
+      mkdirSync(work); mkdirSync(bin);
+      const stand = join(root, "standin.ts");
+      writeFileSync(stand, `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(join(root, "ran.txt"))}, JSON.stringify({ exec: process.execPath, script: process.argv[1], args: process.argv.slice(2) }) + "\\n");\n`);
+      for (const name of ["bun.cmd", "bun.bat", "choice.cmd", "choice.bat"]) writeFileSync(join(bin, name), `@echo off\r\necho competitor>>"${join(root, "competitor.txt")}"\r\n`);
+      writeFileSync(join(bin, "bun.exe"), readFileSync(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "whoami.exe")));
+      const cmdFile = join(root, LAUNCHER_NAME);
+      writeFileSync(cmdFile, launcherText(process.execPath, stand, work, launcherChoice(process.env)));
+      const env = { ...process.env, PATH: `${bin};${process.env.PATH ?? ""}`, PATHEXT: ".CMD;.BAT;.EXE;.COM" };
+      const go = (input: string) => {
+        rmSync(join(root, "ran.txt"), { force: true });
+        const r = spawnSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/c", cmdFile], { cwd: bin, env, input, encoding: "utf8", timeout: 60_000, windowsHide: true });
+        const ran = existsSync(join(root, "ran.txt")) ? readFileSync(join(root, "ran.txt"), "utf8").trim().split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : [];
+        return { r, ran };
+      };
+      expect(go("Q").ran).toEqual([]);
+      expect(go("xQ").ran).toEqual([]);
+      const two = go("2 Q");
+      expect(two.ran.length).toBe(1);
+      expect(two.ran[0]).toMatchObject({ script: stand, args: ["probe", "--attended", "--launcher", "--home", work] });
+      expect(two.ran[0].exec.toLowerCase()).toBe(process.execPath.toLowerCase());
+      expect(existsSync(join(root, "competitor.txt"))).toBe(false);
+      rmSync(root, { recursive: true, force: true });
+    });
   });
 });

@@ -127,6 +127,8 @@ export interface Opts {
   exeVersion?: (exe: string) => string | null;      // a test's stand-in for an executable's file version (Windows reads it with chromeExeVersions)
   chromePs?: () => string;                          // a test's stand-in for chromeExeVersions' PowerShell output (throws as execFileSync would)
   procs?: () => Proc[] | null;                      // the running processes (listProcs unless a test stands in)
+  exeIdentity?: IdentityReader;                     // Windows: a claude.exe's file identity (readExeIdentity unless a test stands in)
+  hostList?: () => HostListing | undefined;         // Windows: every native messaging host registered for Chrome (hostListing unless a test stands in)
   forcelist?: () => ForceList;                      // Windows: Chrome's extension policies as read now (readPolicy unless a test stands in)
   reg?: RegQuery;                                   // Windows: one reg query call, for readPolicy (the real reg.exe unless a test stands in)
   policyCacheDirs?: (string | null)[];              // Windows: the cloud policy cache folders checked (policyCacheDirs unless a test stands in; null: one the environment doesn't name)
@@ -793,8 +795,32 @@ function segKind(segs: string[], env: Record<string, string | undefined>): "chro
 // environment's install folders hold it (Program Files, either view, then LocalAppData), or null. The tests hand in a
 // stand-in (setDiskStandIn); the worker never does.
 // list (Cain 0.19.1, review round 1): a folder's entry names, or null when it can't be read; a stand-in without it lists nothing.
+// Review round 2: cased, whether a path's folders are written exactly as their parents list them (directory entries, not a
+// canonical string); reparse, whether a path is a reparse point (a junction or a symbolic link: lstat), null when it can't be
+// read; installState, the version folders Chrome's installer records (chrome.VisualElementsManifest.xml), null when unreadable.
 export interface Disk { real: (p: string) => string | null; chromeExe: (env: Record<string, string | undefined>) => string | null; env: Record<string, string | undefined>;
-  list?: (dir: string) => string[] | null }
+  list?: (dir: string) => string[] | null; cased?: (path: string) => boolean; reparse?: (path: string) => boolean | null; installState?: (app: string) => string[] | null }
+// Each segment of an absolute path (a drive path or a POSIX one) listed by its parent folder exactly as written.
+export function casedSegs(path: string, list: (dir: string) => string[] | null): boolean {
+  const win = /^[A-Za-z]:[\\/]/.test(path);
+  if (!win && !path.startsWith("/")) return false;
+  const sep = win ? "\\" : "/";
+  const segs = path.replace(/[\\/]+/g, sep).split(sep);
+  if (segs.slice(1).some((x) => !x || x === "." || x === "..")) return false;
+  for (let i = 1; i < segs.length; i++) {
+    const dir = i === 1 ? `${segs[0]}${sep}` : segs.slice(0, i).join(sep);
+    const names = list(dir);
+    if (!names || !names.includes(segs[i])) return false;
+  }
+  return true;
+}
+const listDir = (d: string) => { try { return readdirSync(d); } catch { return null; } };
+export function readInstallState(app: string): string[] | null {
+  try {
+    const x = readFileSync(join(app, "chrome.VisualElementsManifest.xml"), "utf8");
+    return [...new Set([...x.matchAll(/(\d+\.\d+\.\d+\.\d+)[\\/]VisualElements/g)].map((m) => m[1]))];
+  } catch { return null; }
+}
 export function workerChromeExe(env: Record<string, string | undefined>): string | null {
   for (const r of [...programFilesRoots(env).slice(0, 2), env.LOCALAPPDATA ?? env.LocalAppData]) if (r) {
     const f = join(r, "Google", "Chrome", "Application", "chrome.exe");
@@ -803,7 +829,8 @@ export function workerChromeExe(env: Record<string, string | undefined>): string
   return null;
 }
 export const realDisk = (): Disk => ({ real: (p) => { try { return realpathSync.native(p); } catch { return null; } }, chromeExe: workerChromeExe, env: process.env,
-  list: (d) => { try { return readdirSync(d); } catch { return null; } } });
+  list: listDir, cased: (p) => casedSegs(p, listDir),
+  reparse: (p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return null; } }, installState: readInstallState });
 let diskStandIn: Disk | null = null;
 export const setDiskStandIn = (d: Disk | null) => { diskStandIn = d; };
 export const diskNow = (): Disk => diskStandIn ?? realDisk();
@@ -886,7 +913,7 @@ function chromeAppRaw(disk: Disk, env: Record<string, string | undefined>): stri
   const segs = rawSegs(real);
   return segs.length > 2 && segs.slice(1).every((x) => x && x !== "." && x !== "..") ? segs.slice(0, -1) : null;
 }
-export type ComponentShape = { ok: true } | { ok: false; planted?: string };
+export type ComponentShape = { ok: true } | { ok: false; planted?: string; leftover?: boolean; reparse?: string };
 export function componentShape(id: string, path: unknown, chromeVersion: string | null, disk: Disk = diskNow(), env: Record<string, string | undefined> = disk.env): ComponentShape {
   const no: ComponentShape = { ok: false };
   const want = Object.hasOwn(COMPONENT_RESOURCES, id) ? COMPONENT_RESOURCES[id] : null;
@@ -895,6 +922,9 @@ export function componentShape(id: string, path: unknown, chromeVersion: string 
   if (segs.slice(1).some((x) => !x || x === "." || x === ".." || /[. ]$/.test(x))) return no;
   const app = chromeAppRaw(disk, env);
   if (!app || app.length > segs.length || !app.every((x, i) => segs[i] === x)) return no;
+  const sep0 = segs[0] === "" ? "/" : "\\";
+  // Review round 2: the install folder as its parents list it, case for case.
+  if (disk.cased && !disk.cased(app.join(sep0))) return no;
   const [ver, res, name, sub, ...more] = segs.slice(app.length);
   if (more.length || res !== "resources" || name !== want.name || (sub !== undefined && (!want.sub || !/^[a-z0-9_]{1,40}$/.test(sub)))) return no;
   const v = verNums(ver), cur = verNums(chromeVersion);
@@ -903,10 +933,22 @@ export function componentShape(id: string, path: unknown, chromeVersion: string 
   const sep = segs[0] === "" ? "/" : "\\";
   const dirs = disk.list?.(app.join(sep)) ?? null;
   if (!dirs) return no;
-  for (const d of dirs) {
-    if (d === chromeVersion || !/^\d+(\.\d+){3}$/.test(d)) continue;
+  // Review round 2: every version folder, the running version's own included (Chrome 158 has no resources folder at all). One
+  // under a version Chrome's install state lists is named a leftover; any other a plant. Either refuses.
+  const listed = disk.installState?.(app.join(sep)) ?? null;
+  const versions = dirs.filter((d) => /^\d+(\.\d+){3}$/.test(d)).sort();
+  for (const d of versions) {
     const f = [...app, d, "resources", want.name].join(sep);
-    if (disk.real(f) !== null) return { ok: false, planted: f };
+    if (disk.real(f) !== null) return { ok: false, planted: f, ...(listed?.includes(d) || d === chromeVersion ? { leftover: true } : {}) };
+  }
+  // On Windows (and wherever the disk can tell), no reparse point in the install, version or resources chain.
+  if (disk.reparse) {
+    const must: string[] = [];
+    for (let i = 2; i <= app.length; i++) must.push(app.slice(0, i).join(sep));
+    for (const d of versions) must.push([...app, d].join(sep));
+    for (const c of must) if (disk.reparse(c) !== false) return { ok: false, reparse: c };
+    // A version's resources folder: absent is fine (lstat can't read it), present must be a plain folder.
+    for (const d of versions) { const c = [...app, d, "resources"].join(sep); if (disk.reparse(c) === true) return { ok: false, reparse: c }; }
   }
   return { ok: true };
 }
@@ -942,7 +984,7 @@ export type PolicyName = "ExtensionInstallForcelist" | "ExtensionSettings" | "En
 export type RegView = "64" | "32";
 export interface ExtensionLine { id: string; name: string | null; enabled: boolean; component: boolean; kind: ExtensionKind; status: ExtensionStatus;
   location: number | null; state: number | null; disable_reasons: RawReasons; path_kind: PathKind; policy: PolicyHive[]; unrecognised: string[];
-  path?: string | null; planted?: string | null }
+  path?: string | null; planted?: string | null; leftover?: boolean; reparse?: boolean }
 // Chrome's extension policies, as read now (0.12.2, fourth pass): each id a policy installs, with the hive and the
 // policy naming it (ExtensionSettings' installation_mode too), and each hive and policy that couldn't be read. A key
 // or value that isn't there is no entry (reg answers 1); anything else but 0, or a listing that doesn't parse, is
@@ -1170,7 +1212,7 @@ export const forcelistOf = (o: Opts): ForceList => (o.forcelist ?? (() => {
 // refusals: each reason the gate refuses, by name (the entry and the field, the policy id, or the hive).
 export interface Refusal { id?: string; why: "on" | "default_app_on" | "policy" | "unrecognised" | "policy_unreadable" | "policy_unrecognised" | "policy_enrollment"
   | "uninstalls_unrecognised" | "policy_cache";
-  field?: string; hive?: PolicyHive; view?: RegView; policy?: PolicyName; key?: string; name?: string; path_kind?: PathKind; path?: string | null; planted?: string | null }
+  field?: string; hive?: PolicyHive; view?: RegView; policy?: PolicyName; key?: string; name?: string; path_kind?: PathKind; path?: string | null; planted?: string | null; leftover?: boolean; reparse?: boolean }
 export interface ExtensionPrefs { files: string[]; key: string; extensions: ExtensionLine[]; others: string[]; disagree: string[]; policy: ForceList; refusals: Refusal[] }
 const num = (x: unknown) => typeof x === "number" && Number.isFinite(x) ? x : null;
 // 0.12.2, seventh pass: a disable reason is a non-negative integer, never a boolean, a fraction, a negative number or a
@@ -1267,7 +1309,8 @@ function classify(inst: Install, id: string, e: any, hives: PolicyHive[], chrome
   const status: ExtensionStatus = kind === "policy" ? "on" : st.status;
   // Review round 1: a component whose missing path has a folder of the same shape under another version folder names it.
   const shape = kind === "foreign" && location === COMPONENT_LOCATION && pk === "missing" ? componentShape(id, e.path, chromeVersion) : null;
-  const planted = shape && !shape.ok && shape.planted ? { planted: externalPath(shape.planted) } : {};
+  const planted = shape && !shape.ok && shape.planted ? { planted: externalPath(shape.planted), ...(shape.leftover ? { leftover: true } : {}) }
+    : shape && !shape.ok && shape.reparse ? { planted: externalPath(shape.reparse), reparse: true } : {};
   return { ...planted, id, name, enabled: status !== "present, off", component: kind === "chrome", kind, status, location, state, disable_reasons: reasons, path_kind: pk,
     policy: hives, unrecognised: kind === "claude" ? [] : st.unrecognised,
     ...(location === EXTERNAL_COMPONENT_LOCATION && kind !== "chrome" && kind !== "claude" ? { path: externalPath(e.path) } : {}) };
@@ -1306,7 +1349,7 @@ export function extensionPrefs(inst: Install, policy: ForceList = NO_FORCELIST, 
       ? { path_kind: x.path_kind, path: x.path ?? externalPath(merged[x.id]?.path) } : {};
     for (const field of x.unrecognised) refusals.push({ id: x.id, why: "unrecognised", field, ...at });
     if (x.kind === "policy") refusals.push({ id: x.id, why: "policy", ...at });
-    else if (x.status === "on" && x.kind === "foreign") refusals.push({ id: x.id, why: "on", ...at, ...(x.planted ? { planted: x.planted } : {}) });
+    else if (x.status === "on" && x.kind === "foreign") refusals.push({ id: x.id, why: "on", ...at, ...(x.planted ? { planted: x.planted, ...(x.leftover ? { leftover: true } : {}), ...(x.reparse ? { reparse: true } : {}) } : {}) });
     else if (x.status === "on" && x.kind === "default_app") refusals.push({ id: x.id, why: "default_app_on" });
   }
   // A policy id other than Claude in Chrome that isn't in the profile yet: Chrome installs it at its next start.
@@ -2018,11 +2061,63 @@ export function registeredManifests(name: string, plat = process.platform): RegE
   }
   return out;
 }
+// Review round 2: native hosts under any name. Chrome starts any registered host whose manifest lists the extension's origin, so a
+// host of another name (the Claude desktop app's own, or one planted) could answer Claude in Chrome. hostListing reads every
+// subkey of NativeMessagingHosts in the three views and its manifest path; manifestViews reads each manifest and refuses
+// (manifest_path_mismatch) when a host other than the pinned one lists chrome-extension://<the install's extension id>/ in
+// allowed_origins (other_host:<name>), or its host program is in the desktop app's folders (desktop_host:<name>). When the listing
+// can't run (a view's read failed, a manifest can't be read), that refuses while a desktop app process is present
+// (host_scan_failed), since the app's own host is exactly what it would miss; without one it is noted and passes.
+export interface HostListing { entries: (RegEntry & { name: string })[]; failed: string[] }
+export function hostListing(plat = process.platform, reg: RegQuery = regQuery): HostListing | undefined {
+  if (plat !== "win32") return undefined;
+  const out: HostListing = { entries: [], failed: [] };
+  for (const v of HOST_VIEWS) {
+    const r = reg([v.key, v.flag]);
+    if (regAbsent(r)) continue;
+    if (r.status !== 0 || r.error) { out.failed.push(v.view); continue; }
+    const names = (r.stdout ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => /^HKEY_[A-Z_]+\\/i.test(l) && l.toLowerCase() !== v.key.replace(/^HKCU/, "HKEY_CURRENT_USER").replace(/^HKLM/, "HKEY_LOCAL_MACHINE").toLowerCase())
+      .map((l) => l.split("\\").pop() ?? "").filter(Boolean);
+    for (const name of names) {
+      const e = reg([`${v.key}\\${name}`, "/ve", v.flag]);
+      if (regAbsent(e)) continue;
+      const m = e.status === 0 && !e.error ? /REG_(?:EXPAND_)?SZ\s+(.+?)\s*$/m.exec(e.stdout ?? "") : null;
+      if (m) out.entries.push({ view: v.view, name, path: m[1] });
+      else if (e.status !== 0 || e.error) out.failed.push(`${v.view}:${name}`);
+    }
+  }
+  return out;
+}
+const shownHost = (n: string) => /^[A-Za-z0-9._-]{1,128}$/.test(n) ? n : "unnamed";
+// Whether a Claude desktop app process is running (by its install folder alone: wider than isDesktopShell); a list that can't be read counts as yes.
+export function desktopPresent(ps: Proc[] | null): boolean {
+  if (!ps) return true;
+  return ps.some((p) => [p.exe ?? "", splitCmd(p.cmd)?.exe ?? ""].some((x) => !!x && DESKTOP_APP_DIR.test(folded(x))));
+}
+function otherHosts(o: Opts, inst: Install, pinnedName: string, mismatched: string[]): string | null {
+  const listing = (o.hostList ?? (o.registry ? () => ({ entries: [], failed: [] }) : () => hostListing(platform(o), o.reg ?? regQuery)))();
+  if (!listing) return null;
+  const origin = `chrome-extension://${inst.profile.extension_id}/`.toLowerCase();
+  const unread = [...listing.failed];
+  for (const e of listing.entries) {
+    if (e.name.toLowerCase() === pinnedName.toLowerCase()) continue;      // the pinned name: every view's path is compared above
+    const file = e.path.trim().replace(/^"+|"+$/g, "").trim();
+    const m = readJson(file);
+    if (!m || typeof m !== "object") { unread.push(`${e.view}:${shownHost(e.name)}`); continue; }
+    const origins: unknown[] = Array.isArray(m.allowed_origins) ? m.allowed_origins : [];
+    const prog = typeof m.path === "string" ? (pathWin32.isAbsolute(m.path) ? m.path : pathWin32.join(pathWin32.dirname(file), m.path)) : "";
+    if (origins.some((x) => typeof x === "string" && x.trim().replace(/\/?$/, "/").toLowerCase() === origin)) mismatched.push(`other_host:${shownHost(e.name)}`);
+    else if (prog && DESKTOP_APP_DIR.test(folded(prog))) mismatched.push(`desktop_host:${shownHost(e.name)}`);
+  }
+  if (!unread.length) return null;
+  if (desktopPresent((o.procs ?? (() => listProcs(platform(o))))())) mismatched.push("host_scan_failed");
+  return unread.join(", ");
+}
 export const normalPath = (p: string) => slashes(resolve(p.trim().replace(/^"+|"+$/g, "").trim())).replace(/\/+$/, "");
 const HOST_NAME = /^[a-z0-9_]+(\.[a-z0-9_]+)*$/;
 // What the views hold, against install.json: the views whose entry differs (or "none" when
 // no view has one), and how many distinct paths they hold between them.
-export interface ManifestViews { code: "manifest_path_mismatch" | null; entries: RegEntry[]; mismatched: string[]; distinct: number }
+export interface ManifestViews { code: "manifest_path_mismatch" | null; entries: RegEntry[]; mismatched: string[]; distinct: number; unread?: string }
 export function manifestViews(o: Opts, inst: Install): ManifestViews {
   const name = readJson(inst.native_host_manifest)?.name;
   if (typeof name !== "string" || !HOST_NAME.test(name)) return { code: "manifest_path_mismatch", entries: [], mismatched: ["unreadable_manifest"], distinct: 0 };
@@ -2035,7 +2130,8 @@ export function manifestViews(o: Opts, inst: Install): ManifestViews {
   // Cain 0.19.1, review round 1: the pinned manifest itself may not name the Claude desktop app's own host program.
   const host = hostPath(inst);
   if (host && DESKTOP_APP_DIR.test(folded(host))) mismatched.push("desktop_app_host");
-  return { code: mismatched.length || distinct > 1 ? "manifest_path_mismatch" : null, entries: reg, mismatched, distinct };
+  const unread = otherHosts(o, inst, name, mismatched);
+  return { code: mismatched.length || distinct > 1 ? "manifest_path_mismatch" : null, entries: reg, mismatched, distinct, ...(unread ? { unread } : {}) };
 }
 // The Claude desktop app's install folders (its own native host lives there).
 const DESKTOP_APP_DIR = /\\windowsapps\\claude_[^\\]*\\|\\anthropicclaude\\/;
@@ -2044,7 +2140,10 @@ export const manifestCheck = (o: Opts, inst: Install): "manifest_path_mismatch" 
 const manifestDetail = (m: ManifestViews) => `the native host manifest registered for Claude in Chrome isn't the one install.json names (native_host_manifest): `
   + (m.mismatched.includes("none") ? "no registry view has an entry" : `${m.mismatched.join(", ") || "the views disagree"} differs${m.distinct > 1 ? `; ${m.distinct} distinct paths across the views` : ""}`)
   + (m.mismatched.includes("HKLM32") ? " (a WOW6432Node entry: see Troubleshooting)" : "")
-  + (m.mismatched.includes("desktop_app_host") ? " (the pinned manifest names the Claude desktop app's own host program, not Claude Code's: see Troubleshooting)" : "");
+  + (m.mismatched.includes("desktop_app_host") ? " (the pinned manifest names the Claude desktop app's own host program, not Claude Code's: see Troubleshooting)" : "")
+  + (m.mismatched.some((x) => x.startsWith("other_host:")) ? " (another native host lists Claude in Chrome's origin: see Troubleshooting)" : "")
+  + (m.mismatched.some((x) => x.startsWith("desktop_host:")) ? " (a native host runs a program in the Claude desktop app's folder: see Troubleshooting)" : "")
+  + (m.mismatched.includes("host_scan_failed") ? `; the worker couldn't read every registered native host (${m.unread ?? "a registry view"}) while the Claude desktop app is running, so it can't tell whether the app's own host answers Claude in Chrome: close the app, or fix the entry, then run check-host again` : "");
 
 // The extension's hosts left behind by a browser that has gone: their parent is gone, or
 // its PID now belongs to a process that started after them. The preflight fails on them
@@ -2184,6 +2283,23 @@ export function readConfirmed(o: Opts): Confirmed | null {
 // never starts Chrome: the dedicated one must already be open on its profile.
 // Chrome's version is read once for the whole preflight (inChromePhase, twenty-second round).
 // reuse (Cain 0.19.1): a run's preflight reuses the one reading of Chrome's version its start made for the extension notes.
+// Review round 2: the extension gate is read once more after the extension attaches (the bridge check, in next) and right
+// before the job's session is launched (run). Either reading refusing, or differing in any way from the preflight's (an
+// extension, a path, a state, a policy entry or a file changed in between), refuses as extra_extension. No preflight
+// reading in this process refuses too.
+let gateSeen: { snap: string; version: string | null; udd: string } | null = null;
+const gateSnap = (prefs: ExtensionPrefs) => JSON.stringify({ files: prefs.files, disagree: prefs.disagree, refusals: prefs.refusals, policy: prefs.policy,
+  extensions: prefs.extensions.map((x) => [x.id, x.kind, x.status, x.enabled, x.location, x.state, x.disable_reasons, x.path_kind, x.path ?? null, x.planted ?? null]) });
+export function gateAgain(o: Opts, inst: Install): Code | null {
+  const seen = gateSeen;
+  if (!seen || seen.udd !== inst.profile.user_data_dir) return "extra_extension";
+  const prefs = extensionPrefs(inst, forcelistOf(o), seen.version);
+  if (!prefs.files.length || prefs.disagree.length || gateRefuses(prefs) || gateSnap(prefs) !== seen.snap) {
+    try { appendFileSync(P.log(o), `${clock(o).toISOString()} extension_gate_changed\n`); } catch { /* never stops the refusal */ }
+    return "extra_extension";
+  }
+  return null;
+}
 export function browserPreflight(o: Opts, inst: Install, bypassConfirm = false, reuse = false): Code | null {
   return inChromePhase(() => preflightChecks(o, inst, bypassConfirm), reuse);
 }
@@ -2196,10 +2312,13 @@ function preflightChecks(o: Opts, inst: Install, bypassConfirm: boolean): Code |
   if (contained) return contained;
   // The extension's entry in the profile's preferences, and no other extension on there (a policy one counts whatever its state).
   // Cain 0.19.1: Chrome's version, this phase's one reading, for the component rule (componentShape).
-  const prefs = extensionPrefs(inst, forcelistOf(o), chromeVersionRead(o, inst)?.version ?? null);
+  const gateVersion = chromeVersionRead(o, inst)?.version ?? null;
+  const prefs = extensionPrefs(inst, forcelistOf(o), gateVersion);
+  gateSeen = null;
   if (!prefs.files.length) return "extension_entry_missing";
   if (prefs.disagree.length) return "prefs_disagree";
   if (gateRefuses(prefs)) return "extra_extension";
+  gateSeen = { snap: gateSnap(prefs), version: gateVersion, udd: inst.profile.user_data_dir };
   // An extension update unpacked but not yet running, or more than one version folder: held until a new
   // probe (versionHold); the probe itself refuses while either is seen.
   if (bypassConfirm) { if (updatePending(inst)) return "update_pending"; if (extensionFolders(inst).length > 1) return "extension_versions_ambiguous"; }
@@ -2547,7 +2666,7 @@ export async function next(o: Opts): Promise<NextOut> {
     let run: Job | null = null;
     let code: Heartbeat["code"] = "idle";
     if (candidate) {
-      const pre = browserPreflight(o, inst, false, true) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o, inst) ?? await bridgeCheck(o, inst);
+      const pre = browserPreflight(o, inst, false, true) ?? await (o.selfTest ?? hookSelfTest)(o) ?? chromeBusy(o, inst) ?? await bridgeCheck(o, inst) ?? gateAgain(o, inst);
       if (pre === "probe_stale") st.reason = inChromePhase(() => staleReason(o, inst), true);     // the preflight's own reading
       if (pre === "extension_version_unknown") st.reason = "extension_version_unknown";
       if (pre) code = pre;
@@ -4171,21 +4290,121 @@ export function isDesktopExe(exe: string): boolean {
   return (n >= 5 && segs[n - 2] === "app" && /^claude_[a-z0-9._-]+$/.test(segs[n - 3]) && segs[n - 4] === "windowsapps")
     || (n >= 4 && /^app-\d+(\.\d+)*$/.test(segs[n - 2]) && segs[n - 3] === "anthropicclaude");
 }
-export function isDesktopShell(p: Proc): boolean {
-  if (!p.cmd.trim() || hasCliEntry(p.cmd) || NATIVE_HOST.test(p.cmd)) return false;
+// Review round 2: location is not identity. The AnthropicClaude\app-<version> folder is under the owner's own profile, so a
+// copy of the native Claude Code binary (also claude.exe) could sit there. A claude.exe is the desktop shell only when, beside
+// the folder match and the match with the executable path Windows lists (which must be listed, and written on disk case for
+// case: casedOnDisk), the file itself is the Electron shell (desktopIdentity): resources\app.asar beside it, its version
+// info's ProductName and OriginalFilename the desktop app's (DESKTOP_VERSION_INFO), and its Authenticode signature valid with
+// a signer subject naming Anthropic. The file is read through PowerShell (readExeIdentity), once per process image per
+// listing (identityMemo, by path); a reader that fails, or any field that differs, refuses. Off Windows there is no reader:
+// nothing is exempt.
+export interface ExeIdentity { asar: boolean; product: string; original: string; signer: string; status: string; cased: boolean }
+export type IdentityReader = (exe: string) => ExeIdentity | null;
+// The Claude desktop app's own claude.exe, as its version info names it (Electron's packager writes the app's product name
+// and its executable's file name). Anything else, the native Claude Code CLI's values included, refuses.
+export const DESKTOP_VERSION_INFO = { product: "Claude", original: "claude.exe" } as const;
+const ANTHROPIC_SIGNER = /(?:^|,\s*)(?:CN|O)=("?)Anthropic(?:,? PBC)?\1\s*(?:,|$)/i;
+// Whether each segment of an absolute Windows path is written exactly as its directory lists it (the drive letter as the
+// listed executable path gives it). A segment that isn't listed, or a folder that can't be listed, is false.
+export function casedOnDisk(path: string, list: (dir: string) => string[] | null): boolean {
+  if (!/^[A-Za-z]:\\/.test(path) || oddForm(path)) return false;
+  const segs = path.split("\\");
+  if (segs.slice(1).some((x) => !x || x === "." || x === "..")) return false;
+  for (let i = 1; i < segs.length; i++) {
+    const dir = i === 1 ? `${segs[0]}\\` : segs.slice(0, i).join("\\");
+    const names = list(dir);
+    if (!names || !names.includes(segs[i])) return false;
+  }
+  return true;
+}
+const IDENTITY_PS = "$p = $env:PCW_IDENT_EXE; $v = (Get-Item -LiteralPath $p -ErrorAction Stop).VersionInfo; $s = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop; "
+  + "[pscustomobject]@{ product = [string]$v.ProductName; original = [string]$v.OriginalFilename; signer = [string]$s.SignerCertificate.Subject; status = [string]$s.Status } | ConvertTo-Json -Compress";
+export function readExeIdentity(exe: string, plat = process.platform): ExeIdentity | null {
+  if (plat !== "win32" || !exe) return null;
+  try {
+    const out = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", IDENTITY_PS],
+      { encoding: "utf8", env: { ...process.env, PCW_IDENT_EXE: exe }, stdio: ["ignore", "pipe", "ignore"], timeout: 30_000, windowsHide: true });
+    const j = JSON.parse(out.trim());
+    if (!j || typeof j !== "object" || ["product", "original", "signer", "status"].some((k) => typeof j[k] !== "string")) return null;
+    const asar = lstatSync(pathWin32.join(pathWin32.dirname(exe), "resources", "app.asar"), { throwIfNoEntry: false })?.isFile() === true;
+    const cased = casedOnDisk(exe, (d) => { try { return readdirSync(d); } catch { return null; } });
+    return { asar, product: j.product, original: j.original, signer: j.signer, status: j.status, cased };
+  } catch { return null; }
+}
+// One reading per image path for one listing.
+export function identityMemo(reader: IdentityReader): IdentityReader {
+  const seen = new Map<string, ExeIdentity | null>();
+  return (exe) => {
+    const k = normExe(exe);
+    if (!seen.has(k)) { let v: ExeIdentity | null = null; try { v = reader(exe); } catch { v = null; } seen.set(k, v); }
+    return seen.get(k)!;
+  };
+}
+export function desktopIdentity(x: ExeIdentity | null): boolean {
+  return !!x && x.asar === true && x.cased === true && x.product === DESKTOP_VERSION_INFO.product && x.original.toLowerCase() === DESKTOP_VERSION_INFO.original
+    && x.status === "Valid" && ANTHROPIC_SIGNER.test(x.signer);
+}
+// A --type child has a complete known shape (review round 2): a known type, given once; every other argument one of Electron's
+// and Chromium's own process switches (ELECTRON_SWITCHES, by name, a value allowed); --app-path, when given, exactly the
+// app.asar beside the executable; and for a utility child exactly one --utility-sub-type, one of the services that run no
+// script (UTILITY_SAFE). node.mojom.NodeService (Electron's utilityProcess, which runs a script), a missing or unknown
+// sub-type, a positional argument (a packaged entry point), any other switch, or any CLI marker refuses.
+export const ELECTRON_SWITCHES: readonly string[] = [
+  "--type", "--user-data-dir", "--app-path", "--lang", "--locale", "--gpu-preferences", "--field-trial-handle", "--mojo-platform-channel-handle",
+  "--variations-seed-version", "--enable-features", "--disable-features", "--force-fieldtrials", "--service-sandbox-type", "--utility-sub-type",
+  "--video-capture-use-gpu-memory-buffer", "--enable-crash-reporter", "--device-scale-factor", "--num-raster-threads",
+  "--enable-main-frame-before-activation", "--renderer-client-id", "--time-ticks-at-unix-epoch", "--launch-time-ticks", "--first-renderer-process",
+  "--standard-schemes", "--secure-schemes", "--bypasscsp-schemes", "--cors-schemes", "--fetch-schemes", "--service-worker-schemes",
+  "--streaming-schemes", "--code-cache-schemes", "--app-user-model-id", "--context-isolation", "--background-color", "--enable-sandbox",
+  "--metrics-client-id", "--crashpad-handler-pid", "--database", "--url", "--annotation", "--initial-client-data", "--monitor-self-annotation",
+  "--no-rate-limit", "--no-upload-gzip", "--shared-files", "--metrics-shmem-handle", "--pseudonymization-salt-handle",
+  "--trace-process-track-uuid", "--message-loop-type-ui", "--disable-gpu-compositing", "--use-angle", "--use-gl", "--gpu-vendor-id",
+  "--gpu-device-id", "--gpu-sub-system-id", "--gpu-revision", "--gpu-driver-version", "--disable-gpu-sandbox", "--no-pre-read-main-dll",
+  "--enable-dinosaur-easter-egg-alt-images", "--disable-databases", "--ignored", "--prefetch", "--subproc-heap-profiling",
+  "--enable-chrome-runtime", "--webview-tag", "--disable-blink-features", "--enable-blink-features", "--disable-electron-site-instance-overrides",
+  "--enable-node-leakage-in-renderers", "--extension-process", "--renderer-process-limit",
+];
+export const UTILITY_SAFE: readonly string[] = [
+  "network.mojom.NetworkService", "storage.mojom.StorageService", "audio.mojom.AudioService", "video_capture.mojom.VideoCaptureService",
+  "data_decoder.mojom.DataDecoderService", "tracing.mojom.TracingService", "proxy_resolver.mojom.ProxyResolverFactory", "chrome.mojom.UtilWin",
+  "device.mojom.XRDeviceService", "media.mojom.CdmServiceBroker", "media.mojom.MediaFoundationServiceBroker", "printing.mojom.PrintCompositor",
+  "shape_detection.mojom.ShapeDetectionService", "screen_ai.mojom.ScreenAIServiceFactory", "on_device_model.mojom.OnDeviceModelService",
+  "patch.mojom.FilePatcher", "unzip.mojom.Unzipper", "quarantine.mojom.Quarantine", "sharing.mojom.Sharing",
+];
+const switchName = (w: string) => w.split("=")[0].toLowerCase();
+const switchValue = (w: string) => { const i = w.indexOf("="); return i < 0 ? null : w.slice(i + 1).replace(/^"|"$/g, ""); };
+export function childShape(words: string[], exe: string): boolean {
+  const types = words.filter((w) => switchName(w) === "--type");
+  if (types.length !== 1) return false;
+  const type = switchValue(types[0]);
+  if (!type || !DESKTOP_TYPES.includes(type)) return false;
+  for (const w of words) {
+    if (!w.startsWith("--") || w.includes('"') && !/^--[a-z0-9-]+="[^"]*"$/i.test(w)) return false;
+    if (!ELECTRON_SWITCHES.includes(switchName(w))) return false;
+  }
+  for (const w of words.filter((x) => switchName(x) === "--app-path"))
+    if (normExe(switchValue(w) ?? "") !== normExe(`${pathWin32.dirname(exe)}\\resources\\app.asar`)) return false;
+  const subs = words.filter((w) => switchName(w) === "--utility-sub-type");
+  if (type === "utility") return subs.length === 1 && UTILITY_SAFE.includes(switchValue(subs[0]) ?? "");
+  return subs.length === 0;
+}
+export function isDesktopShell(p: Proc, ident: IdentityReader = readExeIdentity): boolean {
+  if (!p.cmd.trim() || hasCliEntry(p.cmd) || NATIVE_HOST.test(p.cmd) || CLI_MARKER.test(p.cmd)) return false;
   const c = splitCmd(p.cmd);
   if (!c || !isDesktopExe(c.exe)) return false;
-  if (p.exe && normExe(p.exe) !== normExe(c.exe)) return false;
+  // The executable Windows lists for it: present, the same file as the command line names, and itself the app's path.
+  if (!p.exe || normExe(p.exe) !== normExe(c.exe) || !isDesktopExe(p.exe)) return false;
   const words = argWords(c.rest);
-  if (!words.length) return !c.rest.trim();
-  const types = words.filter((w) => /^--type=/i.test(w));
-  return types.length > 0 && types.every((w) => DESKTOP_TYPES.includes(w.slice("--type=".length)));
+  if (words.length ? !childShape(words, p.exe) : c.rest.trim() !== "") return false;
+  try { return desktopIdentity(ident(p.exe)); } catch { return false; }
 }
+// Claude Code's own command-line switches, any of which marks a CLI run whatever the executable.
+const CLI_MARKER = /(?:^|\s)(?:-p|--print|--output-format|--input-format|--resume|--continue|--chrome-native-host|--mcp-config|--permission-mode|--dangerously-skip-permissions|mcp\s+serve)(?:[\s=]|$)/i;
 const procName = (p: Proc): string => {
   const n = (p.name ?? "").trim() || (p.exe ?? "").trim() || (splitCmd(p.cmd)?.exe ?? "");
   return (n.split(/[\\/]/).pop() ?? "").toLowerCase();
 };
-export function isClaudeCode(p: Proc, pinned?: string): boolean {
+export function isClaudeCode(p: Proc, pinned?: string, ident: IdentityReader = readExeIdentity): boolean {
   if (p.pid === process.pid) return false;
   const name = procName(p);
   if (!p.cmd.trim()) return RUNTIME_NAMES.includes(name) || RUNTIME_NAMES.includes(`${name}.exe`);
@@ -4193,17 +4412,20 @@ export function isClaudeCode(p: Proc, pinned?: string): boolean {
   const exe = splitCmd(p.cmd)?.exe ?? null;
   if (pinned && ((exe && normExe(exe) === normExe(pinned)) || (p.exe && normExe(p.exe) === normExe(pinned)))) return true;
   if (hasCliEntry(p.cmd)) return true;
-  if (isDesktopShell(p)) return false;
+  if (isDesktopShell(p, ident)) return false;
   return CLAUDE_PROC.test(p.cmd) || name === "claude.exe";
 }
-export const claudeSessions = (ps: Proc[], pinned?: string) => ps.filter((p) => isClaudeCode(p, pinned));
+export const claudeSessions = (ps: Proc[], pinned?: string, ident: IdentityReader = readExeIdentity) => {
+  const once = identityMemo(ident);
+  return ps.filter((p) => isClaudeCode(p, pinned, once));
+};
 export const nativeHosts = (ps: Proc[]) => ps.filter((p) => p.pid !== process.pid && NATIVE_HOST.test(p.cmd) && /claude/i.test(p.cmd));
 
 // The one plain line a launcher run prints when another Claude Code blocks it (Cain 0.19.1): what to close, by kind,
 // never a path or a process id. A list that can't be read says so.
-export function busyLine(ps: Proc[] | null, pinned?: string): string {
+export function busyLine(ps: Proc[] | null, pinned?: string, ident: IdentityReader = readExeIdentity): string {
   if (!ps) return "Stopped: the PC's process list couldn't be read. Close Claude Code wherever it is open, then press a key to try again.";
-  const found = claudeSessions(ps, pinned);
+  const found = claudeSessions(ps, pinned, ident);
   // Review round 1: one whose command line couldn't be read could be either.
   const APP = /[\\/](?:WindowsApps[\\/]Claude_|AnthropicClaude[\\/]|Claude[\\/]claude-code[\\/])/i;
   const where = (p: Proc) => `${p.exe ?? ""} ${p.cmd}`;
@@ -4222,8 +4444,19 @@ export function busyLine(ps: Proc[] | null, pinned?: string): string {
 export const LAUNCHER_NAME = "Cain PC jobs.cmd";
 const CMD_SAFE = /^[\x20-\x7e]+$/;
 const CMD_SPECIAL = /["%!^&|<>]/;
-export function launcherText(bun: string, worker: string, home: string): string {
-  for (const x of [bun, worker, home]) if (typeof x !== "string" || !CMD_SAFE.test(x) || CMD_SPECIAL.test(x) || x !== x.trim())
+// Review round 2: no command is found through PATH or the current folder. cmd's own built-ins (echo, cd, title, setlocal,
+// goto, if, rem, pause) need none; choice is a program, so it is named by its absolute path under the system root, read when
+// the launcher is written (choice: launcherChoice). No %...% expansion, no set /p: the only input is choice's key.
+export const LAUNCHER_BUILTINS: readonly string[] = ["@echo", "echo", "echo.", "rem", "setlocal", "title", "cd", "if", "goto", "pause"];
+export function launcherChoice(env: Record<string, string | undefined>): string {
+  const root = env.SystemRoot ?? env.SYSTEMROOT ?? env.windir ?? "C:\\Windows";
+  return pathWin32.join(root, "System32", "choice.exe");
+}
+export function launcherText(bun: string, worker: string, home: string, choice = "C:\\Windows\\System32\\choice.exe"): string {
+  if (!pathWin32.isAbsolute(choice) || !/^[A-Za-z]:\\/.test(choice) || !/\\choice\.exe$/i.test(choice)) throw new WorkerError("untrusted_config", "the launcher's choice.exe must be an absolute path under the system root");
+  for (const x of [bun, worker, home]) if (typeof x !== "string" || !(/^[A-Za-z]:\\/.test(x) || (process.platform !== "win32" && x.startsWith("/"))))
+    throw new WorkerError("untrusted_config", "a path for the launcher (Bun, worker.ts or the worker folder) isn't absolute");
+  for (const x of [bun, worker, home, choice]) if (typeof x !== "string" || !CMD_SAFE.test(x) || CMD_SPECIAL.test(x) || x !== x.trim())
     throw new WorkerError("untrusted_config", "a path for the launcher (Bun, worker.ts or the worker folder) holds a character cmd.exe would not read as plain text, or one outside plain ASCII: move it to a folder whose path is plain ASCII letters, digits and spaces");
   const call = (cmd: string) => `"${bun}" "${worker}" ${cmd} --attended --launcher --home "${home}"`;
   return [
@@ -4239,7 +4472,7 @@ export function launcherText(bun: string, worker: string, home: string): string 
     "echo   2  Run the probe (setup step 11)",
     "echo   3  Run the queued jobs, while you watch",
     "echo   Q  Quit",
-    'choice /c 123Q /n /m "Press 1, 2, 3 or Q: "',
+    `"${choice}" /c 123Q /n /m "Press 1, 2, 3 or Q: "`,
     "if errorlevel 4 goto :eof",
     "if errorlevel 3 goto run",
     "if errorlevel 2 goto probe",
@@ -4262,20 +4495,21 @@ export function writeLauncher(o: Opts, desktop?: string): { written: string } {
   const dir = desktop ?? join(env.USERPROFILE ?? homedir(), "Desktop");
   if (!existsSync(dir)) throw new WorkerError("untrusted_config", `no desktop folder at ${dir}: pass --desktop <folder>`);
   const file = join(dir, LAUNCHER_NAME);
-  writeFileSync(file, launcherText(process.execPath, WORKER_FILE, o.home));
+  writeFileSync(file, launcherText(process.execPath, WORKER_FILE, o.home, launcherChoice(env)));
   return { written: file };
 }
 // What a launcher run prints after the worker's answer: one plain line for a refusal, nothing when it went through.
 export function launcherLine(code: string | null, o: Opts, inst?: Install | null): string | null {
   if (!code || code === "ok" || code === "idle") return null;
-  if (code === "chrome_busy") return busyLine((o.procs ?? (() => listProcs(platform(o))))(), inst?.claude);
+  if (code === "chrome_busy") return busyLine((o.procs ?? (() => listProcs(platform(o))))(), inst?.claude, identOf(o));
   // Review round 1: one plain line, the code alone: no table, no path, no process id.
   const c = /^[a-z][a-z0-9_]{0,63}$/.test(code) ? code : "worker_failed";
   return `Stopped: ${c}. Tell Cain: refusal ${c}.`;
 }
+const identOf = (o: Opts): IdentityReader => o.exeIdentity ?? ((exe) => readExeIdentity(exe, platform(o)));
 export function chromeBusy(o: Opts, inst?: Install): Code | null {
   const ps = (o.procs ?? (() => listProcs(platform(o))))();
-  return !ps || claudeSessions(ps, inst?.claude).length ? "chrome_busy" : null;
+  return !ps || claudeSessions(ps, inst?.claude, identOf(o)).length ? "chrome_busy" : null;
 }
 
 // The bridge check: a short session that calls tabs_context_mcp, opens a page the worker
@@ -5584,6 +5818,9 @@ export async function run(o: Opts): Promise<RunOut> {
     const limit = Math.min(c.inst.session_minutes * 60_000, MAX_SESSION_MS);
     const leftovers = readLeftovers(o);
     const conf = readConfirmed(o);
+    // Review round 2: the extension gate once more, right before the session starts.
+    const late = gateAgain(o, c.inst);
+    if (late) throw new WorkerError(late, "the extension gate changed between the preflight and the session's start: run check-host");
     const { s, stream, expected, log, canaryUrl, checks } = await session(o, c.inst, h, c.job, limit, leftovers, !!conf?.read_context, pinFor(c.job, c.allow));
     const v = verdict(s, stream, log, tools, h.settings.permissions.deny, canaryUrl, pinFor(c.job, c.allow), leftovers,
       { ...checks, contextAfterRead: !!conf?.read_context, needLive: !o.attended, confirmedExtension: conf?.fingerprint.extension_version ?? null });
@@ -5631,7 +5868,7 @@ export async function run(o: Opts): Promise<RunOut> {
     // The session's own folders failed it (its transcripts couldn't be deleted, or the
     // worker's sign-in went missing): the job fails with that code, loudly, and the
     // heartbeat says so. No session output is judged or kept.
-    if (!(e instanceof WorkerError) || !SESSION_FAILURES.includes(e.code)) throw e;
+    if (!(e instanceof WorkerError) || !(SESSION_FAILURES.includes(e.code) || e.code === "extra_extension")) throw e;
     const code = e.code as Code, now = clock(o), mine = stillOurs(o, c, now);
     if (mine && mine !== "cancelled") {
       close(o, mine, result(mine, "failed", code, now, { tools: allowedTools(sessionHashes(o)?.settings) ?? [], attended: !!o.attended }));

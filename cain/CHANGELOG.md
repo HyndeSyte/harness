@@ -11,6 +11,12 @@
 - Chrome's own parts with their folders gone are accepted only by their exact folder name, under an older Chrome version than the one running, and never when a folder of that name turns up under another version.
 - When something other than a busy Claude stops the launcher, it says one line: "Stopped: <code>. Tell Cain: refusal <code>."
 - The launcher is only written when its folders have plain names, and it quotes each one.
+- The Claude app counts as the Claude app only when the file itself is: its app files beside it, its own name in its file details, and Anthropic's valid signature. A copy of Claude Code put in the app's folder stops setup and runs, and so does any app helper process the worker doesn't recognise, the one that runs scripts included.
+- A second Claude in Chrome helper registered under any other name, or one that runs from the Claude app's folder, now stops check-host, bind-profile and the probe. If the worker can't read every registered helper while the Claude app is open, it stops and says which one.
+- Chrome's own parts: a folder planted under the Chrome version that is running, a linked folder, or a folder name in other letter case now stops setup. A folder Chrome left behind is named as a leftover.
+- The extension check runs once more after Claude in Chrome connects and again just before a job starts, and stops the run if anything changed.
+- The launcher starts Windows' key prompt by its full path, so nothing of the same name elsewhere can run in its place.
+- The setup steps add a one-time check that Chrome ignores a planted copy of one of its parts.
 - The PC needs a new probe and confirmation after this update, as after every new PC worker.
 
 ## 0.19.0
