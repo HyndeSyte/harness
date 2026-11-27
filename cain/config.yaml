@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.19.0"
+version: "0.20.0"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -75,6 +75,9 @@ timeout: 30
 # least 16 characters). The probe gives the keeper its verdict on an install of Cain with it, and the
 # link reads whether the keeper's way back from a bad install is armed. Read only by the run script's link and
 # probe subshells, never by Cain's session, never logged. Empty: no verdicts, and never armed.
+# review_github_token (0.20.0): the review runner's own GitHub token, read-only on HyndeSyte/harness (a fine-grained
+# token with Contents and Pull requests read), for the cut check's fetch of a pull request's head and its
+# description. Empty: both go without a token (review.sh health says whether the fetch works).
 # keeper_accept_min (0.19.0, Keeper 0.1.15): how long the link waits, outside the hook's 10 seconds, for Keeper's
 # "accepted" (its backup made and checked) before it gives up on a Ship run: 1 to 15 minutes, default 5.
 # notice_hook: the id of the Home Assistant webhook the App's alarms go to (DOCS.md,
@@ -100,6 +103,7 @@ options:
   keeper_url: "http://0fcc2575-keeper:8097"
   keeper_token: ""
   keeper_accept_min: 5
+  review_github_token: ""
 schema:
   github_token: password?
   gemini_api_key: password?
@@ -121,3 +125,4 @@ schema:
   keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?
   keeper_token: password?
   keeper_accept_min: int(1,15)?
+  review_github_token: password?

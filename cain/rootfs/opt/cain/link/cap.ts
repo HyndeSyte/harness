@@ -1,44 +1,28 @@
 // The review-round cap at the link (Cain 0.16.0; the runner keeps the count, ../review/rounds.ts).
-//   - The owner's one decision card when the cap's last round left a serious finding: only the
-//     review runner asks for it (root's socket, POST /decision), and the link writes its words here.
-//     Its options are fixed, the recommendation first: "Hold it", then "Ship it with that risk".
-//   - Cain can't post that card another way: his ask is refused when it offers the decision's options,
-//     or names a review round past the cap (a round number above it, or another round for a change
-//     already at the cap), the way a Reviewed line not from the service is refused.
-//   - His tap on it is kept by the link (/data/link/review-decisions.json) and relayed like any tap.
-//     Round 2: kept durably first (temp file in the same folder, fsync, rename, folder fsync), and only
-//     then is the card marked used; a write that fails leaves the card tappable. A decisions file that
-//     doesn't parse is never overwritten: it's moved aside under a timestamped name, no new tap is
-//     written while a moved-aside file stands, and the App's alarm names it.
-//     Round 3: the alarm names the copy and the step back (asideStep: remove or rename it as root;
-//     writes resume once it's gone, the next sweep clears the alarm); the record as kept is returned
-//     and drives the card, the relay and the hold line; a failed write removes its temp file, and stale
-//     temp files are swept at the link's start; the guard's log is capped in size and rotated root-side.
-//   - A Ship card for a pull request at the cap with its decision open or "Hold it" is refused; with
-//     "Ship it with that risk", only while the App's rollback of a bad install is armed for every App
-//     it installs, read from the keeper App (GET /armed with Cain's token, 0.19.0: keeperArmed below),
-//     never from Cain.
-//   - 0.18.0: extra rounds granted by his tap (../review/grants.ts) raise a change's cap. The newest
-//     decision counts; a granted round after it that left nothing serious clears the way (the Ship card
-//     needs nothing more from the cap), one still running or that left something serious with rounds
-//     still to go refuses the card until it settles, and one at the raised cap that left something serious
-//     owes a new decision card. A grant never lifts the armed-rollback condition on ship-with-risk.
-import { closeSync, fchmodSync, fchownSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { countedRounds, decisionOf, readRounds, type DecisionRec, type Rounds } from "../review/rounds.ts";
-import { effectiveCap, readGrants, type Grants } from "../review/grants.ts";
+// Cain 0.20.0, the owner's review rule (R-013): three rounds a piece, never more; no card offers more rounds
+// or a ship with a risk named. The grants of extra rounds, the review service's decision card at the cap and
+// the ship-with-risk path (with its armed-rollback condition) are retired.
+//   - A Ship card for a pull request at its cap goes only when the change's last round left nothing serious
+//     (by the rule's count, review/core.ts seriousLeft), or when the change's one cut check passed: then only
+//     for exactly the cut head it checked, naming that check as its review. Otherwise the piece is held by the
+//     rule, and the card is refused with a plain line saying so.
+//   - Cain can't put a question about rounds, risk or cuts to the owner: his ask is refused when it offers
+//     "Ship it with that risk", names a review round past the cap (a round number above it, or another round for
+//     a change already at the cap), or asks about more rounds, a risk or a cut (asksAboutCap).
+//   - The guard's log stays capped in size and rotated root-side (appendCapped).
+//   - The keeper's armed read (keeperArmed, armedFor) stays for the keeper's own checks; no Ship card reads it.
+import { closeSync, fchmodSync, fchownSync, openSync, readFileSync, renameSync, statSync } from "node:fs";
+import { dirname } from "node:path";
+import { countedRounds, cutOf, decisionOf, heldOf, lastRound, readRounds, type Rounds } from "../review/rounds.ts";
 import { CAIN_GID, capPaths, ROOT_UID } from "../capfiles.ts";
 import { appendSynced, syncFolder } from "./auth.ts";
 
-export const HOLD = "Hold it";
+// The retired decision card's riskier option (0.16.0 to 0.19.0): an ask offering it is refused.
 export const RISK = "Ship it with that risk";
-export const DECISION_OPTIONS = [HOLD, RISK] as const;
 // Constants (../capfiles.ts); an environment override only in test mode.
 const P = capPaths();
 export const ROUNDS_FILE = P.rounds;
 export const SETTINGS_FILE = P.settings;
-export const DECISIONS_FILE = P.decisions;
-export const GRANTS_FILE = P.grants;
 export const GUARD_LOG = P.guardLog;
 
 const WORDS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
@@ -49,38 +33,13 @@ const clean = (s: string, max: number) => {
   return t;
 };
 
-// The card's words: what the piece is (the brief's own topic), what the serious finding is (one line),
-// the question, and the recommendation first. Round 2: a final round that never produced a result (lost)
-// says so instead of a finding; with the rollback not armed, one sentence up front says a Ship would be
-// refused until a release arms it, so holding it is the working choice. No counts (the card gate's
-// count rule): more than one serious finding is said in words.
-export const UNARMED_LINE = "The App's rollback isn't armed yet, so shipping it with the risk would be refused until a release arms it, and holding it is the working choice.";
-export const FALLBACK_LINE = "A serious finding remains; see the item";
-export function decisionText(d: Pick<DecisionRec, "topic" | "finding" | "round" | "serious"> & { lost?: boolean; unarmed?: boolean }): string {
-  const n = d.round >= 0 && d.round < ORDINALS.length ? ORDINALS[d.round] : `round ${d.round}`;
-  const lead = d.unarmed ? `${UNARMED_LINE} ` : "";
-  const ask = "No more review rounds are allowed for it. Ship it with that risk, or hold it? I recommend holding it until it's fixed.";
-  if (d.lost) return `${lead}${clean(d.topic, 120)}: the ${n} and last outside review did not complete, so nothing it would have found is known. ${ask}`;
-  const more = d.serious > 1 ? " (it was not the only one)" : "";
-  return `${lead}${clean(d.topic, 120)}: the ${n} and last outside review still found something serious${more}: ${clean(d.finding, 160).replace(/[.\s]+$/, "")}. ${ask}`;
-}
-// The card's words when its full text fails the card gate: a fixed line and the brief's topic.
-export function fallbackText(topic: string | null, unarmed = false): string {
-  return `${unarmed ? `${UNARMED_LINE} ` : ""}${FALLBACK_LINE}${topic ? `: ${clean(topic, 120).replace(/[.\s]+$/, "")}.` : "."} Ship it with that risk, or hold it? I recommend holding it until it's fixed.`;
-}
-// The question as Cain's relayed tap line quotes it: the topic only, never the seats' words.
-export function decisionSummary(d: Pick<DecisionRec, "topic">): string {
-  return `Ship ${clean(d.topic, 120)} with the serious finding its last review round left, or hold it?`;
-}
-
 export function roundCapNow(path = SETTINGS_FILE): number {
   try { const j = JSON.parse(readFileSync(path, "utf8")); if (Number.isInteger(j?.round_cap) && j.round_cap >= 1) return j.round_cap; } catch { /* default */ }
   return 3;
 }
 
 // Whether Cain's ask names a review round past the cap: refused at the link (Link.ask).
-// grants (0.18.0): the owner's grants, so a change with granted rounds left isn't counted as at its cap.
-export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | null, grants: Grants | null = null): string | null {
+export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | null): string | null {
   const t = String(text ?? "").toLowerCase();
   const past = (n: number) => Number.isFinite(n) && n > cap;
   for (const m of t.matchAll(/\bround\s*(?:#|no\.?|number)?\s*(\d{1,3})\b/g)) if (past(Number(m[1]))) return `round ${m[1]}`;
@@ -92,7 +51,7 @@ export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | nu
   // Another round for a change already at the cap, named by its pull request or change key.
   if (rounds && /\b(round|re-?review|review again|another review|more review)/.test(t)) {
     for (const key of Object.keys(rounds.changes)) {
-      if (countedRounds(rounds, key).length < effectiveCap(cap, rounds, grants, key)) continue;
+      if (countedRounds(rounds, key).length < cap) continue;
       const pr = /^pr-(\d+)$/.exec(key);
       const named = pr ? new RegExp(`(/pull/${pr[1]}\\b|pull request #?${pr[1]}\\b|\\bpr #?${pr[1]}\\b|#${pr[1]}\\b)`).test(t) : t.includes(key);
       if (named) return `another round for ${key}, which has had ${countedRounds(rounds, key).length}`;
@@ -101,87 +60,9 @@ export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | nu
   return null;
 }
 
-export type Decided = Record<string, { choice: string; at: number }>;
-// A moved-aside copy beside the file: "<name>.corrupt-<time>".
-export function asideOf(path: string): string[] {
-  try { return readdirSync(dirname(path)).filter((n) => n.startsWith(`${basename(path)}.corrupt-`)).map((n) => join(dirname(path), n)); }
-  catch { return []; }
-}
-const parseDecided = (text: string): Decided | null => {
-  try { const j = JSON.parse(text); return j && typeof j === "object" && !Array.isArray(j) ? j : null; } catch { return null; }
-};
-// His taps; {} when there's no file yet; null when it can't be read, doesn't parse, or a copy that
-// didn't parse was moved aside (until that's settled no tap counts: the Ship card fails closed).
-export function readDecided(path: string): Decided | null {
-  if (asideOf(path).length) return null;
-  let text: string;
-  try { text = readFileSync(path, "utf8"); } catch (e: any) { return e?.code === "ENOENT" ? {} : null; }
-  return parseDecided(text);
-}
-
-// The way back once a moved-aside copy stands (round 3): the step that turns decision writes back on.
-// It names the copy; once it's gone (removed, or renamed so its name no longer starts with the
-// decisions file's name and ".corrupt-"), the next tap is kept and the link's next sweep clears the alarm.
-export function asideStep(aside: string): string {
-  return `${aside}: remove it or rename it as root; answers are kept again once it is gone, and the link's next sweep clears the alarm`;
-}
-
-// The temp files a tap's write leaves only when the link died mid-write (round 3): swept at the link's
-// start. Only the decisions file's own temp names (".<name>.<pid>.tmp") in its folder.
-export function tempOf(path: string, pid = process.pid): string { return join(dirname(path), `.${basename(path)}.${pid}.tmp`); }
-export function sweepTemps(path: string, log: (m: string) => void = () => {}): number {
-  const re = new RegExp(`^\\.${basename(path).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.tmp$`);
-  let n = 0;
-  let names: string[] = [];
-  try { names = readdirSync(dirname(path)); } catch { return 0; }
-  for (const name of names) {
-    if (!re.test(name)) continue;
-    try { unlinkSync(join(dirname(path), name)); n++; } catch (e) { log(`couldn't remove a stale temp file ${name}: ${String(e).slice(0, 60)}`); }
-  }
-  if (n) log(`removed ${n} stale temp file${n === 1 ? "" : "s"} of ${basename(path)}`);
-  return n;
-}
-
-export class DecisionsUnsaved extends Error {}
-// His tap, kept durably before the card is marked used (Link.onQuestion). The same decision tapped
-// again keeps its first answer (a retry records it once). Throws DecisionsUnsaved when it couldn't be
-// kept; a file that doesn't parse is moved aside (never overwritten), and onCorrupt hears its new name.
-// Round 3: it returns the record as kept, with existed when one was there before this tap: the caller
-// uses that choice, never the label just tapped. A write that fails removes its temp file.
-export type Kept = { choice: string; at: number; existed: boolean };
-export function recordDecision(path: string, id: string, choice: string, at: number,
-    o: { onCorrupt?: (aside: string) => void; sync?: (dir: string) => void; now?: () => number; rename?: (from: string, to: string) => void } = {}): Kept {
-  const aside = asideOf(path);
-  if (aside.length) throw new DecisionsUnsaved(`his decisions file was moved aside and isn't settled yet (${asideStep(aside[0])})`);
-  let text: string | null = null;
-  try { text = readFileSync(path, "utf8"); }
-  catch (e: any) { if (e?.code !== "ENOENT") throw new DecisionsUnsaved(`his decisions file can't be read (${String(e?.code ?? e).slice(0, 40)})`); }
-  let all: Decided = {};
-  if (text !== null) {
-    const j = parseDecided(text);
-    if (!j) {
-      const to = `${path}.corrupt-${new Date((o.now ?? Date.now)()).toISOString().replace(/[-:.]/g, "")}`;
-      try { renameSync(path, to); } catch (e) { throw new DecisionsUnsaved(`his decisions file doesn't parse, and couldn't be moved aside (${String(e).slice(0, 60)})`); }
-      try { o.onCorrupt?.(to); } catch { /* the refusal stands */ }
-      throw new DecisionsUnsaved(`his decisions file didn't parse, so it was moved aside to ${to}`);
-    }
-    all = j;
-  }
-  const had = all[id];
-  if (had && typeof had.choice === "string") return { choice: had.choice, at: Number(had.at), existed: true };
-  all[id] = { choice, at };
-  const tmp = tempOf(path);
-  try {
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeSync(fd, JSON.stringify(all, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-    (o.rename ?? renameSync)(tmp, path);
-    (o.sync ?? syncFolder)(dirname(path));
-  } catch (e) {
-    try { unlinkSync(tmp); } catch { /* gone already, or renamed into place */ }
-    throw new DecisionsUnsaved(`his decision couldn't be written (${String(e).slice(0, 80)})`);
-  }
-  return { choice, at, existed: false };
-}
+// Whether Cain's ask puts a question about review rounds, a risk or a cut to the owner (0.20.0): in the message
+// gate's rules since round 1 of fixes (../gate/cain.ts), so his replies and edits are held by the same check.
+export { asksAboutCap } from "../gate/cain.ts";
 
 // The guard's log, bounded (round 3): one line appended, root-side. When the line would take the file
 // past max, the file is first rotated (renamed to "<log>.1", replacing the previous one, so one previous
@@ -204,8 +85,7 @@ export function appendCapped(path: string, line: string, o: { max?: number; sync
   appendSynced(path, line, sync);
   return rotated;
 }
-// Whether the guard's log (or its one previous file) already has a line with this tag and what: his
-// risk tap's hold is written once, even when a tap is retried after a crash (round 3).
+// Whether the guard's log (or its one previous file) already has a line with this tag and what (round 3).
 export function holdLogged(path: string, tag: string, what: string): boolean {
   for (const f of [path, `${path}.1`]) {
     let text = "";
@@ -216,13 +96,16 @@ export function holdLogged(path: string, tag: string, what: string): boolean {
 }
 
 export type CapState =
-  | { state: "none" }
+  | { state: "none" }                                                  // not at its cap: the normal card
+  | { state: "clean"; key: string; id: string; head: string }          // at its cap, nothing serious left: only the head its last round reviewed (round 1 fixes)
   | { state: "unknown"; why: string }
-  | { state: "waiting" | "hold" | "risk"; key: string; decision: DecisionRec }
-  | { state: "pending"; key: string; decision: DecisionRec; why: string };   // 0.18.0: a granted round after it hasn't settled clean
+  | { state: "waiting"; key: string; why: string }                     // its last round or its cut check is still running
+  | { state: "held"; key: string; why: string }                        // held by the rule: no Ship card
+  | { state: "cut"; key: string; id: string; head: string; seat: string };   // its cut check passed: only that head, naming it
 
-// Where a pull request stands at the cap: its change group's decision, if any, and his tap on it.
-export function capStateFor(pr: string, rounds: Rounds | null, decided: Decided | null): CapState {
+// Where a pull request stands at the cap (0.20.0), from the runner's own record only (never Cain's words):
+// at its cap, its change group's last round and its one cut check decide.
+export function capStateFor(pr: string, rounds: Rounds | null, cap = 3): CapState {
   const m = /\/pull\/(\d+)$/.exec(pr);
   if (!m) return { state: "none" };
   if (!rounds) return { state: "unknown", why: "the review rounds file can't be read" };
@@ -231,27 +114,33 @@ export function capStateFor(pr: string, rounds: Rounds | null, decided: Decided 
   const keys = new Set<string>([key]);
   for (const [k, c] of Object.entries(rounds.changes)) if (c.pr && c.pr.toLowerCase() === pr.toLowerCase()) keys.add(k);
   for (const k of keys) {
-    const d = decisionOf(rounds, k);
-    if (!d) continue;
-    if (!decided) return { state: "unknown", why: "his decisions at the review cap can't be read" };
-    // 0.18.0: rounds after the newest decision (granted by his tap) settle it first.
-    const later = countedRounds(rounds, k).slice(d.round);
-    const last = later[later.length - 1];
-    if (last) {
-      if (last.state === "answered" && (last.serious ?? 0) === 0) return { state: "none" };
-      const why = last.state === "answered" ? `the granted review round after his decision still left something serious`
-        : last.state === "lost" ? "the granted review round after his decision was lost, so it has no result"
-        : "a granted review round after his decision is still running";
-      return { state: "pending", key: k, decision: d, why };
+    if (countedRounds(rounds, k).length < cap) continue;
+    const last = lastRound(rounds, k);
+    if (last.state === "running" || last.state === "none") return { state: "waiting", key: k, why: "its last review round is still running" };
+    if (last.state === "lost") return { state: "held", key: k, why: "its last review round was lost, so nothing serious is known to be gone" };
+    // Round 1 fixes: nothing serious left binds the card to the head that last round reviewed, from the runner's
+    // record; a round recorded without one binds to nothing, so no card goes (fail closed).
+    if (last.serious === 0) {
+      if (!last.head) return { state: "held", key: k, why: "the runner's record of its last review round names no head, so no head can be bound to its Ship card" };
+      return { state: "clean", key: k, id: last.id, head: last.head.toLowerCase() };
     }
-    const tap = decided[d.id];
-    if (!tap) return { state: "waiting", key: k, decision: d };
-    return { state: tap.choice === RISK ? "risk" : "hold", key: k, decision: d };
+    // Round 2 fixes: held by the runner (its cut could not be checked): final, whatever its cut check says later.
+    const h = heldOf(rounds, k);
+    if (h) return { state: "held", key: k, why: `it is held: ${h.why}` };
+    const d = decisionOf(rounds, k);
+    if (d?.choice === "hold") return { state: "held", key: k, why: "its last review round left something serious, and Cain held it" };
+    const c = cutOf(rounds, k);
+    if (!c) return { state: "held", key: k, why: "its last review round left something serious, and it has no passing cut check" };
+    if (c.state === "started") return { state: "waiting", key: k, why: "its cut check is still running" };
+    if (c.state !== "pass") return { state: "held", key: k, why: `its last review round left something serious, and its one cut check ${c.state === "fail" ? "failed" : "has no answer"}` };
+    // Round 1 fixes: a cut check of another pull request never binds this one's card.
+    if (String(c.pr ?? "").toLowerCase() !== pr.toLowerCase()) return { state: "held", key: k, why: "its cut check is of another pull request" };
+    return { state: "cut", key: k, id: c.id, head: c.head.toLowerCase(), seat: c.seat };
   }
   return { state: "none" };
 }
-export function capState(pr: string, decidedFile: string = DECISIONS_FILE): CapState {
-  return capStateFor(pr, readRounds(ROUNDS_FILE), readDecided(decidedFile));
+export function capState(pr: string, cap = roundCapNow()): CapState {
+  return capStateFor(pr, readRounds(ROUNDS_FILE), cap);
 }
 
 // Whether the rollback of a bad install is armed for every App the pull request installs (apps:
@@ -308,4 +197,30 @@ export function keeperArmedText(replies: Record<string, KeeperReply | undefined>
     if (a.armed) armed[app] = a.at!; else why[app] = a.why;
   }
   return JSON.stringify({ armed, why });
+}
+
+// The owner's one plain line at the review cap (Cain 0.20.0, round 1 fixes), worded here from the runner's fields
+// (review/runner.ts OwnerLine): at each terminal outcome, one line, no card, no buttons, no question. The topic
+// (the change's first brief's) and a hold's why are Cain's words: the link checks them by his rules first, and
+// leaves them out when they don't pass (ownerLineText with neither).
+export type OwnerLineFields = { outcome: string; topic?: string; serious?: number; why?: string };
+export const OWNER_LINE_OUTCOMES = ["clean", "cap", "lost", "cut-pass", "cut-fail", "held", "undecided", "unchecked"] as const;
+const findings = (n: number | undefined) => {
+  const k = Number.isInteger(n) && n! >= 1 ? n! : 1;
+  const w = k < WORDS.length ? WORDS[k] : "several";
+  return `${w} serious finding${k === 1 ? "" : "s"}`;
+};
+export function ownerLineText(l: OwnerLineFields): string {
+  const t = l.topic ? clean(l.topic, 120).replace(/[.\s]+$/, "") : "A change";
+  switch (l.outcome) {
+    case "clean": return `${t}: its last outside review round left nothing serious, so its Ship card follows.`;
+    case "cap": return `${t}: its third and last outside review round left ${findings(l.serious)}, so Cain now holds it or cuts those parts.`;
+    case "lost": return `${t}: its last outside review round did not complete, so it is held.`;
+    case "cut-pass": return `${t}: the cut passed its outside check, so its Ship card follows.`;
+    case "cut-fail": return `${t}: the cut failed its outside check, so it is held.`;
+    case "held": return l.why ? `${t}, held: ${clean(l.why, 200).replace(/[.\s]+$/, "")}.` : `${t}, held.`;
+    case "unchecked": return `${t}: the cut could not be checked, so it is held.`;
+    case "undecided": return `${t}: its last outside review round left something serious a day ago, and whether it is held or cut is still undecided.`;
+    default: throw new Error("not an outcome");
+  }
 }

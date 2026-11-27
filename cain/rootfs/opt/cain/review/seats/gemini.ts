@@ -31,7 +31,7 @@ export function geminiSeat(o: GeminiOptions): SeatFn {
     };
     if (b.needs_facts && !input.selftest) body.tools = [{ googleSearch: {} }];
     const j = await postJson(fetcher, `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-      { "x-goog-api-key": o.key }, body, input.signal, [o.key]);
+      { "x-goog-api-key": o.key }, body, input.signal, [o.key], input.onBody);
     const cand = j?.candidates?.[0];
     if (j?.promptFeedback?.blockReason) throw new SeatError("refused", `Gemini blocked the brief (${String(j.promptFeedback.blockReason).slice(0, 40)})`);
     const text = (cand?.content?.parts ?? []).filter((x: any) => typeof x?.text === "string" && !x.thought).map((x: any) => x.text).join("");

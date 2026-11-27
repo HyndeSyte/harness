@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.20.0
+
+- Outside reviews now end by one fixed rule: three rounds a change, never more. No card offers you more rounds, and none offers shipping with a risk named.
+- After the third round, if nothing serious is left, you get the normal Ship card. If something serious is left, Cain either holds the change or cuts out only the parts those findings are about, and one outside reviewer that did not write the cut checks just that cut. If the cut passes, the Ship card names it and its review line reads "Cut checked". If not, the change is held. Cain never asks you about rounds, risk or cuts, in a card or in a message.
+- You hear one plain line, with no buttons and no question, straight from the App: when the third round ends, when a cut check passes or fails, and when Cain holds a change ("held: " and why, which he records with a new decide command). If he hasn't decided a day after the third round, one line says it is still undecided.
+- Reviewers now label every finding serious or follow-up by the same test (could it lose or damage something of yours, act wrongly or without your go, expose a secret or widen access, or fail without anyone hearing). A serious finding stays serious unless every other outside reviewer says in writing which part of the test it fails; one lenient reviewer can't clear it.
+- A Ship card at the cap is only for the exact version reviewed (or the exact cut checked), and a tap after the pull request moved on lands nothing. The cut check reads the diff the App works out itself, asks whether the change still does its job, and fails a cut that adds new code.
+- A Ship tap lands only the exact version its card was for: the App checks the pull request again just before it lands, and if something was pushed after your tap, nothing lands and the card says so.
+- If a cut can't be checked (the reviewer never answers, or only the model that wrote the cut is left to check it), the change is held and you hear one line: "the cut could not be checked". A cut decided but not checked a day later ends the same way.
+- The cut check is stricter: only no answer at all is retried, and anything else that isn't a clear pass is a fail. It checks the cut against what the change must do, kept from the first review round, and a reviewer that can't be read counts as calling a finding serious. A new option, review_github_token, lets the review service read this repository with a read-only token.
+- The card asking you to grant more review rounds, and the card asking you to ship with a risk or hold, are gone. One still up loses its buttons and says Expired, and tapping an old one does nothing. Rounds already granted lapse.
+- Why: the grant became a loop, and shipping with a risk could never be used, since it needed a rollback switch that stays off. Normal Ship installs are already backed up, watched and rolled back by the Keeper.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.

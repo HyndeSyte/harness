@@ -19,6 +19,10 @@ export const KEEP_DAYS = 30;
 export const KEEP_MAX = 200;
 const KEEP_MS = KEEP_DAYS * 86_400_000;
 
+// A cut check's line (Cain 0.20.0, review/core.ts cutLine): "Cut checked: Gemini, pass." It goes on the Ship
+// card of the cut head only, as that card's review line, and the gate takes it word for word like a Reviewed line.
+export const CUT_LINE = /^Cut checked: (OpenAI|Gemini), (pass|fail)\.$/;
+
 export interface Reviewed { id: string; line: string; finished_at: string; pr: string | null; head: string | null }
 
 // The entries that are whole: an id, a line that is a Reviewed line, and a time; the pull
@@ -28,7 +32,7 @@ export function parseReviewed(raw: string): Reviewed[] | null {
   try { j = JSON.parse(raw); } catch { return null; }
   if (!j || typeof j !== "object" || !Array.isArray(j.reviews)) return null;
   return j.reviews
-    .filter((x: any) => typeof x?.id === "string" && typeof x?.line === "string" && x.line.startsWith("Reviewed: ")
+    .filter((x: any) => typeof x?.id === "string" && typeof x?.line === "string" && (x.line.startsWith("Reviewed: ") || CUT_LINE.test(x.line))
       && typeof x?.finished_at === "string" && Number.isFinite(Date.parse(x.finished_at)))
     .map((x: any) => ({ id: x.id, line: x.line, finished_at: x.finished_at,
       pr: typeof x.pr === "string" && x.pr ? x.pr : null,

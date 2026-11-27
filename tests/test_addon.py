@@ -127,7 +127,8 @@ def test_cain_config_denies_every_api_and_mapping():
     # second review: the App's alarms reach Home Assistant without its API), the PC
     # job keeper's token and repo name, the security watch's and the probe's heartbeat URLs
     # (secrets like keys: password fields), and (0.17.0) the keeper App's address and Cain's token
-    # there (a password field), and (Keeper 0.1.15) the link's wait for Keeper's acceptance in minutes. Nothing else.
+    # there (a password field), and (Keeper 0.1.15) the link's wait for Keeper's acceptance in minutes, and (Cain 0.20.0)
+    # the review runner's own GitHub token (a password field). Nothing else.
     text = (CAIN / "config.yaml").read_text()
     assert text.split("options:\n")[1] == (
         '  github_token: ""\n  gemini_api_key: ""\n  perplexity_api_key: ""\n  anthropic_api_key: ""\n'
@@ -135,7 +136,7 @@ def test_cain_config_denies_every_api_and_mapping():
         '  anthropic_monthly_usd: 30\n  codex_monthly_runs: 200\n  review_round_cap: 3\n  usage_reserve_percent: 25\n'
         '  owner_user_id: ""\n  notice_hook: ""\n'
         '  pc_jobs_token: ""\n  pc_jobs_repo: "HyndeSyte/pc-jobs"\n  heartbeat_url: ""\n  probe_heartbeat_url: ""\n'
-        '  keeper_url: "http://0fcc2575-keeper:8097"\n  keeper_token: ""\n  keeper_accept_min: 5\nschema:\n'
+        '  keeper_url: "http://0fcc2575-keeper:8097"\n  keeper_token: ""\n  keeper_accept_min: 5\n  review_github_token: ""\nschema:\n'
         "  github_token: password?\n  gemini_api_key: password?\n  perplexity_api_key: password?\n"
         "  anthropic_api_key: password?\n  review_limit_usd: float(0,20)\n  gemini_monthly_usd: float(0,200)\n"
         "  perplexity_monthly_usd: float(0,200)\n  anthropic_monthly_usd: float(0,200)\n"
@@ -143,7 +144,8 @@ def test_cain_config_denies_every_api_and_mapping():
         "  owner_user_id: match(^([0-9a-f]{32})?$)?\n  notice_hook: password?\n"
         "  pc_jobs_token: password?\n  pc_jobs_repo: match(^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$)?\n"
         "  heartbeat_url: password?\n  probe_heartbeat_url: password?\n"
-        "  keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?\n  keeper_token: password?\n  keeper_accept_min: int(1,15)?\n")
+        "  keeper_url: match(^http://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$)?\n  keeper_token: password?\n  keeper_accept_min: int(1,15)?\n"
+        "  review_github_token: password?\n")
 
 
 def test_cain_owner_user_id_takes_a_user_id_or_nothing():
@@ -2682,7 +2684,7 @@ def test_taps_and_reactions_reach_cain_with_the_relay_key():
     # /pc-notice (the keeper runs as root, so being root is its key), and (Cain 0.16.0) the
     # review runner's decision card at the round cap, so Cain can't post it; and (its second round)
     # the usage guard's hold, which the link decides again before it writes root's guard log.
-    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold"])' in auth
+    assert 'ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold", "/review-line"])' in auth
     from harness import handover
     assert f'key("{handover.KEY_CONTEXT.decode()}")' in link
     assert 'toHarness("/press"' in (CAIN / "rootfs/opt/cain/link/core.ts").read_text(encoding="utf-8")

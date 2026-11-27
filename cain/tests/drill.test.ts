@@ -512,7 +512,7 @@ describe("fix 7: the flag is bound to a target version at tap time", () => {
     expect(routeAllowed("specialist", "/drill-arm")).toBe(false);
     expect(routeAllowed("root", "/drill-arm")).toBe(false);
     const sh = readFileSync(join(ROOT, "rootfs/opt/cain/keeper.sh"), "utf8");
-    expect(sh).toContain("review-grant|drill-arm) url=\"$link/$cmd\"");
+    expect(sh).toContain("connector|drill-arm) url=\"$link/$cmd\"");
     expect(sh).toContain("exit-on-start|verdict-fail) ;;");
     expect(sh).toContain(`body=$(jq -nc --arg m "$1" --arg v "$2" '{mode: $m, version: $v}') ;;`);
     expect(readFileSync(join(ROOT, "rootfs/opt/cain/link/http.ts"), "utf8")).toContain('case "/drill-arm": return json(await link.drillCard(b.mode, b.version));');

@@ -33,8 +33,7 @@
 //                                       allowlist, the moving Stop, and what the safety net found
 //     POST /replay {days}               the gate's rules over his DM, reading only; Cain hears when done
 //     POST /connector {item, text}      the one notice that Claude's Home Assistant connector needs signing in
-//     POST /review-grant {item, change, rounds, text}   a card asking Dane to grant a change at its review cap
-//                                       1 to 3 more fix rounds (0.18.0); only his tap writes the grant
+//     POST /review-grant                 retired (0.20.0): answers that extra review rounds are no longer offered
 //     POST /drill-arm {mode}                         (Keeper 0.1.13) the drill card; only Dane's tap on it sets the drill flag
 //     POST /ship-pass {token}           the RemoteTrigger hook, before a Ship run: the installs registered with the
 //                                       keeper App, "pending" until it accepted every watched one (backup made and
@@ -83,8 +82,7 @@ import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, fileStore, storeMarkPub } from "./drill";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
-import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
-import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
+import { appendCapped, capState, GUARD_LOG, holdLogged, KEEPER_SLUGS, type KeeperReply, roundCapNow, ROUNDS_FILE, SETTINGS_FILE } from "./cap";
 import { readRounds } from "../review/rounds";
 import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
@@ -107,7 +105,6 @@ const SHIP_KEY = `${DIR}/ship.key`;
 const SHIP_PUB = process.env.CAIN_SHIP_PUB ?? `${TRUST_DIR}/ship.pub`;
 const DEPLOY_KEY = `${DIR}/deploy_key`;
 const REPO_DIR = `${DIR}/repo.git`;                  // the link's own copy, for landing his Ship taps
-const DECIDED = DECISIONS_FILE;                      // his taps on the review runner's decision cards (0.16.0, cap.ts): /data/link/review-decisions.json
 const KNOWN_HOSTS = "/opt/cain/link/github_known_hosts";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
@@ -232,17 +229,12 @@ const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${
 // again at each sweep, so they come back without a restart once the file is right, and the alarm clears.
 const capLog = (m: string) => console.log(`[cain] link: ${m}`);
 let capOff: string | null = selfCheck({ log: capLog });
-// Round 3: a tap's temp file left by a link that died mid-write is swept at the start.
-sweepTemps(DECIDED, capLog);
-// Round 3: the alarm for his decisions file moved aside names the copy and the step back; it's raised
-// while a moved-aside copy stands and cleared at the first sweep after it's gone (writes resume then).
-let asideUp: boolean | null = null;
-const asideAlarm = (aside: string) => { raiseAlarm(aside, capLog, "review-decisions"); asideUp = true; };
+// 0.20.0: the decisions file of the retired decision card is no longer written, so its moved-aside alarm is
+// cleared once at the first sweep if an earlier version raised it.
+let asideCleared = false;
 const capSweep = () => {
   capOff = selfCheck({ log: capLog, prev: capOff });
-  const a = asideOf(DECIDED);
-  if (a.length && asideUp !== true) asideAlarm(a[0]);
-  else if (!a.length && asideUp !== false) { if (asideUp) capLog("his decisions file's moved-aside copy is gone: decision writes resume"); clearAlarm(capLog, "decisions"); asideUp = false; }
+  if (!asideCleared) { asideCleared = true; try { clearAlarm(capLog, "decisions"); } catch { /* none up */ } }
 };
 
 // Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
@@ -288,22 +280,12 @@ const link = new Link({
   // GitHub's 60 an hour from this address with every watch).
   gateHead: (pr, ms) => { const p = pullOf(pr); return p ? gateHeadRead(p.repo, p.pr, { ms: Math.max(1_000, ms - 500) }) : Promise.resolve({ unknown: "that isn't a pull request's address" }); },
   reviewed: () => readReviewed(),
-  // The review-round cap (0.16.0, cap.ts): the runner's rounds, his taps on its decision cards (the
-  // link's own file), and the probe's record of the rollback, read as they are now.
-  // Round 2: his tap kept durably before the card is marked used; a decisions file that doesn't parse
-  // is moved aside, never overwritten, and the App's alarm names it. While the install-time self-check
-  // found a file wrong, the cap's state is unknown (no Ship card at the cap) and nothing is kept.
-  capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr, DECIDED),
-  // 0.19.0: from the keeper App (GET /armed, Cain's token), judged as the replies stand now (cap.ts keeperArmed).
-  armed: () => keeperArmedText(keeperReplies, Date.now(), PROBE_HASH),
-  // Round 3: the record as kept comes back, and drives the card, the relay and the hold line.
-  decided: (id, choice, at) => recordDecision(DECIDED, id, choice, at, { onCorrupt: asideAlarm }),
+  // The review-round cap and the owner's review rule (0.16.0; R-013 since 0.20.0, cap.ts): the runner's rounds,
+  // read as they are now: the last round's serious count and the change's one cut check. While the install-time
+  // self-check found a file wrong, the cap's state is unknown (no Ship card at the cap).
+  capState: (pr) => capOff ? { state: "unknown", why: `the review cap's files aren't right (${capOff})` } : capState(pr),
   roundCap: () => roundCapNow(),
   rounds: () => readRounds(ROUNDS_FILE),
-  // 0.18.0: the owner's grants of extra review rounds (/data/review-grants.json, root:cain 0640), written
-  // here only, on his tap on Cain's grant card, durably, made root:cain 0640 at every write and recreation.
-  grants: () => readGrants(GRANTS_FILE),
-  grant: (rec) => { if (capOff) throw new GrantUnsaved(`the review cap's files aren't right (${capOff})`); return recordGrant(GRANTS_FILE, rec); },
   capOff: () => capOff,
   // Round 3: the guard decides only; the link appends the line itself (deduplicated, capped in size and
   // rotated root-side, keeping one previous file: cap.ts appendCapped).

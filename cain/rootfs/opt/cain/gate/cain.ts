@@ -37,6 +37,10 @@
 //                text is an address on another host. An https link to a host off LINK_HOSTS
 //                (and the hosts added with keeper.sh link-host) is never held: it only gets a
 //                notice-only line in the gate report, so the list grows from real use.
+//   cap          (Cain 0.20.0, round 1 fixes; his replies and edits) a question put to him about review rounds,
+//                a risk or a cut (the owner's review rule has Cain decide those himself and tell him one line):
+//                the same asksAboutCap the link runs over his asks, over each sentence that asks him something.
+//                Held for good (no third try): the one plain line ("held: <why>") always says the same.
 // The first three read the words as he'd see them, so nothing slips past by its spelling:
 // compatibility forms folded (NFKC, full-width letters and digits too), invisible characters
 // and combining marks dropped, Cyrillic and Greek letters that look like Latin ones read as
@@ -45,8 +49,8 @@
 import type { Reviewed } from "../reviewed";
 import { around, linkSpans } from "./rules";
 
-export type CainRule = "reviewed" | "ship words" | "codes" | "links";
-export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes", "links"];
+export type CainRule = "reviewed" | "ship words" | "codes" | "links" | "cap";
+export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes", "links", "cap"];
 export interface CainHit { rule: CainRule; result: "refuse" | "unsure" | "note"; at: number; end: number; around: string }
 
 // -- reading the words as he'd see them -----------------------------------------------------
@@ -93,7 +97,8 @@ const VERDICTS = "approve|approved|approves|approving|approval|verdict|verdicts|
 const REVIEW_WORDS = "review|reviews|reviewed|reviewer|reviewers|reviewing";
 // "Reviewed", then any spaces (a line break too), then ":" or "-": a heading only where it
 // starts a sentence or a line ("Done. Reviewed: ..."), never mid-sentence ("what I reviewed: the calendar").
-const HEADING = new RegExp("(?<![A-Za-z0-9])reviewed\\s*[:\\-\\u2013\\u2014]", "gi");
+// Cain 0.20.0: a cut check's "Cut checked:" heading is a claim the same way, taken only as the service gave it.
+const HEADING = new RegExp("(?<![A-Za-z0-9])(?:reviewed|cut\\s+checked)\\s*[:\\-\\u2013\\u2014]", "gi");
 const SEAT = new RegExp(WORD(SEATS), "i");
 const VERDICT = new RegExp(WORD(VERDICTS), "i");
 const REVIEW = new RegExp(WORD(REVIEW_WORDS), "i");
@@ -145,7 +150,8 @@ export function claimsReview(text: string): boolean { return claimsIn(claimText(
 // A line as the gate compares it, the same on both sides: spaces as one, the heading as
 // "Reviewed: ", and the full stop at its end may go.
 const canon = (s: string) => s.replace(/\s+/g, " ").trim()
-  .replace(new RegExp("^reviewed\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Reviewed: ").replace(/\.$/, "");
+  .replace(new RegExp("^reviewed\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Reviewed: ")
+  .replace(new RegExp("^cut\\s+checked\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Cut checked: ").replace(/\.$/, "");
 const excerpt = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 60);
 
 // published: the review service's lines; null (or not given) when they can't be read. Each
@@ -346,6 +352,7 @@ export function cainWhy(h: Pick<CainHit, "rule" | "result">, published?: readonl
   if (h.rule === "ship words") return SHIP_WORDS_WHY;
   if (h.rule === "codes") return CODES_WHY;
   if (h.rule === "links") return LINKS_WHY;
+  if (h.rule === "cap") return CAP_WHY;
   return h.result === "unsure" ? REVIEWED_UNSURE : reviewedWhy(published, n);
 }
 
@@ -365,3 +372,51 @@ export function cainReasons(hits: readonly CainHit[], published?: readonly Revie
     return each > 0 && q.length && why !== REVIEWED_UNSURE ? `${q.slice(0, each).map((a) => `"${a}"`).join(", ")}: ${why}` : why;
   });
 }
+
+// -- the owner's review rule (Cain 0.20.0) ----------------------------------------------------
+// Whether Cain's ask puts a question about review rounds, a risk or a cut to the owner (0.20.0): the rule
+// has Cain decide those himself, so the link refuses the ask. What it names, or null.
+export function asksAboutCap(text: string): string | null {
+  const t = String(text ?? "").toLowerCase().replace(/\s+/g, " ");
+  if (/\b(more|extra|another|additional|further|fourth|4th)\s+(\w+\s+){0,2}(review\s+)?rounds?\b/.test(t) || /\bgrant\w*\b[^.?!]{0,40}\brounds?\b/.test(t))
+    return "more review rounds";
+  if (/\b(ship|land|install|merge)\w*\b[^.?!]{0,60}\bwith\s+(that|the|this|a|its)\s+(\w+\s+)?risks?\b/.test(t) || /\b(accept|take|live with)\s+(that|the|this)\s+risk\b/.test(t))
+    return "shipping with a risk";
+  if (/\bcut\s+check/.test(t) || /\b(cut|remove|drop|strip)\b[^.?!]{0,40}\b(parts?|pieces?|findings?)\b[^.?!]{0,40}\b(serious|review|reviewers?|finding)/.test(t)
+    || (/\bserious\s+findings?\b/.test(t) && /\b(cut|hold|ship)\b/.test(t)))
+    return "a cut, or what to do with a serious finding";
+  return null;
+}
+
+// A sentence that asks him something: it ends in a question mark, or opens as a request for his say.
+const ASKING = /\?\s*$|^(should|shall|do you|would you|want me|can i|may i|ok to|okay to|is it ok|let me know|tell me|your call)\b/i;
+export const CAP_WHY = "by the owner's review rule you decide rounds, risk and cuts yourself and tell him one plain line (\"held: <why>\"): never ask him about them";
+// Each sentence (or line) of a reply that asks him about rounds, a risk or a cut: the cap rule's hits.
+export function capQuestionHits(text: string): CainHit[] {
+  const hits: CainHit[] = [];
+  const t = String(text ?? "");
+  const re = /[^.?!\n]+[.?!]*/g;
+  for (const m of t.matchAll(re)) {
+    const sentence = m[0].trim();
+    if (!sentence || !ASKING.test(sentence)) continue;
+    if (!asksAboutCap(sentence)) continue;
+    hits.push({ rule: "cap", result: "refuse", at: m.index ?? 0, end: (m.index ?? 0) + m[0].length, around: sentence.replace(/\s+/g, " ").slice(0, 60) });
+  }
+  // Round 2 fixes: the whole message too, not only each sentence, so a question split over sentences ("It has one
+  // serious finding left. Should I cut it or hold it?") or put in other words ("The review left something serious.
+  // Want me to keep going with it?") is held as well: a message that asks him anything and, as a whole, is about
+  // rounds, a risk or a cut, or names a serious finding, a risk or a cut and asks whether to go on, ship, hold or stop.
+  if (!hits.length && t.trim()) {
+    const asks = t.includes("?") || [...t.matchAll(re)].some((m) => ASKING.test(m[0].trim()));
+    const whole = t.replace(/\s+/g, " ").toLowerCase();
+    if (asks && (asksAboutCap(whole) || (CAP_CONTEXT.test(whole) && GO_ON.test(whole)) || VAGUE_GO_ON.test(whole)))
+      hits.push({ rule: "cap", result: "refuse", at: 0, end: t.length, around: t.replace(/\s+/g, " ").trim().slice(0, 60) });
+  }
+  return hits;
+}
+// What makes a whole message about the cap (round 2 fixes), and the ways of asking whether to go on with it.
+const CAP_CONTEXT = /\b(serious|risks?|review rounds?|another round|more rounds?|cut check|the cut|cut (?:it|them|those|that|the parts?)|at (?:its|the) cap|findings?)\b/;
+// A bare "keep going with it?" names nothing it is about, so it reads to him as the cap's question: held too (Cain
+// says what he'd go on with: "Want me to keep drafting the letter?").
+const VAGUE_GO_ON = /\b(keep going|carry on|go on|press on|push on|proceed|continue)(\s+(with|on)\s+(it|this|that))?(\s+anyway)?\s*\?/;
+const GO_ON = /\b(keep going|keep at it|carry on|press on|push on|push it|go ahead|go on|proceed|continue|move on|ship|land|merge|install|hold|cut|drop it|stop|leave it|wait|anyway|still)\b/;

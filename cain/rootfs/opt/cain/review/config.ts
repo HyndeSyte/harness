@@ -46,6 +46,8 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
     roundsFile: capPaths(env).rounds,
     settingsFile: capPaths(env).settings,
     guardLog: capPaths(env).guardLog,
-    grantsFile: capPaths(env).grants,
+    // Round 1 fixes: the runner's own bare copy of the repository, for cut diffs (root's, beside its other files).
+    cutRepo: env.REVIEW_CUT_REPO ?? "/data/review-cut.git",
+    cutRemote: env.REVIEW_CUT_REMOTE ?? "https://github.com/HyndeSyte/harness.git",
   };
 }

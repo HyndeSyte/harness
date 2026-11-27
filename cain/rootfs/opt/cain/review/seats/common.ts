@@ -6,6 +6,9 @@ export type SeatInput = {
   role: Role; signal: AbortSignal; maxOutputTokens: number;
   day: string;            // YYYY-MM-DD, for date-dependent prices
   selftest?: boolean;
+  // Round 2 fixes: called once the seat's response has begun (its HTTP response came back), so the runner can tell a
+  // transport failure (nothing came back) from an answer that failed after it began.
+  onBody?: () => void;
 };
 export type SeatAnswer = Answer & {
   model: string; cost_usd: number; tokens?: { input: number; output: number }; searches?: number;
@@ -26,7 +29,7 @@ const HTTP_REASON: Partial<Record<ErrorKind, string>> = {
 };
 
 export async function postJson(fetcher: Fetch, url: string, headers: Record<string, string>, body: unknown,
-  signal: AbortSignal, secrets: (string | undefined)[]): Promise<any> {
+  signal: AbortSignal, secrets: (string | undefined)[], onBody?: () => void): Promise<any> {
   let r: Response;
   try {
     r = await fetcher(url, { method: "POST", headers: { "content-type": "application/json", ...headers },
@@ -35,10 +38,13 @@ export async function postJson(fetcher: Fetch, url: string, headers: Record<stri
     if (signal.aborted) throw new SeatError("timeout", "no answer before the seat's deadline");
     throw new SeatError("transient", scrub(`network: ${(e as Error).message}`, secrets));
   }
+  // The response has begun: whatever happens next, the seat answered (round 2 fixes). An HTTP error status is the
+  // service not reaching its model, and stays a transport failure.
+  if (r.status < 400) { try { onBody?.(); } catch { /* the runner's note only */ } }
   let text = "";
   try { text = await r.text(); } catch (e) {
-    if (signal.aborted) throw new SeatError("timeout", "no answer before the seat's deadline");
-    throw new SeatError("transient", "the answer was cut off");
+    if (signal.aborted) throw new SeatError("timeout", "the answer began but didn't finish before the seat's deadline", 0, r.status < 400);
+    throw new SeatError("transient", "the answer was cut off", 0, r.status < 400);
   }
   if (r.status >= 400) {
     let msg = text;
@@ -48,7 +54,7 @@ export async function postJson(fetcher: Fetch, url: string, headers: Record<stri
     const kind = classifyHttp(r.status, `${msg} ${text}`);
     throw new SeatError(kind, `HTTP ${r.status}: ${HTTP_REASON[kind] ?? HTTP_REASON.refused}`);
   }
-  try { return JSON.parse(text); } catch { throw new SeatError("bad_output", "the service answered with something that was not JSON"); }
+  try { return JSON.parse(text); } catch { throw new SeatError("bad_output", "the service answered with something that was not JSON", 0, true); }
 }
 
 // "Answered as" goes next to the model asked for, so a swap is never silent.
