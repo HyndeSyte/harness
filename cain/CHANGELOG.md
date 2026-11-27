@@ -1,9 +1,14 @@
 # Changelog
 
+## 0.19.3
+
+- A drill release for the Keeper drills, with nothing new: the same code as 0.19.2.
+- If this install fails, that comes only from your Arm the drill tap (the drill flag and mark), never from code in this release.
+
 ## 0.19.2
 
-- A drill release for the Keeper drills, with nothing new: the same code as 0.19.1.
-- If this install fails, that comes only from your Arm the drill tap (the drill flag and mark), never from code in this release.
+- Cain can accept an update of himself again. Since 0.19.0 every install of Cain was refused with "the drill flags' high-water time can't be kept", because of a mix-up in his App's code. That is fixed.
+- His tests now catch that kind of mix-up, so a change with it can't reach a Ship card.
 
 ## 0.19.1
 
