@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash, sign as edSign } from "node:crypto";
 import { claimDeadlineWhy, decideAll, postShipPass, postShipPassCancel, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
-import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, judgeCancel, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
+import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, judgeCancel, attemptEndedWhy, cainInstalled, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { SHIP_KEYS, SHIP_PUB, keeperHolds } from "./link-rig";
 import { generateKeyPairSync } from "node:crypto";
@@ -189,7 +189,7 @@ describe("the registration with the keeper App (Keeper 0.1.5: register, then pol
   // A keeper that answers the polls in turn (the last answer repeats), on a fake clock.
   function keeper(polls: any[], o: { enrolled?: any } = {}) {
     let now = NOW; const posted: any[] = []; const got: string[] = []; const notes: any[] = []; let enrolled = o.enrolled ?? null;
-    const deps = { api, log: () => {}, now: () => now, sleep: async (ms: number) => { now += ms; }, note: (u: any) => notes.push(u), linkFp: FPR,
+    const deps = { api, log: () => {}, now: () => now, sleep: async (ms: number) => { now += ms; }, note: (u: any) => notes.push(u), linkFp: FPR, installed: (_s: string): string | null => "0.18.0",
       enrollment: { load: () => enrolled, store: (e: any) => { enrolled = e; } },
       post: async (b: any) => { posted.push(b); return pending; },
       get: async (p: string) => { got.push(p); const a = polls.length > 1 ? polls.shift() : polls[0]; return a === null ? null : { status: 200, body: a }; } };
@@ -307,7 +307,7 @@ describe("Keeper 0.1.5: the committed fingerprint and the keeper's enrollment", 
       return f ? { status: 200, body: f } : { status: 404, body: null };
     };
     let now = NOW; let posts = 0;
-    const deps = (fs: Record<string, any>, keyFp: string) => ({ api: api(fs), log: () => {}, now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR,
+    const deps = (fs: Record<string, any>, keyFp: string) => ({ api: api(fs), log: () => {}, now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR, installed: () => "0.18.0",
       post: async () => { posts++; return { status: 202, body: { status: "pending", id: ACC.attempt } }; },
       get: async () => ({ status: 200, body: { status: "accepted", id: ACC.attempt, app: ACC.app, from_version: "0.18.0", to_version: "0.19.0", backup: "kb1", ...ENROLLED, key_fp: keyFp } }) });
     const c = (claimFor(PR, SHA, NOW))!;
@@ -606,5 +606,100 @@ describe("Keeper 0.1.11 item 4: a claim, cancel or attestation answer that isn't
     await shipPass(r2.d, { token: TOKEN });
     await Bun.sleep(5);
     expect(got2.map((x) => x.slice(0, 2))).toEqual([[ACC.attempt, "cancel"]]);
+  });
+});
+
+// Cain 0.19.3 (Nov 27): 0.19.1 was merged but never installed, so the next Ship tap registered from 0.19.1 (main's config.yaml at the
+// base) while 0.19.0 ran; Keeper refused it ("is at 0.19.0, not 0.19.1"), the link asked Keeper to cancel the refused attempt,
+// Keeper answered "it is unprotected", and the owner got a retry card with nothing for him to do.
+describe("Cain 0.19.3: the registration starts from the installed version, and a refused one needs no cancel", () => {
+  const b64 = (t: string) => ({ content: Buffer.from(t).toString("base64"), encoding: "base64" });
+  const MAIN = "0.19.1", INSTALLED = "0.19.0", NEXT = "0.19.2";
+  const files: Record<string, any> = {
+    [`cain/config.yaml@${BASE}`]: b64(`version: "${MAIN}"\n`), [`cain/config.yaml@${SHA}`]: b64(`version: "${NEXT}"\n`),
+    [`harness/config.yaml@${BASE}`]: b64('version: "0.30.0"\n'), [`harness/config.yaml@${SHA}`]: b64('version: "0.30.0"\n'),
+    [`cain/rootfs/opt/cain/probe/keeper.ts@${SHA}`]: b64("// the probe\n"), [`cain/SHIP_KEY_FINGERPRINT@${SHA}`]: b64(`${FPR}\n`),
+  };
+  const api = async (path: string) => {
+    if (path.endsWith("/pulls/46")) return { status: 200, body: { base: { sha: BASE } } };
+    const m = /contents\/(.+)\?ref=([0-9a-f]{40})$/.exec(path); const f = m ? files[`${m[1]}@${m[2]}`] : undefined;
+    return f ? { status: 200, body: f } : { status: 404, body: null };
+  };
+  // A keeper like the real one: it refuses (as unprotected, its view answering "refused") a from_version that isn't what is installed.
+  function chain(installed: () => string | null) {
+    let now = NOW; const posted: any[] = []; const logs: string[] = [];
+    const deps = { api, log: (l: string) => logs.push(l), now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR, installed,
+      post: async (b: any) => { posted.push(b); return { status: 202, body: { status: "pending", id: ACC.attempt } }; },
+      get: async () => posted[0].from_version === INSTALLED
+        ? { status: 200, body: { status: "accepted", id: ACC.attempt, app: ACC.app, from_version: INSTALLED, to_version: NEXT, backup: "kb1", ...ENROLLED } }
+        : { status: 200, body: { status: "refused", id: ACC.attempt, app: ACC.app, why: `0fcc2575_cain is at ${INSTALLED}, not ${posted[0].from_version}` } } };
+    return { deps, posted, logs };
+  }
+  const c = (claimFor(PR, SHA, NOW))!;
+  test("main's config is ahead of the installed version: the install registers from the installed one and is accepted", async () => {
+    const k = chain(() => INSTALLED);
+    const r = await registerInstalls(k.deps, TOKEN, c);
+    expect(k.posted.length).toBe(1);
+    expect(k.posted[0].from_version).toBe(INSTALLED);       // not main's 0.19.1
+    expect(k.posted[0].to_version).toBe(NEXT);
+    expect(r.ok).toBe(true);
+    expect((r as any).accepted).toEqual([{ app: ACC.app, attempt: ACC.attempt, backup: "kb1", from: INSTALLED, to: NEXT }]);
+  });
+  test("an installed version that can't be read refuses with a plain reason and registers nothing", async () => {
+    for (const v of [() => null, () => "", () => "garbled", () => { throw new Error("gone"); }]) {
+      const k = chain(v as () => string | null);
+      const r = await registerInstalls(k.deps, TOKEN, c);
+      expect(r.ok).toBe(false);
+      expect(r.said[0]).toBe("Cain's installed version couldn't be read, so it wasn't registered (the link doesn't guess which version this install replaces)");
+      expect(k.posted.length).toBe(0);
+    }
+    const none = await registerInstalls({ ...chain(() => INSTALLED).deps, installed: undefined }, TOKEN, c);
+    expect(none.ok).toBe(false);
+  });
+  test("Cain's installed version: the Supervisor's answer first, then the image's own build version, else none", () => {
+    expect(cainInstalled(() => "0.19.0\n", "0.19.3")).toBe("0.19.0");
+    expect(cainInstalled(() => { throw new Error("ENOENT"); }, "0.19.3")).toBe("0.19.3");
+    expect(cainInstalled(() => "not a version", " 0.19.3 ")).toBe("0.19.3");
+    expect(cainInstalled(() => null, "")).toBe(null);
+    expect(cainInstalled(() => null, undefined)).toBe(null);
+  });
+  test("a registration Keeper refused (unprotected) is marked ended: no cancel is asked and no retry card is posted", async () => {
+    const k = chain(() => MAIN);                              // the old behavior's from_version, which Keeper refuses
+    const r = await registerInstalls(k.deps, TOKEN, c);
+    expect(r.ok).toBe(false);
+    expect((r as any).ended).toEqual([ACC.attempt]);
+    expect(r.said[0]).toContain(`is at ${INSTALLED}, not ${MAIN}`);
+    // the pass settles it: refused, with no cancel and no retry card
+    const l = link({ reg: "hold" });
+    const cards: any[] = []; l.d.retry = (...a: any[]) => { cards.push(a); };
+    expect((await shipPass(l.d, { token: TOKEN })).status).toBe("pending");
+    l.answer(r);
+    const a = await shipPass(l.d, { token: TOKEN });
+    expect(a.status).toBe("refused");
+    expect(l.cancelled).toEqual([]);
+    expect(cards).toEqual([]);
+    expect(l.logs.some((x) => x === `no cancel for ${ACC.attempt}: Keeper had already ended it`)).toBe(true);
+  });
+  test("a registration still live (pending at the wait's end, or an enrollment refusal) is still cancelled", async () => {
+    const l = link({ reg: "hold" });
+    await shipPass(l.d, { token: TOKEN });
+    l.answer({ ok: false, said: ["the keeper didn't accept Cain 0.19.2 within 5 minutes"] });
+    await shipPass(l.d, { token: TOKEN });
+    expect(l.cancelled).toEqual([ACC.attempt]);
+  });
+  test("a cancel Keeper answers \"refused: it is unprotected\" (or another end) counts as done, with no retry card", () => {
+    const l = link();
+    const cards: any[] = []; l.d.retry = (...a: any[]) => { cards.push(a); };
+    for (const why of ["it is unprotected", "it is ended", "it is refused", "it is rolled back"])
+      expect(judgeCancel(l.d, ACC.attempt, { status: 409, body: { status: "refused", id: ACC.attempt, why } })).toBe(true);
+    expect(cards).toEqual([]);
+    expect(l.logs.some((x) => x.includes("Keeper had already ended it (it is unprotected)"))).toBe(true);
+    // a live attempt's refusal still brings the card
+    for (const why of ["it is claimed", "it is accepted", "its claim was handed to a started run (Cain 0.19.2 was seen): it is claimed, and a cancel can't end it now"])
+      expect(judgeCancel(l.d, ACC.attempt, { status: 409, body: { status: "refused", id: ACC.attempt, why } })).toBe(false);
+    expect(cards.length).toBe(3);
+    expect(attemptEndedWhy("it is unprotected")).toBe("unprotected");
+    expect(attemptEndedWhy("it is verifying")).toBe(null);
+    expect(attemptEndedWhy(undefined)).toBe(null);
   });
 });

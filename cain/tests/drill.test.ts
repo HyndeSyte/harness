@@ -76,7 +76,7 @@ function keeper(store: DrillStore, o: { mode?: KeeperMode; markAnswer?: { status
   const idOf = (b: any) => `${b.kind}-46-cain-${SHA.slice(0, 8)}`;
   let last: any = null;
   const drill = drillDeps(store, () => SHIP_PUB, () => now, (l) => logs.push(l), { sign: markSigner, markPub: () => DK.pub, page: (k, key, info) => pages.push([k, key, info]) });
-  const deps = { api, log: (l: string) => logs.push(l), now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR,
+  const deps = { api, log: (l: string) => logs.push(l), now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR, installed: () => "0.18.0",
     enrollment: { load: () => enrolled, store: (e: any) => { enrolled = e; } }, drill,
     post: async (b: any) => { posted.push(b); last = b; if (o.mode === "not-taken") return { status: 409, body: { status: "refused", why: "a replay" } };
       return { status: 202, body: { status: "pending", id: idOf(b) } }; },

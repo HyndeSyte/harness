@@ -519,6 +519,24 @@ with_session() {
   ( sleep 30; list_connectors ) &
 }
 if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
+# The version of Cain installed now (0.19.3), as the Supervisor answers it (/addons/self/info, which every
+# App may read): the link registers a Ship install with the keeper App from it, never from main's
+# config.yaml (Nov 27: 0.19.1 was in main but never installed, so Keeper refused the next install).
+# Read in the background, a few tries, so a Supervisor that hangs never holds up the link; the file is
+# root's, in /run/cain for this container only. Until it is there the link uses the image's own build
+# version (CAIN_BUILD_VERSION), and with neither it refuses the registration with a plain reason.
+(
+  { set +x; } 2>/dev/null
+  rm -f /run/cain/installed-version 2>/dev/null || true
+  for _try in 1 2 3 4 5 6; do
+    v="$(bashio::api.supervisor GET /addons/self/info true 2>/dev/null | jq -r 'if .result == "ok" and (.data.version | type) == "string" then .data.version else empty end' 2>/dev/null || true)"
+    if [[ "$v" =~ ^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,6}$ ]]; then
+      { printf '%s\n' "$v" > /run/cain/installed-version.tmp && chmod 0644 /run/cain/installed-version.tmp \
+        && mv -f /run/cain/installed-version.tmp /run/cain/installed-version; } 2>/dev/null && break
+    fi
+    sleep 10
+  done
+) &
 # Cain's link (link/main.ts): taps, reactions and specialists' cards.
 # Since 0.19.0 it also reads the keeper App's armed state with Cain's keeper token (keeper_url,
 # keeper_token): in this environment only, never logged.

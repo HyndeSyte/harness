@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.19.3
+
+- An install of Cain now starts from the version actually running on the Pi, not the newest one in main. A version that was merged but never installed no longer makes the Keeper refuse the next install.
+- If that version can't be read, the Ship run is refused with a plain reason instead of a guess.
+- When the Keeper has already refused an install, you no longer get a Try again card that had nothing for you to do.
+
 ## 0.19.2
 
 - Cain can accept an update of himself again. Since 0.19.0 every install of Cain was refused with "the drill flags' high-water time can't be kept", because of a mix-up in his App's code. That is fixed.

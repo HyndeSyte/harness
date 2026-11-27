@@ -47,7 +47,7 @@
 // on the same network, already talks to the keeper with Cain's token. So no options are written at all.
 import { createHash } from "node:crypto";
 import { publicKey, readToken, type Claim } from "../ship-token";
-import { bumpsAt, fileAt, type MergeDeps, versionAt } from "./merge";
+import { bumpsAt, fileAt, type MergeDeps } from "./merge";
 import { markHash, type DrillDeps, type DrillMode } from "./drill";
 
 export const PASS_FORMAT = 2;                     // 0.1.4: entries carry their state (format 1 entries count as passed)
@@ -176,7 +176,9 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
 
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
 export interface Claimed { attempt: string; claim: string; until: string }
-export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
+export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string; ended?: string[] };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
+// (Cain 0.19.3) ended: the attempts Keeper itself already ended (refused, unprotected or any other end its poll answered), so the link
+// asks no cancel for them and posts no retry card: there is nothing left at Keeper to cancel.
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
   apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number };
 export interface PassDeps {
@@ -225,11 +227,23 @@ const cancelAll = (d: PassDeps, ids: string[], why: string) => {
 export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; body: any } | null): boolean {
   const ok = !!r && r.status === 200 && r.body?.status === "ended" && (r.body?.id === undefined || r.body.id === attempt);
   if (ok) return true;
+  // (Cain 0.19.3) Keeper refuses a cancel of an attempt it already ended itself ("it is unprotected", "it is ended", ...): nothing is
+  // left to cancel, so that counts as done, logged, with no retry card (a card with nothing for the owner to do)
+  const ended = r && r.status === 409 && r.body?.status === "refused" ? attemptEndedWhy(r.body?.why) : null;
+  if (ended) { d.log(`the keeper's cancel of ${attempt} needs nothing more: Keeper had already ended it (it is ${ended})`); return true; }
   const why = !r ? "the keeper didn't answer" : r.status === 202 || r.body?.status === "pending" ? `the keeper's answer is pending${r.body?.operation ? ` (operation ${String(r.body.operation).slice(0, 40)})` : ""}`
     : `the keeper answered ${String(r.body?.status ?? r.status).slice(0, 40)}${r.body?.why ? `: ${String(r.body.why).slice(0, 120)}` : ""}`;
   d.log(`the keeper's cancel of ${attempt} isn't confirmed (${why}): no success; the owner gets a card offering a retry`);
   d.retry?.(attempt, "cancel", why);
   return false;
+}
+
+// (Cain 0.19.3) Keeper's answer to a cancel of an attempt that is no longer live (keeper core.ts cancelAttempt: "it is <status>" for any
+// status but verifying, accepted or claimed): the status, or null when the answer isn't that.
+const LIVE = new Set(["verifying", "accepted", "claimed", "pending"]);
+export function attemptEndedWhy(why: unknown): string | null {
+  const m = /^it is ([a-z][a-z _-]{0,30})$/.exec(String(why ?? "").trim());
+  return m && !LIVE.has(m[1]) ? m[1] : null;
 }
 
 // (0.1.5) What the registration made so far, kept on its entry: the number of watched Apps (the pass's
@@ -258,7 +272,12 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
   else { e.state = "refused"; e.said = `the keeper didn't accept every install: ${r.said.join("; ").slice(0, 400) || "no reason"}`; }
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's outcome: the pass times out and is refused"); return; }
   d.log(r.ok ? `the keeper accepted every watched install for a Ship token (${r.accepted.map((a) => `${a.attempt} backup ${a.backup}`).join(", ") || "none watched"})` : `a Ship token's pass is refused: ${e.said}`);
-  if (!r.ok) cancelAll(d, e.attempts ?? [], r.cancel ?? "the pass is refused");
+  if (!r.ok) {
+    // (Cain 0.19.3) an attempt Keeper already ended needs no cancel, so it brings no retry card either
+    const ended = new Set(r.ended ?? []);
+    for (const a of ended) if ((e.attempts ?? []).includes(a)) d.log(`no cancel for ${a}: Keeper had already ended it`);
+    cancelAll(d, (e.attempts ?? []).filter((a) => !ended.has(a)), r.cancel ?? "the pass is refused");
+  }
 }
 
 // (Keeper 0.1.15) items 3 and 6: the link's reconcile at its start. A pass left registering, accepted or claiming by a crash or a
@@ -424,6 +443,27 @@ export interface RegisterDeps {
   drill?: DrillDeps;
   // (Keeper 0.1.14) POST /attempt/<id>/drill-mark on the keeper: the link's confirmation that it wrote the drill's signed mark
   markPost?: (attempt: string, body: unknown) => Promise<{ status: number; body: any } | null>;
+  // (Cain 0.19.3) the version of the App installed now (its slug), as the Supervisor answered it to this App's start (Cain's own,
+  // CAIN_INSTALLED_VERSION), or null when it can't be read. It is the registration's from_version: never the base's config.yaml,
+  // since a version merged into main but never installed would make Keeper refuse every later install.
+  installed?: (slug: string) => string | null;
+}
+const VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,6}$/;
+// (Cain 0.19.3) The App's installed version, read through d.installed: a plain X.Y.Z, or null.
+export function installedVersion(d: Pick<RegisterDeps, "installed">, slug: string): string | null {
+  let v: string | null = null;
+  try { v = d.installed?.(slug) ?? null; } catch { v = null; }
+  return typeof v === "string" && VERSION.test(v.trim()) ? v.trim() : null;
+}
+// (Cain 0.19.3) Cain's installed version: the Supervisor's answer the App's start wrote (/run/cain/installed-version), else the
+// image's own build version (CAIN_BUILD_VERSION), else null. The Harness App isn't watched, so nothing reads its version here.
+export function cainInstalled(read: () => string | null, build: string | undefined): string | null {
+  let s: string | null = null;
+  try { s = read(); } catch { s = null; }
+  const sup = (s ?? "").trim();
+  if (VERSION.test(sup)) return sup;
+  const b = (build ?? "").trim();
+  return VERSION.test(b) ? b : null;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
 // is accepted (the keeper's answer "accepted" for that App and versions, with its attempt id and backup
@@ -435,6 +475,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   const accepted: Accepted[] = [];
   let ok = true;
   let cancel: string | undefined;                       // (Keeper 0.1.8) an enrollment refusal's why, for the cancel
+  const ended: string[] = [];                           // (Cain 0.19.3) attempts Keeper ended itself: no cancel for them
   const say = (l: string, bad = true) => { said.push(l); if (bad) ok = false; d.log(`keeper registration: ${l}`); };
   const now = d.now ?? Date.now, sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
   const pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
@@ -452,9 +493,12 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   // (Keeper 0.1.14) no registration removes a mark it doesn't own: a competing, retried or rejected one leaves an active mark be
   for (const b of watched) {
     const slug = APP_SLUGS[b.app];
-    const from = await versionAt(d, c.repo, CONFIGS[b.app], base);
+    // (Cain 0.19.3) from: the version installed now, never the base's config.yaml (Nov 27: 0.19.1 merged but never installed, so a
+    // registration from 0.19.1 was refused while 0.19.0 ran). Not readable: refused, with no guess.
+    const from = installedVersion(d, slug);
+    if (!from) { say(`${b.app}'s installed version couldn't be read, so it wasn't registered (the link doesn't guess which version this install replaces)`); continue; }
     const probe = await fileAt(d, c.repo, PROBE_FILES[b.app] ?? CONFIGS[b.app], c.head);
-    if (!from || from === "none" || !probe || probe === "missing") { say(`${b.app}'s version at the base or its probe at the head couldn't be read: not registered`); continue; }
+    if (!probe || probe === "missing") { say(`${b.app}'s probe at the head couldn't be read: not registered`); continue; }
     // (Keeper 0.1.13) the owner's drill flag, spent here, before the keeper is asked, so it counts once whatever follows:
     // while it was set this install goes as kind drill, and it fails on purpose as the flag names (drill.ts)
     // Keeper 0.1.14: fail closed (a flag file that doesn't verify, names another version or was spent refuses the install and
@@ -525,17 +569,21 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
     } else if (last?.status === 200 && j.status === "refused" && j.code === "no_space") {
+      ended.push(attempt);
       // (Keeper 0.1.10) no room for the keeper's backup: the install is refused. Keeper 0.1.11: always; the link posts one card
       // saying so, with no button that installs without the rollback (the owner clears space or chooses another path)
       say(`the keeper refused ${b.app} ${b.version}: ${String(j.why ?? "no room for its backup").slice(0, 160)}; nothing installs without the keeper's rollback, and the link posts the owner a card saying so`);
       d.noSpace?.(c.pr, c.head, slug, b.version);
       notAccepted("the keeper had no room for its backup");
     } else {
+      // (Cain 0.19.3) any answer but pending, accepted or claimed is an attempt Keeper ended itself (its view answers "refused" for an
+      // unprotected one): nothing to cancel
+      if (last?.status === 200 && typeof j.status === "string" && !LIVE.has(j.status)) ended.push(attempt);
       notAccepted(last?.status === 200 && j.status === "pending" ? "the keeper's answer was still pending when the wait ended" : "the keeper didn't accept it with a confirmed backup");
       say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
       : last?.status === 200 ? `the keeper refused ${b.app} ${b.version}: ${String(j?.why || j?.status).slice(0, 160)}`
       : `the keeper didn't answer for ${b.app} ${b.version} (${attempt})`);
     }
   }
-  return ok ? { ok: true, accepted, said, fp: committed } : { ok: false, said, ...(cancel ? { cancel } : {}) };
+  return ok ? { ok: true, accepted, said, fp: committed } : { ok: false, said, ...(cancel ? { cancel } : {}), ...(ended.length ? { ended } : {}) };
 }

@@ -52,7 +52,7 @@ function keeper(store: DrillStore) {
   let now = NOW; const posted: any[] = []; const logs: string[] = []; const pages: [string, string, any][] = []; let enrolled: any = null; let last: any = null;
   const drill = drillDeps(store, () => SHIP_PUB, () => now, (l) => logs.push(l), { sign: markSigner, markPub: () => DK.pub, page: (k, key, info) => pages.push([k, key, info]) });
   const idOf = (b: any) => `${b.kind}-46-cain-${SHA.slice(0, 8)}`;
-  const deps = { api, log: (l: string) => logs.push(l), now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR,
+  const deps = { api, log: (l: string) => logs.push(l), now: () => now, sleep: async (ms: number) => { now += ms; }, linkFp: FPR, installed: () => "0.18.0",
     enrollment: { load: () => enrolled, store: (e: any) => { enrolled = e; } }, drill,
     post: async (b: any) => { posted.push(b); last = b; return { status: 202, body: { status: "pending", id: idOf(b) } }; },
     get: async () => ({ status: 200, body: { status: "accepted", id: idOf(last), app: "0fcc2575_cain", from_version: "0.18.0", to_version: V, backup: "kb1", until: "x", kind: last.kind,

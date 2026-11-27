@@ -81,7 +81,7 @@ import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, 
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses, cainInstalled, APP_SLUGS } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -436,6 +436,7 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 // keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
 const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
 const ACCEPT_WAIT_MS = acceptWaitMs(process.env.KEEPER_ACCEPT_MIN);   // Keeper 0.1.15 item 6
+const INSTALLED_FILE = process.env.CAIN_INSTALLED_FILE ?? "/run/cain/installed-version";   // Cain 0.19.3, written by the App's start
 const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
 const shipPassDeps: PassDeps = {
   pub: shipPub,
@@ -449,7 +450,9 @@ const shipPassDeps: PassDeps = {
     void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
       post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
-      get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
+      get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null),
+      // Cain 0.19.3: from_version is the version installed now (the Supervisor's answer at the App's start, else the image's own)
+      installed: (slug) => slug === APP_SLUGS.Cain ? cainInstalled(() => readFileSync(INSTALLED_FILE, "utf8"), process.env.CAIN_BUILD_VERSION) : null }, tok, claim)
       .then(done)
       .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
   },
