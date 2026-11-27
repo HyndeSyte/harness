@@ -535,72 +535,44 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
-## What 0.20.0 does: Cain's turns kept for what needs him
+## What 0.20.0 does: fewer turns for job checks, a limit named at once
 
 Cain is one long Claude Code session, and every turn he takes reads his whole context again. In the
 week of Nov 20 to 27 that came to 1.8 billion cached tokens read: relays from the App 37 percent,
-cloud job checks 24, your own messages 21, the hourly liveness check 7, check-ins 3. The largest single
-kind was a relayed line too long to type, which he read from a file (298 a week, about 1,240 model
-calls), and 138 of 305 cloud job checks found nothing new. Each call carried a median of 297K tokens of
-context (90th percentile 683K, the most 966K), with only 8 compactions in the week. And on Nov 27 every
-turn from about 6:20 to 9:04 AM failed on the monthly spend limit while the App's probe called his
-screen ready, so no alarm named the cause.
+cloud job checks 24, your own messages 21, the hourly liveness check 7, check-ins 3. 138 of 305 cloud
+job checks found nothing new. Each call carried a median of 297K tokens of context (the most 966K),
+with only 8 compactions in the week. And on Nov 27 every turn from about 6:20 to 9:04 AM failed on the
+monthly spend limit while the App's probe called his screen ready, so no alarm named the cause.
 
-So in this release code does the routine part, and he gets a turn only when it needs him. After the
-first outside review, nothing is dropped on a model's judgment, and nothing at all is skipped in the
-first week:
+This release keeps only changes that are no riskier than before it. Relays, calendar cards and your
+own messages are typed into his session exactly as before: nothing is skipped, held, shortened or
+reordered, and the App never restarts or compacts his session itself.
 
-- **Your messages are untouched.** They reach him directly, as before. Nothing below classes, holds or
-  summarises them, nor your page's notes.
-- **One queue, cards first.** Every line the App types for him (relays, job lines, the digest, the
-  fresh start's lines) goes through one queue. A calendar card with buttons is recognised before
-  anything else and goes to the head of the queue, typed short with its show command. If a card can't
-  be typed into his ready session within about a minute, you get the usual "Cain isn't getting
-  messages" alarm (the card itself goes out to you by itself at 2 minutes).
-- **Not ready means wait.** The App types only at his idle prompt, recognised by its shape. A usage or
-  spend limit on his screen, a compaction at work, a start, a question or any screen it doesn't know
-  counts as not ready: lines wait in the queue and go in order once he's back, cards first. A limit
-  also raises its own alarm at once, with the fix: switch his model, or raise the limit.
-- **Receipts skip his turn only by an exact list.** A tap of Not now, Hold it, Don't, Drop it, Leave it,
-  Keep cards or No on one of his own questions (with nothing after it, and no date, deadline, error,
-  review or card in its question), a review seat passing its nightly check again, and a held question
-  now in front of you. Anything else, anything from the calendar App, and any new kind of line is a turn.
-  Each skip is kept on disk before it's skipped (if that fails, it goes to him), written to his record
-  (state/receipts), and listed in his daily digest.
-- **A shadow week first.** For the first 7 days after you install this, nothing is skipped: each line the
-  list would skip still reaches him, and his digest lists it as "would skip" so he can mark a mistake.
-  After 7 days the list starts skipping by itself, unless he marked one: then it stays in shadow and his
-  digest says so. The setting is the one word in /data/lean/shadow at the Pi: auto (the default), on, or
-  off.
-- **Long lines are shortened, never dropped.** A line too long to type is summarised by a small worker
-  (Sonnet 5.5, low effort) that has no tools at all and never decides whether he sees it: he always gets
-  its two-line summary and the file with the whole line. It runs at most 45 seconds, with his sign-in but
-  in no group of his (so it can't reach the Discord plugin), with nothing of the App's environment. If it
-  fails or runs out of time, the line goes to him as before.
-- **Cloud jobs are watched by code, and fail open.** Every 10 minutes the App reads each Build job's pull
-  request on GitHub and tells him in one line when it changed (checks passed or failed, merged, closed)
-  or stalled (a Build with no change for 3 hours, a Ship 25 minutes in and then every 45 minutes). A job
-  GitHub can't be read for, or a job file code can't read safely, is a line to him too, never a silent
-  skip. What he heard is kept only once the line went in.
-- **The daily digest.** Each morning from 6:50 he gets one line listing what the receipt list matched,
-  built from the kept record and counted as sent only once it went in; what didn't, comes again the next
-  day.
-- **His context stays small.** Once his context passes 450K tokens the App compacts his session itself,
-  at a quiet moment: never while a card is in its window or anything waits to go in. Claude Code's own
-  compaction stays only as a backstop at 850K. Once a day, between 3 and 5 AM, when you haven't written
-  for 30 minutes, nothing was relayed for 15, nothing waits, no card is in its window and no job is
-  mid-step, the App first asks him for his handover, waits until his record has it, and only then starts
-  his session fresh; lines that come meanwhile wait for the new session.
-- **The hourly liveness check is one word**, and still needs his real reply.
-- **A usage line in the App's log once a day:** his tokens by model and by what started each turn, the
-  context each call carried, compactions, the worker's own use, and how many lines were skipped and how
-  many he marked.
+- **Cloud jobs are checked by code.** Every 15 minutes while /data/jobs has files (as the old nudge
+  was), the App reads each job file and each Build job's pull request on GitHub. He gets one line
+  when a pull request's checks passed or failed at its head, it merged, closed or went away (every
+  look while it stays so, until he closes the job), a Build had no change for 3 hours, or anything
+  couldn't be read: a GitHub error, an answer code doesn't know, a Ship run (code has no state of its
+  own to read for one, so every look, as before), a job file code refused, or the jobs folder itself.
+  A Build still at work (no pull request yet, or its checks running) is no line. What code saw counts
+  as seen only once his line is in. If the code can't run at all, the old "cloud job check" goes in
+  instead. The files are read as root without trusting them: never through a link, never a FIFO,
+  only his own regular file with one name and at most 4 KB, opened from the folder held open.
+- **A usage or spend limit is named at once.** The probe tells that screen apart, never calls it
+  ready, and raises "Cain hit a usage limit" with the fix: switch his model, or raise the limit. A
+  screen it doesn't recognise is never ready either, and raises the usual "Cain may not be answering"
+  alarm once it has lasted 10 minutes.
+- **The hourly liveness check is shorter**, and still needs his model's real reply.
+- **Compaction earlier, by setting only.** Claude Code's own compaction is set to fire at about 450K
+  tokens (45 percent of his 1M window), a few times a day. What he owes lives outside his context
+  (state/RESTART.md, state/PENDING.md, /data/jobs), and his rules say to read them again after one.
+- **A usage line in the App's log once a day:** his tokens by model and by what started each turn,
+  the context each call carried, and his compactions.
 
-How the week after is measured, from those usage lines: at least half the cache reads gone, no missed
-action (no digest line he marks as needing him that was late to matter), and his replies to you no
-slower.
+Left for a later release, designed against the outside review's findings: shortening long relays,
+skipping receipts that need nothing, and a quiet restart of his session.
 
-Nothing for you to do. If his answers seem to miss something, ask him about the digest.
+Nothing for you to do.
 
 ## What 0.19.0 does: working with the Keeper
 

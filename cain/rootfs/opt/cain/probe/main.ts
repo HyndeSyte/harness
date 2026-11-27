@@ -50,7 +50,7 @@ import { chainVerdicts, checkFolder, FolderTampered, folderWhy } from "./folder"
 import {
   afterStart, alarmFor, askDue, bootKind, clockDue, endKind, END_KINDS, exitCause, failedWords, type Facts, hourlyState, type Hourly, type Install,
   inWindow, lastCode, lastSlot, logLine, longTurn, parseBoots, pass, type Pass, PASS_EVERY_S, PROBE_LINE, pruneStarts, parseSelf, parseStarts,
-  parseAsked, parseUnseen, type Screen, tooManyAsked, askedCount, allStarts, allCount, tooManyAll, screenOf, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
+  parseAsked, parseUnseen, type Screen, tooManyAsked, askedCount, allStarts, allCount, tooManyAll, screenOf, otherFor, shouldPing, SELF_WINDOW_S, START_ID, startsIn, STOP_MARK_S, tooManyBoots, tooManySelf, tooManyStarts, tooManyUnseen,
   unseenCount, updateCause, parseSelfRows, selfDecide, selfReport, selfWords, type SelfState, type Switch, SELF_KINDS, SELF_MARK_S,
 } from "./core";
 
@@ -259,9 +259,11 @@ export async function runPass(d: PassDeps): Promise<Pass> {
   const had = (text(p.alarmed) ?? "").trim().split(/\s+/)[1] ?? (exists(p.alarmed) ? "probe" : "");
   // Stopped on purpose (the mode file says none), his stop's own alarm already tells Dane why.
   if (kind && kind !== had && !appStopped) {
-    const cause = kind === "needs-signin" || kind === "api-down" || kind === "usage-limit" ? "" : failedWords(result);
+    const other = otherFor(recent);
+    const cause = kind === "needs-signin" || kind === "api-down" || kind === "usage-limit" ? ""
+      : [failedWords(result), other !== null ? `his screen has shown something the App doesn't know for ${other} minutes` : ""].filter(Boolean).join("; ");
     if (d.notice("tell", kind, cause) <= 1) writeWhole(p.alarmed, `${now} ${kind}\n`, 0o600);
-  } else if (result.status === "ok" && had) {
+  } else if (!kind && result.status === "ok" && had) {
     if (d.notice("clear", "probe") <= 1) rm(p.alarmed);
   }
   return result;

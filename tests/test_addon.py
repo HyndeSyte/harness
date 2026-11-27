@@ -1747,7 +1747,7 @@ def _checkin(tmp_path, now, screen, runs=None, checked=True, after=None, day="20
                PROMPT_STATE=(CAIN / "rootfs/opt/cain/prompt-state.sh").as_posix(),
                # Cain 0.20.0's lean session (lean/main.ts) is driven by cain/tests/lean.test.ts; here it is
                # absent, so checkin.sh takes its fallback, which is exactly what it did before.
-               **{"LEAN_MAIN": "/nonexistent/lean/main.ts", "LEAN_DIR": (tmp_path / "lean").as_posix(), **more})
+               **{"LEAN_MAIN": "/nonexistent/lean/main.ts", **more})
     for k in ("STUB_AFTER", "CAIN_AS"):
         if k not in more:
             env.pop(k, None)

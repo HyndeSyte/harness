@@ -93,8 +93,8 @@ export const LAYER_WORDS: Record<Layer, string> = {
 // model's monthly spend limit stops him. On Nov 27 every turn from about 6:20 to 9:04 AM failed on the
 // monthly spend limit while his prompt looked ready, so the probe called that screen ready and no alarm
 // named the cause. Now it is its own status, alarmed at once with the fix, and never ready. It counts
-// while it is the newest thing on his screen (no reply of his after it, in the last 40 lines), as
-// lean/held.sh reads it for the typing path, so a limit that a later turn got past no longer counts.
+// while it is the newest thing on his screen (no reply of his after it, in the last 40 lines), so a
+// limit that a later turn got past no longer counts. The typing path is unchanged by it.
 export type Screen = "ready" | "working" | "signin" | "api" | "limit" | "other";
 export const LIMIT = /you'?ve (hit|reach(?:ed)) your [a-z ]{0,30}limit|\/usage-credits|\b(monthly )?spend limit\b|usage limit (reach(?:ed)|hit)|limit reach(?:ed)[^\n]{0,40}resets/i;
 const SIGNIN = /run \/login|token has expired|authentication_error|invalid api key|not logged in|paste.*code|oauth\/authorize/i;
@@ -213,7 +213,7 @@ export function longTurn(h: Hourly, now: number): number | null {
 // file says none: the App stopped his session on purpose and told the owner itself), no alarm and no
 // ping. The owner's Stop is none of these: his session keeps running and answering through it.
 export type Status = "ok" | "failed" | "signin" | "api" | "limit" | "stopped";
-export interface Pass { at: number; ok: boolean; failed: string[]; hourly: HourlyState; status?: Status }
+export interface Pass { at: number; ok: boolean; failed: string[]; hourly: HourlyState; status?: Status; screen?: Screen }
 export function pass(f: Facts, h: Hourly, o: { screen?: Screen; appStopped?: boolean } = {}): Pass {
   const failed: string[] = layers(f);
   const hourly = hourlyState(h, f.now, o.screen === "working");
@@ -224,7 +224,8 @@ export function pass(f: Facts, h: Hourly, o: { screen?: Screen; appStopped?: boo
   else if (o.screen === "limit") status = "limit";
   else if (o.screen === "signin") status = "signin";
   else if (o.screen === "api") status = "api";
-  return { at: f.now, ok, failed, hourly, status };
+  // His screen as read, kept only while his session is there: a capture of no session isn't a screen.
+  return { at: f.now, ok, failed, hourly, status, ...(o.screen && f.tmux ? { screen: o.screen } : {}) };
 }
 // The outside heartbeat hears from the probe only when every check passed. A missed ping is the alarm
 // from outside. The owner's Stop doesn't touch it (his session runs on); only the App's own stopped
@@ -233,12 +234,25 @@ export function shouldPing(p: Pass): boolean { return p.ok === true && p.failed.
 // The alarm the App raises for a pass, or null: two failed passes in a row (or a missed hourly
 // answer, at once); a sign-in or API screen as that, at once; never in the App's own stopped mode.
 export type AlarmKind = "probe" | "needs-signin" | "api-down" | "usage-limit";
+// A screen the probe doesn't recognise ("other": not ready, not at work, no sign-in, API error or limit)
+// is never taken as ready, and once it has lasted OTHER_ALARM_S in passes on end it raises the probe's
+// own alarm (Cain 0.20.0), even while every liveness layer passes.
+export const OTHER_ALARM_S = 10 * 60;
+export function otherFor(recent: Pass[]): number | null {
+  let first: Pass | null = null;
+  for (let i = recent.length - 1; i >= 0 && recent[i].screen === "other"; i--) first = recent[i];
+  const last = recent.at(-1);
+  if (!first || !last || last.at - first.at < OTHER_ALARM_S) return null;
+  return Math.floor((last.at - first.at) / 60);
+}
 export function alarmFor(recent: Pass[]): AlarmKind | null {
   const last = recent.at(-1);
   if (!last) return null;
   const st = last.status ?? (last.ok ? "ok" : "failed");
-  if (st === "stopped" || st === "ok") return null;
+  if (st === "stopped") return null;
   if (st === "limit") return "usage-limit";
+  if (otherFor(recent) !== null) return "probe";
+  if (st === "ok") return null;
   if (st === "signin") return "needs-signin";
   if (st === "api") return "api-down";
   if (last.failed.includes("answer")) return "probe";

@@ -16,13 +16,13 @@ fi
 # request, and the App types only into an empty box (prompt-state.sh), which one would fill. The
 # variable outranks any setting (Claude Code's docs, "Turn prompt suggestions off").
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
-# His context kept small (Cain 0.20.0): the App compacts his session itself at a quiet moment once his
-# context reaches lean/core.ts COMPACT_AT_TOKENS (checkin.sh, never while a card is in its window), so
-# Claude Code's own compaction is only the backstop, at lean/core.ts BACKSTOP_AT_TOKENS, set here in
-# code, never by hand. Claude Code takes it as a percentage of the model's context window (1M for his
-# model). 85 if bun can't say.
-CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="$(timeout 20 bun /opt/cain/lean/main.ts compact-pct 2>/dev/null | tr -cd '0-9')"
-export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-85}"
+# His context kept smaller (Cain 0.20.0): Claude Code's own automatic compaction fires at this
+# percentage of his model's context window (1M tokens), so at about 450K instead of near the top. Last
+# week his calls carried a median of 297K and at most 966K, with 8 compactions in the week; at 450K it
+# fires a few times a day. Only a setting: the App never types /compact itself. His open obligations
+# live outside the transcript (state/RESTART.md, state/PENDING.md, /data/jobs), and his rules say to
+# read them again after a compaction. lean/core.ts AUTOCOMPACT_PCT is the same number, for the tests.
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=45
 # The outside heartbeat's URL is the security watch's alone (services.d/cain/run): never Claude's.
 # No xtrace around it (third round), put back as it was after.
 case $- in *x*) hb_xtrace=1 ;; *) hb_xtrace= ;; esac
