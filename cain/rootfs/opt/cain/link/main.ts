@@ -80,7 +80,7 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
-import { armFlag, drillDeps, drillKeyFrom, fileStore, storeMarkPub } from "./drill";
+import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { HcAnnounceAlarm, hcCall, takeKey } from "./healthchecks";
@@ -93,7 +93,7 @@ import { clearAlarmDetached, raiseAlarmDetached, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths, PlanCacheAlarm } from "../guard";
 import { gatewayHealthy, writeGatewayMark } from "./health-gate";
 import { KEEPER_URL, keeperCall, probeHash } from "../probe/keeper";
-import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
+import { check, CHECK_MS, every, fileStore as watchFileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // 0.17.0: the Healthchecks.io management key, from the App's option healthchecks_api_key, in this
 // process alone. Round 2: read from its root-only file, never the environment (healthchecks.ts takeKey).
@@ -275,8 +275,7 @@ void plan.read().catch(() => {});
 
 // Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
 // the spent nonces in /data/link (0700), outside Cain's backups (config.yaml backup_exclude).
-const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`,
-  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`, Date.now, `${DIR}/keeper-drill-refused.json`);   // Keeper 0.1.15: the refused intent, beside the spent list
+const drillStore = linkDrillStore(process.env, TRUST_DIR, DIR, Date.now);   // Keeper 0.1.15: the refused intent sits beside the spent list
 // The drill key, derived from the Ship key under its own domain; its public half kept by root for the run script and the probe.
 const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
 const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
@@ -412,7 +411,7 @@ let lastHeard = 0;                       // ms: the last thing Discord's gateway
 
 // -- the mutual watch on the calendar specialist (watch.ts) -------------------------
 const watchLog = (line: string) => console.log(`[cain] link: ${line}`);
-const watch = new PeerWatch({ ...fileStore(WATCH, watchLog), now: Date.now, mono: () => performance.now() });
+const watch = new PeerWatch({ ...watchFileStore(WATCH, watchLog), now: Date.now, mono: () => performance.now() });
 
 async function harnessAlive(): Promise<boolean | "refused"> {
   if (!token()) return true;             // no key yet: nothing to check with, and nothing to say

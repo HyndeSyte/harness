@@ -200,6 +200,11 @@ are barred from them, and once his session runs as its own user (the next step) 
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy
 key, and Cain is told if it doesn't.
 
+Since 0.19.0 and until 0.19.2, Cain could not accept an update of himself: a mix-up in his App's
+code gave his drill check the wrong kind of store, so every install of Cain was refused with "the
+drill flags' high-water time can't be kept". 0.19.2 fixes it, and his tests now fail on that kind of
+mix-up before a change can reach a Ship card.
+
 ## If the calendar specialist stops
 
 Cain's App and the Harness App check each other every minute. If Harness hasn't
