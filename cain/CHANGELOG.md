@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.3
+
+- No change to what Cain does. This version carries 0.19.1 and 0.19.2 onto the Pi: 0.19.2 was tried once and the keeper refused it because 0.19.1 had never been installed, and the keeper never takes the same update twice, so it needs a new version to install.
+
 ## 0.19.2
 
 - Cain can accept an update of himself again. Since 0.19.0 every install of Cain was refused with "the drill flags' high-water time can't be kept", because of a mix-up in his App's code. That is fixed.
