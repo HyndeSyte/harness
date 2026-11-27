@@ -93,7 +93,8 @@ const VERDICTS = "approve|approved|approves|approving|approval|verdict|verdicts|
 const REVIEW_WORDS = "review|reviews|reviewed|reviewer|reviewers|reviewing";
 // "Reviewed", then any spaces (a line break too), then ":" or "-": a heading only where it
 // starts a sentence or a line ("Done. Reviewed: ..."), never mid-sentence ("what I reviewed: the calendar").
-const HEADING = new RegExp("(?<![A-Za-z0-9])reviewed\\s*[:\\-\\u2013\\u2014]", "gi");
+// Cain 0.20.0: a cut check's "Cut checked:" heading is a claim the same way, taken only as the service gave it.
+const HEADING = new RegExp("(?<![A-Za-z0-9])(?:reviewed|cut\\s+checked)\\s*[:\\-\\u2013\\u2014]", "gi");
 const SEAT = new RegExp(WORD(SEATS), "i");
 const VERDICT = new RegExp(WORD(VERDICTS), "i");
 const REVIEW = new RegExp(WORD(REVIEW_WORDS), "i");
@@ -145,7 +146,8 @@ export function claimsReview(text: string): boolean { return claimsIn(claimText(
 // A line as the gate compares it, the same on both sides: spaces as one, the heading as
 // "Reviewed: ", and the full stop at its end may go.
 const canon = (s: string) => s.replace(/\s+/g, " ").trim()
-  .replace(new RegExp("^reviewed\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Reviewed: ").replace(/\.$/, "");
+  .replace(new RegExp("^reviewed\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Reviewed: ")
+  .replace(new RegExp("^cut\\s+checked\\s*[:\\-\\u2013\\u2014]\\s*", "i"), "Cut checked: ").replace(/\.$/, "");
 const excerpt = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 60);
 
 // published: the review service's lines; null (or not given) when they can't be read. Each

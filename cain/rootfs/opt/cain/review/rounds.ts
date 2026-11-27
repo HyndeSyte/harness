@@ -1,6 +1,5 @@
 // The review-round cap (Cain 0.16.0). The owner's rule since Nov 17, 2026: a piece of work gets at
-// most three outside review rounds; if the third still finds something serious, he gets one decision
-// (ship with the risk named, or hold), never a fourth round. Kept here, in the runner (root), where
+// most three outside review rounds, never a fourth (since Nov 26 the rest is R-013, below). Kept here, in the runner (root), where
 // Cain can't change it: the cap is the App's option `review_round_cap` (default 3), read by the run
 // script from /data/options.json (root's) into the runner's environment only.
 //
@@ -11,37 +10,30 @@
 // new id nor a replacement pull request starts the count again. A round blocked for privacy sent
 // nothing and doesn't count.
 //
-// When the cap's last round leaves a serious finding, the group gets one decision card (decision:
-// owed, then posted), written by the runner through the link; Cain can't post it another way.
-//
 // Round 2: each round is kept as started (at intake, before it runs), then answered, or lost: ended
 // without a result (every seat failed, or a crash recovered at the runner's start, where the round was
 // counted but its review never made it to the queue). A lost round still counts (the count stays
-// conservative), and a lost round that is the cap's last owes the decision card too, saying the final
-// review did not complete.
+// conservative).
 //
-// Cain 0.18.0: the cap for a change is the base cap plus the rounds the owner granted it (grants.ts), on
-// his tap only. A round under the raised cap is fix-only like any later round. A granted round that again
-// leaves something serious at the raised cap owes a new decision card (one per round number): the newest
-// decision is the one that counts, and the earlier ones are kept under `past`.
+// Cain 0.20.0, the owner's review rule (R-013): three rounds a piece, never more, and no card offers more
+// rounds or a ship with a risk named (the grants of extra rounds and the decision card are retired). After
+// the cap's last round: nothing serious left, the normal Ship card; something serious left, Cain either
+// holds the piece or cuts the parts the serious findings are about, and one outside model that did not write
+// the cut checks the cut diff (a cut check, kept under the change as `cut`): not a round, never a second.
 import { chmodSync, chownSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
-import { grantsFor, grantedRounds, grantWords, type GrantRec, type Grants } from "./grants.ts";
 
 export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
 
 export type RoundState = "started" | "answered" | "lost";
 export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundState; blocked?: boolean; done?: boolean; serious?: number };
-export type DecisionRec = {
-  id: string;                        // the decision's own id: "<key>#<round>", what the link files the tap under
-  key: string; round: number; serious: number;
-  topic: string; finding: string; item: string | null; pr: string | null;
-  state: "owed" | "posted"; at: string; message?: string; tries?: number;
-  lost?: boolean;                    // the cap's last round never produced a result (round 2)
-};
-export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; decision?: DecisionRec; past?: DecisionRec[] };
+// The one cut check of a change at its cap (0.20.0): its review id, the cut head it checked, the seat, and
+// how it ended (pass or fail; lost when its seat never answered). One a change group, for good.
+export type CutRec = { id: string; at: string; head: string; pr: string; seat: string; state: "started" | "pass" | "fail" | "lost" };
+// decision and past: written by the retired decision card (0.16.0 to 0.19.0), read nowhere now.
+export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; cut?: CutRec; decision?: unknown; past?: unknown };
 export type Rounds = { format: number; changes: Record<string, ChangeRec> };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
@@ -85,19 +77,30 @@ export function countedRounds(r: Rounds, key: string): (RoundRec & { key: string
   return groupOf(r, key).flatMap((k) => (r.changes[k]?.rounds ?? []).map((x) => ({ ...x, key: k })))
     .filter((x) => !x.blocked).sort((a, b) => a.at.localeCompare(b.at));
 }
-// The group's newest decision (the highest round): since 0.18.0 a granted round can owe another.
-export function decisionOf(r: Rounds, key: string): DecisionRec | null {
-  let best: DecisionRec | null = null;
-  for (const k of groupOf(r, key)) { const d = r.changes[k]?.decision; if (d && (!best || d.round > best.round)) best = d; }
-  return best;
+// The group's cut check, if it has one (0.20.0).
+export function cutOf(r: Rounds, key: string): (CutRec & { key: string }) | null {
+  for (const k of groupOf(r, key)) { const c = r.changes[k]?.cut; if (c) return { ...c, key: k }; }
+  return null;
 }
 
-export type Admit = { ok: true; key: string; round: number; kind: RoundKind; links: string[]; cap: number; granted: GrantRec[] } | { ok: false; why: string };
+// What the change's last counted round left, from the runner's own record (never Cain's words):
+// serious findings it left (by the owner's rule's count), lost, or still running.
+export type LastRound = { state: "answered"; serious: number; id: string; key: string } | { state: "lost"; id: string; key: string } | { state: "running"; id: string; key: string } | { state: "none" };
+export function lastRound(r: Rounds, key: string): LastRound {
+  const done = countedRounds(r, key);
+  const x = done[done.length - 1];
+  if (!x) return { state: "none" };
+  if (x.state === "lost") return { state: "lost", id: x.id, key: x.key };
+  if (x.state === "answered") return { state: "answered", serious: x.serious ?? 0, id: x.id, key: x.key };
+  return { state: "running", id: x.id, key: x.key };
+}
+
+export type Admit = { ok: true; key: string; round: number; kind: RoundKind; links: string[]; cap: number } | { ok: false; why: string };
 
 // Whether a brief may be a new round, and which: the rules A and C of the cap, before anything is
 // queued. The reason is plain, names the count and the rule, and is what review.sh prints.
-// grants (0.18.0): the owner's grants, read by the caller (null when they can't be read: none count).
-export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null = null, tz?: string): Admit {
+export function admit(r: Rounds, b: Brief, base: number): Admit {
+  if (b.kind === "cut-check") return { ok: false, why: "a cut check isn't a round: the runner takes it as a cut check. Nothing was queued." };
   const key = changeKeyOf(b);
   if (!key) return { ok: false, why: "a brief names the change it reviews: pr for a pull request, or change (a stable key) for a plan or document. Nothing was queued." };
   const links: string[] = [];
@@ -111,19 +114,33 @@ export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null =
   if (links.length) view.changes[key] = { ...(view.changes[key] ?? { rounds: [] }), links: [...new Set([...(view.changes[key]?.links ?? []), ...links])] };
   const done = countedRounds(view, key);
   const n = done.length;
-  const granted = grantsFor(view, grants, key);
-  const cap = base + grantedRounds(granted);
+  const cap = base;
   if (n >= cap) {
-    const d = decisionOf(view, key);
-    const g = grantWords(granted, tz);
-    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}. No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} More rounds come only from a grant: Cain asks with keeper.sh review-grant, and only the owner's tap on that card grants them; it never exempts the change from the rule. Nothing was queued.` };
+    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}, never more. No more rounds for it, under any id or a replacement pull request. If the last one left something serious, you decide by the rule: cut what the serious findings are about and submit one cut check (kind cut-check), or hold it. Nothing was queued.` };
   }
   const kind: RoundKind = b.round_kind ?? (n === 0 ? "full" : "fixes");
   if (kind === "full" && n > 0)
     return { ok: false, why: `refused: ${key} has had ${n} round${n === 1 ? "" : "s"} already, so this one is a fix-only round: leave round_kind out or set it to fixes, and list only the fixes. Nothing was queued.` };
   if (kind === "fixes" && n === 0)
     return { ok: false, why: `refused: ${key} has had no round yet, so there's nothing to check fixes against: its first round is full. Nothing was queued.` };
-  return { ok: true, key, round: n + 1, kind, links, cap, granted };
+  return { ok: true, key, round: n + 1, kind, links, cap };
+}
+
+// Whether a brief may be the change's one cut check (0.20.0), before anything is queued: the change is at its
+// cap, its last round ended with something serious left, and it has had no cut check. The reason is plain.
+export type AdmitCut = { ok: true; key: string; last: { id: string; key: string }; serious: number } | { ok: false; why: string };
+export function admitCut(r: Rounds, b: Brief, base: number): AdmitCut {
+  const key = changeKeyOf(b);
+  if (!key || !b.pr || !b.head) return { ok: false, why: "a cut check names the change's pull request (pr) and the cut head (head). Nothing was queued." };
+  const n = countedRounds(r, key).length;
+  if (n < base) return { ok: false, why: `refused: ${key} isn't at its cap (${n} of ${base} rounds), so there's nothing to cut: a cut check is only for a change at its cap. Nothing was queued.` };
+  const had = cutOf(r, key);
+  if (had) return { ok: false, why: `refused: ${key} already had its one cut check (${had.id}, ${had.state}). There is no second cut and no second check. Nothing was queued.` };
+  const last = lastRound(r, key);
+  if (last.state === "running" || last.state === "none") return { ok: false, why: `refused: ${key}'s last round is still running. A cut check waits until it has ended with something serious left. Nothing was queued.` };
+  if (last.state === "lost") return { ok: false, why: `refused: ${key}'s last round was lost, so no serious finding is known to cut: it is held by the owner's rule. Nothing was queued.` };
+  if (last.serious === 0) return { ok: false, why: `refused: ${key}'s last round left nothing serious, so there is nothing to cut: show the normal Ship card. Nothing was queued.` };
+  return { ok: true, key, last: { id: last.id, key: last.key }, serious: last.serious };
 }
 
 // Kept once the review is queued.

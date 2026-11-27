@@ -11,12 +11,11 @@ import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
-  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, checkBrief, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
-  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  CUT_CHECK, CUT_SEATS, FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, checkBrief, cutResult, earlierCheck, findingRef, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
+  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, seriousRaised, shownId, sortOutbound, sortsCount, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun, type SortRec,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
-import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
-import { effectiveCap, readGrants, type Grants } from "./grants.ts";
+import { DEFAULT_ROUND_CAP, addRound, admit, admitCut, countedRounds, readRounds, writeRounds, type Rounds } from "./rounds.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
@@ -40,9 +39,6 @@ export type RunnerConfig = {
   // the Build hook), and the guard's log. Absent files: the cap and guard aren't kept (tests that queue directly).
   roundCap?: number; reservePercent?: number;
   roundsFile?: string; settingsFile?: string; guardLog?: string;
-  // Cain 0.18.0: the owner's grants of extra rounds (grants.ts), written by the link on his tap only.
-  // Absent: no grants count.
-  grantsFile?: string;
 };
 
 export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile" | "termsFile" | "recordQueue" | "relayFile"> = {
@@ -61,9 +57,6 @@ export type RunnerDeps = {
   unavailable?: (seat: SeatName) => Unavailable;   // e.g. Codex not signed in
   now?: () => Date; rand?: () => number; log?: (m: string) => void;
   stopped?: () => boolean;                         // Dane's Stop (../stop.ts): nothing is sent while it holds
-  // Cain 0.16.0: the owner's decision card at the review cap, posted through the link (its root socket);
-  // the message id, or null when it didn't go (tried again next tick). Absent: never posted.
-  postDecision?: (d: DecisionRec) => Promise<string | null>;
   plan?: () => PlanReading;                        // the plan-usage reading (../plan-usage.ts), for the guard
 };
 
@@ -119,6 +112,9 @@ export function loadReview(dir: string, id: string): Review | null {
   return r && typeof r === "object" && r.id === id ? r : null;
 }
 export function saveReview(dir: string, r: Review) { writeAtomic(reviewFile(dir, r.id), JSON.stringify(r, null, 1)); }
+
+// The sorting step's label of one listed finding: "SERIOUS (<arm>) [n]:" or "FOLLOW-UP (<arm>) [n]:".
+const SORT_MARK = /^\s*\**\s*\[?\s*(serious|follow[- ]?up)\s*\]?\s*(?:\(\s*([^)]{1,80}?)\s*\))?\s*\[\s*(\d{1,2})\s*\]\s*\**\s*[:.\-]\s*/i;
 
 export class Runner {
   private now: () => Date; private rand: () => number; private log: (m: string) => void;
@@ -258,7 +254,7 @@ export class Runner {
   }
   // A brief of Cain's into the queue, as a new round of its change, or the reason it isn't (null: queued).
   // The install-time self-check's finding (../capfiles.ts, main.ts): while set, the cap and guard are off,
-  // so no brief is taken (fail closed) and no round is settled or decision card posted.
+  // so no brief is taken (fail closed) and no round is settled.
   capOff: string | null = null;
   admitAndQueue(given: Brief): string | null {
     // Only a brief's own fields go in (Cain 0.18.1): a brief carrying anything else, earlier findings
@@ -272,7 +268,8 @@ export class Runner {
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
-    const a = admit(rounds, b, this.roundCap, this.grants(), this.cfg.tz);
+    if (b.kind === CUT_CHECK) return this.admitCutCheck(rounds, file, b);
+    const a = admit(rounds, b, this.roundCap);
     if (!a.ok) return a.why;
     // A round id is one change's (Cain 0.18.1): an id already kept as a round of another change is refused,
     // so no round's record can stand for two changes and a fix-only round never reads another's findings.
@@ -285,8 +282,7 @@ export class Runner {
       if (!g.ok) return `held by the usage guard: it's labelled ${label}, and ${g.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`;
     }
     const r = newReview(b, this.now());
-    Object.assign(r, { change: a.key, round: a.round, cap: a.cap, round_kind: a.kind,
-      ...(a.granted.length ? { granted: a.granted.map((g) => ({ rounds: g.rounds, at: g.at })), base_cap: this.roundCap } : {}) });
+    Object.assign(r, { change: a.key, round: a.round, cap: a.cap, round_kind: a.kind });
     if (a.kind === "fixes") r.earlier = this.earlierFindings(rounds, a.key);
     // The round is kept before the review is queued: a stop between the two counts a round that never
     // ran (fails safe), never runs one that wasn't counted.
@@ -294,6 +290,42 @@ export class Runner {
     writeRounds(file, rounds);
     saveReview(this.cfg.queueDir, r);
     return null;
+  }
+  // The change's one cut check (0.20.0): not a round, so it isn't counted; refused unless the change is at its
+  // cap with something serious left and has had none. It goes to exactly one outside seat that did not write the
+  // cut (never Claude, never a stand-in: openai unless the brief names gemini, or gemini when openai is down at
+  // intake and the brief names neither), with the serious findings of the change's last round loaded here from
+  // the runner's own record, never from the brief.
+  private admitCutCheck(rounds: Rounds, file: string, given: Brief): string | null {
+    const a = admitCut(rounds, given, this.roundCap);
+    if (!a.ok) return a.why;
+    const other = Object.values(rounds.changes).some((c) => c.rounds.some((x) => x.id === given.id) || c.cut?.id === given.id);
+    if (other) return `refused: the id ${given.id} is already a round or a cut check: give the cut check a new id. Nothing was queued.`;
+    const label = labelOf(given.label)!;
+    if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
+      const g = guard(label, `cut check ${given.id} (${a.key})`, { settingsFile: this.cfg.settingsFile, spendFile: this.cfg.spendFile,
+        logFile: this.cfg.guardLog, tz: this.cfg.tz, now: this.now(), plan: this.deps.plan });
+      if (!g.ok) return `held by the usage guard: it's labelled ${label}, and ${g.why}. Core, commitment and necessary-fix work still run; this is on the guard's log (review.sh guard). Nothing was queued.`;
+    }
+    const serious = this.lastSerious(a.last);
+    if (!serious.length) return `refused: the serious findings of ${a.key}'s last round can't be read from the runner's record, so there's nothing to check the cut against: it's logged for a Build item. Nothing was queued.`;
+    const seat: SeatName = given.seats?.[0] ?? (this.unavailable("openai") && !this.unavailable("gemini") ? "gemini" : "openai");
+    const b: Brief = { ...given, seats: [seat], consequential: false };
+    if (!CUT_SEATS.includes(seat)) return "refused: a cut check goes to one outside seat that did not write the cut. Nothing was queued.";
+    const r = newReview(b, this.now());
+    Object.assign(r, { change: a.key, kind: CUT_CHECK, earlier: serious });
+    const c = rounds.changes[a.key] ??= { rounds: [] };
+    c.cut = { id: b.id, at: this.now().toISOString(), head: b.head!, pr: b.pr!, seat, state: "started" };
+    writeRounds(file, rounds);
+    saveReview(this.cfg.queueDir, r);
+    return null;
+  }
+  // The serious findings (by the rule's count, seriousLeft) the change's last round left, from that round's own
+  // queue record; [] when it can't be read.
+  private lastSerious(last: { id: string; key: string }): string[] {
+    const prev = loadReview(this.cfg.queueDir, last.id);
+    if (!prev || prev.id !== last.id || prev.change !== last.key || prev.status === "blocked: privacy") return [];
+    return seriousLeft(prev).slice(0, 30).map((f) => `${f.arm ? `[serious: ${oneLine(f.arm, 80)}] ` : "[serious] "}${oneLine(f.problem, 400)}`);
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
   // Read only from the runner's own files: the rounds recorded under this change's own key in the rounds file
@@ -311,51 +343,42 @@ export class Runner {
     return [];
   }
   // A finished round, kept in the rounds file once: answered, or lost (no seat answered: it still counts);
-  // a round blocked for privacy sent nothing and doesn't count. The cap's last round owes the owner one
-  // decision card for the change when it left a serious finding, or when it was lost (round 2).
+  // a round blocked for privacy sent nothing and doesn't count. Nothing goes to the owner from here (0.20.0):
+  // the done line says "at its cap" and the serious count, and Cain decides by the owner's rule.
   private settleRound(r: Review): void {
     const file = this.cfg.roundsFile;
     if (!file || this.capOff || !r.change || r.rounded || !FINAL.includes(r.status)) return;
     const rounds = readRounds(file);
     if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s round is settled next tick`); return; }
+    if (r.kind === CUT_CHECK) {
+      const c = rounds.changes[r.change];
+      if (c?.cut?.id === r.id) {
+        // Blocked for privacy: nothing was sent, so it wasn't the check and another may be submitted.
+        if (r.status === "blocked: privacy") delete c.cut;
+        else c.cut.state = cutResult(r) ?? "lost";
+        this.log(`cut check ${shownId(r)} for ${r.change}: ${c.cut?.state ?? "blocked, not counted"}`);
+      }
+      writeRounds(file, rounds);
+      r.rounded = true;
+      return;
+    }
     const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
     const serious = seriousLeft(r);
     if (rec) {
       rec.done = true;
       if (r.status === "blocked: privacy") rec.blocked = true;
       else rec.state = r.seats.some((s) => s.state === "done") ? "answered" : "lost";
-      if (r.round_kind === "fixes" && rec.state === "answered") rec.serious = serious.length;
+      // The serious count by the owner's rule (0.20.0), every round: what the link's Ship card reads at the cap.
+      if (rec.state === "answered") rec.serious = serious.length;
     }
-    if (rec && !rec.blocked) {
-      const b = r.brief;
-      const c = rounds.changes[r.change];
-      const base = { topic: oneLine(b?.topic ?? c.topic ?? r.change, 120), item: b?.item ?? null, pr: b?.pr ?? c.pr ?? null };
-      if (rec.state === "lost") this.owe(rounds, r.change, { ...base, serious: 0, finding: "", lost: true }, `review ${shownId(r)}`);
-      else if (r.round_kind === "fixes" && serious.length)
-        this.owe(rounds, r.change, { ...base, serious: serious.length, finding: oneLine(serious[0].problem, 160) }, `review ${shownId(r)}`);
-    }
+    if (rec && !rec.blocked && countedRounds(rounds, r.change).length >= this.roundCap)
+      this.log(`review ${shownId(r)}: ${r.change} is at its cap ${rec.state === "lost" ? "and its last round was lost" : `with ${serious.length} serious finding(s) left`}; Cain decides by the owner's rule, nothing goes to him from here`);
     writeRounds(file, rounds);
     r.rounded = true;
   }
-  // The owner's grants (0.18.0), read fresh each time; none count when the file can't be read (fail closed).
-  grants(): Grants | null { return this.cfg.grantsFile ? readGrants(this.cfg.grantsFile) : null; }
-  capFor(rounds: Rounds, key: string): number { return effectiveCap(this.roundCap, rounds, this.grants(), key); }
-  // The decision card, owed once per change group and round, when the group is at its cap (the base cap
-  // plus his grants). Since 0.18.0 a granted round that leaves something serious at the raised cap owes
-  // a new card, whatever he tapped on the one before (a Hold doesn't stop a granted round); the newest
-  // decision is the one that counts, and the earlier one is kept under past.
-  private owe(rounds: Rounds, key: string, d: Pick<DecisionRec, "topic" | "item" | "pr" | "serious" | "finding"> & { lost?: boolean }, what: string): void {
-    const n = countedRounds(rounds, key).length;
-    const prev = decisionOf(rounds, key);
-    if (n < this.capFor(rounds, key) || (prev && prev.round >= n)) return;
-    const c = rounds.changes[key];
-    if (c.decision) (c.past ??= []).push(c.decision);
-    c.decision = { id: `${key}#${n}`, key, round: n, ...d, ...(d.lost ? { lost: true } : {}), state: "owed", at: this.now().toISOString() };
-    this.log(`${what}: the round cap is reached for ${key} ${d.lost ? "and its last round was lost" : `with ${d.serious} serious finding(s) left`}; the owner's decision card is owed`);
-  }
   // A round counted at intake whose review never reached the queue (the runner stopped between the
-  // two writes) is lost, found once at the runner's start: it still counts, Cain hears it named, and
-  // at the cap it owes the decision card.
+  // two writes) is lost, found once at the runner's start: it still counts, and Cain hears it named. A cut
+  // check kept the same way is lost too: it was the change's one check.
   private recovered = false;
   recoverLost(): void {
     const file = this.cfg.roundsFile;
@@ -369,41 +392,21 @@ export class Runner {
         if (x.done || x.blocked || x.state === "lost" || x.state === "answered" || existsReview(this.cfg.queueDir, x.id)) continue;
         x.state = "lost"; x.done = true;
         const n = countedRounds(rounds, key).findIndex((y) => y.id === x.id && y.key === key) + 1;
-        lines.push(`Round ${n} of ${this.capFor(rounds, key)} for ${key} was lost: the review runner stopped before its review was queued, so it never ran. It still counts.`);
-        this.owe(rounds, key, { topic: oneLine(c.topic ?? key, 120), item: null, pr: c.pr ?? null, serious: 0, finding: "", lost: true }, `round ${x.id}`);
+        lines.push(`Round ${n} of ${this.roundCap} for ${key} was lost: the review runner stopped before its review was queued, so it never ran. It still counts${n >= this.roundCap ? ", and it was the last: by the owner's rule it is held" : ""}.`);
+      }
+      if (c.cut?.state === "started" && !existsReview(this.cfg.queueDir, c.cut.id)) {
+        c.cut.state = "lost";
+        lines.push(`The cut check ${c.cut.id} for ${key} was lost: the review runner stopped before it was queued, so it never ran. It was the one check, so by the owner's rule ${key} is held.`);
       }
     }
     if (!lines.length) return;
     writeRounds(file, rounds);
     for (const l of lines) this.relay(`${l} Nothing to tell him.`);
   }
-  // Owed decision cards, through the link. Exactly one per change: once posted it's never posted again.
-  async postOwed(): Promise<void> {
-    const file = this.cfg.roundsFile;
-    if (!file || !this.deps.postDecision || this.capOff) return;
-    const rounds = readRounds(file);
-    if (!rounds) return;
-    for (const [key, c] of Object.entries(rounds.changes)) {
-      const d = c.decision;
-      if (!d || d.state !== "owed") continue;
-      let msg: string | null = null;
-      try { msg = await this.deps.postDecision(d); } catch (e) { this.log(`the decision card for ${key} didn't go: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
-      const now = readRounds(file);
-      if (!now?.changes[key]?.decision) continue;
-      const cur = now.changes[key].decision!;
-      if (msg) {
-        Object.assign(cur, { state: "posted", message: msg });
-        this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. If it's a critical change whose fix needs more rounds, the only way is a grant: keeper.sh review-grant asks him, and only his tap grants them. Nothing to tell him.`);
-      } else cur.tries = (cur.tries ?? 0) + 1;
-      writeRounds(file, now);
-    }
-  }
-
   async tick(): Promise<void> {
     try { this.recoverLost(); this.ingest(); await this.reviews(); }
     finally {
       if (this.publishOwed) this.publishReviewed();
-      try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }
     }
   }
 
@@ -446,7 +449,7 @@ export class Runner {
     // on an open review is refused too.
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
-    const e = earlierCheck(r.round_kind === "fixes" ? r.earlier : undefined, this.terms());
+    const e = earlierCheck(r.round_kind === "fixes" || r.kind === CUT_CHECK ? r.earlier : undefined, this.terms());
     if (!e.ok) return this.block(r, e.why);
     for (let pass = 0; pass < 4; pass++) {
       if (this.isStopped()) break;                       // Stop between passes: the rest waits
@@ -457,7 +460,69 @@ export class Runner {
       await Promise.all(due.map((s) => this.runSeat(r, s)));
       this.substitute(r);
     }
+    if (this.settlesNow(r) && !r.sorted && !this.isStopped()) await this.sortPass(r);
     this.settle(r);
+  }
+
+  // Whether settle() would finish the review now (the seats are through and it waits for none).
+  private settlesNow(r: Review): boolean {
+    if (r.seats.some((s) => s.state === "queued" || s.state === "running")) return false;
+    if (!r.consequential) return true;
+    return independent(r).length >= 2 || !(r.wait_until && this.now().toISOString() < r.wait_until);
+  }
+
+  // The sorting step (0.20.0), once, at the cap's last round: each outside seat that answered as itself (never
+  // Claude, never a stand-in) is asked to sort, by the rule's test and in writing, the serious findings the
+  // other seats raised. A finding another such seat labels follow-up with its reason doesn't count as serious
+  // (seriousLeft); one it can't sort (a seat down, over a cap, Stop, the privacy backstop) stays serious. Only
+  // when there are serious findings and at least two such seats. Not a new round: the same round's work.
+  async sortPass(r: Review): Promise<void> {
+    r.sorted = true;
+    if (r.kind === CUT_CHECK || !r.change || !r.round || !r.cap || r.round < r.cap || !r.brief) return;
+    const raised = seriousRaised(r);
+    const sorters = r.seats.filter((s) => s.state === "done" && sortsCount(s));
+    if (!raised.length || sorters.length < 2) return;
+    const sorts: SortRec[] = [];
+    for (const by of sorters) {
+      if (this.isStopped()) break;
+      const theirs = raised.filter((x) => x.seat.key !== by.key);
+      if (!theirs.length) continue;
+      const text = theirs.map((x) => `${oneLine(x.f.problem, 600)} (their fix: ${oneLine(x.f.fix, 300)})`);
+      const g = earlierCheck(text, this.terms());
+      if (!g.ok) { this.log(`review ${shownId(r)}: the sorting step sent nothing to ${LABEL[by.seat]}: the findings matched the privacy backstop`); continue; }
+      const fn = this.fnFor(by.seat);
+      const out = sortOutbound(r.brief, text);
+      const down = this.unavailable(by.seat) ?? this.capCheck(by.seat, out, r.cost_usd);
+      if (down || !fn) { this.log(`review ${shownId(r)}: no sorting step from ${LABEL[by.seat]} (${down?.detail ?? "not set up"}); its findings stay as labelled`); continue; }
+      const ms = this.cfg.timeoutS[by.seat] * 1000;
+      const ctl = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const a = await Promise.race([fn({ brief: out, role: "reviewer", signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[by.seat], day: this.day() }),
+          new Promise<never>((_, rej) => { timer = setTimeout(() => { ctl.abort(); rej(new SeatError("timeout", `no answer within ${ms / 1000} s`)); }, ms); })]);
+        const cost = this.addSpend(by.seat, a.cost_usd, 0, a.searches ?? 0);
+        by.cost_usd += cost; r.cost_usd += cost;
+        for (const raw of a.findings) {
+          // "FOLLOW-UP (<arm>) [n]: why" as asked, or the number after the mark ("FOLLOW-UP (<arm>): [n] why").
+          const whole = SORT_MARK.exec(raw.problem);
+          const f: { severity?: "serious" | "follow-up"; arm?: string; problem: string } = whole
+            ? { severity: /^serious$/i.test(whole[1]) ? "serious" : "follow-up", ...(whole[2] ? { arm: oneLine(whole[2], 80) } : {}), problem: `[${whole[3]}] ${raw.problem.slice(whole[0].length)}` }
+            : readMark(raw);
+          const m = /^\s*\[?\s*(\d{1,2})\s*\]?\s*[:.\-]?\s*/.exec(f.problem);
+          const n = m ? Number(m[1]) : NaN;
+          if (!f.severity || !Number.isInteger(n) || n < 1 || n > theirs.length) continue;
+          const reason = oneLine(f.problem.slice(m![0].length), 600);
+          const x = theirs[n - 1];
+          sorts.push({ by: by.key, ref: findingRef(x.seat, x.i), label: f.severity, ...(f.arm ? { arm: f.arm } : {}), reason });
+        }
+      } catch (e) {
+        const err = e instanceof SeatError ? e : new SeatError("transient", String((e as Error)?.message ?? e).slice(0, 200));
+        if (err.cost_usd) { const c = this.addSpend(by.seat, err.cost_usd, 0); by.cost_usd += c; r.cost_usd += c; }
+        else if (by.seat === "openai") this.addSpend("openai", 0, 0);
+        this.log(`review ${shownId(r)}: the sorting step from ${LABEL[by.seat]} failed (${err.kind}); its findings stay as labelled`);
+      } finally { clearTimeout(timer); }
+    }
+    if (sorts.length) r.sorts = sorts;
   }
 
   private isDue(r: Review, s: SeatRun, now: string): boolean {
@@ -471,7 +536,8 @@ export class Runner {
     const hourly = s.state !== "queued";
     const fn = this.fnFor(s.seat);
     const b = r.brief!;
-    const out = outbound(b, r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined);   // throws on a wrong kind: nothing is sent
+    const out = outbound(b, r.kind === CUT_CHECK ? { earlier: r.earlier ?? [], check: "cut" }
+      : r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined);   // throws on a wrong kind: nothing is sent
     const down = this.unavailable(s.seat) ?? this.capCheck(s.seat, out, r.cost_usd);
     if (down || !fn) return this.fail(r, s, down?.kind ?? "unconfigured", down?.detail ?? "not set up", hourly, 0);
     s.started_at = this.now().toISOString();
@@ -486,8 +552,8 @@ export class Runner {
     try {
       const a = await Promise.race([fn({ brief: out, role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
       const cost = this.addSpend(s.seat, a.cost_usd, a.findings.length, a.searches ?? 0);
-      // A fix-only round's finding a seat didn't mark counts as serious: it fails safe.
-      if (r.round_kind === "fixes") a.findings = a.findings.map((f) => { const m = readMark(f); return m.severity ? m : { ...m, severity: "serious" as const }; });
+      // A finding a seat didn't label by the rule's test counts as serious, in every round (0.20.0): it fails safe.
+      a.findings = a.findings.map((f) => { const m = readMark(f); return m.severity ? m : { ...m, severity: "serious" as const }; });
       Object.assign(s, { state: "done", verdict: a.verdict, findings: a.findings, model: a.model, tokens: a.tokens,
         cost_usd: s.cost_usd + cost, finished_at: this.now().toISOString() });
       delete s.error; delete s.next_at;
@@ -520,6 +586,7 @@ export class Runner {
 
   // A stand-in only when a seat is down, once per seat, and only from Claude.
   substitute(r: Review) {
+    if (r.kind === CUT_CHECK) return;   // a cut check is one outside seat's: never a Claude stand-in (0.20.0)
     for (const s of [...r.seats]) {
       if (s.seat === "claude" || !(s.state === "failed" || s.state === "blocked")) continue;
       if (r.seats.some((x) => x.stands_in_for === s.seat)) continue;

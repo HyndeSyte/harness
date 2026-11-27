@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.0
+
+- Outside reviews now end by one fixed rule: three rounds a change, never more. No card offers you more rounds, and none offers shipping with a risk named.
+- After the third round, if nothing serious is left, you get the normal Ship card. If something serious is left, Cain either holds the change or cuts out only the parts those findings are about, and one outside reviewer that did not write the cut checks just that cut. If the cut passes, the Ship card names it and its review line reads "Cut checked". If not, the change is held. You hear one line either way, and Cain never asks you about rounds, risk or cuts.
+- Reviewers now label every finding serious or follow-up by the same test (could it lose or damage something of yours, act wrongly or without your go, expose a secret or widen access, or fail without anyone hearing). A serious finding counts unless another outside reviewer explains in writing why it is a follow-up.
+- The card asking you to grant more review rounds, and the card asking you to ship with a risk or hold, are gone. One still up loses its buttons and says Expired, and tapping an old one does nothing. Rounds already granted lapse.
+- Why: the grant became a loop, and shipping with a risk could never be used, since it needed a rollback switch that stays off. Normal Ship installs are already backed up, watched and rolled back by the Keeper.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.

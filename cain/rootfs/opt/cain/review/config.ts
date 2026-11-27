@@ -46,6 +46,5 @@ export function configFromEnv(env: Record<string, string | undefined> = process.
     roundsFile: capPaths(env).rounds,
     settingsFile: capPaths(env).settings,
     guardLog: capPaths(env).guardLog,
-    grantsFile: capPaths(env).grants,
   };
 }

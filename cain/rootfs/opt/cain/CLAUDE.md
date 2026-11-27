@@ -695,30 +695,30 @@ second view adds value; skip it for small, obvious things.
   work names `"supersedes": "<earlier key or pull request url>"`: its rounds carry over. The first
   round is full; every later one is fix-only (`"round_kind": "fixes"`, the default then): its body
   lists only the fixes, and the runner sends the seats the earlier findings to check them against,
-  each marked serious or follow-up. A fourth round is refused, under any id or pull request. If the
-  last round leaves something serious, the review service puts one decision in front of him itself
-  (ship it with that risk, or hold it), filed under the brief's `"item": "<PENDING id>"`: never ask
-  him that yourself, never offer another round (the link refuses both), and wait for his tap. A
-  Ship card for it waits on that tap; after "Hold it" there is none, and after "Ship it with that
-  risk" it goes only while the App's rollback is armed (the link says what isn't). A last round
-  that never finishes is lost: it still counts, and the same card comes, saying so. A card whose
-  item someone else holds waits until the hold clears.
-- The one exception is his: more fix rounds for a critical change, granted by his tap only, never
-  an exemption from the rule. When a change has used its rounds, its last round still left something
-  serious, and more fixing is the right way, ask him with
-  `/opt/cain/keeper.sh review-grant --item <its PENDING id> --change <pull request url or change key> --rounds <1 to 3> "<what it does, and why more rounds, one or two lines>"`.
-  The link builds the card (the rounds used and what the last left come from the runner's record)
-  with "Grant <n> more rounds" and "No"; your command writes nothing, and a grant is his tap only.
-  It's refused while the change has rounds left, while its last round runs, for an item someone else
-  holds, while Stop holds, and while a grant card for that change is still open (one at a time; an open
-  one that went out of date, with a new head, a newer decision or rounds moved on, or whose message is
-  gone, is replaced by your new one). His
-  Grant tap checks all of it again first, the pull request's head and its newest decision included: if
-  it no longer holds, nothing is granted and you hear why;
-  ask again only once the change is at its cap with its last round done. On his Grant tap the change's cap goes up by exactly that many: submit
-  the next fix-only round as usual. A granted round that again leaves something serious at the raised
-  cap brings the service's decision card again (after a Hold too); a grant never lifts the armed
-  rollback a risk tap needs.
+  each labelled serious or follow-up. A fourth round is refused, under any id or pull request.
+- At the cap, the owner's review rule decides, and you apply it; the review service puts nothing in
+  front of him. The test for serious: in ordinary use it could lose or corrupt something of his, act
+  wrongly or without his go, expose a secret or widen what anyone can reach, or let something fail
+  without anyone hearing of it. Every seat labels each finding by it; a finding a seat called serious
+  stays serious unless another outside model, applying the test, wrote down why it is a follow-up (the
+  runner counts that, and verdicts.md shows both labels): never re-sort one yourself. The last round's
+  done line says "at its cap" and how many serious findings are left. Then:
+  - Nothing serious left: the normal Ship card.
+  - Something serious left: if removing the parts the serious findings are about would leave the
+    piece's purpose not working, hold it, with no cut and no check. Otherwise cut those parts (only what
+    the piece adds) on its branch through Build, and get one cut check: a brief with
+    `"kind": "cut-check"`, its `pr` and the cut head as `head`, and a body that describes the cut diff
+    for a stranger. It goes to one outside model that did not write the cut (`"seats": ["openai"]` or
+    `["gemini"]`, or leave seats out), which answers: does it remove each serious risk, does it add a
+    serious one, does what is left pass its tests. It is not a round, and there is no second cut or
+    second check; one on a change not at its cap, or whose last round left nothing serious, is refused.
+    Pass: show the normal Ship card for exactly the cut head with `--review <the cut check's id>`; its
+    review line reads "Cut checked: <seat>, pass", and your one line names the cut in what he'll notice.
+    Fail, or no answer: the piece is held. The link refuses any other Ship card for a piece at its cap
+    with something serious left, saying it is held by the rule.
+  - Either way, tell him one line, and never ask him about rounds, risk or cuts: the link refuses an ask
+    that does. There is no shipping with a risk named and no grant of more rounds (`keeper.sh
+    review-grant` only prints that it is retired).
 - Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`
   (something broken now) or `other`; none counts as other. For a run, put `Label: <label>` on its own
@@ -768,9 +768,9 @@ create, update or run any other routine.
    job: see Home Assistant first, below.
    - Build finished with a pull request: get an outside review of the diff through the
      review service (read it with the GitHub connector; brief per Outside reviews, with
-     its `pr` and `head`). If its rounds are used and the last still left something serious, the only
-     way to more fix rounds is his tap: `/opt/cain/keeper.sh review-grant` (Outside reviews); a grant
-     is his tap only. Once it's done, check Home Assistant first (below), then show the Ship card for
+     its `pr` and `head`). If its rounds are used and the last still left something serious, the
+     owner's review rule decides (Outside reviews): hold it, or cut and get one cut check. Once it's
+     done, check Home Assistant first (below), then show the Ship card for
      the pull request's head commit as it is now (its full sha, from the connector):
      `/opt/cain/keeper.sh ship --item <its PENDING id> --pr <pull request url> --head <full head sha> --review <the review id> "<what he'll notice, in one line>"`.
      Its buttons are "Ship" "Not now". Your line says only what he'll notice. The link
