@@ -80,7 +80,7 @@ import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
-import { armFlag, drillDeps, drillKeyFrom, fileStore, linkDrillStore, storeMarkPub } from "./drill";
+import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
 import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
@@ -90,7 +90,7 @@ import { clearAlarm, raiseAlarm, selfCheck } from "../capfiles";
 import { guard, paths as guardPaths } from "../guard";
 import { gatewayHealthy, writeGatewayMark } from "./health-gate";
 import { KEEPER_URL, keeperCall, probeHash } from "../probe/keeper";
-import { check, CHECK_MS, every, fileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
+import { check, CHECK_MS, every, fileStore as watchFileStore, healthBody, hmacKey, NOTICE_TIMEOUT_MS, PeerWatch, probeHarness } from "./watch";
 
 // The bot token and the plugin's allowlist, root's since C1 (the run script points these at
 // their old places only for the old way of starting, before the first cutover).
@@ -373,7 +373,7 @@ let lastHeard = 0;                       // ms: the last thing Discord's gateway
 
 // -- the mutual watch on the calendar specialist (watch.ts) -------------------------
 const watchLog = (line: string) => console.log(`[cain] link: ${line}`);
-const watch = new PeerWatch({ ...fileStore(WATCH, watchLog), now: Date.now, mono: () => performance.now() });
+const watch = new PeerWatch({ ...watchFileStore(WATCH, watchLog), now: Date.now, mono: () => performance.now() });
 
 async function harnessAlive(): Promise<boolean | "refused"> {
   if (!token()) return true;             // no key yet: nothing to check with, and nothing to say
