@@ -120,11 +120,35 @@ describe("landing his Ship tap", () => {
   ] as const) {
     test(`a pull request ${what} doesn't land`, async () => {
       const { d, state } = gh({ pull });
-      expect(await land(d, L)).toEqual({ ok: false, why, again: false });
+      expect(await land(d, L)).toMatchObject({ ok: false, why, again: false });
       expect(state.pushes).toEqual([]);
       expect(state.main).toBe(M1);
     });
   }
+
+  // Round 2 fixes (Cain 0.20.0): the landing is pinned to the head his card was for. GitHub's head is read again just
+  // before the push: one that moved after the tap-time check lands nothing, marked so a bound card says it plainly.
+  test("a head that moves between the tap-time check and the push lands nothing", async () => {
+    const { d, state } = gh();
+    const api = d.api;
+    let reads = 0;
+    d.api = async (path) => {
+      if (path === `/repos/${REPO}/pulls/13` && reads++ > 0)
+        return { status: 200, body: { state: "open", merged: false, base: { ref: "main" }, head: { sha: H2, repo: { full_name: REPO } } } };
+      return api(path);
+    };
+    expect(await land(d, L)).toEqual({ ok: false, why: "its branch moved on since the card: it has newer commits", again: false, moved: true });
+    expect(reads).toBe(2);
+    expect(state.pushes).toEqual([]);
+    expect(state.main).toBe(M1);
+    // GitHub not answering just before the push: nothing is pushed, and it is tried again.
+    const b = gh();
+    const api2 = b.d.api;
+    let n = 0;
+    b.d.api = async (path) => (path === `/repos/${REPO}/pulls/13` && n++ > 0 ? { status: 502, body: null } : api2(path));
+    expect(await land(b.d, L)).toMatchObject({ ok: false, again: true });
+    expect(b.state.pushes).toEqual([]);
+  });
 
   test("its checks must all have passed, from GitHub Actions", async () => {
     const run = (name: string, conclusion: string | null, status = "completed", app = ACTIONS_APP, id = 1) => ({ id, name, status, conclusion, app: { id: app } });

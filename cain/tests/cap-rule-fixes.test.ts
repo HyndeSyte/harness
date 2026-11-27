@@ -34,11 +34,19 @@ const cutBrief = (over: Partial<Brief> = {}): Brief => brief({ id: "2026-11-26-c
   body: "The cut removes the retry loop.", ...over });
 const said = (verdict: SeatAnswer["verdict"], ...problems: string[]): SeatAnswer =>
   ({ verdict, findings: problems.map((p, i) => ({ rank: i + 1, problem: p, fix: "fix it" })), model: "m", cost_usd: 0.01 });
-const cutPass = () => said("approve", "FOLLOW-UP (loses or corrupts): Q1. Gone.", "FOLLOW-UP (acts wrongly): Q2. Nothing new.",
-  "FOLLOW-UP (fails silently): Q3. Tests pass.", "FOLLOW-UP (acts wrongly): Q4. The purpose still works.");
+// A cut check's clear pass (round 2 fixes): questions 1 to 3 good for the cut, and each essential behaviour still done
+// with its evidence on the cut head.
+const cutPass = (i?: SeatInput) => said("approve", "FOLLOW-UP (loses or corrupts): Q1. Gone.", "FOLLOW-UP (acts wrongly): Q2. Nothing new.",
+  "FOLLOW-UP (fails silently): Q3. Tests pass.", ...(i?.brief.essentials ?? ["a", "b"]).map((_, k) => `FOLLOW-UP (acts wrongly): Q4.${k + 1}. Still done, evidence: x.ts:${k + 1}.`));
+// Round 1's outside seats state what the piece must do (round 2 fixes: the purpose record).
+const STATED = "PURPOSE: The piece keeps each calendar change exactly once when a failed write is retried.";
+const withPurpose = (seat: string, i: SeatInput, a: SeatAnswer): SeatAnswer => i.brief.purpose_ask ? { ...a, findings: [{ rank: 0, problem: `${STATED} (as ${seat} reads it)`, fix: "none" }, ...a.findings] } : a;
 const SER = "SERIOUS (loses or corrupts): a crash between two writes loses the record";
 type Answer = (i: SeatInput) => Promise<SeatAnswer>;
-const okDiff = async () => ({ ok: true as const, diff: "--- a/x.ts\n+++ b/x.ts\n-retry()\n", judged: { ok: true as const, reverts: 0, allowed: 0 } });
+const COMMITS = [{ sha: "c".repeat(40), author: "HyndeSyte <HyndeSyte@users.noreply.github.com>", committer: "HyndeSyte <HyndeSyte@users.noreply.github.com>",
+  message: "Cain 0.20.0: the cut\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n" }];
+const okDiff = async () => ({ ok: true as const, diff: "--- a/x.ts\n+++ b/x.ts\n-retry()\n", context: " keep()\n-retry()\n", headFiles: { "x.ts": 10 }, commits: COMMITS,
+  judged: { ok: true as const, reverts: 0, allowed: 0 } });
 
 function rules(o: { openai?: Answer; gemini?: Answer; perplexity?: Answer; claude?: Answer; cutDiff?: any; postLine?: any; down?: string[] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "rulefix-"));
@@ -47,7 +55,7 @@ function rules(o: { openai?: Answer; gemini?: Answer; perplexity?: Answer; claud
     inboxUid: process.getuid!(), reviewedFile: join(dir, "reviewed.json"), roundsFile: join(dir, "rounds.json"), roundCap: 3, settingsFile: join(dir, "settings.json") };
   writeFileSync(cfg.termsFile, "# terms\nAcme Corp\n");
   const calls: { seat: string; input: SeatInput }[] = [];
-  const of = (seat: string, a: Answer | undefined): SeatFn => async (i) => { calls.push({ seat, input: i }); return (a ?? (async (x: SeatInput) => x.brief.check ? cutPass() : said("approve")))(i); };
+  const of = (seat: string, a: Answer | undefined): SeatFn => async (i) => { calls.push({ seat, input: i }); return withPurpose(seat, i, await (a ?? (async (x: SeatInput) => x.brief.check ? cutPass(x) : said("approve")))(i)); };
   const seats: any = { openai: of("openai", o.openai), gemini: of("gemini", o.gemini), claude: of("claude", o.claude) };
   if (o.perplexity) seats.perplexity = of("perplexity", o.perplexity);
   let clock = NOW;
@@ -70,7 +78,7 @@ function rules(o: { openai?: Answer; gemini?: Answer; perplexity?: Answer; claud
   return { dir, cfg, runner, calls, relays, round, lines, diffs, decide, later: (ms: number) => { clock = new Date(clock.getTime() + ms); },
     rounds: () => readRounds(cfg.roundsFile!)!, get: (id: string) => loadReview(cfg.queueDir, id)! };
 }
-const strict: Answer = async (i) => i.brief.sort ? said("approve") : i.brief.check ? cutPass() : said("approve_with_changes", SER);
+const strict: Answer = async (i) => i.brief.sort ? said("approve") : i.brief.check ? cutPass(i) : said("approve_with_changes", SER);
 async function atCap(o: Parameters<typeof rules>[0] = {}) {
   const t = rules({ openai: strict, ...o });
   for (const id of ["c-1", "c-2", "c-3"]) await t.round(id);
@@ -102,14 +110,14 @@ describe("1: sorting can't be zeroed by one seat", () => {
   test("a reason without a valid arm doesn't count", () => {
     expect(left([fu("gemini", "it is fine")])).toBe(1);
     expect(left([{ ...fu("gemini"), arm: undefined }])).toBe(1);
-    expect(left([fu("gemini", "Fails  Silently")])).toBe(0);
+    expect(left([fu("gemini", "Fails  Silently"), fu("perplexity")])).toBe(0);
     expect(validArm("exposes or widens")).toBe(true);
     expect(validArm("hardening")).toBe(false);
   });
   test("a seat demoting all its own findings keeps them in the sort, and another seat's serious label counts", async () => {
     const t = rules({
       openai: async (i) => i.brief.sort ? said("approve") : said("approve_with_changes", "FOLLOW-UP (fails silently): the retry gives up without a word", "FOLLOW-UP (acts wrongly): it posts twice"),
-      gemini: async (i) => i.brief.sort ? said("approve", "SERIOUS (fails silently) [1]: nobody hears it give up", "FOLLOW-UP (acts wrongly) [2]: it is deduplicated") : said("approve"),
+      gemini: async (i) => i.brief.sort ? said("approve", "SERIOUS (fails silently) [1]: nobody hears it give up", "FOLLOW-UP (acts wrongly) [2]: it is deduplicated by its id, so it posts once") : said("approve"),
     });
     for (const id of ["s-1", "s-2", "s-3"]) await t.round(id);
     const sortCall = t.calls.find((c) => c.seat === "gemini" && c.input.brief.sort)!;
@@ -217,10 +225,14 @@ describe("3: the cut check asks whether the piece's purpose still works", () => 
     t.runner.admitAndQueue(cutBrief());
     await t.runner.tick();
     const sent = t.calls.find((c) => c.input.brief.check)!.input.brief;
-    expect(sent.purpose).toBe("Topic: Calendar retries\nQuestion: Do retries keep each change exactly once?");
+    // Round 2 fixes: the frozen purpose record, with each round 1 seat's own statement, and its essential behaviours.
+    expect(sent.purpose).toContain("Topic: Calendar retries\nQuestion: Do retries keep each change exactly once?");
+    expect(sent.purpose).toContain("kept at the change's first review round and frozen then");
+    expect(sent.essentials!.length).toBe(2);
     const p = prompt(sent, "reviewer");
     expect(p.user).toContain("<purpose>\nTopic: Calendar retries");
-    expect(p.system).toContain("4. Does the piece's stated purpose, inside <purpose>, still work after the cut?");
+    expect(p.user).toContain("<essentials>\n1. ");
+    expect(p.system).toContain("4. Does the piece still do what it must, as its purpose record inside <purpose> states");
   });
   test("a cut that removes the feature's core path fails", async () => {
     const t = await atCap({ openai: async (i) => i.brief.check
@@ -233,12 +245,13 @@ describe("3: the cut check asks whether the piece's purpose still works", () => 
     expect(t.rounds().changes["pr-40"].cut!.state).toBe("fail");
   });
   test("an answer missing the fourth question, or unreadable, fails", () => {
-    const r = (findings: string[], verdict = "approve") => cutResult({ kind: CUT_CHECK, status: "done",
+    const r = (findings: string[], verdict = "approve") => cutResult({ kind: CUT_CHECK, status: "done", cut_essentials: ["one thing it does", "another thing"], cut_head_files: { "x.ts": 10 },
       seats: [seat("openai", "openai", { verdict, findings: findings.map((p, i) => ({ rank: i + 1, problem: p, fix: "", severity: "follow-up" })) })] } as any);
-    expect(r(["Q1. a", "Q2. b", "Q3. c", "Q4. d"])).toBe("pass");
+    expect(r(["Q1. a", "Q2. b", "Q3. c", "Q4.1. d, evidence: x.ts:3", "Q4.2. e, evidence: x.ts:4"])).toBe("pass");
+    expect(r(["Q1. a", "Q2. b", "Q3. c", "Q4. d"])).toBe("fail");                                        // round 2 fixes: each essential, with evidence
     expect(r(["Q1. a", "Q2. b", "Q3. c"])).toBe("fail");
     expect(r([])).toBe("fail");
-    expect(r(["Q1. a", "Q2. b", "Q3. c", "Q4. d"], "reject")).toBe("fail");
+    expect(r(["Q1. a", "Q2. b", "Q3. c", "Q4.1. d, evidence: x.ts:3", "Q4.2. e, evidence: x.ts:4"], "reject")).toBe("fail");
   });
 });
 
@@ -290,7 +303,7 @@ describe("4: the runner derives the cut diff and chooses the seat", () => {
   });
 
   test("the allowance: reverts, imports and test lines pass up to the stated amount", () => {
-    expect(judgeCut([{ path: "a.ts", added: ["  old();", "import { x } from \"./x\";"], removed: [] }], () => ["  old();"]).ok).toBe(true);
+    expect(judgeCut([{ path: "a.ts", added: ["  old();", "import { x } from \"./x\";"], removed: [] }], () => ["  old();"], () => ["import { x } from \"./x\";", "x();"]).ok).toBe(true);
     expect(judgeCut([{ path: "tests/a.test.ts", added: Array.from({ length: CUT_ADD_ALLOWANCE + 1 }, (_, i) => `expect(${i});`), removed: [] }], () => []).ok).toBe(false);
   });
 
@@ -321,7 +334,7 @@ describe("4: the runner derives the cut diff and chooses the seat", () => {
     let n = 0, seatN = 0;
     const t = await atCap({
       cutDiff: async () => (n++ === 0 ? { ok: false, kind: "infra", why: "git fetch failed" } : okDiff()),
-      openai: async (i) => { if (!i.brief.check) return strict(i); if (seatN++ === 0) throw new Error("bad output"); return cutPass(); },
+      openai: async (i) => { if (!i.brief.check) return strict(i); if (seatN++ === 0) throw new Error("bad output"); return cutPass(i); },
     });
     t.runner.admitAndQueue(cutBrief());
     await t.runner.tick();
@@ -362,7 +375,7 @@ describe("4: the runner derives the cut diff and chooses the seat", () => {
     expect(t.calls.map((c) => c.seat)).toEqual(["openai"]);
     // Gemini raised two; OpenAI downgraded one in the sort (with Gemini not reaffirming): Gemini checks the cut.
     const u = rules({
-      gemini: async (i) => i.brief.sort ? said("approve") : i.brief.check ? cutPass() : said("approve_with_changes", SER, "SERIOUS (acts wrongly): it posts twice"),
+      gemini: async (i) => i.brief.sort ? said("approve") : i.brief.check ? cutPass(i) : said("approve_with_changes", SER, "SERIOUS (acts wrongly): it posts twice"),
       openai: async (i) => i.brief.sort ? said("approve", "FOLLOW-UP (fails silently) [1]: it is journalled first") : said("approve"),
     });
     for (const id of ["g-1", "g-2", "g-3"]) await u.round(id);

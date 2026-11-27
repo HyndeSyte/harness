@@ -267,10 +267,13 @@ to you as a question.
   hearing of it. Every reviewer gets that test and labels each of its findings serious or follow-up by
   it, naming which part of the test it meets or fails; an unlabelled finding counts as serious. At the
   last round the runner asks every outside reviewer to sort all of that round's findings by the test,
-  its own included, so a reviewer that calls everything a follow-up hides nothing. A finding any of them
-  calls serious stays serious unless every other outside reviewer that sorted it called it a follow-up,
-  each naming which part of the test it fails, in writing; the reviewer that raised it saying serious
-  again keeps it serious, and Claude standing in never sorts. Cain can't re-sort one. The review's
+  its own included, so a reviewer that calls everything a follow-up hides nothing. Who sorts is fixed
+  before the sort: every outside reviewer of that round, never a Claude stand-in. One that gives no
+  sort it can read (down, out of time, garbled) counts as calling every finding serious. A finding any
+  of them calls serious is taken off only when every other outside reviewer called it a follow-up, at
+  least two of them, each naming which part of the test it considered and saying in words why it doesn't
+  apply (a part's name alone isn't a reason); the reviewer that raised it saying serious again keeps it
+  serious. Cain can't re-sort one. The review's
   verdicts.md shows every label. `review.sh health` shows how often each reviewer's findings carried a
   label it could read.
 - Nothing serious left after the third round: the normal Ship card, for exactly the version that round
@@ -280,21 +283,42 @@ to you as a question.
   not doing its job, it is held, with no cut and no check. Otherwise Cain cuts those parts (only what the
   piece adds, on top of the version last reviewed), and one outside reviewer checks the cut diff, which
   the review service works out itself from the code, not from Cain's description. It picks the reviewer
-  too. The check asks four things: does the cut remove each serious risk, does it add a serious one, does
-  what is left pass its tests, and does the piece still do what its first review said it was for. A cut
-  that adds new code fails without asking anyone, and anything but a clear pass is a fail. A reviewer
-  that is down or answers garbled is asked again later; that doesn't use the check up. That cut check
-  isn't a round, and there is no second cut or second check. If it passes, the Ship card goes for exactly
+  too, and never one whose maker is named in the cut's commits (their co-author lines): if both are, the
+  cut could not be checked. The check asks four things: does the cut remove each serious risk, does it
+  add a serious one, does what is left pass its tests, and does the piece still do each thing its purpose
+  record says it must, with the place in the cut version where it still does it. The purpose record is
+  kept at the first round and never changed: the opening of the pull request's "What changed" as you
+  read it, and each first-round reviewer's own statement of what the piece must do (for a change already
+  past its first round, the description alone, and the record says so). A cut that adds new code fails
+  without asking anyone: only exact reverts to where the change began, plain imports of names the code
+  still uses, lines in the test folders and the App's CHANGELOG count as not new. A change with no
+  purpose record, or too little in it to check against, fails too. Anything the reviewer answers that
+  isn't a clear pass is a fail, garbled or cut off included. Only no answer at all (the reviewer down or
+  out of reach, nothing back before its time ran out) is tried again, up to 8 times, each try kept; then
+  the change is held and you hear that the cut could not be checked. That cut check isn't a round, and
+  there is no second cut or second check. If it passes, the Ship card goes for exactly
   the cut version, its review line reads "Cut checked: Gemini, pass" (or OpenAI), and Cain's line names
   the cut. If it fails, the piece is held.
 - Either way you hear one plain line, with no buttons and no question, sent by the App's own code: when
   the third round ends (nothing serious left, or how many serious findings are left and that Cain now
   holds or cuts it), when a cut check passes or fails, and when Cain holds it ("held: " and why). If Cain
-  hasn't decided a day after the third round, you hear one line saying it is still undecided. No card
-  offers more rounds, and none offers shipping with a risk named.
+  hasn't decided a day after the third round, you hear one line saying it is still undecided. A cut
+  decided with no cut check yet, or a cut check with no result, gets Cain a reminder after an hour; a
+  day on, the change is held and you hear one line, "the cut could not be checked". A hold is final: no
+  cut or decision after it counts. The lines are kept on disk before they are sent, so a restart in
+  between still sends them, once. No card offers more rounds, and none offers shipping with a risk named.
+- At your Ship tap the link lands exactly the version the card was for, and reads the pull request's
+  version from GitHub again just before it does: if something was pushed after your tap, nothing lands
+  and the card says so. The link lands by its own push of that exact version to main; it doesn't use
+  GitHub's merge button.
+- The cut check reads the code through the review service's own copy of the repository. A new option,
+  `review_github_token`, takes a read-only token for this repository (Contents and Pull requests, read)
+  for that fetch and the description; empty, it goes without one. `review.sh health` says whether the
+  fetch worked when the service last started.
 - The link holds Cain to it: a Ship card for a piece at its cap with something serious left is refused
   unless its cut check passed for that very version, and an ask or a reply of Cain's that asks you about
-  rounds, a risk or a cut is held.
+  rounds, a risk or a cut is held, judged sentence by sentence and as a whole message (a question spread
+  over two sentences, or "want me to keep going with it?", is held too).
 
 Why: until 0.19.0 the third round's serious finding brought a card asking you to ship with that risk or
 hold, and Cain could ask you for more rounds with a grant card. The grant turned into a loop, and the

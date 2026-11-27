@@ -402,5 +402,21 @@ export function capQuestionHits(text: string): CainHit[] {
     if (!asksAboutCap(sentence)) continue;
     hits.push({ rule: "cap", result: "refuse", at: m.index ?? 0, end: (m.index ?? 0) + m[0].length, around: sentence.replace(/\s+/g, " ").slice(0, 60) });
   }
+  // Round 2 fixes: the whole message too, not only each sentence, so a question split over sentences ("It has one
+  // serious finding left. Should I cut it or hold it?") or put in other words ("The review left something serious.
+  // Want me to keep going with it?") is held as well: a message that asks him anything and, as a whole, is about
+  // rounds, a risk or a cut, or names a serious finding, a risk or a cut and asks whether to go on, ship, hold or stop.
+  if (!hits.length && t.trim()) {
+    const asks = t.includes("?") || [...t.matchAll(re)].some((m) => ASKING.test(m[0].trim()));
+    const whole = t.replace(/\s+/g, " ").toLowerCase();
+    if (asks && (asksAboutCap(whole) || (CAP_CONTEXT.test(whole) && GO_ON.test(whole)) || VAGUE_GO_ON.test(whole)))
+      hits.push({ rule: "cap", result: "refuse", at: 0, end: t.length, around: t.replace(/\s+/g, " ").trim().slice(0, 60) });
+  }
   return hits;
 }
+// What makes a whole message about the cap (round 2 fixes), and the ways of asking whether to go on with it.
+const CAP_CONTEXT = /\b(serious|risks?|review rounds?|another round|more rounds?|cut check|the cut|cut (?:it|them|those|that|the parts?)|at (?:its|the) cap|findings?)\b/;
+// A bare "keep going with it?" names nothing it is about, so it reads to him as the cap's question: held too (Cain
+// says what he'd go on with: "Want me to keep drafting the letter?").
+const VAGUE_GO_ON = /\b(keep going|carry on|go on|press on|push on|proceed|continue)(\s+(with|on)\s+(it|this|that))?(\s+anyway)?\s*\?/;
+const GO_ON = /\b(keep going|keep at it|carry on|press on|push on|push it|go ahead|go on|proceed|continue|move on|ship|land|merge|install|hold|cut|drop it|stop|leave it|wait|anyway|still)\b/;

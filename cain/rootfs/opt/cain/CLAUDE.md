@@ -701,8 +701,9 @@ second view adds value; skip it for small, obvious things.
   wrongly or without his go, expose a secret or widen what anyone can reach, or let something fail
   without anyone hearing of it. Every seat labels each finding by it; at the last round every outside
   seat sorts all of the round's findings, and a finding any seat called serious stays serious unless
-  every other outside seat that sorted it labelled it follow-up naming the arm it fails (the runner
-  counts that, and verdicts.md shows every label): never re-sort one yourself. The last round's done
+  every other outside seat of the round labelled it follow-up, at least two of them, each naming the arm
+  it considered and saying in words why it doesn't apply; a seat that gives no readable sort counts as
+  serious (the runner counts that, and verdicts.md shows every label): never re-sort one yourself. The last round's done
   line says "at its cap" and how many serious findings are left. Then:
   - Nothing serious left: the normal Ship card, for exactly the head that round reviewed; the link
     refuses a card for any other head, and a tap after the head moved lands nothing.
@@ -718,7 +719,11 @@ second view adds value; skip it for small, obvious things.
     that adds new code, and picks the seat (any `seats` you name is ignored). The seat answers: does it
     remove each serious risk, does it add a serious one, does what is left pass its tests, does the
     piece's stated purpose (from its first brief) still work. A seat that is down is tried again; that
-    doesn't use the check up. It is not a round, and there is no second cut or second check; one on a
+    doesn't use the check up, but only no answer at all is tried again (up to 8 times): any answer that isn't
+    a clear pass fails it. The runner checks the cut against the change's purpose record, kept at round 1
+    and never changed, and refuses a judge whose model is named in the cut's commits. A cut decided with no check, or a check with no result,
+    reminds you after an hour; a day on the runner holds it and he hears "the cut could not be checked". A
+    hold is final: no cut or decision after it is kept. It is not a round, and there is no second cut or second check; one on a
     change not at its cap, held, or whose last round left nothing serious, is refused. Undecided an hour
     after the cap, you are reminded once; after a day he hears it is still undecided.
     Pass: show the normal Ship card for exactly the cut head with `--review <the cut check's id>`; its

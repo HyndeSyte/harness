@@ -33,8 +33,11 @@ export function linePoster(linkSock: string, log: (m: string) => void) {
 if (import.meta.main) {
   const env = process.env;
   const keys = { gemini: env.REVIEW_GEMINI_KEY || "", perplexity: env.REVIEW_PERPLEXITY_KEY || "", anthropic: env.REVIEW_ANTHROPIC_KEY || "" };
-  for (const k of ["REVIEW_GEMINI_KEY", "REVIEW_PERPLEXITY_KEY", "REVIEW_ANTHROPIC_KEY"]) delete env[k];
-  const cfg = configFromEnv();
+  const githubToken = env.REVIEW_GITHUB_TOKEN || "";
+  for (const k of ["REVIEW_GEMINI_KEY", "REVIEW_PERPLEXITY_KEY", "REVIEW_ANTHROPIC_KEY", "REVIEW_GITHUB_TOKEN"]) delete env[k];
+  // Round 2 fixes: the runner's own GitHub token (read once, never printed), for the cut diff's fetch and the pull
+  // request's description.
+  const cfg = { ...configFromEnv(), ...(githubToken ? { githubToken } : {}) };
   const codexHome = env.CODEX_HOME_DIR ?? "/data/codex";
   mkdirSync(codexHome, { recursive: true, mode: 0o700 });
 
@@ -62,6 +65,9 @@ if (import.meta.main) {
   // The install-time self-check (Cain 0.16.0, round 2, ../capfiles.ts): a file of the cap's or guard's
   // with the wrong owner or mode turns both off here (no brief is taken), with one alarm naming it.
   runner.capOff = selfCheck({ log });
+  // Round 2 fixes: the cut diff's fetch checked (with the token when there is one, named in review.sh health), and the
+  // lines owed to the owner, kept on disk before any post, drained.
+  await runner.start();
 
   // The ChatGPT sign-in page, reached as <Cain page>/codex through nginx. On a unix socket
   // only nginx's workers and root can open (C1): a TCP port could be taken by Cain's user while

@@ -29,7 +29,7 @@ export function claudeSeat(o: ClaudeOptions): SeatFn {
     let inT = 0, outT = 0, searches = 0, text = "", answered = "", stop = "";
     // A long search turn can pause; it continues by sending the turn back as is.
     for (let round = 0; round < 3; round++) {
-      const j = await postJson(fetcher, `${base}/v1/messages`, headers, body, input.signal, [o.key]);
+      const j = await postJson(fetcher, `${base}/v1/messages`, headers, body, input.signal, [o.key], input.onBody);
       const u = j?.usage ?? {};
       inT += Number(u.input_tokens ?? 0) + Number(u.cache_read_input_tokens ?? 0) + Number(u.cache_creation_input_tokens ?? 0);
       outT += Number(u.output_tokens ?? 0);

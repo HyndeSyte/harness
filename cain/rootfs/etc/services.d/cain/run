@@ -558,6 +558,8 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   REVIEW_GEMINI_KEY="$(opt gemini_api_key)"
   REVIEW_PERPLEXITY_KEY="$(opt perplexity_api_key)"
   REVIEW_ANTHROPIC_KEY="$(opt anthropic_api_key)"
+  # Cain 0.20.0: the runner's own read-only GitHub token, for the cut check's fetch and the pull request's description.
+  REVIEW_GITHUB_TOKEN="$(opt review_github_token)"
   REVIEW_LIMIT_USD="$(opt review_limit_usd)"
   REVIEW_CAP_GEMINI_USD="$(opt gemini_monthly_usd)"
   REVIEW_CAP_PERPLEXITY_USD="$(opt perplexity_monthly_usd)"
@@ -567,7 +569,7 @@ if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
   # Cain's user can't set them; the runner writes what it uses to /data/review-settings.json.
   REVIEW_ROUND_CAP="$(opt review_round_cap)"
   USAGE_RESERVE_PERCENT="$(opt usage_reserve_percent)"
-  export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_LIMIT_USD \
+  export REVIEW_GEMINI_KEY REVIEW_PERPLEXITY_KEY REVIEW_ANTHROPIC_KEY REVIEW_GITHUB_TOKEN REVIEW_LIMIT_USD \
     REVIEW_CAP_GEMINI_USD REVIEW_CAP_PERPLEXITY_USD REVIEW_CAP_ANTHROPIC_USD REVIEW_CAP_CODEX_RUNS \
     REVIEW_ROUND_CAP USAGE_RESERVE_PERCENT
   mkdir -p -m 700 /data/codex

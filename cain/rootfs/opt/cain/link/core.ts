@@ -3236,6 +3236,11 @@ export class Link {
       shown = "You tapped Ship, but Stop came before it landed, so nothing shipped.";
       line = `${tap} The link didn't land it: his Stop came first. Nothing changed in main, and there's no Ship token. Once nothing is stopped, ask again with a new Ship card.`;
       m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
+    } else if (r.moved && m.ship.bound) {
+      // Round 2 fixes: a card bound at the review cap whose head moved between his tap and the landing: its own line.
+      shown = BOUND_TAP;
+      line = `${tap} The link didn't land it: the pull request's head moved after his tap, so nothing landed (${BOUND_MOVED}). Nothing changed in main, and there's no Ship token. By the owner's review rule only the head its last review was for ships; nothing to ask him.`;
+      m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
     } else {
       const waited = r.again ? ", for 2 hours" : "";
       shown = own(`Not shipped: ${r.why}${waited}. Nothing changed in main.`);

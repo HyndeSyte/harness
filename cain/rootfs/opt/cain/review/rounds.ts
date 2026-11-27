@@ -20,10 +20,11 @@
 // the cap's last round: nothing serious left, the normal Ship card; something serious left, Cain either
 // holds the piece or cuts the parts the serious findings are about, and one outside model that did not write
 // the cut checks the cut diff (a cut check, kept under the change as `cut`): not a round, never a second.
-import { chmodSync, chownSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, chownSync, closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { changeKeyOf, keyOfRef, type Brief, type RoundKind } from "./core.ts";
-import { asksAboutCap } from "../gate/cain.ts";
+import { CAP_WHY, asksAboutCap, capQuestionHits } from "../gate/cain.ts";
+import { asksSomething } from "../gate/plugin.ts";
 
 export const DEFAULT_ROUND_CAP = 3;
 export const ROUNDS_FORMAT = 1;
@@ -34,20 +35,35 @@ export type RoundRec = { id: string; at: string; kind: RoundKind; state?: RoundS
 // The one cut check of a change at its cap (0.20.0): its review id, the cut head it checked, the seat, and
 // how it ended (pass or fail; lost when its seat never answered). One a change group, for good.
 // base (round 1 fixes): the head the change's last round reviewed, the cut diff's starting point.
-export type CutRec = { id: string; at: string; head: string; pr: string; seat: string; base?: string; state: "started" | "pass" | "fail" | "lost" };
+// Round 2 fixes: every transport attempt (no answer at all: the seat unreachable, a timeout before any response, git
+// failing before dispatch), at most CUT_TRANSPORT_MAX, and when Cain was reminded the check had no result yet.
+export type CutRec = { id: string; at: string; head: string; pr: string; seat: string; base?: string; state: "started" | "pass" | "fail" | "lost";
+  attempts?: { at: string; kind: string; detail: string }[]; reminded?: string };
+export const CUT_TRANSPORT_MAX = 8;
 // Round 1 fixes: Cain's decision at the cap (review.sh decide), kept by the runner from his inbox.
 export type DecisionRec = { choice: "hold" | "cut"; why?: string; at: string };
 // The one plain line the owner hears at each terminal outcome at the cap, kept until the link confirms it.
-export type OwnerOutcome = "clean" | "cap" | "lost" | "cut-pass" | "cut-fail" | "held" | "undecided";
-export const OWNER_OUTCOMES: readonly OwnerOutcome[] = ["clean", "cap", "lost", "cut-pass", "cut-fail", "held", "undecided"];
+// Round 2 fixes: "unchecked", the change held because its cut could not be checked (transport retries used up, no
+// seat that didn't write the cut, or a cut with no check result a day on).
+export type OwnerOutcome = "clean" | "cap" | "lost" | "cut-pass" | "cut-fail" | "held" | "undecided" | "unchecked";
+export const OWNER_OUTCOMES: readonly OwnerOutcome[] = ["clean", "cap", "lost", "cut-pass", "cut-fail", "held", "undecided", "unchecked"];
 export type OwnerLineRec = { state: "owed" | "sent"; at: string; serious?: number; why?: string; message?: string; tries?: number };
 // The cap's own record (round 1 fixes): when the change reached it with something serious left (for the reminder),
 // and whether Cain had his reminder.
 export type CappedRec = { at: string; id: string; serious: number; reminded?: string };
 // decision and past: written by the retired decision card (0.16.0 to 0.19.0), read nowhere now.
 // purpose (round 1 fixes): the topic and question of the change's first brief, quoted to its cut check.
+// Round 2 fixes: the purpose record, frozen after round 1 (frozen: when): the opening of the pull request description's
+// "What changed" section as the owner reads it, and each round 1 outside seat's own statement of what the piece must
+// do; source says whether it was kept at round 1 or built from the description alone for a change past round 1 when
+// this began. A record with no frozen time is an earlier one (topic and question only).
+export type PurposeRec = { topic: string; question: string; what_changed?: string | null; statements?: { seat: string; text: string }[];
+  source?: "round 1" | "description only"; frozen?: string };
+// Round 2 fixes: the runner's own hold of a change (its cut could not be checked); a hold is final (monotonic).
+export type HeldRec = { at: string; why: string };
 export type ChangeRec = { rounds: RoundRec[]; links?: string[]; pr?: string; topic?: string; cut?: CutRec; decision?: unknown; past?: unknown;
-  purpose?: { topic: string; question: string }; decided?: DecisionRec; capped?: CappedRec; lines?: Partial<Record<OwnerOutcome, OwnerLineRec>> };
+  purpose?: PurposeRec; decided?: DecisionRec; capped?: CappedRec; lines?: Partial<Record<OwnerOutcome, OwnerLineRec>>; held?: HeldRec;
+  cut_reminded?: string };
 export type Rounds = { format: number; changes: Record<string, ChangeRec> };
 
 export const emptyRounds = (): Rounds => ({ format: ROUNDS_FORMAT, changes: {} });
@@ -64,13 +80,17 @@ export function readRounds(path: string): Rounds | null {
   } catch { return null; }
 }
 
-// Written whole (temp file, rename), keeping the file's owner and mode as the runner's other files do.
+// Written whole (temp file, rename), keeping the file's owner and mode as the runner's other files do. Round 2 fixes:
+// synced to disk before the rename and the folder after it, so a line owed to the owner is kept before it is posted,
+// whatever stops the runner (a power cut included).
 export function writeRounds(path: string, r: Rounds): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = join(dirname(path), `.rounds-${process.pid}-${Date.now()}.tmp`);
-  writeFileSync(tmp, JSON.stringify(r, null, 1), { mode: 0o640 });
+  const tmp = join(dirname(path), `.rounds-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.tmp`);
+  const fd = openSync(tmp, "w", 0o640);
+  try { writeSync(fd, JSON.stringify(r, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
   try { const s = statSync(path); chownSync(tmp, s.uid, s.gid); chmodSync(tmp, s.mode & 0o777); } catch { /* a new file */ }
   renameSync(tmp, path);
+  try { const d = openSync(dirname(path), "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* a folder that can't be synced */ }
 }
 
 // Every key linked to this one by supersedes, either way, itself included.
@@ -150,6 +170,8 @@ export function admitCut(r: Rounds, b: Brief, base: number): AdmitCut {
   if (n < base) return { ok: false, why: `refused: ${key} isn't at its cap (${n} of ${base} rounds), so there's nothing to cut: a cut check is only for a change at its cap. Nothing was queued.` };
   const had = cutOf(r, key);
   const dec = decisionOf(r, key);
+  const held = heldOf(r, key);
+  if (held) return { ok: false, why: `refused: ${key} is held (${held.why}), and a hold is final: there is no cut and no check after it. Nothing was queued.` };
   if (dec?.choice === "hold") return { ok: false, why: `refused: ${key} is held (Cain decided so with review.sh decide), so there is no cut and no check. Nothing was queued.` };
   if (had) return { ok: false, why: `refused: ${key} already had its one cut check (${had.id}, ${had.state}). There is no second cut and no second check. Nothing was queued.` };
   const last = lastRound(r, key);
@@ -166,14 +188,15 @@ export function addRound(r: Rounds, b: Brief, a: Extract<Admit, { ok: true }>, a
   if (a.links.length) c.links = [...new Set([...(c.links ?? []), ...a.links])];
   if (b.pr) c.pr = b.pr;
   c.topic = b.topic;
-  // The piece's purpose, from its first brief only (round 1 fixes): what its cut check asks still works.
+  // The piece's purpose, from its first brief only (round 1 fixes): what its cut check asks still works. Round 2 fixes:
+  // completed and frozen when round 1 settles (the runner's freezePurpose); never written after.
   if (a.round === 1 && !purposeOf(r, a.key)) c.purpose = { topic: b.topic, question: b.question };
   c.rounds.push({ id: b.id, at, kind: a.kind, state: "started", ...(b.head ? { head: b.head.toLowerCase() } : {}) });
 }
 
 // The group's purpose (its first brief's topic and question), its decision at the cap, and the key its
 // change-wide records (the cap, the owner's lines, the cut reservation) are kept under: the group's first key.
-export function purposeOf(r: Rounds, key: string): { topic: string; question: string } | null {
+export function purposeOf(r: Rounds, key: string): PurposeRec | null {
   const first = countedRounds(r, key)[0];
   if (first && r.changes[first.key]?.purpose) return r.changes[first.key].purpose!;
   for (const k of groupOf(r, key)) if (r.changes[k]?.purpose) return r.changes[k].purpose!;
@@ -184,6 +207,31 @@ export function decisionOf(r: Rounds, key: string): (DecisionRec & { key: string
   return null;
 }
 export const rootOf = (r: Rounds, key: string): string => groupOf(r, key)[0];
+export function heldOf(r: Rounds, key: string): (HeldRec & { key: string }) | null {
+  for (const k of groupOf(r, key)) { const h = r.changes[k]?.held; if (h) return { ...h, key: k }; }
+  return null;
+}
+// The essential behaviours a cut check must find evidence for (round 2 fixes), from the frozen purpose record only:
+// each sentence of the "What changed" opening and each round 1 seat's statement, of at least five words. Fewer than
+// MIN_ESSENTIALS (core.ts) and the cut fails.
+export function essentialsOf(p: PurposeRec | null): string[] {
+  if (!p?.frozen) return [];
+  const out: string[] = [];
+  const words = (t: string) => (t.match(/[A-Za-z][A-Za-z'-]*/g) ?? []).length;
+  for (const x of String(p.what_changed ?? "").split(/(?<=[.!?])\s+|\n+/).map((t) => t.replace(/^\s*(?:[-*]|\d+\.)\s+/, "").trim()))
+    if (words(x) >= 5) out.push(x.slice(0, 400));
+  for (const st of p.statements ?? []) if (words(st.text) >= 5) out.push(st.text.slice(0, 800));
+  return [...new Set(out)].slice(0, 12);
+}
+// The record as the cut judge reads it, saying where it came from.
+export function purposeText(p: PurposeRec | null): string {
+  if (!p) return "(no purpose record)";
+  const lines = [`Topic: ${p.topic}`, `Question: ${p.question}`,
+    `Source: ${p.source === "description only" ? "built from the pull request's description only, since the change was past its first round when purpose records began" : "kept at the change's first review round and frozen then"}.`];
+  if (p.what_changed) lines.push(`What changed, as the owner reads it: ${p.what_changed}`);
+  for (const st of p.statements ?? []) lines.push(`What it must do, by ${st.seat} at round 1: ${st.text}`);
+  return lines.join("\n");
+}
 
 // The one cut check per change, reserved atomically before anything is dispatched (round 1 fixes): an exclusive
 // create of the group's reservation file beside the rounds file, holding the check's id. A second brief for the
@@ -217,6 +265,8 @@ export function roundById(r: Rounds, key: string, id: string): RoundRec | null {
 // `review.sh decide <change> cut`. The why goes to the owner as his one "held: <why>" line, so it is one plain
 // line: no question, nothing about rounds, risk or cuts put to him (gate/cain.ts asksAboutCap), no em dash.
 export const DECIDE_WHY_MAX = 200;
+// A why that asks him something without a question mark ("let me know if you want it kept").
+const ASKS_HIM = /\b(let me know|tell me|your call|up to you|if you want|do you want|would you like|want me to|should i|ok to|okay to|your go|your say)\b/i;
 export type Decide = { change: string; choice: "hold" | "cut"; why?: string };
 export function checkDecision(d: any): Decide | string {
   if (!d || typeof d !== "object" || Array.isArray(d) || Object.keys(d).some((k) => !["change", "choice", "why"].includes(k)))
@@ -229,7 +279,11 @@ export function checkDecision(d: any): Decide | string {
   if (!why) return "a hold needs its why, in one line.";
   if (/[\r\n]/.test(why) || why.length > DECIDE_WHY_MAX) return `the why is one line of at most ${DECIDE_WHY_MAX} characters.`;
   if (/[—–]/.test(why)) return "the why has a dash he'd read as an em dash: use a comma or a new sentence.";
-  if (why.includes("?") || asksAboutCap(why)) return "the why tells him why it is held; it asks him nothing, and says nothing about rounds, risk or cuts.";
+  // Round 2 fixes: the message gate's own cap check, over the line as he'll read it ("held: <why>"), and anything that
+  // asks him something: refused with the gate's reason.
+  const line = `held: ${why}`;
+  if (why.includes("?") || asksSomething(line) || capQuestionHits(line).length || asksAboutCap(why) || ASKS_HIM.test(why))
+    return `The message gate held this: ${CAP_WHY}. The why tells him why it is held; it asks him nothing, and says nothing about rounds, risk or cuts.`;
   return { change, choice: "hold", why };
 }
 // Why a decision can't be kept now, or null: the change must be at its cap with something serious left by its
@@ -241,6 +295,8 @@ export function decideWhy(r: Rounds, change: string, cap: number): string | null
   const last = lastRound(r, change);
   if (last.state !== "answered") return last.state === "lost" ? `${change}'s last round was lost, so it is held by the rule already.` : `${change}'s last round is still running.`;
   if (last.serious === 0) return `${change}'s last round left nothing serious: show the normal Ship card.`;
+  const h = heldOf(r, change);
+  if (h) return `${change} is held (${h.why}), and a hold is final: no later decision is kept.`;
   const d = decisionOf(r, change);
   if (d) return `${change} is decided already (${d.choice}); a decision is made once.`;
   const c = cutOf(r, change);

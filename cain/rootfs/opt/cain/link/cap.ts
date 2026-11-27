@@ -13,7 +13,7 @@
 //   - The keeper's armed read (keeperArmed, armedFor) stays for the keeper's own checks; no Ship card reads it.
 import { closeSync, fchmodSync, fchownSync, openSync, readFileSync, renameSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { countedRounds, cutOf, decisionOf, lastRound, readRounds, type Rounds } from "../review/rounds.ts";
+import { countedRounds, cutOf, decisionOf, heldOf, lastRound, readRounds, type Rounds } from "../review/rounds.ts";
 import { CAIN_GID, capPaths, ROOT_UID } from "../capfiles.ts";
 import { appendSynced, syncFolder } from "./auth.ts";
 
@@ -124,6 +124,9 @@ export function capStateFor(pr: string, rounds: Rounds | null, cap = 3): CapStat
       if (!last.head) return { state: "held", key: k, why: "the runner's record of its last review round names no head, so no head can be bound to its Ship card" };
       return { state: "clean", key: k, id: last.id, head: last.head.toLowerCase() };
     }
+    // Round 2 fixes: held by the runner (its cut could not be checked): final, whatever its cut check says later.
+    const h = heldOf(rounds, k);
+    if (h) return { state: "held", key: k, why: `it is held: ${h.why}` };
     const d = decisionOf(rounds, k);
     if (d?.choice === "hold") return { state: "held", key: k, why: "its last review round left something serious, and Cain held it" };
     const c = cutOf(rounds, k);
@@ -201,7 +204,7 @@ export function keeperArmedText(replies: Record<string, KeeperReply | undefined>
 // (the change's first brief's) and a hold's why are Cain's words: the link checks them by his rules first, and
 // leaves them out when they don't pass (ownerLineText with neither).
 export type OwnerLineFields = { outcome: string; topic?: string; serious?: number; why?: string };
-export const OWNER_LINE_OUTCOMES = ["clean", "cap", "lost", "cut-pass", "cut-fail", "held", "undecided"] as const;
+export const OWNER_LINE_OUTCOMES = ["clean", "cap", "lost", "cut-pass", "cut-fail", "held", "undecided", "unchecked"] as const;
 const findings = (n: number | undefined) => {
   const k = Number.isInteger(n) && n! >= 1 ? n! : 1;
   const w = k < WORDS.length ? WORDS[k] : "several";
@@ -216,6 +219,7 @@ export function ownerLineText(l: OwnerLineFields): string {
     case "cut-pass": return `${t}: the cut passed its outside check, so its Ship card follows.`;
     case "cut-fail": return `${t}: the cut failed its outside check, so it is held.`;
     case "held": return l.why ? `${t}, held: ${clean(l.why, 200).replace(/[.\s]+$/, "")}.` : `${t}, held.`;
+    case "unchecked": return `${t}: the cut could not be checked, so it is held.`;
     case "undecided": return `${t}: its last outside review round left something serious a day ago, and whether it is held or cut is still undecided.`;
     default: throw new Error("not an outcome");
   }

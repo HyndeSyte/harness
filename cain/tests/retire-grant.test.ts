@@ -33,9 +33,11 @@ const cutBrief = (over: Partial<Brief> = {}): Brief => brief({ id: "2026-11-26-c
 type Answer = (i: SeatInput) => Promise<SeatAnswer>;
 const said = (verdict: SeatAnswer["verdict"], ...problems: string[]): SeatAnswer =>
   ({ verdict, findings: problems.map((p, i) => ({ rank: i + 1, problem: p, fix: "fix it" })), model: "m", cost_usd: 0.01 });
-// A cut check's clear pass (round 1 fixes): each of the four questions answered good for the cut.
-const cutPass = () => said("approve", "FOLLOW-UP (loses or corrupts): Q1. The risk is gone.", "FOLLOW-UP (acts wrongly): Q2. Nothing new.",
-  "FOLLOW-UP (fails silently): Q3. The tests pass.", "FOLLOW-UP (acts wrongly): Q4. The purpose still works.");
+// A cut check's clear pass (round 2 fixes): questions 1 to 3 good for the cut, each essential behaviour with its evidence.
+const cutPass = (i?: SeatInput) => said("approve", "FOLLOW-UP (loses or corrupts): Q1. The risk is gone.", "FOLLOW-UP (acts wrongly): Q2. Nothing new.",
+  "FOLLOW-UP (fails silently): Q3. The tests pass.", ...(i?.brief.essentials ?? ["a", "b"]).map((_, k) => `FOLLOW-UP (acts wrongly): Q4.${k + 1}. Still done, evidence: x.ts:${k + 1}.`));
+const withPurpose = (seat: string, i: SeatInput, a: SeatAnswer): SeatAnswer => i.brief.purpose_ask
+  ? { ...a, findings: [{ rank: 0, problem: `PURPOSE: The piece keeps each calendar change exactly once when a failed write is retried (as ${seat} reads it).`, fix: "none" }, ...a.findings] } : a;
 
 // Two outside seats (OpenAI and Gemini) and Claude, each with its own answers, by call kind.
 function rules(o: { openai?: Answer; gemini?: Answer; claude?: Answer; noOpenai?: boolean; cutDiff?: any } = {}) {
@@ -45,13 +47,15 @@ function rules(o: { openai?: Answer; gemini?: Answer; claude?: Answer; noOpenai?
     reviewedFile: join(dir, "reviewed.json"), roundsFile: join(dir, "rounds.json"), roundCap: 3, settingsFile: join(dir, "settings.json") };
   writeFileSync(cfg.termsFile, "# terms\nAcme Corp\n");
   const calls: { seat: string; input: SeatInput }[] = [];
-  const of = (seat: string, a: Answer | undefined): SeatFn => async (i) => { calls.push({ seat, input: i }); return (a ?? (async (x: SeatInput) => x.brief.check ? cutPass() : said("approve")))(i); };
+  const of = (seat: string, a: Answer | undefined): SeatFn => async (i) => { calls.push({ seat, input: i }); return withPurpose(seat, i, await (a ?? (async (x: SeatInput) => x.brief.check ? cutPass(x) : said("approve")))(i)); };
   const seats: RunnerConfig extends never ? never : any = { gemini: of("gemini", o.gemini), claude: of("claude", o.claude) };
   if (!o.noOpenai) seats.openai = of("openai", o.openai);
   let clock = NOW;
   const lines: any[] = [];
   const runner = new Runner(cfg, { seats, now: () => clock, rand: () => 0.5, log: () => {}, plan: () => ({ fraction: 0.1, at: NOW.toISOString(), reason: "t", tokens_week: 1, files: 1 }),
-    cutDiff: o.cutDiff ?? (async () => ({ ok: true, diff: "--- a/x.ts\n+++ b/x.ts\n-retry()\n", judged: { ok: true, reverts: 0, allowed: 0 } })),
+    cutDiff: o.cutDiff ?? (async () => ({ ok: true, diff: "--- a/x.ts\n+++ b/x.ts\n-retry()\n", context: "", headFiles: { "x.ts": 10 },
+      commits: [{ sha: "c".repeat(40), author: "HyndeSyte <h@x>", committer: "HyndeSyte <h@x>", message: "cut\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" }],
+      judged: { ok: true, reverts: 0, allowed: 0 } })),
     postLine: async (l) => { lines.push(l); return `m-${lines.length}`; } });
   runner.writeSettings();
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
@@ -65,7 +69,7 @@ function rules(o: { openai?: Answer; gemini?: Answer; claude?: Answer; noOpenai?
 }
 // A round's seats: serious from OpenAI unless the answer says otherwise.
 const serious = (text = "SERIOUS (loses or corrupts): a crash between two writes loses the record") => async (i: SeatInput) =>
-  i.brief.sort ? said("approve") : i.brief.check ? cutPass() : said("approve_with_changes", text);
+  i.brief.sort ? said("approve") : i.brief.check ? cutPass(i) : said("approve_with_changes", text);
 const clean = async (i: SeatInput) => said("approve");
 
 describe("1: the grant of extra rounds is retired", () => {
@@ -169,7 +173,8 @@ describe("2: no decision card at the cap; the done line says at its cap and the 
   });
 
   test("round 3 with nothing serious left says so: the normal Ship card", async () => {
-    const t = rules({ openai: async (i) => said("approve_with_changes", "FOLLOW-UP (fails silently): a log line could be clearer") });
+    const t = rules({ openai: async (i) => said("approve_with_changes", "FOLLOW-UP (fails silently): a log line could be clearer"),
+      gemini: async (i) => i.brief.sort ? said("approve", "FOLLOW-UP (fails silently) [1]: it is only the wording of a log line, and someone still hears") : said("approve") });
     for (const id of ["n-1", "n-2", "n-3"]) await t.round(id);
     const last = t.relays().filter((l) => l.includes("Review n-3 done")).pop()!;
     expect(last).toContain("0 serious findings left, at its cap.");
@@ -231,7 +236,7 @@ describe("3: the cut check", () => {
     expect(sent.check).toBe("cut");
     expect(sent.earlier).toEqual(["[serious: loses or corrupts] a crash between two writes loses the record"]);
     const p = prompt(sent, "reviewer");
-    expect(p.system).toContain("1. Does it remove each serious risk listed inside <earlier>? 2. Does it add a serious risk of its own? 3. Does what is left pass its tests? 4. Does the piece's stated purpose, inside <purpose>, still work after the cut?");
+    expect(p.system).toContain("1. Does it remove each serious risk listed inside <earlier>? 2. Does it add a serious risk of its own? 3. Does what is left pass its tests? 4. Does the piece still do what it must, as its purpose record inside <purpose> states");
     expect(p.user).toContain("The cut diff: it removes the new retry loop");
     // Not a round: the count stays 3, and the cut is kept on its own.
     expect(t.rounds().changes["pr-40"].rounds.length).toBe(3);
@@ -287,7 +292,7 @@ describe("4: sorting by the rule's test", () => {
     expect(p).toContain('"SERIOUS (<arm>):" naming the arm it meets, or "FOLLOW-UP (<arm>):" naming the arm it comes nearest to and fails');
   });
 
-  test("the count: serious by any seat, less those another outside seat labelled follow-up in writing; verdicts.md shows both", async () => {
+  test("the count: serious by any seat; one other seat's follow-up alone doesn't take it off (round 2 fixes); verdicts.md shows both", async () => {
     const t = rules({
       openai: async (i) => i.brief.sort ? said("approve") : said("approve_with_changes", "SERIOUS (fails silently): the retry gives up without a word", "SERIOUS (acts wrongly): it posts twice"),
       gemini: async (i) => i.brief.sort
@@ -297,13 +302,15 @@ describe("4: sorting by the rule's test", () => {
     for (const id of ["s-1", "s-2", "s-3"]) await t.round(id);
     const r = t.get("s-3");
     expect(r.sorts?.length).toBe(2);
-    expect(seriousLeft(r).map((f) => f.problem)).toEqual(["it posts twice"]);
-    expect(t.rounds().changes["pr-40"].rounds[2].serious).toBe(1);
+    // Gemini is the only other seat on the panel: a one-seat electorate keeps it serious.
+    expect(seriousLeft(r).map((f) => f.problem)).toEqual(["the retry gives up without a word", "it posts twice"]);
+    expect(t.rounds().changes["pr-40"].rounds[2].serious).toBe(2);
     const md = verdictsMd(r);
     expect(md).toContain("1. [serious: fails silently] the retry gives up without a word");
-    expect(md).toContain("Gemini labelled it follow-up (fails silently): it logs and alarms when it gives up, so someone hears So it doesn't count as serious.");
+    expect(md).toContain("Gemini labelled it follow-up (fails silently): it logs and alarms when it gives up, so someone hears");
+    expect(md).not.toContain("So it doesn't count as serious.");
     expect(md).toContain("Gemini labelled it serious (acts wrongly): agreed, it posts twice");
-    expect(relayLine(r)).toContain("1 serious finding left, at its cap.");
+    expect(relayLine(r)).toContain("2 serious findings left, at its cap.");
   });
 
   test("Claude's follow-up label, the raising seat's own, or one with no reason doesn't take a finding off", () => {
@@ -317,7 +324,11 @@ describe("4: sorting by the rule's test", () => {
     expect(left([{ by: "openai", ref: "openai#0", label: "follow-up", reason: "fine" }])).toBe(1);
     expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", reason: " " }])).toBe(1);
     expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", reason: "it fails safe and is heard" }])).toBe(1);   // round 1 fixes: no arm named
-    expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", arm: "fails silently", reason: "it fails safe and is heard" }])).toBe(0);
+    // Round 2 fixes: one other outside seat alone is a one-seat electorate, which keeps it serious; two take it off.
+    expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", arm: "fails silently", reason: "it fails safe and is heard" }])).toBe(1);
+    const two: any = { ...base, seats: [...base.seats, seat("perplexity", "perplexity")] };
+    const fu = (by: string) => ({ by, ref: "openai#0", label: "follow-up", arm: "fails silently", reason: "it fails safe and someone is told" });
+    expect(seriousLeft({ ...two, sorts: [fu("gemini"), fu("perplexity")] }).length).toBe(0);
   });
 
   test("an unlabelled finding counts as serious in every round, a full one too", async () => {

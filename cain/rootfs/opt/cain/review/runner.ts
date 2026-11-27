@@ -11,13 +11,13 @@ import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
-  CUT_CHECK, CUT_SEATS, FINAL, JUDGES, LABEL, SEATS, SeatError, allRaised, backoffMs, checkBrief, cutResult, downgraded, earlierCheck, findingRef, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
-  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, sortOutbound, sortsCount, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun, type SortRec,
+  CUT_CHECK, CUT_SEATS, FINAL, JUDGES, LABEL, MIN_ESSENTIALS, SEATS, SeatError, allRaised, backoffMs, checkBrief, cutResult, downgraded, earlierCheck, findingRef, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
+  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, sortOutbound, panelOf, retryLimit, seatRun, wroteCut, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun, type SortRec,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
-import { DEFAULT_ROUND_CAP, addRound, admit, admitCut, checkDecision, countedRounds, decideWhy, cutOf, decisionOf, groupOf, lastRound, purposeOf, readRounds, releaseCut, reserveCut, rootOf, writeRounds,
-  type OwnerOutcome, type Rounds } from "./rounds.ts";
-import { gitCutDiff, type CutDiffFn } from "./cutdiff.ts";
+import { CUT_TRANSPORT_MAX, DEFAULT_ROUND_CAP, addRound, admit, admitCut, checkDecision, countedRounds, decideWhy, cutOf, decisionOf, essentialsOf, groupOf, heldOf, lastRound, purposeOf, purposeText,
+  readRounds, releaseCut, reserveCut, rootOf, writeRounds, type OwnerOutcome, type PurposeRec, type Rounds } from "./rounds.ts";
+import { gitCutDiff, verifyFetch, type CutDiffFn } from "./cutdiff.ts";
 import { DEFAULT_RESERVE_PERCENT, SETTINGS_FORMAT, guard, labelOf } from "../guard.ts";
 import type { PlanReading } from "../plan-usage.ts";
 
@@ -43,6 +43,9 @@ export type RunnerConfig = {
   roundsFile?: string; settingsFile?: string; guardLog?: string;
   // Round 1 fixes: the runner's own bare copy of the repository for cut diffs, and where it fetches from.
   cutRepo?: string; cutRemote?: string;
+  // Round 2 fixes: the runner's GitHub token (the App's option review_github_token), for the cut diff's fetch and the
+  // pull request's description; none: both go without one. Never logged.
+  githubToken?: string;
 };
 
 export const DEFAULTS: Omit<RunnerConfig, "queueDir" | "spendFile" | "healthFile" | "termsFile" | "recordQueue" | "relayFile"> = {
@@ -67,6 +70,10 @@ export type RunnerDeps = {
   // confirms it, null while it doesn't (tried again next tick). Absent: lines stay owed.
   cutDiff?: CutDiffFn;
   postLine?: (l: OwnerLine) => Promise<string | null>;
+  // Round 2 fixes: the pull request's description as GitHub has it (default: its API, with the runner's token when
+  // there is one), for the purpose record; and the fetch check at the runner's start (default: cutdiff.ts verifyFetch).
+  prBody?: (pr: string) => Promise<{ ok: true; body: string } | { ok: false; why: string }>;
+  verifyFetch?: () => { ok: boolean; detail: string };
 };
 // One plain line to the owner (no card, no buttons, no question): the link builds its words from these fields.
 export type OwnerLine = { id: string; outcome: OwnerOutcome; topic: string; serious?: number; why?: string };
@@ -91,7 +98,38 @@ export const daysFileOf = (cfg: Pick<RunnerConfig, "spendFile" | "spendDaysFile"
 export type SeatHealth = { ok: boolean; at: string; kind?: ErrorKind; detail?: string; fix?: string };
 // Round 1 fixes: per seat, each round's count of findings with a valid SERIOUS or FOLLOW-UP label (the newest 50).
 export type LabelRow = { id: string; round?: number; labelled: number; total: number; at: string };
-export type Health = Partial<Record<SeatName, SeatHealth>> & { labels?: Partial<Record<SeatName, LabelRow[]>> };
+// fetch (round 2 fixes): whether the runner could fetch the repository at its start, for the cut diff.
+export type Health = Partial<Record<SeatName, SeatHealth>> & { labels?: Partial<Record<SeatName, LabelRow[]>>; fetch?: { ok: boolean; at: string; detail: string } };
+
+// The opening of a pull request description's "What changed" section as the owner reads it (round 2 fixes): its
+// first paragraph, at most 1,200 characters; null when there is none.
+export function whatChangedOpening(body: string): string | null {
+  const lines = String(body ?? "").replace(/\r/g, "").split("\n");
+  const at = lines.findIndex((l) => /^##\s+What changed\s*$/i.test(l.trim()));
+  if (at < 0) return null;
+  const para: string[] = [];
+  for (const l of lines.slice(at + 1)) {
+    if (/^#{1,6}\s/.test(l.trim())) break;
+    if (!l.trim()) { if (para.length) break; continue; }
+    para.push(l.trim());
+  }
+  const t = oneLine(para.join(" "), 1_200);
+  return t || null;
+}
+// The pull request's description through GitHub's API (round 2 fixes), with the token when there is one.
+export function githubPrBody(token?: string, fetcher: typeof fetch = fetch) {
+  return async (pr: string): Promise<{ ok: true; body: string } | { ok: false; why: string }> => {
+    const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)$/i.exec(pr);
+    if (!m) return { ok: false, why: "not a pull request address" };
+    try {
+      const res = await fetcher(`https://api.github.com/repos/${m[1]}/pulls/${m[2]}`, { headers: { accept: "application/vnd.github+json", "user-agent": "cain-review-runner",
+        ...(token ? { authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(30_000) });
+      if (res.status !== 200) return { ok: false, why: `GitHub answered ${res.status}` };
+      const j: any = await res.json();
+      return typeof j?.body === "string" ? { ok: true, body: j.body } : { ok: false, why: "the pull request has no description" };
+    } catch (e) { return { ok: false, why: `GitHub couldn't be reached (${String((e as Error)?.message ?? e).slice(0, 80)})` }; }
+  };
+}
 export const LABEL_ROWS = 50;
 // The parse rate of a seat's labels over the rows kept: labelled findings of all findings, null with none.
 export function labelRate(rows: LabelRow[] | undefined): { labelled: number; total: number; rate: number | null } {
@@ -332,8 +370,7 @@ export class Runner {
     const prev = this.lastReview(a.last);
     const serious = prev ? seriousLeft(prev).slice(0, 30).map((f) => `${f.arm ? `[serious: ${oneLine(f.arm, 80)}] ` : "[serious] "}${oneLine(f.problem, 400)}`) : [];
     if (!serious.length) return `refused: the serious findings of ${a.key}'s last round can't be read from the runner's record, so there's nothing to check the cut against: it's logged for a Build item. Nothing was queued.`;
-    const p = purposeOf(rounds, a.key);
-    if (!p) return `refused: the runner's record has no first brief for ${a.key}, so the piece's purpose can't be quoted to its cut check: it is held. Nothing was queued.`;
+    // Round 2 fixes: the purpose record is read when the check runs (prepareCut); a missing one fails the cut there.
     const seat = this.chooseCutSeat(prev!);
     const root = rootOf(rounds, a.key);
     const queued = (id: string) => existsReview(this.cfg.queueDir, id);
@@ -341,8 +378,7 @@ export class Runner {
       return `refused: ${a.key} already has its one cut check (another was reserved first). There is no second cut and no second check. Nothing was queued.`;
     const b: Brief = { ...given, seats: [seat], consequential: false };
     const r = newReview(b, this.now());
-    Object.assign(r, { change: a.key, kind: CUT_CHECK, earlier: serious, cut_base: a.base,
-      purpose: `Topic: ${oneLine(p.topic, 120)}\nQuestion: ${oneLine(p.question, 2_000)}` });
+    Object.assign(r, { change: a.key, kind: CUT_CHECK, earlier: serious, cut_base: a.base });
     const c = rounds.changes[a.key] ??= { rounds: [] };
     c.cut = { id: b.id, at: this.now().toISOString(), head: b.head!, pr: b.pr!, seat, base: a.base, state: "started" };
     // Submitting the cut check is Cain's decision to cut (review.sh decide cut says the same).
@@ -397,7 +433,10 @@ export class Runner {
         // Blocked for privacy, or refused (round 1 fixes: the cut head doesn't descend from the last-reviewed
         // head): nothing was sent, so it wasn't the check, its reservation is released, and another may be
         // submitted. Otherwise anything but a clear pass is a fail (cutResult), and the owner hears one line.
-        if (r.status === "blocked: privacy" || r.cut_refused) { delete c.cut; releaseCut(file, rootOf(rounds, r.change)); }
+        // Round 2 fixes: a change held meanwhile (its cut could not be checked) stays held, whatever came back late:
+        // its check is lost, and no second line goes to the owner.
+        if (heldOf(rounds, r.change)) { if (c.cut.state === "started") c.cut.state = "lost"; }
+        else if (r.status === "blocked: privacy" || r.cut_refused) { delete c.cut; releaseCut(file, rootOf(rounds, r.change)); }
         else {
           c.cut.state = cutResult(r) ?? "fail";
           this.owe(rounds, r.change, c.cut.state === "pass" ? "cut-pass" : "cut-fail", {});
@@ -416,6 +455,8 @@ export class Runner {
       else rec.state = r.seats.some((s) => s.state === "done") ? "answered" : "lost";
       // The serious count by the owner's rule (0.20.0), every round: what the link's Ship card reads at the cap.
       if (rec.state === "answered") rec.serious = serious.length;
+      // Round 2 fixes: round 1 freezes the change's purpose record.
+      if (r.round === 1 && !rec.blocked) this.freezePurpose(rounds, r);
     }
     // At the cap (round 1 fixes) the owner hears one plain line, from code: nothing serious left (its Ship card
     // follows), the last round lost (held), or the serious count and that Cain now holds or cuts it; the cap's
@@ -432,6 +473,19 @@ export class Runner {
     }
     writeRounds(file, rounds);
     r.rounded = true;
+  }
+  // The purpose record (round 2 fixes), frozen when round 1 settles: the opening of the pull request description's
+  // "What changed" section (read once at round 1) and each round 1 outside seat's own statement of what the piece must
+  // do. Never written again.
+  private freezePurpose(rounds: Rounds, r: Review): void {
+    const c = rounds.changes[r.change!];
+    if (!c) return;
+    const had = purposeOf(rounds, r.change!);
+    if (had?.frozen) return;
+    const statements = r.seats.filter((x) => x.state === "done" && x.counts && x.seat !== "claude" && x.purpose)
+      .map((x) => ({ seat: LABEL[x.seat], text: oneLine(x.purpose!, 1_200) }));
+    c.purpose = { topic: had?.topic ?? r.brief?.topic ?? r.topic, question: had?.question ?? r.brief?.question ?? "", what_changed: r.what_changed ?? null,
+      statements, source: "round 1", frozen: this.now().toISOString() };
   }
   // A round counted at intake whose review never reached the queue (the runner stopped between the
   // two writes) is lost, found once at the runner's start: it still counts, and Cain hears it named. A cut
@@ -463,6 +517,21 @@ export class Runner {
     if (!lines.length) return;
     writeRounds(file, rounds);
     for (const l of lines) this.relay(`${l} Nothing to tell him.`);
+  }
+  // At the runner's start (round 2 fixes): the fetch the cut diff needs is checked, with the token when there is one,
+  // and kept for review.sh health; then every line owed to the owner (kept on disk before any post) is drained.
+  async start(): Promise<void> {
+    try {
+      const v = this.deps.verifyFetch ?? (this.cfg.cutRemote ? () => verifyFetch({ remote: this.cfg.cutRemote!, token: this.cfg.githubToken }) : null);
+      if (v) {
+        const got = v();
+        const h = this.health();
+        h.fetch = { ok: got.ok, at: this.now().toISOString(), detail: got.detail };
+        writeAtomic(this.cfg.healthFile, JSON.stringify(h, null, 1));
+        if (!got.ok) this.log(`the cut diff's fetch doesn't work: ${got.detail}`);
+      }
+    } catch (e) { this.log(`couldn't check the cut diff's fetch: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
+    try { await this.postLines(); } catch (e) { this.log(`owed lines to the owner: ${(e as Error).message}`); }
   }
   async tick(): Promise<void> {
     try { this.recoverLost(); this.ingest(); this.ingestDecisions(); await this.reviews(); this.remind(); }
@@ -515,7 +584,7 @@ export class Runner {
     const now = this.now().getTime();
     for (const [key, c] of Object.entries(rounds.changes)) {
       const cap = c.capped;
-      if (!cap || decisionOf(rounds, key) || cutOf(rounds, key)) continue;
+      if (!cap || decisionOf(rounds, key) || cutOf(rounds, key) || heldOf(rounds, key)) continue;
       const age = now - Date.parse(cap.at);
       if (age >= REMIND_MS && !cap.reminded) {
         cap.reminded = this.now().toISOString(); changed = true;
@@ -523,7 +592,60 @@ export class Runner {
       }
       if (age >= UNDECIDED_MS && this.owe(rounds, key, "undecided", { serious: cap.serious })) changed = true;
     }
+    // Round 2 fixes: every non-terminal state after a cut decision has a deadline. A cut decided with no cut check
+    // yet, or a cut check with no result (its seat in transport retry, or not answering), gets one reminder to Cain
+    // after an hour and, after a day, the change is held with the owner's one "the cut could not be checked" line.
+    for (const [key, c] of Object.entries(rounds.changes)) {
+      if (rootOf(rounds, key) !== key || heldOf(rounds, key)) continue;
+      const dec = decisionOf(rounds, key), cut = cutOf(rounds, key);
+      if (cut ? cut.state !== "started" : dec?.choice !== "cut") continue;
+      const since = Date.parse(cut?.at ?? dec!.at);
+      if (!Number.isFinite(since)) continue;
+      const age = now - since;
+      if (age >= UNDECIDED_MS) {
+        this.holdUnchecked(rounds, key, cut ? "its cut check had no result a day after it was submitted" : "no cut check came a day after the decision to cut");
+        changed = true;
+      } else if (age >= REMIND_MS && !c.cut_reminded) {
+        c.cut_reminded = this.now().toISOString(); changed = true;
+        this.relay(cut
+          ? `${key}'s cut check ${cut.id} has no result an hour on (${(cut.attempts ?? []).length} attempt${(cut.attempts ?? []).length === 1 ? "" : "s"} with no answer). It keeps trying; a day after it was submitted the change is held and he hears that the cut could not be checked. Nothing to tell him.`
+          : `${key} was decided to be cut an hour ago and has no cut check yet. Cut those parts through Build and submit its one cut check; a day after the decision it is held and he hears that the cut could not be checked. Nothing to tell him.`);
+      }
+    }
     if (changed) writeRounds(file, rounds);
+  }
+  // The change held by the runner (round 2 fixes): its cut could not be checked. Final: no later cut or decision is
+  // kept (rounds.ts admitCut, decideWhy), its cut check if any is lost, and the owner hears one line.
+  holdUnchecked(rounds: Rounds, key: string, why: string): void {
+    const root = rootOf(rounds, key);
+    if (heldOf(rounds, key)) return;
+    (rounds.changes[root] ??= { rounds: [] }).held = { at: this.now().toISOString(), why: `the cut could not be checked: ${why}` };
+    const cut = cutOf(rounds, key);
+    if (cut && cut.state === "started") rounds.changes[cut.key].cut!.state = "lost";
+    this.owe(rounds, key, "unchecked", {});
+    this.log(`${key} is held: the cut could not be checked (${why})`);
+    this.relay(`${key} is held: the cut could not be checked (${why}). He hears one line saying so, from the link; no later cut or decision is kept. Nothing to tell him.`);
+  }
+  // One transport attempt of a cut check (round 2 fixes), kept under the change in the rounds file. Returns how many
+  // there have been, or null when the rounds file can't be read (then the check waits: nothing is sent unrecorded).
+  private noteCutAttempt(r: Review, kind: string, detail: string): number | null {
+    const file = this.cfg.roundsFile;
+    const at = { at: this.now().toISOString(), kind, detail: oneLine(detail, 160) };
+    (r.cut_attempts ??= []).push(at);
+    if (!file || !r.change) return r.cut_attempts.length;
+    const rounds = readRounds(file);
+    if (!rounds) return null;
+    const c = rounds.changes[r.change]?.cut;
+    if (c?.id === r.id) {
+      (c.attempts ??= []).push(at);
+      if (c.attempts.length >= CUT_TRANSPORT_MAX) {
+        r.cut_unchecked = `its seat gave no answer in ${c.attempts.length} tries (the last: ${at.kind}, ${at.detail})`;
+        this.holdUnchecked(rounds, r.change, r.cut_unchecked);
+      }
+      writeRounds(file, rounds);
+      return c.attempts.length;
+    }
+    return r.cut_attempts.length;
   }
   // Cain's decision at the cap (review.sh decide), from his inbox: a ".decision" file of his, {change, choice, why}.
   // Kept only for a change at its cap whose last round left something serious and that has no decision or cut
@@ -597,10 +719,18 @@ export class Runner {
     // on an open review is refused too.
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
+    // Round 2 fixes: a cut check of a change held meanwhile (its cut could not be checked) ends here, sending nothing.
+    if (r.kind === CUT_CHECK && r.change && this.cfg.roundsFile) {
+      const rounds = readRounds(this.cfg.roundsFile);
+      const h = rounds ? heldOf(rounds, r.change) : null;
+      if (h) { r.cut_unchecked ??= h.why.replace(/^the cut could not be checked: /, ""); for (const s of r.seats) if (s.state === "queued") s.state = "failed"; this.finish(r, "incomplete"); return; }
+    }
     // A cut check (round 1 fixes): its diff derived through git first, once; the same diff on every later try.
     if (r.kind === CUT_CHECK && !(await this.prepareCut(r))) return;
+    // Round 2 fixes: round 1 of a pull request reads its description once, for the purpose record.
+    if (r.round === 1 && r.kind !== CUT_CHECK && r.brief?.pr && r.what_changed === undefined) await this.readWhatChanged(r);
     const e = earlierCheck(r.round_kind === "fixes" ? r.earlier
-      : r.kind === CUT_CHECK ? [...(r.earlier ?? []), r.purpose ?? "", r.cut_diff ?? ""] : undefined, this.terms());
+      : r.kind === CUT_CHECK ? [...(r.earlier ?? []), r.purpose ?? "", ...(r.cut_essentials ?? []), r.cut_diff ?? "", r.cut_context ?? ""] : undefined, this.terms());
     if (!e.ok) return this.block(r, e.why);
     for (let pass = 0; pass < 4; pass++) {
       if (this.isStopped()) break;                       // Stop between passes: the rest waits
@@ -611,37 +741,110 @@ export class Runner {
       await Promise.all(due.map((s) => this.runSeat(r, s)));
       this.substitute(r);
     }
-    if (this.settlesNow(r) && !r.sorted && !this.isStopped()) await this.sortPass(r);
+    // Round 2 fixes: a round never settles unsorted because of a Stop: it waits, and sorts once nothing is stopped.
+    if (this.settlesNow(r) && !r.sorted) { if (this.isStopped()) return; await this.sortPass(r); }
     this.settle(r);
   }
 
   // The cut diff, from the last-reviewed head to the cut head, through git (cutdiff.ts). true: the check may go on
-  // to its seat. An infrastructure error waits (tried again with the same inputs, nothing consumed); a cut head that
-  // doesn't descend from the last-reviewed head is refused (not consumed); a diff that adds code fails the check
-  // with no seat asked.
+  // to its seat. Round 2 fixes: a git failure before dispatch is a transport attempt (kept under the change, at most
+  // CUT_TRANSPORT_MAX, then the change is held: the cut could not be checked); a cut head that doesn't descend from the
+  // last-reviewed head is refused (not consumed); a diff that adds code, a missing purpose record or too few essential
+  // behaviours fail the check with no seat asked; a judge whose model wrote any commit of the cut is refused, and with
+  // no judge left the cut could not be checked.
   private async prepareCut(r: Review): Promise<boolean> {
     if (r.cut_diff !== undefined) return true;
     if (r.cut_next && this.now().toISOString() < r.cut_next) { r.status = "queued"; return false; }
-    const fn = this.deps.cutDiff ?? (this.cfg.cutRepo && this.cfg.cutRemote ? gitCutDiff({ repo: this.cfg.cutRepo, remote: this.cfg.cutRemote }) : null);
+    const fn = this.deps.cutDiff ?? (this.cfg.cutRepo && this.cfg.cutRemote ? gitCutDiff({ repo: this.cfg.cutRepo, remote: this.cfg.cutRemote, token: this.cfg.githubToken }) : null);
     const b = r.brief!;
     if (!fn || !r.cut_base || !b.pr || !b.head) {
       r.cut_refused = !fn ? "the runner has no copy of the repository to derive the cut diff from" : "the cut check names no last-reviewed head or cut head";
       this.finish(r, "incomplete");
       return false;
     }
-    const got = await fn({ pr: b.pr, base: r.cut_base, head: b.head });
-    if (!got.ok && got.kind === "infra") {
-      r.cut_tries = (r.cut_tries ?? 0) + 1;
+    const wait = (kind: string, why: string): false => {
+      const n = this.noteCutAttempt(r, kind, why);
+      if (r.cut_unchecked) { this.finish(r, "incomplete"); return false; }
+      r.cut_tries = n ?? (r.cut_tries ?? 0) + 1;
       r.cut_next = new Date(this.now().getTime() + Math.min(3_600_000, backoffMs(r.cut_tries, this.rand))).toISOString();
       r.status = "queued";
-      this.log(`cut check ${shownId(r)}: the cut diff couldn't be derived (${got.why}); tried again with the same heads, nothing used up`);
+      this.log(`cut check ${shownId(r)}: ${why}; tried again with the same heads, nothing used up`);
       return false;
+    };
+    // The purpose record, frozen at round 1; for a change past round 1 when records began, built now from the pull
+    // request's description only, and kept, saying so.
+    const file = this.cfg.roundsFile;
+    let purpose: PurposeRec | null = null;
+    if (file && r.change) {
+      const rounds = readRounds(file);
+      if (!rounds) return wait("rounds", "the rounds file can't be read");
+      purpose = purposeOf(rounds, r.change);
+      if (purpose && !purpose.frozen) {
+        const got = await this.prBody()(b.pr);
+        if (!got.ok) return wait("github", `the pull request's description couldn't be read (${got.why})`);
+        const fresh = readRounds(file);
+        if (!fresh) return wait("rounds", "the rounds file can't be read");
+        const first = countedRounds(fresh, r.change)[0];
+        const k = first?.key ?? r.change;
+        purpose = { topic: purpose.topic, question: purpose.question, what_changed: whatChangedOpening(got.body), statements: [], source: "description only", frozen: this.now().toISOString() };
+        (fresh.changes[k] ??= { rounds: [] }).purpose = purpose;
+        writeRounds(file, fresh);
+      }
     }
+    const got = await fn({ pr: b.pr, base: r.cut_base, head: b.head });
+    if (!got.ok && got.kind === "infra") return wait("git", `the cut diff couldn't be derived (${got.why})`);
     if (!got.ok) { r.cut_refused = got.why; this.finish(r, "incomplete"); return false; }
     delete r.cut_next;
     r.cut_diff = got.diff;
+    r.cut_context = got.context ?? "";
+    if (got.headFiles) r.cut_head_files = got.headFiles;
+    r.purpose = purposeText(purpose);
+    r.cut_essentials = essentialsOf(purpose);
     if (!got.judged.ok) { r.cut_added = got.judged.why; this.finish(r, "incomplete"); return false; }
+    if (!purpose) { r.cut_added = "the change has no purpose record, so what the cut must keep can't be checked"; this.finish(r, "incomplete"); return false; }
+    if (r.cut_essentials.length < MIN_ESSENTIALS)
+      { r.cut_added = `the change's purpose record gives ${r.cut_essentials.length} essential behaviour${r.cut_essentials.length === 1 ? "" : "s"}, fewer than the ${MIN_ESSENTIALS} a cut check needs`; this.finish(r, "incomplete"); return false; }
+    if (!got.headFiles) { r.cut_added = "the cut head's files couldn't be listed, so the judge's evidence can't be checked"; this.finish(r, "incomplete"); return false; }
+    // The judge's independence, from the commit authorship the runner reads itself: the chosen seat, or the other
+    // outside judge, whose model family is named in no commit of the cut range.
+    if (!got.commits) return this.unchecked(r, "the cut's commits couldn't be read, so the judge's independence can't be checked");
+    const chosen = r.seats[0]?.seat;
+    const order = [chosen, ...CUT_SEATS.filter((x) => x !== chosen)].filter((x): x is SeatName => !!x && CUT_SEATS.includes(x));
+    const wrote = order.map((x) => ({ seat: x, line: wroteCut(x, got.commits!) }));
+    const ok = wrote.find((x) => !x.line && !this.unavailable(x.seat)) ?? wrote.find((x) => !x.line);
+    if (!ok) return this.unchecked(r, `every outside judge's model is named in the cut's commits (${wrote.map((x) => `${LABEL[x.seat]}: ${x.line}`).join("; ")})`);
+    if (ok.seat !== chosen) {
+      r.cut_refused_seats = wrote.filter((x) => x.line).map((x) => ({ seat: x.seat, line: x.line! }));
+      r.seats = [seatRun(ok.seat, "reviewer")];
+      if (file && r.change) {
+        const rounds = readRounds(file);
+        const c = rounds?.changes[r.change]?.cut;
+        if (rounds && c?.id === r.id) { c.seat = ok.seat; writeRounds(file, rounds); }
+      }
+      this.log(`cut check ${shownId(r)}: ${LABEL[chosen!]} is refused as its judge (its model is named in the cut's commits); ${LABEL[ok.seat]} judges it`);
+    }
     return true;
+  }
+  // The cut could not be checked (round 2 fixes): the change is held, the owner hears one line, nothing is sent.
+  private unchecked(r: Review, why: string): false {
+    r.cut_unchecked = why;
+    const file = this.cfg.roundsFile;
+    const rounds = file ? readRounds(file) : null;
+    if (rounds && r.change) { this.holdUnchecked(rounds, r.change, why); writeRounds(file!, rounds); }
+    for (const s of r.seats) if (s.state === "queued") s.state = "failed";
+    this.finish(r, "incomplete");
+    return false;
+  }
+  // The pull request's description: the dep, or GitHub's API only where the runner is set up to reach GitHub (cutRemote).
+  private prBody(): (pr: string) => Promise<{ ok: true; body: string } | { ok: false; why: string }> {
+    return this.deps.prBody ?? (this.cfg.cutRemote ? githubPrBody(this.cfg.githubToken) : async () => ({ ok: false, why: "the runner has no way to reach GitHub" }));
+  }
+  // Round 1's read of the pull request description (round 2 fixes): its "What changed" opening, or null when it
+  // can't be read (the record says so; the seats' statements still stand).
+  private async readWhatChanged(r: Review): Promise<void> {
+    const got = await this.prBody()(r.brief!.pr!).catch(() => ({ ok: false as const, why: "error" }));
+    r.what_changed = got.ok ? whatChangedOpening(got.body) : null;
+    if (!got.ok) this.log(`review ${shownId(r)}: the pull request's description couldn't be read for the purpose record (${got.why})`);
   }
 
   // Whether settle() would finish the review now (the seats are through and it waits for none).
@@ -661,18 +864,25 @@ export class Runner {
     r.sorted = true;
     if (r.kind === CUT_CHECK || !r.change || !r.round || !r.cap || r.round < r.cap || !r.brief) return;
     const raised = allRaised(r).slice(0, 40);
-    const sorters = r.seats.filter((s) => s.state === "done" && sortsCount(s));
-    if (!raised.length || !sorters.length) return;
+    if (!raised.length) return;
+    // Round 2 fixes: the panel is fixed here, before anything is sent: every outside seat of the round that is not a
+    // Claude stand-in, whatever its review did. A panel seat that gives no valid sort votes serious (core.ts isSerious).
+    const panel = panelOf(r);
+    r.sort_panel = panel;
+    const failed = new Set<string>(panel);
+    const sorts: SortRec[] = [];
+    const done = () => { r.sorts = sorts; r.sort_failed = panel.filter((k) => failed.has(k)); };
     const text = raised.map((x) => `[${x.f.severity ?? "serious"}${x.f.arm ? `: ${oneLine(x.f.arm, 80)}` : ""}] ${oneLine(x.f.problem, 600)} (its fix: ${oneLine(x.f.fix, 300)})`);
     const g = earlierCheck(text, this.terms());
-    if (!g.ok) { this.log(`review ${shownId(r)}: the sorting step sent nothing: the findings matched the privacy backstop`); return; }
-    const sorts: SortRec[] = [];
-    for (const by of sorters) {
+    if (!g.ok) { this.log(`review ${shownId(r)}: the sorting step sent nothing: the findings matched the privacy backstop; every finding counts as serious`); return done(); }
+    for (const key of panel) {
+      const by = r.seats.find((z) => z.key === key);
+      if (!by) continue;
       if (this.isStopped()) break;
       const fn = this.fnFor(by.seat);
       const out = sortOutbound(r.brief, text);
       const down = this.unavailable(by.seat) ?? this.capCheck(by.seat, out, r.cost_usd);
-      if (down || !fn) { this.log(`review ${shownId(r)}: no sorting step from ${LABEL[by.seat]} (${down?.detail ?? "not set up"}); its findings stay as labelled`); continue; }
+      if (down || !fn) { this.log(`review ${shownId(r)}: no sorting step from ${LABEL[by.seat]} (${down?.detail ?? "not set up"}); it votes serious on every finding`); continue; }
       const ms = this.cfg.timeoutS[by.seat] * 1000;
       const ctl = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -696,14 +906,16 @@ export class Runner {
           const x = raised[n - 1];
           sorts.push({ by: by.key, ref: findingRef(x.seat, x.i), label: f.severity, ...(f.arm ? { arm: f.arm } : {}), reason });
         }
+        if (seen.size) failed.delete(key);
+        else this.log(`review ${shownId(r)}: the sorting step from ${LABEL[by.seat]} gave no label that could be read; it votes serious on every finding`);
       } catch (e) {
         const err = e instanceof SeatError ? e : new SeatError("transient", String((e as Error)?.message ?? e).slice(0, 200));
         if (err.cost_usd) { const c = this.addSpend(by.seat, err.cost_usd, 0); by.cost_usd += c; r.cost_usd += c; }
         else if (by.seat === "openai") this.addSpend("openai", 0, 0);
-        this.log(`review ${shownId(r)}: the sorting step from ${LABEL[by.seat]} failed (${err.kind}); its findings stay as labelled`);
+        this.log(`review ${shownId(r)}: the sorting step from ${LABEL[by.seat]} failed (${err.kind}); it votes serious on every finding`);
       } finally { clearTimeout(timer); }
     }
-    if (sorts.length) r.sorts = sorts;
+    done();
   }
 
   private isDue(r: Review, s: SeatRun, now: string): boolean {
@@ -717,10 +929,15 @@ export class Runner {
     const hourly = s.state !== "queued";
     const fn = this.fnFor(s.seat);
     const b = r.brief!;
-    const out = outbound(b, r.kind === CUT_CHECK ? { earlier: r.earlier ?? [], check: "cut", purpose: r.purpose ?? "", diff: r.cut_diff ?? "" }
+    const out = outbound(b, r.kind === CUT_CHECK ? { earlier: r.earlier ?? [], check: "cut", purpose: r.purpose ?? "", diff: r.cut_diff ?? "",
+      essentials: r.cut_essentials ?? [], context: r.cut_context ?? "" }
       : r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined);   // throws on a wrong kind: nothing is sent
+    // Round 2 fixes: round 1 asks each outside seat for its own statement of what the piece must do.
+    const asksPurpose = r.round === 1 && !!r.change && r.kind !== CUT_CHECK && r.round_kind !== "fixes" && s.counts && s.seat !== "claude";
+    if (asksPurpose) out.purpose_ask = true;
     const down = this.unavailable(s.seat) ?? this.capCheck(s.seat, out, r.cost_usd);
     if (down || !fn) return this.fail(r, s, down?.kind ?? "unconfigured", down?.detail ?? "not set up", hourly, 0);
+    let began = false;
     s.started_at = this.now().toISOString();
     s.attempts++;
     const prev = s.state;
@@ -731,7 +948,14 @@ export class Runner {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, rej) => { timer = setTimeout(() => { ctl.abort(); rej(new SeatError("timeout", `no answer within ${ms / 1000} s`)); }, ms); });
     try {
-      const a = await Promise.race([fn({ brief: out, role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day() }), deadline]);
+      const a = await Promise.race([fn({ brief: out, role: s.role, signal: ctl.signal, maxOutputTokens: this.cfg.maxOut[s.seat], day: this.day(),
+        onBody: () => { began = true; } }), deadline]);
+      if (asksPurpose) {
+        const isPurpose = (f: { problem: string }) => /^\s*[*_]*\s*purpose\s*[*_]*\s*:/i.test(String(f.problem ?? ""));
+        const stated = a.findings.find(isPurpose);
+        if (stated) s.purpose = oneLine(String(stated.problem).replace(/^\s*[*_]*\s*purpose\s*[*_]*\s*:\s*/i, ""), 1_200);
+        a.findings = a.findings.filter((f) => !isPurpose(f)).map((f, i) => ({ ...f, rank: i + 1 }));
+      }
       const cost = this.addSpend(s.seat, a.cost_usd, a.findings.length, a.searches ?? 0);
       // A finding a seat didn't label by the rule's test counts as serious, in every round (0.20.0): it fails safe.
       // Round 1 fixes: how many carried a valid label is kept, per seat and round, for review.sh health.
@@ -749,20 +973,30 @@ export class Runner {
       if (err.cost_usd) { const c = this.addSpend(s.seat, err.cost_usd, 0); s.cost_usd += c; r.cost_usd += c; }
       else if (s.seat === "openai") this.addSpend("openai", 0, 0);   // a Codex run counts against the run cap either way
       s.state = prev;
-      this.fail(r, s, err.kind, err.message, hourly, s.attempts);
+      // A cut check (round 2 fixes): an answer that began (any response came back), or one that came back unreadable or
+      // refused, is the check's answer, and it fails; only no response at all is a transport failure.
+      this.fail(r, s, err.kind, err.message, hourly, s.attempts, r.kind === CUT_CHECK && (began || err.body || err.kind === "bad_output" || err.kind === "refused"));
     } finally { clearTimeout(timer); }
   }
 
-  private fail(r: Review, s: SeatRun, kind: ErrorKind, detail: string, hourly: boolean, attempts: number) {
+  private fail(r: Review, s: SeatRun, kind: ErrorKind, detail: string, hourly: boolean, attempts: number, terminal = false) {
     const now = this.now();
     s.error = { kind, detail, fix: fixFor(s.seat, kind, detail) };
-    // A cut check's seat (round 1 fixes): an infrastructure error (a timeout, bad output, the seat down or over a
-    // cap) never ends the check, and never brings a stand-in: the same seat is tried again with the same diff, at
-    // most hourly, and the one check isn't used up.
+    // A cut check's seat (round 2 fixes). Only a transport failure (no response at all: the seat down, unreachable or
+    // over a cap, a timeout before any response) is tried again, never with a stand-in, each attempt kept under the
+    // change; after CUT_TRANSPORT_MAX the change is held (the cut could not be checked). Anything the seat answered
+    // that isn't a clear pass (unreadable, partial, refused, cut off after it began) uses the check up, and it fails.
     if (r.kind === CUT_CHECK) {
-      s.state = "queued";
-      s.next_at = new Date(now.getTime() + Math.min(3_600_000, backoffMs(Math.max(1, attempts), this.rand))).toISOString();
       if (["auth", "credit", "unconfigured"].includes(kind)) this.markHealth(s.seat, s.error, true);
+      if (terminal) {
+        s.state = "failed"; delete s.next_at; s.finished_at = now.toISOString();
+        r.cut_terminal = `${LABEL[s.seat]} answered, but not with a clear pass (${kind}: ${oneLine(detail, 120)})`;
+        return;
+      }
+      const n = this.noteCutAttempt(r, kind, detail);
+      if (r.cut_unchecked) { s.state = "failed"; delete s.next_at; s.finished_at = now.toISOString(); return; }
+      s.state = "queued";
+      s.next_at = new Date(now.getTime() + Math.min(3_600_000, backoffMs(Math.max(1, n ?? attempts), this.rand))).toISOString();
       return;
     }
     if (!hourly && attempts > 0 && attempts <= retryLimit(kind)) {

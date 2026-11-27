@@ -21,7 +21,7 @@ export function perplexitySeat(o: PerplexityOptions): SeatFn {
       max_output_tokens: input.maxOutputTokens,
     };
     if (!input.selftest) body.tools = [{ type: "web_search" }];
-    const j = await postJson(fetcher, `${base}/v1/agent`, { authorization: `Bearer ${o.key}` }, body, input.signal, [o.key]);
+    const j = await postJson(fetcher, `${base}/v1/agent`, { authorization: `Bearer ${o.key}` }, body, input.signal, [o.key], input.onBody);
     if (j?.status && !["completed", "succeeded"].includes(String(j.status)))
       throw new SeatError(j.status === "failed" ? "transient" : "bad_output", `the run ended as ${String(j.status).slice(0, 30)}`);
     let text = typeof j?.output_text === "string" ? j.output_text : "";

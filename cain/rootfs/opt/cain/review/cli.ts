@@ -9,7 +9,8 @@
 //   spend                  this month per seat: dollars, the runner's own cap, runs, findings, useful,
 //                          $ per useful; then the round count per open change against the round cap
 //   guard                  the usage guard's reading now, in two lines (the plan, the seats and the floor)
-//   health                 the last nightly seat check, and each seat's label parse rate (round 1 fixes)
+//   health                 the last nightly seat check, and each seat's label parse rate (round 1 fixes), and
+//                          whether the cut diff's fetch worked at the runner's start (round 2 fixes)
 //   decide <change> hold "<why in one line>" | decide <change> cut
 //                          Cain's decision for a change at its cap with something serious left (Cain 0.20.0, round
 //                          1 fixes): left in the inbox for the runner, which keeps it under the change in the rounds
@@ -186,6 +187,8 @@ switch (cmd) {
     let h: Health = {};
     try { h = JSON.parse(readFileSync(cfg.healthFile, "utf8")); } catch { /* none yet */ }
     for (const s of SEATS) { const x = h[s]; out(`  ${LABEL[s]}: ${!x ? "not checked yet" : x.ok ? `ok (${x.at})` : `${x.kind}: ${x.detail}. Fix: ${x.fix}`}`); }
+    // Round 2 fixes: whether the runner could fetch the repository at its start (the cut check's diff needs it).
+    out(`  Cut diff fetch: ${!h.fetch ? "not checked yet (the runner checks it at each start)" : h.fetch.ok ? `ok, ${h.fetch.detail} (${h.fetch.at})` : `FAILING: ${h.fetch.detail} (${h.fetch.at}). Fix: set review_github_token in the App's options to a read-only token for HyndeSyte/harness, then restart the App`}`);
     // Round 1 fixes: how often each seat's findings carried a valid SERIOUS or FOLLOW-UP label (unlabelled ones
     // count as serious), over the rounds kept.
     out("Label parse rate (findings with a valid SERIOUS or FOLLOW-UP label):");
