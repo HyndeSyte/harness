@@ -87,7 +87,7 @@ import { decideSend, type CardsView, type CardView, type Decision, type Writer }
 import { AT, check as gateCheck, type Context, fixedWhat, type Hit, hostsOnly, imperative, reasonParts, RULES, RULES_VERSION, whyOf } from "../gate/rules";
 import { keyOfRef, safeId } from "../review/core";
 import { freshReviewed, type Reviewed } from "../reviewed";
-import { RISK, asksAboutCap, namesRoundPastCap, type CapState } from "./cap";
+import { OWNER_LINE_OUTCOMES, RISK, asksAboutCap, namesRoundPastCap, ownerLineText, type CapState } from "./cap";
 import { holdLine, labelOf, logLine, type Label, type Verdict } from "../guard";
 import { type Rounds } from "../review/rounds";
 import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
@@ -105,6 +105,10 @@ export const EXPIRED_TAP = "This card expired; nothing was done.";
 export const RETIRED_TAP = "Extra review rounds and shipping with a risk named are no longer offered, so this card does nothing now.";
 // What the retired routes answer (POST /review-grant from keeper.sh, POST /decision from an older runner).
 export const GRANT_RETIRED = "keeper.sh review-grant is retired by the owner's review rule: three review rounds a piece, never more, and no card offers more rounds. At the cap you decide: ship, cut with one cut check (review.sh submit with \"kind\": \"cut-check\"), or hold, and tell him one line. Nothing was posted.";
+// Round 1 fixes: a Ship card for a piece at its review cap is bound to one head; these say why it can't go.
+export const BOUND_MOVED = "the pull request's head on GitHub isn't the head its review bound at the cap (something was pushed after it), so no Ship card: a piece at its cap ships only at that head";
+export const BOUND_UNREAD = "GitHub's head for the pull request can't be read, and a piece at its review cap ships only at the head its review bound: show the card again in a minute";
+export const BOUND_TAP = "You tapped Ship, but the change isn't at the head its last review was for any more, so nothing shipped.";
 export const DECISION_RETIRED = "the review service's decision card at the round cap is retired by the owner's review rule: nothing goes to him from the service. Nothing was posted.";
 // Keeper 0.1.9: the rotation card's one button (rotation.ts).
 export const ROTATION_LABEL = "Old key replaced";
@@ -348,7 +352,9 @@ export interface Shown {
   item?: string; question?: string;  // what the card is about: a PENDING id (or "none") and a question id
   posted?: number;
   expires?: number | null;           // when its buttons stop mattering; null: no time of its own
-  ship?: { pr: string; head: string };
+  // bound (Cain 0.20.0, round 1 fixes): a card for a piece at its review cap, bound to the head its last round
+  // reviewed ("clean") or to its passing cut check's cut head ("cut"); checked again at his tap.
+  ship?: { pr: string; head: string; bound?: "clean" | "cut" };
   own?: string;                      // a Ship card the link built: Cain's own line on it, the rest being the link's (0.11.0)
   buttons?: boolean;                 // it has buttons on Discord, as far as the link knows
   outcome?: "answered" | "expired" | "replaced";
@@ -404,7 +410,8 @@ export interface State {
   stopAt?: string;                   // the message holding the moving Stop
   repostedAt?: number;               // while stopped: when Turn back on was last re-posted
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
-  pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
+  pcNotices?: Record<string, { msg: string; at: number }>;
+  reviewLines?: Record<string, { msg: string; at: number }>;   // the owner's lines at the review cap already posted, by id (0.20.0, round 1 fixes)   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
   // (Keeper 0.1.15) item 21: keeper cards held by the quiet hours, sent at 07:00 (quietFlush), each once by its key
   quietHeld?: { key: string; kind: "retry" | "space"; args: unknown[]; at: number }[];
   // The retired decision cards that waited on an item's hold (0.16.0 to 0.19.0): dropped at the next sweep.
@@ -2111,11 +2118,18 @@ export class Link {
       throw new Refusal(`the piece is held by the owner's review rule: its cut check passed for another head, and only that cut head ships. No Ship card for this head`);
     if (cap.state === "cut" && review !== cap.id)
       throw new Refusal(`the piece is at its cap, and only its passing cut check can be its review: name it with --review ${cap.id}`);
+    // Round 1 fixes: nothing serious left at the cap binds the card to the head the last round reviewed (the
+    // runner's record), the way a passing cut check binds it to the cut head. A bound card needs GitHub's head to
+    // equal it, when it is shown and again at his tap (shipTapRefusal).
+    if (cap.state === "clean" && head !== cap.head)
+      throw new Refusal(`the piece is at its review cap, and only the head its last review round reviewed ships: a head pushed after that round can't get a Ship card`);
+    const bound = cap.state === "clean" || cap.state === "cut" ? cap.state : undefined;
+    if (bound && !this.d.facts) throw new Refusal(BOUND_UNREAD);
     const cutId = cap.state === "cut" ? cap.id : null;
     const w = this.cainWords("ship", "Ship card", said, { rules: CARD_RULES, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
-    const built = this.d.facts ? await this.shipText(pr, head, review, w.text, cutId) : { text: w.text, own: undefined };
+    const built = this.d.facts ? await this.shipText(pr, head, review, w.text, cutId, !!bound) : { text: w.text, own: undefined };
     const text = built.text;
     const nonce = stableNonce("ship", pr, head, text, meta.replyTo ?? "");
     const options = ["Ship", "Not now"];
@@ -2124,7 +2138,7 @@ export class Link {
     const now = this.d.now();
     const s = this.d.load();
     this.remember(s, msg, { kind: "ship", item: meta.item, question: `ship:${m[3]}`, posted: now, expires: this.askExpiry(now),
-      ship: { pr, head }, ...(built.own !== undefined ? { own: built.own } : {}), buttons: true, labels: [...options],
+      ship: { pr, head, ...(bound ? { bound } : {}) }, ...(built.own !== undefined ? { own: built.own } : {}), buttons: true, labels: [...options],
       q: { q: excerpt(text), options, used: false } });
     const replaced = this.markReplaced(s, String(msg.id));
     this.d.save(s);
@@ -2147,7 +2161,7 @@ export class Link {
   // this head is in main already: the landing asks nothing of its checks, so neither does the
   // card. Anything else going wrong while the new lines are built gives the card as it was
   // before: "Ship it?", his line and the line from GitHub as it was. Never no card.
-  private async shipText(pr: string, head: string, review: string | null, words: string, cutId: string | null = null): Promise<{ text: string; own: string }> {
+  private async shipText(pr: string, head: string, review: string | null, words: string, cutId: string | null = null, bound = false): Promise<{ text: string; own: string }> {
     const own = words.trim();
     if (!own) throw new Refusal("a Ship card needs a line saying what he'll notice");
     let rev: Reviewed | null = null;
@@ -2194,7 +2208,8 @@ export class Link {
       : Promise.resolve(null);
     const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
-      throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+      throw new Refusal(bound ? BOUND_MOVED : "GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
+    if (bound && !f?.head) throw new Refusal(BOUND_UNREAD);
     if (watched.length && gateHead) {
       if (gh === null) throw new Refusal(`the Ship gate's state is unknown for this pull request: ${GATE_HEAD_TIMED_OUT}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
       if (typeof gh !== "string") throw new Refusal(`the Ship gate's state is unknown for this pull request: ${gh.unknown}, so its watch acceptance can't be checked against it. Show the card again in a minute`);
@@ -2349,6 +2364,39 @@ export class Link {
       s.pcNotices = Object.fromEntries(kept);
       this.d.save(s);
     }
+    return { status: "posted", message };
+  }
+
+  // -- the owner's one plain line at the review cap (POST /review-line, Cain 0.20.0, round 1 fixes) --------
+  // Root's (the review runner): the words are the link's (cap.ts ownerLineText), no card, no buttons, no Stop, no
+  // question. Deduplicated on the line's id ("<change>#<outcome>"): one already posted is answered "posted" with
+  // that message and nothing is posted again, so a post whose answer was lost isn't repeated. The topic and a
+  // hold's why are Cain's words, checked by his rules; when they don't pass, the line goes without them.
+  async reviewLine(b: any): Promise<{ status: "posted"; message: string; duplicate?: true }> {
+    const id = String(b?.id ?? "");
+    const outcome = String(b?.outcome ?? "");
+    if (!(OWNER_LINE_OUTCOMES as readonly string[]).includes(outcome) || !/^[a-z0-9][a-z0-9-]{2,63}#[a-z-]{3,12}$/.test(id) || !id.endsWith(`#${outcome}`))
+      throw new Refusal("not a line from the review runner");
+    const serious = Number.isInteger(b?.serious) && b.serious >= 0 && b.serious < 1000 ? b.serious : undefined;
+    const topic = typeof b?.topic === "string" ? b.topic.slice(0, 200) : undefined;
+    const why = typeof b?.why === "string" ? b.why.slice(0, 200) : undefined;
+    const had = this.d.load().reviewLines?.[id];
+    if (had) return { status: "posted", message: had.msg, duplicate: true };
+    let text: string;
+    try {
+      text = this.cainWords("review line", "line to him", ownerLineText({ outcome, topic, serious, why }), { rules: ["dash", "app", "machine"] }, { reviewed: true }).text;
+      if (asksSomething(text)) throw new Refusal("it asks him something");
+    } catch (e) {
+      if (!(e instanceof Refusal)) throw e;
+      text = ownerLineText({ outcome, serious });
+    }
+    noMachineText(text);
+    const message = await this.postNotice(this.ownWords("notice", "link", text), false);
+    const s = this.d.load();
+    const kept = Object.entries({ ...(s.reviewLines ?? {}), [id]: { msg: message, at: this.d.now() } })
+      .sort((a, c) => c[1].at - a[1].at).slice(0, PC_NOTICE_KEEP);
+    s.reviewLines = Object.fromEntries(kept);
+    this.d.save(s);
     return { status: "posted", message };
   }
 
@@ -3036,7 +3084,26 @@ export class Link {
     return `Dane tapped "${label}" on your question${what ? ` ${what}` : ""}: "${m.q?.q ?? ""}" ${where}`;
   }
 
+  // Round 1 fixes: at his tap on a bound Ship card, the binding again: the runner's record still binds this head
+  // (clean or its cut check), and GitHub's head equals it. A reason it doesn't, or null.
+  private async shipTapRefusal(ship: { pr: string; head: string; bound?: "clean" | "cut" }): Promise<string | null> {
+    let cap: CapState;
+    try { cap = this.d.capState?.(ship.pr) ?? { state: "none" }; } catch (e) { cap = { state: "unknown", why: String(e).slice(0, 80) }; }
+    if (cap.state !== ship.bound || cap.head !== ship.head)
+      return cap.state === "unknown" ? `where it stands at the review cap can't be read (${cap.why})` : "the runner's record no longer binds the card's head at the review cap";
+    if (!this.d.facts) return BOUND_UNREAD;
+    const f = await within(Promise.resolve().then(() => this.d.facts!(ship.pr, ship.head)).catch(() => null), this.d.factsMs ?? FACTS_MS);
+    if (!f?.head) return BOUND_UNREAD;
+    if (f.head !== ship.head) return BOUND_MOVED;
+    return null;
+  }
+
   private async onQuestion(it: any, cid: string, msgId: string): Promise<string> {
+    // A bound Ship card is checked before anything is marked (round 1 fixes): his tap lands only that head.
+    const pre = this.d.load().messages[msgId];
+    const preI = Number(cid.split(":")[2]);
+    const bindWhy = pre?.kind === "ship" && pre.ship?.bound && pre.q && !pre.q.used && pre.q.options[preI] === "Ship"
+      ? await this.shipTapRefusal(pre.ship) : null;
     let s = this.d.load();
     let m = s.messages[msgId];
     let q = m?.q;
@@ -3050,7 +3117,10 @@ export class Link {
     let shown = `You answered: ${label}`, extra = "", landing = false;
     const words = String(it.message.content ?? "");
     if (m.kind === "ship" && m.ship && label === "Ship") {
-      if (this.stopped().stopped) {
+      if (bindWhy) {
+        shown = BOUND_TAP;
+        extra = ` Nothing landed: ${bindWhy}. By the owner's review rule only the head its last review was for ships; nothing to ask him.`;
+      } else if (this.stopped().stopped) {
         shown = "You tapped Ship, but everything is stopped, so nothing shipped.";
         extra = " Everything is stopped, so nothing lands in main and there's no Ship token: after he taps Turn back on, ask again with a new Ship card.";
       } else if (!this.d.land) {

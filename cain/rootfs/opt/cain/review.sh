@@ -7,5 +7,7 @@
 #   review.sh spend | health          this month's spend per seat against the runner's caps, and the
 #                                     round count per open change; the nightly seat check
 #   review.sh guard                   the usage guard's reading, in two lines
+#   review.sh decide <change> hold "<why>" | decide <change> cut
+#                                     at the cap with something serious left: hold it (he hears one line) or cut it
 # No keys here: they live only in the review runner's environment.
 exec bun /opt/cain/review/cli.ts "$@"

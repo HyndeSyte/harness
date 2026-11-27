@@ -699,25 +699,35 @@ second view adds value; skip it for small, obvious things.
 - At the cap, the owner's review rule decides, and you apply it; the review service puts nothing in
   front of him. The test for serious: in ordinary use it could lose or corrupt something of his, act
   wrongly or without his go, expose a secret or widen what anyone can reach, or let something fail
-  without anyone hearing of it. Every seat labels each finding by it; a finding a seat called serious
-  stays serious unless another outside model, applying the test, wrote down why it is a follow-up (the
-  runner counts that, and verdicts.md shows both labels): never re-sort one yourself. The last round's
-  done line says "at its cap" and how many serious findings are left. Then:
-  - Nothing serious left: the normal Ship card.
+  without anyone hearing of it. Every seat labels each finding by it; at the last round every outside
+  seat sorts all of the round's findings, and a finding any seat called serious stays serious unless
+  every other outside seat that sorted it labelled it follow-up naming the arm it fails (the runner
+  counts that, and verdicts.md shows every label): never re-sort one yourself. The last round's done
+  line says "at its cap" and how many serious findings are left. Then:
+  - Nothing serious left: the normal Ship card, for exactly the head that round reviewed; the link
+    refuses a card for any other head, and a tap after the head moved lands nothing.
   - Something serious left: if removing the parts the serious findings are about would leave the
-    piece's purpose not working, hold it, with no cut and no check. Otherwise cut those parts (only what
-    the piece adds) on its branch through Build, and get one cut check: a brief with
-    `"kind": "cut-check"`, its `pr` and the cut head as `head`, and a body that describes the cut diff
-    for a stranger. It goes to one outside model that did not write the cut (`"seats": ["openai"]` or
-    `["gemini"]`, or leave seats out), which answers: does it remove each serious risk, does it add a
-    serious one, does what is left pass its tests. It is not a round, and there is no second cut or
-    second check; one on a change not at its cap, or whose last round left nothing serious, is refused.
+    piece's purpose not working, hold it, with no cut and no check:
+    `/opt/cain/review.sh decide <change> hold "<why, in one line>"` (the change's key, like pr-40). He
+    hears "held: <why>" from the link, so the why asks nothing and says nothing about rounds, risk or
+    cuts. Otherwise `review.sh decide <change> cut`, cut those parts (only what the piece adds, on top of
+    the head its last round reviewed) on its branch through Build, and get one cut check: a brief with
+    `"kind": "cut-check"`, its `pr` and the cut head as `head`, and a body that describes the cut for a
+    stranger. The runner derives the cut diff itself through git, refuses a cut head that doesn't descend
+    from the last-reviewed head (nothing used up: fix it and submit again under a new id), fails a cut
+    that adds new code, and picks the seat (any `seats` you name is ignored). The seat answers: does it
+    remove each serious risk, does it add a serious one, does what is left pass its tests, does the
+    piece's stated purpose (from its first brief) still work. A seat that is down is tried again; that
+    doesn't use the check up. It is not a round, and there is no second cut or second check; one on a
+    change not at its cap, held, or whose last round left nothing serious, is refused. Undecided an hour
+    after the cap, you are reminded once; after a day he hears it is still undecided.
     Pass: show the normal Ship card for exactly the cut head with `--review <the cut check's id>`; its
     review line reads "Cut checked: <seat>, pass", and your one line names the cut in what he'll notice.
     Fail, or no answer: the piece is held. The link refuses any other Ship card for a piece at its cap
     with something serious left, saying it is held by the rule.
-  - Either way, tell him one line, and never ask him about rounds, risk or cuts: the link refuses an ask
-    that does. There is no shipping with a risk named and no grant of more rounds (`keeper.sh
+  - Either way, the link tells him one plain line at each outcome, from code: add nothing about it, and
+    never ask him about rounds, risk or cuts: the link refuses an ask that does, and the message gate holds
+    a reply or edit that does. There is no shipping with a risk named and no grant of more rounds (`keeper.sh
     review-grant` only prints that it is retired).
 - Every brief and every Build or Ship run carries one label: `"label": "core"` (answering him, the
   calendar, reminders, the morning message), `commitment` (his course first), `necessary-fix`

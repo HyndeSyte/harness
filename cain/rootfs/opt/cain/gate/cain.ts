@@ -37,6 +37,10 @@
 //                text is an address on another host. An https link to a host off LINK_HOSTS
 //                (and the hosts added with keeper.sh link-host) is never held: it only gets a
 //                notice-only line in the gate report, so the list grows from real use.
+//   cap          (Cain 0.20.0, round 1 fixes; his replies and edits) a question put to him about review rounds,
+//                a risk or a cut (the owner's review rule has Cain decide those himself and tell him one line):
+//                the same asksAboutCap the link runs over his asks, over each sentence that asks him something.
+//                Held for good (no third try): the one plain line ("held: <why>") always says the same.
 // The first three read the words as he'd see them, so nothing slips past by its spelling:
 // compatibility forms folded (NFKC, full-width letters and digits too), invisible characters
 // and combining marks dropped, Cyrillic and Greek letters that look like Latin ones read as
@@ -45,8 +49,8 @@
 import type { Reviewed } from "../reviewed";
 import { around, linkSpans } from "./rules";
 
-export type CainRule = "reviewed" | "ship words" | "codes" | "links";
-export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes", "links"];
+export type CainRule = "reviewed" | "ship words" | "codes" | "links" | "cap";
+export const CAIN_RULES: readonly CainRule[] = ["reviewed", "ship words", "codes", "links", "cap"];
 export interface CainHit { rule: CainRule; result: "refuse" | "unsure" | "note"; at: number; end: number; around: string }
 
 // -- reading the words as he'd see them -----------------------------------------------------
@@ -348,6 +352,7 @@ export function cainWhy(h: Pick<CainHit, "rule" | "result">, published?: readonl
   if (h.rule === "ship words") return SHIP_WORDS_WHY;
   if (h.rule === "codes") return CODES_WHY;
   if (h.rule === "links") return LINKS_WHY;
+  if (h.rule === "cap") return CAP_WHY;
   return h.result === "unsure" ? REVIEWED_UNSURE : reviewedWhy(published, n);
 }
 
@@ -366,4 +371,36 @@ export function cainReasons(hits: readonly CainHit[], published?: readonly Revie
     const q = said.get(why)!;
     return each > 0 && q.length && why !== REVIEWED_UNSURE ? `${q.slice(0, each).map((a) => `"${a}"`).join(", ")}: ${why}` : why;
   });
+}
+
+// -- the owner's review rule (Cain 0.20.0) ----------------------------------------------------
+// Whether Cain's ask puts a question about review rounds, a risk or a cut to the owner (0.20.0): the rule
+// has Cain decide those himself, so the link refuses the ask. What it names, or null.
+export function asksAboutCap(text: string): string | null {
+  const t = String(text ?? "").toLowerCase().replace(/\s+/g, " ");
+  if (/\b(more|extra|another|additional|further|fourth|4th)\s+(\w+\s+){0,2}(review\s+)?rounds?\b/.test(t) || /\bgrant\w*\b[^.?!]{0,40}\brounds?\b/.test(t))
+    return "more review rounds";
+  if (/\b(ship|land|install|merge)\w*\b[^.?!]{0,60}\bwith\s+(that|the|this|a|its)\s+(\w+\s+)?risks?\b/.test(t) || /\b(accept|take|live with)\s+(that|the|this)\s+risk\b/.test(t))
+    return "shipping with a risk";
+  if (/\bcut\s+check/.test(t) || /\b(cut|remove|drop|strip)\b[^.?!]{0,40}\b(parts?|pieces?|findings?)\b[^.?!]{0,40}\b(serious|review|reviewers?|finding)/.test(t)
+    || (/\bserious\s+findings?\b/.test(t) && /\b(cut|hold|ship)\b/.test(t)))
+    return "a cut, or what to do with a serious finding";
+  return null;
+}
+
+// A sentence that asks him something: it ends in a question mark, or opens as a request for his say.
+const ASKING = /\?\s*$|^(should|shall|do you|would you|want me|can i|may i|ok to|okay to|is it ok|let me know|tell me|your call)\b/i;
+export const CAP_WHY = "by the owner's review rule you decide rounds, risk and cuts yourself and tell him one plain line (\"held: <why>\"): never ask him about them";
+// Each sentence (or line) of a reply that asks him about rounds, a risk or a cut: the cap rule's hits.
+export function capQuestionHits(text: string): CainHit[] {
+  const hits: CainHit[] = [];
+  const t = String(text ?? "");
+  const re = /[^.?!\n]+[.?!]*/g;
+  for (const m of t.matchAll(re)) {
+    const sentence = m[0].trim();
+    if (!sentence || !ASKING.test(sentence)) continue;
+    if (!asksAboutCap(sentence)) continue;
+    hits.push({ rule: "cap", result: "refuse", at: m.index ?? 0, end: (m.index ?? 0) + m[0].length, around: sentence.replace(/\s+/g, " ").slice(0, 60) });
+  }
+  return hits;
 }

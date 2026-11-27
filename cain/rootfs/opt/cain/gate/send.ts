@@ -27,7 +27,7 @@
 //   note    (not a result of its own) an https link to an unknown host (the list is the known hosts,
 //           noted not blocked), or a link-bearing reply let through while the link was down: logged, never held
 import type { Reviewed } from "../reviewed";
-import { cainReasons, codesHits, hasLink, linksHits, LINKS_KEEPER_WHY, reviewedHits } from "./cain";
+import { cainReasons, capQuestionHits, codesHits, hasLink, linksHits, LINKS_KEEPER_WHY, reviewedHits } from "./cain";
 import { snowflakeTime } from "./plugin";
 import { AT, check, type Hit, reasonParts, type Result } from "./rules";
 
@@ -115,6 +115,11 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   const codes = codesHits(call.text, o.items);
   for (const h of codes) hits.push({ rule: h.rule, result: h.result, around: h.around });
   if (codes.length) hard = true;
+  // A question to him about review rounds, a risk or a cut (Cain 0.20.0, round 1 fixes; gate/cain.ts): held for
+  // good, since the owner's review rule has Cain decide those and tell him one plain line instead.
+  const cap = capQuestionHits(call.text);
+  for (const h of cap) hits.push({ rule: h.rule, result: h.result, around: h.around });
+  if (cap.length) hard = true;
   // A link he can't judge by its look (gate/cain.ts): held for good, since a plain https link to
   // the named site always says the same, so no third try is needed.
   const found = linksHits(call.text, o.hosts);
@@ -131,8 +136,8 @@ export function decideSend(call: SendCall, cards: CardsView | null,
   const would = held ? "refuse" : hits.some((h) => h.result === "fix") ? "fix" : "pass";
   const lines: string[] = [];
   // The wording refusals, each reason said once with its excerpts (an em dash's for all of them).
-  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat", "reviewed", "codes", "links", "keeper"].includes(h.rule));
-  let wordedSaid = false, reviewedSaid = false, codesSaid = false, linksSaid = false;
+  const worded = hits.filter((h) => h.result === "refuse" && !["button", "target", "chat", "reviewed", "codes", "links", "keeper", "cap"].includes(h.rule));
+  let wordedSaid = false, reviewedSaid = false, codesSaid = false, linksSaid = false, capSaid = false;
   for (const h of hits) {
     if (h.rule === "button" && h.label) {
       const with_ = live.filter((c) => c.labels.includes(h.label!) && c.message !== call.replyTo);
@@ -156,6 +161,9 @@ export function decideSend(call: SendCall, cards: CardsView | null,
     } else if (h.rule === "codes") {
       if (!codesSaid) for (const part of cainReasons(codes, null, 3)) lines.push(`${part.charAt(0).toUpperCase()}${part.slice(1)}.`);
       codesSaid = true;
+    } else if (h.rule === "cap") {
+      if (!capSaid) for (const part of cainReasons(cap, null, 3)) lines.push(`${part.charAt(0).toUpperCase()}${part.slice(1)}.`);
+      capSaid = true;
     } else if (h.rule === "keeper") {
       if (h.result === "note") continue;
       lines.push(`${LINKS_KEEPER_WHY.charAt(0).toUpperCase()}${LINKS_KEEPER_WHY.slice(1)}.`);

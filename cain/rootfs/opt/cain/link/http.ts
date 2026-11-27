@@ -44,6 +44,8 @@ export function linkRoutes(d: RouteDeps) {
         case "/look": return json(await link.look(b.m));
         case "/reuse": return json(await link.reuseProof(b.m, b.values));
         case "/pc-notice": return json(await link.pcNotice(b.code, b.job, b.id, b.repeat));
+        // Cain 0.20.0, round 1 fixes: the review runner's one plain line to him at the cap.
+        case "/review-line": return json(await link.reviewLine(b));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
         case "/reply": return json(await link.reply({ text: b.text, replyTo: b.reply_to }));
         // keeper.sh key-expiry and key-ack as his own user (0.13.1): the key record is root's.

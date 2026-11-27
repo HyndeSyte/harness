@@ -69,7 +69,8 @@ export const CAIN_ROUTES = new Set(["/show", "/ask", "/morning", "/ship", "/answ
 // appends only a real refusal to the guard's log, which Cain can no longer write.
 // Root's services, on the unix socket only: what Cain sent (his edit allowlist) and the cards.
 // /decision: the review runner's decision card at the round cap (0.16.0), retired in 0.20.0 (it answers only that).
-export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold"]);
+// /review-line (0.20.0, round 1 fixes): the review runner's one plain line to him at the cap (cap.ts ownerLineText).
+export const ROOT_ROUTES = new Set(["/sent", "/cards", "/check", "/reuse", "/pc-notice", "/decision", "/guard-hold", "/review-line"]);
 
 export function sameKey(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);

@@ -26,27 +26,33 @@ const NOW = new Date("2026-11-26T15:00:00Z");
 const PRN = (n: number) => `https://github.com/HyndeSyte/harness/pull/${n}`;
 const brief = (over: Partial<Brief> = {}): Brief => ({
   id: "2026-11-26-rule-a", topic: "The review rule in code", question: "Is this sound?", body: "Keep the rule in the runner.",
-  needs_facts: false, consequential: false, pr: PRN(40), label: "core", ...over,
+  needs_facts: false, consequential: false, pr: PRN(40), head: SHA1, label: "core", ...over,
 });
 const cutBrief = (over: Partial<Brief> = {}): Brief => brief({ id: "2026-11-26-cut", kind: CUT_CHECK, head: SHA2,
   body: "The cut diff: it removes the new retry loop the serious finding was about, and nothing else.", ...over });
 type Answer = (i: SeatInput) => Promise<SeatAnswer>;
 const said = (verdict: SeatAnswer["verdict"], ...problems: string[]): SeatAnswer =>
   ({ verdict, findings: problems.map((p, i) => ({ rank: i + 1, problem: p, fix: "fix it" })), model: "m", cost_usd: 0.01 });
+// A cut check's clear pass (round 1 fixes): each of the four questions answered good for the cut.
+const cutPass = () => said("approve", "FOLLOW-UP (loses or corrupts): Q1. The risk is gone.", "FOLLOW-UP (acts wrongly): Q2. Nothing new.",
+  "FOLLOW-UP (fails silently): Q3. The tests pass.", "FOLLOW-UP (acts wrongly): Q4. The purpose still works.");
 
 // Two outside seats (OpenAI and Gemini) and Claude, each with its own answers, by call kind.
-function rules(o: { openai?: Answer; gemini?: Answer; claude?: Answer; noOpenai?: boolean } = {}) {
+function rules(o: { openai?: Answer; gemini?: Answer; claude?: Answer; noOpenai?: boolean; cutDiff?: any } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "rule-"));
   const cfg: RunnerConfig = { ...DEFAULTS, queueDir: join(dir, "q"), spendFile: join(dir, "spend.json"), healthFile: join(dir, "health.json"),
     termsFile: join(dir, "terms.txt"), recordQueue: join(dir, "record-queue"), relayFile: join(dir, "relay.queue"),
     reviewedFile: join(dir, "reviewed.json"), roundsFile: join(dir, "rounds.json"), roundCap: 3, settingsFile: join(dir, "settings.json") };
   writeFileSync(cfg.termsFile, "# terms\nAcme Corp\n");
   const calls: { seat: string; input: SeatInput }[] = [];
-  const of = (seat: string, a: Answer | undefined): SeatFn => async (i) => { calls.push({ seat, input: i }); return (a ?? (async () => said("approve")))(i); };
+  const of = (seat: string, a: Answer | undefined): SeatFn => async (i) => { calls.push({ seat, input: i }); return (a ?? (async (x: SeatInput) => x.brief.check ? cutPass() : said("approve")))(i); };
   const seats: RunnerConfig extends never ? never : any = { gemini: of("gemini", o.gemini), claude: of("claude", o.claude) };
   if (!o.noOpenai) seats.openai = of("openai", o.openai);
   let clock = NOW;
-  const runner = new Runner(cfg, { seats, now: () => clock, rand: () => 0.5, log: () => {}, plan: () => ({ fraction: 0.1, at: NOW.toISOString(), reason: "t", tokens_week: 1, files: 1 }) });
+  const lines: any[] = [];
+  const runner = new Runner(cfg, { seats, now: () => clock, rand: () => 0.5, log: () => {}, plan: () => ({ fraction: 0.1, at: NOW.toISOString(), reason: "t", tokens_week: 1, files: 1 }),
+    cutDiff: o.cutDiff ?? (async () => ({ ok: true, diff: "--- a/x.ts\n+++ b/x.ts\n-retry()\n", judged: { ok: true, reverts: 0, allowed: 0 } })),
+    postLine: async (l) => { lines.push(l); return `m-${lines.length}`; } });
   runner.writeSettings();
   const relays = () => existsSync(cfg.relayFile) ? readFileSync(cfg.relayFile, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).text as string) : [];
   const round = async (id: string, over: Partial<Brief> = {}) => {
@@ -55,11 +61,11 @@ function rules(o: { openai?: Answer; gemini?: Answer; claude?: Answer; noOpenai?
     await runner.tick();
     return loadReview(cfg.queueDir, id)!;
   };
-  return { dir, cfg, runner, calls, relays, round, later: (ms: number) => { clock = new Date(clock.getTime() + ms); }, rounds: () => readRounds(cfg.roundsFile!)!, get: (id: string) => loadReview(cfg.queueDir, id)! };
+  return { dir, cfg, runner, calls, relays, round, lines, later: (ms: number) => { clock = new Date(clock.getTime() + ms); }, rounds: () => readRounds(cfg.roundsFile!)!, get: (id: string) => loadReview(cfg.queueDir, id)! };
 }
 // A round's seats: serious from OpenAI unless the answer says otherwise.
 const serious = (text = "SERIOUS (loses or corrupts): a crash between two writes loses the record") => async (i: SeatInput) =>
-  i.brief.sort ? said("approve") : said("approve_with_changes", text);
+  i.brief.sort ? said("approve") : i.brief.check ? cutPass() : said("approve_with_changes", text);
 const clean = async (i: SeatInput) => said("approve");
 
 describe("1: the grant of extra rounds is retired", () => {
@@ -155,7 +161,7 @@ describe("2: no decision card at the cap; the done line says at its cap and the 
     const last = t.relays().filter((l) => l.includes("Review d-3 done")).pop()!;
     expect(last).toContain("Round 3 of 3 for pr-40 (fix-only): 1 serious finding left, at its cap.");
     expect(last).toContain("By the owner's rule you decide");
-    expect(last).toContain("Tell him one line; ask him nothing about rounds, risk or cuts.");
+    expect(last).toContain("He hears one line from the link; ask him nothing about rounds, risk or cuts.");
     expect(t.rounds().changes["pr-40"].rounds[2]).toMatchObject({ state: "answered", serious: 1 });
     expect((t.rounds().changes["pr-40"] as any).decision).toBeUndefined();
     expect((t.runner.deps as any).postDecision).toBeUndefined();
@@ -167,7 +173,7 @@ describe("2: no decision card at the cap; the done line says at its cap and the 
     for (const id of ["n-1", "n-2", "n-3"]) await t.round(id);
     const last = t.relays().filter((l) => l.includes("Review n-3 done")).pop()!;
     expect(last).toContain("0 serious findings left, at its cap.");
-    expect(last).toContain("Nothing serious is left at its cap: show the normal Ship card.");
+    expect(last).toContain("Nothing serious is left at its cap: show the normal Ship card for exactly the head this round reviewed.");
   });
 
   test("Cain's ask can't put a question about rounds, risk or cuts to him", async () => {
@@ -199,8 +205,9 @@ describe("3: the cut check", () => {
     expect(parseBrief(JSON.stringify(cutBrief())).brief).toMatchObject({ kind: "cut-check", head: SHA2 });
     expect(parseBrief(JSON.stringify({ ...cutBrief(), head: undefined })).error).toContain("names the change's pull request (pr) and the cut head");
     expect(parseBrief(JSON.stringify({ ...cutBrief(), round_kind: "fixes" })).error).toContain("a cut check isn't a round");
-    expect(parseBrief(JSON.stringify({ ...cutBrief(), seats: ["claude"] })).error).toContain("exactly one outside seat that did not write the cut");
-    expect(parseBrief(JSON.stringify({ ...cutBrief(), seats: ["openai", "gemini"] })).error).toContain("exactly one outside seat");
+    // Round 1 fixes: the runner chooses the seat; one the brief names is dropped.
+    expect(parseBrief(JSON.stringify({ ...cutBrief(), seats: ["claude"] })).brief!.seats).toBeUndefined();
+    expect(parseBrief(JSON.stringify({ ...cutBrief(), seats: ["openai", "gemini"] })).brief!.seats).toBeUndefined();
     expect(parseBrief(JSON.stringify({ ...cutBrief(), kind: "other" })).error).toContain("kind must be cut-check");
   });
 
@@ -213,33 +220,36 @@ describe("3: the cut check", () => {
     expect(u.runner.admitAndQueue(cutBrief())).toContain("left nothing serious, so there is nothing to cut: show the normal Ship card");
   });
 
-  test("one outside seat, never the Claude stand-in; it gets the three questions and the serious findings; not counted as a round", async () => {
+  test("one outside seat, never the Claude stand-in; it gets the four questions and the serious findings; not counted as a round", async () => {
     const t = await atCap();
     t.calls.length = 0;
     expect(t.runner.admitAndQueue(cutBrief({ seats: ["gemini"] }))).toBeNull();
     await t.runner.tick();
-    expect(t.calls.map((c) => c.seat)).toEqual(["gemini"]);
+    // The runner's choice: OpenAI raised the serious finding and it stands, so OpenAI checks the cut.
+    expect(t.calls.map((c) => c.seat)).toEqual(["openai"]);
     const sent = t.calls[0].input.brief;
     expect(sent.check).toBe("cut");
     expect(sent.earlier).toEqual(["[serious: loses or corrupts] a crash between two writes loses the record"]);
     const p = prompt(sent, "reviewer");
-    expect(p.system).toContain("1. Does it remove each serious risk listed inside <earlier>? 2. Does it add a serious risk of its own? 3. Does what is left pass its tests?");
+    expect(p.system).toContain("1. Does it remove each serious risk listed inside <earlier>? 2. Does it add a serious risk of its own? 3. Does what is left pass its tests? 4. Does the piece's stated purpose, inside <purpose>, still work after the cut?");
     expect(p.user).toContain("The cut diff: it removes the new retry loop");
     // Not a round: the count stays 3, and the cut is kept on its own.
     expect(t.rounds().changes["pr-40"].rounds.length).toBe(3);
-    expect(t.rounds().changes["pr-40"].cut).toMatchObject({ id: "2026-11-26-cut", head: SHA2, seat: "gemini", state: "pass" });
+    expect(t.rounds().changes["pr-40"].cut).toMatchObject({ id: "2026-11-26-cut", head: SHA2, seat: "openai", base: SHA1, state: "pass" });
   });
 
-  test("its seat down: no Claude stands in, and the check has no answer, so the piece is held", async () => {
-    const t = await atCap({ gemini: async (i) => { if (i.brief.check) throw new Error("down"); return said("approve"); } });
+  test("its seat down: no Claude stands in, the same seat is tried again, and the check isn't used up (round 1 fixes)", async () => {
+    const t = await atCap({ openai: async (i) => { if (i.brief.check) throw new Error("down"); return (await serious()(i)); } });
     t.calls.length = 0;
-    t.runner.admitAndQueue(cutBrief({ seats: ["gemini"] }));
+    t.runner.admitAndQueue(cutBrief());
     for (let i = 0; i < 6; i++) { t.later(3_600_000); await t.runner.tick(); }
-    expect(t.calls.every((c) => c.seat === "gemini")).toBe(true);
+    expect(t.calls.length).toBeGreaterThanOrEqual(6);
+    expect(t.calls.every((c) => c.seat === "openai")).toBe(true);
     const r = t.get("2026-11-26-cut");
-    expect(r.seats.map((s) => s.seat)).toEqual(["gemini"]);
-    expect(t.rounds().changes["pr-40"].cut!.state).toBe("lost");
-    expect(capStateFor(PRN(40), t.rounds(), 3)).toMatchObject({ state: "held" });
+    expect(r.seats.map((s) => s.seat)).toEqual(["openai"]);
+    expect(r.status).not.toBe("done");
+    expect(t.rounds().changes["pr-40"].cut!.state).toBe("started");
+    expect(capStateFor(PRN(40), t.rounds(), 3)).toMatchObject({ state: "waiting" });
   });
 
   test("pass: filed under reviews/ like a round, with its line; a second cut check is refused", async () => {
@@ -247,24 +257,24 @@ describe("3: the cut check", () => {
     t.runner.admitAndQueue(cutBrief({ seats: ["gemini"] }));
     await t.runner.tick();
     const r = t.get("2026-11-26-cut");
-    expect(cutLine(r)).toBe("Cut checked: Gemini, pass.");
+    expect(cutLine(r)).toBe("Cut checked: OpenAI, pass.");
     expect(r.record_dir).toBe("reviews/2026-11-26-cut");
     expect(verdictsMd(r)).toContain("Cut check of pr-40 at its cap (not a round): pass.");
     const relay = t.relays().filter((l) => l.includes("Cut check 2026-11-26-cut")).pop()!;
     expect(relay).toContain("(not a round): pass");
     expect(relay).toContain("--review 2026-11-26-cut");
-    expect(relay).toContain("Say it as: Cut checked: Gemini, pass.");
+    expect(relay).toContain("Say it as: Cut checked: OpenAI, pass.");
     const pub = parseReviewed(readFileSync(t.cfg.reviewedFile!, "utf8"))!;
-    expect(pub.find((x) => x.id === "2026-11-26-cut")).toMatchObject({ line: "Cut checked: Gemini, pass.", head: SHA2, pr: PRN(40) });
+    expect(pub.find((x) => x.id === "2026-11-26-cut")).toMatchObject({ line: "Cut checked: OpenAI, pass.", head: SHA2, pr: PRN(40) });
     expect(t.runner.admitAndQueue(cutBrief({ id: "2026-11-26-cut-2" }))).toContain("already had its one cut check");
-    expect(capStateFor(PRN(40), t.rounds(), 3)).toEqual({ state: "cut", key: "pr-40", id: "2026-11-26-cut", head: SHA2, seat: "gemini" });
+    expect(capStateFor(PRN(40), t.rounds(), 3)).toEqual({ state: "cut", key: "pr-40", id: "2026-11-26-cut", head: SHA2, seat: "openai" });
   });
 
   test("fail: an unmarked reason or a reject fails it, and the piece is held", async () => {
-    const t = await atCap({ gemini: async (i) => i.brief.check ? said("approve", "It still retries without a bound.") : said("approve") });
+    const t = await atCap({ openai: async (i) => i.brief.check ? said("approve", "It still retries without a bound.") : (await serious()(i)) });
     t.runner.admitAndQueue(cutBrief({ seats: ["gemini"] }));
     await t.runner.tick();
-    expect(cutLine(t.get("2026-11-26-cut"))).toBe("Cut checked: Gemini, fail.");
+    expect(cutLine(t.get("2026-11-26-cut"))).toBe("Cut checked: OpenAI, fail.");
     expect(t.relays().pop()).toContain("is held by the owner's rule: no second cut and no second check");
     expect(capStateFor(PRN(40), t.rounds(), 3)).toMatchObject({ state: "held", why: expect.stringContaining("its one cut check failed") });
   });
@@ -306,7 +316,8 @@ describe("4: sorting by the rule's test", () => {
     expect(left([{ by: "claude-for-gemini", ref: "openai#0", label: "follow-up", reason: "fine" }])).toBe(1);
     expect(left([{ by: "openai", ref: "openai#0", label: "follow-up", reason: "fine" }])).toBe(1);
     expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", reason: " " }])).toBe(1);
-    expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", reason: "it fails safe and is heard" }])).toBe(0);
+    expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", reason: "it fails safe and is heard" }])).toBe(1);   // round 1 fixes: no arm named
+    expect(left([{ by: "gemini", ref: "openai#0", label: "follow-up", arm: "fails silently", reason: "it fails safe and is heard" }])).toBe(0);
   });
 
   test("an unlabelled finding counts as serious in every round, a full one too", async () => {
@@ -326,7 +337,7 @@ describe("5: the Ship card for a capped change", () => {
     return r;
   }
   const at = new Date(NOV11_8AM - 10 * MIN).toISOString();
-  const roundsWith = (serious: number, cut?: any) => ({ format: 1, changes: { "pr-5": { pr: PR, rounds: [1, 2, 3].map((n) => ({ id: `r-${n}`, at: `2026-11-1${n}`, kind: n === 1 ? "full" : "fixes", state: "answered", done: true, serious: n === 3 ? serious : 0 })), ...(cut ? { cut } : {}) } } });
+  const roundsWith = (serious: number, cut?: any) => ({ format: 1, changes: { "pr-5": { pr: PR, rounds: [1, 2, 3].map((n) => ({ id: `r-${n}`, at: `2026-11-1${n}`, kind: n === 1 ? "full" : "fixes", state: "answered", done: true, serious: n === 3 ? serious : 0, head: SHA1 })), ...(cut ? { cut } : {}) } } });
   const ship = (r: any, head: string, review?: string) => r.link.ship({ text: "Cards keep their place.", item: "P64", pr: PR, head, review });
 
   test("nothing serious left at the cap: the normal card", async () => {

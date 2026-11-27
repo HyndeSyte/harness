@@ -265,24 +265,36 @@ to you as a question.
 - The test for serious: in ordinary use it could lose or corrupt something of yours, act wrongly or
   without your go, expose a secret or widen what anyone can reach, or let something fail without anyone
   hearing of it. Every reviewer gets that test and labels each of its findings serious or follow-up by
-  it, naming which part of the test it meets or fails; an unlabelled finding counts as serious. A
-  finding one reviewer called serious stays serious unless another outside reviewer (not the one that
-  raised it, and never Claude standing in) wrote down, in that same round, why it is a follow-up by the
-  test: at the last round the runner asks the outside reviewers to sort each other's serious findings
-  that way. Cain can't re-sort one. The review's verdicts.md shows both labels.
-- Nothing serious left after the third round: the normal Ship card.
+  it, naming which part of the test it meets or fails; an unlabelled finding counts as serious. At the
+  last round the runner asks every outside reviewer to sort all of that round's findings by the test,
+  its own included, so a reviewer that calls everything a follow-up hides nothing. A finding any of them
+  calls serious stays serious unless every other outside reviewer that sorted it called it a follow-up,
+  each naming which part of the test it fails, in writing; the reviewer that raised it saying serious
+  again keeps it serious, and Claude standing in never sorts. Cain can't re-sort one. The review's
+  verdicts.md shows every label. `review.sh health` shows how often each reviewer's findings carried a
+  label it could read.
+- Nothing serious left after the third round: the normal Ship card, for exactly the version that round
+  reviewed. Anything pushed after it gets no card, and a tap on a card whose pull request has moved on
+  lands nothing.
 - Something serious left: if taking out the parts the serious findings are about would leave the piece
   not doing its job, it is held, with no cut and no check. Otherwise Cain cuts those parts (only what the
-  piece adds), and one outside reviewer that did not write the cut checks the cut diff only: does it
-  remove each serious risk, does it add a serious one, does what is left pass its tests. That cut check
+  piece adds, on top of the version last reviewed), and one outside reviewer checks the cut diff, which
+  the review service works out itself from the code, not from Cain's description. It picks the reviewer
+  too. The check asks four things: does the cut remove each serious risk, does it add a serious one, does
+  what is left pass its tests, and does the piece still do what its first review said it was for. A cut
+  that adds new code fails without asking anyone, and anything but a clear pass is a fail. A reviewer
+  that is down or answers garbled is asked again later; that doesn't use the check up. That cut check
   isn't a round, and there is no second cut or second check. If it passes, the Ship card goes for exactly
   the cut version, its review line reads "Cut checked: Gemini, pass" (or OpenAI), and Cain's line names
   the cut. If it fails, the piece is held.
-- Either way you hear one line from Cain. No card offers more rounds, and none offers shipping with a
-  risk named.
+- Either way you hear one plain line, with no buttons and no question, sent by the App's own code: when
+  the third round ends (nothing serious left, or how many serious findings are left and that Cain now
+  holds or cuts it), when a cut check passes or fails, and when Cain holds it ("held: " and why). If Cain
+  hasn't decided a day after the third round, you hear one line saying it is still undecided. No card
+  offers more rounds, and none offers shipping with a risk named.
 - The link holds Cain to it: a Ship card for a piece at its cap with something serious left is refused
-  unless its cut check passed for that very version, and an ask of Cain's about rounds, a risk or a cut
-  is refused.
+  unless its cut check passed for that very version, and an ask or a reply of Cain's that asks you about
+  rounds, a risk or a cut is held.
 
 Why: until 0.19.0 the third round's serious finding brought a card asking you to ship with that risk or
 hold, and Cain could ask you for more rounds with a grant card. The grant turned into a loop, and the

@@ -9,14 +9,18 @@
 //   spend                  this month per seat: dollars, the runner's own cap, runs, findings, useful,
 //                          $ per useful; then the round count per open change against the round cap
 //   guard                  the usage guard's reading now, in two lines (the plan, the seats and the floor)
-//   health                 the last nightly seat check
+//   health                 the last nightly seat check, and each seat's label parse rate (round 1 fixes)
+//   decide <change> hold "<why in one line>" | decide <change> cut
+//                          Cain's decision for a change at its cap with something serious left (Cain 0.20.0, round
+//                          1 fixes): left in the inbox for the runner, which keeps it under the change in the rounds
+//                          file and, for a hold, has the link post him the one "held: <why>" line
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { readStop, stoppedWhy } from "../stop.ts";
 import { FINAL, LABEL, SEATS, newReview, parseBrief, privacyCheck, resultJson, safeId, shownId, type Brief, type SeatName } from "./core.ts";
 import { configFromEnv } from "./config.ts";
-import { atCap, existsReview, loadReview, type Ledger, type Health } from "./runner.ts";
-import { DEFAULT_ROUND_CAP, admit, admitCut, countedRounds, cutOf, groupOf, lastRound, readRounds } from "./rounds.ts";
+import { atCap, existsReview, labelRate, loadReview, type Ledger, type Health } from "./runner.ts";
+import { DEFAULT_ROUND_CAP, admit, admitCut, checkDecision, countedRounds, cutOf, decideWhy, decisionOf, groupOf, lastRound, readRounds } from "./rounds.ts";
 import { guard, guardLines, labelOf, postHold, readSettings, readings } from "../guard.ts";
 
 const cfg = configFromEnv();
@@ -166,7 +170,8 @@ switch (cmd) {
       const last = lastRound(rounds, key);
       const cut = cutOf(rounds, key);
       const left = atCapNow && last.state === "answered" ? `, ${last.serious} serious left` : atCapNow && last.state === "lost" ? ", its last round lost" : "";
-      open.push(`  ${group.join(" + ")}: ${done.length} of ${capN} round${capN === 1 ? "" : "s"}${atCapNow ? ", at the cap" : ""}${left}${cut ? `, cut check ${cut.state}` : ""}`);
+      const dec = decisionOf(rounds, key);
+      open.push(`  ${group.join(" + ")}: ${done.length} of ${capN} round${capN === 1 ? "" : "s"}${atCapNow ? ", at the cap" : ""}${left}${dec ? `, decided: ${dec.choice}` : ""}${cut ? `, cut check ${cut.state}` : ""}`);
     }
     out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}):`);
     out(open.length ? open.join("\n") : "  no open changes");
@@ -181,8 +186,35 @@ switch (cmd) {
     let h: Health = {};
     try { h = JSON.parse(readFileSync(cfg.healthFile, "utf8")); } catch { /* none yet */ }
     for (const s of SEATS) { const x = h[s]; out(`  ${LABEL[s]}: ${!x ? "not checked yet" : x.ok ? `ok (${x.at})` : `${x.kind}: ${x.detail}. Fix: ${x.fix}`}`); }
+    // Round 1 fixes: how often each seat's findings carried a valid SERIOUS or FOLLOW-UP label (unlabelled ones
+    // count as serious), over the rounds kept.
+    out("Label parse rate (findings with a valid SERIOUS or FOLLOW-UP label):");
+    for (const s of SEATS) {
+      const rows = h.labels?.[s];
+      const r = labelRate(rows);
+      out(`  ${LABEL[s]}: ${r.rate === null ? "no findings yet" : `${Math.round(r.rate * 100)}% (${r.labelled} of ${r.total} over ${rows!.length} round${rows!.length === 1 ? "" : "s"})`}`);
+    }
+    break;
+  }
+  case "decide": {
+    if (!a1 || (a2 !== "hold" && a2 !== "cut")) fail('usage: review.sh decide <change> hold "<why in one line>" | review.sh decide <change> cut');
+    const d = checkDecision(a2 === "hold" ? { change: a1, choice: "hold", why: a3 ?? "" } : { change: a1, choice: "cut" });
+    if (typeof d === "string") fail(`not kept: ${d}`, 3);
+    const v = d as Exclude<typeof d, string>;
+    // Checked here first, so Cain hears at once; the runner decides again when it takes it.
+    const rounds = readRounds(cfg.roundsFile!);
+    if (!rounds) fail("not kept: the review rounds file can't be read. Log it as a Build item.", 3);
+    const why = decideWhy(rounds!, v.change, roundCap());
+    if (why) fail(`not kept: ${why}`, 3);
+    if (!cfg.inboxDir) fail("no inbox for decisions");
+    mkdirSync(cfg.inboxDir!, { recursive: true });
+    const name = `decide-${v.change}-${Date.now()}-${process.pid}`;
+    const tmp = join(cfg.inboxDir!, `.${name}.tmp`);
+    writeFileSync(tmp, JSON.stringify(v), { mode: 0o640 });
+    renameSync(tmp, join(cfg.inboxDir!, `${name}.decision`));
+    out(v.choice === "hold" ? `left for the runner: ${v.change} held; he hears one line from the link, "held: ${v.why}"` : `left for the runner: ${v.change} to be cut; submit its one cut check`);
     break;
   }
   default:
-    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health");
+    fail("usage: review.sh submit <brief.json> | status <id> | result <id> | useful <id> <seat> <n> | spend | guard | health | decide <change> hold \"<why>\" | decide <change> cut");
 }

@@ -13,7 +13,7 @@
 //   - The keeper's armed read (keeperArmed, armedFor) stays for the keeper's own checks; no Ship card reads it.
 import { closeSync, fchmodSync, fchownSync, openSync, readFileSync, renameSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { countedRounds, cutOf, lastRound, readRounds, type Rounds } from "../review/rounds.ts";
+import { countedRounds, cutOf, decisionOf, lastRound, readRounds, type Rounds } from "../review/rounds.ts";
 import { CAIN_GID, capPaths, ROOT_UID } from "../capfiles.ts";
 import { appendSynced, syncFolder } from "./auth.ts";
 
@@ -60,19 +60,9 @@ export function namesRoundPastCap(text: string, cap: number, rounds: Rounds | nu
   return null;
 }
 
-// Whether Cain's ask puts a question about review rounds, a risk or a cut to the owner (0.20.0): the rule
-// has Cain decide those himself, so the link refuses the ask. What it names, or null.
-export function asksAboutCap(text: string): string | null {
-  const t = String(text ?? "").toLowerCase().replace(/\s+/g, " ");
-  if (/\b(more|extra|another|additional|further|fourth|4th)\s+(\w+\s+){0,2}(review\s+)?rounds?\b/.test(t) || /\bgrant\w*\b[^.?!]{0,40}\brounds?\b/.test(t))
-    return "more review rounds";
-  if (/\b(ship|land|install|merge)\w*\b[^.?!]{0,60}\bwith\s+(that|the|this|a|its)\s+(\w+\s+)?risks?\b/.test(t) || /\b(accept|take|live with)\s+(that|the|this)\s+risk\b/.test(t))
-    return "shipping with a risk";
-  if (/\bcut\s+check/.test(t) || /\b(cut|remove|drop|strip)\b[^.?!]{0,40}\b(parts?|pieces?|findings?)\b[^.?!]{0,40}\b(serious|review|reviewers?|finding)/.test(t)
-    || (/\bserious\s+findings?\b/.test(t) && /\b(cut|hold|ship)\b/.test(t)))
-    return "a cut, or what to do with a serious finding";
-  return null;
-}
+// Whether Cain's ask puts a question about review rounds, a risk or a cut to the owner (0.20.0): in the message
+// gate's rules since round 1 of fixes (../gate/cain.ts), so his replies and edits are held by the same check.
+export { asksAboutCap } from "../gate/cain.ts";
 
 // The guard's log, bounded (round 3): one line appended, root-side. When the line would take the file
 // past max, the file is first rotated (renamed to "<log>.1", replacing the previous one, so one previous
@@ -106,7 +96,8 @@ export function holdLogged(path: string, tag: string, what: string): boolean {
 }
 
 export type CapState =
-  | { state: "none" }                                                  // not at its cap, or nothing serious left: the normal card
+  | { state: "none" }                                                  // not at its cap: the normal card
+  | { state: "clean"; key: string; id: string; head: string }          // at its cap, nothing serious left: only the head its last round reviewed (round 1 fixes)
   | { state: "unknown"; why: string }
   | { state: "waiting"; key: string; why: string }                     // its last round or its cut check is still running
   | { state: "held"; key: string; why: string }                        // held by the rule: no Ship card
@@ -127,11 +118,20 @@ export function capStateFor(pr: string, rounds: Rounds | null, cap = 3): CapStat
     const last = lastRound(rounds, k);
     if (last.state === "running" || last.state === "none") return { state: "waiting", key: k, why: "its last review round is still running" };
     if (last.state === "lost") return { state: "held", key: k, why: "its last review round was lost, so nothing serious is known to be gone" };
-    if (last.serious === 0) continue;
+    // Round 1 fixes: nothing serious left binds the card to the head that last round reviewed, from the runner's
+    // record; a round recorded without one binds to nothing, so no card goes (fail closed).
+    if (last.serious === 0) {
+      if (!last.head) return { state: "held", key: k, why: "the runner's record of its last review round names no head, so no head can be bound to its Ship card" };
+      return { state: "clean", key: k, id: last.id, head: last.head.toLowerCase() };
+    }
+    const d = decisionOf(rounds, k);
+    if (d?.choice === "hold") return { state: "held", key: k, why: "its last review round left something serious, and Cain held it" };
     const c = cutOf(rounds, k);
     if (!c) return { state: "held", key: k, why: "its last review round left something serious, and it has no passing cut check" };
     if (c.state === "started") return { state: "waiting", key: k, why: "its cut check is still running" };
     if (c.state !== "pass") return { state: "held", key: k, why: `its last review round left something serious, and its one cut check ${c.state === "fail" ? "failed" : "has no answer"}` };
+    // Round 1 fixes: a cut check of another pull request never binds this one's card.
+    if (String(c.pr ?? "").toLowerCase() !== pr.toLowerCase()) return { state: "held", key: k, why: "its cut check is of another pull request" };
     return { state: "cut", key: k, id: c.id, head: c.head.toLowerCase(), seat: c.seat };
   }
   return { state: "none" };
@@ -194,4 +194,29 @@ export function keeperArmedText(replies: Record<string, KeeperReply | undefined>
     if (a.armed) armed[app] = a.at!; else why[app] = a.why;
   }
   return JSON.stringify({ armed, why });
+}
+
+// The owner's one plain line at the review cap (Cain 0.20.0, round 1 fixes), worded here from the runner's fields
+// (review/runner.ts OwnerLine): at each terminal outcome, one line, no card, no buttons, no question. The topic
+// (the change's first brief's) and a hold's why are Cain's words: the link checks them by his rules first, and
+// leaves them out when they don't pass (ownerLineText with neither).
+export type OwnerLineFields = { outcome: string; topic?: string; serious?: number; why?: string };
+export const OWNER_LINE_OUTCOMES = ["clean", "cap", "lost", "cut-pass", "cut-fail", "held", "undecided"] as const;
+const findings = (n: number | undefined) => {
+  const k = Number.isInteger(n) && n! >= 1 ? n! : 1;
+  const w = k < WORDS.length ? WORDS[k] : "several";
+  return `${w} serious finding${k === 1 ? "" : "s"}`;
+};
+export function ownerLineText(l: OwnerLineFields): string {
+  const t = l.topic ? clean(l.topic, 120).replace(/[.\s]+$/, "") : "A change";
+  switch (l.outcome) {
+    case "clean": return `${t}: its last outside review round left nothing serious, so its Ship card follows.`;
+    case "cap": return `${t}: its third and last outside review round left ${findings(l.serious)}, so Cain now holds it or cuts those parts.`;
+    case "lost": return `${t}: its last outside review round did not complete, so it is held.`;
+    case "cut-pass": return `${t}: the cut passed its outside check, so its Ship card follows.`;
+    case "cut-fail": return `${t}: the cut failed its outside check, so it is held.`;
+    case "held": return l.why ? `${t}, held: ${clean(l.why, 200).replace(/[.\s]+$/, "")}.` : `${t}, held.`;
+    case "undecided": return `${t}: its last outside review round left something serious a day ago, and whether it is held or cut is still undecided.`;
+    default: throw new Error("not an outcome");
+  }
 }
