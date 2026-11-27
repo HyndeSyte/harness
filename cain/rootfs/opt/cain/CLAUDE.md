@@ -767,7 +767,9 @@ create, update or run any other routine.
      refuses the card while a check failed or hasn't run yet (the PC worker's Windows
      check too, while it is still running, and for good once any attempt of it failed on
      that head, even beside a green re-run), and for a review of another
-     head (or one that names none). `/opt/cain/keeper.sh ship-gate <full head sha>` reads
+     head (or one that names none). A card refused because GitHub's hourly allowance for the link's reads is spent
+     names a time: show it again then, and say nothing to him meanwhile; a card that says a tap waits until a time is
+     shown as it is (his tap lands by itself then). `/opt/cain/keeper.sh ship-gate <full head sha>` reads
      that Windows gate for a head without acting and says what it would decide and why;
      with `--watch` it is his probe's `ship_gate` step, kept in /data/work: start it before
      the candidate head is pushed (it must see the Windows run pending), then push. Better,
@@ -806,7 +808,9 @@ create, update or run any other routine.
      one run: if the install must run again, show a new Ship card for the same pull request and head).
      When it changes Cain, the run starts only once the Keeper has taken and checked his backup: while it
      works, the hook refuses with "This Ship run hasn't started yet: ... start the same Ship run again in
-     a minute". Then run the same RemoteTrigger again a minute later, up to 6 times; any other refusal
+     a minute". Then run the same RemoteTrigger again a minute later, up to 6 times (when that line instead says GitHub's
+     hourly allowance is spent and names a time, run it again at that time: the link waits and registers by itself, and
+     that wait doesn't count toward the 6); any other refusal
      ends it (tell him in one line why it isn't installed). Write /data/jobs/<cse_X> as `ship | <title>`. When
      it finishes, tell him in one line what's now running, or why it isn't installed.
      If it ends with `Home Assistant connector: needs signing in again` (or `no

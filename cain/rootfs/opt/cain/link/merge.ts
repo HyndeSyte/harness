@@ -31,7 +31,7 @@ export interface MergeDeps {
 export interface Landing { repo: string; pr: number; head: string }
 export type Landed =
   | { ok: true; already: boolean }
-  | { ok: false; why: string; again: boolean; stopped?: boolean };
+  | { ok: false; why: string; again: boolean; stopped?: boolean; at?: number };   // at (0.19.3): when to try again (GitHub's hour resets)
 
 const no = (why: string, again = false): Landed => ({ ok: false, why, again });
 const first = (s: string) => s.split(/\r?\n/).map((l) => l.trim()).find(Boolean)?.slice(0, 120) ?? "";

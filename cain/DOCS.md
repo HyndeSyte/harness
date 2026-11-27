@@ -189,6 +189,24 @@ are barred from them, and once his session runs as its own user (the next step) 
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy
 key, and Cain is told if it doesn't.
 
+GitHub's hourly reads (since 0.19.3). The App reads GitHub without a key, which GitHub allows 60
+times an hour from your home address. On Nov 27 a busy afternoon of Ship taps spent the hour and a Ship
+tap was refused with "what the tap installs couldn't be read". Now:
+
+- a file at a given commit and a finished test run are read once and kept, and an open Ship card's pull
+  request is looked at mostly through git, which doesn't count against the 60;
+- before a Ship card goes out, and when you tap Ship, the App asks GitHub how much of the hour is left
+  (that question is free). If your tap would run short, the card says until when ("a Ship tap now waits
+  until then"), and a tap waits for the reset and then lands and installs by itself: no second tap. If
+  even the card can't be read, Cain shows it again at the time it names;
+- once an hour the App's log has a line "GitHub API reads in the last hour: ...", the count measured on
+  the Pi.
+
+A key would raise the limit to 5,000 an hour. It is not used: the App keeps to its rule that nothing
+else's credentials take part, and with these changes one Ship takes about 25 reads instead of about 39.
+If the hourly line ever shows the App near 60, the step would be one fine-grained token on your GitHub
+account, read-only, for public repositories only, put in a new App option; that needs a build first.
+
 Since 0.19.0 and until 0.19.2, Cain could not accept an update of himself: a mix-up in his App's
 code gave his drill check the wrong kind of store, so every install of Cain was refused with "the
 drill flags' high-water time can't be kept". 0.19.2 fixes it, and his tests now fail on that kind of

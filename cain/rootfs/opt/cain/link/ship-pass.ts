@@ -49,6 +49,7 @@ import { createHash } from "node:crypto";
 import { publicKey, readToken, type Claim } from "../ship-token";
 import { bumpsAt, fileAt, type MergeDeps, versionAt } from "./merge";
 import { markHash, type DrillDeps, type DrillMode } from "./drill";
+import { type Budget, REG_ASKS, RESET_SLACK_MS, resetClock, shortUntil } from "./budget";
 
 export const PASS_FORMAT = 2;                     // 0.1.4: entries carry their state (format 1 entries count as passed)
 export const ATTEMPT_WAIT_MS = 5 * 60_000;        // (0.1.5) one App's registration polled for this long
@@ -178,14 +179,14 @@ export interface Accepted { app: string; attempt: string; backup: string; from?:
 export interface Claimed { attempt: string; claim: string; until: string }
 export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
-  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number };
+  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number; waitUntil?: number };
 export interface PassDeps {
   pub: () => string | null;                      // the link's public Ship key (base64 SPKI), as /data/trust/ship.pub holds it
   now: () => number;
   load: () => string | null;                     // the pass file's text (null: none yet)
   store: (text: string) => void;                 // writes it whole; throws on failure
   // the keeper registration, in the background; note(upd) keeps how many Apps and which attempts it made
-  register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: { apps?: number; attempt?: string }) => void) => void;
+  register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: { apps?: number; attempt?: string; waitUntil?: number }) => void) => void;
   claim?: (a: Accepted, request: string) => Promise<{ status: number; body: any } | null>;   // (0.1.5) POST /attempt/<id>/claim (Keeper 0.1.7: with its request id)
   // (0.1.5) POST /attempt/<id>/cancel. Keeper 0.1.11: its answer judged when given: only a plain "ended" counts; anything else
   // (pending, refused, an error, no answer) is no success, logged, and the owner gets a card offering a retry (retry)
@@ -197,10 +198,14 @@ export interface PassDeps {
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
   waitMs?: number;                                                          // (Keeper 0.1.15) one App's wait for acceptance (acceptWaitMs)
   view?: (attempt: string) => Promise<{ status: number; body: any } | null>;   // (Keeper 0.1.15) GET /attempt/<id>, for the reconcile at start
+  tz?: string;                                                              // (Cain 0.19.3) his time zone, for a wait's time
   log: (line: string) => void;
 }
 export type PassAnswer = { status: "ok"; pr: number; head: string; accepted: Accepted[]; claims: Claimed[] } | { status: "pending" | "spent" | "refused"; said: string };
 export const PENDING_SAID = "the keeper is taking the backup before this install; nothing has run and the tap still counts: start the same Ship run again in a minute";
+// (Cain 0.19.3) The registration waits for GitHub's hour to reset (what it reads isn't left): the pass stays pending
+// meanwhile, its wait is longer by that much, and the hook's line says when to start the same run again.
+export const budgetPendingSaid = (until: number, tz?: string) => `GitHub's hourly allowance for the link's reads is spent until ${resetClock(until, tz)}, so the link waits and then registers the install by itself; nothing has run and the tap still counts: start the same Ship run again at ${resetClock(until + 60_000, tz)}`;
 
 function readEntries(text: string | null): Entry[] | null {
   if (text === null) return [];
@@ -234,13 +239,14 @@ export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; b
 
 // (0.1.5) What the registration made so far, kept on its entry: the number of watched Apps (the pass's
 // wait scales with it) and each attempt id (cancelled if the pass gives up).
-export function noteEntry(d: PassDeps, id: string, upd: { apps?: number; attempt?: string }): void {
+export function noteEntry(d: PassDeps, id: string, upd: { apps?: number; attempt?: string; waitUntil?: number }): void {
   const spent = readEntries(d.load());
   const e = spent?.find((x) => x.id === id);
   if (!spent || !e) return;
   if (e.state !== "registering") { if (upd.attempt) cancelAll(d, [upd.attempt], "its pass had already ended"); return; }
   if (upd.apps !== undefined) e.apps = upd.apps;
   if (upd.attempt) e.attempts = [...(e.attempts ?? []), upd.attempt];
+  if (upd.waitUntil !== undefined) e.waitUntil = upd.waitUntil;
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's progress"); }
 }
 
@@ -357,7 +363,9 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   }
   if (e.state === "refused") return { status: "refused", said: `${e.said ?? "the keeper didn't accept the install"}. ${again}` };
   if (e.state === "registering") {
-    const wait = passWaitMs(e.apps ?? 1, d.waitMs);
+    // (Cain 0.19.3) a wait for GitHub's hour to reset lengthens the pass's wait by as much
+    const wait = passWaitMs(e.apps ?? 1, d.waitMs) + Math.max(0, (e.waitUntil ?? 0) + RESET_SLACK_MS - e.at);
+    if (e.waitUntil && e.waitUntil + RESET_SLACK_MS > now) return { status: "pending", said: budgetPendingSaid(e.waitUntil, d.tz) };
     if (now - e.at <= wait) return { status: "pending", said: PENDING_SAID };
     return refuseFor(`the keeper didn't accept every install within ${wait / 60_000} minutes`, e.attempts ?? []);
   }
@@ -413,7 +421,11 @@ export interface RegisterDeps {
   get?: (path: string) => Promise<{ status: number; body: any } | null>;    // (0.1.5) GET /attempt/<id>
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
-  note?: (upd: { apps?: number; attempt?: string }) => void;
+  note?: (upd: { apps?: number; attempt?: string; waitUntil?: number }) => void;
+  // (Cain 0.19.3) what is left of GitHub's hour (budget.ts, /rate_limit: not counted); the registration waits for the reset
+  // when what it reads isn't left, and once more if a read was refused for the rate limit
+  budget?: () => Promise<Budget | null>;
+  tz?: string;
   linkFp?: string | null;                                                 // the link's own Ship key's fingerprint
   enrollment?: EnrollmentStore;
   pollMs?: number; waitMs?: number;
@@ -437,10 +449,24 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   let cancel: string | undefined;                       // (Keeper 0.1.8) an enrollment refusal's why, for the cancel
   const say = (l: string, bad = true) => { said.push(l); if (bad) ok = false; d.log(`keeper registration: ${l}`); };
   const now = d.now ?? Date.now, sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
-  const pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
+  // (Cain 0.19.3) GitHub's hour first: when what this reads isn't left, wait for the reset (at most once before the reads and
+  // once after a read the rate limit refused), then go on, with no new tap. The pass stays pending meanwhile.
+  const waitBudget = async (): Promise<boolean> => {
+    const b = d.budget ? await d.budget().catch(() => null) : null;
+    const until = shortUntil(b, REG_ASKS, now());
+    if (until === null) return false;
+    d.note?.({ waitUntil: until });
+    d.log(`keeper registration: GitHub's hourly allowance for the link's reads is spent (${b!.remaining} of ${b!.limit} left), so it waits until ${resetClock(until, d.tz)} and then goes on by itself`);
+    await sleep(Math.min(until - now(), 3_600_000) + RESET_SLACK_MS);
+    return true;
+  };
+  await waitBudget();
+  let pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
+  if (pull?.status !== 200 && (await waitBudget())) pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
   const base = pull?.status === 200 ? String(pull.body?.base?.sha ?? "") : "";
   if (!/^[0-9a-f]{40}$/.test(base)) { say(`pull request ${c.pr}'s base couldn't be read, so nothing was registered`); return { ok: false, said }; }
-  const bumps = await bumpsAt(d, c.repo, base, c.head);
+  let bumps = await bumpsAt(d, c.repo, base, c.head);
+  if (!bumps && (await waitBudget())) bumps = await bumpsAt(d, c.repo, base, c.head);
   if (!bumps) { say("what the tap installs couldn't be read, so nothing was registered"); return { ok: false, said }; }
   const watched = bumps.filter((b) => APP_SLUGS[b.app] && WATCHED.has(APP_SLUGS[b.app]));
   d.note?.({ apps: watched.length });

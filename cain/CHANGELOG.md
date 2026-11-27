@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.3
+
+- A Ship tap no longer fails because GitHub's hourly limit ran out. Cain's App reads GitHub without a key, which GitHub allows 60 times an hour, and on Nov 27 a busy afternoon of Ship taps used them all up.
+- The App now reads less: a file at a given commit and a finished test run are read once and kept, and an open Ship card's pull request is looked at mostly through git, which doesn't count.
+- Before a Ship card goes out, and again when you tap Ship, the App checks how much of the hour is left. If your tap would run short, the card says until when, and a tap waits for GitHub's hour to reset and then lands and installs by itself, with no second tap.
+- Once an hour the App's log says how many GitHub reads it made in the last hour.
+
 ## 0.19.2
 
 - Cain can accept an update of himself again. Since 0.19.0 every install of Cain was refused with "the drill flags' high-water time can't be kept", because of a mix-up in his App's code. That is fixed.

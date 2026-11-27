@@ -96,6 +96,7 @@ import { ROTATION_ID } from "./rotation";
 import { type DrillMode, type DrillPage, isDrillMode, VERSION as DRILL_VERSION } from "./drill";
 import type { StopState } from "../stop";
 import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
+import { type Budget, CARD_ASKS, RESET_SLACK_MS, RUN_ASKS, shortUntil } from "./budget";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -742,6 +743,9 @@ export interface Deps {
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
+  // (0.19.3) what is left of GitHub's hour for the link's reads (budget.ts, /rate_limit: not counted); absent or null: unknown,
+  // which holds nothing back
+  budget?: () => Promise<Budget | null>;
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
   checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
   gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
@@ -865,6 +869,9 @@ export const REVIEW_READ = "The reviewers read Cain's summary of the change, not
 
 // A Ship card's words: the question, Cain's line, then the link's lines. His line gives way,
 // so the link's are never cut off.
+// (0.19.3) The Ship card's line when what is left of GitHub's hour can read the card but not his tap's landing and the Ship run.
+export const budgetLine = (until: number, tz?: string) =>
+  `GitHub's hourly allowance for the link's reads is low until ${clockTime(until, tz)}: a Ship tap now waits until then, and lands and installs by itself.`;
 function shipCard(top: string, own: string, rest: string[]): string {
   const room = LIMIT - [top, ...rest].join("\n").length - 1;
   const mine = own.trimEnd();
@@ -2542,6 +2549,13 @@ export class Link {
     const gateRead = watched.length && gateHead
       ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
       : Promise.resolve(null);
+    // 0.19.3: GitHub's hour first (its /rate_limit isn't counted). Not enough left to read the card: refused, naming when it
+    // can go. Enough for the card but not for his tap's landing and the Ship run: the card says when a tap goes on by itself.
+    const left = this.d.budget ? await within(Promise.resolve().then(() => this.d.budget!()).catch(() => null), wait) : null;
+    const cardShort = shortUntil(left, CARD_ASKS, this.d.now());
+    if (cardShort !== null)
+      throw new Refusal(`GitHub's hourly allowance for the link's reads is spent until ${clockTime(cardShort, this.d.tz)} (${left!.remaining} of ${left!.limit} left), so the card's facts and checks can't be read now: show the card again at ${clockTime(cardShort + 60_000, this.d.tz)}`);
+    const tapShort = shortUntil(left, CARD_ASKS + RUN_ASKS, this.d.now());
     const [f, runs, gh] = await Promise.all([ask(() => facts!(pr, head)), ask(checkRuns && (() => checkRuns(pr, head))), gateRead]);
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
@@ -2581,7 +2595,8 @@ export class Link {
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
-      return { text: shipCard(shipQuestion(f), own, [github, rev ? `${rev.line} ${REVIEW_READ}` : NO_REVIEW]), own };
+      const later = tapShort !== null ? [this.ownWords("ship facts", "link", budgetLine(tapShort, this.d.tz))] : [];
+      return { text: shipCard(shipQuestion(f), own, [github, ...later, rev ? `${rev.line} ${REVIEW_READ}` : NO_REVIEW]), own };
     } catch (e) {
       if (e instanceof Refusal) throw e;
       this.log(`couldn't build a Ship card's new lines, so it goes as it was: ${reason(e)}`);
@@ -3558,7 +3573,12 @@ export class Link {
       if (!m?.ship || m.shipping?.state !== "landing") return;
       const tapped = m.shipping.at;
       let r: Landed;
+      // 0.19.3: his tap needs the landing's reads and the Ship run's left of GitHub's hour; when they aren't, it waits
+      // for the reset by itself (his card says until when) and lands then, with no new tap.
+      const left = this.d.budget && !this.voided(tapped) ? await within(Promise.resolve().then(() => this.d.budget!()).catch(() => null), FACTS_MS) : null;
+      const until = shortUntil(left, RUN_ASKS, this.d.now());
       if (this.voided(tapped)) r = STOPPED_FIRST;
+      else if (until !== null) r = { ok: false, again: true, why: `GitHub's hourly allowance for the link's reads is spent until ${clockTime(until, this.d.tz)}`, at: until + RESET_SLACK_MS };
       else {
         try { r = await this.d.land!({ pr: m.ship.pr, head: m.ship.head, stopped: () => this.voided(tapped) }); }
         catch (e) { r = { ok: false, why: `the link hit an error (${String(e).slice(0, 80)})`, again: true }; }
@@ -3586,7 +3606,7 @@ export class Link {
       const tries = (m.shipping.tries ?? 0) + 1;
       const waiting = own(`You tapped Ship. Waiting: ${r.why}. It lands by itself as soon as it can.`);
       const changed = m.shipping.line !== waiting;
-      m.shipping = { ...m.shipping, tries, next: now + Math.min(15, 2 ** tries) * 60_000, why: r.why,
+      m.shipping = { ...m.shipping, tries, next: r.at !== undefined && r.at > now ? r.at : now + Math.min(15, 2 ** tries) * 60_000, why: r.why,
         ...(changed ? { line: waiting, edited: false } : {}) };
       m.digest = digest(withLine(words, waiting), []);
       this.d.save(s);
