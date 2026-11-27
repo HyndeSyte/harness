@@ -402,7 +402,10 @@ alarm)
     fs.appendFileSync("/fp/hook.log", new URL(r.url).pathname + " " + (await r.text()) + "\n"); return new Response(""); } });' >/dev/null 2>&1 &
   srv=$!
   # Every command line while the alarms go out, to show the hook is on none of them.
+  # Cain 0.19.2: the checks below take the hook from stdin, never as an argument, and the last one waits for this watch to
+  # end, so the test's own grep can't be caught on a command line (a race seen on arm64).
   ( while kill -0 "$srv" 2>/dev/null; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\0' ' ' >> /fp/cmdlines; sleep 0.05; done ) &
+  watcher=$!
   sleep 1
   export NOTICE_URL=http://127.0.0.1:18123
   # One try, as the start makes its first four: not yet, nothing written. Then the start's fifth.
@@ -413,7 +416,7 @@ alarm)
   grep -q "held (not a breach)" /fp/check.out || fail "the check didn't say he's held: $(tail -n 1 /fp/check.out)"
   [ "$(cut -d' ' -f1 $D/c1/check-held)" = 9.9.9 ] && grep -q "the link didn't answer" $D/c1/check-held \
     || fail "the hold isn't on record for this version: $(cat $D/c1/check-held 2>/dev/null)"
-  grep -q "^/api/webhook/$hook {\"state\":\"on\",\"group\":\"stop\",\"alarm\":\"held\",\"title\":\"Cain is paused\"" /fp/hook.log \
+  grep -q -f - <<< "^/api/webhook/$hook {\"state\":\"on\",\"group\":\"stop\",\"alarm\":\"held\",\"title\":\"Cain is paused\"" /fp/hook.log \
     || fail "Home Assistant didn't get the pause: $(head -c 300 /fp/hook.log)"
   grep -q "This isn't a breach" /fp/hook.log && grep -q "under If Cain stops" /fp/hook.log || fail "the pause didn't say what it is and the way back"
   grep -qx "discord 0" $D/c1/notice.d/stop || fail "his bot posted, with its token away"
@@ -428,8 +431,8 @@ alarm)
   # The probe: Home Assistant's automation only notes its time, nobody is notified.
   "$OPT/notice.sh" probe >/dev/null 2>&1 || fail "the probe didn't go"
   grep -q "\"state\":\"test\",\"group\":\"probe\",\"alarm\":\"probe\"" /fp/hook.log && [ -s $D/c1/notice-probed ] || fail "the probe isn't in Home Assistant's log or on record"
-  sleep 0.2; kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null
-  ! grep -qF "$hook" /fp/cmdlines || fail "the hook was on a command line"
+  sleep 0.2; kill "$srv" 2>/dev/null; wait "$srv" 2>/dev/null; wait "$watcher" 2>/dev/null
+  ! grep -qF -f - /fp/cmdlines <<< "$hook" || fail "the hook was on a command line"
   grep -q "18123" /fp/cmdlines || fail "the command lines weren't watched"
   # While it's set, the hook is a secret value like the App's keys: uid 1000 can read it nowhere,
   # by the start's own check (which counts it among them) and by a search of its own.
