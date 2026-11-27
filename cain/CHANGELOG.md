@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.20.0
+
+- PC jobs now run in Microsoft Edge, not Chrome: a Cain jobs Edge that the worker opens itself for each job and closes after it. Your own Chrome is left alone; Chrome stays only for check-host and dump-extensions, and a job set up on Chrome stops with "browser_not_edge".
+- Setup asks you once whether you use Edge for your own browsing. If you do, jobs don't run in Edge, because the jobs settings reach every Edge profile on the PC.
+- A new setup step, edge-setup, prints the lines to run once from an administrator Command Prompt, each with a line saying what it does: Edge allows only Claude in Chrome and only Claude Code's helper, no guest windows, no new profiles and no sync. Claude Code's own setup for Chrome stays as it is.
+- Before Edge starts, every job, the probe and bind-profile check those settings, Claude Code's helper, the jobs profile's extensions and its one profile, and stop naming exactly what is wrong. check-host shows the same list.
+- Once Edge is open, the worker reads Edge's own policy page and checks Edge really applies every setting before any job page opens.
+- When Claude Code updates itself, the next job stops until you run edge-record, which shows the old and new version and signer and asks your go. The same after Claude in Chrome updates from the Web Store.
+- The Claude app open on your PC no longer stops setup or a run; a Claude Code session that is running still does. Only the app's own signed window and helpers are let through, and when one fails its check the stop line says which check and what it read.
+- A new launcher on your desktop, Cain PC jobs, runs bind-profile, the probe or the queued jobs with a double click, and says in one line what stopped it.
+- The Chrome 158 component exception and the component check from the earlier, unshipped design are gone.
+- After installing this update, do the Edge setup steps in order (pc-jobs.md), then bind-profile, the probe and confirm-profile again.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.
