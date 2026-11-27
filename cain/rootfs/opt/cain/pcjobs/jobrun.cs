@@ -180,7 +180,7 @@ public static class PcwJobRun {
     }
     PROCESS_INFORMATION pi;
     if (!Spawn(null, string.Join(" ", parts.ToArray()), list.ToArray(), i0, i1, i2, null, out pi)) {
-      Console.Error.WriteLine("pcw-jobrun: couldn't start the program"); return 122;
+      Console.Error.WriteLine("pcw-jobrun: couldn't start the program (error " + Marshal.GetLastWin32Error() + ")"); return 122;
     }
     CloseHandle(pi.hThread);
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -236,9 +236,9 @@ public static class PcwJobRun {
 
 
   // ---- Spawning with a handle list (version 4) ---------------------------------------------------
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  [StructLayout(LayoutKind.Sequential)]
   struct STARTUPINFO {
-    public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
+    public int cb; public IntPtr lpReserved; public IntPtr lpDesktop; public IntPtr lpTitle;
     public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
     public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2;
     public IntPtr hStdInput, hStdOutput, hStdError;

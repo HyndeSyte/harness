@@ -9570,7 +9570,7 @@ describe("Cain 0.20.0: the Edge jobs browser, the pre-launch gate, the pipe and 
 describe.if(WIN)("Cain 0.20.0 on Windows: the pipe launch and the handle scan", () => {
   const PROBE_CS = `using System; using System.Runtime.InteropServices; using System.Text;
 public static class FdProbe {
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct SI { public int cb; public string r; public string d; public string t;
+  [StructLayout(LayoutKind.Sequential)] struct SI { public int cb; public IntPtr r; public IntPtr d; public IntPtr t;
     public int x, y, xs, ys, xc, yc, fa, fl; public short sw; public short cbR2; public IntPtr lpR2; public IntPtr i, o, e; }
   [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern void GetStartupInfoW(out SI si);
   [DllImport("kernel32.dll")] static extern uint GetFileType(IntPtr h);
@@ -9679,6 +9679,11 @@ public static class FdProbe {
     const helper = jobHelperState20(o).exe!;
     expect(helper).toBeTruthy();
     const d = await decoy();
+    // The stand-in itself, started directly: it runs and writes its report (so a failure below is the helper's).
+    const direct = join(dirname(exe), "direct-report.json");
+    const first = spawnSync(exe, ["0", "0", direct], { encoding: "utf8", timeout: 30_000 });
+    if (first.status !== 0) console.log(`stand-in direct: status ${first.status}, stderr ${JSON.stringify(first.stderr)}`);
+    expect([first.status, existsSync(direct)]).toEqual([0, true]);
     const seen = join(dirname(exe), "run-report.json");
     const r = spawnSync(helper, ["run", exe, d.write, "0", seen], { encoding: "utf8", timeout: 30_000 });
     if (r.status !== 0) console.log(`helper run: status ${r.status}, stdout ${JSON.stringify(r.stdout)}, stderr ${JSON.stringify(r.stderr)}, report ${existsSync(seen) ? readFileSync(seen, "utf8") : "never written"}`);
