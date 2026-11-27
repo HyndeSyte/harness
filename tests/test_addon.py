@@ -790,7 +790,7 @@ def _whole_start(tmp_path, **stubs):
     for name, body in scripts.items():
         (opt / name).write_text(f"#!/bin/bash\n{note}\n{body}\n")
         (opt / name).chmod(0o755)
-    # Cain 0.19.2: the background loops' keeper, sourced by the run script, as the image has it.
+    # Cain 0.19.3: the background loops' keeper, sourced by the run script, as the image has it.
     shutil.copy(CAIN / "rootfs/opt/cain/keep-running.sh", opt / "keep-running.sh")
     for name, body in {"bun": 'case "$2" in container-id) echo boot:1;; esac; exit 0', "tmux": "exit 1", "claude": "exit 0",
                        "setpriv": f'{note}\nrm -f {(tmp_path / "session").as_posix()}; rm -rf {procs.as_posix()}/4242',

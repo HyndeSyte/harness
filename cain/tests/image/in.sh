@@ -402,7 +402,7 @@ alarm)
     fs.appendFileSync("/fp/hook.log", new URL(r.url).pathname + " " + (await r.text()) + "\n"); return new Response(""); } });' >/dev/null 2>&1 &
   srv=$!
   # Every command line while the alarms go out, to show the hook is on none of them.
-  # Cain 0.19.2: the checks below take the hook from stdin, never as an argument, and the last one waits for this watch to
+  # Cain 0.19.3: the checks below take the hook from stdin, never as an argument, and the last one waits for this watch to
   # end, so the test's own grep can't be caught on a command line (a race seen on arm64).
   ( while kill -0 "$srv" 2>/dev/null; do cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\0' ' ' >> /fp/cmdlines; sleep 0.05; done ) &
   watcher=$!

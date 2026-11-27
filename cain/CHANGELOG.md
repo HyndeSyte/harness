@@ -1,10 +1,15 @@
 # Changelog
 
-## 0.19.2
+## 0.19.3
 
 - Cain's background services (the link that carries your taps, the record keeper, the PC job keeper and the others) now start again by themselves after they crash or are stopped, instead of staying down until the App restarts. Each restart is one line in the App's log with its exit code, and one that keeps failing at once waits longer between tries.
 - When a drill file can't be written or read, the log now says why (the error, the system call and the file), never what's in the file. What a drill refuses is unchanged.
 - A stray folder or link left where a drill file's temp goes is cleared, logged once, instead of failing every install after it.
+
+## 0.19.2
+
+- Cain can accept an update of himself again. Since 0.19.0 every install of Cain was refused with "the drill flags' high-water time can't be kept", because of a mix-up in his App's code. That is fixed.
+- His tests now catch that kind of mix-up, so a change with it can't reach a Ship card.
 
 ## 0.19.1
 

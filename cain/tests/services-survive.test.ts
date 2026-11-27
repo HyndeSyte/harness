@@ -1,4 +1,4 @@
-// Cain 0.19.2: the App's background services survive their child's exit (keep-running.sh, sourced by services.d/cain/run), and
+// Cain 0.19.3: the App's background services survive their child's exit (keep-running.sh, sourced by services.d/cain/run), and
 // the drill store says why it failed (link/drill.ts: the error's code, system call and path in its one log line) and recovers a
 // stray temp that isn't a regular file.
 import { describe, expect, test } from "bun:test";
@@ -6,7 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { drillDeps, fileStore, helperMode, storeMarkPub, storeWhy } from "../rootfs/opt/cain/link/drill";
+import { drillDeps, fileStore, helperMode, linkDrillStore, storeMarkPub, storeWhy } from "../rootfs/opt/cain/link/drill";
 
 const ROOT = join(import.meta.dir, "..");
 const KEEP = join(ROOT, "rootfs/opt/cain/keep-running.sh");
@@ -225,6 +225,14 @@ describe("a stray temp that isn't a regular file is recovered", () => {
     expect(statSync(join(d, "trust/keeper-drill.json")).mode & 0o777).toBe(0o600);
     expect(logs).toEqual([`a stray temp (a link) stood in the drill store's way at ${join(d, "trust/keeper-drill.json.tmp")}: removed, and the write goes on`]);
   });
+  test("the link's own store (linkDrillStore, as main.ts builds it) logs a stray temp it clears", () => {
+    const d = mkdtempSync(join(tmpdir(), "drs-"));
+    mkdirSync(join(d, "trust/keeper-drill.json.tmp"), { recursive: true });
+    const logs: string[] = [];
+    linkDrillStore({}, join(d, "trust"), join(d, "link"), Date.now, (l) => logs.push(l)).storeFlag("drl1.a.b");
+    expect(readFileSync(join(d, "trust/keeper-drill.json"), "utf8")).toBe("drl1.a.b");
+    expect(logs).toEqual([`a stray temp (a folder) stood in the drill store's way at ${join(d, "trust/keeper-drill.json.tmp")}: removed, and the write goes on`]);
+  });
   test("the mark's public half recovers the same way, and the link passes its log to the store", () => {
     const d = mkdtempSync(join(tmpdir(), "drs-"));
     mkdirSync(join(d, "mark.pub.tmp"));
@@ -233,7 +241,7 @@ describe("a stray temp that isn't a regular file is recovered", () => {
     expect(readFileSync(join(d, "mark.pub"), "utf8")).toBe("pubkey\n");
     expect(logs).toHaveLength(1);
     const main = readFileSync(join(ROOT, "rootfs/opt/cain/link/main.ts"), "utf8");
-    expect(main).toContain("`${DIR}/keeper-drill-refused.json`,\n  (l) => console.log(`[cain] link: ${l}`));");
+    expect(main).toContain("linkDrillStore(process.env, TRUST_DIR, DIR, Date.now, (l) => console.log(`[cain] link: ${l}`))");
     expect(main).toContain("storeMarkPub(drillKey.pub, DRILL_MARK_PUB, (l) => console.log(`[cain] link: ${l}`))");
   });
 });

@@ -189,6 +189,11 @@ are barred from them, and once his session runs as its own user (the next step) 
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy
 key, and Cain is told if it doesn't.
 
+Since 0.19.0 and until 0.19.2, Cain could not accept an update of himself: a mix-up in his App's
+code gave his drill check the wrong kind of store, so every install of Cain was refused with "the
+drill flags' high-water time can't be kept". 0.19.2 fixes it, and his tests now fail on that kind of
+mix-up before a change can reach a Ship card.
+
 ## If the calendar specialist stops
 
 Cain's App and the Harness App check each other every minute. If Harness hasn't
@@ -535,11 +540,12 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
-## What 0.19.2 does: background services start again by themselves
+## What 0.19.3 does: background services start again by themselves
 
-On Nov 27 a Ship tap was refused because the drill store couldn't keep its high-water time, and its log
-line didn't say why. Restarting the link by hand then left it down: its loop in the App's start script
-ended at the link's first non-zero exit, and stayed down until the App restarted.
+On Nov 27 a Ship tap was refused because the drill store couldn't keep its high-water time (the cause
+was the mix-up 0.19.2 fixes), and its log line didn't say why. Restarting the link by hand then left it
+down: its loop in the App's start script ended at the link's first non-zero exit, and stayed down until
+the App restarted.
 
 - **Every background service starts again after it stops.** The link, the record keeper, the PC job
   keeper, the review runner, the security watch, the probe, the Discord upkeep and the broker each run
