@@ -10,6 +10,11 @@
 - The card asking you to grant more review rounds, and the card asking you to ship with a risk or hold, are gone. One still up loses its buttons and says Expired, and tapping an old one does nothing. Rounds already granted lapse.
 - Why: the grant became a loop, and shipping with a risk could never be used, since it needed a rollback switch that stays off. Normal Ship installs are already backed up, watched and rolled back by the Keeper. Cutting out only the parts a serious finding is about, with one outside check of the cut, is the rule's other branch and comes in a later version.
 
+## 0.19.2
+
+- Cain can accept an update of himself again. Since 0.19.0 every install of Cain was refused with "the drill flags' high-water time can't be kept", because of a mix-up in his App's code. That is fixed.
+- His tests now catch that kind of mix-up, so a change with it can't reach a Ship card.
+
 ## 0.19.1
 
 - Reviews end by your rule with no card: after the last review round, a change with something serious left is held and Cain tells you in one line. The review service no longer sends you "Ship it with that risk" or "Hold it", and Cain can no longer ask you to grant more review rounds.
