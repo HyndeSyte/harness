@@ -61,9 +61,6 @@ export type RunnerDeps = {
   unavailable?: (seat: SeatName) => Unavailable;   // e.g. Codex not signed in
   now?: () => Date; rand?: () => number; log?: (m: string) => void;
   stopped?: () => boolean;                         // Dane's Stop (../stop.ts): nothing is sent while it holds
-  // Cain 0.16.0: the owner's decision card at the review cap, posted through the link (its root socket);
-  // the message id, or null when it didn't go (tried again next tick). Absent: never posted.
-  postDecision?: (d: DecisionRec) => Promise<string | null>;
   plan?: () => PlanReading;                        // the plan-usage reading (../plan-usage.ts), for the guard
 };
 
@@ -119,7 +116,7 @@ export function loadReview(dir: string, id: string): Review | null {
   return r && typeof r === "object" && r.id === id ? r : null;
 }
 export function saveReview(dir: string, r: Review) { writeAtomic(reviewFile(dir, r.id), JSON.stringify(r, null, 1)); }
-// The enqueue lock (Cain 0.19.1): a brief's id is checked against the queue and the rounds record, and its
+// The enqueue lock (Cain 0.19.2): a brief's id is checked against the queue and the rounds record, and its
 // round and queue record written, while this file is held (an exclusive create). One older than a minute is
 // left by a runner that stopped mid-enqueue and is taken over (removed, then the exclusive create again, so
 // one contender wins).
@@ -293,7 +290,7 @@ export class Runner {
     try { return fn(); }
     finally { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(lock); } catch { /* gone */ } }
   }
-  // Under the enqueue lock. A round id is immutable (Cain 0.19.1): an id the queue already holds, or the rounds
+  // Under the enqueue lock. A round id is immutable (Cain 0.19.2): an id the queue already holds, or the rounds
   // record already keeps under any change (this one included), is refused, so a replay of a round resolves to
   // the original record and can alter neither the findings it sends nor the round it counts.
   private admitLocked(b: Brief): string | null {
@@ -330,7 +327,7 @@ export class Runner {
     return null;
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
-  // key: the admitted brief's validated change identity (admit, from changeKeyOf). Cain 0.19.1: the text comes
+  // key: the admitted brief's validated change identity (admit, from changeKeyOf). Cain 0.19.2: the text comes
   // only from the seat answers the runner kept in the rounds record when each answer arrived (keepFindings), under
   // that round of this change's own key; the round's queue record is read only to bind it, its id and change being
   // that round's and it not blocked for privacy. Nothing in a queue record's findings, a brief or a request
@@ -346,7 +343,7 @@ export class Runner {
     return [];
   }
   // A seat's answer's findings, kept in the rounds record under this round of its change as they arrive (Cain
-  // 0.19.1): the only source a later fix-only round's earlier findings are built from. Read and written with no
+  // 0.19.2): the only source a later fix-only round's earlier findings are built from. Read and written with no
   // wait between, so two seats answering in one pass don't lose each other's.
   private keepFindings(r: Review, s: SeatRun, findings: Finding[]): void {
     const file = this.cfg.roundsFile;
@@ -367,6 +364,7 @@ export class Runner {
     if (!file || this.capOff || !r.change || r.rounded || !FINAL.includes(r.status)) return;
     const rounds = readRounds(file);
     if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s round is settled next tick`); return; }
+    this.heldOwed = [];                                // a line from an earlier try whose write failed is made again
     const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
     const serious = seriousLeft(r);
     if (rec) {
@@ -385,11 +383,13 @@ export class Runner {
     }
     writeRounds(file, rounds);
     r.rounded = true;
+    this.relayHeld();
   }
   // The owner's grants (0.18.0), read fresh each time; none count when the file can't be read (fail closed).
   grants(): Grants | null { return this.cfg.grantsFile ? readGrants(this.cfg.grantsFile) : null; }
   capFor(rounds: Rounds, key: string): number { return effectiveCap(this.roundCap, rounds, this.grants(), key); }
-  // The decision card, owed once per change group and round, when the group is at its cap (the base cap
+  // The hold at the cap (Cain 0.19.1: kept as the change's decision record, which refuses its Ship card;
+  // no card goes to him). Before 0.19.1, the decision card, owed once per change group and round, when the group is at its cap (the base cap
   // plus his grants). Since 0.18.0 a granted round that leaves something serious at the raised cap owes
   // a new card, whatever he tapped on the one before (a Hold doesn't stop a granted round); the newest
   // decision is the one that counts, and the earlier one is kept under past.
@@ -400,11 +400,16 @@ export class Runner {
     const c = rounds.changes[key];
     if (c.decision) (c.past ??= []).push(c.decision);
     c.decision = { id: `${key}#${n}`, key, round: n, ...d, ...(d.lost ? { lost: true } : {}), state: "owed", at: this.now().toISOString() };
-    this.log(`${what}: the round cap is reached for ${key} ${d.lost ? "and its last round was lost" : `with ${d.serious} serious finding(s) left`}; the owner's decision card is owed`);
+    this.log(`${what}: the round cap is reached for ${key} ${d.lost ? "and its last round was lost" : `with ${d.serious} serious finding(s) left`}; held by the owner's review rule`);
+    // Cain 0.19.1: no card to him (the owner's review rule, R-013): the change is held, and Cain tells him.
+    // Relayed by the caller only after the rounds file holding the hold is written (heldOwed).
+    this.heldOwed.push(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so by his review rule it's held: no Ship card for it. Tell him in one line that it's held and why, with its Reviewed line, and ask him nothing about rounds, risk or cuts.`);
   }
+  private heldOwed: string[] = [];
+  private relayHeld(): void { for (const l of this.heldOwed.splice(0)) this.relay(l); }
   // A round counted at intake whose review never reached the queue (the runner stopped between the
   // two writes) is lost, found once at the runner's start: it still counts, Cain hears it named, and
-  // at the cap it owes the decision card.
+  // at the cap it's held (Cain 0.19.1; before, it owed the decision card).
   private recovered = false;
   recoverLost(): void {
     const file = this.cfg.roundsFile;
@@ -412,6 +417,7 @@ export class Runner {
     const rounds = readRounds(file);
     if (!rounds) return;                               // tried again next tick
     this.recovered = true;
+    this.heldOwed = [];
     const lines: string[] = [];
     for (const [key, c] of Object.entries(rounds.changes)) {
       for (const x of c.rounds) {
@@ -425,34 +431,12 @@ export class Runner {
     if (!lines.length) return;
     writeRounds(file, rounds);
     for (const l of lines) this.relay(`${l} Nothing to tell him.`);
+    this.relayHeld();
   }
-  // Owed decision cards, through the link. Exactly one per change: once posted it's never posted again.
-  async postOwed(): Promise<void> {
-    const file = this.cfg.roundsFile;
-    if (!file || !this.deps.postDecision || this.capOff) return;
-    const rounds = readRounds(file);
-    if (!rounds) return;
-    for (const [key, c] of Object.entries(rounds.changes)) {
-      const d = c.decision;
-      if (!d || d.state !== "owed") continue;
-      let msg: string | null = null;
-      try { msg = await this.deps.postDecision(d); } catch (e) { this.log(`the decision card for ${key} didn't go: ${String((e as Error)?.message ?? e).slice(0, 120)}`); }
-      const now = readRounds(file);
-      if (!now?.changes[key]?.decision) continue;
-      const cur = now.changes[key].decision!;
-      if (msg) {
-        Object.assign(cur, { state: "posted", message: msg });
-        this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so the review service put one decision in front of Dane (ship it with that risk, or hold it). Start no other round for it, and don't ask him about it yourself; his tap comes to you like any tap. If it's a critical change whose fix needs more rounds, the only way is a grant: keeper.sh review-grant asks him, and only his tap grants them. Nothing to tell him.`);
-      } else cur.tries = (cur.tries ?? 0) + 1;
-      writeRounds(file, now);
-    }
-  }
-
   async tick(): Promise<void> {
     try { this.recoverLost(); this.ingest(); await this.reviews(); }
     finally {
       if (this.publishOwed) this.publishReviewed();
-      try { await this.postOwed(); } catch (e) { this.log(`owed decision cards: ${(e as Error).message}`); }
     }
   }
 
@@ -495,7 +479,7 @@ export class Runner {
     // on an open review is refused too.
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
-    // Then the payload as a seat is handed it (Cain 0.19.1): the strict rules over all of it but the earlier
+    // Then the payload as a seat is handed it (Cain 0.19.2): the strict rules over all of it but the earlier
     // findings' span, the findings rules over that span alone (payloadCheck).
     const e = payloadCheck(outbound(r.brief!, r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined), this.terms());
     if (!e.ok) return this.block(r, e.why);

@@ -1,12 +1,18 @@
 # Changelog
 
-## 0.19.1
+## 0.19.2
 
 - A fix-only review round is still let through when the earlier findings hold a tool name ending in a date, but only that: a date written as eight digits on its own, or followed by more digits, now blocks the round, and the date has to be a real one (leap days included).
 - A card number written in groups with hyphens or spaces now blocks, in your brief and in the earlier findings.
 - The earlier findings sent with a fix-only round now come only from the seats' answers as the review runner kept them when they arrived; findings from rounds answered before this version aren't sent.
 - A review id can't be used twice: not for another change, not for the same change again, and not while a review with that id is queued.
 - A brief can't name a change key that looks like a pull request's.
+
+## 0.19.1
+
+- Reviews end by your rule with no card: after the last review round, a change with something serious left is held and Cain tells you in one line. The review service no longer sends you "Ship it with that risk" or "Hold it", and Cain can no longer ask you to grant more review rounds.
+- If an old card of either kind is still up, tapping it does nothing but take its buttons off and say it's retired.
+- A change held at the last review round can't be shipped through an earlier "Ship it with that risk" tap any more.
 
 ## 0.19.0
 
