@@ -72,13 +72,13 @@ describe("the grant raises the cap by exactly the rounds it names", () => {
     expect(effectiveCap(3, r, null, "pr-46")).toBe(3);
   });
 
-  test("a fourth round is refused without a grant, saying how a grant works, and runs as fix-only with one", async () => {
+  test("a fourth round is refused, saying it's held, and an earlier grant still runs as fix-only", async () => {
     const t = runnerRig();
     await threeRounds(t);
     const why = t.runner.admitAndQueue(brief({ id: "k-4" }))!;
     expect(why).toContain("pr-46 has had 3 outside review rounds, and the owner's rule allows at most 3.");
     expect(why).not.toContain("review-grant");                                // 0.19.1: grants are retired
-    expect(why).toContain("it's held by his review rule");
+    expect(why).toContain("It's held at the cap. Tell him in one line if it's held, and ask him nothing about rounds, risk or cuts.");
     expect(loadReview(t.cfg.queueDir, "k-4")).toBeNull();
     t.grant("pr-46", 2);
     expect(t.runner.admitAndQueue(brief({ id: "k-4" }))).toBeNull();
