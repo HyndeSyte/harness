@@ -99,6 +99,9 @@ new_mark() {
   done
   return 1
 }
+# Whether his screen holds what the App types though his prompt may look ready (Cain 0.20.0): a usage or
+# spend limit that is the newest thing on it, or a compaction at work (lean/held.sh). 0 when held.
+held_now() { printf '%s\n' "$1" | "${LEAN_HELD:-${OPT:-/opt/cain}/lean/held.sh}" >/dev/null 2>&1; }
 # A file of his in $FROM_APP, written whole, as his own (the new way).
 put_his() {   # put_his <name> <text>
   printf '%s\n' "$2" | as_him sh -c 'umask 077; mkdir -p "$1" && cat > "$1/.$2" && mv -f "$1/.$2" "$1/$2"' sh "$FROM_APP" "$1"

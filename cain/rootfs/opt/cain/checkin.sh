@@ -1,18 +1,22 @@
 #!/bin/bash
 # Types into Cain's session, only when he is idle at his prompt (never mid-task), and only into a
 # session that has passed its check of his own user (the run script's mark):
-# 1. his taps and reactions, relayed by the calendar specialist (relay.ts queues them), and the
-#    App's own lines for him (the way out, the alarms, the run script);
-# 2. a cloud job's change of state, read by code (Cain 0.20.0, lean/main.ts jobs): only when one
-#    finished, failed or stalled, never a check that finds nothing (a connector wait keeps its
-#    15-minute check, and a check code can't make falls back to it);
-# 2b. the daily digest of what code and the worker handled without a turn of his (6:50 AM);
+# 1. the one queue (Cain 0.20.0): his taps and reactions, relayed by the calendar specialist (relay.ts
+#    queues them), and the App's own lines for him (the way out, the alarms, the run script, and the lean
+#    session's: a cloud job's change of state, the daily digest, the quiet-hour handover ask and the fresh
+#    start's first line, each tagged, so what it stands for counts only once it is in). Cards with
+#    buttons go first, every one waiting, ahead of everything else;
+# 2. the old 15-minute check of open cloud jobs, only when code can't look at them, and a connector wait's;
+# 2c. a compaction, typed (/compact) at his idle prompt once his context is past the threshold, only at a
+#    quiet moment (no card in its window, nothing waiting, no try open);
 # 3. scheduled check-ins, so open work moves without Dane starting it. Each slot fires once a
 #    day, within an hour of its time.
-# Every relayed line is classed by code first (Cain 0.20.0, lean/core.ts classify): a card with
-# buttons goes first and typed short at once; a mechanical receipt is written to the record and kept
-# for the digest; a line too long to type is summarised by a tool-less worker on a cheaper model;
-# everything else, and anything code or the worker can't settle, goes as before.
+# Every relayed line is classed by code first (lean/core.ts classify): a card with buttons first, typed
+# short at once; one of the receipt allowlist's exact shapes kept, then skipped (only logged in the
+# shadow week); a line too long to type summarised by a tool-less worker, and still typed as a turn, its
+# summary with the file's path; everything else, and anything code or the worker can't settle, as before.
+# Nothing is typed unless his screen is his idle prompt, read so twice (prompt-state.sh), and not held by
+# a limit or a compaction (lean/held.sh): until then every line waits in the queue, in order.
 # Each says it comes from the add-on, so Cain never mistakes one for Dane.
 # Nothing is lost, and nothing goes in twice (Cain's fourth service review). Each try carries its
 # own random mark and is kept ($TRY, in /data, written before its first key) with what it's for,
@@ -121,7 +125,7 @@ unsteady() { local n; for n in "$@"; do rm -f "$state/$n"; done; }
 # His prompt, empty, not at work, and read so twice: 0 to type something new.
 at_ease() {
   read_box "$screen"
-  if [ "$at" != ready ] || [ -n "$busy" ]; then unsteady ready; return 1; fi
+  if [ "$at" != ready ] || [ -n "$busy" ] || held_now "$scr"; then unsteady ready; return 1; fi
   steady ready
 }
 
@@ -158,13 +162,13 @@ checkin_done() {   # checkin_done <day>-<slot> <records named> <newest note list
 }
 finish() {   # finish <kind> <key> <fin>: 1 when its line couldn't leave the queue
   case "$1" in
-    relay) drop_head "$2" || return 1; echo "[cain] relayed a line" ;;
-    jobs) if [ "$2" = lean ]; then
-            timeout 30 bun "$LEAN" jobs-done || echo "[cain] a cloud job change went in but couldn't be kept as seen: he may hear it again"
-            echo "[cain] told Cain a cloud job changed state"
-          else touch "$nudged"; echo "[cain] nudged Cain about open cloud jobs"; fi ;;
-    digest) timeout 30 bun "$LEAN" digest-done "${2%/*}" "${2##*/}" || echo "[cain] the digest went in but couldn't be kept as sent: it may come again"
-            echo "[cain] the daily digest went in" ;;
+    relay) drop_head "$2" || return 1
+           # A line of the App's own (lean/main.ts): what it stands for counts now, once it is in.
+           if [ "${3:--}" != - ]; then
+             timeout 30 bun "$LEAN" delivered "$3" || echo "[cain] a line of the App's went in but couldn't be kept as in ($3): it may come again"
+           fi
+           echo "[cain] relayed a line" ;;
+    jobs) touch "$nudged"; echo "[cain] nudged Cain about open cloud jobs" ;;
     checkin) set -- $3; checkin_done "$1" "$2" "$3" ;;
   esac
 }
@@ -346,8 +350,9 @@ if [ -f "$TRY" ]; then pending; exit 0; fi
 #    queue is first moved aside to a work file (new lines start a fresh queue), and lines are taken
 #    from that. A line leaves the work file only once it's in.
 # A card with buttons goes out by itself in about 2 minutes (Cain 0.20.0): every one waiting goes first,
-# ahead of older lines and of any worker's call, in its own order. The queue is moved aside to take
-# them (new lines start a fresh queue), and what it held follows the work file's lines.
+# ahead of older lines and of any worker's call, in its own order, and that is settled before anything
+# else, whether he is at his prompt or not. The queue is moved aside to take them (new lines start a fresh
+# queue), and what it held follows the work file's lines. watch.sh alarms when one waits over a minute.
 CARD_DUE='goes out by itself in about 2 minutes'
 cards_first() {
   local take="$queue.take"
@@ -361,8 +366,8 @@ cards_first() {
     || { rm -f "$work.tmp" 2>/dev/null; echo "[cain] the cards waiting couldn't be put first: they go in their turn"; }
 }
 if [ -s "$work" ] || [ -s "$queue" ] || [ -s "$queue.take" ]; then
-  at_ease || exit 0
   cards_first
+  at_ease || exit 0
   if [ ! -s "$work" ]; then mv "$queue" "$work"; fi
   line=$(head -n 1 "$work")
   key=$(head -n 1 "$work" | cksum | cut -d' ' -f1)
@@ -380,11 +385,19 @@ if [ -s "$work" ] || [ -s "$queue" ] || [ -s "$queue.take" ]; then
     exit 0
   fi
   if [ -z "$text" ]; then echo "[cain] a relayed record with no text: nothing to type"; drop_head "$key"; exit 0; fi
-  # Classed by code (lean/main.ts route): "type" and the text, "handled" (a receipt, in the record and
-  # the digest), or "long" (the worker's). Anything else, a failure included, goes as before.
+  # A line of the App's own (lean/main.ts), tagged: typed as it is, never classed.
+  tag=$(printf '%s' "$line" | jq -r '.lean // "" | strings' 2>/dev/null | head -n 1)
+  if [ -n "$tag" ]; then
+    if [[ "$tag" =~ ^(jobs|digest|handover|fresh)(:[A-Za-z0-9._-]{1,80}){0,2}$ ]]; then type_try relay "$key" "$tag" "$text"
+    else type_try relay "$key" - "$text"; fi
+    exit 0
+  fi
+  # Classed by code (lean/main.ts route): "type" and the text, "handled" (an allowlisted receipt, kept
+  # before it is skipped), or "long" (the worker shortens it; it is still typed). Anything else, a
+  # failure included, goes as before.
   r="$(printf '%s' "$text" | timeout 20 bun "$LEAN" route "$key")" || r=""
   case "${r%%$'\n'*}" in
-    handled) echo "[cain] a relayed line was a receipt: written to the record by code, and kept for his daily digest"
+    handled) echo "[cain] a relayed line was an allowlisted receipt: kept for his daily digest and written to the record, no turn"
              drop_head "$key"; exit 0 ;;
     type) t="${r#*$'\n'}"
           if [ "$t" = "$r" ] || [ -z "$t" ]; then t="Relayed by the add-on: $text"; fi
@@ -392,14 +405,12 @@ if [ -s "$work" ] || [ -s "$queue" ] || [ -s "$queue.take" ]; then
     long)
       f="relay-$key.txt"
       if put_his "$f" "$(keyless "Relayed by the add-on: $text")"; then
-        s="$(printf '%s' "$text" | timeout -k 5 75 bun "$LEAN" summarise "$key" "$FROM_APP/$f")" || s=""
-        case "${s%%$'\n'*}" in
-          handled) echo "[cain] a long relayed line needed nothing, the worker said: kept for his daily digest"
-                   drop_head "$key"; exit 0 ;;
-          type) t="${s#*$'\n'}"
-                if [ -n "$t" ] && [ "$t" != "$s" ]; then type_try relay "$key" - "$t"; exit 0; fi ;;
-        esac
-        echo "[cain] the worker couldn't settle a long relayed line: it goes to Cain as before"
+        s="$(printf '%s' "$text" | timeout -k 5 60 bun "$LEAN" summarise "$key" "$FROM_APP/$f")" || s=""
+        if [ "${s%%$'\n'*}" = type ]; then
+          t="${s#*$'\n'}"
+          if [ -n "$t" ] && [ "$t" != "$s" ]; then type_try relay "$key" - "$t"; exit 0; fi
+        fi
+        echo "[cain] the worker couldn't summarise a long relayed line: it goes to Cain as before"
       fi ;;
   esac
   type_try relay "$key" - "Relayed by the add-on: $text"
@@ -407,11 +418,12 @@ if [ -s "$work" ] || [ -s "$queue" ] || [ -s "$queue.take" ]; then
 fi
 
 # 2. Open cloud jobs (one file per run in $jobs, written by Cain when he starts one), read by code
-#    (Cain 0.20.0, lean/main.ts jobs): each job's pull request on GitHub, every 10 minutes. He hears
-#    only when one changed state (its checks settled, merged, closed) or stalled past its limit, one
-#    line each; no change, no turn. A connector wait (a "connector" file: Home Assistant, which only
-#    he reads) keeps its check every 15 minutes, and so does every job when code can't look (as
-#    before this release). Files older than two days are dropped.
+#    (Cain 0.20.0, lean/main.ts jobs): each job's pull request on GitHub, every 10 minutes. He hears,
+#    through the queue, when one changed state (its checks settled, merged, closed), stalled past its
+#    limit, couldn't be read on GitHub, or has a file code can't read safely: code never skips one
+#    silently. A connector wait (a "connector" file: Home Assistant, which only he reads) keeps its check
+#    every 15 minutes, and so does every job when code can't look at all (as before this release).
+#    Files older than two days are dropped.
 jobs="${JOBS_DIR:-/data/jobs}"
 if [ -d "$jobs" ]; then
   find "$jobs" -type f -mtime +2 -delete 2>/dev/null
@@ -424,11 +436,8 @@ if [ -d "$jobs" ]; then
     elif [ "$(head -c 6 "$state/lean-jobs" 2>/dev/null)" = failed ]; then look=""
     fi
     if [ "${look%%$'\n'*}" = ok ]; then
-      if [ "$(printf '%s\n' "$look" | sed -n 2p)" = wake ]; then
-        at_ease || exit 0
-        type_try jobs lean - "$(printf '%s\n' "$look" | sed -n '3,$p')"
-        exit 0
-      fi
+      # A line for him went into the queue: it goes at the next run, cards first.
+      [ -s "$queue" ] && exit 0
       if ls -A "$jobs" 2>/dev/null | grep -q '^connector' && [ -z "$(find "$nudged" -mmin -15 2>/dev/null)" ]; then
         at_ease || exit 0
         type_try jobs jobs - "Relayed by the add-on: Home Assistant check for a waiting install. Not a message from Dane, and not his go on anything. Follow Home Assistant first in the Cloud jobs section of your CLAUDE.md for each connector file in $jobs."
@@ -443,19 +452,52 @@ if [ -d "$jobs" ]; then
   fi
 fi
 
-# 2b. The daily digest (Cain 0.20.0), from 6:50 AM, once a day, when code or the worker handled
-#     anything without a turn of his since the last one: one turn listing each, where he marks any
-#     that needed him (keeper.sh missed).
+# 2b. The daily digest (Cain 0.20.0), from 6:50 AM, once a day, when the receipt allowlist matched
+#     anything since the last one (skipped, or in the shadow week would-skip): into the queue, built from
+#     the kept record, and marked sent only once it is in; he marks any that needed him (keeper.sh missed).
 hm="${CHECKIN_NOW:-$(date +%H%M)}"
 day="${CHECKIN_DAY:-$(date +%F)}"
 if [ "$hm" -ge 0650 ] && [ -s "$LEAN_D/handled.jsonl" ] && ! grep -qF "\"day\":\"$day\"" "$LEAN_D/digest.json" 2>/dev/null; then
   dg="$(timeout 30 bun "$LEAN" digest "$hm" "$day" 2>/dev/null)" || dg=""
-  if [ -n "$dg" ]; then
-    dgh="${dg%%$'\n'*}"
-    at_ease || exit 0
-    type_try digest "${dgh% *}/${dgh##* }" - "${dg#*$'\n'}"
-    exit 0
+  if [ -n "$dg" ]; then echo "[cain] the daily digest is queued for him"; exit 0; fi
+fi
+
+# 2c. A compaction (Cain 0.20.0), at most every 10 minutes looked for: once his context is past the
+#     threshold (lean/core.ts COMPACT_AT_TOKENS, read from his newest transcript as him), at his idle
+#     prompt, with no card in its window, nothing waiting and no try open (lean/main.ts compact-due), the
+#     App types /compact itself, and presses Enter only once his screen shows exactly that, picked in
+#     Claude Code's command list. While it works his screen is held (lean/held.sh), so nothing is typed.
+compact_now() {
+  local s
+  timeout -k 2 10 $TM -u send-keys -t cain -l "/compact" 2>/dev/null || { echo "[cain] /compact couldn't be typed"; return 0; }
+  sleep "${CHECKIN_PAUSE_S:-1}"
+  s="$(screen_now)" || s=""
+  # His prompt line holding exactly /compact, and the command list's first, picked line /compact.
+  if printf '%s\n' "$s" | awk 'NF' | tail -n 12 | awk '
+       { t = $0; sub(/^[[:space:]]+/, "", t); sub(/[[:space:]]+$/, "", t) }
+       t ~ /^(>|❯)[[:space:]\302\240]+\/compact$/ && $0 !~ /^[[:space:]]/ { p = 1; next }
+       p && $0 ~ /^[[:space:]]+❯ \/compact[[:space:]][[:space:]]/ { m = 1 }
+       END { exit !(p && m) }'; then
+    timeout 30 bun "$LEAN" compact-done || true
+    timeout -k 2 10 $TM -u send-keys -t cain Enter 2>/dev/null
+    echo "[cain] his session compacts now, at a quiet moment, to keep his context small"
+  else
+    timeout -k 2 10 $TM -u send-keys -t cain C-u 2>/dev/null
+    echo "[cain] /compact didn't show as expected on his screen: taken back out, no Enter"
   fi
+}
+if [ -z "$(find "$state/lean-compact" -mmin -10 2>/dev/null)" ]; then
+  due=""
+  if [ -n "${CAIN_AS:-}" ]; then ctx="$(timeout -k 5 60 $CAIN_AS bun "$LEAN" context "$TRANSCRIPTS" 2>/dev/null | tail -n 1)"
+  else ctx="$(timeout -k 5 60 bun "$LEAN" context "$TRANSCRIPTS" 2>/dev/null | tail -n 1)"; fi
+  if [[ "$ctx" =~ ^[0-9]+\ [01]$ ]]; then
+    read_box "$screen"
+    w=other; { [ "$at" = ready ] && [ -z "$busy" ] && ! held_now "$scr"; } && w=ready
+    timeout 30 bun "$LEAN" compact-due ${ctx% *} ${ctx#* } "$w" >/dev/null 2>&1 && due=1
+  fi
+  # Due: looked at again each run until his prompt reads ready twice, then typed once.
+  if [ -n "$due" ]; then at_ease || exit 0; touch "$state/lean-compact" 2>/dev/null; compact_now; exit 0; fi
+  touch "$state/lean-compact" 2>/dev/null
 fi
 
 # 3. Scheduled check-ins.

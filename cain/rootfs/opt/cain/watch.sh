@@ -4,6 +4,7 @@
 # run script runs it every 10 seconds while his session runs, bounded by a timeout. It reads his
 # screen as checkin.sh does, and raises one alarm (notice.sh tell stalled: his bot, from root's own
 # token, and Home Assistant's push to his phone as the fallback), once a stretch, when
+#   - a calendar card with buttons has waited a minute to go in (Cain 0.20.0): its window is 2 minutes;
 #   - something waits to go in (a relayed line, a try of the App's not yet known to be in, a
 #     check-in within its hour) and nothing has gone in for 30 minutes in which his screen was
 #     neither at work nor showing a question (unstick.sh's), or for 2 hours in all; or
@@ -40,7 +41,16 @@ if [ "$at" = ready ] && printf '%s\n' "$screen" | awk 'NF' | tail -n 12 | grep -
 
 # Something to go in: a relayed line, a try not yet known in, or a check-in within its hour.
 waiting=""
-if [ -s "$QUEUE" ] || [ -s "$QUEUE.work" ] || [ -f "$TRY" ]; then waiting=1; fi
+if [ -s "$QUEUE" ] || [ -s "$QUEUE.work" ] || [ -s "$QUEUE.take" ] || [ -f "$TRY" ]; then waiting=1; fi
+# A card with buttons waiting to go in (Cain 0.20.0): the link posts it by itself 2 minutes after it was
+# made, so one that hasn't been typed into a ready session within CARD_S (a minute) is an alarm at once.
+card_since=""
+if cat "$QUEUE" "$QUEUE.work" "$QUEUE.take" "$TRY" 2>/dev/null | grep -F 'has a card for Dane (card ' | grep -qF 'goes out by itself in about 2 minutes'; then
+  card_since="$(num card)"
+  [ -n "$card_since" ] && [ "$now" -ge "$card_since" ] || { card_since="$now"; keep card "$now"; }
+else
+  rm -f "$DIR/card"
+fi
 hm="${WATCH_HM:-$(date +%H%M)}"; day="${WATCH_DAY:-$(date +%F)}"
 for s in 0710 1230 1730; do
   if [ "$hm" -ge "$s" ] && [ "$hm" -lt "$(( 10#$s + 100 ))" ] && [ ! -f "$CHECKINS/$day-$s" ]; then waiting=1; fi
@@ -84,6 +94,8 @@ fi
 cause=""; kind=stalled
 if [ -n "$odd_since" ] && [ "$odd" = signin ] && [ $((now - odd_since)) -ge "$ODD_S" ]; then
   kind=signin; cause="for $(( (now - odd_since) / 60 )) minutes"
+elif [ -n "$card_since" ] && [ $((now - card_since)) -ge "${WATCH_CARD_S:-60}" ]; then
+  cause="a calendar card with buttons has waited $((now - card_since)) seconds to go in, and goes out to you by itself"
 elif [ -n "$waiting" ] && { [ "$idle" -ge "$IDLE_S" ] || [ $((now - since)) -ge "$ALL_S" ]; }; then
   cause="nothing has gone in for $(( (now - since) / 60 )) minutes"
 elif [ -n "$odd_since" ] && [ $((now - odd_since)) -ge "$ODD_S" ]; then

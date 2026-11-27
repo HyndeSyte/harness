@@ -185,4 +185,28 @@ cleanup_health; trap - EXIT
 ran=$((ran + 1))
 echo "the Supervisor's health check: /health 200 to the hassio network, 503 with the self-restart mark; /ready 503 without the gateway mark, 200 with it; 404 outside it and on any other path, each 404 noted"
 
+# The lean worker (Cain 0.20.0, the first outside review's item 8), in the image with his real user: its
+# launch prefix (lean/main.ts worker-argv, everything before the timeout and Claude Code) can't open the
+# chat plugin's socket, root:cain 0660 as the broker makes it, while as-cain (his own groups) can; and its
+# environment holds only the fixed names.
+lw="$(docker run --rm --entrypoint /bin/bash "$IMG" -c '
+  set -eu
+  mkdir -p /run/cain /data/cain && chown cain:cain /data/cain
+  bun -e "require(\"node:net\").createServer((c) => c.end()).listen(\"/run/cain/discord.sock\")" & sleep 2
+  chown root:cain /run/cain/discord.sock && chmod 0660 /run/cain/discord.sock
+  pre="$(CAIN_AS=/opt/cain/as-cain bun /opt/cain/lean/main.ts worker-argv | jq -r ".cmd | .[0:index(\"timeout\")] | .[]")"
+  mapfile -t P <<< "$pre"
+  probe="const s = require(\"node:net\").connect(\"/run/cain/discord.sock\"); s.on(\"connect\", () => { console.log(\"open\"); process.exit(0); }); s.on(\"error\", (e) => { console.log(e.code); process.exit(0); });"
+  echo "worker $(cd /data/cain && "${P[@]}" bun -e "$probe")"
+  echo "cain $(/opt/cain/as-cain bun -e "$probe")"
+  echo "env $(cd /data/cain && "${P[@]}" env | cut -d= -f1 | sort | tr "\n" " ")"
+  echo "id $(cd /data/cain && "${P[@]}" id -u):$(cd /data/cain && "${P[@]}" id -G)"
+' 2>&1)" || die "the lean worker's launch didn't run in the image: $lw"
+printf '%s\n' "$lw" | grep -qx "worker EACCES" || die "the lean worker's launch could open the chat plugin's socket: $lw"
+printf '%s\n' "$lw" | grep -qx "cain open" || die "as-cain couldn't open the chat plugin's socket, so the lean worker's check proves nothing: $lw"
+printf '%s\n' "$lw" | grep -qx "env DISABLE_AUTOUPDATER HOME LANG LC_ALL LOGNAME PATH TZ USER " || die "the lean worker's environment holds more than its fixed names: $lw"
+printf '%s\n' "$lw" | grep -qx "id 1000:65534" || die "the lean worker doesn't run as his user in no group of his: $lw"
+ran=$((ran + 1))
+echo "the lean worker: his user in no group of his, can't open the chat plugin's socket, only its fixed environment"
+
 echo "C1 image test: $ran cases passed"

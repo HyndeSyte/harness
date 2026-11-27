@@ -92,14 +92,25 @@ export const LAYER_WORDS: Record<Layer, string> = {
 // A usage or spend limit (Cain 0.20.0): Claude Code's own reply when the plan's usage limit or the
 // model's monthly spend limit stops him. On Nov 27 every turn from about 6:20 to 9:04 AM failed on the
 // monthly spend limit while his prompt looked ready, so the probe called that screen ready and no alarm
-// named the cause. Now it is its own status, alarmed at once with the fix, and never ready.
+// named the cause. Now it is its own status, alarmed at once with the fix, and never ready. It counts
+// while it is the newest thing on his screen (no reply of his after it, in the last 40 lines), as
+// lean/held.sh reads it for the typing path, so a limit that a later turn got past no longer counts.
 export type Screen = "ready" | "working" | "signin" | "api" | "limit" | "other";
 export const LIMIT = /you'?ve (hit|reach(?:ed)) your [a-z ]{0,30}limit|\/usage-credits|\b(monthly )?spend limit\b|usage limit (reach(?:ed)|hit)|limit reach(?:ed)[^\n]{0,40}resets/i;
 const SIGNIN = /run \/login|token has expired|authentication_error|invalid api key|not logged in|paste.*code|oauth\/authorize/i;
 const API = /api error|overloaded_error|internal server error|request timed out|connection error|api_error|rate_limit_error|\b(500|502|503|529)\b.*(error|status)|retrying in \d+/i;
+export function limitNow(capture: string): boolean {
+  const lines = capture.split("\n").filter((l) => l.trim()).slice(-40);
+  let lim = false;
+  for (const l of lines) {
+    if (LIMIT.test(l)) lim = true;
+    else if (lim && /^\s*(⏺|●)/.test(l)) lim = false;
+  }
+  return lim;
+}
 export function screenOf(capture: string, promptState: string): Screen {
   const last = capture.split("\n").filter((l) => l.trim()).slice(-12);
-  if (last.some((l) => LIMIT.test(l))) return "limit";
+  if (limitNow(capture)) return "limit";
   if (last.some((l) => SIGNIN.test(l))) return "signin";
   if (last.some((l) => /esc to interrupt/i.test(l))) {
     // A turn at work that is only retrying the model's API is the API not answering.

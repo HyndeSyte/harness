@@ -1050,16 +1050,21 @@ while session_up; do
     end_his_session || fail_closed
     break
   fi
-  # The daily fresh start (Cain 0.20.0, lean/main.ts fresh-due): once a day at a quiet hour (3 to 5 AM,
-  # no message of the owner's for 30 minutes, no job mid-step, nothing waiting to be typed, his screen at
-  # his prompt, an hour since his session started) his session starts fresh, as the App's own restarts
-  # do, from the handover: a line queued first tells him to read state/RESTART.md and the record. A stop
+  # The daily fresh start (Cain 0.20.0, lean/main.ts fresh-due): once a day at a quiet hour (3 to 5 AM),
+  # only when every sign holds: his idle prompt (and no limit or compaction holding it), nothing waiting
+  # to be typed, no card in its window, no relayed line for 15 minutes, no message of the owner's for 30,
+  # no job mid-step, an hour since his session started. Then his handover is asked for first (a line in
+  # the queue with a request id of the App's), and only once the record keeper has that request done,
+  # and every sign holds again, does his session start fresh, as the App's own restarts do. Lines that
+  # come meanwhile wait in the queue for the new session, its first line telling him to read up. A stop
   # the App asks for itself (end_his_session records it), so the probe counts no early exit.
   if [ -n "$checked" ] && [ $(( $(date +%s) - fresh_looked )) -ge "${LEAN_FRESH_EVERY_S:-300}" ]; then
     fresh_looked=$(date +%s)
-    scr="$(timeout 10 $TMUX_CMD -u capture-pane -p -J -t cain -S -400 2>/dev/null | "$OPT/prompt-state.sh" 2>/dev/null | head -n 1)" || scr=other
+    cap="$(timeout 10 $TMUX_CMD -u capture-pane -p -J -t cain -S -400 2>/dev/null)" || cap=""
+    scr="$(printf '%s\n' "$cap" | "$OPT/prompt-state.sh" 2>/dev/null | head -n 1)" || scr=other
+    if printf '%s\n' "$cap" | "$OPT/lean/held.sh" >/dev/null 2>&1; then scr=held; fi
     if timeout 30 bun "$OPT/lean/main.ts" fresh-due "${scr:-other}" "$up_since" >/dev/null 2>&1; then
-      bashio::log.info "His session starts fresh for its daily clean start at a quiet hour, from the handover (state/RESTART.md and the record), to keep his context small"
+      bashio::log.info "His session starts fresh for its daily clean start at a quiet hour, from his handover in the record, to keep his context small"
       end_his_session || fail_closed
       break
     fi

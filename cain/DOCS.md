@@ -536,40 +536,55 @@ context (90th percentile 683K, the most 966K), with only 8 compactions in the we
 turn from about 6:20 to 9:04 AM failed on the monthly spend limit while the App's probe called his
 screen ready, so no alarm named the cause.
 
-So in this release code does the routine part, and he gets a turn only when it needs him:
+So in this release code does the routine part, and he gets a turn only when it needs him. After the
+first outside review, nothing is dropped on a model's judgment, and nothing at all is skipped in the
+first week:
 
 - **Your messages are untouched.** They reach him directly, as before. Nothing below classes, holds or
   summarises them, nor your page's notes.
-- **Cloud jobs are watched by code.** Every 10 minutes the App reads each Build job's pull request on
-  GitHub and tells him in one line only when it changed: its checks passed or failed, it merged or
-  closed. No change, no turn. A job nobody finishes is still heard: a Build with no change for 3
-  hours, a Ship 25 minutes after it started and then every 45 minutes. If GitHub can't be read, he
-  gets the old check every 15 minutes. A wait on Home Assistant's connector keeps its 15-minute check.
-- **Relayed lines are sorted by code first.** A calendar card with buttons always goes first and at
-  once, typed short with its show command, never behind anything (it goes out by itself in about 2
-  minutes). A receipt that needs nothing (a tap of Not now, Hold it, Don't, Drop it, Leave it, Keep
-  cards or No, a review seat passing again, a held question now in front of you) is written to his
-  record by the App (state/receipts) with no turn. A line too long to type is read first by a small
-  worker on a cheaper model (Sonnet 5.5, low effort, pinned in code) with no tools at all, nothing that
-  reaches you, Discord or his record: it only says "needs Cain", and then he gets its two-line summary,
-  or "no action". If the worker fails or answers anything else, the line goes to him as before.
-  Everything else goes as before.
-- **Nothing is dropped silently.** Each morning at 6:50 he gets one digest of everything code and the
-  worker handled without him, and marks any that turned out to need him; the App counts those for the
-  week.
-- **His context stays small.** His session compacts at 250K tokens, set in code. Once a day, between 3
-  and 5 AM, when you haven't written for 30 minutes and no job is mid-step, the App starts his session
-  fresh from his handover (state/RESTART.md and the record), the same way its own restarts do.
-- **The hourly liveness check is one word.** The line is shorter, and he answers it with a single word
-  and no other tool call.
-- **A usage or spend limit is named at once.** When his screen shows Claude Code's usage or spend limit
-  reply ("You've hit your monthly spend limit", "/usage-credits"), the App alarms through the usual
-  alarm path with the fix: switch his model, or raise the limit. The 5-minute probe no longer calls
-  that screen ready.
-- **A usage line in the App's log once a day:** his tokens by model and by what started each turn (you,
-  a relay, a job, the probe, a check-in, the digest), the context each call carried (median, 90th
-  percentile, most), compactions, the worker's own use, and how many lines were handled without him
-  and how many he marked as needing him.
+- **One queue, cards first.** Every line the App types for him (relays, job lines, the digest, the
+  fresh start's lines) goes through one queue. A calendar card with buttons is recognised before
+  anything else and goes to the head of the queue, typed short with its show command. If a card can't
+  be typed into his ready session within about a minute, you get the usual "Cain isn't getting
+  messages" alarm (the card itself goes out to you by itself at 2 minutes).
+- **Not ready means wait.** The App types only at his idle prompt, recognised by its shape. A usage or
+  spend limit on his screen, a compaction at work, a start, a question or any screen it doesn't know
+  counts as not ready: lines wait in the queue and go in order once he's back, cards first. A limit
+  also raises its own alarm at once, with the fix: switch his model, or raise the limit.
+- **Receipts skip his turn only by an exact list.** A tap of Not now, Hold it, Don't, Drop it, Leave it,
+  Keep cards or No on one of his own questions (with nothing after it, and no date, deadline, error,
+  review or card in its question), a review seat passing its nightly check again, and a held question
+  now in front of you. Anything else, anything from the calendar App, and any new kind of line is a turn.
+  Each skip is kept on disk before it's skipped (if that fails, it goes to him), written to his record
+  (state/receipts), and listed in his daily digest.
+- **A shadow week first.** For the first 7 days after you install this, nothing is skipped: each line the
+  list would skip still reaches him, and his digest lists it as "would skip" so he can mark a mistake.
+  After 7 days the list starts skipping by itself, unless he marked one: then it stays in shadow and his
+  digest says so. The setting is the one word in /data/lean/shadow at the Pi: auto (the default), on, or
+  off.
+- **Long lines are shortened, never dropped.** A line too long to type is summarised by a small worker
+  (Sonnet 5.5, low effort) that has no tools at all and never decides whether he sees it: he always gets
+  its two-line summary and the file with the whole line. It runs at most 45 seconds, with his sign-in but
+  in no group of his (so it can't reach the Discord plugin), with nothing of the App's environment. If it
+  fails or runs out of time, the line goes to him as before.
+- **Cloud jobs are watched by code, and fail open.** Every 10 minutes the App reads each Build job's pull
+  request on GitHub and tells him in one line when it changed (checks passed or failed, merged, closed)
+  or stalled (a Build with no change for 3 hours, a Ship 25 minutes in and then every 45 minutes). A job
+  GitHub can't be read for, or a job file code can't read safely, is a line to him too, never a silent
+  skip. What he heard is kept only once the line went in.
+- **The daily digest.** Each morning from 6:50 he gets one line listing what the receipt list matched,
+  built from the kept record and counted as sent only once it went in; what didn't, comes again the next
+  day.
+- **His context stays small.** Once his context passes 450K tokens the App compacts his session itself,
+  at a quiet moment: never while a card is in its window or anything waits to go in. Claude Code's own
+  compaction stays only as a backstop at 850K. Once a day, between 3 and 5 AM, when you haven't written
+  for 30 minutes, nothing was relayed for 15, nothing waits, no card is in its window and no job is
+  mid-step, the App first asks him for his handover, waits until his record has it, and only then starts
+  his session fresh; lines that come meanwhile wait for the new session.
+- **The hourly liveness check is one word**, and still needs his real reply.
+- **A usage line in the App's log once a day:** his tokens by model and by what started each turn, the
+  context each call carried, compactions, the worker's own use, and how many lines were skipped and how
+  many he marked.
 
 How the week after is measured, from those usage lines: at least half the cache reads gone, no missed
 action (no digest line he marks as needing him that was late to matter), and his replies to you no

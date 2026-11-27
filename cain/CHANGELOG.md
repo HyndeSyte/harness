@@ -3,11 +3,12 @@
 ## 0.20.0
 
 - Cain now gets a turn only when something needs him, so he spends far less of his usage. Your own messages reach him as before, untouched.
-- The App watches his cloud jobs itself and tells him only when one finishes, fails or stalls, instead of asking him to check every 15 minutes.
-- Calendar cards with buttons still reach him at once, first in line, so they don't go out on their own.
-- Receipts that need nothing, like a tap of Not now, are written to his record by the App. Long relayed lines are read first by a small, cheaper helper with no tools, which only says whether Cain must look.
-- Nothing is dropped: each morning he gets one list of what was handled without him, and marks anything that needed him after all.
-- His working memory stays smaller: he compacts sooner, and starts fresh from his notes once a day in the early morning when nothing is going on.
+- The App watches his cloud jobs itself and tells him when one finishes, fails, stalls, or can't be read, instead of asking him to check every 15 minutes.
+- Calendar cards with buttons always go to him first. If one can't reach him within about a minute, you get the usual alarm.
+- Nothing is dropped on a model's say: long relayed lines reach him as a short summary with the whole line beside it.
+- For the first week nothing is skipped at all. After that, only a short fixed list of receipts that need nothing (like a tap of Not now) skips his turn, each one kept and listed for him every morning.
+- Nothing is typed into his session while it can't take it (a usage limit, a compaction, a restart): lines wait and go in order once he's back.
+- His working memory stays smaller: the App compacts it at quiet moments, and starts him fresh once a day in the early morning, after he has written down where things stand.
 - If a usage or spend limit stops him, you get an alarm right away naming it, with the fix: switch his model or raise the limit.
 - A daily usage line in the App's log shows where his usage goes, so the change can be measured.
 
