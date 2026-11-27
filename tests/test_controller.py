@@ -125,10 +125,11 @@ def test_canary_then_clear_digest(ledger, tmp_path, clock):
     assert "canary ok" not in " ".join(rig.texts())          # silent when fine
     at_local(clock, 7, 0)
     rig.c.tick()
-    assert rig.texts()[-1].startswith("Clear · inputs fresh · 0 need you · 0 failures")
+    assert ledger.get_meta("last_digest_text").startswith("Clear · inputs fresh · 0 need you · 0 failures")
+    assert rig.texts()[-1].startswith("<b>Today, ") and "need you" not in rig.texts()[-1]   # his digest
     at_local(clock, 7, 30)
     rig.c.tick()
-    assert sum(t.startswith("Clear") for t in rig.texts()) == 1       # once a day
+    assert sum(t.startswith("<b>Today, ") for t in rig.texts()) == 1  # once a day
 
 
 def test_a_failed_canary_makes_the_digest_say_so(ledger, tmp_path, clock):
@@ -139,7 +140,7 @@ def test_a_failed_canary_makes_the_digest_say_so(ledger, tmp_path, clock):
     rig.c.tick()
     at_local(clock, 7, 1)
     rig.c.tick()
-    digest = rig.texts()[-1]
+    digest = ledger.get_meta("last_digest_text")      # the full digest, Cain's (0.24.5)
     assert digest.startswith("<b>Attention needed</b>")
     assert "Claude canary failed: wrong answer" in digest
 

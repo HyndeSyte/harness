@@ -394,11 +394,8 @@ def owner_text(a: Agenda | None, *, now: datetime, local: ZoneInfo, failures: li
                 if _clash(p, q):
                     out.append(f"{when(p)} {model_text(_cut(p.title, cut))} and {when(q)} "
                                f"{model_text(_cut(q.title, cut))} are at the same time: move one of them.")
-        for f in failures:
-            line = f[:1].upper() + f[1:]
-            if line.endswith("Nothing changed."):
-                line += " Ask again if you still want it."
-            out.append(escape(line))
+        for f in failures:                 # what he asked for, when, and what came of it (daily._failed)
+            out.append(escape(f[:1].upper() + f[1:]))
         if a.read < a.configured:
             out.append(f"{a.configured - a.read} of {a.configured} calendars weren't read today, so this "
                        "list may be missing events.")

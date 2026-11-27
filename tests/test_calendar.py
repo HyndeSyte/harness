@@ -336,7 +336,7 @@ def test_work_titles_are_kept_as_slots_not_words(ledger, tmp_path, clock):
     at_local(clock, 7, 0)
     r.c.tick()
     d = r.bot.texts()[-1]
-    assert "MSIP" not in d and "9:00 AM–10:00 AM (work item, title not kept)" in d
+    assert "MSIP" not in d and "• <b>9:00</b> (work item, title not kept)" in d
     assert "MSIP" not in ledger.get_meta("last_digest_text")
 
 
@@ -386,13 +386,15 @@ def test_the_morning_digest_carries_todays_calendar(ledger, tmp_path, clock):
     r.c.tick()
     at_local(clock, 7, 0)
     r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("Clear · inputs fresh")
     assert "<b>Today</b>\nAll day · Feed delivery\n9:00 AM–10:00 AM Vet visit ⚠ overlaps\n" \
            "9:30 AM–10:30 AM School call ⚠ overlaps" in d
     assert r.status["last_digest"]["sent"] is True and "Vet visit" in \
         r.status["last_digest"]["text"]
     assert r.status["calendar"][0]["label"] == "owner@example.com"
+    assert r.bot.texts()[-1] == ("<b>Today, Wed Oct 21</b>\n• <b>9:00</b> Vet visit\n• <b>9:30</b> School call\n"
+                                 "<small>All day: Feed delivery</small>")    # his digest
 
 
 def test_before_launch_the_digest_is_kept_for_the_page_not_sent(ledger, tmp_path, clock):
@@ -414,7 +416,7 @@ def test_a_dead_feed_makes_the_digest_say_so(ledger, tmp_path, clock):
     r.c.tick()
     at_local(clock, 7, 0)
     r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("<b>Attention needed</b>")
     assert "One of your calendars: not read yet; Google says" in d and "reset" in d
     assert "can't say what's on it" in d
@@ -432,10 +434,10 @@ def test_the_digest_waits_briefly_for_a_read_in_flight(ledger, tmp_path, clock):
         ledger.db.execute("UPDATE inputs SET last_success_at=? WHERE name LIKE 'calendar:%'",
                           ((clock() - timedelta(hours=1)).isoformat(),))
     r.c.tick()
-    assert ex.pending and not any(t.startswith("Clear") for t in r.bot.texts())
+    assert ex.pending and not any("Today" in t for t in r.bot.texts())
     at_local(clock, 7, 6)              # past the grace period: compose without it
     r.c.tick()
-    assert any("Clear" in t or "Attention" in t for t in r.bot.texts())
+    assert any(t.startswith("<b>Today, ") for t in r.bot.texts())
 
 
 def test_a_feed_that_stopped_reading_goes_stale_after_two_hours(ledger, tmp_path, clock):
@@ -447,7 +449,7 @@ def test_a_feed_that_stopped_reading_goes_stale_after_two_hours(ledger, tmp_path
         r.c.tick()
     at_local(clock, 7, 0)
     r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("<b>Attention needed</b>")
     assert "Calendar owner@example.com: not working since 4:30 AM today; Google isn't answering right now" in d
 
@@ -462,7 +464,8 @@ def test_a_dead_feed_is_tried_once_before_the_digest_not_hammered(ledger, tmp_pa
             timedelta(seconds=s_)
         r.c.tick()
     assert len(r.transport.requests) - n <= 1
-    assert any(t.startswith("<b>Attention needed</b>") for t in r.bot.texts())
+    assert ledger.get_meta("last_digest_text").startswith("<b>Attention needed</b>")
+    assert any("can't say what's on them" in t for t in r.bot.texts())          # his digest
 
 
 def test_a_read_that_never_finishes_is_abandoned(ledger, clock):
@@ -502,7 +505,8 @@ def test_no_calendar_no_reads_and_no_section(ledger, tmp_path, clock):
     at_local(clock, 7, 0)
     r.c.tick()
     assert r.transport.requests == []
-    assert "Today" not in r.bot.texts()[-1] and r.status["calendar"] == []
+    assert "Today" not in ledger.get_meta("last_digest_text") and r.status["calendar"] == []
+    assert r.bot.texts()[-1].endswith("No calendar is set up yet.")                # his digest
 
 
 def test_the_harness_never_writes_to_a_calendar(ledger, tmp_path, clock):

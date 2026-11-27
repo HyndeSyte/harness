@@ -118,11 +118,11 @@ def test_at_most_three_problem_lines():
     text = shown(d)
     problems = text.split("\n\n", 1)[1].split("\n")
     assert len(problems) == 3 and all("same time" in p for p in problems)
-    # A change he asked for that didn't go through says what to do.
+    # A change he asked for that didn't go through: what it was, when, and what came of it.
     d = compose(digest.Agenda([ev(9, 0, 10, 0, "A")], 0, 1, 1),
                 failures=["your change to “Lunch” (Thu 3:00 PM) wasn't done: the calendar refused it. "
                           "Nothing changed."])
-    assert shown(d).endswith("Nothing changed. Ask again if you still want it.")
+    assert shown(d).endswith("wasn't done: the calendar refused it. Nothing changed.")
     assert shown(d).split("\n")[-1].startswith("Your change to")
 
 

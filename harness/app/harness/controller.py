@@ -3752,8 +3752,8 @@ class Controller:
                                 self.mail_dates.digest_line() if self.mail_dates else "",
                                 self.meaning_live.digest_line() if self.meaning_live else "")
                                 if x), watch=self.inputs,
-                            pairs=self.family_copy.pairs if self.family_copy else None,
-                            name=self.family_copy.name() if self.family_copy else "")
+                            pairs=getattr(self.family_copy, "pairs", None),
+                            name=self.family_copy.name() if hasattr(self.family_copy, "name") else "")
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:
