@@ -58,10 +58,13 @@ jobs:
           bun add -d typescript@5.9.3 @types/bun@1.3.1 >/dev/null
           cd "$GITHUB_WORKSPACE"
           /tmp/tscheck/node_modules/.bin/tsc -p cain/tsconfig.check.json > /tmp/tsc.txt || true
-          if grep -E "error TS(2304|2305|2307|2552|2724)" /tmp/tsc.txt; then exit 1; fi
+          # TS2300 (a name declared twice, two imports of one name included) and TS2440 (an import that clashes
+          # with a local name) are gated too (Cain 0.19.2): Bun binds one of the two silently. The one exception is
+          # pcjobs/worker.ts's two Refusal types, a type-only clash erased at run time, left until its next policy round.
+          if grep -E "error TS(2300|2304|2305|2307|2440|2552|2724)" /tmp/tsc.txt | grep -vE "^cain/rootfs/opt/cain/pcjobs/worker\.ts\([0-9]+,[0-9]+\): error TS2300: Duplicate identifier 'Refusal'\.$"; then exit 1; fi
           echo "every name and import resolves ($(grep -c 'error TS' /tmp/tsc.txt) type nits not gated)"
           /tmp/tscheck/node_modules/.bin/tsc -p keeper/tsconfig.check.json > /tmp/tsc-keeper.txt || true
-          if grep -E "error TS(2304|2305|2307|2552|2724)" /tmp/tsc-keeper.txt; then exit 1; fi
+          if grep -E "error TS(2300|2304|2305|2307|2440|2552|2724)" /tmp/tsc-keeper.txt; then exit 1; fi
           echo "the keeper's names and imports resolve too ($(grep -c 'error TS' /tmp/tsc-keeper.txt) type nits not gated)"
       # C1's image test: Cain's real image (amd64 here; the Pi is arm64, where the first start
       # checks the real Discord login and a real Claude session before it switches), the

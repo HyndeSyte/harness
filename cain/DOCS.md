@@ -189,6 +189,11 @@ are barred from them, and once his session runs as its own user (the next step) 
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy
 key, and Cain is told if it doesn't.
 
+Since 0.19.0 and until 0.19.2, Cain could not accept an update of himself: a mix-up in his App's
+code gave his drill check the wrong kind of store, so every install of Cain was refused with "the
+drill flags' high-water time can't be kept". 0.19.2 fixes it, and his tests now fail on that kind of
+mix-up before a change can reach a Ship card.
+
 ## If the calendar specialist stops
 
 Cain's App and the Harness App check each other every minute. If Harness hasn't
@@ -213,7 +218,7 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
-### The privacy backstop (since 0.18.1, tightened in 0.19.2)
+### The privacy backstop (since 0.18.1, tightened in 0.19.3)
 
 Before anything goes to a seat, the review runner checks it in code and fails closed. Over the
 brief (its topic, question, body and id) it runs every built-in pattern (an email address, a phone
@@ -249,7 +254,7 @@ findings are kept in the rounds file under that round of that change. A fix-only
 findings are built from those lines alone, for the change key taken from the brief's validated change
 identity (its pull request, or its change key); the previous round's queue record is read only to
 check it is that round of that change and wasn't blocked, never for its text. Rounds answered before
-0.19.2 kept no such lines, so a fix-only round after one sends no earlier findings. A brief has no
+0.19.3 kept no such lines, so a fix-only round after one sends no earlier findings. A brief has no
 field for them, so a brief carrying earlier findings, or any field not in its allowlist, is refused
 whole and nothing is queued. A change key can't be shaped like a pull request's key (`pr-<number>`).
 A round id is fixed for good: an id already queued, or already a round of any change (the same change
