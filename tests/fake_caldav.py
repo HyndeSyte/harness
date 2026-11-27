@@ -108,6 +108,7 @@ class FakeICloud:
         self.drop_response_next = False  # the next write lands, then its answer is lost
         self.status_after_write = None   # the next write lands, then answers this
         self.before_write = None         # called just before a write is decided
+        self.stale_report: dict[str, tuple[str, str]] = {}   # path -> (etag, ics) a listing still shows: behind
 
     # -- what the tests look at ---------------------------------------------------
     def methods(self) -> list[str]:
@@ -158,7 +159,8 @@ class FakeICloud:
                 f"<D:getetag>{escape(etag)}</D:getetag>"
                 f"<C:calendar-data>{escape(ics)}</C:calendar-data></D:prop>"
                 "<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
-                for p, (etag, ics) in self.events.items() if p.startswith(cal))
+                for p, (etag, ics) in ({**self.events, **{k: v for k, v in self.stale_report.items()
+                                                           if k in self.events}}).items() if p.startswith(cal))
             return HttpResponse(207, {}, ('<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:'
                                           f'xml:ns:caldav">{items}</D:multistatus>').encode())
         if method == "GET":

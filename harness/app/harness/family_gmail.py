@@ -132,6 +132,8 @@ PARTIAL_SINCE = "family_gmail_partial_since"
 OWN_MODE = "family_gmail_own_mode"         # "dry" or "live": leaving the dry run clears what it kept
 _DRY_METAS = (FEED_SIZE, FEED_SMALL, OWN_ODD, OWN_SUSPECT, PARTIAL_SINCE)
 DRY_COUNTS = "family_gmail_dry_counts"     # the dry run's would-write and would-remove, for the digest
+DRY_WEEK = "family_gmail_dry_week"         # each drive block the dry run would write, and when it was first seen
+WEEK = timedelta(days=7)
 MAX_SAMPLES = 3                     # anonymised feed samples kept for each kind, in the dry run
 SAMPLE_DAYS = 14                    # and none kept longer than this
 SAMPLE_FORMAT = "7"                 # samples written by any other build are removed when the dry run starts
@@ -256,17 +258,50 @@ def own_days_from_options(data_dir: str) -> int:
     return min(max(value, 1), OWN_DAYS_MAX)
 
 
-def own_dry_run_from_options(data_dir: str) -> bool:
-    """The drive_dry_run option: his own appointments' drives only logged, never written or told. Off unless
-    it reads as a plain true: drive blocks are written (Nov 27, at his word: "no drive time"). It took the
-    place of own_drive_dry_run, which was on by default and is no longer read, so the old setting doesn't
-    keep his drives in the log. Settings that can't be read at all are a dry run."""
+_MISSING = object()
+
+
+def _drive_options(data_dir: str) -> dict | None:
     try:
         with open(os.path.join(data_dir, "options.json"), encoding="utf-8") as f:
-            value = json.load(f).get("drive_dry_run", False)
-    except (OSError, ValueError, AttributeError):
-        return True                    # settings that can't be read write nothing new: a dry run
-    return value is True
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def drive_dry(ledger: Ledger, data_dir: str) -> bool:
+    """His own appointments' drives only logged, never written or told: True unless he has turned them on by
+    a tap (drive_cards.LIVE, in the ledger). No option ever turns them on (the review of Nov 27).
+
+    On the first read, the old own_drive_dry_run setting is carried into the switch: live only when it was a
+    plain false and drive_dry_run a plain false too, so he had them on already; a true, a missing value,
+    settings that can't be read or anything but a clean boolean keep the dry run. After that the
+    drive_dry_run setting can only stop them: a plain true turns the switch off (so turning the setting off
+    again is still a dry run until he taps Turn on), and settings that can't be read are a dry run for that
+    read."""
+    opts = _drive_options(data_dir)
+    state = ledger.get_meta(drive_cards.LIVE)
+    if state not in ("on", "off"):
+        if opts is None:
+            return True                        # migrated once they can be read
+        old, new = opts.get("own_drive_dry_run", _MISSING), opts.get("drive_dry_run", _MISSING)
+        state = "on" if old is False and new is False else "off"
+        with ledger.tx() as db:
+            ledger.set_meta(drive_cards.LIVE, state, db)
+            ledger.event("drive_dry_run_migrated", {"live": state == "on",
+                                                    "old": old if isinstance(old, bool) else "other",
+                                                    "new": new if isinstance(new, bool) else "other"}, db=db)
+        log.info("drive blocks: the old dry run setting carried over, %s", "live" if state == "on" else "dry run")
+    if opts is None:
+        return True
+    if opts.get("drive_dry_run") is True:
+        if state == "on":
+            with ledger.tx() as db:
+                ledger.set_meta(drive_cards.LIVE, "off", db)
+                ledger.event("drive_live_off_by_option", {}, db=db)
+        return True
+    return state != "on"
 
 
 def cleanup_from_options(data_dir: str) -> bool:
@@ -560,17 +595,8 @@ class FamilyGmail:
         self._last: tuple | None = None    # (settings, what he'd said) at the last read
 
     def _own_dry(self) -> bool:
-        """His own appointments' drives only logged: the drive_dry_run option, unless he tapped Write them on
-        the drive blocks' card (drive_cards.note_card). That tap lasts while the option stays on; once it reads
-        off, the tap is let go, so turning it on again is a dry run again."""
-        dry = bool(self.own_dry_fn())
-        cards = getattr(self.live, "drive_cards", None)
-        if cards is None:
-            return dry
-        if not dry:
-            cards.let_go_tap()
-            return False
-        return not cards.written_by_tap()
+        """His own appointments' drives only logged (drive_dry: on until his Turn on tap)."""
+        return bool(self.own_dry_fn())
 
     def drive_note_card(self, chat_id: int | None, job_id: str | None = None) -> bool:
         """The drive blocks' card, for a note of Cain's naming one (Nov 27). False when it can't go."""
@@ -2088,6 +2114,7 @@ class FamilyGmail:
             log.info("drive dry run: would remove the drive blocks for the appointment on %s", _at(start, zone))
             self.live.drive_cards.forget(self._ck(key))   # said once: it has no drives to take off again
         self._count_dry(writes, removes)
+        self._offer_live()
         for key in (*mine, *self._own_gone):
             for which in ("there", "back"):
                 self.dropped.discard(leg_key(key, which))
@@ -2103,8 +2130,32 @@ class FamilyGmail:
         except ValueError:
             kept = {}
         w, r = set(kept.get("write", [])) | writes, set(kept.get("remove", [])) | removes
+        now = self.ledger.now()
+        week = {k: t for k, t in self._dry_week().items() if now - datetime.fromisoformat(t) < WEEK}
+        week.update({k: iso(now) for k in writes if k not in week})
         with self.ledger.tx() as db:
             self.ledger.set_meta(DRY_COUNTS, json.dumps({"write": sorted(w), "remove": sorted(r)}), db)
+            self.ledger.set_meta(DRY_WEEK, json.dumps(week), db)
+
+    def _dry_week(self) -> dict[str, str]:
+        try:
+            d = json.loads(self.ledger.get_meta(DRY_WEEK) or "{}")
+            return {str(k): str(v) for k, v in d.items() if datetime.fromisoformat(str(v))} if isinstance(d, dict) else {}
+        except (ValueError, TypeError, AttributeError):
+            return {}
+
+    def _offer_live(self) -> None:
+        """Once after install, while his drives are only logged: the card asking to turn them on (drive_cards),
+        with how many blocks the dry run would have added over the last week."""
+        try:
+            kept = json.loads(self.ledger.get_meta(DRY_COUNTS) or "{}")
+            since = set(kept.get("write", [])) if isinstance(kept, dict) else set()
+        except (ValueError, TypeError):
+            since = set()
+        try:
+            self.live.drive_cards.offer_live(self.live.chat_id, len(since | set(self._dry_week())))
+        except Exception as e:                 # a card is a help, never a stop
+            log.warning("drive blocks: the turn on card failed: %s", type(e).__name__)
 
     def _dry_line(self) -> str:
         """While the dry run is on: the counts since the last digest, then they start again."""

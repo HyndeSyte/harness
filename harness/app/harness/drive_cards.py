@@ -49,12 +49,13 @@ LATER = "later"                        # this read's lookups ran out before it (
 FAILS_BEFORE_CARD = 2                  # reads in a row a lookup must fail before he hears of it
 NEAR = timedelta(hours=24)             # a drive left off this near always gets its card, at once
 MAX_CARDS_PER_READ = 3
-NOTE_KINDS = ("drive_write", "drive_retry", "drive_read", "drive_leave")
+NOTE_KINDS = ("drive_write", "drive_retry", "drive_read", "drive_leave", "drive_on", "drive_off")
 MAX_RECEIPTS = 5
 CARD_TTL_S = 7 * 24 * 3600
-# meta: his Write them on the drive blocks' card (note_card): his own appointments' drives are written though the
-# drive_dry_run option is on. Let go once the option reads off, so turning it on again is a dry run again.
-WRITE_BY_TAP = "drive_write_by_tap"
+# meta: the live switch for his own appointments' drive blocks, "on" only by his tap (Turn on, or Write them on
+# the drive blocks' card), never by an option (the review of Nov 27). Anything else is the dry run.
+LIVE = "drive_live"
+LIVE_OFFER = "drive_live_offer"        # meta: the one card after install asking to turn them on was sent
 NOTE_CARD = "drive_note_card:"         # meta, per card: the events a Try again on it is for
 SHORT = {NO_ADDRESS: "no usable address", FAILED: "the drive lookup failed", PLACE: "where it is isn't known yet",
          CHAIN: "the drive from the event before it can't be worked out", LATER: "not looked up yet"}
@@ -431,19 +432,56 @@ class DriveCards:
                 nonce = choices.mint(self.ledger, kind=kind, target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
                 row.append((label, choices.callback_data(nonce)))
                 binds.append({"type": "choice", "nonce": nonce})
-            self.ledger.set_meta(NOTE_CARD + bid, json.dumps([r["key"] for r in rows]), db)
+            self.ledger.set_meta(NOTE_CARD + bid, json.dumps({"keys": [r["key"] for r in rows], "chat": chat_id}), db)
             self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db, job_id=job_id,
                                 buttons=[row] if row else None, binds=binds or None)
             self.ledger.event("drive_note_card", {"planned": planned, "dry": dry, "missing": len(rows)}, db=db)
         return True
 
     def written_by_tap(self) -> bool:
-        return bool(self.ledger.get_meta(WRITE_BY_TAP))
+        return live_on(self.ledger)
 
-    def let_go_tap(self) -> None:
-        if self.ledger.get_meta(WRITE_BY_TAP):
-            with self.ledger.tx() as db:
-                db.execute("DELETE FROM meta WHERE key=?", (WRITE_BY_TAP,))
+    def offer_live(self, chat_id: int | None, would: int) -> bool:
+        """Once after install, while his drive blocks are only logged: one card asking to turn them on, with
+        what last week's dry run would have added. Never again once sent, answered or not."""
+        if chat_id is None or self.ledger.get_meta(LIVE_OFFER) or live_on(self.ledger):
+            return False
+        bid = secrets.token_hex(8)
+        text = (f"Drive blocks: add them to your Gmail calendar from now on? Last week's dry run would have "
+                f"added {would}.")
+        with self.ledger.tx() as db:
+            if self.ledger.get_meta(LIVE_OFFER):
+                return False
+            row, binds = [], []
+            for label, kind in (("Turn on", "drive_on"), ("Keep logging", "drive_leave")):
+                nonce = choices.mint(self.ledger, kind=kind, target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+                row.append((label, choices.callback_data(nonce)))
+                binds.append({"type": "choice", "nonce": nonce})
+            self.ledger.set_meta(LIVE_OFFER, iso(self.ledger.now()), db)
+            self.ledger.set_meta(NOTE_CARD + bid, json.dumps({"chat": chat_id}), db)
+            self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db, buttons=[row],
+                                binds=binds)
+            self.ledger.event("drive_live_offered", {"would": would}, db=db)
+        return True
+
+    def _turned(self, on: bool, chat_id: int | None, db) -> str:
+        """The live switch set by his tap, in the ledger (never the options file). Turning on gets a receipt
+        with Turn off, which puts it back to the dry run."""
+        self.ledger.set_meta(LIVE, "on" if on else "off", db)
+        self.ledger.event("drive_live_tap", {"on": on}, db=db)
+        if not on:
+            return "Drive blocks are back to logging only. Nothing new goes on your Gmail calendar for them."
+        text = ("Turned on: drive blocks go on your Gmail calendar from the next read. Tap Turn off to go back "
+                "to logging only.")
+        if chat_id is None:
+            return text
+        bid = secrets.token_hex(8)
+        nonce = choices.mint(self.ledger, kind="drive_off", target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+        self.ledger.set_meta(NOTE_CARD + bid, json.dumps({"chat": chat_id}), db)
+        self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db,
+                            buttons=[[("Turn off", choices.callback_data(nonce))]],
+                            binds=[{"type": "choice", "nonce": nonce}])
+        return ""                              # the receipt above is the reply
 
     def _note_choice(self, kind: str, target: str) -> str:
         raw = self.ledger.get_meta(NOTE_CARD + (target or ""))
@@ -451,20 +489,25 @@ class DriveCards:
             return "Nothing changed."
         if raw == "done":
             return "Already settled. Nothing changed."
+        try:
+            kept = json.loads(raw)
+        except ValueError:
+            kept = {}
+        kept = kept if isinstance(kept, dict) else {"keys": kept if isinstance(kept, list) else []}
+        chat = kept.get("chat") if isinstance(kept.get("chat"), int) else None
         with self.ledger.tx() as db:
             self.ledger.set_meta(NOTE_CARD + target, "done", db)
+            if kind in ("drive_on", "drive_off"):
+                return self._turned(kind == "drive_on", chat, db)
             if kind == "drive_write":
-                self.ledger.set_meta(WRITE_BY_TAP, iso(self.ledger.now()), db)
+                said = self._turned(True, chat, db)
+                return said and ("Writing the drives around your own appointments on your Gmail calendar from the "
+                                 "next read.")
             if kind == "drive_retry":
-                try:
-                    keys = [k for k in json.loads(raw) if isinstance(k, str)]
-                except ValueError:
-                    keys = []
-                for key in keys:          # asked again, and tried again, as if new
+                for key in (k for k in kept.get("keys") or [] if isinstance(k, str)):
+                    # asked again, and tried again, as if new
                     db.execute("UPDATE drive_cards SET ask='', aid='', fails=0, updated_at=? WHERE key=?",
                                (iso(self.ledger.now()), key))
-        if kind == "drive_write":
-            return "Writing the drives around your own appointments on your Gmail calendar from the next read."
         if kind == "drive_retry":
             return "Working out those drives again at the next read."
         if kind == "drive_read":
@@ -505,3 +548,8 @@ class DriveCards:
             self._set(row["key"], ask="skipped")
             return "Got it. No drive blocks for that event, and I won't ask about it again."
         return "Nothing changed."
+
+
+def live_on(ledger: Ledger) -> bool:
+    """His own appointments' drive blocks are written: only once he tapped Turn on (or Write them)."""
+    return ledger.get_meta(LIVE) == "on"

@@ -47,7 +47,7 @@ def test_config_denies_every_api_and_mapping():
                                            "  family_school_address: str?\n  calendar_changes: bool?\n"
                                            "  mail_dates: bool?\n  meaning_shadow: bool?\n  meaning_live: bool?\n"
                                            "  home_location: str?\n  own_drive_days: int(1,60)?\n  drive_dry_run: bool?\n"
-                                           "  remove_all_blocks: bool?\n  his_calendar: str?\n")
+                                           "  own_drive_dry_run: bool?\n  remove_all_blocks: bool?\n  his_calendar: str?\n")
     assert cfg["ingress"] == "true" and cfg["ingress_port"] == "8099"
     assert cfg["panel_admin"] == "true"
     assert cfg["backup"] == "cold"                 # SQLite is copied with the add-on stopped

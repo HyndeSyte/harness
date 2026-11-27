@@ -2507,8 +2507,8 @@ def test_the_own_drive_days_option_is_read_short_by_default(tmp_path, text, days
 # Through the real reader of his calendar's secret iCal feed (calendar_feed.fetch_one and ical.window: repeat
 # rules, excluded dates, overrides) and the real sync loop. Only Google's answers are fakes.
 
-from harness import calendar_feed                                     # noqa: E402
-from harness.family_gmail import own_dry_run_from_options            # noqa: E402
+from harness import calendar_feed, drive_cards                        # noqa: E402
+from harness.family_gmail import drive_dry                            # noqa: E402
 
 FEED_URL = "https://calendar.google.com/calendar/ical/parent%40gmail.com/private-0123456789abcdef/basic.ics"
 UTC_FMT = "%Y%m%dT%H%M%SZ"
@@ -2813,7 +2813,7 @@ def email_date(t):
 
 def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(drives, caplog, tmp_path):
     (tmp_path / "options.json").write_text('{"drive_dry_run": true}')
-    drives.gm.own_dry_fn = lambda: own_dry_run_from_options(str(tmp_path))   # off by default since Nov 27
+    drives.gm.own_dry_fn = lambda: drive_dry(drives.ledger, str(tmp_path))   # on until his tap
     a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=12)
     goes(drives, "Eye doctor", b, CLINIC)
     dentist = mine(drives, "Dentist", a, PARK)
@@ -2842,21 +2842,54 @@ def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(d
     go(drives)
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("drive dry run: would remove")]
     assert len(lines) == 1
-    (tmp_path / "options.json").write_text('{"drive_dry_run": false}')   # he's read the log: off
+    (tmp_path / "options.json").write_text('{"drive_dry_run": false}')   # the setting off: still only logged
     drives.feeds.window.occurrences.append(dentist)
+    go(drives)
+    assert ("Busy (drive there)", a - 30 * M, a, "") not in blocks(drives)
+    with drives.ledger.tx() as db:                                          # his Turn on tap
+        drives.ledger.set_meta(drive_cards.LIVE, "on", db)
     go(drives)
     assert ("Busy (drive there)", a - 30 * M, a, "") in blocks(drives)
 
 
-@pytest.mark.parametrize("text,dry", [("{}", False), ('{"drive_dry_run": false}', False),
-                                      ('{"drive_dry_run": true}', True), ('{"drive_dry_run": "yes"}', False),
-                                      ('{"own_drive_dry_run": true}', False),     # the old setting isn't read
-                                      ("not json", True)])
-def test_the_dry_run_option_is_off_unless_it_reads_as_on(tmp_path, text, dry):
-    """Nov 27, at his word ("no drive time"): drive blocks are written unless the dry run is plainly on.
-    Settings that can't be read at all write nothing new."""
+@pytest.mark.parametrize("text,dry", [
+    ("{}", True), ('{"drive_dry_run": false}', True),                       # the old value missing
+    ('{"own_drive_dry_run": true, "drive_dry_run": false}', True),           # the old saved true
+    ('{"own_drive_dry_run": false}', True),                                 # the new value missing
+    ('{"own_drive_dry_run": "no", "drive_dry_run": false}', True),           # not a clean boolean
+    ('{"own_drive_dry_run": false, "drive_dry_run": "no"}', True),
+    ('{"own_drive_dry_run": false, "drive_dry_run": true}', True),
+    ('{"own_drive_dry_run": false, "drive_dry_run": false}', False),         # he had them live already
+    ("not json", True)])
+def test_the_old_dry_run_setting_is_carried_over_once_and_keeps_the_dry_run_unless_plainly_off(
+        ledger, tmp_path, text, dry):
+    """The review of Nov 27: drive blocks turn on only by his tap. The old own_drive_dry_run is carried into the
+    switch on the first read, keeping the dry run unless both settings are a clean false."""
     (tmp_path / "options.json").write_text(text)
-    assert own_dry_run_from_options(str(tmp_path)) is dry
+    assert drive_dry(ledger, str(tmp_path)) is dry
+    assert ledger.get_meta(drive_cards.LIVE) == (None if text == "not json" else "off" if dry else "on")
+
+
+def test_no_setting_change_turns_drive_blocks_on(ledger, tmp_path):
+    options = tmp_path / "options.json"
+    options.write_text('{"own_drive_dry_run": true, "drive_dry_run": false}')
+    assert drive_dry(ledger, str(tmp_path)) is True
+    for text in ('{"drive_dry_run": true}', '{"drive_dry_run": false}', '{"own_drive_dry_run": false, '
+                 '"drive_dry_run": false}', "{}"):
+        options.write_text(text)
+        assert drive_dry(ledger, str(tmp_path)) is True
+    with ledger.tx() as db:                                                 # his tap
+        ledger.set_meta(drive_cards.LIVE, "on", db)
+    options.write_text('{"drive_dry_run": false}')
+    assert drive_dry(ledger, str(tmp_path)) is False
+    options.write_text("not json")
+    assert drive_dry(ledger, str(tmp_path)) is True                         # unreadable: dry for that read
+    options.write_text('{"drive_dry_run": false}')
+    assert drive_dry(ledger, str(tmp_path)) is False
+    options.write_text('{"drive_dry_run": true}')                           # the setting can stop them
+    assert drive_dry(ledger, str(tmp_path)) is True
+    options.write_text('{"drive_dry_run": false}')
+    assert drive_dry(ledger, str(tmp_path)) is True                         # and only a tap starts them again
 
 
 def test_drives_put_back_as_he_was_told_send_no_second_card(drives):
@@ -3119,7 +3152,7 @@ def test_the_remove_all_blocks_option_takes_off_every_marked_block_and_writes_no
     assert len(blocks(drives)) == 5
     family = [b for b in blocks(drives) if b[1] >= when(drives, days=4, hour=0)]
     assert len(family) == 3
-    (tmp_path / "options.json").write_text('{"remove_all_blocks": true, "drive_dry_run": false}')
+    (tmp_path / "options.json").write_text('{"remove_all_blocks": true, "own_drive_dry_run": false}')
     drives.gm.cleanup_fn = lambda: cleanup_from_options(str(tmp_path))
     for _ in range(3):
         go(drives)

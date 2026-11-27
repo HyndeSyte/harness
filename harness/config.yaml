@@ -40,9 +40,10 @@ timeout: 30
 # Empty leaves drive blocks off.
 # How many days ahead his own Gmail appointments get drive blocks (family_gmail.py), 1 to 60.
 # Starts short, so the first run is a few days he can check; widen it once they look right.
-# drive_dry_run: off (the default, at his word on Nov 27), those drive blocks are written to his Gmail calendar.
-# On, they're only written to the log (day and time), never to Gmail, and no card goes out for them.
-# It took the place of own_drive_dry_run, which was on by default and is no longer read.
+# Those drive blocks are only written to the log (day and time), never to Gmail, until he taps Turn on on
+# their card; no setting turns them on. drive_dry_run: on, they go back to the log and stay there until he
+# taps Turn on again. own_drive_dry_run, the old setting, is read once and carried over (only a plain false
+# keeps them live); it stays in the schema so that one read can find it.
 # remove_all_blocks: on, the drive blocks Harness made around his own appointments come off Gmail
 # (Family events' blocks stay; ones he edited stay) and nothing new is written while it stays on. For a
 # clean start; off again, blocks are written as before.
@@ -74,5 +75,6 @@ schema:
   home_location: str?
   own_drive_days: int(1,60)?
   drive_dry_run: bool?
+  own_drive_dry_run: bool?
   remove_all_blocks: bool?
   his_calendar: str?

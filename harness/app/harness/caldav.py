@@ -524,9 +524,11 @@ class FamilyCalDav:
             return None
 
     def put_copy(self, uid: str, title: str, start, end, now: datetime,
-                 etag: str | None = None, data: str = "") -> Outcome:
+                 etag: str | None = None, data: str = "", *, again: bool = True) -> Outcome:
         """A copy from Gmail: new, or a change to our own. The uid is fixed per copy, so a
-        write whose answer was lost finds itself on the next try instead of doubling."""
+        write whose answer was lost finds itself on the next try instead of doubling. again=False:
+        a change refused for its version is answered "changed" at once, and the caller reads the
+        copy again and judges it before writing anything more (family_copy._write_ours)."""
         ready = self._auth()
         if ready is None:
             return Outcome("no_credentials")
@@ -546,6 +548,8 @@ class FamilyCalDav:
         if r.status in (200, 201, 204):
             return Outcome("ok", r.status, r.headers.get("etag"))
         if r.status == 412:
+            if etag and not again:
+                return Outcome("changed", r.status)
             if etag:
                 current = self._current_etag(auth, href, uid, data)
                 if current.kind != "ok":

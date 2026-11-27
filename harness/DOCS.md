@@ -1377,12 +1377,26 @@ and `/status` says if the Gmail calendar isn't being read.
 - **Moved or cancelled** on Gmail, the copy follows, within one read, whether you moved it or Harness
   did. A copy knows its Gmail event by that event's own identity (for one day of a repeating event, the
   series and the day's original start), never by its time, so a day moved by hand or by a card keeps its
-  copy. A Family read that still shows a time Harness itself had put on the copy is taken as behind,
-  not as someone's edit, and the copy is brought to its event.
+  copy.
+- **Its own late reads, told by version:** for each copy Harness keeps the version (iCloud's ETag) the
+  copy had when one of its own writes went out, and the version it left. A Family read showing the copy
+  otherwise than Harness wrote it is taken as behind only when it is at that first version, for a write
+  still undecided or sent within the last 5 minutes; then the copy is brought to its event. Any other
+  version is someone's edit, even at a time Harness once wrote, and the copy is left alone. Every write
+  goes only over the version just checked. When iCloud refuses it for its version, or its answer is lost,
+  the copy is read again by its address and judged again before anything more is written; after 2 such
+  retries in an hour the copy is left alone and named in the digest.
 - **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
-  family mirrored event not updating"), even as a question, and you get a card that brings each Family
-  copy out of step back to its Gmail event, or takes off one whose event is really gone. Nothing asks you
-  to change a calendar by hand. A copy you fixed by hand that already matches its event stays as it is.
+  family mirrored event not updating"), even as a question, and you get a card that brings that copy back
+  to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name
+  none and more than one is out of step, Harness asks which and changes nothing. All the copies out of step
+  over the next 14 days are offered only when you ask for all of them ("fix all the family copies"). A copy
+  is offered off only when a read of its Gmail event by its id says it was cancelled or deleted, and the
+  card names the copy, its day and which; a read that fails or can't say leaves the copy as it is, with a
+  plain line. Each card is bound to the copy and its event as it read them, by id and version: at your tap
+  both are read again, and if either changed, nothing is written and a fresh card comes instead. Nothing
+  asks you to change a calendar by hand. A copy you fixed by hand that already matches its event stays as
+  it is.
 - **Yours by hand:** a matching event with your first name in it is taken over, not doubled. It's
   replaced only when the event changes on Gmail. Events with other people, repeating ones and
   anyone else's are never touched.
@@ -1557,16 +1571,23 @@ how many blocks are on Gmail.
   Family event's blocks and drives stay. One you edited (its title or times not as written) stays and
   is named in the digest. With `drive_dry_run` on, each is only logged as "would remove". Nothing
   new is written while it stays on. Off again, blocks are written as before.
-- **Drive blocks written (`drive_dry_run`, off by default):** since Nov 27, at your word ("no drive
-  time"), your own appointments' drive blocks are written to your Gmail calendar, never to Family: for
-  every event you go to that has a place, a drive there and a drive back, each from the real drive time
-  rounded up to the quarter hour, one drive between back-to-back places, and the last drive home. A
-  moved or cancelled event takes its drive blocks with it. The setting took the place of
-  `own_drive_dry_run`, which was on by default and is no longer read. A note from Cain on your message
-  that names a drive block gets one card about them (marked as from his note): with the dry run on,
-  Write them writes them from the next read while it stays on; otherwise it lists any event still
-  without drives, with Work them out. The dry run, when you turn it back on, works as below.
-- **The dry run (`drive_dry_run` on):** while it's on, your own appointments'
+- **Drive blocks written, by your tap only:** your own appointments' drive blocks go on your Gmail
+  calendar, never on Family, once you tap Turn on: for every event you go to that has a place, a drive
+  there and a drive back, each from the real drive time rounded up to the quarter hour, one drive between
+  back-to-back places, and the last drive home. A moved or cancelled event takes its drive blocks with it.
+  The switch is kept in Harness's own record, never in the settings, and no setting turns it on. After
+  installing 0.24.5, while they're only logged, one card asks once: "Drive blocks: add them to your Gmail
+  calendar from now on? Last week's dry run would have added N.", with Turn on and Keep logging; it isn't
+  sent again, answered or not. Turn on's receipt carries Turn off, which puts them back to the log. A note
+  from Cain on your message that names a drive block gets one card about them (marked as from his note):
+  in the dry run, its Write them is the same tap as Turn on; otherwise it lists any event still without
+  drives, with Work them out.
+- **The old setting:** `own_drive_dry_run` is read once, on the first read after installing, and carried
+  into the switch: they stay live only when it was a plain false and `drive_dry_run` a plain false too
+  (they were on already). A true, a missing value, settings that can't be read or anything but a clean
+  true or false keep the dry run. `drive_dry_run` on turns the switch off; off again, they stay in the dry
+  run until you tap Turn on. Settings that can't be read are a dry run for that read.
+- **The dry run (until Turn on, or with `drive_dry_run` on):** while it lasts, your own appointments'
   drive blocks are only written to Harness's log ("drive dry run: would write ...", "would remove
   ..." and "would ask before removing ...", each with the appointment's day and time), never to
   Gmail, no card goes out for them and nothing is kept as written. Family events' drives are worked

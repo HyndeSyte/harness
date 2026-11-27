@@ -129,6 +129,9 @@ COPY_NAMED = re.compile(r"\b(?:family\b[^.?!]{0,40}\b(?:cop(?:y|ies)|mirror\w*|d
                         r"\b(?:event|copy|copies|appointment)|cop(?:y|ies) (?:on|in) (?:the )?family)\b", re.I)
 COPY_WRONG = re.compile(r"\b(?:fix\w*|wrong|stale|behind|out of (?:step|sync|date)|(?:not|n't|never) "
                         r"(?:updat|follow|match|mov|chang|sync)\w*|updat\w*|sync\w*|match\w*|correct\w*|left)\b", re.I)
+# Every copy, said outright: only then are all the copies out of step offered at once (the review of Nov 27).
+COPY_ALL = re.compile(r"\b(?:all|every|each)\b(?: (?:of )?(?:the|my|his|our))?(?: \w+)? (?:family )?"
+                      r"(?:cop(?:y|ies)|mirror\w*|duplicates?)\b", re.I)
 # A drive block named in Cain's note: his own words may be only a question ("why is there no travel time").
 DRIVE_NAMED = re.compile(r"\b(?:drive|driving|travel)[ -]?(?:blocks?|times?)\b|\bdrive (?:there|back|home)\b", re.I)
 CARDS_BACK = timedelta(hours=24)
@@ -446,18 +449,27 @@ class Runner:
         his, _, note = text.partition(NOTE_HEAD)
         if self.calendar_change is not None and any(
                 COPY_NAMED.search(t) and COPY_WRONG.search(t) for t in (his, note) if t):
-            changes = self.calendar_change.copy_fixes()
-            if changes is None:
+            # Only the copy his words name, or all of them only when he says all (the review of Nov 27).
+            every = any(COPY_ALL.search(t) for t in (his, note) if t)
+            got = self.calendar_change.copy_fixes(" ".join(t for t in (his, note) if t), every=every)
+            if got is None:
                 return False               # a calendar can't be read: the model's own reply stands
             receipt["plain"] = "copy_fix"
-            if changes:
+            tail = (" " + " ".join(got["unresolved"])) if got["unresolved"] else ""
+            if got["ask"]:
+                self._on_answer(job, {"text": f"Nothing changed: {got['ask']}{tail}"}, receipt, fired)
+            elif got["changes"]:
                 receipt["type"] = "proposal"
-                self._on_proposal(job, {"effect_type": "calendar_change", "params": {"changes": changes},
-                                        "summary": "Bring the Family copies back to their Gmail events"},
+                many = len(got["changes"]) > 1
+                self._on_proposal(job, {"effect_type": "calendar_change", "params": {"changes": got["changes"]},
+                                        "summary": "Bring the Family copies back to their Gmail events" if many
+                                        else "Bring the Family copy back to its Gmail event"},
                                   receipt, fired)
             else:
-                self._on_answer(job, {"text": "Every Family copy of your Gmail events matches its event now, "
-                                              "so there's nothing to fix."}, receipt, fired)
+                self._on_answer(job, {"text": ("Every Family copy of your Gmail events matches its event now, "
+                                               "so there's nothing to fix." if every else
+                                               "That Family copy matches its Gmail event now, so there's "
+                                               "nothing to fix.") + tail}, receipt, fired)
             return True
         if note and DRIVE_NAMED.search(note) and self.drive_card is not None:
             if not self.drive_card(job["chat_id"], job["id"]):
