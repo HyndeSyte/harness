@@ -299,6 +299,13 @@ export function fileStore(flag = FLAG_FILE, mark = MARK_FILE, spentDir = SPENT_D
     highWater,
   };
 }
+// Cain 0.19.2: the link's drill store, built here so main.ts needs no fileStore name of its own (it imported watch.ts's
+// fileStore under the same name, and Bun bound that one: no highWater, so every install of Cain was refused).
+export function linkDrillStore(env: Record<string, string | undefined> = process.env, trustDir = TRUST, linkDir = "/data/link",
+  nowFn: () => number = Date.now): DrillStore {
+  return fileStore(env.CAIN_DRILL_FLAG ?? `${trustDir}/keeper-drill.json`, env.CAIN_DRILL_MARK ?? `${trustDir}/keeper-drill-mark.json`,
+    env.CAIN_DRILL_SPENT ?? `${linkDir}/keeper-drill-spent`, `${trustDir}/keeper-drill-aborted.jsonl`, nowFn, `${linkDir}/keeper-drill-refused.json`);
+}
 // The drill key's public half, kept by root beside the mark (main.ts, at each start of the link).
 export function storeMarkPub(pub: string, path = MARK_PUB_FILE): void {
   if (readOrNull(path)?.trim() === pub) { chmodSync(path, 0o600); return; }
