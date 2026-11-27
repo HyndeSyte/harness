@@ -174,7 +174,7 @@ switch (cmd) {
       const eff = capN + g.reduce((n, x) => n + x.rounds, 0);
       const gw = grantWords(g, cfg.tz);
       const atCapNow = done.length >= eff;
-      const dec = d && d.round >= done.length ? `, decision card ${d.state === "posted" ? "with him" : "owed"}` : atCapNow ? ", at the cap" : "";
+      const dec = d && d.round >= done.length ? ", held at the cap" : atCapNow ? ", at the cap" : "";
       open.push(`  ${group.join(" + ")}: ${done.length} of ${eff} round${eff === 1 ? "" : "s"}${gw ? ` (${gw})` : ""}${dec}`);
     }
     out(`Review rounds (cap ${capN}, the runner's${st ? "" : " default: its settings aren't written yet"}${gr ? "" : "; the grants file can't be read, so no grants count"}):`);

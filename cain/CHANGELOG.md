@@ -1,9 +1,15 @@
 # Changelog
 
+## 0.19.2
+
+- A drill release for the Keeper drills, with nothing new: the same code as 0.19.1.
+- If this install fails, that comes only from your Arm the drill tap (the drill flag and mark), never from code in this release.
+
 ## 0.19.1
 
-- A drill release for the Keeper drills, with nothing new: the same code as 0.19.0.
-- If this install fails, that comes only from your Arm the drill tap (the drill flag and mark), never from code in this release.
+- Reviews end by your rule with no card: after the last review round, a change with something serious left is held and Cain tells you in one line. The review service no longer sends you "Ship it with that risk" or "Hold it", and Cain can no longer ask you to grant more review rounds.
+- If an old card of either kind is still up, tapping it does nothing but take its buttons off and say it's retired.
+- A change held at the last review round can't be shipped through an earlier "Ship it with that risk" tap any more.
 
 ## 0.19.0
 
