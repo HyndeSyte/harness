@@ -63,7 +63,7 @@
 // the link lands his Ship tap in main (merge.ts), over SSH to GitHub, whose host keys
 // are pinned (github_known_hosts). Its public half is in the log, to add on GitHub.
 import { sign as edSign } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
@@ -451,8 +451,11 @@ const shipPassDeps: PassDeps = {
       post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null),
-      // Cain 0.19.3: from_version is the version installed now (the Supervisor's answer at the App's start, else the image's own)
-      installed: (slug) => slug === APP_SLUGS.Cain ? cainInstalled(() => readFileSync(INSTALLED_FILE, "utf8"), process.env.CAIN_BUILD_VERSION) : null }, tok, claim)
+      // Cain 0.19.3: from_version is the version installed now (the Supervisor's answer at the App's start, waited for briefly while
+      // that lookup runs, else the image's own build version); never main's config.yaml
+      installed: (slug) => slug === APP_SLUGS.Cain ? cainInstalled({ read: () => readFileSync(INSTALLED_FILE, "utf8"),
+        pendingSince: () => { try { return statSync(`${INSTALLED_FILE}.pending`).mtimeMs; } catch { return null; } }, build: process.env.CAIN_BUILD_VERSION }) : null,
+      refused: (attempt, app, version, why) => { void link.refusedCard(attempt, app, version, why).catch((e) => console.log(`[cain] link: couldn't post the refusal line: ${String(e).slice(0, 80)}`)); } }, tok, claim)
       .then(done)
       .catch((e) => done({ ok: false, said: [`the keeper registration failed: ${String(e).slice(0, 80)}`] }));
   },

@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash, sign as edSign } from "node:crypto";
 import { claimDeadlineWhy, decideAll, postShipPass, postShipPassCancel, SHIP } from "../rootfs/opt/cain/hooks/remote-trigger";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
-import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, judgeCancel, attemptEndedWhy, cainInstalled, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
+import { PASS_WAIT_MS, CLAIM_START_MIN_MS, enrollmentCheck, enrollmentCheckNow, ENROLL_BEHIND, ENROLL_REFUSED, noteArmedEnrollment, keyFingerprint, passId, passWaitMs, readFingerprintFile, registerInstalls, shipPass, judgeCancel, cancelUnprotected, pollEnded, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { CAIN_ROUTES, routeAllowed } from "../rootfs/opt/cain/link/auth";
 import { SHIP_KEYS, SHIP_PUB, keeperHolds } from "./link-rig";
 import { generateKeyPairSync } from "node:crypto";
@@ -656,13 +656,6 @@ describe("Cain 0.19.3: the registration starts from the installed version, and a
     const none = await registerInstalls({ ...chain(() => INSTALLED).deps, installed: undefined }, TOKEN, c);
     expect(none.ok).toBe(false);
   });
-  test("Cain's installed version: the Supervisor's answer first, then the image's own build version, else none", () => {
-    expect(cainInstalled(() => "0.19.0\n", "0.19.3")).toBe("0.19.0");
-    expect(cainInstalled(() => { throw new Error("ENOENT"); }, "0.19.3")).toBe("0.19.3");
-    expect(cainInstalled(() => "not a version", " 0.19.3 ")).toBe("0.19.3");
-    expect(cainInstalled(() => null, "")).toBe(null);
-    expect(cainInstalled(() => null, undefined)).toBe(null);
-  });
   test("a registration Keeper refused (unprotected) is marked ended: no cancel is asked and no retry card is posted", async () => {
     const k = chain(() => MAIN);                              // the old behavior's from_version, which Keeper refuses
     const r = await registerInstalls(k.deps, TOKEN, c);
@@ -687,19 +680,78 @@ describe("Cain 0.19.3: the registration starts from the installed version, and a
     await shipPass(l.d, { token: TOKEN });
     expect(l.cancelled).toEqual([ACC.attempt]);
   });
-  test("a cancel Keeper answers \"refused: it is unprotected\" (or another end) counts as done, with no retry card", () => {
+  test("a cancel counts as done only on ended, or on refused with the unprotected reason, for that same attempt", () => {
     const l = link();
     const cards: any[] = []; l.d.retry = (...a: any[]) => { cards.push(a); };
-    for (const why of ["it is unprotected", "it is ended", "it is refused", "it is rolled back"])
-      expect(judgeCancel(l.d, ACC.attempt, { status: 409, body: { status: "refused", id: ACC.attempt, why } })).toBe(true);
+    expect(judgeCancel(l.d, ACC.attempt, { status: 200, body: { status: "ended", id: ACC.attempt } })).toBe(true);
+    expect(judgeCancel(l.d, ACC.attempt, { status: 409, body: { status: "refused", id: ACC.attempt, why: "it is unprotected" } })).toBe(true);
     expect(cards).toEqual([]);
     expect(l.logs.some((x) => x.includes("Keeper had already ended it (it is unprotected)"))).toBe(true);
-    // a live attempt's refusal still brings the card
-    for (const why of ["it is claimed", "it is accepted", "its claim was handed to a started run (Cain 0.19.2 was seen): it is claimed, and a cancel can't end it now"])
-      expect(judgeCancel(l.d, ACC.attempt, { status: 409, body: { status: "refused", id: ACC.attempt, why } })).toBe(false);
-    expect(cards.length).toBe(3);
-    expect(attemptEndedWhy("it is unprotected")).toBe("unprotected");
-    expect(attemptEndedWhy("it is verifying")).toBe(null);
-    expect(attemptEndedWhy(undefined)).toBe(null);
+    // anything else keeps today's path: no success, and the retry card
+    const others: ({ status: number; body: any } | null)[] = [
+      { status: 409, body: { status: "refused", id: "ship-46-cain-89abcdef", why: "it is unprotected" } },   // another attempt's answer
+      { status: 409, body: { status: "refused", why: "it is unprotected" } },                               // no id
+      { status: 409, body: { status: "refused", id: ACC.attempt, why: "it is refused" } },
+      { status: 409, body: { status: "refused", id: ACC.attempt, why: "it is ended" } },
+      { status: 409, body: { status: "refused", id: ACC.attempt, why: "it is claimed" } },
+      { status: 409, body: { status: "refused", id: ACC.attempt, why: "its claim was handed to a started run (Cain 0.19.2 was seen): it is claimed, and a cancel can't end it now" } },
+      { status: 200, body: { status: "ended", id: "ship-46-cain-89abcdef" } },                              // ended, but another attempt
+      { status: 500, body: { status: "error", why: "it is unprotected" } },
+      { status: 503, body: null },
+      { status: 200, body: { status: "mystery", id: ACC.attempt } },
+      { status: 202, body: { status: "pending", id: ACC.attempt } },
+      null,                                                                                                    // lost or timed out
+    ];
+    for (const r of others) expect(judgeCancel(l.d, ACC.attempt, r)).toBe(false);
+    expect(cards.length).toBe(others.length);
+    expect(cancelUnprotected(ACC.attempt, { status: 409, body: { status: "refused", id: ACC.attempt, why: " it is unprotected" } })).toBe(false);
+  });
+  test("the cancel shortcut: only a latest poll answer of refused or unprotected for that same attempt id", () => {
+    const at = (body: any, status = 200) => ({ status, body });
+    expect(pollEnded(ACC.attempt, at({ status: "refused", id: ACC.attempt }))).toBe(true);
+    expect(pollEnded(ACC.attempt, at({ status: "unprotected", id: ACC.attempt }))).toBe(true);
+    for (const last of [at({ status: "refused", id: "ship-46-cain-89abcdef" }), at({ status: "refused" }), at({ status: "ended", id: ACC.attempt }),
+      at({ status: "rolled back", id: ACC.attempt }), at({ status: "mystery", id: ACC.attempt }), at({ status: "pending", id: ACC.attempt }),
+      at({ status: "refused", id: ACC.attempt }, 500), at({ status: "refused", id: ACC.attempt }, 503), at(null), null, undefined])
+      expect(pollEnded(ACC.attempt, last as any)).toBe(false);
+  });
+  for (const [name, answer] of [
+    ["an error answer", { status: 500, body: { status: "refused", id: ACC.attempt, why: "boom" } }],
+    ["a 5xx with no body", { status: 503, body: null }],
+    ["an unknown state", { status: 200, body: { status: "mystery", id: ACC.attempt } }],
+    ["another attempt's refusal", { status: 200, body: { status: "refused", id: "ship-46-cain-89abcdef", why: "x" } }],
+    ["an ended answer", { status: 200, body: { status: "ended", id: ACC.attempt } }],
+    ["a lost answer", null],
+  ] as const) test(`a latest poll answer that is ${name} keeps today's path: not marked ended, so it is cancelled, and no refusal line`, async () => {
+    let now = NOW; const lines: any[] = [];
+    const deps = { ...chain(() => INSTALLED).deps, now: () => now, sleep: async (ms: number) => { now += ms; }, waitMs: 60_000,
+      get: async () => answer as any, refused: (...a: any[]) => { lines.push(a); } };
+    const r = await registerInstalls(deps, TOKEN, c);
+    expect(r.ok).toBe(false);
+    expect((r as any).ended).toBeUndefined();
+    expect(lines).toEqual([]);
+    const l = link({ reg: "hold" });
+    await shipPass(l.d, { token: TOKEN });
+    l.answer(r);
+    await shipPass(l.d, { token: TOKEN });
+    expect(l.cancelled).toEqual([ACC.attempt]);
+  });
+  test("a refused or unprotected registration tells the owner once, in one plain line, why nothing installed", async () => {
+    for (const status of ["refused", "unprotected"]) {
+      const lines: any[] = [];
+      const deps = { ...chain(() => INSTALLED).deps,
+        get: async () => ({ status: 200, body: { status, id: ACC.attempt, app: ACC.app, why: `0fcc2575_cain is at 0.18.9, not ${INSTALLED}` } }), refused: (...a: any[]) => { lines.push(a); } };
+      const r = await registerInstalls(deps, TOKEN, c);
+      expect(r.ok).toBe(false);
+      expect((r as any).ended).toEqual([ACC.attempt]);
+      expect(lines).toEqual([[ACC.attempt, ACC.app, NEXT, `0fcc2575_cain is at 0.18.9, not ${INSTALLED}`]]);
+    }
+    // a refusal for want of space has its own card, not this line
+    const space: any[] = [], lines: any[] = [];
+    const deps = { ...chain(() => INSTALLED).deps, noSpace: (...a: any[]) => { space.push(a); }, refused: (...a: any[]) => { lines.push(a); },
+      get: async () => ({ status: 200, body: { status: "refused", code: "no_space", id: ACC.attempt, app: ACC.app, why: "no room" } }) };
+    const r = await registerInstalls(deps, TOKEN, c);
+    expect((r as any).ended).toEqual([ACC.attempt]);
+    expect([space.length, lines.length]).toEqual([1, 0]);
   });
 });

@@ -546,12 +546,16 @@ again a card it sent after its backup was taken; the newest card is the one to a
   version of Cain installed on the Pi, as Home Assistant reports it when the App starts, not the version
   in `main`. Before, a version that was merged but never installed (0.19.1 on Nov 27) made the Keeper
   refuse every later install of Cain, since the Pi was still on the one before.
-- If Home Assistant's answer can't be read, the link uses the version the running App was built as. If
-  neither can be read, nothing is registered and the Ship run is refused with that reason; the link never
-  guesses.
-- When the Keeper has already refused an install (or marked it unprotected), there is nothing left to
-  cancel: the link no longer asks it to cancel, and you no longer get a Try again card that had nothing
-  for you to do. A cancel the Keeper answers with "it is unprotected" (or another end) counts as done.
+- The App reads that version from Home Assistant at each start, in the background and for at most a minute,
+  and keeps it only in `/run/cain` (cleared at every start), as a plain version number. If the Ship run comes
+  while that read is still going, the link waits for it a few seconds. If it can't be read, the link uses the
+  version the running App was built as, when that is a real version number. If neither can be read, nothing
+  is registered and the Ship run is refused with that reason; the link never guesses.
+- When the Keeper itself has refused an install, or left it unprotected, there is nothing left to cancel: the
+  link doesn't ask it to cancel and posts no Try again card. You get one plain line instead, saying the Keeper
+  refused it and why, with no button. Any other answer (an error, no answer, something unexpected) is handled
+  as before: the link cancels, and a cancel it can't confirm still brings the Try again card. A cancel counts
+  as done only when the Keeper answers that it ended, or refuses it because the install is unprotected.
 
 ## What 0.19.0 does: working with the Keeper
 

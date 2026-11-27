@@ -177,8 +177,9 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
 export interface Claimed { attempt: string; claim: string; until: string }
 export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string; ended?: string[] };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
-// (Cain 0.19.3) ended: the attempts Keeper itself already ended (refused, unprotected or any other end its poll answered), so the link
-// asks no cancel for them and posts no retry card: there is nothing left at Keeper to cancel.
+// (Cain 0.19.3) ended: the attempts whose latest poll answer, for that same attempt id, was refused or unprotected, so the link asks
+// no cancel for them and posts no retry card: there is nothing left at Keeper to cancel. Any other answer (an error, a timeout, a 5xx,
+// an unknown state or no answer at all) keeps today's path: the cancel, and the retry card if it isn't confirmed.
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
   apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number };
 export interface PassDeps {
@@ -227,10 +228,9 @@ const cancelAll = (d: PassDeps, ids: string[], why: string) => {
 export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; body: any } | null): boolean {
   const ok = !!r && r.status === 200 && r.body?.status === "ended" && (r.body?.id === undefined || r.body.id === attempt);
   if (ok) return true;
-  // (Cain 0.19.3) Keeper refuses a cancel of an attempt it already ended itself ("it is unprotected", "it is ended", ...): nothing is
-  // left to cancel, so that counts as done, logged, with no retry card (a card with nothing for the owner to do)
-  const ended = r && r.status === 409 && r.body?.status === "refused" ? attemptEndedWhy(r.body?.why) : null;
-  if (ended) { d.log(`the keeper's cancel of ${attempt} needs nothing more: Keeper had already ended it (it is ${ended})`); return true; }
+  // (Cain 0.19.3) Keeper refuses a cancel of an attempt it had already left unprotected ("it is unprotected", for that same attempt
+  // id): nothing is left to cancel, so that alone counts as done, logged, with no retry card. Any other refusal keeps the card.
+  if (cancelUnprotected(attempt, r)) { d.log(`the keeper's cancel of ${attempt} needs nothing more: Keeper had already ended it (it is unprotected)`); return true; }
   const why = !r ? "the keeper didn't answer" : r.status === 202 || r.body?.status === "pending" ? `the keeper's answer is pending${r.body?.operation ? ` (operation ${String(r.body.operation).slice(0, 40)})` : ""}`
     : `the keeper answered ${String(r.body?.status ?? r.status).slice(0, 40)}${r.body?.why ? `: ${String(r.body.why).slice(0, 120)}` : ""}`;
   d.log(`the keeper's cancel of ${attempt} isn't confirmed (${why}): no success; the owner gets a card offering a retry`);
@@ -238,12 +238,16 @@ export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; b
   return false;
 }
 
-// (Cain 0.19.3) Keeper's answer to a cancel of an attempt that is no longer live (keeper core.ts cancelAttempt: "it is <status>" for any
-// status but verifying, accepted or claimed): the status, or null when the answer isn't that.
-const LIVE = new Set(["verifying", "accepted", "claimed", "pending"]);
-export function attemptEndedWhy(why: unknown): string | null {
-  const m = /^it is ([a-z][a-z _-]{0,30})$/.exec(String(why ?? "").trim());
-  return m && !LIVE.has(m[1]) ? m[1] : null;
+// (Cain 0.19.3) Keeper's refusal of a cancel because the attempt is unprotected (keeper core.ts cancelAttempt: 409, refused, the
+// same id, "it is unprotected"). Nothing else counts: not another reason, another id, an error or no answer.
+export function cancelUnprotected(attempt: string, r: { status: number; body: any } | null): boolean {
+  return !!r && r.status === 409 && r.body?.status === "refused" && r.body?.id === attempt && String(r.body?.why ?? "") === "it is unprotected";
+}
+// (Cain 0.19.3) The latest poll answer (GET /attempt/<id>) says Keeper itself ended this same attempt as refused or unprotected (its
+// view answers "refused" for an unprotected one). Anything else, a lost answer included, is not that.
+export function pollEnded(attempt: string, last: { status: number; body: any } | null | undefined): boolean {
+  const j = last?.body;
+  return !!last && last.status === 200 && !!j && j.id === attempt && (j.status === "refused" || j.status === "unprotected");
 }
 
 // (0.1.5) What the registration made so far, kept on its entry: the number of watched Apps (the pass's
@@ -444,25 +448,53 @@ export interface RegisterDeps {
   // (Keeper 0.1.14) POST /attempt/<id>/drill-mark on the keeper: the link's confirmation that it wrote the drill's signed mark
   markPost?: (attempt: string, body: unknown) => Promise<{ status: number; body: any } | null>;
   // (Cain 0.19.3) the version of the App installed now (its slug), as the Supervisor answered it to this App's start (Cain's own,
-  // CAIN_INSTALLED_VERSION), or null when it can't be read. It is the registration's from_version: never the base's config.yaml,
+  // cainInstalled), or null when it can't be read. It is the registration's from_version: never the base's config.yaml,
   // since a version merged into main but never installed would make Keeper refuse every later install.
-  installed?: (slug: string) => string | null;
+  installed?: (slug: string) => string | null | Promise<string | null>;
+  // (Cain 0.19.3) Keeper refused (or left unprotected) this install: the owner's one plain line saying why nothing installed, no button
+  // (core.ts refusedCard). Not for a refusal for want of space, which has its own card (noSpace).
+  refused?: (attempt: string, app: string, version: string, why: string) => void;
 }
 const VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,6}$/;
 // (Cain 0.19.3) The App's installed version, read through d.installed: a plain X.Y.Z, or null.
-export function installedVersion(d: Pick<RegisterDeps, "installed">, slug: string): string | null {
+export async function installedVersion(d: Pick<RegisterDeps, "installed">, slug: string): Promise<string | null> {
   let v: string | null = null;
-  try { v = d.installed?.(slug) ?? null; } catch { v = null; }
+  try { v = (await d.installed?.(slug)) ?? null; } catch { v = null; }
   return typeof v === "string" && VERSION.test(v.trim()) ? v.trim() : null;
 }
-// (Cain 0.19.3) Cain's installed version: the Supervisor's answer the App's start wrote (/run/cain/installed-version), else the
-// image's own build version (CAIN_BUILD_VERSION), else null. The Harness App isn't watched, so nothing reads its version here.
-export function cainInstalled(read: () => string | null, build: string | undefined): string | null {
+// (Cain 0.19.3) The longest the link waits for the start's lookup of the installed version while it is still running, and how old its
+// running mark may be before it counts as left over (the lookup itself is bounded to 60 seconds, installed-version.sh).
+export const INSTALLED_WAIT_MS = 5_000;
+export const INSTALLED_LOOKUP_MAX_MS = 75_000;
+export interface InstalledDeps {
+  read: () => string | null;                     // /run/cain/installed-version (cleared at every start), or null
+  pendingSince: () => number | null;             // when the start's lookup began (its running mark's time), or null when it isn't running
+  build: string | undefined;                     // CAIN_BUILD_VERSION, the image's own version
+  now?: () => number; sleep?: (ms: number) => Promise<void>; waitMs?: number;
+}
+const readVersion = (read: () => string | null): string | null => {
   let s: string | null = null;
   try { s = read(); } catch { s = null; }
-  const sup = (s ?? "").trim();
-  if (VERSION.test(sup)) return sup;
-  const b = (build ?? "").trim();
+  const v = (s ?? "").trim();
+  return VERSION.test(v) ? v : null;
+};
+// (Cain 0.19.3) Cain's installed version: the Supervisor's answer the App's start wrote (/run/cain/installed-version), when present and
+// valid; while that lookup is still running (its mark is there and young), the link waits for it, at most INSTALLED_WAIT_MS; then the
+// image's own build version (CAIN_BUILD_VERSION) only if it is a valid X.Y.Z (not empty, dev or latest); else null, which refuses the
+// registration with a plain reason. The file lives only in /run/cain, which every start clears, so no earlier start's value is read.
+export async function cainInstalled(o: InstalledDeps): Promise<string | null> {
+  const now = o.now ?? Date.now, sleep = o.sleep ?? ((ms: number) => Bun.sleep(ms));
+  const until = now() + (o.waitMs ?? INSTALLED_WAIT_MS);
+  for (;;) {
+    const v = readVersion(o.read);
+    if (v) return v;
+    let since: number | null = null;
+    try { since = o.pendingSince(); } catch { since = null; }
+    const running = since !== null && Number.isFinite(since) && now() - since < INSTALLED_LOOKUP_MAX_MS;
+    if (!running || now() >= until) break;
+    await sleep(Math.min(250, Math.max(1, until - now())));
+  }
+  const b = (o.build ?? "").trim();
   return VERSION.test(b) ? b : null;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
@@ -495,7 +527,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     const slug = APP_SLUGS[b.app];
     // (Cain 0.19.3) from: the version installed now, never the base's config.yaml (Nov 27: 0.19.1 merged but never installed, so a
     // registration from 0.19.1 was refused while 0.19.0 ran). Not readable: refused, with no guess.
-    const from = installedVersion(d, slug);
+    const from = await installedVersion(d, slug);
     if (!from) { say(`${b.app}'s installed version couldn't be read, so it wasn't registered (the link doesn't guess which version this install replaces)`); continue; }
     const probe = await fileAt(d, c.repo, PROBE_FILES[b.app] ?? CONFIGS[b.app], c.head);
     if (!probe || probe === "missing") { say(`${b.app}'s probe at the head couldn't be read: not registered`); continue; }
@@ -569,16 +601,19 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
     } else if (last?.status === 200 && j.status === "refused" && j.code === "no_space") {
-      ended.push(attempt);
+      if (pollEnded(attempt, last)) ended.push(attempt);
       // (Keeper 0.1.10) no room for the keeper's backup: the install is refused. Keeper 0.1.11: always; the link posts one card
       // saying so, with no button that installs without the rollback (the owner clears space or chooses another path)
       say(`the keeper refused ${b.app} ${b.version}: ${String(j.why ?? "no room for its backup").slice(0, 160)}; nothing installs without the keeper's rollback, and the link posts the owner a card saying so`);
       d.noSpace?.(c.pr, c.head, slug, b.version);
       notAccepted("the keeper had no room for its backup");
     } else {
-      // (Cain 0.19.3) any answer but pending, accepted or claimed is an attempt Keeper ended itself (its view answers "refused" for an
-      // unprotected one): nothing to cancel
-      if (last?.status === 200 && typeof j.status === "string" && !LIVE.has(j.status)) ended.push(attempt);
+      // (Cain 0.19.3) only a latest answer of refused or unprotected for this same attempt is an attempt Keeper ended itself: nothing to
+      // cancel, and the owner gets one plain line saying why nothing installed (no button). Anything else keeps the cancel.
+      if (pollEnded(attempt, last)) {
+        ended.push(attempt);
+        d.refused?.(attempt, slug, b.version, String(j.why || j.status).replace(/[^\x20-\x7e]/g, " ").slice(0, 160));
+      }
       notAccepted(last?.status === 200 && j.status === "pending" ? "the keeper's answer was still pending when the wait ended" : "the keeper didn't accept it with a confirmed backup");
       say(last?.status === 200 && j.status === "pending" ? `the keeper didn't accept ${b.app} ${b.version} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes`
       : last?.status === 200 ? `the keeper refused ${b.app} ${b.version}: ${String(j?.why || j?.status).slice(0, 160)}`
