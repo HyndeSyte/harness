@@ -31,9 +31,16 @@ export interface MergeDeps {
 export interface Landing { repo: string; pr: number; head: string }
 export type Landed =
   | { ok: true; already: boolean }
-  | { ok: false; why: string; again: boolean; stopped?: boolean };
+  | { ok: false; why: string; again: boolean; stopped?: boolean; moved?: boolean; mainMoved?: boolean };
 
 const no = (why: string, again = false): Landed => ({ ok: false, why, again });
+// The pull request's head isn't the commit his card was for (Cain 0.20.0: marked, so a card bound at the review cap
+// says it in its own plain line).
+const HEAD_MOVED: Landed = { ok: false, why: "its branch moved on since the card: it has newer commits", again: false, moved: true };
+// Cain 0.20.0: the push names exactly "<bound sha>:refs/heads/main", with no force flag and no plus, so git itself
+// refuses it when main moved after the checks; that refusal is marked, and his Ship card says it in one plain line.
+export const pushRefspec = (head: string) => `${head}:refs/heads/main`;
+const MAIN_MOVED: Landed = { ok: false, why: "main moved on while it was landing: the branch needs main merged in, then a new Ship card", again: false, mainMoved: true };
 const first = (s: string) => s.split(/\r?\n/).map((l) => l.trim()).find(Boolean)?.slice(0, 120) ?? "";
 export const remote = (repo: string) => `git@github.com:${repo}.git`;
 const where = (d: Pick<MergeDeps, "remote">, repo: string) => d.remote?.(repo) ?? remote(repo);
@@ -356,7 +363,7 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
     if (pull.state !== "open") return no("the pull request was closed");
     if (String(pull.base?.ref ?? "") !== "main") return no("it isn't a pull request into main");
     if (String(pull.head?.repo?.full_name ?? "").toLowerCase() !== repo) return no("its branch isn't in this repository");
-    if (String(pull.head?.sha ?? "").toLowerCase() !== l.head) return no("its branch moved on since the card: it has newer commits");
+    if (String(pull.head?.sha ?? "").toLowerCase() !== l.head) return HEAD_MOVED;
     const runs = await headChecks(d, l.repo, l.head);
     if (runs === "missing") return no("GitHub doesn't have that commit");
     if (!runs) return no("GitHub didn't answer about its checks", true);
@@ -372,13 +379,20 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
   if (!(await ancestor(d, "refs/ship/main", l.head)))
     return no("main moved on since its branch was made: the branch needs main merged in, then a new Ship card");
   if (d.stopped()) return { ok: false, why: "everything is stopped", again: false, stopped: true };
-  const push = await d.git(["push", "--porcelain", "--no-verify", where(d, l.repo), `${l.head}:refs/heads/main`], { ssh: true, timeoutMs: 90_000 });
+  // Cain 0.20.0: the head pinned at the landing itself. The link lands by pushing exactly the bound sha to main (the
+  // deploy key's push names that commit, never the branch, so a commit pushed to the branch after the tap can't land
+  // with it); and just before the push it reads the pull request's head from GitHub again: a head that moved since
+  // the tap-time check, or one that can't be read, lands nothing (a moved head is said in the plain line his bound
+  // card uses for it).
+  const now = await read(d, `/repos/${l.repo}/pulls/${l.pr}`);
+  if (!now || now === "missing") return no("GitHub didn't answer about the pull request just before it landed", true);
+  if (now.merged !== true && String(now.head?.sha ?? "").toLowerCase() !== l.head) return HEAD_MOVED;
+  const push = await d.git(["push", "--porcelain", "--no-verify", where(d, l.repo), pushRefspec(l.head)], { ssh: true, timeoutMs: 90_000 });
   if (push.code === 0) return { ok: true, already: false };
   // Did it land anyway (the answer was lost)? main says.
   if ((await inMain(d, l.repo, l.head)) === true) return { ok: true, already: false };
   const said = `${push.out}\n${push.err}`;
-  if (/non-fast-forward|fetch first|\[rejected\]/i.test(said))
-    return no("main moved on while it was landing: the branch needs main merged in, then a new Ship card");
+  if (/non-fast-forward|fetch first|\[rejected\]/i.test(said)) return MAIN_MOVED;
   if (KEY_REFUSED.test(said) || /read.only|key is not/i.test(said)) return no(DEPLOY_KEY_REFUSED);
   if (/rule violation|protected branch|GH0\d\d/i.test(said)) return no(`GitHub refused it (${first(push.err)})`);
   return no(`the push to GitHub failed (${first(push.err) || `git exit ${push.code}`})`, true);

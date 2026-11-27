@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.20.0
+
+- Outside reviews now end by one fixed rule: three rounds a change, never more. No card offers you more rounds, and none offers shipping with a risk named.
+- After the third round, if nothing serious is left, you get the normal Ship card, for exactly the version that round reviewed. If something serious is left, the change is held: no Ship card for it. Cain never asks you about rounds, risk or cuts, in a card or in a message.
+- You hear one plain line, with no buttons and no question, straight from the App: when the third round ends clean, when it ends with something serious left (how many, and that Cain holds it), and when Cain records why he holds it ("held: " and why). If no reason is recorded a day after the third round, one line says it is still undecided. Each line comes once.
+- Reviewers now label every finding serious or follow-up by the same test (could it lose or damage something of yours, act wrongly or without your go, expose a secret or widen access, or fail without anyone hearing). A finding any outside reviewer calls serious, or that has no label, counts as serious; no reviewer can clear another's.
+- A Ship tap lands only the exact version its card was for: the App checks the pull request again just before it lands. If something was pushed after your tap, nothing lands and the card says so; if main moved meanwhile, the card says "main moved; the change wasn't landed".
+- The card asking you to grant more review rounds, and the card asking you to ship with a risk or hold, are gone. One still up loses its buttons and says Expired, and tapping an old one does nothing. Rounds already granted lapse.
+- Why: the grant became a loop, and shipping with a risk could never be used, since it needed a rollback switch that stays off. Normal Ship installs are already backed up, watched and rolled back by the Keeper. Cutting out only the parts a serious finding is about, with one outside check of the cut, is the rule's other branch and comes in a later version.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.

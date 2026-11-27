@@ -5,7 +5,7 @@
 import { since } from "../stop";
 import { boundedText, type Caller, routeAllowed } from "./auth";
 import { noteKey } from "../security/main";
-import { type Link, Refusal, SAID_MAX } from "./core";
+import { DECISION_RETIRED, GRANT_RETIRED, type Link, Refusal, SAID_MAX } from "./core";
 import type { PassAnswer } from "./ship-pass";
 
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
@@ -44,6 +44,8 @@ export function linkRoutes(d: RouteDeps) {
         case "/look": return json(await link.look(b.m));
         case "/reuse": return json(await link.reuseProof(b.m, b.values));
         case "/pc-notice": return json(await link.pcNotice(b.code, b.job, b.id, b.repeat));
+        // Cain 0.20.0: the review runner's one plain line to him at the cap.
+        case "/review-line": return json(await link.reviewLine(b));
         case "/check": return json(link.checkSend({ text: b.text, replyTo: b.reply_to, edit: b.edit }));
         case "/reply": return json(await link.reply({ text: b.text, replyTo: b.reply_to }));
         // keeper.sh key-expiry and key-ack as his own user (0.13.1): the key record is root's.
@@ -51,10 +53,11 @@ export function linkRoutes(d: RouteDeps) {
         case "/sent": return json(await link.sent(b, { background: true }));
         case "/replay": return json(link.replay(b.days));
         case "/connector": return json(await link.connector({ item: b.item, text: b.text }));
-        case "/decision": return json(await link.decision(b));
+        // Retired (0.20.0, the owner's review rule): nothing goes to him from the review service.
+        case "/decision": throw new Refusal(DECISION_RETIRED);
         // Keeper 0.1.13: Cain asks for the drill card (keeper.sh drill-arm); only the owner's tap on it sets the flag
         case "/drill-arm": return json(await link.drillCard(b.mode, b.version));
-        case "/review-grant": return json(await link.reviewGrant({ item: b.item, change: b.change, rounds: b.rounds, text: b.text, replyTo: b.reply_to }));
+        case "/review-grant": throw new Refusal(GRANT_RETIRED);
         // The usage guard's hold from a part of Cain's (round 2): the link decides again and logs it.
         case "/guard-hold": return json(link.guardHoldFor(b, caller));
         case "/ship-pass": return json(d.shipPass ? await d.shipPass(b) : { status: "refused", said: "the link can't spend Ship tokens" });
