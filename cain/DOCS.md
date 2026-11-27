@@ -249,7 +249,17 @@ again. The first round reads the whole change; every later round is fix-only: th
 fixes and the earlier findings, and mark each finding serious (could lose or corrupt something of
 yours, act without your go, expose a secret, widen reach, or fail silently) or follow-up (a window
 that needs a crash or rare timing and fails safe, hardening, edge cases, wording, polish). A fourth
-round is refused, with the count and the rule. If the third still leaves something serious, the
+round is refused, with the count and the rule.
+
+**Since 0.19.1** (your review rule as you changed it on Nov 26, 2026): if the third round still leaves
+something serious, the change is held and Cain tells you in one line, with no card. The review runner
+no longer sends the ship-or-hold card, the link refuses it and Cain's grant card, and `keeper.sh
+review-grant` answers that grants are retired. A tap on an old grant or ship-or-hold card still up
+writes nothing: its buttons come off with one line saying it's retired. A Ship card for a held change
+is refused. The rest of this section, and "More rounds, granted by your tap" below, describe how those
+cards worked before 0.19.1; the code behind them goes in a later release.
+
+Before 0.19.1: if the third still leaves something serious, the
 runner itself sends you one card: what the piece is, the serious finding in one line, and "Hold it"
 or "Ship it with that risk", holding recommended. Cain can't send that card or ask for another
 round: the link refuses both. Its Ship card waits for your tap; after "Hold it" there is none, and
