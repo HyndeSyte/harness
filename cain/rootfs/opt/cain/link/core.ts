@@ -2246,7 +2246,7 @@ export class Link {
   // any ask, and a decision for an item held by another holder waits (one per decision, tried again at
   // each sweep) and answers "held"; a lost final round says so; and while the rollback isn't armed the
   // card says up front that a Ship would be refused.
-  async decision(d: Partial<DecisionRec>, _salt = ""): Promise<{ status: "posted"; message: string } | { status: "held"; said: string }> {
+  async decision(d: Partial<DecisionRec>, salt = ""): Promise<{ status: "posted"; message: string } | { status: "held"; said: string }> {
     // Cain 0.19.1: retired. No decision card goes out, and one still waiting on an item's hold is dropped at
     // the next sweep (retryDecisions drops a decision on any refusal but the files check's).
     throw new Refusal(`the review cap's decision card is retired by ${RETIRED_CAP}`);
