@@ -74,8 +74,10 @@ export const CHECKIN_SLOTS = ["0710", "1230", "1730"];
 // The hourly liveness check. The chat id is no Discord chat (no real id starts with zeros): the
 // broker answers a reply to it itself and never sends it on, to Discord or to the gate.
 export const PROBE_CHAT = "000000000000000000";
-export const PROBE_REPLY = "probe answered";
-export const PROBE_LINE = `Hourly liveness check from your App, not from Dane: answer at once with the reply tool, chat_id ${PROBE_CHAT}, text exactly "${PROBE_REPLY}", and nothing else. Nothing to tell him.`;
+// Cain 0.20.0: the shortest line that proves he answers, one word back and no other tool call (his
+// rules say so), since this turn ran every hour on his whole context (7 percent of his week's reads).
+export const PROBE_REPLY = "alive";
+export const PROBE_LINE = `App liveness check: reply tool, chat_id ${PROBE_CHAT}, text "${PROBE_REPLY}". Nothing else.`;
 
 export type Layer = "plugin" | "tmux" | "gateway" | "input";
 export const LAYER_WORDS: Record<Layer, string> = {
@@ -87,11 +89,28 @@ export const LAYER_WORDS: Record<Layer, string> = {
 
 // What his screen shows, read from a capture of his pane (prompt-state.sh for his prompt, and the
 // sign-in and API-error screens by their words in the last lines).
-export type Screen = "ready" | "working" | "signin" | "api" | "other";
+// A usage or spend limit (Cain 0.20.0): Claude Code's own reply when the plan's usage limit or the
+// model's monthly spend limit stops him. On Nov 27 every turn from about 6:20 to 9:04 AM failed on the
+// monthly spend limit while his prompt looked ready, so the probe called that screen ready and no alarm
+// named the cause. Now it is its own status, alarmed at once with the fix, and never ready. It counts
+// while it is the newest thing on his screen (no reply of his after it, in the last 40 lines), so a
+// limit that a later turn got past no longer counts. The typing path is unchanged by it.
+export type Screen = "ready" | "working" | "signin" | "api" | "limit" | "other";
+export const LIMIT = /you'?ve (hit|reach(?:ed)) your [a-z ]{0,30}limit|\/usage-credits|\b(monthly )?spend limit\b|usage limit (reach(?:ed)|hit)|limit reach(?:ed)[^\n]{0,40}resets/i;
 const SIGNIN = /run \/login|token has expired|authentication_error|invalid api key|not logged in|paste.*code|oauth\/authorize/i;
 const API = /api error|overloaded_error|internal server error|request timed out|connection error|api_error|rate_limit_error|\b(500|502|503|529)\b.*(error|status)|retrying in \d+/i;
+export function limitNow(capture: string): boolean {
+  const lines = capture.split("\n").filter((l) => l.trim()).slice(-40);
+  let lim = false;
+  for (const l of lines) {
+    if (LIMIT.test(l)) lim = true;
+    else if (lim && /^\s*(⏺|●)/.test(l)) lim = false;
+  }
+  return lim;
+}
 export function screenOf(capture: string, promptState: string): Screen {
   const last = capture.split("\n").filter((l) => l.trim()).slice(-12);
+  if (limitNow(capture)) return "limit";
   if (last.some((l) => SIGNIN.test(l))) return "signin";
   if (last.some((l) => /esc to interrupt/i.test(l))) {
     // A turn at work that is only retrying the model's API is the API not answering.
@@ -193,8 +212,8 @@ export function longTurn(h: Hourly, now: number): number | null {
 // can't answer (alarmed as that, never as a failure); "stopped" the App's own stopped mode (the mode
 // file says none: the App stopped his session on purpose and told the owner itself), no alarm and no
 // ping. The owner's Stop is none of these: his session keeps running and answering through it.
-export type Status = "ok" | "failed" | "signin" | "api" | "stopped";
-export interface Pass { at: number; ok: boolean; failed: string[]; hourly: HourlyState; status?: Status }
+export type Status = "ok" | "failed" | "signin" | "api" | "limit" | "stopped";
+export interface Pass { at: number; ok: boolean; failed: string[]; hourly: HourlyState; status?: Status; screen?: Screen }
 export function pass(f: Facts, h: Hourly, o: { screen?: Screen; appStopped?: boolean } = {}): Pass {
   const failed: string[] = layers(f);
   const hourly = hourlyState(h, f.now, o.screen === "working");
@@ -202,9 +221,11 @@ export function pass(f: Facts, h: Hourly, o: { screen?: Screen; appStopped?: boo
   const ok = failed.length === 0;
   let status: Status = ok ? "ok" : "failed";
   if (o.appStopped) status = "stopped";
+  else if (o.screen === "limit") status = "limit";
   else if (o.screen === "signin") status = "signin";
   else if (o.screen === "api") status = "api";
-  return { at: f.now, ok, failed, hourly, status };
+  // His screen as read, kept only while his session is there: a capture of no session isn't a screen.
+  return { at: f.now, ok, failed, hourly, status, ...(o.screen && f.tmux ? { screen: o.screen } : {}) };
 }
 // The outside heartbeat hears from the probe only when every check passed. A missed ping is the alarm
 // from outside. The owner's Stop doesn't touch it (his session runs on); only the App's own stopped
@@ -212,12 +233,26 @@ export function pass(f: Facts, h: Hourly, o: { screen?: Screen; appStopped?: boo
 export function shouldPing(p: Pass): boolean { return p.ok === true && p.failed.length === 0 && p.status !== "stopped"; }
 // The alarm the App raises for a pass, or null: two failed passes in a row (or a missed hourly
 // answer, at once); a sign-in or API screen as that, at once; never in the App's own stopped mode.
-export type AlarmKind = "probe" | "needs-signin" | "api-down";
+export type AlarmKind = "probe" | "needs-signin" | "api-down" | "usage-limit";
+// A screen the probe doesn't recognise ("other": not ready, not at work, no sign-in, API error or limit)
+// is never taken as ready, and once it has lasted OTHER_ALARM_S in passes on end it raises the probe's
+// own alarm (Cain 0.20.0), even while every liveness layer passes.
+export const OTHER_ALARM_S = 10 * 60;
+export function otherFor(recent: Pass[]): number | null {
+  let first: Pass | null = null;
+  for (let i = recent.length - 1; i >= 0 && recent[i].screen === "other"; i--) first = recent[i];
+  const last = recent.at(-1);
+  if (!first || !last || last.at - first.at < OTHER_ALARM_S) return null;
+  return Math.floor((last.at - first.at) / 60);
+}
 export function alarmFor(recent: Pass[]): AlarmKind | null {
   const last = recent.at(-1);
   if (!last) return null;
   const st = last.status ?? (last.ok ? "ok" : "failed");
-  if (st === "stopped" || st === "ok") return null;
+  if (st === "stopped") return null;
+  if (st === "limit") return "usage-limit";
+  if (otherFor(recent) !== null) return "probe";
+  if (st === "ok") return null;
   if (st === "signin") return "needs-signin";
   if (st === "api") return "api-down";
   if (last.failed.includes("answer")) return "probe";

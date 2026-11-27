@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.20.0
+
+- Cloud jobs are checked by the App itself every 15 minutes, as before, and Cain gets a line only when a job changed or something couldn't be read, instead of a check every 15 minutes whether or not anything happened.
+- If a usage or spend limit stops Cain, you get an alarm right away naming it, with the fix: switch his model or raise the limit. A screen the App doesn't recognise is never taken as ready, and alarms if it lasts 10 minutes.
+- The hourly liveness check is a shorter line, and still needs his real reply.
+- His working memory compacts earlier, at about 450K tokens, a few times a day, so each turn reads less. After a compaction he reads his record of open work again before acting.
+- A daily usage line in the App's log shows where his usage goes, so the change can be measured.
+- Your messages, taps and calendar cards reach him exactly as before.
+
 ## 0.19.1
 
 - Reviews end by your rule with no card: after the last review round, a change with something serious left is held and Cain tells you in one line. The review service no longer sends you "Ship it with that risk" or "Hold it", and Cain can no longer ask you to grant more review rounds.

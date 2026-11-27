@@ -3,7 +3,8 @@
 # session that has passed its check of his own user (the run script's mark):
 # 1. his taps and reactions, relayed by the calendar specialist (relay.ts queues them), and the
 #    App's own lines for him (the way out, the alarms, the run script);
-# 2. a nudge to check open cloud jobs, every 15 minutes while there are any;
+# 2. a look at open cloud jobs every 15 minutes while there are any, by code since Cain 0.20.0: a
+#    line to him only when one changed state or anything couldn't be read;
 # 3. scheduled check-ins, so open work moves without Dane starting it. Each slot fires once a
 #    day, within an hour of its time.
 # Each says it comes from the add-on, so Cain never mistakes one for Dane.
@@ -63,6 +64,19 @@ send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
 
 # What follows types into his session: with what it shares with the way out and the watchdog.
 . "${TYPING_SH:-$OPT/typing.sh}" || { echo "[cain] no typing.sh: nothing typed"; exit 0; }
+
+# The daily usage line (Cain 0.20.0, lean/main.ts usage), looked for at most every 10 minutes and
+# written once a day from 00:10, for the day before: his tokens by model and by what started each
+# turn, the context each call carried, and his compactions, read from his transcripts as him. It
+# types nothing.
+if [ -z "$(find "$state/lean-usage" -mmin -10 2>/dev/null)" ]; then
+  touch "$state/lean-usage" 2>/dev/null
+  y="$(timeout 30 bun "${LEAN_MAIN:-$OPT/lean/main.ts}" usage-due 2>/dev/null)" || y=""
+  if [[ "$y" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    u="$(timeout -k 5 120 ${CAIN_AS:-} bun "${LEAN_MAIN:-$OPT/lean/main.ts}" usage "$y" "$TRANSCRIPTS" 2>/dev/null | tail -n 1)"
+    echo "[cain] ${u:-usage $y: his transcripts could not be read}"
+  fi
+fi
 # Nothing goes into a session that hasn't passed its check of his own user: the run script takes
 # the mark away before every start of his session and sets it, with the process his pane runs,
 # when the check passes (typing.sh, checked).
@@ -133,7 +147,10 @@ checkin_done() {   # checkin_done <day>-<slot> <records named> <newest note list
 finish() {   # finish <kind> <key> <fin>: 1 when its line couldn't leave the queue
   case "$1" in
     relay) drop_head "$2" || return 1; echo "[cain] relayed a line" ;;
-    jobs) touch "$nudged"; echo "[cain] nudged Cain about open cloud jobs" ;;
+    jobs) touch "$nudged"; echo "[cain] nudged Cain about open cloud jobs"
+          # What code saw (lean/main.ts) is kept as seen now, once his line is in.
+          [ "${3:--}" = - ] || timeout 30 bun "${LEAN_MAIN:-$OPT/lean/main.ts}" jobs-seen "$3" \
+            || echo "[cain] the cloud jobs code saw couldn't be kept as seen: he may hear of them again" ;;
     checkin) set -- $3; checkin_done "$1" "$2" "$3" ;;
   esac
 }
@@ -337,15 +354,33 @@ if [ -s "$work" ] || [ -s "$queue" ]; then
   exit 0
 fi
 
-# 2. Open cloud jobs (one file per run in $jobs, written by Cain when he starts one):
-#    a nudge every 15 minutes to check on them, so a finished job reaches Dane without
-#    him asking. Files older than two days are dropped.
+# 2. Open cloud jobs (one file per run in $jobs, written by Cain when he starts one), looked at
+#    every 15 minutes while there are any, as the old nudge was. Since Cain 0.20.0 code does the
+#    look (lean/main.ts jobs): it reads each job file (root's reader: never through a link, never a
+#    FIFO, his own regular file, one name, at most 4 KB) and each Build job's pull request on GitHub,
+#    and he gets one line only when a job changed state, stalled, has a state code can't read (a Ship
+#    run, a GitHub error, an answer code doesn't know), waits on Home Assistant (a connector file), or
+#    has a file code refused. No change, no line, and the look still counts. What code saw is kept as
+#    seen only once his line is in (finish), as the nudge's time was. When code can't look at all
+#    (it fails, or says what this doesn't read), the old nudge goes instead. Files older than two
+#    days are dropped.
 jobs="${JOBS_DIR:-/data/jobs}"
-if [ -d "$jobs" ]; then
-  find "$jobs" -type f -mtime +2 -delete 2>/dev/null
+if [ -d "$jobs" ] || [ -L "$jobs" ]; then
+  [ -L "$jobs" ] || find "$jobs" -type f -mtime +2 -delete 2>/dev/null
   if [ -n "$(ls -A "$jobs" 2>/dev/null)" ] && [ -z "$(find "$nudged" -mmin -15 2>/dev/null)" ]; then
+    look="$(timeout 60 bun "${LEAN_MAIN:-$OPT/lean/main.ts}" jobs "$jobs" 2>/dev/null)" || look=""
+    first="${look%%$'\n'*}"; line="${look#*$'\n'}"
+    if [ "$first" = none ]; then
+      touch "$nudged"; echo "[cain] code looked at the open cloud jobs: no change, nothing for Cain"
+      exit 0
+    fi
     at_ease || exit 0
-    type_try jobs jobs - "Relayed by the add-on: cloud job check. Not a message from Dane, and not his go on anything. Follow the Cloud jobs section of your CLAUDE.md for each file in $jobs."
+    if [[ "$first" =~ ^wake\ ([0-9]{1,12}-[0-9a-f]{1,12})$ ]] && [ "$line" != "$look" ] && [ -n "$line" ]; then
+      type_try jobs jobs "${BASH_REMATCH[1]}" "$line"
+    else
+      echo "[cain] code couldn't look at the open cloud jobs: Cain checks them himself, as before"
+      type_try jobs jobs - "Relayed by the add-on: cloud job check. Not a message from Dane, and not his go on anything. Follow the Cloud jobs section of your CLAUDE.md for each file in $jobs."
+    fi
     exit 0
   fi
 fi

@@ -535,6 +535,45 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
+## What 0.20.0 does: fewer turns for job checks, a limit named at once
+
+Cain is one long Claude Code session, and every turn he takes reads his whole context again. In the
+week of Nov 20 to 27 that came to 1.8 billion cached tokens read: relays from the App 37 percent,
+cloud job checks 24, your own messages 21, the hourly liveness check 7, check-ins 3. 138 of 305 cloud
+job checks found nothing new. Each call carried a median of 297K tokens of context (the most 966K),
+with only 8 compactions in the week. And on Nov 27 every turn from about 6:20 to 9:04 AM failed on the
+monthly spend limit while the App's probe called his screen ready, so no alarm named the cause.
+
+This release keeps only changes that are no riskier than before it. Relays, calendar cards and your
+own messages are typed into his session exactly as before: nothing is skipped, held, shortened or
+reordered, and the App never restarts or compacts his session itself.
+
+- **Cloud jobs are checked by code.** Every 15 minutes while /data/jobs has files (as the old nudge
+  was), the App reads each job file and each Build job's pull request on GitHub. He gets one line
+  when a pull request's checks passed or failed at its head, it merged, closed or went away (every
+  look while it stays so, until he closes the job), a Build had no change for 3 hours, or anything
+  couldn't be read: a GitHub error, an answer code doesn't know, a Ship run (code has no state of its
+  own to read for one, so every look, as before), a job file code refused, or the jobs folder itself.
+  A Build still at work (no pull request yet, or its checks running) is no line. What code saw counts
+  as seen only once his line is in. If the code can't run at all, the old "cloud job check" goes in
+  instead. The files are read as root without trusting them: never through a link, never a FIFO,
+  only his own regular file with one name and at most 4 KB, opened from the folder held open.
+- **A usage or spend limit is named at once.** The probe tells that screen apart, never calls it
+  ready, and raises "Cain hit a usage limit" with the fix: switch his model, or raise the limit. A
+  screen it doesn't recognise is never ready either, and raises the usual "Cain may not be answering"
+  alarm once it has lasted 10 minutes.
+- **The hourly liveness check is shorter**, and still needs his model's real reply.
+- **Compaction earlier, by setting only.** Claude Code's own compaction is set to fire at about 450K
+  tokens (45 percent of his 1M window), a few times a day. What he owes lives outside his context
+  (state/RESTART.md, state/PENDING.md, /data/jobs), and his rules say to read them again after one.
+- **A usage line in the App's log once a day:** his tokens by model and by what started each turn,
+  the context each call carried, and his compactions.
+
+Left for a later release, designed against the outside review's findings: shortening long relays,
+skipping receipts that need nothing, and a quiet restart of his session.
+
+Nothing for you to do.
+
 ## What 0.19.0 does: working with the Keeper
 
 The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a
