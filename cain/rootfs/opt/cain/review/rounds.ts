@@ -116,7 +116,7 @@ export function admit(r: Rounds, b: Brief, base: number, grants: Grants | null =
   if (n >= cap) {
     const d = decisionOf(view, key);
     const g = grantWords(granted, tz);
-    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}. No more rounds for it, under any id or a replacement pull request.${d ? " Its decision card went to him." : " If the last one left something serious, he gets one decision card from the review service; nothing else to send."} More rounds come only from a grant: Cain asks with keeper.sh review-grant, and only the owner's tap on that card grants them; it never exempts the change from the rule. Nothing was queued.` };
+    return { ok: false, why: `refused: ${key} has had ${n} outside review round${n === 1 ? "" : "s"}, and the owner's rule allows at most ${base}${g ? `, plus ${g}, so ${cap}` : ""}. No more rounds for it, under any id or a replacement pull request.${d ? " It's held at the cap." : " If the last one left something serious, it's held by his review rule."} Tell him in one line if it's held, and ask him nothing about rounds, risk or cuts. Nothing was queued.` };
   }
   const kind: RoundKind = b.round_kind ?? (n === 0 ? "full" : "fixes");
   if (kind === "full" && n > 0)

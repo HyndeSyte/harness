@@ -39,16 +39,14 @@ const tmpFile = () => join(mkdtempSync(join(tmpdir(), "c2r-")), "review-decision
 
 describe("fix 1: the link reads the plan in a child, with a time budget", () => {
   test("a tap is answered while a slow read is in flight", async () => {
-    const file = tmpFile();
+    // Cain 0.19.1 retired the review cap's decision card, so the tap is on an ordinary ask card.
     const plan = new PlanRefresher({ cmd: slowChild(1500, reading({})), budgetMs: 4000, tz: TZ, log: () => {} });
     const r = rig({ holds: keeperHolds({}) });
-    const lines: string[] = [];
     Object.assign((r.link as any).d, {
-      decided: (id: string, c: string, at: number) => recordDecision(file, id, c, at, { sync: () => {} }),
-      decisionsReset: () => readReset(file), rounds: () => ROUNDS, holdLog: (l: string) => { lines.push(l); },
       guardHold: async () => { const p = await plan.read(); return p.fraction !== null && p.fraction < 0.5 ? { ok: true } : { ok: false, floor: "plan", why: p.reason }; },
     });
-    const res = await r.link.decision(DEC) as any;
+    const res: any = await r.link.ask({ text: "Pause the garden plan?", options: ["One", "Two"], item: "none" });
+    expect(res.status).toBe("posted");
     let settled = false;
     const check = (r.link as any).guardHoldFor({ label: "other", what: "Build on claude/x" }, "cain").then((v: any) => { settled = true; return v; });
     await Bun.sleep(50);                                                       // the child is running now
@@ -57,8 +55,7 @@ describe("fix 1: the link reads the plan in a child, with a time budget", () => 
     const took = performance.now() - t0;
     expect(settled).toBe(false);                                               // the read is still in flight
     expect(took).toBeLessThan(1000);
-    expect(r.answers().length).toBeGreaterThan(0);                             // his tap was answered
-    expect(readDecided(file)).toMatchObject({ "pr-5#3": { choice: HOLD } });
+    expect(r.relayed.filter((l) => l.includes('Dane tapped "One"')).length).toBe(1);   // his tap was answered and relayed
     expect(await check).toEqual({ status: "passes" });
     expect(plan.started).toBe(1);
   });
@@ -340,32 +337,25 @@ const decisionRig = (file: string, extra: Record<string, unknown> = {}) => {
 const removeAside = (file: string) => { for (const n of readdirSync(join(file, ".."))) if (n.includes(".corrupt-")) rmSync(join(file, "..", n)); };
 
 describe("fix 4: the reset mark is written whole before the move-aside", () => {
+  // Cain 0.19.1 retired the decision card (a tap on an old one writes nothing: cap-retired.test.ts), so this is
+  // the file's rule alone: a crash on either side of the rename leaves the mark, and writes resume after.
   for (const side of ["before", "after"] as const) {
-    test(`a crash ${side} the rename never lets an old card record a decision after recovery`, async () => {
+    test(`a crash ${side} the rename leaves the mark, and writes resume once the copy is gone`, () => {
       const file = tmpFile();
-      const t = decisionRig(file);
-      const res = await t.r.link.decision(DEC) as any;                         // the old card, posted now
-      t.r.later(60_000);
       writeFileSync(file, "{not json");
-      const now = () => (t.r as any).t.now;
-      // The crash: the process stops at the rename (before: it never happens; after: it happened).
+      const at = 1_700_000_000_000;
+      const now = () => at;
       const crash = (from: string, to: string) => { if (side === "after") renameSync(from, to); throw new Error("crash"); };
       expect(() => recordDecision(file, "x#1", HOLD, 1, { sync: () => {}, now, moveAside: crash })).toThrow();
-      expect(readReset(file)).toBe(now());                                     // the mark is there either way
+      expect(readReset(file)).toBe(at);                                        // the mark is there either way
       if (side === "before") {
-        // The next tap after the restart marks again and moves it aside.
-        t.r.later(1_000);
+        // The next write after the restart marks again and moves it aside.
         expect(() => recordDecision(file, "x#1", HOLD, 1, { sync: () => {}, now })).toThrow(DecisionsPaused);
-        expect(readReset(file)).toBe(now());
+        expect(readReset(file)).toBe(at);
       }
-      // The owner removes the moved-aside copy as the alarm says; writes resume on a fresh file.
       removeAside(file);
-      t.r.later(60_000);
-      await t.r.tap(t.r.msg(res.message), t.r.ids(res.message)[0]);
-      expect(readDecided(file)).toEqual({});                                   // the old card's tap isn't kept
-      expect(String(t.r.msg(res.message).content)).toEndWith(REPLACED);
-      expect(t.r.ephemerals().map((e) => e.content)).toEqual([RESET_TAP]);
-      expect(t.r.relayed.filter((l) => l.includes("Dane tapped"))).toEqual([]);
+      expect(recordDecision(file, "y#1", HOLD, 2, { sync: () => {} })).toMatchObject({ choice: HOLD, existed: false });
+      expect(readReset(file)).toBe(at);
     });
   }
 

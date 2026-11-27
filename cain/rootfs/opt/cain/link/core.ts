@@ -143,6 +143,11 @@ export const grantLabel = (n: number) => `Grant ${n} more round${n === 1 ? "" : 
 // change is written, and a grant tap whose checks no longer hold writes nothing; its card says why.
 export const GRANT_REPLACED = "Replaced by a newer grant";
 const GRANT_REFUSED = "Nothing was granted: ";
+// Cain 0.19.1: grant cards and the review cap's ship-or-hold card are retired by the owner's review rule
+// (R-013, Nov 26, 2026). A tap on one still up writes nothing; the card loses its buttons and says this.
+export const RETIRED_GRANT = "Extra review rounds are retired, so nothing was granted.";
+export const RETIRED_DECISION = "This choice is retired: a change with something serious left after its last review is held, and nothing was recorded.";
+const RETIRED_CAP = "the owner's review rule at the cap: a change whose last round left something serious is held, with one line to him, and he is never asked about rounds or risk";
 // Second review of 0.18.0: a passing failure at his Grant tap (the holds file, the runner's records or the pull
 // request's head can't be read just then) keeps the card's buttons, and he's told to try again in a minute.
 export const grantRetry = (what: string) => `${what} can't be read right now, so nothing was granted yet. The card is still up: try again in a minute.`;
@@ -1963,6 +1968,8 @@ export class Link {
   // holds, and (first review) while another grant card for the same change key is still open, naming
   // when that one went up. His tap checks all of it again before it writes (grantBlock).
   async reviewGrant(a: { item?: unknown; change?: unknown; rounds?: unknown; text?: unknown; replyTo?: unknown }): Promise<AskResult> {
+    // Cain 0.19.1: retired. No grant card goes out; the checks below stay until the grant code is removed.
+    throw new Refusal(`grant cards are retired by ${RETIRED_CAP}. Never ask him for more rounds`);
     const meta = checkMeta({ item: a.item, replyTo: a.replyTo });
     if (meta.item === "none") throw new Refusal("a grant card is filed under the change's item: its PENDING id");
     if (this.stopped().stopped) throw new Refusal("Everything is stopped: Dane tapped Stop, so no grant card until he taps Turn back on. Only he can; don't ask him to.");
@@ -2138,6 +2145,26 @@ export class Link {
     return "retry";
   }
 
+  // Cain 0.19.1: his tap on a retired grant or cap decision card. Nothing is written (no grant, no decision
+  // kept), the card loses its buttons and says so, and Cain hears it with nothing to tell him.
+  private async retiredTap(it: any, s: State, msgId: string, kind: "grant" | "decision", label: string): Promise<string> {
+    const m = s.messages[msgId];
+    const key = (kind === "grant" ? m.grant?.key : m.decision?.key) ?? "a change";
+    const line = kind === "grant" ? RETIRED_GRANT : RETIRED_DECISION;
+    m.outcome = "expired"; m.why = line;
+    if (m.q) m.q.used = true;
+    const content = withLine(String(it.message?.content ?? ""), line);
+    m.digest = digest(content, []);
+    this.d.save(s);
+    this.log(`his tap on a retired ${kind} card for ${key} wrote nothing`);
+    this.d.relay(`Dane tapped "${label}" on an old ${kind === "grant" ? "grant" : "ship-or-hold"} card for ${key}. Those cards are retired, so nothing was written and its buttons came off (Discord message ${msgId}). Nothing to tell him.`);
+    const ok = await this.answer(it, UPDATE, { content, components: [], allowed_mentions: { parse: [] } });
+    const s2 = this.d.load();
+    if (s2.messages[msgId]) { s2.messages[msgId].buttons = !ok; if (ok) s2.messages[msgId].off = this.d.now(); this.d.save(s2); }
+    if (m.kind === "ask") await this.releaseHeld();
+    return `refused: ${line}`;
+  }
+
   // A grant tap that failed its checks: nothing written, the card loses its buttons and says why, and he
   // gets the same line to him alone. Cain hears it like any tap.
   private async grantRefused(it: any, s: State, msgId: string, line: string, label?: string): Promise<string> {
@@ -2219,9 +2246,10 @@ export class Link {
   // any ask, and a decision for an item held by another holder waits (one per decision, tried again at
   // each sweep) and answers "held"; a lost final round says so; and while the rollback isn't armed the
   // card says up front that a Ship would be refused.
-  // salt (0.17.0): a card posted again after a reset gets a nonce of its own, so Discord doesn't take it
-  // for the first card's post.
-  async decision(d: Partial<DecisionRec>, salt = ""): Promise<{ status: "posted"; message: string } | { status: "held"; said: string }> {
+  async decision(d: Partial<DecisionRec>, _salt = ""): Promise<{ status: "posted"; message: string } | { status: "held"; said: string }> {
+    // Cain 0.19.1: retired. No decision card goes out, and one still waiting on an item's hold is dropped at
+    // the next sweep (retryDecisions drops a decision on any refusal but the files check's).
+    throw new Refusal(`the review cap's decision card is retired by ${RETIRED_CAP}`);
     const off = this.capOff();
     if (off) throw new Refusal(`the review cap's files aren't right (${off}), so no decision card goes out until they are`);
     const id = String(d.id ?? ""), key = String(d.key ?? "");
@@ -2294,6 +2322,8 @@ export class Link {
         this.log(`a waiting decision card didn't go: ${String(e).slice(0, 80)}`);
         if (e instanceof Refusal && !/files aren't right/.test(e.message)) {           // it can never go: dropped, the runner asks again
           const s = this.d.load(); if (s.decisions?.[String(d.id)]) { delete s.decisions[String(d.id)]; this.d.save(s); }
+          // Cain 0.19.1: one waiting from before the card was retired is held by his rule; Cain says so once.
+          if (/is retired/.test(e.message)) this.d.relay(`The review cap was reached for ${String(d.key ?? "a change")} before this release, and its decision card never went out: by his review rule it's held, with no Ship card. Tell him in one line that it's held and why, and ask him nothing about rounds, risk or cuts.`);
         }
       }
     }
@@ -2402,12 +2432,12 @@ export class Link {
     // The review-round cap (0.16.0): the decision at the cap is the review service's card alone, and no
     // ask may offer a round past it.
     if (raw.some((o) => o.toLowerCase() === RISK.toLowerCase()))
-      throw new Refusal("the decision at the review-round cap is the review service's own card: it posts it itself when the last round leaves something serious. Ask nothing about it, and offer no review round past the cap");
+      throw new Refusal("shipping with a risk named is retired: by the owner's review rule a change whose last round left something serious is held, with one line to him. Ask him nothing about rounds, risk or cuts, and offer no review round past the cap");
     let rounds: Rounds | null = null, grants: Grants | null = null;
     try { rounds = this.d.rounds?.() ?? null; } catch { rounds = null; }
     try { grants = this.d.grants?.() ?? null; } catch { grants = null; }
     const past = namesRoundPastCap([asked, ...raw].join("\n"), this.d.roundCap?.() ?? 3, rounds, grants);
-    if (past) throw new Refusal(`this names ${past}, past the review-round cap of ${this.d.roundCap?.() ?? 3}: the owner's rule allows no more rounds for a change, and the review service asks him the one decision itself. Take it out`);
+    if (past) throw new Refusal(`this names ${past}, past the review-round cap of ${this.d.roundCap?.() ?? 3}: the owner's rule allows no more rounds for a change, and a change past its last round is held by his review rule. Ask him nothing about rounds, risk or cuts. Take it out`);
     // The gate, before the nonce is made: the same words always make the same card.
     const opts = raw.map((o) => this.cainWords("ask option", "ask's option", o, { rules: ["dash", "app", "count", "machine"] }, { reviewed: true }));
     const w = this.cainWords("ask", "ask", asked, { rules: CARD_RULES, buttons: opts.map((o) => o.text), known: this.liveLabels() }, { reviewed: true });
@@ -2487,10 +2517,12 @@ export class Link {
     let cap: CapState = { state: "none" };
     try { cap = this.d.capState?.(pr) ?? { state: "none" }; } catch (e) { cap = { state: "unknown", why: String(e).slice(0, 80) }; }
     if (cap.state === "unknown") throw new Refusal(`where this pull request stands at the review-round cap is unknown (${cap.why}): no Ship card until it can be read`);
-    if (cap.state === "waiting") throw new Refusal("its last review round left something serious, and his decision on it (ship it with that risk, or hold it) is still open: no Ship card until he taps it");
-    if (cap.state === "hold") throw new Refusal("he chose to hold it at the review-round cap: no Ship card for it. A fix is new work, with its own item and a new change, or more fix rounds if he grants them (keeper.sh review-grant asks him)");
-    if (cap.state === "pending") throw new Refusal(`${cap.why}: no Ship card until a granted round leaves nothing serious, or the review service's next decision card has his tap`);
-    if (cap.state === "risk") risk = true;
+    if (cap.state === "waiting") throw new Refusal("its last review round left something serious, so it's held by the owner's review rule: no Ship card for it. Tell him in one line it's held and why; a fix is new work, with its own item and a new change");
+    if (cap.state === "hold") throw new Refusal("it was held at the review-round cap: no Ship card for it. A fix is new work, with its own item and a new change");
+    if (cap.state === "pending") throw new Refusal(`${cap.why}: no Ship card until a granted round leaves nothing serious`);
+    // Cain 0.19.1: shipping with a risk named is retired, so an earlier "Ship it with that risk" tap no longer
+    // opens a Ship card: the change is held like any other with something serious left.
+    if (cap.state === "risk") throw new Refusal("its last review round left something serious, so it's held by the owner's review rule: no Ship card for it, whatever was tapped on the old card. A fix is new work, with its own item and a new change");
     const w = this.cainWords("ship", "Ship card", said, { rules: CARD_RULES, buttons: ["Ship", "Not now"], known: this.liveLabels() },
       { shipWords: true });
     // Without GitHub to read (only the tests' rig has none), the card is his words alone.
@@ -3552,6 +3584,8 @@ export class Link {
     const i = Number(cid.split(":")[2]);
     if (!m || !q || q.used || !(i >= 0 && i < q.options.length)) return this.deadTap(it, msgId, "answered");
     const tapped = q.options[i];
+    // Cain 0.19.1: a grant card or a cap decision card still up is retired: his tap writes nothing.
+    if (m.grant || m.decision) return this.retiredTap(it, s, msgId, m.grant ? "grant" : "decision", tapped);
     // His Grant tap (second review of 0.18.0): under the change key's lock (onInteraction), everything is checked
     // again first, the head read from GitHub included; then the state is read afresh for the write and the card.
     if (m.grant && tapped !== GRANT_NO) {

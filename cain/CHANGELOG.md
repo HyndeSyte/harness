@@ -18,12 +18,18 @@
 - Heartbeat checks: grace and period are each capped at one hour, and every change Cain makes is posted to you in one line with the old and new values. The Healthchecks key now reaches the link in a root-only file, never an environment its helper programs could see.
 - Third round of review fixes: the App's alarms no longer hold up your taps. The link starts each alarm in the background with its own time limit, so a tap is answered while an alarm is still being sent.
 - The plan count's high-water mark can no longer go down when the review runner and the link both save it at once: each keeps the larger mark, and a reading behind the newer one holds other work until the next reading catches up.
-- If the reset mark of your review-cap answers can't be read, the App writes it again with the current time instead of asking you to delete it, so cards from before the reset still can't be answered. If it can't, the alarm names the one command to run as root.
+- If the reset mark of Cain's file of review-cap answers can't be read, the App writes it again with the current time instead of asking you to delete it, so the reset it records is never lost. If it can't, the alarm names the one command to run as root.
 - A plan reader that keeps failing (two readings in a row, or half an hour with none complete) now raises its own alarm with the cause, and it clears with the next complete reading.
 - While a new plan reading runs long, a reading from the last 2 minutes is used with its own reason, so a missing allowance is no longer reported as "out of time".
 - The link writes the Build hook's "not ready" hold line only when its own plan reading is not ready the same way; any other such request is refused and not counted.
 - A heartbeat change whose line couldn't be posted to you now raises an alarm naming the check, at most hourly, and the line is checked against the message gate's rules first.
 - Leftover temp files from an interrupted reset mark write are cleaned up, never one still being written.
+
+## 0.19.1
+
+- Reviews end by your rule with no card: after the last review round, a change with something serious left is held and Cain tells you in one line. The review service no longer sends you "Ship it with that risk" or "Hold it", and Cain can no longer ask you to grant more review rounds.
+- If an old card of either kind is still up, tapping it does nothing but take its buttons off and say it's retired.
+- A change held at the last review round can't be shipped through an earlier "Ship it with that risk" tap any more.
 
 ## 0.19.0
 

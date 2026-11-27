@@ -72,9 +72,10 @@ describe("fix 1: the link's alarms never block its event loop", () => {
     const child = steered();
     child.set({ out: reading({ cache_write: "the plan reader's cache /data/review-plan-cache.json couldn't be written (ENOSPC)" }) });
     const plan = new PlanRefresher({ cmd: child.cmd, budgetMs: 4000, tz: TZ, log: () => {}, onReading: (p) => alarm.saw(p), onAsk: () => alarm.asked() });
-    const file = tmpFile();
-    const t = decisionRig(file);
-    const res = await t.r.link.decision(DEC) as any;
+    // Cain 0.19.1 retired the review cap's decision card, so the tap is on an ordinary ask card.
+    const t = { r: rig({ holds: keeperHolds({}) }) };
+    const res: any = await t.r.link.ask({ text: "Pause the garden plan?", options: ["One", "Two"], item: "none" });
+    expect(res.status).toBe("posted");
     const t0 = performance.now();
     await plan.read();                                                         // the child finished: its reading raised the alarm
     expect(performance.now() - t0).toBeLessThan(1500);
@@ -84,7 +85,7 @@ describe("fix 1: the link's alarms never block its event loop", () => {
     await t.r.tap(t.r.msg(res.message), t.r.ids(res.message)[0]);
     expect(performance.now() - t1).toBeLessThan(1000);
     expect(existsSync(done)).toBe(false);                                      // the notice is still asleep
-    expect(readDecided(file)).toMatchObject({ "pr-5#3": { choice: HOLD } });   // his tap was kept and answered
+    expect(t.r.relayed.filter((l) => l.includes('Dane tapped "One"')).length).toBe(1);   // his tap was answered and relayed
     expect(t.r.answers().length).toBeGreaterThan(0);
   });
 
@@ -165,21 +166,22 @@ describe("fix 2: the high-water mark is the maximum of every writer's, under the
 
 // -- 3 --------------------------------------------------------------------------------------------------
 describe("fix 3: the way back from an unreadable reset mark keeps the boundary", () => {
+  // Cain 0.19.1 retired the review cap's decision card, so a tap on an old one writes nothing whatever the mark
+  // says (cap-retired.test.ts). What stays is the mark itself: never deleted, and written again with a fresh
+  // boundary later than the reset, so the decisions file it guards can't take an answer from before it.
   for (const way of ["the sweep", "the root command"] as const) {
-    test(`${way} writes the mark again with now; a card from before the reset is still refused and replaced`, async () => {
+    test(`${way} writes the mark again with now, a boundary later than the reset, and never removes it`, () => {
       const file = tmpFile();
-      const t = decisionRig(file);
-      const res = await t.r.link.decision(DEC) as any;                         // the old card
-      t.r.later(60_000);
       writeFileSync(file, "{not json");
-      const now = () => (t.r as any).t.now;
-      expect(() => recordDecision(file, "x#1", HOLD, 1, { sync: () => {}, now })).toThrow();   // marked and moved aside
+      const resetAt = Date.now() - 60_000;
+      expect(() => recordDecision(file, "x#1", HOLD, 1, { sync: () => {}, now: () => resetAt })).toThrow();   // marked and moved aside
       expect(asideIn(file)).toBe(true);
+      expect(readReset(file)).toBe(resetAt);
       writeFileSync(resetOf(file), "garbage");                                 // the mark is corrupted
       expect(readReset(file)).toBeNaN();
       if (way === "the sweep") {
         const raised: string[] = [];
-        new CapAlarms({ decided: file, guardLog: join(file, "..", "guard.log"), raise: (k) => raised.push(k), clear: () => {}, now }).sweep();
+        new CapAlarms({ decided: file, guardLog: join(file, "..", "guard.log"), raise: (k) => raised.push(k), clear: () => {} }).sweep();
         expect(raised).toEqual([]);                                            // written again, no alarm
       } else {
         const r = spawnSync("bun", [join(S, "link", "cap.ts"), "reset-mark"], { encoding: "utf8",
@@ -187,16 +189,12 @@ describe("fix 3: the way back from an unreadable reset mark keeps the boundary",
         expect(r.status).toBe(0);
         expect(r.stdout).toContain("written again with the current time");
       }
-      expect(readReset(file)).toBeGreaterThan(Number(t.r.msg(res.message).timestamp ? Date.parse(t.r.msg(res.message).timestamp) : 0));
-      expect(existsSync(resetOf(file))).toBe(true);
-      // The owner removes the moved-aside copy; the old card's tap is refused and replaced, not recorded.
+      expect(readReset(file)).toBeGreaterThan(resetAt);                        // a fresh boundary, later than the reset
+      expect(existsSync(resetOf(file))).toBe(true);                            // never removed
+      // The owner removes the moved-aside copy; writes resume on a fresh file, and the mark stays.
       for (const n of readdirSync(join(file, ".."))) if (n.includes(".corrupt-")) rmSync(join(file, "..", n));
-      t.r.later(60_000);
-      await t.r.tap(t.r.msg(res.message), t.r.ids(res.message)[0]);
-      expect(readDecided(file)).toEqual({});
-      expect(String(t.r.msg(res.message).content)).toEndWith(REPLACED);
-      expect(t.r.ephemerals().map((e) => e.content)).toEqual([RESET_TAP]);
-      expect(t.r.relayed.filter((l) => l.includes("Dane tapped"))).toEqual([]);
+      expect(recordDecision(file, "y#1", HOLD, 2, { sync: () => {} })).toMatchObject({ choice: HOLD, existed: false });
+      expect(existsSync(resetOf(file))).toBe(true);
     });
   }
 
@@ -300,7 +298,7 @@ describe("fix 5: a fresh reading is reused with its own reason", () => {
     expect(late.not_ready).toBe("out of time");                                // older than 2 minutes: not reused
     expect(FRESH_MS).toBe(120_000);
     await Bun.sleep(1200);
-  });
+  }, 15_000);                                                                  // three waits of 1.2 s on purpose: past bun's 5 s default
 });
 
 // -- 6 --------------------------------------------------------------------------------------------------

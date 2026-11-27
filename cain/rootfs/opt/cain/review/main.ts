@@ -7,7 +7,6 @@ import { pinSocket } from "../pinned.ts";
 import { readStop } from "../stop.ts";
 import { configFromEnv } from "./config.ts";
 import { Runner, type RunnerDeps } from "./runner.ts";
-import type { DecisionRec } from "./rounds.ts";
 import { capPaths, selfCheck } from "../capfiles.ts";
 import { PlanCacheAlarm, readSettings } from "../guard.ts";
 import { readPlanUsage, weekStart } from "../plan-usage.ts";
@@ -19,21 +18,6 @@ import { CodexLogin, handle } from "./signin.ts";
 
 const log = (m: string) => console.log(`[review] ${m}`);
 
-// The owner's decision card at the review cap (Cain 0.16.0): through the link's root socket (only root
-// can open it), which builds the card's words itself and files his tap. The message id once it's up;
-// null while it isn't (the link didn't answer, or it waits on its item's hold: round 2), tried again.
-export function decisionPoster(linkSock: string, log: (m: string) => void) {
-  return async (d: DecisionRec): Promise<string | null> => {
-    const res = await fetch("http://link/decision", { method: "POST", unix: linkSock, headers: { "content-type": "application/json" },
-      body: JSON.stringify(d), signal: AbortSignal.timeout(45_000) } as any);
-    const j: any = await res.json().catch(() => ({}));
-    if (res.ok && j?.status === "posted" && typeof j.message === "string") return j.message;
-    // Round 2: its item is held by another holder; the link keeps it waiting and posts it once that clears.
-    if (res.ok && j?.status === "held") return null;
-    log(`the link didn't post the decision card for ${d.key}: ${String(j?.said ?? j?.status ?? res.status).slice(0, 160)}`);
-    return null;
-  };
-}
 
 // The plan reader's cache, warmed by root (0.17.0, round 2 of the review fixes): at the runner's start,
 // whenever the plan's week turns, and every WARM_MS between, so the link's reading (in its own child
@@ -80,9 +64,8 @@ if (import.meta.main) {
   if (keys.anthropic) seats.claude = claudeSeat({ key: keys.anthropic, model: cfg.models.claude, selftestModel: "claude-haiku-5-5",
     version: env.ANTHROPIC_VERSION_HEADER || undefined });
 
-  const postDecision = decisionPoster(env.CAIN_LINK_SOCK ?? "/run/cain/link.sock", log);
   const runner = new Runner(cfg, {
-    seats, log, postDecision,
+    seats, log,
     stopped: () => readStop().stopped,
     unavailable: (s) => (s === "openai" && !codexSignedIn(codexHome) ? { kind: "unconfigured", detail: "Codex isn't signed in to ChatGPT yet" } : null),
   });

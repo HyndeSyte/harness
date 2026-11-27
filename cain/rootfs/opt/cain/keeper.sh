@@ -158,13 +158,7 @@
 #   keeper.sh connector --item P41 "what waits"
 #                                        the one notice that Claude's Home Assistant connector needs
 #                                        him to sign in again, with a button to its settings
-#   keeper.sh review-grant --item P46 --change <pull request url or change key> --rounds <1-3> "why"
-#                                        a card asking him to grant a change at its review-round cap more
-#                                        fix rounds: what it does (your line), the rounds it used and what
-#                                        the last left (the runner's record), with "Grant <n> more rounds"
-#                                        and "No". Only his tap writes the grant; this writes nothing.
-#                                        Refused while the change has rounds left, its item is held by
-#                                        another holder, or Stop holds
+#   keeper.sh review-grant ...         retired in 0.19.1: the link answers that grants are retired
 #   keeper.sh drill-arm <exit-on-start|verdict-fail> <version>
 #                                        (Keeper 0.1.13) posts Dane the drill card for the Keeper App: his tap on it,
 #                                        and only his tap, arms the next install of Cain as a drill that fails on

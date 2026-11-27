@@ -260,20 +260,11 @@ const decisionRig = (file: string, extra: Record<string, unknown> = {}) => {
 const tmpFile = () => join(mkdtempSync(join(tmpdir(), "c-")), "review-decisions.json");
 
 describe("C1: a stored choice outside the card's options fails closed", () => {
-  test("no relay, no hold line, the card marked unreadable, an alarm naming the decision", async () => {
+  // Cain 0.19.1 retired the review cap's decision card: a tap on an old one writes nothing and only retires it
+  // (cap-retired.test.ts). What stays is the file's own rule: a stored choice outside the options is unreadable.
+  test("a stored choice outside the options is unreadable, and the change's cap state is unknown", () => {
     const file = tmpFile();
     writeFileSync(file, JSON.stringify({ "pr-5#3": { choice: "Ship it anyway", at: 1 } }));       // hand-edited
-    const t = decisionRig(file);
-    const res = await t.r.link.decision(DEC) as any;
-    const [hold] = t.r.ids(res.message);
-    expect(await (t.r.tap(t.r.msg(res.message), hold))).toBeDefined();
-    expect(t.r.relayed.filter((l) => l.includes("Dane tapped"))).toEqual([]);
-    expect(t.lines).toEqual([]);
-    expect(String(t.r.msg(res.message).content)).toEndWith(UNREADABLE_LINE);
-    expect(t.r.state().messages[res.message]).toMatchObject({ outcome: "expired", why: "stored answer unreadable" });
-    expect(t.r.state().messages[res.message].q!.used).toBe(true);
-    expect(t.alarms).toEqual([["review-decision", "the decision for pr-5 (pr-5#3)"]]);
-    // The file is left as it was, and the cap's state for the change is unknown (no Ship card).
     expect(readDecided(file)).toEqual({ "pr-5#3": { choice: "Ship it anyway", at: 1 } });
     expect(capStateFor(PR, ROUNDS, readDecided(file))).toMatchObject({ state: "unknown" });
     expect(unreadableDecisions(readDecided(file))).toEqual(["pr-5#3"]);
@@ -282,35 +273,8 @@ describe("C1: a stored choice outside the card's options fails closed", () => {
 });
 
 describe("C2: the hold line's duplicate check", () => {
-  test("a guard log that can't be read raises an alarm and writes nothing on a guess", async () => {
-    const file = tmpFile();
-    recordDecision(file, "pr-5#3", RISK, 1, { sync: () => {} });               // kept before a crash, card never marked
-    const t = decisionRig(file, { hasHold: () => { throw new HoldLogUnreadable("/data/review-guard.log can't be read (EACCES)"); } });
-    const res = await t.r.link.decision(DEC) as any;
-    const [, risk] = t.r.ids(res.message);
-    await t.r.tap(t.r.msg(res.message), risk);
-    expect(t.lines).toEqual([]);
-    expect(t.alarms.map((a) => a[0])).toEqual(["review-holdlog"]);
-    const relay = t.r.relayed.filter((l) => l.includes("Dane tapped"));
-    expect(relay.length).toBe(1);
-    expect(relay[0]).toContain("The guard's log can't be read");
-  });
-
-  test("the hold-written flag on the record stops a second line, even when the log can't tell", async () => {
-    const file = tmpFile();
-    const t = decisionRig(file, { hasHold: () => false });                     // the log never tells
-    const res = await t.r.link.decision(DEC) as any;
-    const [, risk] = t.r.ids(res.message);
-    await t.r.tap(t.r.msg(res.message), risk);
-    expect(t.lines.length).toBe(1);
-    expect(readDecided(file)!["pr-5#3"]).toMatchObject({ choice: RISK, hold_written: true });
-    // A retried tap after a crash (the card unmarked again): no second line.
-    const s = t.r.state(); s.messages[res.message].q!.used = false; (t.r.link as any).d.save(s);
-    await t.r.tap(t.r.msg(res.message), risk);
-    expect(t.lines.length).toBe(1);
-    expect(recordDecision(file, "pr-5#3", HOLD, 9, { sync: () => {} })).toEqual({ choice: RISK, at: expect.any(Number), existed: true, hold_written: true });
-  });
-
+  // Cain 0.19.1: the risk tap that wrote a hold line is retired (it writes nothing now), so the two tests of
+  // its duplicate check went with it; the log's own reading stays.
   test("holdLogged throws on an unreadable log; a missing one is just empty", () => {
     const dir = mkdtempSync(join(tmpdir(), "c2-"));
     const log = join(dir, "guard.log");
@@ -331,52 +295,25 @@ describe("C2: the hold line's duplicate check", () => {
 });
 
 describe("C3: while a moved-aside file stands, and after writes resume on a fresh one", () => {
-  test("a tap while the moved-aside copy stands says decisions are paused and points to the alarm", async () => {
+  // Cain 0.19.1 retired the decision card, so these are the file's rules alone (taps: cap-retired.test.ts).
+  test("while the moved-aside copy stands no answer is kept, and the reset mark is there", () => {
     const file = tmpFile();
     writeFileSync(file, "{not json");
-    const t = decisionRig(file, { decisionsReset: () => null });
-    const res = await t.r.link.decision(DEC) as any;
-    const [hold] = t.r.ids(res.message);
-    await t.r.tap(t.r.msg(res.message), hold);                                 // moves it aside
-    expect(t.r.ephemerals().map((e) => e.content)).toEqual([DECISIONS_PAUSED]);
-    await t.r.tap(t.r.msg(res.message), hold);                                 // the copy stands
-    expect(t.r.ephemerals().map((e) => e.content)).toEqual([DECISIONS_PAUSED, DECISIONS_PAUSED]);
-    expect(DECISIONS_PAUSED).toContain("alarm");
-    expect(t.r.state().messages[res.message].q!.used).toBe(false);
-    expect(t.r.relayed.filter((l) => l.includes("Dane tapped"))).toEqual([]);
-    expect(() => recordDecision(file, "pr-5#3", HOLD, 1, { sync: () => {} })).toThrow(DecisionsPaused);
-    // The link's own reading of the reset mark says paused (NaN) while a copy stands (main.ts).
+    expect(() => recordDecision(file, "pr-5#3", HOLD, 1, { sync: () => {} })).toThrow(DecisionsPaused);   // moves it aside
+    expect(() => recordDecision(file, "pr-5#3", HOLD, 1, { sync: () => {} })).toThrow(DecisionsPaused);   // the copy stands
     expect(readReset(file)).toBeGreaterThan(0);
   });
 
-  test("after the copy is gone, a card from before the move-aside is refused and posted again", async () => {
+  test("after the copy is gone, writes resume on a fresh file and the mark keeps the reset's time", () => {
     const file = tmpFile();
-    const t = decisionRig(file);
-    const res = await t.r.link.decision(DEC) as any;                           // the card goes up
-    t.r.later(60_000);
     writeFileSync(file, "{not json");
-    expect(() => recordDecision(file, "x#1", HOLD, 1, { sync: () => {}, now: () => (t.r as any).t.now })).toThrow(DecisionsPaused);
-    expect(readReset(file)).toBe((t.r as any).t.now);
-    // The owner removes the copy as the alarm says: writes resume on a fresh file.
+    const at = 1_700_000_000_000;
+    expect(() => recordDecision(file, "x#1", HOLD, 1, { sync: () => {}, now: () => at })).toThrow(DecisionsPaused);
+    expect(readReset(file)).toBe(at);
     for (const n of require("node:fs").readdirSync(join(file, ".."))) if (n.includes(".corrupt-")) renameSync(join(file, "..", n), join(file, "..", `old-${n.slice(-6)}`));
-    t.r.later(60_000);
-    const before = t.r.posts();
-    const [hold] = t.r.ids(res.message);
-    await t.r.tap(t.r.msg(res.message), hold);
-    // Not kept, the old card marked replaced, a new card up, his tap told so.
-    expect(readDecided(file)).toEqual({});
-    expect(String(t.r.msg(res.message).content)).toEndWith(REPLACED);
-    expect(t.r.state().messages[res.message]).toMatchObject({ outcome: "replaced", why: "decisions reset" });
-    expect(t.r.state().messages[res.message].decision).toBeUndefined();
-    expect(t.r.posts()).toBe(before + 1);
-    expect(t.r.ephemerals().map((e) => e.content)).toEqual([RESET_TAP]);
-    expect(t.r.relayed.filter((l) => l.includes("Dane tapped"))).toEqual([]);
-    // The new card takes his tap.
-    const fresh = Object.entries(t.r.state().messages).find(([, m]) => m.decision?.id === "pr-5#3")![0];
-    expect(fresh).not.toBe(res.message);
-    await t.r.tap(t.r.msg(fresh), t.r.ids(fresh)[0]);
+    expect(recordDecision(file, "pr-5#3", HOLD, 2, { sync: () => {} })).toMatchObject({ choice: HOLD, existed: false });
     expect(readDecided(file)).toMatchObject({ "pr-5#3": { choice: HOLD } });
-    expect(t.r.relayed.filter((l) => l.includes(`Dane tapped "${HOLD}"`)).length).toBe(1);
+    expect(readReset(file)).toBe(at);
   });
 
   test("the reset mark: none, a time, or unreadable (paused)", () => {
