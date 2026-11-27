@@ -3390,11 +3390,15 @@ class Controller:
             h.finish("none", "No calendar digest is waiting. Today's was already posted, "
                              "or it isn't 7:00 AM yet.")
             return
-        # 0.24.5: "said" is his digest as he'd see it (Today, each event once, at most three
-        # problems), ready to fold in; "detail" is the full digest, for Cain only, never posted.
+        # 0.24.5: "said" is his digest as he'd see it (Today, each event once, its problems), ready
+        # to fold in, each message marked when a long day takes two; "parts" has them one by one.
+        # "detail" is the full digest, for Cain only, never posted.
         detail = render.plain(self.ledger.get_meta("last_digest_text") or "")
-        owner = self.ledger.get_meta("last_digest_owner")
-        h.finish("ok", digest.as_markdown(owner) if owner else detail, detail=detail)
+        if self.ledger.get_meta("last_digest_owner"):
+            parts = daily.owner_parts(self.ledger)
+            h.finish("ok", digest.said(parts), parts=[digest.as_markdown(p) for p in parts], detail=detail)
+        else:
+            h.finish("ok", detail, parts=[detail], detail=detail)
 
     def _fastpath(self, h) -> None:
         """Cain's keeper.sh fastpath (0.24.0, fourth to sixth rounds). "smoke-start" starts a smoke run
@@ -3580,10 +3584,10 @@ class Controller:
             return
         with self.ledger.tx() as db:
             self.ledger.set_meta("digest_held_at", "", db)
-            # 0.24.5: his digest alone, the shape he reads every morning; the full text stays Cain's.
-            self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="alert", db=db,
-                                text=(self.ledger.get_meta("last_digest_owner")
-                                      or self.ledger.get_meta("last_digest_text") or ""))
+            # 0.24.5: his digest alone, the shape he reads every morning, one message or two in
+            # order; the full text stays Cain's.
+            for part in daily.owner_parts(self.ledger) or [""]:
+                self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="alert", db=db, text=part)
         log.warning("digest posted without Cain's morning message")
 
     def _finish_handovers(self) -> None:

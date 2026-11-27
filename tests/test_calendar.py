@@ -394,7 +394,8 @@ def test_the_morning_digest_carries_todays_calendar(ledger, tmp_path, clock):
         r.status["last_digest"]["text"]
     assert r.status["calendar"][0]["label"] == "owner@example.com"
     assert r.bot.texts()[-1] == ("<b>Today, Wed Oct 21</b>\n• <b>9:00</b> Vet visit\n• <b>9:30</b> School call\n"
-                                 "<small>All day: Feed delivery</small>")    # his digest
+                                 "<small>All day: Feed delivery</small>\n\n"
+                                 "9:00 Vet visit and 9:30 School call overlap: move one of them.")    # his digest
 
 
 def test_before_launch_the_digest_is_kept_for_the_page_not_sent(ledger, tmp_path, clock):

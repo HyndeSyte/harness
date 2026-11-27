@@ -34,12 +34,15 @@ until you turn it on: adding an event to the iCloud Family calendar.
   *Keep rule* on a card showing its exact text; it then has an *Undo* button. `/rule` lists
   them, including any still waiting.
 - Sends a short digest every morning (from the configured start date): today's calendar,
-  one line per timed event with its start time in bold, the all-day items on one small line
-  at the end, and an event on two calendars (Gmail and its Family copy) said once. After it,
-  at most three plain lines for a real problem: two events at the same time, a change you
-  asked for that didn't go through, a calendar that couldn't be read. It never shows an
-  unread day as empty. Cain gets the full digest (*Clear*, *Decision needed* or *Attention
-  needed*, the counts, the blocks, the dry run) to fold into his morning message.
+  one line per timed event with its start time in bold (one that started yesterday marked
+  so), the all-day items on one small line at the end, and an event on two calendars (Gmail
+  and its Family copy) said once, only when it is clearly the same event. After it, a plain
+  line for each real problem: two of your events that overlap by more than 10 minutes, a
+  change you asked for that didn't go through, a calendar that couldn't be read. Past three
+  lines the overlaps share one line; nothing else is ever dropped. A day too long for one
+  message comes as two. It never shows an unread day as empty. Cain gets the full digest
+  (*Clear*, *Decision needed* or *Attention needed*, the counts, the blocks, the dry run) to
+  fold into his morning message.
 - Before the start date the digest is still written every morning, just not sent.
   The last one is shown on this add-on's page, so you can check it against your
   calendar.

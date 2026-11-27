@@ -319,8 +319,11 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = Fa
         # Kept for the add-on page, so a silent (pre-launch) digest can be
         # read there and checked against the real calendar.
         ledger.set_meta("last_digest_text", d.text, db)
-        # 0.24.5: what he sees is his digest; the full text above is Cain's (keeper.sh digest).
-        ledger.set_meta("last_digest_owner", d.owner or d.text, db)
+        # 0.24.5: what he sees is his digest, one message or two; the full text above is Cain's
+        # (keeper.sh digest).
+        parts = list(d.owner_parts) or [d.text]
+        ledger.set_meta("last_digest_owner", "\n\n".join(parts), db)
+        ledger.set_meta("last_digest_owner_parts", json.dumps(parts), db)
         ledger.set_meta("last_digest_sent", "yes" if allowed else "no", db)
         ledger.event("digest", {"state": d.state, "sent": allowed, **d.facts}, db=db)
         if allowed and hold:
@@ -328,7 +331,8 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = Fa
             # take it, the controller posts it on its own (controller._release_digest).
             ledger.set_meta("digest_held_at", iso(now), db)
         elif allowed:
-            ledger.enqueue(chat_id=config.owner_user_id, kind="digest", text=d.owner or d.text, db=db)
+            for part in parts:            # in order: the second starts "Today, continued"
+                ledger.enqueue(chat_id=config.owner_user_id, kind="digest", text=part, db=db)
     # The external watchdog reads this line from the add-on log (Supervisor),
     # so a missing digest is noticed without giving the add-on any API.
     # Counts only: no titles, no text.
@@ -393,3 +397,16 @@ def _failed(ledger: Ledger, job, detail: dict, tz: str) -> str:
     tail = "" if partway else " Nothing changed."
     done = "only partly went through" if partway else "wasn't done"
     return f"{what} ({when}) {done}: {why}.{tail}"
+
+
+def owner_parts(ledger: Ledger) -> list[str]:
+    """His last digest as the messages he gets (0.24.5): one, or two when the day is long. A digest
+    kept before the split is one message; one kept before 0.24.5 is the full text."""
+    try:
+        parts = json.loads(ledger.get_meta("last_digest_owner_parts") or "[]")
+    except ValueError:
+        parts = []
+    if isinstance(parts, list) and parts and all(isinstance(p, str) and p for p in parts):
+        return parts
+    text = ledger.get_meta("last_digest_owner") or ledger.get_meta("last_digest_text") or ""
+    return [text] if text else []

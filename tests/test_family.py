@@ -285,9 +285,11 @@ def test_the_digest_lists_family_as_context_never_as_an_overlap(ledger, tmp_path
             "9:30 AM–10:30 AM Sam - Dentist · Family\n"
             "9:30 AM–10:30 AM School call · owner ⚠ overlaps") in d
     assert "Tomorrow thing" not in d
-    # His digest: Family's events are listed, never a clash with his own.
-    assert r.bot.texts()[-1] == ledger.get_meta("last_digest_owner")
-    assert "same time" not in r.bot.texts()[-1] and "Sam - Dentist" in r.bot.texts()[-1]
+    # His digest: Family's events are listed, never a clash with his own; his two are one clash.
+    mine = r.bot.texts()[-1]
+    assert mine == ledger.get_meta("last_digest_owner") and "Sam - Dentist" in mine
+    assert [x for x in mine.split("\n") if "overlap" in x] == [
+        "9:00 Vet visit and 9:30 School call overlap: move one of them."]
 
 
 def test_without_a_push_the_day_is_never_clear(ledger, tmp_path, clock, caplog):

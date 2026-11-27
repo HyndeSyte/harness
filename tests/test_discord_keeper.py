@@ -396,6 +396,36 @@ def test_cain_gets_his_digest_to_fold_in_and_the_detail_apart(rig):
     assert "Drive dry run" not in out["said"] and rig.link.cards == {}
 
 
+def long_day_held(rig):
+    """A day too long for one message, held for Cain's morning message (0.24.5, fix round)."""
+    from harness import daily, digest
+    from test_readable_digest import compose, ev
+    events = [ev(6 + k // 3, 20 * (k % 3), 6 + k // 3, 20 * (k % 3) + 15,
+                 f"Event {k:02d} with a long title about the plans of the whole family " * 3) for k in range(40)]
+    d = compose(digest.Agenda(events, 0, 1, 1))
+    assert len(d.owner_parts) == 2
+    assert daily.deliver(rig.ledger, rig.c.config, d, hold=True)
+    return d
+
+
+def test_a_long_day_reaches_cain_as_two_marked_messages(rig):
+    from harness.discord_chat import to_markdown
+    d = long_day_held(rig)
+    out = rig.handover(kind="digest")
+    assert out["status"] == "ok" and out["parts"] == [to_markdown(p) for p in d.owner_parts]
+    assert out["said"] == "\n\n".join(f"[Message {k} of 2]\n{p}" for k, p in enumerate(out["parts"], 1))
+    assert out["parts"][1].startswith("**Today, continued**")
+
+
+def test_a_long_day_at_740_goes_out_as_two_messages_in_order(rig):
+    from harness.discord_chat import to_markdown
+    d = long_day_held(rig)
+    rig.clock.advance(minutes=41)
+    rig.c.tick()
+    texts = [c["text"] for _, c in sorted(rig.link.cards.items()) if c["kind"] == "alert"][-2:]
+    assert texts == [to_markdown(p) for p in d.owner_parts]
+
+
 def test_the_740_digest_on_its_own_is_his_digest_alone(rig):
     from test_readable_digest import TARGET
     nov27_held(rig)
