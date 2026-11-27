@@ -55,6 +55,60 @@ CONFIRM_AFTER = timedelta(minutes=2)   # the second look before a removal, not t
 
 HOLD = "family_copy_hold:"     # meta, per copy: a read showing these old times is from before his change
 HOLD_FOR = timedelta(hours=3)
+# meta, per copy: its Gmail event's own identity, the series uid and the day's original start ("" for a
+# single event), as the last read gave it. The key is made from the same two, so this is what the key
+# means, kept so the event can be read again by it wherever it now sits (calendar_change.py).
+SOURCE = "family_copy_source:"
+# meta, per copy: the times Harness itself has put on it. A Family read that still shows one of them is
+# from before Harness's own later write (iCloud can be behind), or a write of its own that didn't land:
+# never someone's edit, so the copy is brought to its event, not left behind (Nov 27).
+WROTE = "family_copy_wrote:"
+MAX_WROTE = 8
+
+
+def source_of(ledger: Ledger, key: str) -> tuple[str, str] | None:
+    """(series uid, original start) of this copy's Gmail event, or None if no read has named it."""
+    try:
+        d = json.loads(ledger.get_meta(SOURCE + key) or "null")
+        return (str(d["uid"]), str(d.get("instance", ""))) if isinstance(d, dict) and d.get("uid") else None
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
+def remember_source(ledger: Ledger, key: str, occ: ical.Occurrence, db=None) -> None:
+    value = json.dumps({"uid": occ.uid, "instance": occ.instance})
+    if ledger.get_meta(SOURCE + key) != value:
+        _set_meta(ledger, SOURCE + key, value, db)
+
+
+def _set_meta(ledger: Ledger, key: str, value: str, db=None) -> None:
+    if db is not None:
+        ledger.set_meta(key, value, db)
+        return
+    with ledger.tx() as d:
+        ledger.set_meta(key, value, d)
+
+
+def google_id(uid: str, instance: str) -> str:
+    """The Google event id of that event or that day of it: the series id, then for a day of a series
+    "_" and its original start (Google's recurringEventId and originalStartTime)."""
+    base = uid.removesuffix("@google.com")
+    return f"{base}_{instance}" if instance else base
+
+
+def wrote(ledger: Ledger, key: str) -> list[tuple[str, str]]:
+    try:
+        return [(str(a), str(b)) for a, b in json.loads(ledger.get_meta(WROTE + key) or "[]")]
+    except (ValueError, TypeError):
+        return []
+
+
+def note_wrote(ledger: Ledger, key: str, start: str, end: str, db=None) -> None:
+    """Times Harness put on this copy, its own sync's writes and the changes he asked for alike."""
+    if not start or not end:
+        return
+    times = [t for t in wrote(ledger, key) if t != (start, end)] + [(start, end)]
+    _set_meta(ledger, WROTE + key, json.dumps([list(t) for t in times[-MAX_WROTE:]]), db)
 
 
 def hold(ledger: Ledger, key: str, start: str = "", end: str = "", *, gone: bool = False,
@@ -70,6 +124,7 @@ def hold(ledger: Ledger, key: str, start: str = "", end: str = "", *, gone: bool
         d, times = {}, []
     if start and end and [start, end] not in times:
         times.append([start, end])
+    note_wrote(ledger, key, start, end, db)      # Harness's own write had put these on it
     ledger.set_meta(HOLD + key, json.dumps({"times": times[-8:], "gone": bool(gone or d.get("gone")),
                                             "until": iso(ledger.now() + HOLD_FOR)}), db)
 
@@ -102,12 +157,16 @@ _WORDS = (("PT", r"pt|physical therapy|physio"),
           ("Haircut", r"haircut|barber"),
           ("Coffee", r"coffee"),
           ("Computer Lab", r"computer lab"),
+          ("Massage", r"massages?|massage therap\w*"),
           ("Appointment", r"appt|appointment"))
 _WORD_RES = tuple((word, re.compile(rf"\b(?:{pattern})\b", re.I)) for word, pattern in _WORDS)
 _SKIP = re.compile(r"\b(busy|call|session|meeting|flight|stay|reservation|drive|transit|uber|lyft"
                    r"|deadline|checkpoint|task|reminder|onboarding|keynote|webinar|reception"
                    r"|interview|standup|sync)\b", re.I)
 _STAY = re.compile(r"stay at\b(?! home\b)", re.I)
+# An event Harness itself added to his Gmail calendar at his word (calendar_change._gmail_add: "cm" and 32
+# hex). His by construction, never anyone's invitation, so its appointment gets a copy whatever it's called.
+_MADE_HERE = re.compile(r"cm[0-9a-f]{32}(?:@google\.com)?")
 # A city of up to three words of letters: no dot or colon, so it can't look like an address.
 _FLIGHT = re.compile(r"flight to ((?:[A-Za-z'-]+ ){0,2}[A-Za-z'-]+) \(([A-Z0-9]{2} ?[0-9]{1,4})\)",
                      re.I)
@@ -143,7 +202,15 @@ def word_for(occ: ical.Occurrence) -> str | None:
         return None
     if "☕" in occ.summary:
         return "Coffee"
-    return next((word for word, rx in _WORD_RES if rx.search(occ.summary)), None)
+    word = next((word for word, rx in _WORD_RES if rx.search(occ.summary)), None)
+    if word is None and made_here(occ):
+        return "Appointment"       # one he had Harness add: his appointment, copied like the rest (Nov 27)
+    return word
+
+
+def made_here(occ: ical.Occurrence) -> bool:
+    """Added to his Gmail calendar by Harness itself, at his word."""
+    return bool(_MADE_HERE.fullmatch(occ.uid))
 
 
 @dataclass(frozen=True)
@@ -190,7 +257,9 @@ def _flight_words(flight: ical.Occurrence | None, label: str, tz: ZoneInfo) -> s
 
 
 def _his(occ: ical.Occurrence) -> bool:
-    return not occ.organizer or occ.organizer == occ.calendar.casefold()
+    """His own: no organizer, or him. One Harness added for him is his whoever Google names as its
+    organizer (the service account that wrote it, say)."""
+    return not occ.organizer or occ.organizer == occ.calendar.casefold() or made_here(occ)
 
 
 def plan(occurrences: list[ical.Occurrence], name: str, tz: str) -> dict[str, Want]:
@@ -361,7 +430,20 @@ class FamilyCopy:
             self._let_go(planned)
         problems = [self._follow(wants, family, now, feed.ahead.unreadable == 0, until, odd)]
         problems.append(self._add_new(wants, sources, family.items, name))
+        self._remember(occ)
         self._problem(next((p for p in problems if p), ""))
+
+    def _remember(self, occ: list[ical.Occurrence]) -> None:
+        """Each copy's Gmail event by its own identity (series uid and original start), whatever state
+        the copy is in, so a request about it can read that event again wherever it now sits."""
+        by_key = {_key(o): o for o in occ if o.uid}
+        keys = [r["key"] for r in self.ledger.db.execute("SELECT key FROM family_copies").fetchall()
+                if r["key"] in by_key]
+        if not keys:
+            return
+        with self.ledger.tx() as db:
+            for key in keys:
+                remember_source(self.ledger, key, by_key[key], db)
 
     def _thin(self, total: int, rest: int) -> bool:
         """Gmail holds more than what copies, so the rest of it doesn't suddenly halve, and it's
@@ -440,7 +522,23 @@ class FamilyCopy:
                     self._unhold(row["key"])
                 continue
             elif not self._as_written(item.occ, row, start, end) or caldav.details(item.data):
-                self._leave(row, "edited")         # someone edited it: theirs now
+                if want is None or not self._ours_behind(row, item):
+                    self._leave(row, "edited")     # someone edited it: theirs now
+                    continue
+                # Times Harness itself put there: a read from before its own later write, or a write of
+                # its own that didn't land. Not anyone's edit: brought to its event (Nov 27).
+                stale_times, _ = held.get(row["key"], ((), False))
+                if any(_same(want.start, a) and _same(want.end, b) for a, b in stale_times):
+                    continue                   # the Gmail read is the one from before: the next shows it
+                if not self._room():
+                    waiting += 1
+                    continue
+                failed = self._move(row, item, want, retry=True)
+                if failed:
+                    problem = problem or failed
+                    tries += 1
+                    if tries >= MAX_FAILED_WRITES:
+                        break
                 continue
             stale_times, stale_gone = held.get(row["key"], ((), False))
             if want is None:
@@ -509,6 +607,17 @@ class FamilyCopy:
     def _landed(occ: ical.Occurrence, want: Want) -> bool:
         return (occ.summary == want.title[:ical.MAX_SUMMARY] and _same(occ.start, want.start)
                 and _same(occ.end, want.end))
+
+    def _ours_behind(self, row, item: caldav.Item) -> bool:
+        """Our own copy, as Harness wrote it at an earlier time: its uid and title, no note or place,
+        and times Harness itself put on it. A copy someone moved by hand shows times Harness never
+        wrote, and stays theirs."""
+        occ = item.occ
+        if row["hand"] or occ.uid != row["uid"] or occ.summary != row["title"][:ical.MAX_SUMMARY] \
+                or caldav.details(item.data):
+            return False
+        return any(_same(occ.start, self._when(a)) and _same(occ.end, self._when(b))
+                   for a, b in wrote(self.ledger, row["key"]))
 
     @staticmethod
     def _as_written(occ: ical.Occurrence, row, start, end) -> bool:
@@ -592,7 +701,9 @@ class FamilyCopy:
         self._set(row, "removed")
         self._log("family_copy_removed", row["key"])
 
-    def _move(self, row, item, want: Want) -> str:
+    def _move(self, row, item, want: Want, *, retry: bool = False) -> str:
+        """retry: a copy of ours a read showed behind; a write refused for its version means that read
+        was old, so it's tried again at the next read, never taken for someone's edit."""
         now = self.ledger.now()
         if row["hand"]:
             # Takes over his copy: removed, and ours written in its place.
@@ -609,7 +720,8 @@ class FamilyCopy:
         uid = _uid(row["key"]) if row["hand"] else row["uid"]
         out = self.client.put_copy(uid, want.title, want.start, want.end, now, etag=etag, data=data)
         if out.kind == "changed":
-            self._leave(row, "changed")
+            if not retry:
+                self._leave(row, "changed")
             return ""
         if out.kind != "ok":
             if row["hand"]:
@@ -621,6 +733,9 @@ class FamilyCopy:
     def _moved(self, row, uid: str, want: Want) -> None:
         self._update(row, uid=uid, hand=0, href="", seen="", title=want.title,
                      start=_text(want.start), end=_text(want.end), missing=0)
+        if not row["hand"]:
+            note_wrote(self.ledger, row["key"], row["start"], row["end"])   # what it had, from us
+        note_wrote(self.ledger, row["key"], _text(want.start), _text(want.end))
         self._log("family_copy_moved", row["key"])
         self.writes += 1
 
@@ -662,6 +777,7 @@ class FamilyCopy:
             if out.kind != "ok":
                 return self._write_problem(out)
             self._insert(key, want, uid, "", hand=0)
+            note_wrote(self.ledger, key, _text(want.start), _text(want.end))
             self._log("family_copy_added", key)
             self.writes += 1
         return ""

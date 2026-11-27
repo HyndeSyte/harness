@@ -2812,8 +2812,8 @@ def email_date(t):
 
 
 def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(drives, caplog, tmp_path):
-    (tmp_path / "options.json").write_text("{}")
-    drives.gm.own_dry_fn = lambda: own_dry_run_from_options(str(tmp_path))   # on by default
+    (tmp_path / "options.json").write_text('{"drive_dry_run": true}')
+    drives.gm.own_dry_fn = lambda: own_dry_run_from_options(str(tmp_path))   # off by default since Nov 27
     a, b = when(drives, days=3, hour=10), when(drives, days=3, hour=12)
     goes(drives, "Eye doctor", b, CLINIC)
     dentist = mine(drives, "Dentist", a, PARK)
@@ -2842,16 +2842,19 @@ def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(d
     go(drives)
     lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("drive dry run: would remove")]
     assert len(lines) == 1
-    (tmp_path / "options.json").write_text('{"own_drive_dry_run": false}')   # he's read the log: off
+    (tmp_path / "options.json").write_text('{"drive_dry_run": false}')   # he's read the log: off
     drives.feeds.window.occurrences.append(dentist)
     go(drives)
     assert ("Busy (drive there)", a - 30 * M, a, "") in blocks(drives)
 
 
-@pytest.mark.parametrize("text,dry", [("{}", True), ('{"own_drive_dry_run": false}', False),
-                                      ('{"own_drive_dry_run": true}', True), ('{"own_drive_dry_run": "no"}', True),
+@pytest.mark.parametrize("text,dry", [("{}", False), ('{"drive_dry_run": false}', False),
+                                      ('{"drive_dry_run": true}', True), ('{"drive_dry_run": "yes"}', False),
+                                      ('{"own_drive_dry_run": true}', False),     # the old setting isn't read
                                       ("not json", True)])
-def test_the_dry_run_option_is_on_unless_it_reads_as_off(tmp_path, text, dry):
+def test_the_dry_run_option_is_off_unless_it_reads_as_on(tmp_path, text, dry):
+    """Nov 27, at his word ("no drive time"): drive blocks are written unless the dry run is plainly on.
+    Settings that can't be read at all write nothing new."""
     (tmp_path / "options.json").write_text(text)
     assert own_dry_run_from_options(str(tmp_path)) is dry
 
@@ -3116,7 +3119,7 @@ def test_the_remove_all_blocks_option_takes_off_every_marked_block_and_writes_no
     assert len(blocks(drives)) == 5
     family = [b for b in blocks(drives) if b[1] >= when(drives, days=4, hour=0)]
     assert len(family) == 3
-    (tmp_path / "options.json").write_text('{"remove_all_blocks": true, "own_drive_dry_run": false}')
+    (tmp_path / "options.json").write_text('{"remove_all_blocks": true, "drive_dry_run": false}')
     drives.gm.cleanup_fn = lambda: cleanup_from_options(str(tmp_path))
     for _ in range(3):
         go(drives)

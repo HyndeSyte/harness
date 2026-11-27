@@ -4,7 +4,7 @@
 # It also listens on 8100 for Family calendar pushes from Home Assistant, on
 # the internal add-on network only (no host port is mapped; see family.py).
 name: Harness
-version: "0.24.4"
+version: "0.24.5"
 slug: harness
 description: >-
   The calendar specialist behind Cain on Discord, with Claude and GPT as engines. A small
@@ -40,8 +40,9 @@ timeout: 30
 # Empty leaves drive blocks off.
 # How many days ahead his own Gmail appointments get drive blocks (family_gmail.py), 1 to 60.
 # Starts short, so the first run is a few days he can check; widen it once they look right.
-# own_drive_dry_run: on, those drive blocks are only written to the log (day and time), never to
-# Gmail, and no card goes out for them. Read the log against his calendar, then turn it off.
+# drive_dry_run: off (the default, at his word on Nov 27), those drive blocks are written to his Gmail calendar.
+# On, they're only written to the log (day and time), never to Gmail, and no card goes out for them.
+# It took the place of own_drive_dry_run, which was on by default and is no longer read.
 # remove_all_blocks: on, the drive blocks Harness made around his own appointments come off Gmail
 # (Family events' blocks stay; ones he edited stay) and nothing new is written while it stays on. For a
 # clean start; off again, blocks are written as before.
@@ -58,7 +59,7 @@ options:
   meaning_live: false
   home_location: ""
   own_drive_days: 3
-  own_drive_dry_run: true
+  drive_dry_run: false
   remove_all_blocks: false
   his_calendar: ""
 schema:
@@ -72,6 +73,6 @@ schema:
   meaning_live: bool?
   home_location: str?
   own_drive_days: int(1,60)?
-  own_drive_dry_run: bool?
+  drive_dry_run: bool?
   remove_all_blocks: bool?
   his_calendar: str?

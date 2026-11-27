@@ -79,6 +79,12 @@ _CONTEXT_SKIP = frozenset({"the", "and", "for", "are", "again", "next", "week", 
                            "from", "until", "each", "our", "his", "her", "him", "she", "you", "your"})
 CHECK_EVERY = timedelta(minutes=30)
 END_AHEAD = timedelta(days=366)        # how far on a series's next day is looked for
+# A copy on Family is part of its Gmail event while Harness keeps it, and also once it was left alone after an
+# edit: a request about it brings it back to its event (Nov 27).
+COPY_FOLLOWS = ("live", "hands_off")
+SOURCE_AROUND = 14                      # days either side a copy's event, or an event's copy, is looked for
+FIX_AHEAD_DAYS = 14                     # a request to fix the copies looks this far ahead
+MAX_FIXES = 6                           # copies brought back to their events on one card, at most
 RETURN_AHEAD = timedelta(days=366)     # how far on a day that came back is looked for
 MAX_REPLY_CHAIN = 10
 LAST_CHECK = "calendar_change_checked"
@@ -998,6 +1004,9 @@ class Found:
     taken: list = field(default_factory=list)    # on Gmail: his own Family events it keeps true
     copy_of: str = ""                  # on Family: a copy's key (family_copy.py), if it is one
     block: str = ""                    # on Gmail: a block this add-on made (family_gmail.py): its key
+    # On Family, a copy whose Gmail event was looked for by its own identity (the series id and the day's
+    # original start) and not found: "gone" when Google says so, "unknown" when it couldn't be read.
+    orphan: str = ""
 
 
 @dataclass
@@ -4711,6 +4720,8 @@ class CalendarChange:
                        (*r["set"].values(), now, r["key"], r["was"].get("state", "live")))
             if r.get("hold"):
                 family_copy.hold(self.ledger, r["key"], *r["hold"], db=db)
+            if r["table"] == "family_copies" and r["set"].get("start") and r["set"].get("end"):
+                family_copy.note_wrote(self.ledger, r["key"], r["set"]["start"], r["set"]["end"], db)
 
     def _undo_rows(self, db, rows: list[dict]) -> None:
         """As they were before the change, if nothing has moved them on since."""
@@ -5443,18 +5454,19 @@ class CalendarChange:
         events = self.google.events_between(self._gmail_address(), start, end, **extra)
         if events is None:
             raise Refuse("I couldn't read your Gmail calendar")
-        out = []
-        for e in events:
-            first, last = self._gmail_when(e.get("start")), self._gmail_when(e.get("end"))
-            if first is None or last is None or e.get("status") == "cancelled":
-                continue
-            invited = bool([a for a in e.get("attendees") or [] if not a.get("self")]
-                           or e.get("attendeesOmitted")
-                           or ("organizer" in e and not (e.get("organizer") or {}).get("self")))
-            out.append(Found(e.get("recurringEventId") or e["id"], e["id"], e.get("summary", ""),
-                             *self._span(first, last), bool(e.get("recurringEventId")), first, e, invited,
-                             "gmail", last))
+        out = [f for f in (self._gmail_found(e) for e in events) if f is not None]
         return out, 0
+
+    def _gmail_found(self, e: dict) -> Found | None:
+        first, last = self._gmail_when(e.get("start")), self._gmail_when(e.get("end"))
+        if first is None or last is None or e.get("status") == "cancelled":
+            return None
+        invited = bool([a for a in e.get("attendees") or [] if not a.get("self")]
+                       or e.get("attendeesOmitted")
+                       or ("organizer" in e and not (e.get("organizer") or {}).get("self")))
+        return Found(e.get("recurringEventId") or e["id"], e["id"], e.get("summary", ""),
+                     *self._span(first, last), bool(e.get("recurringEventId")), first, e, invited,
+                     "gmail", last)
 
     def context_address(self) -> str | None:
         """His Gmail address for context_for, or None. On the controller's thread, never in a
@@ -5556,7 +5568,12 @@ class CalendarChange:
 
     def _fold(self, found: list[Found]) -> tuple[list[Found], list[Found]]:
         """(Gmail events, Family events). A copy Harness keeps of a Gmail event is part of it,
-        so "PT" isn't two events. A copy whose Gmail event isn't there stays on its own, marked."""
+        so "PT" isn't two events. Each copy finds its Gmail event by that event's own identity (the
+        series id and the day's original start, or a single event's id), wherever it now sits, never by
+        its time or day (Nov 27): one the days read don't hold is read again by it, and a copy the days
+        read don't hold is read from Family by its record. A copy left out of step, or left alone after
+        an edit, is still part of its event, so a request about it brings it back to that event. A copy
+        whose Gmail event is really gone stays on its own, marked."""
         sources: dict[str, Found] = {}
         gmail = [f for f in found if f.calendar == "gmail"]
         for g in gmail:
@@ -5564,24 +5581,149 @@ class CalendarChange:
             key = self._copy_key(g)
             if key:
                 sources.setdefault(key, g)
-        rows = self.ledger.db.execute("SELECT key, uid, href, hand, state FROM family_copies").fetchall()
+        rows = self.ledger.db.execute("SELECT key, uid, href, hand, state, start FROM family_copies").fetchall()
         made = {r["uid"]: r for r in rows if not r["hand"]}
-        taken = {caldav.href_path(r["href"]): r for r in rows if r["hand"] and r["href"] and r["state"] == "live"}
+        taken = {caldav.href_path(r["href"]): r for r in rows if r["hand"] and r["href"]
+                 and r["state"] in COPY_FOLLOWS}
         family = []
+        seen_copies: set[str] = set()
         for f in (f for f in found if f.calendar == "family"):
             row = made.get(f.series) or taken.get(caldav.href_path(getattr(f.raw, "href", "") or ""))
             if row is None:
                 family.append(f)
                 continue
             f.copy_of = row["key"]
-            source = sources.get(row["key"]) if row["state"] == "live" else None
+            source = None
+            if row["state"] in COPY_FOLLOWS:
+                source = sources.get(row["key"])
+                if source is None:
+                    source, f.orphan = self._source_by_identity(row)
+                    if source is not None:
+                        source.block = self._block_key(source)
+                        sources[row["key"]] = source
+                        gmail.append(source)
             if source is None:
                 family.append(f)               # its Gmail event isn't there: never changed alone
-            elif row["hand"]:
+                continue
+            seen_copies.add(row["key"])
+            if row["hand"] and row["state"] == "live":
                 source.taken.append(f)         # his own, which its sync keeps true: it follows
             else:
                 source.copies.append(f)
+        for key, g in sources.items():         # its copy sits on a day not read: read by its record
+            if key in seen_copies:
+                continue
+            row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (key,)).fetchone()
+            if row is None or row["state"] not in COPY_FOLLOWS or (row["hand"] and row["state"] == "live"):
+                continue
+            copy_ = self._copy_by_record(row)
+            if copy_ is not None:
+                copy_.copy_of = key
+                g.copies.append(copy_)
         return gmail, family
+
+    def copy_fixes(self, days: list[date] | None = None) -> list[dict] | None:
+        """The changes that bring every Family copy out of step back to its Gmail event, found by that
+        event's own identity (Nov 27): a move to its times, never a write to Gmail, or, for a copy whose
+        event is really gone, its removal. From today on, or on those days. [] when every copy matches;
+        None when a calendar can't be read. Each goes on a card like any change he asks for."""
+        today = self._today()
+        span = days or [today + timedelta(days=i) for i in range(FIX_AHEAD_DAYS)]
+        try:
+            found = self._read("family", span)[0] + self._read("gmail", span)[0]
+        except Refuse:
+            return None
+        gmail, family = self._fold(found)
+        out: list[dict] = []
+
+        def change(calendar: str, op: str, title: str, first: date, start: str = "", end: str = "") -> dict:
+            return {"calendar": calendar, "op": op, "title": title, "dates": first.isoformat(), "start": start,
+                    "end": end, "days": "", "until": "", "location": ""}
+        for g in sorted(gmail, key=lambda g: (g.first, _text(g.start))):
+            if g.end is None or not any(not (_same_start(x.start, g.start) and x.end is not None
+                                             and _same_start(x.end, g.end)) for x in g.copies):
+                continue
+            if isinstance(g.start, datetime):
+                out.append(change("gmail", "move", g.title, g.first, _text(g.start), _text(g.end)))
+            else:                              # all day: he names the last day, not the day after
+                out.append(change("gmail", "move", g.title, g.first, _text(g.start),
+                                  _text(g.end - timedelta(days=1))))
+        for f in sorted(family, key=lambda f: f.first):
+            if f.copy_of and f.orphan == "gone" and any(f.first <= d <= f.last for d in span):
+                out.append(change("family", "remove", f.title, f.first))
+        kept = []
+        for c in out[:MAX_FIXES]:
+            try:
+                effects._one_change(c)
+            except (effects.ParamError, effects.ChangeRefusal):
+                continue
+            kept.append(c)
+        return kept
+
+    def _source_by_identity(self, row) -> tuple["Found | None", str]:
+        """A copy's Gmail event read by its own identity: (it, "") when it's there, (None, "gone") when
+        Google says it isn't, (None, "unknown") when that can't be said. The identity is what the copy's
+        last read named (family_copy.SOURCE); a copy from before that was kept is matched by its key
+        over the weeks around its day."""
+        if self.google is None or not self._readable("gmail"):
+            return None, "unknown"
+        try:
+            address = self._gmail_address()
+        except Refuse:
+            return None, "unknown"
+        ident = family_copy.source_of(self.ledger, row["key"])
+        if ident is not None:
+            kind, e = self.google.look(address, family_copy.google_id(*ident))
+            if kind == "ok" and isinstance(e, dict) and e.get("status") != "cancelled":
+                g = self._gmail_found(e)
+                if g is not None and self._copy_key(g) == row["key"]:
+                    return g, ""
+            if kind == "gone" or (kind == "ok" and isinstance(e, dict) and e.get("status") == "cancelled"):
+                return None, "gone"
+            if kind != "ok":
+                return None, "unknown"
+        try:
+            day = self._span(*(2 * [_when(row["start"])]))[0]
+        except (ValueError, TypeError):
+            return None, "unknown"
+        zone = ZoneInfo(self.tz)
+        start = datetime.combine(day - timedelta(days=SOURCE_AROUND), datetime.min.time(), zone)
+        events = self.google.events_between(address, start, start + timedelta(days=2 * SOURCE_AROUND + 1))
+        if events is None:
+            return None, "unknown"
+        for e in events:
+            g = self._gmail_found(e)
+            if g is not None and self._copy_key(g) == row["key"]:
+                return g, ""
+        return None, "gone"
+
+    def _copy_by_record(self, row) -> "Found | None":
+        """A copy on Family read by its own address, wherever its day is now."""
+        if self.client is None or not self.client.configured():
+            return None
+        href = row["href"] if row["hand"] and row["href"] else self.client.href_for(row["uid"])
+        try:
+            back, body = self.client.fetch(href)
+        except Exception as e:                 # a look is a help, never a stop
+            log.warning("calendar change: a copy couldn't be read by its record: %s", type(e).__name__)
+            return None
+        if back.kind != "ok" or not body:
+            return None
+        try:
+            start = _when(row["start"])
+            zone = ZoneInfo(self.tz)
+            first = start if isinstance(start, datetime) else datetime.combine(start, datetime.min.time(), zone)
+            occs = ical.window(body, start=first - timedelta(days=SOURCE_AROUND),
+                               end=first + timedelta(days=SOURCE_AROUND), tz=self.tz,
+                               fallback_name="Family").occurrences
+        except (ValueError, TypeError, ical.Unreadable):
+            return None
+        if len(occs) != 1:
+            return None
+        occ = occs[0]
+        item = caldav.Item(occ, href, back.etag or "", body)
+        return Found(occ.uid, occ.instance, occ.summary, *self._span(occ.start, occ.end), bool(occ.instance),
+                     occ.start, item, bool(occ.attendees), "family", occ.end)
 
     def _copy_key(self, g: Found) -> str:
         """The key family_copy.py gives the copy of this Gmail event: how the feed names it."""
@@ -5627,7 +5769,7 @@ class CalendarChange:
         want, times = said(asked)
 
         def scored(pool: list[Found]) -> list[tuple[int, Found]]:
-            on = [f for f in pool if any(f.first <= d <= f.last for d in days)]
+            on = [f for f in pool if any(_on_day(f, d) for d in days)]
             out = [(self._fits(asked, f), f) for f in on]
             return [(score, f) for score, f in out if score and (not times or self._at(f, times))]
         pools = [scored(first), scored(rest)]
@@ -5654,7 +5796,7 @@ class CalendarChange:
         raise self._missing(asked, days, first + rest, unreadable, unread)
 
     def _hits(self, named: list[Found], day: date, asked: str = "") -> list[Found]:
-        hits = [f for f in named if f.first <= day <= f.last]
+        hits = [f for f in named if _on_day(f, day)]
         if len({(f.calendar, f.series) for f in hits}) > 1:
             raise self._several(asked or hits[0].title, [day], hits)
         return hits
@@ -5662,9 +5804,10 @@ class CalendarChange:
     def _guard(self, f: Found) -> None:
         if f.invited:
             raise Refuse(f"{f.title} has invitees, and changing it could message them")
-        if f.copy_of and f.calendar == "family":
-            raise Refuse(f"{f.title} on {_day_words(f.first)} is Harness's copy of a Gmail event I "
-                         "can't find that day, so I left it. Change the event on Gmail, and the copy follows")
+        if f.copy_of and f.calendar == "family" and f.orphan == "unknown":
+            # Never "change it on Gmail" (Nov 27): he's never asked to edit a calendar by hand.
+            raise Refuse(f"I couldn't read your Gmail calendar to find the event {f.title} on "
+                         f"{_day_words(f.first)} is a copy of, so nothing changed. I'll be able to once it answers")
 
     def _part_guard(self, asked: str, days: list[date], chosen: list[Found], best: int) -> None:
         """His words are only part of a one-off's name, and around that day something fits them
@@ -5814,11 +5957,15 @@ class CalendarChange:
             raise self._missing(c["title"], days, first + rest, unreadable, unread)
         hit = hits[0]
         self._guard(hit)
-        if hit.repeats and hit.first != days[0]:
+        if hit.repeats and hit.first != days[0] and not any(x.first <= days[0] <= x.last for x in hit.copies):
             raise Refuse(f"that day of {hit.title} starts on {_day_words(hit.first)}. Name that day")
         start, end, _ = self._new_times(c)
-        if _same_start(hit.start, start) and hit.end is not None and _same_start(hit.end, end) \
-                and all(_same_start(x.start, start) for x in hit.copies):
+        at_times = _same_start(hit.start, start) and hit.end is not None and _same_start(hit.end, end)
+        behind = [x for x in hit.copies if not (_same_start(x.start, start) and x.end is not None
+                                                and _same_start(x.end, end))]
+        if at_times and hit.calendar == "gmail" and behind:
+            return [self._copy_catch_up(c["title"], hit, behind, start, end)], []
+        if at_times and not behind:
             # Already at that time (0.24.0, fourth round): the current time is checked again at the
             # apply, so a move that landed already (late, or before a card offering it again was
             # tapped) is a no-op, never a second write.
@@ -5851,6 +5998,20 @@ class CalendarChange:
             part.length = (hit.end - hit.start, end - start, end, name)
         return [part], []
 
+    def _copy_catch_up(self, asked: str, hit: Found, behind: list[Found], start, end) -> Part:
+        """His Gmail event is already where he wants it and its Family copy isn't (Nov 27): only the copy
+        moves, to match it. Gmail isn't written."""
+        name = self._name(asked, hit)
+        text = f"the Family copy of {name} to {self._at_words(start, end)}, to match your Gmail calendar"
+        steps = [self._copy_move(x, start, end) for x in behind]
+        targets = frozenset((x.calendar, x.series, x.instance) for x in behind)
+        bound = [b for x in behind for b in self._bound_of(x, "move")]
+        expect = [{"kind": "moved", "calendar": b["calendar"], "series": b["series"], "instance": b["instance"],
+                   "title": b["title"], "start": _text(start), "end": _text(end), "was": b["start"]}
+                  for b in bound]
+        return Part(f"Move {text}", f"Moved {text}", steps, (targets, ("move", _moment(start), _moment(end))),
+                    name=name, bound=bound, expect=expect)
+
     def _plan_remove(self, asked: str, days: list[date], chosen: list[Found], found: list[Found],
                      unreadable: int, unread: list[str]) -> tuple[list[Part], list[str]]:
         picked, absent = {}, []
@@ -5860,6 +6021,11 @@ class CalendarChange:
                 absent.append(day)
             for f in hits:
                 self._guard(f)
+                if not f.first <= day <= f.last:
+                    # Only its Family copy was left on that day (Nov 27): which one he means is asked.
+                    raise Unclear(f"{self._name(asked, f)} is {render.day_words(f.first, self._today())} on your "
+                                  f"Gmail calendar now, and only its Family copy was still {render.day_words(day, self._today())}",
+                                  "Which did you mean?")
                 covered = [f.first + timedelta(days=i) for i in range((f.last - f.first).days + 1)]
                 if not set(covered) <= set(days):
                     raise Refuse(f"{f.title} runs {_day_words(f.first)} to {_day_words(f.last)}, so "
@@ -6818,12 +6984,13 @@ class CalendarChange:
         back from a read taken before the change."""
         step = self._family_move(f, start, end)
         step.what = "the Family copy"
-        row = self.ledger.db.execute("SELECT start, end FROM family_copies WHERE key=? AND state='live'",
-                                     (f.copy_of,)).fetchone()
+        row = self.ledger.db.execute("SELECT start, end, state FROM family_copies WHERE key=? AND state IN "
+                                     f"({','.join('?' * len(COPY_FOLLOWS))})", (f.copy_of, *COPY_FOLLOWS)).fetchone()
         if row is not None:
+            # One left alone after an edit is kept true again from here on (Nov 27): brought to its event.
             step.rows = [{"table": "family_copies", "key": f.copy_of,
-                          "set": {"start": _text(start), "end": _text(end), "missing": 0},
-                          "was": {"start": row["start"], "end": row["end"]},
+                          "set": {"start": _text(start), "end": _text(end), "missing": 0, "state": "live"},
+                          "was": {"start": row["start"], "end": row["end"], "state": row["state"]},
                           "hold": [row["start"], row["end"]]}]
         return step
 
@@ -8520,6 +8687,11 @@ def _plan(row) -> dict:
         return json.loads(row["settle_json"] or "{}")
     except (ValueError, TypeError, IndexError, KeyError):
         return {}
+
+
+def _on_day(f: Found, day: date) -> bool:
+    """On that day, or its Family copy is: a copy left behind on its old day is still that event (Nov 27)."""
+    return f.first <= day <= f.last or any(x.first <= day <= x.last for x in f.copies)
 
 
 def _found_json(f: Found) -> dict:

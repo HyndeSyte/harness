@@ -48,7 +48,7 @@ known by its mark, a "Busy" hold, an invitation from someone else, or a call), e
 series on its own, chained with the Family events he goes to,
 with a card and Undo for each event's drives (drive_cards.py). They are read from his calendar's
 secret iCal feed only, never the API read, and come off only when the feed says so or after two
-full reads without them (FamilyGmail._own_events). With the own_drive_dry_run option on, they're
+full reads without them (FamilyGmail._own_events). With the drive_dry_run option on, they're
 only logged. A drive that can't be found gets the
 digest's line and one card (drive_cards.py), and an event he goes to left without its drives for
 any reason not already said gets them too, and a log line by its title and day. A block written
@@ -257,14 +257,16 @@ def own_days_from_options(data_dir: str) -> int:
 
 
 def own_dry_run_from_options(data_dir: str) -> bool:
-    """The own_drive_dry_run option: his own appointments' drives only logged, never written or
-    told. On unless it reads as a plain false: the first live run is a dry run."""
+    """The drive_dry_run option: his own appointments' drives only logged, never written or told. Off unless
+    it reads as a plain true: drive blocks are written (Nov 27, at his word: "no drive time"). It took the
+    place of own_drive_dry_run, which was on by default and is no longer read, so the old setting doesn't
+    keep his drives in the log. Settings that can't be read at all are a dry run."""
     try:
         with open(os.path.join(data_dir, "options.json"), encoding="utf-8") as f:
-            value = json.load(f).get("own_drive_dry_run", True)
+            value = json.load(f).get("drive_dry_run", False)
     except (OSError, ValueError, AttributeError):
-        return True
-    return value is not False
+        return True                    # settings that can't be read write nothing new: a dry run
+    return value is True
 
 
 def cleanup_from_options(data_dir: str) -> bool:
@@ -557,6 +559,31 @@ class FamilyGmail:
         self.dropped: set[str] = set()     # no longer wanted only because of what he said
         self._last: tuple | None = None    # (settings, what he'd said) at the last read
 
+    def _own_dry(self) -> bool:
+        """His own appointments' drives only logged: the drive_dry_run option, unless he tapped Write them on
+        the drive blocks' card (drive_cards.note_card). That tap lasts while the option stays on; once it reads
+        off, the tap is let go, so turning it on again is a dry run again."""
+        dry = bool(self.own_dry_fn())
+        cards = getattr(self.live, "drive_cards", None)
+        if cards is None:
+            return dry
+        if not dry:
+            cards.let_go_tap()
+            return False
+        return not cards.written_by_tap()
+
+    def drive_note_card(self, chat_id: int | None, job_id: str | None = None) -> bool:
+        """The drive blocks' card, for a note of Cain's naming one (Nov 27). False when it can't go."""
+        cards = getattr(self.live, "drive_cards", None)
+        if cards is None:
+            return False
+        try:
+            return cards.note_card(chat_id, planned=self._live_on() and self.drives is not None,
+                                   dry=self._own_dry(), now=self.ledger.now(), job_id=job_id)
+        except Exception as e:                 # a card is a help, never a stop
+            log.warning("drive note card failed: %s", type(e).__name__)
+            return False
+
     def _live_on(self) -> bool:
         return self.live is not None and bool(self.live_fn())
 
@@ -716,7 +743,7 @@ class FamilyGmail:
         if blocks is None:
             self._problem(self._said(why))
             return
-        dry = bool(self.own_dry_fn())
+        dry = self._own_dry()
         zone = ZoneInfo(self.tz)
         gone, spared = 0, []
         for block in sorted(blocks, key=lambda b: b.start):
@@ -1012,7 +1039,7 @@ class FamilyGmail:
             self.drives.begin()            # one allowance of lookups for the whole read
         self.leg_note = ""
         if self._live_on():
-            self._dry = bool(self.own_dry_fn())
+            self._dry = self._own_dry()
             self._mode(self._dry)
             if not self._dry:
                 self._warm_near(now)
@@ -2038,7 +2065,7 @@ class FamilyGmail:
                                     getattr(self, "_feed_note", "")) if x)
 
     def _dry_run(self, own: dict[str, Want], mine: dict[str, Want], now: datetime) -> None:
-        """The first live run (the own_drive_dry_run option): the drives his own appointments would
+        """The first live run (the drive_dry_run option): the drives his own appointments would
         get, and the ones that would come off, in the log with the event's day and time, and nothing
         written, sent or kept as written for them. Family events' drives were already worked out
         without them (_sync), so nothing here can change those."""
@@ -2087,7 +2114,7 @@ class FamilyGmail:
             kept = {}
         with self.ledger.tx() as db:
             self.ledger.set_meta(DRY_COUNTS, "", db)
-        if not self._live_on() or not self.own_dry_fn():
+        if not self._live_on() or not self._own_dry():
             return ""
         w, r = len(kept.get("write", [])), len(kept.get("remove", []))
         return (f"Drive dry run since the last digest: {w} drive block{'' if w == 1 else 's'} would be written and "

@@ -1371,7 +1371,18 @@ and `/status` says if the Gmail calendar isn't being read.
   blocks an hour on Family and says nothing private.
 - **Trips** are one block, from a "Stay at" event: "Name - Springfield (out Tue 3:15 PM ZZ 101, back
   Fri 1:40 PM ZZ 101)", or "Name - away".
-- **Moved or cancelled** on Gmail, the copy follows.
+- **Massages** go on as "Name - Massage", and any appointment Harness added to your Gmail calendar for
+  you gets its copy too ("Name - Appointment" when its title has no word above). Drive blocks and busy
+  blocks never do.
+- **Moved or cancelled** on Gmail, the copy follows, within one read, whether you moved it or Harness
+  did. A copy knows its Gmail event by that event's own identity (for one day of a repeating event, the
+  series and the day's original start), never by its time, so a day moved by hand or by a card keeps its
+  copy. A Family read that still shows a time Harness itself had put on the copy is taken as behind,
+  not as someone's edit, and the copy is brought to its event.
+- **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
+  family mirrored event not updating"), even as a question, and you get a card that brings each Family
+  copy out of step back to its Gmail event, or takes off one whose event is really gone. Nothing asks you
+  to change a calendar by hand. A copy you fixed by hand that already matches its event stays as it is.
 - **Yours by hand:** a matching event with your first name in it is taken over, not doubled. It's
   replaced only when the event changes on Gmail. Events with other people, repeating ones and
   anyone else's are never touched.
@@ -1544,9 +1555,18 @@ how many blocks are on Gmail.
   yesterday on, come off at the next read, each known by its mark and read again by its id just before: it must
   still carry the own-drive mark, with the title and times it was listed with. A
   Family event's blocks and drives stay. One you edited (its title or times not as written) stays and
-  is named in the digest. With `own_drive_dry_run` on, each is only logged as "would remove". Nothing
+  is named in the digest. With `drive_dry_run` on, each is only logged as "would remove". Nothing
   new is written while it stays on. Off again, blocks are written as before.
-- **First live run (`own_drive_dry_run`, on by default):** while it's on, your own appointments'
+- **Drive blocks written (`drive_dry_run`, off by default):** since Nov 27, at your word ("no drive
+  time"), your own appointments' drive blocks are written to your Gmail calendar, never to Family: for
+  every event you go to that has a place, a drive there and a drive back, each from the real drive time
+  rounded up to the quarter hour, one drive between back-to-back places, and the last drive home. A
+  moved or cancelled event takes its drive blocks with it. The setting took the place of
+  `own_drive_dry_run`, which was on by default and is no longer read. A note from Cain on your message
+  that names a drive block gets one card about them (marked as from his note): with the dry run on,
+  Write them writes them from the next read while it stays on; otherwise it lists any event still
+  without drives, with Work them out. The dry run, when you turn it back on, works as below.
+- **The dry run (`drive_dry_run` on):** while it's on, your own appointments'
   drive blocks are only written to Harness's log ("drive dry run: would write ...", "would remove
   ..." and "would ask before removing ...", each with the appointment's day and time), never to
   Gmail, no card goes out for them and nothing is kept as written. Family events' drives are worked

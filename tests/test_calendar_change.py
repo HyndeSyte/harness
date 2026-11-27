@@ -415,7 +415,9 @@ def test_a_day_already_off_is_said_and_the_rest_goes(r):
     assert "didn't find it on Nov 4" in r.texts()[-1] and "2026-11-23" not in days_of(r.body())
 
 
-def test_a_copy_of_a_gmail_event_is_refused(r):
+def test_a_copy_whose_gmail_event_isnt_kept_can_be_taken_off_and_he_is_never_sent_to_gmail(r):
+    """Nov 27: a copy was never removable at his word ("Change the event on Gmail, and the copy follows").
+    One Harness no longer keeps comes off when he asks, like any Family event."""
     r.icloud.seed(FAMILY_PATH + "hx-abc.ics", ONE.replace("UID:one-off", "UID:hx-abc"))
     cols = [c[1] for c in r.ledger.db.execute("PRAGMA table_info(family_copies)").fetchall()]
     row = {c: 0 if c in ("hand", "missing") else "x" for c in cols}
@@ -424,7 +426,8 @@ def test_a_copy_of_a_gmail_event_is_refused(r):
         db.execute(f"INSERT INTO family_copies({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
                    [row[c] for c in cols])
     r.tell(change(title="oil change", dates="2026-12-01"))
-    assert FAMILY_PATH + "hx-abc.ics" in r.icloud.events and "copy" in r.texts()[-1]
+    assert FAMILY_PATH + "hx-abc.ics" not in r.icloud.events
+    assert not any("Change the event on Gmail" in t for t in r.texts())
 
 
 def test_a_past_day_is_refused(r):

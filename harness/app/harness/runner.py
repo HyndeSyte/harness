@@ -122,6 +122,15 @@ MEANING = re.compile(
 # Words that point at something it posted: the cards are put in front of the model then.
 CARD_WORDS = re.compile(r"\b(?:cards?|receipts?|notices?|that message|this message|your message|"
                         r"you (?:sent|posted|said)|it says|says due|due date)\b", re.I)
+# A Family copy of his Gmail event that's out of step, named with what's wrong with it: in his words or in
+# Cain's note, a question or not ("why is the family mirrored event not updating", Nov 27). Plain code finds
+# every such copy by its event's own identity and offers the fix on a card (calendar_change.copy_fixes).
+COPY_NAMED = re.compile(r"\b(?:family\b[^.?!]{0,40}\b(?:cop(?:y|ies)|mirror\w*|duplicate)|mirror(?:ed|ing)?\b[^.?!]{0,20}"
+                        r"\b(?:event|copy|copies|appointment)|cop(?:y|ies) (?:on|in) (?:the )?family)\b", re.I)
+COPY_WRONG = re.compile(r"\b(?:fix\w*|wrong|stale|behind|out of (?:step|sync|date)|(?:not|n't|never) "
+                        r"(?:updat|follow|match|mov|chang|sync)\w*|updat\w*|sync\w*|match\w*|correct\w*|left)\b", re.I)
+# A drive block named in Cain's note: his own words may be only a question ("why is there no travel time").
+DRIVE_NAMED = re.compile(r"\b(?:drive|driving|travel)[ -]?(?:blocks?|times?)\b|\bdrive (?:there|back|home)\b", re.I)
 CARDS_BACK = timedelta(hours=24)
 MAX_CARDS = 6
 
@@ -151,6 +160,9 @@ class Runner:
                  calendar_change=None):
         self.family_add = family_add       # family_add.FamilyAdd, or None
         self.calendar_change = calendar_change   # calendar_change.CalendarChange, or None
+        # Posts the drive blocks' card to that chat (meaning_live.drive_card), True when it went: set by the
+        # controller once drive blocks are wired.
+        self.drive_card: Callable[[int, str], bool] | None = None
         self.ledger = ledger
         self.config = config
         self.engines = engines
@@ -419,8 +431,42 @@ class Runner:
         receipt = {"engine": engine, "model": res.model, "usd": round(res.usd, 5),
                    "tokens": [res.input_tokens, res.output_tokens], "rules": fired,
                    "type": out.type}
+        if out.type != "proposal" and self._plain_fix(job, receipt, fired):
+            return
         handler = getattr(self, f"_on_{out.type}")
         handler(job, out.body, receipt, fired)
+
+    def _plain_fix(self, job, receipt: dict, fired) -> bool:
+        """A copy fix or a drive block that the model answered in words, or asked about, still gets its card
+        (Nov 27: "not a change", twice, when his words were a question). A copy fix in his words or Cain's
+        note: plain code finds each Family copy out of step with its Gmail event and offers to bring it
+        back, on a card like any change. A drive block in Cain's note: the drive blocks' card. A card from
+        Cain's note says so, as every change resting on his words does. True when it's handled here."""
+        text = self.ledger.job_text(job["id"]) or ""
+        his, _, note = text.partition(NOTE_HEAD)
+        if self.calendar_change is not None and any(
+                COPY_NAMED.search(t) and COPY_WRONG.search(t) for t in (his, note) if t):
+            changes = self.calendar_change.copy_fixes()
+            if changes is None:
+                return False               # a calendar can't be read: the model's own reply stands
+            receipt["plain"] = "copy_fix"
+            if changes:
+                receipt["type"] = "proposal"
+                self._on_proposal(job, {"effect_type": "calendar_change", "params": {"changes": changes},
+                                        "summary": "Bring the Family copies back to their Gmail events"},
+                                  receipt, fired)
+            else:
+                self._on_answer(job, {"text": "Every Family copy of your Gmail events matches its event now, "
+                                              "so there's nothing to fix."}, receipt, fired)
+            return True
+        if note and DRIVE_NAMED.search(note) and self.drive_card is not None:
+            if not self.drive_card(job["chat_id"], job["id"]):
+                return False
+            receipt["plain"] = "drive_card"     # the card is its answer, to Cain as to him
+            with self.ledger.tx() as db:
+                self.ledger.transition(job["id"], "answered", receipt=json.dumps(receipt), db=db)
+            return True
+        return False
 
     def _footer_args(self, fired):
         return dict(rules_fired=tuple(fired), allowlist=self.config.link_allowlist)

@@ -49,8 +49,15 @@ LATER = "later"                        # this read's lookups ran out before it (
 FAILS_BEFORE_CARD = 2                  # reads in a row a lookup must fail before he hears of it
 NEAR = timedelta(hours=24)             # a drive left off this near always gets its card, at once
 MAX_CARDS_PER_READ = 3
+NOTE_KINDS = ("drive_write", "drive_retry", "drive_read", "drive_leave")
 MAX_RECEIPTS = 5
 CARD_TTL_S = 7 * 24 * 3600
+# meta: his Write them on the drive blocks' card (note_card): his own appointments' drives are written though the
+# drive_dry_run option is on. Let go once the option reads off, so turning it on again is a dry run again.
+WRITE_BY_TAP = "drive_write_by_tap"
+NOTE_CARD = "drive_note_card:"         # meta, per card: the events a Try again on it is for
+SHORT = {NO_ADDRESS: "no usable address", FAILED: "the drive lookup failed", PLACE: "where it is isn't known yet",
+         CHAIN: "the drive from the event before it can't be worked out", LATER: "not looked up yet"}
 REASONS = {NO_ADDRESS: "no usable address. Add a street address to it, or tap Skip.",
            FAILED: "the drive lookup failed. I'll keep trying at each read; tap Skip to leave it "
                    "without drive blocks.",
@@ -381,8 +388,93 @@ class DriveCards:
                        (kept_start.isoformat(), iso(now), key))
             self.ledger.event("drive_conflict_told", {}, db=db)
 
+    # -- the drive blocks' card, from Cain's note on his message (Nov 27) -------------------------------------
+    def note_card(self, chat_id: int | None, *, planned: bool, dry: bool, now: datetime,
+                  job_id: str | None = None) -> bool:
+        """One card about his drive blocks, for a note of Cain's that names one, even when his own words were a
+        question ("why is there no travel time"). Marked as from Cain's note. planned: drive blocks are set up
+        (live mode and a home); dry: they're only being logged. False: there's no one to send it to."""
+        if chat_id is None:
+            return False
+        head = "From Cain's note on your message, about your drive blocks: "
+        bid = secrets.token_hex(8)
+        zone = ZoneInfo(self.tz)
+        rows: list = []
+        if not planned:
+            text = head + ("drive blocks need the meaning_live and home_location settings in Harness, so none "
+                           "are planned now. Nothing changed.")
+            buttons: list = []
+        elif dry:
+            text = head + ("the drives around your own appointments are only planned and logged right now, not "
+                           "written, because the drive_dry_run setting is on. Write them on your Gmail calendar "
+                           "from the next read?")
+            buttons = [("Write them", "drive_write"), ("Keep logging", "drive_leave")]
+        else:
+            rows = [r for r in self.ledger.db.execute(
+                "SELECT * FROM drive_cards WHERE ask IN ('asked','skipped','failing') ORDER BY start").fetchall()
+                if datetime.fromisoformat(r["start"]) > now][:MAX_RECEIPTS]
+            if rows:
+                said = "; ".join(f"{_day(datetime.fromisoformat(r['start']).astimezone(zone))} at "
+                                 f"{_time(datetime.fromisoformat(r['start']).astimezone(zone))} "
+                                 f"({SHORT.get(r['reason'], SHORT[FAILED])})" for r in rows)
+                text = head + f"these events have no drive blocks yet: {said}. Work out their drives again at the next read?"
+                buttons = [("Work them out", "drive_retry"), ("Leave them", "drive_leave")]
+            else:
+                text = head + ("they're on. Each event you go to with a place gets a drive there and a drive back "
+                               "on your Gmail calendar, rounded up to the quarter hour, one drive between "
+                               "back-to-back places, and the last one home. Read your calendars again now?")
+                buttons = [("Read now", "drive_read")]
+        with self.ledger.tx() as db:
+            row: list = []
+            binds = []
+            for label, kind in buttons:
+                nonce = choices.mint(self.ledger, kind=kind, target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+                row.append((label, choices.callback_data(nonce)))
+                binds.append({"type": "choice", "nonce": nonce})
+            self.ledger.set_meta(NOTE_CARD + bid, json.dumps([r["key"] for r in rows]), db)
+            self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db, job_id=job_id,
+                                buttons=[row] if row else None, binds=binds or None)
+            self.ledger.event("drive_note_card", {"planned": planned, "dry": dry, "missing": len(rows)}, db=db)
+        return True
+
+    def written_by_tap(self) -> bool:
+        return bool(self.ledger.get_meta(WRITE_BY_TAP))
+
+    def let_go_tap(self) -> None:
+        if self.ledger.get_meta(WRITE_BY_TAP):
+            with self.ledger.tx() as db:
+                db.execute("DELETE FROM meta WHERE key=?", (WRITE_BY_TAP,))
+
+    def _note_choice(self, kind: str, target: str) -> str:
+        raw = self.ledger.get_meta(NOTE_CARD + (target or ""))
+        if raw is None:
+            return "Nothing changed."
+        if raw == "done":
+            return "Already settled. Nothing changed."
+        with self.ledger.tx() as db:
+            self.ledger.set_meta(NOTE_CARD + target, "done", db)
+            if kind == "drive_write":
+                self.ledger.set_meta(WRITE_BY_TAP, iso(self.ledger.now()), db)
+            if kind == "drive_retry":
+                try:
+                    keys = [k for k in json.loads(raw) if isinstance(k, str)]
+                except ValueError:
+                    keys = []
+                for key in keys:          # asked again, and tried again, as if new
+                    db.execute("UPDATE drive_cards SET ask='', aid='', fails=0, updated_at=? WHERE key=?",
+                               (iso(self.ledger.now()), key))
+        if kind == "drive_write":
+            return "Writing the drives around your own appointments on your Gmail calendar from the next read."
+        if kind == "drive_retry":
+            return "Working out those drives again at the next read."
+        if kind == "drive_read":
+            return "Reading your calendars again now."
+        return "Leaving them as they are."
+
     # -- taps ------------------------------------------------------------------------------------------
     def on_choice(self, kind: str, target: str) -> str:
+        if kind in NOTE_KINDS:
+            return self._note_choice(kind, target)
         if kind in ("drive_remove", "drive_keep"):
             rows = self.ledger.db.execute("SELECT * FROM drive_cards WHERE bid=? AND bid!=''",
                                           (target or "",)).fetchall()

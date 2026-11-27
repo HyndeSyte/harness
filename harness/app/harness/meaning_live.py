@@ -695,8 +695,12 @@ class MeaningLive:
             return self._undo(rid, code)
         if kind == "place_skip":
             return self.places.on_choice(kind, target)
-        if kind in ("drive_undo", "drive_skip", "drive_remove", "drive_keep"):
-            return self.drive_cards.on_choice(kind, target)
+        if kind in ("drive_undo", "drive_skip", "drive_remove", "drive_keep", *drive_cards.NOTE_KINDS):
+            out = self.drive_cards.on_choice(kind, target)
+            if kind in ("drive_read", "drive_retry", "drive_write") and not out.startswith(("Already", "Nothing")) \
+                    and hasattr(self.calendar, "read_soon"):
+                self.calendar.read_soon()
+            return out
         return "Nothing changed."
 
     def _example(self, f: dict, source: str, types: list[str], **kw) -> str:

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.24.5
+
+- **A Family copy follows its Gmail event every time**, whether you move that day yourself or Harness moves it on a card. A copy knows its event by the event itself (for one day of a repeating event, which day of the series it is), never by its time, so the coffee copy that stayed at 1:45 on Nov 27 now moves with its event.
+- **Asking to fix a copy gets a card that fixes it**, even as a question ("why is the family mirrored event not updating"). Harness never tells you to change a calendar by hand. A copy whose event is really gone is offered off instead.
+- **Massages, and every appointment Harness adds for you, get their Family copy.** Drive blocks and busy blocks never go to Family.
+- **Drive blocks are now written to your Gmail calendar**, not only logged: a drive there and back for each event you go to with a place, rounded up to the quarter hour, one drive between back-to-back places and the last one home. They move or come off with their event. The `drive_dry_run` setting turns the log-only mode back on.
+- A note from Cain naming a drive block now gets you a card about your drive blocks, marked as from his note.
+- The copy you fixed by hand on Nov 27 stays as you left it.
+
 ## 0.24.4
 
 - **A tap Harness crosses off stays crossed off**, even when it can't lock its tap journal at that moment, and it never writes the journal without that lock.
