@@ -248,11 +248,12 @@ const capSweep = () => {
 // Keeper 0.1.14: the drill's files, root's 0600 (drill.ts): the flag, the signed mark and the aborted record in /data/trust, and
 // the spent nonces in /data/link (0700), outside Cain's backups (config.yaml backup_exclude).
 const drillStore = fileStore(process.env.CAIN_DRILL_FLAG ?? `${TRUST_DIR}/keeper-drill.json`, process.env.CAIN_DRILL_MARK ?? `${TRUST_DIR}/keeper-drill-mark.json`,
-  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`, Date.now, `${DIR}/keeper-drill-refused.json`);   // Keeper 0.1.15: the refused intent, beside the spent list
+  process.env.CAIN_DRILL_SPENT ?? `${DIR}/keeper-drill-spent`, `${TRUST_DIR}/keeper-drill-aborted.jsonl`, Date.now, `${DIR}/keeper-drill-refused.json`,
+  (l) => console.log(`[cain] link: ${l}`));   // Keeper 0.1.15: the refused intent, beside the spent list
 // The drill key, derived from the Ship key under its own domain; its public half kept by root for the run script and the probe.
 const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
 const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
-if (drillKey) { try { storeMarkPub(drillKey.pub, DRILL_MARK_PUB); } catch (e) { console.log(`[cain] link: couldn't keep the drill key's public half: ${String(e).slice(0, 80)}`); } }
+if (drillKey) { try { storeMarkPub(drillKey.pub, DRILL_MARK_PUB, (l) => console.log(`[cain] link: ${l}`)); } catch (e) { console.log(`[cain] link: couldn't keep the drill key's public half: ${String(e).slice(0, 80)}`); } }
 const link = new Link({
   rest, load, save, now: Date.now, paired, toHarness,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.

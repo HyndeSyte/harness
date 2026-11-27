@@ -63,7 +63,7 @@
 //     refused and its cancel drops the mark too.
 //   - mark confirmed: the install goes on as a drill; a refused pass cancels the attempt and drops the mark.
 import { createHash, createHmac, createPrivateKey, createPublicKey, randomBytes, verify as edVerify, type KeyObject } from "node:crypto";
-import { chmodSync, closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync, appendFileSync, existsSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync, appendFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { b64url, publicKey } from "../ship-token";
 
@@ -219,7 +219,7 @@ export interface DrillStore {
   removeMark: () => void;
   spent: (nonce: string) => boolean;              // the nonce is in the spent list (throws when the list can't be read)
   recordNonce: (nonce: string, expMs: number) => "recorded" | "taken";   // exclusive: one caller records it; throws on failure
-  aborted: (line: string) => void;                // an aborted drill attempt, recorded (best effort)
+  aborted: (line: string) => void;                // an aborted drill attempt, recorded (best effort: throws when it can't, the caller logs why)
   // (Keeper 0.1.15) item 8: the flag consumed by an atomic claim of its exact instance: claimFlag renames it aside and answers the
   // claimed instance (null: no flag, or another claimed it first); claimed lists instances left claimed (a crash); dropClaim removes one
   claimFlag: () => { id: string; text: string } | null;
@@ -231,18 +231,50 @@ export interface DrillStore {
   // (Keeper 0.1.15) item 15: the later of now and the highest time the spent list has seen, persisted before it is answered
   highWater: (nowMs: number) => number;
 }
+// Why a store call failed, for the one log line that says so (Cain 0.19.2): the error's code, system call and path, never a
+// file's contents (a parse error says only its kind, since its message can quote the file).
+export function storeWhy(e: unknown): string {
+  const x = e as { code?: unknown; syscall?: unknown; path?: unknown; name?: unknown } | null;
+  const parts: string[] = [];
+  const clip = (v: unknown, n: number) => String(v).replace(/[\u0000-\u001f]/g, "?").slice(0, n);
+  if (x && typeof x === "object") {
+    if (typeof x.code === "string" && x.code) parts.push(clip(x.code, 40));
+    if (typeof x.syscall === "string" && x.syscall) parts.push(clip(x.syscall, 40));
+    if (typeof x.path === "string" && x.path) parts.push(clip(x.path, 200));
+  }
+  if (!parts.length) parts.push(x && typeof x === "object" && typeof x.name === "string" && x.name ? clip(x.name, 40) : "no error code");
+  return parts.join(", ");
+}
 // Written whole, durably, root's (0600 whatever the file or its temp was before; Keeper 0.1.15: mode, 0644 for the mark).
-function writeWhole(path: string, body: string, mode = 0o600): void {
+// Cain 0.19.2: a stray temp that isn't a regular file (a folder, a link, a socket) is removed, logged once, instead of failing
+// every write after it.
+const withPath = (e: any, p: string) => { if (e && typeof e === "object" && !e.path) { try { e.path = p; } catch { /* the code alone */ } } };
+function writeWholeLogged(path: string, body: string, mode = 0o600, log?: (l: string) => void): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
+  let st: ReturnType<typeof lstatSync> | null = null;
+  try { st = lstatSync(tmp); } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
+  if (st && !st.isFile()) {
+    const kind = st.isDirectory() ? "a folder" : st.isSymbolicLink() ? "a link" : "not a regular file";
+    rmSync(tmp, { recursive: true, force: true });
+    log?.(`a stray temp (${kind}) stood in the drill store's way at ${tmp}: removed, and the write goes on`);
+  }
   rmSync(tmp, { force: true });
   const fd = openSync(tmp, "wx", mode);
-  try { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }
+  try { writeSync(fd, body); fsyncSync(fd); } catch (e: any) { withPath(e, tmp); throw e; } finally { closeSync(fd); }   // an fd's error names no path
   chmodSync(tmp, mode);
   renameSync(tmp, path);
 }
-const readOrNull = (p: string) => { try { return readFileSync(p, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; throw e; } };
-export function fileStore(flag = FLAG_FILE, mark = MARK_FILE, spentDir = SPENT_DIR, abortedFile = ABORTED_FILE, nowFn: () => number = Date.now, refusedFile = REFUSED_FILE): DrillStore {
+const readOrNull = (p: string) => {
+  try { return readFileSync(p, "utf8"); } catch (e: any) {
+    if (e?.code === "ENOENT") return null;
+    withPath(e, p);   // Bun leaves the path off a read's error
+    throw e;
+  }
+};
+export function fileStore(flag = FLAG_FILE, mark = MARK_FILE, spentDir = SPENT_DIR, abortedFile = ABORTED_FILE, nowFn: () => number = Date.now, refusedFile = REFUSED_FILE,
+  log?: (l: string) => void): DrillStore {
+  const writeWhole = (path: string, body: string, mode = 0o600) => writeWholeLogged(path, body, mode, log);
   const nonceFile = (n: string) => { if (!NONCE.test(n)) throw new Error("not a nonce"); return join(spentDir, n); };
   const hwFile = join(spentDir, HIGH_WATER);
   const readHw = () => { try { const n = Number(readFileSync(hwFile, "utf8").trim()); return Number.isFinite(n) && n > 0 ? n : 0; } catch { return 0; } };
@@ -277,7 +309,7 @@ export function fileStore(flag = FLAG_FILE, mark = MARK_FILE, spentDir = SPENT_D
       try { const d = openSync(spentDir, "r"); try { fsyncSync(d); } finally { closeSync(d); } } catch { /* the file itself is synced */ }
       return "recorded";
     },
-    aborted: (line) => { try { mkdirSync(dirname(abortedFile), { recursive: true }); appendFileSync(abortedFile, `${line}\n`, { mode: 0o600 }); chmodSync(abortedFile, 0o600); } catch { /* the log has it */ } },
+    aborted: (line) => { mkdirSync(dirname(abortedFile), { recursive: true }); appendFileSync(abortedFile, `${line}\n`, { mode: 0o600 }); chmodSync(abortedFile, 0o600); },
     claimFlag: () => {
       const id = randomBytes(6).toString("hex");
       try { renameSync(flag, claimName(id)); } catch (e: any) { if (e?.code === "ENOENT") return null; throw e; }
@@ -300,9 +332,9 @@ export function fileStore(flag = FLAG_FILE, mark = MARK_FILE, spentDir = SPENT_D
   };
 }
 // The drill key's public half, kept by root beside the mark (main.ts, at each start of the link).
-export function storeMarkPub(pub: string, path = MARK_PUB_FILE): void {
+export function storeMarkPub(pub: string, path = MARK_PUB_FILE, log?: (l: string) => void): void {
   if (readOrNull(path)?.trim() === pub) { chmodSync(path, 0o600); return; }
-  writeWhole(path, `${pub}\n`);
+  writeWholeLogged(path, `${pub}\n`, 0o600, log);
 }
 
 // His tap's flag, written (core.ts drillTap calls this through main.ts armDrill, after it checked the tap is his).
@@ -337,11 +369,11 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
   // one page, until the owner clears it or arms a new drill.
   const refuseIntent = (claimId: string | null, text: string, why: string, kind: "damaged" | "version", info: { armed?: string; version?: string }): Spent => {
     const key = `${kind}:${markHash(text).slice(0, 16)}`;
-    let kept = true;
-    try { store.storeRefused({ at: now(), why: why.slice(0, 200), kind, key, ...info }); } catch { kept = false; }
+    let kept = true; let keptWhy = "";
+    try { store.storeRefused({ at: now(), why: why.slice(0, 200), kind, key, ...info }); } catch (e) { kept = false; keptWhy = storeWhy(e); }
     let gone = true;
     try { if (claimId) store.dropClaim(claimId); else store.removeFlag(); } catch { gone = false; }
-    log(`a drill flag was refused${gone ? " and removed" : " (it couldn't be removed)"}: ${why}; nothing is installed, and ${kept ? "the refusal stands until the owner clears it or arms a new drill" : "the refusal couldn't be kept (the next install reads the flag again)"}`);
+    log(`a drill flag was refused${gone ? " and removed" : " (it couldn't be removed)"}: ${why}; nothing is installed, and ${kept ? "the refusal stands until the owner clears it or arms a new drill" : `the refusal couldn't be kept (${keptWhy}; the next install reads the flag again)`}`);
     page("refused", `refused:${key}`, info);
     return { error: `the drill flag ${why}, so nothing was installed; every install is refused until the owner clears the drill or arms a new one` };
   };
@@ -349,10 +381,10 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
     spend: (version, app = DRILL_APP) => {
       // the later of the clock and the spent list's high-water time (item 15)
       let t: number;
-      try { t = store.highWater(now()); } catch { log("the drill flags' high-water time can't be kept: nothing is installed"); return { error: "the drill flags' spent list can't be written, so nothing was installed" }; }
+      try { t = store.highWater(now()); } catch (e) { log(`the drill flags' high-water time can't be kept (${storeWhy(e)}): nothing is installed`); return { error: "the drill flags' spent list can't be written, so nothing was installed" }; }
       // a refused intent stands (item 8)
       let intent: RefusedIntent | null;
-      try { intent = store.refused(); } catch { log("the refused drill intent can't be read: nothing is installed"); page("refused", "refused:unreadable", {}); return { error: "the refused drill intent can't be read, so nothing was installed" }; }
+      try { intent = store.refused(); } catch (e) { log(`the refused drill intent can't be read (${storeWhy(e)}): nothing is installed`); page("refused", "refused:unreadable", {}); return { error: "the refused drill intent can't be read, so nothing was installed" }; }
       if (intent) {
         log(`a refused drill intent stands (${intent.why}): nothing is installed until the owner clears it or arms a new drill`);
         page("refused", `refused:${intent.key}`, { armed: intent.armed, version: intent.version });
@@ -367,7 +399,7 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
         if (r.ok && r.app !== app) continue;
         if (!r.ok) return refuseIntent(l.id, l.text, `left claimed by an interrupted registration didn't verify (${(r as { why: string }).why})`, "damaged", {});
         let was: boolean;
-        try { was = store.spent(r.nonce); } catch { log("the drill flags' spent list can't be read: nothing is installed"); return { error: "the drill flags' spent list can't be read, so nothing was installed" }; }
+        try { was = store.spent(r.nonce); } catch (e) { log(`the drill flags' spent list can't be read (${storeWhy(e)}): nothing is installed`); return { error: "the drill flags' spent list can't be read, so nothing was installed" }; }
         if (was) {
           try { store.dropClaim(l.id); } catch { log("a spent drill flag left by an interrupted registration couldn't be removed: nothing is installed"); return { error: "a spent drill flag couldn't be removed, so nothing was installed" }; }
           log(`a drill flag left claimed by an interrupted registration was already spent (nonce ${r.nonce}): removed and refused once; the next install goes as usual`);
@@ -378,11 +410,11 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
       }
       if (!claim) {
         let text: string | null;
-        try { text = store.loadFlag(); } catch { log("the drill flag exists but can't be read: nothing is installed"); page("damaged", "damaged:unreadable", {}); return { error: "the drill flag can't be read, so nothing was installed" }; }
+        try { text = store.loadFlag(); } catch (e) { log(`the drill flag exists but can't be read (${storeWhy(e)}): nothing is installed`); page("damaged", "damaged:unreadable", {}); return { error: "the drill flag can't be read, so nothing was installed" }; }
         if (text === null) return { mode: null };
         const pre = readDrillFlag(text, pub(), t);
         if (pre.ok && pre.app !== app) { log(`the drill flag is for ${pre.app}, not ${app}: this registration leaves it be`); return { mode: null }; }   // item 12
-        try { claim = store.claimFlag(); } catch { log("the drill flag couldn't be claimed: nothing is installed"); return { error: "the drill flag couldn't be claimed, so nothing was installed" }; }
+        try { claim = store.claimFlag(); } catch (e) { log(`the drill flag couldn't be claimed (${storeWhy(e)}): nothing is installed`); return { error: "the drill flag couldn't be claimed, so nothing was installed" }; }
         if (!claim) { log("another registration claimed this drill flag at the same moment: this one stops"); return { error: "another registration is spending the drill flag at the same moment, so this one stops and installs nothing" }; }
       }
       // the claimed instance, exactly: judged again, whatever was read before (a replacement meanwhile is another instance)
@@ -394,7 +426,7 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
       }
       if (r.version !== version) return refuseIntent(claim.id, claim.text, `was armed for Cain ${r.version}, but this install carries ${version}`, "version", { armed: r.version, version });
       let spentAlready: boolean;
-      try { spentAlready = store.spent(r.nonce); } catch { log("the drill flags' spent list can't be read: nothing is installed"); return { error: "the drill flags' spent list can't be read, so nothing was installed" }; }
+      try { spentAlready = store.spent(r.nonce); } catch (e) { log(`the drill flags' spent list can't be read (${storeWhy(e)}): nothing is installed`); return { error: "the drill flags' spent list can't be read, so nothing was installed" }; }
       if (spentAlready) {
         try { store.dropClaim(claim.id); } catch { /* the next registration finds it spent again */ }
         log(`a drill flag was refused and removed: it was spent before (nonce ${r.nonce} is in the spent list: an old flag brought back); nothing is installed, once`);
@@ -402,7 +434,7 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
         return { error: "the drill flag was spent before (an old flag brought back), so this install is refused once; the next one goes as usual" };
       }
       let rec: "recorded" | "taken";
-      try { rec = store.recordNonce(r.nonce, r.exp); } catch { log("the drill flag's nonce couldn't be recorded as spent: nothing is installed, and the flag stays claimed for the next try"); return { error: "the drill flag's nonce couldn't be recorded as spent, so nothing was installed" }; }
+      try { rec = store.recordNonce(r.nonce, r.exp); } catch (e) { log(`the drill flag's nonce couldn't be recorded as spent (${storeWhy(e)}): nothing is installed, and the flag stays claimed for the next try`); return { error: "the drill flag's nonce couldn't be recorded as spent, so nothing was installed" }; }
       if (rec === "taken") { log("another registration recorded this drill flag's nonce at the same moment: this one stops"); return { error: "another registration is spending the drill flag at the same moment, so this one stops and installs nothing" }; }
       try { store.dropClaim(claim.id); } catch { log("the drill flag couldn't be removed after its nonce was recorded (it can't count again): nothing is installed"); return { error: "the drill flag couldn't be removed, so nothing was installed" }; }
       log(`the owner's drill flag (${r.mode}, Cain ${r.version}) is spent by this registration: its nonce is recorded and it goes as kind drill`);
@@ -421,8 +453,9 @@ export function drillDeps(store: DrillStore, pub: () => string | null, now: () =
       } catch { /* it lapses by itself, and the run-time helper asks Keeper before acting on it */ }
     },
     aborted: (attempt, version, why) => {
-      store.aborted(JSON.stringify({ at: new Date(now()).toISOString(), attempt, version, why: why.slice(0, 200) }));
-      log(`the drill attempt ${attempt} is recorded as aborted: ${why}`);
+      let notKept = "";
+      try { store.aborted(JSON.stringify({ at: new Date(now()).toISOString(), attempt, version, why: why.slice(0, 200) })); } catch (e) { notKept = storeWhy(e); }
+      log(notKept ? `the drill attempt ${attempt} is aborted, but its record couldn't be written (${notKept}): ${why}` : `the drill attempt ${attempt} is recorded as aborted: ${why}`);
       page("aborted", `aborted:${attempt}`, { version });
     },
     page,
@@ -440,7 +473,7 @@ export interface HelperDeps {
   loadMark: () => string | null; dropMark: () => void; pub: () => string | null;
   ask: ((attempt: string) => Promise<{ status: number; body: any } | null>) | null;   // GET /attempt/<attempt>, Cain's token; null: no token set
   abortedFor: (attempt: string) => boolean;                                          // an earlier start of this attempt aborted
-  aborted: (line: string) => void;
+  aborted: (line: string) => void;                                                   // throws when it can't: the log line says why
   log: (m: string) => void;
   boundMs?: number; retryMs?: number;
 }
@@ -452,8 +485,9 @@ export async function helperMode(d: HelperDeps): Promise<string> {
   if (!pre.ok || pre.mark.version !== d.version) { d.log(`${drillModeFor(text, d.pub(), d.version, d.now(), null).why}; this start goes on as usual`); return ""; }
   const attempt = pre.mark.attempt;
   const abort = (why: string) => {
-    d.aborted(JSON.stringify({ at: new Date(d.now()).toISOString(), attempt, version: d.version, why: why.slice(0, 200), page: true, by: "the run script's helper" }));
-    d.log(`the drill of ${attempt} is aborted: ${why}; this start stops (never a usual start of the drill), the App's finish tells the outside heartbeat, and Keeper rolls it back once it sees it`);
+    let notKept = "";
+    try { d.aborted(JSON.stringify({ at: new Date(d.now()).toISOString(), attempt, version: d.version, why: why.slice(0, 200), page: true, by: "the run script's helper" })); } catch (e) { notKept = storeWhy(e); }
+    d.log(`the drill of ${attempt} is aborted${notKept ? ` (its record couldn't be written: ${notKept})` : ""}: ${why}; this start stops (never a usual start of the drill), the App's finish tells the outside heartbeat, and Keeper rolls it back once it sees it`);
     return "abort";
   };
   if (d.abortedFor(attempt)) return abort("an earlier start of this drill attempt was aborted");
@@ -488,7 +522,7 @@ if (import.meta.main) {
     pub: () => { try { return readOrNull(env.CAIN_DRILL_MARK_PUB ?? MARK_PUB_FILE)?.trim() || null; } catch { return null; } },
     ask: token ? (attempt) => keeperCall(base, token, `/attempt/${encodeURIComponent(attempt)}`, undefined, 8_000) : null,
     abortedFor: (attempt) => { try { return (readOrNull(abortedPath) ?? "").split("\n").some((l) => { try { const j = JSON.parse(l); return j?.attempt === attempt && j?.page === true; } catch { return false; } }); } catch { return false; } },
-    aborted: (line) => { try { mkdirSync(dirname(abortedPath), { recursive: true }); appendFileSync(abortedPath, `${line}\n`, { mode: 0o600 }); chmodSync(abortedPath, 0o600); } catch { /* the log has it */ } },
+    aborted: (line) => { mkdirSync(dirname(abortedPath), { recursive: true }); appendFileSync(abortedPath, `${line}\n`, { mode: 0o600 }); chmodSync(abortedPath, 0o600); },   // helperMode logs why it failed
     log: (m) => console.error(`[cain] drill: ${m}`),
   });
   if (out) process.stdout.write(`${out}\n`);
