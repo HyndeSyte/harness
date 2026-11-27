@@ -64,9 +64,13 @@ SOURCE = "family_copy_source:"
 # against (the pre-write version), when, and whether it's known to have landed; "retries": when it wrote
 # again after a conflict. A Family read showing anything other than the copy as Harness wrote it is behind only
 # when its version is that pre-write version, of a write still undecided or sent within LAG_FOR. Any other
-# version is someone's edit, whatever times it shows, and the copy is theirs.
+# version is someone's edit, whatever times it shows, and the copy is theirs. A version is recorded as Harness's
+# own only when the copy read there shows what Harness wrote (content_is: title, start, end, and no place or
+# notes); any difference is someone's edit (round 3). A write still undecided after PENDING_FOR is settled the
+# same way, by the copy's content, and its pre-write version is never lag after that.
 VERSION = "family_copy_version:"
 LAG_FOR = timedelta(minutes=5)
+PENDING_FOR = timedelta(hours=1)
 MAX_RETRIES = 2                # writes again after a conflict, per copy per RETRY_WINDOW
 RETRY_WINDOW = timedelta(hours=1)
 
@@ -115,14 +119,61 @@ def _set_version(ledger: Ledger, key: str, d: dict, db=None) -> None:
         _set_meta(ledger, VERSION + key, value, db)
 
 
-def note_write(ledger: Ledger, key: str, was: str, got: str = "", *, landed: bool, db=None) -> None:
+def note_write(ledger: Ledger, key: str, was: str, got: str = "", *, landed: bool, db=None,
+               wrote: tuple | None = None) -> None:
     """A write of Harness's own to this copy, its own sync's or a change he asked for: sent against `was` (the
-    version just checked), leaving `got` ("" when not known). Not landed: its outcome is still undecided."""
+    version just checked), leaving `got` ("" when not known). Not landed: its outcome is still undecided.
+    `wrote`: (title, start, end) as written, kept so an undecided write can be settled by content later."""
     d = version(ledger, key)
     d["pending"] = {"from": was or "", "at": iso(ledger.now()), "landed": bool(landed)}
+    if wrote is not None:
+        d["pending"]["wrote"] = {"title": wrote[0] or "", "start": _text(wrote[1]), "end": _text(wrote[2])}
     if landed:
         d["confirmed"] = got or ""
     _set_version(ledger, key, d, db)
+
+
+def settle(ledger: Ledger, key: str, etag: str, own: bool, db=None) -> None:
+    """A write of Harness's own decided by the copy's content at this version: as written (own), the version is
+    Harness's; anything else is someone's edit, kept apart and never Harness's own."""
+    d = version(ledger, key)
+    pending = d.get("pending")
+    if isinstance(pending, dict):
+        pending["landed"] = True
+    if own:
+        d["confirmed"] = etag or ""
+        d.pop("edited", None)
+    else:
+        d["edited"] = etag or ""
+    _set_version(ledger, key, d, db)
+
+
+def expired(ledger: Ledger, key: str) -> dict | None:
+    """The write still undecided after PENDING_FOR, if there is one: to be settled by content."""
+    pending = version(ledger, key).get("pending")
+    if not isinstance(pending, dict) or pending.get("landed"):
+        return None
+    try:
+        old = ledger.now() - datetime.fromisoformat(pending["at"]) > PENDING_FOR
+    except (KeyError, TypeError, ValueError):
+        old = True
+    return pending if old else None
+
+
+def content_is(body: str, uid: str, title: str, start, end, tz: str) -> bool:
+    """The copy's body shows exactly what Harness writes: one event, its uid, this title, start and end, and no
+    place or notes (caldav.details). Anything else is someone's edit (round 3 of the review of Nov 27)."""
+    if not body or caldav.details(body):
+        return False
+    def moment(v):
+        return v if isinstance(v, datetime) else datetime.combine(v, datetime.min.time(), tzinfo=ZoneInfo(tz))
+    try:
+        occs = ical.window(body, start=moment(start) - timedelta(days=2), end=moment(end) + timedelta(days=2),
+                           tz=tz, fallback_name="Family").occurrences
+    except ical.Unreadable:
+        return False
+    return (len(occs) == 1 and occs[0].uid == uid and occs[0].summary == (title or "")[:ical.MAX_SUMMARY]
+            and _same(occs[0].start, start) and _same(occs[0].end, end))
 
 
 def confirm(ledger: Ledger, key: str, etag: str, db=None) -> None:
@@ -144,7 +195,7 @@ def lagging(ledger: Ledger, key: str, etag: str) -> bool:
     if not etag or not isinstance(pending, dict) or pending.get("from") != etag:
         return False
     if not pending.get("landed"):
-        return True
+        return expired(ledger, key) is None    # undecided an hour: settled by content, never lag (round 3)
     try:
         return ledger.now() - datetime.fromisoformat(pending["at"]) <= LAG_FOR
     except (KeyError, TypeError, ValueError):
@@ -571,7 +622,9 @@ class FamilyCopy:
                     continue
                 if row["seen"] == _seen(item.occ):
                     self._update(row, seen=_seen_now(item))    # from before notes were seen
-            elif want is not None and self._landed(item.occ, want):
+            elif (pending := expired(self.ledger, row["key"])) is not None and self._settle_expired(row, item, pending):
+                continue
+            elif want is not None and self._landed(item.occ, want) and not caldav.details(item.data):
                 # Already as it should be: a write whose answer was lost, or a change he asked for.
                 if not (_same(want.start, start) and _same(want.end, end)):
                     self._moved(row, row["uid"], want)
@@ -667,6 +720,24 @@ class FamilyCopy:
     def _landed(occ: ical.Occurrence, want: Want) -> bool:
         return (occ.summary == want.title[:ical.MAX_SUMMARY] and _same(occ.start, want.start)
                 and _same(occ.end, want.end))
+
+    def _settle_expired(self, row, item, pending: dict) -> bool:
+        """A write of Harness's own undecided for an hour, settled by what the copy shows now (round 3): what that
+        write wrote, or for a change he asked for what the record holds, is Harness's own at this version; anything
+        else is someone's edit, and the version before the write is never taken as lag again. False: go on to judge
+        the copy as usual."""
+        wrote = pending.get("wrote") if isinstance(pending.get("wrote"), dict) else {}
+        try:
+            title = wrote.get("title") or row["title"]
+            start = self._when(wrote.get("start") or row["start"])
+            end = self._when(wrote.get("end") or row["end"])
+        except (TypeError, ValueError):
+            title, start, end = row["title"], self._when(row["start"]), self._when(row["end"])
+        own = content_is(item.data, row["uid"], title, start, end, self.tz)
+        settle(self.ledger, row["key"], item.etag, own)
+        log.info("family copy: a %s copy's write undecided an hour, settled by its content: %s", row["word"],
+                 "as written" if own else "someone's edit")
+        return False
 
     @staticmethod
     def _as_written(occ: ical.Occurrence, row, start, end) -> bool:
@@ -778,7 +849,7 @@ class FamilyCopy:
         alone and said."""
         uid = row["uid"]
         while True:
-            note_write(self.ledger, row["key"], etag, landed=False)
+            note_write(self.ledger, row["key"], etag, landed=False, wrote=(want.title, want.start, want.end))
             out = self.client.put_copy(uid, want.title, want.start, want.end, self.ledger.now(), etag=etag,
                                        data=data, again=False)
             if out.kind == "ok":
@@ -787,10 +858,10 @@ class FamilyCopy:
                 return ""
             if out.kind not in ("changed", "unknown"):
                 return self._write_problem(out)
-            verdict, etag, data = self._judge_again(row, want)
+            verdict, etag, data = self._judge_again(row, want, lost=out.kind == "unknown")
             log.info("family copy: a %s copy's write answered %s; read again: %s", row["word"], out.kind, verdict)
-            if verdict == "landed":
-                confirm(self.ledger, row["key"], etag)
+            if verdict == "landed":                  # its content is what was written (_judge_again)
+                settle(self.ledger, row["key"], etag, True)
                 self._moved(row, uid, want)
                 return ""
             if verdict == "theirs":
@@ -802,11 +873,13 @@ class FamilyCopy:
                 self._leave(row, "conflicts")
                 return ""
 
-    def _judge_again(self, row, want: Want) -> tuple[str, str, str]:
+    def _judge_again(self, row, want: Want, *, lost: bool = False) -> tuple[str, str, str]:
         """The copy read again by its address after a conflict or a lost answer: ("landed", its version, body)
-        when it shows the event, ("ours", ...) when it's still as Harness left it (only its version moved on,
-        or the write didn't land), ("theirs", ...) when it shows anything else at a version that isn't the
-        pre-write one, or ("gone" | "unread", "", "")."""
+        when it shows exactly what was written (content_is), ("ours", ...) when it's still as Harness left it (a
+        refusal: only its version moved on; or still at the pre-write version, so the write didn't land),
+        ("theirs", ...) when it shows anything else, or ("gone" | "unread", "", ""). After a lost answer the
+        write may have landed, so Harness's earlier content at a new version is someone putting it back, never
+        Harness's own (round 3)."""
         back, body = self.client.fetch(self.client.href_for(row["uid"]))
         if back.kind == "gone":
             return "gone", "", ""
@@ -823,7 +896,7 @@ class FamilyCopy:
         if occ is not None and occ.uid == row["uid"] and not caldav.details(body):
             if self._landed(occ, want):
                 return "landed", back.etag, body
-            if self._as_written(occ, row, start, end):
+            if self._as_written(occ, row, start, end) and not lost:
                 return "ours", back.etag, body
         if lagging(self.ledger, row["key"], back.etag):
             return "ours", back.etag, body

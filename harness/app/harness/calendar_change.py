@@ -4722,11 +4722,14 @@ class CalendarChange:
     # -- this add-on's own records of a copy or block it changed for him -----------------------
     _ROW_TABLES = ("family_copies", "family_gmail")
 
-    def _keep_rows(self, db, rows: list[dict], entry: dict | None = None, *, landed: bool = True) -> None:
+    def _keep_rows(self, db, rows: list[dict], entry: dict | None = None, *, landed: bool = True,
+                   read_body: str | None = None) -> None:
         """Kept true in the same transaction as the write's record, so the copy's or block's own
         sync sees this add-on's work, not someone's edit, and doesn't put it back. A copy's write also
         keeps its versions (the review of Nov 27): the one it was sent against and the one it left, so a
-        Family read still at the first is known to be behind (family_copy.lagging)."""
+        Family read still at the first is known to be behind (family_copy.lagging). Round 3: the version left is
+        recorded as Harness's own only when the copy read there (read_body, or the read back kept as the entry's
+        "after") shows what was written (family_copy.content_is); anything else is someone's edit."""
         now = iso(self.ledger.now())
         for r in rows:
             if r["table"] not in self._ROW_TABLES:
@@ -4737,8 +4740,20 @@ class CalendarChange:
             if r.get("hold"):
                 family_copy.hold(self.ledger, r["key"], *r["hold"], db=db)
             if r["table"] == "family_copies" and r["set"].get("start") and entry and entry.get("cal") == "family":
-                family_copy.note_write(self.ledger, r["key"], entry.get("was") or "", entry.get("etag") or "",
-                                       landed=landed, db=db)
+                self._note_copy_write(db, r, entry, landed=landed, read_body=read_body)
+
+    def _note_copy_write(self, db, r: dict, entry: dict, *, landed: bool, read_body: str | None = None) -> None:
+        """A copy's write, with what it wrote, so it can be settled by content (family_copy.note_write). Landed:
+        the version left is Harness's own only when the read there shows what was written."""
+        copy = db.execute("SELECT uid, title FROM family_copies WHERE key=?", (r["key"],)).fetchone()
+        title = copy["title"] if copy is not None else ""
+        wrote = (title, _when(r["set"]["start"]), _when(r["set"]["end"]))
+        family_copy.note_write(self.ledger, r["key"], entry.get("was") or "", landed=False, db=db, wrote=wrote)
+        if not landed:
+            return
+        body = read_body if read_body is not None else entry.get("after") or ""
+        own = copy is not None and family_copy.content_is(body, copy["uid"], title, *wrote[1:], self.tz)
+        family_copy.settle(self.ledger, r["key"], entry.get("etag") or "", own, db=db)
 
     def _undo_rows(self, db, rows: list[dict]) -> None:
         """As they were before the change, if nothing has moved them on since."""
@@ -7595,12 +7610,17 @@ class CalendarChange:
         with self.ledger.tx() as db:
             if not rec.get("applied"):
                 self._note_removed(db, rec.get("removed", []))
-                self._keep_rows(db, rec.get("rows", []), entry, landed=True)
+                self._keep_rows(db, rec.get("rows", []), {**entry, "etag": read.get("etag") or ""}, landed=True,
+                                read_body=read.get("body") or "")
                 rec["applied"] = True
-            elif entry.get("cal") == "family" and read.get("etag") and self._reads_as_written(entry, read):
-                for r in rec.get("rows", []):        # a copy's write found landed: decided, at this version
+            elif entry.get("cal") == "family" and read.get("etag"):
+                for r in rec.get("rows", []):        # a copy's write found landed: decided by what the read shows
                     if r.get("table") == "family_copies" and r.get("set", {}).get("start"):
-                        family_copy.confirm(self.ledger, r["key"], read["etag"], db)
+                        copy = db.execute("SELECT uid, title FROM family_copies WHERE key=?", (r["key"],)).fetchone()
+                        own = (copy is not None and self._reads_as_written(entry, read) and family_copy.content_is(
+                            read.get("body") or "", copy["uid"], copy["title"], _when(r["set"]["start"]),
+                            _when(r["set"]["end"]), self.tz))
+                        family_copy.settle(self.ledger, r["key"], read["etag"], own, db)
             db.execute("UPDATE calendar_changes SET undo_json=? WHERE proposal_id=?",
                        (json.dumps(self._undo_entries(plan)), pid))
             self._save_plan(pid, plan, db)

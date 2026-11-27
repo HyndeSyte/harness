@@ -274,9 +274,10 @@ def drive_dry(ledger: Ledger, data_dir: str) -> bool:
     """His own appointments' drives only logged, never written or told: True unless he has turned them on by
     a tap (drive_cards.LIVE, in the ledger). No option ever turns them on (the review of Nov 27).
 
-    On the first read, the old own_drive_dry_run setting is carried into the switch: live only when it was a
-    plain false and drive_dry_run a plain false too, so he had them on already; a true, a missing value,
-    settings that can't be read or anything but a clean boolean keep the dry run. After that the
+    The first read after install always leaves them in the dry run, whatever the settings say (round 3 of the
+    review of Nov 27). When the old own_drive_dry_run and drive_dry_run were both a plain false (he had them
+    live), that is noted (drive_cards.WAS_LIVE) so the one Turn on card says so; its Turn on is still the only
+    way live. Settings that can't be read wait for a read that can. After that the
     drive_dry_run setting can only stop them: a plain true turns the switch off (so turning the setting off
     again is still a dry run until he taps Turn on), and settings that can't be read are a dry run for that
     read."""
@@ -286,13 +287,16 @@ def drive_dry(ledger: Ledger, data_dir: str) -> bool:
         if opts is None:
             return True                        # migrated once they can be read
         old, new = opts.get("own_drive_dry_run", _MISSING), opts.get("drive_dry_run", _MISSING)
-        state = "on" if old is False and new is False else "off"
+        was_live = old is False and new is False
+        state = "off"                          # never live without his tap, not even here
         with ledger.tx() as db:
             ledger.set_meta(drive_cards.LIVE, state, db)
-            ledger.event("drive_dry_run_migrated", {"live": state == "on",
+            if was_live:
+                ledger.set_meta(drive_cards.WAS_LIVE, "1", db)
+            ledger.event("drive_dry_run_migrated", {"live": False, "was_live": was_live,
                                                     "old": old if isinstance(old, bool) else "other",
                                                     "new": new if isinstance(new, bool) else "other"}, db=db)
-        log.info("drive blocks: the old dry run setting carried over, %s", "live" if state == "on" else "dry run")
+        log.info("drive blocks: dry run after this update%s", ", they were live before" if was_live else "")
     if opts is None:
         return True
     if opts.get("drive_dry_run") is True:

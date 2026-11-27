@@ -2852,22 +2852,24 @@ def test_the_dry_run_logs_his_drives_writes_nothing_for_them_and_sends_no_card(d
     assert ("Busy (drive there)", a - 30 * M, a, "") in blocks(drives)
 
 
-@pytest.mark.parametrize("text,dry", [
-    ("{}", True), ('{"drive_dry_run": false}', True),                       # the old value missing
-    ('{"own_drive_dry_run": true, "drive_dry_run": false}', True),           # the old saved true
-    ('{"own_drive_dry_run": false}', True),                                 # the new value missing
-    ('{"own_drive_dry_run": "no", "drive_dry_run": false}', True),           # not a clean boolean
-    ('{"own_drive_dry_run": false, "drive_dry_run": "no"}', True),
-    ('{"own_drive_dry_run": false, "drive_dry_run": true}', True),
-    ('{"own_drive_dry_run": false, "drive_dry_run": false}', False),         # he had them live already
-    ("not json", True)])
-def test_the_old_dry_run_setting_is_carried_over_once_and_keeps_the_dry_run_unless_plainly_off(
-        ledger, tmp_path, text, dry):
-    """The review of Nov 27: drive blocks turn on only by his tap. The old own_drive_dry_run is carried into the
-    switch on the first read, keeping the dry run unless both settings are a clean false."""
+@pytest.mark.parametrize("text,was_live", [
+    ("{}", False), ('{"drive_dry_run": false}', False),                     # the old value missing
+    ('{"own_drive_dry_run": true, "drive_dry_run": false}', False),          # the old saved true
+    ('{"own_drive_dry_run": false}', False),                                # the new value missing
+    ('{"own_drive_dry_run": "no", "drive_dry_run": false}', False),          # not a clean boolean
+    ('{"own_drive_dry_run": false, "drive_dry_run": "no"}', False),
+    ('{"own_drive_dry_run": false, "drive_dry_run": true}', False),
+    ('{"own_drive_dry_run": false, "drive_dry_run": false}', True),          # he had them live: still dry
+    ("not json", False)])
+def test_the_first_read_never_turns_drive_blocks_on_whatever_the_old_settings(ledger, tmp_path, text, was_live):
+    """Round 3 of the review of Nov 27: drive blocks turn on only by his tap, not even by the first read's
+    carrying over of the old own_drive_dry_run. No case of options goes live; both a clean false is only noted,
+    for the Turn on card's words."""
     (tmp_path / "options.json").write_text(text)
-    assert drive_dry(ledger, str(tmp_path)) is dry
-    assert ledger.get_meta(drive_cards.LIVE) == (None if text == "not json" else "off" if dry else "on")
+    assert drive_dry(ledger, str(tmp_path)) is True
+    assert ledger.get_meta(drive_cards.LIVE) == (None if text == "not json" else "off")
+    assert bool(ledger.get_meta(drive_cards.WAS_LIVE)) is was_live
+    assert drive_dry(ledger, str(tmp_path)) is True                         # and the next read too
 
 
 def test_no_setting_change_turns_drive_blocks_on(ledger, tmp_path):

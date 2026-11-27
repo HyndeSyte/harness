@@ -56,6 +56,7 @@ CARD_TTL_S = 7 * 24 * 3600
 # the drive blocks' card), never by an option (the review of Nov 27). Anything else is the dry run.
 LIVE = "drive_live"
 LIVE_OFFER = "drive_live_offer"        # meta: the one card after install asking to turn them on was sent
+WAS_LIVE = "drive_was_live"            # meta: the old settings had them live before this update (the card says so)
 NOTE_CARD = "drive_note_card:"         # meta, per card: the events a Try again on it is for
 SHORT = {NO_ADDRESS: "no usable address", FAILED: "the drive lookup failed", PLACE: "where it is isn't known yet",
          CHAIN: "the drive from the event before it can't be worked out", LATER: "not looked up yet"}
@@ -449,6 +450,9 @@ class DriveCards:
         bid = secrets.token_hex(8)
         text = (f"Drive blocks: add them to your Gmail calendar from now on? Last week's dry run would have "
                 f"added {would}.")
+        if self.ledger.get_meta(WAS_LIVE):
+            text = ("Drive blocks were on before this update; tap Turn on to keep them on. Until you do they're "
+                    f"only logged. Last week's dry run would have added {would}.")
         with self.ledger.tx() as db:
             if self.ledger.get_meta(LIVE_OFFER):
                 return False

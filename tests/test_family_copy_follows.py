@@ -531,6 +531,30 @@ def test_the_old_saved_dry_run_still_only_logs_until_his_tap_and_turn_off_stops_
     assert len(offers(drives)) == 1                                          # and not asked again
 
 
+def test_drives_live_before_the_update_stay_dry_and_the_turn_on_card_says_so(drives, tmp_path):
+    """Round 3: he had them live (both old settings a plain false). The first read still leaves them in the dry
+    run; the one card says they were on and Turn on is the only way live."""
+    (tmp_path / "options.json").write_text(json.dumps({"own_drive_dry_run": False, "drive_dry_run": False}))
+    drives.gm.own_dry_fn = lambda: drive_dry(drives.ledger, str(tmp_path))
+    drives.maps.minutes[frozenset({"home", CLINIC})] = 31
+    quiet_family(drives)
+    a = when(drives, days=2, hour=10)
+    mine(drives, "Dentist", a, CLINIC)
+    go(drives)
+    go(drives)
+    assert not [x for x in blocks(drives) if x[0].startswith("Busy (drive")]
+    cards = [x for x in drives.bot.sent if x[1].startswith("Drive blocks were on before this update")]
+    assert len(cards) == 1
+    assert cards[0][1].startswith("Drive blocks were on before this update; tap Turn on to keep them on.")
+    assert [label for row in cards[0][2] for label, _ in row] == ["Turn on", "Keep logging"]
+    go(drives)
+    assert not [x for x in blocks(drives) if x[0].startswith("Busy (drive")]
+    assert drives.live.on_choice("drive_on", target_of(drives, "drive_on")[0]) == ""
+    go(drives)
+    go(drives)
+    assert ("Busy (drive there)", a - 45 * M, a, "") in blocks(drives)
+
+
 def test_his_drives_follow_their_events_once_turned_on(drives):
     drives.gm.own_dry_fn = lambda: False
     drives.maps.minutes[frozenset({"home", CLINIC})] = 31
@@ -597,3 +621,149 @@ def test_write_them_on_the_card_writes_his_drives_while_the_dry_run_setting_stay
     go(drives)
     assert ("Busy (drive there)", a - 30 * M, a, "") in blocks(drives)
     assert drives.live.drive_cards.written_by_tap()
+
+
+# -- round 3 (the review of Nov 27, round 2's findings) -------------------------------------------------------
+
+def edited_on_family(m, start, end, extra="LOCATION:Corner Cafe"):
+    """Someone on Family edits the copy: its times kept or changed, and a line Harness never writes."""
+    ics = caldav.build_copy_ics(family_copy._uid(m.key), COPY_TITLE, start, end, m.clock())
+    m.icloud.seed(copy_path(m), ics.replace("END:VEVENT", f"{extra}\r\nEND:VEVENT", 1))
+
+
+def edit_before_the_next_fetch(m, start, end, extra="LOCATION:Corner Cafe"):
+    """A family edit lands after Harness's write and before its read of the copy by its address."""
+    real = m.client.fetch
+
+    def fetch(href):
+        m.client.fetch = real
+        edited_on_family(m, start, end, extra)
+        return real(href)
+    m.client.fetch = fetch
+
+
+def test_a_lost_answer_then_a_family_edit_before_the_read_is_never_taken_as_harnesss_own(m):
+    """Round 3, item 2: the write lands, its answer is lost, and someone adds a place to the copy (same times and
+    title as Harness wrote) before Harness reads it by its address. That version isn't Harness's own: the copy is
+    left as theirs, and the next syncs write nothing over the edit, even once its event moves."""
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.icloud.drop_response_next = True
+    edit_before_the_next_fetch(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    sync(m)
+    edited = m.icloud.events[copy_path(m)]
+    assert "LOCATION:Corner Cafe" in edited[1]
+    assert family_copy.version(m.ledger, m.key).get("confirmed") != edited[0]
+    n = len(puts(m))
+    sync(m)
+    moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))
+    sync(m)
+    assert len(puts(m)) == n and m.icloud.events[copy_path(m)] == edited          # nothing over the edit
+    assert row(m)["state"] == "hands_off"
+
+
+def test_a_lost_answer_then_someone_putting_the_copy_back_before_the_read_is_left_theirs(m):
+    """Round 3, item 2: the write to 1:45 lands, its answer is lost, and someone on Family puts the copy back to
+    8:30 (what Harness had written before) before the read by its address. That's a new version with other content
+    than what was written: their edit. Nothing is written over it, then or at the next syncs."""
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.icloud.drop_response_next = True
+    real = m.client.fetch
+
+    def fetch(href):
+        m.client.fetch = real
+        m.icloud.seed(copy_path(m), caldav.build_copy_ics(family_copy._uid(m.key), COPY_TITLE, ORIGINAL,
+                                                          ORIGINAL + timedelta(hours=1), m.clock()))
+        return real(href)
+    m.client.fetch = fetch
+    sync(m)
+    edited = m.icloud.events[copy_path(m)]
+    assert copy_times(m) == (ORIGINAL, ORIGINAL + timedelta(hours=1)) and len(puts(m)) == 2
+    assert family_copy.version(m.ledger, m.key).get("confirmed") != edited[0]
+    sync(m)
+    sync(m)
+    assert m.icloud.events[copy_path(m)] == edited and len(puts(m)) == 2 and row(m)["state"] == "hands_off"
+
+
+def test_a_family_edit_keeping_harnesss_times_is_never_confirmed_as_its_own_by_a_sync(m):
+    """The listing shows the copy at Harness's times and title, with a place someone added: not as Harness wrote
+    it, so that version is never recorded as Harness's own and a later move of its event writes nothing."""
+    at_coffee_time(m)
+    edited_on_family(m, ORIGINAL, ORIGINAL + timedelta(hours=1))
+    edited = m.icloud.events[copy_path(m)]
+    sync(m)
+    assert family_copy.version(m.ledger, m.key).get("confirmed") != edited[0]
+    moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))
+    sync(m)
+    assert m.icloud.events[copy_path(m)] == edited and row(m)["state"] == "hands_off"
+
+
+def test_a_lost_fix_card_write_then_a_family_edit_is_left_theirs(m):
+    """The fix card's write lands and its answer is lost; someone adds a place before the read. Only content as
+    Harness wrote it makes the read's version Harness's own, so this one isn't, and the sync leaves it."""
+    out_of_step(m)
+    m.tells("the family copy of my coffee is wrong", result({"type": "answer", "text": "I see."}))
+    m.icloud.drop_response_next = True
+    edit_before_the_next_fetch(m, at(14, 15, day=DAY), at(15, 15, day=DAY))
+    m.tap("Approve")
+    edited = m.icloud.events[copy_path(m)]
+    for _ in range(3):
+        m.clock.advance(minutes=2)
+        m.c.tick()
+    assert family_copy.version(m.ledger, m.key).get("confirmed") != edited[0]
+    sync(m)
+    moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))
+    sync(m)
+    assert m.icloud.events[copy_path(m)] == edited
+
+
+def test_an_undecided_write_expires_after_an_hour_and_the_old_version_is_no_longer_lag(m):
+    """Round 3, item 3: a write of Harness's own left undecided an hour is settled by the copy's content. Here the
+    copy still shows the version from before it with other content: someone's edit, not a late read."""
+    at_coffee_time(m)
+    etag = m.icloud.events[copy_path(m)][0]
+    with m.ledger.tx() as db:                       # a write sent over that version and never decided
+        db.execute("UPDATE family_copies SET start=?, end=? WHERE key=?",
+                   (at(13, 45, day=DAY).isoformat(), at(14, 45, day=DAY).isoformat(), m.key))
+        family_copy.note_write(m.ledger, m.key, etag, landed=False, db=db,
+                               wrote=(COPY_TITLE, at(13, 45, day=DAY), at(14, 45, day=DAY)))
+    assert family_copy.lagging(m.ledger, m.key, etag)
+    m.clock.advance(minutes=61)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    sync(m)
+    assert not family_copy.lagging(m.ledger, m.key, etag)
+    assert copy_times(m) == (ORIGINAL, ORIGINAL + timedelta(hours=1)) and row(m)["state"] == "hands_off"
+
+
+def test_an_undecided_write_found_as_written_after_an_hour_is_harnesss_own(m):
+    at_coffee_time(m)
+    etag = m.icloud.events[copy_path(m)][0]
+    with m.ledger.tx() as db:                       # undecided, though its content is what's there
+        family_copy.note_write(m.ledger, m.key, "\"older\"", landed=False, db=db,
+                               wrote=(COPY_TITLE, ORIGINAL, ORIGINAL + timedelta(hours=1)))
+    m.clock.advance(minutes=61)
+    sync(m)
+    d = family_copy.version(m.ledger, m.key)
+    assert d["pending"]["landed"] and d["confirmed"] == etag and row(m)["state"] == "live"
+
+
+def test_a_family_edit_between_the_approval_read_and_the_write_is_refused_and_a_fresh_card_follows(m):
+    """Round 3, item 4: the fix card's write carries If-Match on the copy's version read at approval. An edit
+    landing between that read and the write is refused by Family, nothing is written, and a fresh card comes."""
+    out_of_step(m)
+    m.tells("the family copy of my coffee is wrong", result({"type": "answer", "text": "I see."}))
+    cards = len(m.seen())
+    approval_read = m.icloud.events[copy_path(m)][0]                               # the version read at approval
+
+    def edit():
+        m.icloud.before_write = None
+        m.icloud.seed(copy_path(m), caldav.build_copy_ics(family_copy._uid(m.key), COPY_TITLE, at(9, day=DAY),
+                                                          at(10, day=DAY), m.clock()))
+    m.icloud.before_write = edit
+    m.tap("Approve")
+    sent = [x for x in m.icloud.log if x[0] == "PUT" and x[1] == copy_path(m)]
+    assert sent and sent[-1][2].get("If-Match") == approval_read                     # over the version just read
+    assert copy_times(m) == (at(9, day=DAY), at(10, day=DAY))                        # and refused
+    assert any("changed since" in x and "fresh card" in x for x in m.seen()[cards:])
+    assert "Coffee with Chris to 2:15 to 3:15 tomorrow" in m.seen()[-1]                # the fresh card

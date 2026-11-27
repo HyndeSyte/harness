@@ -1385,7 +1385,11 @@ and `/status` says if the Gmail calendar isn't being read.
   version is someone's edit, even at a time Harness once wrote, and the copy is left alone. Every write
   goes only over the version just checked. When iCloud refuses it for its version, or its answer is lost,
   the copy is read again by its address and judged again before anything more is written; after 2 such
-  retries in an hour the copy is left alone and named in the digest.
+  retries in an hour the copy is left alone and named in the digest. A version is taken as Harness's own
+  only when the copy there shows exactly what Harness wrote (title, start and end, and no place or notes);
+  any difference is someone's edit and the copy is left alone. After a lost answer, the copy back at what
+  Harness had before under a new version is someone's edit too. A write still undecided after an hour is
+  settled the same way, by what the copy shows, and its old version never counts as a late read after that.
 - **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
   family mirrored event not updating"), even as a question, and you get a card that brings that copy back
   to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name
@@ -1582,11 +1586,11 @@ how many blocks are on Gmail.
   from Cain on your message that names a drive block gets one card about them (marked as from his note):
   in the dry run, its Write them is the same tap as Turn on; otherwise it lists any event still without
   drives, with Work them out.
-- **The old setting:** `own_drive_dry_run` is read once, on the first read after installing, and carried
-  into the switch: they stay live only when it was a plain false and `drive_dry_run` a plain false too
-  (they were on already). A true, a missing value, settings that can't be read or anything but a clean
-  true or false keep the dry run. `drive_dry_run` on turns the switch off; off again, they stay in the dry
-  run until you tap Turn on. Settings that can't be read are a dry run for that read.
+- **The old setting:** the first read after installing always leaves drive blocks in the dry run,
+  whatever `own_drive_dry_run` and `drive_dry_run` say. When both were a plain false (you had them on),
+  the one Turn on card says so: "Drive blocks were on before this update; tap Turn on to keep them on."
+  Its Turn on is still the only way they go live. `drive_dry_run` on turns the switch off; off again,
+  they stay in the dry run until you tap Turn on. Settings that can't be read are a dry run for that read.
 - **The dry run (until Turn on, or with `drive_dry_run` on):** while it lasts, your own appointments'
   drive blocks are only written to Harness's log ("drive dry run: would write ...", "would remove
   ..." and "would ask before removing ...", each with the appointment's day and time), never to
