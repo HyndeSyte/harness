@@ -400,10 +400,9 @@ describe("D: shipping with the risk named needs the rollback armed", () => {
     await expect(ship(shipRig("hold", null))).rejects.toThrow("it was held at the review-round cap");
     await expect(ship(shipRig("waiting", null))).rejects.not.toThrow("review-grant");
   });
-  test("with the risk named: refused while the rollback isn't armed, saying what isn't; allowed once it is", async () => {
-    await expect(ship(shipRig("risk", null))).rejects.toThrow("the keeper has no record that its rollback of a bad install is armed");
-    await expect(ship(shipRig("risk", JSON.stringify({ armed: { harness: "2026-11-21T10:00:00Z" } })))).rejects.toThrow("isn't armed for Cain");
-    expect((await ship(shipRig("risk", JSON.stringify({ armed: { cain: "2026-11-21T10:00:00Z" } })))).status).toBe("posted");
+  test("0.19.1: an earlier risk tap opens no Ship card, armed or not; a change not at the cap is as before", async () => {
+    await expect(ship(shipRig("risk", null))).rejects.toThrow("whatever was tapped on the old card");
+    await expect(ship(shipRig("risk", JSON.stringify({ armed: { cain: "2026-11-21T10:00:00Z" } })))).rejects.toThrow("held by the owner's review rule");
     expect((await ship(shipRig("none", null))).status).toBe("posted");             // a change not at the cap: as before
   });
   test("the state is read from the runner's rounds and his own tap, never Cain's words", async () => {

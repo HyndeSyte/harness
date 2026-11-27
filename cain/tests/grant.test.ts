@@ -165,13 +165,13 @@ describe("the runner honours an earlier grant, and holds again with no card", ()
     expect(capStateFor(PRN(46), t.rounds(), held)).toEqual({ state: "none" });
   });
 
-  test("the Ship card is refused while a granted round hasn't settled clean, and the risk tap still needs the rollback armed", async () => {
+  test("the Ship card is refused while a granted round hasn't settled clean, and an earlier risk tap opens none (0.19.1)", async () => {
     const decision = { id: "pr-5#4", key: "pr-5", round: 4, serious: 1, topic: "t", finding: "f", item: null, pr: "https://github.com/HyndeSyte/harness/pull/5", state: "posted" as const, at: "x" };
     const r = rig({ holds: keeperHolds({}) });
     Object.assign((r.link as any).d, { capState: () => ({ state: "pending", key: "pr-5", decision, why: "a granted review round after his decision is still running" }) });
     await expect(r.link.ship({ text: "A way back for every install.", item: "none", pr: decision.pr, head: "1".repeat(40) })).rejects.toThrow("still running: no Ship card");
     Object.assign((r.link as any).d, { capState: () => ({ state: "risk", key: "pr-5", decision }), armed: () => null });
-    await expect(r.link.ship({ text: "A way back for every install.", item: "none", pr: decision.pr, head: "1".repeat(40) })).rejects.toThrow("rollback armed");
+    await expect(r.link.ship({ text: "A way back for every install.", item: "none", pr: decision.pr, head: "1".repeat(40) })).rejects.toThrow("held by the owner's review rule");
   });
 });
 
