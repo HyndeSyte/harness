@@ -114,7 +114,7 @@ group_of() {
     waiting) echo screen ;;
     stalled|signin) echo deliver ;;
     phone) echo phone ;;
-    probe|needs-signin|api-down) echo probe ;;
+    probe|needs-signin|api-down|usage-limit) echo probe ;;
     restarts) echo restarts ;;
     self-loop) echo self ;;
     boots) echo boots ;;
@@ -186,6 +186,8 @@ alarm() {   # alarm <kind> [cause]: sets T (its title) and M (its text); 1 for n
       M="Cain may not be answering: the App's liveness checks of him failed${c}. These checks show his parts are running, not that he answers you. The App keeps bringing him back by itself. $SELFRESTART $DETAILS" ;;
     needs-signin) T="Cain needs sign-in"
       M="Cain needs his Claude sign-in: his screen waits at it, so he can't answer. Only you can sign him in: the sign-in link is on the Cain page in Home Assistant, and the code it gives you goes in the box there." ;;
+    usage-limit) T="Cain hit a usage limit"
+      M="Cain can't answer: his screen shows Claude's usage or spend limit stopping him (for example the monthly spend limit for his model), so every turn fails until it changes. The fix is one of two: switch his model, or raise the limit (claude.ai, Settings, Usage). The App keeps checking, and this comes down once his screen is clear." ;;
     api-down) T="The model's API isn't answering"
       M="The model's API isn't answering Cain: his screen shows its errors, so he can't answer for now. Nothing for you to do: it usually comes back by itself, and the App keeps checking." ;;
     restarts) T="Cain's session keeps exiting early"
@@ -335,7 +337,7 @@ finish_clear() {   # a group's cleared alarm: its notification comes down, then 
 # instead. The same rank, or a greater, replaces it.
 rank() {
   case "$1" in breach) echo 6 ;; switch-stopped) echo 5 ;; switch-blocked|damaged) echo 4 ;; setup) echo 3 ;; exited) echo 2 ;;
-    held|switch-restart|session|channel|server-gone|self-restart|self-off|self-refused|self-loops|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered|nginx) echo 1 ;; *) echo 0 ;; esac
+    held|switch-restart|session|channel|server-gone|self-restart|self-off|self-refused|self-loops|switch-waits|waiting|stalled|signin|phone|probe|needs-signin|api-down|restarts|self-loop|boots|asked-loop|start-loop|update-exits|update-unseen|update-boots|update-asked|update-starts|unseen-loop|turn-long|tampered|nginx|usage-limit) echo 1 ;; *) echo 0 ;; esac
 }
 tell() {   # tell <kind> [cause]
   local g c

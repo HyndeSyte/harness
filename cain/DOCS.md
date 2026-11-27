@@ -525,6 +525,58 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
+## What 0.20.0 does: Cain's turns kept for what needs him
+
+Cain is one long Claude Code session, and every turn he takes reads his whole context again. In the
+week of Nov 20 to 27 that came to 1.8 billion cached tokens read: relays from the App 37 percent,
+cloud job checks 24, your own messages 21, the hourly liveness check 7, check-ins 3. The largest single
+kind was a relayed line too long to type, which he read from a file (298 a week, about 1,240 model
+calls), and 138 of 305 cloud job checks found nothing new. Each call carried a median of 297K tokens of
+context (90th percentile 683K, the most 966K), with only 8 compactions in the week. And on Nov 27 every
+turn from about 6:20 to 9:04 AM failed on the monthly spend limit while the App's probe called his
+screen ready, so no alarm named the cause.
+
+So in this release code does the routine part, and he gets a turn only when it needs him:
+
+- **Your messages are untouched.** They reach him directly, as before. Nothing below classes, holds or
+  summarises them, nor your page's notes.
+- **Cloud jobs are watched by code.** Every 10 minutes the App reads each Build job's pull request on
+  GitHub and tells him in one line only when it changed: its checks passed or failed, it merged or
+  closed. No change, no turn. A job nobody finishes is still heard: a Build with no change for 3
+  hours, a Ship 25 minutes after it started and then every 45 minutes. If GitHub can't be read, he
+  gets the old check every 15 minutes. A wait on Home Assistant's connector keeps its 15-minute check.
+- **Relayed lines are sorted by code first.** A calendar card with buttons always goes first and at
+  once, typed short with its show command, never behind anything (it goes out by itself in about 2
+  minutes). A receipt that needs nothing (a tap of Not now, Hold it, Don't, Drop it, Leave it, Keep
+  cards or No, a review seat passing again, a held question now in front of you) is written to his
+  record by the App (state/receipts) with no turn. A line too long to type is read first by a small
+  worker on a cheaper model (Sonnet 5.5, low effort, pinned in code) with no tools at all, nothing that
+  reaches you, Discord or his record: it only says "needs Cain", and then he gets its two-line summary,
+  or "no action". If the worker fails or answers anything else, the line goes to him as before.
+  Everything else goes as before.
+- **Nothing is dropped silently.** Each morning at 6:50 he gets one digest of everything code and the
+  worker handled without him, and marks any that turned out to need him; the App counts those for the
+  week.
+- **His context stays small.** His session compacts at 250K tokens, set in code. Once a day, between 3
+  and 5 AM, when you haven't written for 30 minutes and no job is mid-step, the App starts his session
+  fresh from his handover (state/RESTART.md and the record), the same way its own restarts do.
+- **The hourly liveness check is one word.** The line is shorter, and he answers it with a single word
+  and no other tool call.
+- **A usage or spend limit is named at once.** When his screen shows Claude Code's usage or spend limit
+  reply ("You've hit your monthly spend limit", "/usage-credits"), the App alarms through the usual
+  alarm path with the fix: switch his model, or raise the limit. The 5-minute probe no longer calls
+  that screen ready.
+- **A usage line in the App's log once a day:** his tokens by model and by what started each turn (you,
+  a relay, a job, the probe, a check-in, the digest), the context each call carried (median, 90th
+  percentile, most), compactions, the worker's own use, and how many lines were handled without him
+  and how many he marked as needing him.
+
+How the week after is measured, from those usage lines: at least half the cache reads gone, no missed
+action (no digest line he marks as needing him that was late to matter), and his replies to you no
+slower.
+
+Nothing for you to do. If his answers seem to miss something, ask him about the digest.
+
 ## What 0.19.0 does: working with the Keeper
 
 The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a

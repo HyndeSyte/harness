@@ -16,6 +16,11 @@ fi
 # request, and the App types only into an empty box (prompt-state.sh), which one would fill. The
 # variable outranks any setting (Claude Code's docs, "Turn prompt suggestions off").
 export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+# His context kept small (Cain 0.20.0): his session compacts once its context reaches
+# lean/core.ts COMPACT_AT_TOKENS (250K, well before 300K), set here in code, never by hand. Claude
+# Code takes it as a percentage of the model's context window (1M for his model). 25 if bun can't say.
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="$(timeout 20 bun /opt/cain/lean/main.ts compact-pct 2>/dev/null | tr -cd '0-9')"
+export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="${CLAUDE_AUTOCOMPACT_PCT_OVERRIDE:-25}"
 # The outside heartbeat's URL is the security watch's alone (services.d/cain/run): never Claude's.
 # No xtrace around it (third round), put back as it was after.
 case $- in *x*) hb_xtrace=1 ;; *) hb_xtrace= ;; esac

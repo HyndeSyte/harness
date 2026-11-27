@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.0
+
+- Cain now gets a turn only when something needs him, so he spends far less of his usage. Your own messages reach him as before, untouched.
+- The App watches his cloud jobs itself and tells him only when one finishes, fails or stalls, instead of asking him to check every 15 minutes.
+- Calendar cards with buttons still reach him at once, first in line, so they don't go out on their own.
+- Receipts that need nothing, like a tap of Not now, are written to his record by the App. Long relayed lines are read first by a small, cheaper helper with no tools, which only says whether Cain must look.
+- Nothing is dropped: each morning he gets one list of what was handled without him, and marks anything that needed him after all.
+- His working memory stays smaller: he compacts sooner, and starts fresh from his notes once a day in the early morning when nothing is going on.
+- If a usage or spend limit stops him, you get an alarm right away naming it, with the fix: switch his model or raise the limit.
+- A daily usage line in the App's log shows where his usage goes, so the change can be measured.
+
 ## 0.19.0
 
 - A drill flag that was damaged, ran out or named the wrong version no longer turns into a normal install on the next try: every install of Cain is refused until you tap Clear the drill on its message, or arm a new drill.

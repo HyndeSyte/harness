@@ -148,6 +148,9 @@
 #                                        a reply of Cain's that carries a link: the link posts it with its
 #                                        preview off from the start (the plugin's reply would unfold it), after
 #                                        the same gate rules, and records it as his own reply (he may edit it)
+#   keeper.sh missed <digest id> <n> ...  marks lines of the App's daily digest (its id, a date, and the
+#                                        numbers it listed them by) that needed him after all: kept for
+#                                        the week's measure of what code and the worker handled (Cain 0.20.0)
 #   keeper.sh link-host <host>           adds a host Cain cites to the gate's list (a link to a host off it
 #                                        is only noted in the gate report, never held)
 #   keeper.sh connector --item P41 "what waits"
@@ -200,6 +203,20 @@ if { [ "$cmd" = key-expiry ] || [ "$cmd" = key-ack ]; } && [ "$(head -c 10 "${CA
   exec bun "${CAIN_SECURITY:-/opt/cain/security/main.ts}" "$cmd" "$@"
 fi
 # Needs no key and no link: the gate's list of cited hosts is a file of Cain's own.
+# Needs no key and no link either: his marks of digest lines that needed him go to a file of his own,
+# which the App reads as him (checkin.sh) and keeps for the week's measure.
+if [ "$cmd" = missed ]; then
+  [[ "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && [ $# -ge 2 ] && [ $# -le 51 ] \
+    || { echo '{"status":"error","said":"missed takes the digest id (its date) and the numbers of its lines that needed you: missed <YYYY-MM-DD> <n> ..."}'; exit 2; }
+  id="$1"; shift
+  for n in "$@"; do [[ "$n" =~ ^[1-9][0-9]{0,2}$ ]] || { echo '{"status":"error","said":"each line is named by its number in the digest"}'; exit 2; }; done
+  d="${LEAN_MARKS:-/data/work/lean}"
+  f="missed-$(date +%s)-$$.txt"
+  if mkdir -p "$d" && printf '%s %s\n' "$id" "$*" > "$d/.$f" && mv -f "$d/.$f" "$d/$f"; then
+    echo "{\"status\":\"ok\",\"said\":\"Marked $# line(s) of the $id digest as needing you. Nothing to tell him.\"}"; exit 0
+  fi
+  echo '{"status":"error","said":"the mark could not be written; try again"}'; exit 1
+fi
 if [ "$cmd" = link-host ]; then exec bun "${CAIN_GATE_DIR:-/opt/cain/gate}/hosts.ts" add "$@"; fi
 case "$cmd" in
   handover|digest|meanings|places) url="$harness/$cmd"; ctx=harness-handover-v1 ;;

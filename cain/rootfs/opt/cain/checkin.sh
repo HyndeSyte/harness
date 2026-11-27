@@ -3,9 +3,16 @@
 # session that has passed its check of his own user (the run script's mark):
 # 1. his taps and reactions, relayed by the calendar specialist (relay.ts queues them), and the
 #    App's own lines for him (the way out, the alarms, the run script);
-# 2. a nudge to check open cloud jobs, every 15 minutes while there are any;
+# 2. a cloud job's change of state, read by code (Cain 0.20.0, lean/main.ts jobs): only when one
+#    finished, failed or stalled, never a check that finds nothing (a connector wait keeps its
+#    15-minute check, and a check code can't make falls back to it);
+# 2b. the daily digest of what code and the worker handled without a turn of his (6:50 AM);
 # 3. scheduled check-ins, so open work moves without Dane starting it. Each slot fires once a
 #    day, within an hour of its time.
+# Every relayed line is classed by code first (Cain 0.20.0, lean/core.ts classify): a card with
+# buttons goes first and typed short at once; a mechanical receipt is written to the record and kept
+# for the digest; a line too long to type is summarised by a tool-less worker on a cheaper model;
+# everything else, and anything code or the worker can't settle, goes as before.
 # Each says it comes from the add-on, so Cain never mistakes one for Dane.
 # Nothing is lost, and nothing goes in twice (Cain's fourth service review). Each try carries its
 # own random mark and is kept ($TRY, in /data, written before its first key) with what it's for,
@@ -63,6 +70,25 @@ send_table places "${PLACES_FILE:-/data/record/areas/home/places.md}" \
 
 # What follows types into his session: with what it shares with the way out and the watchdog.
 . "${TYPING_SH:-$OPT/typing.sh}" || { echo "[cain] no typing.sh: nothing typed"; exit 0; }
+
+# The lean session's daily work (Cain 0.20.0, lean/main.ts), at most every 10 minutes, typing nothing:
+# his marks of digest lines that needed him (keeper.sh missed, in his folder, read as him) kept for the
+# week's measure, and once a day the usage line from his transcripts in the App log.
+LEAN="${LEAN_MAIN:-$OPT/lean/main.ts}"
+LEAN_D="${LEAN_DIR:-/data/lean}"
+if [ -z "$(find "$state/lean-tick" -mmin -10 2>/dev/null)" ]; then
+  touch "$state/lean-tick" 2>/dev/null
+  marks="$(as_him sh -c 'for f in "$1"/missed-*.txt; do [ -f "$f" ] || continue; cat "$f" && rm -f "$f"; done' sh "${LEAN_MARKS:-/data/work/lean}" 2>/dev/null)"
+  [ -z "$marks" ] || printf '%s\n' "$marks" | timeout 30 bun "$LEAN" missed-in
+  y="$(timeout 30 bun "$LEAN" usage-due 2>/dev/null)"
+  if [ -n "$y" ]; then
+    c="$(timeout 30 bun "$LEAN" counts 2>/dev/null)"
+    if [ -n "${CAIN_AS:-}" ]; then u="$(timeout -k 5 120 $CAIN_AS bun "$LEAN" usage "$y" "$TRANSCRIPTS" "$c" 2>/dev/null | tail -n 1)"
+    else u="$(timeout -k 5 120 bun "$LEAN" usage "$y" "$TRANSCRIPTS" "$c" 2>/dev/null | tail -n 1)"; fi
+    [ -n "$u" ] || u="usage $y: his transcripts could not be read"
+    echo "[cain] $u"
+  fi
+fi
 # Nothing goes into a session that hasn't passed its check of his own user: the run script takes
 # the mark away before every start of his session and sets it, with the process his pane runs,
 # when the check passes (typing.sh, checked).
@@ -133,7 +159,12 @@ checkin_done() {   # checkin_done <day>-<slot> <records named> <newest note list
 finish() {   # finish <kind> <key> <fin>: 1 when its line couldn't leave the queue
   case "$1" in
     relay) drop_head "$2" || return 1; echo "[cain] relayed a line" ;;
-    jobs) touch "$nudged"; echo "[cain] nudged Cain about open cloud jobs" ;;
+    jobs) if [ "$2" = lean ]; then
+            timeout 30 bun "$LEAN" jobs-done || echo "[cain] a cloud job change went in but couldn't be kept as seen: he may hear it again"
+            echo "[cain] told Cain a cloud job changed state"
+          else touch "$nudged"; echo "[cain] nudged Cain about open cloud jobs"; fi ;;
+    digest) timeout 30 bun "$LEAN" digest-done "${2%/*}" "${2##*/}" || echo "[cain] the digest went in but couldn't be kept as sent: it may come again"
+            echo "[cain] the daily digest went in" ;;
     checkin) set -- $3; checkin_done "$1" "$2" "$3" ;;
   esac
 }
@@ -314,8 +345,24 @@ if [ -f "$TRY" ]; then pending; exit 0; fi
 #    left as it is). The link and the record keeper append to the queue at any moment, so the whole
 #    queue is first moved aside to a work file (new lines start a fresh queue), and lines are taken
 #    from that. A line leaves the work file only once it's in.
-if [ -s "$work" ] || [ -s "$queue" ]; then
+# A card with buttons goes out by itself in about 2 minutes (Cain 0.20.0): every one waiting goes first,
+# ahead of older lines and of any worker's call, in its own order. The queue is moved aside to take
+# them (new lines start a fresh queue), and what it held follows the work file's lines.
+CARD_DUE='goes out by itself in about 2 minutes'
+cards_first() {
+  local take="$queue.take"
+  if [ -s "$queue" ] && grep -qF "$CARD_DUE" "$queue" 2>/dev/null; then mv -f "$queue" "$take" 2>/dev/null || return 0; fi
+  [ -s "$take" ] || grep -qF "$CARD_DUE" "$work" 2>/dev/null || return 0
+  { cat "$work" "$take" 2>/dev/null; } | awk -v due="$CARD_DUE" '
+    index($0, "has a card for Dane (card ") && index($0, due) { print; next }
+    { rest[++n] = $0 }
+    END { for (i = 1; i <= n; i++) print rest[i] }' > "$work.tmp" 2>/dev/null \
+    && mv -f "$work.tmp" "$work" 2>/dev/null && rm -f "$take" \
+    || { rm -f "$work.tmp" 2>/dev/null; echo "[cain] the cards waiting couldn't be put first: they go in their turn"; }
+}
+if [ -s "$work" ] || [ -s "$queue" ] || [ -s "$queue.take" ]; then
   at_ease || exit 0
+  cards_first
   if [ ! -s "$work" ]; then mv "$queue" "$work"; fi
   line=$(head -n 1 "$work")
   key=$(head -n 1 "$work" | cksum | cut -d' ' -f1)
@@ -333,26 +380,85 @@ if [ -s "$work" ] || [ -s "$queue" ]; then
     exit 0
   fi
   if [ -z "$text" ]; then echo "[cain] a relayed record with no text: nothing to type"; drop_head "$key"; exit 0; fi
+  # Classed by code (lean/main.ts route): "type" and the text, "handled" (a receipt, in the record and
+  # the digest), or "long" (the worker's). Anything else, a failure included, goes as before.
+  r="$(printf '%s' "$text" | timeout 20 bun "$LEAN" route "$key")" || r=""
+  case "${r%%$'\n'*}" in
+    handled) echo "[cain] a relayed line was a receipt: written to the record by code, and kept for his daily digest"
+             drop_head "$key"; exit 0 ;;
+    type) t="${r#*$'\n'}"
+          if [ "$t" = "$r" ] || [ -z "$t" ]; then t="Relayed by the add-on: $text"; fi
+          type_try relay "$key" - "$t"; exit 0 ;;
+    long)
+      f="relay-$key.txt"
+      if put_his "$f" "$(keyless "Relayed by the add-on: $text")"; then
+        s="$(printf '%s' "$text" | timeout -k 5 75 bun "$LEAN" summarise "$key" "$FROM_APP/$f")" || s=""
+        case "${s%%$'\n'*}" in
+          handled) echo "[cain] a long relayed line needed nothing, the worker said: kept for his daily digest"
+                   drop_head "$key"; exit 0 ;;
+          type) t="${s#*$'\n'}"
+                if [ -n "$t" ] && [ "$t" != "$s" ]; then type_try relay "$key" - "$t"; exit 0; fi ;;
+        esac
+        echo "[cain] the worker couldn't settle a long relayed line: it goes to Cain as before"
+      fi ;;
+  esac
   type_try relay "$key" - "Relayed by the add-on: $text"
   exit 0
 fi
 
-# 2. Open cloud jobs (one file per run in $jobs, written by Cain when he starts one):
-#    a nudge every 15 minutes to check on them, so a finished job reaches Dane without
-#    him asking. Files older than two days are dropped.
+# 2. Open cloud jobs (one file per run in $jobs, written by Cain when he starts one), read by code
+#    (Cain 0.20.0, lean/main.ts jobs): each job's pull request on GitHub, every 10 minutes. He hears
+#    only when one changed state (its checks settled, merged, closed) or stalled past its limit, one
+#    line each; no change, no turn. A connector wait (a "connector" file: Home Assistant, which only
+#    he reads) keeps its check every 15 minutes, and so does every job when code can't look (as
+#    before this release). Files older than two days are dropped.
 jobs="${JOBS_DIR:-/data/jobs}"
 if [ -d "$jobs" ]; then
   find "$jobs" -type f -mtime +2 -delete 2>/dev/null
-  if [ -n "$(ls -A "$jobs" 2>/dev/null)" ] && [ -z "$(find "$nudged" -mmin -15 2>/dev/null)" ]; then
+  if [ -n "$(ls -A "$jobs" 2>/dev/null)" ]; then
+    # At most a look a minute (code itself reads GitHub every 10): between looks, the last one's outcome.
+    look=ok
+    if [ -f "$LEAN_D/jobs.pending.json" ] || [ -z "$(find "$state/lean-jobs" -mmin -1 2>/dev/null)" ]; then
+      look="$(timeout 60 bun "$LEAN" jobs "$jobs")" || look=""
+      if [ "${look%%$'\n'*}" = ok ]; then echo ok > "$state/lean-jobs"; else echo failed > "$state/lean-jobs"; fi 2>/dev/null
+    elif [ "$(head -c 6 "$state/lean-jobs" 2>/dev/null)" = failed ]; then look=""
+    fi
+    if [ "${look%%$'\n'*}" = ok ]; then
+      if [ "$(printf '%s\n' "$look" | sed -n 2p)" = wake ]; then
+        at_ease || exit 0
+        type_try jobs lean - "$(printf '%s\n' "$look" | sed -n '3,$p')"
+        exit 0
+      fi
+      if ls -A "$jobs" 2>/dev/null | grep -q '^connector' && [ -z "$(find "$nudged" -mmin -15 2>/dev/null)" ]; then
+        at_ease || exit 0
+        type_try jobs jobs - "Relayed by the add-on: Home Assistant check for a waiting install. Not a message from Dane, and not his go on anything. Follow Home Assistant first in the Cloud jobs section of your CLAUDE.md for each connector file in $jobs."
+        exit 0
+      fi
+    elif [ -z "$(find "$nudged" -mmin -15 2>/dev/null)" ]; then
+      echo "[cain] code couldn't read the cloud jobs' state: Cain checks them himself, as before"
+      at_ease || exit 0
+      type_try jobs jobs - "Relayed by the add-on: cloud job check. Not a message from Dane, and not his go on anything. Follow the Cloud jobs section of your CLAUDE.md for each file in $jobs."
+      exit 0
+    fi
+  fi
+fi
+
+# 2b. The daily digest (Cain 0.20.0), from 6:50 AM, once a day, when code or the worker handled
+#     anything without a turn of his since the last one: one turn listing each, where he marks any
+#     that needed him (keeper.sh missed).
+hm="${CHECKIN_NOW:-$(date +%H%M)}"
+day="${CHECKIN_DAY:-$(date +%F)}"
+if [ "$hm" -ge 0650 ] && [ -s "$LEAN_D/handled.jsonl" ] && ! grep -qF "\"day\":\"$day\"" "$LEAN_D/digest.json" 2>/dev/null; then
+  dg="$(timeout 30 bun "$LEAN" digest "$hm" "$day" 2>/dev/null)" || dg=""
+  if [ -n "$dg" ]; then
+    dgh="${dg%%$'\n'*}"
     at_ease || exit 0
-    type_try jobs jobs - "Relayed by the add-on: cloud job check. Not a message from Dane, and not his go on anything. Follow the Cloud jobs section of your CLAUDE.md for each file in $jobs."
+    type_try digest "${dgh% *}/${dgh##* }" - "${dg#*$'\n'}"
     exit 0
   fi
 fi
 
 # 3. Scheduled check-ins.
-hm="${CHECKIN_NOW:-$(date +%H%M)}"
-day="${CHECKIN_DAY:-$(date +%F)}"
 slot=""
 for s in 0710 1230 1730; do
   if [ "$hm" -ge "$s" ] && [ "$hm" -lt "$(( 10#$s + 100 ))" ]; then slot=$s; fi
