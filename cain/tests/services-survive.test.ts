@@ -1,9 +1,9 @@
 // Cain 0.19.3: the App's background services survive their child's exit (keep-running.sh, sourced by services.d/cain/run), and
-// the drill store says why it failed (link/drill.ts: the error's code, system call and path in its one log line) and recovers a
-// stray temp that isn't a regular file.
+// the drill store says why it failed (link/drill.ts: the error's code, system call and path in its one log line) and moves a
+// stray temp that isn't a regular file aside (never deleting it).
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, statSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { drillDeps, fileStore, helperMode, linkDrillStore, storeMarkPub, storeWhy } from "../rootfs/opt/cain/link/drill";
@@ -198,40 +198,87 @@ describe("the drill store says why it failed", () => {
   });
 });
 
-describe("a stray temp that isn't a regular file is recovered", () => {
-  test("a folder in the high-water temp's place: removed, logged once, and the install's spend goes on", () => {
+describe("a stray temp that isn't a regular file is moved aside, never deleted", () => {
+  const strays = (dir: string, base: string) => readdirSync(dir).filter((n) => n.startsWith(`${base}.stray-`) && /^\d+$/.test(n.slice(base.length + 7)));
+  const line = (tmp: string, kind: string, aside: string) => `a stray temp (${kind}) stood in the drill store's way at ${tmp}: moved aside to ${aside}, and the write goes on`;
+  test("a folder with a file inside, in the high-water temp's place: moved aside whole, logged once, and the install's spend goes on", () => {
     const { d, s, logs } = store();
-    const tmp = join(d, "link/keeper-drill-spent/.high-water.tmp");
+    const sd = join(d, "link/keeper-drill-spent");
+    const tmp = join(sd, ".high-water.tmp");
     mkdirSync(join(tmp, "inner"), { recursive: true });
     writeFileSync(join(tmp, "inner/x"), "x");
     const dl: string[] = [];
     expect(deps(s, dl).spend("0.19.2")).toEqual({ mode: null });
     expect(dl).toEqual([]);
-    expect(logs).toEqual([`a stray temp (a folder) stood in the drill store's way at ${tmp}: removed, and the write goes on`]);
-    expect(existsSync(tmp)).toBe(false);
-    expect(Number(readFileSync(join(d, "link/keeper-drill-spent/.high-water"), "utf8"))).toBeGreaterThan(0);
+    const moved = strays(sd, ".high-water.tmp");
+    expect(moved).toHaveLength(1);
+    expect(readFileSync(join(sd, moved[0], "inner/x"), "utf8")).toBe("x");   // the file is still there, under the .stray- name
+    expect(logs).toEqual([line(tmp, "a folder", join(sd, moved[0]))]);
+    expect(Number(readFileSync(join(sd, ".high-water"), "utf8"))).toBeGreaterThan(0);
     // the next write finds nothing stray: no second line
     s.storeFlag("x");
     expect(logs).toHaveLength(1);
   });
-  test("a link in the flag temp's place is removed, not followed; the flag is written 0600", () => {
+  test("a link to a file outside the store, in the flag temp's place: the link is moved aside, its target untouched; the flag is written 0600", () => {
     const { d, s, logs } = store();
     mkdirSync(join(d, "trust"), { recursive: true });
-    writeFileSync(join(d, "target"), "keep me");
-    symlinkSync(join(d, "target"), join(d, "trust/keeper-drill.json.tmp"));
+    const outside = mkdtempSync(join(tmpdir(), "drs-out-"));
+    writeFileSync(join(outside, "target"), "keep me");
+    const tmp = join(d, "trust/keeper-drill.json.tmp");
+    symlinkSync(join(outside, "target"), tmp);
     s.storeFlag("drl1.a.b");
-    expect(readFileSync(join(d, "target"), "utf8")).toBe("keep me");
+    expect(readFileSync(join(outside, "target"), "utf8")).toBe("keep me");
+    expect(readdirSync(outside)).toEqual(["target"]);
+    const moved = strays(join(d, "trust"), "keeper-drill.json.tmp");
+    expect(moved).toHaveLength(1);
+    expect(lstatSync(join(d, "trust", moved[0])).isSymbolicLink()).toBe(true);
+    expect(readlinkSync(join(d, "trust", moved[0]))).toBe(join(outside, "target"));
     expect(readFileSync(join(d, "trust/keeper-drill.json"), "utf8")).toBe("drl1.a.b");
     expect(statSync(join(d, "trust/keeper-drill.json")).mode & 0o777).toBe(0o600);
-    expect(logs).toEqual([`a stray temp (a link) stood in the drill store's way at ${join(d, "trust/keeper-drill.json.tmp")}: removed, and the write goes on`]);
+    expect(logs).toEqual([line(tmp, "a link", join(d, "trust", moved[0]))]);
   });
-  test("the link's own store (linkDrillStore, as main.ts builds it) logs a stray temp it clears", () => {
+  test("an earlier stray of the same name is never moved over", () => {
+    const { d, s, logs } = store();
+    const tmp = join(d, "trust/keeper-drill.json.tmp");
+    mkdirSync(tmp, { recursive: true });
+    s.storeFlag("one");
+    const first = strays(join(d, "trust"), "keeper-drill.json.tmp");
+    writeFileSync(join(d, "trust", first[0], "mine"), "1");
+    mkdirSync(tmp);
+    s.storeFlag("two");
+    const both = strays(join(d, "trust"), "keeper-drill.json.tmp");
+    expect(both).toHaveLength(2);
+    expect(readFileSync(join(d, "trust", first[0], "mine"), "utf8")).toBe("1");
+    expect(logs).toHaveLength(2);
+  });
+  test("a move aside that fails throws with the temp's path, and nothing is deleted", () => {
+    if (isRoot) return;   // root may rename in a read-only folder
+    const { d, s } = store();
+    const tdir = join(d, "trust");
+    const tmp = join(tdir, "keeper-drill.json.tmp");
+    mkdirSync(join(tmp, "inner"), { recursive: true });
+    chmodSync(tdir, 0o500);
+    try {
+      let err: any = null;
+      try { s.storeFlag("x"); } catch (e) { err = e; }
+      expect(err).not.toBeNull();
+      expect(storeWhy(err)).toContain(tmp);
+      expect(existsSync(join(tmp, "inner"))).toBe(true);
+    } finally { chmodSync(tdir, 0o700); }
+  });
+  test("the link's own store (linkDrillStore(env, trustDir, linkDir, now, log), as main.ts builds it) logs the move aside", () => {
     const d = mkdtempSync(join(tmpdir(), "drs-"));
-    mkdirSync(join(d, "trust/keeper-drill.json.tmp"), { recursive: true });
+    const tmp = join(d, "trust/keeper-drill.json.tmp");
+    mkdirSync(tmp, { recursive: true });
     const logs: string[] = [];
     linkDrillStore({}, join(d, "trust"), join(d, "link"), Date.now, (l) => logs.push(l)).storeFlag("drl1.a.b");
     expect(readFileSync(join(d, "trust/keeper-drill.json"), "utf8")).toBe("drl1.a.b");
-    expect(logs).toEqual([`a stray temp (a folder) stood in the drill store's way at ${join(d, "trust/keeper-drill.json.tmp")}: removed, and the write goes on`]);
+    const moved = strays(join(d, "trust"), "keeper-drill.json.tmp");
+    expect(moved).toHaveLength(1);
+    expect(logs).toEqual([line(tmp, "a folder", join(d, "trust", moved[0]))]);
+    // main.ts hands the store a log
+    const main = readFileSync(join(ROOT, "rootfs/opt/cain/link/main.ts"), "utf8");
+    expect(main).toMatch(/linkDrillStore\(process\.env, TRUST_DIR, DIR, Date\.now, \(l\) => console\.log\(/);
   });
   test("the mark's public half recovers the same way, and the link passes its log to the store", () => {
     const d = mkdtempSync(join(tmpdir(), "drs-"));
@@ -240,6 +287,7 @@ describe("a stray temp that isn't a regular file is recovered", () => {
     storeMarkPub("pubkey", join(d, "mark.pub"), (l) => logs.push(l));
     expect(readFileSync(join(d, "mark.pub"), "utf8")).toBe("pubkey\n");
     expect(logs).toHaveLength(1);
+    expect(readdirSync(d).filter((n) => n.startsWith("mark.pub.tmp.stray-"))).toHaveLength(1);
     const main = readFileSync(join(ROOT, "rootfs/opt/cain/link/main.ts"), "utf8");
     expect(main).toContain("linkDrillStore(process.env, TRUST_DIR, DIR, Date.now, (l) => console.log(`[cain] link: ${l}`))");
     expect(main).toContain("storeMarkPub(drillKey.pub, DRILL_MARK_PUB, (l) => console.log(`[cain] link: ${l}`))");

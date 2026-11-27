@@ -246,8 +246,9 @@ export function storeWhy(e: unknown): string {
   return parts.join(", ");
 }
 // Written whole, durably, root's (0600 whatever the file or its temp was before; Keeper 0.1.15: mode, 0644 for the mark).
-// Cain 0.19.3: a stray temp that isn't a regular file (a folder, a link, a socket) is removed, logged once, instead of failing
-// every write after it.
+// Cain 0.19.3: a stray temp that isn't a regular file (a folder, a link, a socket) is moved aside whole to <temp>.stray-<unix ms>
+// (renamed, never followed: a link is moved, not its target), logged once, instead of failing every write after it. Nothing under
+// it is deleted; a move that fails throws with the temp's path.
 const withPath = (e: any, p: string) => { if (e && typeof e === "object" && !e.path) { try { e.path = p; } catch { /* the code alone */ } } };
 function writeWholeLogged(path: string, body: string, mode = 0o600, log?: (l: string) => void): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -256,8 +257,12 @@ function writeWholeLogged(path: string, body: string, mode = 0o600, log?: (l: st
   try { st = lstatSync(tmp); } catch (e: any) { if (e?.code !== "ENOENT") throw e; }
   if (st && !st.isFile()) {
     const kind = st.isDirectory() ? "a folder" : st.isSymbolicLink() ? "a link" : "not a regular file";
-    rmSync(tmp, { recursive: true, force: true });
-    log?.(`a stray temp (${kind}) stood in the drill store's way at ${tmp}: removed, and the write goes on`);
+    let ms = Date.now();
+    const free = (p: string) => { try { lstatSync(p); return false; } catch (e: any) { if (e?.code === "ENOENT") return true; withPath(e, tmp); throw e; } };
+    while (!free(`${tmp}.stray-${ms}`)) ms++;   // never onto an earlier stray: a rename over a file would replace it
+    const aside = `${tmp}.stray-${ms}`;
+    try { renameSync(tmp, aside); } catch (e: any) { withPath(e, tmp); throw e; }
+    log?.(`a stray temp (${kind}) stood in the drill store's way at ${tmp}: moved aside to ${aside}, and the write goes on`);
   }
   rmSync(tmp, { force: true });
   const fd = openSync(tmp, "wx", mode);

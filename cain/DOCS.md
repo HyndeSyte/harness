@@ -563,7 +563,8 @@ the App restarted.
   /data/link/keeper-drill-spent/.high-water.tmp): nothing is installed". Never a file's contents: a
   file that doesn't parse is named only as SyntaxError. What is refused, and when, is unchanged.
 - **A stray temp no longer blocks every write.** If something that isn't a regular file (a folder, a
-  link) sits where a drill file's temp goes, it is removed, logged once, and the write goes on.
+  link) sits where a drill file's temp goes, it is moved aside whole to `<temp>.stray-<time>` (a link is
+  moved, never its target), never deleted, logged once with where it went, and the write goes on.
 
 ## What 0.19.0 does: working with the Keeper
 
