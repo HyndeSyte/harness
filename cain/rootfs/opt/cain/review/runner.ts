@@ -315,6 +315,7 @@ export class Runner {
     if (!file || this.capOff || !r.change || r.rounded || !FINAL.includes(r.status)) return;
     const rounds = readRounds(file);
     if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s round is settled next tick`); return; }
+    this.heldOwed = [];                                // a line from an earlier try whose write failed is made again
     const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
     const serious = seriousLeft(r);
     if (rec) {
@@ -333,6 +334,7 @@ export class Runner {
     }
     writeRounds(file, rounds);
     r.rounded = true;
+    this.relayHeld();
   }
   // The owner's grants (0.18.0), read fresh each time; none count when the file can't be read (fail closed).
   grants(): Grants | null { return this.cfg.grantsFile ? readGrants(this.cfg.grantsFile) : null; }
@@ -351,11 +353,14 @@ export class Runner {
     c.decision = { id: `${key}#${n}`, key, round: n, ...d, ...(d.lost ? { lost: true } : {}), state: "owed", at: this.now().toISOString() };
     this.log(`${what}: the round cap is reached for ${key} ${d.lost ? "and its last round was lost" : `with ${d.serious} serious finding(s) left`}; held by the owner's review rule`);
     // Cain 0.19.1: no card to him (the owner's review rule, R-013): the change is held, and Cain tells him.
-    this.relay(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so by his review rule it's held: no Ship card for it. Tell him in one line that it's held and why, with its Reviewed line, and ask him nothing about rounds, risk or cuts.`);
+    // Relayed by the caller only after the rounds file holding the hold is written (heldOwed).
+    this.heldOwed.push(`The review cap is reached for ${key}: ${d.lost ? "its last round was lost (it never produced a result)" : `its last round left ${d.serious} serious finding${d.serious === 1 ? "" : "s"}`}, so by his review rule it's held: no Ship card for it. Tell him in one line that it's held and why, with its Reviewed line, and ask him nothing about rounds, risk or cuts.`);
   }
+  private heldOwed: string[] = [];
+  private relayHeld(): void { for (const l of this.heldOwed.splice(0)) this.relay(l); }
   // A round counted at intake whose review never reached the queue (the runner stopped between the
   // two writes) is lost, found once at the runner's start: it still counts, Cain hears it named, and
-  // at the cap it owes the decision card.
+  // at the cap it's held (Cain 0.19.1; before, it owed the decision card).
   private recovered = false;
   recoverLost(): void {
     const file = this.cfg.roundsFile;
@@ -363,6 +368,7 @@ export class Runner {
     const rounds = readRounds(file);
     if (!rounds) return;                               // tried again next tick
     this.recovered = true;
+    this.heldOwed = [];
     const lines: string[] = [];
     for (const [key, c] of Object.entries(rounds.changes)) {
       for (const x of c.rounds) {
@@ -376,6 +382,7 @@ export class Runner {
     if (!lines.length) return;
     writeRounds(file, rounds);
     for (const l of lines) this.relay(`${l} Nothing to tell him.`);
+    this.relayHeld();
   }
   async tick(): Promise<void> {
     try { this.recoverLost(); this.ingest(); await this.reviews(); }

@@ -2298,6 +2298,8 @@ export class Link {
         this.log(`a waiting decision card didn't go: ${String(e).slice(0, 80)}`);
         if (e instanceof Refusal && !/files aren't right/.test(e.message)) {           // it can never go: dropped, the runner asks again
           const s = this.d.load(); if (s.decisions?.[String(d.id)]) { delete s.decisions[String(d.id)]; this.d.save(s); }
+          // Cain 0.19.1: one waiting from before the card was retired is held by his rule; Cain says so once.
+          if (/is retired/.test(e.message)) this.d.relay(`The review cap was reached for ${String(d.key ?? "a change")} before this release, and its decision card never went out: by his review rule it's held, with no Ship card. Tell him in one line that it's held and why, and ask him nothing about rounds, risk or cuts.`);
         }
       }
     }

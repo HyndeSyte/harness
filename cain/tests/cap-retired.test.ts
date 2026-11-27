@@ -58,6 +58,9 @@ describe("0.19.1: neither card goes out", () => {
     await (r.link as any).retryDecisions();
     expect((r.state() as any).decisions?.[DEC.id]).toBeUndefined();
     expect(r.posts()).toBe(0);
+    expect(r.relayed.filter((l) => l.includes("The review cap was reached for pr-46 before this release")).length).toBe(1);
+    await (r.link as any).retryDecisions();                                    // dropped once: no second line
+    expect(r.relayed.filter((l) => l.includes("before this release")).length).toBe(1);
   });
   test("an ask can't offer shipping with a risk named", async () => {
     const r = rig({ holds: keeperHolds({}) });
