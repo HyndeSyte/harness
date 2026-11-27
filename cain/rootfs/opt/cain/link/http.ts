@@ -7,8 +7,6 @@ import { boundedText, type Caller, routeAllowed } from "./auth";
 import { noteKey } from "../security/main";
 import { type Link, Refusal, SAID_MAX } from "./core";
 import type { PassAnswer } from "./ship-pass";
-import { fileStore } from "./drill";
-import { fileStore } from "./watch";
 
 const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status, headers: { "content-type": "application/json" } });
 const list = (v: unknown): string[] => (Array.isArray(v) ? v : []).map(String);
