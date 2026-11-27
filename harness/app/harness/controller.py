@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from . import (approvals, callbacks, choices, commands, daily, effects, ingress_filter, integrity, migrate,
+from . import (approvals, callbacks, choices, commands, daily, digest, effects, ingress_filter, integrity, migrate,
                handover, policy, provenance, render, rules, scrub, vault, watch)
 from .calendar_change import CalendarChange
 from .chat import Decision, Incoming
@@ -3390,7 +3390,11 @@ class Controller:
             h.finish("none", "No calendar digest is waiting. Today's was already posted, "
                              "or it isn't 7:00 AM yet.")
             return
-        h.finish("ok", render.plain(self.ledger.get_meta("last_digest_text") or ""))
+        # 0.24.5: "said" is his digest as he'd see it (Today, each event once, at most three
+        # problems), ready to fold in; "detail" is the full digest, for Cain only, never posted.
+        detail = render.plain(self.ledger.get_meta("last_digest_text") or "")
+        owner = self.ledger.get_meta("last_digest_owner")
+        h.finish("ok", digest.as_markdown(owner) if owner else detail, detail=detail)
 
     def _fastpath(self, h) -> None:
         """Cain's keeper.sh fastpath (0.24.0, fourth to sixth rounds). "smoke-start" starts a smoke run
@@ -3576,10 +3580,10 @@ class Controller:
             return
         with self.ledger.tx() as db:
             self.ledger.set_meta("digest_held_at", "", db)
+            # 0.24.5: his digest alone, the shape he reads every morning; the full text stays Cain's.
             self.ledger.enqueue(chat_id=self.config.owner_user_id, kind="alert", db=db,
-                                text=("<i>Cain didn't post his morning message, so here is the "
-                                      "calendar digest on its own.</i>\n"
-                                      + (self.ledger.get_meta("last_digest_text") or "")))
+                                text=(self.ledger.get_meta("last_digest_owner")
+                                      or self.ledger.get_meta("last_digest_text") or ""))
         log.warning("digest posted without Cain's morning message")
 
     def _finish_handovers(self) -> None:
@@ -3747,7 +3751,9 @@ class Controller:
                                 self.calendar_change.digest_line() if self.calendar_change else "",
                                 self.mail_dates.digest_line() if self.mail_dates else "",
                                 self.meaning_live.digest_line() if self.meaning_live else "")
-                                if x), watch=self.inputs)
+                                if x), watch=self.inputs,
+                            pairs=self.family_copy.pairs if self.family_copy else None,
+                            name=self.family_copy.name() if self.family_copy else "")
 
     # -- status ------------------------------------------------------------------------------
     def status_text(self) -> str:
@@ -3829,7 +3835,8 @@ class Controller:
                        and self.base_config.family_entity else None),
             "last_digest": {"at": self.ledger.get_meta("last_digest_at"),
                             "sent": self.ledger.get_meta("last_digest_sent") == "yes",
-                            "text": self.ledger.get_meta("last_digest_text") or ""},
+                            "text": self.ledger.get_meta("last_digest_text") or "",
+                            "owner": self.ledger.get_meta("last_digest_owner") or ""},
             "meaning_shadow": self.meaning.status() if self.meaning is not None else None,
             "discord": self._discord_status(),
             # Fifteenth round: mail skipped by kind (sender, subject, rule), and why mail_skip.json was ignored.

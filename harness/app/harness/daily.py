@@ -171,14 +171,17 @@ def family_problem(view, tz: str) -> str:
 
 def gather(ledger: Ledger, config: Config, *, paused: bool,
            notes: list[str] = (), calendar=None, family=None,
-           mirror_line: str = "", family_add_line: str = "", watch=None) -> digest.Digest:
+           mirror_line: str = "", family_add_line: str = "", watch=None,
+           pairs=None, name: str = "") -> digest.Digest:
     """`mirror_line`: the work-hours mirror's one line (shadow mode), counts
     only. It is appended as information and can never make the digest
     anything but what the inputs, waits and failures say it is.
     `family_add_line`: said on every digest, Clear included, while Family
     calendar adds skip his tap.
     `watch` (inputs.Watch): each input with no success since its last error,
-    mail included, and one line for those that came back since the last digest."""
+    mail included, and one line for those that came back since the last digest.
+    `pairs` (0.24.5): given today's events, the pairs of uids Harness keeps a record of as one
+    event on two calendars; `name`: his first name. His digest says each such event once."""
     now = ledger.now()
     since = _since(ledger)
     inputs = [digest.InputCoverage(ledger.get_meta("chat_name") or "Discord", ledger.last_poll_success(),
@@ -221,7 +224,14 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
             notes.append(f"Family calendar: {view.wrong_keys} push(es) with the wrong key")
     if configured:
         occ = sorted((_screened(o, config) for o in occ), key=_order)
-        agenda = digest.Agenda(occ, unreadable, read, configured, labels=configured > 1)
+        same: frozenset = frozenset()
+        if pairs is not None:
+            try:                      # a record that can't be read never costs him the digest
+                same = frozenset(pairs(occ))
+            except Exception as e:
+                log.warning("digest: couldn't read the copies' record: %s", type(e).__name__)
+        agenda = digest.Agenda(occ, unreadable, read, configured, labels=configured > 1,
+                               pairs=same, name=name)
     rows = ledger.inputs()
     canary_ok: bool | None = True
     canary_notes: list[str] = []
@@ -273,6 +283,7 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
     dead = ledger.db.execute("SELECT COUNT(*) AS n FROM events WHERE kind IN"
                              " ('delivery_failed', 'delivery_expired') AND at>=?",
                              (iso(since),)).fetchone()["n"]
+    asked = list(failures)            # his digest names these; the rest is Cain's
     if dead:
         failures.append(f"{dead} message(s) couldn't be delivered")
 
@@ -291,7 +302,8 @@ def gather(ledger: Ledger, config: Config, *, paused: bool,
                        failures=failures, low_balance=low, canary_ok=canary_ok,
                        config_unchanged_since=ledger.meta_time("integrity_since"),
                        canary_notes=canary_notes, notes=notes, agenda=agenda,
-                       extra=[x for x in (family_add_line, mirror_line, back) if x])
+                       extra=[x for x in (family_add_line, mirror_line, back) if x],
+                       asked_failures=asked)
     if fam_status is not None:
         d.facts["family"] = fam_status
     return replace(d, named=d.named + tuple(watched))
@@ -307,6 +319,8 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = Fa
         # Kept for the add-on page, so a silent (pre-launch) digest can be
         # read there and checked against the real calendar.
         ledger.set_meta("last_digest_text", d.text, db)
+        # 0.24.5: what he sees is his digest; the full text above is Cain's (keeper.sh digest).
+        ledger.set_meta("last_digest_owner", d.owner or d.text, db)
         ledger.set_meta("last_digest_sent", "yes" if allowed else "no", db)
         ledger.event("digest", {"state": d.state, "sent": allowed, **d.facts}, db=db)
         if allowed and hold:
@@ -314,7 +328,7 @@ def deliver(ledger: Ledger, config: Config, d: digest.Digest, *, hold: bool = Fa
             # take it, the controller posts it on its own (controller._release_digest).
             ledger.set_meta("digest_held_at", iso(now), db)
         elif allowed:
-            ledger.enqueue(chat_id=config.owner_user_id, kind="digest", text=d.text, db=db)
+            ledger.enqueue(chat_id=config.owner_user_id, kind="digest", text=d.owner or d.text, db=db)
     # The external watchdog reads this line from the add-on log (Supervisor),
     # so a missing digest is noticed without giving the add-on any API.
     # Counts only: no titles, no text.

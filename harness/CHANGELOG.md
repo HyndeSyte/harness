@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.24.5
+
+- **Your calendar digest reads like the Today part of Cain's morning message**: one line per event with its start time in bold, and the all-day items on one small line at the end.
+- **An event on both your Gmail and Family calendars is said once**, with the clearer name ("Coffee with Chris", not "Dane - Coffee" and "Dane + Chris"), and is never marked as overlapping itself.
+- A real problem gets one plain line after the list, at most three: two events at the same time, a change you asked for that didn't go through, or a calendar that couldn't be read.
+- No status line, counts, drive dry run or lists of other days on your digest any more. Cain still gets all of that.
+
 ## 0.24.4
 
 - **A tap Harness crosses off stays crossed off**, even when it can't lock its tap journal at that moment, and it never writes the journal without that lock.
