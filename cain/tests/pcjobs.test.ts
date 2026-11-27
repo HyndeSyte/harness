@@ -9591,6 +9591,7 @@ public static class FdProbe {
     while (h3 != IntPtr.Zero && ReadFile(h3, b, 1, out got, IntPtr.Zero) && got == 1 && b[0] != 0) msg.Append((char)b[0]);
     string rep = "{\\"count\\":" + n + ",\\"f3\\":" + f3 + ",\\"f4\\":" + f4 + ",\\"t3\\":" + GetFileType(h3) + ",\\"t4\\":" + GetFileType(h4) + ",\\"decoy_write\\":" + wrote + ",\\"echo\\":\\"" + msg + "\\"}";
     var bytes = Encoding.UTF8.GetBytes(rep + "\\0"); int put;
+    if (a.Length > 2) System.IO.File.WriteAllText(a[2], rep);
     if (h4 != IntPtr.Zero) WriteFile(h4, bytes, bytes.Length, out put, IntPtr.Zero);
     else { try { Console.Out.Write(rep); Console.Out.Flush(); } catch (Exception) { } }
     System.Threading.Thread.Sleep(a.Length > 1 ? int.Parse(a[1]) : 0);
@@ -9634,10 +9635,11 @@ public static class FdProbe {
     const { exe, o } = build();
     expect(existsSync(exe)).toBe(true);
     const d = await decoy();
-    const launched = await edgeLaunchHelper(o, exe, [d.write, "15000"]);
+    const seen = join(dirname(exe), "launch-report.json");
+    const launched = await edgeLaunchHelper(o, exe, [d.write, "15000", seen]);
     const got = reply(launched.io);
     launched.io.write(Buffer.from("ping\0"));
-    const r = await got;
+    const r = await got.catch((e) => { console.log(`edge-launch child: pid ${launched.pid}, report file ${existsSync(seen) ? readFileSync(seen, "utf8") : "never written"}`); throw e; });
     expect(r).toMatchObject({ count: 5, f3: 9, f4: 9, t3: 3, t4: 3, echo: "ping" });   // FOPEN|FPIPE, FILE_TYPE_PIPE
     expect(d.leaked()).toBe(false);                                                       // the decoy didn't reach the child
     const edge = { pid: launched.pid, exe, cdp: null as any, refs: launched.refs, version: "" };
@@ -9677,7 +9679,9 @@ public static class FdProbe {
     const helper = jobHelperState20(o).exe!;
     expect(helper).toBeTruthy();
     const d = await decoy();
-    const r = spawnSync(helper, ["run", exe, d.write, "0"], { encoding: "utf8", timeout: 30_000 });
+    const seen = join(dirname(exe), "run-report.json");
+    const r = spawnSync(helper, ["run", exe, d.write, "0", seen], { encoding: "utf8", timeout: 30_000 });
+    if (r.status !== 0) console.log(`helper run: status ${r.status}, stdout ${JSON.stringify(r.stdout)}, stderr ${JSON.stringify(r.stderr)}, report ${existsSync(seen) ? readFileSync(seen, "utf8") : "never written"}`);
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout.trim())).toMatchObject({ count: 0 });
     expect(d.leaked()).toBe(false);

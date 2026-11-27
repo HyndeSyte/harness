@@ -2501,7 +2501,8 @@ export function edgePrefsItems(inst: Install, rec: EdgeSetup, edgeApp: string | 
       if (id === allowed) {
         if (loc !== LOC.INTERNAL) { out.push(miss(`prefs_location:${shown}:${loc === null ? "none" : LOCATION_NAMES[loc] ?? loc}`, X, `Claude in Chrome isn't at location INTERNAL (a Web Store install) in ${file}`)); continue; }
         const full = path === null ? null : pathWin32.isAbsolute(path) || path.startsWith("/") ? path : join(extRoot, path);
-        if (!full || oddForm(full) || !inside(full, join(extRoot, id))) out.push(miss(`prefs_path:${shown}`, X, `Claude in Chrome's path in ${file} isn't inside Extensions\\${id}`));
+        // The entry's own path in an odd form (8.3, \\?\, UNC) refuses; the profile's folder is install.json's, checked elsewhere.
+        if (!full || !path || oddForm(path) || !inside(full, join(extRoot, id))) out.push(miss(`prefs_path:${shown}`, X, `Claude in Chrome's path in ${file} isn't inside Extensions\\${id}`));
       } else if (builtins.has(id)) {
         if (loc === null || !EDGE_COMPONENT_LOCATIONS.includes(loc)) { out.push(miss(`prefs_location:${shown}:${loc === null ? "none" : LOCATION_NAMES[loc] ?? loc}`, X, `the built-in ${shown} isn't at a component location in ${file}`)); continue; }
         if (!path || !edgeApp || oddForm(path) || !inside(path, edgeApp)) out.push(miss(`prefs_path:${shown}`, X, `the built-in ${shown}'s path in ${file} isn't inside Edge's Application folder`));
