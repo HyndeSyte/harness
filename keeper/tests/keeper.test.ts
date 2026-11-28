@@ -13,7 +13,7 @@ import { CONFIRM_MS, DELIVERY_MS, HC_HEARTBEAT_MS, Keeper, POLL_MS, RESTORE_LIMI
   ACCEPT_MS, CLAIM_MS, PAGE_ACK_MS, HC_READ_MS, judgeHc, HC_RW_WHY, KEY_CODE_MS, MHB_MAX_MS, MHB_CAP_MS, LIMITS_VERSION, PHONE_WINDOW_MS, DROP_TRIES,
   OLD_KEY_WHY, ENROLL_BEHIND, ENROLL_REFUSED, jobsWhy, CLEANUP_TICK_MS, KEPT_GRACE_MS, KEPT_MAX_MS, BACKUP_CHECK_WHY, OPTIONS_UNKNOWN_WHY, CODE_EPOCH,
   EXCLUDE_HASH, BACKUP_EXCLUDE, KEY_NAME, HOOK_BOUND_MS, SHIP_TTL_S, FIRST_BACKUP_BYTES, ROTATION_PROOF_TAP, revocation, BARE_401_WHY, excludedName, FOLLOWUPS_WHY, JOB_GRACE_MS, KEY_TMP_PREFIX,
-  OP_MOVES, LOCK_WRITES, OUTSIDE_LOCK, SUPERVISOR_CALL_MS, LOCK_STEP_MS, PENDING_CEILING_MS, FIRST_BACKUP_MS,
+  OP_MOVES, LOCK_WRITES, OUTSIDE_LOCK, SUPERVISOR_CALL_MS, LOCK_STEP_MS, PENDING_CEILING_MS, FIRST_BACKUP_MS, FIRST_PHASES_MS, TAP_WINDOW_MS, FIRST_OLD_LINK_WHY, REGISTER_WAIT_MS,
   type AppInfo, type BackupInfo, type HcCheck, type JobState, type RestoreResult, type State, type InstallJob } from "../rootfs/opt/keeper/core.ts";
 import { backupKeys, drillSpent, hcChecks, hcKeyStore, healthUrl, keyFiles, liveUrl, writeWhole } from "../rootfs/opt/keeper/main.ts";
 import { supervisor } from "../rootfs/opt/keeper/supervisor.ts";
@@ -28,6 +28,7 @@ const T0 = Date.parse("2026-11-21T15:00:00Z");
 const HEAD = "7d7b5f9".padEnd(40, "0");
 const HASH = "abcdef0123456789";
 const ID = `ship-46-cain-${HEAD.slice(0, 8)}`;
+const MAIN = "c".repeat(40);                            // (0.1.19) main's commit at the tap, as the link reads it
 const ROLL = CONFIRM_MS / POLL_MS + 4;
 const LIMIT_POLLS = RESTORE_LIMIT_MS / POLL_MS + 2;
 
@@ -79,7 +80,7 @@ function withKeys(opts: any): any {
 }
 
 let nonces = 0;
-function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean; hcKey?: string; limits?: boolean; uniq?: boolean; backupCheck?: boolean } = {}) {
+function rig(o: { today?: boolean; opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | null; confirm?: boolean; hcKey?: string; limits?: boolean; uniq?: boolean; backupCheck?: boolean } = {}) {
   let now = T0;
   const logs: string[] = [];
   const pings: { url: string; body: string }[] = [];
@@ -100,6 +101,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     app, alive: true, ready: true, infoUp: true, pingOk: true, restoreQueue: [] as RestoreResult[],
     jobs: {} as Record<string, JobState>, jobsUp: true,
     backupJobs: [] as string[], backupJobsUp: true,                          // (0.1.16) the Supervisor's running backup jobs
+    restoreAt: 0 as number | null,                                           // (0.1.19) the newest restore job seen (null: unreadable)
     // (0.1.15) the App's install and update jobs as the Supervisor lists them (install() adds one), and the drill flags' spent list
     installJobs: [] as InstallJob[], installJobsUp: true, spent: new Set<string>(), spentOk: true, spentListOk: true,
     hcUp: true, hcOver: {} as Record<string, Partial<HcCheck> | null>, hcReads: 0,
@@ -117,6 +119,8 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
   };
   const k = new Keeper({
     now: () => now, version: "0.1.0", self: "0fcc2575_keeper",
+    // (0.1.19) today: Cain stands in for any other App, whose install still makes its backup at the registration (the generic path)
+    ...(o.today ? { selfApp: null } : {}),
     appInfo: async (slug) => (f.infoUp && slug === CAIN ? { ...app } : null),
     backupInfo: async () => (f.backup ? { date: new Date(now).toISOString(), ...f.backup } : null),
     makeBackup: async (a, _name, password) => { backupsMade.push(a); passwords.push(password); return f.makeBackup(a); },
@@ -133,6 +137,7 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     backups: async () => f.backupsList,
     activeJobs: async () => f.activeJobs,
     backupJobs: async () => (f.backupJobsUp ? [...f.backupJobs] : null),
+    restoreSeenAt: async () => f.restoreAt,                   // (0.1.19) the newest restore job in the Supervisor's jobs list
     diskFree: async () => f.free,
     backupKeys: { store: (n, key) => { if (!f.keyStoreOk) return false; keys.set(n, key); return true; }, load: (n) => (f.keyLoadOk ? keys.get(n) ?? null : null),
       drop: (n) => keys.delete(n), list: () => [...keys.keys()] },
@@ -172,10 +177,17 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
     // signed drill mark it wrote (noMark: it never does)
     async register(over: any = {}, caller: string | null = CAIN) {
       const head = over.head ?? HEAD;
-      const { noMark, ...rest } = over;
+      const { noMark, first, ...rest } = over;
       const drill = rest.kind === "drill" ? { drill_mode: "verdict-fail", drill_nonce: (++nonces).toString(16).padStart(16, "0") } : {};
       const body: any = { token: shipToken({ head, now }), app: CAIN, pr: 46, head, from_version: "0.16.0", to_version: "0.17.0",
         probe_hash: HASH, kind: "ship", ...drill, ...rest };
+      // (0.1.19) Cain's own ship install, as the link sends it since Cain 0.19.4: the backup taken first at the tap (POST
+      // /backup-first), then the registration carrying the tap's nonce and main (first: false sends one with no backup first)
+      if (body.app === CAIN && body.kind === "ship" && first !== false && caller === CAIN && k.selfApp === CAIN) {
+        const tap = first && typeof first === "object" ? first : r.tapFirst({ head, to: body.to_version });
+        if (!tap.reuse) { await k.backupFirst(CAIN, tap.body); await k.whenFirst(CAIN); }
+        body.first_nonce ??= tap.body.nonce; body.first_main ??= tap.body.main;
+      }
       const ans = await k.registerAttempt(caller, body);
       if (ans.status !== 202) return ans;
       await k.whenSettled(String(ans.body.id));
@@ -184,10 +196,15 @@ function rig(o: { opts?: any; saved?: unknown; backup?: Partial<BackupInfo> | nu
         expect(k.markAttempt(CAIN, String(ans.body.id), { mode: body.drill_mode, to_version: body.to_version, mark: "ab".repeat(32) }).status).toBe(200);
       return { status: v.body.status === "accepted" ? 200 : 409, body: v.body };
     },
-    // (0.1.5) The link's claim of an accepted attempt, as the Ship run starts.
+    // (0.1.19) The link's POST /backup-first body at a tap: a fresh request id and tap nonce, main and Cain's version there.
+    tapFirst(o: { head?: string; pr?: number; to?: string; main?: string } = {}) {
+      const n = (++nonces).toString(16);
+      return { body: { app: CAIN, pr: o.pr ?? 46, head: o.head ?? HEAD, request: n.padStart(16, "e"), nonce: n.padStart(32, "f"), main: o.main ?? MAIN, to_version: o.to ?? "0.17.0" }, reuse: false };
+    },
+    // (0.1.5) The link's claim of an accepted attempt, as the Ship run starts (0.1.19: with main's commit read now, when backed up first).
     claim(id = ID, over: any = {}) {
       const a = k.st.attempts[id];
-      return k.claimAttempt(CAIN, id, { app: a?.app, from_version: a?.from, to_version: a?.to, backup: a?.backup, ...over });
+      return k.claimAttempt(CAIN, id, { app: a?.app, from_version: a?.from, to_version: a?.to, backup: a?.backup, ...(a?.firstMain ? { main: a.firstMain } : {}), ...over });
     },
     async poll(n = 1) { for (let i = 0; i < n; i++) { await k.poll(); await k.deadman(); now += POLL_MS; } },
     // The install, claimed first by the link as the Ship run starts (claim false: an install with no claim). 0.1.15: the Ship run's
@@ -250,7 +267,7 @@ describe("fix 1: the owner's tap proven to the keeper (a signed Ship token, spen
     expect(r.logs.filter((l) => l.startsWith("accepting")).length).toBe(1);
   });
   test("a replay of the same token for the same App is refused, and reported", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     const token = shipToken();
     const body = { token, app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH };
     expect((await r.k.registerAttempt(CAIN, body)).status).toBe(202);
@@ -274,7 +291,7 @@ describe("fix 1: the owner's tap proven to the keeper (a signed Ship token, spen
     ["no token", { token: "" }, "no Ship token"],
   ] as const) {
     test(`${name} is refused: no attempt, nothing ever restored, the owner hears`, async () => {
-      const r = rig();
+      const r = rig({ today: true });
       const ans = await r.register(over);
       expect(ans.status).toBe(409);
       expect(String(ans.body.why)).toContain(why);
@@ -299,7 +316,7 @@ describe("fix 1: the owner's tap proven to the keeper (a signed Ship token, spen
     expect((await r.register({}, null)).status).toBe(403);
   });
   test("the state never holds the token, only its id", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     const token = shipToken();
     await r.k.registerAttempt(CAIN, { token, app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
     expect(JSON.stringify(r.saved)).not.toContain(token);
@@ -333,7 +350,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     handle(r.k, new Request(`http://keeper${path}`, { ...init, headers: token ? { authorization: `Bearer ${token}` } : {} }), ip, (m) => log.push(m));
   const body = (over: any = {}) => JSON.stringify({ token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, ...over });
   test("POST /attempt with Cain's token and the right body registers; nothing else does", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     const log: string[] = [];
     expect((await call(r, "/attempt", { method: "POST", body: body() }, "192.168.1.10", TOKEN, log)).status).toBe(403);
     expect((await call(r, "/attempt", { method: "POST", body: body() }, "172.30.33.4", null, log)).status).toBe(401);
@@ -377,7 +394,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     expect((r2.saved as any).kept).toBeUndefined();
   });
   test("(0.1.5) register-then-poll: POST /attempt answers 202 at once; the poll reads pending until the backup is verified, then accepted with its slug", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     const ans = await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, kind: "ship" });
@@ -397,38 +414,38 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     expect(r.k.attemptView(CAIN, "ship-1-cain-00000000").status).toBe(404);
   });
   test("(0.1.4) the App at another version, a failed backup, a backup past 4 minutes or a restart while making it: refused, unprotected, paged", async () => {
-    const r = rig(); r.f.app.version = "0.15.0";
+    const r = rig({ today: true }); r.f.app.version = "0.15.0";
     expect((await r.register()).status).toBe(409);
     expect(r.a().status).toBe("unprotected");
     expect(r.backupsMade).toEqual([]);
-    const r2 = rig(); r2.f.makeBackup = async () => ({ why: "400 busy" });
+    const r2 = rig({ today: true }); r2.f.makeBackup = async () => ({ why: "400 busy" });
     const a2 = await r2.register();
     expect([a2.status, a2.body.status, String(a2.body.why).includes("400 busy")]).toEqual([409, "refused", true]);
     expect(r2.a().status).toBe("unprotected");
     await r2.poll();
     expect(r2.pings.some((p) => p.url.endsWith("/failed/fail") && p.body.startsWith("Keeper can't protect the install of Cain 0.17.0"))).toBe(true);
     expect(r2.logs.some((l) => l.includes("UNPROTECTED"))).toBe(true);
-    const slow = rig(); slow.f.makeBackup = () => new Promise(() => {}); slow.f.timer = async () => {};
+    const slow = rig({ today: true }); slow.f.makeBackup = () => new Promise(() => {}); slow.f.timer = async () => {};
     const a3 = await slow.register();
     expect(a3.status).toBe(409);
     expect(String(a3.body.why)).toContain("didn't complete within 4 minutes");
     expect(slow.a().status).toBe("unprotected");
-    const r3 = rig(); r3.f.makeBackup = () => new Promise(() => {});
+    const r3 = rig({ today: true }); r3.f.makeBackup = () => new Promise(() => {});
     void r3.register();
     for (let i = 0; i < 5; i++) await Bun.sleep(0);
-    const r4 = rig({ saved: JSON.parse(JSON.stringify(r3.k.st)) });
+    const r4 = rig({ today: true,  saved: JSON.parse(JSON.stringify(r3.k.st)) });
     await r4.poll();
     expect(r4.a().status).toBe("unprotected");
     expect(r4.a().why).toContain("restarted while it made the backup");
     expect(r4.backupsMade).toEqual([]);
   });
   test("(0.1.4) a registration naming a backup is refused, and a backup dated before the token's issue isn't accepted", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     const ans = await r.register({ backup_slug: "b1234567" });
     expect(ans.status).toBe(409);
     expect(String(ans.body.why)).toContain("always makes the backup itself");
     expect(r.backupsMade).toEqual([]);
-    const old = rig({ backup: { date: new Date(T0 - 10 * 60_000).toISOString() } as any });
+    const old = rig({ today: true,  backup: { date: new Date(T0 - 10 * 60_000).toISOString() } as any });
     expect((await old.register()).status).toBe(409);
     expect(old.a().why).toBe("its backup is dated before the Ship token was issued");
   });
@@ -441,7 +458,7 @@ describe("fix 4: registration over the keeper's own service, never an options wr
     ["is shown as protected false (0.1.12: made without Keeper's key)", { protected: false }, "isn't shown as protected (protected true)"],
   ] as const) {
     test(`a backup that ${name} leaves the attempt unprotected`, async () => {
-      const r = rig({ backup: backup as any }); await r.register();
+      const r = rig({ today: true,  backup: backup as any }); await r.register();
       expect(r.a().status).toBe("unprotected");
       expect(r.logs.some((l) => l.startsWith(`refusing ${ID}: `) && l.includes(why))).toBe(true);
       r.install("error"); await r.poll(5);
@@ -478,10 +495,14 @@ describe("fix 4: registration over the keeper's own service, never an options wr
       options: () => sup.selfOptions(), save: () => {}, log: (l) => klogs.push(l) }, null);
     k.useOptions(options); k.start(); k.keyCode(); k.keyConfirm(keyFp(PUB), codeIn(klogs, "key-confirm"));
     const poll = async (n: number) => { for (let i = 0; i < n; i++) { await k.poll(); now += POLL_MS; } };
-    await k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
+    // (0.1.19) Cain's own install: the backup taken first at the tap, then the registration with that tap's nonce and main
+    const tap = { app: CAIN, pr: 46, head: HEAD, request: "a".repeat(16), nonce: "b".repeat(32), main: MAIN, to_version: "0.17.0" };
+    expect((await k.backupFirst(CAIN, tap)).status).toBe(202);
+    await k.whenFirst(CAIN);
+    await k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, first_nonce: tap.nonce, first_main: MAIN });
     await k.whenSettled(ID);
     await poll(2); expect(k.st.attempts[ID].status).toBe("accepted");
-    expect(k.claimAttempt(CAIN, ID, { app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: "kb1" }).status).toBe(200);
+    expect(k.claimAttempt(CAIN, ID, { app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: "kb1", main: MAIN }).status).toBe(200);
     installedAt = now; app.version = "0.17.0"; await poll(1);
     k.verdict(CAIN, { app: CAIN, version: "0.17.0", attempt: ID, result: "FAIL", reason: "x" });
     await poll(ROLL);
@@ -983,7 +1004,7 @@ describe("0.1.4: the acceptance is single use", () => {
     expect(String(again.body.why)).toContain("a replay");
   });
   test("an install seen before the acceptance (the backup still running) is unprotected, never covered", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     const p = r.register();
@@ -1164,7 +1185,7 @@ describe("0.1.5: the claim at the install", () => {
     expect(r.logs).toContain(`claimed ${ID} claim ${first.body.claim} ${CAIN} 0.16.0 to 0.17.0 backup kb-cain until ${new Date(T0 + CLAIM_MS).toISOString()}`);
   });
   test("a claim bound to other versions or another backup, by another App, or before acceptance is refused; a failed save takes it back", async () => {
-    const r = rig(); await r.register();
+    const r = rig({ today: true }); await r.register();
     expect(r.claim(ID, { backup: "kb-other" }).status).toBe(409);
     expect(r.claim(ID, { to_version: "0.18.0" }).status).toBe(409);
     expect(r.k.claimAttempt(HARNESS, ID, { app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: "kb-cain" }).status).toBe(403);
@@ -1174,7 +1195,7 @@ describe("0.1.5: the claim at the install", () => {
     expect([r.a().status, r.a().claim]).toEqual(["accepted", undefined]);
     r.f.saveFails = false;
     expect(r.claim().status).toBe(200);
-    const p = rig(); p.f.makeBackup = () => new Promise(() => {});
+    const p = rig({ today: true }); p.f.makeBackup = () => new Promise(() => {});
     await p.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
     expect(String(p.claim().body.why)).toContain("verifying, not accepted");
   });
@@ -1208,7 +1229,7 @@ describe("0.1.5: the claim at the install", () => {
     expect([c.a().status, c.restores.length]).toEqual(["unprotected", 0]);
   });
   test("a cancellation while the backup is still being made: the late backup is never accepted", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
@@ -1221,7 +1242,7 @@ describe("0.1.5: the claim at the install", () => {
     expect((await r.k.cancel(HARNESS, ID, {})).status).toBe(403);
   });
   test("over HTTP: GET /attempt/<id>, POST /attempt/<id>/claim and /cancel, Cain's token only", async () => {
-    const r = rig(); await r.register();
+    const r = rig({ today: true }); await r.register();
     const call = (path: string, init: RequestInit = {}, token = TOKEN) =>
       handle(r.k, new Request(`http://keeper${path}`, { ...init, headers: { authorization: `Bearer ${token}` } }), "172.30.33.4", () => {});
     const claim = JSON.stringify({ app: CAIN, from_version: "0.16.0", to_version: "0.17.0", backup: "kb-cain" });
@@ -1534,7 +1555,7 @@ describe("0.1.6: orphan backups", () => {
     expect(r.logs.some((l) => l.startsWith(`${ID}: ended; backup kept: cancelled;`) && l.includes(`backup ${slug} "${r.a().backupName}"`))).toBe(true);
   });
   test("(0.1.9) a backup still being made when the registration is cancelled is kept and bound once it is made", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
@@ -1812,14 +1833,14 @@ describe("0.1.7: codes bound to their challenge, and the enrollment counter", ()
 
 describe("0.1.7: orphan backups by their own name, and the network mode", () => {
   test("the backup's name is kept before the call; after a restart lost its slug, a cancelled attempt's backup is found by that exact name and (0.1.9) bound, not deleted", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.makeBackup = () => new Promise(() => {});         // the backup call never answers in this process
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
     for (let i = 0; i < 5; i++) await Bun.sleep(0);
     const name = r.saved!.attempts[ID].backupName!;
     expect(name).toMatch(new RegExp(`^Keeper ${ID} [0-9a-f]{8}$`));
     (await r.k.cancel(CAIN, ID, {}));
-    const again = rig({ saved: r.saved });
+    const again = rig({ today: true,  saved: r.saved });
     again.f.backupsList = [{ slug: "kb-other", name: `Keeper ${ID} 00000000` }, { slug: "kb-mine", name }];
     await again.poll();
     expect(again.deleted).toEqual([]);
@@ -1828,12 +1849,12 @@ describe("0.1.7: orphan backups by their own name, and the network mode", () => 
     expect(again.logs.some((l) => l.startsWith(`backup kb-other ("Keeper ${ID} 00000000") is named like Keeper's but has no generation record here: never deleted by Keeper`))).toBe(true);
   });
   test("an attempt left unprotected by a restart keeps its backup: adopted by its name with its generation, deleted only by the bounded cleanup past 48 hours", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.makeBackup = () => new Promise(() => {});
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH });
     for (let i = 0; i < 5; i++) await Bun.sleep(0);
     const name = r.saved!.attempts[ID].backupName!;
-    const again = rig({ saved: r.saved });
+    const again = rig({ today: true,  saved: r.saved });
     again.f.backupsList = [{ slug: "kb-mine", name }];
     await again.poll(2);
     expect(again.a().status).toBe("unprotected");
@@ -2358,7 +2379,7 @@ describe("0.1.9 B: the bounded cleanup of kept backups", () => {
     expect(r.deleted).toEqual([old.backup]);                // its own backup is never the cleanup's
   });
   test("a new backup needs the free-space reserve (the last size and a half): one that can't fit is refused, logged and paged", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.backup = { ...r.f.backup!, size: 600 } as any;      // 600 MB
     await r.register({ head: headN(1) }); await r.poll();
     expect(r.k.st.lastBackupBytes).toBe(600 * 1024 * 1024);
@@ -2822,7 +2843,7 @@ describe("0.1.10 item 3: the cleanup's grace and eligibility", () => {
 
 describe("0.1.10 item 4: a backup create that outran its bound, and a route whose write is in flight", () => {
   test("a create that times out and completes later is found by its pre-chosen name under the next lock holder and adopted with its generation", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     r.f.timer = () => Promise.resolve();                   // the create's bound passes at once
@@ -2831,7 +2852,7 @@ describe("0.1.10 item 4: a backup create that outran its bound, and a route whos
     const a = r.a();
     expect(a.lateBackup).toBeGreaterThan(0);
     // the process restarts before the answer comes back: only the name is left
-    const again = rig({ saved: r.saved });
+    const again = rig({ today: true,  saved: r.saved });
     again.f.backupsList = [{ slug: "kb-late", name: a.backupName! }];
     await again.poll();
     const x = again.a();
@@ -2842,13 +2863,13 @@ describe("0.1.10 item 4: a backup create that outran its bound, and a route whos
     finish({ slug: "kb-late" });
   });
   test("found with no generation record, it is deleted, logged", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.makeBackup = () => new Promise(() => {});
     r.f.timer = () => Promise.resolve();
     await r.register();
     const saved = JSON.parse(JSON.stringify(r.saved));
     delete saved.attempts[ID].gen;
-    const again = rig({ saved });
+    const again = rig({ today: true,  saved });
     again.f.backupsList = [{ slug: "kb-late", name: saved.attempts[ID].backupName }];
     await again.poll();
     expect(again.deleted).toEqual(["kb-late"]);
@@ -2878,13 +2899,13 @@ describe("0.1.10 item 4: a backup create that outran its bound, and a route whos
 
 describe("0.1.10 item 6: the first backup's reserve floor, and the refusal's code", () => {
   test("no last size: 2 GB when the image size isn't known, 1 GB plus the image size when it is; the refusal carries code no_space", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.free = FIRST_BACKUP_BYTES - 1;
     const ans = await r.register();
     expect(ans.status).toBe(409);
     expect(ans.body.code).toBe("no_space");
     expect(String(ans.body.why)).toContain("under the first backup's reserve floor of 2048 MB (2 GB, the App's image size not known)");
-    const k = rig();
+    const k = rig({ today: true });
     (k.k as any).d.imageBytes = async () => 300 * 1024 ** 2;
     k.f.free = 1024 ** 3 + 299 * 1024 ** 2;
     expect(String((await k.register()).body.why)).toContain("reserve floor of 1324 MB (1 GB plus the App's image size)");
@@ -2965,11 +2986,11 @@ describe("0.1.11 item 1: a late backup is retention-only", () => {
     expect(String(r.a().why)).toContain("has no usable backup to restore");
   });
   test("adopting a late backup marks it retention-only", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.makeBackup = () => new Promise(() => {});
     r.f.timer = () => Promise.resolve();
     await r.register();
-    const again = rig({ saved: r.saved });
+    const again = rig({ today: true,  saved: r.saved });
     again.f.backupsList = [{ slug: "kb-late", name: r.a().backupName! }];
     await again.poll();
     expect(again.a().backup).toBe("kb-late");
@@ -2990,7 +3011,7 @@ describe("0.1.11 item 1: a late backup is retention-only", () => {
 
 describe("0.1.11 item 2: a pending lock has a ceiling", () => {
   test("a write that never resolves: answered pending with an operation id, the lock released at the ceiling, the owner paged once, the next calls not wedged", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     await r.register({ head: headN(9) }); await r.poll();
     (r.k as any).d.pendingCeilingMs = 400;
     let calls = 0;
@@ -3078,22 +3099,22 @@ describe("0.1.11 item 5: an install the watch can't take as its own pages the ow
 // -- 0.1.12 (round 13) ---------------------------------------------------------------------------------------
 describe("0.1.12 item 1: Keeper's backups of a watched App are protected with a key only Keeper holds", () => {
   test("the create carries a fresh password (32 random bytes, base64url), kept under the backup's name; the info must say protected true", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     expect((await r.register()).status).toBe(200);
     const pw = r.passwords[0]!;
     expect(pw).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(Buffer.from(pw, "base64url")).toHaveLength(32);
     expect(r.keys.get(r.a().backupName!)).toBe(pw);
-    const r2 = rig(); await r2.register({ head: headN(2) });
+    const r2 = rig({ today: true }); await r2.register({ head: headN(2) });
     expect(r2.passwords[0]).not.toBe(pw);                  // one per backup
-    const bare = rig({ backup: { protected: false } });
+    const bare = rig({ today: true,  backup: { protected: false } });
     expect((await bare.register()).status).toBe(409);
     expect(bare.a().why).toBe("its backup isn't shown as protected (protected true) with Keeper's own key, and the keeper restores only such a backup");
     bare.install("error"); await bare.poll(5);
     expect(bare.restores).toEqual([]);
   });
   test("a key that can't be kept: no backup is made, the install is unprotected", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.f.keyStoreOk = false;
     expect((await r.register()).status).toBe(409);
     expect(r.backupsMade).toEqual([]);
@@ -3517,7 +3538,7 @@ describe("0.1.14: drill evidence, nonces, the Ship token's kind and the follow-u
 // for it (the Cain side of items 1, 3, 6, 7, 8, 11, 12, 13, 14, 15 and 21 is in cain/tests/round16.test.ts).
 describe("0.1.15 item 1: every Ship approval is single use", () => {
   test("the keeper refuses a second registration with the same token, whatever happened to the first", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     const token = shipToken();
     const body = { token, app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, kind: "ship" };
     expect((await r.k.registerAttempt(CAIN, body)).status).toBe(202);
@@ -3669,7 +3690,7 @@ describe("0.1.15 item 4: the backup is kept until its attempt ends", () => {
 
 describe("0.1.15 item 5: only a backup made for this attempt and verified before submission is its rollback point", () => {
   test("a backup whose create timed out is disqualified for good, however it finishes later", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     let fire: () => void = () => {};
@@ -3689,7 +3710,7 @@ describe("0.1.15 item 5: only a backup made for this attempt and verified before
 
 describe("0.1.15 item 6: acceptance outside the hook's bound", () => {
   test("the registration answers pending at once; an acceptance the link never claims ends by itself as a terminal abort, paged, backup kept", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     const ans = await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, kind: "ship" });
     expect([ans.status, ans.body.status]).toEqual([202, "pending"]);
     await r.k.whenSettled(ID);
@@ -3721,7 +3742,7 @@ describe("0.1.15 item 9: a cancel that fails, times out or answers pending", () 
     expect(r.restores).toEqual([]);
   });
   test("a cancel asked while the backup is still being made wins over the backup's late completion", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     let finish: (v: { slug: string }) => void = () => {};
     r.f.makeBackup = () => new Promise((res) => { finish = res; });
     await r.k.registerAttempt(CAIN, { token: shipToken(), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, kind: "ship" });
@@ -4305,7 +4326,7 @@ describe("0.1.16 item 4: while an operation is late, every Supervisor write is h
     expect(r.restores).toHaveLength(1);
   });
   test("a new backup is refused while an operation is late: the registration is refused, nothing made", async () => {
-    const r = rig();
+    const r = rig({ today: true });
     r.k.st.ops = { "cancel z": { id: "op-00000000000000cc", op: "cancel z", at: T0, state: "late", writes: ["w"], gen: 1 } };
     r.f.backupJobs = ["backup_manager_remove"];
     const reg = await r.register();
@@ -4355,122 +4376,206 @@ describe("0.1.16 item 11: the device checks stay before drill_followups_open goe
 });
 
 // (0.1.19) Backup first: Cain's backup is cold (it stops and starts Cain, and his link cancelled the registration that asked for
-// it), so the link asks for it at the owner's Ship tap and the registration that follows is accepted against it.
+// it), so the link asks for it at the owner's Ship tap, and Cain's registration must use it: one tap identity (the nonce) end to
+// end, the Keeper's word gating the token, what installs (main) bound at the tap, the registration and the claim, and fail closed.
 describe("0.1.19: Cain backed up first, at the owner's Ship tap", () => {
-  const first = async (r: ReturnType<typeof rig>, over: any = {}) => {
-    const ans = await r.k.backupFirst(CAIN, { app: CAIN, pr: 46, head: HEAD, ...over });
-    await r.k.whenFirst(CAIN);
-    return ans;
-  };
-  test("a Cain install backed up first registers without a second backup, and the backup is the acceptance's", async () => {
+  const ask = async (r: ReturnType<typeof rig>, tap = r.tapFirst()) => { const ans = await r.k.backupFirst(CAIN, tap.body); await r.k.whenFirst(CAIN); return { ans, tap }; };
+  const view = async (r: ReturnType<typeof rig>, request = "") => (await r.k.firstView(CAIN, CAIN, request)).body;
+  test("item 3: a Cain install backed up first: named by the tap's nonce, verified, used once by the registration with that nonce, no second backup", async () => {
     const r = rig();
     r.f.makeBackup = async () => ({ slug: "kb-first" });
-    const ans = await first(r);
+    const { ans, tap } = await ask(r);
     expect(ans.status).toBe(202);
-    expect(r.k.firstView(CAIN, CAIN).body).toMatchObject({ status: "ready", pr: 46, head: HEAD });
+    expect(await view(r, tap.body.request)).toMatchObject({ status: "ready", verified: true, request: tap.body.request, backup_first: 1, window_ms: TAP_WINDOW_MS });
     expect(r.backupsMade).toEqual([CAIN]);
     const name = r.k.st.firstBackup![CAIN].name;
-    expect(name.startsWith(`Keeper ${ID} `)).toBe(true);          // the attempt's own name
+    expect(name).toBe(`Keeper ${ID} ${tap.body.nonce.slice(0, 8)}`);                 // named by the tap's nonce
+    expect(r.logs.some((l) => l.includes("backup first timing: the backup took"))).toBe(true);
     r.advance(4 * 60_000);                                         // Cain restarted, the token issued, his Ship run started
-    r.f.makeBackup = async () => ({ slug: "kb-second" });
-    const reg = await r.register();
+    const reg = await r.register({ first: { ...tap, reuse: true } });
     expect(reg.status).toBe(200);
     expect(reg.body.backup).toBe("kb-first");
     expect(r.backupsMade).toEqual([CAIN]);                          // no second backup, so no second stop of Cain
     expect(r.a().backupName).toBe(name);
-    expect(r.logs.some((l) => l.startsWith(`${ID}: uses the backup Keeper took first, kb-first`))).toBe(true);
-    expect(r.k.st.firstBackup?.[CAIN]).toBeUndefined();            // used once, then removed
+    expect(r.logs.some((l) => l.startsWith(`${ID}: uses the backup Keeper took first, kb-first`) && l.includes("backup first timing: tap to registration"))).toBe(true);
+    expect(await view(r, tap.body.request)).toMatchObject({ status: "consumed", verified: false });
     expect(r.claim().status).toBe(200);
     r.install(); await r.poll(2);
     expect(r.a().status).toBe("watching");
   });
-  test("a backup older than the window isn't used: Keeper takes one as today, and the unused one is kept for the cleanup", async () => {
+  test("item 3: the same nonce never registers twice (consumed once), and POST is idempotent by request id", async () => {
+    const r = rig();
+    const { tap } = await ask(r);
+    const again = await r.k.backupFirst(CAIN, tap.body);
+    expect(again.status).toBe(200);
+    expect(r.backupsMade).toEqual([CAIN]);                          // the same request starts nothing new
+    expect((await r.k.backupFirst(CAIN, { ...tap.body, nonce: "9".repeat(32) })).status).toBe(409);   // the same request, other contents
+    expect((await r.register({ first: { ...tap, reuse: true } })).status).toBe(200);
+    const second = await r.k.registerAttempt(CAIN, { token: shipToken({ head: HEAD, now: r.now + 1000 }), app: CAIN, pr: 47, head: HEAD, from_version: "0.16.0", to_version: "0.17.0",
+      probe_hash: HASH, kind: "ship", first_nonce: tap.body.nonce, first_main: MAIN });
+    expect(second.status).toBe(409);
+    expect((await r.k.backupFirst(CAIN, tap.body)).status).toBe(409);   // a consumed request is never made again
+  });
+  test("item 1: fail closed: a stale backup first is refused at the registration with its reason, deleted at once, and no backup is made then", async () => {
     const r = rig();
     r.f.makeBackup = async () => ({ slug: "kb-first" });
-    await first(r);
+    const { tap } = await ask(r);
     r.f.backupsList = [{ slug: "kb-first", name: r.k.st.firstBackup![CAIN].name }];
-    r.advance(FIRST_BACKUP_MS + 60_000);
-    r.f.makeBackup = async () => ({ slug: "kb-second" });
-    const reg = await r.register();
+    r.advance(FIRST_BACKUP_MS - 60_000);
+    r.k.st.firstBackup![CAIN].madeAt = r.now - FIRST_BACKUP_MS - 60_000;   // its own snapshot older than the window
+    const reg = await r.register({ first: { ...tap, reuse: true } });
+    expect(reg.status).toBe(409);
+    expect(String(reg.body.why)).toContain(`over the ${FIRST_BACKUP_MS / 60_000} minutes`);
+    expect(String(reg.body.why)).toContain("a fresh Ship tap installs it");
+    expect(r.backupsMade).toEqual([CAIN]);                          // never a fallback backup for Cain's own install
+    expect(r.deleted).toEqual(["kb-first"]);                        // item 9: at once, not after the bounded grace
+    expect(r.k.st.attempts[ID]).toBeUndefined();
+  });
+  test("item 1: missing, unverified and other-nonce backups first are refused too; other Apps and drills keep the registration's backup", async () => {
+    const r2 = rig();
+    const none = await r2.k.registerAttempt(CAIN, { token: shipToken({ now: r2.now }), app: CAIN, pr: 46, head: HEAD, from_version: "0.16.0", to_version: "0.17.0", probe_hash: HASH, kind: "ship", first_nonce: "d".repeat(32), first_main: MAIN });
+    expect(none.status).toBe(409);
+    expect(String(none.body.why)).toContain("no backup taken first is waiting");
+    const r3 = rig();
+    r3.f.makeBackup = async () => ({ why: "500 busy" });
+    const { tap } = await ask(r3);
+    expect(await view(r3, tap.body.request)).toMatchObject({ status: "failed", verified: false });
+    expect(String((await view(r3, tap.body.request)).why)).toContain("500 busy");
+    const reg = await r3.register({ first: { ...tap, reuse: true } });
+    expect(reg.status).toBe(409);
+    expect(r3.backupsMade).toEqual([CAIN]);
+    // the generic path every other App keeps: its backup at the registration (Cain standing in), and a drill's own backup
+    const t = rig({ today: true });
+    expect((await t.register()).status).toBe(200);
+    expect(t.backupsMade).toEqual([CAIN]);
+    const d = rig();
+    expect((await d.k.backupFirst(CAIN, { ...d.tapFirst().body, app: HARNESS })).status).toBe(409);
+  });
+  test("item 7: the new Keeper and a link without backup first: Cain's install is refused with a clear message, nothing made", async () => {
+    const r = rig();
+    const reg = await r.register({ first: false });
+    expect(reg.status).toBe(409);
+    expect(String(reg.body.why)).toContain(FIRST_OLD_LINK_WHY);
+    expect(String(reg.body.why)).toContain("install Cain 0.19.4 once by hand");
+    expect(r.backupsMade).toEqual([]);
+    // the Keeper advertises backup first, for the Ship card's check
+    expect(await view(r)).toMatchObject({ status: "none", backup_first: 1 });
+  });
+  test("item 3: two taps for one head: the newer replaces the older at once; only the newest nonce registers", async () => {
+    const r = rig();
+    let n = 0;
+    r.f.makeBackup = async () => ({ slug: `kb-${++n}` });
+    const one = await ask(r);
+    r.f.backupsList = [{ slug: "kb-1", name: r.k.st.firstBackup![CAIN].name }];
+    const two = await ask(r);
+    expect(r.deleted).toEqual(["kb-1"]);                            // at most one outstanding: the older deleted at once
+    expect(await view(r, one.tap.body.request)).toMatchObject({ status: "failed" });
+    expect(await view(r, two.tap.body.request)).toMatchObject({ status: "ready", verified: true });
+    expect((await r.k.backupFirst(CAIN, one.tap.body)).status).toBe(409);   // the older request never comes back
+    const reg = await r.register({ first: { ...two.tap, reuse: true } });
     expect(reg.status).toBe(200);
-    expect(reg.body.backup).toBe("kb-second");
-    expect(r.backupsMade).toEqual([CAIN, CAIN]);
-    expect(r.logs.some((l) => l.includes("the backup taken first isn't used") && l.includes(`over the ${FIRST_BACKUP_MS / 60_000} minutes`))).toBe(true);
-    expect(r.k.st.keptBackups?.["kb-first"]).toMatchObject({ first: true, attempt: ID });
+    expect(reg.body.backup).toBe("kb-2");
+    // and an older nonce is refused (the newest one is then discarded as well: fail closed)
+    const r2 = rig();
+    const a1 = await ask(r2); await ask(r2);
+    const old = await r2.register({ first: { ...a1.tap, reuse: true } });
+    expect(old.status).toBe(409);
+    expect(String(old.body.why)).toContain("isn't the newest one");
   });
-  test("the window is the backup's own snapshot time, not the time it was asked for", async () => {
-    const r = rig();
-    // the Supervisor took the snapshot 20 minutes before Keeper's answer came back (its date is the backup's own)
-    r.f.makeBackup = async () => { r.f.backup = { ...r.f.backup!, date: new Date(r.now - 20 * 60_000).toISOString() }; return { slug: "kb-first" }; };
-    await first(r);
-    r.f.backup = { ...r.f.backup!, date: undefined as any };
-    delete (r.f.backup as any).date;
-    r.f.makeBackup = async () => ({ slug: "kb-second" });
-    const reg = await r.register();
-    expect(reg.body.backup).toBe("kb-second");
-  });
-  test("a backup from before a restore of Cain isn't used", async () => {
+  test("item 5: a restore between the tap and the registration (by hand through Home Assistant, or Keeper's own) invalidates the backup first", async () => {
     const r = rig();
     r.f.makeBackup = async () => ({ slug: "kb-first" });
-    await first(r);
+    const { tap } = await ask(r);
     r.advance(60_000);
-    // a rollback Keeper sent after that backup (an earlier attempt's restore)
-    r.k.st.attempts["ship-45-cain-00000000"] = { id: "ship-45-cain-00000000", app: CAIN, from: "0.15.0", to: "0.16.0", backup: "kb-old", deadline: 0, auth: "ship", authHash: "x",
+    r.f.restoreAt = r.now;                                          // a restore job in the Supervisor's jobs list
+    const v = await view(r, tap.body.request);
+    expect(v).toMatchObject({ status: "failed", restored_at: new Date(r.now).toISOString() });
+    expect(String(v.why)).toContain("was restored");
+    expect((await r.register({ first: { ...tap, reuse: true } })).status).toBe(409);
+    // the jobs list unreadable: a restore can't be ruled out, so the registration is refused
+    const r2 = rig();
+    const b = await ask(r2);
+    r2.f.restoreAt = null;
+    const reg = await r2.register({ first: { ...b.tap, reuse: true } });
+    expect(reg.status).toBe(409);
+    expect(String(reg.body.why)).toContain("a restore since the tap can't be ruled out");
+    // a restore Keeper sent itself, after the backup first's snapshot
+    const r3 = rig();
+    const c = await ask(r3);
+    r3.advance(60_000);
+    r3.k.st.attempts["ship-45-cain-00000000"] = { id: "ship-45-cain-00000000", app: CAIN, from: "0.15.0", to: "0.16.0", backup: "kb-old", deadline: 0, auth: "ship", authHash: "x",
       pr: 45, head: "0".repeat(40), authExpires: 0, probeHash: HASH, registeredAt: T0, status: "rolled back", notStarted: 0, healthFails: 0, startedEveryPoll: true, health: [],
-      restore: { tries: 1, nextTry: 0, limit: 0, inflight: false, called: true, sentAt: r.now } } as any;
-    r.advance(60_000);
-    r.f.makeBackup = async () => ({ slug: "kb-second" });
-    const reg = await r.register();
-    expect(reg.body.backup).toBe("kb-second");
-    expect(r.logs.some((l) => l.includes("is from before Keeper's restore of"))).toBe(true);
+      restore: { tries: 1, nextTry: 0, limit: 0, inflight: false, called: true, sentAt: r3.now } } as any;
+    expect((await r3.register({ first: { ...c.tap, reuse: true } })).status).toBe(409);
   });
-  test("a backup taken for another head isn't used, and is used once only", async () => {
+  test("item 6: bound to what installs: another main at the registration, or at the claim, is refused", async () => {
     const r = rig();
-    r.f.makeBackup = async () => ({ slug: "kb-first" });
-    await first(r, { head: headN(3) });
-    r.f.makeBackup = async () => ({ slug: "kb-second" });
-    const reg = await r.register();
-    expect(reg.body.backup).toBe("kb-second");
-    expect(r.logs.some((l) => l.includes("not this install's"))).toBe(true);
-    expect(r.k.st.firstBackup?.[CAIN]).toBeUndefined();
+    const { tap } = await ask(r);
+    const reg = await r.register({ first: { ...tap, reuse: true }, first_main: "d".repeat(40) });
+    expect(reg.status).toBe(409);
+    expect(String(reg.body.why)).toContain("isn't the one recorded at the tap");
+    const r2 = rig();
+    const b = await ask(r2);
+    expect((await r2.register({ first: { ...b.tap, reuse: true } })).status).toBe(200);
+    expect(r2.a().firstMain).toBe(MAIN);
+    const c = r2.claim(ID, { main: "d".repeat(40) });
+    expect(c.status).toBe(409);
+    expect(String(c.body.why)).toContain("what installs moved");
+    expect(r2.claim(ID, { main: undefined }).status).toBe(409);      // a claim naming no main is refused as well
+    expect(r2.claim().status).toBe(200);
+    // a version at main other than the one recorded at the tap
+    const r3 = rig();
+    const t3 = await ask(r3, r3.tapFirst({ to: "0.18.0" }));
+    expect((await r3.register({ first: { ...t3.tap, reuse: true } })).status).toBe(409);
   });
-  test("only Cain's link asks, and only for Cain's own install; never beside an open attempt", async () => {
+  test("item 9: refused when backup storage is low (nothing made), and an unconsumed backup first is deleted at once when it expires", async () => {
     const r = rig();
-    expect((await r.k.backupFirst(HARNESS, { app: CAIN, pr: 46, head: HEAD })).status).toBe(403);
-    expect((await r.k.backupFirst(CAIN, { app: HARNESS, pr: 46, head: HEAD })).status).toBe(409);
-    expect((await r.k.backupFirst(CAIN, { app: CAIN, pr: 46, head: "nope" })).status).toBe(409);
+    r.f.free = 100 * 1024 ** 2;
+    const { ans } = await ask(r);
+    expect(ans.status).toBe(507);
+    expect(String(ans.body.why)).toContain("no room for its backup");
+    expect(r.backupsMade).toEqual([]);
+    const r2 = rig();
+    r2.f.makeBackup = async () => ({ slug: "kb-first" });
+    const { tap } = await ask(r2);
+    r2.f.backupsList = [{ slug: "kb-first", name: r2.k.st.firstBackup![CAIN].name }];
+    r2.advance(FIRST_BACKUP_MS + 60_000);
+    await r2.poll();
+    expect(r2.deleted).toEqual(["kb-first"]);
+    expect(await view(r2, tap.body.request)).toMatchObject({ status: "failed" });
+    expect(r2.k.st.firstBackup?.[CAIN]).toBeUndefined();
+  });
+  test("a Keeper restart while the backup first is made: it fails, and its request answers failed", async () => {
+    const r = rig();
+    r.f.makeBackup = () => new Promise(() => {});
+    const tap = r.tapFirst();
+    expect((await r.k.backupFirst(CAIN, tap.body)).status).toBe(202);
+    const r2 = rig({ saved: JSON.parse(JSON.stringify(r.k.st)) });
+    expect(await view(r2, tap.body.request)).toMatchObject({ status: "failed", why: "Keeper restarted while it was made" });
+  });
+  test("only Cain's link asks, and only for Cain's own install; never beside an open attempt; an unknown request answers unknown", async () => {
+    const r = rig();
+    const b = r.tapFirst().body;
+    expect((await r.k.backupFirst(HARNESS, b)).status).toBe(403);
+    expect((await r.k.backupFirst(CAIN, { ...b, head: "nope" })).status).toBe(409);
+    expect((await r.k.backupFirst(CAIN, { ...b, nonce: "short" })).status).toBe(409);
+    expect((await r.k.firstView(HARNESS, CAIN)).status).toBe(403);
+    expect(await view(r, "0".repeat(16))).toMatchObject({ status: "unknown", verified: false });
     expect(r.backupsMade).toEqual([]);
     await r.register();
-    const ans = await r.k.backupFirst(CAIN, { app: CAIN, pr: 47, head: headN(4) });
+    const ans = await r.k.backupFirst(CAIN, r.tapFirst({ pr: 47, head: headN(4) }).body);
     expect(ans.status).toBe(409);
     expect(String(ans.body.why)).toContain("another attempt");
   });
-  test("a failed backup first is said in its view, and the registration then backs up as today", async () => {
-    const r = rig();
-    r.f.makeBackup = async () => ({ why: "500 busy" });
-    await first(r);
-    expect(r.k.firstView(CAIN, CAIN).body).toMatchObject({ status: "failed" });
-    r.f.makeBackup = async () => ({ slug: "kb-second" });
-    expect((await r.register()).body.backup).toBe("kb-second");
-  });
-  test("an unused backup taken first is deleted by the bounded cleanup after its limit, like any kept backup", async () => {
-    const r = rig();
-    r.f.makeBackup = async () => ({ slug: "kb-first" });
-    await first(r);
-    const name = r.k.st.firstBackup![CAIN].name;
-    r.f.backupsList = [{ slug: "kb-first", name }];
-    await first(r, { pr: 47, head: headN(5) });                  // replaced: the first one is kept unused
-    expect(r.k.st.keptBackups?.["kb-first"]).toMatchObject({ first: true });
-    r.advance(49 * 3_600_000);
-    r.k.st.cleanupAt = r.now - CLEANUP_TICK_MS;
-    await r.poll();
-    expect(r.deleted).toContain("kb-first");
-  });
-  test("other Apps' installs and Cain's without a backup first are unchanged", async () => {
-    const r = rig();
-    const reg = await r.register();
-    expect(reg.status).toBe(200);
-    expect(r.backupsMade).toEqual([CAIN]);
-    expect(r.logs.some((l) => l.includes("took first"))).toBe(false);
+  test("item 8: one timing file, the same bytes in the link and the Keeper; the backup phase is Keeper's backup bound; production never sets selfApp", () => {
+    const here = readFileSync(join(import.meta.dir, "..", "rootfs", "opt", "keeper", "backup-first-timing.ts"), "utf8");
+    const link = readFileSync(join(import.meta.dir, "..", "..", "cain", "rootfs", "opt", "cain", "link", "backup-first-timing.ts"), "utf8");
+    expect(here).toBe(link);
+    expect(FIRST_PHASES_MS.backup).toBe(REGISTER_WAIT_MS);
+    expect(TAP_WINDOW_MS).toBe(FIRST_PHASES_MS.backup + FIRST_PHASES_MS.restart + FIRST_PHASES_MS.session);
+    expect(FIRST_BACKUP_MS).toBeGreaterThan(TAP_WINDOW_MS);
+    const main = readFileSync(join(import.meta.dir, "..", "rootfs", "opt", "keeper", "main.ts"), "utf8");
+    expect(main).not.toContain("selfApp");
+    expect(main).toContain("restoreSeenAt: sup.restoreSeenAt");
   });
 });

@@ -441,7 +441,7 @@ async function serve(): Promise<void> {
   const k = new Keeper({
     now: Date.now, version, self,
     appInfo: sup.appInfo, backupInfo: sup.backupInfo, makeBackup: sup.makeBackup, restore: sup.restore, deleteBackup: sup.deleteBackup, job: sup.job, hcChecks: (key) => hcChecks(key),
-    backups: sup.backups, activeJobs: sup.activeJobs, backupJobs: sup.backupJobs, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
+    backups: sup.backups, activeJobs: sup.activeJobs, backupJobs: sup.backupJobs, restoreSeenAt: sup.restoreSeenAt, installStartedAt: sup.installStartedAt, hcKeyStore: hcKeyStore(),
     installJobs: sup.installJobs, drillSpent: drillSpent(),   // (0.1.15) items 2 and 10
     diskFree: sup.diskFree, download: (slug, o) => archives().through(slug, (path) => sup.downloadTo(slug, path, o)), archives: archives(),
     // (0.1.17) in a child process; fix round: given what the check's deadline leaves, and stopped by its abort

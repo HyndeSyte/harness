@@ -436,6 +436,22 @@ Ship run the link refused or that failed can leave a live claim on the Keeper fo
 installed from Home Assistant's page while a Ship run is live, or until the Keeper's log shows no live claim (each
 claim's start and end is logged there with its deadline).
 
+## Backup first, the one-time install (Cain 0.19.4, Keeper 0.1.19)
+
+An install of Cain goes through the Ship tap backed up first (Keeper DOCS, "Cain backed up first"): the link asks
+the Keeper for Cain's backup at the tap, and the token comes only once the Keeper says that backup is verified.
+Keeper 0.1.19 refuses Cain's own install from a link older than Cain 0.19.4 ("this registration carries no tap
+nonce"), and Cain 0.19.3's link cancels its own install, so the first install of Cain 0.19.4 is done once by hand,
+on Dane's word at the device:
+
+1. Install Keeper 0.1.19 first, as Keeper's own updates go (above: a backup taken first, no 4a), while no attempt of
+   Cain is open.
+2. Then update Cain to 0.19.4 from Home Assistant's own page, with its backup before updating on, once Keeper's log
+   shows no live claim. Keeper logs it as unprotected (no claim): nothing is rolled back for it, and that Home
+   Assistant backup is the way back.
+3. From then on, Cain's updates go through the Ship tap. His Ship card says so when the Keeper can't back him up
+   first.
+
 ## The Keeper's setup (Dane, once, and after its state is lost)
 
 At the Pi, with the SSH App, in the Keeper App's container (`docker exec "$(docker ps --format '{{.Names}}' | grep 0fcc2575_keeper)" bun

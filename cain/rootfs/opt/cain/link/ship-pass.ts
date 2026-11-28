@@ -174,7 +174,7 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
   } catch { log("couldn't record the keeper's enrollment"); }
 };
 
-export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
+export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string; main?: string }   // (Cain 0.19.4) main: backed up first, the tap's main commit
 export interface Claimed { attempt: string; claim: string; until: string }
 export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
@@ -424,6 +424,9 @@ export interface RegisterDeps {
   drill?: DrillDeps;
   // (Keeper 0.1.14) POST /attempt/<id>/drill-mark on the keeper: the link's confirmation that it wrote the drill's signed mark
   markPost?: (attempt: string, body: unknown) => Promise<{ status: number; body: any } | null>;
+  // (Cain 0.19.4) the used backup-first tap this token's claim stands for (backup-first.ts usedFor): its nonce and main commit go
+  // with Cain's registration, and the Keeper uses the backup taken first only for that nonce
+  first?: (c: Claim) => { nonce: string; main: string } | null;
 }
 // The registration of each watched App the tap installs (0.1.5: register, then poll): ok only when every one
 // is accepted (the keeper's answer "accepted" for that App and versions, with its attempt id and backup
@@ -470,8 +473,11 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
     }
     // (Keeper 0.1.14) a drill that won't be a definitive acceptance: the install refused (by the caller's say), the owner paged once
     const notAccepted = (why: string) => { if (drill) { d.log(`keeper registration: the spent drill flag (${drill}) installs nothing: ${why}`); d.drill!.page("accept", `accept:${nonce}`, { version: b.version }); } };
+    // (Cain 0.19.4) Cain's own install carries its tap's nonce and main commit; without one the Keeper refuses it (fail closed)
+    let tapFirst: { nonce: string; main: string } | null = null;
+    if (!drill && slug === "0fcc2575_cain" && d.first) { try { tapFirst = d.first(c); } catch { tapFirst = null; } }
     const r = await d.post({ token, app: slug, pr: c.pr, head: c.head, from_version: from, to_version: b.version, kind: drill ? "drill" : "ship",
-      ...(drill ? { drill_mode: drill, drill_nonce: nonce } : {}),
+      ...(drill ? { drill_mode: drill, drill_nonce: nonce } : {}), ...(tapFirst ? { first_nonce: tapFirst.nonce, first_main: tapFirst.main } : {}),
       probe_hash: createHash("sha256").update(probe).digest("hex").slice(0, 16) }).catch(() => null);
     let j = r?.body ?? {};
     if (!r || r.status !== 202 || j.status !== "pending" || typeof j.id !== "string" || !ATTEMPT_ID.test(j.id)) {
@@ -522,7 +528,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
         }
         say(`${b.app} ${b.version} is a drill (${drill}): it fails on purpose so the keeper rolls it back`, false);
       }
-      accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version });
+      accepted.push({ app: slug, attempt, backup: j.backup, from, to: b.version, ...(tapFirst ? { main: tapFirst.main } : {}) });
       say(`${b.app} ${from} to ${b.version} accepted as ${attempt}, backup ${j.backup}`, false);
     } else if (last?.status === 200 && j.status === "refused" && j.code === "no_space") {
       // (Keeper 0.1.10) no room for the keeper's backup: the install is refused. Keeper 0.1.11: always; the link posts one card
