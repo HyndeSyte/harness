@@ -81,7 +81,8 @@ import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, 
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
+import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses, reapPasses, RELAY_MAX } from "./ship-pass";
+import { flockFile } from "./pass-lock";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -442,6 +443,8 @@ const shipPassDeps: PassDeps = {
   now: Date.now,
   load: () => { try { return readFileSync(SHIP_PASSES, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; return "unreadable"; } },
   store: (text) => writeSynced(SHIP_PASSES, text),
+  // Cain 0.19.4, review round 1: every transition of the pass file under one flock, held across its read, check and rename
+  lock: flockFile(`${SHIP_PASSES}.lock`),
   // Keeper 0.1.5: POST /attempt answers 202 at once and the link polls GET /attempt/<id> until accepted or
   // refused (ATTEMPT_WAIT_MS per App); the pass stays "pending" meanwhile (ship-pass.ts).
   register: (tok, claim, done, note) => {
@@ -464,15 +467,23 @@ const shipPassDeps: PassDeps = {
   // Keeper 0.1.15: the wait for Keeper's acceptance (keeper_accept_min), and its reads for the reconcile at start
   waitMs: ACCEPT_WAIT_MS,
   view: (attempt) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${attempt}`) : Promise.resolve(null),
-  // Cain 0.19.4: a pass the keeper's own backup restart left waiting is resumed: its token signed again from the kept claim (the same
-  // token), and Cain told to start the same Ship run again (or why it can't go on), through the same durable queue as the Ship tap's line
+  // Cain 0.19.4: a pass the keeper's own backup restart left waiting is resumed, and Cain told to start the same Ship run again by its
+  // pass id (or why it can't go on), through the same durable queue as the Ship tap's line. Review round 1: the token is never put in
+  // the queue; it is signed again from the kept claim (the same token) only for the Ship run's hook (ship-pass.ts fetchToken). A line
+  // is written whole or not at all: one too long or with a line break throws, and the pass is cancelled.
   sign: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
-  relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
+  relay: (text) => {
+    if (text.length > RELAY_MAX || /[\r\n\t]/.test(text)) throw new Error("a Ship pass line too long or not one line");
+    appendSynced(QUEUE, JSON.stringify({ text }) + "\n");
+  },
   log: (l) => console.log(`[cain] link: ${l}`),
 };
 // Keeper 0.1.15 items 3 and 6: a pass a crash or restart left open is refused and its attempts cancelled; a passed one is read.
 // Cain 0.19.4: one left waiting for the keeper (its own backup stops and starts this App) is resumed instead (ship-pass.ts)
 void reconcilePasses(shipPassDeps).catch((e) => console.log(`[cain] link: the reconcile at start failed: ${String(e).slice(0, 80)}`));
+// Cain 0.19.4, review round 1: the one deadline-driven reaper, every half minute, after the reconcile: a pass past its pending deadline
+// without a claim is refused and cancelled at the Keeper, and every owed cancel is sent again until the Keeper confirms
+setInterval(() => { void reapPasses(shipPassDeps).catch((e) => console.log(`[cain] link: the Ship pass reaper failed: ${String(e).slice(0, 80)}`)); }, 30_000);
 const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ, shipPass: (b: any) => shipPass(shipPassDeps, b) };
 const route = linkRoutes(routeDeps);
 

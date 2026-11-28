@@ -236,6 +236,40 @@ export async function postShipPass(token: string, o: { url?: string; key?: strin
   }
 }
 
+// (Cain 0.19.4, review round 1) A Ship run resumed after the restart Cain's cold backup causes carries the link's pass id
+// ("Ship pass: <32 hex>") instead of his Ship token, so the token never goes through Cain's queue or his relayed line. The hook asks
+// the link for the token by that id (POST /ship-pass {fetch}, the same local channel and key as its pass), puts it in the run's text
+// in place of the pass line, and the whole decision then runs on that text; a run it lets through goes with that text (allow, with
+// the updated input). The link hands the token only for a pass accepted again after a restart and relayed to Cain. Not both a token
+// and a pass id; one pass line only.
+export const PASS_REF = /\bShip pass: ([0-9a-f]{32})(?![0-9a-f])/;
+export async function resolvePassRef(call: any, fetchToken: (id: string) => Promise<{ token: string } | { why: string }>): Promise<{ call: any; rewritten: boolean } | { why: string }> {
+  const t = call?.tool_input;
+  if (call?.tool_name !== undefined && call.tool_name !== "RemoteTrigger") return { call, rewritten: false };
+  if (!t || String(t.action ?? "") !== "run" || String(t.trigger_id ?? "") !== SHIP) return { call, rewritten: false };
+  const text = typeof t.body?.text === "string" ? t.body.text : "";
+  if (!/Ship pass:/i.test(text)) return { call, rewritten: false };
+  const m = PASS_REF.exec(text);
+  if (!m || (text.match(/Ship pass:/gi) ?? []).length !== 1) return { why: "A resumed Ship job carries one line \"Ship pass: <id>\", exactly as the relayed line gave it." };
+  if (findToken(text)) return { why: "A Ship job carries his Ship token or, after the App's restart, the link's Ship pass id: not both." };
+  const r = await fetchToken(m[1]);
+  if ("why" in r) return { why: `The link didn't hand over the Ship token for that pass: ${r.why}. Nothing was installed; if the install still has to happen, show a new Ship card for the same pull request and head.` };
+  if (!findToken(r.token) || findToken(r.token) !== r.token) return { why: "The link's answer for that pass isn't a Ship token. Nothing was installed." };
+  const rewritten = text.replace(m[0], `Ship token: ${r.token}`);
+  return { call: { ...call, tool_input: { ...t, body: { ...t.body, text: rewritten } } }, rewritten: true };
+}
+export async function fetchPassToken(id: string, o: { url?: string; key?: string; keyFile?: string; fetch?: typeof fetch } = {}): Promise<{ token: string } | { why: string }> {
+  let key = o.key ?? "";
+  if (!key) { try { key = readFileSync(o.keyFile ?? CAIN_KEY_FILE, "utf8").trim(); } catch { return { why: "this start has no key for the link" }; } }
+  try {
+    const r = await (o.fetch ?? fetch)(`${o.url ?? LINK_URL}/ship-pass`, { method: "POST", body: JSON.stringify({ fetch: id }),
+      headers: { "content-type": "application/json", "x-harness-key": key }, signal: AbortSignal.timeout(3_000) });
+    const j: any = await r.json().catch(() => ({}));
+    if (r.ok && j?.status === "token" && typeof j.token === "string") return { token: j.token };
+    return { why: String(j?.said ?? `the link answered ${j?.status ?? r.status}`).slice(0, 200) };
+  } catch (e) { return { why: `the link didn't answer (${String(e).slice(0, 60)})` }; }
+}
+
 // The whole decision: the checks (decide, with the usage guard), then for a Ship run that passed them the
 // link's one-run-per-token pass, last, so only a run that would otherwise start spends its token.
 export async function decideAll(call: any, holdsText: string | null, env: Env,
@@ -257,16 +291,27 @@ export async function decideAll(call: any, holdsText: string | null, env: Env,
 
 if (import.meta.main) {
   let reason: string;
+  let allowed: any = null;
   if (testMode()) reason = `${TEST_MODE_VAR} is set, a tests-only variable, so no Build or Ship run starts. The App's run script never sets it: log it as a Build item.`;
   else {
     const p = paths();
     const now = Date.now();
     const reading = (label: Label, what: string): Verdict => label !== "other" ? { ok: true }
       : guardDecide(label, readings({ settingsFile: p.settings, spendFile: p.spend, tz: p.tz, now: new Date(now) }), new Date(now));
-    try { reason = await decideAll(JSON.parse(await Bun.stdin.text()), read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w),
-      (tok) => postShipPass(tok), (tok, why) => postShipPassCancel(tok, why)); }
+    try {
+      const res = await resolvePassRef(JSON.parse(await Bun.stdin.text()), (id) => fetchPassToken(id));
+      if ("why" in res) reason = res.why;
+      else {
+        reason = await decideAll(res.call, read(HOLDS), { pub: read(SHIP_PUB), stop: readStop(), now }, reading, (l, w) => postHold(l, w),
+          (tok) => postShipPass(tok), (tok, why) => postShipPassCancel(tok, why));
+        if (!reason && res.rewritten) allowed = res.call.tool_input;
+      }
+    }
     catch { reason = "couldn't read the RemoteTrigger call, so it's refused"; }
   }
   if (reason) process.stdout.write(JSON.stringify({ hookSpecificOutput: {
     hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }));
+  // (Cain 0.19.4, review round 1) a resumed Ship run goes with his token put in by the hook, never typed by Cain
+  else if (allowed) process.stdout.write(JSON.stringify({ hookSpecificOutput: {
+    hookEventName: "PreToolUse", permissionDecision: "allow", permissionDecisionReason: "the resumed Ship run, with his Ship token put in by the hook from the link's pass", updatedInput: allowed } }));
 }
