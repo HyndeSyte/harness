@@ -920,10 +920,39 @@ class Ledger:
                 raise LedgerError(f"job {job_id}: terminal {new_state} needs a receipt")
             d.execute("UPDATE jobs SET state=?, updated_at=? WHERE id=?",
                       (new_state, iso(self.now()), job_id))
+            if old == "running":
+                self._fill_note_slot(d, job_id, new_state)
             if receipt:
                 d.execute("INSERT INTO receipts(job_id, kind, detail, created_at)"
                           " VALUES(?,?,?,?)",
                           (job_id, new_state, receipt, iso(self.now())))
+
+    def _fill_note_slot(self, d, job_id: str, new_state: str) -> None:
+        """Harness 0.24.5, round 3: a request read again in place for Cain's note holds its message's slot
+        (controller._note_for_question_in). Its answer, a card or words, is recorded in the same transaction
+        as this move out of running, and so is the slot's: claimed becomes answered, with the state."""
+        row = d.execute("SELECT value FROM meta WHERE key=?", (f"note_slot_of:{job_id}",)).fetchone()
+        if row is None:
+            return
+        slot = d.execute("SELECT value FROM meta WHERE key=?", (row[0],)).fetchone()
+        try:
+            held = json.loads(slot[0]) if slot else None
+        except ValueError:
+            held = None
+        if not isinstance(held, dict) or held.get("state") != "claimed" or held.get("job") != job_id:
+            return
+        d.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps(
+            {**held, "state": "answered", "answer": new_state, "at": iso(self.now())}), row[0]))
+
+    def note_slot_claimed(self, job_id: str) -> bool:
+        """Whether this request is a re-run for Cain's note whose answer isn't recorded yet (round 3)."""
+        row = self.db.execute("SELECT value FROM meta WHERE key=?", (f"note_slot_of:{job_id}",)).fetchone()
+        slot = self.db.execute("SELECT value FROM meta WHERE key=?", (row[0],)).fetchone() if row else None
+        try:
+            held = json.loads(slot[0]) if slot else {}
+        except ValueError:
+            return False
+        return isinstance(held, dict) and held.get("state") == "claimed" and held.get("job") == job_id
 
     def open_jobs(self) -> list[sqlite3.Row]:
         marks = ",".join("?" * len(TERMINAL))

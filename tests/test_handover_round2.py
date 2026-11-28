@@ -83,7 +83,8 @@ def test_a_removal_card_names_the_event_it_binds_to(m):
     uid = m.blocks["drop"][1]
     line = m.seen()[-1]
     assert "the Gmail event “Busy (school drop-off)”, 8:00 AM Wed Nov 11" in line
-    assert f"id ending {uid[-6:]}" in line
+    # 0.24.5: the id stays bound in the ledger, never on the card.
+    assert "id ending" not in line and uid[-6:] not in line
 
 
 def test_a_removal_never_takes_off_another_event_than_the_card_named(m):
@@ -95,7 +96,10 @@ def test_a_removal_never_takes_off_another_event_than_the_card_named(m):
     other = dict(m.gmail.events.pop(uid), id="other0drop", etag='"9"')
     m.gmail.events["other0drop"] = other
     m.tap("Approve")
-    assert m.seen()[-1].startswith("Nothing changed: the event to take off isn't the one that card named")
+    # Harness 0.24.5, round 3: refused as changed since the card, and one fresh card follows.
+    said = next(t for t in m.seen() if t.startswith("Nothing changed: the event changed since your card"))
+    assert "the event to take off isn't the one that card named" in said and "A fresh card" in said
+    assert m.seen()[-1].startswith("Change your calendar?")
     assert m.gmail.events["other0drop"].get("status", "confirmed") == "confirmed"
 
 

@@ -365,6 +365,39 @@ def change_line(c: dict, tz: str, now: datetime) -> str:
     return f"Add {title} {at}{where}"
 
 
+# Harness 0.24.5, round 3: the first line of a card made by a re-run for Cain's note after the message was
+# answered only in words.
+RECONSIDERED = "Reconsidered after Cain's note:"
+
+# An en or em dash between two words (a letter or a closing mark on each side), never one between digits.
+_WORD_DASH = re.compile(r"(?<=[^\W\d_]|[)\"\u201d'])\s*[\u2013\u2014]\s*(?=[^\W\d_]|[(\"\u201c'])")
+
+CHECK_MAX = 900          # characters of the check line's points, before it's escaped
+
+
+def check_line(warnings) -> list[str]:
+    """A calendar change's warnings folded into one short line (0.24.5): the points separated by
+    semicolons, each without its own full stop. [] when there are none. Review round: only a bullet
+    dash leading a point and an em or en dash set between words come out (as a comma); a hyphen inside
+    a word, a time range (9:00-10:00) or a date (2026-12-21) stays. Round 3: an en or em dash between
+    digits (9:00\u201310:00, Dec 21 \u2013 28) stays as it is too; only one with a letter on each side goes.
+    Escaped once, last, after any cut."""
+    points = []
+    for w in warnings:
+        text = re.sub(r"^\s*(?:[-*\u2022\u2013\u2014]\s+)+", "", str(w))       # a leading bullet
+        text = _WORD_DASH.sub(", ", text)                                   # a dash between words
+        text = text.strip().rstrip(".").strip()
+        if text:
+            points.append(text)
+    points = list(dict.fromkeys(points))
+    if not points:
+        return []
+    joined = "; ".join(points)
+    if len(joined) > CHECK_MAX:
+        joined = joined[:CHECK_MAX].rsplit(" ", 1)[0].rstrip(",;") + " \u2026"
+    return [f"\u26a0 <b>Check before approving:</b> {escape(joined)}."]
+
+
 def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime,
                   job_id: str, warnings=(), lines: list[str] | None = None,
                   now: datetime | None = None) -> str:
@@ -378,7 +411,7 @@ def proposal_card(effect: EffectDef, params: dict, *, tz: str, expires: datetime
             lines = [change_line(c, tz, now or expires) for c in params["changes"]]
         return fit("\n".join([
             "<b>Change your calendar?</b>",
-            *[f"\u26a0 <b>Check before approving:</b> {escape(w)}" for w in warnings],
+            *check_line(warnings),
             *lines]))
     if effect.name == "calendar_hold":
         lines = [

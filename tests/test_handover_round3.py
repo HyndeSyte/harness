@@ -358,7 +358,7 @@ def test_taking_off_one_day_of_a_series_binds_that_occurrence_and_undo_puts_back
     m.claude.script = [ask(change("gmail", "remove", "Swim"))]
     m.handover(paired=OWNER, message=mid)
     card = m.seen()[-1]
-    assert "this occurrence only (the rest of the series stays)" in card and "id ending 1230000Z"[-6:] in card
+    assert "this occurrence only (the rest of the series stays)" in card and "id ending" not in card
     bound = m.cc.bound_of(m.ledger.db.execute("SELECT id FROM proposals WHERE state='proposed'").fetchone()[0])
     assert bound["bound"][0]["recurrence"] == today and bound["bound"][0]["scope"] == "occurrence"
     m.tap("Approve")

@@ -639,7 +639,8 @@ def test_cains_rules_keeper_and_docs_name_this_rounds_behaviour():
     assert "migrate-clock" in keeper
     # Cain's side is the section that introduced the calendar specialist's restore, restart and clock
     # behaviour, Cain 0.17.0, found by its version heading (newer Cain sections need not repeat it).
-    for log in ((ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## ", 2)[1],
+    # Harness's side is likewise its 0.24.4 section, found by its version heading.
+    for log in ((ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## 0.24.4\n", 1)[1].split("\n## ", 1)[0],
                 cain_changelog_section("0.17.0")):
         assert "restart" in log.lower() and "clock" in log.lower()
 
