@@ -15,6 +15,7 @@ until his tap, and it does not move the stage.
 """
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -226,9 +227,29 @@ def _change_time(text: str, *, day_ok: bool = False) -> bool:
         and _YEARS[0] <= when.year <= _YEARS[1]
 
 
+COPY_BINDING = ("key", "src", "src_v", "fam", "fam_v")
+
+
+def _copy_binding(c: dict) -> None:
+    """A copy fix's binding: the copy's key, its Gmail event's id and version, and the Family copy's address and
+    version, as the card read them. Only a move of the copy to its event, or the copy's removal, on Family."""
+    try:
+        b = json.loads(c["copy"])
+    except ValueError:
+        raise ParamError("a copy fix's binding can't be read") from None
+    if not isinstance(b, dict) or not all(isinstance(b.get(k), str) for k in COPY_BINDING) \
+            or not (b["key"] and b["src"] and b["fam"] and b["fam_v"]) or len(c["copy"]) > 2000:
+        raise ParamError("a copy fix's binding has the wrong shape")
+    if c["calendar"] != "family" or c["op"] not in ("move", "remove"):
+        raise ParamError("a copy fix only moves or removes a Family copy")
+    if c["op"] == "move" and not b["src_v"]:
+        raise ParamError("a copy fix's move needs its Gmail event's version")
+
+
 def _one_change(c: Any) -> None:
     # "kind" came with rules and "every" with repeats; a change written before them has neither.
-    if not isinstance(c, dict) or not _CHANGE_KEYS <= set(c) <= _CHANGE_KEYS | {"kind", "every"} \
+    # "copy" (Nov 27): a fix to a Family copy, bound to its Gmail event and the copy as the card read them.
+    if not isinstance(c, dict) or not _CHANGE_KEYS <= set(c) <= _CHANGE_KEYS | {"kind", "every", "copy"} \
             or not all(isinstance(v, str) for v in c.values()):
         raise ParamError("a change has the wrong shape")
     if c["calendar"] not in ("family", "gmail"):
@@ -251,6 +272,8 @@ def _one_change(c: Any) -> None:
         return
     if c.get("kind"):
         raise ParamError(f"{op} doesn't fit kind")
+    if "copy" in c:
+        _copy_binding(c)
     if c.get("every", "") not in ("", "1", "2", "3", "4") or (c.get("every") and op != "add_series"):
         raise ChangeRefusal("I couldn't read how often that repeats")
     days =[x for x in c["dates"].split(",") if x]
