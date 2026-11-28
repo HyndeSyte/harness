@@ -1,4 +1,4 @@
-# Cain 0.19.3: the run script's background loops (services.d/cain/run), sourced there. The run script runs
+# Cain 0.19.4: the run script's background loops (services.d/cain/run), sourced there. The run script runs
 # under bashio, which sets errexit, so a loop written "while true; do bun x.ts; sleep 5; done" ended its
 # subshell the first time its child exited non-zero (a crash, or a SIGTERM's 143) and that service stayed
 # down until the App restarted. keep_running never lets its child's exit end the loop:

@@ -340,7 +340,7 @@ if [ "$mode" = old ]; then
   fi
 fi
 
-# The background loops below run their child through keep_running (Cain 0.19.3): under bashio's errexit a
+# The background loops below run their child through keep_running (Cain 0.19.4): under bashio's errexit a
 # child's non-zero exit or a signal used to end its loop for good; now it is logged with its code and the
 # child starts again, backing off when it keeps exiting at once.
 . "$OPT/keep-running.sh"
@@ -634,7 +634,7 @@ if [ "$mode" != none ] && [ -z "$held" ]; then checkins; fi
 printf '%s' '<!doctype html><meta name=viewport content="width=device-width"><p>No sign-in link on screen yet. Type /login in the Cain page, then reload this.</p>' > /run/cain-web/www/signin.html \
   || bashio::log.error "Couldn't write the sign-in page"
 (
-  # Each pass in a subshell of its own (Cain 0.19.3): under errexit a failed write (a full disk, a
+  # Each pass in a subshell of its own (Cain 0.19.4): under errexit a failed write (a full disk, a
   # missing page) ended this loop for good; now that pass ends and the next one runs.
   while true; do (
     screen=$($TMUX_CMD -u capture-pane -p -J -t cain -S -400 2>/dev/null || true)

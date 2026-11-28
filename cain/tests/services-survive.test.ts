@@ -1,4 +1,4 @@
-// Cain 0.19.3: the App's background services survive their child's exit (keep-running.sh, sourced by services.d/cain/run), and
+// Cain 0.19.4: the App's background services survive their child's exit (keep-running.sh, sourced by services.d/cain/run), and
 // the drill store says why it failed (link/drill.ts: the error's code, system call and path in its one log line) and moves a
 // stray temp that isn't a regular file aside (never deleting it).
 import { describe, expect, test } from "bun:test";

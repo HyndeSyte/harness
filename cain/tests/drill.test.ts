@@ -329,7 +329,7 @@ describe("fix 4: spent nonces", () => {
     const ex = cfg.slice(cfg.indexOf("backup_exclude:"), cfg.indexOf("timeout:"));
     expect(ex).toContain('  - "link/keeper-drill-spent*"');
     const main = readFileSync(join(ROOT, "rootfs/opt/cain/link/main.ts"), "utf8");
-    // Cain 0.19.2: main.ts builds the store with linkDrillStore (drill.ts), handing it the link's folder (Cain 0.19.3: and its log)
+    // Cain 0.19.2: main.ts builds the store with linkDrillStore (drill.ts), handing it the link's folder (Cain 0.19.4: and its log)
     expect(main).toContain("linkDrillStore(process.env, TRUST_DIR, DIR, Date.now, ");
     const drillSrc = readFileSync(join(ROOT, "rootfs/opt/cain/link/drill.ts"), "utf8");
     expect(drillSrc).toContain("env.CAIN_DRILL_SPENT ?? `${linkDir}/keeper-drill-spent`");

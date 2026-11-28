@@ -231,7 +231,7 @@ export interface DrillStore {
   // (Keeper 0.1.15) item 15: the later of now and the highest time the spent list has seen, persisted before it is answered
   highWater: (nowMs: number) => number;
 }
-// Why a store call failed, for the one log line that says so (Cain 0.19.3): the error's code, system call and path, never a
+// Why a store call failed, for the one log line that says so (Cain 0.19.4): the error's code, system call and path, never a
 // file's contents (a parse error says only its kind, since its message can quote the file).
 export function storeWhy(e: unknown): string {
   const x = e as { code?: unknown; syscall?: unknown; path?: unknown; name?: unknown } | null;
@@ -246,7 +246,7 @@ export function storeWhy(e: unknown): string {
   return parts.join(", ");
 }
 // Written whole, durably, root's (0600 whatever the file or its temp was before; Keeper 0.1.15: mode, 0644 for the mark).
-// Cain 0.19.3: a stray temp that isn't a regular file (a folder, a link, a socket) is moved aside whole to <temp>.stray-<unix ms>
+// Cain 0.19.4: a stray temp that isn't a regular file (a folder, a link, a socket) is moved aside whole to <temp>.stray-<unix ms>
 // (renamed, never followed: a link is moved, not its target), logged once, instead of failing every write after it. Nothing under
 // it is deleted; a move that fails throws with the temp's path.
 const withPath = (e: any, p: string) => { if (e && typeof e === "object" && !e.path) { try { e.path = p; } catch { /* the code alone */ } } };
@@ -339,7 +339,7 @@ export function fileStore(flag = FLAG_FILE, mark = MARK_FILE, spentDir = SPENT_D
 // Cain 0.19.2: the link's drill store, built here so main.ts needs no fileStore name of its own (it imported watch.ts's
 // fileStore under the same name, and Bun bound that one: no highWater, so every install of Cain was refused).
 export function linkDrillStore(env: Record<string, string | undefined> = process.env, trustDir = TRUST, linkDir = "/data/link",
-  nowFn: () => number = Date.now, log?: (l: string) => void): DrillStore {   // Cain 0.19.3: log, for a stray temp the store clears
+  nowFn: () => number = Date.now, log?: (l: string) => void): DrillStore {   // Cain 0.19.4: log, for a stray temp the store clears
   return fileStore(env.CAIN_DRILL_FLAG ?? `${trustDir}/keeper-drill.json`, env.CAIN_DRILL_MARK ?? `${trustDir}/keeper-drill-mark.json`,
     env.CAIN_DRILL_SPENT ?? `${linkDir}/keeper-drill-spent`, `${trustDir}/keeper-drill-aborted.jsonl`, nowFn, `${linkDir}/keeper-drill-refused.json`, log);
 }

@@ -540,7 +540,7 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
-## What 0.19.3 does: background services start again by themselves
+## What 0.19.4 does: background services start again by themselves
 
 On Nov 27 a Ship tap was refused because the drill store couldn't keep its high-water time (the cause
 was the mix-up 0.19.2 fixes), and its log line didn't say why. Restarting the link by hand then left it
