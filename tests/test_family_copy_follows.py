@@ -269,8 +269,10 @@ def test_a_question_about_the_copy_with_cains_note_makes_a_card_never_change_it_
                   suggestion="Fix the Family copy of his coffee tomorrow: Gmail has it at 2:15 PM.")
     assert out["status"] == "waiting for his tap", out
     text = m.seen()[-1]
-    assert "Move the Family copy of Coffee with Chris to 2:15 to 3:45 tomorrow, to match your Gmail calendar" \
-        in text
+    # Left alone, so a take-back part of its own (round 3 of the second review): it says approving discards it.
+    assert ("Take back the Family copy of Coffee with Chris (left alone earlier, though nothing on it changed). "
+            "Approving discards that and writes Harness's copy over it at 2:15 to 3:45 tomorrow, to match your Gmail "
+            "calendar") in text
     assert "Cain" in text                                                     # marked as from his note
     assert "Change the event on Gmail" not in " ".join(m.seen())
     m.tap("Approve")
@@ -330,7 +332,8 @@ def test_approval_after_the_gmail_event_moved_again_writes_nothing_and_sends_a_f
     assert copy_times(m) == (ORIGINAL, ORIGINAL + timedelta(hours=1))         # not written
     assert m.gmail_times(INSTANCE) == ("16:00", "17:00")                       # and Gmail never moved back
     assert any("its Gmail event changed since your card. A fresh card follows" in x for x in m.seen())
-    assert "Move the Family copy of Coffee with Chris to 4:00 to 5:00 tomorrow" in m.seen()[-1]
+    assert "Take back the Family copy of Coffee with Chris (left alone earlier, though nothing on it changed). " \
+        "Approving discards that and writes Harness's copy over it at 4:00 to 5:00 tomorrow" in m.seen()[-1]
     m.tap("Approve")
     assert copy_times(m) == (at(16, day=DAY), at(17, day=DAY)) and m.gmail_times(INSTANCE) == ("16:00", "17:00")
 
@@ -344,8 +347,8 @@ def test_approval_after_the_copy_changed_writes_nothing_and_sends_a_fresh_card(m
     assert copy_times(m) == (at(9, day=DAY), at(10, day=DAY))
     assert any("that Family copy changed since your card. A fresh card follows" in x for x in m.seen())
     # Round 5: someone changed it on Family, so the fresh card is a take-back that says what changed.
-    assert ("Take back the Family copy of Coffee with Chris (changed on Family: its start and its end), writing "
-            "Harness's copy over it at 2:15 to 3:15 tomorrow") in m.seen()[-1]
+    assert ("Take back the Family copy of Coffee with Chris (changed on Family: its start and its end). Approving "
+            "discards that and writes Harness's copy over it at 2:15 to 3:15 tomorrow") in m.seen()[-1]
 
 
 # -- 3c. scope: the copy he names, or all only when he says all ----------------------------------------------
@@ -405,7 +408,8 @@ def test_every_copy_is_offered_only_on_an_explicit_ask_for_all(m):
     out = m.tells("fix all the family copies, they're out of sync", result({"type": "answer", "text": "Hm."}))
     assert out["status"] == "waiting for his tap"
     assert sorted(json.loads(c["copy"])["key"] for c in changes_offered(m)) == sorted([m.key, other])
-    assert "Move the Family copy of Dentist checkup to 10:00 to 11:00 Saturday" in m.seen()[-1]
+    assert "Take back the Family copy of Dentist checkup (left alone earlier, though nothing on it changed). " \
+        "Approving discards that and writes Harness's copy over it at 10:00 to 11:00 Saturday" in m.seen()[-1]
 
 
 def test_nothing_out_of_step_is_said_plainly(m):
@@ -1446,29 +1450,28 @@ def test_7_a_lost_answer_with_its_record_gone_is_never_guessed(m):
 # 8. Google: the revision a write used, reconciled if it moved meanwhile; showDeleted; repeated 404s said.
 
 def test_8_an_event_that_moves_while_its_copy_is_written_is_reconciled_with_the_checks_again(m):
+    """Round 3 of the second review (fix 5): the move found by the check after the write is queued (saved), and the
+    next read brings the copy to it, with the ownership and version checks again."""
     at_coffee_time(m)
     moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
     m.icloud.before_write = lambda: moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))
     sync(m)
+    assert family_copy.queued(m.ledger, m.key)["op"] == "move"
+    m.icloud.before_write = None
+    sync(m)
     puts_ = [x for x in copy_writes(m) if x[0] == "PUT"]
     assert copy_times(m) == (at(16, day=DAY), at(17, day=DAY)) and len(puts_) == 3
     assert puts_[2][2]["If-Match"] != puts_[1][2]["If-Match"] and row(m)["state"] == "live"
+    assert family_copy.queued(m.ledger, m.key) is None
 
 
 def test_8_a_copy_edited_before_the_reconcile_is_left_theirs(m):
     at_coffee_time(m)
     moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
-
-    def both():
-        moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))
-        real = m.client.fetch
-
-        def fetch(href):
-            m.client.fetch = real
-            m.icloud.seed(copy_path(m), with_added(m.icloud.events[copy_path(m)][1], ALARM))
-            return real(href)
-        m.client.fetch = fetch
-    m.icloud.before_write = both
+    m.icloud.before_write = lambda: moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))
+    sync(m)
+    m.icloud.before_write = None
+    m.icloud.seed(copy_path(m), with_added(m.icloud.events[copy_path(m)][1], ALARM))
     sync(m)
     assert ALARM in m.icloud.events[copy_path(m)][1] and row(m)["state"] == "hands_off"
     assert len([x for x in copy_writes(m) if x[0] == "PUT"]) == 2

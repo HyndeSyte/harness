@@ -373,6 +373,189 @@ def _name_of(said_line: str) -> str:
     return re.split(r"[;:]", said_line, maxsplit=1)[0].upper()
 
 
+# Round 3 of the second review (Nov 28): a time zone block beside a copy is judged, not set aside. A VTIMEZONE whose
+# definition for a TZID the copy's DTSTART or DTEND uses would put that time at another instant than Harness wrote,
+# or that can't be evaluated here, is an edit ("VTIMEZONE"); one that only spells the same instants otherwise passes.
+# Evaluated here: DTSTART and offsets of each STANDARD and DAYLIGHT, RDATEs, and a yearly RRULE by BYMONTH and an
+# nth-weekday BYDAY (with UNTIL), which is how every common zone is written. Anything else can't be evaluated.
+_ZONE_RULE_PARTS = frozenset({"FREQ", "BYMONTH", "BYDAY", "UNTIL"})
+_WEEKDAY_CODES = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+
+
+class _ZoneUnreadable(Exception):
+    pass
+
+
+def _offset(value: str):
+    from datetime import timedelta
+    m = re.fullmatch(r"([+-])(\d{2})(\d{2})(\d{2})?", value.strip())
+    if not m:
+        raise _ZoneUnreadable(value)
+    sign = -1 if m.group(1) == "-" else 1
+    return sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3)), seconds=int(m.group(4) or 0))
+
+
+def _naive(value: str) -> datetime:
+    v = value.strip()
+    if not re.fullmatch(r"\d{8}T\d{6}", v):
+        raise _ZoneUnreadable(value)
+    return datetime.strptime(v, "%Y%m%dT%H%M%S")
+
+
+def _zone_blocks(ics: str) -> dict[str, list[dict] | None]:
+    """Each top-level VTIMEZONE by its TZID: its observances, each {"start", "from", "to", "rrule", "rdates"}; None
+    for a TZID defined twice or a block that can't be read."""
+    lines, _ = _lines(ics)
+    out: dict[str, list[dict] | None] = {}
+    stack: list[str] = []
+    tzid, obs, cur, bad = "", [], None, False
+    for line in lines:
+        prop = ical.parse_line(line)
+        if prop is None:
+            if stack and stack[-1] in ("VTIMEZONE", "STANDARD", "DAYLIGHT"):
+                bad = True
+            continue
+        if prop.name == "BEGIN":
+            comp = prop.value.strip().upper()
+            stack.append(comp)
+            if stack == ["VCALENDAR", "VTIMEZONE"]:
+                tzid, obs, cur, bad = "", [], None, False
+            elif stack[:2] == ["VCALENDAR", "VTIMEZONE"] and comp in ("STANDARD", "DAYLIGHT") and len(stack) == 3:
+                cur = {"rdates": []}
+            elif stack[:2] == ["VCALENDAR", "VTIMEZONE"]:
+                bad = True
+            continue
+        if prop.name == "END":
+            comp = stack.pop() if stack else ""
+            if comp in ("STANDARD", "DAYLIGHT") and cur is not None:
+                if not all(k in cur for k in ("start", "from", "to")):
+                    bad = True
+                obs.append(cur)
+                cur = None
+            elif comp == "VTIMEZONE" and stack == ["VCALENDAR"]:
+                out[tzid] = None if (tzid in out or bad or not obs or not tzid) else obs
+            continue
+        if stack == ["VCALENDAR", "VTIMEZONE"] and prop.name == "TZID":
+            tzid = prop.value.strip()
+        elif cur is not None and len(stack) == 3:
+            try:
+                if prop.name == "DTSTART":
+                    cur["start"] = _naive(prop.value)
+                elif prop.name == "TZOFFSETFROM":
+                    cur["from"] = _offset(prop.value)
+                elif prop.name == "TZOFFSETTO":
+                    cur["to"] = _offset(prop.value)
+                elif prop.name == "RRULE":
+                    if "rrule" in cur:
+                        bad = True
+                    cur["rrule"] = prop.value.strip().upper()
+                elif prop.name == "RDATE":
+                    if prop.params.get("VALUE", "DATE-TIME").upper() != "DATE-TIME":
+                        bad = True
+                    cur["rdates"] += [_naive(v) for v in prop.value.split(",")]
+            except _ZoneUnreadable:
+                bad = True
+    return out
+
+
+def _onsets(o: dict, last_year: int) -> list[datetime]:
+    """Where this observance starts, as wall times in its TZOFFSETFROM, up to the end of last_year."""
+    from datetime import timedelta
+    out = [o["start"], *o["rdates"]]
+    rule = o.get("rrule")
+    if rule:
+        parts = dict(p.split("=", 1) for p in rule.split(";") if "=" in p)
+        if set(parts) - _ZONE_RULE_PARTS or parts.get("FREQ") != "YEARLY" or "BYMONTH" not in parts \
+                or "BYDAY" not in parts:
+            raise _ZoneUnreadable(rule)
+        m = re.fullmatch(r"([+-]?[1-5])(MO|TU|WE|TH|FR|SA|SU)", parts["BYDAY"])
+        if not m or not re.fullmatch(r"\d{1,2}", parts["BYMONTH"]) or not 1 <= int(parts["BYMONTH"]) <= 12:
+            raise _ZoneUnreadable(rule)
+        n, wd, month = int(m.group(1)), _WEEKDAY_CODES.index(m.group(2)), int(parts["BYMONTH"])
+        until = None
+        if "UNTIL" in parts:
+            u = parts["UNTIL"]
+            if re.fullmatch(r"\d{8}T\d{6}Z", u):
+                until = datetime.strptime(u[:15], "%Y%m%dT%H%M%S") + o["from"]   # as a wall time in "from"
+            elif re.fullmatch(r"\d{8}(T\d{6})?", u):
+                until = datetime.strptime(u if "T" in u else u + "T235959", "%Y%m%dT%H%M%S")
+            else:
+                raise _ZoneUnreadable(rule)
+        for year in range(o["start"].year, last_year + 1):
+            first = datetime(year, month, 1)
+            if n > 0:
+                date_ = first + timedelta(days=(wd - first.weekday()) % 7 + 7 * (n - 1))
+            else:
+                nxt = datetime(year + (month == 12), month % 12 + 1, 1)
+                lastd = nxt - timedelta(days=1)
+                date_ = lastd - timedelta(days=(lastd.weekday() - wd) % 7 + 7 * (-n - 1))
+            if date_.month != month:
+                continue
+            at = datetime.combine(date_.date(), o["start"].time())
+            if at >= o["start"] and (until is None or at <= until):
+                out.append(at)
+    return out
+
+
+def _zone_instant(obs: list[dict], local: datetime) -> datetime | None:
+    """The one instant this zone definition gives a wall time, or None when it gives none or two (a gap or a fold)
+    or can't be evaluated."""
+    try:
+        onsets = sorted(((at - o["from"]), o["to"]) for o in obs for at in _onsets(o, local.year + 1))
+    except (_ZoneUnreadable, ValueError, OverflowError, KeyError):
+        return None
+    found = set()
+    for to in {o["to"] for o in obs}:
+        instant = local - to
+        before = [t for at, t in onsets if at <= instant]
+        if before and before[-1] == to:
+            found.add(instant)
+    if len(found) != 1:
+        return None
+    return found.pop().replace(tzinfo=timezone.utc)
+
+
+def zone_differences(ics: str, uid: str, start, end) -> list[str]:
+    """["VTIMEZONE"] when a time zone block beside the copy defines a TZID its DTSTART or DTEND uses so that the time
+    falls at another instant than Harness wrote (start, end), or so that it can't be evaluated; [] otherwise. A TZID
+    with no block beside it is read by its name, as every other read of the copy does."""
+    lines, _ = _lines(ics)
+    blocks: dict | None = None
+    events: list[list[str]] = []
+    cur: list[str] | None = None
+    for line in lines:
+        upper = line.upper()
+        if upper == "BEGIN:VEVENT":
+            cur = []
+        elif upper == "END:VEVENT" and cur is not None:
+            events.append(cur)
+            cur = None
+        elif cur is not None:
+            cur.append(line)
+    for ev in events:
+        props = [p for p in (ical.parse_line(x) for x in ev) if p is not None]
+        if not any(p.name == "UID" and p.value.strip() == uid for p in props):
+            continue
+        for prop in props:
+            if prop is None or prop.name not in ("DTSTART", "DTEND") or not prop.params.get("TZID"):
+                continue
+            if blocks is None:
+                blocks = _zone_blocks(ics)
+            tzid = prop.params["TZID"]
+            if tzid not in blocks:
+                continue
+            written = start if prop.name == "DTSTART" else end
+            obs = blocks[tzid]
+            try:
+                local = _naive(prop.value)
+            except _ZoneUnreadable:
+                return ["VTIMEZONE"]
+            got = _zone_instant(obs, local) if obs else None
+            if got is None or not isinstance(written, datetime) or got != written.astimezone(timezone.utc):
+                return ["VTIMEZONE"]
+    return []
+
+
 def copy_differences(ics: str, uid: str, title: str, start, end) -> list[str]:
     """What a Family copy holds beyond, or short of, exactly what Harness writes for this title, start and end, by
     line name ("SUMMARY", "DTSTART", "VALARM", "X-APPLE-TRAVEL-DURATION", "EVENTS" for a second event, "MARKER" for
@@ -398,6 +581,7 @@ def copy_differences(ics: str, uid: str, title: str, start, end) -> list[str]:
     if not _is_ours(ics, uid):
         out.add("MARKER" if f"{MARKER}:1" not in _lines(ics)[0] else "NOT-PLAIN")
     out |= {_name_of(x) for x in (said - want) + (want - said)}
+    out |= set(zone_differences(ics, uid, start, end))
     return sorted(out)
 
 

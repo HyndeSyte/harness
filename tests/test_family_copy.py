@@ -90,8 +90,14 @@ def copy(on):
     return on
 
 
-def read(rig, *events, unreadable=0):
-    """A new read of Gmail lands, and a tick looks at it."""
+def read(rig, *events, unreadable=0, cancelled=True):
+    """A new read of Gmail lands, and a tick looks at it. Since round 3 of the second review of Nov 27 a copy comes
+    off by itself only on affirmative evidence of its event's deletion; these tests are about the reads and the
+    holds around it, so an event a read leaves out is one the feed marks cancelled (ical.Window.cancelled), unless
+    `cancelled` is False (the event merely left out, which never takes a copy off)."""
+    w = rig.feeds.window
+    ids = {(e.uid, e.instance) for e in events}
+    w.cancelled = ((set(w.cancelled) | {(o.uid, o.instance) for o in w.occurrences}) if cancelled else set()) - ids
     rig.feeds.window.occurrences = list(events)
     rig.feeds.window.unreadable = unreadable
     rig.feeds.generation += 1
@@ -1248,23 +1254,46 @@ def test_a_repeating_series_on_family_is_never_taken_over(copy):
     assert path in on_family(copy)
 
 
-def test_a_failed_put_after_removing_his_copy_tries_again(copy):
-    start = when(copy, 5)
-    seed(copy, "Sam - PT", start)
-    read(copy, occ(uid="u1", start=start))
+def _put_once(copy, kind):
     original = copy.icloud.request
 
     def refuse_put(method, url, **kw):
         if method == "PUT":
             copy.icloud.request = original
-            raise TransportError("timeout")
+            raise TransportError(kind)
         return original(method, url, **kw)
     copy.icloud.request = refuse_put
+
+
+def test_a_lost_create_after_removing_his_copy_is_left_absent_and_said_once(copy):
+    """Round 3 of the second review (fix 2): the create's answer is lost and a read at its address finds nothing.
+    It may still land, so it is never sent again by itself: the copy is left absent and the digest names it."""
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    _put_once(copy, "timeout")
     moved = occ(uid="u1", start=when(copy, 7))
     read(copy, moved)
-    assert titles(copy) == ["Sam - PT"]        # the same pass writes it anew
+    assert titles(copy) == []
+    puts = [x for x in copy.icloud.log if x[0] == "PUT"]
     read(copy, moved)
-    assert titles(copy) == ["Sam - PT"]
+    read(copy, moved)
+    assert titles(copy) == [] and [x for x in copy.icloud.log if x[0] == "PUT"] == puts    # never sent again
+    assert copy.ledger.db.execute("SELECT state FROM family_copies").fetchone()["state"] == "uncertain"
+    assert events(copy, "family_copy_uncertain") == 1
+    assert "iCloud's answer was lost when I made the Family copy of PT" in copy.copy.digest_line()
+
+
+def test_a_create_known_to_have_failed_is_made_again(copy):
+    """A create refused before it was sent (blocked) is known not to have made anything: made again next read."""
+    start = when(copy, 5)
+    seed(copy, "Sam - PT", start)
+    read(copy, occ(uid="u1", start=start))
+    _put_once(copy, "blocked")
+    moved = occ(uid="u1", start=when(copy, 7))
+    read(copy, moved)
+    read(copy, moved)
+    assert titles(copy) == ["Sam - PT"] and events(copy, "family_copy_uncertain") == 0
 
 
 def test_a_long_trip_title_is_not_taken_for_an_edit(copy):

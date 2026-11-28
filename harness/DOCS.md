@@ -673,6 +673,17 @@ On Gmail, and then the same on Family:
     events (two at a time never would; if it does, note the line it names). Then move one untouched copy's
     Gmail event and check its copy follows within a read, and ask about one changed copy and check its Take
     back card names what changed. Delete the throwaway events after.
+3e. Family copies the other way round (done by hand, once per install, on the first day, beside 3d): one
+    untouched copy of Harness's own, created, read back, moved and deleted on the real Family calendar, must
+    read as the App's own at each step, so iCloud's real way of keeping a copy never makes Harness leave its
+    own copies alone. In the App's container: `python3 -m harness.copy_check /data --out /data/copy-check`. It
+    writes only its own throwaway copy ("Harness check - Copy", tomorrow at noon, then 1 PM) with the same
+    guarded writes the App uses, takes it off at the end whatever happened, prints a line per step, and exits 0
+    only when every step read as the App's own (a step that doesn't names the lines that differ). The bodies
+    iCloud returned are in `/data/copy-check` (`created.ics`, `moved.ics`, `summary.json`): read them through,
+    then have a build copy them into `tests/fixtures/family_copy_icloud/<a folder of their own>/`, where the
+    tests check every kept body still reads as the App's own. Until then the tests have only the modelled set
+    (`modeled/`).
 
 Cain's link watching `/health` for its `storage` and `waiting` fields and telling you is separate work, not
 in this build: it is a precondition of turning these handovers on beyond the smoke run, since the digest
@@ -1401,7 +1412,10 @@ and `/status` says if the Gmail calendar isn't being read.
   record, never read back from the copy), busy (`TRANSP:OPAQUE`, which Harness writes, and which is also what
   a copy without that line means) and Harness's mark, and nothing more. Lines are compared by what they say,
   so times kept in a zone's form with a time zone block beside the event, or folded across lines, are not an
-  edit. Set aside by name, and only these: the stamps (`DTSTAMP`, `LAST-MODIFIED`, `CREATED`, `SEQUENCE`,
+  edit. A time zone block is judged, not set aside: one whose definition for a zone the copy's start or end
+  uses puts that time at another instant than Harness wrote, or can't be evaluated (Harness evaluates each
+  part's start and offsets, extra start dates and a yearly rule by month and nth weekday, which is how common
+  zones are written), is an edit, named "its time zone". Set aside by name, and only these: the stamps (`DTSTAMP`, `LAST-MODIFIED`, `CREATED`, `SEQUENCE`,
   `PRODID`), iCloud's `X-APPLE-CREATOR-IDENTITY` and `X-APPLE-CREATOR-TEAM-IDENTITY`, and an alert iCloud
   marks as its default (`X-APPLE-DEFAULT-ALARM:TRUE`) only when what it does is one of iCloud's own two:
   "none" (`ACTION:NONE` at `19760401T005545Z`) or a 15-minute reminder (`ACTION:DISPLAY`, `TRIGGER:-PT15M`,
@@ -1417,6 +1431,18 @@ and `/status` says if the Gmail calendar isn't being read.
   sent, Harness saves its record of the write: the version and body it goes over and the body it sends. On a
   412 or a lost answer the copy is read again and judged again by the allowlist; nothing is retried blindly.
   A write whose record is missing or can't be read leaves the copy alone rather than guess.
+- **Only a take-back writes to a copy left alone:** once a copy is left alone (someone changed it, or Harness
+  stopped following it), no card writes to it in passing, not even one moving or taking off its Gmail event.
+  An ordinary request naming it ("move my coffee to 3", "cancel coffee tomorrow") gets a take-back part of
+  its own on the card, always on your tap: it says what changed on the copy, that approving discards it, and
+  then writes Harness's copy over it, or takes it off, with `If-Match` on exactly the version the card
+  showed. The Gmail change on the same card goes ahead either way.
+- **A new copy whose answer was lost:** the copy is read again at its address. Exactly as written: Harness's
+  own. Not there: it may still turn up, so it's never sent again by itself. The digest says once that it was
+  left off rather than risk making it twice, and if it turns up later exactly as written it's followed from
+  then on. A new copy is made again only after a write known to have failed without making anything (refused
+  outright, or refused because something was at its address that has gone since). If Harness stops between
+  sending a new copy and its answer, the next read reads its address first, the same way.
 - **Taken off Family:** a copy Harness last saw as its own that is gone from Family was taken off by
   someone: it's left alone, said once in the digest, and never made again by itself, even if its Gmail
   event comes back.
@@ -1431,12 +1457,26 @@ and `/status` says if the Gmail calendar isn't being read.
   again by its id (with the Google key set, and `showDeleted=true`), and the copy takes that read's times.
   For one day of a repeating event that id is the series and the day's original start, moved or not, and an
   answer for another series or another original start gets no write. The revision that read gave is kept,
-  and the event is read once more after the write: if it moved on meanwhile, the copy is corrected once,
-  after the same checks pass again. If the read fails, nothing is written, the digest says so, and the next
-  read tries again. Only Google answering 410 Gone, or the event as cancelled, counts as deleted; a "not
-  found" never does, here or on a fix card, and three reads in a row of "not found" for one copy are named
-  in the digest. A trip's block (made from several events) and a copy with no Google key go by the
-  calendar's read alone.
+  and the event is read once more after every write to a copy, the correction's included, a card's too (at
+  the copy's next read). If it moved on or was cancelled meanwhile, or can't be read, that is saved as owed
+  (saved before the write is sent, so a write cut off is still checked) and worked off at the next read,
+  with the same checks again; a cancel takes the guarded removal. After 3 tries the digest says so and the
+  usual reads keep the copy in step. If the read before a write fails, nothing is written, the digest says
+  so, and the next read tries again. A trip's block (made from several events) and a copy with no Google key
+  take their times from the calendar's read alone.
+- **When a Gmail event is deleted:** a copy comes off by itself only on affirmative evidence: a cancelled
+  record in the read of your Gmail calendar itself, or Google answering 410 Gone, or the event as cancelled,
+  when it's read by its id (or Google having it, as the copy's own event, but no longer one that gets a copy,
+  a rename say). An event a read merely leaves out, or a read that fails, leaves the copy as it is. A "not
+  found" (404) never takes a copy off, here or on a fix card. What Google returns after a deletion: for a
+  while the event, read by its id with `showDeleted=true`, comes back with `"status": "cancelled"`; once
+  Google purges it (it keeps deleted events only for a limited time, and doesn't say how long) the same read
+  answers 404 Not Found, the same answer as for an id it never had, so a 404 can't tell a purged deletion from
+  anything else. 410 Gone is what Google's API documents for a resource that's gone (and for an expired sync
+  token). So a copy whose event Google answers "not found" for three reads in a row, while the read leaves it
+  out, is left as it is, named once in the digest, and gets one card with the next digest to take it off,
+  done only on your tap, with `If-Match` on the version the card showed. Step 3a below checks what Google
+  answers on your account.
 - **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
   family mirrored event not updating"), even as a question, and you get a card that brings that copy back
   to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name
