@@ -145,7 +145,7 @@ def changelog_top(text: str | None) -> str | None:
     return None
 
 
-# The leading version token of a "## " heading (Cain 0.19.3): after the heading is trimmed, any opening
+# The leading version token of a "## " heading (Cain 0.19.4): after the heading is trimmed, any opening
 # brackets and a leading v are dropped, and the X.Y.Z at its start is the version, whatever follows it (a
 # closing bracket, a date, a suffix like -rc1): "## [v0.4.6] - 2026-11-22", "## 0.4.6 (Nov 22)" and
 # "## 0.4.6-beta" are all 0.4.6. A fourth number part ("0.4.6.1") is not an X.Y.Z token.

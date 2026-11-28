@@ -106,7 +106,7 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
   // a valid year-month-day date. The brief still gets every built-in pattern and the list.
   test("earlierCheck lets a tool name ending in a date through", () => {
     expect(earlierCheck(["Claude: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
-    // Cain 0.19.3: a bare eight-digit date is no longer excused.
+    // Cain 0.19.4: a bare eight-digit date is no longer excused.
     expect(earlierCheck(["Claude: pinned since 20250305, see the tool list"], TERMS)).toEqual({ ok: false, why: ["an account or card number in the earlier findings"] });
     expect(earlierCheck(undefined, null)).toEqual({ ok: true });
   });
@@ -201,7 +201,7 @@ describe("A: the runner counts rounds per change and refuses past the cap", () =
     expect(t.get("gu-2").blocked_why).toEqual(["an account or card number in the earlier findings"]);
     expect(t.calls.length).toBe(1);
   });
-  test("earlierCheck: only a glued eight-digit valid date passes (Cain 0.19.3: a bare date blocks)", () => {
+  test("earlierCheck: only a glued eight-digit valid date passes (Cain 0.19.4: a bare date blocks)", () => {
     const acct = { ok: false, why: ["an account or card number in the earlier findings"] };
     expect(earlierCheck(["Gemini: the web_search_20250305 tool is pinned"], TERMS)).toEqual({ ok: true });
     expect(earlierCheck(["Gemini: pinned since 20250305"], TERMS)).toEqual(acct);
@@ -971,8 +971,8 @@ describe("round 3, fix 7: no silent gap between the plan reader and the hook", (
   });
 });
 
-// Cain 0.19.3: the first review's tightening of the earlier-findings backstop.
-describe("0.19.3: glued dates only, a real calendar check, Luhn over grouped runs, provenance", () => {
+// Cain 0.19.4: the first review's tightening of the earlier-findings backstop.
+describe("0.19.4: glued dates only, a real calendar check, Luhn over grouped runs, provenance", () => {
   const ACCT = { ok: false, why: ["an account or card number in the earlier findings"] };
   const blocksBrief = (body: string) => privacyCheck(brief({ id: "b-1", body }), TERMS);
 

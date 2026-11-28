@@ -92,7 +92,7 @@ export function checkBrief(j: any): { brief?: Brief; error?: string } {
     return { error: "head must be the pull request's full 40-character head sha" };
   if (j.change !== undefined && (typeof j.change !== "string" || !CHANGE_KEY.test(j.change)))
     return { error: "change must be a stable key for the change: 3 to 64 of a-z, 0-9 and -" };
-  // Cain 0.19.3: a pull request's change key is pr-<number>, taken from its pr only, so a change key can't take
+  // Cain 0.19.4: a pull request's change key is pr-<number>, taken from its pr only, so a change key can't take
   // that shape and stand for (or read the findings of) a pull request it doesn't name.
   if (j.change !== undefined && PR_KEY.test(j.change))
     return { error: "change can't be shaped like a pull request's key (pr-<number>): name the pull request with pr" };
@@ -167,7 +167,7 @@ export function digest(b: Brief): string {
 
 export type Terms = { entries: { line: number; re: RegExp }[] };
 const BUILT_IN: { what: string; re: RegExp }[] = [
-  // Anchored at the start of a run of address characters (Cain 0.19.3): the same matches, in linear time on a
+  // Anchored at the start of a run of address characters (Cain 0.19.4): the same matches, in linear time on a
   // long run with no @ in it, now that the payload is checked as well as the brief.
   { what: "an email address", re: /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
   { what: "a phone number", re: /(?<![\w-])(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?![\w-])/ },
@@ -203,7 +203,7 @@ export function loadTerms(text: string | null): { terms?: Terms; error?: string 
   return { terms: { entries } };
 }
 
-// ---- The two scanners (Cain 0.19.3). ----
+// ---- The two scanners (Cain 0.19.4). ----
 // One for everything that leaves but the earlier findings (scanStrict), one for the earlier findings only
 // (scanFindingsOnly), each its own named entry point: the strict one has no mode, so no call can relax it by
 // passing a flag, and the brief's check (privacyCheck) calls only scanStrict.
@@ -235,7 +235,7 @@ export function luhnCard(run: string): boolean {
   }
   return sum % 10 === 0;
 }
-// Luhn over grouped runs (Cain 0.19.3): digit groups joined by single spaces or hyphens (4111-1111-1111-1111,
+// Luhn over grouped runs (Cain 0.19.4): digit groups joined by single spaces or hyphens (4111-1111-1111-1111,
 // 4111 1111 1111 1111) are read with the joins taken out, and any span of whole groups that comes to 13 to 19
 // Luhn-valid digits counts as a card number. Used by both scanners.
 const GROUPED = /(?<!\d)\d+(?:[ -]\d+)*(?!\d)/g;
@@ -263,7 +263,7 @@ export function scanStrict(text: string, terms: Terms): string[] {
 }
 
 // The findings rules, over the normalized earlier-findings span only (Cain 0.16.0, narrowed in 0.18.1 and
-// 0.19.3). The email, phone and SSN-shaped patterns, a grouped card number and the owner's list run as over a
+// 0.19.4). The email, phone and SSN-shaped patterns, a grouped card number and the owner's list run as over a
 // brief. The account-or-card pattern is relaxed there, and only there, for one shape: a letter or an
 // underscore immediately before exactly eight digits that make a valid date written year, month, day, years
 // 1900 to 2099, as in a web search tool's name ending in a date (web_search_20250305). The excuse holds only
@@ -313,7 +313,7 @@ export function earlierBlock(earlier: string[] | undefined): string {
   return (earlier ?? []).map((e, i) => `${i + 1}. ${e}`).join("\n") || "(none kept)";
 }
 
-// The outgoing payload's check (Cain 0.19.3), run on exactly what a seat is handed. The payload is assembled
+// The outgoing payload's check (Cain 0.19.4), run on exactly what a seat is handed. The payload is assembled
 // first: topic and question, then for a fix-only round the findings span, then the body, the span set off on
 // each side by PAYLOAD_SEP. The strict rules run over everything but that exact span (the span cut out, the
 // separators left, so nothing on either side joins), and the findings rules over the span alone.

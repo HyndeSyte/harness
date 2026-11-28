@@ -116,7 +116,7 @@ export function loadReview(dir: string, id: string): Review | null {
   return r && typeof r === "object" && r.id === id ? r : null;
 }
 export function saveReview(dir: string, r: Review) { writeAtomic(reviewFile(dir, r.id), JSON.stringify(r, null, 1)); }
-// The enqueue lock (Cain 0.19.3): a brief's id is checked against the queue and the rounds record, and its
+// The enqueue lock (Cain 0.19.4): a brief's id is checked against the queue and the rounds record, and its
 // round and queue record written, while this file is held (an exclusive create). One older than a minute is
 // left by a runner that stopped mid-enqueue and is taken over (removed, then the exclusive create again, so
 // one contender wins).
@@ -290,7 +290,7 @@ export class Runner {
     try { return fn(); }
     finally { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(lock); } catch { /* gone */ } }
   }
-  // Under the enqueue lock. A round id is immutable (Cain 0.19.3): an id the queue already holds, or the rounds
+  // Under the enqueue lock. A round id is immutable (Cain 0.19.4): an id the queue already holds, or the rounds
   // record already keeps under any change (this one included), is refused, so a replay of a round resolves to
   // the original record and can alter neither the findings it sends nor the round it counts.
   private admitLocked(b: Brief): string | null {
@@ -327,7 +327,7 @@ export class Runner {
     return null;
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
-  // key: the admitted brief's validated change identity (admit, from changeKeyOf). Cain 0.19.3: the text comes
+  // key: the admitted brief's validated change identity (admit, from changeKeyOf). Cain 0.19.4: the text comes
   // only from the seat answers the runner kept in the rounds record when each answer arrived (keepFindings), under
   // that round of this change's own key; the round's queue record is read only to bind it, its id and change being
   // that round's and it not blocked for privacy. Nothing in a queue record's findings, a brief or a request
@@ -343,7 +343,7 @@ export class Runner {
     return [];
   }
   // A seat's answer's findings, kept in the rounds record under this round of its change as they arrive (Cain
-  // 0.19.3): the only source a later fix-only round's earlier findings are built from. Read and written with no
+  // 0.19.4): the only source a later fix-only round's earlier findings are built from. Read and written with no
   // wait between, so two seats answering in one pass don't lose each other's.
   private keepFindings(r: Review, s: SeatRun, findings: Finding[]): void {
     const file = this.cfg.roundsFile;
@@ -479,7 +479,7 @@ export class Runner {
     // on an open review is refused too.
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
-    // Then the payload as a seat is handed it (Cain 0.19.3): the strict rules over all of it but the earlier
+    // Then the payload as a seat is handed it (Cain 0.19.4): the strict rules over all of it but the earlier
     // findings' span, the findings rules over that span alone (payloadCheck).
     const e = payloadCheck(outbound(r.brief!, r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined), this.terms());
     if (!e.ok) return this.block(r, e.why);
