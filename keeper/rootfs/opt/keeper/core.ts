@@ -175,7 +175,13 @@ export const WATCH_MS = 15 * 60_000;
 export const HEARTBEAT_MS = 60_000;              // the heartbeat time in /data, /armed's timestamp, the dead-man ping
 export const HC_HEARTBEAT_MS = 5 * 60_000;       // the ping to hc_done, and the log ping to each alert check
 export const REGISTER_WAIT_MS = 4 * 60_000;      // (0.1.4) the keeper's backup must complete within this (0.1.5: in the background)
-export const BACKUP_DATE_SKEW_MS = 60_000;       // (0.1.4) the backup's date may read this much before the token's issue
+export const BACKUP_DATE_SKEW_MS = 60_000;
+// (0.1.19) Backup first: Cain's backup is cold (it stops and starts Cain, and his link with him), so for an install of Cain the
+// link asks for the backup at the owner's Ship tap (POST /backup-first), before any token or registration. Cain's registration
+// that follows is accepted against that backup, with no second backup, only when the backup's own snapshot time is within this
+// before the registration, after every restore Keeper made of Cain and after Keeper's state was created. Otherwise Keeper takes a
+// backup at the registration as for any install.
+export const FIRST_BACKUP_MS = 15 * 60_000;       // (0.1.4) the backup's date may read this much before the token's issue
 export const ACCEPT_MS = 30 * 60_000;            // (0.1.5) an acceptance must be claimed within this
 export const CLAIM_MS = 30 * 60_000;             // (0.1.5) a claim is valid this long: to_version must show within it
 export const RESTORE_LIMIT_MS = 15 * 60_000;     // the restore's whole limit, refusals included, from the fail
@@ -560,6 +566,7 @@ export interface Attempt {
   // (0.1.15) item 9: a cancel was asked (whatever its step's outcome): the attempt can't be claimed or consumed any more, and the
   // next poll ends it as a terminal abort unless the cancel ended it first
   abortAsked?: { at: number; why: string };
+  firstMadeAt?: number;                          // (0.1.19) its backup is the one taken first, with that snapshot time
 }
 // (0.1.15) An install or update job of an App as the Supervisor's jobs list shows it (supervisor.ts installJobs).
 export interface InstallJob { uuid: string; created: number; done: boolean; errors: number; name: string }
@@ -573,7 +580,12 @@ export interface OpRec { id: string; op: string; at: number; state: "pending" | 
 export const OP_MOVES: Record<OpRec["state"], OpRec["state"][]> = { pending: ["done", "late"], late: ["reconciled"], done: [], reconciled: [] };
 // (0.1.9) A backup kept after its attempt ended unused (a cancel, an expiry): bound to the attempt and its generation,
 // left for the bounded cleanup only.
-export interface KeptRec { slug: string; name: string; attempt: string; gen: number; endedAt: number; reason: string }
+export interface KeptRec { slug: string; name: string; attempt: string; gen: number; endedAt: number; reason: string;
+  first?: true }                                 // (0.1.19) a backup taken first that no registration used: its attempt was never made
+// (0.1.19) Cain's backup taken first, at the owner's Ship tap (POST /backup-first): bound to that pull request and head, made under
+// the name the attempt for them will have, used once by the registration that follows within FIRST_BACKUP_MS, then removed.
+export interface FirstBackup { app: string; pr: number; head: string; askedAt: number; status: "making" | "ready" | "failed"; name: string; gen: number;
+  slug?: string; madeAt?: number; version?: string; why?: string }
 export interface Binding { protocol: number; probe_hash: string; keeper_version: string; options_hash: string; backup_scope: string }
 export interface DrillRec { attempt: string; kind: "fail-verdict" | "exits-on-start"; trigger: string; restoredAt: number; lineDeliveredAt: number; binding: Binding; at: number;
   mode?: DrillMode; markAt?: number; markHash?: string }   // (0.1.14) the evidence: the drill's mode and the mark the link confirmed
@@ -644,6 +656,7 @@ export interface State {
   drillDue?: { phone?: number; mhb?: number };    // (0.1.8) the confirm time each drill's due reminder was logged for
   gen?: number;                                   // (0.1.9) the backups' generation counter, never down
   keptBackups?: Record<string, KeptRec>;                 // (0.1.9) kept backups by slug, for the bounded cleanup
+  firstBackup?: Record<string, FirstBackup>;             // (0.1.19) the backup taken first, by App (Cain's only)
   ops?: Record<string, OpRec>;                    // (0.1.11) operations whose write outlived their step, by operation name
   cleanupAt?: number;                             // (0.1.9) the cleanup's last run (the daily tick)
   lastBackupBytes?: number;                       // (0.1.9) the last backup's size: the projection for the next
@@ -687,6 +700,7 @@ export function loadState(raw: unknown): State {
     ...(r.limits && Number(r.limits.version) > 0 ? { limits: { version: Number(r.limits.version), at: Number(r.limits.at) || 0 } } : {}), counter: Number(r.counter) > 0 ? Math.floor(Number(r.counter)) : 0,
     ...(Number(r.enrollRefused) > 0 ? { enrollRefused: Number(r.enrollRefused) } : {}), ...(r.drillDue && typeof r.drillDue === "object" ? { drillDue: obj(r.drillDue) as any } : {}),
     ...(Number(r.gen) > 0 ? { gen: Math.floor(Number(r.gen)) } : {}), ...(r.keptBackups && typeof r.keptBackups === "object" ? { keptBackups: obj(r.keptBackups) as any } : {}),
+    ...(r.firstBackup && typeof r.firstBackup === "object" && !Array.isArray(r.firstBackup) ? { firstBackup: obj(r.firstBackup) as any } : {}),
     ...(Number(r.cleanupAt) > 0 ? { cleanupAt: Number(r.cleanupAt) } : {}), ...(r.ops && typeof r.ops === "object" && !Array.isArray(r.ops) ? { ops: obj(r.ops) as any } : {}), ...(Number(r.lastBackupBytes) > 0 ? { lastBackupBytes: Number(r.lastBackupBytes) } : {}),
     ...(r.backupCheck && Number(r.backupCheck.at) > 0 ? { backupCheck: r.backupCheck } : {}),
     ...(r.backupCheckRun && typeof r.backupCheckRun.name === "string" ? { backupCheckRun: r.backupCheckRun } : {}),
@@ -827,6 +841,7 @@ export class Keeper {
   private busy = false;
   private loopDone = 0;                                // (0.1.4) the last poll that completed, in this process
   private settling = new Map<string, Promise<void>>(); // (0.1.5) registrations whose backup is being made in the background
+  private firstSettling = new Map<string, Promise<void>>(); // (0.1.19) backups taken first, being made in the background, by App
   hcSeen: ({ at: number } & HcJudged) | null = null;  // (0.1.5) the last Healthchecks settings read
   private hcSaid = "";
   hcKey = "";                                          // (0.1.7) the kept Healthchecks read-only key (never logged)
@@ -1617,6 +1632,8 @@ export class Keeper {
       // (0.1.5) and the Ship key must be confirmed again at the device before any registration counts.
       if (this.st.pinnedKey?.confirmed) { delete this.st.pinnedKey.confirmed; this.d.log("the pinned Ship key needs the owner's key-confirm again (a rewound state)"); }
     }
+    // (0.1.19) a backup first that was being made when Keeper stopped: failed (its backup, if it finished, is named in the log at start)
+    for (const rec of Object.values(this.st.firstBackup ?? {})) if (rec.status === "making") { rec.status = "failed"; rec.why = "Keeper restarted while it was made"; this.d.log(`the backup first of ${rec.app} for pull request ${rec.pr} was interrupted by a restart: it isn't used ("${rec.name}")`); }
     // (0.1.7) a drill that ran when Keeper stopped is interrupted: its code no longer counts
     const running = this.drillRunning(now);
     if (running) this.interruptDrill(running, "Keeper restarted");
@@ -1876,6 +1893,167 @@ export class Keeper {
   }
   // (0.1.5) The background backup of a registration, for tests and the server: resolves once it settled.
   async whenSettled(id: string): Promise<void> { await this.settling.get(id); }
+
+  // -- backup first (0.1.19: POST /backup-first and GET /backup-first, Cain's link only) -------------------------------------
+  // Cain's backup is cold: making it stops and starts Cain, and his link with him. So for an install of Cain the link asks for
+  // the backup at the owner's Ship tap, {app, pr, head}, before any Ship token or registration exists, and Keeper makes it in the
+  // background (answered 202 at once; the link may be stopped by it). The backup is made under the very name the attempt for that
+  // pull request and head will have, and checked as a registration's is (that App alone, at the version running now, protected
+  // with Keeper's own key). Cain's registration that follows uses it once (firstFor) instead of a second backup; one not used, one
+  // replaced and one that failed are kept for the bounded cleanup. Only Cain's own install backs up first: any other App's backup
+  // doesn't stop the link, and is made at its registration as before.
+  async backupFirst(caller: string | null, body: any): Promise<Answer> {
+    const app = s(body?.app), pr = Number(body?.pr), head = s(body?.head).toLowerCase();
+    const now = this.now();
+    const no = (why: string, status = 409): Answer => {
+      this.d.log(`refused to back ${SLUG.test(app) ? app : "an App"} up first: ${why}`);
+      return { status, body: { status: "refused", why } };
+    };
+    if (caller !== REGISTRAR) return no(`only ${appName(REGISTRAR)}'s App asks for a backup first`, 403);
+    if (app !== REGISTRAR) return no(`only ${appName(REGISTRAR)}'s own install backs up first (any other App's backup is made at its registration)`);
+    if (!this.opts.watch.includes(app)) return no(`${app} isn't in the keeper's watch list`);
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !HEAD.test(head)) return no("its pull request or head isn't one");
+    if (!this.st.pinnedKey?.confirmed) return no("the pinned Ship key isn't confirmed, so no registration could use it");
+    const drill = this.drillRunning(now);
+    if (drill) return no(`${drill} is running, and Keeper takes no backup for an install during a drill`);
+    const held = this.writesHeldWhy();
+    if (held) return no(`no backup is made now: ${held}`, 503);
+    if (this.open(app).length) return no(`another attempt for ${app} is open (${this.open(app)[0].id})`);
+    const job = this.jobOpen(app);
+    if (job) return no(`the install job ${job.job!.id} of ${job.id} has no recorded end yet (one installer at a time)`);
+    const cur = this.st.firstBackup?.[app];
+    if (cur?.status === "making") return cur.pr === pr && cur.head === head ? { status: 202, body: { status: "pending", app, pr, head } } : no(`a backup first for pull request ${cur.pr} is being made`);
+    if (cur) this.dropFirst(app, "replaced by a new backup first");
+    const rec: FirstBackup = { app, pr, head, askedAt: now, status: "making", name: "", gen: 0 };
+    (this.st.firstBackup ??= {})[app] = rec;
+    if (!this.save()) { delete this.st.firstBackup[app]; return no("Keeper couldn't save its state", 503); }
+    this.d.log(`backing ${app} up first for pull request ${pr} at head ${head.slice(0, 12)}, at the owner's Ship tap: the backup stops and starts it; a registration of that pull request and head within ${FIRST_BACKUP_MS / 60_000} minutes of its snapshot uses it`);
+    this.firstSettling.set(app, this.makeFirst(rec).catch((e) => this.failFirst(rec, `the backup failed (${String((e as Error)?.message ?? e).slice(0, 80)})`)).finally(() => this.firstSettling.delete(app)));
+    return { status: 202, body: { status: "pending", app, pr, head } };
+  }
+  // (0.1.19) GET /backup-first?app=<slug>, Cain's link only: where the backup taken first stands (none, making, ready, failed).
+  firstView(caller: string | null, app: string): Answer {
+    if (caller !== REGISTRAR) return { status: 403, body: { status: "refused", why: `only ${appName(REGISTRAR)}'s App reads it` } };
+    const r = this.st.firstBackup?.[app];
+    if (!r) return { status: 200, body: { status: "none", app } };
+    return { status: 200, body: { status: r.status, app, pr: r.pr, head: r.head, ...(r.madeAt ? { made_at: new Date(r.madeAt).toISOString() } : {}), ...(r.why ? { why: r.why } : {}) } };
+  }
+  // (0.1.19) For tests and the server: resolves once the backup taken first settled.
+  async whenFirst(app: string): Promise<void> { await this.firstSettling.get(app); }
+  private async makeFirst(rec: FirstBackup): Promise<void> {
+    const info = await this.d.appInfo(rec.app).catch(() => null);
+    if (!info) return this.failFirst(rec, `the Supervisor didn't answer for ${rec.app}`);
+    rec.version = info.version;
+    const id = `ship-${rec.pr}-${rec.app.replace(/^[0-9a-f]{8}_/, "")}-${rec.head.slice(0, 8)}`;
+    const ready = await this.record(async (f) => {
+      const held = this.writesHeldWhy();
+      if (held) return `no backup is made now: ${held}`;
+      await this.cleanup("before a new backup", f);
+      const room = await this.roomWhy(rec.app, id, f);
+      if (room) return room;
+      if (this.st.firstBackup?.[rec.app] !== rec) return "it was replaced";
+      rec.gen = this.st.gen = (this.st.gen ?? 0) + 1;
+      rec.name = `Keeper ${id} ${randomBytes(4).toString("hex")}`;   // the attempt's own name, so the registration that uses it owns it
+      this.save();
+      return "";
+    }, (why) => `Keeper's backup step failed (${why})`).catch((e) => `Keeper's backup step failed (${String(e).slice(0, 80)})`);
+    if (ready) return this.failFirst(rec, ready);
+    const password = randomBytes(BACKUP_KEY_BYTES).toString("base64url");
+    let keptKey = false;
+    try { keptKey = !!this.d.backupKeys?.store(rec.name, password); } catch { keptKey = false; }
+    if (!keptKey) return this.failFirst(rec, `Keeper couldn't keep the key for its backup (${BACKUP_KEYS_DIR}), so no backup was made`);
+    const timer = this.d.timer ?? ((ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); (t as any)?.unref?.(); }));
+    const made = Promise.resolve().then(() => this.d.makeBackup(rec.app, rec.name, password)).catch((e) => ({ why: String((e as Error)?.message ?? e).slice(0, 80) }));
+    const res = await Promise.race([made, timer(REGISTER_WAIT_MS).then(() => ({ late: true as const }))]);
+    if ("late" in res) {
+      void made.then((r) => { if ("slug" in r && BACKUP.test(r.slug) && !rec.slug) { rec.slug = r.slug; this.keepFirst(rec, "it completed after its bound"); this.save(); } });
+      return this.failFirst(rec, `the backup didn't complete within ${REGISTER_WAIT_MS / 60_000} minutes`);
+    }
+    if (!("slug" in res) || !BACKUP.test(res.slug)) return this.failFirst(rec, `the backup failed (${"why" in res ? res.why : "no backup slug in its answer"})`);
+    rec.slug = res.slug;
+    let b: BackupInfo | null = null;
+    for (let i = 0; i < 3 && !b; i++) b = await this.d.backupInfo(rec.slug).catch(() => null);
+    if (!b) return this.failFirst(rec, "the Supervisor didn't answer for its backup");
+    if (Number(b.size) > 0) this.st.lastBackupBytes = Math.round(Number(b.size) * 1024 * 1024);
+    const addons = Array.isArray(b.addons) ? b.addons : [];
+    const madeAt = typeof b.date === "string" ? Date.parse(b.date) : NaN;
+    const why = (b.homeassistant !== null && b.homeassistant !== false && b.homeassistant !== undefined && b.homeassistant !== "") ? "its backup holds Home Assistant"
+      : addons.length !== 1 || addons[0].slug !== rec.app ? `its backup doesn't hold ${rec.app} alone`
+      : Array.isArray(b.folders) && b.folders.length ? "its backup holds folders"
+      : addons[0].version !== rec.version ? `its backup holds ${rec.app} ${addons[0].version}, not ${rec.version}`
+      : b.protected !== true ? "its backup isn't shown as protected with Keeper's own key"
+      : !Number.isFinite(madeAt) ? "its backup's date can't be read"
+      : null;
+    if (why) return this.failFirst(rec, why);
+    if (this.st.firstBackup?.[rec.app] !== rec) { this.keepFirst(rec, "it was replaced while it was made"); this.save(); return; }
+    rec.madeAt = madeAt; rec.status = "ready";
+    this.save();
+    this.d.log(`backed ${rec.app} up first: backup ${rec.slug} "${rec.name}" of ${rec.version}, its snapshot made ${new Date(madeAt).toISOString()}; the registration of pull request ${rec.pr} at head ${rec.head.slice(0, 12)} within ${FIRST_BACKUP_MS / 60_000} minutes of it uses it`);
+  }
+  private failFirst(rec: FirstBackup, why: string): void {
+    rec.status = "failed"; rec.why = why.slice(0, 200);
+    if (rec.slug) this.keepFirst(rec, `the backup first failed: ${why}`.slice(0, 200));
+    this.d.log(`the backup first of ${rec.app} for pull request ${rec.pr} failed: ${why}. Nothing was registered or installed; a new Ship tap starts again`);
+    this.save();
+  }
+  // A backup taken first that no registration uses: kept for the bounded cleanup, never deleted here.
+  private keepFirst(rec: FirstBackup, reason: string): void {
+    if (!rec.slug || !rec.name) return;
+    const m = KEEPER_BACKUP.exec(rec.name);
+    (this.st.keptBackups ??= {})[rec.slug] = { slug: rec.slug, name: rec.name, attempt: m ? m[1] : "", gen: rec.gen, endedAt: this.now(), reason, first: true };
+    this.d.log(`the backup taken first, ${rec.slug} "${rec.name}", is kept unused: ${reason} (generation ${rec.gen}; only the bounded cleanup may delete it)`);
+  }
+  private dropFirst(app: string, why: string): void {
+    const rec = this.st.firstBackup?.[app];
+    if (!rec) return;
+    delete this.st.firstBackup![app];
+    this.keepFirst(rec, why);
+    this.save();
+  }
+  // (0.1.19) The latest restore Keeper sent for the App (a rollback or a drill's), or 0.
+  lastRestore(app: string): number {
+    let at = 0;
+    for (const x of Object.values(this.st.attempts)) if (x.app === app && x.restore?.sentAt) at = Math.max(at, x.restore.sentAt);
+    for (const d of Object.values(this.st.drills[app] ?? {})) if (d?.restoredAt) at = Math.max(at, d.restoredAt);
+    return at;
+  }
+  // (0.1.19) Why a backup snapshot made at madeAt can't stand for a registration made at registeredAt ("" when it can): it must be
+  // within FIRST_BACKUP_MS before the registration (by the backup's own date, never the request's time), after every restore Keeper
+  // sent for the App, and after Keeper's state was created (a restored or rewound Keeper can't vouch for it).
+  firstAgeWhy(app: string, madeAt: number, registeredAt: number): string {
+    if (!Number.isFinite(madeAt)) return "the backup taken first has no snapshot time";
+    if (madeAt > registeredAt + BACKUP_DATE_SKEW_MS) return "the backup taken first is dated after this registration";
+    if (registeredAt - madeAt > FIRST_BACKUP_MS) return `the backup taken first is ${Math.floor((registeredAt - madeAt) / 60_000)} minutes older than this registration, over the ${FIRST_BACKUP_MS / 60_000} minutes it may be`;
+    const restored = this.lastRestore(app);
+    if (restored && madeAt <= restored) return `the backup taken first is from before Keeper's restore of ${app} (${new Date(restored).toISOString()})`;
+    if (madeAt < this.st.createdAt) return "the backup taken first is from before Keeper's state was created (a restore or rewind of Keeper)";
+    return "";
+  }
+  // (0.1.19) Cain's registration: the backup taken first, used once (removed whatever happens) when it was made for this pull request
+  // and head, at the version this install replaces, under this attempt's own name, and is fresh (firstAgeWhy). True when it is used.
+  private async firstFor(a: Attempt): Promise<boolean> {
+    const p = this.firstSettling.get(a.app);
+    if (p) { this.d.log(`${a.id}: waiting for the backup taken first, still being made`); await p; }
+    const rec = this.st.firstBackup?.[a.app];
+    if (!rec || a.status !== "verifying") return false;
+    delete this.st.firstBackup![a.app];
+    const why = rec.status !== "ready" ? (rec.status === "failed" ? `it failed (${rec.why ?? "no reason"})` : "it wasn't finished")
+      : a.auth !== "ship" ? "a drill makes its own backup"
+      : rec.pr !== a.pr || rec.head !== a.head ? `it was taken for pull request ${rec.pr} at ${rec.head.slice(0, 12)}, not this install's`
+      : rec.version !== a.from ? `it holds ${rec.version}, not ${a.from}`
+      : !rec.slug || !rec.name.startsWith(`Keeper ${a.id} `) ? "it isn't under this attempt's own name"
+      : this.firstAgeWhy(a.app, rec.madeAt ?? NaN, a.registeredAt);
+    if (why) {
+      this.keepFirst(rec, `not used by ${a.id}: ${why}`.slice(0, 200));
+      this.save();
+      this.d.log(`${a.id}: the backup taken first isn't used (${why}); Keeper takes the backup now, as for any install${a.app === REGISTRAR ? ", which stops and starts Cain: a fresh Ship tap installs it" : ""}`);
+      return false;
+    }
+    a.backup = rec.slug!; a.backupName = rec.name; a.gen = rec.gen; a.firstMadeAt = rec.madeAt; a.backupAsked = rec.askedAt;
+    this.save();
+    this.d.log(`${a.id}: uses the backup Keeper took first, ${rec.slug} (its snapshot ${Math.max(0, Math.round((a.registeredAt - rec.madeAt!) / 60_000))} minutes before this registration): no second backup`);
+    return true;
+  }
   // (0.1.5) GET /attempt/<id>, Cain's link only: where a registration stands. "pending" while its backup
   // is made, "accepted" with its backup and until, "claimed" with its claim, else "refused" (unprotected)
   // or its status, with why. Every answer carries the enrollment (the pinned fingerprint, its
@@ -2095,6 +2273,10 @@ export class Keeper {
     if (!info) return this.unprotected(a, `the Supervisor didn't answer for ${a.app}`);
     if (info.version !== a.from) return this.unprotected(a, `${a.app} is at ${info.version}, not ${a.from}`);
     if (a.status !== "verifying") return;                  // (0.1.5) cancelled before the backup was asked
+    // (0.1.19) Cain's install: the backup taken first at the owner's tap, when it qualifies, instead of a second backup (which
+    // would stop and start Cain, and his link would cancel this very registration)
+    if (a.app === REGISTRAR && await this.firstFor(a)) return this.verifyBackup(a);
+    if (a.status !== "verifying") return;
     this.backups.add(a.id);                                // (0.1.9) from here, a restart's verifyLeft waits for it
     const ready = await this.record((f) => this.prepareBackup(a, f), (why) => `Keeper's backup step failed (${why})`).catch((e) => `Keeper's backup step failed (${String(e).slice(0, 80)})`);
     if (ready) { this.backups.delete(a.id); return this.unprotected(a, ready); }
@@ -2125,6 +2307,10 @@ export class Keeper {
     if (!("slug" in res) || !BACKUP.test(res.slug)) return this.unprotected(a, `the keeper's backup of ${a.app} failed (${"why" in res ? res.why : "no backup slug in its answer"})`);
     a.backup = res.slug;
     this.d.log(`${a.id}: the keeper made backup ${res.slug} of ${a.app} alone (generation ${a.gen ?? 0})`);
+    return this.verifyBackup(a);
+  }
+  // The attempt's backup (made now, or 0.1.19: taken first) checked, then the acceptance committed under the lock.
+  private async verifyBackup(a: Attempt): Promise<void> {
     let b: BackupInfo | null = null;
     for (let i = 0; i < 3 && !b; i++) b = await this.d.backupInfo(a.backup).catch(() => null);
     if (!b) return this.unprotected(a, "the Supervisor didn't answer for its backup");
@@ -2139,6 +2325,8 @@ export class Keeper {
       : b.protected !== true ? "its backup isn't shown as protected (protected true) with Keeper's own key, and the keeper restores only such a backup"
       : !this.backupKey(a) ? `its backup's key file is missing or unreadable`
       : !Number.isFinite(made_at) ? "its backup's date can't be read"
+      // (0.1.19) a backup taken first predates the token by design: it is judged by its own snapshot time instead (firstAgeWhy)
+      : a.firstMadeAt !== undefined ? (this.firstAgeWhy(a.app, made_at, a.registeredAt) || null)
       : made_at < (a.issuedAt ?? 0) - BACKUP_DATE_SKEW_MS || made_at < a.registeredAt - BACKUP_DATE_SKEW_MS ? "its backup is dated before the Ship token was issued"
       : null;
     if (why) return this.unprotected(a, why);
@@ -2165,22 +2353,8 @@ export class Keeper {
     const held = this.writesHeldWhy();
     if (held) return `no backup is made now: ${held}`;
     await this.cleanup("before a new backup", f, a.id);
-    // (0.1.10) with no last size (a first backup) the reserve floor is 1 GB plus the App's image size when known, else 2 GB
-    const last = this.st.lastBackupBytes;
-    const image = !last && this.d.imageBytes ? await this.bounded(() => this.d.imageBytes!(a.app), "the App's image size") : null;
-    const projected = last ? Math.round(last * 1.5) : 0;
-    const need = last ? projected + SPACE_RESERVE_BYTES : image && image > 0 ? SPACE_RESERVE_BYTES + image : FIRST_BACKUP_BYTES;
-    const free = this.d.diskFree ? await this.bounded(() => this.d.diskFree!(), "the Supervisor's free space") : null;
-    if (!f.live()) return "Keeper's backup step ran out of time";
-    if (free === null || free < need) {
-      a.code = "no_space";
-      const words = free === null ? "the free space for backups couldn't be read"
-        : last ? `only ${mb(free)} MB is free for backups, and its backup needs about ${mb(projected)} MB plus a reserve of ${mb(SPACE_RESERVE_BYTES)} MB`
-        : `only ${mb(free)} MB is free for backups, under the first backup's reserve floor of ${mb(need)} MB (${image && image > 0 ? "1 GB plus the App's image size" : "2 GB, the App's image size not known"})`;
-      const kept = Object.keys(this.st.keptBackups ?? {}).length;
-      this.d.log(`refused a new backup for ${a.id}: ${words}${kept ? `; the cleanup couldn't free enough (${kept} kept backup${kept === 1 ? "" : "s"} still inside their bound)` : ""}`);
-      return `no room for its backup: ${words} (delete old backups in Home Assistant, Settings, System, Backups)`;
-    }
+    const room = await this.roomWhy(a.app, a.id, f);
+    if (room) { if (room.startsWith("no room")) a.code = "no_space"; return room; }
     if (a.status !== "verifying") return "";
     a.gen = this.st.gen = (this.st.gen ?? 0) + 1;
     a.backupAsked = this.now();
@@ -2188,6 +2362,26 @@ export class Keeper {
     this.save();                                           // asked once, before the call
     return "";
   }
+  // (0.1.9) The free-space reserve before a new backup (0.1.19: shared by the backup taken first): "" when there is room, else why not.
+  private async roomWhy(app: string, id: string, f: Fence): Promise<string> {
+    // (0.1.10) with no last size (a first backup) the reserve floor is 1 GB plus the App's image size when known, else 2 GB
+    const last = this.st.lastBackupBytes;
+    const image = !last && this.d.imageBytes ? await this.bounded(() => this.d.imageBytes!(app), "the App's image size") : null;
+    const projected = last ? Math.round(last * 1.5) : 0;
+    const need = last ? projected + SPACE_RESERVE_BYTES : image && image > 0 ? SPACE_RESERVE_BYTES + image : FIRST_BACKUP_BYTES;
+    const free = this.d.diskFree ? await this.bounded(() => this.d.diskFree!(), "the Supervisor's free space") : null;
+    if (!f.live()) return "Keeper's backup step ran out of time";
+    if (free === null || free < need) {
+      const words = free === null ? "the free space for backups couldn't be read"
+        : last ? `only ${mb(free)} MB is free for backups, and its backup needs about ${mb(projected)} MB plus a reserve of ${mb(SPACE_RESERVE_BYTES)} MB`
+        : `only ${mb(free)} MB is free for backups, under the first backup's reserve floor of ${mb(need)} MB (${image && image > 0 ? "1 GB plus the App's image size" : "2 GB, the App's image size not known"})`;
+      const kept = Object.keys(this.st.keptBackups ?? {}).length;
+      this.d.log(`refused a new backup for ${id}: ${words}${kept ? `; the cleanup couldn't free enough (${kept} kept backup${kept === 1 ? "" : "s"} still inside their bound)` : ""}`);
+      return `no room for its backup: ${words} (delete old backups in Home Assistant, Settings, System, Backups)`;
+    }
+    return "";
+  }
+
   // (0.1.9) The bounded cleanup of kept backups, under the lock (f): only at start, before a new backup (except: that
   // attempt) and on the daily tick. It touches only Keeper's own backups (a name Keeper gives and a kept record with its
   // generation), never the owner's or a drill's. 0.1.10: its limits hold only while cleanup is eligible: it runs only with
@@ -2246,10 +2440,12 @@ export class Keeper {
     const ended = (x: Attempt | undefined) => !!x && (x.status === "ended" || x.status === "aborted" || x.status === "unprotected") && Number(x.endedAt) > 0 && (!x.claim || !!x.claimEndSaid || x.status === "unprotected");
     const mine = (r: KeptRec) => {
       const x = this.st.attempts[r.attempt];
+      // (0.1.19) a backup taken first that no registration used: Keeper's own name and generation, and no attempt names it
+      if (r.first) { const m = KEEPER_BACKUP.exec(r.name); return !!m && m[1] === r.attempt && listed.get(r.slug) === r.name && r.gen > 0 && !Object.values(this.st.attempts).some((y) => y.backup === r.slug); }
       const m = KEEPER_BACKUP.exec(r.name);
       return !!x && x.auth !== "drill" && !!m && m[1] === r.attempt && listed.get(r.slug) === r.name && x.backup === r.slug && (x.gen ?? 0) === r.gen && r.gen > 0 && ended(x);
     };
-    const since = (r: KeptRec) => now - Math.max(r.endedAt, this.st.attempts[r.attempt]?.endedAt ?? Infinity);
+    const since = (r: KeptRec) => now - (r.first ? r.endedAt : Math.max(r.endedAt, this.st.attempts[r.attempt]?.endedAt ?? Infinity));
     for (const r of Object.values(kept)) if (!mine(r) && this.st.attempts[r.attempt] && !ended(this.st.attempts[r.attempt]) && now - r.endedAt >= KEPT_MAX_MS)
       this.d.log(`kept backup ${r.slug} of ${r.attempt} stays past its limit: its attempt has no recorded end (a deadline alone never counts as one)`);
     const past = Object.values(kept).filter((r) => mine(r) && since(r) >= KEPT_GRACE_MS).sort((p, q) => p.endedAt - q.endedAt);
@@ -2270,18 +2466,20 @@ export class Keeper {
       if (!mine(r) || Object.values(this.st.attempts).some(busy)) { this.d.log(`the cleanup left backup ${slug}: its attempt, generation or claim changed`); continue; }
       // (0.1.15) item 4: never a backup an accepted or open attempt references, and never one pinned by an install job without a
       // recorded end (or a claim the Supervisor can't confirm had none): the attempt records are read right before every delete
-      const pin = await this.pinWhy(x, slug);
+      const holder = Object.values(this.st.attempts).find((y) => y.backup === slug && OPEN.includes(y.status));
+      const pin = x && !r.first ? await this.pinWhy(x, slug) : holder ? `${holder.id} is ${holder.status} and names it` : "";
       if (!f.live()) return;
       if (pin) { this.d.log(`the cleanup left backup ${slug}: it is pinned (${pin})`); continue; }
       const age = Math.round(since(r) / 3_600_000);
       await f.write(`the delete of kept backup ${slug}`, () => this.bounded(() => this.d.deleteBackup!(slug), `the delete of backup ${slug}`), (ok) => {
-        if (ok) { delete kept[slug]; x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); this.dropKey(r.name, "its backup was deleted"); }
+        if (ok) { delete kept[slug]; if (x && !r.first) x.backupDropped = true; this.d.log(`the cleanup deleted kept backup ${slug} ("${r.name}") of ${r.attempt}, generation ${r.gen}, ${age} hours after its claim ended (${r.reason})`); this.dropKey(r.name, "its backup was deleted"); }
         else this.d.log(`the cleanup couldn't delete kept backup ${slug} ("${r.name}"): tried again at the next cleanup`);
         this.save();
       }, slug);
     }
     // Keeper-named backups with no kept record: never deleted, named once per start
-    if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name && !TEST_BACKUP_NAME.test(b.name))
+    if (when === "at start") for (const b of list) if (/^Keeper /.test(b.name) && !kept[b.slug] && !Object.values(this.st.attempts).some((x) => x.backup === b.slug || x.backupName === b.name) && b.name !== this.st.backupCheckRun?.name && !TEST_BACKUP_NAME.test(b.name)
+      && !Object.values(this.st.firstBackup ?? {}).some((x) => x.name === b.name || x.slug === b.slug))
       this.d.log(`backup ${b.slug} ("${b.name}") is named like Keeper's but has no generation record here: never deleted by Keeper; delete it by hand (Settings, System, Backups) if you don't want it`);
     if (f.live()) this.save();
   }

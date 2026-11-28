@@ -75,13 +75,14 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
-import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { bumpsAt, facts, headChecks, inMain, land, type MergeDeps } from "./merge";
+import { CAIN_SLUG, fileFirstStore, judgeAsk, judgeStatus } from "./backup-first";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
 import { loadShipKey } from "./shipkey";
 import { attestFlow, rotationNeeded } from "./rotation";
 import { armFlag, drillDeps, drillKeyFrom, linkDrillStore, storeMarkPub } from "./drill";
-import { type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses } from "./ship-pass";
+import { APP_SLUGS, type EnrollmentStore, keyFingerprint, noteArmedEnrollment, parseEnrollment, type PassDeps, registerInstalls, shipPass, acceptWaitMs, reconcilePasses, WATCHED } from "./ship-pass";
 import { linkRoutes, rootFetch } from "./http";
 import { GrantUnsaved, readGrants, recordGrant } from "../review/grants";
 import { appendCapped, asideOf, capState, DECISIONS_FILE, GRANTS_FILE, GUARD_LOG, holdLogged, keeperArmedText, KEEPER_SLUGS, type KeeperReply, recordDecision, roundCapNow, ROUNDS_FILE, SETTINGS_FILE, sweepTemps } from "./cap";
@@ -252,8 +253,38 @@ const drillStore = linkDrillStore(process.env, TRUST_DIR, DIR, Date.now);   // K
 const DRILL_MARK_PUB = process.env.CAIN_DRILL_MARK_PUB ?? `${TRUST_DIR}/keeper-drill-mark.pub`;
 const drillKey = shipPriv ? drillKeyFrom(shipPriv) : null;
 if (drillKey) { try { storeMarkPub(drillKey.pub, DRILL_MARK_PUB); } catch (e) { console.log(`[cain] link: couldn't keep the drill key's public half: ${String(e).slice(0, 80)}`); } }
+// Cain 0.19.4: backup first (backup-first.ts). His Ship tap for an install of Cain is recorded in root's /data/trust (the used taps
+// in the link's own folder), both left out of Cain's backups; the Keeper backs Cain up at the tap, and the token goes out after.
+const BOOTED = Date.now();
+const firstStore = fileFirstStore(process.env.CAIN_BACKUP_FIRST ?? `${TRUST_DIR}/backup-first.json`, process.env.CAIN_BACKUP_FIRST_USED ?? `${DIR}/backup-first-used.json`, writeSynced);
+async function pullNowOf(ship: { pr: string }): Promise<{ repo: string; pr: number; body: any } | null> {
+  const p = pullOf(ship.pr);
+  if (!p) return null;
+  const r = await githubApi(`/repos/${p.repo}/pulls/${p.pr}`).catch(() => null);
+  return r?.status === 200 ? { ...p, body: r.body } : null;
+}
+const backupFirst = {
+  store: firstStore, booted: BOOTED,
+  // what the tap installs, read as the Ship pass reads it (ship-pass.ts registerInstalls): Cain bumped between the base and the head
+  installsCain: async (ship: { pr: string; head: string }) => {
+    if (!WATCHED.has(CAIN_SLUG)) return false;
+    const p = await pullNowOf(ship);
+    const base = String(p?.body?.base?.sha ?? "");
+    if (!p || !/^[0-9a-f]{40}$/.test(base)) return null;
+    const b = await bumpsAt(github, p.repo, base, ship.head);
+    return b ? b.some((x) => APP_SLUGS[x.app] === CAIN_SLUG) : null;
+  },
+  ask: async (ship: { pr: string; head: string }) => {
+    const p = pullOf(ship.pr);
+    if (!p) return { ok: false as const, why: "that isn't a pull request's address" };
+    if (!KEEPER_TOKEN) return { ok: false as const, why: "no keeper_token is set" };
+    return judgeAsk(await keeperCall(KEEPER_BASE, KEEPER_TOKEN, "/backup-first", { app: CAIN_SLUG, pr: p.pr, head: ship.head }));
+  },
+  status: async () => KEEPER_TOKEN ? judgeStatus(await keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/backup-first?app=${CAIN_SLUG}`)) : null,
+  head: async (ship: { pr: string; head: string }) => { const p = await pullNowOf(ship); const h = String(p?.body?.head?.sha ?? ""); return /^[0-9a-f]{40}$/.test(h) ? h : null; },
+};
 const link = new Link({
-  rest, load, save, now: Date.now, paired, toHarness,
+  rest, load, save, now: Date.now, paired, toHarness, backupFirst,
   // A Ship tap's line carries its token (about 230 characters), so lines run to 1000.
   // Durable (C1 re-check N2): a card's line to Cain is on disk before the card's request is done.
   relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),

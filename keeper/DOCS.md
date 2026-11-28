@@ -374,6 +374,29 @@ backup Keeper took at the registration. That covers two windows (0.1.5 says both
 
 Home Assistant itself, `/share` and every other App are left alone.
 
+## Cain backed up first (0.1.19)
+
+Cain's backup is cold: making it stops and starts Cain, and his link with him. Before 0.1.19 Keeper made it
+when Cain's install was registered, and the restarted link cancelled that very registration, so every install
+of Cain failed (Nov 27). Now the backup comes first, and nothing is carried across that restart:
+
+- At Dane's Ship tap for a change that installs Cain, once it is in main, Cain's link records only the tap (its
+  own file, left out of Cain's backups) and asks Keeper for the backup: `POST /backup-first {app, pr, head}`,
+  Cain's token, Cain's own App only. Keeper answers 202 and makes the backup in the background, under the name
+  the attempt for that pull request and head will have, and checks it as a registration's backup is checked
+  (Cain alone, at the version running now, protected with Keeper's own key). `GET /backup-first?app=<slug>` says
+  where it stands: none, making, ready or failed. It is refused during a drill, beside an open attempt or an
+  install job with no recorded end, while an operation is late, and before the Ship key is confirmed.
+- After the restart the link gives the Ship token for that tap once, as for any App, and the Ship run's pass
+  registers the install as usual (`POST /attempt`).
+- Keeper accepts Cain's registration against that backup, used once and removed whatever happens, only when it
+  was made for the same pull request and head, at the version the install replaces, and its own snapshot time
+  (the backup's date as the Supervisor gives it, never the time it was asked for) is within 15 minutes before the
+  registration, after every restore Keeper sent for Cain and after Keeper's state was created. Then it makes no
+  second backup. Otherwise it logs why, keeps the unused backup for the bounded cleanup, and takes a backup as for
+  any install: for Cain that restarts him again, so the install needs a new Ship tap.
+- A drill makes its own backup at its registration, as before. Every other App's install is unchanged.
+
 ## Keeper's own install and updates (0.1.5)
 
 Keeper doesn't gate its own install or updates: an install or update of Keeper goes through the normal

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.19.4
+
+- Fixed: an update of Cain can install again. Until now the Keeper backed Cain up only after the install was registered, that backup restarted Cain, and the restarted Cain cancelled the install, so every update of Cain failed.
+- Now, when you tap Ship on a change that updates Cain, it lands in main, then the Keeper backs Cain up right away. Cain restarts for a minute or two, and once he's back the install goes ahead as for any other App, using that backup.
+- Your Ship card says so. If that backup can't be used (your tap is over 10 minutes old by the time Cain is back, the change moved, you tapped Stop, or the Keeper couldn't make the backup), nothing installs, Cain tells you in one line and the card says a new Ship tap installs it.
+- Changes that don't update Cain ship exactly as before.
+
 ## 0.19.3
 
 - No change to what Cain does. This version carries 0.19.1 and 0.19.2 onto the Pi: 0.19.2 was tried once and the keeper refused it because 0.19.1 had never been installed, and the keeper never takes the same update twice, so it needs a new version to install.

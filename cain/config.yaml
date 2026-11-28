@@ -4,7 +4,7 @@
 # page is Ingress: a terminal for the one-time sign-in, reachable only through
 # Home Assistant (nginx admits the Ingress proxy and nothing else).
 name: Cain
-version: "0.19.3"
+version: "0.19.4"
 slug: cain
 description: >-
   A Claude Code session that stays running on this box and answers your private
@@ -37,12 +37,16 @@ backup: cold
 # deploy key is remade"). Keeper 0.1.14: the drill flags' spent nonces too (link/drill.ts), so a restored backup
 # never brings back a spent list that forgets a nonce spent after it was taken (Keeper keeps every drill nonce as well).
 # Keeper 0.1.15: and the drill flag (its claimed copies included) and the drill mark, so a restore never brings either back.
+# Cain 0.19.4: and his Ship tap recorded for the backup first, with the list of used ones (link/backup-first.ts), so a restore never
+# brings a tap back to be used again.
 backup_exclude:
   - "link/deploy_key*"
   - "link/ship.key*"
   - "link/keeper-drill-spent*"
   - "trust/keeper-drill.json*"
   - "trust/keeper-drill-mark*"
+  - "trust/backup-first*"
+  - "link/backup-first-used*"
 timeout: 30
 # Keys, entered by Dane here, never shown or logged. github_token: the record
 # keeper's GitHub fine-grained token for the org repo only (Contents read and write).

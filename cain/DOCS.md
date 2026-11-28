@@ -184,6 +184,17 @@ service recorded them, for a review of the change as it is now, with a note that
 reviewers read Cain's summary of it, not the code; or "No outside review attached." Cain's own line says only what you'll notice. Cards and Cain's messages never
 show item codes.
 
+**An update of Cain himself (since 0.19.4).** Cain's backup stops and starts Cain, so it can't be
+taken in the middle of his own install. When your Ship tap is for a change that updates Cain, the App
+lands it in main as usual, then writes down only your tap (which change, at which commit, and when) and
+asks the Keeper to back Cain up right away. Cain restarts for a minute or two. Once he's back, the App
+gives him the go for that tap, once, and the install goes on as for any other App, with the Keeper using
+the backup it just took. The card says this while it happens. Your tap gets no go, and a new Ship tap is
+needed, when it is over 10 minutes old by the time Cain is back, when the change has moved on since, when
+you tapped Stop meanwhile, or when the Keeper couldn't make the backup: Cain tells you in one line and the
+card says so. Your written-down tap is left out of Home Assistant's backups, so a restore can't bring it
+back. Changes that don't update Cain ship as before.
+
 Both keys are kept by the App and left out of Home Assistant's backups. Cain's tools
 are barred from them, and once his session runs as its own user (the next step) he
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy

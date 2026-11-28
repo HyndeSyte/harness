@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.19
+
+- Fixed: Cain's own updates. Cain's backup stops and starts Cain, so the backup Keeper took when Cain's install was registered restarted him and cancelled that install. Now Cain asks Keeper for his backup at your Ship tap, before anything is registered, and when the install is registered a few minutes later Keeper uses that backup instead of taking a second one.
+- Keeper uses it only once, only for that same change, and only when the backup itself was made within 15 minutes before the registration and after any rollback Keeper did of Cain. Otherwise Keeper takes a backup as before (for Cain that means the restart again, and a new Ship tap).
+- A backup taken this way that isn't used is kept and cleaned up later like any other unused Keeper backup.
+- Other Apps' installs work exactly as before.
+
 ## 0.1.18
 
 - Fixed: `backup-check` on your Pi stopped at a compressed system log inside Keeper's own software image (`eipp.log.xz`,
