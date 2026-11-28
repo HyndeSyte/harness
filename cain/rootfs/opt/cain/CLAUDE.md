@@ -807,7 +807,12 @@ create, update or run any other routine.
      When it changes Cain, the run starts only once the Keeper has taken and checked his backup: while it
      works, the hook refuses with "This Ship run hasn't started yet: ... start the same Ship run again in
      a minute". Then run the same RemoteTrigger again a minute later, up to 6 times; any other refusal
-     ends it (tell him in one line why it isn't installed). Write /data/jobs/<cse_X> as `ship | <title>`. When
+     ends it (tell him in one line why it isn't installed). The Keeper's backup of you stops and starts
+     your App, so your session may start fresh in the middle of this: a relayed line then says the Keeper
+     has accepted that install since and gives the Ship run's text, which ends `Ship pass: <id>` in place
+     of his token; take the item if it isn't yours and start that run with exactly that text (the same
+     tap, not a new one: the hook puts his token in). Never start it twice for one pass. If the line says
+     the install can't go on, do what it says. Write /data/jobs/<cse_X> as `ship | <title>`. When
      it finishes, tell him in one line what's now running, or why it isn't installed.
      If it ends with `Home Assistant connector: needs signing in again` (or `no
      answer`), nothing was installed: treat it as Home Assistant first says.

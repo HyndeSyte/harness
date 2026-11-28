@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.19.4
+
+- An update of Cain through the Keeper can finish now. The Keeper backs Cain up before it lets an install of him go, and that backup stops and starts Cain. Until now Cain's link took that restart as a reason to call the install off, so your Ship tap installed nothing (Nov 27, Cain 0.19.3).
+- After that restart the link picks up the same install again: it asks the Keeper, and once the Keeper says the backup is made, checked and not yet used, the install goes ahead on your same tap. Cain is told to carry on, so you don't need to tap again.
+- If the Keeper says anything else, nothing is installed, as before, and Cain tells you in one line. A drill, or an install cut off before the Keeper was asked, still needs a new Ship card.
+- Your Ship token no longer passes through Cain's messages after that restart: Cain gets only a short pass code, and the check before the install fetches the token from the link itself.
+- An install the link gives up on is now called off at the Keeper until the Keeper confirms it, and one the Keeper has already handed to a run is never called off by the link.
+- A wait that runs too long ends by itself, counted from your tap, never restarted, and an install never goes ahead on a backup older than 30 minutes.
+- Cain's backups stay as they are: he is still stopped while he is backed up, so his files are never copied half written.
+
 ## 0.19.3
 
 - No change to what Cain does. This version carries 0.19.1 and 0.19.2 onto the Pi: 0.19.2 was tried once and the keeper refused it because 0.19.1 had never been installed, and the keeper never takes the same update twice, so it needs a new version to install.

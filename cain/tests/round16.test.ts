@@ -96,7 +96,10 @@ describe("items 3 and 6: the link's reconcile at its start, and its wait outside
       { id: "b".repeat(32), exp, state: "passed", at: NOW, claims: [{ attempt: "ship-47-cain-89abcdef", claim: "claim-0123456789abcdef", until: T(NOW + 600_000) }] }] });
     const cancelled: string[] = []; const logs: string[] = [];
     const d: PassDeps = { pub: () => SHIP_PUB, now: () => NOW, load: () => file, store: (t) => { file = t; }, register: () => {}, log: (l) => logs.push(l),
-      cancel: (a) => { cancelled.push(a); }, view: async (a) => ({ status: 200, body: { id: a, status: "watching", install_job: "u1", install_job_at: T(NOW) } }) };
+      // Cain 0.19.4, review round 1: the left-open pass's attempt is accepted at Keeper (never claimed), so it is cancelled; a claimed
+      // or watching attempt is never cancelled by the link
+      cancel: (a) => { cancelled.push(a); }, view: async (a) => ({ status: 200, body: a === "ship-46-cain-01234567" ? { id: a, status: "accepted" }
+        : { id: a, status: "watching", install_job: "u1", install_job_at: T(NOW) } }) };
     expect(await reconcilePasses(d)).toBe(1);
     expect(cancelled).toEqual(["ship-46-cain-01234567"]);
     expect(JSON.parse(file!).spent.map((x: any) => x.state)).toEqual(["refused", "passed"]);
