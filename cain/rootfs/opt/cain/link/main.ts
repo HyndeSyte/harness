@@ -180,7 +180,7 @@ function readOr(path: string): string | null {
 }
 
 // A pull request now. GitHub's API says whether it's open and its head; GitHub's own refs (git
-// ls-remote, not counted against the API's 60 asks an hour) give the head alone. 0.19.3: the API is
+// ls-remote, not counted against the API's 60 asks an hour) give the head alone. 0.19.4: the API is
 // asked for one pull request at most every PULL_STATE_EVERY_MS, and never while what is left of the
 // hour is his taps' reserve (budget.ts RESERVE); the refs answer in between. Nothing it can't tell
 // takes a card off.
@@ -224,7 +224,7 @@ const deployKey = loadDeployKey(DEPLOY_KEY, (line) => console.log(`[cain] link: 
 
 // GitHub, for landing his Ship taps: its API without a key (a public repository; 60 asks
 // an hour), and git in the link's own copy, over SSH with the deploy key and GitHub's
-// pinned host keys. Nothing else's config or credentials take part. 0.19.3: every API read
+// pinned host keys. Nothing else's config or credentials take part. 0.19.4: every API read
 // goes through budget.ts (a file at a commit kept for good, ETags, what is left of the hour).
 const gh = makeGithub();
 const githubApi = (path: string) => gh.api(path);

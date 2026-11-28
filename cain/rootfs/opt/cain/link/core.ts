@@ -743,7 +743,7 @@ export interface Deps {
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
   land?: (l: { pr: string; head: string; stopped: () => boolean }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
-  // (0.19.3) what is left of GitHub's hour for the link's reads (budget.ts, /rate_limit: not counted); absent or null: unknown,
+  // (0.19.4) what is left of GitHub's hour for the link's reads (budget.ts, /rate_limit: not counted); absent or null: unknown,
   // which holds nothing back
   budget?: () => Promise<Budget | null>;
   facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
@@ -869,7 +869,7 @@ export const REVIEW_READ = "The reviewers read Cain's summary of the change, not
 
 // A Ship card's words: the question, Cain's line, then the link's lines. His line gives way,
 // so the link's are never cut off.
-// (0.19.3) The Ship card's line when what is left of GitHub's hour can read the card but not his tap's landing and the Ship run.
+// (0.19.4) The Ship card's line when what is left of GitHub's hour can read the card but not his tap's landing and the Ship run.
 export const budgetLine = (until: number, tz?: string) =>
   `GitHub's hourly allowance for the link's reads is low until ${clockTime(until, tz)}: a Ship tap now waits until then, and lands and installs by itself.`;
 function shipCard(top: string, own: string, rest: string[]): string {
@@ -2549,7 +2549,7 @@ export class Link {
     const gateRead = watched.length && gateHead
       ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
       : Promise.resolve(null);
-    // 0.19.3: GitHub's hour first (its /rate_limit isn't counted). Not enough left to read the card: refused, naming when it
+    // 0.19.4: GitHub's hour first (its /rate_limit isn't counted). Not enough left to read the card: refused, naming when it
     // can go. Enough for the card but not for his tap's landing and the Ship run: the card says when a tap goes on by itself.
     const left = this.d.budget ? await within(Promise.resolve().then(() => this.d.budget!()).catch(() => null), wait) : null;
     const cardShort = shortUntil(left, CARD_ASKS, this.d.now());
@@ -3573,7 +3573,7 @@ export class Link {
       if (!m?.ship || m.shipping?.state !== "landing") return;
       const tapped = m.shipping.at;
       let r: Landed;
-      // 0.19.3: his tap needs the landing's reads and the Ship run's left of GitHub's hour; when they aren't, it waits
+      // 0.19.4: his tap needs the landing's reads and the Ship run's left of GitHub's hour; when they aren't, it waits
       // for the reset by itself (his card says until when) and lands then, with no new tap.
       const left = this.d.budget && !this.voided(tapped) ? await within(Promise.resolve().then(() => this.d.budget!()).catch(() => null), FACTS_MS) : null;
       const until = shortUntil(left, RUN_ASKS, this.d.now());

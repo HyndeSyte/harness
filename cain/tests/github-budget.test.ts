@@ -1,4 +1,4 @@
-// GitHub's read allowance for the link (Cain 0.19.3, link/budget.ts): a file read at a commit is kept and never
+// GitHub's read allowance for the link (Cain 0.19.4, link/budget.ts): a file read at a commit is kept and never
 // read again, other reads carry their ETag, two reads at once share one request, and what is left of the hour
 // is read from the answers' headers and GitHub's /rate_limit. A Ship card, his tap and the Ship run's
 // registration each check it first: short, the card says when a tap can go, the tap waits for the reset by

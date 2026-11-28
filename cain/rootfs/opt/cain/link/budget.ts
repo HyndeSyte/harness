@@ -1,4 +1,4 @@
-// GitHub's read allowance for the link (Cain 0.19.3). The link reads GitHub's API without a key: GitHub
+// GitHub's read allowance for the link (Cain 0.19.4). The link reads GitHub's API without a key: GitHub
 // allows 60 reads an hour from the Pi's address, and on Nov 27 a day of Ship taps and the link's own
 // reads spent the hour, so his Ship tap was refused for a reason that had nothing to do with the change.
 // So every read the link makes goes through here:

@@ -189,7 +189,7 @@ are barred from them, and once his session runs as its own user (the next step) 
 can't reach them at all. Once a day the App checks that GitHub still knows its deploy
 key, and Cain is told if it doesn't.
 
-GitHub's hourly reads (since 0.19.3). The App reads GitHub without a key, which GitHub allows 60
+GitHub's hourly reads (since 0.19.4). The App reads GitHub without a key, which GitHub allows 60
 times an hour from your home address. On Nov 27 a busy afternoon of Ship taps spent the hour and a Ship
 tap was refused with "what the tap installs couldn't be read". Now:
 

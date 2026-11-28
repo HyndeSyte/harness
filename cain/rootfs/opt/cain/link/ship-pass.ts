@@ -198,12 +198,12 @@ export interface PassDeps {
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
   waitMs?: number;                                                          // (Keeper 0.1.15) one App's wait for acceptance (acceptWaitMs)
   view?: (attempt: string) => Promise<{ status: number; body: any } | null>;   // (Keeper 0.1.15) GET /attempt/<id>, for the reconcile at start
-  tz?: string;                                                              // (Cain 0.19.3) his time zone, for a wait's time
+  tz?: string;                                                              // (Cain 0.19.4) his time zone, for a wait's time
   log: (line: string) => void;
 }
 export type PassAnswer = { status: "ok"; pr: number; head: string; accepted: Accepted[]; claims: Claimed[] } | { status: "pending" | "spent" | "refused"; said: string };
 export const PENDING_SAID = "the keeper is taking the backup before this install; nothing has run and the tap still counts: start the same Ship run again in a minute";
-// (Cain 0.19.3) The registration waits for GitHub's hour to reset (what it reads isn't left): the pass stays pending
+// (Cain 0.19.4) The registration waits for GitHub's hour to reset (what it reads isn't left): the pass stays pending
 // meanwhile, its wait is longer by that much, and the hook's line says when to start the same run again.
 export const budgetPendingSaid = (until: number, tz?: string) => `GitHub's hourly allowance for the link's reads is spent until ${resetClock(until, tz)}, so the link waits and then registers the install by itself; nothing has run and the tap still counts: start the same Ship run again at ${resetClock(until + 60_000, tz)}`;
 
@@ -363,7 +363,7 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   }
   if (e.state === "refused") return { status: "refused", said: `${e.said ?? "the keeper didn't accept the install"}. ${again}` };
   if (e.state === "registering") {
-    // (Cain 0.19.3) a wait for GitHub's hour to reset lengthens the pass's wait by as much
+    // (Cain 0.19.4) a wait for GitHub's hour to reset lengthens the pass's wait by as much
     const wait = passWaitMs(e.apps ?? 1, d.waitMs) + Math.max(0, (e.waitUntil ?? 0) + RESET_SLACK_MS - e.at);
     if (e.waitUntil && e.waitUntil + RESET_SLACK_MS > now) return { status: "pending", said: budgetPendingSaid(e.waitUntil, d.tz) };
     if (now - e.at <= wait) return { status: "pending", said: PENDING_SAID };
@@ -422,7 +422,7 @@ export interface RegisterDeps {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   note?: (upd: { apps?: number; attempt?: string; waitUntil?: number }) => void;
-  // (Cain 0.19.3) what is left of GitHub's hour (budget.ts, /rate_limit: not counted); the registration waits for the reset
+  // (Cain 0.19.4) what is left of GitHub's hour (budget.ts, /rate_limit: not counted); the registration waits for the reset
   // when what it reads isn't left, and once more if a read was refused for the rate limit
   budget?: () => Promise<Budget | null>;
   tz?: string;
@@ -449,7 +449,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   let cancel: string | undefined;                       // (Keeper 0.1.8) an enrollment refusal's why, for the cancel
   const say = (l: string, bad = true) => { said.push(l); if (bad) ok = false; d.log(`keeper registration: ${l}`); };
   const now = d.now ?? Date.now, sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
-  // (Cain 0.19.3) GitHub's hour first: when what this reads isn't left, wait for the reset (at most once before the reads and
+  // (Cain 0.19.4) GitHub's hour first: when what this reads isn't left, wait for the reset (at most once before the reads and
   // once after a read the rate limit refused), then go on, with no new tap. The pass stays pending meanwhile.
   const waitBudget = async (): Promise<boolean> => {
     const b = d.budget ? await d.budget().catch(() => null) : null;
