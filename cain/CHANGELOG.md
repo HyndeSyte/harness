@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.4
+
+- A drill release for the Keeper drills, with nothing new: the same code as 0.19.3.
+- If this install fails, that comes only from your Arm the drill tap (the drill flag and mark), never from code in this release.
+
 ## 0.19.3
 
 - No change to what Cain does. This version carries 0.19.1 and 0.19.2 onto the Pi: 0.19.2 was tried once and the keeper refused it because 0.19.1 had never been installed, and the keeper never takes the same update twice, so it needs a new version to install.
