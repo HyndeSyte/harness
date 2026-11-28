@@ -767,7 +767,8 @@ create, update or run any other routine.
      refuses the card while a check failed or hasn't run yet (the PC worker's Windows
      check too, while it is still running, and for good once any attempt of it failed on
      that head, even beside a green re-run), and for a review of another
-     head (or one that names none). `/opt/cain/keeper.sh ship-gate <full head sha>` reads
+     head (or one that names none). A card that says GitHub's hourly allowance for the link's reads is low or couldn't be read (its
+     facts unread, or a tap waiting until a time) is shown as it is: his tap reads everything and lands by itself then. `/opt/cain/keeper.sh ship-gate <full head sha>` reads
      that Windows gate for a head without acting and says what it would decide and why;
      with `--watch` it is his probe's `ship_gate` step, kept in /data/work: start it before
      the candidate head is pushed (it must see the Windows run pending), then push. Better,
@@ -806,7 +807,11 @@ create, update or run any other routine.
      one run: if the install must run again, show a new Ship card for the same pull request and head).
      When it changes Cain, the run starts only once the Keeper has taken and checked his backup: while it
      works, the hook refuses with "This Ship run hasn't started yet: ... start the same Ship run again in
-     a minute". Then run the same RemoteTrigger again a minute later, up to 6 times; any other refusal
+     a minute". Then run the same RemoteTrigger again a minute later, up to 6 times (when that line instead says GitHub's
+     hourly allowance is spent and names a time, run it again at that time: the link waits and registers by itself, and
+     that wait doesn't count toward the 6, and a refusal with that same line means that run is already waiting: start no
+     other, run the same one again at that time; a refusal that says a Ship tap on a new card can go at a time means his tap ran
+     out first: show a new Ship card for the same pull request and head at that time); any other refusal
      ends it (tell him in one line why it isn't installed). Write /data/jobs/<cse_X> as `ship | <title>`. When
      it finishes, tell him in one line what's now running, or why it isn't installed.
      If it ends with `Home Assistant connector: needs signing in again` (or `no

@@ -67,7 +67,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameS
 import { appendSynced, type Caller, checkRequest, RequestLog, RERUN_SAFE, sameKey, SIG_CONTEXT, SIG_HEADER, SignedOps, signResponse, writeSynced, boundedText } from "./auth";
 import { type LinkMode, linkDecides } from "../c1/contract";
 import { readReviewed } from "../reviewed";
-import { makeToken } from "../ship-token";
+import { makeToken, TTL_S } from "../ship-token";
 import { ensureStop, readStop, TRUST_DIR, writeStop } from "../stop";
 import { KEEPER_SENT, noteAt } from "../gate/held";
 import { readHosts } from "../gate/hosts";
@@ -75,6 +75,7 @@ import { appendGate, GATE_LOG, GATE_LOG_MAX } from "../gate/log";
 import { discordError, Link, Protocol, PULL, type Pull, type State } from "./core";
 import { loadDeployKey } from "./deploykey";
 import { keyStatus, makeGit, sshArgs, timeoutBin } from "./github";
+import { type ApiOpts, makeGithub, pullStateReader, REG_ASKS, resetClock } from "./budget";
 import { facts, headChecks, inMain, land, type MergeDeps } from "./merge";
 import { gateHeadRead, gateState, WATCH_DIR } from "./shipgate";
 import { CARDS_DELAY_MS, CARDS_FILE, CardsWriter, readTranscripts, seedReplies, stateFile, TRANSCRIPTS, writeReplayReport } from "./publish";
@@ -111,6 +112,7 @@ const DECIDED = DECISIONS_FILE;                      // his taps on the review r
 const KNOWN_HOSTS = "/opt/cain/link/github_known_hosts";
 const HARNESS = "http://0fcc2575-harness:8098";
 const API = "https://discord.com/api/v10";
+const TZ = process.env.CHECKIN_TZ ?? "America/New_York";      // his time zone, for the times the link says
 const SWEEP_MS = 60_000;
 
 mkdirSync(DIR, { recursive: true, mode: 0o700 });
@@ -177,22 +179,21 @@ function readOr(path: string): string | null {
   catch (e: any) { return e?.code === "ENOENT" ? null : ""; }
 }
 
-// A pull request now. GitHub's API says whether it's open and its head; when that
-// can't be read (it allows 60 asks an hour without a key), the head alone comes from
-// GitHub's own refs. Nothing it can't tell takes a card off.
+// A pull request now. GitHub's API says whether it's open and its head; GitHub's own refs (git
+// ls-remote, not counted against the API's 60 asks an hour) give the head alone. 0.19.4: the API is
+// asked for one pull request at most every PULL_STATE_EVERY_MS (the time is kept before it is asked,
+// whatever the answer), and only while what is known to be left, less the holds of taps landing or
+// registering, is above his taps' reserve (budget.ts RESERVE): it stops at the reserve, never spends into
+// it, and an unknown hour isn't spent. The refs answer in between. Nothing it can't tell takes a card off.
 async function pullNow(pr: string): Promise<Pull | null> {
   const m = PULL.exec(pr);
   if (!m) return null;
-  try {
-    const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/pulls/${m[3]}`, { redirect: "error",
-      headers: { accept: "application/vnd.github+json", "user-agent": "cain-link" }, signal: AbortSignal.timeout(15000) });
-    if (r.ok) {
-      const j: any = await r.json();
-      const head = String(j?.head?.sha ?? "");
-      return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null,
-        merged: j?.merged === true };
-    }
-  } catch { /* fall back to the refs */ }
+  const j: any = await pullState(`/repos/${m[1]}/${m[2]}/pulls/${m[3]}`);
+  if (j) {
+    const head = String(j?.head?.sha ?? "");
+    return { head: /^[0-9a-f]{40}$/.test(head) ? head : null, open: j?.state === "open" ? true : j?.state === "closed" ? false : null,
+      merged: j?.merged === true };
+  }
   try {
     const p = Bun.spawn(["git", "-c", "credential.helper=", "ls-remote", `https://github.com/${m[1]}/${m[2]}.git`, `refs/pull/${m[3]}/head`],
       { stdout: "pipe", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_TERMINAL_PROMPT: "0", HOME: "/tmp" } });
@@ -215,15 +216,23 @@ const deployKey = loadDeployKey(DEPLOY_KEY, (line) => console.log(`[cain] link: 
 
 // GitHub, for landing his Ship taps: its API without a key (a public repository; 60 asks
 // an hour), and git in the link's own copy, over SSH with the deploy key and GitHub's
-// pinned host keys. Nothing else's config or credentials take part.
-async function githubApi(path: string): Promise<{ status: number; body: any }> {
-  const r = await fetch(`https://api.github.com${path}`, { redirect: "error", signal: AbortSignal.timeout(15000),
-    headers: { accept: "application/vnd.github+json", "user-agent": "cain-link", "x-github-api-version": "2022-11-28" } });
-  return { status: r.status, body: await r.json().catch(() => null) };
-}
+// pinned host keys. Nothing else's config or credentials take part. 0.19.4: every API read
+// goes through budget.ts (a file at a commit and a finished attempt's job list kept for good, what is
+// left of the hour, one reservation book for every consumer). No ETags: without a key they save nothing.
+const gh = makeGithub();
+const githubApi = (path: string, o?: ApiOpts) => gh.api(path, o);
+const pullState = pullStateReader(gh);
+// Once an hour, what the link asked of GitHub's API in the last hour, measured on the device: reads sent, reads answered from the link's kept ones, and /rate_limit calls on
+// their own (not counted against the 60, but they can count against GitHub's secondary limits: never polled in a loop).
+setInterval(() => {
+  const h = gh.hour(), b = gh.seen();
+  console.log(`[cain] link: GitHub API reads in the last hour: ${h.asked} asked, ${h.kept} answered from the link's kept reads, ${h.limits} /rate_limit reads${b ? `; ${b.remaining} of ${b.limit} left until ${resetClock(b.reset, TZ)}` : "; what is left is unknown"}`);
+}, 3_600_000);
 const SSH = sshArgs(DEPLOY_KEY, KNOWN_HOSTS);
 const gitRun = makeGit({ repoDir: REPO_DIR, ssh: SSH.join(" "), home: DIR, timeoutBin: timeoutBin() });
-const github: MergeDeps = { api: githubApi, git: gitRun, stopped: () => readStop().stopped };
+const github: MergeDeps = { api: githubApi, git: gitRun, stopped: () => readStop().stopped, lists: gh.lists };
+// (round 2) the same, with every read charged to one consumer's reservation in the book
+const githubAs = (as?: string): MergeDeps => (as ? { ...github, api: (path, o) => gh.api(path, { ...o, as }) } : github);
 const SHIP_REPO = "HyndeSyte/harness";
 const pullOf = (pr: string) => { const m = PULL.exec(pr); return m ? { repo: `${m[1]}/${m[2]}`, pr: Number(m[3]) } : null; };
 
@@ -259,7 +268,11 @@ const link = new Link({
   relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   record: () => ({ pending: readOr(`${RECORD}/state/PENDING.md`), holds: readOr(HOLDS) }),
   pull: pullNow,
-  tz: process.env.CHECKIN_TZ ?? "America/New_York",
+  tz: TZ,
+  // 0.19.4: a card's view is what is left less what taps landing or registering hold; his tap's landing sees it whole
+  // 0.19.4: what is left of GitHub's hour; round 2: the one reservation book every consumer shares
+  budget: () => gh.rateLimit(),
+  book: gh.book,
   stop: { read: () => readStop(), write: (stopped, at) => writeStop(stopped, at) },
   signShip: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
   // Keeper 0.1.9: his tap on the rotation card, signed with the Ship key here and sent to the keeper (rotation.ts)
@@ -269,17 +282,17 @@ const link = new Link({
     return attestFlow({ get: (path) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path), post: (path, body) => keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body, 20_000),
       sign: (data) => edSign(null, data, shipPriv), now: Date.now }, id);
   } : undefined,
-  land: deployKey ? async ({ pr, head, stopped }) => {
+  land: deployKey ? async ({ pr, head, stopped, late, key, push }) => {
     const p = pullOf(pr);
     if (!p) return { ok: false, why: "that isn't a pull request's address", again: false };
-    return land({ ...github, stopped }, { repo: p.repo, pr: p.pr, head });
+    return land({ ...githubAs(key), stopped }, { repo: p.repo, pr: p.pr, head, late, push });
   } : undefined,
   landed: deployKey ? async ({ pr, head }) => { const p = pullOf(pr); return p ? inMain(github, p.repo, head) : null; } : undefined,
-  facts: async (pr, head) => { const p = pullOf(pr); return p ? facts(github, p.repo, p.pr, head) : null; },
+  facts: async (pr, head, as) => { const p = pullOf(pr); return p ? facts(githubAs(as), p.repo, p.pr, head) : null; },
   // A Ship card reads the head's checks as the landing does (merge.ts headChecks, pcjobs-windows
   // included when the head's tests.yml names it), and the review
   // service's lines (/data/trust/reviewed.json), for a review of that head.
-  checkRuns: async (pr, head) => { const p = pullOf(pr); return p ? headChecks(github, p.repo, head) : null; },
+  checkRuns: async (pr, head, as) => { const p = pullOf(pr); return p ? headChecks(githubAs(as), p.repo, head) : null; },
   gateWatch: (pr) => { const p = pullOf(pr); if (!p) return []; const st = gateState(WATCH_DIR, Number(p.pr)); return "heads" in st ? (st.owed ? { owed: st.owed } : st.heads) : st; },
   // 0.12.2: while a watch's acceptance stands, the card reads the gate's head through the gate's own curl wrapper
   // (shipgate.ts gateHeadRead: curl's version read anew each time, killed at its limit, a timeout named), never fetch.
@@ -439,14 +452,24 @@ const ACCEPT_WAIT_MS = acceptWaitMs(process.env.KEEPER_ACCEPT_MIN);   // Keeper 
 const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
 const shipPassDeps: PassDeps = {
   pub: shipPub,
+  tz: TZ,
   now: Date.now,
   load: () => { try { return readFileSync(SHIP_PASSES, "utf8"); } catch (e: any) { if (e?.code === "ENOENT") return null; return "unreadable"; } },
   store: (text) => writeSynced(SHIP_PASSES, text),
   // Keeper 0.1.5: POST /attempt answers 202 at once and the link polls GET /attempt/<id> until accepted or
   // refused (ATTEMPT_WAIT_MS per App); the pass stays "pending" meanwhile (ship-pass.ts).
-  register: (tok, claim, done, note) => {
+  // Cain 0.19.4: bound to the base his tap's landing read, its reads charged to its own reservation in the book (taken when
+  // it waits, kept across the reset), the pass and his Stop checked after any wait for GitHub's hour and, under the link's
+  // ship lock (round 2), before each keeper write
+  register: (tok, claim, done, note, active, expires) => {
     const pub = shipPub();
-    void registerInstalls({ api: githubApi, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
+    const key = `pass:${claim.pr}:${claim.head}`;
+    const tapped = claim.exp * 1000 - TTL_S * 1000;          // his tap: a Stop after it voids the pass
+    void registerInstalls({ api: (path, o) => gh.api(path, { ...o, as: key }), budget: () => gh.rateLimit(), tz: TZ, log: (l) => console.log(`[cain] link: ${l}`), note, enrollment, linkFp: pub ? keyFingerprint(pub) : null,
+      active: () => { const st = link.stopped(); return (!active || active()) && !st.stopped && !(st.at !== null && st.at > tapped); },
+      expires, landing: () => link.landedBase(`https://github.com/${claim.repo}/pull/${claim.pr}`, claim.head),
+      reserve: (on) => { if (on) gh.book.reserve(key, REG_ASKS, claim.exp * 1000); else gh.book.release(key); },
+      exclusive: (fn) => link.shipExclusive(fn),
       post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null) }, tok, claim)
