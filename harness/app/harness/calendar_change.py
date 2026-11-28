@@ -4585,6 +4585,9 @@ class CalendarChange:
             # google_cal.py), and a step stopped before its write never sent one.
             rec.update(status="failed", entry=None, kind=stopped.kind, words=stopped.words)
             self._save_plan(pid, plan)
+            for r in step.rows or []:            # a removal turned down: its "approving" mark goes (round 4)
+                if r.get("table") == "family_copies" and r.get("set", {}).get("state") == "asked_off":
+                    family_copy.unsuppress(self.ledger, r["key"], only="approving")
             self._gate_blocked(plan, rec, stopped)
             return "failed", None, stopped
         full = {**entry, "removed": [list(x[:3]) for x in step.removed], **({"rows": step.rows} if step.rows else {})}
@@ -4740,6 +4743,11 @@ class CalendarChange:
                        (*r["set"].values(), now, r["key"], r["was"].get("state", "live")))
             if r.get("hold"):
                 family_copy.hold(self.ledger, r["key"], *r["hold"], db=db)
+            if r["table"] == "family_copies" and r["set"].get("state") == "asked_off":
+                # Round 4 of the second review: his approved removal, kept as a reason never to make the copy again
+                # by itself nor to reconcile it, until his Undo.
+                family_copy.suppress(self.ledger, r["key"], "asked_off", db)
+                family_copy.unqueue(self.ledger, r["key"], db)
             if r["table"] == "family_copies" and r["set"].get("start") and entry and entry.get("cal") == "family":
                 self._note_copy_write(db, r, entry, landed=landed, read_body=read_body)
 
@@ -4782,6 +4790,8 @@ class CalendarChange:
                 family_copy.hold(self.ledger, r["key"], r["set"]["start"], r["set"]["end"], db=db)
             if r.get("gone"):                    # a read from before the undo shows it gone
                 family_copy.hold(self.ledger, r["key"], gone=True, db=db)
+            if r["table"] == "family_copies" and r["set"].get("state") == "asked_off":
+                family_copy.unsuppress(self.ledger, r["key"], db)   # his Undo: it may follow again
 
     def _finish(self, p, results: list, undo: list[dict], notes: list[str], after_all: bool = False) -> None:
         """One receipt: what was done, and what wasn't, each by name with why. Never "Nothing
@@ -5788,26 +5798,40 @@ class CalendarChange:
     def copy_purged_change(self, key: str) -> dict | None:
         """The take-it-off change for a copy left because Google no longer has its Gmail event (family_copy, round 3
         of the second review): bound to the copy as read now by its record, for a card on his tap. None when it
-        can't be read, isn't Harness's own as written, or isn't left for that."""
+        can't be read or isn't one Harness keeps.
+
+        Round 4 of the second review: the same approval as every removal of a copy left alone (_kept_part), whether
+        the copy is still exactly Harness's own or someone changed it since: the card names the exact copy and what
+        changed on it, says approving discards it, and the removal goes only with If-Match on the version the card
+        showed; a newer version at his tap is a fresh card (copy_fix_for)."""
         row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (key,)).fetchone()
         ident = family_copy.source_of(self.ledger, key)
-        if row is None or row["hand"] or row["state"] != "live" or ident is None:
+        if row is None or row["hand"] or row["state"] not in COPY_FOLLOWS or ident is None:
             return None
         x = self._copy_by_record(row)
         if x is None:
             return None
         x.copy_of = key
-        if self._copy_diff(x, row):
-            return None                            # someone's now: the sync says so, never offered off
+        diff = self._copy_diff(x, row)
         return self._fix_change("remove", x.title, x.first, "", "", {
-            "key": key, "src": family_copy.google_id(*ident), "src_v": "", "gone": "purged", **self._copy_ref(x)})
+            "key": key, "src": family_copy.google_id(*ident), "src_v": "", "gone": "purged",
+            "diff": ",".join(diff)[:300], **self._copy_ref(x)})
 
     def copy_fix_for(self, key: str) -> list[dict] | None:
         """The fix for one copy as it is now (a fresh card after a stale one): [] when it matches its event."""
         got = self.copy_fixes(every=True)
         if got is None:
             return None
-        return [c for c in got["changes"] if json.loads(c["copy"]).get("key") == key]
+        found = [c for c in got["changes"] if json.loads(c["copy"]).get("key") == key]
+        if not found and self.ledger.get_meta(family_copy.PURGED + key):
+            # Round 4 of the second review: a purged copy's card, its copy at a newer version by his tap: the
+            # take-it-off card again, as the copy reads now. Unreadable now: asked again with the next digest.
+            c = self.copy_purged_change(key)
+            if c is None:
+                family_copy._set_meta(self.ledger, family_copy.PURGED + key, "due")
+                return None
+            return [c]
+        return found
 
     def _copy_fresh_card(self, p, key: str, words: str) -> None:
         """His tap on a copy fix whose copy or event changed since the card: nothing written, and the fix as it
@@ -5848,11 +5872,12 @@ class CalendarChange:
             raise Refuse("I couldn't read that Family copy just now")
         x.copy_of = key
         back_card = b.get("back") == "1"
+        purged_card = b.get("gone") == "purged" and c["op"] == "remove" and not row["hand"]
         if back_card and (row["hand"] or row["state"] != "hands_off"):
             raise CopyChanged("that Family copy is Harness's own again", key)
         if not back_card and not row["hand"] and row["state"] == "hands_off" and c["op"] != "remove":
             raise CopyChanged("that Family copy was left alone since your card", key)
-        if not row["hand"] and not back_card:
+        if not row["hand"] and not back_card and not purged_card:
             diff = self._copy_diff(x, row)
             if diff:
                 # The whole copy against what Harness last wrote there (its own record): a changed title or time
@@ -5879,6 +5904,14 @@ class CalendarChange:
             why = ("is no longer known to Google (it answers \u201cnot found\u201d, as it does once a deleted event "
                    "is purged)" if purged else "was cancelled" if cancelled else "was deleted")
             name = f"the Family copy \u201c{_safe(x.title)}\u201d on {_day_words(x.first)}"
+            if purged_card:
+                # Round 4 of the second review: the three-404 card takes the same approval as a copy left alone,
+                # whatever state the copy is in: the exact copy, what changed on it, that approving discards it, and
+                # If-Match on exactly the version the card showed (checked above, and again at the write).
+                part = self._kept_part(f"\u201c{_safe(x.title)}\u201d on {_day_words(x.first)}", x, row, "remove",
+                                       None, None, b["fam_v"], self._copy_diff(x, row), live_ok=True)
+                part.will += f": the Gmail event it copies {why}"
+                return part
             if not row["hand"] and row["state"] == "hands_off":
                 # Left alone: taken off only on a take-back part, at exactly the version shown (round 3 of the
                 # second review).
@@ -5929,15 +5962,18 @@ class CalendarChange:
         diff = [d for d in (b.get("diff") or "").split(",") if re.fullmatch(r"[A-Z0-9-]{1,40}", d)]
         return self._kept_part(self._name(asked, g), x, row, "move", start, end, b["fam_v"], diff)
 
-    def _kept_part(self, name: str, x: Found, row, op: str, start, end, version: str, diff: list[str]) -> Part:
+    def _kept_part(self, name: str, x: Found, row, op: str, start, end, version: str, diff: list[str], *,
+                   live_ok: bool = False) -> Part:
         """Round 3 of the second review: the one way a card writes to a copy Harness left alone (hands-off), from a
         copy fix or an ordinary move, retime or removal alike. Its own part, always on his tap: it names what someone
         changed on the copy, says approving discards that, and writes Harness's copy over it, or takes it off, only
         with If-Match on exactly the version the card showed (_copy_take_back, _copy_take_back_remove)."""
-        what = f"changed on Family: {_diff_words(diff)}" if diff else "left alone earlier, though nothing on it changed"
+        what = (f"changed on Family: {_diff_words(diff)}" if diff
+                else "nothing on it changed since Harness wrote it" if row["state"] == "live"
+                else "left alone earlier, though nothing on it changed")
         targets = frozenset({(x.calendar, x.series, x.instance)})
         if op == "remove":
-            step = self._copy_take_back_remove(x, row, version)
+            step = self._copy_take_back_remove(x, row, version, live_ok=live_ok)
             bound = self._bound_of(x)
             text = f"the Family copy of {name} off ({what})"
             part = Part(f"Take {text}. Approving discards it as it is now", f"Took {text}", [step],
@@ -7212,7 +7248,7 @@ class CalendarChange:
         return bool(ical.parse_calendar(body)[1])           # "there": a new event
 
     def _copy_owned(self, key: str, read: "FamilyRead", op: str, new: str = "", start=None, end=None, *,
-                    take_back: str = "") -> None:
+                    take_back: str = "", live_ok: bool = False) -> None:
         """Round 5: a card's write to a copy of Harness's (a move or a removal, with its event or on its own) goes only
         over a copy that holds exactly what Harness last wrote there, matched whole against its own record (title
         and times included), and only with If-Match on the version that passed that check (_family_write and
@@ -7224,7 +7260,9 @@ class CalendarChange:
             return                     # his own copy taken over (its own check), or one Harness no longer keeps
         base = family_copy.baseline(self.ledger, key, row)
         if take_back:
-            if not _etag_same(read.etag, take_back) or row["state"] != "hands_off":
+            # live_ok: the three-404 card (round 4 of the second review), approved over the version it showed
+            # whether or not the copy was left alone meanwhile.
+            if not _etag_same(read.etag, take_back) or (row["state"] != "hands_off" and not live_ok):
                 raise Stopped("changed", words="that Family copy changed since your card, so nothing was sent")
         elif row["state"] == "hands_off":
             # Round 3 of the second review: a copy Harness left alone is written to only by a take-back part, which
@@ -7242,6 +7280,12 @@ class CalendarChange:
             raise Stopped("failed", words="a Family copy is written only with If-Match on its version, and none could "
                                           "be sent, so nothing was sent")
         wrote = (row["title"], start, end) if op == "put" and start is not None else None
+        with self.ledger.tx() as db:
+            if op == "delete":
+                # Round 4 of the second review: a removal he approved outranks any reconciliation queued before it,
+                # from before it is sent: its queued work is dropped and none acts on the copy meanwhile.
+                family_copy.suppress(self.ledger, key, "approving", db)
+                family_copy.unqueue(self.ledger, key, db)
         family_copy.note_write(self.ledger, key, read.etag, landed=False, wrote=wrote, before=base,
                                prior_body=read.body, intended=new, op=op)
 
@@ -7451,7 +7495,7 @@ class CalendarChange:
             shown = ""
         return shown or version or "\x00no version"
 
-    def _copy_take_back_remove(self, f: Found, row, version: str) -> Step:
+    def _copy_take_back_remove(self, f: Found, row, version: str, *, live_ok: bool = False) -> Step:
         """Round 3 of the second review: a copy someone changed on Family taken off on his tap only, with If-Match on
         exactly the version his card showed (_copy_owned); gone with its event, never put back while that's off."""
         href = f.raw.href
@@ -7461,14 +7505,16 @@ class CalendarChange:
             read = self._family_fetch(href)
             if ics_edit.people(read.body):
                 raise ics_edit.Cant("it has invitees, and changing it could message them")
-            self._copy_owned(key, read, "delete", take_back=self._shown_version(href, version))
+            self._copy_owned(key, read, "delete", take_back=self._shown_version(href, version), live_ok=live_ok)
             return self._family_delete(read, f.title, key)
         step = Step(f"Family: the copy {_safe(f.title)} on {_day_words(f.first)} taken off.", run,
                     [("family", f.series, "", f.title, f.first)], what="the Family copy",
-                    spec={"fn": "copy_take_back_remove", "found": [_found_json(f)], "version": version})
+                    spec={"fn": "copy_take_back_remove", "found": [_found_json(f)], "version": version,
+                          **({"live_ok": "1"} if live_ok else {})})
         step.removed = []
+        was = "live" if live_ok and row["state"] == "live" else "hands_off"
         step.rows = [{"table": "family_copies", "key": key, "set": {"state": "asked_off"},
-                      "was": {"state": "hands_off", "missing": row["missing"]}, "undo_from": ["asked_off", "cancelled"],
+                      "was": {"state": was, "missing": row["missing"]}, "undo_from": ["asked_off", "cancelled"],
                       "gone": True}]
         return step
 
@@ -8165,7 +8211,7 @@ class CalendarChange:
             row = self.ledger.db.execute("SELECT * FROM family_copies WHERE key=?", (found[0].copy_of,)).fetchone()
             if row is None:
                 raise ValueError("no copy to take off")
-            step = self._copy_take_back_remove(found[0], row, spec["version"])
+            step = self._copy_take_back_remove(found[0], row, spec["version"], live_ok=spec.get("live_ok") == "1")
         elif fn == "gmail_remove":
             step = self._gmail_remove(found[0])
         elif fn == "gmail_end":

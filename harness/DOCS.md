@@ -1475,8 +1475,15 @@ and `/status` says if the Gmail calendar isn't being read.
   anything else. 410 Gone is what Google's API documents for a resource that's gone (and for an expired sync
   token). So a copy whose event Google answers "not found" for three reads in a row, while the read leaves it
   out, is left as it is, named once in the digest, and gets one card with the next digest to take it off,
-  done only on your tap, with `If-Match` on the version the card showed. Step 3a below checks what Google
-  answers on your account.
+  done only on your tap, with `If-Match` on the version the card showed. That card is the same as for any
+  copy left alone: it names the copy and its day, says what someone changed on it (or that nothing did), and
+  says approving discards it as it is now. If the copy changes before your tap, nothing is written and a
+  fresh card comes instead. Step 3a below checks what Google answers on your account.
+- **Removed stays removed:** a copy you approved taking off, and a copy someone took off Family, are
+  recorded, and Harness never makes it again by itself, nor brings it to its event, even if the event comes
+  back. Only your Undo of that removal clears the record. A check queued after an earlier write is dropped
+  as soon as you approve the copy's removal, before the removal is sent, and a queued move only ever changes
+  the copy in place, with `If-Match` on its version, never by making a new one.
 - **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
   family mirrored event not updating"), even as a question, and you get a card that brings that copy back
   to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name

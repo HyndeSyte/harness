@@ -104,6 +104,14 @@ RECONCILE_CAPPED = "family_copy_reconcile_capped"
 # "carded").
 PURGED = "family_copy_purged:"
 PURGED_EVENT = "family_copy_purged"
+# Round 4 of the second review (Nov 28). Reasons never to make a copy again by itself, nor to reconcile it (meta, per
+# copy: {"why", "at"}): "asked_off" for a removal he approved that went through, "household" for a copy someone took
+# off Family, and "approving" from the moment an approved removal is about to be sent until it lands or fails (good
+# for APPROVING_FOR at most, should neither ever be said). Checked when queued work runs and before a create. Only his
+# Undo of that removal clears one.
+SUPPRESS = "family_copy_suppress:"
+SUPPRESS_WHY = ("asked_off", "household", "approving")
+APPROVING_FOR = timedelta(hours=1)
 KNOWN_EDITS = frozenset({"SUMMARY", "DTSTART", "DTEND", "LOCATION", "DESCRIPTION", "VALARM", "ATTENDEE", "URL",
                          "STATUS", "RRULE", "CATEGORIES", "TRANSP", "X-APPLE-TRAVEL-DURATION", "CLASS",
                          "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR", "X-APPLE-TRAVEL-START", "X-APPLE-STRUCTURED-LOCATION",
@@ -440,6 +448,50 @@ def unqueue(ledger: Ledger, key: str, db=None) -> None:
         return
     with ledger.tx() as d:
         d.execute("DELETE FROM meta WHERE key=?", (RECONCILE + key,))
+
+
+def suppress(ledger: Ledger, key: str, why: str, db=None) -> None:
+    """A reason never to make this copy again, nor to reconcile it (SUPPRESS). A removal that went through outranks
+    one being sent, and nothing outranks a removal: "approving" never replaces "asked_off" or "household"."""
+    assert why in SUPPRESS_WHY
+    if why == "approving" and (suppressed(ledger, key) or {}).get("why") in ("asked_off", "household"):
+        return
+    _set_meta(ledger, SUPPRESS + key, json.dumps({"why": why, "at": iso(ledger.now())}, sort_keys=True), db)
+
+
+def suppressed(ledger: Ledger, key: str) -> dict | None:
+    """Why this copy is never made again nor reconciled, or None. A record that can't be read counts (fail closed);
+    an "approving" mark older than APPROVING_FOR is a removal that never got as far as landing or failing, and lapses."""
+    raw = ledger.get_meta(SUPPRESS + key)
+    if raw is None:
+        return None
+    try:
+        d = json.loads(raw)
+        why = d["why"] if isinstance(d, dict) and d.get("why") in SUPPRESS_WHY else None
+    except (ValueError, TypeError, KeyError):
+        why = None
+    if why is None:
+        return {"why": "unreadable"}
+    if why == "approving":
+        try:
+            if ledger.now() - datetime.fromisoformat(d["at"]) > APPROVING_FOR:
+                return None
+        except (ValueError, TypeError, KeyError):
+            pass
+    return d
+
+
+def unsuppress(ledger: Ledger, key: str, db=None, *, only: str = "") -> None:
+    """His Undo of the removal (or, with only="approving", a removal that failed outright): the copy may follow again."""
+    if ledger.get_meta(SUPPRESS + key) is None:
+        return
+    if only and (suppressed(ledger, key) or {}).get("why") != only:
+        return
+    if db is not None:
+        db.execute("DELETE FROM meta WHERE key=?", (SUPPRESS + key,))
+        return
+    with ledger.tx() as d:
+        d.execute("DELETE FROM meta WHERE key=?", (SUPPRESS + key,))
 
 
 def confirm_soon(ledger: Ledger, table: str, calendar) -> None:
@@ -1015,8 +1067,8 @@ class FamilyCopy:
 
     def _let_go(self, planned: dict) -> None:
         """A copy taken off with its Gmail event, at his word, waits only while a read may still
-        show that event. Once a whole read doesn't, it's an ordinary cancelled copy, so if the
-        event comes back, by Undo or by his own hand, the copy comes back with it."""
+        show that event. Once a whole read doesn't, it's cancelled. Round 4 of the second review: his approved
+        removal is recorded (suppressed), so it comes back only by his Undo, which clears that record."""
         for row in self.ledger.db.execute("SELECT * FROM family_copies WHERE state='asked_off'").fetchall():
             if row["key"] not in planned:
                 self._set(row, "cancelled")
@@ -1110,7 +1162,8 @@ class FamilyCopy:
                            "I changed nothing. I'll try again.")
             elif want is None and not row["hand"]:
                 # Gone from Family with no write of Harness's: someone took it off. Left alone and said once, and
-                # never made again by itself, even if its event comes back (round 5).
+                # never made again by itself, even if its event comes back (round 5), and recorded so (round 4).
+                suppress(self.ledger, row["key"], "household")
                 self._leave(row, "gone")
             elif want is None:
                 self._set(row, "cancelled")        # gone on both sides: nothing to learn
@@ -1219,6 +1272,7 @@ class FamilyCopy:
             self._set(row, "done")
             self._note(row, "gone")
             return
+        suppress(self.ledger, row["key"], "household")
         self._set(row, "removed")
         self._log("family_copy_removed", row["key"])
 
@@ -1264,6 +1318,9 @@ class FamilyCopy:
         if content_is(data, uid, want.title, want.start, want.end):
             self._moved(row, uid, want)            # already so: the feed was behind the event
             unqueue(self.ledger, row["key"])
+            return ""
+        if suppressed(self.ledger, row["key"]) is not None:
+            unqueue(self.ledger, row["key"])       # a removal he approved, or someone's, outranks this write
             return ""
         if self._looks(row, want):
             queue(self.ledger, row["key"], "check", rev)   # saved before the write: checked after it, even cut off
@@ -1318,6 +1375,14 @@ class FamilyCopy:
         q = queued(self.ledger, key)
         if q is None:
             return False
+        if suppressed(self.ledger, key) is not None:
+            # Round 4 of the second review: a removal he approved (being sent, or done) or someone's removal outranks
+            # any check queued before it. Never acted on: dropped, and this read leaves the copy alone.
+            unqueue(self.ledger, key)
+            log.info("family copy: a %s copy's queued reconciliation dropped: its removal outranks it", row["word"])
+            return True
+        if not item.etag:
+            return True                              # a queued move only ever updates, with If-Match: next read
         base = baseline(self.ledger, key, row)
         if base is None or not content_is(item.data, uid, *base):
             return False
@@ -1334,7 +1399,7 @@ class FamilyCopy:
             return False
         kind, e = self._look(row)
         if kind == "deleted":
-            if not self._room():
+            if not self._room() or suppressed(self.ledger, key) is not None:
                 return True
             verdict, out = self._guarded_delete(row, item)
             if verdict in ("ok", "gone"):
@@ -1368,6 +1433,10 @@ class FamilyCopy:
         the copy's retry cap), or anything else, left alone. Never retried blindly. Returns (ok | changed |
         conflicts | record | failed, the last answer)."""
         uid, key = row["uid"], row["key"]
+        if not etag:
+            # Round 4 of the second review: a change of a copy (a queued move included) is an update with If-Match on
+            # a version, never a create: with no version, nothing is sent.
+            return "failed", caldav.Outcome("failed")
         while True:
             body = caldav.build_copy_ics(uid, want.title, want.start, want.end, self.ledger.now())
             note_write(self.ledger, key, etag, landed=False, wrote=(want.title, want.start, want.end),
@@ -1627,6 +1696,8 @@ class FamilyCopy:
             if want.word in stopped or want.quiet or (
                     row is not None and not again and row["state"] not in ("cancelled", "lost")):
                 continue
+            if suppressed(self.ledger, key) is not None:
+                continue                       # he approved its removal, or someone took it off: never made again
             match = match_on_family(want, sources.get(key, ""), free, name)
             if match is not None:
                 if _takeable(match.occ):
@@ -1802,6 +1873,7 @@ class FamilyCopy:
                     # Last seen as Harness's own and gone now: someone took it off. Said once, never made again
                     # by itself, and not waited on (round 5).
                     gone.add(row["key"])
+                    suppress(self.ledger, row["key"], "household")
                     self._note(row, "gone")
                     continue
                 unseen = unseen or self._moment(start) < until
