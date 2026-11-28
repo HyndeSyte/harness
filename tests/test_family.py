@@ -275,7 +275,7 @@ def test_the_digest_lists_family_as_context_never_as_an_overlap(ledger, tmp_path
     r.inbox.receive(KEY, body(clock.t))
     at_local(clock, 7, 0)
     r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("Clear · inputs fresh"), d
     assert ("<b>Today</b>\n"
             "All day · Feed delivery · owner\n"
@@ -285,6 +285,11 @@ def test_the_digest_lists_family_as_context_never_as_an_overlap(ledger, tmp_path
             "9:30 AM–10:30 AM Sam - Dentist · Family\n"
             "9:30 AM–10:30 AM School call · owner ⚠ overlaps") in d
     assert "Tomorrow thing" not in d
+    # His digest: Family's events are listed, never a clash with his own; his two are one clash.
+    mine = r.bot.texts()[-1]
+    assert mine == ledger.get_meta("last_digest_owner") and "Sam - Dentist" in mine
+    assert [x for x in mine.split("\n") if "overlap" in x] == [
+        "9:00 Vet visit and 9:30 School call overlap: move one of them."]
 
 
 def test_without_a_push_the_day_is_never_clear(ledger, tmp_path, clock, caplog):
@@ -294,7 +299,7 @@ def test_without_a_push_the_day_is_never_clear(ledger, tmp_path, clock, caplog):
     at_local(clock, 7, 0)
     with caplog.at_level(logging.INFO, logger="harness.daily"):
         r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("<b>Attention needed</b>")
     assert "• Family calendar: nothing from Home Assistant yet" in d
     assert "<b>Today</b> · from 1 of 2 calendars" in d
@@ -309,7 +314,7 @@ def test_family_alone_without_google_feeds(ledger, tmp_path, clock, caplog):
     at_local(clock, 7, 0)
     with caplog.at_level(logging.INFO, logger="harness.daily"):
         r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("Clear"), d
     assert "<b>Today</b>\nAll day · Trip\n8:30 AM–3:15 PM School day\n" \
            "9:30 AM–10:30 AM Sam - Dentist" in d
@@ -498,7 +503,7 @@ def test_wrong_keys_reach_the_digest_even_while_good_pushes_arrive(ledger, tmp_p
     r.c.tick()
     at_local(clock, 7, 0)
     r.c.tick()
-    d = r.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("<b>Attention needed</b>")
     assert "Family calendar: 3 push(es) with the wrong key" in d
     assert "School day" in d                       # still listed: the good push is fresh
@@ -507,7 +512,7 @@ def test_wrong_keys_reach_the_digest_even_while_good_pushes_arrive(ledger, tmp_p
     r.inbox.receive(KEY, body(clock.t))
     at_local(clock, 7, 0, d=22)
     r.c.tick()
-    assert "wrong key" not in r.bot.texts()[-1]
+    assert "wrong key" not in ledger.get_meta("last_digest_text")
 
 
 def test_refusals_before_the_body_are_recorded(server):

@@ -369,7 +369,71 @@ def test_without_cains_morning_message_the_digest_goes_out_on_its_own(rig):
     rig.clock.advance(minutes=2)
     rig.c.tick()
     card = rig.link.last()
-    assert card["kind"] == "alert" and "didn't post his morning message" in card["text"]
+    assert card["kind"] == "alert" and card["text"] == "**Today**: dentist 2 PM"   # held from before 0.24.5
+    assert ids(card) == [STOP]
+
+
+def nov27_held(rig):
+    """Nov 27's digest, composed and held for Cain's morning message as on the day (0.24.5)."""
+    from harness import daily, digest
+    from test_readable_digest import NOW, compose, nov27
+    extra = ["Drive dry run since the last digest: 3 drive blocks would be written and 1 appointment would "
+             "lose its drive blocks. Nothing was written for them; the log has each one."]
+    d = compose(nov27(), extra=extra)
+    assert daily.deliver(rig.ledger, rig.c.config, d, hold=True)
+    return d, extra
+
+
+def test_cain_gets_his_digest_to_fold_in_and_the_detail_apart(rig):
+    from test_readable_digest import TARGET
+    d, extra = nov27_held(rig)
+    out = rig.handover(kind="digest")
+    assert out["status"] == "ok" and out["said"] == TARGET
+    # Everything taken off his digest is still Cain's, in its own field, never posted.
+    for kept in ["Clear · inputs fresh · 0 need you · 0 failures", "All day · Dane - Off Work · Family",
+                 "8:30 AM–10:00 AM Dane + Chris ☕️ · dane rickett ⚠ overlaps", *extra]:
+        assert kept in out["detail"], kept
+    assert "Drive dry run" not in out["said"] and rig.link.cards == {}
+
+
+def long_day_held(rig):
+    """A day too long for one message, held for Cain's morning message (0.24.5, fix round)."""
+    from harness import daily, digest
+    from test_readable_digest import compose, ev
+    events = [ev(6 + k // 3, 20 * (k % 3), 6 + k // 3, 20 * (k % 3) + 15,
+                 f"Event {k:02d} with a long title about the plans of the whole family " * 3) for k in range(40)]
+    d = compose(digest.Agenda(events, 0, 1, 1))
+    assert len(d.owner_parts) == 2
+    assert daily.deliver(rig.ledger, rig.c.config, d, hold=True)
+    return d
+
+
+def test_a_long_day_reaches_cain_as_two_marked_messages(rig):
+    from harness.discord_chat import to_markdown
+    d = long_day_held(rig)
+    out = rig.handover(kind="digest")
+    assert out["status"] == "ok" and out["parts"] == [to_markdown(p) for p in d.owner_parts]
+    assert out["said"] == "\n\n".join(f"[Message {k} of 2]\n{p}" for k, p in enumerate(out["parts"], 1))
+    assert out["parts"][1].startswith("**Today, continued**")
+
+
+def test_a_long_day_at_740_goes_out_as_two_messages_in_order(rig):
+    from harness.discord_chat import to_markdown
+    d = long_day_held(rig)
+    rig.clock.advance(minutes=41)
+    rig.c.tick()
+    texts = [c["text"] for _, c in sorted(rig.link.cards.items()) if c["kind"] == "alert"][-2:]
+    assert texts == [to_markdown(p) for p in d.owner_parts]
+
+
+def test_the_740_digest_on_its_own_is_his_digest_alone(rig):
+    from test_readable_digest import TARGET
+    nov27_held(rig)
+    rig.clock.advance(minutes=41)
+    rig.c.tick()
+    card = rig.link.last()
+    assert card["kind"] == "alert" and card["text"] == TARGET
+    assert "inputs fresh" not in card["text"] and "Drive dry run" not in card["text"]
     assert ids(card) == [STOP]
 
 

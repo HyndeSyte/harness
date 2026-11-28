@@ -47,7 +47,7 @@ WORDS = (
     ("/stop", "Stop"),
 )
 
-_TAG = re.compile(r"<(/?)(b|i)>")
+_TAG = re.compile(r"<(/?)(b|i|small)>")
 # The hosts of the links in the steps he follows (inputs.py): those are kept whole, so their - and
 # _ survive. Any other link, a calendar's own name say, is escaped like the rest of the text, and
 # no ( ) [ ] can be part of one, so nothing becomes a masked link.
@@ -71,13 +71,15 @@ def _text(text: str) -> str:
 
 
 def to_markdown(text: str) -> str:
-    """The harness's HTML (only <b> and <i> are used) to Discord markdown."""
+    """The harness's HTML (<b>, <i>, and <small> for a line of small text: the digest's all-day
+    line, which starts a line) to Discord markdown."""
     for old, new in WORDS:
         text = text.replace(old, new)
     out, pos = [], 0
     for m in _TAG.finditer(text):
         out.append(_text(html.unescape(re.sub(r"<[^>]+>", "", text[pos:m.start()]))))
-        out.append("**" if m.group(2) == "b" else "*")
+        tag = m.group(2)
+        out.append("**" if tag == "b" else "*" if tag == "i" else "" if m.group(1) else "-# ")
         pos = m.end()
     out.append(_text(html.unescape(re.sub(r"<[^>]+>", "", text[pos:]))))
     return "".join(out)

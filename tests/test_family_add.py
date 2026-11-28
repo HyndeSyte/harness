@@ -1468,7 +1468,8 @@ def test_the_controllers_digest_carries_it(on, clock):
     on.ledger.db.execute("DELETE FROM meta WHERE key='integrity_since'")
     on.c._daily(False)
     on.c.outbox.flush()
-    assert "last write failed" in on.texts()[-1] and "Attention needed" in on.texts()[-1]
+    full = on.ledger.get_meta("last_digest_text")              # the full digest, Cain's (0.24.5)
+    assert "last write failed" in full and "Attention needed" in full
 
 
 def test_a_successful_undo_counts_as_a_write_that_succeeded(on):
@@ -2267,7 +2268,7 @@ def test_the_controller_puts_the_line_in_the_real_digest(loose):
     loose.ledger.set_meta("digest_date", "2000-01-01")
     loose.c._daily(False)
     loose.c.outbox.flush()
-    assert "skip the Approve tap" in loose.texts()[-1]
+    assert "skip the Approve tap" in loose.ledger.get_meta("last_digest_text")   # Cain's, 0.24.5
 
 
 def test_gather_passes_the_line(loose):

@@ -270,6 +270,18 @@ class FamilyCopy:
     def name(self) -> str:
         return (self.name_fn() or "").strip()
 
+    def pairs(self, occurrences) -> set[frozenset]:
+        """0.24.5: today's events that are one event on two calendars by this record: his Gmail event
+        and its copy on Family (ours, or his own we took over). Read only; his digest says each once."""
+        copies = {r["key"]: r["uid"] for r in self.ledger.db.execute(
+            "SELECT key, uid FROM family_copies WHERE state IN ('live', 'hands_off')")}
+        out = set()
+        for o in occurrences:
+            uid = copies.get(_key(o)) if o.uid else None
+            if uid and uid != o.uid:
+                out.add(frozenset((o.uid, uid)))
+        return out
+
     # -- what he sees ----------------------------------------------------------------
     def status_line(self) -> str:
         if not self.name():

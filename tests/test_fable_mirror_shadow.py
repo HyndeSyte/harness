@@ -480,10 +480,10 @@ def test_the_digest_carries_the_line_and_a_shadow_failure_leaves_it_clear(ledger
     at_local(clock, 7, 0)
     s.inbox.receive(KEY, push(clock(), FAMILY))
     s.c.tick()
-    d = s.bot.texts()[-1]
+    d = ledger.get_meta("last_digest_text")          # the full digest, Cain's (0.24.5)
     assert d.startswith("Clear · inputs fresh")
     assert "Mirror: shadow only, not writing · last run failed (ZeroDivisionError)" in d
-    assert ledger.get_meta("last_digest_text") == d
+    assert "Mirror" not in s.bot.texts()[-1]
 
 
 def _digest_text(base, clock, wired):
@@ -497,7 +497,7 @@ def _digest_text(base, clock, wired):
     s.inbox.receive(KEY, push(clock(), FAMILY))
     s.c.tick()
     text = lg.get_meta("last_digest_text")
-    assert text and s.bot.texts()[-1] == text
+    assert text and s.bot.texts()[-1] == lg.get_meta("last_digest_owner")
     return text
 
 
