@@ -177,7 +177,7 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
 export interface Claimed { attempt: string; claim: string; until: string }
 export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string; ended?: string[] };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
-// (Cain 0.19.3) ended: the attempts whose latest poll answer, for that same attempt id, was refused or unprotected, so the link asks
+// (Cain 0.19.4) ended: the attempts whose latest poll answer, for that same attempt id, was refused or unprotected, so the link asks
 // no cancel for them and posts no retry card: there is nothing left at Keeper to cancel. Any other answer (an error, a timeout, a 5xx,
 // an unknown state or no answer at all) keeps today's path: the cancel, and the retry card if it isn't confirmed.
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
@@ -228,7 +228,7 @@ const cancelAll = (d: PassDeps, ids: string[], why: string) => {
 export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; body: any } | null): boolean {
   const ok = !!r && r.status === 200 && r.body?.status === "ended" && (r.body?.id === undefined || r.body.id === attempt);
   if (ok) return true;
-  // (Cain 0.19.3) Keeper refuses a cancel of an attempt it had already left unprotected ("it is unprotected", for that same attempt
+  // (Cain 0.19.4) Keeper refuses a cancel of an attempt it had already left unprotected ("it is unprotected", for that same attempt
   // id): nothing is left to cancel, so that alone counts as done, logged, with no retry card. Any other refusal keeps the card.
   if (cancelUnprotected(attempt, r)) { d.log(`the keeper's cancel of ${attempt} needs nothing more: Keeper had already ended it (it is unprotected)`); return true; }
   const why = !r ? "the keeper didn't answer" : r.status === 202 || r.body?.status === "pending" ? `the keeper's answer is pending${r.body?.operation ? ` (operation ${String(r.body.operation).slice(0, 40)})` : ""}`
@@ -238,12 +238,12 @@ export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; b
   return false;
 }
 
-// (Cain 0.19.3) Keeper's refusal of a cancel because the attempt is unprotected (keeper core.ts cancelAttempt: 409, refused, the
+// (Cain 0.19.4) Keeper's refusal of a cancel because the attempt is unprotected (keeper core.ts cancelAttempt: 409, refused, the
 // same id, "it is unprotected"). Nothing else counts: not another reason, another id, an error or no answer.
 export function cancelUnprotected(attempt: string, r: { status: number; body: any } | null): boolean {
   return !!r && r.status === 409 && r.body?.status === "refused" && r.body?.id === attempt && String(r.body?.why ?? "") === "it is unprotected";
 }
-// (Cain 0.19.3) The latest poll answer (GET /attempt/<id>) says Keeper itself ended this same attempt as refused or unprotected (its
+// (Cain 0.19.4) The latest poll answer (GET /attempt/<id>) says Keeper itself ended this same attempt as refused or unprotected (its
 // view answers "refused" for an unprotected one). Anything else, a lost answer included, is not that.
 export function pollEnded(attempt: string, last: { status: number; body: any } | null | undefined): boolean {
   const j = last?.body;
@@ -277,7 +277,7 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's outcome: the pass times out and is refused"); return; }
   d.log(r.ok ? `the keeper accepted every watched install for a Ship token (${r.accepted.map((a) => `${a.attempt} backup ${a.backup}`).join(", ") || "none watched"})` : `a Ship token's pass is refused: ${e.said}`);
   if (!r.ok) {
-    // (Cain 0.19.3) an attempt Keeper already ended needs no cancel, so it brings no retry card either
+    // (Cain 0.19.4) an attempt Keeper already ended needs no cancel, so it brings no retry card either
     const ended = new Set(r.ended ?? []);
     for (const a of ended) if ((e.attempts ?? []).includes(a)) d.log(`no cancel for ${a}: Keeper had already ended it`);
     cancelAll(d, (e.attempts ?? []).filter((a) => !ended.has(a)), r.cancel ?? "the pass is refused");
@@ -447,22 +447,22 @@ export interface RegisterDeps {
   drill?: DrillDeps;
   // (Keeper 0.1.14) POST /attempt/<id>/drill-mark on the keeper: the link's confirmation that it wrote the drill's signed mark
   markPost?: (attempt: string, body: unknown) => Promise<{ status: number; body: any } | null>;
-  // (Cain 0.19.3) the version of the App installed now (its slug), as the Supervisor answered it to this App's start (Cain's own,
+  // (Cain 0.19.4) the version of the App installed now (its slug), as the Supervisor answered it to this App's start (Cain's own,
   // cainInstalled), or null when it can't be read. It is the registration's from_version: never the base's config.yaml,
   // since a version merged into main but never installed would make Keeper refuse every later install.
   installed?: (slug: string) => string | null | Promise<string | null>;
-  // (Cain 0.19.3) Keeper refused (or left unprotected) this install: the owner's one plain line saying why nothing installed, no button
+  // (Cain 0.19.4) Keeper refused (or left unprotected) this install: the owner's one plain line saying why nothing installed, no button
   // (core.ts refusedCard). Not for a refusal for want of space, which has its own card (noSpace).
   refused?: (attempt: string, app: string, version: string, why: string) => void;
 }
 const VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,6}$/;
-// (Cain 0.19.3) The App's installed version, read through d.installed: a plain X.Y.Z, or null.
+// (Cain 0.19.4) The App's installed version, read through d.installed: a plain X.Y.Z, or null.
 export async function installedVersion(d: Pick<RegisterDeps, "installed">, slug: string): Promise<string | null> {
   let v: string | null = null;
   try { v = (await d.installed?.(slug)) ?? null; } catch { v = null; }
   return typeof v === "string" && VERSION.test(v.trim()) ? v.trim() : null;
 }
-// (Cain 0.19.3) The longest the link waits for the start's lookup of the installed version while it is still running, and how old its
+// (Cain 0.19.4) The longest the link waits for the start's lookup of the installed version while it is still running, and how old its
 // running mark may be before it counts as left over (the lookup itself is bounded to 60 seconds, installed-version.sh).
 export const INSTALLED_WAIT_MS = 5_000;
 export const INSTALLED_LOOKUP_MAX_MS = 75_000;
@@ -478,7 +478,7 @@ const readVersion = (read: () => string | null): string | null => {
   const v = (s ?? "").trim();
   return VERSION.test(v) ? v : null;
 };
-// (Cain 0.19.3) Cain's installed version: the Supervisor's answer the App's start wrote (/run/cain/installed-version), when present and
+// (Cain 0.19.4) Cain's installed version: the Supervisor's answer the App's start wrote (/run/cain/installed-version), when present and
 // valid; while that lookup is still running (its mark is there and young), the link waits for it, at most INSTALLED_WAIT_MS; then the
 // image's own build version (CAIN_BUILD_VERSION) only if it is a valid X.Y.Z (not empty, dev or latest); else null, which refuses the
 // registration with a plain reason. The file lives only in /run/cain, which every start clears, so no earlier start's value is read.
@@ -507,7 +507,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   const accepted: Accepted[] = [];
   let ok = true;
   let cancel: string | undefined;                       // (Keeper 0.1.8) an enrollment refusal's why, for the cancel
-  const ended: string[] = [];                           // (Cain 0.19.3) attempts Keeper ended itself: no cancel for them
+  const ended: string[] = [];                           // (Cain 0.19.4) attempts Keeper ended itself: no cancel for them
   const say = (l: string, bad = true) => { said.push(l); if (bad) ok = false; d.log(`keeper registration: ${l}`); };
   const now = d.now ?? Date.now, sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
   const pull = await d.api(`/repos/${c.repo}/pulls/${c.pr}`).catch(() => null);
@@ -525,7 +525,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   // (Keeper 0.1.14) no registration removes a mark it doesn't own: a competing, retried or rejected one leaves an active mark be
   for (const b of watched) {
     const slug = APP_SLUGS[b.app];
-    // (Cain 0.19.3) from: the version installed now, never the base's config.yaml (Nov 27: 0.19.1 merged but never installed, so a
+    // (Cain 0.19.4) from: the version installed now, never the base's config.yaml (Nov 27: 0.19.1 merged but never installed, so a
     // registration from 0.19.1 was refused while 0.19.0 ran). Not readable: refused, with no guess.
     const from = await installedVersion(d, slug);
     if (!from) { say(`${b.app}'s installed version couldn't be read, so it wasn't registered (the link doesn't guess which version this install replaces)`); continue; }
@@ -608,7 +608,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       d.noSpace?.(c.pr, c.head, slug, b.version);
       notAccepted("the keeper had no room for its backup");
     } else {
-      // (Cain 0.19.3) only a latest answer of refused or unprotected for this same attempt is an attempt Keeper ended itself: nothing to
+      // (Cain 0.19.4) only a latest answer of refused or unprotected for this same attempt is an attempt Keeper ended itself: nothing to
       // cancel, and the owner gets one plain line saying why nothing installed (no button). Anything else keeps the cancel.
       if (pollEnded(attempt, last)) {
         ended.push(attempt);

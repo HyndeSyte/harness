@@ -382,7 +382,7 @@ export interface Shown {
   drillPage?: { key: string; clear?: boolean };   // (Keeper 0.1.14) a drill that installed nothing, told to him once per key (drill.ts); 0.1.15: clear, its Clear button
   space?: { pr: number; head: string; app: string; version: string };   // the free-space card (Keeper 0.1.10, ship-pass.ts; 0.1.11: no button)
   retry?: { attempt: string; what: "claim" | "cancel" };   // the card offering a retry after a keeper answer that wasn't a plain success (Keeper 0.1.11)
-  refused?: { attempt: string };   // (Cain 0.19.3) the one line saying Keeper refused an install, so nothing installed (no button)
+  refused?: { attempt: string };   // (Cain 0.19.4) the one line saying Keeper refused an install, so nothing installed (no button)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
   grant?: { key: string; rounds: number; pr: string | null; reason: string;       // Cain's grant card for extra review rounds (0.18.0, ../review/grants.ts)
     used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
@@ -1888,7 +1888,7 @@ export class Link {
     return { status: "posted", message: String(msg.id) };
   }
 
-  // -- the keeper refused a registration, or left it unprotected (Cain 0.19.3, ship-pass.ts) --
+  // -- the keeper refused a registration, or left it unprotected (Cain 0.19.4, ship-pass.ts) --
   // Nothing was installed and there is nothing to cancel, so no retry card: one plain line per attempt saying why, the link's own
   // words with Keeper's reason, and no button. Not while stopped; held through quiet hours like the other Keeper cards.
   async refusedCard(attempt: string, app: string, version: string, why: string): Promise<{ status: "posted" | "open" | "stopped" | "quiet"; message?: string }> {

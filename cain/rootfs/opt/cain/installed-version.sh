@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# The version of Cain installed now (Cain 0.19.3), as the Supervisor answers it (/addons/self/info, which
+# The version of Cain installed now (Cain 0.19.4), as the Supervisor answers it (/addons/self/info, which
 # every App may read). Sourced by the App's start (services.d/cain/run), which runs installed_version_lookup
 # in the background before the link starts. The link registers a Ship install with the keeper App from it,
 # never from main's config.yaml (link/ship-pass.ts cainInstalled).

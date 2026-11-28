@@ -609,10 +609,10 @@ describe("Keeper 0.1.11 item 4: a claim, cancel or attestation answer that isn't
   });
 });
 
-// Cain 0.19.3 (Nov 27): 0.19.1 was merged but never installed, so the next Ship tap registered from 0.19.1 (main's config.yaml at the
+// Cain 0.19.4 (Nov 27): 0.19.1 was merged but never installed, so the next Ship tap registered from 0.19.1 (main's config.yaml at the
 // base) while 0.19.0 ran; Keeper refused it ("is at 0.19.0, not 0.19.1"), the link asked Keeper to cancel the refused attempt,
 // Keeper answered "it is unprotected", and the owner got a retry card with nothing for him to do.
-describe("Cain 0.19.3: the registration starts from the installed version, and a refused one needs no cancel", () => {
+describe("Cain 0.19.4: the registration starts from the installed version, and a refused one needs no cancel", () => {
   const b64 = (t: string) => ({ content: Buffer.from(t).toString("base64"), encoding: "base64" });
   const MAIN = "0.19.1", INSTALLED = "0.19.0", NEXT = "0.19.2";
   const files: Record<string, any> = {

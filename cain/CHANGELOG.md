@@ -1,11 +1,15 @@
 # Changelog
 
-## 0.19.3
+## 0.19.4
 
 - An install of Cain now starts from the version actually running on the Pi, not the newest one in main. A version that was merged but never installed no longer makes the Keeper refuse the next install.
 - If that version can't be read, the Ship run is refused with a plain reason instead of a guess.
 - When the Keeper has already refused an install, you no longer get a Try again card that had nothing for you to do.
 - Instead you get one plain line saying the Keeper refused it and why, with no button.
+
+## 0.19.3
+
+- No change to what Cain does. This version carries 0.19.1 and 0.19.2 onto the Pi: 0.19.2 was tried once and the keeper refused it because 0.19.1 had never been installed, and the keeper never takes the same update twice, so it needs a new version to install.
 
 ## 0.19.2
 

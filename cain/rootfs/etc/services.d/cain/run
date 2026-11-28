@@ -519,7 +519,7 @@ with_session() {
   ( sleep 30; list_connectors ) &
 }
 if [ "$mode" != none ] && [ -z "$held" ] && session_up; then with_session; fi
-# The version of Cain installed now (0.19.3), as the Supervisor answers it: the link registers a Ship install
+# The version of Cain installed now (0.19.4), as the Supervisor answers it: the link registers a Ship install
 # with the keeper App from it, never from main's config.yaml (Nov 27: 0.19.1 was in main but never installed,
 # so Keeper refused the next install). In the background, bounded to 60 seconds, the token fed to curl on
 # stdin and never on a command line or in a log; the file is root's, in /run/cain for this container only,

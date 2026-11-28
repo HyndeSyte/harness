@@ -540,7 +540,7 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
-## What 0.19.3 does: an install starts from the version you actually have
+## What 0.19.4 does: an install starts from the version you actually have
 
 - When you tap Ship, the link tells the Keeper which version the install replaces. That is now the
   version of Cain installed on the Pi, as Home Assistant reports it when the App starts, not the version
@@ -580,7 +580,7 @@ bad one back from the backup taken just before it. Cain's part:
   the spent ids (hashes, never the token) in root's `/data/trust/ship-passes.json`, and registers each
   install the tap makes with the Keeper over the Keeper's own service (`POST /attempt` with Cain's
   `keeper_token`): the token itself, the pull request, the head, the App's version before and after (since
-  0.19.3 the version installed now and the `config.yaml` at the head) and the verdict probe's hash at the head. The Keeper
+  0.19.4 the version installed now and the `config.yaml` at the head) and the verdict probe's hash at the head. The Keeper
   checks the token's signature with the link's public Ship key (its `ship_public_key` option: the line
   `Ship key (public): ...` in this App's log; since Keeper 0.1.4 pinned on first use, a changed one needs
   confirming at the device), spends it once per App and takes the App-only backup itself. A link that

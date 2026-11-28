@@ -1,4 +1,4 @@
-// Cain 0.19.3, its first outside review's fixes: the start's lookup of the installed version (opt/cain/installed-version.sh) keeps the
+// Cain 0.19.4, its first outside review's fixes: the start's lookup of the installed version (opt/cain/installed-version.sh) keeps the
 // Supervisor's token off every command line, trace and log, is bounded, writes only a checked X.Y.Z atomically into /run/cain; the
 // link's choice (ship-pass.ts cainInstalled) waits briefly for a running lookup, then takes only a valid build version, and never a
 // value from an earlier start; a refused registration's one plain line (core.ts refusedCard).
@@ -34,7 +34,7 @@ function lookup(answer: string | null, o: { stale?: string; limit?: number; paus
 }
 const OK = (v: unknown) => JSON.stringify({ result: "ok", data: { version: v, slug: "0fcc2575_cain" } });
 
-describe("Cain 0.19.3: the start's lookup of the installed version", () => {
+describe("Cain 0.19.4: the start's lookup of the installed version", () => {
   test("the token goes to curl on stdin only, never in its argv, a trace or the output; every call is bounded", () => {
     const r = lookup(OK("0.19.0"), { xtrace: true });
     expect(r.p.status).toBe(0);
@@ -68,7 +68,7 @@ describe("Cain 0.19.3: the start's lookup of the installed version", () => {
   }, 20_000);
   test("the start runs it in the background, in /run/cain, with no bashio Supervisor call and nothing in /data", () => {
     expect(RUN).toContain(`( . "$OPT/installed-version.sh" && installed_version_lookup /run/cain ) >/dev/null 2>&1 &`);
-    const block = RUN.slice(RUN.indexOf("# The version of Cain installed now (0.19.3)"), RUN.indexOf("# Cain's link (link/main.ts): taps"));
+    const block = RUN.slice(RUN.indexOf("# The version of Cain installed now (0.19.4)"), RUN.indexOf("# Cain's link (link/main.ts): taps"));
     expect(block).not.toContain("bashio::api.supervisor");
     expect(block).not.toContain("/data");
     const src = readFileSync(SCRIPT, "utf8");
@@ -80,7 +80,7 @@ describe("Cain 0.19.3: the start's lookup of the installed version", () => {
   });
 });
 
-describe("Cain 0.19.3: the link's choice of the installed version", () => {
+describe("Cain 0.19.4: the link's choice of the installed version", () => {
   const clock = () => { let t = 1_000_000; return { now: () => t, sleep: async (ms: number) => { t += ms; }, get t() { return t; } }; };
   test("the file when present and valid", async () => {
     const k = clock();
@@ -120,7 +120,7 @@ describe("Cain 0.19.3: the link's choice of the installed version", () => {
   }, 20_000);
 });
 
-describe("Cain 0.19.3: the owner's line for a refused install", () => {
+describe("Cain 0.19.4: the owner's line for a refused install", () => {
   const ATT = "ship-46-cain-01234567";
   test("one plain line per attempt, with Keeper's reason and no button; not while stopped; held through quiet hours", async () => {
     const r = rig();

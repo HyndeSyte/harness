@@ -436,7 +436,7 @@ const loopback = (ip: string) => ip === "127.0.0.1" || ip === "::1" || ip === ":
 // keeper App over its own service (ship-pass.ts). The spent ids live in root's /data/trust.
 const SHIP_PASSES = process.env.CAIN_SHIP_PASSES ?? `${TRUST_DIR}/ship-passes.json`;
 const ACCEPT_WAIT_MS = acceptWaitMs(process.env.KEEPER_ACCEPT_MIN);   // Keeper 0.1.15 item 6
-const INSTALLED_FILE = process.env.CAIN_INSTALLED_FILE ?? "/run/cain/installed-version";   // Cain 0.19.3, written by the App's start
+const INSTALLED_FILE = process.env.CAIN_INSTALLED_FILE ?? "/run/cain/installed-version";   // Cain 0.19.4, written by the App's start
 const keeperPost = (path: string, body: unknown) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path, body) : Promise.resolve(null);
 const shipPassDeps: PassDeps = {
   pub: shipPub,
@@ -451,7 +451,7 @@ const shipPassDeps: PassDeps = {
       post: (body) => keeperPost("/attempt", body), drill, markPost: (attempt, body) => keeperPost(`/attempt/${attempt}/drill-mark`, body), waitMs: ACCEPT_WAIT_MS,
       noSpace: (pr, head, app, version) => { void link.spaceCard(pr, head, app, version).catch((e) => console.log(`[cain] link: couldn't post the free-space card: ${String(e).slice(0, 80)}`)); },
       get: (path) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, path) : Promise.resolve(null),
-      // Cain 0.19.3: from_version is the version installed now (the Supervisor's answer at the App's start, waited for briefly while
+      // Cain 0.19.4: from_version is the version installed now (the Supervisor's answer at the App's start, waited for briefly while
       // that lookup runs, else the image's own build version); never main's config.yaml
       installed: (slug) => slug === APP_SLUGS.Cain ? cainInstalled({ read: () => readFileSync(INSTALLED_FILE, "utf8"),
         pendingSince: () => { try { return statSync(`${INSTALLED_FILE}.pending`).mtimeMs; } catch { return null; } }, build: process.env.CAIN_BUILD_VERSION }) : null,
