@@ -632,6 +632,25 @@ class GoogleCalendar:
             return "unknown", None
         return ("ok", found) if isinstance(found, dict) else ("unknown", None)
 
+    def look_by_id(self, address: str, uid: str) -> tuple[str, dict | None]:
+        """One event by its id, where a deletion matters (the review of Nov 27, round 4): "ok" and it; "deleted"
+        only on 410 Gone or the event answered as cancelled (then with it); "unknown" for anything else. A 404
+        says nothing about a deletion, so it is "unknown", never "deleted"."""
+        url = self._events(address)
+        token, _ = self._access()
+        if url is None or token is None or not _ANY_ID_RE.fullmatch(uid):
+            return "unknown", None
+        try:
+            r = self._call(token, "GET", f"{url}/{uid}")
+            if r.status == 410:
+                return "deleted", None
+            found = r.json() if r.status == 200 else None
+        except (TransportError, ValueError):
+            return "unknown", None
+        if not isinstance(found, dict):
+            return "unknown", None
+        return ("deleted" if found.get("status") == "cancelled" else "ok"), found
+
     def read_back(self, address: str, uid: str) -> tuple[str, dict | None]:
         """One event, read to check what was written: "ok" and it, "gone", "unknown" when this one
         answer says nothing about it, or "down" when the calendar itself can't be read now (no key

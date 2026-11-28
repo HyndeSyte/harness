@@ -470,11 +470,12 @@ class DriveCards:
 
     def _turned(self, on: bool, chat_id: int | None, db) -> str:
         """The live switch set by his tap, in the ledger (never the options file). Turning on gets a receipt
-        with Turn off, which puts it back to the dry run."""
+        with Turn off, which puts it back to the dry run; Turning off gets one with Turn on, the way back."""
         self.ledger.set_meta(LIVE, "on" if on else "off", db)
         self.ledger.event("drive_live_tap", {"on": on}, db=db)
         if not on:
-            return "Drive blocks are back to logging only. Nothing new goes on your Gmail calendar for them."
+            return self._way_back("Drive blocks are back to logging only. Nothing new goes on your Gmail calendar "
+                                  "for them. Tap Turn on whenever you want them back.", chat_id, db)
         text = ("Turned on: drive blocks go on your Gmail calendar from the next read. Tap Turn off to go back "
                 "to logging only.")
         if chat_id is None:
@@ -486,6 +487,20 @@ class DriveCards:
                             buttons=[[("Turn off", choices.callback_data(nonce))]],
                             binds=[{"type": "choice", "nonce": nonce}])
         return ""                              # the receipt above is the reply
+
+    def _way_back(self, text: str, chat_id: int | None, db) -> str:
+        """A reply that leaves drive blocks logging only carries Turn on, so the way to turn them on is always
+        on his latest drive blocks message, not only on the one card after install (round 4)."""
+        if chat_id is None:
+            return text
+        bid = secrets.token_hex(8)
+        nonce = choices.mint(self.ledger, kind="drive_on", target=bid, chat_id=chat_id, ttl_s=CARD_TTL_S, db=db)
+        self.ledger.set_meta(NOTE_CARD + bid, json.dumps({"chat": chat_id}), db)
+        self.ledger.enqueue(chat_id=chat_id, kind="reply", text=render.fit(text), db=db,
+                            buttons=[[("Turn on", choices.callback_data(nonce))]],
+                            binds=[{"type": "choice", "nonce": nonce}])
+        self.ledger.event("drive_live_way_back", {}, db=db)
+        return ""                              # the message above is the reply
 
     def _note_choice(self, kind: str, target: str) -> str:
         raw = self.ledger.get_meta(NOTE_CARD + (target or ""))
@@ -507,6 +522,9 @@ class DriveCards:
                 said = self._turned(True, chat, db)
                 return said and ("Writing the drives around your own appointments on your Gmail calendar from the "
                                  "next read.")
+            if kind == "drive_leave" and not live_on(self.ledger):
+                return self._way_back("Leaving them as they are: drive blocks stay logging only. Tap Turn on "
+                                      "whenever you want them on your Gmail calendar.", chat, db)
             if kind == "drive_retry":
                 for key in (k for k in kept.get("keys") or [] if isinstance(k, str)):
                     # asked again, and tried again, as if new

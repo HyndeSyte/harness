@@ -4748,7 +4748,15 @@ class CalendarChange:
         copy = db.execute("SELECT uid, title FROM family_copies WHERE key=?", (r["key"],)).fetchone()
         title = copy["title"] if copy is not None else ""
         wrote = (title, _when(r["set"]["start"]), _when(r["set"]["end"]))
-        family_copy.note_write(self.ledger, r["key"], entry.get("was") or "", landed=False, db=db, wrote=wrote)
+        was = r.get("was") or {}
+        before = None
+        if was.get("start") and was.get("end"):
+            try:                                 # what the copy held as Harness's own before: the decision table
+                before = (was.get("title") or title, _when(was["start"]), _when(was["end"]))
+            except (TypeError, ValueError):
+                before = None
+        family_copy.note_write(self.ledger, r["key"], entry.get("was") or "", landed=False, db=db, wrote=wrote,
+                               before=before)
         if not landed:
             return
         body = read_body if read_body is not None else entry.get("after") or ""
@@ -5800,14 +5808,20 @@ class CalendarChange:
         if x is None:
             raise Refuse("I couldn't read that Family copy just now")
         x.copy_of = key
+        if not row["hand"] and not caldav.copy_holds_only_ours(body, row["uid"]):
+            # Something was added to it on Family (an alert, a note, a place, a guest, a link): writing over it or
+            # taking it off would lose that, so it's his to keep (round 4 of the review of Nov 27).
+            raise Refuse(f"the Family copy \u201c{_safe(x.title)}\u201d has something added to it on Family, so "
+                         "it's yours to keep now and I left it as it is")
         if self.google is None or not self._readable("gmail"):
             raise Refuse("I couldn't read your Gmail calendar")
-        kind, e = self.google.look(self._gmail_address(), b["src"]) if b["src"] else ("failed", None)
-        cancelled = kind == "ok" and isinstance(e, dict) and e.get("status") == "cancelled"
+        # Read again right before the write, by its id. Only 410 Gone or cancelled is a deletion (round 4).
+        kind, e = self.google.look_by_id(self._gmail_address(), b["src"]) if b["src"] else ("unknown", None)
+        cancelled = kind == "deleted" and isinstance(e, dict)
         if c["op"] == "remove":
-            if kind == "ok" and not cancelled:
+            if kind == "ok":
                 raise CopyChanged("its Gmail event is on your Gmail calendar again", key)
-            if kind != "gone" and not cancelled:
+            if kind != "deleted":
                 raise Refuse(f"I couldn't confirm the Gmail event the Family copy \u201c{x.title}\u201d copies is "
                              "gone, so I left the copy")
             why = "was cancelled" if cancelled else "was deleted"
@@ -5819,7 +5833,7 @@ class CalendarChange:
                         f"Took {name} off: the Gmail event it copies {why}", [step],
                         (frozenset({("family", x.series, x.instance)}), ("remove",)), name=name, bound=bound,
                         expect=[{"kind": "gone", **bb} for bb in bound])
-        if kind == "gone" or cancelled:
+        if kind == "deleted":
             raise CopyChanged("its Gmail event is gone since your card", key)
         if kind != "ok" or not isinstance(e, dict):
             raise Refuse("I couldn't read your Gmail calendar just now")
@@ -5864,14 +5878,12 @@ class CalendarChange:
         if ident is None:
             return None, "unknown"
         gid = family_copy.google_id(*ident)
-        kind, e = self.google.look(address, gid)
+        kind, e = self.google.look_by_id(address, gid)     # only 410 Gone or cancelled is a deletion (round 4)
         self._source_ids[row["key"]] = gid
-        if kind == "gone":
-            return None, "deleted"
+        if kind == "deleted":
+            return None, "cancelled" if isinstance(e, dict) else "deleted"
         if kind != "ok" or not isinstance(e, dict):
             return None, "unknown"
-        if e.get("status") == "cancelled":
-            return None, "cancelled"
         g = self._gmail_found(e)
         if g is not None and self._copy_key(g) == row["key"]:
             return g, ""

@@ -169,7 +169,8 @@ def build(data_dir: str, *, port: int = 8099, family_port: int = family.FAMILY_P
                             family=inbox if base.family_entity else None, mirror=None,   # retired: the work holds script does it
                             family_add=adds,
                             family_copy=FamilyCopy(ledger, adds, calendar, tz=base.timezone,
-                                                   name_fn=lambda: name_from_options(data_dir)),
+                                                   name_fn=lambda: name_from_options(data_dir),
+                                                   google=google, address_fn=family_gmail._address),
                             family_gmail=family_gmail,
                             calendar_change=CalendarChange(
                                 ledger, client, google,

@@ -99,6 +99,18 @@ class FakeGmail:
             e = self._instance(uid)
         return ("ok", copy.deepcopy(e)) if e is not None else ("gone", None)
 
+    def look_by_id(self, address, uid):
+        """As Google answers by id: a deleted event as cancelled, or 410 Gone for one in gone_410; a 404 says
+        nothing about a deletion (google_cal.look_by_id)."""
+        if self.down:
+            return "unknown", None
+        if uid in getattr(self, "gone_410", ()):
+            return "deleted", None
+        kind, e = self.look(address, uid)
+        if kind != "ok":
+            return "unknown", None
+        return ("deleted" if e.get("status") == "cancelled" else "ok"), e
+
     def _instance(self, uid):
         """One day of a series read by its instance id, as Google gives it (made on first read)."""
         base, stamp = uid.rsplit("_", 1)

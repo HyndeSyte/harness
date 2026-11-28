@@ -290,6 +290,36 @@ def _as_sent(read: str, sent: str) -> bool:
     return True
 
 
+def copy_as_written(ics: str, uid: str, title: str, start, end) -> bool:
+    """A Family copy (family_copy.py) holds exactly what Harness writes for it and nothing more: one plain event,
+    its uid, Harness's marker kept, and by what they say (times as instants, text unfolded and unescaped, the lines
+    servers manage and an alarm a server marks as its default aside, _as_sent) only the lines build_copy_ics
+    writes, with this title, start and end. An allowlist: an alarm, an attendee, a link, a status, a repeat, a
+    second event, a place or notes someone added, or any line build_copy_ics doesn't write, is someone's edit
+    (the review of Nov 27, round 4)."""
+    if not ics or not uid or not _is_ours(ics, uid):
+        return False
+    try:
+        sent = build_copy_ics(uid, title or "", start, end, datetime(2000, 1, 1, tzinfo=timezone.utc))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return _as_sent(ics, sent)
+
+
+def copy_holds_only_ours(ics: str, uid: str) -> bool:
+    """A Family copy holds nothing but the lines build_copy_ics writes (its uid, start, end and title, the lines
+    servers manage aside), whatever its title and times now say: a write over it, or its removal, loses nothing
+    anyone added (round 4)."""
+    if not ics or not uid or not _is_ours(ics, uid):
+        return False
+    events = _events_said(ics)
+    if len(events) != 1:
+        return False
+    (said, defaults), = events.values()
+    names = sorted(re.split(r"[;:]", x, maxsplit=1)[0].upper() for x in (said - defaults).elements())
+    return names == ["DTEND", "DTSTART", "SUMMARY", "UID"]
+
+
 def _uids(ics: str) -> set[str]:
     """The ids of the events in it: an alarm's own id inside one isn't."""
     lines, names = _lines(ics)

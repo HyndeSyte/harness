@@ -18,7 +18,7 @@ from fakes import result
 from test_family_add import on, rig  # noqa: F401
 from test_family_gmail import g  # noqa: F401
 from test_meaning_live import CLINIC, M, PARK, blocks, drives, go, live, mine, quiet_family  # noqa: F401
-from test_family_copy import Feeds, when
+from test_family_copy import GMAIL as GMAIL_G, Feeds, when
 from test_plain_commands import GMAIL, NY, TZ, Morning, ask, at, change, plain_prompt  # noqa: F401
 
 SERIES = "s0ai2c7kb1mbia2n4mdl3e6p10"                   # invented, shaped like Google's
@@ -40,7 +40,8 @@ def m(ledger, tmp_path, clock):
         "end": {"dateTime": (ORIGINAL + timedelta(hours=1)).isoformat(), "timeZone": TZ}}
     m.feeds = Feeds()
     m.feeds.window.calendar = GMAIL
-    m.copier = FamilyCopy(ledger, m.fa, m.feeds, name_fn=lambda: "Alex", tz=TZ)
+    m.copier = FamilyCopy(ledger, m.fa, m.feeds, name_fn=lambda: "Alex", tz=TZ, google=m.gmail,
+                          address_fn=lambda: GMAIL)
     m.key = family_copy._key(google_cal._occurrence(m.gmail.events[INSTANCE], GMAIL, ""))
     return m
 
@@ -520,8 +521,12 @@ def test_the_old_saved_dry_run_still_only_logs_until_his_tap_and_turn_off_stops_
         ("Busy (drive there)", b - 15 * M, b, ""),                           # one drive between the places
         ("Busy (drive back)", b + 60 * M, b + 90 * M, "")]                   # and the last one home
     assert drives.live.on_choice("drive_on", target_of(drives, "drive_on")[0]).startswith("Already settled")
-    assert drives.live.on_choice("drive_off", target_of(drives, "drive_off")[0]).startswith(
-        "Drive blocks are back to logging only")
+    assert drives.live.on_choice("drive_off", target_of(drives, "drive_off")[0]) == ""   # its receipt is the reply
+    with drives.ledger.tx() as db:
+        drives.ledger.release_held(db=db)
+    drives.tick()
+    back = [x for x in drives.bot.sent if x[1].startswith("Drive blocks are back to logging only")]
+    assert back and [label for row in back[0][2] for label, _ in row] == ["Turn on"]   # the way back (round 4)
     drives.feeds.window.occurrences.remove(dentist)
     later = when(drives, days=2, hour=15)
     mine(drives, "Dentist", later, CLINIC)
@@ -767,3 +772,305 @@ def test_a_family_edit_between_the_approval_read_and_the_write_is_refused_and_a_
     assert copy_times(m) == (at(9, day=DAY), at(10, day=DAY))                        # and refused
     assert any("changed since" in x and "fresh card" in x for x in m.seen()[cards:])
     assert "Coffee with Chris to 2:15 to 3:15 tomorrow" in m.seen()[-1]                # the fresh card
+
+
+# -- round 4 (the review of Nov 27, round 3's findings): Harness's own is an allowlist of what it writes ------
+
+ALARM = "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM"
+ADDED = {"an alarm": ALARM, "an attendee": "ATTENDEE:mailto:chris@example.com",
+         "a link": "URL:https://example.com/coffee", "a status": "STATUS:TENTATIVE",
+         "a repeat": "RRULE:FREQ=WEEKLY;COUNT=3", "a place": "LOCATION:Corner Cafe",
+         "notes": "DESCRIPTION:Bring the book", "travel time": "X-APPLE-TRAVEL-DURATION;VALUE=DURATION:PT15M",
+         "a category": "CATEGORIES:Family"}
+SECOND = ("BEGIN:VEVENT\r\nUID:someone-else-1\r\nDTSTAMP:20261111T120000Z\r\nDTSTART:20261112T200000Z\r\n"
+          "DTEND:20261112T210000Z\r\nSUMMARY:Alex - Coffee\r\nEND:VEVENT\r\n")
+
+
+def with_added(ics, extra):
+    return ics.replace("END:VEVENT", f"{extra}\r\nEND:VEVENT", 1)
+
+
+def icloud_way(ics):
+    """As iCloud keeps a copy it stored: its own lines, stamps and a default alarm marked as one, the times in
+    the zone's own form, and a long line folded."""
+    from test_calendar_change import ICLOUD_OWN
+
+    def local(x):
+        moment = datetime.strptime(x.group(2), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).astimezone(NY)
+        return f"{x.group(1)};TZID={TZ}:{moment:%Y%m%dT%H%M%S}"
+    out = re.sub(r"(DTSTART|DTEND):(\d{8}T\d{6}Z)", local, ics)
+    out = out.replace("SUMMARY:Alex - Coffee", "SUMMARY:Alex -\r\n  Coffee")
+    return out.replace("END:VEVENT", ICLOUD_OWN + "SEQUENCE:1\r\nEND:VEVENT", 1)
+
+
+def test_the_allowlist_holds_on_icloud_rewrites_and_fails_on_anything_added():
+    start, end = at(8, 30, day=DAY), at(9, 30, day=DAY)
+    ics = caldav.build_copy_ics("hx-1", COPY_TITLE, start, end, datetime(2026, 11, 11, tzinfo=timezone.utc))
+    assert family_copy.content_is(ics, "hx-1", COPY_TITLE, start, end)
+    assert family_copy.content_is(icloud_way(ics), "hx-1", COPY_TITLE, start, end)    # iCloud's own: not an edit
+    assert caldav.copy_holds_only_ours(icloud_way(ics), "hx-1")
+    for what, extra in ADDED.items():
+        for kept in (ics, icloud_way(ics)):
+            assert not family_copy.content_is(with_added(kept, extra), "hx-1", COPY_TITLE, start, end), what
+            assert not caldav.copy_holds_only_ours(with_added(kept, extra), "hx-1"), what
+    two = ics.replace("END:VCALENDAR", SECOND + "END:VCALENDAR")
+    assert not family_copy.content_is(two, "hx-1", COPY_TITLE, start, end)              # a second event
+    assert not family_copy.content_is(ics.replace(f"{caldav.MARKER}:1\r\n", ""), "hx-1", COPY_TITLE, start, end)
+    assert not family_copy.content_is(ics, "hx-1", COPY_TITLE, start, end + timedelta(minutes=15))
+    assert not family_copy.content_is(ics, "hx-1", "Alex - Coffee!", start, end)
+    assert not family_copy.content_is(ics, "hx-2", COPY_TITLE, start, end)
+
+
+def test_the_moved_coffee_event_moves_its_untouched_family_copy_within_a_minute(m):
+    """Nov 27, Dane + Chris coffee: its Gmail event moved and its Family copy stayed behind. The copy, as iCloud
+    keeps it (its own lines and a new version, times in the zone's form), is untouched: one read after the move,
+    a minute later, brings it to the new time."""
+    at_coffee_time(m)
+    m.icloud.seed(copy_path(m), icloud_way(m.icloud.events[copy_path(m)][1]))          # iCloud's own rewrite
+    sync(m)
+    assert row(m)["state"] == "live" and not left_why(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.clock.advance(seconds=60)
+    sync(m)
+    assert copy_times(m) == (at(13, 45, day=DAY), at(14, 45, day=DAY)) and row(m)["state"] == "live"
+    assert len(puts(m)) == 2
+
+
+@pytest.mark.parametrize("what", sorted(ADDED))
+def test_a_copy_with_anything_added_is_never_rewritten_and_hes_told_once(m, what):
+    at_coffee_time(m)
+    m.icloud.seed(copy_path(m), with_added(m.icloud.events[copy_path(m)][1], ADDED[what]))
+    edited = m.icloud.events[copy_path(m)]
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    sync(m)
+    sync(m)
+    assert m.icloud.events[copy_path(m)] == edited and len(puts(m)) == 1                  # only the add, ever
+    assert row(m)["state"] == "hands_off" and left_why(m) == ["edited"]
+    line = m.copier.digest_line()
+    assert "Left alone, yours to keep now: Coffee Nov 12 (changed on Family). I won't change those copies again." \
+        in line
+    m.clock.advance(minutes=1)
+    with m.ledger.tx() as db:                                                            # the digest went out
+        m.ledger.set_meta("last_digest_at", iso(m.clock()), db)
+    sync(m)
+    assert "yours to keep" not in m.copier.digest_line()                                 # once
+
+
+def test_an_alarm_added_as_harness_writes_is_refused_and_never_written_over(m):
+    """Someone adds an alarm to the copy just as Harness writes it: Family refuses the write for its version, and
+    the read after shows the copy with the alarm. Not as Harness had it, so it's theirs: no retry over it."""
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+
+    def alarm():
+        m.icloud.before_write = None
+        m.icloud.seed(copy_path(m), with_added(m.icloud.events[copy_path(m)][1], ALARM))
+    m.icloud.before_write = alarm
+    sync(m)
+    assert ALARM in m.icloud.events[copy_path(m)][1] and copy_times(m) == (ORIGINAL, ORIGINAL + timedelta(hours=1))
+    assert len(puts(m)) == 2 and row(m)["state"] == "hands_off" and left_why(m) == ["changed"]
+    sync(m)
+    assert len(puts(m)) == 2
+
+
+def test_a_write_that_didnt_land_and_an_alarm_added_before_the_read_is_never_written_over(m):
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.icloud.force_status = 503                                              # not applied, no answer
+    edit_before_the_next_fetch(m, ORIGINAL, ORIGINAL + timedelta(hours=1), extra=ALARM)
+    sync(m)
+    m.icloud.force_status = None
+    assert ALARM in m.icloud.events[copy_path(m)][1] and row(m)["state"] == "hands_off"
+    n = len(puts(m))
+    sync(m)
+    assert len(puts(m)) == n
+
+
+def test_a_read_at_the_pre_write_version_with_an_alarm_added_is_never_taken_as_behind(m):
+    """Within minutes of a write of Harness's own, a read at the version it went over counts as behind only while
+    it holds exactly what Harness had there: one with an alarm is someone's edit, and no rewrite goes over it."""
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    sync(m)
+    etag, ics = m.icloud.events[copy_path(m)]
+    card_move(m, at(14, 15, day=DAY), at(15, 15, day=DAY))
+    m.icloud.events[copy_path(m)] = (etag, with_added(ics, ALARM))           # that version, with an alarm
+    n = len(puts(m))
+    m.clock.advance(minutes=2)
+    sync(m)
+    assert len(puts(m)) == n and ALARM in m.icloud.events[copy_path(m)][1] and row(m)["state"] == "hands_off"
+
+
+def undecided(m, start, end):
+    """A write of Harness's own sent over the copy's current version, from its first time to these, and never
+    decided; the record moved on to these times, as a change he asked for leaves it."""
+    etag = m.icloud.events[copy_path(m)][0]
+    with m.ledger.tx() as db:
+        db.execute("UPDATE family_copies SET start=?, end=? WHERE key=?", (start.isoformat(), end.isoformat(), m.key))
+        family_copy.note_write(m.ledger, m.key, etag, landed=False, db=db, wrote=(COPY_TITLE, start, end),
+                               before=(COPY_TITLE, ORIGINAL, ORIGINAL + timedelta(hours=1)))
+    return etag
+
+
+def test_an_expired_write_that_never_landed_is_written_once_more_over_its_version(m):
+    """The decision table: the same version, holding exactly what Harness had there before the write. It never
+    landed: one conditional rewrite, over that version."""
+    at_coffee_time(m)
+    etag = undecided(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.clock.advance(minutes=61)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    sync(m)
+    sent = puts(m)
+    assert len(sent) == 2 and sent[-1][2].get("If-Match") == etag
+    assert copy_times(m) == (at(13, 45, day=DAY), at(14, 45, day=DAY)) and row(m)["state"] == "live"
+    assert family_copy.version(m.ledger, m.key)["pending"]["landed"]
+    sync(m)
+    assert len(puts(m)) == 2
+
+
+def test_an_expired_write_at_a_new_version_holding_the_old_content_is_someones_edit(m):
+    """The decision table: a new version holding what Harness had before the write is someone putting it back."""
+    at_coffee_time(m)
+    undecided(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.icloud.seed(copy_path(m), caldav.build_copy_ics(family_copy._uid(m.key), COPY_TITLE, ORIGINAL,
+                                                      ORIGINAL + timedelta(hours=1), m.clock()))
+    m.clock.advance(minutes=61)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    sync(m)
+    assert len(puts(m)) == 1 and row(m)["state"] == "hands_off" and left_why(m) == ["edited"]
+
+
+def test_an_expired_write_found_with_an_alarm_added_is_someones_edit(m):
+    at_coffee_time(m)
+    undecided(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    etag, ics = m.icloud.events[copy_path(m)]
+    m.icloud.events[copy_path(m)] = (etag, with_added(ics, ALARM))
+    m.clock.advance(minutes=61)
+    sync(m)
+    assert len(puts(m)) == 1 and row(m)["state"] == "hands_off"
+
+
+def feed_now(m):
+    """What his Gmail calendar's feed shows at this moment, kept for a sync that runs later."""
+    events = [{"iCalUID": f"{e['id']}@google.com", **e} for e in m.gmail.events.values()
+              if e.get("status") != "cancelled"]
+    m.feeds.window.occurrences = [o for o in (google_cal._occurrence(e, GMAIL, "") for e in events) if o is not None]
+    m.feeds.generation += 1
+
+
+def test_the_gmail_event_is_read_again_right_before_the_family_write_and_its_newer_times_win(m):
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    feed_now(m)
+    moved_by_hand(m, at(16, day=DAY), at(17, day=DAY))                       # moved again, the feed is behind
+    m.copier._sync()
+    assert copy_times(m) == (at(16, day=DAY), at(17, day=DAY)) and len(puts(m)) == 2
+
+
+def test_a_gmail_event_cancelled_since_the_feed_gets_no_family_write(m):
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    feed_now(m)
+    m.gmail.events[INSTANCE]["status"] = "cancelled"
+    m.copier._sync()
+    assert copy_times(m) == (ORIGINAL, ORIGINAL + timedelta(hours=1)) and len(puts(m)) == 1
+
+
+def test_a_gmail_event_that_cant_be_read_again_gets_no_family_write_and_its_said(m):
+    at_coffee_time(m)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+    m.gmail.down = True
+    sync(m)
+    m.gmail.down = False
+    assert copy_times(m) == (ORIGINAL, ORIGINAL + timedelta(hours=1)) and len(puts(m)) == 1
+    assert "couldn't read a Gmail event again" in m.ledger.get_meta(family_copy.PROBLEM)
+    assert row(m)["state"] == "live"
+    sync(m)
+    assert copy_times(m) == (at(13, 45, day=DAY), at(14, 45, day=DAY))
+
+
+def test_a_404_for_the_copys_event_is_never_taken_as_deleted(m):
+    """Only 410 Gone or the event answered as cancelled is a deletion: a 404 says nothing, so no removal."""
+    at_coffee_time(m)
+    del m.gmail.events[INSTANCE]                                             # read by its id: 404
+    out = m.tells("the family copy of my coffee is stale", result({"type": "answer", "text": "Hm."}))
+    assert out["status"] != "waiting for his tap", out
+    assert "Take the Family copy" not in " ".join(m.seen()) and copy_path(m) in m.icloud.events
+
+
+def test_a_410_for_the_copys_event_offers_it_off_as_deleted(m):
+    at_coffee_time(m)
+    del m.gmail.events[INSTANCE]
+    m.gmail.gone_410 = {INSTANCE}
+    out = m.tells("the family copy of my coffee is stale", result({"type": "answer", "text": "Hm."}))
+    assert out["status"] == "waiting for his tap", out
+    assert "the Gmail event it copies was deleted" in m.seen()[-1]
+
+
+def test_google_answers_by_id_count_as_deleted_only_on_410_or_cancelled(g):
+    g.google.shared = True
+    g.google.events["evt1"] = {"id": "evt1", "status": "confirmed", "summary": "Coffee", "etag": '"1"',
+                               "start": {"dateTime": "2026-11-12T08:30:00-05:00"},
+                               "end": {"dateTime": "2026-11-12T09:30:00-05:00"}}
+    assert g.client.look_by_id(GMAIL_G, "evt1")[0] == "ok"
+    assert g.client.look_by_id(GMAIL_G, "nothere1") == ("unknown", None)              # 404
+    g.google.events["evt1"]["status"] = "cancelled"
+    assert g.client.look_by_id(GMAIL_G, "evt1")[0] == "deleted"
+    g.google.fail["GET"] = 410
+    assert g.client.look_by_id(GMAIL_G, "evt1") == ("deleted", None)
+    g.google.fail["GET"] = 500
+    assert g.client.look_by_id(GMAIL_G, "evt1") == ("unknown", None)
+
+
+def test_a_copys_retries_are_capped_in_all_not_only_per_hour(m):
+    at_coffee_time(m)
+    d = family_copy.version(m.ledger, m.key)
+    d["retried"] = family_copy.MAX_TOTAL_RETRIES - 1                         # retried over earlier hours
+    family_copy._set_version(m.ledger, m.key, d)
+    moved_by_hand(m, at(13, 45, day=DAY), at(14, 45, day=DAY))
+
+    def touch():
+        etag, ics = m.icloud.events[copy_path(m)]
+        m.icloud.seed(copy_path(m), ics)
+        m.icloud.before_write = touch
+    m.icloud.before_write = touch
+    sync(m)
+    m.icloud.before_write = None
+    assert len(puts(m)) == 1 + 1 + 1                                         # the add, the write, one retry
+    assert row(m)["state"] == "hands_off" and left_why(m) == ["conflicts"]
+    assert family_copy.version(m.ledger, m.key)["retried"] == family_copy.MAX_TOTAL_RETRIES
+
+
+def test_a_fix_card_for_a_copy_with_an_alarm_added_writes_nothing(m):
+    out_of_step(m)
+    m.icloud.seed(copy_path(m), with_added(m.icloud.events[copy_path(m)][1], ALARM))
+    edited = m.icloud.events[copy_path(m)]
+    m.tells("the family copy of my coffee is wrong", result({"type": "answer", "text": "I see."}))
+    if "Approve" in m.labels():
+        m.tap("Approve")
+    assert m.icloud.events[copy_path(m)] == edited
+    assert any("has something added to it on Family, so it's yours to keep now" in x for x in m.seen())
+
+
+def test_keep_logging_on_the_turn_on_card_leaves_a_way_back(drives, tmp_path):
+    """Round 4: Keep logging on the one Turn on card isn't the end of it. Its reply carries Turn on, and that
+    tap turns them on as the card's own would."""
+    (tmp_path / "options.json").write_text(json.dumps({"drive_dry_run": False}))
+    drives.gm.own_dry_fn = lambda: drive_dry(drives.ledger, str(tmp_path))
+    quiet_family(drives)
+    a = when(drives, days=2, hour=10)
+    mine(drives, "Dentist", a, CLINIC)
+    go(drives)
+    go(drives)
+    assert len(offers(drives)) == 1
+    assert drives.live.on_choice("drive_leave", target_of(drives, "drive_leave")[0]) == ""
+    with drives.ledger.tx() as db:
+        drives.ledger.release_held(db=db)
+    drives.tick()
+    back = [x for x in drives.bot.sent if x[1].startswith("Leaving them as they are: drive blocks stay logging")]
+    assert back and [label for row in back[0][2] for label, _ in row] == ["Turn on"]
+    assert drives.live.on_choice("drive_on", target_of(drives, "drive_on")[-1]) == ""
+    assert drive_cards.live_on(drives.ledger)
+    go(drives)
+    go(drives)
+    assert ("Busy (drive there)", a - 30 * M, a, "") in blocks(drives)

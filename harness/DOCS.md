@@ -1385,11 +1385,25 @@ and `/status` says if the Gmail calendar isn't being read.
   version is someone's edit, even at a time Harness once wrote, and the copy is left alone. Every write
   goes only over the version just checked. When iCloud refuses it for its version, or its answer is lost,
   the copy is read again by its address and judged again before anything more is written; after 2 such
-  retries in an hour the copy is left alone and named in the digest. A version is taken as Harness's own
-  only when the copy there shows exactly what Harness wrote (title, start and end, and no place or notes);
-  any difference is someone's edit and the copy is left alone. After a lost answer, the copy back at what
-  Harness had before under a new version is someone's edit too. A write still undecided after an hour is
-  settled the same way, by what the copy shows, and its old version never counts as a late read after that.
+  retries in an hour, or 6 in all for that copy, the copy is left alone and named in the digest.
+- **Harness's own, by an allowlist:** a copy counts as Harness's own only when it holds exactly what
+  Harness writes for it: one event, its id, its title, start and end, and Harness's mark, and nothing more.
+  Lines are compared by what they say, so iCloud's own housekeeping (its stamps and own lines, an alert it
+  marks as its default, times kept in a zone's form or folded across lines) is not an edit. Anything else,
+  an alert, a guest, a link, a status, a repeat, a second event, a place, notes, travel time, or any other
+  line, means someone edited it: the copy is left alone and never written over or taken off, not even by a
+  write that checks its version, and the next digest says once, in one line: "Left alone, yours to keep
+  now: ... I won't change those copies again." A read at the version from before a write of Harness's own
+  is taken as behind only while it holds exactly what Harness had written there.
+- **A write whose answer never came back:** after an hour it's settled by what the copy shows. As written:
+  Harness's own. Still the version it went over, holding exactly what Harness had there before: it never
+  landed, and the copy gets one more write over that version (counted in the 6). Anything else, a new
+  version even one holding what Harness had before, is someone's edit and stays theirs.
+- **The Gmail event read again before each write:** just before a copy is changed, its Gmail event is read
+  again by its id (with the Google key set), and the copy takes that read's times. If the read fails,
+  nothing is written, the digest says so, and the next read tries again. Only Google answering 410 Gone,
+  or the event as cancelled, counts as deleted; a "not found" never does, here or on a fix card. A trip's
+  block (made from several events) and a copy with no Google key go by the calendar's read alone.
 - **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
   family mirrored event not updating"), even as a question, and you get a card that brings that copy back
   to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name
@@ -1400,7 +1414,8 @@ and `/status` says if the Gmail calendar isn't being read.
   plain line. Each card is bound to the copy and its event as it read them, by id and version: at your tap
   both are read again, and if either changed, nothing is written and a fresh card comes instead. Nothing
   asks you to change a calendar by hand. A copy you fixed by hand that already matches its event stays as
-  it is.
+  it is. A fix card never writes over, or takes off, a copy with anything added to it on Family (an alert,
+  a note, a place, a guest, a link): it says the copy is yours to keep and leaves it.
 - **Yours by hand:** a matching event with your first name in it is taken over, not doubled. It's
   replaced only when the event changes on Gmail. Events with other people, repeating ones and
   anyone else's are never touched.
@@ -1582,7 +1597,9 @@ how many blocks are on Gmail.
   The switch is kept in Harness's own record, never in the settings, and no setting turns it on. After
   installing 0.24.5, while they're only logged, one card asks once: "Drive blocks: add them to your Gmail
   calendar from now on? Last week's dry run would have added N.", with Turn on and Keep logging; it isn't
-  sent again, answered or not. Turn on's receipt carries Turn off, which puts them back to the log. A note
+  sent again, answered or not. Turn on's receipt carries Turn off, which puts them back to the log. Keep
+  logging and Turn off each answer with a Turn on button, valid for a week, so the way back to turning them
+  on is always on your latest drive blocks message. A note
   from Cain on your message that names a drive block gets one card about them (marked as from his note):
   in the dry run, its Write them is the same tap as Turn on; otherwise it lists any event still without
   drives, with Work them out.
