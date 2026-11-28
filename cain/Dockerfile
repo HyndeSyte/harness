@@ -99,8 +99,13 @@ RUN set -eu; seed=/opt/cain/plugin-seed; pin=/opt/cain/discord/pin.json; \
 RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
     && test -z "$(find / -xdev -type f -perm /6000 -print -quit)"
 
+# The App's own version (0.19.4), as the Supervisor's build passes it: the link's fallback for the version
+# installed now when the Supervisor's answer can't be read (link/ship-pass.ts cainInstalled).
+ARG BUILD_VERSION=""
+ENV CAIN_BUILD_VERSION=${BUILD_VERSION}
+
 LABEL \
     io.hass.type="addon" \
-    io.hass.version="0.19.3" \
+    io.hass.version="0.19.4" \
     org.opencontainers.image.title="Cain" \
     org.opencontainers.image.description="Claude Code answering a private Discord bot"

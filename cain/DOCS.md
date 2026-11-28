@@ -540,6 +540,25 @@ calendar App's (Settings, System, Backups). Either order is safe: neither App dr
 while the other is on its old version, it waits. After a restore, the calendar App may send
 again a card it sent after its backup was taken; the newest card is the one to answer.
 
+## What 0.19.4 does: an install starts from the version you actually have
+
+- When you tap Ship, the link tells the Keeper which version the install replaces. That is now the
+  version of Cain installed on the Pi, as Home Assistant reports it when the App starts, not the version
+  in `main`. Before, a version that was merged but never installed (0.19.1 on Nov 27) made the Keeper
+  refuse every later install of Cain, since the Pi was still on the one before.
+- The App reads that version from Home Assistant at each start, in the background and for at most a minute,
+  and keeps it only in `/run/cain` (cleared at every start), as a plain version number: one to four groups of
+  digits separated by single dots, like 0.19.3 (anything else, such as `1..2`, `dev` or `latest`, counts as
+  unreadable). If the Ship run comes while that read is still going, the link waits for it to finish, up to
+  its own bound of about a minute. If it can't be read, the link uses the version the running App was built
+  as, when that is a plain version number too, and says so in one line of its log. If neither can be read, nothing
+  is registered and the Ship run is refused with that reason; the link never guesses.
+- When the Keeper itself has refused an install, or left it unprotected, there is nothing left to cancel: the
+  link doesn't ask it to cancel and posts no Try again card. You get one plain line instead, saying the Keeper
+  refused it and why, with no button. Any other answer (an error, no answer, something unexpected) is handled
+  as before: the link cancels, and a cancel it can't confirm still brings the Try again card. A cancel counts
+  as done only when the Keeper answers that it ended, or refuses it because the install is unprotected.
+
 ## What 0.19.0 does: working with the Keeper
 
 The Keeper App (in this repository, `keeper/`) checks every install of Cain for 15 minutes and rolls a
@@ -562,8 +581,8 @@ bad one back from the backup taken just before it. Cain's part:
   Cain's key). The link refuses a token it has already let through (a second Ship run on one tap), keeps
   the spent ids (hashes, never the token) in root's `/data/trust/ship-passes.json`, and registers each
   install the tap makes with the Keeper over the Keeper's own service (`POST /attempt` with Cain's
-  `keeper_token`): the token itself, the pull request, the head, the App's version before and after (each
-  `config.yaml` at the pull request's base and head) and the verdict probe's hash at the head. The Keeper
+  `keeper_token`): the token itself, the pull request, the head, the App's version before and after (since
+  0.19.4 the version installed now and the `config.yaml` at the head) and the verdict probe's hash at the head. The Keeper
   checks the token's signature with the link's public Ship key (its `ship_public_key` option: the line
   `Ship key (public): ...` in this App's log; since Keeper 0.1.4 pinned on first use, a changed one needs
   confirming at the device), spends it once per App and takes the App-only backup itself. A link that

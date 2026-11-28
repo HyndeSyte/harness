@@ -382,6 +382,7 @@ export interface Shown {
   drillPage?: { key: string; clear?: boolean };   // (Keeper 0.1.14) a drill that installed nothing, told to him once per key (drill.ts); 0.1.15: clear, its Clear button
   space?: { pr: number; head: string; app: string; version: string };   // the free-space card (Keeper 0.1.10, ship-pass.ts; 0.1.11: no button)
   retry?: { attempt: string; what: "claim" | "cancel" };   // the card offering a retry after a keeper answer that wasn't a plain success (Keeper 0.1.11)
+  refused?: { attempt: string };   // (Cain 0.19.4) the one line saying Keeper refused an install, so nothing installed (no button)
   decision?: { id: string; key: string; pr: string | null; unarmed?: boolean };   // the review runner's decision card at the round cap (0.16.0, cap.ts); unarmed: posted while the rollback wasn't armed (round 2)
   grant?: { key: string; rounds: number; pr: string | null; reason: string;       // Cain's grant card for extra review rounds (0.18.0, ../review/grants.ts)
     used?: number; cap?: number;     // the runner's round count and the change's cap when it was posted: checked again at the tap
@@ -422,7 +423,7 @@ export interface State {
   hisAt?: number;                    // the newest message of his the link heard of (a reply of Cain's answered it)
   pcNotices?: Record<string, { msg: string; at: number }>;   // the PC job keeper's notice ids already posted (0.12.0, twenty-first round)
   // (Keeper 0.1.15) item 21: keeper cards held by the quiet hours, sent at 07:00 (quietFlush), each once by its key
-  quietHeld?: { key: string; kind: "retry" | "space"; args: unknown[]; at: number }[];
+  quietHeld?: { key: string; kind: "retry" | "space" | "refused"; args: unknown[]; at: number }[];
   // The review runner's decision cards waiting while their item is held by another holder (0.16.0,
   // round 2), by decision id: one each, tried again at each sweep until the hold clears.
   decisions?: Record<string, Partial<DecisionRec> & { since: number }>;
@@ -1841,7 +1842,7 @@ export class Link {
   }
   // (Keeper 0.1.15) item 21: quiet hours, in the check-ins' zone
   quiet(): boolean { return quietHours(this.d.now(), this.d.tz ?? "America/New_York"); }
-  private holdQuiet(key: string, kind: "retry" | "space", args: unknown[]): void {
+  private holdQuiet(key: string, kind: "retry" | "space" | "refused", args: unknown[]): void {
     const s = this.d.load();
     const q = (s.quietHeld ??= []);
     if (!q.some((x) => x.key === key)) { q.push({ key, kind, args, at: this.d.now() }); if (q.length > 50) q.shift(); this.d.save(s); this.log(`a ${kind} card waits for the end of quiet hours (07:00)`); }
@@ -1857,6 +1858,7 @@ export class Link {
     for (const h of q) {
       try {
         if (h.kind === "retry") await this.retryCard(...(h.args as [string, "claim" | "cancel"]));
+        else if (h.kind === "refused") await this.refusedCard(...(h.args as [string, string, string, string]));
         else await this.spaceCard(...(h.args as [number, string, string, string]));
         n++;
       } catch (e) { this.log(`a held ${h.kind} card couldn't go out: ${String(e).slice(0, 80)}`); }
@@ -1883,6 +1885,27 @@ export class Link {
       labels: [], space: { pr, head, app, version } });
     this.d.save(s);
     this.log(`a free-space card for pull request ${pr} (${name} ${version}) went to him, with no button`);
+    return { status: "posted", message: String(msg.id) };
+  }
+
+  // -- the keeper refused a registration, or left it unprotected (Cain 0.19.4, ship-pass.ts) --
+  // Nothing was installed and there is nothing to cancel, so no retry card: one plain line per attempt saying why, the link's own
+  // words with Keeper's reason, and no button. Not while stopped; held through quiet hours like the other Keeper cards.
+  async refusedCard(attempt: string, app: string, version: string, why: string): Promise<{ status: "posted" | "open" | "stopped" | "quiet"; message?: string }> {
+    if (!RETRY_ATTEMPT.test(attempt) || !/^[a-z0-9_]{1,64}$/.test(app) || !/^[0-9A-Za-z.+-]{1,32}$/.test(version)) throw new Refusal("that isn't a keeper attempt, App and version");
+    if (this.stopped().stopped) return { status: "stopped" };
+    const reason = String(why ?? "").replace(/[^\x20-\x7e]/g, " ").replace(/\b[0-9a-f]{8}_([a-z0-9]{1,40})\b/g, (_m, n: string) => n.replace(/^./, (c) => c.toUpperCase())).replace(/[`*_~|<>@]/g, " ").replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "").slice(0, 160) || "no reason given";
+    if (this.quiet()) { this.holdQuiet(`refused:${attempt}`, "refused", [attempt, app, version, reason]); return { status: "quiet" }; }
+    const prior = Object.entries(this.d.load().messages).find(([, x]) => x.refused && x.refused.attempt === attempt);
+    if (prior) return { status: "open", message: prior[0] };
+    const name = app.replace(/^[0-9a-f]{8}_/, "").replace(/^./, (c) => c.toUpperCase());
+    const text = `Keeper refused the install of ${name} ${version}, so nothing was installed: ${reason}.`;
+    const msg = await this.post(text, [], { nonce: stableNonce("refused", attempt) });
+    const s = this.d.load();
+    this.remember(s, msg, { kind: "notice", item: "none", question: `refused:${attempt}`, posted: this.d.now(), expires: null, buttons: false,
+      labels: [], refused: { attempt } });
+    this.d.save(s);
+    this.log(`a line saying Keeper refused ${name} ${version} went to him, with no button`);
     return { status: "posted", message: String(msg.id) };
   }
 
