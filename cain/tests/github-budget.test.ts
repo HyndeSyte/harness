@@ -6,7 +6,8 @@
 // registration waits once at most, bound to the landing's base. Review round 1's fixes each have a test here.
 import { describe, expect, test } from "bun:test";
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
-import { CARD_ASKS, finishedJobs, IMMUTABLE, LAND_ASKS, makeGithub, PULL_STATE_EVERY_MS, pullStateReader, rateRefused, refusedUntil, REG_ASKS, RESERVE, RUN_ASKS, shortUntil } from "../rootfs/opt/cain/link/budget";
+import { CARD_ASKS, IMMUTABLE, LAND_ASKS, makeBook, makeGithub, PULL_STATE_EVERY_MS, pullStateReader, rateRefused, refusedUntil, REG_ASKS, RESERVE, SECONDARY_WAIT_MS, shortUntil } from "../rootfs/opt/cain/link/budget";
+import { BUDGET_UNKNOWN_LINE } from "../rootfs/opt/cain/link/core";
 import { facts, headChecks, land, windowsAttempts, type Git } from "../rootfs/opt/cain/link/merge";
 import { budgetPendingSaid, budgetRestartSaid, keyFingerprint, passId, reconcilePasses, registerInstalls, shipPass, type PassDeps, type RegResult } from "../rootfs/opt/cain/link/ship-pass";
 import { claimFor, makeToken } from "../rootfs/opt/cain/ship-token";
@@ -76,26 +77,6 @@ describe("the link's GitHub reads (budget.ts)", () => {
     await gh.api(path);
     expect(asked).toHaveLength(2);                                 // the 200 is kept
   });
-  test("fix 2: a job list is kept only when a fresh read of that attempt confirms it completed; all its jobs done while the run is in_progress is not kept", async () => {
-    const asked: string[] = [];
-    const fetch = async (url: string) => {
-      asked.push(url);
-      return json({ total_count: 2, jobs: [{ id: 1, status: "completed", conclusion: "success" }, { id: 2, status: "completed", conclusion: "failure" }] });
-    };
-    const gh = makeGithub({ fetch: fetch as any });
-    const path = `${REPO}/actions/runs/7/attempts/1/jobs?per_page=100&page=1`;
-    await gh.api(path); await gh.api(path);                        // no confirmation: the list alone never decides
-    expect(asked).toHaveLength(2);
-    await gh.api(path, { confirm: () => false }); await gh.api(path, { confirm: () => false });   // the run is in_progress
-    expect(asked).toHaveLength(4);
-    let asks = 0;
-    await gh.api(path, { confirm: () => { asks++; return true; } });
-    const last = await gh.api(path, { confirm: () => { asks++; return true; } });
-    expect(asked).toHaveLength(5);
-    expect(asks).toBe(1);                                          // a kept list asks nothing more
-    expect(last.body.jobs[1].conclusion).toBe("failure");
-    expect(finishedJobs({ total_count: 3, jobs: last.body.jobs })).toBe(false);   // not whole on this page
-  });
   test("fix 2: attempt 1 failed, then attempt 2 passed: judged on attempt 2's own list, and a further re-run is never read from attempt 1's", async () => {
     const run = { id: 7, head_sha: SHA, run_attempt: 1, status: "completed" };
     const jobs: Record<number, any> = { 1: { id: 101, name: "pcjobs-windows", status: "completed", conclusion: "failure" } };
@@ -112,7 +93,7 @@ describe("the link's GitHub reads (budget.ts)", () => {
       return json({ message: "Not Found" }, 404);
     };
     const gh = makeGithub({ fetch: fetch as any });
-    const d = { api: gh.api };
+    const d = { api: gh.api, lists: gh.lists };
     const jobsOf = (a: number) => `${REPO}/actions/runs/7/attempts/${a}/jobs?per_page=100&page=1`;
     const listing = () => asked.filter((p) => p.startsWith(`${REPO}/actions/runs?head_sha=`)).length;
     const by = (x: any) => Object.fromEntries((x as any[]).map((w) => [w.run_attempt, `${w.status} ${w.conclusion}`]));
@@ -151,24 +132,27 @@ describe("the link's GitHub reads (budget.ts)", () => {
       return json({ message: "Not Found" }, 404);
     };
     const gh = makeGithub({ fetch: fetch as any });
-    await windowsAttempts({ api: gh.api }, "HyndeSyte/harness", SHA);
-    await windowsAttempts({ api: gh.api }, "HyndeSyte/harness", SHA);
+    const d = { api: gh.api, lists: gh.lists };
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);
     const one = `${REPO}/actions/runs/9/attempts/1/jobs?per_page=100&page=1`;
     expect(asked.filter((p) => p === one)).toHaveLength(2);
     earlier = "completed";
-    await windowsAttempts({ api: gh.api }, "HyndeSyte/harness", SHA);
-    await windowsAttempts({ api: gh.api }, "HyndeSyte/harness", SHA);
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);
     expect(asked.filter((p) => p === one)).toHaveLength(3);
   });
-  test("a read that can change carries its ETag, and a 304 answers from what was kept; it counts as asked (fix 9)", async () => {
+  test("round 2, 6: without a key no ETag is sent or kept (a 304 saves nothing then); conditional reads only when asked for", async () => {
     const f = fakeGithub();
     const gh = makeGithub({ fetch: f.fetch as any });
-    const one = await gh.api(`${REPO}/pulls/46`);
-    const two = await gh.api(`${REPO}/pulls/46`);
-    expect(f.asked.map((x) => x.inm)).toEqual([null, '"v1"']);
-    expect(two.status).toBe(200);
+    await gh.api(`${REPO}/pulls/46`); await gh.api(`${REPO}/pulls/46`);
+    expect(f.asked.map((x) => x.inm)).toEqual([null, null]);
+    expect(gh.hour()).toEqual({ asked: 2, kept: 0, limits: 0 });
+    const g = fakeGithub();
+    const authed = makeGithub({ fetch: g.fetch as any, conditional: true });
+    const one = await authed.api(`${REPO}/pulls/46`), two = await authed.api(`${REPO}/pulls/46`);
+    expect(g.asked.map((x) => x.inm)).toEqual([null, '"v1"']);
     expect(two.body).toEqual(one.body);
-    expect(gh.hour()).toEqual({ asked: 2, kept: 0, limits: 0 });   // without a key GitHub counts the 304 too
   });
   test("fix 8: two identical reads at once share one request, and every caller, the first included, gets its own copy", async () => {
     const f = fakeGithub();
@@ -200,13 +184,13 @@ describe("the link's GitHub reads (budget.ts)", () => {
     expect((await gh.rateLimit())?.remaining).toBe(9);
     hdr = 50;
     await gh.api(`${REPO}/pulls/2`);
-    expect(gh.seen()?.remaining).toBe(9);
+    expect(gh.seen()?.remaining).toBe(8);                          // round 2: each read is charged as it goes out
     hdr = 3;
     await gh.api(`${REPO}/pulls/3`);
     expect(gh.seen()?.remaining).toBe(3);
     expect(gh.hour()).toEqual({ asked: 3, kept: 0, limits: 2 });
-    expect(gh.short(RESERVE)).toBe(reset * 1000);
-    expect(gh.short(3)).toBeNull();
+    expect(shortUntil(gh.seen(), RESERVE, t)).toBe(reset * 1000);
+    expect(shortUntil(gh.seen(), 3, t)).toBeNull();
     t = reset * 1000 + 1;                                          // the window is over: unknown, never a full allowance
     expect(gh.seen()).toBeNull();
     limit = new Error("no answer");
@@ -227,32 +211,26 @@ describe("the link's GitHub reads (budget.ts)", () => {
     expect(down.room(1)).toBe(false);                              // the card polling spends nothing on an unknown hour
     expect(shortUntil(null, 6, 1_000)).toBeNull();                 // a step that must go never waits on an unknown hour
   });
-  test("fix 6: a tap landing or registering holds RUN_ASKS from what card builds and the card polling see, until it lets go or its time ends", async () => {
-    let t = 1_799_999_000_000;
-    const gh = makeGithub({ fetch: (async () => json({ resources: { core: { limit: 60, remaining: 60, reset: 1_800_000_000 } } })) as any, now: () => t });
-    await gh.rateLimit();
-    gh.hold("tap:1", t + 60_000);
-    expect(gh.held()).toBe(RUN_ASKS);
-    expect(gh.room(60 - RUN_ASKS)).toBe(true);
-    expect(gh.room(60 - RUN_ASKS + 1)).toBe(false);
-    gh.hold("pass:1", t + 120_000);
-    expect(gh.held()).toBe(2 * RUN_ASKS);
-    gh.free("pass:1");
-    t += 60_001;
-    expect(gh.held()).toBe(0);
-  });
-  test("fix 4: a refusal for the rate limit is a 429 or a 403 with no reads left; its reset is taken only when plausible", () => {
+  test("round 2, 4: a rate-limit refusal is a 429, or a 403 with none left, a Retry-After or the secondary limit's message; when it lifts", () => {
     expect(rateRefused({ status: 429 })).toBe(true);
     expect(rateRefused({ status: 403, headers: { "x-ratelimit-remaining": "0" } })).toBe(true);
-    expect(rateRefused({ status: 403, headers: { "x-ratelimit-remaining": "12" } })).toBe(false);
+    expect(rateRefused({ status: 403, headers: { "x-ratelimit-remaining": "12", "retry-after": "90" } })).toBe(true);
+    expect(rateRefused({ status: 403, headers: { "x-ratelimit-remaining": "12" }, body: { message: "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." } })).toBe(true);
+    expect(rateRefused({ status: 403, headers: { "x-ratelimit-remaining": "12" }, body: { message: "Resource not accessible by integration" } })).toBe(false);
     expect(rateRefused({ status: 403 })).toBe(false);
     expect(rateRefused({ status: 500 })).toBe(false);
     const now = 1_000_000_000_000;
-    expect(refusedUntil({ "x-ratelimit-reset": String(now / 1000 + 600) }, now)).toBe(now + 600_000);
-    expect(refusedUntil({ "x-ratelimit-reset": String(now / 1000 - 5) }, now)).toBeNull();
-    expect(refusedUntil({ "x-ratelimit-reset": String(now / 1000 + 9_999) }, now)).toBeNull();
-    expect(refusedUntil({ "retry-after": "60" }, now)).toBe(now + 60_000);
-    expect(refusedUntil({}, now)).toBeNull();
+    const spent = (reset: number) => ({ status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } });
+    expect(refusedUntil(spent(now / 1000 + 600), now)).toBe(now + 600_000);                   // the primary reset
+    expect(refusedUntil(spent(now / 1000 - 5), now)).toBeNull();
+    expect(refusedUntil(spent(now / 1000 + 9_999), now)).toBeNull();
+    // Retry-After stands first, whatever is left
+    expect(refusedUntil({ status: 403, headers: { "x-ratelimit-remaining": "12", "retry-after": "90", "x-ratelimit-reset": String(now / 1000 + 600) } }, now)).toBe(now + 90_000);
+    expect(refusedUntil({ status: 429, headers: { "retry-after": "60" } }, now)).toBe(now + 60_000);
+    // a secondary limit, or a 429, with no Retry-After: a bounded wait
+    expect(refusedUntil({ status: 429, headers: {} }, now)).toBe(now + SECONDARY_WAIT_MS);
+    expect(refusedUntil({ status: 403, headers: { "x-ratelimit-remaining": "12" }, body: { message: "secondary rate limit" } }, now)).toBe(now + SECONDARY_WAIT_MS);
+    expect(SECONDARY_WAIT_MS).toBeLessThanOrEqual(5 * 60_000);
   });
   test("fix 7: the card polling keeps its ask before it is sent, whatever the answer, and stops at the reserve", async () => {
     const t = 1_799_999_000_000;
@@ -334,6 +312,8 @@ describe("the reads each step makes stay within its constant", () => {
     };
     return { asked, gh: makeGithub({ fetch: fetch as any }) };
   }
+  // round 2, 8: the exact counts, which DOCS and the pull request quote (one under each constant at 15 runs)
+  const COUNTS: Record<number, { card: number; land: number; reg: number }> = { 6: { card: 18, land: 13, reg: 7 }, 10: { card: 22, land: 17, reg: 7 }, 15: { card: 27, land: 22, reg: 7 } };
   for (const runs of [6, 10, 15]) {
     test(`with ${runs} workflow runs on the head: a card at most ${CARD_ASKS}, a landing at most ${LAND_ASKS}, a registration at most ${REG_ASKS}`, async () => {
       const card = counted(runs);
@@ -341,6 +321,7 @@ describe("the reads each step makes stay within its constant", () => {
       expect(f?.bumps).toEqual([{ app: "Cain", version: "0.19.4" }]);
       expect(checks && checks !== "missing" && checks.windows).toBe(true);
       expect(card.asked.length).toBeLessThanOrEqual(CARD_ASKS);
+      expect(card.asked.length).toBe(COUNTS[runs].card);
       const landing = counted(runs);
       const git = async (args: string[]): Promise<Git> => {
         if (args[0] === "rev-parse") return { code: 0, out: `${SHA}\n`, err: "" };
@@ -349,6 +330,7 @@ describe("the reads each step makes stay within its constant", () => {
       };
       expect(await land({ api: landing.gh.api, git, stopped: () => false }, { repo: "HyndeSyte/harness", pr: 46, head: SHA })).toEqual({ ok: true, already: false, base: BASE });
       expect(landing.asked.length).toBeLessThanOrEqual(LAND_ASKS);
+      expect(landing.asked.length).toBe(COUNTS[runs].land);
       const keys = generateKeyPairSync("ed25519");
       const fp = keyFingerprint(keys.publicKey.export({ type: "spki", format: "der" }).toString("base64"));
       const reg = counted(runs, fp);
@@ -358,6 +340,7 @@ describe("the reads each step makes stay within its constant", () => {
         post: async () => ({ status: 202, body: { status: "pending", id: acc.id } }), get: async () => ({ status: 200, body: acc }) } as any, "tok", claimFor("https://github.com/HyndeSyte/harness/pull/46", SHA, Date.now())!);
       expect(r.ok).toBe(true);
       expect(reg.asked.length).toBeLessThanOrEqual(REG_ASKS);
+      expect(reg.asked.length).toBe(COUNTS[runs].reg);
     });
   }
 });
@@ -379,7 +362,6 @@ describe("a Ship card and his tap, short of GitHub's hour (core.ts)", () => {
     expect(text).toContain("From GitHub: the pull request couldn't be read just now.");
     expect(text).toContain("GitHub's hourly allowance for the link's reads is low until 8:20 AM, so this card's facts and checks weren't read; Ship reads them before it lands.");
     expect(r.github.asked).toEqual([]);
-    expect(r.github.budgetViews).toEqual(["card"]);               // a card sees the hour less what taps hold
     r.github.budget = { limit: 60, remaining: LAND_ASKS - 1, reset: r.t.now + 20 * MIN };
     const id2 = ((await r.link.ship({ text: "Again.", item: "P70", pr: LINK_PR, head: SHA1 })) as any).message;
     expect(String(r.msg(id2).content)).toContain("weren't read; Ship reads them before it lands, and a Ship tap now waits until 8:20 AM and lands by itself.");
@@ -391,23 +373,29 @@ describe("a Ship card and his tap, short of GitHub's hour (core.ts)", () => {
     expect(String(r.msg(id).content)).toContain("GitHub's hourly allowance for the link's reads is low until 8:20 AM: a Ship tap now waits until then, and lands and installs by itself.");
     expect(r.github.asked.length).toBeGreaterThan(0);
   });
-  test("enough left, or nothing known: the card is as before", async () => {
-    for (const b of [{ limit: 60, remaining: CARD_ASKS + LAND_ASKS, reset: 0 }, null]) {
-      const r = shipRig();
-      r.github.budget = b ? { ...b, reset: r.t.now + 20 * MIN } : null;
-      const id = ((await ship(r)) as any).message;
-      expect(String(r.msg(id).content)).not.toContain("allowance");
-    }
+  test("enough left: the card is as before", async () => {
+    const r = shipRig();
+    r.github.budget = { limit: 60, remaining: CARD_ASKS + LAND_ASKS, reset: r.t.now + 20 * MIN };
+    const id = ((await ship(r)) as any).message;
+    expect(String(r.msg(id).content)).not.toContain("allowance");
+    expect(r.book.reserved()).toEqual({});                         // its own reservation is let go once it is built
+  });
+  test("round 2, 5: nothing known of the hour: a card build reads nothing, and says so", async () => {
+    const r = shipRig();
+    r.github.budget = null;
+    const id = ((await ship(r)) as any).message;
+    expect(String(r.msg(id).content)).toContain(BUDGET_UNKNOWN_LINE);
+    expect(r.github.asked).toEqual([]);
   });
   test("fix 3: his tap short of the landing's reads waits for the reset by itself, holds its reads, isn't a try, then lands with no new tap", async () => {
     const r = shipRig();
     const id = ((await ship(r)) as any).message;
     const tapped = r.t.now;
-    r.github.budget = { limit: 60, remaining: LAND_ASKS - 1, reset: r.t.now + 20 * MIN };
+    r.github.budget = { limit: 60, remaining: 0, reset: r.t.now + 20 * MIN };
     await r.tap(snap(r.msg(id)), r.ids(id)[0]);
     await r.link.whenLanded();
     expect(r.github.landings).toEqual([]);
-    expect(r.github.holds[`tap:${id}`]).toBe(tapped + 2 * HOUR_MS);
+    expect(r.book.reserved()[`tap:${id}`]).toBe(LAND_ASKS);       // round 2: its reads reserved while it waits
     expect(String(r.msg(id).content)).toContain("You tapped Ship. Waiting: GitHub's hourly allowance for the link's reads is spent until 8:20 AM. It lands by itself as soon as it can.");
     expect(r.relayed.at(-1)).toContain("the link keeps trying for up to 2 hours and lands it by itself");
     expect(shipping(r, id).tries ?? 0).toBe(0);                    // a wait only for the budget isn't a try
@@ -423,7 +411,7 @@ describe("a Ship card and his tap, short of GitHub's hour (core.ts)", () => {
     expect(String(r.msg(id).content)).toContain("Shipped: it's in main as of 8:21 AM. Installing it is next.");
     expect(r.relayed.at(-1)).toContain("Ship token: ");
     expect(r.link.landedBase(LINK_PR, SHA1)).toBe(BASE);           // fix 4: the registration binds to it
-    expect(r.github.holds[`tap:${id}`]).toBe(r.t.now + 15 * MIN);
+    expect(r.book.reserved()[`tap:${id}`]).toBeUndefined();        // released once it landed
   });
   test("fix 3: a reset past his tap's 2 hours: never waited for; the card says plainly the tap runs out, and when to tap again", async () => {
     const r = shipRig();
@@ -442,7 +430,7 @@ describe("a Ship card and his tap, short of GitHub's hour (core.ts)", () => {
     expect(text).toContain("Not shipped: GitHub's hourly allowance for the link's reads is spent until");
     expect(text).toContain("after the tap's 2 hours run out at 10:00 AM, so this tap can't land it: a Ship tap on a new card can go at 10:11 AM or later");
     expect(shipping(r, id).state).toBe("not landed");
-    expect(r.github.holds[`tap:${id}`]).toBeNull();
+    expect(r.book.reserved()[`tap:${id}`]).toBeUndefined();
   });
   test("fix 3: a try is never set past his tap's 2 hours", async () => {
     const r = shipRig();
@@ -658,3 +646,344 @@ describe("the Ship run's registration and GitHub's hour (ship-pass.ts)", () => {
     expect(JSON.parse(p.file!).spent.find((x: any) => x.id === passId(p.token)).said).toBe(budgetRestartSaid(NOW + 25 * MIN, "America/New_York"));
   });
 });
+
+// Review round 2: one test or more for each fix.
+describe("review round 2", () => {
+  const route = (path: string, runs: any[], jobs: (run: number, attempt: number, page: number) => any) => {
+    if (path.includes("/check-runs?")) return json({ total_count: 0, check_runs: [] });
+    if (path.startsWith(`${REPO}/actions/runs?head_sha=`)) return json({ total_count: runs.length, workflow_runs: runs });
+    const j = /\/actions\/runs\/(\d+)\/attempts\/(\d+)\/jobs\?per_page=100&page=(\d+)$/.exec(path);
+    if (j) return json(jobs(Number(j[1]), Number(j[2]), Number(j[3])));
+    return json({ message: "Not Found" }, 404);
+  };
+  test("1: a job list whose read resolves before the run reads completed is never kept; it is read once more after that", async () => {
+    const run = { id: 7, head_sha: SHA, run_attempt: 1, status: "in_progress" };
+    const asked: string[] = [];
+    const fetch = async (url: string) => {
+      const path = url.replace("https://api.github.com", "");
+      asked.push(path);
+      return route(path, [{ ...run }], () => {
+        run.status = "completed";                                   // the run finishes while its list is read
+        return { total_count: 1, jobs: [{ id: 101, name: "pcjobs-windows", status: "completed", conclusion: "success", head_sha: SHA }] };
+      });
+    };
+    const gh = makeGithub({ fetch: fetch as any });
+    const d = { api: gh.api, lists: gh.lists };
+    const list = `${REPO}/actions/runs/7/attempts/1/jobs?per_page=100&page=1`;
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);
+    expect(asked.filter((p) => p === list)).toHaveLength(1);
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);          // the listing now says completed: read once more, then kept
+    expect(asked.filter((p) => p === list)).toHaveLength(2);
+    await windowsAttempts(d, "HyndeSyte/harness", SHA);
+    expect(asked.filter((p) => p === list)).toHaveLength(2);
+  });
+  test("1: every page is read, a failing job on a later page is seen, and the list is kept only whole", async () => {
+    const asked: string[] = [];
+    const ok = (i: number) => ({ id: 1000 + i, name: "tests", status: "completed", conclusion: "success", head_sha: SHA });
+    let page2 = 200;
+    const fetch = async (url: string) => {
+      const path = url.replace("https://api.github.com", "");
+      asked.push(path);
+      return route(path, [{ id: 8, head_sha: SHA, run_attempt: 1, status: "completed" }], (_r, _a, page) => page === 1
+        ? { total_count: 101, jobs: Array.from({ length: 100 }, (_, i) => ok(i)) }
+        : page2 === 200 ? { total_count: 101, jobs: [{ id: 5, name: "pcjobs-windows", status: "completed", conclusion: "failure", head_sha: SHA }] } : null);
+    };
+    const gh = makeGithub({ fetch: fetch as any });
+    const d = { api: gh.api, lists: gh.lists };
+    page2 = 500;                                                    // a later page that fails: nothing judged, nothing kept
+    expect(await windowsAttempts(d, "HyndeSyte/harness", SHA)).toBeNull();
+    page2 = 200;
+    const one = await windowsAttempts(d, "HyndeSyte/harness", SHA);
+    expect((one as any[]).map((w) => w.conclusion)).toEqual(["failure"]);
+    const pages = () => asked.filter((p) => p.includes("/attempts/1/jobs?")).length;
+    const before = pages();
+    const two = await windowsAttempts(d, "HyndeSyte/harness", SHA);
+    expect(pages()).toBe(before);                                   // kept whole
+    expect((two as any[]).map((w) => w.conclusion)).toEqual(["failure"]);
+  });
+
+  test("4: a landing refused by GitHub's rate limit waits until it lifts: a 403 with Retry-After and reads left, a 429 with and without", async () => {
+    const t = 1_799_999_000_000;
+    for (const [how, until] of [
+      [{ status: 403, headers: { "x-ratelimit-remaining": "12", "retry-after": "120" } }, t + 120_000],
+      [{ status: 429, headers: { "retry-after": "60" } }, t + 60_000],
+      [{ status: 429, headers: {} }, t + SECONDARY_WAIT_MS],
+    ] as const) {
+      const api = async () => ({ status: how.status, body: { message: "slow down" }, headers: how.headers as Record<string, string> });
+      const r = await land({ api, git: async () => ({ code: 0, out: "", err: "" }), stopped: () => false, now: () => t }, { repo: "HyndeSyte/harness", pr: 46, head: SHA });
+      expect(r).toEqual({ ok: false, again: true, why: "GitHub refused a read for its rate limit", until, budget: true });
+    }
+  });
+  test("4: his tap, refused by GitHub's rate limit, waits until it lifts; past his 2 hours it ends saying when to tap again", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.answers.push({ ok: false, again: true, why: "GitHub refused a read for its rate limit", until: r.t.now + 10 * MIN, budget: true });
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    expect(String(r.msg(id).content)).toContain("Waiting: GitHub's rate limit holds the link's reads until 8:10 AM.");
+    expect((r.state().messages as any)[id].shipping.next).toBe(r.t.now + 10 * MIN + 5_000);
+    expect(r.book.reserved()[`tap:${id}`]).toBe(LAND_ASKS);
+    r.later(10 * MIN + 5_000);
+    r.github.answers.push({ ok: false, again: true, why: "GitHub refused a read for its rate limit", until: r.t.now + 2 * HOUR_MS, budget: true });
+    await r.link.sweep(); await r.link.whenLanded();
+    expect(String(r.msg(id).content)).toContain("Not shipped: GitHub's rate limit holds the link's reads until 10:10 AM, after the tap's 2 hours run out at 10:00 AM, so this tap can't land it: a Ship tap on a new card can go at 10:11 AM or later.");
+  });
+  test("4: the registration waits on a 403 with Retry-After and reads left, and on a 429 with or without Retry-After", async () => {
+    for (const [how, ms] of [
+      [{ status: 403, headers: { "x-ratelimit-remaining": "40", "retry-after": "120" } }, 2 * MIN],
+      [{ status: 429, headers: { "retry-after": "300" } }, 5 * MIN],
+      [{ status: 429, headers: {} }, SECONDARY_WAIT_MS],
+    ] as const) {
+      const k = runReg({ remaining: 40, refuse: 1, landing: BASE, how: how as any });
+      const r = await registerInstalls(k.deps as any, "tok", regClaim());
+      expect(r.ok).toBe(true);
+      expect(k.sleeps.filter((x) => x >= MIN)).toEqual([ms + 5_000]);
+    }
+  });
+  test("4: the expiry checks apply to the time a refusal gives: a Retry-After past the tap refuses at once", async () => {
+    const late = claimFor(REG_PR, SHA, REG_NOW - 100 * MIN)!;           // 20 minutes left
+    const k = runReg({ remaining: 40, refuse: 1, landing: BASE, how: { status: 403, headers: { "x-ratelimit-remaining": "40", "retry-after": "1800" } } });
+    const r = await registerInstalls(k.deps as any, "tok", late);
+    expect(r.ok).toBe(false);
+    expect(r.said[0]).toContain("after this Ship tap runs out at 5:38 PM");
+    expect(k.sleeps).toEqual([]);
+  });
+
+  test("5: two reservations at the reset never take the same reads: the older is covered first, and a read past one's share isn't sent", async () => {
+    const t = 1_799_999_000_000;
+    let remaining = 30, sent = 0;
+    const fetch = async (url: string) => {
+      if (url.endsWith("/rate_limit")) return json({ resources: { core: { limit: 60, remaining, reset: 1_800_000_000 } } });
+      sent++; remaining--;
+      return json({ ok: true }, 200, H(remaining));
+    };
+    const gh = makeGithub({ fetch: fetch as any, now: () => t });
+    await gh.rateLimit();
+    gh.book.reserve("tap:a", LAND_ASKS, t + HOUR_MS);
+    gh.book.reserve("pass:b", LAND_ASKS, t + HOUR_MS);
+    expect([gh.book.spare("tap:a"), gh.book.spare("pass:b"), gh.book.spare("card:x"), gh.book.spare()]).toEqual([LAND_ASKS, 30 - LAND_ASKS, 0, 0]);
+    for (let i = 0; i < LAND_ASKS; i++) expect((await gh.api(`${REPO}/pulls/${i}`, { as: "tap:a" })).status).toBe(200);
+    const over = await gh.api(`${REPO}/pulls/x`, { as: "tap:a" });
+    expect(over.status).toBe(429);                                  // b's reads are b's
+    expect(over.headers["x-cain-local"]).toBe("1");
+    expect(rateRefused(over)).toBe(true);
+    for (let i = 0; i < 30 - LAND_ASKS; i++) expect((await gh.api(`${REPO}/pulls/b${i}`, { as: "pass:b" })).status).toBe(200);
+    expect((await gh.api(`${REPO}/pulls/y`, { as: "pass:b" })).status).toBe(429);
+    expect(sent).toBe(30);
+    expect(gh.hour().asked).toBe(30);
+  });
+  test("5: a read answered from what was kept or shared in flight isn't charged", async () => {
+    const t = 1_799_999_000_000;
+    const fetch = async (url: string) => url.endsWith("/rate_limit") ? json({ resources: { core: { limit: 60, remaining: 10, reset: 1_800_000_000 } } })
+      : json({ content: "eA==", encoding: "base64" }, 200, H(9));
+    const gh = makeGithub({ fetch: fetch as any, now: () => t });
+    await gh.rateLimit();
+    gh.book.reserve("tap:a", 5, t + HOUR_MS);
+    const path = `${REPO}/contents/x?ref=${SHA}`;
+    await Promise.all([gh.api(path, { as: "tap:a" }), gh.api(path, { as: "tap:a" })]);
+    await gh.api(path, { as: "tap:a" });
+    expect(gh.book.reserved()).toEqual({ "tap:a": 4 });
+    expect(gh.seen()?.remaining).toBe(9);
+  });
+  test("5: a book with nothing known gives nothing to spare; an expired reservation goes", () => {
+    let t = 1_000;
+    let b: any = null;
+    const book = makeBook(() => b, () => t);
+    expect(book.spare("tap:a")).toBeNull();
+    b = { limit: 60, remaining: 20, reset: 9_000 };
+    book.reserve("tap:a", 15, 5_000);
+    expect(book.spare()).toBe(5);
+    t = 5_000;
+    expect(book.spare()).toBe(20);
+  });
+  test("5: a warm-cache landing below the old floor goes ahead at once", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.budget = { limit: 60, remaining: 10, reset: r.t.now + 20 * MIN };   // under the 23 a cold landing could take
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    expect(r.github.landings).toEqual([{ pr: LINK_PR, head: SHA1 }]);
+    expect(r.github.lands[0].key).toBe(`tap:${id}`);                // its reads are charged to its own reservation
+    expect(String(r.msg(id).content)).toContain("Shipped: it's in main");
+  });
+  test("5: a card build at the reset while a tap waits leaves the tap's reads", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.budget = { limit: 60, remaining: 0, reset: r.t.now + 20 * MIN };
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    expect(r.book.reserved()[`tap:${id}`]).toBe(LAND_ASKS);
+    r.later(20 * MIN + 1);
+    r.github.budget = { limit: 60, remaining: 40, reset: r.t.now + HOUR_MS };   // 40 at the reset: 23 of them the tap's
+    r.github.asked.length = 0;
+    const card = ((await r.link.ship({ text: "Another change.", item: "P71", pr: "https://github.com/HyndeSyte/harness/pull/6", head: SHA1 })) as any).message;
+    expect(String(r.msg(card).content)).toContain("so this card's facts and checks weren't read");
+    expect(r.github.asked).toEqual([]);
+    expect(r.book.reserved()[`tap:${id}`]).toBe(LAND_ASKS);
+  });
+
+  test("2: a Stop just before the ship lock: the push never starts", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.beforePush = () => { r.stop.stopped = true; r.stop.at = r.t.now; };
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    expect(r.github.pushed).toEqual([]);
+    expect(String(r.msg(id).content)).toContain("Stop came before it landed");
+  });
+  test("2: a Stop that arrives while the push starts waits for the lock: the push was first, and no Ship token follows", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    let stopped: Promise<void> | null = null;
+    r.github.duringPush = () => { stopped = r.link.shipExclusive(() => { r.stop.stopped = true; r.stop.at = r.t.now; }); };
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    await stopped;
+    expect(r.github.pushed).toEqual([SHA1]);
+    expect(String(r.msg(id).content)).toContain("Installing it waits until you turn things back on.");
+    expect(r.relayed.filter((l) => l.includes("Ship token: "))).toHaveLength(0);
+  });
+  test("2: the push's claim is kept before it starts, and a second worker finding it claimed doesn't push", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.duringPush = () => { expect((r.state().messages as any)[id].shipping.pushing).toBeDefined(); };
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    expect((r.state().messages as any)[id].shipping.pushing).toBeUndefined();   // its result kept: the claim is cleared
+    expect(r.github.pushed).toEqual([SHA1]);
+  });
+  test("2: a restart after a push that went through but whose result was never kept: main is read first, and nothing lands twice", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.afterPush = () => new Promise<void>(() => {});           // the link stops right after the push
+    void r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    for (let i = 0; i < 20 && !r.github.pushed.length; i++) await Bun.sleep(1);
+    expect(r.github.pushed).toEqual([SHA1]);
+    expect((r.state().messages as any)[id].shipping).toMatchObject({ state: "landing", pushing: { at: r.t.now } });
+    r.github.afterPush = null;
+    r.restart();
+    r.later(6 * MIN);
+    await r.link.sweep(); await r.link.whenLanded();
+    await r.link.sweep(); await r.link.whenLanded();
+    expect(r.github.pushed).toEqual([SHA1]);                        // never pushed again
+    expect(r.github.landings).toHaveLength(1);                      // nor landed again: main said it was there
+    expect((r.state().messages as any)[id].shipping.state).toBe("landed");
+    expect(r.relayed.filter((l) => l.includes("Ship token: "))).toHaveLength(1);
+  });
+  test("2: a Stop after the restart, before main is read, doesn't call a pushed tap \"nothing shipped\"", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.afterPush = () => new Promise<void>(() => {});
+    void r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    for (let i = 0; i < 20 && !r.github.pushed.length; i++) await Bun.sleep(1);
+    r.github.afterPush = null;
+    r.restart();
+    r.stop.stopped = true; r.stop.at = r.t.now + 1;
+    r.later(6 * MIN);
+    await r.link.sweep(); await r.link.whenLanded();
+    expect((r.state().messages as any)[id].shipping.state).toBe("landed");
+    expect(String(r.msg(id).content)).not.toContain("nothing shipped");
+  });
+  test("2: the registration checks the pass under the ship lock before each keeper write: a Stop just before it registers nothing", async () => {
+    let stopped = false;
+    const order: string[] = [];
+    const k = runReg({ remaining: 60, landing: BASE, active: () => { order.push("check"); return !stopped; } });
+    (k.deps as any).exclusive = async (fn: () => any) => { stopped = true; order.push("lock"); const v = await fn(); order.push("unlock"); return v; };
+    const r = await registerInstalls(k.deps as any, "tok", regClaim());
+    expect(r.ok).toBe(false);
+    expect(k.posted).toEqual([]);
+    expect(r.said.at(-1)).toBe("the pass ended before the link registered the install, so nothing was registered");
+    stopped = false;
+    const k2 = runReg({ remaining: 60, landing: BASE, active: () => true });
+    const seen: string[] = [];
+    (k2.deps as any).exclusive = async (fn: () => any) => { seen.push("lock"); const v = await fn(); seen.push(`unlock after ${k2.posted.length} posted`); return v; };
+    expect((await registerInstalls(k2.deps as any, "tok", regClaim())).ok).toBe(true);
+    expect(seen).toEqual(["lock", "unlock after 1 posted"]);       // the write started under the lock
+  });
+
+  test("3: a tap pushed back twice: the first reset falls inside its 2 hours, the second past them, and the card says it ran out and when to tap again", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    r.github.budget = { limit: 60, remaining: 0, reset: r.t.now + 30 * MIN };
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    expect(String(r.msg(id).content)).toContain("Waiting: GitHub's hourly allowance for the link's reads is spent until 8:30 AM.");
+    r.later(30 * MIN + 5_000);
+    r.github.budget = { limit: 60, remaining: 0, reset: r.t.now + 100 * MIN };   // spent again, until 10:10: past 10:00
+    await r.link.sweep(); await r.link.whenLanded();
+    expect(r.github.landings).toEqual([]);
+    expect(String(r.msg(id).content)).toContain("Not shipped: GitHub's hourly allowance for the link's reads is spent until 10:10 AM, after the tap's 2 hours run out at 10:00 AM, so this tap can't land it: a Ship tap on a new card can go at 10:11 AM or later.");
+    expect(r.logs.some((l) => l.includes("didn't land") && l.includes("can't land it"))).toBe(true);
+    expect(r.book.reserved()[`tap:${id}`]).toBeUndefined();
+  });
+  test("3: a tap that waited on GitHub's hour and reaches its 2 hours unlanded: the card says so, and when to tap again", async () => {
+    const r = shipRig2();
+    const id = ((await ship2(r)) as any).message;
+    const tapped = r.t.now;
+    r.github.budget = { limit: 60, remaining: 0, reset: r.t.now + 110 * MIN };
+    await r.tap(snap2(r.msg(id)), r.ids(id)[0]);
+    await r.link.whenLanded();
+    r.t.now = tapped + 110 * MIN + 5_000;
+    r.github.budget = "full";
+    r.github.answers.push({ ok: false, again: true, why: "CI is still running bun on it" });
+    await r.link.sweep(); await r.link.whenLanded();
+    r.t.now = tapped + 2 * HOUR_MS;
+    await r.link.sweep(); await r.link.whenLanded();
+    expect(String(r.msg(id).content)).toContain("Not shipped: GitHub's hourly allowance for the link's reads kept it waiting, and the tap's 2 hours ran out at 10:00 AM, so this tap can't land it: a Ship tap on a new card can go at 10:00 AM or later.");
+    expect(r.logs.some((l) => l.includes("ran out at its 2 hours while it waited for GitHub's hourly allowance"))).toBe(true);
+  });
+
+  test("7: while a registration waits for the reset, the hook's line says so and when, and a second start for the same head is refused with it", async () => {
+    let file: string | null = null, note: ((u: any) => void) | null = null;
+    const now = REG_NOW;
+    const d: PassDeps = { pub: () => REG_PUB, now: () => now, load: () => file, store: (t) => { file = t; }, tz: "America/New_York",
+      register: (_t, _c, _dn, n) => { note = n; n({ apps: 1 }); }, log: () => {} };
+    const one = makeToken(regClaim(), (x) => edSign(null, x, REG_KEYS.privateKey));
+    expect((await shipPass(d, { token: one })).status).toBe("pending");
+    note!({ waitUntil: now + 25 * MIN });
+    const line = budgetPendingSaid(now + 25 * MIN, "America/New_York");
+    expect(await shipPass(d, { token: one })).toEqual({ status: "pending", said: line });
+    expect(line).toContain("spent until 5:43 PM, so the link waits and then registers the install by itself");
+    const two = makeToken(claimFor(REG_PR, SHA, now + 30_000)!, (x) => edSign(null, x, REG_KEYS.privateKey));   // another tap, the same head
+    expect(await shipPass(d, { token: two })).toEqual({ status: "refused", said: line });
+    expect(JSON.parse(file!).spent).toHaveLength(1);               // nothing recorded for it
+  });
+});
+
+// For the round 2 tests: the same rigs as above.
+const shipRig2 = () => { const r = rig({ facts: true }); r.github.facts = { head: SHA1, commits: 2, files: 3, areas: ["Cain's link"], title: "t", bumps: [{ app: "Cain", version: "0.19.3" }], merged: false } as any; return r; };
+const ship2 = (r: ReturnType<typeof rig>) => r.link.ship({ text: "Ship taps go through even on busy days.", item: "P70", pr: LINK_PR, head: SHA1 });
+const snap2 = (m: any) => JSON.parse(JSON.stringify(m));
+const REG_KEYS = generateKeyPairSync("ed25519");
+const REG_PUB = REG_KEYS.publicKey.export({ type: "spki", format: "der" }).toString("base64");
+const REG_FP = keyFingerprint(REG_PUB);
+const REG_PR = "https://github.com/HyndeSyte/harness/pull/46";
+const REG_NOW = Date.UTC(2026, 10, 27, 22, 18);                     // 5:18 PM in his time zone
+const regClaim = () => claimFor(REG_PR, SHA, REG_NOW)!;
+function runReg(o: { remaining: number; refuse?: number; how?: { status: number; headers: Record<string, string> }; landing?: string; active?: () => boolean }) {
+  let now = REG_NOW;
+  const reset = REG_NOW + 25 * MIN;
+  const b64 = (t: string) => ({ content: Buffer.from(t).toString("base64"), encoding: "base64" });
+  const files: Record<string, any> = {
+    [`cain/config.yaml@${BASE}`]: b64('version: "0.19.2"\n'), [`cain/config.yaml@${SHA}`]: b64('version: "0.19.3"\n'),
+    [`harness/config.yaml@${BASE}`]: b64('version: "0.30.0"\n'), [`harness/config.yaml@${SHA}`]: b64('version: "0.30.0"\n'),
+    [`cain/rootfs/opt/cain/probe/keeper.ts@${SHA}`]: b64("// the probe\n"), [`cain/SHIP_KEY_FINGERPRINT@${SHA}`]: b64(`${REG_FP}\n`),
+  };
+  const enrolled = { key_fp: REG_FP, key_confirmed_at: new Date(REG_NOW - 3_600_000).toISOString(), state_created: new Date(REG_NOW - 7_200_000).toISOString(), enroll_id: "0123456789abcdef", counter: 10 };
+  const attempt = "ship-46-cain-01234567";
+  let refuse = o.refuse ?? 0, remaining = o.remaining;
+  const sleeps: number[] = [], posted: any[] = [];
+  const api = async (path: string) => {
+    if (refuse > 0) { refuse--; return { status: o.how!.status, body: { message: "slow down" }, headers: o.how!.headers }; }
+    if (path === `${REPO}/pulls/46`) return { status: 200, body: { base: { sha: BASE } }, headers: {} };
+    const m = /contents\/(.+)\?ref=([0-9a-f]{40})$/.exec(path);
+    const f = m ? files[`${m[1]}@${m[2]}`] : undefined;
+    return f ? { status: 200, body: f, headers: {} } : { status: 404, body: null, headers: {} };
+  };
+  const deps = { api, log: () => {}, now: () => now, sleep: async (ms: number) => { sleeps.push(ms); now += ms; if (now >= reset) remaining = 60; },
+    note: () => {}, linkFp: REG_FP, tz: "America/New_York", budget: async () => ({ limit: 60, remaining, reset }),
+    landing: o.landing ? () => o.landing! : undefined, active: o.active, enrollment: { load: () => null, store: () => {} },
+    post: async (b: any) => { posted.push(b); return { status: 202, body: { status: "pending", id: attempt } }; },
+    get: async () => ({ status: 200, body: { status: "accepted", id: attempt, app: "0fcc2575_cain", from_version: "0.19.2", to_version: "0.19.3", backup: "kb1", ...enrolled } }) };
+  return { deps, sleeps, posted };
+}

@@ -95,8 +95,8 @@ import { claimFor, type Claim, SHIP_REPOS } from "../ship-token";
 import { ROTATION_ID } from "./rotation";
 import { type DrillMode, type DrillPage, isDrillMode, VERSION as DRILL_VERSION } from "./drill";
 import type { StopState } from "../stop";
-import { judgeChecks, WINDOWS_CHECK, type Facts, type HeadChecks, type Landed } from "./merge";
-import { type Budget, CARD_ASKS, LAND_ASKS, RESET_SLACK_MS, shortUntil } from "./budget";
+import { judgeChecks, WINDOWS_CHECK, type Facts, type Git, type HeadChecks, type Landed } from "./merge";
+import { type Book, type Budget, CARD_ASKS, LAND_ASKS, RESET_SLACK_MS } from "./budget";
 
 export const STOP = "k:stop";
 export const RESUME = "k:resume";
@@ -377,6 +377,8 @@ export interface Shown {
     tries?: number; next?: number;    // it can't land yet: how often it was tried, and when it's tried next
     told?: boolean;                    // (0.19.4) Cain heard it waits (a wait for GitHub's hour isn't a try)
     base?: string;                     // (0.19.4) landed: the pull request's base as the landing read it (the registration binds to it)
+    budget?: number;                   // (0.19.4, round 2) it waited for GitHub's hour at least once: the last reset it waited for
+    pushing?: { at: number; base?: string };   // (0.19.4, round 2) its push was claimed and started; cleared once its result is kept
     line?: string; edited?: boolean }; // the line his card shows now, and whether Discord took that edit
   toggle?: string;                   // the link's own Stop notice: the button it carries (STOP or RESUME)
   values?: string[];                 // an ask: the values it quoted ("..."), as the link posted it, for owner reuse (0.12.0, askValues)
@@ -743,15 +745,19 @@ export interface Deps {
   armDrill?: (mode: DrillMode, version: string) => { ok: boolean; why: string };   // (Keeper 0.1.14) bound to the version the card names
   clearDrill?: () => boolean;                                      // (Keeper 0.1.15) his Clear tap: the refused drill intent removed
   // His Ship tap, landed in main with the deploy key (merge.ts); absent: no key, nothing lands.
-  land?: (l: { pr: string; head: string; stopped: () => boolean; late?: () => boolean }) => Promise<Landed>;   // late (0.19.4): his tap's 2 hours are over
+  // late (0.19.4): his tap's 2 hours are over. key (round 2): its reads are charged to this reservation. push (round 2): the
+  // push starts through it, under the link's ship lock (merge.ts Landing.push)
+  land?: (l: { pr: string; head: string; stopped: () => boolean; late?: () => boolean; key?: string;
+    push?: (start: () => Promise<Git>, base?: string) => Promise<{ run: Promise<Git> } | Landed> }) => Promise<Landed>;
   landed?: (ship: { pr: string; head: string }) => Promise<boolean | null>;   // that head in main now; null: can't tell
   // (0.19.4) what is left of GitHub's hour for the link's reads (budget.ts: /rate_limit joined with the answers' headers);
-  // absent or null: unknown, which holds nothing back. "card": less what taps landing or registering hold
-  budget?: (view?: "card") => Promise<Budget | null>;
-  // (0.19.4) a tap landing holds RUN_ASKS of the hour from card builds and the card polling until then; null lets go
-  hold?: (key: string, until: number | null) => void;
-  facts?: (pr: string, head?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head)
-  checkRuns?: (pr: string, head: string) => Promise<HeadChecks | "missing" | null>;
+  // null: unknown (a card build then reads nothing; a landing tries once and GitHub's answer decides)
+  budget?: () => Promise<Budget | null>;
+  // (0.19.4, round 2) the one reservation book every consumer shares (budget.ts makeBook): a waiting tap's reads are reserved
+  // there until it lands, is voided, Stopped or runs out, and a card build's while it builds
+  book?: Pick<Book, "reserve" | "release" | "spare">;
+  facts?: (pr: string, head?: string, as?: string) => Promise<Facts | null>;    // what GitHub says the pull request changes (its Apps' versions read at head); as: its reads' reservation
+  checkRuns?: (pr: string, head: string, as?: string) => Promise<HeadChecks | "missing" | null>;
   gateWatch?: (pr: string) => string[] | { unknown: string } | { owed: string };     // every unsuperseded head a ship_gate watch of this pull request accepted, the gate state unknown, or (twenty-eighth round) an acceptance with a supersede owed (shipgate.ts gateState)
   // 0.12.2: the pull request's head as the gate reads it (shipgate.ts gateHeadRead, through its curl wrapper), within ms:
   // the head, or the gate's state unknown, named. Absent (the tests' rig): the facts' head is used, as before.
@@ -879,6 +885,8 @@ export const budgetLine = (until: number, tz?: string) =>
 // (0.19.4) The line on a card built without reading GitHub (too little left of the hour to read it): Ship reads it all before it lands.
 export const budgetUnreadLine = (until: number, tapWaits: number | null, tz?: string) =>
   `GitHub's hourly allowance for the link's reads is low until ${clockTime(until, tz)}, so this card's facts and checks weren't read; Ship reads them before it lands${tapWaits !== null ? `, and a Ship tap now waits until ${clockTime(tapWaits, tz)} and lands by itself` : ""}.`;
+// (0.19.4, round 2) The line on a card built while what is left of GitHub's hour is unknown: a card build never reads on that.
+export const BUDGET_UNKNOWN_LINE = "What is left of GitHub's hourly allowance for the link's reads couldn't be read just now, so this card's facts and checks weren't read; Ship reads them before it lands.";
 function shipCard(top: string, own: string, rest: string[]): string {
   const room = LIMIT - [top, ...rest].join("\n").length - 1;
   const mine = own.trimEnd();
@@ -2556,16 +2564,27 @@ export class Link {
     const gateRead = watched.length && gateHead
       ? within(Promise.resolve().then(() => gateHead(pr, wait)).catch((): { unknown: string } => ({ unknown: "the read of the pull request's head failed" })), wait)
       : Promise.resolve(null);
-    // 0.19.4: GitHub's hour first, less what taps landing or registering hold. Not enough left to read the card: the card
-    // as it was before, with its facts unread (nothing read from GitHub) and a line saying so; his tap's landing reads
-    // everything. Enough for the card but not for his tap's landing after it: the card says when a tap goes on by itself.
-    // The Ship run's registration waits for GitHub's hour by itself (ship-pass.ts), so it isn't counted here.
-    const left = this.d.budget ? await within(Promise.resolve().then(() => this.d.budget!("card")).catch(() => null), wait) : null;
-    const cardShort = shortUntil(left, CARD_ASKS, this.d.now());
-    const tapShort = shortUntil(left, cardShort !== null ? LAND_ASKS : CARD_ASKS + LAND_ASKS, this.d.now());
-    if (cardShort !== null) this.log(`GitHub's hourly allowance for the link's reads is low (${left!.remaining} of ${left!.limit} left after the taps' holds): a Ship card goes with its facts unread`);
-    const [f, runs, gh] = await Promise.all([cardShort === null ? ask(() => facts!(pr, head)) : Promise.resolve(null),
-      cardShort === null ? ask(checkRuns && (() => checkRuns(pr, head))) : Promise.resolve(null), gateRead]);
+    // 0.19.4: GitHub's hour first, and what of it is free of the reservations of taps and registrations waiting (round 2:
+    // the one book). Not enough free to read the card, or (round 2) nothing known of the hour: the card as it was before,
+    // with its facts unread (nothing read from GitHub) and a line saying so; his tap's landing reads everything. Enough for
+    // the card but not for his tap's landing after it: the card says when a tap goes on by itself. Its own reads are
+    // reserved while it builds and charged to it, so they never take a waiting tap's.
+    const key = `card:${pr}:${head}`;
+    const left = this.d.budget ? await within(Promise.resolve().then(() => this.d.budget!()).catch(() => null), wait) : null;
+    const spare = this.d.budget ? (left && this.d.book ? this.d.book.spare(key) : left ? left.remaining : null) : Infinity;
+    const now = this.d.now();
+    const resets = left && left.reset > now ? left.reset : null;
+    const unknown = spare === null;
+    const cardShort = unknown ? null : spare! < CARD_ASKS && resets !== null ? resets : null;
+    const tapShort = unknown || resets === null ? null : spare! < (cardShort !== null ? LAND_ASKS : CARD_ASKS + LAND_ASKS) ? resets : null;
+    const unread = unknown || cardShort !== null;
+    if (unknown) this.log("what is left of GitHub's hourly allowance for the link's reads is unknown: a Ship card goes with its facts unread");
+    else if (cardShort !== null) this.log(`GitHub's hourly allowance for the link's reads is low (${spare} of ${left!.limit} free of the reservations): a Ship card goes with its facts unread`);
+    if (!unread && this.d.book && resets !== null) this.d.book.reserve(key, CARD_ASKS, now + 5 * 60_000);
+    const as = this.d.book ? key : undefined;
+    const [f, runs, gh] = await Promise.all([!unread ? ask(() => facts!(pr, head, as)) : Promise.resolve(null),
+      !unread ? ask(checkRuns && (() => checkRuns(pr, head, as))) : Promise.resolve(null), gateRead])
+      .finally(() => this.d.book?.release(key));
     if (f?.head && f.head !== head)
       throw new Refusal("GitHub has a newer head for that pull request than the one this card names: show the card for its head as it is now");
     // Shipped with the risk named (0.16.0): only while the rollback is armed for every App it installs.
@@ -2604,7 +2623,8 @@ export class Link {
       const said = merged ? (inMain ? IN_MAIN : MERGED_UNREAD)
         : !checks ? CHECKS_UNREAD : checks.some((c) => c.state === "running") ? CHECKS_RUNNING : CHECKS_PASSED;
       const github = this.ownWords("ship facts", "link", f ? githubLine(f, said) : factsLine(null));
-      const later = cardShort !== null ? [this.ownWords("ship facts", "link", budgetUnreadLine(cardShort, tapShort, this.d.tz))]
+      const later = unknown ? [this.ownWords("ship facts", "link", BUDGET_UNKNOWN_LINE)]
+        : cardShort !== null ? [this.ownWords("ship facts", "link", budgetUnreadLine(cardShort, tapShort, this.d.tz))]
         : tapShort !== null ? [this.ownWords("ship facts", "link", budgetLine(tapShort, this.d.tz))] : [];
       return { text: shipCard(shipQuestion(f), own, [github, ...later, rev ? `${rev.line} ${REVIEW_READ}` : NO_REVIEW]), own };
     } catch (e) {
@@ -2878,7 +2898,7 @@ export class Link {
     // Stop only ever makes things safer, so it's his from any card of ours, as it shows
     // now, and it stops whatever else the card says.
     if (cid === STOP) {
-      this.setStop(true);
+      await this.shipExclusive(() => this.setStop(true));     // (0.19.4, round 2) never between a landing's last check and its push
       const out = await this.stopTap(it, cid, msgId);
       await this.cancelLandings();                   // after his tap is answered, within Discord's 3 seconds
       return out;
@@ -2931,7 +2951,7 @@ export class Link {
       }
     }
     if (cid.startsWith("q:")) return this.onQuestion(it, cid, msgId);
-    if (cid === RESUME) { this.setStop(false); return this.stopTap(it, cid, msgId); }
+    if (cid === RESUME) { await this.shipExclusive(() => this.setStop(false)); return this.stopTap(it, cid, msgId); }
     return this.toSpecialist(it, cid, msgId);
   }
 
@@ -3531,7 +3551,6 @@ export class Link {
       } else {
         shown = LANDING_LINE;
         m.shipping = { state: "landing", at: this.d.now(), text: words, line: LANDING_LINE, edited: false };
-        this.d.hold?.(`tap:${msgId}`, this.d.now() + LANDING_TRY_MS);   // 0.19.4: its reads are held from card builds and polling
         landing = true;
       }
     }
@@ -3586,6 +3605,26 @@ export class Link {
   // Settles once every landing in line now has (for the tests; the sweep never waits).
   whenLanded(): Promise<void> { return this.landChain.then(() => {}); }
 
+  // (0.19.4, round 2) The link's ship lock: his Stop (and Turn back on), a landing's last check, its claim and the start of
+  // its push, and each keeper write of a Ship run's registration (main.ts) go under it, one at a time.
+  shipExclusive<T>(fn: () => T | Promise<T>): Promise<T> { return this.underKey("ship", async () => fn()); }
+
+  // (0.19.4) GitHub's hour holds his tap's landing until a time: a wait, or, when that time falls after his tap's 2 hours,
+  // the end of it, saying when a tap on a new card can go.
+  private budgetWait(until: number, deadline: number, what: string): Landed {
+    const tz = this.d.tz;
+    if (until + RESET_SLACK_MS >= deadline)
+      return { ok: false, again: false, why: `${what} until ${clockTime(until, tz)}, after the tap's 2 hours run out at ${clockTime(deadline, tz)}, so this tap can't land it: a Ship tap on a new card can go at ${clockTime(until + 60_000, tz)} or later` };
+    return { ok: false, again: true, why: `${what} until ${clockTime(until, tz)}`, at: until + RESET_SLACK_MS, budget: true, until };
+  }
+  // (0.19.4, round 2) Past his tap's 2 hours and not in main: the reason, saying plainly when it waited on GitHub's hour.
+  private ranOut(sh: NonNullable<Shown["shipping"]>, why?: string): string {
+    if (sh.budget === undefined) return `it couldn't land within 2 hours of the tap${why ? `: ${why}` : ""}`;
+    const tz = this.d.tz, deadline = sh.at + LANDING_TRY_MS;
+    this.log(`his Ship tap ran out at its 2 hours while it waited for GitHub's hourly allowance for the link's reads`);
+    return `GitHub's hourly allowance for the link's reads kept it waiting, and the tap's 2 hours ran out at ${clockTime(deadline, tz)}, so this tap can't land it: a Ship tap on a new card can go at ${clockTime(Math.max(this.d.now(), sh.budget + 60_000), tz)} or later`;
+  }
+
   private landShip(msgId: string): Promise<void> {
     return this.queue(msgId, async () => {
       const m = this.d.load().messages[msgId];
@@ -3593,12 +3632,25 @@ export class Link {
       const tapped = m.shipping.at;
       const deadline = tapped + LANDING_TRY_MS;                  // his tap's 2 hours: kept through every wait
       const late = () => this.d.now() >= deadline;
+      const key = `tap:${msgId}`;
       let r: Landed;
-      // 0.19.4: his tap needs the landing's reads left of GitHub's hour (the Ship run's registration waits for itself); when
-      // they aren't, it waits for the reset by itself (his card says until when) and lands then, with no new tap. A reset
-      // that falls after his tap's 2 hours can't be waited for: it ends now, saying when a tap on a new card can go.
+      // (round 2) a push claimed and started whose result was never kept (the link stopped meanwhile): main is read
+      // before anything else, and its head there means it landed; one that can't be read waits for the next sweep.
+      if (m.shipping.pushing) {
+        const inMain = this.d.landed ? await this.d.landed(m.ship).catch(() => null) : null;
+        if (inMain === null) return;
+        if (inMain) { await this.settleLanding(msgId, { ok: true, already: false, ...(m.shipping.pushing.base ? { base: m.shipping.pushing.base } : {}) }, true); return; }
+        const s = this.d.load(), cur = s.messages[msgId];
+        if (cur?.shipping?.pushing) { delete cur.shipping.pushing; this.d.save(s); }
+      }
+      // 0.19.4: what of GitHub's hour is free for his tap (round 2: its own reservation, covered first, and whatever no
+      // reservation covers). Nothing free: it waits for the reset by itself (his card says until when) and lands then,
+      // with no new tap; a reset after his tap's 2 hours can't be waited for, so it ends now, saying when a tap on a new
+      // card can go. Anything free goes ahead (a landing with its reads kept needs few), and so does an unknown hour, once:
+      // GitHub's answer then decides (a read it refuses for a rate limit is a wait, below).
       const left = this.d.budget && !this.voided(tapped) && !late() ? await within(Promise.resolve().then(() => this.d.budget!()).catch(() => null), FACTS_MS) : null;
-      const until = shortUntil(left, LAND_ASKS, this.d.now());
+      const spare = left ? (this.d.book ? this.d.book.spare(key) : left.remaining) : null;
+      const until = left && spare !== null && spare < 1 && left.reset > this.d.now() ? left.reset : null;
       // Checked again after the read (and after every wait: each try starts here): Stop, his tap voided, the 2 hours,
       // and the card already settled by another try. Already in main is read by the landing itself, right before its push.
       if (this.d.load().messages[msgId]?.shipping?.state !== "landing") return;
@@ -3607,16 +3659,32 @@ export class Link {
         // past his tap's 2 hours nothing is pushed: main alone says whether it landed (as the sweep does)
         const inMain = this.d.landed ? await this.d.landed(m.ship).catch(() => null) : null;
         if (inMain === null) return;                             // can't tell: the next sweep looks again
-        r = inMain ? { ok: true, already: true } : { ok: false, why: "it couldn't land within 2 hours of the tap", again: false };
+        r = inMain ? { ok: true, already: true } : { ok: false, why: this.ranOut(m.shipping), again: false };
       }
-      else if (until !== null && until + RESET_SLACK_MS >= deadline)
-        r = { ok: false, again: false, why: `GitHub's hourly allowance for the link's reads is spent until ${clockTime(until, this.d.tz)}, after the tap's 2 hours run out at ${clockTime(deadline, this.d.tz)}, so this tap can't land it: a Ship tap on a new card can go at ${clockTime(until + 60_000, this.d.tz)} or later` };
-      else if (until !== null) r = { ok: false, again: true, why: `GitHub's hourly allowance for the link's reads is spent until ${clockTime(until, this.d.tz)}`, at: until + RESET_SLACK_MS, budget: true };
+      else if (until !== null) r = this.budgetWait(until, deadline, "GitHub's hourly allowance for the link's reads is spent");
       else {
-        try { r = await this.d.land!({ pr: m.ship.pr, head: m.ship.head, stopped: () => this.voided(tapped), late }); }
-        catch (e) { r = { ok: false, why: `the link hit an error (${String(e).slice(0, 80)})`, again: true }; }
+        // (round 2) under the ship lock: the card still landing for this tap, Stop, his tap voided and its 2 hours checked
+        // again, the claim kept, and the push started, so no Stop or other worker comes between the last check and the push
+        const push = (start: () => Promise<Git>, base?: string) => this.shipExclusive((): { run: Promise<Git> } | Landed => {
+          const s = this.d.load(), cur = s.messages[msgId];
+          if (!cur?.ship || cur.shipping?.state !== "landing" || cur.shipping.at !== tapped) return { ok: false, why: "his tap was settled meanwhile", again: false };
+          if (this.voided(tapped)) return STOPPED_FIRST;
+          if (late()) return { ok: false, why: "his tap is over 2 hours old, so the link didn't push it", again: false };
+          if (cur.shipping.pushing) return { ok: false, why: "another try of this tap is pushing it", again: true };
+          cur.shipping.pushing = { at: this.d.now(), ...(base ? { base } : {}) };
+          try { this.d.save(s); } catch { return { ok: false, why: "the link couldn't keep its claim before the push", again: true }; }
+          return { run: start() };
+        });
+        try { r = await this.d.land!({ pr: m.ship.pr, head: m.ship.head, stopped: () => this.voided(tapped), late, key, push }); }
+        catch (e) {
+          // a push claimed and started: nothing is settled from here; the next try reads main first
+          if (this.d.load().messages[msgId]?.shipping?.pushing) { this.log(`his Ship tap's landing hit an error after its push started; main is read before anything else: ${String(e).slice(0, 80)}`); return; }
+          r = { ok: false, why: `the link hit an error (${String(e).slice(0, 80)})`, again: true };
+        }
+        // (round 2) GitHub refused a read for a rate limit: a wait until it lifts, or the end when that is past the 2 hours
+        if (!r.ok && r.until !== undefined) r = this.budgetWait(r.until, deadline, "GitHub's rate limit holds the link's reads");
       }
-      await this.settleLanding(msgId, r);
+      await this.settleLanding(msgId, r, true);
     });
   }
 
@@ -3624,10 +3692,16 @@ export class Link {
   // install, unless a Stop came since his tap (then a new tap installs it). While GitHub
   // doesn't answer, or its checks are still running, it's tried again (the sweep), for
   // up to 2 hours after his tap, and his card says what it waits on.
-  private async settleLanding(msgId: string, r: Landed): Promise<void> {
+  // tried (round 2): r comes from a try that read main or pushed (landShip). One that didn't, for a tap whose push was
+  // claimed with no result kept, isn't settled here: the landing reads main first (landShip), so a push that went
+  // through is never called "nothing shipped".
+  private async settleLanding(msgId: string, r: Landed, tried = false): Promise<void> {
     const s = this.d.load();
     const m = s.messages[msgId];
     if (!m?.ship || m.shipping?.state !== "landing") return;
+    if (m.shipping.pushing && !tried) { if (!this.landingNow.has(msgId)) void this.landShip(msgId); return; }
+    delete m.shipping.pushing;
+    const key = `tap:${msgId}`;
     const now = this.d.now();
     const tapped = m.shipping.at;
     const words = m.shipping.text;
@@ -3642,8 +3716,11 @@ export class Link {
       const changed = m.shipping.line !== waiting;
       const first = !m.shipping.told && !m.shipping.tries;
       const next = Math.min(tapped + LANDING_TRY_MS, r.at !== undefined && r.at > now ? r.at : now + Math.min(15, 2 ** Math.max(1, tries)) * 60_000);
-      m.shipping = { ...m.shipping, tries, next, why: r.why, told: true,
+      m.shipping = { ...m.shipping, tries, next, why: r.why, told: true, ...(r.until !== undefined ? { budget: r.until } : {}),
         ...(changed ? { line: waiting, edited: false } : {}) };
+      // (round 2) a wait for GitHub's hour reserves the landing's reads in the one book, kept across the reset until it
+      // lands, is voided, Stopped or runs out
+      if (r.budget) this.d.book?.reserve(key, LAND_ASKS, tapped + LANDING_TRY_MS);
       m.digest = digest(withLine(words, waiting), []);
       this.d.save(s);
       this.log(`his Ship tap is waiting (${r.why}); trying again`);
@@ -3666,15 +3743,14 @@ export class Link {
           ? ` Ship token: ${token} (good for 2 hours): start the Ship job now to install it, with that token in its text as it is.`
           : " The link has no Ship key, so there's no Ship token and the install run will be refused: tell him in one line that it's in main but installing is down, and log a Build item.");
       m.shipping = { state: "landed", at: now, text: words, line: shown, edited: false, ...(r.base ? { base: r.base } : {}) };
-      // 0.19.4: its hold stays a while for the Ship run's registration (which holds its own once it starts)
-      this.d.hold?.(`tap:${msgId}`, token ? now + 15 * 60_000 : null);
+      this.d.book?.release(key);                                 // the Ship run's registration reserves its own
     } else if (r.stopped) {
-      this.d.hold?.(`tap:${msgId}`, null);
+      this.d.book?.release(key);
       shown = "You tapped Ship, but Stop came before it landed, so nothing shipped.";
       line = `${tap} The link didn't land it: his Stop came first. Nothing changed in main, and there's no Ship token. Once nothing is stopped, ask again with a new Ship card.`;
       m.shipping = { state: "not landed", at: now, text: words, why: r.why, line: shown, edited: false };
     } else {
-      this.d.hold?.(`tap:${msgId}`, null);
+      this.d.book?.release(key);
       const waited = r.again ? ", for 2 hours" : "";
       shown = own(`Not shipped: ${r.why}${waited}. Nothing changed in main.`);
       line = `${tap} The link didn't land it: ${r.why}${waited}. Nothing changed in main, and there's no Ship token. Tell him in one line, as a reply to the card, what happens next.`;
@@ -3726,8 +3802,8 @@ export class Link {
         const ship = m.ship, why = sh.why;
         void this.queue(id, async () => {
           const inMain = this.d.landed ? await this.d.landed(ship).catch(() => null) : null;
-          if (inMain === true) await this.settleLanding(id, { ok: true, already: true });
-          else if (inMain === false) await this.settleLanding(id, { ok: false, why: `it couldn't land within 2 hours of the tap${why ? `: ${why}` : ""}`, again: false });
+          if (inMain === true) await this.settleLanding(id, { ok: true, already: true }, true);
+          else if (inMain === false) { const cur = this.d.load().messages[id]?.shipping; await this.settleLanding(id, { ok: false, why: this.ranOut(cur ?? sh, why), again: false }, true); }
         });                                          // can't tell: the next sweep looks again
         continue;
       }

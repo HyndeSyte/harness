@@ -23,21 +23,29 @@ const TESTS_YML = ".github/workflows/tests.yml";
 
 export interface Git { code: number; out: string; err: string }
 export interface MergeDeps {
-  // GET https://api.github.com<path> (headers lower-cased, where read); o.confirm (0.19.4, budget.ts): an attempt's job list may be kept
+  // GET https://api.github.com<path> (headers lower-cased, where read)
   api: (path: string, o?: ApiOpts) => Promise<{ status: number; body: any; headers?: Record<string, string> }>;
+  // (0.19.4, round 2) attempts' whole job lists, kept once they can't change (budget.ts lists); absent: none kept
+  lists?: { get: (key: string) => any[] | undefined; put: (key: string, jobs: any[]) => void };
+  now?: () => number;
   git: (args: string[], o?: { ssh?: boolean; timeoutMs?: number }) => Promise<Git>;
   stopped: () => boolean;
   remote?: (repo: string) => string;   // where git fetches and pushes; GitHub over SSH unless a test says
 }
-export interface Landing { repo: string; pr: number; head: string; late?: () => boolean }   // late (0.19.4): his tap's 2 hours are over
+// late (0.19.4): his tap's 2 hours are over. push (0.19.4, round 2): the push started under the link's ship lock (core.ts),
+// which checks Stop, the tap and its 2 hours again and records the tap's claim first; it answers the push under way, or
+// the Landed that stops it. Without it the push starts here.
+export interface Landing { repo: string; pr: number; head: string; late?: () => boolean;
+  push?: (start: () => Promise<Git>, base?: string) => Promise<{ run: Promise<Git> } | Landed> }
 export type Landed =
   | { ok: true; already: boolean; base?: string }   // base (0.19.4): the pull request's base as the landing read it
-  // at (0.19.4): when to try again (GitHub's hour resets); budget: a wait only for GitHub's hour (not a try)
-  | { ok: false; why: string; again: boolean; stopped?: boolean; at?: number; budget?: boolean };
+  // at (0.19.4): when to try again (GitHub's hour resets); budget: a wait only for GitHub's hour (not a try);
+  // until (round 2): GitHub refused a read for a rate limit, and lifts it then (core.ts turns it into a wait or an end)
+  | { ok: false; why: string; again: boolean; stopped?: boolean; at?: number; budget?: boolean; until?: number };
 
 const no = (why: string, again = false): Landed => ({ ok: false, why, again });
 const first = (s: string) => s.split(/\r?\n/).map((l) => l.trim()).find(Boolean)?.slice(0, 120) ?? "";
-import type { ApiOpts } from "./budget";
+import { type ApiOpts, rateRefused, refusedUntil } from "./budget";
 export const remote = (repo: string) => `git@github.com:${repo}.git`;
 const where = (d: Pick<MergeDeps, "remote">, repo: string) => d.remote?.(repo) ?? remote(repo);
 
@@ -159,11 +167,11 @@ async function runsOf(d: Pick<MergeDeps, "api">, repo: string, head: string, nam
 // pages add up to that total. A page that fails, a total that shifts, a short page before the
 // total is reached, or more than RUN_PAGES pages: null, so nothing is judged on part of it.
 // "missing" only when the very first page says there's no such thing.
-async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string, key: string, o?: ApiOpts): Promise<any[] | "missing" | null> {
+async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string, key: string): Promise<any[] | "missing" | null> {
   const got: any[] = [];
   let total: number | null = null;
   for (let page = 1; page <= RUN_PAGES; page++) {
-    const r = await read(d, path(page), o);
+    const r = await read(d, path(page));
     if (r === "missing") return page === 1 ? "missing" : null;
     if (!r || !Array.isArray(r[key])) return null;
     const t = Number(r.total_count);
@@ -186,12 +194,14 @@ async function pagesOf(d: Pick<MergeDeps, "api">, path: (page: number) => string
 // Any listing that isn't whole, a page that fails, or more than ATTEMPT_LISTS attempt listings:
 // null, and the gate holds. trace, when given, gets every path read, for the dry run.
 // 0.19.4 (budget.ts): the workflow runs listing is read afresh every time (never kept for good), so each card and
-// landing reads every run's current run_attempt. An attempt's job list may be kept only once a read of that run
-// attempt that wasn't kept says that very attempt number is completed: the run in the listing for its newest attempt,
-// GET .../runs/{id}/attempts/{n} for an earlier one (asked only when the list isn't kept yet). Never from the job list alone.
+// landing reads every run's current run_attempt. Round 2: an attempt's job list is kept whole (d.lists) only when its
+// first page was asked after a read of that run attempt that wasn't kept had said that very attempt number is
+// completed (the run in this listing for its newest attempt, GET .../runs/{id}/attempts/{n} for an earlier one, asked
+// only while the list isn't kept), every page was read, and every job in it finished. A list read before that
+// confirmation is never kept: the list is read once more after it. Never from the job list alone.
 const ATTEMPT_LISTS = 30;
 export interface WindowsAttempt { id: number; name: string; status: string; conclusion: string | null; head_sha: string; app: { id: number }; run_id?: number; run_attempt?: number; via: string[] }
-export async function windowsAttempts(d: Pick<MergeDeps, "api">, repo: string, head: string): Promise<WindowsAttempt[] | "missing" | null> {
+export async function windowsAttempts(d: Pick<MergeDeps, "api" | "lists">, repo: string, head: string): Promise<WindowsAttempt[] | "missing" | null> {
   const checks = await runsOf(d, repo, head, WINDOWS_CHECK, "all");
   if (checks === "missing") return "missing";
   if (checks === null) return null;
@@ -216,11 +226,15 @@ export async function windowsAttempts(d: Pick<MergeDeps, "api">, repo: string, h
     if (!Number.isInteger(n) || n < 1) return null;
     for (let a = 1; a <= n; a++) {
       if (++lists > ATTEMPT_LISTS) return null;
-      let done: Promise<boolean> | null = null;
-      const confirm = () => (done ??= a === n ? Promise.resolve(r?.status === "completed" && Number(r?.run_attempt) === a)
-        : attemptDone(d, repo, Number(r.id), a));
-      const jobs = await pagesOf(d, (page) => `/repos/${repo}/actions/runs/${r.id}/attempts/${a}/jobs?per_page=100&page=${page}`, "jobs", { confirm });
-      if (jobs === null || jobs === "missing") return null;
+      const key = `${repo.toLowerCase()}#${Number(r.id)}#${a}`;
+      let jobs: any[] | "missing" | null = d.lists?.get(key) ?? null;
+      if (!jobs) {
+        // confirmed first, so every page is asked after the confirmation; only then may the whole list be kept
+        const confirmed = d.lists ? (a === n ? r?.status === "completed" && Number(r?.run_attempt) === a : await attemptDone(d, repo, Number(r.id), a)) : false;
+        jobs = await pagesOf(d, (page) => `/repos/${repo}/actions/runs/${r.id}/attempts/${a}/jobs?per_page=100&page=${page}`, "jobs");
+        if (jobs === null || jobs === "missing") return null;
+        if (confirmed && jobs.length > 0 && jobs.every((j: any) => j?.status === "completed" && typeof j?.conclusion === "string")) d.lists!.put(key, jobs);
+      }
       for (const j of jobs) if (j?.name === WINDOWS_CHECK)
         add({ ...j, head_sha: j?.head_sha ?? head }, `run ${r.id} attempt ${a}`, { app: { id: ACTIONS_APP }, run_id: Number(r.id), run_attempt: a });
     }
@@ -361,7 +375,24 @@ export function failedChecks(h: HeadChecks): Landed | null {
   return null;
 }
 
-export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
+export async function land(d0: MergeDeps, l: Landing): Promise<Landed> {
+  // (round 2) a read GitHub refused for a rate limit (budget.ts rateRefused: a 429, or a 403 with none left, a Retry-After
+  // or the secondary limit's message) is a wait until it lifts (its Retry-After, the primary reset, or a bounded wait for a
+  // secondary limit), not a failure: the landing that holds on it says until when
+  const now = d0.now ?? Date.now;
+  let until: number | null = null, refused = false;
+  const d: MergeDeps = { ...d0, api: async (path, o) => {
+    const r = await d0.api(path, o);
+    if (rateRefused(r)) { refused = true; const u = refusedUntil(r, now()); if (u !== null) until = Math.max(until ?? 0, u); }
+    return r;
+  } };
+  const r = await landOnce(d, l);
+  if (refused && !r.ok && r.again) return until === null
+    ? { ok: false, again: true, why: "GitHub refused a read for its rate limit and didn't say when it lifts" }
+    : { ok: false, again: true, why: "GitHub refused a read for its rate limit", until, budget: true };
+  return r;
+}
+async function landOnce(d: MergeDeps, l: Landing): Promise<Landed> {
   const repo = l.repo.toLowerCase();
   const pull = await read(d, `/repos/${l.repo}/pulls/${l.pr}`);
   if (pull === "missing") return no("GitHub has no such pull request");
@@ -391,7 +422,12 @@ export async function land(d: MergeDeps, l: Landing): Promise<Landed> {
   if (d.stopped()) return { ok: false, why: "everything is stopped", again: false, stopped: true };
   // (0.19.4) right before the push, his tap's 2 hours too
   if (l.late?.()) return no("his tap is over 2 hours old, so the link didn't push it");
-  const push = await d.git(["push", "--porcelain", "--no-verify", where(d, l.repo), `${l.head}:refs/heads/main`], { ssh: true, timeoutMs: 90_000 });
+  const start = () => d.git(["push", "--porcelain", "--no-verify", where(d, l.repo), `${l.head}:refs/heads/main`], { ssh: true, timeoutMs: 90_000 });
+  // (round 2) under the link's ship lock: Stop, the tap and its 2 hours checked again and the tap's claim recorded, then the
+  // push started, all before a Stop or another worker can come between
+  const begun = l.push ? await l.push(start, base.base) : { run: start() };
+  if (!("run" in begun)) return begun;
+  const push = await begun.run;
   if (push.code === 0) return { ok: true, already: false, ...base };
   // Did it land anyway (the answer was lost)? main says.
   if ((await inMain(d, l.repo, l.head)) === true) return { ok: true, already: false, ...base };

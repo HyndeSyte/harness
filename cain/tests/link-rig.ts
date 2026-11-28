@@ -4,6 +4,7 @@ import { emptyState, Link, type Pull, State } from "../rootfs/opt/cain/link/core
 import { ACTIONS_APP, type Facts, type Landed } from "../rootfs/opt/cain/link/merge";
 import type { Reviewed } from "../rootfs/opt/cain/reviewed";
 import { makeToken } from "../rootfs/opt/cain/ship-token";
+import { makeBook } from "../rootfs/opt/cain/link/budget";
 
 // A check run as GitHub Actions posts it, and the three required ones passed.
 export const checkRun = (name: string, conclusion: string | null = "success", status = "completed", id = 1) =>
@@ -58,10 +59,15 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     runsHang: false,
     asked: [] as string[],
     watched: {} as Record<string, string>,         // the head a ship_gate watch accepted, by pull request (merge.ts watchAccepted)
-    budget: null as null | { limit: number; remaining: number; reset: number },   // (0.19.4) what is left of GitHub's hour; null: unknown
+    // (0.19.4) what is left of GitHub's hour; null: unknown; "full": all 60, resetting an hour from now
+    budget: "full" as null | "full" | { limit: number; remaining: number; reset: number },
     budgetAsked: 0,
-    budgetViews: [] as (string | undefined)[],      // (0.19.4) who asked: "card", or the tap's landing (undefined)
-    holds: {} as Record<string, number | null>,     // (0.19.4) what taps hold of the hour, by key (null: let go)
+    // (round 2) a landing's push: pushed heads, and what happens right after one starts (a throw: the link stopped then)
+    pushed: [] as string[],
+    afterPush: null as null | (() => void | Promise<void>),
+    beforePush: null as null | (() => void),        // right before the landing asks for the ship lock
+    duringPush: null as null | (() => void),        // as the push starts, under the lock
+    lands: [] as { key?: string }[],
   };
   // The review service's lines, as /data/trust/reviewed.json has them (null: it can't be read).
   const reviews = { list: [] as Reviewed[] | null };
@@ -159,6 +165,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
     }
     return null;
   };
+  const budgetNow = () => github.budget === "full" ? { limit: 60, remaining: 60, reset: t.now + HOUR } : github.budget ? copy(github.budget) : null;
+  const book = makeBook(() => { const b = budgetNow(); return b && b.reset > t.now ? b : null; }, () => t.now);
   const deps = {
     rest, load: () => copy(state), save: (s: State) => { state = copy(s); }, now: () => t.now,
     relay: (x: string) => { if (relayFail.n > 0) { relayFail.n--; throw new Error("relay queue: EIO"); } relayed.push(x); }, toHarness: async (p: string, b: unknown) => { harness.push([p, b]); return !harnessDown.down; },
@@ -169,12 +177,22 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       write: (stopped: boolean, at: number) => { stop.stopped = stopped; stop.at = at; },
     },
     signShip: opts.noKey ? undefined : (claim: any) => makeToken(claim, (d) => edSign(null, d, SHIP_KEYS.privateKey)),
-    land: opts.noDeployKey ? undefined : async (l: { pr: string; head: string; stopped: () => boolean }): Promise<Landed> => {
+    land: opts.noDeployKey ? undefined : async (l: { pr: string; head: string; stopped: () => boolean; key?: string;
+        push?: (start: () => Promise<any>, base?: string) => Promise<{ run: Promise<any> } | Landed> }): Promise<Landed> => {
       github.landings.push({ pr: l.pr, head: l.head });
+      github.lands.push({ key: l.key });
       if (github.hold) await new Promise<void>((ok) => landWaiting.push(ok));
       const next = github.answers.shift();
       if (next) { if (next.ok) github.main.push(l.head); return next; }
       if (l.stopped()) return { ok: false, why: "everything is stopped", again: false, stopped: true };
+      if (l.push) {
+        github.beforePush?.();
+        const begun = await l.push(async () => { github.pushed.push(l.head); github.main.push(l.head); github.duringPush?.(); return { code: 0, out: "", err: "" }; });
+        if (!("run" in begun)) return begun;
+        await begun.run;
+        await github.afterPush?.();
+        return { ok: true, already: false };
+      }
       github.main.push(l.head);
       return { ok: true, already: false };
     },
@@ -185,8 +203,8 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
       : github.runs); } : undefined,
     gateWatch: opts.gateWatch ?? ((pr: string) => (github.watched[pr] ? [github.watched[pr]] : [])),
     ...(opts.gateHead ? { gateHead: opts.gateHead } : {}),
-    budget: async (view?: "card") => { github.budgetAsked++; github.budgetViews.push(view); return github.budget ? copy(github.budget) : null; },
-    hold: (key: string, until: number | null) => { github.holds[key] = until; },
+    budget: async () => { github.budgetAsked++; return budgetNow(); },
+    book,
     factsMs: opts.factsMs ?? 50,
     reviewed: () => (reviews.list ? copy(reviews.list) : null),
     keyKnown: opts.keyCheck ? async () => { github.keyAsked++; return github.key; } : undefined,
@@ -211,7 +229,7 @@ export function rig(opts: { paired?: string; now?: number; pending?: string | nu
   const r = {
     get link() { return link; },
     calls, relayed, harness, posted, logs, files, pulls, failing, refusing, limited, lose, hang, gate, beyond, t, tap, his, snowflake, stop, harnessDown, github, relayFail,
-    reports, replays, sent, discord, limitN, spy, reviews, refuseFlag,
+    reports, replays, sent, discord, limitN, spy, reviews, refuseFlag, book,
     release: () => { gate.posts = false; gate.history = false; gate.identity = false; for (const ok of waiting.splice(0)) ok(); },
     go: () => { github.hold = false; for (const ok of landWaiting.splice(0)) ok(); },
     reads: () => calls.filter((c) => c.method === "GET" && c.path.startsWith(`/channels/${DM}/messages?`)).length,

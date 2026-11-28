@@ -180,7 +180,8 @@ export interface Claimed { attempt: string; claim: string; until: string }
 // (Keeper 0.1.8) cancel: the enrollment refusal's why. (Cain 0.19.4) plain: said is the whole reason (GitHub's hour), not the keeper's
 export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string; plain?: boolean };
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
-  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number; waitUntil?: number; base?: string };
+  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number; waitUntil?: number; base?: string;
+  repo?: string; pr?: number; head?: string };   // (Cain 0.19.4, round 2) what it installs, for a second start of the same head
 type Note = { apps?: number; attempt?: string; waitUntil?: number; base?: string };
 export interface PassDeps {
   pub: () => string | null;                      // the link's public Ship key (base64 SPKI), as /data/trust/ship.pub holds it
@@ -353,8 +354,16 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   const where = `pull request ${c.claim.pr} at ${c.claim.head.slice(0, 12)}`;
   const again = "Nothing was installed; a new Ship card for the same pull request and head tries again";
   if (!e) {
+    // (Cain 0.19.4, round 2) another tap's registration of this very head waits for GitHub's hour here: a second start is
+    // refused with that registration's own line (when it goes on by itself, and when to start that run again)
+    const same = spent.find((x) => x.state === "registering" && x.waitUntil && x.waitUntil + RESET_SLACK_MS > now && running(d).has(x.id)
+      && x.pr === c.claim.pr && x.head === c.claim.head && (x.repo ?? "").toLowerCase() === c.claim.repo.toLowerCase());
+    if (same) {
+      d.log(`refused a second Ship run for ${where}: its registration waits for GitHub's hourly allowance`);
+      return { status: "refused", said: budgetPendingSaid(same.waitUntil!, d.tz) };
+    }
     spent = spent.filter((x) => x.exp * 1000 > now - 86_400_000);
-    spent.push({ id, exp: c.claim.exp, state: "registering", at: now });
+    spent.push({ id, exp: c.claim.exp, state: "registering", at: now, repo: c.claim.repo, pr: c.claim.pr, head: c.claim.head });
     try { writeEntries(d, spent); }
     catch { return { status: "refused", said: "the link couldn't record the Ship token, so no Ship run starts: try again in a minute" }; }
     d.log(`registering the installs of ${where} with the keeper; the Ship run waits for its acceptance`);
@@ -446,10 +455,15 @@ export interface RegisterDeps {
   // reads isn't left or GitHub refused a read for its rate limit (registerInstalls)
   budget?: () => Promise<Budget | null>;
   tz?: string;
-  active?: () => boolean;                                                 // (Cain 0.19.4) the pass is still registering
+  active?: () => boolean;                                                 // (Cain 0.19.4) the pass is still registering (and no Stop since the tap)
   expires?: () => number | null;                                          // (Cain 0.19.4) the pass's recorded expiry (ms)
   landing?: () => string | null;                                          // (Cain 0.19.4) the base his tap's landing read
-  hold?: (on: boolean) => void;                                           // (Cain 0.19.4) its reads held from card builds while it runs
+  // (Cain 0.19.4, round 2) its reads reserved in the one book from when it starts waiting for GitHub's hour (kept across the
+  // reset) until it ends
+  reserve?: (on: boolean) => void;
+  // (Cain 0.19.4, round 2) the link's ship lock (core.ts shipExclusive): the pass is checked and each keeper write started
+  // under it, so his Stop can't come between the check and the write
+  exclusive?: <T>(fn: () => T | Promise<T>) => Promise<T>;
   linkFp?: string | null;                                                 // the link's own Ship key's fingerprint
   enrollment?: EnrollmentStore;
   pollMs?: number; waitMs?: number;
@@ -467,8 +481,7 @@ export interface RegisterDeps {
 // bumps, a version, a probe or the fingerprint file that can't be read, a keeper that refuses, or no
 // acceptance within ATTEMPT_WAIT_MS of polling: not ok, so the pass is refused.
 export async function registerInstalls(d: RegisterDeps, token: string, c: Claim): Promise<RegResult> {
-  d.hold?.(true);                                       // (Cain 0.19.4) its reads held from card builds while it runs
-  try { return await registerOnce(d, token, c); } finally { d.hold?.(false); }
+  try { return await registerOnce(d, token, c); } finally { d.reserve?.(false); }
 }
 async function registerOnce(d: RegisterDeps, token: string, c: Claim): Promise<RegResult> {
   const said: string[] = [];
@@ -499,6 +512,7 @@ async function registerOnce(d: RegisterDeps, token: string, c: Claim): Promise<R
         return false;
       }
       if (!active()) { stop = "the pass ended before the link waited for GitHub's hourly allowance, so nothing was registered"; return false; }
+      d.reserve?.(true);
       d.note?.({ waitUntil: until });
       d.log(`keeper registration: GitHub's hourly allowance for the link's reads is spent${left}, so it waits until ${resetClock(until, d.tz)} and then goes on by itself`);
       await sleep(Math.max(0, wake - now()));
@@ -510,13 +524,18 @@ async function registerOnce(d: RegisterDeps, token: string, c: Claim): Promise<R
   const api = async (path: string, o?: ApiOpts) => {
     const r = await d.api(path, o);
     if (!rateRefused(r as any)) return r;
-    let until = refusedUntil(r.headers, now());
+    let until = refusedUntil(r, now());
     if (until === null) { const b = d.budget ? await d.budget().catch(() => null) : null; until = b ? shortUntil(b, 1, now()) : null; }
     if (until === null) { stop ??= "GitHub refused a read of the registration for its rate limit, and when its hour resets couldn't be read, so nothing was registered: try again with a new Ship card in an hour"; return r; }
     if (!(await waitFor(until, ""))) return r;
     return d.api(path, o);
   };
   const gh = { api };
+  // (round 2) a keeper write, started under the link's ship lock once the pass is checked there; null: the pass had ended
+  const locked = async <T>(go: () => Promise<T>): Promise<{ v: T } | null> => {
+    const started = await (d.exclusive ? d.exclusive(() => (active() ? { run: go() } : null)) : Promise.resolve(active() ? { run: go() } : null));
+    return started ? { v: await started.run } : null;
+  };
   const fail = (l: string): RegResult => { say(stop ?? l); return { ok: false, said, ...(stop ? { plain: true } : {}) }; };
   // Bound to the base and head his tap's landing used (the head is the token's): the landing's base, or (no landing known
   // here) the pull request's base read first, kept on the pass before the wait for GitHub's hour below.
@@ -564,9 +583,11 @@ async function registerOnce(d: RegisterDeps, token: string, c: Claim): Promise<R
     }
     // (Keeper 0.1.14) a drill that won't be a definitive acceptance: the install refused (by the caller's say), the owner paged once
     const notAccepted = (why: string) => { if (drill) { d.log(`keeper registration: the spent drill flag (${drill}) installs nothing: ${why}`); d.drill!.page("accept", `accept:${nonce}`, { version: b.version }); } };
-    const r = await d.post({ token, app: slug, pr: c.pr, head: c.head, from_version: from, to_version: b.version, kind: drill ? "drill" : "ship",
+    const posted = await locked(() => d.post({ token, app: slug, pr: c.pr, head: c.head, from_version: from, to_version: b.version, kind: drill ? "drill" : "ship",
       ...(drill ? { drill_mode: drill, drill_nonce: nonce } : {}),
-      probe_hash: createHash("sha256").update(probe).digest("hex").slice(0, 16) }).catch(() => null);
+      probe_hash: createHash("sha256").update(probe).digest("hex").slice(0, 16) }).catch(() => null));
+    if (!posted) { notAccepted("its pass ended"); return fail("the pass ended before the link registered the install, so nothing was registered"); }
+    const r = posted.v;
     let j = r?.body ?? {};
     if (!r || r.status !== 202 || j.status !== "pending" || typeof j.id !== "string" || !ATTEMPT_ID.test(j.id)) {
       say(!r ? `the keeper didn't answer for ${b.app} ${b.version}` : r.status === 202 || r.status === 200 ? `the keeper's answer for ${b.app} ${b.version} isn't a registration of it`
@@ -607,7 +628,9 @@ async function registerOnce(d: RegisterDeps, token: string, c: Claim): Promise<R
           say(`the drill mark for ${attempt} couldn't be written, so ${b.app} ${b.version} wouldn't fail as the drill needs: the drill is aborted, not installed`); continue;
         }
         if (!active()) { d.drill!.drop(attempt); cancel = "the drill was aborted: its pass ended"; d.drill!.aborted(attempt, b.version, "its pass ended"); say(`the pass ended before the drill mark for ${attempt} was confirmed: the drill is aborted, not installed`); continue; }
-        const conf = d.markPost ? await d.markPost(attempt, { mode: drill, to_version: b.version, mark: markHash(text) }).catch(() => null) : null;
+        const marked = d.markPost ? await locked(() => d.markPost!(attempt, { mode: drill, to_version: b.version, mark: markHash(text) }).catch(() => null)) : { v: null };
+        if (!marked) { d.drill!.drop(attempt); cancel = "the drill was aborted: its pass ended"; d.drill!.aborted(attempt, b.version, "its pass ended"); say(`the pass ended before the drill mark for ${attempt} was confirmed: the drill is aborted, not installed`); continue; }
+        const conf = marked.v;
         if (!conf || conf.status !== 200 || conf.body?.status !== "marked" || conf.body?.id !== attempt) {
           const why = !conf ? "the keeper didn't confirm its mark (no answer)" : `the keeper didn't confirm its mark (${String(conf.body?.why ?? conf.body?.status ?? conf.status).slice(0, 120)})`;
           d.drill!.drop(attempt);

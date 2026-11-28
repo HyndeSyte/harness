@@ -5,7 +5,11 @@
 - A Ship tap no longer fails because GitHub's hourly limit ran out. Cain's App reads GitHub without a key, which GitHub allows 60 times an hour, and on Nov 27 a busy afternoon of Ship taps used them all up.
 - The App now reads less: a file at a given commit and a finished test run are read once and kept, and an open Ship card's pull request is looked at mostly through git, which doesn't count. A re-run test is always read again.
 - If the hour runs low, a Ship card still goes out, saying its facts weren't read; your tap reads everything before it lands. If your tap would run short, it waits for GitHub's hour to reset and then lands and installs by itself, with no second tap.
-- A tap still lasts 2 hours: when GitHub's hour resets after that, the card says so plainly and when a new tap can go.
+- A tap still lasts 2 hours: when GitHub's hour resets after that, or a tap held back by it runs out of time, the card says so plainly and when a new tap can go.
+- When GitHub asks the App to slow down for a short while, the App waits as long as GitHub says (a few minutes when it doesn't say), for your tap and for the install alike.
+- Each waiting tap and install keeps its share of the hour, so a new Ship card or a second tap can't use it up; a card that can't tell how much is left goes with its facts unread.
+- Your Stop and the landing in main can no longer cross: a Stop either comes before the push, and nothing ships, or after it. If the App restarts in the middle of a landing, it checks main before trying again, so nothing lands twice.
+- A second Ship run for the same change while the first waits on GitHub is turned away with the time the first goes on.
 - Once an hour the App's log says how many GitHub reads it made in the last hour.
 
 ## 0.19.3
