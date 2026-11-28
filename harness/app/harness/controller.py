@@ -191,6 +191,9 @@ class Controller:
                              sleep=self.sleep, monotonic=self.monotonic,
                              budgets_ok=self._budget_ok, family_add=self.family_add,
                              calendar_change=self.calendar_change)
+        # A note of Cain's that names a drive block gets the drive blocks' card (Nov 27), read when it's used.
+        self.runner.drive_card = lambda chat, job_id=None: bool(self.family_gmail is not None
+                                                                and self.family_gmail.drive_note_card(chat, job_id))
         if self.calendar_change is not None:
             self.calendar_change.fast_check = self._still_his
             self.calendar_change.after_fast = self._newer_since

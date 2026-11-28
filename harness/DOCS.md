@@ -1371,7 +1371,36 @@ and `/status` says if the Gmail calendar isn't being read.
   blocks an hour on Family and says nothing private.
 - **Trips** are one block, from a "Stay at" event: "Name - Springfield (out Tue 3:15 PM ZZ 101, back
   Fri 1:40 PM ZZ 101)", or "Name - away".
-- **Moved or cancelled** on Gmail, the copy follows.
+- **Massages** go on as "Name - Massage", and any appointment Harness added to your Gmail calendar for
+  you gets its copy too ("Name - Appointment" when its title has no word above). Drive blocks and busy
+  blocks never do.
+- **Moved or cancelled** on Gmail, the copy follows, within one read, whether you moved it or Harness
+  did. A copy knows its Gmail event by that event's own identity (for one day of a repeating event, the
+  series and the day's original start), never by its time, so a day moved by hand or by a card keeps its
+  copy.
+- **Its own late reads, told by version:** for each copy Harness keeps the version (iCloud's ETag) the
+  copy had when one of its own writes went out, and the version it left. A Family read showing the copy
+  otherwise than Harness wrote it is taken as behind only when it is at that first version, for a write
+  still undecided or sent within the last 5 minutes; then the copy is brought to its event. Any other
+  version is someone's edit, even at a time Harness once wrote, and the copy is left alone. Every write
+  goes only over the version just checked. When iCloud refuses it for its version, or its answer is lost,
+  the copy is read again by its address and judged again before anything more is written; after 2 such
+  retries in an hour the copy is left alone and named in the digest. A version is taken as Harness's own
+  only when the copy there shows exactly what Harness wrote (title, start and end, and no place or notes);
+  any difference is someone's edit and the copy is left alone. After a lost answer, the copy back at what
+  Harness had before under a new version is someone's edit too. A write still undecided after an hour is
+  settled the same way, by what the copy shows, and its old version never counts as a late read after that.
+- **Fixing a copy:** ask, or have Cain pass it on ("the Family copy of my coffee is wrong", "why is the
+  family mirrored event not updating"), even as a question, and you get a card that brings that copy back
+  to its Gmail event. Only the copy your words name is offered; when more than one fits, or your words name
+  none and more than one is out of step, Harness asks which and changes nothing. All the copies out of step
+  over the next 14 days are offered only when you ask for all of them ("fix all the family copies"). A copy
+  is offered off only when a read of its Gmail event by its id says it was cancelled or deleted, and the
+  card names the copy, its day and which; a read that fails or can't say leaves the copy as it is, with a
+  plain line. Each card is bound to the copy and its event as it read them, by id and version: at your tap
+  both are read again, and if either changed, nothing is written and a fresh card comes instead. Nothing
+  asks you to change a calendar by hand. A copy you fixed by hand that already matches its event stays as
+  it is.
 - **Yours by hand:** a matching event with your first name in it is taken over, not doubled. It's
   replaced only when the event changes on Gmail. Events with other people, repeating ones and
   anyone else's are never touched.
@@ -1544,9 +1573,25 @@ how many blocks are on Gmail.
   yesterday on, come off at the next read, each known by its mark and read again by its id just before: it must
   still carry the own-drive mark, with the title and times it was listed with. A
   Family event's blocks and drives stay. One you edited (its title or times not as written) stays and
-  is named in the digest. With `own_drive_dry_run` on, each is only logged as "would remove". Nothing
+  is named in the digest. With `drive_dry_run` on, each is only logged as "would remove". Nothing
   new is written while it stays on. Off again, blocks are written as before.
-- **First live run (`own_drive_dry_run`, on by default):** while it's on, your own appointments'
+- **Drive blocks written, by your tap only:** your own appointments' drive blocks go on your Gmail
+  calendar, never on Family, once you tap Turn on: for every event you go to that has a place, a drive
+  there and a drive back, each from the real drive time rounded up to the quarter hour, one drive between
+  back-to-back places, and the last drive home. A moved or cancelled event takes its drive blocks with it.
+  The switch is kept in Harness's own record, never in the settings, and no setting turns it on. After
+  installing 0.24.5, while they're only logged, one card asks once: "Drive blocks: add them to your Gmail
+  calendar from now on? Last week's dry run would have added N.", with Turn on and Keep logging; it isn't
+  sent again, answered or not. Turn on's receipt carries Turn off, which puts them back to the log. A note
+  from Cain on your message that names a drive block gets one card about them (marked as from his note):
+  in the dry run, its Write them is the same tap as Turn on; otherwise it lists any event still without
+  drives, with Work them out.
+- **The old setting:** the first read after installing always leaves drive blocks in the dry run,
+  whatever `own_drive_dry_run` and `drive_dry_run` say. When both were a plain false (you had them on),
+  the one Turn on card says so: "Drive blocks were on before this update; tap Turn on to keep them on."
+  Its Turn on is still the only way they go live. `drive_dry_run` on turns the switch off; off again,
+  they stay in the dry run until you tap Turn on. Settings that can't be read are a dry run for that read.
+- **The dry run (until Turn on, or with `drive_dry_run` on):** while it lasts, your own appointments'
   drive blocks are only written to Harness's log ("drive dry run: would write ...", "would remove
   ..." and "would ask before removing ...", each with the appointment's day and time), never to
   Gmail, no card goes out for them and nothing is kept as written. Family events' drives are worked

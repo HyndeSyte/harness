@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.24.5
+
+- **A Family copy follows its Gmail event every time**, whether you move that day yourself or Harness moves it on a card. A copy knows its event by the event itself (for one day of a repeating event, which day of the series it is), never by its time, so the coffee copy that stayed at 1:45 on Nov 27 now moves with its event.
+- **A copy someone changes on Family stays theirs**, even at a time Harness once put there. Harness tells its own late reads from real edits by the copy's version, not by its times, and after two refused writes in an hour it leaves the copy and says so.
+- **Harness only takes a copy as its own when it shows exactly what Harness wrote.** A place or note someone added, or a copy put back while Harness's answer from Family was lost, stays theirs. A write left undecided for an hour is settled by what the copy shows.
+- **Asking to fix a copy gets a card for that copy**, even as a question ("why is the family mirrored event not updating"). If more than one could be meant, Harness asks which. Every copy is offered only when you ask for all of them. Nothing tells you to change a calendar by hand.
+- **A fix card does only what it showed.** If the copy or its Gmail event changes before you tap, nothing is written and a fresh card comes instead. A copy is offered off only when Google confirms its event was cancelled or deleted, and the card says which and why.
+- **Massages, and every appointment Harness adds for you, get their Family copy.** Drive blocks and busy blocks never go to Family.
+- **Drive blocks stay in their dry run until you tap Turn on**, even if you had them on before this update. One card asks once: "Drive blocks: add them to your Gmail calendar from now on?", with how many last week's dry run would have added; if they were on before, it says "Drive blocks were on before this update; tap Turn on to keep them on." Turn on's receipt has Turn off. No setting turns them on; drive_dry_run turns them back off.
+- A note from Cain naming a drive block now gets you a card about your drive blocks, marked as from his note.
+- The copy you fixed by hand on Nov 27 stays as you left it.
+
 ## 0.24.4
 
 - **A tap Harness crosses off stays crossed off**, even when it can't lock its tap journal at that moment, and it never writes the journal without that lock.
