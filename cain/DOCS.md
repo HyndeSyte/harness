@@ -218,31 +218,48 @@ updates are shorter than 5 minutes and say nothing.
 
 A seat with no key or sign-in is simply off; Cain is told once, with the fix.
 
-### The privacy backstop (since 0.18.1)
+### The privacy backstop (since 0.18.1, tightened in 0.19.4)
 
 Before anything goes to a seat, the review runner checks it in code and fails closed. Over the
 brief (its topic, question, body and id) it runs every built-in pattern (an email address, a phone
 number, an account or card number, an SSN-shaped number) and your private-terms list
-(`/data/review-private-terms.txt`); a brief that matches is blocked and nothing is sent.
+(`/data/review-private-terms.txt`); a brief that matches is blocked and nothing is sent. A card
+number written in groups joined by single spaces or hyphens (`4111-1111-1111-1111`) is read with the
+joins taken out, and any 13 to 19 digits that pass the Luhn check block, in the brief and in the
+earlier findings.
 
 Over the earlier findings a fix-only round carries it runs the same email, phone and SSN-shaped
-patterns and your private-terms list. Only the account-or-card pattern is relaxed there, and only
-for an unbroken run of exactly eight digits that is a valid date written year, month, day, years 1900
-to 2099 (`20250305`), whether glued to an identifier (a letter or an underscore right before it, as in
-a web search tool's name ending in a date, `web_search_20250305`) or bare. A bare eight-digit date in
-the findings is accepted on purpose: it can't be told from a date, and it is shorter than any card
-number. Any other run of eight or more digits in the findings still blocks the round: a bare
-`12345678`, a longer or non-date run glued to an identifier (`card_4111111111111111`,
-`account_123456789012`), or a spaced card number; a Luhn-valid run of 13 to 19 digits always blocks.
-A match names its kind (or the list's line), never the text. A blocked round sends nothing and
-doesn't count toward the cap.
+patterns, the grouped card check and your private-terms list. Only the account-or-card pattern is
+relaxed there, and only for one shape: a letter or an underscore immediately before exactly eight
+digits that make a real date written year, month, day, years 1900 to 2099, as in a web search tool's
+name ending in a date (`web_search_20250305`). The date is checked on the calendar (the date is built
+and its parts compared back), so month 00 or 13, day 00, April 31 and February 29 of a year that isn't
+a leap year all block. The excuse holds only when the pattern's whole match is those eight digits with
+no space inside: a glued date followed by a space and more digits (`web_search_20250305 1234`) is one
+longer match and blocks. A bare eight-digit date (`20250305` with nothing glued before it) blocks, and
+so does any other run of eight or more digits: a bare `12345678`, a longer or non-date run glued to an
+identifier (`card_4111111111111111`, `account_123456789012`), or a spaced card number. A match names its
+kind (or the list's line), never the text. A blocked round sends nothing and doesn't count toward the
+cap.
 
-The earlier findings come only from the runner's own record: it reads the change's previous round
-from the rounds recorded under that change's own key in its rounds file (each round by its id) and the
-queue record that round left, which must be that round of that change. A brief has no field for them,
-so a brief carrying earlier findings, or any field not in its allowlist, is refused whole and nothing
-is queued. A round id is one change's: a brief whose id is already a round of another change is
-refused and nothing is queued.
+The two sets of rules are separate entry points in code (`scanStrict` and `scanFindingsOnly`), and the
+brief's own check calls only the strict one. Just before sending, the runner assembles the payload a
+seat is handed (topic and question, the earlier findings as numbered in the prompt, then the body, the
+findings set off on each side by a line break around a character that is no digit, space or hyphen),
+runs the strict rules over all of it except the exact findings span, and the findings rules over that
+span alone, so digits on either side of the span never join into one run.
+
+The earlier findings come only from the runner's own record: as each seat's answer arrives, its
+findings are kept in the rounds file under that round of that change. A fix-only round's earlier
+findings are built from those lines alone, for the change key taken from the brief's validated change
+identity (its pull request, or its change key); the previous round's queue record is read only to
+check it is that round of that change and wasn't blocked, never for its text. Rounds answered before
+0.19.4 kept no such lines, so a fix-only round after one sends no earlier findings. A brief has no
+field for them, so a brief carrying earlier findings, or any field not in its allowlist, is refused
+whole and nothing is queued. A change key can't be shaped like a pull request's key (`pr-<number>`).
+A round id is fixed for good: an id already queued, or already a round of any change (the same change
+included), is refused and the original round stands as it was. The id is checked against the queue
+and the rounds file under the queue's enqueue lock, so two briefs can't both take one id.
 
 ### The review-round cap (since 0.16.0)
 

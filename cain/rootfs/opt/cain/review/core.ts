@@ -49,6 +49,7 @@ export const BRIEF_FIELDS = {
   change: "local", supersedes: "local", round_kind: "local", item: "local", label: "local",
 } as const;
 export const CHANGE_KEY = /^[a-z0-9][a-z0-9-]{2,63}$/;
+export const PR_KEY = /^pr-[0-9]+$/;
 export const ITEM_ID = /^P\d{1,4}$/i;
 export const REVIEW_PR = /^https:\/\/github\.com\/hyndesyte\/harness\/pull\/[1-9][0-9]*$/i;
 export const REVIEW_HEAD = /^[0-9a-f]{40}$/i;
@@ -91,6 +92,10 @@ export function checkBrief(j: any): { brief?: Brief; error?: string } {
     return { error: "head must be the pull request's full 40-character head sha" };
   if (j.change !== undefined && (typeof j.change !== "string" || !CHANGE_KEY.test(j.change)))
     return { error: "change must be a stable key for the change: 3 to 64 of a-z, 0-9 and -" };
+  // Cain 0.19.4: a pull request's change key is pr-<number>, taken from its pr only, so a change key can't take
+  // that shape and stand for (or read the findings of) a pull request it doesn't name.
+  if (j.change !== undefined && PR_KEY.test(j.change))
+    return { error: "change can't be shaped like a pull request's key (pr-<number>): name the pull request with pr" };
   if (j.supersedes !== undefined && (typeof j.supersedes !== "string" || !(CHANGE_KEY.test(j.supersedes) || REVIEW_PR.test(j.supersedes))))
     return { error: "supersedes must be the earlier change key or pull request address this one replaces" };
   if (j.round_kind !== undefined && j.round_kind !== "full" && j.round_kind !== "fixes")
@@ -162,7 +167,9 @@ export function digest(b: Brief): string {
 
 export type Terms = { entries: { line: number; re: RegExp }[] };
 const BUILT_IN: { what: string; re: RegExp }[] = [
-  { what: "an email address", re: /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
+  // Anchored at the start of a run of address characters (Cain 0.19.4): the same matches, in linear time on a
+  // long run with no @ in it, now that the payload is checked as well as the brief.
+  { what: "an email address", re: /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i },
   { what: "a phone number", re: /(?<![\w-])(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?![\w-])/ },
   { what: "a phone number", re: /(?<![\w-])\+\d{1,3}[\s.-]?\d(?:[\s.-]?\d){6,13}(?![\w-])/ },
   { what: "an account or card number", re: /(?<![\d-])\d(?: ?\d){7,}(?![\d-])/ },
@@ -196,50 +203,26 @@ export function loadTerms(text: string | null): { terms?: Terms; error?: string 
   return { terms: { entries } };
 }
 
-// The allowlist first (the shape), then the backstop: the text that leaves (topic,
-// question, body) and the id, which names the record folder, match no private term.
-// Says what matched by kind and line number only, so the private text itself is
-// never repeated into a log, the record or Discord.
-export function privacyCheck(b: Brief, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
-  if (!checkBrief(b).brief) return { ok: false, why: [STORED_BAD] };
-  const loaded = loadTerms(termsText);
-  if (!loaded.terms) return { ok: false, why: [loaded.error!] };
-  const id = normalizeText(b.id);
-  const text = normalizeText([b.topic, b.question, b.body].join("\n"));
-  const why = new Set<string>();
-  for (const p of BUILT_IN) if (p.re.test(text) || p.re.test(id)) why.add(p.what);
-  for (const e of loaded.terms.entries) if (e.re.test(text) || e.re.test(id)) why.add(`private term on line ${e.line} of the list`);
-  if (BUILT_IN.some((p) => p.re.test(id)) || loaded.terms.entries.some((e) => e.re.test(id))) why.add(ID_PRIVATE);
-  return why.size ? { ok: false, why: [...why] } : { ok: true };
-}
-
-// The same gate for a whole review read back from the queue: a brief in the
-// allowed shape, a safe id that is the brief's own, and no private term.
-export function reviewCheck(r: Review, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
-  if (!r.brief || !safeId(r.id) || r.brief.id !== r.id) return { ok: false, why: [STORED_BAD] };
-  return privacyCheck(r.brief, termsText);
-}
-
-// The earlier findings a fix-only round sends (Cain 0.16.0). The runner loads them itself from its own
-// record of the change's previous round (earlierFindings in runner.ts), never from a brief: a brief has no
-// field for them (BRIEF_FIELDS), so one that carries any is refused whole.
-// Over them run the email, phone and SSN-shaped patterns and the owner's private-terms list, as over a
-// brief. The account-or-card pattern is relaxed there, and only there (Cain 0.18.1, narrowed in the second
-// review): a digit run it matches passes only when it is exactly eight unbroken digits that make a valid
-// date written year, month, day, years 1900 to 2099 (20250305), whether glued to an identifier (a letter or
-// an underscore right before it, as in a web search tool's name ending in a date, web_search_20250305) or
-// bare. A bare eight-digit date in the findings is accepted on purpose: it can't be told from a date, and
-// eight digits is shorter than any card number. Any other run of eight or more digits, longer or not a date,
-// glued to an identifier or not (a bare 12345678, card_4111111111111111, _123456789012, a spaced card number), still
-// blocks the round, and a Luhn-valid run of 13 to 19 digits always blocks. A missing or broken list still
-// fails closed, and the brief's own check (privacyCheck) is unchanged.
+// ---- The two scanners (Cain 0.19.4). ----
+// One for everything that leaves but the earlier findings (scanStrict), one for the earlier findings only
+// (scanFindingsOnly), each its own named entry point: the strict one has no mode, so no call can relax it by
+// passing a flag, and the brief's check (privacyCheck) calls only scanStrict.
 const ACCOUNT = BUILT_IN.find((p) => p.what === "an account or card number")!;
+const ACCOUNT_ALL = new RegExp(ACCOUNT.re.source, ACCOUNT.re.flags.includes("g") ? ACCOUNT.re.flags : ACCOUNT.re.flags + "g");
+const IN_EARLIER = " in the earlier findings";
+// Between the spans of an assembled payload: a line break around a character that is no digit, space or
+// hyphen, so no digit run, grouped run or phone shape can join across it.
+export const PAYLOAD_SEP = "\n|\n";
+
+// A valid date written year, month, day as eight digits, years 1900 to 2099: the date is built and its parts
+// compared back, so month 00 or 13, day 00, April 31 and Feb 29 of a year that isn't a leap year all fail.
 export function validYmd(d: string): boolean {
   const m = /^(\d{4})(\d{2})(\d{2})$/.exec(d);
   if (!m) return false;
   const [y, mo, da] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  if (y < 1900 || y > 2099 || mo < 1 || mo > 12 || da < 1) return false;
-  return da <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  if (y < 1900 || y > 2099) return false;
+  const t = new Date(Date.UTC(y, mo - 1, da));
+  return t.getUTCFullYear() === y && t.getUTCMonth() === mo - 1 && t.getUTCDate() === da;
 }
 // A run of 13 to 19 digits whose Luhn check digit is right: the shape of a payment card number.
 export function luhnCard(run: string): boolean {
@@ -252,26 +235,115 @@ export function luhnCard(run: string): boolean {
   }
   return sum % 10 === 0;
 }
-// A digit run the account-or-card pattern matched in the earlier findings that may pass (see above): only
-// an unbroken eight-digit valid date, glued or bare.
-function excusedRun(run: string): boolean {
-  if (!/^\d+$/.test(run) || luhnCard(run)) return false;    // spaced digits and card numbers never pass
-  return run.length === 8 && validYmd(run);
+// Luhn over grouped runs (Cain 0.19.4): digit groups joined by single spaces or hyphens (4111-1111-1111-1111,
+// 4111 1111 1111 1111) are read with the joins taken out, and any span of whole groups that comes to 13 to 19
+// Luhn-valid digits counts as a card number. Used by both scanners.
+const GROUPED = /(?<!\d)\d+(?:[ -]\d+)*(?!\d)/g;
+export function groupedCard(text: string): boolean {
+  for (const m of text.matchAll(GROUPED)) {
+    const groups = m[0].split(/[ -]/);
+    for (let i = 0; i < groups.length; i++) {
+      let run = "";
+      for (let j = i; j < groups.length && run.length <= 19; j++) {
+        run += groups[j];
+        if (run.length >= 13 && luhnCard(run)) return true;
+      }
+    }
+  }
+  return false;
 }
+
+// The strict rules, over normalized text: every built-in pattern, a grouped card number, and the list.
+export function scanStrict(text: string, terms: Terms): string[] {
+  const why = new Set<string>();
+  for (const p of BUILT_IN) if (p.re.test(text)) why.add(p.what);
+  if (groupedCard(text)) why.add(ACCOUNT.what);
+  for (const e of terms.entries) if (e.re.test(text)) why.add(`private term on line ${e.line} of the list`);
+  return [...why];
+}
+
+// The findings rules, over the normalized earlier-findings span only (Cain 0.16.0, narrowed in 0.18.1 and
+// 0.19.4). The email, phone and SSN-shaped patterns, a grouped card number and the owner's list run as over a
+// brief. The account-or-card pattern is relaxed there, and only there, for one shape: a letter or an
+// underscore immediately before exactly eight digits that make a valid date written year, month, day, years
+// 1900 to 2099, as in a web search tool's name ending in a date (web_search_20250305). The excuse holds only
+// when the pattern's whole match is those eight contiguous digits, with no space inside it: a glued date
+// followed by a space and more digits (web_search_20250305 1234) is one longer match and blocks. A bare
+// eight-digit date (20250305 with nothing glued before it) blocks, as does any other run of eight or more
+// digits, glued or not (12345678, tool_12345678, card_4111111111111111, _123456789012, a spaced or hyphened
+// card number). A missing or broken list fails closed.
+function excusedRun(text: string, m: RegExpMatchArray): boolean {
+  if (!/^\d{8}$/.test(m[0])) return false;
+  const before = m.index! > 0 ? text[m.index! - 1] : "";
+  return /^[\p{L}_]$/u.test(before) && validYmd(m[0]);
+}
+export function scanFindingsOnly(text: string, terms: Terms): string[] {
+  const why = new Set<string>();
+  for (const p of BUILT_IN) if (p !== ACCOUNT && p.re.test(text)) why.add(p.what + IN_EARLIER);
+  for (const m of text.matchAll(ACCOUNT_ALL)) if (!excusedRun(text, m)) { why.add(ACCOUNT.what + IN_EARLIER); break; }
+  if (groupedCard(text)) why.add(ACCOUNT.what + IN_EARLIER);
+  for (const e of terms.entries) if (e.re.test(text)) why.add(`private term on line ${e.line} of the list, in the earlier findings`);
+  return [...why];
+}
+
+// The allowlist first (the shape), then the backstop: the text that leaves (topic,
+// question, body) and the id, which names the record folder, match no private term.
+// Says what matched by kind and line number only, so the private text itself is
+// never repeated into a log, the record or Discord. Strict rules only.
+export function privacyCheck(b: Brief, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
+  if (!checkBrief(b).brief) return { ok: false, why: [STORED_BAD] };
+  const loaded = loadTerms(termsText);
+  if (!loaded.terms) return { ok: false, why: [loaded.error!] };
+  const id = normalizeText(b.id);
+  const text = normalizeText([b.topic, b.question, b.body].join("\n"));
+  const why = new Set<string>([...scanStrict(text, loaded.terms), ...scanStrict(id, loaded.terms)]);
+  if (scanStrict(id, loaded.terms).length) why.add(ID_PRIVATE);
+  return why.size ? { ok: false, why: [...why] } : { ok: true };
+}
+
+// The same gate for a whole review read back from the queue: a brief in the
+// allowed shape, a safe id that is the brief's own, and no private term.
+export function reviewCheck(r: Review, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
+  if (!r.brief || !safeId(r.id) || r.brief.id !== r.id) return { ok: false, why: [STORED_BAD] };
+  return privacyCheck(r.brief, termsText);
+}
+
+// The earlier findings as the seats' prompt carries them, numbered (prompt, below): the exact findings span.
+export function earlierBlock(earlier: string[] | undefined): string {
+  return (earlier ?? []).map((e, i) => `${i + 1}. ${e}`).join("\n") || "(none kept)";
+}
+
+// The outgoing payload's check (Cain 0.19.4), run on exactly what a seat is handed. The payload is assembled
+// first: topic and question, then for a fix-only round the findings span, then the body, the span set off on
+// each side by PAYLOAD_SEP. The strict rules run over everything but that exact span (the span cut out, the
+// separators left, so nothing on either side joins), and the findings rules over the span alone.
+export function payloadParts(o: Outbound): { strict: string; findings: string | null } {
+  const head = `${o.topic}\n${o.question}`;
+  if (o.round_kind !== "fixes") return { strict: `${head}\n${o.body}`, findings: null };
+  const span = earlierBlock(o.earlier);
+  const payload = `${head}${PAYLOAD_SEP}${span}${PAYLOAD_SEP}${o.body}`;
+  const start = head.length + PAYLOAD_SEP.length, end = start + span.length;
+  return { strict: payload.slice(0, start) + payload.slice(end), findings: payload.slice(start, end) };
+}
+export function payloadCheck(o: Outbound, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
+  const loaded = loadTerms(termsText);
+  if (!loaded.terms) return { ok: false, why: [loaded.error!] };
+  const parts = payloadParts(o);
+  const why = new Set<string>(scanStrict(normalizeText(parts.strict), loaded.terms));
+  if (parts.findings !== null) for (const w of scanFindingsOnly(normalizeText(parts.findings), loaded.terms)) why.add(w);
+  return why.size ? { ok: false, why: [...why] } : { ok: true };
+}
+
+// The earlier findings a fix-only round sends (Cain 0.16.0). The runner loads them itself from its own
+// record of the change's previous round (earlierFindings in runner.ts), never from a brief: a brief has no
+// field for them (BRIEF_FIELDS), so one that carries any is refused whole. This is the findings rules alone
+// over the span as sent; the runner checks the whole payload with payloadCheck.
 export function earlierCheck(earlier: string[] | undefined, termsText: string | null): { ok: true } | { ok: false; why: string[] } {
   if (!earlier?.length) return { ok: true };
   const loaded = loadTerms(termsText);
   if (!loaded.terms) return { ok: false, why: [loaded.error!] };
-  const text = normalizeText(earlier.join("\n"));
-  const why = new Set<string>();
-  for (const p of BUILT_IN) {
-    if (p === ACCOUNT) continue;
-    if (p.re.test(text)) why.add(`${p.what} in the earlier findings`);
-  }
-  const all = new RegExp(ACCOUNT.re.source, ACCOUNT.re.flags.includes("g") ? ACCOUNT.re.flags : ACCOUNT.re.flags + "g");
-  for (const m of text.matchAll(all)) if (!excusedRun(m[0])) { why.add(`${ACCOUNT.what} in the earlier findings`); break; }
-  for (const e of loaded.terms.entries) if (e.re.test(text)) why.add(`private term on line ${e.line} of the list, in the earlier findings`);
-  return why.size ? { ok: false, why: [...why] } : { ok: true };
+  const why = scanFindingsOnly(normalizeText(earlierBlock(earlier)), loaded.terms);
+  return why.length ? { ok: false, why } : { ok: true };
 }
 
 export const ID_PRIVATE = "the id itself matched";
@@ -405,7 +477,7 @@ export function prompt(b: Outbound, role: Role): { system: string; user: string 
   if (b.needs_facts && (role === "reviewer" || role === "stand-in")) sys.push("Some claims depend on current facts: use web search where it matters and cite what you relied on in the fix.");
   if (b.round_kind === "fixes") {
     sys.push(...FIX_RULE);
-    const earlier = (b.earlier ?? []).map((e, i) => `${i + 1}. ${e}`).join("\n") || "(none kept)";
+    const earlier = earlierBlock(b.earlier);
     return { system: sys.join("\n"), user: `Topic: ${b.topic}\nQuestion: ${b.question}\n\n<earlier>\n${earlier}\n</earlier>\n\n<brief>\n${b.body}\n</brief>` };
   }
   return { system: sys.join("\n"), user: `Topic: ${b.topic}\nQuestion: ${b.question}\n\n<brief>\n${b.body}\n</brief>` };

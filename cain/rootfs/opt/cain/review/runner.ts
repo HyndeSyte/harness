@@ -6,13 +6,13 @@
 // Each finished review's Reviewed line is published to /data/trust/reviewed.json
 // (../reviewed.ts) before Cain hears it's done, and the file is rebuilt from the queue
 // at start, so it survives a restart.
-import { appendFileSync, chmodSync, chownSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, chownSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CAIN_UID, readOwned } from "../owned.ts";
 import { keptReviewed, type Reviewed, writeReviewed } from "../reviewed.ts";
 import {
-  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, checkBrief, earlierCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
-  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun,
+  FINAL, JUDGES, LABEL, SEATS, SeatError, backoffMs, checkBrief, payloadCheck, readMark, estimate, fixFor, independent, markBlocked, oneLine, outbound, recordRequest,
+  newReview, parseBrief, relayLine, reviewCheck, safeId, sayLine, seatName, seriousLeft, shownId, retryLimit, seatRun, type Brief, type ErrorKind, type Outbound, type Review, type SeatName, type SeatRun, type Finding,
 } from "./core.ts";
 import type { SeatFn } from "./seats/common.ts";
 import { DEFAULT_ROUND_CAP, addRound, admit, countedRounds, decisionOf, readRounds, writeRounds, type DecisionRec, type Rounds } from "./rounds.ts";
@@ -116,6 +116,14 @@ export function loadReview(dir: string, id: string): Review | null {
   return r && typeof r === "object" && r.id === id ? r : null;
 }
 export function saveReview(dir: string, r: Review) { writeAtomic(reviewFile(dir, r.id), JSON.stringify(r, null, 1)); }
+// The enqueue lock (Cain 0.19.4): a brief's id is checked against the queue and the rounds record, and its
+// round and queue record written, while this file is held (an exclusive create). One older than a minute is
+// left by a runner that stopped mid-enqueue and is taken over (removed, then the exclusive create again, so
+// one contender wins).
+export const MAX_EARLIER = 30;
+export const ENQUEUE_LOCK = ".enqueue.lock";
+export const ENQUEUE_STALE_MS = 60_000;
+export const ENQUEUE_BUSY = "another brief is being queued just now, so this one wasn't: submit it again in a minute. Nothing was queued.";
 
 export class Runner {
   private now: () => Date; private rand: () => number; private log: (m: string) => void;
@@ -263,9 +271,32 @@ export class Runner {
     // runner loads itself from its own record of the change's previous round (earlierFindings).
     const c = checkBrief(given);
     if (!c.brief) return `not a brief: ${c.error}. Nothing was queued.`;
-    const b = c.brief;
+    return this.underEnqueueLock(() => this.admitLocked(c.brief!));
+  }
+  private underEnqueueLock(fn: () => string | null): string | null {
+    mkdirSync(this.cfg.queueDir, { recursive: true });
+    const lock = join(this.cfg.queueDir, ENQUEUE_LOCK);
+    let fd: number;
+    try { fd = openSync(lock, "wx", 0o600); }
+    catch (e: any) {
+      if (e?.code !== "EEXIST") return `the queue's enqueue lock can't be taken (${e?.code ?? "error"}), so no id can be checked: it's logged for a Build item. Nothing was queued.`;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs <= ENQUEUE_STALE_MS) return ENQUEUE_BUSY;
+        unlinkSync(lock);
+        fd = openSync(lock, "wx", 0o600);
+        this.log("took over a stale enqueue lock left by a runner that stopped mid-enqueue");
+      } catch { return ENQUEUE_BUSY; }
+    }
+    try { return fn(); }
+    finally { try { closeSync(fd); } catch { /* closed */ } try { unlinkSync(lock); } catch { /* gone */ } }
+  }
+  // Under the enqueue lock. A round id is immutable (Cain 0.19.4): an id the queue already holds, or the rounds
+  // record already keeps under any change (this one included), is refused, so a replay of a round resolves to
+  // the original record and can alter neither the findings it sends nor the round it counts.
+  private admitLocked(b: Brief): string | null {
+    const queued = `refused: a review with the id ${b.id} is already queued, and it stands as it was: give this brief a new id. Nothing was queued.`;
     const file = this.cfg.roundsFile;
-    if (!file) { saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
+    if (!file) { if (existsReview(this.cfg.queueDir, b.id)) return queued; saveReview(this.cfg.queueDir, newReview(b, this.now())); return null; }
     if (this.capOff) return `the review cap's files aren't right (${this.capOff}), so no round can be counted: the App's alarm says so, and it's logged for a Build item. Nothing was queued.`;
     const rounds = readRounds(file);
     if (!rounds) return "the review rounds file (/data/review-rounds.json) can't be read, so no round can be counted: it's logged for a Build item. Nothing was queued.";
@@ -273,8 +304,11 @@ export class Runner {
     if (!a.ok) return a.why;
     // A round id is one change's (Cain 0.18.1): an id already kept as a round of another change is refused,
     // so no round's record can stand for two changes and a fix-only round never reads another's findings.
+    const same = rounds.changes[a.key]?.rounds.findIndex((x) => x.id === b.id) ?? -1;
+    if (same >= 0) return `refused: the id ${b.id} is already a round of ${a.key}, and that round stands as it was (its findings and its count unchanged): give this round a new id. Nothing was queued.`;
     const other = Object.entries(rounds.changes).find(([k, c]) => k !== a.key && c.rounds.some((x) => x.id === b.id));
     if (other) return `refused: the id ${b.id} is already a round of another change, so it can't be a round of ${a.key}: give this round a new id. Nothing was queued.`;
+    if (existsReview(this.cfg.queueDir, b.id)) return queued;
     const label = labelOf(b.label)!;
     if (this.cfg.settingsFile && this.cfg.guardLog && this.cfg.spendFile) {
       const g = guard(label, `review ${b.id} (${a.key}, round ${a.round})`, { settingsFile: this.cfg.settingsFile, spendFile: this.cfg.spendFile,
@@ -293,19 +327,34 @@ export class Runner {
     return null;
   }
   // The findings of the change's latest round that answered, for a fix-only round to check the fixes against.
-  // Read only from the runner's own files: the rounds recorded under this change's own key in the rounds file
-  // (each round by its id; Cain 0.18.1: not a linked change's) and the queue record that round left, which
-  // must be that round of this change. Nothing a brief or request carries reaches them.
+  // key: the admitted brief's validated change identity (admit, from changeKeyOf). Cain 0.19.4: the text comes
+  // only from the seat answers the runner kept in the rounds record when each answer arrived (keepFindings), under
+  // that round of this change's own key; the round's queue record is read only to bind it, its id and change being
+  // that round's and it not blocked for privacy. Nothing in a queue record's findings, a brief or a request
+  // reaches them.
   private earlierFindings(rounds: Rounds, key: string): string[] {
     const own = (rounds.changes[key]?.rounds ?? []).filter((x) => !x.blocked).sort((a, b) => a.at.localeCompare(b.at)).reverse();
     for (const x of own) {
       const prev = loadReview(this.cfg.queueDir, x.id);
       if (!prev || prev.id !== x.id || prev.change !== key || prev.status === "blocked: privacy") continue;
-      const list = prev.seats.filter((s) => s.state === "done").flatMap((s) => (s.findings ?? []).map((f) =>
-        `${seatName(s)}${f.severity ? ` [${f.severity}]` : ""}: ${oneLine(f.problem, 400)}`));
-      if (list.length) return list.slice(0, 30);
+      const list = (Array.isArray(x.findings) ? x.findings : []).filter((f): f is string => typeof f === "string");
+      if (list.length) return list.slice(0, MAX_EARLIER);
     }
     return [];
+  }
+  // A seat's answer's findings, kept in the rounds record under this round of its change as they arrive (Cain
+  // 0.19.4): the only source a later fix-only round's earlier findings are built from. Read and written with no
+  // wait between, so two seats answering in one pass don't lose each other's.
+  private keepFindings(r: Review, s: SeatRun, findings: Finding[]): void {
+    const file = this.cfg.roundsFile;
+    if (!file || this.capOff || !r.change || !r.round || !findings.length) return;
+    const rounds = readRounds(file);
+    if (!rounds) { this.log(`the rounds file can't be read; review ${shownId(r)}'s findings from ${LABEL[s.seat]} weren't kept for a later round`); return; }
+    const rec = rounds.changes[r.change]?.rounds.find((x) => x.id === r.id);
+    if (!rec) return;
+    const lines = findings.map((f) => `${seatName(s)}${f.severity ? ` [${f.severity}]` : ""}: ${oneLine(f.problem, 400)}`);
+    rec.findings = [...(rec.findings ?? []), ...lines].slice(0, MAX_EARLIER);
+    writeRounds(file, rounds);
   }
   // A finished round, kept in the rounds file once: answered, or lost (no seat answered: it still counts);
   // a round blocked for privacy sent nothing and doesn't count. The cap's last round owes the owner one
@@ -430,7 +479,9 @@ export class Runner {
     // on an open review is refused too.
     const g = reviewCheck(r, this.terms());
     if (!g.ok) return this.block(r, g.why);
-    const e = earlierCheck(r.round_kind === "fixes" ? r.earlier : undefined, this.terms());
+    // Then the payload as a seat is handed it (Cain 0.19.4): the strict rules over all of it but the earlier
+    // findings' span, the findings rules over that span alone (payloadCheck).
+    const e = payloadCheck(outbound(r.brief!, r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined), this.terms());
     if (!e.ok) return this.block(r, e.why);
     for (let pass = 0; pass < 4; pass++) {
       if (this.isStopped()) break;                       // Stop between passes: the rest waits
@@ -456,6 +507,8 @@ export class Runner {
     const fn = this.fnFor(s.seat);
     const b = r.brief!;
     const out = outbound(b, r.round_kind === "fixes" ? { earlier: r.earlier ?? [] } : undefined);   // throws on a wrong kind: nothing is sent
+    // The exact payload this seat is handed passes payloadCheck first (advance blocked the review already if not).
+    if (!payloadCheck(out, this.terms()).ok) throw new Error("the payload failed the privacy check just before sending, so nothing was sent");
     const down = this.unavailable(s.seat) ?? this.capCheck(s.seat, out, r.cost_usd);
     if (down || !fn) return this.fail(r, s, down?.kind ?? "unconfigured", down?.detail ?? "not set up", hourly, 0);
     s.started_at = this.now().toISOString();
@@ -474,6 +527,7 @@ export class Runner {
       if (r.round_kind === "fixes") a.findings = a.findings.map((f) => { const m = readMark(f); return m.severity ? m : { ...m, severity: "serious" as const }; });
       Object.assign(s, { state: "done", verdict: a.verdict, findings: a.findings, model: a.model, tokens: a.tokens,
         cost_usd: s.cost_usd + cost, finished_at: this.now().toISOString() });
+      this.keepFindings(r, s, a.findings);
       delete s.error; delete s.next_at;
       r.cost_usd += cost;
       this.markHealth(s.seat, null, true);

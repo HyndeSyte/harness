@@ -1,0 +1,10 @@
+# The round 2 findings of the earlier-digits change (pull request 50), one finding a line, as the
+# review runner rendered them for the next fix-only round.
+# STAND-IN: the stored text was not reachable from the build session that wrote this file (it is in
+# the owner's record, outside this repository, and the pull request descriptions don't quote it). The
+# lines below restate the round's findings from pull request 50's description. Replace them with the
+# text from the round's verdicts file, exactly as stored, and the test (cap.test.ts) checks it as is.
+Gemini [serious]: The excuse for a digit run glued to an identifier is too wide: a card number glued to a prefix or an underscore passes. Narrow it to an eight-digit valid date like the one in web_search_20250305, and block a Luhn-valid run whatever is glued to it.
+OpenAI [serious]: A round id kept under one change can be used again for another change, so a fix-only round could read another change's findings. Refuse such an id at admission and read only the change's own rounds.
+OpenAI [follow-up]: The taken-version rule compares main's changelog headings as written; trim them and drop a leading v before comparing.
+Claude [follow-up]: The two changelog tests read the whole Cain changelog; scope them to the section that introduced the behaviour, found by its version heading.

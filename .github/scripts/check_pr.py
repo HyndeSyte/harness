@@ -8,7 +8,9 @@
    main (patch, minor or major), and its CHANGELOG.md opens with a section for
    that version. An App whose shipped files didn't change keeps main's version.
    A version an App goes up to must not already have a section heading in main's
-   CHANGELOG for that App: that version is taken, so step it again.
+   CHANGELOG for that App: that version is taken, so step it again. Each heading's
+   leading version token is read after trimming, brackets and a leading v; a heading
+   with none is skipped, and the output says so.
    Shipped means anything in the App's folder except its tests/ and tools/
    (neither can reach the image: tests/test_check_pr.py checks the Dockerfiles).
    A change to a repo-root release file (repository.yaml) needs at least one App
@@ -143,19 +145,37 @@ def changelog_top(text: str | None) -> str | None:
     return None
 
 
-HEADING_VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?![\d.])", re.IGNORECASE)
+# The leading version token of a "## " heading (Cain 0.19.4): after the heading is trimmed, any opening
+# brackets and a leading v are dropped, and the X.Y.Z at its start is the version, whatever follows it (a
+# closing bracket, a date, a suffix like -rc1): "## [v0.4.6] - 2026-11-22", "## 0.4.6 (Nov 22)" and
+# "## 0.4.6-beta" are all 0.4.6. A fourth number part ("0.4.6.1") is not an X.Y.Z token.
+HEADING_VERSION = re.compile(r"[\[(\s]*v?(\d+)\.(\d+)\.(\d+)(?!\d|\.\d)", re.IGNORECASE)
+
+
+def heading_version(heading: str) -> Version | None:
+    m = HEADING_VERSION.match(heading.strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def changelog_headings(text: str | None) -> tuple[set[Version], list[str]]:
+    """The version of every "## " heading of a CHANGELOG (heading_version), and the headings skipped
+    because no version token was found in them."""
+    found, skipped = set(), []
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        if line.startswith("## "):
+            v = heading_version(line[3:])
+            if v:
+                found.add(v)
+            else:
+                skipped.append(line[3:].strip())
+    return found, skipped
 
 
 def changelog_versions(text: str | None) -> set[Version]:
-    """The version of every "## " heading of a CHANGELOG, normalised: the heading trimmed, a leading v
-    dropped, the version parsed, so "## v0.4.6 " and "## 0.4.6" are the same version."""
-    found = set()
-    for line in (text or "").replace("\r\n", "\n").split("\n"):
-        if line.startswith("## "):
-            m = HEADING_VERSION.match(line[3:].strip())
-            if m:
-                found.add(tuple(int(g) for g in m.groups()))
-    return found
+    """The version of every "## " heading of a CHANGELOG, normalised: the heading trimmed, brackets and a
+    leading v dropped, the leading version token parsed, so "## [v0.4.6] - date" and "## 0.4.6" are the
+    same version."""
+    return changelog_headings(text)[0]
 
 
 def changelog_section(text: str | None) -> str | None:
@@ -289,9 +309,11 @@ def check_body(body: str) -> list[str]:
 Snapshot = dict[str, tuple[str | None, str | None]]
 
 
-def check_versions(changed: list[str], base: Snapshot, head: Snapshot) -> list[str]:
+def check_versions(changed: list[str], base: Snapshot, head: Snapshot,
+                   notes: list[str] | None = None) -> list[str]:
     """base and head: {app: (config.yaml text, CHANGELOG.md text)} on main and in the
-    pull request, None where the file doesn't exist."""
+    pull request, None where the file doesn't exist. notes, when given, gets a line for each
+    heading of main's CHANGELOG the taken-version rule skipped (no version token in it)."""
     problems = []
     root_changed = sorted(p for p in changed if p in ROOT_RELEASE)
     bumped = []
@@ -329,7 +351,11 @@ def check_versions(changed: list[str], base: Snapshot, head: Snapshot) -> list[s
         if top != show(new):
             problems.append(f'{app}/CHANGELOG.md should open with "## {show(new)}"; '
                             f'its first section is "{top or "missing"}".')
-        if new != old and new in changelog_versions(base.get(app, (None, None))[1]):
+        taken, skipped = changelog_headings(base.get(app, (None, None))[1])
+        if new != old and notes is not None:
+            notes += [f'{app}: main\'s CHANGELOG heading "## {h}" has no version token, so the '
+                      "taken-version rule skipped it." for h in skipped]
+        if new != old and new in taken:
             problems.append(f"{app} {show(new)} is taken: main's {app}/CHANGELOG.md already has it. "
                             "Step the version again.")
     if root_changed and not bumped:
@@ -469,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/name")
     a = ap.parse_args(argv)
     problems: list[str] = []
+    notes: list[str] = []
 
     body = None
     if a.body_file:
@@ -492,13 +519,15 @@ def main(argv: list[str] | None = None) -> int:
     else:
         base_snap, head_snap = snapshot(a.base), snapshot(head)
         changed = changed_files(a.base, head)
-        problems += check_versions(changed, base_snap, head_snap)
+        problems += check_versions(changed, base_snap, head_snap, notes)
         if body is not None:
             problems += check_round(body, expected_markers(base_snap, head_snap))
         problems += check_guard(changed, {f: file_at(a.base, f) for f in GUARD_FILES},
                                 {f: file_at(head, f) for f in GUARD_FILES}, body)
         problems += check_workflows(workflows_at(head))
 
+    for n in notes:
+        print(f"::notice::{n}" if os.environ.get("GITHUB_ACTIONS") else f"note: {n}")
     for p in problems:
         print(f"::error::{p}" if os.environ.get("GITHUB_ACTIONS") else p)
     if not problems:

@@ -165,6 +165,36 @@ def test_a_taken_version_is_found_under_a_variant_heading():
     assert check_pr.changelog_versions("## V1.2.3\n## 1.2.30\n## notes\n") == {(1, 2, 3), (1, 2, 30)}
 
 
+
+@pytest.mark.parametrize("heading", ["[0.4.6]", "[v0.4.6] - 2026-11-22", "0.4.6 - 2026-11-22", "0.4.6 (Nov 22, 2026)",
+                                     "0.4.6-rc1", "v0.4.6+build.7", "  ( 0.4.6 )  "])
+def test_a_taken_version_is_found_under_bracketed_dated_and_suffixed_headings(heading):
+    text = f"# Changelog\n\n## {heading}\n\n- a change\n\n## 0.4.5\n\n- a change\n"
+    assert check_pr.heading_version(heading) == (0, 4, 6)
+    assert check_pr.changelog_versions(text) == {(0, 4, 6), (0, 4, 5)}
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), text)}
+    notes = []
+    problems = check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.4.6", "0.4.5")), notes)
+    assert problems == ["cain 0.4.6 is taken: main's cain/CHANGELOG.md already has it. Step the version again."]
+    assert notes == []
+
+
+def test_a_heading_with_no_version_token_is_skipped_and_the_output_says_so():
+    text = "# Changelog\n\n## Unreleased\n\n- a change\n\n## 0.4.6.1\n\n## 0.4.5\n\n- a change\n"
+    assert check_pr.heading_version("Unreleased") is None
+    assert check_pr.heading_version("0.4.6.1") is None
+    assert check_pr.changelog_headings(text) == ({(0, 4, 5)}, ["Unreleased", "0.4.6.1"])
+    base = {"harness": state()["harness"], "cain": (cfg("0.4.5"), text)}
+    notes = []
+    assert check_pr.check_versions(["cain/run.sh"], base, state(cain=("0.4.6", "0.4.5")), notes) == []
+    assert notes == ['cain: main\'s CHANGELOG heading "## Unreleased" has no version token, so the taken-version rule skipped it.',
+                     'cain: main\'s CHANGELOG heading "## 0.4.6.1" has no version token, so the taken-version rule skipped it.']
+    # An App that keeps its version isn't asked, so nothing is said about its headings.
+    notes = []
+    assert check_pr.check_versions([], base, base, notes) == []
+    assert notes == []
+
+
 # -- versions fail closed ------------------------------------------------------------
 
 @pytest.mark.parametrize("text, why", [

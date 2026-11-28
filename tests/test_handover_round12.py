@@ -567,8 +567,12 @@ def test_cains_rules_keeper_and_docs_name_this_rounds_behaviour():
     assert "migrate-restore <schema> <build>" in keeper
     # Cain's side is the section that introduced the calendar specialist's restore, restart and clock
     # behaviour, Cain 0.17.0, found by its version heading (newer Cain sections need not repeat it).
+    # The heading must be there and the section non-empty before the word checks run on it.
+    cain_section = cain_changelog_section("0.17.0")
+    assert "\n## 0.17.0\n" in (ROOT / "cain" / "CHANGELOG.md").read_text()
+    assert cain_section.strip()
     for log in ((ROOT / "harness" / "CHANGELOG.md").read_text().split("\n## ", 2)[1],
-                cain_changelog_section("0.17.0")):
+                cain_section):
         assert "Unprotected" in log or "restore" in log.lower()
 
 
@@ -577,4 +581,6 @@ def cain_changelog_section(version):
     text = (ROOT / "cain" / "CHANGELOG.md").read_text()
     head = f"\n## {version}\n"
     assert head in text, f"Cain's CHANGELOG has no {version} section"
-    return text.split(head, 1)[1].split("\n## ", 1)[0]
+    section = text.split(head, 1)[1].split("\n## ", 1)[0]
+    assert section.strip(), f"Cain's CHANGELOG {version} section is empty"
+    return section
