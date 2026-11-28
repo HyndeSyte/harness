@@ -176,16 +176,21 @@ const noteRecord = (e: EnrollmentStore | undefined, r: Enrollment | undefined, l
 
 export interface Accepted { app: string; attempt: string; backup: string; from?: string; to?: string }
 export interface Claimed { attempt: string; claim: string; until: string }
+// (Cain 0.19.4) What a registration expects of each attempt it made, kept on the pass so a restart can pick it up again
+export interface Expect { attempt: string; app: string; from: string; to: string }
+type PassClaim = { repo: string; pr: number; head: string; exp: number };   // the token's claim, public data only (never the token)
 export type RegResult = { ok: true; accepted: Accepted[]; said: string[]; fp?: string } | { ok: false; said: string[]; cancel?: string };   // (Keeper 0.1.8) cancel: the enrollment refusal's why
 type Entry = { id: string; exp: number; state: "registering" | "accepted" | "claiming" | "refused" | "passed"; at: number; said?: string; accepted?: Accepted[];
-  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number };
+  apps?: number; attempts?: string[]; fp?: string; claims?: Claimed[]; claimingAt?: number;
+  claim?: PassClaim; expect?: Expect[]; resumedAt?: number; resumes?: number };   // (Cain 0.19.4) a pass a restart can resume
+type NoteUpd = { apps?: number; attempt?: string; expect?: Expect; fp?: string };
 export interface PassDeps {
   pub: () => string | null;                      // the link's public Ship key (base64 SPKI), as /data/trust/ship.pub holds it
   now: () => number;
   load: () => string | null;                     // the pass file's text (null: none yet)
   store: (text: string) => void;                 // writes it whole; throws on failure
   // the keeper registration, in the background; note(upd) keeps how many Apps and which attempts it made
-  register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: { apps?: number; attempt?: string }) => void) => void;
+  register: (token: string, claim: Claim, done: (r: RegResult) => void, note: (upd: NoteUpd) => void) => void;
   claim?: (a: Accepted, request: string) => Promise<{ status: number; body: any } | null>;   // (0.1.5) POST /attempt/<id>/claim (Keeper 0.1.7: with its request id)
   // (0.1.5) POST /attempt/<id>/cancel. Keeper 0.1.11: its answer judged when given: only a plain "ended" counts; anything else
   // (pending, refused, an error, no answer) is no success, logged, and the owner gets a card offering a retry (retry)
@@ -197,6 +202,12 @@ export interface PassDeps {
   enrollment?: EnrollmentStore;                                             // (0.1.5) the recorded enrollment
   waitMs?: number;                                                          // (Keeper 0.1.15) one App's wait for acceptance (acceptWaitMs)
   view?: (attempt: string) => Promise<{ status: number; body: any } | null>;   // (Keeper 0.1.15) GET /attempt/<id>, for the reconcile at start
+  // (Cain 0.19.4) the resume after a restart: the token signed again from its kept claim (Ed25519 is deterministic, so it is the
+  // same token), the line to Cain, and the poll's pause
+  sign?: (claim: Claim) => string | null;
+  relay?: (line: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  pollMs?: number;
   log: (line: string) => void;
 }
 export type PassAnswer = { status: "ok"; pr: number; head: string; accepted: Accepted[]; claims: Claimed[] } | { status: "pending" | "spent" | "refused"; said: string };
@@ -234,13 +245,15 @@ export function judgeCancel(d: PassDeps, attempt: string, r: { status: number; b
 
 // (0.1.5) What the registration made so far, kept on its entry: the number of watched Apps (the pass's
 // wait scales with it) and each attempt id (cancelled if the pass gives up).
-export function noteEntry(d: PassDeps, id: string, upd: { apps?: number; attempt?: string }): void {
+export function noteEntry(d: PassDeps, id: string, upd: NoteUpd): void {
   const spent = readEntries(d.load());
   const e = spent?.find((x) => x.id === id);
   if (!spent || !e) return;
   if (e.state !== "registering") { if (upd.attempt) cancelAll(d, [upd.attempt], "its pass had already ended"); return; }
   if (upd.apps !== undefined) e.apps = upd.apps;
   if (upd.attempt) e.attempts = [...(e.attempts ?? []), upd.attempt];
+  if (upd.fp) e.fp = upd.fp;                                    // (Cain 0.19.4) the fingerprint committed at the head
+  if (upd.expect) e.expect = [...(e.expect ?? []), upd.expect];  // (Cain 0.19.4) the attempt's App and versions
   try { writeEntries(d, spent); } catch { d.log("couldn't keep a keeper registration's progress"); }
 }
 
@@ -267,13 +280,91 @@ export function settle(d: PassDeps, id: string, r: RegResult): void {
 // passed is only read: each claimed attempt's state at Keeper, the Supervisor's install job Keeper tied to it included, is logged,
 // so the install the Ship run submitted (or its absence) is in the link's log before anything else happens. Nothing is installed or
 // claimed here. Answers how many passes it refused.
+//
+// (Cain 0.19.4) Except a pass the restart caught waiting for the keeper: Cain's backup is cold, so the keeper's own backup of him
+// stops and starts this App, and a pass left registering or accepted by that restart is resumed, not refused. Resumable only when
+// the pass kept everything its registration made (the token's claim, the committed fingerprint, each attempt's App and versions,
+// one per watched App), every attempt is a ship one (a drill is never resumed), the token still has CLAIM_START_MIN_MS left, the
+// token signed again from its claim is the same token, and it hasn't been resumed RESUME_MAX times. The resume polls the keeper
+// (GET /attempt/<id>) as the registration did and judges the answer the same way: accepted, unclaimed, for that App, versions and
+// enrollment. Anything else refuses the pass and cancels as before. Either way Cain is told: his session started again too.
+// A pass left claiming is still refused: a claim may have been sent.
+export const RESUME_MAX = 2;
+function resumable(d: PassDeps, e: Entry, now: number): { token: string } | { why: string } {
+  if (!d.view || !d.sign) return { why: "the link can't read the keeper or sign the token again" };
+  const ex = e.expect ?? [];
+  if (!e.claim || !e.fp || !ex.length) return { why: "the pass didn't keep what its registration made (a pass from before Cain 0.19.4, or one cut off before it registered)" };
+  if (e.apps !== ex.length) return { why: "not every watched install was registered before the restart" };
+  if ((e.attempts ?? []).some((a) => !ex.some((x) => x.attempt === a))) return { why: "an attempt it made has no record of its App and versions" };
+  if (ex.some((x) => !x.attempt.startsWith("ship-"))) return { why: "a drill isn't resumed after a restart" };
+  if ((e.resumes ?? 0) >= RESUME_MAX) return { why: `it was already resumed ${RESUME_MAX} times` };
+  if (e.claim.exp * 1000 - now < CLAIM_START_MIN_MS) return { why: "its Ship token has too little time left to start a run" };
+  let token: string | null = null;
+  try { token = d.sign({ v: 1, kind: "ship", ...e.claim }); } catch { token = null; }
+  if (!token || passId(token) !== e.id) return { why: "its Ship token couldn't be made again" };
+  return { token };
+}
+const pullUrl = (c: PassClaim) => `https://github.com/${c.repo}/pull/${c.pr}`;
+// (Cain 0.19.4) The resumed registration: each attempt polled at the keeper until it isn't pending or one App's wait has passed, then
+// settled as the registration would have been. Cain hears the outcome.
+export async function resumePass(d: PassDeps, id: string, token: string): Promise<void> {
+  const e0 = readEntries(d.load())?.find((x) => x.id === id);
+  if (!e0 || e0.state !== "registering" || !e0.claim || !e0.expect || !e0.fp) return;
+  const claim = e0.claim, fp = e0.fp;
+  const sleep = d.sleep ?? ((ms: number) => Bun.sleep(ms));
+  const pub = d.pub();
+  const linkFp = pub ? keyFingerprint(pub) : null;
+  const accepted: Accepted[] = [], said: string[] = [];
+  let cancel: string | undefined;
+  for (const x of e0.expect) {
+    const until = d.now() + (d.waitMs ?? ATTEMPT_WAIT_MS);
+    let last: { status: number; body: any } | null = null, j: any = {}, before: Enrollment | null = null;
+    for (;;) {
+      before = d.enrollment?.load() ?? null;
+      last = await d.view!(x.attempt).catch(() => null);
+      j = last?.body ?? {};
+      if (last?.status === 200 && j.status !== "pending") break;
+      if (d.now() >= until) break;
+      await sleep(d.pollMs ?? POLL_MS);
+    }
+    if (last?.status === 200 && j.status === "accepted" && j.id === x.attempt && j.app === x.app && j.from_version === x.from && j.to_version === x.to
+        && (j.kind === undefined || j.kind === "ship") && typeof j.backup === "string" && BACKUP_SLUG.test(j.backup)) {
+      const en = enrollmentCheckNow(j, fp, linkFp, before, d.enrollment);
+      if (en.record) noteRecord(d.enrollment, en.record, d.log);
+      if (!en.ok) { cancel ??= en.cancel; said.push(`the keeper accepted ${x.attempt}, but its enrollment is refused: ${en.why}`); continue; }
+      accepted.push({ app: x.app, attempt: x.attempt, backup: j.backup, from: x.from, to: x.to });
+      d.log(`the resumed pass: the keeper accepted ${x.attempt} ${x.app} ${x.from} to ${x.to}, backup ${j.backup}, unclaimed`);
+    } else said.push(!last ? `the keeper didn't answer for ${x.attempt}` : last.status === 200 && j.status === "pending" ? `the keeper didn't accept ${x.attempt} within ${(d.waitMs ?? ATTEMPT_WAIT_MS) / 60_000} minutes of the restart`
+      : `the keeper has ${x.attempt} as ${String(j.status ?? last.status).slice(0, 30)}, not accepted and unclaimed${j.why ? ` (${String(j.why).slice(0, 120)})` : ""}`);
+  }
+  settle(d, id, said.length ? { ok: false, said, ...(cancel ? { cancel } : {}) } : { ok: true, accepted, said: [], fp });
+  const e = readEntries(d.load())?.find((x) => x.id === id);
+  const what = `pull request ${pullUrl(claim)}, landed in main at ${claim.head}`;
+  if (e?.state === "accepted")
+    d.relay?.(`The App restarted while the Keeper backed it up before installing ${what}, and the Keeper has accepted that install since: his Ship tap still counts, nothing is installed yet. Start the same Ship run again now, its text: "Install ${what}. Ship token: ${token}." Nothing to tell him unless it isn't installed in the end.`);
+  else if (e?.state === "refused")
+    d.relay?.(`The App restarted while the Keeper backed it up before installing ${what}, and that install can't go on (${String(e.said ?? "").slice(0, 200)}). Nothing was installed: tell him in one line, then show a new Ship card for the same pull request and head.`);
+}
+
 export async function reconcilePasses(d: PassDeps): Promise<number> {
   const spent = readEntries(d.load());
   if (!spent) { d.log("the reconcile at start couldn't read the Ship passes: nothing was reconciled"); return 0; }
   const now = d.now();
   let refused = 0;
+  const resumed: { id: string; token: string }[] = [];
   for (const e of spent) {
     if (e.exp * 1000 <= now - 86_400_000) continue;
+    if (e.state === "registering" || e.state === "accepted") {
+      const r = resumable(d, e, now);
+      if ("token" in r) {
+        const was = e.state;
+        e.state = "registering"; delete e.accepted; delete e.said; e.resumedAt = now; e.resumes = (e.resumes ?? 0) + 1;
+        resumed.push({ id: e.id, token: r.token });
+        d.log(`the reconcile at start resumed a pass left ${was} by a restart (${(e.expect ?? []).map((x) => x.attempt).join(", ")}): waiting for the keeper's acceptance again, nothing installed yet`);
+        continue;
+      }
+      d.log(`the reconcile at start can't resume a pass left ${e.state} by a restart: ${r.why}`);
+    }
     if (e.state === "registering" || e.state === "accepted" || e.state === "claiming") {
       const ids = [...new Set([...(e.attempts ?? []), ...(e.accepted ?? []).map((a) => a.attempt)])];
       const was = e.state;
@@ -281,6 +372,7 @@ export async function reconcilePasses(d: PassDeps): Promise<number> {
       refused++;
       d.log(`the reconcile at start refused a pass left ${was} by a restart (${ids.join(", ") || "no attempt registered yet"}): nothing was installed`);
       if (ids.length) cancelAll(d, ids, "the link restarted before its Ship run started");
+      if (e.claim) d.relay?.(`The App restarted before the Ship run for pull request ${pullUrl(e.claim)} started, and the link couldn't pick it up again. Nothing was installed: tell him in one line, then show a new Ship card for the same pull request and head.`);
       continue;
     }
     if (e.state === "passed" && d.view) for (const k of e.claims ?? []) {
@@ -290,7 +382,16 @@ export async function reconcilePasses(d: PassDeps): Promise<number> {
         + (b.install_job ? `tied to the Supervisor's install job ${String(b.install_job).slice(0, 64)} made ${String(b.install_job_at ?? "?").slice(0, 30)}` : "no install job tied to it"));
     }
   }
-  if (refused) { try { writeEntries(d, spent); } catch { d.log("the reconcile at start couldn't record the refused passes: the hook's next ask refuses them on their wait"); } }
+  if (refused || resumed.length) {
+    try { writeEntries(d, spent); }
+    catch {
+      d.log("the reconcile at start couldn't record the refused or resumed passes: the hook's next ask refuses them on their wait");
+      for (const r of resumed) cancelAll(d, spent.find((x) => x.id === r.id)?.expect?.map((x) => x.attempt) ?? [], "the link restarted before its Ship run started");
+      return refused;
+    }
+  }
+  // (Cain 0.19.4) the resumed passes, polled after the passed ones were read
+  await Promise.all(resumed.map((r) => resumePass(d, r.id, r.token).catch((err) => d.log(`the resumed pass failed: ${String(err).slice(0, 80)}`))));
   return refused;
 }
 
@@ -333,7 +434,7 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   const again = "Nothing was installed; a new Ship card for the same pull request and head tries again";
   if (!e) {
     spent = spent.filter((x) => x.exp * 1000 > now - 86_400_000);
-    spent.push({ id, exp: c.claim.exp, state: "registering", at: now });
+    spent.push({ id, exp: c.claim.exp, state: "registering", at: now, claim: { repo: c.claim.repo, pr: c.claim.pr, head: c.claim.head, exp: c.claim.exp } });
     try { writeEntries(d, spent); }
     catch { return { status: "refused", said: "the link couldn't record the Ship token, so no Ship run starts: try again in a minute" }; }
     d.log(`registering the installs of ${where} with the keeper; the Ship run waits for its acceptance`);
@@ -358,7 +459,7 @@ export async function shipPass(d: PassDeps, body: any, depth = 0): Promise<PassA
   if (e.state === "refused") return { status: "refused", said: `${e.said ?? "the keeper didn't accept the install"}. ${again}` };
   if (e.state === "registering") {
     const wait = passWaitMs(e.apps ?? 1, d.waitMs);
-    if (now - e.at <= wait) return { status: "pending", said: PENDING_SAID };
+    if (now - Math.max(e.at, e.resumedAt ?? 0) <= wait) return { status: "pending", said: PENDING_SAID };   // (Cain 0.19.4) from a resume
     return refuseFor(`the keeper didn't accept every install within ${wait / 60_000} minutes`, e.attempts ?? []);
   }
   if (e.state === "claiming") {
@@ -413,7 +514,7 @@ export interface RegisterDeps {
   get?: (path: string) => Promise<{ status: number; body: any } | null>;    // (0.1.5) GET /attempt/<id>
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
-  note?: (upd: { apps?: number; attempt?: string }) => void;
+  note?: (upd: NoteUpd) => void;
   linkFp?: string | null;                                                 // the link's own Ship key's fingerprint
   enrollment?: EnrollmentStore;
   pollMs?: number; waitMs?: number;
@@ -449,6 +550,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
   const committed = fpFile && fpFile !== "missing" ? readFingerprintFile(fpFile.toString("utf8")) : "";
   if (!committed) { say(`${FINGERPRINT_FILE} at the head ${fpFile === null ? "couldn't be read" : "holds no fingerprint"} (the Build run when the link's Ship key is made writes it), so nothing was registered`); return { ok: false, said }; }
   if (d.linkFp && committed !== d.linkFp) { say(`${FINGERPRINT_FILE} at the head (${committed}) isn't the link's own Ship key (${d.linkFp}), so nothing was registered`); return { ok: false, said }; }
+  d.note?.({ fp: committed });                          // (Cain 0.19.4) kept for a resume after a restart
   // (Keeper 0.1.14) no registration removes a mark it doesn't own: a competing, retried or rejected one leaves an active mark be
   for (const b of watched) {
     const slug = APP_SLUGS[b.app];
@@ -481,7 +583,7 @@ export async function registerInstalls(d: RegisterDeps, token: string, c: Claim)
       continue;
     }
     const attempt = j.id;
-    d.note?.({ attempt });
+    d.note?.({ attempt, expect: { attempt, app: slug, from, to: b.version } });
     const until = now() + (d.waitMs ?? ATTEMPT_WAIT_MS);
     let last: { status: number; body: any } | null = null;
     let before: Enrollment | null = null;

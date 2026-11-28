@@ -202,7 +202,7 @@ describe("the registration with the keeper App (Keeper 0.1.5: register, then pol
     expect(k.posted).toEqual([{ token: TOKEN, app: "0fcc2575_cain", pr: 46, head: SHA, from_version: "0.18.0", to_version: "0.19.0", kind: "ship",
       probe_hash: createHash("sha256").update("// the probe\n").digest("hex").slice(0, 16) }]);
     expect(k.got).toEqual([`/attempt/${ACC.attempt}`, `/attempt/${ACC.attempt}`, `/attempt/${ACC.attempt}`]);
-    expect(k.notes).toEqual([{ apps: 1 }, { attempt: ACC.attempt }]);
+    expect(k.notes).toEqual([{ apps: 1 }, { fp: FPR }, { attempt: ACC.attempt, expect: { attempt: ACC.attempt, app: "0fcc2575_cain", from: "0.18.0", to: "0.19.0" } }]);   // Cain 0.19.4: what a resume needs
     expect(r).toEqual({ ok: true, accepted: [ACC], said: ["Cain 0.18.0 to 0.19.0 accepted as ship-46-cain-01234567, backup kb1"], fp: FPR });
     expect(k.enrolled).toEqual(REC);   // the owner's confirm seen
   });

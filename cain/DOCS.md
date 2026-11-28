@@ -640,6 +640,35 @@ bad one back from the backup taken just before it. Cain's part:
 - The two options: `keeper_url` (filled in) and `keeper_token`, the same token as the Keeper's
   `tokens` entry for Cain. Empty: no verdicts, and the rollback never reads as armed.
 
+### Since 0.19.4: an install of Cain survives the Keeper's own backup
+
+Cain's backup is cold (`backup: cold` in his `config.yaml`): Home Assistant stops him while it copies
+his folder, then starts him again. The Keeper makes that backup after the link has asked it to protect
+the install and before the Ship run starts, so every install of Cain restarts his link in the middle of
+its wait. Until 0.19.4 the link's check at its start refused any pass it found waiting and cancelled it
+at the Keeper, so no Ship tap could ever install Cain (Nov 27, pull request 72).
+
+Now the link resumes that pass instead:
+
+- When it asks the Keeper, the pass keeps on disk (root's `/data/trust/ship-passes.json`) what a resume
+  needs: the Ship tap's pull request, head and expiry (never the token itself), the key fingerprint
+  committed at the head, and each attempt's App and versions.
+- At its next start the link reads each such attempt at the Keeper (`GET /attempt/<id>`) for up to
+  `keeper_accept_min` minutes, and takes it only when the Keeper has it accepted and unclaimed, for that
+  App and those versions, with a good enrollment: the same checks as before the restart. The Ship run
+  then claims it as usual. The link signs the same token again from what it kept (the signature is
+  deterministic) and tells Cain, whose session also started fresh, the Ship run's text to start again.
+- Anything else refuses the pass and cancels it at the Keeper, as before, and Cain hears that nothing
+  was installed. A pass left mid claim, a drill, a pass from before 0.19.4, one cut off before every
+  App was registered, or one whose token has under 20 minutes left is never resumed; nor is one already
+  resumed twice.
+
+Why not the other ways: a hot backup (`backup: hot`) would copy Cain's folder while he writes to it
+(his passes, cards, record copy and session files), so the very backup the Keeper restores on a
+rollback could hold files cut off mid write, and Home Assistant offers no way for one backup to skip
+stopping a cold App. Keeping the backup cold and letting the link pick up its own wait changes nothing
+about what is backed up or what the Keeper checks.
+
 ## What 0.15.0 does: Cain stays on Discord
 
 On Nov 20 two drills found gaps: when the Discord plugin's server stopped, nothing started it again,

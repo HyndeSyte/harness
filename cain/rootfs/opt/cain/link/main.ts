@@ -464,9 +464,14 @@ const shipPassDeps: PassDeps = {
   // Keeper 0.1.15: the wait for Keeper's acceptance (keeper_accept_min), and its reads for the reconcile at start
   waitMs: ACCEPT_WAIT_MS,
   view: (attempt) => KEEPER_TOKEN ? keeperCall(KEEPER_BASE, KEEPER_TOKEN, `/attempt/${attempt}`) : Promise.resolve(null),
+  // Cain 0.19.4: a pass the keeper's own backup restart left waiting is resumed: its token signed again from the kept claim (the same
+  // token), and Cain told to start the same Ship run again (or why it can't go on), through the same durable queue as the Ship tap's line
+  sign: shipPriv ? (claim) => makeToken(claim, (data) => edSign(null, data, shipPriv)) : undefined,
+  relay: (text) => appendSynced(QUEUE, JSON.stringify({ text: text.replace(/[\r\n\t]+/g, " ").slice(0, 1000) }) + "\n"),
   log: (l) => console.log(`[cain] link: ${l}`),
 };
-// Keeper 0.1.15 items 3 and 6: a pass a crash or restart left open is refused and its attempts cancelled; a passed one is read
+// Keeper 0.1.15 items 3 and 6: a pass a crash or restart left open is refused and its attempts cancelled; a passed one is read.
+// Cain 0.19.4: one left waiting for the keeper (its own backup stops and starts this App) is resumed instead (ship-pass.ts)
 void reconcilePasses(shipPassDeps).catch((e) => console.log(`[cain] link: the reconcile at start failed: ${String(e).slice(0, 80)}`));
 const routeDeps = { link, toHarness, tz: process.env.CHECKIN_TZ, shipPass: (b: any) => shipPass(shipPassDeps, b) };
 const route = linkRoutes(routeDeps);
